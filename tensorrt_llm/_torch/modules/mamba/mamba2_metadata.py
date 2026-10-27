@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import contextlib
+import itertools
 import math
 from typing import NamedTuple, Optional, Tuple
 
@@ -352,6 +353,11 @@ class Mamba2Metadata:
     # inference from a stray shell export or a forked worker.
     _warmup_force_initial_states: bool = False
 
+    # Warmup-only knob, set via ``inforward_split_for_warmup``: ``prepare()``
+    # plans an in-forward snapshot split for the context requests, so warmup
+    # captures the CUDA graphs of the split GDN prefill core.
+    _warmup_inforward_split: bool = False
+
     # Set by a subclass whose prefill kernel compiles a separate variant
     # depending on whether every context length is a multiple of this value.
     # Warmup reads it to cover both variants.
@@ -366,6 +372,16 @@ class Mamba2Metadata:
             yield
         finally:
             cls._warmup_force_initial_states = prev
+
+    @classmethod
+    @contextlib.contextmanager
+    def inforward_split_for_warmup(cls):
+        prev = cls._warmup_inforward_split
+        cls._warmup_inforward_split = True
+        try:
+            yield
+        finally:
+            cls._warmup_inforward_split = prev
 
     def __init__(
         self,
@@ -422,8 +438,13 @@ class Mamba2Metadata:
                                            device="cuda")
         self._arange_buffer_long = self._arange_buffer.to(torch.long)
 
-        # In-forward Mamba snapshot split of this step (None: no split).
+        # In-forward Mamba snapshot split of this step (None: no split), and
+        # the buffer its index tensors live in at fixed field offsets, so they
+        # keep their addresses across steps (sized on the first split from the
+        # cache manager's staging capacity).
         self.inforward_split: Optional[InforwardSnapshotSplit] = None
+        self._inforward_split_buf: Optional[torch.Tensor] = None
+        self._inforward_split_offsets: list[int] = []
         self._cu_seqlens_long = torch.zeros(max_batch_size + 1,
                                             dtype=torch.long,
                                             device="cuda")
@@ -535,19 +556,50 @@ class Mamba2Metadata:
             raise RuntimeError(
                 f"In-forward Mamba snapshot: {k} requests / {num_tail_tokens} "
                 "tail tokens exceed the staging capacity")
+        if self._inforward_split_buf is None:
+            batch_cap = self.max_batch_size
+            capacity = (batch_cap + rows_cap + 1, batch_cap + rows_cap,
+                        batch_cap, batch_cap, rows_cap, rows_cap, tail_cap,
+                        rows_cap + 1, rows_cap, width * rows_cap)
+            self._inforward_split_offsets = [0, *itertools.accumulate(capacity)]
+            self._inforward_split_buf = torch.zeros(
+                self._inforward_split_offsets[-1],
+                dtype=torch.long,
+                device="cuda")
+        offsets = self._inforward_split_offsets
+        flat = [0] * offsets[-1]
+        for name, start in zip(_INFORWARD_SPLIT_FIELDS, offsets):
+            flat[start:start + len(vals[name])] = vals[name]
         # One upload through a fresh pinned tensor: no later host write can
         # race the copy.
-        flat = torch.tensor(
-            [v for name in _INFORWARD_SPLIT_FIELDS for v in vals[name]],
-            dtype=torch.long,
-            pin_memory=prefer_pinned()).to("cuda", non_blocking=True)
-        views = dict(
-            zip(
-                _INFORWARD_SPLIT_FIELDS,
-                flat.split(
-                    [len(vals[name]) for name in _INFORWARD_SPLIT_FIELDS])))
+        self._inforward_split_buf.copy_(torch.tensor(
+            flat, dtype=torch.long, pin_memory=prefer_pinned()),
+                                        non_blocking=True)
+        views = {
+            name: self._inforward_split_buf[start:start + len(vals[name])]
+            for name, start in zip(_INFORWARD_SPLIT_FIELDS, offsets)
+        }
         self.inforward_split = InforwardSnapshotSplit(
             k=k, num_tail_tokens=num_tail_tokens, **views)
+
+    @staticmethod
+    def _warmup_inforward_split_plan(attn_metadata: AttentionMetadata,
+                                     kv_cache_manager,
+                                     num_contexts: int) -> dict:
+        """Split each context request with room for the longest tail, up to the
+        staging rows (``inforward_split_for_warmup``)."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import \
+            InforwardSnapshotEntry
+        tail = kv_cache_manager.inforward_snapshot_max_tail
+        plan = {}
+        for rid, length in zip(attn_metadata.request_ids[:num_contexts],
+                               attn_metadata.seq_lens[:num_contexts].tolist()):
+            if (len(plan) < kv_cache_manager.inforward_snapshot_rows
+                    and length - tail
+                    >= kv_cache_manager.inforward_snapshot_min_main):
+                plan[rid] = InforwardSnapshotEntry(len(plan), length - tail,
+                                                   length - tail, tail)
+        return plan
 
     def prepare(self, attn_metadata: AttentionMetadata):
         batch_size = attn_metadata.seq_lens.shape[0]
@@ -685,6 +737,11 @@ class Mamba2Metadata:
 
         self.inforward_split = None
         plan = getattr(kv_cache_manager, "inforward_snapshot_plan", None)
+        if (Mamba2Metadata._warmup_inforward_split and num_contexts > 0
+                and request_ids is not None):
+            plan = self._warmup_inforward_split_plan(attn_metadata,
+                                                     kv_cache_manager,
+                                                     num_contexts)
         if (isinstance(plan, dict) and plan and num_contexts > 0
                 and request_ids is not None):
             self._prepare_inforward_split(attn_metadata, kv_cache_manager, plan,

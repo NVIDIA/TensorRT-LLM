@@ -238,7 +238,48 @@ def gdn_custom_op_inplace(
     )
 
 
-maybe_bcg_gdn_custom_op_inplace = eager_on_graph(gdn_custom_op_inplace)
+def _gdn_prefill_graph_key(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    layer_idx: str,
+    output: torch.Tensor,
+) -> Optional[tuple]:
+    attn_metadata, gdn_layer, _ = _extract_gdn_extra_attrs(layer_idx)
+    return gdn_layer.prefill_graph_key(attn_metadata)
+
+
+def _gdn_prefill_graph_body(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    layer_idx: str,
+    output: torch.Tensor,
+) -> None:
+    """The core of a context-only batch over all its padded rows, whose launches
+    depend only on its prefill graph key."""
+    attn_metadata, gdn_layer, spec_metadata = _extract_gdn_extra_attrs(layer_idx)
+    mamba_metadata = attn_metadata.mamba_metadata
+    # FlashInfer's chunked prefill lets a NaN / Inf row past the last sequence
+    # that shares a chunk with real tokens reach their outputs and final state.
+    padded = (
+        _cached_arange(mixed_qkv.shape[0], mixed_qkv.device)
+        >= mamba_metadata.query_start_loc[attn_metadata.num_contexts]
+    ).unsqueeze(-1)
+    for rows in (mixed_qkv, a, b):
+        rows.masked_fill_(padded, 0)
+    gdn_layer.forward_core(
+        mixed_qkv, a, b, attn_metadata, mamba_metadata, spec_metadata=spec_metadata, output=output
+    )
+
+
+# Under a breakable prefill CUDA graph the GDN core is an eager break; a
+# context-only batch's core replays as a CUDA graph per prefill graph key.
+maybe_bcg_gdn_custom_op_inplace = eager_on_graph(
+    gdn_custom_op_inplace,
+    graph_key=_gdn_prefill_graph_key,
+    graph_body=_gdn_prefill_graph_body,
+)
 
 
 def ensure_divisibility(numerator, denominator):
@@ -339,6 +380,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         config = model_config.pretrained_config
         self.model_config = model_config
         self.pretrained_config = config
+        # FlashInfer's chunked prefill reads the sequence boundaries on the
+        # device only; the Triton one plans its chunks on the host, so its core
+        # cannot replay as a CUDA graph (prefill_graph_key).
+        self.prefill_graphable = _use_flashinfer_gdn_prefill()
         replay_enabled = is_gdn_replay_enabled()
         if replay_enabled:
             logger.info_once(
@@ -1583,6 +1628,38 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
 
         return self._postprocess_gdn_output(attn_out, z, all_reduce_params)
+
+    def prefill_graph_key(self, attn_metadata: AttentionMetadata) -> Optional[tuple]:
+        """Key of the CUDA graph of this layer's core under a breakable prefill
+        graph, or None to run it eagerly.
+
+        Only context-only batches qualify. Besides the token inputs, the core's
+        launches depend on the request count and the in-forward snapshot
+        split's shape; the key also names the metadata and state buffers the
+        graph reads, so it never replays against moved ones.
+        """
+        num_contexts = attn_metadata.num_contexts
+        if (
+            not self.prefill_graphable
+            or num_contexts == 0
+            or attn_metadata.seq_lens.shape[0] != num_contexts
+        ):
+            return None
+        mamba_metadata = attn_metadata.mamba_metadata
+        layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
+        key = (
+            num_contexts,
+            mamba_metadata.query_start_loc.data_ptr(),
+            mamba_metadata.query_start_loc_long.data_ptr(),
+            mamba_metadata.state_indices.data_ptr(),
+            mamba_metadata.has_initial_states.data_ptr(),
+            layer_cache.conv.data_ptr(),
+            layer_cache.temporal.data_ptr(),
+        )
+        split = mamba_metadata.inforward_split
+        if split is not None:
+            key += (split.k, split.num_tail_tokens, split.cu.data_ptr())
+        return key
 
     def forward_core(
         self,

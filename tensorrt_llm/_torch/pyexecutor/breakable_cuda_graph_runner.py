@@ -41,6 +41,11 @@ class BreakableCUDAGraphRunner:
         self._captured_num_tokens: list[int] = []
         self._outputs: dict[int, torch.Tensor] = {}
         self._memory_pool = None
+        # Break graphs (see eager_on_graph) get a pool of their own: they are
+        # captured while a bucket graph replays, when its capture-time tensors
+        # hold live data in blocks that pool's allocator counts as free.
+        self._break_graph_pool = None
+        self._capturing_break_graphs = False
         self._capture_stream = torch.cuda.Stream()
         self._shared_output: Optional[torch.Tensor] = None
         self._state = BreakableCUDAGraphRunnerState.IDLE
@@ -72,6 +77,11 @@ class BreakableCUDAGraphRunner:
     def captured_num_tokens(self) -> list[int]:
         """Token buckets with a captured graph, in ascending order."""
         return self._captured_num_tokens
+
+    @property
+    def num_break_graphs(self) -> int:
+        """CUDA graphs captured for graphable breaks, over all buckets."""
+        return sum(graph.num_break_graphs for graph in self._graphs.values())
 
     def warmup(
         self,
@@ -220,10 +230,35 @@ class BreakableCUDAGraphRunner:
         finally:
             self.layer_model.forward = original_body_forward
 
+    def capture_break_graphs(
+        self, engine_forward: Callable[[], Any], scope_inputs: Any = None
+    ) -> None:
+        """Run a warmup engine forward whose bucket graph replay captures a CUDA
+        graph for every graphable break key it meets without one (see
+        eager_on_graph). Other replays only replay break graphs."""
+        if self._state != BreakableCUDAGraphRunnerState.IDLE:
+            raise RuntimeError(f"Cannot capture break graphs while runner is {self._state.value}")
+        if self._break_graph_pool is None:
+            self._break_graph_pool = torch.cuda.graph_pool_handle()
+        current_stream = torch.cuda.current_stream()
+        self._capture_stream.wait_stream(current_stream)
+        self._capturing_break_graphs = True
+        try:
+            with (
+                torch.cuda.stream(self._capture_stream),
+                discard_nccl_window_tensor_outputs(scope_inputs),
+            ):
+                engine_forward()
+        finally:
+            self._capturing_break_graphs = False
+        current_stream.wait_stream(self._capture_stream)
+
     def replay(self, num_tokens: int) -> torch.Tensor:
         if num_tokens not in self._graphs:
             raise KeyError(f"No BCG captured for num_tokens={num_tokens}")
-        self._graphs[num_tokens].replay()
+        self._graphs[num_tokens].replay(
+            self._break_graph_pool if self._capturing_break_graphs else None
+        )
         return self._outputs[num_tokens]
 
     def execute(self, num_tokens: int, outer_forward: Callable[[], Any]) -> Any:
@@ -262,3 +297,4 @@ class BreakableCUDAGraphRunner:
         self._outputs.clear()
         self._shared_output = None
         self._memory_pool = None
+        self._break_graph_pool = None

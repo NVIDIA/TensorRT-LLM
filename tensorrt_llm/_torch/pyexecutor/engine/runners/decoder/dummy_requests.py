@@ -110,8 +110,12 @@ class DummyRequestFactory:
         least_requests: bool = True,
         chunk_alignment: int | None = None,
         chunk_aligned: bool = False,
+        num_context_requests: int | None = None,
     ) -> ScheduledRequests | None:
         """Creates a generic dummy ScheduledRequests object for warmup.
+
+        ``num_context_requests``, when set, splits the context tokens evenly
+        over that many requests instead of following ``least_requests``.
 
         ``chunk_alignment``, when set, rewrites the context lengths onto one
         side of it, so a kernel specializing on chunk alignment can be primed
@@ -174,7 +178,16 @@ class DummyRequestFactory:
             return None
 
         if num_ctx_tokens > 0:
-            if least_requests:
+            if num_context_requests is not None:
+                if not 0 < num_context_requests <= min(num_ctx_tokens, max_context_requests):
+                    return None
+                base_length, remainder = divmod(num_ctx_tokens, num_context_requests)
+                ctx_token_nums = [base_length + 1] * remainder + [base_length] * (
+                    num_context_requests - remainder
+                )
+                if ctx_token_nums[0] > max_seq_len:
+                    return None
+            elif least_requests:
                 num_full_seqs, remainder = divmod(num_ctx_tokens, max_seq_len)
                 ctx_token_nums = [max_seq_len] * num_full_seqs
                 if remainder:

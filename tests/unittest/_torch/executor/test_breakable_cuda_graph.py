@@ -206,6 +206,61 @@ def test_break_graph_inserts_empty_breakpoint():
     torch.testing.assert_close(output, torch.full_like(output, 13))
 
 
+def test_graphed_break_captures_only_with_a_pool_and_replays_per_key():
+    calls = {"eager": 0, "body": 0}
+    keys = {"value": "a"}
+    scale = torch.ones(4, device="cuda")
+
+    def eager_scale(value):
+        calls["eager"] += 1
+        value.mul_(scale)
+
+    def body_scale(value):
+        calls["body"] += 1
+        value.mul_(scale)
+
+    scale_in_place = eager_on_graph(
+        eager_scale, graph_key=lambda value: keys["value"], graph_body=body_scale
+    )
+    x = torch.zeros(4, device="cuda")
+    output = torch.zeros_like(x)
+
+    def body():
+        value = x + 1
+        scale_in_place(value)
+        output.copy_(value + 1)
+
+    graph = _capture(body)
+    assert calls == {"eager": 1, "body": 0}
+
+    def replay(value, factor, pool=None):
+        x.fill_(value)
+        scale.fill_(factor)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            graph.replay(break_graph_pool=pool)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, torch.full_like(output, (value + 1) * factor + 1))
+
+    # Without a pool a key without a graph runs eagerly.
+    replay(1, 2)
+    assert calls == {"eager": 2, "body": 0} and graph.num_break_graphs == 0
+    # With one, the key's body runs once eagerly, then is captured.
+    replay(2, 3, torch.cuda.graph_pool_handle())
+    assert calls == {"eager": 2, "body": 2} and graph.num_break_graphs == 1
+    # Its graph replays the body; a new key or None runs eagerly.
+    replay(3, 4)
+    assert calls == {"eager": 2, "body": 2}
+    for key in ("b", None):
+        keys["value"] = key
+        replay(4, 5)
+    assert calls == {"eager": 4, "body": 2} and graph.num_break_graphs == 1
+    graph.reset()
+    assert graph.num_break_graphs == 0
+
+
 def test_output_writeback_for_tensor_dict_and_object():
     class Output:
         def __init__(self, tensor, label):
@@ -375,6 +430,48 @@ def test_runner_first_bucket_segments_share_one_memory_pool():
     assert graph.num_segments == 3
     assert runner._memory_pool is not None
     assert all(segment.pool() == runner._memory_pool for segment in graph._segments)
+
+
+def test_runner_captures_break_graphs_only_in_capture_break_graphs():
+    calls = {"eager": 0}
+
+    def eager_add_one(value):
+        calls["eager"] += 1
+        return value + 1
+
+    class GraphedBreakBody(nn.Module):
+        add_one = staticmethod(eager_on_graph(eager_add_one, graph_key=lambda value: 0))
+
+        def forward(self, value):
+            return self.add_one(value * 2) * 3
+
+    body = GraphedBreakBody().cuda()
+    runner = BreakableCUDAGraphRunner(body)
+    inputs = {"value": torch.zeros((8, 4), device="cuda")}
+
+    def engine_forward():
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(inputs["value"]))
+        if runner.has_graph(8):
+            return runner.execute(8, lambda: body(inputs["value"]))
+        return body(inputs["value"])
+
+    runner.capture(8, engine_forward)
+    eager_calls = calls["eager"]
+    runner.execute(8, lambda: body(inputs["value"]))
+    assert calls["eager"] == eager_calls + 1 and runner.num_break_graphs == 0
+
+    runner.capture_break_graphs(engine_forward)
+    assert runner.num_break_graphs == 1 and runner.state == BreakableCUDAGraphRunnerState.IDLE
+    eager_calls = calls["eager"]
+    inputs["value"].fill_(2)
+    result = runner.execute(8, lambda: body(inputs["value"]))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(result, torch.full((8, 4), 15.0, device="cuda"))
+    assert calls["eager"] == eager_calls
+
+    runner.clear()
+    assert runner.num_break_graphs == 0 and runner._break_graph_pool is None
 
 
 def test_runner_clear_releases_memory_pool_after_graph_reset(monkeypatch):
