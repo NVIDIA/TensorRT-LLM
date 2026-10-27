@@ -345,6 +345,22 @@ void initBindingsEarly(nb::module_& m)
     nb::class_<tr::BufferManager>(m, "BufferManager")
         .def(nb::init<tr::BufferManager::CudaStreamPtr, bool>(), nb::arg("stream"), nb::arg("trim_pool") = false,
             nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("stream", &tr::BufferManager::getStream);
+        .def_prop_ro("stream", &tr::BufferManager::getStream)
+        // These describe TensorRT-LLM's own per-device pool from
+        // createPrimaryDevicePool, not the CUDA default pool and not PyTorch's
+        // allocator, so they stay at zero on a PyTorch-path run that never
+        // allocates through a BufferManager.
+        //
+        // Reserved is what that pool holds from the driver; used is what has
+        // been handed out of it. Freeing drops used while reserved stays put,
+        // which is the point: the difference is memory the process still owns
+        // after the free was submitted.
+        //
+        // memory_pool_free is that difference, not an independent reading
+        // (bufferManager.cpp:267), so `reserved == used + free` holds by
+        // construction and is worthless as a consistency check.
+        .def_prop_ro("memory_pool_reserved", &tr::BufferManager::memoryPoolReserved)
+        .def_prop_ro("memory_pool_used", &tr::BufferManager::memoryPoolUsed)
+        .def_prop_ro("memory_pool_free", &tr::BufferManager::memoryPoolFree);
 }
 } // namespace tensorrt_llm::nanobind::runtime
