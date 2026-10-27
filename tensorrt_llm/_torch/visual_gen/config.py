@@ -635,13 +635,6 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             resolved_pipeline_config = dict(args.pipeline_config) if args else {}
         extra_attrs.update(resolved_pipeline_config)
 
-        fastvideo_inference_path = checkpoint_path / "fastvideo_inference.json"
-        if fastvideo_inference_path.exists():
-            with open(fastvideo_inference_path) as f:
-                fastvideo_inference = json.load(f)
-            if str(fastvideo_inference.get("schema_version", "")).startswith("fasth3-"):
-                extra_attrs["fastvideo_inference"] = fastvideo_inference
-
         model_index_path = checkpoint_path / "model_index.json"
         if not model_index_path.exists():
             model_index_path = checkpoint_path / "modular_model_index.json"

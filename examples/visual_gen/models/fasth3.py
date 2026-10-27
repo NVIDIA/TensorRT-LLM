@@ -32,7 +32,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--visual_gen_args",
-        default="configs/fasth3-bf16-1gpu.yaml",
+        default="configs/fasth3-bf16-trtllm-vsa-1gpu.yaml",
         help="Path to YAML config (same as trtllm-serve --visual_gen_args).",
     )
     parser.add_argument(
