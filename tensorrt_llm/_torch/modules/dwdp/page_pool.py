@@ -84,6 +84,7 @@ class PagePool:
         "_slot_pages",
         "_page_handles",
         "_released",
+        "_release_failed",
     )
 
     # Default pool page multiplier: each pool handle = 8 * granularity.
@@ -111,6 +112,7 @@ class PagePool:
                 ``DEFAULT_PAGE_SIZE_MULTIPLIER * granularity`` (16MB on GB200).
         """
         self._device_id = device_id
+        self._release_failed = 0
 
         if granularity is None:
             self._granularity = get_allocation_granularity(device_id)
@@ -212,15 +214,63 @@ class PagePool:
         return len(self._page_handles)
 
     def num_pages(self, slot: int) -> int:
-        """Get number of pages in a slot.
+        """Get the number of pages a slot is configured to hold.
+
+        This is a configuration value, not a measure of occupancy: it keeps
+        its value after :meth:`release` has handed every page back to the
+        driver. Use :meth:`held_pages` for what the pool currently holds.
 
         Args:
             slot: Double buffer slot (0 or 1).
 
         Returns:
-            Number of pages in the slot.
+            Number of pages the slot is configured for.
+        """
+        return self.configured_pages(slot)
+
+    def configured_pages(self, slot: int) -> int:
+        """Pages the slot is sized for, whether or not they are held.
+
+        Args:
+            slot: Double buffer slot (0 or 1).
+
+        Returns:
+            Configured page count; unchanged by :meth:`release`.
         """
         return self._slot_pages[slot]
+
+    def held_pages(self, slot: int) -> int:
+        """Pages whose handles the pool currently owns.
+
+        Drops to zero once :meth:`release` runs, which makes this the figure
+        to use for physical occupancy. ``configured_pages`` would still report
+        a full pool at that point.
+
+        A handle whose release raised is dropped from this count but added to
+        :attr:`release_failed`; the memory may well still be resident, so a
+        caller reporting occupancy must treat a non-zero ``release_failed`` as
+        "at least this much, exact amount unknown" rather than trusting the
+        zero.
+
+        Args:
+            slot: Double buffer slot (0 or 1).
+
+        Returns:
+            Number of page handles currently held.
+        """
+        if slot < 0 or slot >= len(self._page_handles):
+            raise IndexError(f"Invalid slot {slot}, must be in [0, {len(self._page_handles)})")
+        return len(self._page_handles[slot])
+
+    @property
+    def release_failed(self) -> int:
+        """Page handles whose release raised, summed over every slot.
+
+        ``release()`` logs and continues so that teardown cannot be derailed
+        by one bad handle. That leaves memory which is plausibly still mapped
+        but no longer tracked, so the count is kept rather than only logged.
+        """
+        return self._release_failed
 
     def slot_size(self, slot: int) -> int:
         """Get the size of a slot in bytes.
@@ -342,11 +392,20 @@ class PagePool:
                 try:
                     release_handle(handle)
                 except Exception as e:
+                    self._release_failed += 1
                     logger.warning(
                         f"[PagePool] Failed to release page {page_idx} in slot {slot_idx}: {e}"
                     )
 
-        self._page_handles = [[], []]
+        # One empty list per configured slot: num_slots reads this, so a
+        # fixed-length literal would misreport the slot count for any pool
+        # that is not double buffered.
+        self._page_handles = [[] for _ in self._slot_pages]
+        if self._release_failed:
+            logger.warning(
+                f"[PagePool] {self._release_failed} page handle(s) failed to "
+                "release; that memory may still be resident"
+            )
         logger.debug("[PagePool] Released all page handles")
 
     def __del__(self):
