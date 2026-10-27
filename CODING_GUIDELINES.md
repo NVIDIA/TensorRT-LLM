@@ -859,7 +859,7 @@ tells you to run `python scripts/legacy_utils.py gen-configs`.
 
 **Dependency chain** — after editing `legacy-files.txt`, two downstream artifacts must be updated:
 ```bash
-# After editing legacy-files.txt (manually or via --prune):
+# After editing legacy-files.txt (manually or via prune-files):
 
 # 1. Regenerate derived configs (ruff-legacy.toml, pyproject.toml blocks, pre-commit anchors)
 python scripts/legacy_utils.py gen-configs
@@ -868,10 +868,17 @@ python scripts/legacy_utils.py gen-configs
 python scripts/legacy_utils.py lint-update-violations
 ```
 
+**Renaming or moving a legacy file** — group membership is keyed by path. A legacy file that is
+renamed or moved without updating `legacy-files.txt` becomes a Group A file at its new path
+(unless that path is matched by `[tool.ruff] exclude` in `pyproject.toml`): starting with the rename
+commit itself, pre-commit runs `ruff-format` and the full ruff rule set on it. To keep it in
+Group B, replace the old path with the new one in `legacy-files.txt` in the same change, then run
+the dependency chain above.
+
 **Periodic housekeeping** — when files listed in `legacy-files.txt` are deleted or renamed by
-unrelated PRs, their entries become stale. This is not fatal and doesn't break anything — no hook
-matches a non-existent file — but the file list and violation snapshot can accumulate noise over
-time. The generate command warns about stale entries and suggests running `prune-files`:
+unrelated PRs, their entries become stale. A stale entry itself is not fatal — no hook matches a
+non-existent file — but the file list and violation snapshot can accumulate noise over time. The
+generate command warns about stale entries and suggests running `prune-files`:
 ```bash
 python scripts/legacy_utils.py prune-files          # cleans legacy-files.txt
 python scripts/legacy_utils.py gen-configs           # regenerate configs
