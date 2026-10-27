@@ -651,7 +651,7 @@ def mergeWaiveList(pipeline, globalVars)
                 'CPU-Generic-WaiveRefresh-Isolated-1',
             ]
             if (requestedStages && requestedStages.every { it in validationStages }) {
-                writeFile file: 'waives.txt', text: ''
+                sh ': > waives.txt'
                 writeFile file: "waives_TOT_initial_${env.gitlabCommit}.txt", text:
                     '# snapshot-time: 2026-10-27T02:52:27.045Z\n' +
                     '# target-branch-commit: simulated-old-baseline\n' +
