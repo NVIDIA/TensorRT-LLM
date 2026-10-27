@@ -834,8 +834,14 @@ class DecoderInputPreparer:
             spec_config,
             enable_spec_decode=enable_spec_decode,
         )
-        generation_mrope_positions = self._pack_generation_requests(
-            host, promoted_context_request_ids, new_tokens_device
+        batched_mrope_generation_updates: list[tuple[int, int, torch.Tensor]] | None = (
+            [] if host.use_mrope else None
+        )
+        self._pack_generation_requests(
+            host,
+            promoted_context_request_ids,
+            new_tokens_device,
+            batched_mrope_generation_updates=batched_mrope_generation_updates,
         )
 
         self._copy_token_ids_to_device(
@@ -848,7 +854,9 @@ class DecoderInputPreparer:
             attn_metadata=attn_metadata,
             enable_spec_decode=enable_spec_decode,
         )
-        self._copy_position_ids_to_device(host, generation_mrope_positions)
+        self._copy_position_ids_to_device(
+            host, batched_mrope_generation_updates=batched_mrope_generation_updates
+        )
 
         if enable_spec_decode:
             self._gather_ids_buffer.update(torch.tensor(host.lists.gather_ids, dtype=torch.int))
@@ -1513,9 +1521,10 @@ class DecoderInputPreparer:
         host: HostInputs,
         promoted_context_request_ids: frozenset[int],
         new_tokens_device: torch.Tensor | None,
-    ) -> list[tuple[int, int, torch.Tensor]]:
-        """Pack generation tokens and return deferred (row, base position, delta) updates."""
-        generation_mrope_positions = []
+        *,
+        batched_mrope_generation_updates: list[tuple[int, int, torch.Tensor]] | None = None,
+    ) -> None:
+        """Pack generation tokens, collecting (row, base, delta) updates when supplied."""
         generation_requests = host.lists.generation_requests
         draft_lens = host.lists.draft_lens
         sequence_lengths = host.lists.sequence_lengths
@@ -1677,7 +1686,8 @@ class DecoderInputPreparer:
                         # Batch deltas that need no device or dtype conversion.
                         mrope_position_buffer = self._buffers.mrope_position_ids_cuda
                         can_batch_mrope = (
-                            mrope_position_delta.numel() == 1
+                            batched_mrope_generation_updates is not None
+                            and mrope_position_delta.numel() == 1
                             and mrope_position_delta.device == mrope_position_buffer.device
                             and mrope_position_delta.dtype == mrope_position_buffer.dtype
                         )
@@ -1708,8 +1718,8 @@ class DecoderInputPreparer:
                         for beam in range(beam_width):
                             # Locate this beam's single token in the flat array.
                             token_start = len(position_ids) - beam_width + beam
-                            if can_batch_mrope:
-                                generation_mrope_positions.append(
+                            if can_batch_mrope and batched_mrope_generation_updates is not None:
+                                batched_mrope_generation_updates.append(
                                     (token_start, past_seen_token_num, mrope_position_delta)
                                 )
                             else:
@@ -1766,7 +1776,6 @@ class DecoderInputPreparer:
         host.has_any_multimodal_request = _has_any_multimodal_request
         if _n_gen > 0:
             host.beam_width = beam_width
-        return generation_mrope_positions
 
     def _copy_token_ids_to_device(
         self,
@@ -1962,7 +1971,8 @@ class DecoderInputPreparer:
     def _copy_position_ids_to_device(
         self,
         host: HostInputs,
-        generation_mrope_positions: Sequence[tuple[int, int, torch.Tensor]],
+        *,
+        batched_mrope_generation_updates: Sequence[tuple[int, int, torch.Tensor]] | None = None,
     ) -> None:
         total_num_tokens = host.total_num_tokens
         position_ids = apply_position_id_offset(host.lists.position_ids, model=self.model)
@@ -2005,8 +2015,8 @@ class DecoderInputPreparer:
                 self._buffers.mrope_position_ids_cuda[:, :, start_idx:end_idx].copy_(
                     segment[:, :, : end_idx - start_idx], non_blocking=True
                 )
-            if generation_mrope_positions:
-                rows, positions, deltas = zip(*generation_mrope_positions)
+            if batched_mrope_generation_updates:
+                rows, positions, deltas = zip(*batched_mrope_generation_updates)
                 indices_and_positions = torch.tensor(
                     (rows, positions), dtype=torch.long, pin_memory=prefer_pinned()
                 ).to(device=self._buffers.mrope_position_ids_cuda.device, non_blocking=True)

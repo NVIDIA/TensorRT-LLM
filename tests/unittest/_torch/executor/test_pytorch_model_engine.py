@@ -1933,14 +1933,22 @@ class DecoderForwardTestCase(unittest.TestCase):
                           context_prompt_lookahead=None)
         host.lists.generation_requests.extend(requests)
 
-        generation_mrope_positions = preparer._pack_generation_requests(
-            host, frozenset(), None)
+        batched_mrope_generation_updates: list[tuple[int, int,
+                                                     torch.Tensor]] = []
+        preparer._pack_generation_requests(
+            host,
+            frozenset(),
+            None,
+            batched_mrope_generation_updates=batched_mrope_generation_updates)
         host.total_num_tokens = len(host.lists.position_ids)
-        preparer._copy_position_ids_to_device(host, generation_mrope_positions)
+        preparer._copy_position_ids_to_device(
+            host,
+            batched_mrope_generation_updates=batched_mrope_generation_updates)
 
         # Both deltas take the batched scalar path, one row per beam.
-        self.assertEqual([row for row, _, _ in generation_mrope_positions],
-                         [0, 1, 2, 3])
+        self.assertEqual(
+            [row for row, _, _ in batched_mrope_generation_updates],
+            [0, 1, 2, 3])
         self.assertEqual(host.lists.mrope_position_ids, [])
         # Without a previous tensor the past length is num_tokens - 1.
         expected_row = [
@@ -1994,14 +2002,22 @@ class DecoderForwardTestCase(unittest.TestCase):
                               extra_inputs=preparer._new_extra_inputs(),
                               context_prompt_lookahead=None)
             host.lists.generation_requests.extend(requests)
-            generation_mrope_positions = preparer._pack_generation_requests(
-                host, frozenset(), None)
+            batched_mrope_generation_updates: list[tuple[int, int,
+                                                         torch.Tensor]] = []
+            preparer._pack_generation_requests(
+                host,
+                frozenset(),
+                None,
+                batched_mrope_generation_updates=batched_mrope_generation_updates
+            )
             host.total_num_tokens = len(host.lists.position_ids)
             preparer._buffers.mrope_position_ids_cuda.fill_(sentinel)
-            preparer._copy_position_ids_to_device(host,
-                                                  generation_mrope_positions)
+            preparer._copy_position_ids_to_device(
+                host,
+                batched_mrope_generation_updates=batched_mrope_generation_updates
+            )
             positions = preparer._buffers.mrope_position_ids_cuda.clone()
-            return host, generation_mrope_positions, positions
+            return host, batched_mrope_generation_updates, positions
 
         mixed_host, mixed_updates, mixed = run((torch.int32, torch.int64))
         _, fallback_updates, fallback = run((torch.int64, torch.int64))
