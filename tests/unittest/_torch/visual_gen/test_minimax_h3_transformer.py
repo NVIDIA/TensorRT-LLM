@@ -219,10 +219,9 @@ def test_adaln_modulation_keeps_dynamic_fp8_input_high_precision() -> None:
 @pytest.mark.parametrize(
     ("quant_algo", "dynamic_weight_quant"),
     [
-        (QuantAlgo.FP8, False),
         (QuantAlgo.FP8_BLOCK_SCALES, False),
-        (QuantAlgo.NVFP4, False),
         (QuantAlgo.W4A8_AWQ, True),
+        (QuantAlgo.W4A8_AWQ, False),
     ],
 )
 def test_transformer_rejects_unvalidated_quantization_modes(
@@ -263,6 +262,54 @@ def test_transformer_accepts_dynamic_nvfp4_configuration() -> None:
 
     assert model.model_config.quant_config.quant_algo == QuantAlgo.NVFP4
     assert model.model_config.dynamic_weight_quant
+
+
+_H3_MEDIA_PROJECTIONS = ("proj_in", "audio_proj_in", "proj_out", "audio_proj_out")
+
+
+def _make_prequantized_nvfp4_model_config(**overrides: object) -> DiffusionModelConfig:
+    """A ModelOpt NVFP4 export: static weights and activation scales, media projections excluded."""
+    return _make_model_config(
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4, exclude_modules=list(_H3_MEDIA_PROJECTIONS)
+        ),
+        dynamic_weight_quant=False,
+        force_dynamic_quantization=False,
+        **(_NVFP4_SHAPES | overrides),
+    )
+
+
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8])
+def test_transformer_accepts_prequantized_checkpoint_config(quant_algo: QuantAlgo) -> None:
+    """ModelOpt NVFP4 and per-tensor FP8 exports: static weights and activation scales."""
+    model = h3.MiniMaxH3Transformer3DModel(
+        _make_prequantized_nvfp4_model_config(
+            quant_config=QuantConfig(
+                quant_algo=quant_algo, exclude_modules=list(_H3_MEDIA_PROJECTIONS)
+            )
+        )
+    )
+
+    assert model.transformer_blocks is not None
+    for name in _H3_MEDIA_PROJECTIONS:
+        assert not getattr(model, name).has_any_quant
+
+
+def test_media_projection_input_dtype_follows_each_projection() -> None:
+    """Excluded projections keep FP32 inputs; quantized ones get the model dtype."""
+    hidden_states = torch.zeros(1, 2, 16, dtype=torch.float32)
+
+    static_model = h3.MiniMaxH3Transformer3DModel(_make_prequantized_nvfp4_model_config())
+    for name in _H3_MEDIA_PROJECTIONS:
+        projection = getattr(static_model, name)
+        assert static_model._projection_input(projection, hidden_states).dtype == torch.float32
+
+    dynamic_model = h3.MiniMaxH3Transformer3DModel(_make_dynamic_nvfp4_model_config())
+    for name in _H3_MEDIA_PROJECTIONS:
+        projection = getattr(dynamic_model, name)
+        cast = dynamic_model._projection_input(projection, hidden_states)
+        assert cast.dtype == dynamic_model._model_dtype
+        assert cast.dtype != torch.float32
 
 
 def test_post_load_quantizes_nvfp4_projections_like_fp8() -> None:
@@ -1077,6 +1124,59 @@ def test_diffusers_swiglu_weight_is_reordered_from_up_gate_to_gate_up() -> None:
     torch.testing.assert_close(remapped["transformer_blocks.0.ff.gate.weight"], gate)
     torch.testing.assert_close(remapped["transformer_blocks.0.ff.up.weight"], up)
     torch.testing.assert_close(remapped["transformer_blocks.0.ff.down_proj.weight"], down)
+
+
+def test_prequantized_swiglu_splits_rows_and_shares_input_side_tensors() -> None:
+    """ModelOpt NVFP4 exports carry one scale set for the fused ``[up, gate]``."""
+    n, k = 4, 32
+    up_rows = torch.arange(n * k // 2, dtype=torch.uint8).reshape(n, k // 2)
+    gate_rows = up_rows + 100
+    weight = torch.cat((up_rows, gate_rows))
+    weight_scale = torch.arange(2 * n * (k // 16), dtype=torch.float32).reshape(2 * n, k // 16)
+    weight_scale_2 = torch.tensor(0.5)
+    input_scale = torch.tensor(2.0)
+    pre_quant_scale = torch.arange(k, dtype=torch.float32)
+    prefix = "transformer_blocks.0.ff.net.0.proj."
+    remapped = h3.MiniMaxH3Transformer3DModel._remap_feed_forward_weights(
+        {
+            prefix + "weight": weight,
+            prefix + "weight_scale": weight_scale,
+            prefix + "weight_scale_2": weight_scale_2,
+            prefix + "input_scale": input_scale,
+            prefix + "pre_quant_scale": pre_quant_scale,
+        }
+    )
+
+    for half, rows in (("up", slice(0, n)), ("gate", slice(n, 2 * n))):
+        base = f"transformer_blocks.0.ff.{half}."
+        torch.testing.assert_close(remapped[base + "weight"], weight[rows])
+        torch.testing.assert_close(remapped[base + "weight_scale"], weight_scale[rows])
+        # Per-tensor and input-side tensors are shared, not halved.
+        assert remapped[base + "weight_scale_2"] is weight_scale_2
+        assert remapped[base + "input_scale"] is input_scale
+        assert remapped[base + "pre_quant_scale"] is pre_quant_scale
+
+
+def test_prequantized_fp8_swiglu_shares_scalar_weight_scale() -> None:
+    """Per-tensor FP8 exports store ``weight_scale`` as a scalar: shared, not split."""
+    n, k = 4, 32
+    weight = torch.zeros(2 * n, k, dtype=torch.float8_e4m3fn)
+    weight_scale = torch.tensor(0.03)
+    input_scale = torch.tensor(2.0)
+    prefix = "transformer_blocks.0.ff.net.0.proj."
+    remapped = h3.MiniMaxH3Transformer3DModel._remap_feed_forward_weights(
+        {
+            prefix + "weight": weight,
+            prefix + "weight_scale": weight_scale,
+            prefix + "input_scale": input_scale,
+        }
+    )
+
+    for half in ("up", "gate"):
+        base = f"transformer_blocks.0.ff.{half}."
+        assert remapped[base + "weight"].shape == (n, k)
+        assert remapped[base + "weight_scale"] is weight_scale
+        assert remapped[base + "input_scale"] is input_scale
 
 
 def test_weight_loader_reports_missing_linear_biases(
