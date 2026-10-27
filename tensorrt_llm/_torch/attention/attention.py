@@ -626,8 +626,11 @@ class Attention(nn.Module):
         total_kv_heads = self.num_key_value_heads
         self.num_key_value_heads = (self.num_key_value_heads + tp_size -
                                     1) // tp_size
+        # Not with Helix CP: its backend call takes no KV-append plan, so a
+        # folded prologue would leave the projection un-normalized.
         self.use_gqa_decode_fmha = (use_gqa_decode_fmha
-                                    and config.attn_backend == "TRTLLM")
+                                    and config.attn_backend == "TRTLLM"
+                                    and not self.mapping.has_cp_helix())
         gqa_decode = None
         if self.use_gqa_decode_fmha:
             # Consecutive TP ranks that hold the same KV head may split its pages in generation.
