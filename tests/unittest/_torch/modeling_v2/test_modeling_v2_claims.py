@@ -243,12 +243,23 @@ def test_every_target_has_the_accuracy_gate_of_its_name():
     )
 
 
+# Unit tests that need hardware no CI stage provides, by path under
+# `unittest/`, with what they wait for. They are the only tests no list may
+# reach, and none of them may be listed.
+_NO_CI_STAGE = {
+    "unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/comm": (
+        "4 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
+}
+
+
 def test_every_unit_test_is_in_a_test_list():
     """The modeling_v2 unit tests are listed per file or per family directory.
 
     Lists that name files do not pick up a new file by themselves, and a test
     no list reaches never runs in CI. The other way round, an entry naming a
     path with no test at it fails its CI stage: pytest finds nothing to run.
+    A test under `_NO_CI_STAGE` is exempt until a stage can run it.
     """
     listed = set()
     for path in (_TESTS_ROOT / "integration/test_lists/test-db").glob("*.yml"):
@@ -262,9 +273,19 @@ def test_every_unit_test_is_in_a_test_list():
     for test in sorted(unit_root.rglob("test_*.py")):
         rel = test.relative_to(_TESTS_ROOT / "unittest")
         candidates = {f"unittest/{p.as_posix()}" for p in (rel, *rel.parents)}
-        if not candidates & listed:
+        if not candidates & (listed | _NO_CI_STAGE.keys()):
             unlisted.append(rel.as_posix())
     assert not unlisted, f"unit tests no test-db list reaches: {unlisted}"
+
+    # An exemption outlives its reason once its tests move, vanish, or a list
+    # starts running them.
+    stale = sorted(
+        path
+        for path in _NO_CI_STAGE
+        if not any((_TESTS_ROOT / path).rglob("test_*.py"))
+        or any(e == path or e.startswith(f"{path}/") for e in listed)
+    )
+    assert not stale, f"_NO_CI_STAGE entries with no test or now listed: {stale}"
 
     # A directory left behind with only `__pycache__` in it exists on disk but
     # holds no test, so require a test file at or under each entry.
