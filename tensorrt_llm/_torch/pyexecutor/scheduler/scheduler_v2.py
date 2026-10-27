@@ -47,6 +47,14 @@ class ScheduleAction(enum.Enum):
     STOP = "stop"  # stop the scheduling loop
 
 
+class SeparatedBatchKind(enum.Enum):
+    """Composition of the batch one scheduling pass produced."""
+
+    PREFILL_ONLY = "prefill_only"  # context work, no generation requests
+    DECODE_ONLY = "decode_only"  # generation requests, no context work
+    MIXED = "mixed"  # both, or neither
+
+
 class _RecomputePauseState:
     """Candidate frontier and exact victims for one scheduling iteration."""
 
@@ -170,8 +178,25 @@ class KVCacheV2Scheduler(RequestScheduler):
         cross_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for enc-dec cross-attn
         enable_prefix_aware_scheduling: bool = True,
         enable_recompute_pause: bool = True,
+        separate_prefill_and_decode: bool = False,
+        separate_min_context_tokens: int = 1,
+        separation_coordinated: bool = False,
     ) -> None:
         self.remote_tail_phase: RemoteTailPhase | None = None
+        # When both context and generation work are pending, alternate a
+        # context-only pass with a generation-only pass instead of mixing them.
+        # A mixed batch runs eagerly, so its generation rows lose their CUDA
+        # graph, and their tokens share max_num_tokens with the context chunk,
+        # which splits a prompt that would otherwise fit one pass. Generation
+        # requests wait at most one pass, which is no longer than the eager
+        # mixed pass they would otherwise ride in. A coordinated scheduler
+        # (attention DP) runs the kind its executor sets for each pass.
+        self.separate_prefill_and_decode = separate_prefill_and_decode
+        self.separate_min_context_tokens = max(1, separate_min_context_tokens)
+        self.separation_coordinated = separate_prefill_and_decode and separation_coordinated
+        self._coordinated_batch_kind: Optional[SeparatedBatchKind] = None
+        self._last_batch_kind = SeparatedBatchKind.MIXED
+        self._deferred_generation: RequestList = []
         self._remote_tail_context_ids: frozenset[int] = frozenset()
         self._remote_tail_generation_ids: frozenset[int] = frozenset()
         self.max_num_tokens = max_num_tokens
@@ -232,7 +257,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"draft_mgr={draft_mgr_name}, cross_mgr={cross_mgr_name}, "
             f"enable_prefix_aware_scheduling={enable_prefix_aware_scheduling}, "
             f"prefix_skip_enabled={self._prefix_skip_enabled}, "
-            f"enable_recompute_pause={enable_recompute_pause}"
+            f"enable_recompute_pause={enable_recompute_pause}, "
+            f"separate_prefill_and_decode={separate_prefill_and_decode}"
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
@@ -340,7 +366,39 @@ class KVCacheV2Scheduler(RequestScheduler):
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
+        separated_kind = self._select_separated_batch_kind(active_requests, inflight_request_ids)
         # Main scheduling loop
+        result = self._schedule_loop(
+            active_requests, inflight_request_ids, separated_kind=separated_kind
+        )
+        if separated_kind is not None:
+            # A separated pass that admitted nothing of its own kind (no KV room
+            # for the context, or no generation request fits) falls back to an
+            # ordinary mixed pass, so the iteration still makes progress. Only
+            # a pass without evictions or pauses is redone: those must reach the
+            # executor, and such a pass is progress on its own. A coordinated
+            # rank instead sits the pass out: running its other kind of work
+            # would put an eager forward on every rank.
+            scheduled_ctx, scheduled_gen, evicted, recompute_paused = result[1:5]
+            admitted = (
+                scheduled_ctx
+                if separated_kind is SeparatedBatchKind.PREFILL_ONLY
+                else scheduled_gen
+            )
+            if (
+                not admitted
+                and not evicted
+                and not recompute_paused
+                and not self.separation_coordinated
+            ):
+                result = self._schedule_loop(active_requests, inflight_request_ids)
+            else:
+                # The executor harvests a deferred request's previous sample into
+                # its host tokens during this iteration, so its next pass must
+                # read those tokens instead of the one-step-behind overlap tensor.
+                for req in self._deferred_generation:
+                    self._clear_request_runtime_state(req)
+        self._deferred_generation = []
         (
             scheduled_encoder,
             scheduled_ctx,
@@ -349,7 +407,13 @@ class KVCacheV2Scheduler(RequestScheduler):
             recompute_paused,
             disagg_candidates,
             has_chunking,
-        ) = self._schedule_loop(active_requests, inflight_request_ids)
+        ) = result
+        if scheduled_ctx and not scheduled_gen:
+            self._last_batch_kind = SeparatedBatchKind.PREFILL_ONLY
+        elif scheduled_gen and not scheduled_ctx:
+            self._last_batch_kind = SeparatedBatchKind.DECODE_ONLY
+        else:
+            self._last_batch_kind = SeparatedBatchKind.MIXED
 
         # Sort by LoRA task ID
         scheduled_encoder.sort(key=_get_lora_task_id)
@@ -364,6 +428,77 @@ class KVCacheV2Scheduler(RequestScheduler):
             fitting_disagg_gen_init_requests=disagg_candidates,
             num_fitting_requests=(len(scheduled_encoder) + len(scheduled_ctx) + len(scheduled_gen)),
         )
+
+    def pending_separable_work(
+        self, active_requests: RequestList, inflight_request_ids: set[int]
+    ) -> tuple[bool, int]:
+        """Summarize the work a separated pass would choose between.
+
+        Returns ``(has_context, num_generation)``: whether schedulable context
+        work of at least ``separate_min_context_tokens`` is pending, and how many
+        generation requests are schedulable. Both are ``False``/``0`` when
+        separation cannot apply to this pass at all.
+        """
+        if (
+            not self.separate_prefill_and_decode
+            or self.remote_tail_phase is not None
+            # Generation requests hold their adapters through a skipped pass,
+            # which the PEFT page budget below does not account for.
+            or self.peft_cache_manager is not None
+        ):
+            return False, 0
+        num_generation = 0
+        context_tokens = 0
+        for req in active_requests:
+            # An attention-DP pad dummy is no work of either kind.
+            if req.request_id in inflight_request_ids or req.is_attention_dp_dummy is True:
+                continue
+            state_value = req.state_value
+            if state_value == self._context_init_state_value:
+                if getattr(req, "py_csa2_remote_tail_mode", None) is not None:
+                    return False, 0
+                context_tokens += req.context_remaining_length
+            elif (
+                self._no_schedule_until_state_value
+                <= state_value
+                < self._no_schedule_after_state_value
+                and state_value != self._encoder_init_state_value
+                and state_value != self._disagg_gen_init_state_value
+            ):
+                num_generation += 1
+        return context_tokens >= self.separate_min_context_tokens, num_generation
+
+    def set_coordinated_batch_kind(self, kind: Optional[SeparatedBatchKind]) -> None:
+        """Set the kind of the next pass when separation is coordinated across ranks.
+
+        Attention-DP ranks agree on one kind per iteration, so that every
+        rank's generation rows stay in the CUDA graph of a generation-only
+        forward; the executor decides it and hands it in before scheduling.
+        """
+        self._coordinated_batch_kind = kind
+
+    def _select_separated_batch_kind(
+        self, active_requests: RequestList, inflight_request_ids: set[int]
+    ) -> Optional[SeparatedBatchKind]:
+        """Pick the kind of this pass when context and generation work are separated.
+
+        Returns ``None`` for an ordinary pass: separation is off, the pass has
+        only one kind of work, or the pending context is shorter than
+        ``separate_min_context_tokens``. Otherwise alternates, starting with
+        context so a new prompt is not held behind a generation step. A
+        coordinated scheduler takes the kind its executor set instead.
+        """
+        if self.separation_coordinated:
+            kind, self._coordinated_batch_kind = self._coordinated_batch_kind, None
+            return kind
+        has_context, num_generation = self.pending_separable_work(
+            active_requests, inflight_request_ids
+        )
+        if not has_context or num_generation == 0:
+            return None
+        if self._last_batch_kind is SeparatedBatchKind.PREFILL_ONLY:
+            return SeparatedBatchKind.DECODE_ONLY
+        return SeparatedBatchKind.PREFILL_ONLY
 
     def set_remote_tail_phase(
         self,
@@ -411,7 +546,12 @@ class KVCacheV2Scheduler(RequestScheduler):
     # ---- Main scheduling loop ----
 
     def _schedule_loop(
-        self, active_requests, inflight_request_ids, *, defer_remote_tail_context=False
+        self,
+        active_requests,
+        inflight_request_ids,
+        *,
+        defer_remote_tail_context=False,
+        separated_kind: Optional[SeparatedBatchKind] = None,
     ):
         scheduled_ctx: RequestList = []
         scheduled_remote_mode = None
@@ -459,6 +599,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         req_it_end = len(requests_list)
         recompute_pause_state = _RecomputePauseState(req_it_end)
         req_it = 0
+        # Generation requests a prefill-only pass leaves for the next pass.
+        deferred_generation: RequestList = []
+        deferred_generation_ids: set[int] = set()
+        self._deferred_generation = deferred_generation
 
         # Context requests are always deferred to a second phase so that
         # generation requests are fully accounted for in the budget before
@@ -558,6 +702,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                     self._clear_request_runtime_state(req)
                     req_it += 1
                     continue
+                if separated_kind is SeparatedBatchKind.PREFILL_ONLY:
+                    # Runs in the next, generation-only pass.
+                    deferred_generation.append(req)
+                    deferred_generation_ids.add(req.py_request_id)
+                    req_it += 1
+                    continue
                 peft_pages = budget.peft_pages_needed(req)
                 if peft_pages is None:
                     break
@@ -606,6 +756,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             """
             protected = {r.py_request_id for r in scheduled_gen}
             protected.update(r.py_request_id for r in scheduled_ctx)
+            # A prefill-only pass must not preempt the decoders it deferred.
+            protected.update(deferred_generation_ids)
             protected.add(req.py_request_id)
             # Demotion reorders compute, not page priority: a demoted request
             # that arrived before `req` would have been scheduled, and so
@@ -638,6 +790,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         # iteration as a stall even though the contributor is running. Deferring
         # is itself the progress in that case.
         deferred_behind_contributor = False
+        # A separated pass that deliberately leaves the other kind of work for
+        # the next pass is not a scheduling stall either.
+        deferred_context = False
 
         # After any reordering: pre-grown requests go first so no other request
         # takes the budget their replay needs (stable sort).
@@ -653,6 +808,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         for req in pending_ctx:
             if budget.requests_full:
                 break
+            if (
+                separated_kind is SeparatedBatchKind.DECODE_ONLY
+                and req.state_value == self._context_init_state_value
+            ):
+                deferred_context = True
+                continue
             # A radix probe cannot affect admission once the chunk token budget
             # is exhausted. Keep scanning: an encoder request may still fit.
             if (
@@ -743,6 +904,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             or evicted
             or recompute_paused
             or deferred_behind_contributor
+            or deferred_context
+            or bool(deferred_generation_ids)
         )
         if (
             self.remote_tail_phase is None
