@@ -47,7 +47,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     PyResult,
     SamplingConfig,
 )
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     EncoderStepResult,
@@ -157,7 +157,7 @@ def test_forward_step_carries_context_logits_request_to_runner(request_flags, ex
     runner.forward.side_effect = lambda inputs, **kwargs: {
         "logits": logits if inputs.gather_context_logits else logits[2::3]
     }
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._runner = runner
     engine._warmup_depth = 0
     engine.route_capture = None
@@ -985,7 +985,7 @@ def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8
         ),
         encoder_max_batch_size=encoder_max_batch_size,
     )
-    executor.model_engine = object.__new__(PyTorchModelEngine)
+    executor.model_engine = object.__new__(ModelEngine)
     executor.model_engine._cleanup_done = True
     executor.model_engine._runner = _encoder_decoder_runner(batch_sizes, pad_to_limit=True)
     executor.batch_wait_timeout_iters = 48
@@ -1008,7 +1008,7 @@ def _make_feature_encoder_batch_wait_executor(
         encoder_cuda_graph_config=EncodeCudaGraphConfig(enable_padding=True),
         encoder_max_batch_size=encoder_max_batch_size,
     )
-    executor.model_engine = object.__new__(PyTorchModelEngine)
+    executor.model_engine = object.__new__(ModelEngine)
     executor.model_engine._cleanup_done = True
     executor.model_engine._runner = _encoder_decoder_runner(
         runner_batch_sizes if runner_enabled else (), pad_to_limit=False
@@ -1025,7 +1025,7 @@ def _make_encoder_fallback_batch_wait_executor():
         encoder_cuda_graph_config=None,
         encoder_max_batch_size=None,
     )
-    executor.model_engine = object.__new__(PyTorchModelEngine)
+    executor.model_engine = object.__new__(ModelEngine)
     executor.model_engine._cleanup_done = True
     executor.model_engine._runner = None
     executor.batch_wait_timeout_iters = 48

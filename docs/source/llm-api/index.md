@@ -139,7 +139,7 @@ The `py_executor` property contains the timed scopes in `create_py_executor()`, 
 | `worker_start_seconds` | Start the final PyExecutor worker. |
 | `total_py_executor_creation_seconds` | Total time for the `create_py_executor()` call, including all applicable scopes above. |
 
-The two model-engine properties contain times for various `PyTorchModelEngine` warmup stages.
+The two model-engine properties contain times for various `ModelEngine` warmup stages.
 `initial_model_engine` measures the timings for the initial model engine creation as part of the
 `py_executor.initial_py_executor_creation_seconds_for_kv_cache_estimation` timing.
 Likewise, `final_model_engine` measures the timings for the final model engine creation as part of

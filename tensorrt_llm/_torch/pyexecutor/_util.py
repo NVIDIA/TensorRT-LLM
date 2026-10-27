@@ -73,7 +73,7 @@ from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager,
                                            use_py_mamba_cache_manager)
 from .llm_request import ExecutorResponse, LlmRequestState
-from .model_engine import PyTorchModelEngine
+from .model_engine import ModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
@@ -924,7 +924,7 @@ class KvCacheCreator:
     def __init__(
         self,
         *,
-        model_engine: PyTorchModelEngine,
+        model_engine: ModelEngine,
         mapping: Mapping,
         net_max_seq_len: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
@@ -999,7 +999,7 @@ class KvCacheCreator:
 
     def _get_model_kv_cache_manager_cls(
         self,
-        model_engine: PyTorchModelEngine,
+        model_engine: ModelEngine,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
     ):
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
@@ -2072,7 +2072,7 @@ class KvCacheCreator:
 
     def _create_kv_cache_manager(
         self,
-        model_engine: PyTorchModelEngine,
+        model_engine: ModelEngine,
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
         cold_page_codec_provider: Optional[object] = None,
@@ -2613,10 +2613,8 @@ class KvCacheCreator:
         throughput than the extra concurrency buys; still valid at low load,
         hence a warning that names the knobs rather than a refusal.
         """
-        capture_sizes = getattr(self._model_engine, "_cuda_graph_batch_sizes",
-                                None)
-        padding = getattr(self._model_engine, "_cuda_graph_padding_enabled",
-                          None)
+        capture_sizes = self._model_engine.cuda_graph_batch_sizes
+        padding = self._model_engine.cuda_graph_padding_enabled
         if (not isinstance(capture_sizes, (list, tuple)) or not capture_sizes
                 or not all(isinstance(s, int) for s in capture_sizes)):
             # CUDA graphs disabled, or the engine does not expose its capture
@@ -3276,7 +3274,7 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
 
 
 def _create_kv_cache_manager(
-        model_engine: Optional[PyTorchModelEngine],
+        model_engine: Optional[ModelEngine],
         kv_cache_manager_cls,
         mapping: Mapping,
         kv_cache_config: KvCacheConfig,
@@ -3840,7 +3838,7 @@ def validate_kv_cache_compression_compatibility(
 def create_kv_cache_compression_manager(
     config: Optional[KvCacheCompressionConfig],
     *,
-    model_engine: PyTorchModelEngine,
+    model_engine: ModelEngine,
     kv_cache_config: KvCacheConfig,
     estimating_kv_cache: bool = False,
 ) -> Optional[KVCacheCompressionManager]:
@@ -4499,7 +4497,7 @@ def create_torch_sampler_args(
 
 
 def instantiate_sampler(
-    engine: PyTorchModelEngine,
+    engine: ModelEngine,
     llm_args: TorchLlmArgs,
     mapping: Mapping,
     *,

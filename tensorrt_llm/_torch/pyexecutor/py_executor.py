@@ -574,8 +574,7 @@ class PyExecutor:
         # Under beam search a request's per-beam token lists are not the
         # hypotheses the beams hold; the sampler rebuilds those for the engine's
         # logits post-processors.
-        if (hasattr(model_engine, "register_beam_histories_callable")
-                and hasattr(sampler, "start_beam_histories")):
+        if hasattr(sampler, "start_beam_histories"):
             model_engine.register_beam_histories_callable(
                 sampler.start_beam_histories)
         self.drafter = drafter

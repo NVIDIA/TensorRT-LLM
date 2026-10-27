@@ -169,7 +169,7 @@ class TestQwen3VL(TestModelingMultimodal):
             )
         else:
             # Mrope position ids. For chunked prefill / KV cache reuse we must
-            # mirror production `PyTorchModelEngine` behavior and slice the
+            # mirror production `ModelEngine` behavior and slice the
             # request's full `mrope_position_ids` to the current chunk's
             # range -- the model now indexes mrope cos/sin by batch-flat
             # per-token index, so the position_ids tensor must contain only
