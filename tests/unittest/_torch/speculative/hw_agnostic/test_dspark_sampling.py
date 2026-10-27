@@ -36,6 +36,7 @@ from tensorrt_llm._torch.models.modeling_speculative import (
     dspark_markov_chain_ancestral,
     dspark_markov_step_bias,
 )
+from tensorrt_llm._torch.speculative.block_verification import block_verify, counter_uniforms
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm._torch.speculative.interface import _RNG_SLOT_SPAN, SpecWorkerBase
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, DSparkDecodingConfig, TorchLlmArgs
@@ -80,6 +81,7 @@ def _metadata(
     top_p=1.0,
     min_p=0.0,
     temperature_only=False,
+    method="standard",
     mode=None,
     device="cpu",
 ):
@@ -95,6 +97,7 @@ def _metadata(
         use_rejection_sampling=True,
         max_draft_len=draft_len,
         draft_temperature_only=temperature_only,
+        rejection_sample_method=method,
         # Slots in reverse batch order, so a batch-order write would be caught.
         batch_slot_ids=torch.arange(batch, dtype=torch.long, device=device).flip(0),
         draft_probs=torch.full((num_slots, draft_len, vocab), 7.0, device=device),
@@ -152,23 +155,33 @@ def _expected_rows(drafter, base, anchors, tokens, temperature):
 # ---------------------------------------------------------------------------
 
 
-def test_config_field_defaults_to_the_existing_behavior():
-    assert DSparkDecodingConfig(max_draft_len=3).draft_temperature_only is False
+def test_config_fields_default_to_the_existing_behavior():
+    config = DSparkDecodingConfig(max_draft_len=3)
+    assert config.rejection_sample_method == "standard"
+    assert config.draft_temperature_only is False
     config = DSparkDecodingConfig(
-        max_draft_len=3, use_rejection_sampling=True, draft_temperature_only=True
+        max_draft_len=3,
+        use_rejection_sampling=True,
+        rejection_sample_method="block",
+        draft_temperature_only=True,
     )
-    assert config.draft_temperature_only
+    assert config.rejection_sample_method == "block" and config.draft_temperature_only
+    with pytest.raises(ValueError):
+        DSparkDecodingConfig(max_draft_len=3, rejection_sample_method="tree")
 
 
-def test_temperature_only_requires_rejection_sampling():
-    off = types.SimpleNamespace(
-        speculative_config=DSparkDecodingConfig(max_draft_len=3, draft_temperature_only=True)
-    )
+@pytest.mark.parametrize(
+    "options",
+    [dict(rejection_sample_method="block"), dict(draft_temperature_only=True)],
+    ids=["block", "temperature_only"],
+)
+def test_rejection_options_require_rejection_sampling(options):
+    off = types.SimpleNamespace(speculative_config=DSparkDecodingConfig(max_draft_len=3, **options))
     with pytest.raises(ValueError, match="use_rejection_sampling=True"):
         TorchLlmArgs._validate_rejection_sampling_options(off)
     on = types.SimpleNamespace(
         speculative_config=DSparkDecodingConfig(
-            max_draft_len=3, use_rejection_sampling=True, draft_temperature_only=True
+            max_draft_len=3, use_rejection_sampling=True, **options
         )
     )
     TorchLlmArgs._validate_rejection_sampling_options(on)
@@ -353,7 +366,7 @@ def _chi_square(counts, probs):
 
 
 def _token_level(draft_tokens, draft_probs, target_probs, uniforms, resample_uniforms):
-    """Token-level rejection sampling (Leviathan et al., 2023), vectorized."""
+    """Token-level rejection sampling with the same uniforms layout as block_verify."""
     num, num_drafts = draft_tokens.shape
     tokens_x = draft_tokens.long().unsqueeze(-1)
     ratio = (
@@ -378,8 +391,9 @@ def _token_level(draft_tokens, draft_probs, target_probs, uniforms, resample_uni
     return out, length + 1
 
 
-def test_sampled_drafts_verify_losslessly():
-    generator = torch.Generator().manual_seed(22)
+@pytest.mark.parametrize("verify", ["block", "token"])
+def test_sampled_drafts_verify_losslessly(verify):
+    generator = torch.Generator().manual_seed(21 if verify == "block" else 22)
     num = 100_000
     worker = _worker()
     drafter = _drafter(generator, vocab=_TOY_VOCAB, scale=2.0)
@@ -395,7 +409,8 @@ def test_sampled_drafts_verify_losslessly():
     ).float()
     uniforms = torch.rand(num, K, generator=generator, dtype=torch.float64)
     resample_uniforms = torch.rand(num, generator=generator, dtype=torch.float64)
-    accepted_tokens, num_accepted = _token_level(
+    run = block_verify if verify == "block" else _token_level
+    accepted_tokens, num_accepted = run(
         drafts, draft_probs, target_probs, uniforms, resample_uniforms
     )
 
@@ -424,7 +439,7 @@ def test_ancestral_proposal_is_exact_where_the_greedy_chained_one_is_not():
     def accepted_lengths(drafts, draft_probs):
         uniforms = torch.rand(num, K, generator=generator, dtype=torch.float64)
         resample = torch.rand(num, generator=generator, dtype=torch.float64)
-        _, accepted = _token_level(drafts, draft_probs, target_rows(drafts), uniforms, resample)
+        _, accepted = block_verify(drafts, draft_probs, target_rows(drafts), uniforms, resample)
         return accepted.double() - 1
 
     meta = _metadata(num, vocab=_TOY_VOCAB, num_slots=num + 1)
@@ -511,3 +526,122 @@ def test_sampled_block_captures_in_a_cuda_graph(temperature_only):
     meta.request_offsets += 1 << 20
     graph.replay()
     assert not torch.equal(first, tokens)
+
+
+@_needs_cuda
+@pytest.mark.parametrize("method", ["standard", "block"])
+def test_rejection_acceptance_routes_and_captures(method):
+    generator = torch.Generator().manual_seed(41)
+    vocab, num_gens = 2048, 5
+    worker = _worker()
+    meta = _metadata(
+        num_gens,
+        vocab=vocab,
+        num_slots=num_gens + 1,
+        method=method,
+        mode=AdvancedSamplingMode.FULL,
+        device="cuda",
+        top_p=0.95,
+    )
+    rows = num_gens * (K + 1)
+    meta.temperatures = torch.ones(rows, device="cuda")
+    meta.top_ks = torch.full((rows,), INT32_MAX, dtype=torch.int32, device="cuda")
+    meta.top_ps = torch.full((rows,), 0.95, device="cuda")
+    meta.min_ps = torch.zeros(rows, device="cuda")
+    logits = 3 * torch.randn(rows, vocab, generator=generator).cuda()
+    draft_logits = (
+        logits.view(num_gens, K + 1, vocab)[:, :K]
+        + torch.randn(num_gens, K, vocab, generator=generator).cuda()
+    )
+    draft_probs = torch.softmax(draft_logits, -1)
+    draft_tokens = torch.multinomial(draft_probs.view(-1, vocab), 1).view(num_gens, K).int()
+
+    def accept():
+        return worker._sample_and_accept_draft_tokens_rejection(
+            logits, draft_tokens, draft_probs, 0, num_gens, meta
+        )
+
+    eager_tokens, eager_accepted = accept()
+    graph, (graph_tokens, graph_accepted) = _capture(accept)
+    graph.replay()
+    assert torch.equal(graph_accepted, eager_accepted)
+    assert torch.equal(graph_tokens, eager_tokens)
+    assert ((eager_accepted >= 1) & (eager_accepted <= K + 1)).all()
+
+    if method == "block":
+        target_probs = SpecWorkerBase._compute_probs_from_logits(
+            AdvancedSamplingMode.FULL,
+            logits,
+            meta.temperatures,
+            meta.top_ks,
+            meta.top_ps,
+            meta.min_ps,
+        ).view(num_gens, K + 1, vocab)
+        seed = meta.request_seeds
+        offset = meta.request_offsets + meta.rng_accept_slot * _RNG_SLOT_SPAN
+        drawn = {}
+
+        def record(weights):
+            drawn["weights"] = weights
+            return eager_tokens[torch.arange(num_gens), eager_accepted.long() - 1]
+
+        # The acceptance decisions are block_verify's on the counter uniforms of the
+        # acceptance slot; the emitted token comes from the seeded sampler and must
+        # carry residual mass.
+        expected_tokens, expected_accepted = block_verify(
+            draft_tokens,
+            draft_probs,
+            target_probs,
+            counter_uniforms(seed, offset, K),
+            sample_emitted=record,
+        )
+        assert torch.equal(eager_accepted, expected_accepted)
+        assert torch.equal(eager_tokens, expected_tokens)
+        emitted = eager_tokens[torch.arange(num_gens), eager_accepted.long() - 1].long()
+        assert (drawn["weights"].gather(1, emitted[:, None]) > 0).all()
+
+
+@_needs_cuda
+@pytest.mark.parametrize("case", ["all_rejected", "all_accepted"])
+def test_block_verify_emitted_token_follows_the_residual(case):
+    """The seeded sampler draws the emitted token from the normalized residual.
+
+    Each case pins the accepted length regardless of the uniforms, so thousands
+    of rows that differ only in their RNG offset sample one known distribution:
+    all drafts impossible under the target -> L = 0 and max(p_0 - q_0, 0);
+    draft == target -> L = K and the bonus row p_K.
+    """
+    generator = torch.Generator().manual_seed(51)
+    vocab, rows = 64, 20_000
+    worker = _worker()
+    meta = _metadata(rows, vocab=vocab, mode=AdvancedSamplingMode.FULL, device="cuda")
+    target = torch.softmax(torch.randn(1, K + 1, vocab, generator=generator), -1)
+    if case == "all_rejected":
+        target[:, :, 0] = 0.0
+        target = target / target.sum(-1, keepdim=True)
+        draft = torch.softmax(torch.randn(1, K, vocab, generator=generator), -1)
+        draft[:, :, 0] = 0.5
+        draft = draft / draft.sum(-1, keepdim=True)
+        tokens = torch.zeros(1, K, dtype=torch.int32)
+        expected = (target[0, 0] - draft[0, 0]).clamp_min(0)
+        position = 0
+    else:
+        draft = target[:, :K].clone()
+        tokens = torch.multinomial(draft[0], 1).view(1, K).int()
+        expected = target[0, K]
+        position = K
+    expected = expected / expected.sum()
+    seed = meta.request_seeds
+    offset = meta.request_offsets + 7
+    out, accepted = worker._block_verify(
+        meta,
+        tokens.cuda().expand(rows, -1),
+        draft.cuda().expand(rows, -1, -1),
+        target.cuda().expand(rows, -1, -1),
+        seed,
+        offset,
+    )
+    assert (accepted == position + 1).all()
+    histogram = torch.bincount(out[:, position].long().cpu(), minlength=vocab).double()
+    stat, critical = _chi_square(histogram, expected.double())
+    assert stat < critical, f"chi-square {stat:.1f} >= {critical:.1f}"
