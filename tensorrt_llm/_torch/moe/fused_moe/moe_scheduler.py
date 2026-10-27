@@ -852,7 +852,12 @@ class ExternalCommMoEScheduler(MoEScheduler):
             else [None] * num_chunks
         )
 
-        use_multi_stream = not moe.enable_alltoall and moe.aux_stream is not None
+        # A backend that reuses its buffers across calls can have only one chunk
+        # in flight, and each chunk's output is gone once the next one runs.
+        reuses_buffers = moe.backend.input_requirement.run_moe_reuses_buffers
+        use_multi_stream = (
+            not moe.enable_alltoall and moe.aux_stream is not None and not reuses_buffers
+        )
 
         # ========== Setup auxiliary stream ==========
         if use_multi_stream:
@@ -975,7 +980,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
             row_offset += chunk_size_list[idx_chunk]
             if chunked_used[idx_chunk]:
-                outputs_list.append(outputs)
+                outputs_list.append(outputs.clone() if reuses_buffers else outputs)
 
         # ========== Wait for auxiliary stream to complete ==========
         if use_multi_stream:
