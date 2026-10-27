@@ -25,6 +25,11 @@ chokepoint through which the chat, completions, and responses endpoints all
 render request errors. These tests cover the message builder, the detector,
 that chokepoint, and the disaggregated router's forwarding of the worker's
 error envelope; they are CPU-only.
+
+A streamed Responses request is the exception: it is answered as OpenAI
+answers it, with a stream that opens and ends in ``response.failed`` carrying
+the code, because that event, not a 400, is what clients such as the Codex
+CLI act on.
 """
 
 import json
@@ -35,13 +40,22 @@ from unittest.mock import Mock
 import aiohttp
 import pytest
 from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
 
+import tensorrt_llm.serve.openai_server as openai_server_module
+from tensorrt_llm.executor.executor import GenerationExecutor
+from tensorrt_llm.executor.request import GenerationRequest
+from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.executor.utils import (
     CONTEXT_LENGTH_EXCEEDED_CODE,
+    ErrorResponse,
+    RequestError,
     context_length_exceeded_message,
     is_context_length_exceeded_message,
 )
+from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
+from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ResponsesRequest
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 # The CPU stage collects with `-m cpu_only`; unittest/conftest.py also skips
@@ -169,3 +183,195 @@ def test_disagg_route_other_upstream_errors_unchanged():
         _disagg_server()._handle_exception(_upstream_error(worker_body))
     assert excinfo.value.status_code == 400
     assert excinfo.value.detail == "`max_tokens` (0) must be greater than 0"
+
+
+# ---------------------------------------------------------------------------
+# A streamed Responses request fails in-stream
+# ---------------------------------------------------------------------------
+
+_MSG = context_length_exceeded_message(max_context_length=8, num_prompt_tokens=9)
+
+_RAW_REQUEST = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+
+
+class _Executor:
+    """Holds the executor's per-request error handler; a result keeps only a weak reference."""
+
+    _handle_background_error = GenerationExecutor._handle_background_error
+
+
+class _RejectingEngine:
+    """LLM stand-in whose executor rejects every prompt with ``error_msg``.
+
+    ``in_worker``: the executor runs in worker processes, so the rejection
+    arrives as the worker's error response and is raised while the stream
+    iterates the result. Otherwise it runs in this process and
+    ``generate_async`` itself raises.
+    """
+
+    def __init__(self, error_msg: str, in_worker: bool) -> None:
+        self._error_msg = error_msg
+        self._in_worker = in_worker
+        self._executor = _Executor()
+        self.args = SimpleNamespace(num_postprocess_workers=0, reasoning_parser=None)
+
+    def generate_async(self, inputs, sampling_params, streaming, **_kwargs):
+        if not self._in_worker:
+            raise RequestError(self._error_msg)
+        request = GenerationRequest(inputs, sampling_params, streaming=streaming)
+        request.set_id(1)
+        result = GenerationResult(
+            request, background_error_handler=self._executor._handle_background_error
+        )
+        result.aqueue.put(ErrorResponse(request.id, self._error_msg, request.id))
+        return RequestOutput._from_generation_result(result)
+
+
+def _responses_server(engine: _RejectingEngine, monkeypatch) -> OpenAIServer:
+    async def preprocess(**kwargs):
+        return [1, 2, 3], kwargs["request"].to_sampling_params()
+
+    monkeypatch.setattr(openai_server_module, "responses_api_request_preprocess", preprocess)
+    server = object.__new__(OpenAIServer)
+    server.generator = engine
+    server.model = "served-model"
+    server.enable_store = False
+    server._is_visual_gen = False
+    server.use_harmony = False
+    server.tokenizer = None
+    server.model_config = None
+    server.processor = None
+    server.multimodal_server_config = None
+    server.chat_template = None
+    server.tool_parser = None
+    server.conversation_store = None
+    server._validate_internal_disagg_request = lambda *args: None
+    return server
+
+
+def _event(frame):
+    if isinstance(frame, bytes):
+        frame = frame.decode()
+    return json.loads(frame.split("data: ", 1)[1])
+
+
+async def _events(response: StreamingResponse) -> list:
+    # Iterated to the end: a body that raised would abort the connection.
+    return [_event(frame) async for frame in response.body_iterator]
+
+
+def _assert_failed_in_stream(events, request: ResponsesRequest) -> None:
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.in_progress",
+        "error",
+        "response.failed",
+    ]
+    assert [event["sequence_number"] for event in events] == [0, 1, 2, 3]
+    assert {event["response"]["id"] for event in events if "response" in event} == {
+        request.request_id
+    }
+    failed = events[-1]["response"]
+    assert (failed["status"], failed["output"]) == ("failed", [])
+    assert (failed["error"]["code"], failed["error"]["message"]) == (
+        CONTEXT_LENGTH_EXCEEDED_CODE,
+        _MSG,
+    )
+
+
+@pytest.mark.parametrize("in_worker", [True, False], ids=["in_worker", "in_process"])
+@pytest.mark.asyncio
+async def test_a_streamed_responses_request_fails_in_stream(in_worker, monkeypatch):
+    server = _responses_server(_RejectingEngine(_MSG, in_worker), monkeypatch)
+    request = ResponsesRequest(model="client-model", input="hi", stream=True)
+
+    response = await server.openai_responses(request, _RAW_REQUEST)
+
+    assert isinstance(response, StreamingResponse), getattr(response, "body", response)
+    _assert_failed_in_stream(await _events(response), request)
+
+
+@pytest.mark.parametrize("in_worker", [True, False], ids=["in_worker", "in_process"])
+@pytest.mark.asyncio
+async def test_a_non_streamed_responses_request_keeps_the_400(in_worker, monkeypatch):
+    server = _responses_server(_RejectingEngine(_MSG, in_worker), monkeypatch)
+    request = ResponsesRequest(model="client-model", input="hi", stream=False)
+
+    response = await server.openai_responses(request, _RAW_REQUEST)
+
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+    assert (_body(response)["code"], _body(response)["message"]) == (
+        CONTEXT_LENGTH_EXCEEDED_CODE,
+        _MSG,
+    )
+
+
+@pytest.mark.parametrize("in_worker", [True, False], ids=["in_worker", "in_process"])
+@pytest.mark.asyncio
+async def test_other_rejections_of_a_streamed_request_are_unchanged(in_worker, monkeypatch):
+    server = _responses_server(_RejectingEngine("Insufficient KV cache", in_worker), monkeypatch)
+    request = ResponsesRequest(model="client-model", input="hi", stream=True)
+
+    response = await server.openai_responses(request, _RAW_REQUEST)
+
+    if not in_worker:
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert _body(response)["code"] == 400
+        return
+    frames = []
+    with pytest.raises(RequestError):
+        async for frame in response.body_iterator:
+            frames.append(frame)
+    assert _event(frames[-1])["response"]["error"]["code"] == "server_error"
+
+
+def _context_worker_rejection() -> aiohttp.ClientResponseError:
+    return _upstream_error(OpenAIServer.create_error_response(_MSG).body.decode())
+
+
+@pytest.mark.asyncio
+async def test_disagg_route_fails_a_streamed_responses_request_in_stream():
+    """The context phase never streams, so its worker answers with the 400."""
+    request = ResponsesRequest(model="client-model", input="hi", stream=True)
+
+    response = _disagg_server()._handle_exception(_context_worker_rejection(), request)
+
+    assert isinstance(response, StreamingResponse)
+    events = await _events(response)
+    _assert_failed_in_stream(events, request)
+    assert events[-1]["response"]["model"] == "client-model"
+
+
+@pytest.mark.parametrize(
+    "request_",
+    [
+        ResponsesRequest(model="m", input="hi", stream=False),
+        ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}], stream=True),
+    ],
+    ids=["responses_non_streamed", "chat_streamed"],
+)
+def test_disagg_route_keeps_the_400_for_other_requests(request_):
+    response = _disagg_server()._handle_exception(_context_worker_rejection(), request_)
+
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+    assert _body(response)["code"] == CONTEXT_LENGTH_EXCEEDED_CODE
+
+
+@pytest.mark.asyncio
+async def test_disagg_route_hands_the_request_to_its_failure_path():
+    async def rejected(req, hooks):
+        raise _context_worker_rejection()
+
+    server = _disagg_server()
+    server._perf_metrics_collector = Mock()
+    server._allow_request_chat_template = False
+    server._config = SimpleNamespace(conversation_affinity_header_for_subagents=None)
+    server._collect_perf_metrics = False
+    route = server._wrap_entry_point(rejected, ResponsesRequest)
+    request = ResponsesRequest(model="client-model", input="hi", stream=True)
+    raw_request = SimpleNamespace(state=SimpleNamespace(server_arrival_time=0.0), headers={})
+
+    response = await route(request, raw_request)
+
+    assert isinstance(response, StreamingResponse)
+    _assert_failed_in_stream(await _events(response), request)
