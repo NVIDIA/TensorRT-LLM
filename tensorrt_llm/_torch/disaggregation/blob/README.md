@@ -42,7 +42,7 @@ store SDK
 pytest tests/unittest/_torch/disaggregation/blob
 ```
 
-All of it is CPU-only. The files, top down:
+All of it is CPU-only; `test_mooncake_real.py` also needs a Mooncake pool. The files, top down:
 
 - `test_blob_example.py`: the backend end to end, each test the smallest example of one part
   of the picture: two endpoints sharing objects, a lease holder's decisions and leases, the
@@ -58,6 +58,8 @@ All of it is CPU-only. The files, top down:
   answers as 0.3.13 does, the conformance suite included.
 - `test_mooncake_setup.py`: the store config, the SDK's setup and the refused settings and builds,
   and that each module imports only its layer.
+- `test_mooncake_real.py`: the Mooncake driver and the backend over a real pool; runs only with
+  `TRTLLM_MOONCAKE_REAL=1`.
 
 ## Writing a driver
 
