@@ -1097,7 +1097,8 @@ class BaseLLM:
                 else:
                     # Convert to shared tensor handle to reduce IPC overhead.
                     # An in-process worker reads CUDA tensors from this
-                    # process, where a CUDA IPC handle cannot be reopened.
+                    # process, where a CUDA IPC handle cannot be reopened,
+                    # so they stay as they are.
                     multimodal_params.to_handle("multimodal_data",
                                                 local=isinstance(
                                                     self._executor,

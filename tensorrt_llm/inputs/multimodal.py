@@ -1009,8 +1009,6 @@ class MultimodalParams:
         elif method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
             cpu_keys = {'tensor_size', 'storage_handle', 'manager_handle'}
             return cpu_keys.issubset(obj.keys())
-        elif method_key == _SharedTensorRebuildMethodRegistry.REBUILD_LOCAL:
-            return {'local_token', 'producer_pid'}.issubset(obj.keys())
 
         return False
 
@@ -1084,10 +1082,13 @@ class MultimodalParams:
                     # Import here to avoid circular imports
                     from tensorrt_llm._torch.shared_tensor import \
                         SharedTensorContainer
-                    local = bool(kwargs.get("local",
-                                            False)) and input_data.is_cuda
+                    if kwargs.get("local", False) and input_data.is_cuda:
+                        # The consumer reads it from this process; a CUDA
+                        # IPC handle cannot be reopened here, and no handle
+                        # is needed. to_tensor leaves tensors as they are.
+                        return input_data
                     return SharedTensorContainer.from_tensor(
-                        input_data, local=local).dump_to_dict()
+                        input_data).dump_to_dict()
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to convert tensor to shared tensor: {e}")
@@ -1122,11 +1123,10 @@ class MultimodalParams:
         Args:
             element: Element to move (only "multimodal_data" is supported)
             local: The consumer runs in this process (an in-process executor
-                worker). CUDA tensors are then kept in the process-local
-                store instead of being exported as CUDA IPC handles, which
-                cannot be reopened in the exporting process; such a handle
-                is consumed once, by this process only. CPU tensors still
-                use shared-memory handles, which work in any process.
+                worker). CUDA tensors are then left in place, since a CUDA
+                IPC handle cannot be reopened in the exporting process and
+                the request itself keeps the tensor alive. CPU tensors
+                still use shared-memory handles, which work in any process.
 
         Raises:
             ValueError: If element is not "multimodal_data"

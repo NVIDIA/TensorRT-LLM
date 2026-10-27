@@ -389,8 +389,8 @@ def test_whisper_pytorch_precomputed_spectrogram(monkeypatch, encoder_graphs, si
     eager and under encoder CUDA graphs. The captured graph input is the
     spectrogram; audio requests are converted on the GPU before the graph
     replays, so both kinds of request must replay the same graphs. The CUDA
-    spectrogram crosses to the worker as a process-local tensor in
-    single-process mode and as a CUDA IPC handle with a worker process; the
+    spectrogram reaches the worker as the tensor itself in single-process
+    mode and as a CUDA IPC handle with a worker process; the
     third case covers the latter (and cannot introspect the engine).
     """
     if single_process:
