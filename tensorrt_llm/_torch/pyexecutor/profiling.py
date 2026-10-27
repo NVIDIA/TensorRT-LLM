@@ -56,6 +56,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import get_global_profiler
 
 from .host_path_probe import make_host_path_probe
+from .perf_metrics_manager import GpuTimestamp, timing_event
 from .phase_capture import make_phase_capture
 from .runtime_hooks import runtime_hooks_of
 
@@ -608,20 +609,21 @@ class PyExecutorProfileManager:
         # batch. We need two sets of start-end events so that the
         # ping-pong pattern works with the overlap scheduler.
         start_event_1 = None
-        end_event_1 = torch.cuda.Event(enable_timing=True)
+        end_event_1 = timing_event()
         start_event_2 = None
-        end_event_2 = torch.cuda.Event(enable_timing=True)
+        end_event_2 = timing_event()
         prev_device_step_time = None
         # With RuntimeHooks.iteration_timing_one_event, boundary_events[k % 3] marks the boundary before
         # iteration k, recorded on timing_stream, and replaces the start/end ping-pong above.
         one_timing_event = runtime_hooks_of(
             getattr(executor.model_engine, "model", None)
         ).iteration_timing_one_event
-        boundary_events = (
-            [torch.cuda.Event(enable_timing=True) for _ in range(3)] if one_timing_event else None
-        )
+        boundary_events = [timing_event() for _ in range(3)] if one_timing_event else None
         boundary_count = 0
-        timing_stream = torch.cuda.Stream() if one_timing_event else None
+        # A GpuTimestamp (arm_gpu_timestamps) has its own follower stream: it records at the current stream's position
+        # without the side stream.
+        stamp_boundaries = one_timing_event and isinstance(boundary_events[0], GpuTimestamp)
+        timing_stream = torch.cuda.Stream() if one_timing_event and not stamp_boundaries else None
         if one_timing_event:
             logger.info("[M3 host] iteration timing: one side-stream event per iteration boundary")
         # Cumulative fetch counter as of the previous iter log line; the
@@ -755,8 +757,11 @@ class PyExecutorProfileManager:
             should_capture_timing = executor.print_log or executor.enable_iter_perf_stats
             if should_capture_timing and one_timing_event:
                 # Iteration k - 2 spans the two previous boundaries: the step the ping-pong reports here.
-                timing_stream.wait_stream(torch.cuda.current_stream())
-                boundary_events[boundary_count % 3].record(timing_stream)
+                if stamp_boundaries:
+                    boundary_events[boundary_count % 3].record()
+                else:
+                    timing_stream.wait_stream(torch.cuda.current_stream())
+                    boundary_events[boundary_count % 3].record(timing_stream)
                 if boundary_count >= 2:
                     boundary_events[(boundary_count - 1) % 3].synchronize()
                     prev_device_step_time = boundary_events[(boundary_count - 2) % 3].elapsed_time(
@@ -897,11 +902,11 @@ class PyExecutorProfileManager:
             if should_capture_timing and not one_timing_event:
                 if it % 2 == 0:
                     if start_event_1 is None:
-                        start_event_1 = torch.cuda.Event(enable_timing=True)
+                        start_event_1 = timing_event()
                     start_event_1.record()
                 else:
                     if start_event_2 is None:
-                        start_event_2 = torch.cuda.Event(enable_timing=True)
+                        start_event_2 = timing_event()
                     start_event_2.record()
 
         try:

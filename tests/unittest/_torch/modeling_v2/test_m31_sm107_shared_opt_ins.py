@@ -27,7 +27,7 @@ from tensorrt_llm._torch import cute_aot
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
 from tensorrt_llm._torch.attention.backends.fmha import msa_prefill
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_indexer
-from tensorrt_llm._torch.pyexecutor import llm_request, py_executor
+from tensorrt_llm._torch.pyexecutor import llm_request, perf_metrics_manager, py_executor
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative import dflash, interface
@@ -52,6 +52,7 @@ ARM_CALLS = (
     "arm_proxy_ms_reuse",
     "arm_onehot_index_fill",
     "arm_host_ctx_alloc",
+    "arm_gpu_timestamps",
 )
 # (module, flag, value once armed) for every process-wide flag the helper sets.
 FLAGS = (
@@ -64,6 +65,7 @@ FLAGS = (
     (msa_indexer, "_PROXY_MS_REUSE", True),
     (interface, "_ONEHOT_INDEX_FILL", True),
     (dflash, "_HOST_CTX_ALLOC_DISABLED", False),
+    (perf_metrics_manager, "_GPU_TIMESTAMPS", True),
 )
 KILL_SWITCHES = (
     "TRTLLM_M31_DISABLE_DRAFT_KV_RESERVE",
@@ -72,6 +74,7 @@ KILL_SWITCHES = (
     "TRTLLM_M31_DISABLE_PROXY_MS_REUSE",
     "TRTLLM_M31_DISABLE_ONEHOT_INDEX_FILL",
     "TRTLLM_DFLASH_DISABLE_HOST_CTX_ALLOC",
+    "TRTLLM_M31_DISABLE_GPU_TIMESTAMPS",
 )
 
 
@@ -107,6 +110,8 @@ def test_helper_sets_every_flag(monkeypatch):
     for env in KILL_SWITCHES:
         monkeypatch.delenv(env, raising=False)
     monkeypatch.setattr(py_executor, "_KV_GPU_PREFETCH_KILLED", False)
+    # CPU only: stand in for the native stamp op, which GPU timestamps need to arm.
+    monkeypatch.setattr(perf_metrics_manager, "_native_stamp_op", lambda: object())
     for module, flag, armed in FLAGS:
         monkeypatch.setattr(module, flag, not armed)
     routing.arm_sm107_shared_opt_ins()

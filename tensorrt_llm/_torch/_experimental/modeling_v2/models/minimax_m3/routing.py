@@ -155,13 +155,14 @@ def arm_sm107_shared_opt_ins() -> None:
     """Arm, process-wide and before the model is built, the shared paths the MiniMax-M3.1 sm_107 targets take: the
     shipped ahead-of-time CuTe DSL objects, the drafter KV reserve and guard page, the host-tier KV prefetch, the
     context-only int32 prompt tokens, the BF16X / E4M3X sparse-prefill fork, the indexer proxy max-score buffer reuse,
-    the context one-hot index_fill and the DFlash host-side context allocation. Each keeps its kill switch. Armed here
+    the context one-hot index_fill, the DFlash host-side context allocation and GPU timestamps for the executor's
+    timing events. Each keeps its kill switch. Armed here
     rather than in a target's RuntimeHooks so that the target directories (the AOT objects' source digests) are not
     edited."""
     from tensorrt_llm._torch import cute_aot
     from tensorrt_llm._torch.attention.backends.fmha import msa_prefill
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_indexer
-    from tensorrt_llm._torch.pyexecutor import llm_request, py_executor
+    from tensorrt_llm._torch.pyexecutor import llm_request, perf_metrics_manager, py_executor
     from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
     from tensorrt_llm._torch.speculative import dflash, interface
 
@@ -173,6 +174,7 @@ def arm_sm107_shared_opt_ins() -> None:
     msa_indexer.arm_proxy_ms_reuse()
     interface.arm_onehot_index_fill()
     dflash.arm_host_ctx_alloc()
+    perf_metrics_manager.arm_gpu_timestamps()
 
 
 def route(
