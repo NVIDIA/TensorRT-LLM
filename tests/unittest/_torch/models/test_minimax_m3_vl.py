@@ -2971,13 +2971,32 @@ def test_video_timing_is_forwarded_to_the_processor(monkeypatch):
         "frame_list",
         None,
         {"fps": 0, "frames_indices": [0, 1]},
+        {"fps": float("nan"), "frames_indices": [0, 1]},
+        {"fps": float("inf"), "frames_indices": [0, 1]},
         {"fps": 10.0},
         {"fps": 10.0, "frames_indices": []},
+        {"fps": 10.0, "frames_indices": [0]},
+        {"fps": 10.0, "frames_indices": [0, 5, 9]},
     ],
-    ids=["frame_list", "no_metadata", "zero_fps", "no_frame_indices", "empty_frame_indices"],
+    ids=[
+        "frame_list",
+        "no_metadata",
+        "zero_fps",
+        "nan_fps",
+        "inf_fps",
+        "no_frame_indices",
+        "empty_frame_indices",
+        "fewer_frame_indices_than_frames",
+        "more_frame_indices_than_frames",
+    ],
 )
 def test_video_without_timing_passes_no_metadata(monkeypatch, metadata):
-    """Without usable timing the processor gets no ``video_metadata`` and adds no timestamps."""
+    """Without usable timing the processor gets no ``video_metadata`` and adds no timestamps.
+
+    Usable timing is a finite, positive ``fps`` and one frame index per
+    delivered frame: a timestamp from a NaN or infinite rate, or from indices
+    that do not line up with the frames, would be wrong.
+    """
     recorder = _MediaRecordingProcessor()
     proc, _ = _tokenizer_only_processor(monkeypatch, recorder)
     frames = [np.zeros((28, 42, 3), dtype=np.uint8)] * 2
