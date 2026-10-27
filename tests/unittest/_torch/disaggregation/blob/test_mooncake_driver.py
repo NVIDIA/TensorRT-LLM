@@ -756,7 +756,7 @@ def test_put_session_start_answers_map_to_row_statuses(case: str) -> None:
 
 PUT_WRITE_ANSWERS = {
     # case: (the scatter's answer, the end's answer (None: real), status, fault, the session's end:
-    #        ended, revoked, left_for_drain or left_to_master)
+    #        ended, revoked, left_for_close or left_to_master)
     "written": (None, None, "ready", None, "ended"),
     "short_write": (5, None, "fault", "put ranges: moved 5 of 8 bytes", "revoked"),
     # A TCP target may still write into the object's space.
@@ -765,7 +765,7 @@ PUT_WRITE_ANSWERS = {
     "end_refused": (None, -704, "fault", "put session end: OBJECT_NOT_FOUND(-704)", "revoked"),
     "end_not_owner": (None, -601, "fault", "put session end: ILLEGAL_CLIENT(-601)", "revoked"),
     # The end may still reach the master.
-    "end_timed_out": (None, -901, "fault", "put session end: RPC_TIMEOUT(-901)", "left_for_drain"),
+    "end_timed_out": (None, -901, "fault", "put session end: RPC_TIMEOUT(-901)", "left_for_close"),
 }
 
 
@@ -783,7 +783,7 @@ def test_put_ranges_and_end_answers_map_to_row_statuses(case: str) -> None:
     assert (bench.fake.pool.objects.get(key("A")) == b"aaaaaaaa") == (status == "ready")
     assert bench.keys_of(PUT_REVOKE) == ([key("A")] if session == "revoked" else [])
     stats = bench.driver.stats()
-    assert stats["put_sessions_left_for_drain"] == (session == "left_for_drain")
+    assert stats["put_sessions_left_for_close"] == (session == "left_for_close")
     assert stats["put_sessions_left_to_master"] == (session == "left_to_master")
 
 
@@ -824,7 +824,7 @@ class SessionScenario(NamedTuple):
     rows: str  # each row ready (R) or faulted (F)
     access_ends: bool = True
     revoked: str = ""  # rows whose session the put revokes, or tries to
-    left_for_drain: str = ""  # rows whose session is left open for drain to revoke
+    left_for_close: str = ""  # rows whose session is left open for close to revoke
     left_to_master: str = ""  # rows whose session is left open for the master alone to free
 
 
@@ -836,32 +836,32 @@ SESSION_SCENARIOS = {
     "end_retried": SessionScenario({PUT_END: [[-900, None, None], [None]]}, "RRR"),
     # Ends that may still reach the master.
     "end_fails_twice": SessionScenario(
-        {PUT_END: [[-901, None, None], [-900]]}, "FRR", left_for_drain="A"
+        {PUT_END: [[-901, None, None], [-900]]}, "FRR", left_for_close="A"
     ),
     "end_retry_refused": SessionScenario(
-        {PUT_END: [[-901, None, None], [-704]]}, "FRR", left_for_drain="A"
+        {PUT_END: [[-901, None, None], [-704]]}, "FRR", left_for_close="A"
     ),
     "end_retry_raises": SessionScenario(
-        {PUT_END: [[-901, None, None], RuntimeError("x")]}, "FRR", left_for_drain="A"
+        {PUT_END: [[-901, None, None], RuntimeError("x")]}, "FRR", left_for_close="A"
     ),
     "end_raises": SessionScenario(
-        {PUT_END: [RuntimeError("rpc lost")]}, "FFF", left_for_drain="ABC"
+        {PUT_END: [RuntimeError("rpc lost")]}, "FFF", left_for_close="ABC"
     ),
     "end_committed_then_raised": SessionScenario(
-        {PUT_END: [reply_lost]}, "FFF", left_for_drain="ABC"
+        {PUT_END: [reply_lost]}, "FFF", left_for_close="ABC"
     ),
     "end_and_revoke_fail": SessionScenario(
         {PUT_END: [[-704, None, None]], PUT_REVOKE: [[-900]]},
         "FRR",
         revoked="A",
-        left_for_drain="A",
+        left_for_close="A",
     ),
     # The SDK may have opened any of the sessions.
     "start_raises": SessionScenario(
-        {PUT_START: [RuntimeError("rpc lost")]}, "FFF", left_for_drain="ABC"
+        {PUT_START: [RuntimeError("rpc lost")]}, "FFF", left_for_close="ABC"
     ),
     "start_miscounts": SessionScenario(
-        {PUT_START: [lambda answers: answers[:-1]]}, "FFF", left_for_drain="ABC"
+        {PUT_START: [lambda answers: answers[:-1]]}, "FFF", left_for_close="ABC"
     ),
     # The scatter may still be running: nothing is ended or revoked.
     "ranges_raise": SessionScenario(
@@ -889,35 +889,39 @@ def test_every_started_put_session_is_ended_revoked_or_left_open(name: str) -> N
     assert bench.keys_of(PUT_REVOKE) == [key(n) for n in scenario.revoked]
     settled = Counter(bench.fake.keys_answered(PUT_END, 0) + bench.keys_of(PUT_REVOKE))
     assert set(settled.values()) <= {1}, f"a session ended or revoked twice: {settled}"
-    for_drain = {key(n) for n in scenario.left_for_drain}
+    for_close = {key(n) for n in scenario.left_for_close}
     to_master = {key(n) for n in scenario.left_to_master}
     stats = bench.driver.stats()
-    assert stats["put_sessions_left_for_drain"] == len(for_drain)
+    assert stats["put_sessions_left_for_close"] == len(for_close)
     assert stats["put_sessions_left_to_master"] == len(to_master)
     # Every session the SDK still holds is left open; the SDK may have dropped one the driver
     # could not see end, as when an end landed but its reply did not.
-    assert bench.fake.put_sessions <= for_drain | to_master
+    assert bench.fake.put_sessions <= for_close | to_master
     # Only a row written whole may be ended: its object becomes readable as it stands.
     written = bench.fake.keys_answered(PUT_RANGES, SLOT)
     assert set(bench.keys_of(PUT_END)) <= set(written)
     ready = [key(n) for n, r in zip("ABC", results) if r.status is RowStatus.READY]
     assert set(ready) == set(bench.fake.keys_answered(PUT_END, 0))
-    # A drain revokes the sessions left for it, never those left to the master.
+    # Close revokes the sessions left for it, never those left to the master; drain revokes none.
     if scenario.access_ends:
+        revocations = len(bench.keys_of(PUT_REVOKE))
         assert bench.driver.drain(WAIT_S) is True
-        assert bench.driver.stats()["put_sessions_left_for_drain"] == 0
+        assert len(bench.keys_of(PUT_REVOKE)) == revocations
+        bench.driver.unregister(bench.handle)
+        bench.driver.close()
+        assert bench.driver.stats()["put_sessions_left_for_close"] == 0
         assert bench.driver.stats()["put_sessions_left_to_master"] == len(to_master)
         assert bench.fake.put_sessions == to_master
         assert not to_master & set(bench.keys_of(PUT_REVOKE))
 
 
-def test_sessions_left_open_are_revoked_only_in_drain() -> None:
+def test_sessions_left_open_are_revoked_only_in_close() -> None:
     bench = Bench()
     bench.write(0, b"aaaaaaaa")
     bench.fake.script(PUT_END, [-704])
     bench.fake.script(PUT_REVOKE, [-900])
     bench.run("put", "A")
-    assert bench.driver.stats()["put_sessions_left_for_drain"] == 1
+    assert bench.driver.stats()["put_sessions_left_for_close"] == 1
     bench.write(1, b"bbbbbbbb")
     bench.store(C=b"cccccccc")
     bench.run("put", "X", "B")
@@ -927,16 +931,37 @@ def test_sessions_left_open_are_revoked_only_in_drain() -> None:
     assert summary(results) == [("not_ready", None)]  # and no complete object exists
     assert bench.keys_of(PUT_START).count(key("A")) == 1
 
-    bench.fake.script(PUT_REVOKE, [-900])
     assert bench.driver.drain(WAIT_S) is True  # sessions left open hold no lender memory
+    assert bench.keys_of(PUT_REVOKE) == [key("A")]
+    bench.driver.unregister(bench.handle)
+    bench.fake.script(PUT_REVOKE, [-900])
+    bench.driver.close()
     assert bench.keys_of(PUT_REVOKE) == [key("A")] * 2
-    assert bench.driver.stats()["put_sessions_left_for_drain"] == 1  # retried by the next drain
-    assert bench.driver.drain(0.0) is True
-    assert bench.driver.stats()["put_sessions_left_for_drain"] == 0
+    assert bench.driver.stats()["put_sessions_left_for_close"] == 1  # the master frees it later
+    assert len(bench.fake.calls_to("close")) == 1
+
+
+def test_drain_returns_at_once_while_a_revocation_would_block() -> None:
+    bench = Bench()
+    bench.fill_sources("put", "A")
+    bench.fake.script(PUT_END, [-901])
+    bench.fake.script(PUT_END, [-901])  # the end and its retry go unanswered
+    bench.run("put", "A")
+    assert bench.driver.stats()["put_sessions_left_for_close"] == 1
+    gate = bench.fake.block(PUT_REVOKE)
+    started = time.monotonic()
+    assert bench.driver.drain(WAIT_S) is True  # once the idle workers exit
+    assert time.monotonic() - started < PROMPT_S
+    assert not gate.entered.is_set()
+    gate.release.set()
+    bench.driver.unregister(bench.handle)
+    bench.driver.close()
+    assert bench.keys_of(PUT_REVOKE) == [key("A")]
+    assert bench.driver.stats()["put_sessions_left_for_close"] == 0
     assert bench.fake.put_sessions == set()
 
 
-def test_a_put_whose_worker_thread_exits_leaves_its_session_open_for_drain(
+def test_a_put_whose_worker_thread_exits_leaves_its_session_open_for_close(
     thread_escapes: list[BaseException],
 ) -> None:
     bench = Bench()
@@ -946,7 +971,7 @@ def test_a_put_whose_worker_thread_exits_leaves_its_session_open_for_drain(
     assert summary(results) == [("fault", "the worker stopped before the row was decided")]
     assert not access_ended
     assert key("A") in bench.fake.put_sessions
-    assert bench.driver.stats()["put_sessions_left_for_drain"] == 1
+    assert bench.driver.stats()["put_sessions_left_for_close"] == 1
     results, _ = bench.run("put", "A")  # the driver holds A's session: it starts no other
     assert summary(results) == [("not_ready", None)]
     assert bench.keys_of(PUT_START).count(key("A")) == 1
@@ -975,7 +1000,7 @@ def test_a_key_another_put_of_this_driver_holds_is_not_ready_without_asking_the_
     assert summary(results) == [("ready", None)]  # it exists already, committed
 
 
-@pytest.mark.parametrize("left", ["for_drain", "to_master"])
+@pytest.mark.parametrize("left", ["for_close", "to_master"])
 def test_a_key_whose_session_was_left_open_is_ready_once_its_object_exists(left: str) -> None:
     bench = Bench()
     bench.fill_sources("put", "A")
@@ -1123,7 +1148,7 @@ def test_a_fault_past_the_sdk_calls_keeps_access_open(direction: str, monkeypatc
     assert summary(results) == [("fault", f"{direction} failed: ValueError('mapping bug')")]
     assert not access_ended
     # A put's session may still be open: the driver keeps holding the key.
-    assert bench.driver.stats()["put_sessions_left_for_drain"] == (direction == "put")
+    assert bench.driver.stats()["put_sessions_left_for_close"] == (direction == "put")
 
 
 # Admission, registration, concurrency.

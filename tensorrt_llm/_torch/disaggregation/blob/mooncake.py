@@ -166,7 +166,7 @@ _SKIP_RESULTS = {
 }
 
 # Session-end answers after which the end may still reach the master, even if the retry is refused.
-# Such a session is left for drain and its key is never put again: the master matches an end by key
+# Such a session is left for close and its key is never put again: the master matches an end by key
 # and client only, so a late end would mark complete this client's next object of the key.
 _END_OUTCOME_UNKNOWN = (_Code.RPC_FAIL, _Code.RPC_TIMEOUT, _Code.METADATA_CALL_FAILED)
 # Session-end answers retried once, as the master ends a session idempotently; an end call that
@@ -177,7 +177,7 @@ _END_RETRIED = (_Code.RPC_FAIL, _Code.RPC_TIMEOUT)
 class _LeftOpen(enum.Enum):
     """Who ends a put session this driver left open."""
 
-    FOR_DRAIN = "for_drain"  # drain revokes it once no part runs
+    FOR_CLOSE = "for_close"  # close revokes it, as the owner's last step
     TO_MASTER = "to_master"  # the target may still write into its object: the master frees it
 
 
@@ -303,12 +303,13 @@ class MooncakeDriver:
        - to the master, never revoked here, since the target may still write into the object: a
          scatter that raised or miscounted, a row answered TRANSFER_FAIL. The master frees them
          after ``put_start_release_timeout_sec``.
-       - for ``drain`` to revoke once no part runs: any other, such as a start that raised or
+       - for ``close`` to revoke, once no put runs: any other, such as a start that raised or
          miscounted, an end whose outcome is unknown (``_END_OUTCOME_UNKNOWN``), a revoke that
          failed, or a put stopped by a raise.
 
     Args:
-        store: An SDK store whose ``setup`` returned 0.
+        store: An SDK store whose ``setup`` returned 0. The driver takes it over: ``close``
+            closes it.
         workers: The most threads running SDK calls; each blocks while its call waits on the
             store.
         rows_per_call: The most rows of one part, so of each SDK call.
@@ -471,12 +472,9 @@ class MooncakeDriver:
     def drain(self, budget_s: float) -> bool:
         """Refuses new work for good, cancels the rows no worker took, ends the worker threads,
         and waits up to ``budget_s`` for the running parts to end and every worker thread to exit.
-        Returns False at once while an operation is unprovable.
-
-        Each drain that returns True also tries once to revoke the sessions left for drain: no put
-        runs any more, so none is in use. They hold no lender memory, so they never change the
-        answer; one whose revocation fails stays for the next drain, or until the master discards
-        it. Sessions left to the master are never revoked here."""
+        Returns False at once while an operation is unprovable. Makes no SDK call, so it returns
+        within ``budget_s``: the sessions left for close hold no lender memory, and ``close``
+        revokes them."""
         with self._lock:
             self._require_open()
             self._draining = True
@@ -495,19 +493,14 @@ class MooncakeDriver:
             )
             if drained:
                 self._drained = True
-            left = self._sessions_left_open.items()
-            to_revoke = [key for key, by in left if by is _LeftOpen.FOR_DRAIN] if drained else []
-        if to_revoke:
-            codes = self._metadata_call(self._store.batch_put_session_revoke, to_revoke)
-            with self._lock:
-                for key, code in zip(to_revoke, codes):
-                    if _session_gone(code):
-                        del self._sessions_left_open[key]
-        return drained
+            return drained
 
     def close(self) -> None:
-        """Closes the SDK client once a drain returned True and every region is unregistered.
-        Never called in production: it holds the GIL through unmount RPCs; process exit frees it."""
+        """The owner's last step, once a drain returned True and every region is unregistered:
+        tries once to revoke the sessions left for close, then closes the SDK client. Both wait on
+        the master and the unmount with the GIL held, so the owner calls it off the executor loop's
+        thread. A session whose revocation fails is freed by the master after
+        ``put_start_release_timeout_sec``; sessions left to the master are never revoked here."""
         with self._lock:
             if self._closed:
                 return
@@ -516,6 +509,14 @@ class MooncakeDriver:
             if any(r.live for r in self._registrations):
                 raise DriverRejected("close needs every registration unregistered")
             self._closed = True
+            left = self._sessions_left_open.items()
+            to_revoke = [key for key, by in left if by is _LeftOpen.FOR_CLOSE]
+        if to_revoke:  # no put runs any more, so none of them is in use
+            codes = self._metadata_call(self._store.batch_put_session_revoke, to_revoke)
+            with self._lock:
+                for key, code in zip(to_revoke, codes):
+                    if _session_gone(code):
+                        del self._sessions_left_open[key]
         self._store.close()
 
     def stats(self) -> dict[str, int]:
@@ -528,7 +529,7 @@ class MooncakeDriver:
                     for reason, r in _SKIP_RESULTS.items()
                 },
                 "ops_unprovable": self._unprovable_op_count,
-                "put_sessions_left_for_drain": left.count(_LeftOpen.FOR_DRAIN),
+                "put_sessions_left_for_close": left.count(_LeftOpen.FOR_CLOSE),
                 "put_sessions_left_to_master": left.count(_LeftOpen.TO_MASTER),
             }
 
@@ -782,11 +783,11 @@ class MooncakeDriver:
         self, reserved: list[str], closed: set[str], to_master: set[str]
     ) -> None:
         """Ends the reservation of ``reserved`` and records each session not ``closed`` as left
-        open: for the master when its key is in ``to_master``, otherwise for ``drain``."""
+        open: for the master when its key is in ``to_master``, otherwise for ``close``."""
         left: dict[str, _LeftOpen] = {}
         if not closed.issuperset(reserved):  # usually every session ended
             left = {
-                key: _LeftOpen.TO_MASTER if key in to_master else _LeftOpen.FOR_DRAIN
+                key: _LeftOpen.TO_MASTER if key in to_master else _LeftOpen.FOR_CLOSE
                 for key in reserved
                 if key not in closed
             }

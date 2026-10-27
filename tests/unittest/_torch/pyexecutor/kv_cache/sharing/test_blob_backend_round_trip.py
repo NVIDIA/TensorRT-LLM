@@ -90,15 +90,16 @@ class Wake:
 
 
 class Stores:
-    """Drivers over one store: the in-memory one, or with ``master`` a real Mooncake pool.
-    ``close`` closes the Mooncake clients only once every backend built over them shut down
-    cleanly. ``cancel_effective=False`` makes the in-memory drivers ignore a cancel."""
+    """Drivers over one store: the in-memory one, or with ``master`` a real Mooncake pool. A test
+    closes each driver it opened as its owner does, last; ``close`` closes those a failed test left
+    open, only once every backend built over them shut down cleanly. ``cancel_effective=False``
+    makes the in-memory drivers ignore a cancel."""
 
     def __init__(self, master: str | None = None, cancel_effective: bool = True) -> None:
         self._store = MemoryStore() if master is None else None
         self._master = master
         self._cancel_effective = cancel_effective
-        self._clients = []
+        self._drivers = []
         self.backends = []
 
     def open_driver(self):
@@ -106,10 +107,11 @@ class Stores:
         if self._store is not None:
             driver = MemoryDriver(self._store, capabilities=ONE_ROW_PER_CALL, background=True)
             driver.set_cancel_effective(self._cancel_effective)
-            return driver
-        sdk = open_sdk(MooncakeConfig(self._master, 0, PROTOCOL, DEVICES, local_buffer_size=0))
-        self._clients.append(sdk)
-        return MooncakeDriver(sdk, workers=2, rows_per_call=1)
+        else:
+            sdk = open_sdk(MooncakeConfig(self._master, 0, PROTOCOL, DEVICES, local_buffer_size=0))
+            driver = MooncakeDriver(sdk, workers=2, rows_per_call=1)
+        self._drivers.append(driver)
+        return driver
 
     def commit(self, object_key: np.ndarray, data: bytes) -> None:
         """Commits ``data`` straight into the in-memory store, with the driver's trailer."""
@@ -119,8 +121,8 @@ class Stores:
 
     def close(self) -> None:
         if all(backend.shutdown(WAIT_S) == frozenset() for backend in self.backends):
-            for client in self._clients:
-                client.close()
+            for driver in self._drivers:
+                driver.close()
 
 
 @pytest.fixture(params=["memory", "mooncake"])
@@ -174,7 +176,7 @@ class HostRegion:
 def build(stores: Stores, lender, wake: Wake):
     """A backend over ``lender``'s regions, built on this thread: a driver, the lender's hold, the
     regions registered under it, and the backend. Returns the binding, whose ``release_hold``
-    gives the hold back once the backend shut down, and the backend."""
+    gives the hold back once the backend shut down, before its driver is closed, and the backend."""
     regions = [
         HostRegion(r.layout_label, r.address, r.nbytes, r.slot_bytes, r.slot_count)
         for r in lender.regions
@@ -200,6 +202,7 @@ def publish(stores, kit, mgr, select=None):
     lease.release()
     assert backend.shutdown(WAIT_S) == frozenset()
     binding.release_hold()
+    binding.driver.close()
     return source, view
 
 
@@ -230,6 +233,7 @@ def test_publish_then_fetch_restores_pages(kit, real_manager, stores) -> None:
         lease.release()
         assert backend.shutdown(WAIT_S) == frozenset()
         binding.release_hold()
+        binding.driver.close()
 
 
 def test_a_partial_fetch_resumes_only_up_to_its_first_undelivered_block(kit, real_manager) -> None:
@@ -254,3 +258,4 @@ def test_a_partial_fetch_resumes_only_up_to_its_first_undelivered_block(kit, rea
         lease.release()
         assert backend.shutdown(WAIT_S) == frozenset()
         binding.release_hold()
+        binding.driver.close()
