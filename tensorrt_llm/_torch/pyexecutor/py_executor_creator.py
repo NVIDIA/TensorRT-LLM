@@ -45,7 +45,7 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler,
-                    is_disagg_enabled, is_mla, validate_feature_combination)
+                    is_disagg_enabled, is_mla)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
@@ -814,7 +814,6 @@ def _create_py_executor(
     # Model loading can disable reuse after runtime features were created.
     model_engine.attn_runtime_features.cache_reuse = (
         kv_cache_config.enable_block_reuse)
-    validate_feature_combination(llm_args, model_engine)
 
     calibrator = get_calibrator()
     layer_wise_benchmarks_config = llm_args.layer_wise_benchmarks_config
