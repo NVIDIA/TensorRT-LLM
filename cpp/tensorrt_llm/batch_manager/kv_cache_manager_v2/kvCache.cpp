@@ -984,15 +984,16 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
     }
     if (mNeverResumed && _shouldRecordManagerStats())
     {
-        for (auto lc : mManager->lifeCycles().ssmLifeCycleIds())
+        for (auto lc : mSelectedOptionalGroups)
         {
-            if (reusePolicy(mManager->lifeCycles()[lc]) != ReusePolicy::OPTIONAL)
+            if (!mManager->lifeCycles().isSsm(lc))
+            {
                 continue;
-            bool const selected = std::find(mSelectedOptionalGroups.begin(), mSelectedOptionalGroups.end(), lc)
-                != mSelectedOptionalGroups.end();
-            if (mPendingStats.recordSsmSnapshotLookup(
-                    lc, mNumLookupTokens, selected ? numCommittedTokens() : 0, mTokensPerBlock))
+            }
+            if (mPendingStats.recordSsmSnapshotLookup(lc, mNumLookupTokens, numCommittedTokens(), mTokensPerBlock))
+            {
                 mManager->markStatsDirty(id);
+            }
         }
     }
     mOptionalCandidates.clear();
