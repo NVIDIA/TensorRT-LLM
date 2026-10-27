@@ -108,7 +108,8 @@ def test_fi_decode_misaligned_index_slice() -> None:
 
 
 @SKIP_UNSUPPORTED
-def test_fi_decode_misaligned_ab_slices() -> None:
+@pytest.mark.parametrize("N", [1, 3])
+def test_fi_decode_misaligned_ab_slices(N: int) -> None:
     """Non-32B-aligned ``a``/``b`` column slices must be realigned.
 
     ``gdn_mixer`` splits the fused ``in_proj_ba`` output into
@@ -129,7 +130,7 @@ def test_fi_decode_misaligned_ab_slices() -> None:
 
     torch.manual_seed(0)
     dev = "cuda"
-    N, H, HV, K, V = 3, 4, 8, 128, 128
+    H, HV, K, V = 4, 8, 128, 128
     q = (torch.randn(1, N, H, K, device=dev) * 0.1).to(torch.bfloat16)
     k = (torch.randn(1, N, H, K, device=dev) * 0.1).to(torch.bfloat16)
     v = (torch.randn(1, N, HV, V, device=dev) * 0.1).to(torch.bfloat16)
@@ -152,6 +153,11 @@ def test_fi_decode_misaligned_ab_slices() -> None:
     a_aligned = shifted_ba[:, HV:].view(1, N, HV)
     assert b_misaligned.data_ptr() % 32 == 16
     assert a_aligned.data_ptr() % 32 == 0
+    if N == 1:
+        # Real decode shape: a size-1 token dim makes the offset view report as
+        # contiguous, so ``.contiguous()`` would keep the misaligned pointer.
+        assert a_misaligned.is_contiguous()
+        assert b_misaligned.is_contiguous()
 
     def _run(a_in, b_in):
         pool = state_pool.clone()
