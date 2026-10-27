@@ -120,7 +120,7 @@ def _compile_so(path: Path, emit_relocs: bool) -> bool:
     cmd = ["gcc", "-shared", "-fPIC", "-o", str(path), str(src)]
     if emit_relocs:
         cmd.insert(3, "-Wl,--emit-relocs")
-    return subprocess.run(cmd, capture_output=True).returncode == 0
+    return subprocess.run(cmd, capture_output=True, timeout=60).returncode == 0
 
 
 needs_toolchain = pytest.mark.skipif(

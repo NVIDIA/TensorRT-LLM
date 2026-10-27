@@ -32,10 +32,6 @@ HIDDEN_SIZE = 7168
 
 
 def _has_supported_gpu() -> bool:
-    # Defer to the predicate the runtime actually dispatches on rather than
-    # restating its capability set. It accepts SM100/SM103 only; SM107 takes
-    # the FLA fallback in KDAKernelDispatch, so admitting it here would run
-    # these parity assertions against the unoptimized path.
     if not torch.cuda.is_available():
         return False
     return is_kda_optimized_supported()
@@ -43,7 +39,7 @@ def _has_supported_gpu() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _has_supported_gpu(),
-    reason="KDA optimized prefill kernels require Blackwell SM100/SM103",
+    reason="FlashInfer KDA prefill requires SM100/SM103/SM107",
 )
 
 
@@ -144,7 +140,7 @@ def _run_production_prefill(
     )
     core = attention.forward_prefill(
         hidden_states.reshape(-1, HIDDEN_SIZE),
-        cu_seqlens,
+        cu_seqlens.to(torch.int64),
         metadata,
         batch_size,
         conv_pool,
@@ -170,10 +166,7 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
 @pytest.mark.parametrize("sequence_length", [1, 127, 256])
 @torch.no_grad()
 def test_fused_kda_post_conv_matches_reference(sequence_length: int, token_major: bool) -> None:
-    """Packed convolution output is normalized and transposed correctly.
-
-    Token-major input is the transposed view of ``[T, 3P]`` rows.
-    """
+    """The unfused convolution path produces contiguous raw Q/K/V without normalization."""
     torch.manual_seed(1)
     num_heads, head_dim = 8, 128
     projection_size = num_heads * head_dim
@@ -184,21 +177,18 @@ def test_fused_kda_post_conv_matches_reference(sequence_length: int, token_major
     if token_major:
         packed = packed.t()
 
-    actual_q, actual_k, actual_v = fused_kda_post_conv(packed, num_heads, head_dim)
+    actual_q, actual_k, actual_v = fused_kda_post_conv(
+        packed, num_heads, head_dim, normalize_qk=False
+    )
     unpacked = packed.reshape(3, projection_size, sequence_length)
     expected_q = unpacked[0].transpose(0, 1).reshape(1, sequence_length, num_heads, head_dim)
     expected_k = unpacked[1].transpose(0, 1).reshape(1, sequence_length, num_heads, head_dim)
     expected_v = unpacked[2].transpose(0, 1).reshape(1, sequence_length, num_heads, head_dim)
-    expected_q = expected_q.float()
-    expected_k = expected_k.float()
-    expected_q *= torch.rsqrt((expected_q * expected_q).sum(dim=-1, keepdim=True) + 1e-6)
-    expected_k *= torch.rsqrt((expected_k * expected_k).sum(dim=-1, keepdim=True) + 1e-6)
-
     assert actual_q.is_contiguous()
     assert actual_k.is_contiguous()
     assert actual_v.is_contiguous()
-    torch.testing.assert_close(actual_q, expected_q.to(packed.dtype), rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(actual_k, expected_k.to(packed.dtype), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(actual_k, expected_k, rtol=0, atol=0)
     assert torch.equal(actual_v, expected_v)
 
 
@@ -233,6 +223,7 @@ def test_project_packed_conv_input_layout(
     torch.manual_seed(3)
     # Only the projection layout is checked, so two heads keep the weights small.
     kda = _make_kda(num_heads=2).to(dtype)
+    kda._fuse_prefill_conv = False
     kda.finalize_decode_weights()
     assert kda._qkvg_proj_weight is not None
     x2d = torch.randn(num_tokens, HIDDEN_SIZE, dtype=dtype, device="cuda") * 0.05
@@ -408,8 +399,7 @@ def test_optimized_prefill_matches_fla_reference(num_heads: int, use_full_rank_g
         optimized.state_dict(), num_heads=num_heads, use_full_rank_gate=use_full_rank_gate
     )
 
-    # Keep B=2 across a T transition: eqlen mBeta/mAqk/mAkk batch strides
-    # depend on T and therefore require distinct compiled kernel variants.
+    # Reuse the same module across changing token counts and batch sizes.
     for batch_size, sequence_length in [(2, 256), (2, 512), (1, 1024)]:
         hidden_states = (
             torch.randn(
@@ -449,111 +439,6 @@ def test_optimized_prefill_matches_fla_reference(num_heads: int, use_full_rank_g
     actual = _run_production_prefill(optimized, hidden_states, cumulative_lengths)
     expected = reference.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
     _assert_close(actual, expected)
-
-
-@torch.no_grad()
-@pytest.mark.parametrize(
-    "sequence_lengths",
-    [None, [100, 257, 63]],
-    ids=["padded_eqlen", "varlen"],
-)
-def test_fused_prefill_beta_sigmoid_matches_unfused_kernel(
-    sequence_lengths: list[int] | None,
-) -> None:
-    """In-kernel beta sigmoid matches the legacy host launch."""
-    from fla.modules.l2norm import l2norm_fwd
-    from fla.ops.common.gate import fused_beta_sigmoid
-
-    torch.manual_seed(10)
-    batch_size = 1
-    if sequence_lengths is None:
-        sequence_length = 300
-        num_sequences = batch_size
-        cu_seqlens = None
-    else:
-        sequence_length = sum(sequence_lengths)
-        num_sequences = len(sequence_lengths)
-        cu_seqlens = torch.tensor(
-            [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
-            dtype=torch.long,
-            device="cuda",
-        )
-    A_log = torch.randn(NUM_HEADS, dtype=torch.float32, device="cuda") * 0.1
-    dt_bias = torch.randn(NUM_HEADS * HEAD_DIM, dtype=torch.float32, device="cuda") * 0.1
-
-    for seed in (11, 12):
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-
-        def randn(
-            *shape: int, dtype: torch.dtype = torch.bfloat16, scale: float = 0.05
-        ) -> torch.Tensor:
-            return (
-                torch.randn(*shape, generator=generator, dtype=torch.float32, device="cuda") * scale
-            ).to(dtype)
-
-        q = randn(batch_size, sequence_length, NUM_HEADS, HEAD_DIM)
-        k = randn(batch_size, sequence_length, NUM_HEADS, HEAD_DIM)
-        v = randn(batch_size, sequence_length, NUM_HEADS, HEAD_DIM)
-        g = randn(batch_size, sequence_length, NUM_HEADS, HEAD_DIM)
-        if seed == 11:
-            beta = randn(batch_size, sequence_length, NUM_HEADS, dtype=torch.float32)
-        else:
-            # Exercise the L2 epsilon path and saturated sigmoid tails.
-            q[:, ::17].zero_()
-            k[:, ::19].zero_()
-            beta = torch.linspace(
-                -20.0,
-                20.0,
-                batch_size * sequence_length * NUM_HEADS,
-                dtype=torch.float32,
-                device="cuda",
-            ).reshape(batch_size, sequence_length, NUM_HEADS)
-        initial_state = randn(
-            num_sequences, NUM_HEADS, HEAD_DIM, HEAD_DIM, dtype=torch.float32, scale=0.01
-        )
-        state_indices = torch.arange(num_sequences, dtype=torch.int32, device="cuda")
-
-        common = dict(
-            v=v,
-            g=g,
-            scale=HEAD_DIM**-0.5,
-            state_indices=state_indices,
-            safe_gate=True,
-            lower_bound=-5.0,
-            use_gate_in_kernel=True,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            cu_seqlens=cu_seqlens,
-        )
-
-        q_unfused, _ = l2norm_fwd(q)
-        k_unfused, _ = l2norm_fwd(k)
-        beta_unfused = fused_beta_sigmoid(beta, scale=1.0).to(torch.bfloat16)
-        state_unfused = initial_state.clone()
-        output_unfused = torch.ops.trtllm.kda_prefill(
-            q=q_unfused,
-            k=k_unfused,
-            beta=beta_unfused,
-            state_pool=state_unfused,
-            use_beta_sigmoid_in_kernel=False,
-            **common,
-        )
-        # The op reuses shape-keyed output buffers; retain the first result
-        # before the fused call overwrites it.
-        output_unfused = output_unfused.clone()
-
-        state_fused = initial_state.clone()
-        output_fused = torch.ops.trtllm.kda_prefill(
-            q=q_unfused,
-            k=k_unfused,
-            beta=beta,
-            state_pool=state_fused,
-            use_beta_sigmoid_in_kernel=True,
-            **common,
-        )
-
-        _assert_close(output_fused, output_unfused)
-        _assert_close(state_fused, state_unfused)
 
 
 @torch.no_grad()
@@ -603,86 +488,10 @@ def test_kda_mixer_empty_prefill_preserves_initial_conv_state():
 
 
 @torch.no_grad()
-def test_indexed_prefill_routing_validates_equal_length_state_indices() -> None:
-    dispatch = _kda_kernels.KDAKernelDispatch(
-        use_optimized_prefill=True,
-        use_optimized_decode=False,
-    )
-    assert dispatch.prefill_kernel_path == "optimized"
-    state_pool = torch.zeros(3, 1, 2, 2, dtype=torch.float32, device="cuda")
-    state_indices = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
-    has_initial_states = torch.zeros(2, dtype=torch.bool, device="cuda")
-    common = {
-        "state_pool": state_pool,
-        "has_initial_states": has_initial_states,
-        "cu_seqlens": None,
-        "num_tokens": 256,
-    }
-
-    assert dispatch.can_use_indexed_prefill(
-        state_indices=state_indices,
-        num_sequences=2,
-        **common,
-    )
-    assert not dispatch.can_use_indexed_prefill(
-        state_indices=state_indices,
-        num_sequences=1,
-        **common,
-    )
-
-    misaligned_storage = torch.tensor([-1, 0, 1], dtype=torch.int32, device="cuda")
-    misaligned_indices = misaligned_storage[1:]
-    assert misaligned_indices.is_contiguous()
-    assert misaligned_indices.data_ptr() % 16 != 0
-    assert not dispatch.can_use_indexed_prefill(
-        state_indices=misaligned_indices,
-        num_sequences=2,
-        **common,
-    )
-
-
-@torch.no_grad()
-def test_kda_prefill_op_rejects_misaligned_state_indices() -> None:
-    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_custom_ops  # noqa: F401
-
-    q = torch.zeros(1, 256, 1, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    beta = torch.zeros(1, 256, 1, dtype=torch.float32, device="cuda")
-    state_pool = torch.zeros(1, 1, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device="cuda")
-    index_storage = torch.tensor([-1, 0], dtype=torch.int32, device="cuda")
-    state_indices = index_storage[1:]
-    assert state_indices.is_contiguous()
-    assert state_indices.data_ptr() % 16 != 0
-
-    with pytest.raises(ValueError, match="16-byte-aligned state_indices"):
-        torch.ops.trtllm.kda_prefill(
-            q=q,
-            k=q,
-            v=q,
-            g=q,
-            beta=beta,
-            state_pool=state_pool,
-            state_indices=state_indices,
-            scale=HEAD_DIM**-0.5,
-        )
-
-
-@torch.no_grad()
 def test_kda_prefill_op_partial_final_chunk_large_batch():
-    """Regression: varlen batches whose FINAL chunk is partial.
+    """Large packed batches with short final sequences match the FLA reference.
 
-    The chunk-tile kernels access the full 64-row tile of every chunk and
-    neutralize invalid rows only after the access, so the batch's final
-    partial chunk touches up to 63 rows past the logical packed length —
-    OOB reads on the beta input (now bounds-checked in fused_k123) and on
-    the A_kk/A_qk scratch (now allocated with one chunk of slack). The
-    runtime's autotuner-warmup shape [max_seq_len - 1, 1] = [8191, 1] hit
-    this as CUDA_ERROR_ILLEGAL_ADDRESS whenever the following page was
-    unmapped.
-
-    - [8191, 1]: the exact autotuner-warmup composition (one max_seq_len-1
-      context plus a 1-token remainder).
-    - [8000, 150, 42]: interior partial chunks (cross-sequence rows) plus
-      a partial final chunk, at eval-like scale.
+    Cover the autotuner warmup split [8191, 1] and a mixed-length 8192-token batch.
     """
     optimized = _make_kda()
     reference = _make_reference(optimized.state_dict())
@@ -712,23 +521,21 @@ def test_kda_prefill_op_partial_final_chunk_large_batch():
     "sequence_lengths",
     ([1], [30], [65], [6, 12], [64, 64], [1, 2, 3], [64, 64, 63], [6, 12, 20, 25]),
     ids=(
-        # The only shape taking the sentinel-padded, forced-VARLEN_PURE branch.
         "single-token",
-        "one-chunk",
-        "two-chunk-single-seq",
-        "two-chunk-varlen",
-        # All-aligned, so the tile guard alone bounds the kernel's stores.
-        "two-chunk-varlen-aligned",
+        "short-single-seq",
+        "partial-single-seq",
+        "two-short-seqs",
+        "two-aligned-seqs",
         "three-short-seqs",
-        "three-chunk-boundary",
-        "four-chunk",
+        "three-seqs-partial-tail",
+        "four-short-seqs",
     ),
 )
 def test_kda_prefill_small_varlen_stays_on_optimized_op(
     monkeypatch: pytest.MonkeyPatch,
     sequence_lengths: list[int],
 ) -> None:
-    """The optimized op owns every small varlen chunk count, not just NT >= 4.
+    """Short packed prompts stay on the optimized prefill path.
 
     Routing these short-prompt shapes to FLA instead would make a real serving
     run pay FLA's cold Triton autotune on its first short context.
@@ -760,20 +567,22 @@ def test_kda_prefill_small_varlen_stays_on_optimized_op(
     actual = _run_production_prefill(optimized, hidden_states, cumulative_lengths)
     assert fla_spy.call_count == 0, (
         f"prefill fell back to FLA for sequence lengths {sequence_lengths}; "
-        "the optimized op must handle every varlen chunk count"
+        "the optimized op must handle short packed prompts"
     )
 
     expected = reference.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
     _assert_close(actual, expected)
 
 
-@pytest.mark.parametrize("misaligned_indices", [False, True], ids=["indexed", "fallback"])
+@pytest.mark.parametrize(
+    "misaligned_indices", [False, True], ids=["aligned-indices", "offset-indices"]
+)
 @torch.no_grad()
 def test_kda_prefill_state_pool_matches_fallback_with_mixed_initial_states(
     monkeypatch: pytest.MonkeyPatch,
     misaligned_indices: bool,
 ) -> None:
-    """Indexed and unsupported-index paths match FLA state handling."""
+    """Aligned and offset int32 slot views both match the explicit FLA fallback."""
     torch.manual_seed(3)
     optimized = _make_kda()
     monkeypatch.setattr(_kda_kernels, "is_intree_prefill_available", lambda: False)
@@ -856,6 +665,66 @@ def test_kda_prefill_state_pool_matches_fallback_with_mixed_initial_states(
 
 
 @torch.no_grad()
+@pytest.mark.parametrize(
+    "sequence_lengths",
+    [[100, 200], None],
+    ids=["varlen", "single-sequence"],
+)
+def test_kda_prefill_op_output_survives_the_next_call(sequence_lengths) -> None:
+    """The op's output belongs to the caller, as its fake (a new tensor) declares.
+
+    A second call with the same shapes and other inputs must leave the first
+    call's output as it was. ``None`` runs one packed 300-token sequence.
+    """
+    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_custom_ops  # noqa: F401
+
+    heads = 2
+    tokens = sum(sequence_lengths) if sequence_lengths else 300
+    rows = len(sequence_lengths) if sequence_lengths else 1
+    state_pool = torch.zeros(rows, heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device="cuda")
+    state_indices = torch.arange(rows, dtype=torch.int32, device="cuda")
+    cu_seqlens = torch.tensor([0, tokens], dtype=torch.int64, device="cuda")
+    if sequence_lengths:
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
+            dtype=torch.long,
+            device="cuda",
+        )
+
+    def call(seed: int) -> torch.Tensor:
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        shape = (1, tokens, heads, HEAD_DIM)
+
+        def unit() -> torch.Tensor:
+            t = torch.randn(*shape, generator=gen, device="cuda")
+            return (t / t.norm(dim=-1, keepdim=True)).to(torch.bfloat16)
+
+        state_pool.zero_()
+        return torch.ops.trtllm.kda_prefill(
+            q=unit(),
+            k=unit(),
+            v=(torch.randn(*shape, generator=gen, device="cuda") * 0.5).to(torch.bfloat16),
+            g=torch.randn(*shape, generator=gen, device="cuda").to(torch.bfloat16),
+            beta=torch.randn(1, tokens, heads, generator=gen, device="cuda", dtype=torch.bfloat16),
+            state_pool=state_pool,
+            state_indices=state_indices,
+            scale=HEAD_DIM**-0.5,
+            cu_seqlens=cu_seqlens,
+            lower_bound=-5.0,
+            A_log=torch.zeros(heads, device="cuda"),
+            dt_bias=torch.zeros(heads * HEAD_DIM, device="cuda"),
+        )
+
+    first = call(seed=0)
+    kept = first.clone()
+    second = call(seed=1)
+    torch.cuda.synchronize()
+    assert first.shape == second.shape == (1, tokens, heads, HEAD_DIM)
+    assert not torch.equal(second, kept), "the two calls must compute different outputs"
+    assert torch.equal(first, kept), "a later call wrote an earlier call's output"
+
+
+@torch.no_grad()
 def test_token_major_prefill_matches_channel_major_with_initial_states(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -868,6 +737,7 @@ def test_token_major_prefill_matches_channel_major_with_initial_states(
     """
     torch.manual_seed(5)
     kda = _make_kda()
+    kda._fuse_prefill_conv = False
     sequence_lengths = [64, 64, 64, 63]
     assert sum(sequence_lengths) * torch.bfloat16.itemsize % 16 != 0
     cumulative_lengths = torch.tensor(
@@ -945,30 +815,18 @@ def test_token_major_prefill_matches_channel_major_with_initial_states(
 
 @torch.no_grad()
 def test_kda_prefill_op_shape_growth_and_cu_dtype_transitions():
-    """Cross-call transitions through one process's compile caches.
+    """Changing token counts and caller offset dtypes preserve reference parity.
 
-    Regression for the cu/ci-dtype cache-key bug: the K123/akk_inv compile
-    caches were keyed shape-independently but NOT on the cu_seqlens /
-    chunk_indices dtype, while the compiled kernels bake the element type
-    (int64 reads use stride 8, int32 stride 4). Reusing an int64-compiled
-    kernel on int32 cu/ci misaddressed every cu/ci element — garbage seq
-    ids / chunk starts -> cudaErrorIllegalAddress on the first call after
-    the flip (memcheck: 4-byte read one element past the 2-entry int32 cu);
-    the reverse direction (int32-compiled, int64 passed) corrupted
-    silently. Shape growth alone (same dtype) was already sound.
-
-    The sequence below covers, in one process: buffer-cache growth
-    (T 1171 -> 8191), int64 -> int32 flip on the grown shape, shrink with
-    a flip back, and a multi-seq int32 batch. Every call is parity-checked
-    against FLA (catches the silent-corruption direction too).
+    The production adapter prepares int64 packed offsets for FlashInfer from
+    either caller dtype. Repeated growth and shrinkage exercise cached kernels.
     """
     torch.manual_seed(0)
     optimized = _make_kda()
     reference = _make_reference(optimized.state_dict())
     cases = [
         ([517, 654], torch.long),  # small batch, int64 cu (dump-replay-like)
-        ([8191], torch.int32),  # buffer growth + dtype flip (crashed pre-fix)
-        ([1171], torch.long),  # shrink + flip back (silent corruption pre-fix)
+        ([8191], torch.int32),  # growth + dtype conversion
+        ([1171], torch.long),  # shrink + flip back
         ([150, 900, 333, 640], torch.int32),  # multi-seq int32
     ]
     for sequence_lengths, cu_dtype in cases:

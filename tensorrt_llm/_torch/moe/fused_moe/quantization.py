@@ -555,11 +555,11 @@ class FusedMoEMethodBase(ABC):
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
         if allow_partial_loading:
-            if not isinstance(self,
-                              (UnquantizedFusedMoEMethod, FP8QDQFusedMoEMethod,
-                               DeepSeekFP8BlockScalesFusedMoEMethod,
-                               DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
-                               NVFP4FusedMoEMethod)):
+            if not isinstance(
+                    self, (UnquantizedFusedMoEMethod, FP8QDQFusedMoEMethod,
+                           DeepSeekFP8BlockScalesFusedMoEMethod,
+                           DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
+                           NVFP4FusedMoEMethod, MXFP8CutlassFusedMoEMethod)):
                 raise NotImplementedError(
                     f"Partial loading is not supported for {type(self).__name__}"
                 )
@@ -1541,20 +1541,35 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
                 f"Weight Only Quantization currently only supports INT8. Got: {module.quant_config.layer_quant_mode}."
             )
 
+        # The INT8 mixed-GEMM preprocessor packs rows in tiles of 64
+        # (preprocess_weights_for_mixed_gemm: rows_per_tile = 128 * 8 //
+        # BITS_PER_ELT_A, and BITS_PER_ELT_A = 16 for W8A16). When the per-partition
+        # intermediate size is not a multiple of 64 - e.g. moe_intermediate_size
+        # = 1856 = 64 * 29 sharded by a power-of-2 tp_size - the sharded rows are not
+        # 64-aligned and weight loading fails at TP>1. The FP8/NVFP4/MXFP4/WFP4A16
+        # methods round the sharded intermediate up and F.pad; do the same here.
+        ALIGN = 64
+        inter_padded = ((module.intermediate_size_per_partition + ALIGN - 1) //
+                        ALIGN) * ALIGN
+        module._int8woq_inter_padded = inter_padded
+        # expand_intermediate_size_per_partition is 2*inter (gated) or inter
+        # (non-gated); scale the padded width by the same ratio.
+        expand_ratio = (module.expand_intermediate_size_per_partition //
+                        module.intermediate_size_per_partition)
+        expand_padded = inter_padded * expand_ratio
+
         # notice the weight shape for int8 weight-only is different from the original shape,
         # since the quantized weights have their own layout
         w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.hidden_size,
-                              module.expand_intermediate_size_per_partition)
-        w2_weight_shape = (module.expert_size_per_partition,
-                           module.intermediate_size_per_partition,
+                              module.hidden_size, expand_padded)
+        w2_weight_shape = (module.expert_size_per_partition, inter_padded,
                            module.hidden_size)
 
-        fc31_weight_scale = nn.Parameter(torch.empty(
-            module.expert_size_per_partition,
-            module.expand_intermediate_size_per_partition,
-            dtype=module.dtype),
-                                         requires_grad=False)
+        fc31_weight_scale = nn.Parameter(
+            torch.empty(module.expert_size_per_partition,
+                        expand_padded,
+                        dtype=module.dtype),
+            requires_grad=False)
         module.register_parameter("fc31_weight_scale", fc31_weight_scale)
 
         fc2_weight_scale = nn.Parameter(torch.empty(
@@ -1587,6 +1602,11 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN)
+        # Pad the sharded intermediate rows up to a multiple of 64 (see
+        # create_weights); the mixed-GEMM preprocessor requires 64-aligned rows.
+        pad = module._int8woq_inter_padded - w1_weight_shard.shape[0]
+        if pad:
+            w1_weight_shard = F.pad(w1_weight_shard, (0, 0, 0, pad))
 
         # w3_weight (gate_proj) is empty for non-gated MoE (e.g. Nemotron-H squared-ReLU).
         # Only concatenate the gate projection when present; otherwise the single
@@ -1596,6 +1616,8 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
             w3_weight_shard = load_weight_shard(w3_weight, module.tp_size,
                                                 module.tp_rank,
                                                 TensorParallelMode.COLUMN)
+            if pad:
+                w3_weight_shard = F.pad(w3_weight_shard, (0, 0, 0, pad))
             w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard],
                                          dim=0)
         else:
@@ -1625,6 +1647,11 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         w2_weight_shard = load_weight_shard(w2_weight, module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.ROW)
+        # Pad the row-sharded intermediate up to a multiple of 64 (see
+        # create_weights) so the mixed-GEMM preprocessor sees 64-aligned rows.
+        pad = module._int8woq_inter_padded - w2_weight_shard.shape[1]
+        if pad:
+            w2_weight_shard = F.pad(w2_weight_shard, (0, pad))
 
         weight_dtype = torch.int8
         if not module.quant_config.layer_quant_mode.is_int8_weight_only():
@@ -1644,19 +1671,28 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         # for non-gated MoE (e.g. Nemotron-H squared-ReLU). Only concatenate the
         # gate-projection scales when the gate weights are present; otherwise the
         # up-projection scales alone fill the (non-doubled) fc31 scale buffer.
+        # Pad each per-channel scale shard to the 64-aligned intermediate size
+        # (value=1.0 is inert: the padded weight rows are zero, so 0 * scale = 0;
+        # 1.0 merely avoids any downstream reciprocal producing NaN/Inf).
+        def _pad_scale(t):
+            p = module._int8woq_inter_padded - t.shape[-1]
+            return F.pad(t, (0, p), value=1.0) if p else t
+
         all_w1_scales = [
-            load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
-                              module.tp_size, module.tp_rank,
-                              TensorParallelMode.COLUMN)
+            _pad_scale(
+                load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
+                                  module.tp_size, module.tp_rank,
+                                  TensorParallelMode.COLUMN))
             for expert_id in module.initial_local_expert_ids
         ]
         has_w3_scales = all(f"{expert_id}.w3.weight_scale" in weights
                             for expert_id in module.initial_local_expert_ids)
         if module.is_gated_activation and has_w3_scales:
             all_w3_scales = [
-                load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
-                                  module.tp_size, module.tp_rank,
-                                  TensorParallelMode.COLUMN)
+                _pad_scale(
+                    load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
+                                      module.tp_size, module.tp_rank,
+                                      TensorParallelMode.COLUMN))
                 for expert_id in module.initial_local_expert_ids
             ]
             w3_w1_scales = torch.cat(
@@ -2543,6 +2579,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         """
         module.tmp_raw_input_scales = {}
         module.tmp_weight_scale_2 = {}
+        # Created unconditionally even though only an NVFP4_AWQ / NVFP4_ARC
+        # checkpoint fills it: whether this checkpoint carries a pre-quant
+        # scale is not known until the first expert arrives, by which time
+        # several loader threads are already running.
+        module.tmp_pre_quant_scales = {}
         module._streamed_expert_slots = set()
 
     def _finalize_staged_w3_w1_expert(
@@ -2599,6 +2640,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         w3_weight_scale: torch.Tensor,
         w3_weight_scale_2: torch.Tensor,
         w3_input_scale: torch.Tensor,
+        w1_pre_quant_scale: Optional[torch.Tensor] = None,
+        w3_pre_quant_scale: Optional[torch.Tensor] = None,
     ) -> None:
         """Load one NVFP4 checkpoint expert into a local slot.
 
@@ -2612,6 +2655,15 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         ``prepare_streaming_expert_load`` must have run first, and
         ``module.process_weights_after_loading()`` must run once the layer's
         last slot is in — nothing else calls it on this path.
+
+        ``w1_pre_quant_scale`` / ``w3_pre_quant_scale`` are the per-channel
+        pre-quant scale an NVFP4_AWQ / NVFP4_ARC checkpoint carries and a plain
+        NVFP4 one does not; passing them stages them exactly as
+        ``load_quant_scales`` does, so ``_finalize_pre_quant_scales`` lands the
+        same ``fc31_act_scale`` on either path. Leaving them out of such a
+        checkpoint's load is silently wrong rather than merely unoptimized: the
+        activation would be quantized unsmoothed against an ``input_scale``
+        calibrated on ``x * pre_quant_scale``.
 
         One deliberate difference from ``load_quant_scales``: it reduces the
         activation ``input_scale`` over every expert in the checkpoint, whereas
@@ -2644,6 +2696,18 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             if value.dtype != torch.uint8:
                 raise TypeError(f"{name} must contain packed NVFP4 uint8 data, "
                                 f"got {value.dtype}.")
+
+        has_pre_quant_scale = (w1_pre_quant_scale is not None
+                               or w3_pre_quant_scale is not None)
+        if has_pre_quant_scale:
+            if w1_pre_quant_scale is None or w3_pre_quant_scale is None:
+                raise ValueError(
+                    "w1_pre_quant_scale and w3_pre_quant_scale must be loaded "
+                    "together; fc31_act_scale is their elementwise maximum.")
+            if not module.is_gated_activation:
+                raise ValueError(
+                    "pre_quant_scale (NVFP4_AWQ / NVFP4_ARC) is not supported "
+                    "with non-gated activations.")
 
         # Cutlass stages the two halves of w3_w1 per expert and needs the slot
         # id as the staging key; other backends write straight through.
@@ -2680,6 +2744,25 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             'w3': w3_input_scale[...].reshape([]),
             'w2': w2_input_scale[...].reshape([]),
         }
+
+        # Per-channel pre-quant scale (NVFP4_AWQ / NVFP4_ARC), keyed by global
+        # expert id like the input scales above and for the same reason: it is
+        # only cross-checked and reduced, never indexed positionally. Sharded
+        # with the same ROW mode ``load_quant_scales`` uses, which for this
+        # 1-D per-channel tensor leaves it whole. Staged on the host
+        # (``load_weight_shard``'s default), where a streaming checkpoint's
+        # tensors already are, so nothing holds device memory for the length of
+        # the layer load; ``_finalize_pre_quant_scales`` moves the reduction's
+        # result onto ``fc31_act_scale``.
+        if has_pre_quant_scale:
+            module.tmp_pre_quant_scales[global_expert_id] = {
+                'w1':
+                load_weight_shard(w1_pre_quant_scale, module.tp_size,
+                                  module.tp_rank, TensorParallelMode.ROW),
+                'w3':
+                load_weight_shard(w3_pre_quant_scale, module.tp_size,
+                                  module.tp_rank, TensorParallelMode.ROW),
+            }
 
         # Backends that only stage their input here resolve this slot right
         # away, so the staged footprint stays proportional to the experts in
@@ -2782,6 +2865,37 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 tmp_weight_scale_2.setdefault(expert_idx, {})
                 tmp_weight_scale_2[expert_idx]['w2'] = w2_weight_scale_2
 
+    def _ensure_fc31_act_scale(self, module: torch.nn.Module) -> None:
+        """Register the per-channel act scale an AWQ checkpoint needs.
+
+        ``create_weights`` registers the slot as ``None`` because only a
+        checkpoint carrying ``*.pre_quant_scale`` (NVFP4_AWQ / NVFP4_ARC) has a
+        value for it. The whole-checkpoint loader creates it as soon as it sees
+        those keys; the streaming loader has no such single point, so it
+        creates it from ``_finalize_pre_quant_scales`` instead, which is the
+        first place after a layer's experts are all in.
+        """
+        if getattr(module, "fc31_act_scale", None) is not None:
+            return
+        # Shape: (1, hidden_size) - single vector for all experts (they share
+        # the same input).
+        #
+        # Named device, unlike the staging tensors around it, because this is
+        # a forward operand rather than load scratch: ``quantize_input``
+        # multiplies the activation by it on every call, so it belongs on the
+        # compute device whichever loader allocates it. The current device is
+        # the right one for both callers -- the whole-checkpoint loader runs
+        # on it, and each streaming loader thread calls
+        # ``torch.cuda.set_device`` before it loads an expert. This is the one
+        # place the device is chosen: ``_finalize_pre_quant_scales`` moves the
+        # staged scales onto this parameter.
+        fc31_act_scale = nn.Parameter(torch.empty(1,
+                                                  module.hidden_size,
+                                                  dtype=module.dtype,
+                                                  device='cuda'),
+                                      requires_grad=False)
+        module.register_parameter("fc31_act_scale", fc31_act_scale)
+
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         # Check if pre_quant_scale exists in the checkpoint (for NVFP4_AWQ)
         has_pre_quant_scale = False
@@ -2792,14 +2906,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         # If pre_quant_scale exists, we need a per-channel act scale for fc31
         # All experts share the same input, so pre_quant_scale should be identical across experts
         if has_pre_quant_scale:
-            # Create fc31_act_scale parameter (for gate_up_proj / w3_w1)
-            # Shape: (1, hidden_size) - single vector for all experts (they share the same input)
-            fc31_act_scale = nn.Parameter(torch.empty(1,
-                                                      module.hidden_size,
-                                                      dtype=module.dtype,
-                                                      device='cuda'),
-                                          requires_grad=False)
-            module.register_parameter("fc31_act_scale", fc31_act_scale)
+            self._ensure_fc31_act_scale(module)
 
         # Step1: Store raw per-expert input scales individually into tmp dict.
         # Consistency check + global max computation deferred to process_weights_after_loading().
@@ -2977,6 +3084,15 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         """Verify pre_quant_scale consistency across experts and compute fc31_act_scale."""
         if not hasattr(module, 'tmp_pre_quant_scales'):
             return
+        if not module.tmp_pre_quant_scales:
+            # Only the streaming loader gets here: it pre-creates the container
+            # before it knows whether the checkpoint carries a pre-quant scale,
+            # and a plain NVFP4 one leaves it empty. The whole-checkpoint loader
+            # creates it only after finding the keys, so an empty-but-present
+            # container never means "the scales went missing" there either.
+            delattr(module, 'tmp_pre_quant_scales')
+            return
+        self._ensure_fc31_act_scale(module)
         # Collect all loaded w3/w1 pre_quant_scales
         all_w3 = []
         all_w1 = []
@@ -3011,10 +3127,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                     logger.error(msg)
                     raise ValueError(msg)
 
-        # Take the max of w3 and w1 from the first expert
-        fc31_pre_quant_scale = torch.max(w3_reference,
-                                         w1_reference).to(dtype=module.dtype,
-                                                          device='cuda')
+        # Take the max of w3 and w1 from the first expert, moved onto the
+        # destination parameter's device: the staged scales sit wherever the
+        # loader that staged them put them -- the host for the streaming
+        # loader, ``fc31_act_scale.device`` for ``load_quant_scales``, which
+        # keys its own staging off this same parameter -- and
+        # ``_ensure_fc31_act_scale`` is the one place that chooses the device.
+        fc31_pre_quant_scale = torch.max(w3_reference, w1_reference).to(
+            dtype=module.dtype, device=module.fc31_act_scale.device)
         module.fc31_act_scale.data.copy_(fc31_pre_quant_scale.unsqueeze(0))
 
         delattr(module, 'tmp_pre_quant_scales')
@@ -3797,7 +3917,7 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     Inherits the full CUTLASS NVFP4 weight pipeline (cat + pad +
     block_scale_interleave) so the backend's
     hybrid prefill path can continue to consume the standard CUTLASS
-    NVFP4 GroupGEMM layout via the inherited ``CutlassFusedMoE.run_moe``.
+    NVFP4 GroupGEMM layout via the inherited ``TrtllmCutlassNvfp4Impl.run_moe``.
 
     On top of that base layout, ``transform_weights`` materialises the
     b12x-specific weight tensors: SF un-normalization (multiply per-block
@@ -6616,6 +6736,20 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
                                        requires_grad=False)
         module.register_parameter("w2_weight_scale", w2_weight_scale)
 
+        # Local slots whose staged UE8M0 bytes still need the CUTLASS swizzle.
+        # The swizzle is deferred to ``process_weights_after_loading`` because
+        # it is a read-modify-write on the destination buffer and therefore
+        # NOT an involution: under partial loading every bucket that touches
+        # this module calls ``load_quant_scales``, so applying it during
+        # staging would re-swizzle slots written by an earlier bucket (e.g. a
+        # down_proj-only bucket following a gate_up bucket) and scramble them.
+        # Tracking slots rather than a single flag keeps expert-sharded
+        # buckets correct, and clearing them makes repeated finalize a no-op.
+        # The w3_w1 entries are (slot, "w3" | "w1") so that a partial refit of
+        # one projection swizzles only the half that was rewritten.
+        module._mxfp8_w3_w1_sf_pending_slots = set()
+        module._mxfp8_w2_sf_pending_slots = set()
+
         self._online_eplb_not_verified(module)
         self.setup_quant_scales(module)
 
@@ -6646,10 +6780,25 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
                 w1_sf = weights[w1_key] if w1_key is not None else None
                 w3_sf = weights[w3_key] if w3_key is not None else None
                 w2_sf = weights[w2_key] if w2_key is not None else None
+            elif (module.weight_loading_mode ==
+                  MoEWeightLoadingMode.FUSED_GATE_UP_PROJ):
+                # Stacked [E, K/32, N] scales, mirroring how the weights
+                # themselves are read in load_expert_weights_to_dst: transpose
+                # into [N, K/32] and split gate/up. Either key may be absent
+                # when a partial bucket carries only one of the projections.
+                w1_sf, w3_sf, w2_sf = None, None, None
+                gate_up_sf = weights.get("gate_up_proj_weight_scale")
+                if gate_up_sf is not None:
+                    w1_w3_sf = gate_up_sf[expert_id].transpose(0,
+                                                               1).contiguous()
+                    w1_sf, w3_sf = w1_w3_sf.chunk(2, dim=0)
+                down_sf = weights.get("down_proj_weight_scale")
+                if down_sf is not None:
+                    w2_sf = down_sf[expert_id].transpose(0, 1).contiguous()
             else:
                 raise NotImplementedError(
                     f"MXFP8 MoE: weight loading mode {module.weight_loading_mode} "
-                    "not yet supported (only VANILLA today).")
+                    "not supported (VANILLA and FUSED_GATE_UP_PROJ only).")
 
             # View the int32-packed storage as raw uint8 [E_slot, 2*N, K/32]
             # so we can write per-row UE8M0 scales naturally. The byte layout
@@ -6686,25 +6835,70 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
                                              device=device)
                 dst_w2_u8.copy_(w2_shard.to(torch.uint8))
 
-            # Swizzle each expert's block scale into the CUTLASS Mxf8f6f4
-            # block-scaled layout expected by the kernel mainloop. The op
-            # operates on the uint8 view; the result is then re-viewed back
-            # to int32 (same bytes, new dtype interpretation matching what
-            # the MoE TMA descriptor reads).
-            orig_w3_w1_int32_shape = module.w3_w1_weight_scale.data[
-                local_slot_id].shape
-            swizzled_w3_w1 = torch.ops.trtllm.block_scale_interleave(
-                dst_w3_w1_u8)
-            module.w3_w1_weight_scale.data[local_slot_id].copy_(
-                swizzled_w3_w1.view(
-                    self.BLOCK_SCALES_DTYPE).reshape(orig_w3_w1_int32_shape))
+            # Only stage raw UE8M0 bytes here and record which slots still owe
+            # the swizzle; process_weights_after_loading applies it exactly
+            # once. Arm a slot only when its bytes actually arrived, so a
+            # bucket that carries no scale for this tensor cannot re-swizzle a
+            # slot that a previous finalize already converted.
+            if w1_sf is not None:
+                module._mxfp8_w3_w1_sf_pending_slots.add((local_slot_id, "w1"))
+            if w3_sf is not None:
+                module._mxfp8_w3_w1_sf_pending_slots.add((local_slot_id, "w3"))
+            if w2_sf is not None:
+                module._mxfp8_w2_sf_pending_slots.add(local_slot_id)
 
-            orig_w2_int32_shape = module.w2_weight_scale.data[
-                local_slot_id].shape
-            swizzled_w2 = torch.ops.trtllm.block_scale_interleave(dst_w2_u8)
-            module.w2_weight_scale.data[local_slot_id].copy_(
-                swizzled_w2.view(
-                    self.BLOCK_SCALES_DTYPE).reshape(orig_w2_int32_shape))
+    def _swizzle_scale(self, scale: torch.Tensor) -> None:
+        """Swizzle a block-scale tensor into the CUTLASS Mxf8f6f4 layout.
+
+        The op operates on the uint8 view; the result is re-viewed back to
+        int32 (same bytes, new dtype interpretation matching what the MoE TMA
+        descriptor reads).
+        """
+        orig_int32_shape = scale.shape
+        swizzled = torch.ops.trtllm.block_scale_interleave(
+            scale.view(torch.uint8))
+        scale.copy_(
+            swizzled.view(self.BLOCK_SCALES_DTYPE).reshape(orig_int32_shape))
+
+    def _swizzle_w3_w1_slot(self, scale_data: torch.Tensor, local_slot_id: int,
+                            halves: set) -> None:
+        slot = scale_data[local_slot_id]
+        if len(halves) == 2:
+            self._swizzle_scale(slot)
+            return
+        # The swizzle works on 128-row tiles, so a single projection can be
+        # swizzled on its own only when it is a whole number of tiles; the
+        # result is then identical to swizzling the full slot.
+        half_rows = slot.shape[0] // 2
+        if half_rows % 128 != 0:
+            raise RuntimeError(
+                "MXFP8 MoE partial refit of a single w1/w3 projection needs "
+                f"intermediate size per partition to be a multiple of 128, got "
+                f"{half_rows}")
+        w3, w1 = slot.chunk(2, dim=0)
+        self._swizzle_scale(w1 if "w1" in halves else w3)
+
+    def process_weights_after_loading(self, module: torch.nn.Module):
+        # Apply the deferred swizzle once per load/refit sequence. Draining the
+        # pending sets keeps the RLHF finalize walk -- which invokes both
+        # process_weights_after_loading and post_load_weights -- from
+        # double-swizzling.
+        pending_w3_w1 = getattr(module, "_mxfp8_w3_w1_sf_pending_slots", None)
+        if pending_w3_w1:
+            scale_data = module.w3_w1_weight_scale.data
+            halves_by_slot: Dict[int, set] = {}
+            for local_slot_id, half in pending_w3_w1:
+                halves_by_slot.setdefault(local_slot_id, set()).add(half)
+            for local_slot_id in sorted(halves_by_slot):
+                self._swizzle_w3_w1_slot(scale_data, local_slot_id,
+                                         halves_by_slot[local_slot_id])
+            pending_w3_w1.clear()
+        pending_w2 = getattr(module, "_mxfp8_w2_sf_pending_slots", None)
+        if pending_w2:
+            scale_data = module.w2_weight_scale.data
+            for local_slot_id in sorted(pending_w2):
+                self._swizzle_scale(scale_data[local_slot_id])
+            pending_w2.clear()
 
 
 # Serializes the duplicate-check + slot-claim step of
@@ -7248,6 +7442,11 @@ def _import_deep_gemm():
     try:
         from tensorrt_llm import deep_gemm as _dg
     except ImportError as e:
+        # An ImportError chained to an AttributeError (from
+        # tensorrt_llm.__getattr__) means deep_gemm raised while importing;
+        # surface it instead of turning it into _MegaMoEUnavailable.
+        if isinstance(e.__cause__, AttributeError):
+            raise
         raise _MegaMoEUnavailable(
             f"tensorrt_llm.deep_gemm not importable: {e}") from e
 
@@ -7264,6 +7463,11 @@ def _import_deep_gemm():
             f"tensorrt_llm.deep_gemm missing mega_moe symbols {missing}; "
             f"upgrade the TRT-LLM bundled DeepGEMM to a release that "
             f"includes fp8_fp4_mega_moe.")
+    if not hasattr(_dg, "set_barrier_timeout_seconds"):
+        raise _MegaMoEUnavailable(
+            "tensorrt_llm.deep_gemm lacks set_barrier_timeout_seconds; rebuild "
+            "so the bundled DeepGEMM carries "
+            "3rdparty/patches/deepgemm_configurable_barrier_timeout.patch.")
 
     mega_moe_params = inspect.signature(_dg.fp8_fp4_mega_moe).parameters
     missing_situ_params = [

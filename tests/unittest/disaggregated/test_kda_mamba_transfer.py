@@ -66,8 +66,8 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     build_page_table_from_manager,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
 from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_params
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
@@ -126,7 +126,7 @@ def _kimi_linear_config():
 def _create_kda_managers(
     tp: int, enable_attention_dp: bool = False, max_batch_size: int = MAX_BATCH_SIZE
 ):
-    """Create MixedMambaHybridCacheManagers with K3-style KDA slots.
+    """Create KimiK3HybridCacheManagers with K3-style KDA slots.
 
     Mirrors the ``is_kimi_linear`` route in ``_util.py``: the mamba params
     come from ``extract_mamba_kv_cache_params`` UNSCALED (global
@@ -150,7 +150,7 @@ def _create_kda_managers(
             pp_size=1,
             enable_attention_dp=enable_attention_dp,
         )
-        mgr = MixedMambaHybridCacheManager(
+        mgr = KimiK3HybridCacheManager(
             mamba_d_state=params.state_size,
             mamba_d_conv=params.conv_kernel,
             mamba_num_heads=params.num_heads,
@@ -165,6 +165,7 @@ def _create_kda_managers(
                 max_tokens=256 * max_batch_size,
                 enable_block_reuse=False,
                 event_buffer_max_size=0,
+                use_kv_cache_manager_v2=True,
             ),
             kv_cache_type=CacheTypeCpp.SELF,
             num_layers=1,
@@ -176,7 +177,8 @@ def _create_kda_managers(
             max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=DataType.FLOAT,
-            model_type="qwen3_next",
+            is_disagg=True,
+            conv_state_layout="q_k_v",
         )
         managers.append(mgr)
     return managers
@@ -201,17 +203,18 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
         pt = build_page_table_from_manager(mgr)
         mlg = _get_mamba_layer_group(pt)
 
-        conv = mgr._impl.mamba_cache.conv
-        ssm = mgr._impl.mamba_cache.temporal
+        layer_id = next(iter(mgr.mamba_layer_offsets))
+        conv = mgr.get_conv_states(layer_id)
+        ssm = mgr.get_ssm_states(layer_id)
 
         # Shapes/dtypes of the backing tensors are KDA-shaped.
         assert conv.dtype == CONV_DTYPE
         assert ssm.dtype == SSM_DTYPE
-        assert tuple(conv.shape[2:]) == (
+        assert tuple(conv.shape[1:]) == (
             3 * KDA_NUM_HEADS * KDA_HEAD_DIM,
             KDA_CONV_STATE_WIDTH,
         )
-        assert tuple(ssm.shape[2:]) == (KDA_NUM_HEADS, KDA_HEAD_DIM, KDA_HEAD_DIM)
+        assert tuple(ssm.shape[1:]) == (KDA_NUM_HEADS, KDA_HEAD_DIM, KDA_HEAD_DIM)
 
         # Both pool_views present with correct roles and byte sizes.
         conv_pv = next((pv for pv in mlg.pool_views if pv.pool_role == MAMBA_CONV_ROLE), None)
@@ -565,8 +568,9 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
     ctx_tcs, gen_tcs = [], []
     try:
         for mgr in ctx_mgrs + gen_mgrs:
-            mgr._impl.mamba_cache.conv.zero_()
-            mgr._impl.mamba_cache.temporal.zero_()
+            for layer_id in mgr.mamba_layer_offsets:
+                mgr.get_conv_states(layer_id).zero_()
+                mgr.get_ssm_states(layer_id).zero_()
 
         config = CacheTransceiverConfig(
             backend="NIXL",
@@ -616,12 +620,17 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
             gen_reqs.append(gen_req)
 
         ctx_batch = ScheduledRequests()
-        ctx_batch.reset_context_requests(ctx_reqs)
+        ctx_batch.context_requests_last_chunk = ctx_reqs
         for mgr in ctx_mgrs:
+            for req in ctx_reqs:
+                assert mgr.prepare_context(req)
+                assert mgr.resize_context(req, req.context_chunk_size)
             mgr.prepare_resources(ctx_batch)
         gen_batch = ScheduledRequests()
-        gen_batch.reset_context_requests(gen_reqs)
+        gen_batch.context_requests_last_chunk = gen_reqs
         for mgr in gen_mgrs:
+            for req in gen_reqs:
+                assert mgr.prepare_disagg_gen_init(req)
             mgr.prepare_resources(gen_batch)
         for req in ctx_reqs + gen_reqs:
             req.context_current_position = req.prompt_len
@@ -639,8 +648,8 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
             # state); with ADP off rank r holds shard r.
             shard_rank = rank % ctx_state_tp
             for req_idx, rid in enumerate(ctx_rids):
-                slot = mgr.mamba_cache_index[rid]
-                for layer_idx in mgr._impl.mamba_layer_offsets:
+                slot = mgr._request_id_to_state_index[rid]
+                for layer_idx in mgr.mamba_layer_offsets:
                     full = ground_truth[req_idx][layer_idx]
                     mgr.get_conv_states(layer_idx)[slot] = _shard_kda_conv(
                         full["conv"], ctx_state_tp, shard_rank
@@ -681,8 +690,8 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
             for req_idx, rid in enumerate(gen_rids):
                 if gen_rank not in _gen_ranks(req_idx):
                     continue
-                slot = mgr.mamba_cache_index[rid]
-                for layer_idx in mgr._impl.mamba_layer_offsets:
+                slot = mgr._request_id_to_state_index[rid]
+                for layer_idx in mgr.mamba_layer_offsets:
                     full = ground_truth[req_idx][layer_idx]
                     expected = {
                         "conv": _shard_kda_conv(full["conv"], gen_state_tp, shard_rank),

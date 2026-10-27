@@ -23,6 +23,7 @@
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/fmha/prepareCustomMask.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include "tensorrt_llm/thop/attentionOp.h"
@@ -352,9 +353,10 @@ public:
 
     virtual ~RunnerBase() = default;
     virtual void prepare(AttentionOp& op) const = 0;
-    virtual int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
-        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0,
-        int const maxCrossKvLength = 0) const
+    virtual int64_t getWorkspaceSize(AttentionOp const& op, int const num_contexts, int const num_context_tokens,
+        int const max_context_q_len, int const cross_kv_length, int const num_generations,
+        int const max_attention_window_size, int const num_gen_tokens, int const max_blocks_per_sequence,
+        int const ctx_total_kv_len = 0) const
         = 0;
     // typically, we use single qkv input, but for context MLA, we use separate qkv inputs
     virtual void run(AttentionOp& op, bool const is_context, int32_t const seq_offset, int32_t const num_seqs,
@@ -419,14 +421,15 @@ public:
         op.reserveSemaphoreArray(std::max(op.mNumHeads * max_num_sequences, op.getMultiProcessorCount()));
     }
 
-    int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
-        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0,
-        int const maxCrossKvLength = 0) const override
+    int64_t getWorkspaceSize(AttentionOp const& op, int const num_contexts, int const num_context_tokens,
+        int const max_context_q_len, int const cross_kv_length, int const num_generations,
+        int const max_attention_window_size, int const num_gen_tokens, int const max_blocks_per_sequence,
+        int const ctx_total_kv_len = 0) const override
     {
         size_t const context_workspace_size = op.getWorkspaceSizeForContext(
-            op.mType, max_num_requests, op.mMaxContextLength, maxCrossKvLength, num_tokens, ctx_total_kv_len);
+            op.mType, num_contexts, max_context_q_len, cross_kv_length, num_context_tokens, ctx_total_kv_len);
         size_t const generation_workspace_size = op.getWorkspaceSizeForGeneration(
-            op.mType, max_num_sequences, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
+            op.mType, num_generations, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
 
         return std::max(context_workspace_size, generation_workspace_size);
     }
@@ -507,19 +510,11 @@ public:
                     // kv cache reuse / chunked context cases, latent_cache is not used
                     mla_params.latent_cache = nullptr;
                 }
-                TORCH_CHECK(q_pe.has_value());
-                TORCH_CHECK(q_pe->dim() == 3);
-                TORCH_CHECK(q_pe->strides()[2] == 1);
-
-                mla_params.q_pe = static_cast<T*>(q_pe->data_ptr());
-                mla_params.q_pe_ld = q_pe->strides()[1];
-                mla_params.q_pe_stride = q_pe->strides()[0];
-
                 // Fused FP8-Q path: forward caller's quant_q_buffer / scale so
                 // applyMLARopeAndAssignQKVKernelOptContext<kOutputFp8Q=true>
                 // appends rope FP8 in place and the standalone quantize is
-                // skipped. Without this wiring the sparse-MLA context branch
-                // runs the legacy quantize over the bf16 placeholder q.
+                // skipped. A missing q_pe on this path means the upstream q_b
+                // fusion has already written the complete rotated FP8 Q.
                 mla_params.bmm1_scale = mla_bmm1_scale.has_value()
                     ? reinterpret_cast<float*>(mla_bmm1_scale.value().data_ptr())
                     : nullptr;
@@ -532,6 +527,23 @@ public:
                     ? reinterpret_cast<float const*>(quant_scale_qkv.value().data_ptr())
                     : nullptr;
                 mla_params.fuse_q_fp8_in_rope = (quant_q_buffer.has_value() && quant_scale_qkv.has_value());
+                mla_params.q_rope_applied = mla_params.fuse_q_fp8_in_rope && !q_pe.has_value();
+                if (q_pe.has_value())
+                {
+                    TORCH_CHECK(q_pe->dim() == 3);
+                    TORCH_CHECK(q_pe->strides()[2] == 1);
+                    mla_params.q_pe = static_cast<T*>(q_pe->data_ptr());
+                    mla_params.q_pe_ld = q_pe->strides()[1];
+                    mla_params.q_pe_stride = q_pe->strides()[0];
+                }
+                else
+                {
+                    TORCH_CHECK(mla_params.q_rope_applied,
+                        "Sparse MLA context requires q_pe unless quant_q_buffer already contains rotated Q.");
+                    mla_params.q_pe = nullptr;
+                    mla_params.q_pe_ld = 0;
+                    mla_params.q_pe_stride = 0;
+                }
 
                 // Fused kv_a_layernorm: the norm weight implies `latent_cache` is the
                 // RAW kv_a_proj output, with the caller's RMSNorm and concat dropped.
@@ -586,8 +598,10 @@ public:
                 TORCH_CHECK(v.has_value());
                 TORCH_CHECK(k->dim() == 2);
                 TORCH_CHECK(v->dim() == 2);
-                TORCH_CHECK(k->strides()[1] == 1);
-                TORCH_CHECK(v->strides()[1] == 1);
+                TORCH_CHECK(
+                    k->strides()[1] == 1, "Separate-K context FMHA requires contiguous K features within each token");
+                TORCH_CHECK(
+                    v->strides()[1] == 1, "Separate-V context FMHA requires contiguous V features within each token");
 
                 k_ptr = static_cast<T*>(k->slice(0, token_offset).data_ptr());
                 v_ptr = static_cast<T*>(v->slice(0, token_offset).data_ptr());
@@ -699,12 +713,10 @@ public:
         if (max_context_q_len_override.has_value())
         {
             int32_t const override_value = static_cast<int32_t>(max_context_q_len_override.value());
-            TORCH_CHECK(override_value >= max_context_q_len_computed,
-                "max_context_q_len_override (%d) must be >= computed max context q length (%d).", override_value,
-                max_context_q_len_computed);
-            TORCH_CHECK(override_value >= max_past_kv_length_computed,
-                "max_context_q_len_override (%d) must be >= computed max past kv length (%d).", override_value,
-                max_past_kv_length_computed);
+            TORCH_CHECK(override_value >= max_context_q_len_computed, "max_context_q_len_override (", override_value,
+                ") must be >= computed max context q length (", max_context_q_len_computed, ").");
+            TORCH_CHECK(override_value >= max_past_kv_length_computed, "max_context_q_len_override (", override_value,
+                ") must be >= computed max past kv length (", max_past_kv_length_computed, ").");
         }
 
         int32_t const max_context_q_len = max_context_q_len_override.has_value()
@@ -956,6 +968,16 @@ public:
                     cu_kv_seqlens->size(0) >= num_seqs + 1, "cu_kv_seqlens must have at least num_seqs + 1 elements.");
                 enqueue_params.cu_kv_seqlens = cu_kv_seqlens->data_ptr<int32_t>();
             }
+            if (op.mIsMLAEnabled && v_ptr != nullptr && v.has_value())
+            {
+                TORCH_CHECK(v->stride(0) > 0, "Separate-V context FMHA requires a positive V token stride");
+                enqueue_params.v_stride_in_bytes = v->stride(0) * v->element_size();
+                constexpr int64_t kTmaAlignmentBytes = 16;
+                TORCH_CHECK(enqueue_params.v_stride_in_bytes % kTmaAlignmentBytes == 0,
+                    "Separate-V context FMHA requires a 16-byte aligned V token stride");
+                TORCH_CHECK(reinterpret_cast<std::uintptr_t>(v_ptr) % kTmaAlignmentBytes == 0,
+                    "Separate-V context FMHA requires a 16-byte aligned V pointer");
+            }
             if (is_cross && cross_kv.has_value())
             {
                 auto const& cross_kv_tensor = cross_kv.value();
@@ -1032,11 +1054,14 @@ public:
                         "Expecting spec_decoding_bl_tree_mask_offset in trtllm-gen spec-dec mode.");
                     TORCH_CHECK(spec_decoding_bl_tree_mask.has_value(),
                         "Expecting spec_decoding_bl_tree_mask in trtllm-gen spec-dec mode.");
+                    TORCH_CHECK(spec_decoding_bl_tree_mask->is_contiguous() && spec_decoding_bl_tree_mask->numel() > 0,
+                        "spec_decoding_bl_tree_mask must be a non-empty contiguous tensor.");
                     TORCH_CHECK(spec_bl_tree_first_sparse_mask_offset_kv.has_value(),
                         "Expecting spec_bl_tree_first_sparse_mask_offset_kv in trtllm-gen spec-dec mode.");
                     enqueue_params.spec_decoding_bl_tree_mask_offset
                         = spec_decoding_bl_tree_mask_offset->data_ptr<int64_t>();
                     enqueue_params.spec_decoding_bl_tree_mask = spec_decoding_bl_tree_mask->data_ptr<uint32_t>();
+                    enqueue_params.spec_decoding_bl_tree_mask_capacity = spec_decoding_bl_tree_mask->numel();
                     enqueue_params.spec_bl_tree_first_sparse_mask_offset_kv
                         = spec_bl_tree_first_sparse_mask_offset_kv->data_ptr<int32_t>();
                 }
@@ -1351,7 +1376,11 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mRotaryEmbeddingLongMscale = rope_long_m_scale;
     op->mRotaryEmbeddingMaxPositions = rope_max_positions;
     op->mRotaryEmbeddingOriginalMaxPositions = rope_original_max_positions;
+    // Only the FP8 context FMHA kernels read an NVFP4 KV cache, whatever the output type; they do so on SM100-family
+    // GPUs only, so elsewhere an NVFP4 KV cache still fails the FP4 KV check in AttentionOp. MLA keeps its own NVFP4 KV
+    // handling (mUseNvfp4MlaKvCache, mFP8ContextMLA below) and must not pick this up.
     op->mFP8ContextFMHA = is_fp8_out || is_fp4_out || (op->mKVCacheQuantMode.hasFp8KvCache() && use_paged_context_fmha)
+        || (!is_mla_enable && op->mKVCacheQuantMode.hasFp4KvCache() && tensorrt_llm::common::isSM100Family())
         || use_sage_attn;
     // SageAttention block sizes and quantization mode.
     op->mSageAttnNumEltsPerBlkQ = static_cast<int>(sage_attn_num_elts_per_blk_q);
@@ -1483,6 +1512,27 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     auto const ctx_total_kv_len = host_total_kv_lens.index({0}).item<int32_t>();
     auto const gen_total_kv_len = host_total_kv_lens.index({1}).item<int32_t>();
 
+    // The thop workspace is resized for each call, so size the quadratic
+    // unfused-context buffers for this batch rather than the model's configured
+    // maximum context length. Keep the explicit override for CUDA graph capture,
+    // where launch dimensions are padded to a stable length.
+    int32_t max_context_q_len = 0;
+    if (num_contexts > 0)
+    {
+        int32_t const computed_max_context_q_len = host_context_lengths.slice(0, 0, num_contexts).max().item<int32_t>();
+        if (max_context_q_len_override.has_value())
+        {
+            int32_t const override_value = static_cast<int32_t>(max_context_q_len_override.value());
+            TORCH_CHECK(override_value >= computed_max_context_q_len, "max_context_q_len_override (", override_value,
+                ") must be >= computed max context q length (", computed_max_context_q_len, ").");
+            max_context_q_len = override_value;
+        }
+        else
+        {
+            max_context_q_len = computed_max_context_q_len;
+        }
+    }
+
     for (int32_t idx = num_contexts; idx < num_seqs; idx++)
     {
         TLLM_CHECK(request_types[idx] == RequestType::kGENERATION);
@@ -1502,8 +1552,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     {
         maxCrossKvLength = host_past_key_value_lengths.slice(0, 0, num_contexts).max().item<int32_t>();
     }
-    int64_t const workspace_size = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size, num_gen_tokens,
-        max_blocks_per_sequence, ctx_total_kv_len, maxCrossKvLength);
+    int64_t const workspace_size
+        = runner->getWorkspaceSize(*op, num_contexts, num_ctx_tokens, max_context_q_len, maxCrossKvLength,
+            num_generations, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence, ctx_total_kv_len);
     TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
 
     torch::Tensor workspace;
@@ -1627,6 +1678,13 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     return op->supportsNvFp4Output();
 }
 
+int64_t spec_dec_tree_custom_mask_capacity(
+    int64_t const max_num_requests, int64_t const max_seq_len_q, int64_t const num_heads_q_per_kv)
+{
+    return tensorrt_llm::kernels::getCustomMaskCapacityUpperBound(static_cast<int32_t>(max_num_requests),
+        static_cast<int32_t>(max_seq_len_q), static_cast<int32_t>(num_heads_q_per_kv));
+}
+
 KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,
     int64_t intraPoolOffset, int64_t blockSize, int32_t layerIdxInCachePool, int32_t kvFactor, bool isFp4KvCache)
 {
@@ -1659,14 +1717,17 @@ KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPo
     }
     else
     {
-        TORCH_CHECK(hostKvCachePoolPointers.dim() == 2);
+        TORCH_CHECK(hostKvCachePoolPointers.dim() == 2 || hostKvCachePoolPointers.dim() == 3);
+        // Non-FP4 layers use only the data pointers in a mixed-format pool table.
+        auto const dataPointers
+            = hostKvCachePoolPointers.dim() == 3 ? hostKvCachePoolPointers.select(2, 0) : hostKvCachePoolPointers;
         pointers.primaryPoolPtr = reinterpret_cast<void*>(
             reinterpret_cast<char*>(
-                readHostTensor2D<int64_t>(hostKvCachePoolPointers, poolIndex, 0, "host_kv_cache_pool_pointers"))
+                readHostTensor2D<int64_t>(dataPointers, poolIndex, 0, "host_kv_cache_pool_pointers"))
             + intraPoolOffset);
         pointers.secondaryPoolPtr = reinterpret_cast<void*>(
             reinterpret_cast<char*>(
-                readHostTensor2D<int64_t>(hostKvCachePoolPointers, poolIndex, 1, "host_kv_cache_pool_pointers"))
+                readHostTensor2D<int64_t>(dataPointers, poolIndex, 1, "host_kv_cache_pool_pointers"))
             + intraPoolOffset);
     }
     return pointers;
@@ -1796,4 +1857,5 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("attention_supports_nvfp4_output", &tensorrt_llm::torch_ext::attention_supports_nvfp4_output);
+    m.def("spec_dec_tree_custom_mask_capacity", &tensorrt_llm::torch_ext::spec_dec_tree_custom_mask_capacity);
 }

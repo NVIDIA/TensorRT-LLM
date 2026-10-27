@@ -293,6 +293,10 @@ class TransformersTokenizer(TokenizerBase):
     def encode(self, text: str, *args, **kwargs) -> List[int]:
         return self.tokenizer.encode(text, *args, **kwargs)
 
+    def num_special_tokens_to_add(self, pair: bool = False) -> int:
+        # PreTrainedTokenizerBase.num_special_tokens_to_add raises NotImplementedError.
+        return self.tokenizer.num_special_tokens_to_add(pair)
+
     def decode(self, token_ids: List[int], *args, **kwargs) -> str:
         return self.tokenizer.decode(token_ids, *args, **kwargs)
 
@@ -319,6 +323,14 @@ class TransformersTokenizer(TokenizerBase):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
+        # AutoTokenizer resolves the checkpoint config first, so any model_type
+        # TRT-LLM overrides or gap-fills has to be in CONFIG_MAPPING by now; the
+        # registration is an import side effect of tensorrt_llm._torch.configs.
+        # Without this, nemotron_h checkpoints whose hybrid_override_pattern
+        # carries "-" MLP layers reach the stock transformers config and die
+        # with KeyError: '-' before the model is ever built.
+        import tensorrt_llm._torch.configs  # noqa: F401
+
         try:
             with _hf_remote_code_guard(kwargs.get('trust_remote_code', False)):
                 tokenizer = AutoTokenizer.from_pretrained(
@@ -469,6 +481,7 @@ class TransformersTokenizer(TokenizerBase):
                 token_ids,
                 prev_text,
                 states,
+                flush=flush,
                 skip_special_tokens=skip_special_tokens,
                 clean_up_tokenization_spaces=clean_up_tokenization_spaces)
 
@@ -536,9 +549,20 @@ class TransformersTokenizer(TokenizerBase):
         prev_text: Optional[str] = None,
         states: Optional[dict] = None,
         *,
+        flush: bool = False,
         skip_special_tokens: bool = False,
         clean_up_tokenization_spaces: Optional[bool] = None
     ) -> Tuple[str, dict]:
+        """Incremental detokenization with the HF ``DecodeStream``.
+
+        ``DecodeStream.step`` returns ``None`` while a token cannot be decoded
+        on its own yet (e.g. the first byte-level piece of a multi-byte UTF-8
+        character), and has no way to release what it is holding. The ids it
+        holds are tracked in ``states['pending_ids']``, along with the last id
+        that did produce text, so that ``flush`` -- set on the final response
+        of a request -- can emit the held-back text the way a full decode of
+        the output would, instead of silently dropping it.
+        """
         if states is None:
             states = {
                 'decode_stream':
@@ -546,6 +570,7 @@ class TransformersTokenizer(TokenizerBase):
             }
 
         decode_stream = states.get('decode_stream')
+        pending_ids = states.setdefault('pending_ids', [])
         results = []
         for tid in token_ids:
             try:
@@ -561,9 +586,20 @@ class TransformersTokenizer(TokenizerBase):
                 decode_stream = DecodeStream(
                     skip_special_tokens=skip_special_tokens)
                 states['decode_stream'] = decode_stream
+                pending_ids.clear()
+                states.pop('last_decoded_id', None)
                 result = decode_stream.step(self.tokenizer._tokenizer, tid)
-            if result is not None:
+            if result is None:
+                pending_ids.append(tid)
+            else:
                 results.append(result)
+                pending_ids.clear()
+                states['last_decoded_id'] = tid
+        if flush and pending_ids:
+            results.append(
+                self._decode_pending_tail(states.get('last_decoded_id'),
+                                          pending_ids, skip_special_tokens))
+            pending_ids.clear()
         curr_new_text = "".join(results)
         if clean_up_tokenization_spaces is None:
             clean_up_tokenization_spaces = self.clean_up_tokenization_spaces
@@ -574,6 +610,29 @@ class TransformersTokenizer(TokenizerBase):
             return curr_new_text, states
         else:
             return prev_text + curr_new_text, states
+
+    def _decode_pending_tail(self, last_decoded_id: Optional[int],
+                             pending_ids: List[int],
+                             skip_special_tokens: bool) -> str:
+        """Text a full decode would add for the ids ``DecodeStream`` still holds.
+
+        The ids are decoded after the last id that already produced text, and
+        only the part past that id's own text is returned, so decoders that
+        depend on the previous token (e.g. a leading-space rule) see the same
+        context the stream did. Space clean-up is left to the caller, which
+        applies it to the streamed text as a whole.
+        """
+        kwargs = {
+            'skip_special_tokens': skip_special_tokens,
+            'clean_up_tokenization_spaces': False,
+        }
+        if last_decoded_id is None:
+            return self.tokenizer.decode(pending_ids, **kwargs)
+        prefix = self.tokenizer.decode([last_decoded_id], **kwargs)
+        text = self.tokenizer.decode([last_decoded_id] + pending_ids, **kwargs)
+        if text.startswith(prefix):
+            return text[len(prefix):]
+        return self.tokenizer.decode(pending_ids, **kwargs)
 
 
 def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,

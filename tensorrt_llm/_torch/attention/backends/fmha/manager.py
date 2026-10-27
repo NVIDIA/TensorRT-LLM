@@ -311,6 +311,20 @@ class FmhaManager:
         for fmha_cls in get_enabled_fmha_lib_classes():
             if fmha_cls.is_available(attn):
                 self.fmha_libs.append(fmha_cls(attn))
+        self._layer_idx = getattr(attn, "layer_idx", None)
+
+    def _announce(self, fmha: Fmha, cache_key: _FmhaCacheKey) -> None:
+        # One line per library per layer is enough to tell which kernel
+        # serves a model; the logger dedups on the key.
+        logger.info_once(
+            f"FMHA layer {self._layer_idx}: {type(fmha).__name__} serves "
+            f"{cache_key.attention_mask_type.name} requests "
+            f"(context_batch<={cache_key.context_batch_size}, "
+            f"generation_batch<={cache_key.generation_batch_size}, "
+            f"generation_seq_len_q<={cache_key.generation_seq_len_q}, "
+            f"output_dtype={cache_key.output_dtype}).",
+            key=f"fmha_serves:{self._layer_idx}:{type(fmha).__name__}",
+        )
 
     def _make_cache_key(
         self,
@@ -422,6 +436,7 @@ class FmhaManager:
         if fmha is None:
             return None
         self._cache[cache_key] = fmha
+        self._announce(fmha, cache_key)
         if self._cache_sanity_check_enabled:
             self._cache_inputs[cache_key] = _snapshot_fmha_cache_inputs(
                 q, k, v, metadata, forward_args

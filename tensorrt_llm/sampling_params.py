@@ -94,14 +94,8 @@ class GuidedDecodingParams:
 
 class LogprobParams(NamedTuple):
     prompt_logprobs: Optional[int] = None
-    logprobs: Optional[int] = None
     # Drop the logits once the logprobs are computed
     drop_context_logits: bool = False
-    # Drop the geneation_logits once the logprobs are computed
-    drop_generation_logits: bool = False
-    # Return generation logprobs as `list[float]` instead of the default
-    # `list[dict[int, Logprob]]`. Only valid when logprobs == 0.
-    logprobs_simple_format: bool = False
     # Return prompt logprobs as `list[float]` instead of the default
     # `list[dict[int, Logprob]]`. Only valid when prompt_logprobs == 0.
     prompt_logprobs_simple_format: bool = False
@@ -143,7 +137,11 @@ class LogitsProcessor(ABC):
             req_id (int): Request id.
             logits (torch.Tensor): Logits tensor to be modified.
             token_ids (List[List[int]]): Token ids produced by the request so far.
-                The shape is beam_width * sequence_length.
+                The shape is beam_width * sequence_length. Under beam search on the
+                PyTorch backend, row ``i`` is the prompt plus the hypothesis held by the
+                beam whose logits are row ``i`` of ``logits``; beams that already
+                finished are not included. With the overlap scheduler the history
+                trails the beam's newest token by one step, as for every request.
             stream_ptr (int, optional): The operation stream used by the logits tensor.
                 Not required for PyTorch backend.
             client_id (int, optional): An optional client id.
@@ -344,9 +342,6 @@ class SamplingParams:
         default_factory=tuple, init=False, repr=False
     )
 
-    # TODO: deprecate this after trtllm-serve migrate to use TopK logprobs
-    _return_log_probs: bool = False
-
     # Guided decoding params
     guided_decoding: Optional[GuidedDecodingParams] = None
     thinking_token_budget: Optional[int] = None
@@ -502,7 +497,7 @@ class SamplingParams:
         self._validate()
 
     # NB: The predicates below are static because downstream code (e.g.
-    #     sampler_strategy.resolve_sampling_strategy) only holds instances of
+    #     sampling_resolution.resolve_row_params) only holds instances of
     #     bindings.SamplingConfig (not SamplingParams). They are the single
     #     source of truth for the greedy / top-p-decay resolution shared by
     #     _greedy_decoding and the torch sampler.
@@ -692,7 +687,7 @@ class SamplingParams:
 
         return tllme.SamplingConfig(**llmapi_to_rt_param_map)
 
-    def _get_output_config(self, is_pytorch_backend: bool = False) -> tllme.OutputConfig:
+    def _get_output_config(self) -> tllme.OutputConfig:
         sampling_param_fields = set(dir(SamplingParams))
         fields = [
             f
@@ -702,24 +697,21 @@ class SamplingParams:
 
         config_kwargs = {f: getattr(self, f) for f in fields}
 
-        if is_pytorch_backend:
-            config_kwargs["return_log_probs"] = self.logprobs is not None
-            if self.prompt_logprobs is not None and not self.return_context_logits:
-                logger.info(
-                    "Since prompt_logprobs is requested but return_context_logits is False, "
-                    "internally enabling context logits for prompt logprobs computation. "
-                    "context logits will be dropped after computation as the user didn't explicitly request them."
-                )
-                # TODO: Find a more elegant way to do this.
-                # NOTE: This is an internal hack, so we can entirely avoid introducing
-                # `prompt_logprobs` into the executor bindings and further into
-                # model engine / sampler.
-                # This is because, prompt_logprobs is a derived quantity from
-                # context logits, and the capability to post-compute it
-                # already exists in the worker. (see _get_logprobs in worker.py)
-                config_kwargs["return_context_logits"] = True
-        else:
-            config_kwargs["return_log_probs"] = self._return_log_probs
+        config_kwargs["return_log_probs"] = self.logprobs is not None
+        if self.prompt_logprobs is not None and not self.return_context_logits:
+            logger.info(
+                "Since prompt_logprobs is requested but return_context_logits is False, "
+                "internally enabling context logits for prompt logprobs computation. "
+                "context logits will be dropped after computation as the user didn't explicitly request them."
+            )
+            # TODO: Find a more elegant way to do this.
+            # NOTE: This is an internal hack, so we can entirely avoid introducing
+            # `prompt_logprobs` into the executor bindings and further into
+            # model engine / sampler.
+            # This is because, prompt_logprobs is a derived quantity from
+            # context logits, and the capability to post-compute it
+            # already exists in the worker. (see _get_logprobs in base_worker.py)
+            config_kwargs["return_context_logits"] = True
 
         if config_kwargs.get("additional_model_outputs") is not None:
             config_kwargs["additional_model_outputs"] = [

@@ -23,6 +23,7 @@ def createKubernetesPodConfig()
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux"""
     def image = "artifactory.pdx.nvidia.com/docker-remote/ubuntu:24.04"
+    def jnlpImage = "artifactory.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_amd_linux:jdk17"
     // release mode requires a longer pod lifetime to survive the manual license review window
     def scannerSleepSeconds = (params?.scanMode == 'release') ? '345600' : '7200'
     def podConfig = [
@@ -35,6 +36,7 @@ def createKubernetesPodConfig()
                 nodeSelector: ${selectors}
                 imagePullSecrets:
                   - name: svc-tensorrt.gitlab-registry
+                  - name: trtllm-artifactory
                 containers:
                   - name: cpu
                     image: ${image}
@@ -50,6 +52,35 @@ def createKubernetesPodConfig()
                         memory: 32Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
+                  - name: jnlp
+                    image: ${jnlpImage}
+                    args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
+                    resources:
+                      requests:
+                        cpu: '2'
+                        memory: 5Gi
+                        ephemeral-storage: 25Gi
+                      limits:
+                        cpu: '2'
+                        memory: 5Gi
+                        ephemeral-storage: 25Gi
+                  - name: pulse-malware-scanner
+                    image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-malware-scanner-cli:stable
+                    command: ['sleep', '${scannerSleepSeconds}']
+                    tty: true
+                    resources:
+                      requests:
+                        cpu: '16'
+                        memory: 64Gi
+                        ephemeral-storage: 200Gi
+                      limits:
+                        cpu: '16'
+                        memory: 64Gi
+                        ephemeral-storage: 200Gi
+                    imagePullPolicy: Always
+                    securityContext:
+                      runAsUser: 0
+                      runAsGroup: 0
                   - name: pulse-container-scanner
                     image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-container-scanner:stable
                     command: ['sleep', '${scannerSleepSeconds}']
@@ -151,6 +182,7 @@ def savePipelineScripts() {
     checkout scm
     sh "cp -r jenkins/scripts/pulse_in_pipeline_scanning /tmp/pulse_in_pipeline_scanning"
     sh "cp scripts/generate_lock_file.py /tmp/generate_lock_file.py"
+    sh "cp jenkins/scripts/get_image_key_to_tag.py /tmp/get_image_key_to_tag.py"
 }
 
 def checkoutSource ()
@@ -241,7 +273,9 @@ def generateLockFiles(llmRepo, ref)
                 sh "git fetch origin ${ref}"
                 sh "git status"
                 sh "git rebase origin/${ref}"
-                sh "git push origin HEAD:${ref}"
+                // setupGitMirror() installs a global read-only Authorization header for github.com,
+                // which would override the push credentials embedded in authedUrl. Reset it.
+                sh "git -c http.https://github.com/.extraheader= push origin HEAD:${ref}"
             }
         }
     }
@@ -251,12 +285,74 @@ def sonarScan()
 {
     container("cpu") {
         def sonarScannerCliVer = "8.0.0.6341"
-        sh "wget https://maven-central.storage-download.googleapis.com/maven2/org/sonarsource/scanner/cli/sonar-scanner-cli/${sonarScannerCliVer}/sonar-scanner-cli-${sonarScannerCliVer}.zip"
+        // Expected SHA-256 of the scanner zip; update it together with sonarScannerCliVer.
+        def sonarScannerCliSha256 = "c55773294e951dcba23ebe7084616f33721b0ce0d199401c7e07d3a6cdfafdb1"
+        sh "wget https://artifactory.pdx.nvidia.com/artifactory/maven-central-remote/org/sonarsource/scanner/cli/sonar-scanner-cli/${sonarScannerCliVer}/sonar-scanner-cli-${sonarScannerCliVer}.zip"
+        sh "echo '${sonarScannerCliSha256}  sonar-scanner-cli-${sonarScannerCliVer}.zip' | sha256sum -c -"
         sh "unzip sonar-scanner-cli-${sonarScannerCliVer}.zip"
         sh "mv sonar-scanner-${sonarScannerCliVer} ../sonar-scanner"
         sh "rm sonar-scanner-cli-${sonarScannerCliVer}.zip"
         withSonarQubeEnv() {
-          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.branchName} -Dsonar.exclusions=cpp/build/**,**/*.lock,**/*.cubin,**/*.zst,**/*.tar.zst,**/cubin/**,3rdparty/**,docs/**,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.ico,**/*.pdf,**/*.whl,**/*.egg-info/**,security_scanning/**"
+            def excludedExtensions = [
+                // Images and documents
+                "png", "jpg", "jpeg", "gif", "ico", "svg", "pdf", "xlsx",
+                // Archives and packages
+                "zst", "xz", "txz", "tar", "gz", "zip", "whl",
+                // Compiled files, model data, and media
+                "lock", "cubin", "a", "so", "o", "mp4", "avi",
+                "npy", "pt", "safetensors", "bin",
+            ]
+
+            def excludedPaths = [
+                // Build artifacts and metadata
+                "cpp/build/**",
+                "**/cubin/**",
+                "**/*.egg-info/**",
+                "ATTRIBUTIONS-*.md",
+
+                // Dependencies and documentation
+                "3rdparty/**",
+                "docs/**",
+                "security_scanning/**",
+                "triton_kernels/**",
+
+                // Tests and benchmarks
+                ".github/**",
+                "jenkins/**",
+                "tests/**",
+                "cpp/tests/**",
+                "cpp/micro_benchmarks/**",
+                "cpp/kernels/**/test/**",
+                "triton_backend/**/tests/**",
+
+                // Examples and tooling
+                "examples/**",
+                "scripts/**",
+                "agent-flow/**",
+                ".claude/**",
+
+                // Generated and experimental Python code
+                "tensorrt_llm/_torch/cute_dsl_kernels/**",
+                "tensorrt_llm/_torch/_experimental/modeling_v2/**",
+                "tensorrt_llm/grpc/openengine/_generated/**",
+                "**/*_pb2*.py",
+
+                // Generated or vendored C++ kernels
+                "cpp/kernels/fmha_v2/**",
+                "cpp/kernels/xqa/**",
+                "cpp/tensorrt_llm/deep_gemm/**",
+                "cpp/tensorrt_llm/cutlass_extensions/**",
+                "cpp/tensorrt_llm/kernels/trtllmGenKernels/**",
+                "cpp/tensorrt_llm/kernels/internal_cutlass_kernels/**",
+                "cpp/tensorrt_llm/kernels/cutlass_kernels/**",
+                "cpp/tensorrt_llm/kernels/flashMLA/**",
+                "cpp/tensorrt_llm/kernels/moe/cutlass/**",
+            ]
+
+            def sonarExclusions = (
+                excludedExtensions.collect { "**/*.${it}" } + excludedPaths
+            ).join(",")
+            sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.ref} -Dsonar.sourceEncoding=UTF-8 -Dsonar.cfamily.symbolicExecution.automaticShallowModeThreshold=70 -Dsonar.exclusions=${sonarExclusions}"
         }
     }
 }
@@ -298,15 +394,37 @@ def pulseScanSourceCode(llmRepo, ref) {
         sh "mv nspect_scan_report.json ${outputDir}/vulns.json"
     }
 }
-def pulseScanContainer(llmRepo, ref) {
+def getImageScriptArgs() {
+    // Validate and shell-quote the arguments passed to get_image_key_to_tag.py
+    def pipelineName = params.postMergePipelineName?.trim()
+    def buildNumber = params.postMergeBuildNumber?.trim()
+    if (pipelineName && buildNumber) {
+        if (!(pipelineName ==~ /^[A-Za-z0-9_.\-\/]+$/) || pipelineName.contains("..")) {
+            error("Invalid postMergePipelineName: '${pipelineName}'")
+        }
+        if (!(buildNumber ==~ /^[0-9]+$/)) {
+            error("Invalid postMergeBuildNumber (must be an integer): '${buildNumber}'")
+        }
+        return "'${pipelineName}' '${buildNumber}'"
+    }
+    if (pipelineName || buildNumber) {
+        error("postMergePipelineName and postMergeBuildNumber must be set together")
+    }
+    def branch = params.ref?.trim()
+    if (!branch || !(branch ==~ /^[A-Za-z0-9_.\-\/]+$/) || branch.contains("..")) {
+        error("Invalid ref for image lookup: '${branch}'")
+    }
+    return "'${branch}'"
+}
+
+def pulseLicenseScanContainer(llmRepo, ref) {
     // imageTags: key -> [image: <full image:tag>, platform: <platform or empty>]
     def imageTags = [:]
+    def token
     container("cpu") {
-        def imageScriptArgs = (params.postMergePipelineName?.trim() && params.postMergeBuildNumber?.trim())
-            ? "${params.postMergePipelineName} ${params.postMergeBuildNumber}"
-            : "${params.ref}"
+        def imageScriptArgs = getImageScriptArgs()
         def output = sh(
-            script: "python3 ./jenkins/scripts/get_image_key_to_tag.py ${imageScriptArgs}",
+            script: "python3 /tmp/get_image_key_to_tag.py ${imageScriptArgs}",
             returnStdout: true
         ).trim()
         println("Container image key-to-tag mapping for branch '${params.ref}':\n${output}")
@@ -318,9 +436,8 @@ def pulseScanContainer(llmRepo, ref) {
         def baseTag = sh(script: "grep -m1 '^ARG BASE_TAG=' docker/Dockerfile.multi | cut -d= -f2", returnStdout: true).trim()
         imageTags["base_amd64"] = [image: "${baseImage}:${baseTag}", platform: "linux/amd64"]
         imageTags["base_arm64"] = [image: "${baseImage}:${baseTag}", platform: "linux/arm64"]
-    }
-    container("pulse-container-scanner") {
-        sh "apk add jq curl"
+
+        sh "command -v jq >/dev/null || (apt-get update -y && apt-get install -y jq)"
         withCredentials([
             usernamePassword(
                 credentialsId: 'trtllm-artifactory-credentials',
@@ -336,25 +453,24 @@ def pulseScanContainer(llmRepo, ref) {
         ]) {
             sh '''
                 set +x
-                mkdir -p /root/.docker
-                ARTIFACTORY_AUTH="$(printf '%s' "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" | base64 | tr -d '\n')"
-                GITLAB_REGISTRY_AUTH="$(printf '%s' "${GITLAB_REGISTRY_USER}:${GITLAB_REGISTRY_PASSWORD}" | base64 | tr -d '\n')"
                 jq -n \
-                    --arg artifactoryAuth "${ARTIFACTORY_AUTH}" \
+                    --arg artifactoryAuth "$(printf '%s' "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" | base64 | tr -d '\n')" \
                     --arg gitlabRegistry "${DEFAULT_GIT_URL}:5005" \
-                    --arg gitlabRegistryAuth "${GITLAB_REGISTRY_AUTH}" \
+                    --arg gitlabRegistryAuth "$(printf '%s' "${GITLAB_REGISTRY_USER}:${GITLAB_REGISTRY_PASSWORD}" | base64 | tr -d '\n')" \
                     '{auths: {
                         "artifactory.nvidia.com": {auth: $artifactoryAuth},
                         ($gitlabRegistry): {auth: $gitlabRegistryAuth}
-                    }}' > /root/.docker/config.json
-                unset ARTIFACTORY_AUTH GITLAB_REGISTRY_AUTH
+                    }}' > docker_config_license.json
                 set -x
             '''
         }
-        def token = getPulseToken("x9thwm-cootr2q1jdv5p7b8iw4fs4ob3x6nqqsoznyk", "nspect.verify%20scan.anchore")
+        token = getPulseToken("x9thwm-cootr2q1jdv5p7b8iw4fs4ob3x6nqqsoznyk", "nspect.verify%20scan.anchore")
         if (!token) {
             throw new Exception("Invalid token get")
         }
+    }
+    container("pulse-container-scanner") {
+        sh "mkdir -p /root/.docker && cp docker_config_license.json /root/.docker/config.json"
         withEnv([
             "NSPECT_ID=NSPECT-95LK-6FZF",
             "SSA_TOKEN=${token}",
@@ -370,6 +486,100 @@ def pulseScanContainer(llmRepo, ref) {
                         label: "Scan ${entry.image}"
                     )
                 })
+            }
+        }
+    }
+}
+def pulseMalwareScanContainer(llmRepo, ref) {
+    // imageTags: key -> [image: <full image:tag>, platform: <platform or empty>]
+    def imageTags = [:]
+    def token
+    container("cpu") {
+        def imageScriptArgs = getImageScriptArgs()
+        def output = sh(
+            script: "python3 /tmp/get_image_key_to_tag.py ${imageScriptArgs}",
+            returnStdout: true
+        ).trim()
+        println("Container image key-to-tag mapping for branch '${params.ref}':\n${output}")
+        def containerTagMap = new JsonSlurper().parseText(output)
+        imageTags["release_amd64"] = [image: containerTagMap["NGC Release Image amd64"], platform: "linux/amd64"]
+        imageTags["release_arm64"] = [image: containerTagMap["NGC Release Image arm64"], platform: "linux/arm64"]
+        imageTags["devel_amd64"] = [image: containerTagMap["NGC Devel Image amd64"], platform: "linux/amd64"]
+        imageTags["devel_arm64"] = [image: containerTagMap["NGC Devel Image arm64"], platform: "linux/arm64"]
+
+        sh "command -v jq >/dev/null || (apt-get update -y && apt-get install -y jq)"
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'trtllm-artifactory-credentials',
+                usernameVariable: 'ARTIFACTORY_USER',
+                passwordVariable: 'ARTIFACTORY_PASSWORD'
+            ),
+            usernamePassword(
+                credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+                usernameVariable: 'GITLAB_REGISTRY_USER',
+                passwordVariable: 'GITLAB_REGISTRY_PASSWORD'
+            ),
+            string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
+        ]) {
+            sh '''
+                set +x
+                jq -n \
+                    --arg artifactoryAuth "$(printf '%s' "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" | base64 | tr -d '\n')" \
+                    --arg gitlabRegistry "${DEFAULT_GIT_URL}:5005" \
+                    --arg gitlabRegistryAuth "$(printf '%s' "${GITLAB_REGISTRY_USER}:${GITLAB_REGISTRY_PASSWORD}" | base64 | tr -d '\n')" \
+                    '{auths: {
+                        "artifactory.nvidia.com": {auth: $artifactoryAuth},
+                        ($gitlabRegistry): {auth: $gitlabRegistryAuth}
+                    }}' > docker_config_malware.json
+                set -x
+            '''
+        }
+        token = getPulseToken("x9thwm-cootr2q1jdv5p7b8iw4fs4ob3x6nqqsoznyk", "nspect.verify%20pms.read.malware%20pms.scan.image%20pcsf.verify.skopeo")
+        if (!token) {
+            throw new Exception("Invalid token get")
+        }
+    }
+    container("pulse-malware-scanner") {
+        sh "mkdir -p /root/.docker && cp docker_config_malware.json /root/.docker/config.json"
+        withEnv([
+            "NSPECT_ID=NSPECT-95LK-6FZF",
+            "SSA_TOKEN=${token}",
+        ]) {
+            def failedScans = []
+            imageTags.each { key, entry ->
+                def platform = entry.platform.replace("linux/", "")
+                def outputDir = "scan_report/${key}"
+                sh "mkdir -p ${outputDir}"
+                echo "Scanning ${key}: ${entry.image} (${entry.platform}) -> ${outputDir}"
+                try {
+                    sh(
+                        script: "pulse-malware-scanner-cli -n \$NSPECT_ID image-scan --image-ref ${entry.image} --output-dir=${outputDir} --wait-sec=300 --wait-retries=3 --tenant=general-access",
+                        label: "Scan ${entry.image}"
+                    )
+                    sh "ls ${outputDir}"
+                    def reportFiles = findFiles(glob: "${outputDir}/malware_report_*.json")
+                    if (reportFiles.length == 0) {
+                        throw new Exception("No malware_report_*.json files found in ${outputDir} for ${entry.image}")
+                    }
+                    reportFiles.each { reportFile ->
+                        def report = new JsonSlurper().parseText(readFile(reportFile.path))
+                        def success = report.success
+                        def status = report.data?.status
+                        echo "Malware scan result for ${entry.image} (${reportFile.name}): success=${success}, status=${status}"
+                        if (!(success == true && status == "CLEAN")) {
+                            throw new Exception("Malware scan failed for ${entry.image} (${reportFile.name}): success=${success}, status=${status}")
+                        }
+                    }
+                } catch (Exception e) {
+                    if (e instanceof org.jenkinsci.plugins.workflow.steps.FlowInterruptedException) {
+                        throw e
+                    }
+                    echo "Malware scan failed for ${entry.image}, continuing with next image: ${e.getMessage()}"
+                    failedScans << "${entry.image}: ${e.getMessage()}"
+                }
+            }
+            if (failedScans) {
+                unstable("Malware scan failed for ${failedScans.size()} image(s):\n${failedScans.join('\n')}")
             }
         }
     }
@@ -410,7 +620,7 @@ def processScanResults(ref) {
                     }
                     skipArgs += " --skip-source-code"
                 }
-                if (!params.runContainerScanning) {
+                if (!params.runContainerOssScanning) {
                     skipArgs += " --skip-container"
                 }
                 def token = getPulseToken("4ubglassowmtsi7ogqwarmut7msn1q5ynts62fwnr1i", "public.api:read")
@@ -452,10 +662,46 @@ def processScanResults(ref) {
                         }
                         rows << sep
                         detectedLicensesTable = "Non-permissive licenses detected:\n${rows.join('\n')}"
-                        if (params.scanMode == "monitor") {
+                        if (params.scanMode in ["monitor", "pre_merge"]) {
                             echo detectedLicensesTable
                             currentBuild.description = "⚠️ Non-permissive licenses detected — click 'Console Output' to review"
                         }
+                    }
+                    if (result.detected_vulnerabilities && params.scanMode in ["monitor", "pre_merge"]) {
+                        def vulnCols = [
+                            [title: 'SCAN TYPE',       key: 'scan_type'],
+                            [title: 'PACKAGE NAME',    key: 'package_name'],
+                            [title: 'PACKAGE VERSION', key: 'package_version'],
+                            [title: 'SEVERITY',        key: 'severity'],
+                            [title: 'CVE',             key: 'cve'],
+                            [title: 'FIX VERSION',     key: 'fix_version'],
+                        ]
+                        // Plain index loops: Collection.max() is blocked by the script sandbox, and the
+                        // implicit `it` of `indices.collect {}` is null under the CPS transform.
+                        def vulnWidths = []
+                        for (int c = 0; c < vulnCols.size(); c++) {
+                            int width = vulnCols[c].title.length()
+                            for (def entry : result.detected_vulnerabilities) {
+                                width = Math.max(width, entry[vulnCols[c].key].toString().length())
+                            }
+                            vulnWidths << width
+                        }
+                        def vulnSep = "+"
+                        def vulnHeader = "|"
+                        for (int c = 0; c < vulnCols.size(); c++) {
+                            vulnSep += '-' * (vulnWidths[c] + 2) + "+"
+                            vulnHeader += " " + vulnCols[c].title.padRight(vulnWidths[c]) + " |"
+                        }
+                        def vulnRows = [vulnSep, vulnHeader, vulnSep]
+                        for (def entry : result.detected_vulnerabilities) {
+                            def row = "|"
+                            for (int c = 0; c < vulnCols.size(); c++) {
+                                row += " " + entry[vulnCols[c].key].toString().padRight(vulnWidths[c]) + " |"
+                            }
+                            vulnRows << row
+                        }
+                        vulnRows << vulnSep
+                        echo "New vulnerabilities detected:\n${vulnRows.join('\n')}"
                     }
                     if (result.dashboard_url) {
                         echo "Dashboard: ${result.dashboard_url}"
@@ -487,7 +733,8 @@ pipeline {
         string(name: 'postMergeBuildNumber', defaultValue: '', description: 'Optional: post-merge pipeline build number to associate with this scan')
         choice(name: 'scanMode', choices: ['monitor','release','pre_merge'], description: "When set to monitor, only report newly introduced dependencies. When set to release, will report all detected risks")
         booleanParam(name: 'runSourceCodeScanning', defaultValue: true, description: 'Run Source Code OSS Scanning (lock file generation + Pulse OSS scan)')
-        booleanParam(name: 'runContainerScanning', defaultValue: true, description: 'Run Container Scanning (Pulse container scan)')
+        booleanParam(name: 'runContainerOssScanning', defaultValue: true, description: 'Run Container OSS Scanning (Pulse container scan)')
+        booleanParam(name: 'runContainerMalwareScanning', defaultValue: false, description: 'Run Container Malware Scanning (Pulse container scan)')
         booleanParam(name: 'runSonarQube', defaultValue: true, description: 'Run SonarQube Code Analysis')
     }
     options {
@@ -520,7 +767,7 @@ pipeline {
             }
         }
         stage('Run TRT-LLM PLC Jobs') {
-            options { timeout(time: 90, unit: 'MINUTES') }
+            options { timeout(time: 120, unit: 'MINUTES') }
             parallel {
                 stage("Source Code OSS Scanning") {
                     when {
@@ -533,13 +780,23 @@ pipeline {
                         }
                     }
                 }
-                stage("Container Scanning") {
+                stage("Container OSS Scanning") {
                     when {
-                        expression { return params.runContainerScanning }
+                        expression { return params.runContainerOssScanning }
                     }
                     steps {
                         script {
-                            pulseScanContainer(env.LLM_REPO, env.REF)
+                            pulseLicenseScanContainer(env.LLM_REPO, env.REF)
+                        }
+                    }
+                }
+                stage("Container Malware Scanning") {
+                    when {
+                        expression { return params.runContainerMalwareScanning }
+                    }
+                    steps {
+                        script {
+                            pulseMalwareScanContainer(env.LLM_REPO, env.REF)
                         }
                     }
                 }

@@ -79,7 +79,6 @@ worker_config:
     moe_config:
       backend: CUTEDSL
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
       backend: NIXL
       transceiver_runtime: PYTHON
     disable_overlap_scheduler: false
@@ -101,6 +100,5 @@ worker_config:
       free_gpu_memory_fraction: 0.85
       dtype: fp8
     cache_transceiver_config:
-      max_tokens_in_buffer: 4608
       backend: NIXL
       transceiver_runtime: PYTHON

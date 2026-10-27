@@ -1236,7 +1236,6 @@ class TestLogsprobsInBatchedSampling:
         logits_orig = logits.clone()
         try:
             yield {
-                # No 'd2t': Not relevant for tested functionality
                 "logits": logits,
             }
         finally:
