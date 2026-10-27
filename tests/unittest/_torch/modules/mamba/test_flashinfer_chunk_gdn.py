@@ -23,7 +23,7 @@ def _supported_arch() -> bool:
 
 skip_unsupported = pytest.mark.skipif(
     not _supported_arch(),
-    reason="FlashInfer GDN prefill requires SM90 (Hopper) or SM100/SM103/SM120/SM121 (Blackwell)",
+    reason="FlashInfer GDN prefill requires SM90, SM100/SM103/SM107 or SM120/SM121",
 )
 
 
@@ -36,6 +36,7 @@ skip_unsupported = pytest.mark.skipif(
         (90, True),  # Hopper
         (100, True),  # datacenter Blackwell (B200)
         (103, True),  # datacenter Blackwell (B300/GB200)
+        (107, True),
         (120, True),  # consumer Blackwell (RTX 5090 / PRO 6000)
         (121, True),  # consumer Blackwell (GB10 / DGX Spark)
         (89, False),  # Ada
@@ -55,6 +56,7 @@ def test_is_flashinfer_gdn_prefill_supported_arch(sm_version, expected):
         (90, True),  # Hopper
         (100, True),  # datacenter Blackwell (B200)
         (103, True),  # datacenter Blackwell (B300/GB200)
+        (107, False),  # FlashInfer prefill only; decode stays on Triton
         (120, False),  # consumer Blackwell: prefill kernel exists, decode does not
         (121, False),  # consumer Blackwell: prefill kernel exists, decode does not
         (89, False),  # Ada
@@ -63,8 +65,8 @@ def test_is_flashinfer_gdn_prefill_supported_arch(sm_version, expected):
 )
 def test_is_flashinfer_gdn_decode_supported_arch(sm_version, expected):
     """The bf16-state decode / MTP-verify kernels are SM90/SM100/SM103 only --
-    narrower than the prefill set, which also covers SM120/SM121. Pure predicate,
-    no GPU required."""
+    narrower than the prefill set, which also covers SM107/SM120/SM121. Pure
+    predicate, no GPU required."""
     from tensorrt_llm._utils import is_flashinfer_gdn_decode_supported_arch
 
     assert is_flashinfer_gdn_decode_supported_arch(sm_version) is expected
@@ -651,7 +653,7 @@ def test_indexed_gather_inplace_scatter_matches_triton():
 def test_gdn_mixer_resolve_chunk_gated_delta_rule(monkeypatch):
     """gdn_mixer resolves its prefill kernel lazily (``_resolve_chunk_gated_delta_rule``):
     the FlashInfer wrapper when the env opt-in is set (default) *and* the arch is
-    supported (SM90/SM100/SM103/SM120/SM121), otherwise the vendored Triton kernel
+    supported (SM90/SM100/SM103/SM107/SM120/SM121), otherwise the vendored Triton kernel
     (env opt-out, or an unsupported arch such as SM89).
 
     The arch predicate is monkeypatched so the routing is checked independent of
