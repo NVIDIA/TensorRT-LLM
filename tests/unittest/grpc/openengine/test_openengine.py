@@ -31,6 +31,7 @@ pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 from grpc_health.v1 import health_pb2, health_pb2_grpc  # noqa: E402
 
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
+    generation_pb2,
     kv_pb2,
     openengine_pb2_grpc,
     server_pb2,
@@ -190,6 +191,81 @@ def test_health_and_control_are_reachable_on_pod_address(grpc_server: str) -> No
                 assert list(sources.sources) == []
         finally:
             await server.stop(grace=0)
+
+    asyncio.run(exercise_server())
+
+
+class _StreamingResult:
+    """Streams one token per result, as GenerationResult does."""
+
+    def __init__(self, results: list[SimpleNamespace]) -> None:
+        self._results = results
+        self.finished = False
+        self.prompt_token_ids: list[int] = []
+        self.outputs: list[SimpleNamespace] = []
+        self.cached_tokens = 0
+        self.error = None
+
+    async def __aiter__(self):
+        for result in self._results:
+            self.finished = all(output.finish_reason for output in result.outputs)
+            result.finished = self.finished
+            self.prompt_token_ids = result.prompt_token_ids
+            self.outputs = result.outputs
+            yield result
+
+    def abort(self) -> None:
+        pass
+
+
+def _token_result(token_ids: list[int], text: str, finish_reason: str | None) -> SimpleNamespace:
+    output = SimpleNamespace(
+        index=0,
+        token_ids=token_ids,
+        text=text,
+        logprobs=None,
+        prompt_logprobs=None,
+        finish_reason=finish_reason,
+        stop_reason=None,
+    )
+    return SimpleNamespace(prompt_token_ids=[1, 2], outputs=[output], cached_tokens=0, error=None)
+
+
+def test_generate_streams_through_the_server(grpc_server: str) -> None:
+    """A Generate call streams its tokens and finish event over a real listener."""
+    llm = SimpleNamespace(
+        args=SimpleNamespace(guided_decoding_backend=None),
+        llm_id="test-instance",
+        tokenizer=None,
+        _check_health=lambda: True,
+        generate_async=lambda **kwargs: _StreamingResult(
+            [_token_result([10], "A", None), _token_result([10, 11], "AB", "length")]
+        ),
+    )
+
+    async def exercise_server() -> None:
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model", grpc_server=grpc_server)
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                inference = openengine_pb2_grpc.InferenceStub(channel)
+                request = generation_pb2.GenerateRequest(
+                    request_id="request-1",
+                    model="test-model",
+                    prompt="hello",
+                    stopping=generation_pb2.StoppingOptions(max_tokens=2),
+                )
+                responses = [r async for r in inference.Generate(request, timeout=5)]
+        finally:
+            await server.stop(grace=0)
+
+        assert [r.WhichOneof("event") for r in responses] == ["token", "token", "finished"]
+        assert [t.token_id for t in responses[0].token.tokens] == [10]
+        assert responses[0].token.text == "A"
+        assert [t.token_id for t in responses[1].token.tokens] == [11]
+        assert responses[1].token.text == "B"
+        assert responses[2].finished.reason == generation_pb2.FINISH_REASON_LENGTH
+        assert responses[2].usage.completion_tokens == 2
 
     asyncio.run(exercise_server())
 
