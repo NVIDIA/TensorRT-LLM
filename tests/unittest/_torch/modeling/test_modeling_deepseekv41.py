@@ -2317,6 +2317,8 @@ def test_empty_decoder_layer_participates_only_in_required_collectives(
         assert layer.forward_MoE.call_args.kwargs["hidden_states"].shape == (0, 64)
 
 
+# SM120 pads attention-DP inputs to the largest rank; this checks the unpadded path.
+@skip_blackwell_geforce
 def test_empty_decoder_moe_runs_expert_communication_without_local_gemms():
     from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4MoE
     from tensorrt_llm._torch.utils import EventType
@@ -2340,12 +2342,8 @@ def test_empty_decoder_moe_runs_expert_communication_without_local_gemms():
     module.shared_experts = Mock(side_effect=AssertionError("empty shared expert GEMM"))
     module.event_dict = {EventType.Main: None, EventType.MoeShared: None}
     module.aux_stream = None
-    # SM120 pads attention-DP inputs to the largest rank; this checks the unpadded path.
-    with (
-        patch(
-            "torch.ops.trtllm.dsv3_router_gemm_op", side_effect=AssertionError("empty router GEMM")
-        ),
-        patch("tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version", return_value=100),
+    with patch(
+        "torch.ops.trtllm.dsv3_router_gemm_op", side_effect=AssertionError("empty router GEMM")
     ):
         result = module(hidden, all_rank_num_tokens=[0, 7])
     assert result.shape == hidden.shape
