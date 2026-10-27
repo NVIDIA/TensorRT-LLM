@@ -162,6 +162,41 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 _failed_kv_connector_executors: dict[int, "PyExecutor"] = {}
 
 
+def _validate_connector_admission(connector: Optional[KvCacheConnectorManager],
+                                  request: LlmRequest) -> None:
+    """Refuse work a speculative-prefill-only KV connector cannot serve.
+
+    Such a connector runs next to one-model speculation on context-only
+    requests alone, and its manager raises inside resource preparation for
+    anything else, which takes the whole executor down (and, under attention
+    DP, the connector fail-stop). Refusing at admission fails only this
+    request, e.g. a /health_generate probe sent straight to a disaggregated
+    context server.
+
+    A module-level function rather than a method, so the minimal executors
+    unit tests assemble need no stub for it.
+
+    Args:
+        connector: The executor's connector manager, or None.
+        request: The request being admitted.
+
+    Raises:
+        ValueError: When the connector runs in the speculative-prefill-only
+            mode, transfers KV, and the request is not context-only.
+    """
+    if connector is None:
+        return
+    if getattr(connector, "speculative_prefill_only", False) is not True:
+        return
+    if getattr(connector, "capacity_only", False) is True:
+        return
+    if getattr(request, "is_context_only_request", False) is not True:
+        raise ValueError(
+            "This server's KV cache connector runs next to one-model "
+            "speculative decoding and accepts context-only "
+            "(disaggregated prefill) requests only.")
+
+
 @dataclasses.dataclass
 class _KvConnectorTransferDeadline:
     expires_at: float
@@ -1285,6 +1320,19 @@ class PyExecutor:
 
             is_kv_cache_manager_v2 = isinstance(self.kv_cache_manager,
                                                 KVCacheManagerV2)
+            # Compared against True like `capacity_only`, because a mocked
+            # connector answers every attribute truthily.
+            speculative_prefill_only = getattr(self.kv_connector_manager,
+                                               "speculative_prefill_only",
+                                               False) is True
+
+            if speculative_prefill_only and not is_kv_cache_manager_v2:
+                # The creator sets the mode for an explicit V2 selection or
+                # "auto" only, so this is "auto" resolving to V1.
+                raise NotImplementedError(
+                    "KV connector speculative-prefill-only mode requires "
+                    "KVCacheManagerV2. Set "
+                    "kv_cache_config.use_kv_cache_manager_v2=True.")
 
             if self.enable_attention_dp and not is_kv_cache_manager_v2:
                 raise NotImplementedError(
@@ -1298,7 +1346,8 @@ class PyExecutor:
                     "KVCacheManagerV2, which restarts the affected requests. "
                     "Set kv_cache_config.use_kv_cache_manager_v2=True.")
 
-            if is_kv_cache_manager_v2 and self.max_draft_len > 0:
+            if (is_kv_cache_manager_v2 and self.max_draft_len > 0
+                    and not speculative_prefill_only):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with speculative "
                     "decoding. Rejected draft tokens "
@@ -1306,7 +1355,10 @@ class PyExecutor:
                     "whichever request allocates next. The connector is only "
                     "told about pages appended since the last report, so it "
                     "would keep addressing a slot another request now owns. "
-                    "Disable speculative decoding to run a connector.")
+                    "One-model MTP or EAGLE3 is supported on a disaggregated "
+                    "context server when the connector scheduler and worker "
+                    "both declare supports_speculative_prefill=True. Otherwise "
+                    "disable speculative decoding to run a connector.")
 
             scheduler_config = getattr(self.llm_args, 'scheduler_config', None)
             capacity_scheduler_policy = getattr(scheduler_config,
@@ -1357,6 +1409,17 @@ class PyExecutor:
                     "rather than per-token KV blocks, so the connector's "
                     "per-layer load/save hooks have nothing meaningful to "
                     "transfer for those layers.")
+
+            # The creator keeps one-model draft layers in the target pool on a
+            # disaggregated server, so this is a backstop.
+            if (speculative_prefill_only and getattr(
+                    self, "draft_kv_cache_manager", None) is not None):
+                raise NotImplementedError(
+                    "KV Cache Connector with one-model speculative prefill "
+                    "requires the draft layers to share the target KV cache. "
+                    "A separate draft KV cache is not registered with the "
+                    "connector, so a restored prefix would carry stale draft "
+                    "KV.")
 
             self.kv_connector_manager.configure_prefix_reservations(
                 is_kv_cache_manager_v2
@@ -6902,6 +6965,8 @@ class PyExecutor:
         request.py_csa2_remote_tail_split = split
 
     def _validate_request(self, request: LlmRequest):
+        _validate_connector_admission(
+            getattr(self, "kv_connector_manager", None), request)
         self._configure_csa2_remote_tail(request)
         retention = request.kv_cache_retention_config
         if self._is_kv_manager_v2 and retention is not None:

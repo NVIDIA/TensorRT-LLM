@@ -82,6 +82,9 @@ on the leader process; with attention DP, they run on each owning rank.
 
     A set is complete when both of its methods are defined. An existing flat connector needs no change on the models it already covers: with a single layer group the base per-layer-group implementation folds back to the flat call. Hybrid / linear-attention models are not enabled for the connector yet; the per-layer-group set is the shape their cache will need. See [Running under VSWA](#running-under-vswa).
 
+* **`supports_speculative_prefill: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts, read from the class before the scheduler is constructed. Declares a scheduler whose content identity (its store keys) covers the `draft_prompt_lookahead` prompt tokens past each block's end, which never offers or saves a block whose lookahead tokens fall outside the prompt, and which never saves a block the current pass has not computed. Together with the worker's declaration it lets the connector run next to one-model speculative decoding on a disaggregated context server; see [Speculative decoding on a disaggregated context server](#speculative-decoding-on-a-disaggregated-context-server).
+
 ##### Running under VSWA
 
 KVCacheManagerV2 supports multiple layer groups with a connector implementing the grouped APIs below. KVCacheManagerV1 registers a single primary pool and cannot describe VSWA to a connector. Single-window SWA remains allowed with either manager.
@@ -198,13 +201,64 @@ following configuration limits at bring-up.
 
 | Configuration | Mechanism |
 |---|---|
-| Speculative decoding | Rejected draft tokens shrink a request's page list, and the freed slot goes to whichever request allocates next. The connector is never told the tail block moved. |
+| Speculative decoding, outside the [speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server) | Rejected draft tokens shrink a request's page list, and the freed slot goes to whichever request allocates next. The connector is never told the tail block moved. |
 | A capacity scheduler policy other than `GUARANTEED_NO_EVICT` with KV cache manager V1 | V1 does not reset the connector block delta when a request is destroyed and replayed. V2 resets that state and permits replay; an active connector load retains its allocation until completion. |
 | A host or disk cache tier | Tier eviction reassigns the GPU slot. See [KV cache tiers are GPU-only under a connector](#kv-cache-tiers-are-gpu-only-under-a-connector). |
 
 The exact set the runtime refuses depends on your cache configuration; the bring-up error is
-authoritative. Speculative decoding is unsupported with a connector wherever it is not refused —
-the same page-list shrink happens there.
+authoritative. Outside the speculative-prefill-only mode below, speculative decoding is unsupported
+with a connector wherever it is not refused — the same page-list shrink happens there.
+
+##### Speculative decoding on a disaggregated context server
+
+A context-only request finishes after prefill and never rejects a draft token, so on a
+disaggregated context server the page list the connector is told about only grows. The runtime
+therefore lets one-model speculative decoding run next to a connector there, in what it calls the
+speculative-prefill-only mode. The mode is on when all of the following hold:
+
+* The KV cache manager is `KVCacheManagerV2`. An explicit `use_kv_cache_manager_v2=False` keeps
+  V1's behaviour unchanged, without this mode; `"auto"` resolving to V1 is rejected once the manager
+  is built.
+* `cache_transceiver_config.backend` is set, so the server takes part in disaggregated serving.
+* Speculative decoding is one-model MTP (MTP-Eagle or vanilla MTP) or EAGLE3. Other modes, such as
+  NGram or the suffix automaton, keep the refusal above.
+* The draft layers share the target KV cache. A separate draft KV cache is not registered with the
+  connector and is refused.
+* The connector's scheduler and worker classes both declare `supports_speculative_prefill = True`.
+
+What the declaration promises:
+
+* The scheduler's content identity covers the `draft_prompt_lookahead(speculative_config)` prompt
+  tokens past each block's end: one for MTP-Eagle and EAGLE3, `max_draft_len` for vanilla MTP. A
+  one-model draft writes the KV at a position from the tokens after it, so a served block's
+  draft-layer KV then belongs to this prompt. A block whose lookahead tokens fall outside the
+  prompt is neither offered nor saved.
+* Only blocks the current pass has computed are saved. One-model speculation allocates
+  `max_draft_len - 1` extra KV slots past every context chunk, so a block can own a page before it
+  is computed.
+* Loads and saves move whole pages of every layer group in the registered `KvCacheLayout`, which
+  includes the draft layers. Per-layer hooks are installed on `DecoderLayer` modules only, and
+  whether a model's draft layers are such modules depends on the model, so a worker that saves per
+  layer must make sure it covers them.
+
+At runtime:
+
+* A request that is not context-only gets an error response at admission, and only that request
+  fails. That includes `/health_generate` sent straight to the context server.
+* The connector manager refuses such a request again at the lookup, the prefix reservation and
+  the per-iteration scheduler output, for anything that bypasses admission. There the error is not
+  confined to the request.
+* A disaggregated generation server should use a connector role that transfers no KV
+  (`capacity_only`). When its classes declare the mode, such a role is exempt from both refusals
+  and may itself run one-model MTP or EAGLE3. A generation server whose connector transfers KV and
+  which meets the conditions above refuses every generation-only request.
+* A one-model draft can back a local reuse match off by its prompt lookahead, which leaves a match
+  of whole blocks short of a block boundary. A worker that stores whole blocks can ask
+  `KVCacheManagerV2` to align local matches down to a block (`requires_block_aligned_reuse`) or to
+  drop the backoff (`drops_reuse_match_backoff`), both described with the worker interface below.
+  Dropping it can lower draft acceptance but never changes the output.
+* The mode composes with [attention data parallelism](#attention-data-parallelism) when both
+  classes also declare `supports_attention_dp`.
 
 ##### `RequestData` fields that may not be populated
 
@@ -368,13 +422,16 @@ These methods run on all workers (GPU processes) and interact with the actual GP
 * **`capacity_only(self) -> bool`** (property)
   * **Description**: Optional, `False` by default. Declares a worker that contributes resources to an external store but transfers no KV of its own — for example a rank that lends host memory to a shared pool other engines read and write. Must be the same on every rank; the runtime gathers it at startup and rejects a deployment whose ranks disagree. Such a worker is never asked for a lookup, a save, a prefix reservation, or a completion, and the runtime keeps its own connector bookkeeping — page-index gathers, scheduler output, the per-layer hooks — off the forward path entirely.
 
+* **`supports_speculative_prefill: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts, read from the class before the worker is constructed. Declares a worker whose every load and save moves whole pages of every layer group in the registered `KvCacheLayout`, including the one-model draft layers that share the target pool. A worker that saves per layer must make sure its hooks cover the draft layers, since hooks are installed on `DecoderLayer` modules only. Together with the scheduler's declaration it lets the connector run next to one-model speculative decoding on a disaggregated context server; see [Speculative decoding on a disaggregated context server](#speculative-decoding-on-a-disaggregated-context-server).
+
 * **`requires_block_aligned_reuse: bool`** (class attribute)
   * **Description**: Optional, `False` by default; only an explicit `True` counts. Declares a connector that stores and offers KV by whole blocks starting at the local prefix match, so that match must end on a block boundary. It matters only when a one-model speculative-decoding draft (for example MTP or one-model EAGLE3) makes `KVCacheManagerV2` back every local reuse match off by the draft's prompt lookahead, which leaves a match of whole blocks a few tokens short of a boundary, and partial reuse is off. The manager then aligns every local match down to a multiple of `tokens_per_block`, trading the trimmed block for the connector serving it along with the rest of the prefix. Partial reuse keeps matches token-granular, so a connector that sets this should also turn `KvCacheConfig.enable_partial_reuse` off.
 
 * **`drops_reuse_match_backoff: bool`** (class attribute)
   * **Description**: Optional, `False` by default; only an explicit `True` counts. Declares a connector that prefers whole local matches to backed-off ones: the target `KVCacheManagerV2` drops the one-model draft's reuse backoff, so a local match of whole blocks is used whole and needs no alignment. The draft KV at the tail of a reused block may then belong to a different next token, which can lower draft acceptance but never changes the output. A draft pool never drops its own backoff.
 
-Both declarations are read once, when the cache manager is built after the connector, so a worker may set them per instance in `__init__`. A `capacity_only` worker's declarations are ignored. They must be the same on every rank: unlike `capacity_only`, they are not gathered at startup, and ranks that disagree would claim different local prefixes for the same request.
+The two reuse declarations above are read once, when the cache manager is built after the connector, so a worker may set them per instance in `__init__`. A `capacity_only` worker's declarations are ignored. They must be the same on every rank: unlike `capacity_only`, they are not gathered at startup, and ranks that disagree would claim different local prefixes for the same request.
 
 ## Attention data parallelism
 
@@ -481,7 +538,10 @@ rejected after the manager is built. V1 connector behavior remains unchanged.
 PP=1, CP=1 and beam width 1 are required. V2 layer-group layout and callbacks
 are used directly. A backend must implement both grouped callbacks for multiple
 layer groups; the existing layout validation remains in place. Internal host
-or disk tiers, speculative decoding and Mamba/hybrid state remain unsupported.
+or disk tiers and Mamba/hybrid state remain unsupported. Speculative decoding
+is supported only in the
+[speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server),
+for which both classes declare `supports_speculative_prefill` as well.
 This change adds no Mooncake backend, deployment configuration or capacity tuning.
 
 Select a connector through `connector_module`, `connector_scheduler_class`,
