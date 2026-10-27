@@ -345,6 +345,21 @@ These methods run on all workers (GPU processes) and interact with the actual GP
 * **`get_finished_prefix_loads(self) -> list[int]`**
   * **Description**: Reports locally completed reservation identities for loads dispatched through `SchedulerOutput.prefix_loads`, including synchronous loads. Completion means this worker has finished all reads and writes and established the required CUDA stream visibility. This method must not wait for other workers. The runtime collects reports asynchronously and distributes retirement decisions before scheduling; parked async requests resume and shared resources are released only after every worker has reported.
   * **Compatibility**: Legacy request-ID load and save completions continue through `get_finished`.
+
+* **`shutdown(self)`**
+  * **Description**: Optional, with a no-op default. Releases whatever the worker holds — store handles, registered buffers, background threads. Called once, after the executor's worker thread has joined, so no transfer can start afterwards; implementations must be idempotent. Without it a worker's resources live as long as the process, so engines built back to back in one session accumulate them.
+
+* **`capacity_only(self) -> bool`** (property)
+  * **Description**: Optional, `False` by default. Declares a worker that contributes resources to an external store but transfers no KV of its own — for example a rank that lends host memory to a shared pool other engines read and write. Must be the same on every rank; the runtime gathers it at startup and rejects a deployment whose ranks disagree. Such a worker is never asked for a lookup, a save, a prefix reservation, or a completion, and the runtime keeps its own connector bookkeeping — page-index gathers, scheduler output, the per-layer hooks — off the forward path entirely.
+
+* **`requires_block_aligned_reuse: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts. Declares a connector that stores and offers KV by whole blocks starting at the local prefix match, so that match must end on a block boundary. It matters only when a one-model speculative-decoding draft (for example MTP or one-model EAGLE3) makes `KVCacheManagerV2` back every local reuse match off by the draft's prompt lookahead, which leaves a match of whole blocks a few tokens short of a boundary, and partial reuse is off. The manager then aligns every local match down to a multiple of `tokens_per_block`, trading the trimmed block for the connector serving it along with the rest of the prefix. Partial reuse keeps matches token-granular, so a connector that sets this should also turn `KvCacheConfig.enable_partial_reuse` off.
+
+* **`drops_reuse_match_backoff: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts. Declares a connector that prefers whole local matches to backed-off ones: the target `KVCacheManagerV2` drops the one-model draft's reuse backoff, so a local match of whole blocks is used whole and needs no alignment. The draft KV at the tail of a reused block may then belong to a different next token, which can lower draft acceptance but never changes the output. A draft pool never drops its own backoff.
+
+Both declarations are read once, when the cache manager is built after the connector, so a worker may set them per instance in `__init__`. A `capacity_only` worker's declarations are ignored. They must be the same on every rank: unlike `capacity_only`, they are not gathered at startup, and ranks that disagree would claim different local prefixes for the same request.
+
 ## Attention data parallelism
 
 Set `enable_attention_dp=True` and
@@ -469,12 +484,6 @@ kv_connector_config:
 Add `examples/llm-api` to `PYTHONPATH`. The example supports one full-attention
 layer group and no chunked prefill; it demonstrates shared storage, not
 production transfer performance.
-
-* **`shutdown(self)`**
-  * **Description**: Optional, with a no-op default. Releases whatever the worker holds — store handles, registered buffers, background threads. Called once, after the executor's worker thread has joined, so no transfer can start afterwards; implementations must be idempotent. Without it a worker's resources live as long as the process, so engines built back to back in one session accumulate them.
-
-* **`capacity_only(self) -> bool`** (property)
-  * **Description**: Optional, `False` by default. Declares a worker that contributes resources to an external store but transfers no KV of its own — for example a rank that lends host memory to a shared pool other engines read and write. Must be the same on every rank; the runtime gathers it at startup and rejects a deployment whose ranks disagree. Such a worker is never asked for a lookup, a save, a prefix reservation, or a completion, and the runtime keeps its own connector bookkeeping — page-index gathers, scheduler output, the per-layer hooks — off the forward path entirely.
 
 ## Example Implementation
 

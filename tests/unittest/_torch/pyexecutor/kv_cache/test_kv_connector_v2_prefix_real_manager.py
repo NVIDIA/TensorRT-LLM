@@ -33,7 +33,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfi
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, AttnLifeCycle
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, AttnLifeCycle, ReuseScope
 
 DataType = tensorrt_llm.bindings.DataType
 CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -376,6 +376,72 @@ def test_freeing_the_allocation_makes_the_request_askable_again(manager, connect
     run(manager, request)
 
     assert len(connector.queries) == 2
+
+
+@pytest.mark.parametrize(
+    ("requires", "drops", "expected_local_end", "expected_backoff"),
+    [
+        # A one-token backoff leaves a match of four whole blocks one short.
+        (False, False, 4 * TOKENS_PER_BLOCK - 1, 1),
+        # Aligned down: the connector serves the trimmed block and the rest.
+        (True, False, 3 * TOKENS_PER_BLOCK, 1),
+        # The backoff is dropped, so the whole local match is used.
+        (True, True, 4 * TOKENS_PER_BLOCK, 0),
+    ],
+    ids=["no_declaration", "align", "off"],
+)
+def test_whole_block_connector_is_queried_from_a_block_boundary(
+    monkeypatch, requires, drops, expected_local_end, expected_backoff
+):
+    """The local match a whole-block connector is asked from, against the real tree.
+
+    A one-model draft's lookahead backoff is stood in for by patching the
+    lookahead the manager reads at construction; the connector offers nothing,
+    so the query records the local match alone.
+    """
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.speculative.draft_prompt_lookahead", lambda _spec_config: 1
+    )
+    torch.cuda.init()
+    gc.collect()
+    torch.cuda.empty_cache()
+    connector = FakeConnectorManager(num_matched=0)
+    connector.worker = SimpleNamespace(
+        requires_block_aligned_reuse=requires, drops_reuse_match_backoff=drops
+    )
+    manager = make_manager(
+        connector,
+        # Partial reuse keeps matches token-granular, so alignment needs it off.
+        kv_cache_config=KvCacheConfig(
+            max_tokens=2048, enable_block_reuse=True, enable_partial_reuse=False
+        ),
+    )
+    try:
+        assert manager.reuse_match_backoff == expected_backoff
+
+        # Seed four whole blocks under the scope the manager derives for
+        # `make_request`, which carries no LoRA task and no cache salt.
+        seed = manager.impl.create_kv_cache(
+            ReuseScope(lora_id=None, salt=manager._derive_reuse_salt(None))
+        )
+        assert seed.resume(manager._stream.cuda_stream)
+        assert seed.resize(4 * TOKENS_PER_BLOCK)
+        seed.commit(list(range(4 * TOKENS_PER_BLOCK)))
+        seed.close()
+
+        request = make_request(prompt_len=6 * TOKENS_PER_BLOCK)
+        assert manager.probe_context_reuse(request) == expected_local_end
+
+        # The connector is asked in `prepare_resources`, not while scheduling.
+        assert schedule(manager, request)
+        assert connector.queries == []
+        run(manager, request)
+        assert connector.queries[-1] == (request.py_request_id, expected_local_end)
+    finally:
+        manager.shutdown()
+        del manager
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
