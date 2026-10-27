@@ -3,7 +3,6 @@
 """Exact, qualified half-row TF32 router dispatch for the M3.1 TP2 IPC boundary."""
 
 import os
-from pathlib import Path
 
 import torch
 
@@ -21,11 +20,6 @@ def _load():
     global _LOADED
     if _LOADED:
         return hasattr(torch.ops.trtllm, "m31_router_half_pin")
-    import tensorrt_llm
-
-    library = Path(tensorrt_llm.__file__).parent / "libs/libm31_router_half_pin.so"
-    if not hasattr(torch.ops.trtllm, "m31_router_half_pin") and library.is_file():
-        torch.ops.load_library(str(library))
     if hasattr(torch.ops.trtllm, "m31_router_half_pin"):
 
         @torch.library.register_fake("trtllm::m31_router_half_pin")
