@@ -826,7 +826,10 @@ class TestDefaultADPRouter:
 
     def test_gather_all_rank_states_skips_cp_gather_without_helix(self):
         dist = _mock_dist(tp_rank=0, tp_size=2, has_cp_helix=False)
-        dist.tp_allgather.return_value = [[0, 1, 10], [1, 2, 20]]
+        dist.tp_allgather.return_value = [
+            _as_state_payload([0, 1, 10]),
+            _as_state_payload([1, 2, 20]),
+        ]
         router = DefaultADPRouter(dist=dist)
 
         router.gather_all_rank_states([Mock(py_orig_prompt_len=10)])
