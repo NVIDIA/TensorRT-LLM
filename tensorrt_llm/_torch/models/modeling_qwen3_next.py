@@ -340,9 +340,16 @@ def _fp8_input_scale(layer: nn.Module) -> Optional[torch.Tensor]:
         linear = layer.self_attn.qkv_proj
     else:
         return None
+    return _fp8_linear_input_scale(linear)
+
+
+def _fp8_linear_input_scale(
+        linear: Optional[nn.Module]) -> Optional[torch.Tensor]:
+    """Static input scale of an FP8 per-tensor Linear, or None."""
     # remove_weights (layer-wise benchmark) leaves no input_scale.
-    if (getattr(linear, "_weights_removed", False)
-            or not isinstance(linear.quant_method, FP8QDQLinearMethod)):
+    if (linear is None
+            or getattr(linear, "_weights_removed", False) or not isinstance(
+                getattr(linear, "quant_method", None), FP8QDQLinearMethod)):
         return None
     scale = linear.quant_method.get_static_input_scale(linear)
     return scale.detach() if scale is not None else None
@@ -389,6 +396,31 @@ def _takes_resident_band(layer: nn.Module, projection: Optional[Linear],
     n, k = projection.weight.shape
     return all(
         plan(rows, k, n) is not None for rows in range(min_rows, max_rows + 1))
+
+
+def _attach_norm_fp8_scales(layers, model_config: ModelConfig) -> None:
+    """Let norms that run outside a fused all-reduce also write the E4M3 copy
+    their static-FP8 consumer reads: a layer's input norm for its input
+    projection, and its post-attention norm for the shared expert.
+
+    Expects ``next_layer_input_scale`` to be set on ``layers``. Pipeline stages
+    send a plain tensor, Helix all-gathers the attention input and LoRA
+    adapters read the BF16 input, so none of them use the copy.
+    """
+    mapping = model_config.mapping
+    if (model_config.lora_config is not None or mapping.has_pp()
+            or mapping.has_cp_helix()):
+        return
+    for layer, next_layer in zip(layers, layers[1:]):
+        next_layer.input_layernorm.fp8_scale = (
+            None if layer.fusion_config.POST_MOE_FUSION else
+            layer.next_layer_input_scale)
+    for layer in layers:
+        shared_expert = getattr(layer.mlp, "shared_expert", None)
+        layer.post_attention_layernorm.fp8_scale = (
+            None
+            if layer.fusion_config.PRE_MOE_FUSION else _fp8_linear_input_scale(
+                getattr(shared_expert, "gate_up_proj", None)))
 
 
 def _post_moe_allreduce(layer: nn.Module, mlp_output, residual: torch.Tensor):
@@ -1088,7 +1120,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         """``do_finalize=False`` (``can_defer_finalize``): the experts' un-finalized output (fc2 rows, top-k
         weights, expanded -> permuted index) with the shared expert's output and gate logits, for a MoE-output
         all-reduce that finalizes them. ``fold_shared_expert`` (the caller runs that all-reduce with
-        MoEAllReduceParams): the finalized routed output with the shared expert's output and gate logits."""
+        MoEAllReduceParams): the finalized routed output with the shared expert's output and gate logits.
+        ``_Fp8HiddenStates`` input carries the shared expert's gate_up_proj input already quantized."""
+        shared_expert_fp8 = None
+        if isinstance(hidden_states, _Fp8HiddenStates):
+            hidden_states, shared_expert_fp8 = hidden_states
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
@@ -1123,6 +1159,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         dual_quant = None if use_dp_padding else self._moe_input_dual_quant(
             hidden_states, lora_params)
         shared_input = hidden_states if dual_quant is None else dual_quant[1]
+        # Otherwise the E4M3 copy the post-attention norm wrote, if any.
+        if (dual_quant is None and shared_expert_fp8 is not None
+                and not use_dp_padding and not lora_params):
+            shared_input = shared_expert_fp8.view(-1, self.hidden_dim)
 
         # On the fold path the experts may write their FC2 rows into the
         # Lamport buffer, which the MoE-output all-reduce polls; the shared
@@ -1472,11 +1512,20 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
+        fp8 = None
+        if isinstance(hidden_states, tuple):
+            # The norm also wrote the shared expert's E4M3 input.
+            fp8, hidden_states = hidden_states
         if kept_rows is not None:
             hidden_states, residual = gather_rows2(hidden_states, residual,
                                                    kept_rows.ids)
+            if fp8 is not None:
+                fp8 = fp8.index_select(0, kept_rows.ids)
             if kept_rows.all_rank_counts is not None:
                 attn_metadata.all_rank_num_tokens = kept_rows.all_rank_counts
+        mlp_input = hidden_states
+        if fp8 is not None:
+            mlp_input = _Fp8HiddenStates(hidden_states, fp8)
 
         # The MoE-output all-reduce combines the shared expert, and finalizes
         # the experts' output where they can hand it back un-finalized.
@@ -1496,7 +1545,7 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
             and not (spec_metadata is not None
                      and spec_metadata.is_layer_capture(self.layer_idx)))
         hidden_states = self.mlp(
-            hidden_states,
+            mlp_input,
             attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
@@ -1520,6 +1569,14 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
+                if isinstance(hidden_states, tuple):
+                    # The norm also wrote the next layer's E4M3 input: GDN
+                    # reads both, attention only the E4M3 copy.
+                    fp8, hidden_states = hidden_states
+                    if self.next_layer_reads_bf16:
+                        hidden_states = _Fp8HiddenStates(hidden_states, fp8)
+                    else:
+                        hidden_states = fp8
         return hidden_states, residual
 
 
@@ -2103,6 +2160,7 @@ class Qwen3NextModel(DecoderModel):
                                             is None else None)
             layer.next_layer_reads_bf16 = isinstance(
                 next_layer, Qwen3NextLinearDecoderLayer)
+        _attach_norm_fp8_scales(layers, self.model_config)
         if _uses_tp_decode_kernels(self.model_config):
             self._cache_tp_decode_gates(layers)
             self._drop_expert_prefetch_without_record(layers)
