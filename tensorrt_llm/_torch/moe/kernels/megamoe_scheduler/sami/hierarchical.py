@@ -587,10 +587,13 @@ class HierarchicalSamiWeightBroadcast:
         """Order the copy stream after this rank's live-bank consumer.
 
         The consumer is ``completion_event``, or without it the work already
-        queued on the current stream. This establishes only local stream
-        ordering.  The bound reuse authority must separately attest its
-        bounded all-rank barrier before another generation may overwrite the
-        single live bank.
+        queued on the current stream. That stream must be the one the next
+        fused launch follows: the launch orders the copy stream after the work
+        queued on its current stream (see ``submit_fused``), which then
+        includes this consumer, so no separate device wait is queued for it.
+        This establishes only local stream ordering. The bound reuse authority
+        must separately attest its bounded all-rank barrier before another
+        generation may overwrite the single live bank.
         """
 
         if type(generation) is not int or generation <= 0:
@@ -607,9 +610,7 @@ class HierarchicalSamiWeightBroadcast:
                 raise ValueError("generation is not the active live bank")
             if self._local_release_generation >= generation:
                 raise RuntimeError("generation already has a local release event")
-            if completion_event is None:
-                torch.ops.trtllm.moe_rebalance_tma_release(self._handle)
-            else:
+            if completion_event is not None:
                 check_cuda(
                     self.cuda.cuStreamWaitEvent(self._stream, event_handle, 0),
                     "cuStreamWaitEvent(live-bank consumer)",

@@ -11,8 +11,10 @@ memory wait on that epoch that holds no SM. MegaMoE's system-acquire READY gate
 protects helper reads while the copy finishes concurrently.
 
 For each rank and generation g:
-    MAIN: MegaMoE(g) -> consumer_done(g)
-    COPY: wait consumer_done(g) -> [HALO-Q(g+1) EP exchange -> TMA(g+1)]
+    MAIN: MegaMoE(g) -> ... -> routes(g+1) -> input_ready(g+1)
+    COPY: wait input_ready(g+1) -> [HALO-Q(g+1) EP exchange -> TMA(g+1)]
+Every launch orders COPY after the MAIN work queued before it, which includes
+the previous consumer MegaMoE(g), so finish() queues no device work of its own.
 All ranks enter the bounded EP exchange after their own previous consumer, so no
 next-generation overwrite can precede any previous-generation consumer. No host
 collective or auxiliary copy submitter is needed in the serving path.
@@ -76,9 +78,9 @@ class SchedulerSpinBound:
 class _LiveBankLeaseProvider:
     """Authorize ordered reuse, not a claim of completed GPU work on the host.
 
-    release_generation_after() enqueues the local consumer wait on COPY.
-    prove() is legal right before the next fused HALO-Q + TMA launch on that
-    same stream. The launch's bounded all-rank count exchange precedes its plan,
+    release_generation_after() registers the local consumer; the next fused
+    HALO-Q + TMA launch orders COPY after it on MAIN. prove() is legal right
+    before that launch. The launch's bounded all-rank count exchange precedes its plan,
     and its copy follows the plan in the same CTAs. Therefore a delayed peer
     consumer blocks every rank's overwrite without a host-side barrier.
     """
@@ -264,7 +266,7 @@ class RebalanceSlotSchedulerGroup:
         )
         self.broadcaster.bind_scheduler(self.scheduler, self.scheduler_stream, self._route_epoch)
 
-        # A prior consumer event precedes the next HALO-Q EP rendezvous.
+        # The previous consumer precedes the next HALO-Q EP rendezvous.
         self.lease = _LiveBankLeaseProvider(self)
         self.broadcaster.bind_generation_reuse_authority(self.lease)
 
@@ -419,10 +421,11 @@ class RebalanceSlotSchedulerGroup:
         self.finish()
 
     def finish(self, completion_event: torch.cuda.Event | None = None) -> None:
-        """Queue the previous consumer wait before any next-generation producer.
+        """Release this generation to the next-generation producer.
 
         The consumer is ``completion_event``, or without it the MAIN work
         queued so far: the MegaMoE launch that read this generation, if any.
+        The next fused launch, submitted on MAIN, orders COPY after it.
         """
         self._check_owner()
         if (

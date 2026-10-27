@@ -239,16 +239,8 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
     def submit_fused(handle, routes, route_target, spin_cycles):
         native.append(("launch", handle, routes, route_target, spin_cycles))
 
-    def release(handle):
-        native.append(("release", handle))
-
     torch = SimpleNamespace(
-        ops=SimpleNamespace(
-            trtllm=SimpleNamespace(
-                moe_rebalance_tma_submit_fused=submit_fused,
-                moe_rebalance_tma_release=release,
-            )
-        ),
+        ops=SimpleNamespace(trtllm=SimpleNamespace(moe_rebalance_tma_submit_fused=submit_fused)),
     )
     ticket_cls = _extract_class(
         source,
@@ -322,10 +314,11 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
     with pytest.raises(RuntimeError, match="local consumer release"):
         broadcast.mark_collective_reuse_safe(authority, 1)
     native.clear()
-    # Without an event, the consumer is the work queued on the current stream,
-    # which one native call orders the copy stream after.
+    # Without an event, the consumer is the work queued on the current stream.
+    # The next launch orders the copy stream after that stream, so the release
+    # queues no device work.
     broadcast.release_generation_after(1)
-    assert native == [("release", 4242)]
+    assert native == []
     with pytest.raises(RuntimeError, match="already has a local release"):
         broadcast.release_generation_after(1)
     broadcast.mark_collective_reuse_safe(authority, 1)
