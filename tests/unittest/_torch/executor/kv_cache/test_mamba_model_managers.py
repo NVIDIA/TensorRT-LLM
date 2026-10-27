@@ -191,6 +191,7 @@ def _shutdown_manager(manager, monkeypatch):
     if isinstance(manager, Qwen4ExpHybridCacheManager):
         manager._ple_conv_states = {42: object()}
         manager._ple_ngram_contexts = {42: object()}
+        manager._ple_kernel_caches = {42: (object(), object())}
 
     def check_before_pool_shutdown():
         assert manager.intermediate_state_indices is None
@@ -323,7 +324,7 @@ def test_k3_initializes_only_the_selected_state(
     else:
         selector.assert_not_called()
 
-    manager._state_layout = object()
+    manager._state_layout = _layout()
     manager.all_ssm_states, manager.all_conv_states = [], []
     pool_bind = Mock()
     monkeypatch.setattr(manager, "_bind_speculative_pool_buffers", pool_bind)
@@ -464,7 +465,7 @@ def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
     assert isinstance(state, (Mamba2State, GDNIntermediateState)) == (mode != "replay")
     assert isinstance(state, (ReplayHistory, GDNReplayState)) == (mode == "replay")
 
-    manager._state_layout = object()
+    manager._state_layout = _layout()
     manager.local_num_mamba_layers = 0
     if manager_cls is Qwen4ExpHybridCacheManager:
         manager._ple_conv_states = {}
@@ -1482,7 +1483,7 @@ def test_constructor_validates_before_pool_and_binds_after_slot_capacity(monkeyp
     monkeypatch.setattr(module, "get_pp_layers", lambda *args, **kwargs: ([0, 1], None))
     monkeypatch.setattr(torch, "zeros", cpu_zeros)
     monkeypatch.setattr(torch, "arange", cpu_arange)
-    config = SimpleNamespace(enable_block_reuse=False)
+    config = SimpleNamespace(enable_block_reuse=False, enable_kv_pool_rebalance=False)
     config.model_copy = lambda **kwargs: config
     params = Qwen4ExpPLECacheParams(
         ple_layer_mask=[True, False],
