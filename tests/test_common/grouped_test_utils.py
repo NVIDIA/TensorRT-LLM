@@ -9,30 +9,19 @@ circular import during package initialization.
 """
 
 
-def _barrier_run(fn):
-    """Runs inside a worker; module-level so it is picklable.
-
-    The leading barrier is what makes ``submit_sync_per_worker`` exactly-once:
-    a worker that picked up one of the ``n_workers`` submitted tasks blocks
-    here until every other worker holds a task of its own, so no worker can
-    drain a second one (pigeonhole). The workers' ``MPI_COMM_WORLD`` is the
-    spawned worker world (the parent process is not a member), so the barrier
-    spans exactly the pool's ``n_workers`` ranks.
-    """
+def _ranked_run(fn):
+    """Runs inside a worker; module-level so it is picklable."""
     from mpi4py import MPI
 
-    MPI.COMM_WORLD.barrier()
-    return (MPI.COMM_WORLD.Get_rank(), fn())
+    return MPI.COMM_WORLD.Get_rank(), fn()
 
 
 def submit_sync_per_worker(mpi_session, fn, timeout: float = 60.0) -> list:
     """Run ``fn`` exactly ONCE on every worker; return results ordered by rank.
 
-    ``MpiPoolSession.submit_sync`` enqueues ``n_workers`` tasks, but
-    ``MPIPoolExecutor`` gives no one-task-per-worker guarantee: a fast task can
-    be drained twice by one idle worker, leaving another untouched. Each task
-    therefore opens with a barrier across the worker world (see
-    ``_barrier_run``), which pins the tasks one-per-worker.
+    ``MpiPoolSession.submit`` runs ``fn`` once per worker behind a barrier
+    across the worker world, but returns the results in arbitrary order; each
+    result is tagged with its worker's rank to order them.
 
     This doubles as the pool health probe: completing the barrier proves every
     worker is alive AND that the worker world's collectives still function —
@@ -44,7 +33,7 @@ def submit_sync_per_worker(mpi_session, fn, timeout: float = 60.0) -> list:
     """
     import concurrent.futures
 
-    futures = mpi_session.submit(_barrier_run, fn)
+    futures = mpi_session.submit(_ranked_run, fn)
     done, not_done = concurrent.futures.wait(futures, timeout=timeout)
     if not_done:
         raise RuntimeError(
@@ -53,7 +42,7 @@ def submit_sync_per_worker(mpi_session, fn, timeout: float = 60.0) -> list:
         )
     by_rank = dict(f.result() for f in done)  # .result() re-raises worker errors
     missing = set(range(mpi_session.n_workers)) - set(by_rank)
-    if missing:  # unreachable given the barrier; guards scheduler surprises
+    if missing:  # unreachable given submit's one-per-worker guarantee
         raise RuntimeError(f"no task ran on worker ranks {sorted(missing)}")
     return [result for _, result in sorted(by_rank.items())]
 

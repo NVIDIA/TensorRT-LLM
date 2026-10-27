@@ -64,6 +64,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_prims_ts_bfloat16
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=disable-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
@@ -99,6 +100,7 @@ l0_b200:
   - accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[qwen3vl_2b_instruct]
   - accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[nemotron_nano_v3_omni_nvfp4]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_mtp
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_mtp_flashinfer_ring_replay
   - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction # nvbugs 5300551
   - test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Nano-9B-v2-nvfp4-NVIDIA-Nemotron-Nano-9B-v2-NVFP4]
   - test_e2e.py::test_ptp_quickstart_advanced_mtp[DeepSeek-V3-Lite-BF16-DeepSeek-V3-Lite/bf16]
@@ -231,6 +233,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_create_moe_forwards_situ_activation_as_one_carrier
   - unittest/_torch/moe/test_moe_backend.py::test_create_moe_backend_rejects_apply_router_weight_on_input_by_declaration
   - unittest/_torch/moe/test_moe_backend.py::test_apply_router_weight_on_input_support_is_not_inherited
+  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_nvfp4_pre_quant_scale_matches_cutlass
   # WideEP DeepEP-to-CuTeDSL metadata selection and adapter-free contracts.
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens
@@ -441,6 +444,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_glm_image_transformer.py
   - unittest/_torch/visual_gen/test_glm_image_pipeline.py
   - unittest/_torch/visual_gen/test_minimax_h3_transformer.py
+  - unittest/_torch/visual_gen/test_minimax_h3_fused_rope.py
   - unittest/_torch/visual_gen/test_minimax_h3_fused_adaln.py
   - unittest/_torch/visual_gen/test_minimax_h3_vae_decode.py
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_public_visual_gen_api_smoke TIMEOUT (30)

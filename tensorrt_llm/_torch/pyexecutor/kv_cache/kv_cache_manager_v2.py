@@ -132,6 +132,7 @@ from ..resource_manager import (
     _project_max_attention_window_vec,
     get_pp_layers,
     request_context,
+    scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
 
@@ -1668,13 +1669,18 @@ class KVCacheManagerV2(BaseResourceManager):
                     "KVCacheManagerV2 does not support a draft cache "
                     "manager or draft-owned layers with helix context parallelism."
                 )
-            if mapping.enable_attention_dp:
+            if mapping.enable_attention_dp and mapping.pp_size > 1:
+                # Only the pp=1 executor loops call
+                # DisaggTransferCoordinator.align_gen_admission_across_cp. Without
+                # it a CP rank can admit a gen-init request its peers did not
+                # admit and hang alone in the gen transfer status collective.
+                # KvCacheTransceiverV2._check_compatible rejects the same
+                # combination; lift both together.
                 raise ValueError(
-                    "KVCacheManagerV2 does not support attention-DP with "
-                    "helix context parallelism: disagg transfer-completion "
-                    "consensus is skipped under attention-DP, so the "
-                    "scheduler's request view would not be rank-invariant "
-                    "across the CP group."
+                    "KVCacheManagerV2 does not support attention-DP with helix "
+                    "context parallelism when pp_size > 1 "
+                    f"(got pp_size={mapping.pp_size}). Set "
+                    "pipeline_parallel_size=1 or enable_attention_dp=False."
                 )
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
@@ -2825,12 +2831,22 @@ class KVCacheManagerV2(BaseResourceManager):
             self.impl.get_mem_pool_base_address(layer_id, Role.KEY, PageIndexMode.SHARED)
             - key_base_addr
         )
-        return exact_div(
-            addr_offset,
+        layer_stride = (
             self.get_layer_bytes_per_token(layer_id, Role.KEY)
             * self._get_layer_kv_factor_by_local_id(layer_id)
-            * self.tokens_per_block,
+            * self.tokens_per_block
         )
+        offset, remainder = divmod(addr_offset, layer_stride)
+        if remainder:
+            raise RuntimeError(
+                f"Layer {int(layer_id)}'s K page starts {addr_offset} B into its pool slot, "
+                f"which is not a multiple of one layer's K/V pages ({layer_stride} B). "
+                "V2 coalesces a lifecycle's buffers by page size, so another buffer of this "
+                "page size shares the K/V pool and the attention op cannot address the layer. "
+                "Register that buffer with a different page size or override "
+                "_kv_pool_mapping_offset."
+            )
+        return offset
 
     def _get_runtime_cache_size_layer_components(self) -> tuple[List[int], List[Optional[int]]]:
         if self.layer_specs is not None:
@@ -4783,12 +4799,11 @@ class KVCacheManagerV2(BaseResourceManager):
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init"
         )
-        if self._has_cp_helix and not req.is_dummy_request:
+        if self._has_cp_helix and self.is_disagg and not req.is_dummy_request:
             raise ValueError(
-                "resize_context is not helix-aware: its rank-local chunk "
-                "target would under-size the global ledger. Helix requests "
-                "are disagg-generation-only and must never take the context "
-                "path."
+                "resize_context is not available under disaggregated helix: "
+                "requests hold only this rank's slice of the prompt, which "
+                "would under-size the global ledger."
             )
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
@@ -6970,14 +6985,8 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
         for layer_id, buffer in self._iter_cache_buffers_for_invalid_check():
-            # process in chunks of 256 pages to avoid OoM
-            for i in range(0, buffer.shape[0], 256):
-                buffer_slice = buffer[i : i + 256]
-                try:
-                    has_invalid_values.logical_or_(torch.isnan(buffer_slice).any())
-                    has_invalid_values.logical_or_(torch.isinf(buffer_slice).any())
-                except NotImplementedError:
-                    some_checks_unavailable = True
+            if scan_kv_buffer_for_invalid_values(buffer, has_invalid_values):
+                some_checks_unavailable = True
             if fill_with_zero:
                 buffer.zero_()
                 # warmup runs this with fill_with_zero=True to scrub the cache

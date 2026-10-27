@@ -35,7 +35,11 @@ from tensorrt_llm.serve.chat_tokenization import (
     resolve_model_type_from_config,
     uses_harmony_tokenization,
 )
-from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, CompletionRequest
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    ResponsesRequest,
+)
 from tensorrt_llm.serve.render import (
     HarmonyConversionError,
     PreparedContext,
@@ -62,7 +66,7 @@ KV_CACHE_HASH_ALGOS = frozenset(
 hash_v1_block_key = kv_cache_hash.hash_v1_block_key
 truncate_sha256_hash_to_int64 = kv_cache_hash.truncate_sha256_hash_to_int64
 
-OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest]
+OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest, ResponsesRequest]
 BlockHash = Union[int, str]
 
 __all__ = [
@@ -75,6 +79,7 @@ __all__ = [
     "truncate_sha256_hash_to_int64",
     "OpenAIRequest",
     "BlockHash",
+    "responses_request_text",
     "get_request_num_tokens",
     "block_key_hasher",
     "BlockHashMixin",
@@ -136,9 +141,29 @@ class PrefixBlockSet:
         return bool(self._blocks)
 
 
+def responses_request_text(request: ResponsesRequest) -> str:
+    """Return the instructions and input as ``role:content`` lines, like a chat request's text.
+
+    A later turn re-sends the earlier turns' input, so its text extends theirs.
+    """
+    from tensorrt_llm.serve.responses_utils import chat_messages_from_responses_input
+
+    messages = chat_messages_from_responses_input(request, [])
+    return "\n".join(f"{m.get('role', '')}:{m.get('content', '')}" for m in messages)
+
+
 def get_request_num_tokens(request: Optional[OpenAIRequest]) -> int:
     if request is None:
         return 0
+
+    if isinstance(request, ResponsesRequest):
+        # Without relayed token ids the text is counted in characters, as a
+        # string completion prompt is below, which weighs a request several
+        # times what its token count would. A router sees one kind only: the
+        # context router routes before any ids exist, and the generation
+        # router gets them relayed (context-first) or never (generation-first).
+        token_ids = request.relayed_prompt_token_ids()
+        return len(responses_request_text(request) if token_ids is None else token_ids)
 
     if (
         request.disaggregated_params is None
@@ -474,6 +499,9 @@ class BlockHashMixin:
         return rendered.token_ids
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
+        if isinstance(request, ResponsesRequest):
+            return [self._tokenize_responses_request(request)]
+
         # Handle ChatCompletionRequest (has messages, not prompt)
         if isinstance(request, ChatCompletionRequest):
             return [self._tokenize_chat(request)]
@@ -497,6 +525,45 @@ class BlockHashMixin:
         # skips re-tokenization
         request.prompt = token_lists if len(token_lists) > 1 else token_lists[0]
         return token_lists
+
+    def _tokenize_responses_request(self, request: ResponsesRequest) -> list[int]:
+        """Return the token ids of the prompt a worker builds for a Responses request.
+
+        The ids only drive routing and are not stored on the request, so the
+        context worker still renders the prompt itself.
+        """
+        token_ids = request.relayed_prompt_token_ids()
+        if token_ids is not None:
+            return token_ids
+        from tensorrt_llm.serve import responses_utils
+
+        # A disaggregated server rejects previous_response_id, so there is no
+        # stored history: the input is the whole conversation.
+        if uses_harmony_tokenization(
+            use_harmony=self._use_harmony, model_type_resolver=self._get_model_type
+        ):
+            return responses_utils._render_for_completion(
+                responses_utils._construct_harmony_messages(request, None)
+            )
+        tools = responses_utils._get_chat_completion_function_tools(request.tools)
+        # As on the worker, developer messages render as system for a chat
+        # template that has no developer role.
+        messages = responses_utils._render_developer_as_system(
+            responses_utils.chat_messages_from_responses_input(request, []),
+            self._get_tokenizer(request.model),
+            None,
+            [tool.model_dump() for tool in tools],
+        )
+        chat_request = ChatCompletionRequest.model_construct(
+            model=request.model,
+            messages=messages,
+            tools=tools,
+            chat_template_kwargs=responses_utils.reasoning_chat_template_kwargs(request),
+            injected_chat_template_kwargs=list(
+                responses_utils.reasoning_injected_chat_template_keys(request)
+            ),
+        )
+        return self._tokenize(chat_request)[0]
 
     def _compute_block_hashes(
         self,

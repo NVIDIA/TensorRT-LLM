@@ -26,7 +26,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE, CuteDslFusedMoE
+from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     ACTIVATION_PAYLOAD,
     SimpleActivation,
@@ -34,6 +34,10 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     SwigluActivation,
     SwigluBiasActivation,
     activation_constant_names,
+)
+from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
+    cutedsl_grouped_gemm_leaf,
+    find_cutedsl_grouped_gemm_leaf,
 )
 from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     cutlass_leaf,
@@ -106,6 +110,7 @@ def get_backend_class(
             MoeBackendType.CUTLASS: cutlass_leaf,
             MoeBackendType.TRTLLM: trtllm_gen_leaf,
             MoeBackendType.MARLIN: marlin_leaf,
+            MoeBackendType.CUTEDSL: cutedsl_grouped_gemm_leaf,
         }.get(backend_type)
         if raising_lookup is None:
             raise ValueError(
@@ -120,16 +125,16 @@ def find_backend_class(
 ) -> type[MoE] | None:
     """The MoE backend class, or ``None`` if the family has no leaf for the format.
 
-    ``CUTLASS``, ``TRTLLM``, ``MARLIN`` and ``CUTE_DSL_B12X`` are not one class
-    each but sets of leaves keyed by quant (and, for TRTLLM-Gen, provider), so
-    all four need ``quant_algo``. CUTLASS publishes ``fp8_block_scales`` twice,
-    once per SM family, so for that format the leaf is the one this device runs.
+    ``CUTLASS``, ``TRTLLM``, ``MARLIN``, ``CUTEDSL`` and ``CUTE_DSL_B12X`` are
+    not one class each but sets of leaves keyed by quant (and, for TRTLLM-Gen,
+    provider), so each needs ``quant_algo``. CUTLASS publishes
+    ``fp8_block_scales`` twice, once per SM family, so for that format the leaf
+    is the one this device runs.
     TRTLLM-Gen prefers the native leaf for that format and falls back to the
     FlashInfer sibling, which is what "the TRTLLM backend" has to mean for the
     unquantized format: bf16 has no native leaf, only
     ``FlashinferTrtllmGenBf16Impl``. For every other format the native leaf
     exists and wins, so only bf16 tests are exercising a FlashInfer class.
-    Marlin has a single provider, so its lookup is keyed by quant alone.
 
     Absence is returned rather than raised so that a parameter generator can
     tell it apart from a real failure: catching the exception instead would let
@@ -142,6 +147,8 @@ def find_backend_class(
         return find_trtllm_gen_leaf(quant_algo)
     if backend_type is MoeBackendType.MARLIN:
         return find_marlin_leaf(quant_algo)
+    if backend_type is MoeBackendType.CUTEDSL:
+        return find_cutedsl_grouped_gemm_leaf(quant_algo)
     if backend_type is MoeBackendType.CUTE_DSL_B12X:
         # Two leaves, one format each: NVFP4 keeps the CUTLASS prefill path,
         # W4A16_NVFP4 never leaves the b12x kernel. Compared after
@@ -157,7 +164,6 @@ def find_backend_class(
         )
 
     backend_class_map = {
-        MoeBackendType.CUTEDSL: CuteDslFusedMoE,
         MoeBackendType.CUTEDSL_FC12: CuteDslFc12FusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,

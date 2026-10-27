@@ -585,8 +585,7 @@ class PyExecutor:
         # Under beam search a request's per-beam token lists are not the
         # hypotheses the beams hold; the sampler rebuilds those for the engine's
         # logits post-processors.
-        if (hasattr(model_engine, "register_beam_histories_callable")
-                and hasattr(sampler, "start_beam_histories")):
+        if hasattr(sampler, "start_beam_histories"):
             model_engine.register_beam_histories_callable(
                 sampler.start_beam_histories)
         self.drafter = drafter
@@ -861,6 +860,11 @@ class PyExecutor:
             attention_dp_config=self.llm_args.attention_dp_config,
             async_transfer_manager=self.async_transfer_manager,
         )
+        # The router publishes the uncached-prefill estimate only when the
+        # scheduler's long-prefill demotion consumes it.
+        if hasattr(self.adp_router, "set_publish_uncached_estimate"):
+            self.adp_router.set_publish_uncached_estimate(
+                getattr(self.scheduler, "ctx_demote_uncached_tokens", 0) > 0)
 
         self.previous_batch: Optional[BatchState] = None
         self.num_scheduled_requests: int = 0
@@ -4151,10 +4155,17 @@ class PyExecutor:
                              and (sizes[:, 1] > 0).any())
             can_queue_this_rank = scheduled_batch.batch_size > 0
         elif self.enable_attention_dp:
-            tp_batch_sizes = self.dist.tp_allgather_int64(
-                [scheduled_batch.batch_size])[:, 0].tolist()
-            can_queue = 0 not in tp_batch_sizes
-            can_queue_this_rank = scheduled_batch.batch_size > 0
+            # Vote over TP x CP. The helix CP ranks of one DP rank run each
+            # forward together, but their batch sizes can differ: one CP rank
+            # can pad a dummy request that its peer failed to allocate. With
+            # cp_size == 1 this is the TP gather.
+            batch_sizes = self.dist.tp_cp_allgather_int64(
+                [scheduled_batch.batch_size])[:, 0]
+            can_queue = bool(batch_sizes.all())
+            # Rows are TP-major, CP-minor. The CP peers of this DP rank decide
+            # together whether to defer the previous batch.
+            cp_rows = batch_sizes.reshape(-1, self.dist.cp_size)
+            can_queue_this_rank = bool(cp_rows[self.dist.tp_rank].any())
         else:
             can_queue = can_queue_this_rank = scheduled_batch.batch_size > 0
 
@@ -4213,7 +4224,7 @@ class PyExecutor:
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.
 
-        Dummy allocation is rank-local, while ``can_queue`` is a TP-wide
+        Dummy allocation is rank-local, while ``can_queue`` is a TP x CP-wide
         decision. If one rank cannot allocate its dummy, peers that succeeded
         must release theirs before retrying or the fixed dummy request ID leaks
         cache resources on every skipped iteration.
@@ -4514,6 +4525,12 @@ class PyExecutor:
             wait_for_disagg_gen_transfer_progress = False
             admitted_disagg_gen_init_requests, wait_for_disagg_gen_transfer_progress = (
                 self.disagg.admit(scheduler_fitting_disagg_gen_init_requests))
+            # receive_gen_init enters the gen transfer status collective only
+            # on ranks that admitted something, so every CP rank must start
+            # the same receives.
+            admitted_disagg_gen_init_requests = (
+                self.disagg.align_gen_admission_across_cp(
+                    admitted_disagg_gen_init_requests))
             # Prepare KV cache manager resources only for requests admitted
             # into the transfer window this iteration.
             self.disagg.receive_gen_init(admitted_disagg_gen_init_requests)
@@ -5833,7 +5850,7 @@ class PyExecutor:
 
         The extra collective costs one allgather per check, and the check is
         already throttled to one iteration in
-        ``KV_POOL_REBALANCE_CHECK_INTERVAL``, against the ``tp_allgather`` that
+        ``KV_POOL_REBALANCE_CHECK_INTERVAL``, against the batch-size gather that
         ``_can_queue`` runs every iteration under ADP anyway.  It does add a
         lockstep requirement that ADP did not have before: every TP rank must
         reach this on the same iteration, so the ``_can_pause_for_rebalance``
@@ -7218,7 +7235,8 @@ class PyExecutor:
                               cp_rank=self.dist.cp_rank,
                               cp_size=self.dist.cp_size,
                               exclude_last_generation_logits=self.
-                              _should_exclude_last_generation_logits())
+                              _should_exclude_last_generation_logits(),
+                              is_disagg=self.kv_cache_transceiver is not None)
 
     def _handle_special_queue_items(
             self,

@@ -377,7 +377,7 @@ def _get_or_scale_allreduce_mnnvl_workspace(
                 f"[MNNVL] AllReduce workspace must grow to {buffer_size_bytes} "
                 "bytes inside a torch.compile'd region, but allocation cannot "
                 "run under tracing. Pre-scale the workspace before compiling "
-                "via MNNVLAllReduce.prescale_workspace (PyTorchModelEngine "
+                "via MNNVLAllReduce.prescale_workspace (ModelEngine "
                 "does this for max_num_tokens x hidden_size).")
         # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
         init_buffer_size_bytes = max(1024 * 8192 * elem_size, buffer_size_bytes

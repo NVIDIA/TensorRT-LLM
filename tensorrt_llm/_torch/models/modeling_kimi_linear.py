@@ -116,8 +116,13 @@ from ..model_config import ModelConfig
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
 from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
+from ..modules.linear import (
+    Fp8BlockScaleLowMGemmRange,
+    TensorParallelMode,
+    fp8_block_scale_ue8m0_gemm,
+    load_weight_shard,
+)
 from ..modules.linear import Linear as TrtllmLinear
-from ..modules.linear import TensorParallelMode, load_weight_shard
 from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
@@ -815,6 +820,13 @@ def _rubin_mxfp8_is_available() -> bool:
     return get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
 
 
+def _low_m_gemm_scale_from_mxfp8(weight_scale: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    """The DeepGEMM-packed scale the low-M GEMM reads, from the SM107 CuTe MXFP8 scale."""
+    from ..kernels.blackwell import fp8_block_scale_low_m_gemm
+
+    return fp8_block_scale_low_m_gemm.pack_block_scale_from_mxfp8_layout(weight_scale, n, k)
+
+
 class _Fp8BlockScaleWeightReadLinear(nn.Module):
     """Bias-free FP8 block-scale GEMM for checkpoint attention and converted MLPs.
 
@@ -823,8 +835,11 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
     scales are packed for DeepGEMM, which quantizes BF16 activations inside the
     GEMM. On Rubin (SM107) the scales are packed into the CuTe DSL K32 R128c4
     layout and the activation is quantized by the specialized CuTe quantizer
-    before the native MXFP8 GEMM, which runs with K3's fine-grained low-M
-    tuning buckets.
+    before the native MXFP8 GEMM, which runs with K3's fine-grained low-M tuning
+    buckets. On both, the low-M GEMM is a candidate of forward like in the
+    generic FP8 block-scale linear (``Fp8BlockScaleLowMGemmRange``); it reads a
+    DeepGEMM-packed scale, which is ``weight_scale`` on SM100/SM103 and a copy
+    repacked from the MXFP8 scale on SM107.
     """
 
     def __init__(
@@ -840,6 +855,9 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         # touched by any later autocast/dtype move.
         self.register_buffer("weight", weight_fp8, persistent=False)
         self.register_buffer("weight_scale", weight_scale, persistent=False)
+        # Rows the low-M GEMM serves and the DeepGEMM-packed scale it reads; set at post-load.
+        self._low_m = Fp8BlockScaleLowMGemmRange()
+        self._low_m_weight_scale: Optional[torch.Tensor] = None
 
     @property
     def has_fp8_qdq(self) -> bool:
@@ -929,6 +947,23 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
 
     def post_load_weights(self) -> None:
         self.transform_weights()
+        self._prepare_low_m_gemm()
+
+    def _prepare_low_m_gemm(self) -> None:
+        """Select the low-M GEMM for this weight where it has a DeepGEMM-packed scale.
+
+        On SM107 that scale is a copy (N * K / 128 bytes) derived from the MXFP8
+        ``weight_scale``; row views of a fused KDA projection have none (the fused module
+        serves decode).
+        """
+        n, k = self.out_features, self.in_features
+        self._low_m = Fp8BlockScaleLowMGemmRange.for_weight(n, k)
+        if not _rubin_mxfp8_is_available():
+            self._low_m_weight_scale = self.weight_scale
+        elif self._low_m.max_m and self._fused_projection is None:
+            self._low_m_weight_scale = _low_m_gemm_scale_from_mxfp8(self.weight_scale, n, k)
+        else:
+            self._low_m, self._low_m_weight_scale = Fp8BlockScaleLowMGemmRange(), None
 
     def forward(
         self,
@@ -940,7 +975,15 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
     ) -> torch.Tensor:
         out_shape = (*x.shape[:-1], self.out_features)
         x_flat = x.reshape(-1, x.shape[-1])
-        if _rubin_mxfp8_is_available():
+        if not _rubin_mxfp8_is_available():
+            out = fp8_block_scale_ue8m0_gemm(
+                x_flat, self.weight, self.weight_scale, self._low_m, output_dtype=x.dtype
+            )
+        elif self._low_m.serves(x_flat):
+            out = torch.ops.trtllm.fp8_block_scale_low_m_gemm(
+                x_flat, self.weight, self._low_m_weight_scale
+            )
+        else:
             act_fp8, act_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x_flat)
             out = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
                 act_fp8,
@@ -949,14 +992,6 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
                 self.weight_scale,
                 output_dtype=torch.bfloat16,
                 fine_grained_m=True,
-            )
-        else:
-            out = torch.ops.trtllm.fp8_swap_ab_gemm(
-                x_flat,
-                self.weight,
-                self.weight_scale,
-                output_dtype=x.dtype,
-                disable_ue8m0_cast=True,
             )
         return out.reshape(out_shape)
 
@@ -1590,8 +1625,8 @@ class KimiK3MoERuntime(nn.Module):
             # memory, frees the originals, and rebinds param.data to a
             # composite VA view.  K3's packed-checkpoint streaming produces
             # exactly those tensors, so the two are compatible -- but only on
-            # the backends that declare supports_dwdp, which is the CuteDSL
-            # family (fused_moe_cute_dsl.py) and NVFP4 only.
+            # the NVFP4 CuteDSL leaves that declare supports_dwdp (CUTEDSL,
+            # CUTEDSL_FC12).
             #
             # MEGAMOE_CUTEDSL is excluded deliberately rather than by
             # oversight: its process_weights_after_loading packs into the mega

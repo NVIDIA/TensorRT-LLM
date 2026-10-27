@@ -87,7 +87,12 @@ class RemoteVisualGenServer:
     adapted for diffusion / visual-gen models.
     """
 
-    MAX_SERVER_START_WAIT_S = 1200  # 20 min – large models need time to load
+    # Startup is bounded by one cold read of the checkpoint. Wan2.2-I2V-A14B is
+    # 117.5 GiB; at the 83-111 MiB/s measured from shared model storage that read
+    # takes 1080-1450 s, plus ~30 s of process start and ~80 s of warmup. Cold
+    # starts measured 1150-1201 s at 111 MiB/s, so 1200 s left no margin.
+    # The suite's per-test timeout (2400 s) still bounds a real hang.
+    MAX_SERVER_START_WAIT_S = 1800
 
     def __init__(
         self,
