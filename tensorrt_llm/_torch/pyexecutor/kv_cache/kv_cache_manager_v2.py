@@ -673,10 +673,10 @@ def _compute_auto_host_tier_quota(
     pinnable-memory (RLIMIT_MEMLOCK) limit.
 
     On an integrated GPU the device pool and the host tier are the same
-    physical memory, so ``mem_available`` counts bytes the device quota is
-    about to consume. Charging the device quota against the budget keeps the
-    two tiers from double-counting; when nothing is left the tier is dropped
-    rather than falling back to the device quota.
+    physical memory, so ``mem_available`` counts bytes the local device pools
+    are about to consume. Charge a device quota for every local rank before
+    sharing the remaining budget between host tiers; when nothing is left the
+    tier is dropped rather than falling back to the device quota.
 
     Args:
         quota: Device (GPU) KV cache quota in bytes; must be positive.
@@ -686,8 +686,8 @@ def _compute_auto_host_tier_quota(
         memlock_limit: RLIMIT_MEMLOCK soft limit in bytes, or
             ``float("inf")`` if unlimited or unknown.
         shares_device_memory: Whether host and device memory are one physical
-            pool (integrated GPU). Charges ``quota`` against ``mem_available``
-            and allows a zero result.
+            pool (integrated GPU). Charges ``quota * local_ranks`` against
+            ``mem_available`` and allows a zero result.
         pins_offloaded_history: Whether sparse KV cache offload pins host
             memory beside the tier. ``mem_available`` and ``memlock_limit``
             already exclude it, so falling back to the device quota could pin
@@ -699,7 +699,7 @@ def _compute_auto_host_tier_quota(
         "provision no host tier".
     """
     if shares_device_memory and mem_available != float("inf"):
-        mem_available = max(0.0, mem_available - quota)
+        mem_available = max(0.0, mem_available - quota * local_ranks)
     candidates = [quota]
     if mem_available != float("inf"):
         candidates.append(int(mem_available / local_ranks * AUTO_HOST_MEMORY_SHARE))
@@ -713,8 +713,9 @@ def _compute_auto_host_tier_quota(
             # OOM-killed.
             logger.warning(
                 "KV cache manager v2 auto host tier sizing has no headroom "
-                "left on this integrated GPU after reserving the "
-                f"{quota / (1 << 30):.2f}GiB device quota; provisioning no "
+                "left on this integrated GPU after reserving "
+                f"{local_ranks} local device quota(s) of "
+                f"{quota / (1 << 30):.2f}GiB each; provisioning no "
                 "host tier. Lower kv_cache_config.max_tokens or "
                 "free_gpu_memory_fraction, or set an explicit "
                 "kv_cache_config.host_cache_size."
