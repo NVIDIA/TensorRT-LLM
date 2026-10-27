@@ -168,6 +168,10 @@ class RebalanceSlotSchedulerGroup:
         self._route_wait_generation = 0
         # Routes of the latest launch, held until MAIN waits for its route epoch.
         self._routes_in_flight: Optional[torch.Tensor] = None
+        # The lent physical routes view and its row count: every layer of a
+        # forward plans the same number of tokens, so one view serves them.
+        self._lent_rows = -1
+        self._lent_routes: Optional[torch.Tensor] = None
         self._execution_stream_handle: Optional[int] = None
         self._closed = False
         self.scheduler = None
@@ -286,6 +290,8 @@ class RebalanceSlotSchedulerGroup:
         self._plan_part = None
         self._pending_release = None
         self._routes_in_flight = None
+        self._lent_rows = -1
+        self._lent_routes = None
         self.lease = None
         self.broadcaster = None
         self.scheduler = None
@@ -387,7 +393,12 @@ class RebalanceSlotSchedulerGroup:
         outputs, num_tokens = part
         if not defer_wait:
             self.wait_for_routes()
-        physical = outputs.physical_slot_ids[:num_tokens]
+        physical = self._lent_routes
+        if num_tokens != self._lent_rows:
+            # A view of the scheduler's fixed output buffer; slicing it is
+            # the cost, so reuse it while the token count repeats.
+            physical = self._lent_routes = outputs.physical_slot_ids[:num_tokens]
+            self._lent_rows = num_tokens
         self.plan_calls += 1
         self._plan_part = None
         return physical, self._generation

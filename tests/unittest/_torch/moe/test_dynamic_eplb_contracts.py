@@ -1264,6 +1264,8 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
     group._plan_part = None
     group._pending_release = None
     group._routes_in_flight = None
+    group._lent_rows = -1
+    group._lent_routes = None
     group._closed = False
     group._execution_stream_handle = None
     group.device = 0
@@ -1273,8 +1275,8 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
     group.copy_stream = group.scheduler_stream = copy
     group._stream_handle = 19
     group._route_epoch_ptr = 77
-    # Generation 1 launches during warmup, generation 2 while serving.
-    bounds = iter((_WARMUP_SPIN_CYCLES, _SERVING_SPIN_CYCLES))
+    # Generation 1 launches during warmup, the later ones while serving.
+    bounds = iter((_WARMUP_SPIN_CYCLES, _SERVING_SPIN_CYCLES, _SERVING_SPIN_CYCLES))
     group._spin_bound = SimpleNamespace(cycles=lambda: next(bounds))
 
     def driver_call(*entry):
@@ -1313,7 +1315,8 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
     )
     group.lease = lease_cls(group)
 
-    for generation, rows in enumerate((16, 0), 1):
+    lent = {}
+    for generation, rows in enumerate((16, 16, 0), 1):
         trace.clear()
         routes = _Routes(rows, trace)
         target = generation * auxiliary_sms
@@ -1322,6 +1325,8 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
         physical, actual_generation = group.plan_finish(part, defer_wait=True)
         assert physical.shape == (rows, 6)
         assert actual_generation == generation
+        # The view of the fixed output buffer is reused while the token count repeats.
+        assert lent.setdefault(rows, physical) is physical
         assert route_wait not in trace
         # The group, not an allocator stream event, keeps the routes alive
         # until MAIN waits for every HALO-Q read of them.
@@ -1340,7 +1345,7 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
             assert trace.index(("lease", generation - 1)) < trace.index(
                 ("FUSED", rows, target, generation)
             )
-    assert launch_bounds == [_WARMUP_SPIN_CYCLES, _SERVING_SPIN_CYCLES]
+    assert launch_bounds == [_WARMUP_SPIN_CYCLES, _SERVING_SPIN_CYCLES, _SERVING_SPIN_CYCLES]
 
     # The bound-stream fast path still rejects another stream or device.
     main.cuda_stream = 45

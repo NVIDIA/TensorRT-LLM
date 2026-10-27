@@ -251,8 +251,12 @@ def _token_back_ready_granularity_choices(*, load_balance: bool = False) -> tupl
     return _TOKEN_BACK_READY_GRANULARITIES if load_balance else ("expert",)
 
 
+@functools.cache
 def _megamoe_tuning_op_name(helper_expert_count: int) -> str:
-    """Separate timing caches without changing the registered op or kernel ABI."""
+    """Separate timing caches without changing the registered op or kernel ABI.
+
+    Every launch that may tune asks for it, so each name is built once.
+    """
     base = "trtllm::cute_dsl_megamoe_nvfp4_blackwell"
     load_balance = helper_expert_count > 0
     alpha = _autotune_pl_alpha(helper_expert_count)

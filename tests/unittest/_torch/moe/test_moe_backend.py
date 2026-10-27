@@ -2666,6 +2666,8 @@ def test_rebalance_discard_plan_orders_release_and_allows_next_reuse():
 
     group = RebalanceSlotSchedulerGroup.__new__(RebalanceSlotSchedulerGroup)
     group._check_owner = MagicMock()
+    group._lent_rows = -1
+    group._lent_routes = None
     group._plan_part = part
     group._generation = 1
     group._finished_generation = 0
