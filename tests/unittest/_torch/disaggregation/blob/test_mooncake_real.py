@@ -154,6 +154,8 @@ class Clients:
 
     ``close`` closes the clients only once every endpoint's shutdown returns no labels: a backend
     thread still inside the SDK would crash on a closed client, so a failed test leaves them open.
+    A closed endpoint's driver has closed its client already, and closing a client twice does
+    nothing.
     """
 
     def __init__(self, master: str) -> None:

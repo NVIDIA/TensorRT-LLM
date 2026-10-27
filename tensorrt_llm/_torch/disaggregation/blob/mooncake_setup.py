@@ -219,6 +219,9 @@ def open_mooncake_driver(
     """Opens the Mooncake driver a store config describes, once both its sections are read: opening
     waits for the master and mounts this process's segment, so a bad config fails before that.
 
+    The caller owns the driver and closes it last, with ``MooncakeDriver.close``, which also closes
+    the SDK client.
+
     Args:
         config: A store config, as ``load_store_config`` takes it.
         read_blob_section: Reads the ``blob`` section (for the blob backend, into a

@@ -226,6 +226,8 @@ def test_open_passes_setup_arguments_by_name(
     assert store.calls_to("register_buffer")
     driver.unregister(handle)
     assert driver.drain(DRAIN_S)  # its worker threads exit
+    driver.close()  # the caller owns the driver, and closing it closes the client
+    assert len(store.calls_to("close")) == 1
 
     open_sdk(MooncakeConfig(MASTER, 1 << 30, "tcp", "eth9", "10.9.9.9", "etcd://m:2379", 0))
     assert sdk.stores[1].calls_to("setup")[0].kwargs == {
@@ -337,6 +339,7 @@ def test_only_pinned_sdk_builds_are_opened(
         driver, _ = open_mooncake_driver(store_config(), read_blob)
         assert len(sdk.stores) == 1
         assert driver.drain(DRAIN_S)  # its worker threads exit
+        driver.close()
         return
     with pytest.raises(ImportError, match=f"comes from .*{refused}.*follows 0.3.13 of"):
         open_mooncake_driver(store_config(), read_blob)
