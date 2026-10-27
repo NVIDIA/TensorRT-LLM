@@ -246,25 +246,6 @@ void initRequestBindings(nb::module_& m)
         .def("__getstate__", outputConfigGetstate)
         .def("__setstate__", outputConfigSetstate);
 
-    auto promptTuningConfigGetstate = [](tle::PromptTuningConfig const& self)
-    { return nb::make_tuple(self.getEmbeddingTable(), self.getInputTokenExtraIds()); };
-    auto promptTuningConfigSetstate = [](tle::PromptTuningConfig& promptTuningConfig, nb::tuple const& state)
-    {
-        if (state.size() != 2)
-        {
-            throw std::runtime_error("Invalid PromptTuningConfig state!");
-        }
-        new (&promptTuningConfig)
-            tle::PromptTuningConfig(nb::cast<Tensor>(state[0]), nb::cast<std::optional<VecTokenExtraIds>>(state[1]));
-    };
-    nb::class_<tle::PromptTuningConfig>(m, "PromptTuningConfig")
-        .def(nb::init<Tensor, std::optional<VecTokenExtraIds>>(), nb::arg("embedding_table"),
-            nb::arg("input_token_extra_ids") = nb::none())
-        .def_prop_ro("embedding_table", &tle::PromptTuningConfig::getEmbeddingTable)
-        .def_prop_ro("input_token_extra_ids", &tle::PromptTuningConfig::getInputTokenExtraIds)
-        .def("__getstate__", promptTuningConfigGetstate)
-        .def("__setstate__", promptTuningConfigSetstate);
-
     auto loraConfigGetstate = [](tle::LoraConfig const& self)
     { return nb::make_tuple(self.getTaskId(), self.getWeights(), self.getConfig()); };
     auto loraConfigSetstate = [](tle::LoraConfig& loraConfig, nb::tuple const& state)

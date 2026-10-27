@@ -252,27 +252,6 @@ public:
     std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs;
 };
 
-/// @brief Configuration for prompt tuning
-class PromptTuningConfig
-{
-public:
-    explicit PromptTuningConfig(
-        Tensor embeddingTable, std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt);
-
-    [[nodiscard]] Tensor getEmbeddingTable() const;
-
-    [[nodiscard]] std::optional<VecTokenExtraIds> getInputTokenExtraIds() const;
-
-private:
-    friend class Serialization;
-    /// @brief The prompt embedding table. Expected shape: [task vocab_size, hidden_size]. Data type must match model
-    /// weights.
-    Tensor mEmbeddingTable;
-
-    /// @brief The input token extra ids for KV Cache reuse when p-tuning is enabled
-    std::optional<VecTokenExtraIds> mInputTokenExtraIds;
-};
-
 /// @brief Multimodal input data class
 class MultimodalInput
 {

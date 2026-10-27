@@ -230,28 +230,6 @@ size_t Serialization::serializedSize(AdditionalModelOutput const& additionalMode
     return totalSize;
 }
 
-// PromptTuningConfig
-PromptTuningConfig Serialization::deserializePromptTuningConfig(std::istream& is)
-{
-    auto tensor = su::deserialize<Tensor>(is);
-    auto inputTokenExtraIds = su::deserialize<std::optional<VecTokenExtraIds>>(is);
-    return PromptTuningConfig{std::move(tensor), std::move(inputTokenExtraIds)};
-}
-
-void Serialization::serialize(PromptTuningConfig const& config, std::ostream& os)
-{
-    su::serialize(config.mEmbeddingTable, os);
-    su::serialize(config.mInputTokenExtraIds, os);
-}
-
-size_t Serialization::serializedSize(PromptTuningConfig const& config)
-{
-    size_t totalSize = 0;
-    totalSize += su::serializedSize(config.mEmbeddingTable);
-    totalSize += su::serializedSize(config.mInputTokenExtraIds);
-    return totalSize;
-}
-
 // MultimodalInput
 MultimodalInput Serialization::deserializeMultimodalInput(std::istream& is)
 {

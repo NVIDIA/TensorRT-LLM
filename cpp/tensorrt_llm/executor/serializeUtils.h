@@ -132,7 +132,6 @@ static_assert(hasSerializedSize<Request>(size_t()));
 static_assert(hasSerializedSize<SamplingConfig>(size_t()));
 static_assert(hasSerializedSize<OutputConfig>(size_t()));
 static_assert(hasSerializedSize<AdditionalModelOutput>(size_t()));
-static_assert(hasSerializedSize<PromptTuningConfig>(size_t()));
 static_assert(hasSerializedSize<MultimodalInput>(size_t()));
 static_assert(hasSerializedSize<MropeConfig>(size_t()));
 static_assert(hasSerializedSize<LoraConfig>(size_t()));
@@ -248,7 +247,6 @@ static_assert(hasSerialize<Request>(nullptr));
 static_assert(hasSerialize<SamplingConfig>(nullptr));
 static_assert(hasSerialize<OutputConfig>(nullptr));
 static_assert(hasSerialize<AdditionalModelOutput>(nullptr));
-static_assert(hasSerialize<PromptTuningConfig>(nullptr));
 static_assert(hasSerialize<MultimodalInput>(nullptr));
 static_assert(hasSerialize<MropeConfig>(nullptr));
 static_assert(hasSerialize<LoraConfig>(nullptr));
@@ -422,10 +420,6 @@ T deserialize(std::istream& is)
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::AdditionalModelOutput>)
     {
         return Serialization::deserializeAdditionalModelOutput(is);
-    }
-    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::PromptTuningConfig>)
-    {
-        return Serialization::deserializePromptTuningConfig(is);
     }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::MultimodalInput>)
     {

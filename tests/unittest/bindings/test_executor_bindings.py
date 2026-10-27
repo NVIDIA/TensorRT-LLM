@@ -92,12 +92,6 @@ def test_output_config_pickle():
     assert additional_model_output.gather_context == True
 
 
-def test_prompt_tuning_config():
-    embedding_table = torch.ones(100, 64)
-    config = trtllm.PromptTuningConfig(embedding_table)
-    assert (config.embedding_table == embedding_table).all()
-
-
 @pytest.mark.cpu_only
 def test_multimodal_input():
     multimodal_hashes = [[1, 2, 3], [4, 5, 6]]
