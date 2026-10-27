@@ -56,7 +56,7 @@ from .engine.runners.decoder.inputs import uses_full_generation_page_table
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from .model_engine import PyTorchModelEngine
+from .model_engine import ModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
@@ -438,7 +438,7 @@ def create_encoder_executor(
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
     dist = Distributed.get(mapping)
 
-    model_engine = PyTorchModelEngine(
+    model_engine = ModelEngine(
         model_path=checkpoint_dir,
         llm_args=llm_args,
         mapping=mapping,
@@ -469,8 +469,7 @@ def log_memory_usage(stage: str):
 
 
 def _move_model_engine_metrics(py_executor: PyExecutor,
-                               model_engine: PyTorchModelEngine,
-                               stage: str) -> None:
+                               model_engine: ModelEngine, stage: str) -> None:
     """Move model-engine metrics into the executor under a startup stage."""
     py_executor.metrics[f"{stage}_model_engine"] = dict(model_engine.metrics)
     model_engine.metrics.clear()
@@ -676,6 +675,15 @@ def _create_py_executor(
     enable_sleep = sleep_config is not None
 
     cache_transceiver_config = llm_args.cache_transceiver_config
+    # TODO(TRTLLM-17127): remove once aggregated helix is validated end to end.
+    if (mapping.has_cp_helix()
+            and not is_disagg_enabled(cache_transceiver_config)
+            and os.environ.get("TRTLLM_HELIX_AGG_EXPERIMENTAL", "0") != "1"):
+        raise NotImplementedError(
+            "Helix context parallelism is supported only on disaggregated "
+            "generation servers; aggregated serving with Helix is not "
+            "supported yet (set TRTLLM_HELIX_AGG_EXPERIMENTAL=1 for "
+            "development only).")
 
     has_spec_drafter = False
     if spec_config is not None:
@@ -791,7 +799,7 @@ def _create_py_executor(
             model_weights_restore_mode = sleep_config.restore_modes[
                 ExecutorMemoryType.MODEL_WEIGHTS_MAIN]
 
-        model_engine = PyTorchModelEngine(
+        model_engine = ModelEngine(
             model_path=checkpoint_dir,
             llm_args=llm_args,
             mapping=mapping,
@@ -817,7 +825,7 @@ def _create_py_executor(
                     dist=dist)
     calibrator.maybe_wrap_model(model_engine.model)
 
-    # PyTorchModelEngine modifies these fields, update them
+    # ModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len
     if not llm_args.disable_overlap_scheduler and spec_config is not None:

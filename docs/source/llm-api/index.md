@@ -139,7 +139,7 @@ The `py_executor` property contains the timed scopes in `create_py_executor()`, 
 | `worker_start_seconds` | Start the final PyExecutor worker. |
 | `total_py_executor_creation_seconds` | Total time for the `create_py_executor()` call, including all applicable scopes above. |
 
-The two model-engine properties contain times for various `PyTorchModelEngine` warmup stages.
+The two model-engine properties contain times for various `ModelEngine` warmup stages.
 `initial_model_engine` measures the timings for the initial model engine creation as part of the
 `py_executor.initial_py_executor_creation_seconds_for_kv_cache_estimation` timing.
 Likewise, `final_model_engine` measures the timings for the final model engine creation as part of
@@ -312,11 +312,11 @@ nonzero task status still takes precedence.
 ### Remote MPI batch ordering
 
 The remote MPI server dispatches the next batch only after every future in the
-previous batch has completed. The task wrapper retains its entry barrier to
-place one task on each rank, but has no trailing barrier: an individual rank can
-finish or report an error while its peers are still running. Cross-batch ordering
-is enforced by the server; directly invoking the wrapper does not provide a
-collective completion barrier.
+previous batch has completed. Each batch runs exactly once on every rank, but
+the task wrapper has no trailing barrier: an individual rank can finish or report
+an error while its peers are still running. Cross-batch ordering is enforced by
+the server; directly invoking the wrapper does not provide a collective
+completion barrier.
 
 ### Disaggregated MPI leader failures
 
