@@ -271,6 +271,7 @@ def test_destroy_releases_group_then_comm_and_frees_mpi_only_when_split(
     comm = ctx.comm
     proxy = bootstrap.register.call_args.args[0]
     order = Mock(name="teardown_order")
+    order.attach_mock(bootstrap.unregister, "unregister")
     order.attach_mock(bootstrap.ep_group.destroy, "group_destroy")
     order.attach_mock(comm.finalize, "comm_finalize")
     order.attach_mock(comm.destroy, "comm_destroy")
@@ -279,7 +280,13 @@ def test_destroy_releases_group_then_comm_and_frees_mpi_only_when_split(
     ctx.destroy()
 
     bootstrap.unregister.assert_called_once_with(proxy)
-    expected = [call.group_destroy(), call.comm_finalize(), call.comm_destroy()]
+    # The timeout proxy must be unregistered before the group it points at is destroyed.
+    expected = [
+        call.unregister(proxy),
+        call.group_destroy(),
+        call.comm_finalize(),
+        call.comm_destroy(),
+    ]
     if not mpi_disabled:
         expected.append(call.mpi_free())
     assert order.mock_calls == expected
