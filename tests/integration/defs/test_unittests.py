@@ -163,21 +163,6 @@ def _fail_unittests(reason: str, output_xml: str, output_dir: str,
 
 
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
-    validation_stage = os.environ.get("TRTLLM_WAIVE_REFRESH_VALIDATION", "")
-    if (validation_stage in {
-            "CPU-Generic-WaiveRefresh-Pass-1",
-            "CPU-Generic-WaiveRefresh-Fail-1",
-            "CPU-Generic-WaiveRefresh-Isolated-1",
-    } and validation_stage == request.config.getoption("--test-prefix")
-            and case in {
-                "unittest/llmapi/test_mpi_session.py::test_remote_mpi_session",
-                "unittest/llmapi/test_mpi_session.py::test_mpi_session_basic",
-            }):
-        if (case.endswith("::test_remote_mpi_session")
-                or validation_stage == "CPU-Generic-WaiveRefresh-Fail-1"):
-            raise AssertionError(
-                f"Intentional TOT waive validation failure: {case}")
-        return
     import pandas as pd
     import pynvml
     try:

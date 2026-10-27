@@ -642,23 +642,6 @@ def mergeWaiveList(pipeline, globalVars)
         writeFile file: "waives_TOT_initial_${env.gitlabCommit}.txt",
             text: "# snapshot-time: ${snapshotTime}\n" +
                 "# target-branch-commit: ${targetBranchTOTCommit ?: 'unknown'}\n" + readFile(waiveTot)
-        if (globalVars['github_pr_api_url']?.endsWith('/pulls/21009')) {
-            def requestedStages = (readJSON(text: env.gitlabTriggerPhrase ?: '{}', returnPojo: true)
-                .stage_list ?: '').tokenize(',').collect { it.trim() }
-            def validationStages = [
-                'CPU-Generic-WaiveRefresh-Pass-1',
-                'CPU-Generic-WaiveRefresh-Fail-1',
-                'CPU-Generic-WaiveRefresh-Isolated-1',
-            ]
-            if (requestedStages && requestedStages.every { it in validationStages }) {
-                sh ': > waives.txt'
-                writeFile file: "waives_TOT_initial_${env.gitlabCommit}.txt", text:
-                    '# snapshot-time: 2026-10-27T02:52:27.045Z\n' +
-                    '# target-branch-commit: simulated-old-baseline\n' +
-                    '# validation-fixture: TRTLLMINF-400 bot-run validation\n'
-                echo '[WAIVE-VALIDATION] Using an empty initial waive list and simulated old snapshot; final refresh still queries real OpenDB.'
-            }
-        }
         trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
         echo "New merged test waive list: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/waive_list/waives.txt"
     } catch (InterruptedException e) {
@@ -2767,13 +2750,6 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         },
         "SBSA-Linux": {
             script {
-                if (globalVars[GITHUB_PR_API_URL]?.endsWith('/pulls/21009') &&
-                        testFilter[TEST_STAGE_LIST] && testFilter[TEST_STAGE_LIST].every {
-                            it.startsWith('CPU-Generic-WaiveRefresh-')
-                        }) {
-                    echo '[WAIVE-VALIDATION] Only x86 CPU validation stages were requested; skipping the SBSA branch.'
-                    return
-                }
                 if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
                     return
