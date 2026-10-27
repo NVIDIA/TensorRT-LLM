@@ -1158,7 +1158,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.prepare(self, kv_lens)
 
-        if self._has_mixed_precision_kv():
+        if self._has_mixed_precision_staging():
             # Native BF16 paged-context FMHA reads 32-token pages.
             self.prepare_mixed_precision_kv(
                 "HND", min(self.kv_cache_manager.tokens_per_block, 32))

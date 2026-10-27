@@ -438,15 +438,6 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                     kv_cache_manager.nvfp4_residual_dim,
                     num_pool_tokens,
                 )
-                if metadata.has_mixed_precision_retained_rows:
-                    overlay_retained_rows(
-                        self,
-                        metadata,
-                        compressed_local_indices,
-                        req_id,
-                        compressed_indices,
-                        scratch,
-                    )
             else:
                 request_count = (
                     metadata.num_contexts
@@ -488,15 +479,15 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                         max_compressed_kv_tokens,
                         num_pool_tokens,
                     )
-                    if metadata.has_mixed_precision_retained_rows:
-                        overlay_retained_rows(
-                            self,
-                            metadata,
-                            compressed_local_indices,
-                            req_id,
-                            compressed_indices,
-                            scratch,
-                        )
+            if metadata.has_mixed_precision_retained_rows:
+                overlay_retained_rows(
+                    self,
+                    metadata,
+                    compressed_local_indices,
+                    req_id,
+                    compressed_indices,
+                    scratch,
+                )
             metadata.nvfp4_compress_fp8_scratch = scratch
             global_indices[:, -num_compressed_indices:] = compressed_indices
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()

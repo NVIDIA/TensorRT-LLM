@@ -381,8 +381,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.create_buffers_for_indexer(capture_graph=capture_graph)
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
 
-    def _has_mixed_precision_kv(self) -> bool:
-        # No staging copy: the gather's FP8 scratch already is one; see has_mixed_precision_retained_rows.
+    def _has_mixed_precision_staging(self) -> bool:
+        # The gather's FP8 scratch already is the copy; see has_mixed_precision_retained_rows.
         return False
 
     @property

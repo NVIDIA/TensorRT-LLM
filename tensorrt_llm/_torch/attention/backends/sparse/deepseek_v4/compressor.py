@@ -311,6 +311,7 @@ class Compressor(nn.Module):
 
         position_ids = metadata.compressed_position_ids_cuda[self.compress_ratio][:total_tokens]
         compressed_mask = metadata.compressed_mask_cuda[self.compress_ratio][:total_tokens]
+
         if self.footer_scale_cache and not self.is_indexer:
             self._footer_scale_postprocess_scatter(
                 kv_comp,

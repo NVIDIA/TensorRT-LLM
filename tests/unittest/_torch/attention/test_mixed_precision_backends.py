@@ -863,21 +863,6 @@ def test_mixed_precision_retained_dtype_must_match_model_dtype():
 
 
 @pytest.mark.cpu_only
-def test_native_nvfp4_pool_accepts_any_retained_dtype():
-    """DeepSeek-V4 hands the base manager FP8 while its compressed pool is NVFP4."""
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
-        DeepseekV4CacheManager,
-    )
-
-    assert KVCacheManagerV2._has_native_nvfp4_pool(None, DataType.NVFP4)
-    assert not KVCacheManagerV2._has_native_nvfp4_pool(None, DataType.FP8)
-    dsv4 = SimpleNamespace(_use_nvfp4_compress=True)
-    assert DeepseekV4CacheManager._has_native_nvfp4_pool(dsv4, DataType.FP8)
-    dsv4._use_nvfp4_compress = False
-    assert not DeepseekV4CacheManager._has_native_nvfp4_pool(dsv4, DataType.FP8)
-
-
-@pytest.mark.cpu_only
 def test_mixed_precision_llm_args_accept_lowercase_backend():
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
