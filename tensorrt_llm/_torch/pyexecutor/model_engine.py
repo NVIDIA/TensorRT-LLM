@@ -668,7 +668,6 @@ class ModelEngine:
             dtype=self.model.config.torch_dtype,
             enable_attention_dp=self.enable_attention_dp,
             disable_overlap_scheduler=self.llm_args.disable_overlap_scheduler,
-            is_encode_only=self.llm_args.encode_only,
             is_spec_decode=self.is_spec_decode,
             max_draft_len=self.max_draft_len,
             max_total_draft_tokens=self.max_total_draft_tokens,

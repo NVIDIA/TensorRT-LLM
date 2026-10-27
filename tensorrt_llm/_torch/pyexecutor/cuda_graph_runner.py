@@ -139,15 +139,13 @@ class CUDAGraphRunnerConfig:
     max_beam_width: int
     max_num_tokens: int
     spec_config: Optional[DecodingBaseConfig]
-    cuda_graph_mem_pool: Any
     use_mrope: bool
     original_max_total_draft_tokens: int
     enable_attention_dp: bool
     is_encoder_decoder: bool
     batch_size: int
-    mapping: Optional[Mapping]
+    mapping: Mapping
     dist: Optional[Distributed]
-    kv_cache_manager_key: Any
     dynamic_draft_len_mapping: Optional[Dict[int, int]] = None
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
     enable_encoder_decoder_mixed_cuda_graph: bool = False
@@ -204,7 +202,7 @@ class CUDAGraphRunner:
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
-        self.memory_pool = config.cuda_graph_mem_pool
+        self.memory_pool = None
         self.padding_dummy_requests: Dict[int, LlmRequest] = {}
         self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
 
@@ -1113,7 +1111,7 @@ class CUDAGraphRunner:
             return self.padding_dummy_requests[runtime_draft_len]
 
         kv_cache_manager = resource_manager.get_resource_manager(
-            self.config.kv_cache_manager_key)
+            ResourceManagerType.KV_CACHE_MANAGER)
 
         runtime_tokens_per_gen_step = (
             self.spec_config.get_runtime_tokens_per_gen_step(runtime_draft_len)
@@ -1175,7 +1173,7 @@ class CUDAGraphRunner:
         """
         candidates = [
             resource_manager.get_resource_manager(
-                self.config.kv_cache_manager_key),
+                ResourceManagerType.KV_CACHE_MANAGER),
             get_draft_kv_cache_manager(self.spec_config, resource_manager),
             resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER),
@@ -1249,7 +1247,7 @@ class CUDAGraphRunner:
         if not (self.enabled and self.padding_enabled):
             return
         kv_cache_manager = resource_manager.get_resource_manager(
-            self.config.kv_cache_manager_key)
+            ResourceManagerType.KV_CACHE_MANAGER)
         if kv_cache_manager is None or getattr(kv_cache_manager,
                                                'is_estimating_kv_cache', False):
             # The estimation-phase KV cache is sized with no headroom for
@@ -1294,7 +1292,7 @@ class CUDAGraphRunner:
             return True
 
         kv_cache_manager = resource_manager.get_resource_manager(
-            self.config.kv_cache_manager_key)
+            ResourceManagerType.KV_CACHE_MANAGER)
         kv_cache_manager.free_resources(dummy_request)
         if draft_kv_cache_manager is not None:
             draft_kv_cache_manager.free_resources(dummy_request)
@@ -1393,7 +1391,6 @@ class EncoderCUDAGraphRunnerConfig:
     max_cuda_graph_num_tokens: int
     max_num_tokens: int
     max_seq_len: int
-    cuda_graph_mem_pool: Any
     is_encoder_decoder: bool = False
     use_fixed_sequence_slots: bool = False
 
@@ -1499,7 +1496,7 @@ class EncoderCUDAGraphRunner:
         self.graph_outputs: Dict[EncoderKeyType, Callable[[],
                                                           Optional[Any]]] = {}
         self.graph_metadata: Dict[EncoderKeyType, Dict[str, Any]] = {}
-        self.memory_pool = config.cuda_graph_mem_pool
+        self.memory_pool = None
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
         self.shared_static_tensors_cpu: Dict[str, torch.Tensor] = {}

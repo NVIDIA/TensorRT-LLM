@@ -268,9 +268,7 @@ class DecoderRunner(ScheduledModelRunner):
         cuda_graph_runner = self._initialize_cuda_graph_runner()
         return dict(
             cuda_graph_runner=cuda_graph_runner,
-            breakable_cuda_graph_runner=self._initialize_breakable_cuda_graph_runner(
-                cuda_graph_runner
-            ),
+            breakable_cuda_graph_runner=self._initialize_breakable_cuda_graph_runner(),
             config=self._config,
             mapping=self._mapping,
             model=self._model,
@@ -313,7 +311,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._inputs.guided_decoder = value
 
     @property
-    def cuda_graph_runner(self) -> CUDAGraphRunner | None:
+    def cuda_graph_runner(self) -> CUDAGraphRunner:
         return self._graphs.cuda_graph_runner
 
     @torch.inference_mode()
@@ -395,13 +393,9 @@ class DecoderRunner(ScheduledModelRunner):
             attn_backend=self._config.attention_backend,
             cuda_graph_manager=None,
         )
-        # Let the first CUDA graph capture create its private pool. Piecewise
-        # CUDA graphs use a separate pool owned by their runners, so sharing a
-        # pre-created pool handle with the outer graph runner is unnecessary.
-        self._cuda_graph_mem_pool = None
         self._dynamic_draft_len_mapping = compute_dynamic_draft_len_mapping(self._config)
 
-    def _initialize_cuda_graph_runner(self) -> CUDAGraphRunner | None:
+    def _initialize_cuda_graph_runner(self) -> CUDAGraphRunner:
         cuda_graph_runner = CUDAGraphRunner(self._cuda_graph_runner_config())
         register_hooks = getattr(self._model, "register_cuda_graph_pre_replay_hooks", None)
         if register_hooks is not None:
@@ -410,15 +404,12 @@ class DecoderRunner(ScheduledModelRunner):
 
     def _cuda_graph_runner_config(self) -> CUDAGraphRunnerConfig:
         return CUDAGraphRunnerConfig(
-            use_cuda_graph=(
-                not self._config.is_encode_only and self._config.cuda_graph_config is not None
-            ),
+            use_cuda_graph=self._config.cuda_graph_config is not None,
             cuda_graph_padding_enabled=self._config.cuda_graph_padding_enabled,
             cuda_graph_batch_sizes=self._config.cuda_graph_batch_sizes,
             max_cuda_graph_batch_size=self._config.max_cuda_graph_batch_size,
             max_beam_width=self._config.max_beam_width,
             spec_config=self._config.spec_config,
-            cuda_graph_mem_pool=self._cuda_graph_mem_pool,
             dynamic_draft_len_mapping=self._dynamic_draft_len_mapping,
             max_num_tokens=self._config.max_num_tokens,
             use_mrope=self._config.use_mrope,
@@ -428,7 +419,6 @@ class DecoderRunner(ScheduledModelRunner):
             batch_size=self._config.max_batch_size,
             mapping=self._mapping,
             dist=self._dist,
-            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
             sparse_attention_config=self._sparse_attention_config,
             enable_in_graph_sampling=self._config.enable_in_graph_sampling,
             # Speculative steps rewrite every input token and position, so
@@ -445,13 +435,8 @@ class DecoderRunner(ScheduledModelRunner):
             ),
         )
 
-    def _initialize_breakable_cuda_graph_runner(
-        self, cuda_graph_runner: CUDAGraphRunner | None
-    ) -> BreakableCUDAGraphRunner | None:
-        if (
-            cuda_graph_runner is None
-            or self._config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE
-        ):
+    def _initialize_breakable_cuda_graph_runner(self) -> BreakableCUDAGraphRunner | None:
+        if self._config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:
             return None
 
         decoder_model = (

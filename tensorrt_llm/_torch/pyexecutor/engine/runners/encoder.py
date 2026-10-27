@@ -302,7 +302,6 @@ class EncoderMixin:
                 max_cuda_graph_num_tokens=config.max_cuda_graph_num_tokens,
                 max_num_tokens=self._config.max_num_tokens,
                 max_seq_len=self._config.max_seq_len,
-                cuda_graph_mem_pool=None,
                 is_encoder_decoder=config.is_encoder_decoder,
                 use_fixed_sequence_slots=config.use_fixed_sequence_slots,
                 feature_shape=config.feature_shape,
