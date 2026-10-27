@@ -23,9 +23,7 @@ def test_reuse_status_and_optional_selection_bindings(priority):
             layer_id=i,
             buffers=[kv.BufferConfig(role="key", size=4096)],
             sliding_window_size=None if i == 0 else 4 if i == 1 else 2,
-            reuse_policy=kv.AttentionReusePolicy.OPTIONAL
-            if i
-            else kv.AttentionReusePolicy.REQUIRED,
+            reuse_policy=kv.ReusePolicy.OPTIONAL if i else kv.ReusePolicy.REQUIRED,
         )
         for i in range(3)
     ]
@@ -87,6 +85,70 @@ def test_reuse_status_and_optional_selection_bindings(priority):
         reader.suspend()
         assert reader.resume(stream.cuda_stream)
         assert reader.get_base_page_indices(encoder)[1] == source_indices[1][1]
+    finally:
+        for cache in reversed(caches):
+            cache.close()
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("length", [7, 8])
+@pytest.mark.parametrize("select_optional", [False, True])
+def test_ssm_layer_reuse_policies(length, select_optional):
+    layers = [
+        kv.AttentionLayerConfig(layer_id=0, buffers=[kv.BufferConfig(role="key", size=4096)]),
+        *[
+            kv.SsmLayerConfig(
+                layer_id=i,
+                buffers=[
+                    kv.BufferConfig(role="state", size=4096),
+                    kv.BufferConfig(role="conv", size=4096),
+                ],
+                reuse_policy=policy,
+            )
+            for i, policy in enumerate(
+                [kv.ReusePolicy.REQUIRED, kv.ReusePolicy.OPTIONAL, kv.ReusePolicy.PRIVATE],
+                start=1,
+            )
+        ],
+    ]
+    config = kv.KVCacheManagerConfig(
+        tokens_per_block=4,
+        cache_tiers=[kv.GpuCacheTierConfig(quota=8 << 20)],
+        layers=layers,
+        commit_min_snapshot=True,
+    )
+    manager = kv.KVCacheManager(config)
+    stream = torch.cuda.Stream()
+    tokens = list(range(length))
+    caches = []
+    try:
+        source = manager.create_kv_cache(input_tokens=[])
+        caches.append(source)
+        assert source.resume(stream.cuda_stream)
+        assert source.resize(length)
+        source.commit(tokens, is_end=True)
+        source.close()
+        required, optional, private = [manager.get_layer_group_id(i) for i in (1, 2, 3)]
+        assert len({required, optional, private}) == 3
+        reader = manager.create_kv_cache(input_tokens=tokens)
+        caches.append(reader)
+        assert reader.num_committed_tokens == length
+        assert reader.reuse_status[required].policy == kv.ReusePolicy.REQUIRED
+        assert reader.reuse_status[optional].complete
+        assert list(reader.reuse_status[optional].coverage) == [(length, length)]
+        assert not reader.reuse_status[private].complete
+        assert reader.resume(
+            stream.cuda_stream, optional_reuse_groups=[optional] if select_optional else []
+        )
+        indices = [
+            reader.get_ssm_block_base_index(group) for group in (required, optional, private)
+        ]
+        assert all(index >= 0 for index in indices)
+        reader.suspend()
+        assert reader.resume(stream.cuda_stream)
+        assert indices == [
+            reader.get_ssm_block_base_index(group) for group in (required, optional, private)
+        ]
     finally:
         for cache in reversed(caches):
             cache.close()

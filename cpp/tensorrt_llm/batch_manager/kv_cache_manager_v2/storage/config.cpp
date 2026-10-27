@@ -209,7 +209,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     // Distinct sparsity and reuse policies need separate GPU pools and eviction queues.
     struct PoolGroupKey
     {
-        AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
+        ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
         std::vector<size_t> slotSizes;
         bool isSparse = false;
 
@@ -226,7 +226,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         auto const sizes = sg.slotSizeList();
         auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
         bool const isSparse = attn != nullptr && attn->isSparse;
-        auto const policy = attn ? attn->reusePolicy : AttentionReusePolicy::REQUIRED;
+        auto const policy = reusePolicy(registry.getLifeCycle(sg.lifeCycleId));
         poolGroups[{.reusePolicy = policy, .slotSizes = sizes.raw(), .isSparse = isSparse}].push_back(std::move(sg));
     }
 

@@ -100,7 +100,7 @@ class AttnLifeCycle:
         window_size: int | None,
         num_sink_blocks: int,
         is_sparse: bool = False,
-        reuse_policy: AttentionReusePolicy = ...,
+        reuse_policy: ReusePolicy = ...,
     ) -> None: ...
     @staticmethod
     def make(
@@ -108,7 +108,7 @@ class AttnLifeCycle:
         num_sink_tokens: int | None,
         tokens_per_block: int,
         is_sparse: bool = False,
-        reuse_policy: AttentionReusePolicy = ...,
+        reuse_policy: ReusePolicy = ...,
     ) -> "AttnLifeCycle": ...
     @property
     def window_size(self) -> int | None: ...
@@ -117,7 +117,7 @@ class AttnLifeCycle:
     @property
     def is_sparse(self) -> bool: ...
     @property
-    def reuse_policy(self) -> AttentionReusePolicy: ...
+    def reuse_policy(self) -> ReusePolicy: ...
     def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
 
 CacheLevel = NewType("CacheLevel", int)
@@ -265,7 +265,7 @@ class BufferConfig:
     is_sparse: bool = False
     coalescing_group: int = 0
 
-class AttentionReusePolicy(enum.IntEnum):
+class ReusePolicy(enum.IntEnum):
     REQUIRED = 0
     PRIVATE = 1
     OPTIONAL = 2
@@ -276,14 +276,21 @@ class AttentionLayerConfig:
     buffers: list[BufferConfig]
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
-    reuse_policy: AttentionReusePolicy = AttentionReusePolicy.REQUIRED
+    reuse_policy: ReusePolicy = ReusePolicy.REQUIRED
     @property
     def window_size(self) -> int | None: ...
 
 @dataclass(slots=True)
 class SsmLayerConfig:
+    """Recurrent buffers sharing a layer-level reuse policy.
+
+    OPTIONAL state is restored only when selected on first resume at the exact
+    matched endpoint. The caller initializes or reconstructs all fresh state.
+    """
+
     layer_id: LayerId
     buffers: list[BufferConfig]
+    reuse_policy: ReusePolicy = ReusePolicy.REQUIRED
 
 LayerConfig = AttentionLayerConfig | SsmLayerConfig
 
@@ -581,7 +588,7 @@ class ReuseGroupStatus:
     def group_id(self) -> LayerGroupId: ...
     # REQUIRED constrains the match; OPTIONAL is selected at resume; PRIVATE is never reused.
     @property
-    def policy(self) -> AttentionReusePolicy: ...
+    def policy(self) -> ReusePolicy: ...
     # Exclusive token endpoint claimed by REQUIRED groups, shared by all groups.
     @property
     def endpoint(self) -> int: ...

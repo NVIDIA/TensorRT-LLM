@@ -209,8 +209,7 @@ UncommittedPage::~UncommittedPage()
     // switching to monostate, so during destruction the slot still references this page.
     if (TLLM_UNLIKELY(gDebug))
     {
-        auto ssmLcId = manager->lifeCycles().ssmLifeCycleId();
-        bool isSsm = ssmLcId.has_value() && lifeCycle == *ssmLcId;
+        bool const isSsm = manager->lifeCycles().isSsm(lifeCycle);
         if (!isSsm)
         {
             bool blockRemoved = kvCache->blocks().size() <= ordinal;

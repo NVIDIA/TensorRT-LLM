@@ -67,7 +67,7 @@ protected:
         return tokens;
     }
 
-    static void addWindow(KVCacheManagerConfig& config, int id, int window, AttentionReusePolicy policy, int sinks = 0)
+    static void addWindow(KVCacheManagerConfig& config, int id, int window, ReusePolicy policy, int sinks = 0)
     {
         auto layer = std::get<AttentionLayerConfig>(config.layers.front());
         layer.layerId = id;
@@ -86,7 +86,7 @@ TEST_F(ReplayCacheTest, GlobalReuseKeepsPrivateAttentionUnpublished)
     {
         SCOPED_TRACE(length);
         auto config = makeConfig();
-        addWindow(config, 1, 8, AttentionReusePolicy::PRIVATE);
+        addWindow(config, 1, 8, ReusePolicy::PRIVATE);
         auto manager = std::make_shared<KvCacheManager>(config);
         auto const globalLc = manager->getLayerGroupId(LayerId{0});
         auto const privateLc = manager->getLayerGroupId(LayerId{1});
@@ -142,11 +142,11 @@ TEST_F(ReplayCacheTest, ConcurrentRebaseDoesNotResurrectRetiredPages)
 {
     auto const tokens = makeTokens(24);
     TokenSpan const tokenSpan{tokens.data(), static_cast<int>(tokens.size())};
-    for (auto policy : {AttentionReusePolicy::REQUIRED, AttentionReusePolicy::PRIVATE, AttentionReusePolicy::OPTIONAL})
+    for (auto policy : {ReusePolicy::REQUIRED, ReusePolicy::PRIVATE, ReusePolicy::OPTIONAL})
     {
         SCOPED_TRACE(static_cast<int>(policy));
         auto config = makeConfig();
-        if (policy != AttentionReusePolicy::REQUIRED)
+        if (policy != ReusePolicy::REQUIRED)
         {
             addWindow(config, 1, 8, policy);
         }
@@ -162,11 +162,11 @@ TEST_F(ReplayCacheTest, ConcurrentRebaseDoesNotResurrectRetiredPages)
         first->commit(tokenSpan);
         second->commit(tokenSpan);
         EXPECT_EQ(first->getBasePageIndices(globalLc)[5], second->getBasePageIndices(globalLc)[5]);
-        if (policy != AttentionReusePolicy::REQUIRED)
+        if (policy != ReusePolicy::REQUIRED)
         {
             auto const privateLc = manager->getLayerGroupId(LayerId{1});
             EXPECT_EQ(first->getBasePageIndices(privateLc)[5] == second->getBasePageIndices(privateLc)[5],
-                policy == AttentionReusePolicy::OPTIONAL);
+                policy == ReusePolicy::OPTIONAL);
         }
         second->close();
         first->close();
@@ -180,7 +180,7 @@ TEST_F(ReplayCacheTest, ShrinkReleasesRetiredLocksBeforeVariantChanges)
     {
         SCOPED_TRACE(privateState);
         auto config = makeConfig();
-        addWindow(config, 1, 8, privateState ? AttentionReusePolicy::PRIVATE : AttentionReusePolicy::REQUIRED);
+        addWindow(config, 1, 8, privateState ? ReusePolicy::PRIVATE : ReusePolicy::REQUIRED);
         auto manager = std::make_shared<KvCacheManager>(config);
         auto cache = manager->createKvCache({}, {}, 1);
         ASSERT_TRUE(cache->resume(mStream));
@@ -221,6 +221,177 @@ TEST_F(ReplayCacheTest, SsmSnapshotLocksDoNotUseAttentionPageIndices)
     manager->shutdown();
 }
 
+TEST_F(ReplayCacheTest, MixedSsmPoliciesRestoreStateAndCopyEveryBeam)
+{
+    for (int length : {7, 8})
+    {
+        SCOPED_TRACE(length);
+        auto config = makeConfig();
+        config.commitMinSnapshot = true;
+        config.enablePartialCommit = false;
+        std::array<ReusePolicy, 4> const policies{
+            ReusePolicy::REQUIRED, ReusePolicy::OPTIONAL, ReusePolicy::PRIVATE, ReusePolicy::REQUIRED};
+        for (int i = 0; i < static_cast<int>(policies.size()); ++i)
+        {
+            SsmLayerConfig layer;
+            layer.layerId = i + 1;
+            layer.buffers = {BufferConfig{"state", 4096}, BufferConfig{"conv", 4096}};
+            layer.reusePolicy = policies[i];
+            config.layers.emplace_back(layer);
+        }
+        auto manager = std::make_shared<KvCacheManager>(config);
+        auto const required = manager->getLayerGroupId(1);
+        auto const optional = manager->getLayerGroupId(2);
+        auto const privateGroup = manager->getLayerGroupId(3);
+        EXPECT_EQ(required, manager->getLayerGroupId(4));
+        EXPECT_NE(required, optional);
+        EXPECT_NE(optional, privateGroup);
+        auto const tokens = makeTokens(length);
+        TokenSpan const span{tokens.data(), length};
+        auto address = [&](KvCache const& cache, int layer, DataRole const& role, int beam = 0)
+        {
+            auto const group = manager->getLayerGroupId(layer);
+            auto const slot = cache.getSsmBlockBaseIndex(group, BeamIndex{beam});
+            return manager->getMemPoolBaseAddress(layer, role)
+                + static_cast<size_t>(slot) * manager->getPageIndexScale(layer, role)
+                * manager->getPageStride(layer, role);
+        };
+        auto fill = [&](KvCache const& cache, int layer, DataRole const& role, int pattern)
+        {
+            EXPECT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(address(cache, layer, role)), pattern, 4096, mStream),
+                cudaSuccess);
+        };
+        auto check = [&](KvCache const& cache, int layer, DataRole const& role, int beam, uint8_t pattern)
+        {
+            EXPECT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+            std::vector<uint8_t> data(4096);
+            EXPECT_EQ(cudaMemcpy(data.data(), reinterpret_cast<void const*>(address(cache, layer, role, beam)),
+                          data.size(), cudaMemcpyDeviceToHost),
+                cudaSuccess);
+            EXPECT_TRUE(std::all_of(data.begin(), data.end(), [pattern](uint8_t value) { return value == pattern; }));
+        };
+        auto source = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(source->resume(mStream));
+        ASSERT_TRUE(source->resize(length));
+        for (int layer = 1; layer <= 4; ++layer)
+        {
+            fill(*source, layer, "state", 10 + layer);
+            fill(*source, layer, "conv", 20 + layer);
+        }
+        source->commit(span);
+        source->stopCommitting();
+        auto reader = manager->createKvCache({}, span, 2, {}, length);
+        ASSERT_EQ(reader->numCommittedTokens(), length);
+        EXPECT_TRUE(reader->reuseStatus()[required.value()].complete);
+        EXPECT_TRUE(reader->reuseStatus()[optional.value()].complete);
+        EXPECT_FALSE(reader->reuseStatus()[privateGroup.value()].complete);
+        EXPECT_EQ(
+            reader->reuseStatus()[optional.value()].coverage, (std::vector<std::pair<int, int>>{{length, length}}));
+        EXPECT_THROW(
+            reader->resume(mStream, std::nullopt, std::vector<LifeCycleId>{privateGroup}), std::invalid_argument);
+        ASSERT_TRUE(reader->resume(mStream, std::nullopt, std::vector<LifeCycleId>{optional}));
+        for (int layer : {1, 2, 4})
+        {
+            check(*reader, layer, "state", 0, 10 + layer);
+            check(*reader, layer, "conv", 0, 20 + layer);
+        }
+        EXPECT_NE(address(*source, 3, "state"), address(*reader, 3, "state"));
+        fill(*reader, 3, "state", 13);
+        fill(*reader, 3, "conv", 23);
+        ASSERT_TRUE(reader->resize(length + 4));
+        reader->setBeamWidth(BeamIndex{3});
+        for (int layer = 1; layer <= 4; ++layer)
+        {
+            for (int beam = 0; beam < 3; ++beam)
+            {
+                check(*reader, layer, "state", beam, 10 + layer);
+                check(*reader, layer, "conv", beam, 20 + layer);
+            }
+        }
+        reader->suspend();
+        ASSERT_TRUE(reader->resume(mStream));
+        reader->setBeamWidth(BeamIndex{1});
+        reader->close();
+        source->close();
+        manager->shutdown();
+    }
+}
+
+TEST_F(ReplayCacheTest, OptionalSsmRequiresExactEndpointAndDoesNotLimitAttentionReuse)
+{
+    for (auto policy : {ReusePolicy::OPTIONAL, ReusePolicy::PRIVATE})
+    {
+        auto config = makeConfig();
+        config.commitMinSnapshot = true;
+        config.layers.emplace_back(SsmLayerConfig{1, {BufferConfig{"state", 4096}}, policy});
+        auto manager = std::make_shared<KvCacheManager>(config);
+        auto const group = manager->getLayerGroupId(1);
+        auto const tokens = makeTokens(8);
+        TokenSpan const full{tokens.data(), 8};
+        auto source = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(source->resume(mStream));
+        ASSERT_TRUE(source->resize(8));
+        source->commit(full, true);
+        source->close();
+        for (int length : {7, 8})
+        {
+            SCOPED_TRACE(length);
+            auto reader = manager->createKvCache({}, TokenSpan{tokens.data(), length}, 2);
+            EXPECT_EQ(reader->numCommittedTokens(), length);
+            bool const available = policy == ReusePolicy::OPTIONAL && length == 8;
+            EXPECT_EQ(reader->reuseStatus()[group.value()].complete, available);
+            if (!available)
+            {
+                EXPECT_THROW(
+                    reader->resume(mStream, std::nullopt, std::vector<LifeCycleId>{group}), std::invalid_argument);
+            }
+            // Unselected OPTIONAL and PRIVATE state both get writable request-local storage.
+            ASSERT_TRUE(reader->resume(mStream));
+            EXPECT_GE(reader->getSsmBlockBaseIndex(group), 0);
+            reader->suspend();
+            ASSERT_TRUE(reader->resume(mStream));
+            reader->close();
+        }
+        manager->shutdown();
+    }
+}
+
+TEST_F(ReplayCacheTest, OptionalSsmEvictionPreservesRequiredPrefix)
+{
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    config.layers.emplace_back(SsmLayerConfig{1, {BufferConfig{"state", 4096}}, ReusePolicy::REQUIRED});
+    config.layers.emplace_back(SsmLayerConfig{2, {BufferConfig{"state", 4096}}, ReusePolicy::OPTIONAL});
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto const optional = manager->getLayerGroupId(2);
+    auto const tokens = makeTokens(8);
+    TokenSpan const span{tokens.data(), 8};
+    auto source = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(source->resume(mStream));
+    ASSERT_TRUE(source->resize(8));
+    source->commit(span, true);
+    source->close();
+    auto& storage = manager->storage();
+    auto const pool = storage.getPoolGroupIndex(kHotLevel, optional);
+    auto const stats = storage.getStatistics(kHotLevel, pool);
+    auto reservations = storage.newSlotsForPoolGroup(kHotLevel, pool, stats.free + stats.evictable);
+    EXPECT_EQ(manager->probeReuse({}, span), 8);
+    auto reader = manager->createKvCache({}, span, 2);
+    EXPECT_EQ(reader->numCommittedTokens(), 8);
+    EXPECT_FALSE(reader->reuseStatus()[optional.value()].complete);
+    EXPECT_FALSE(reader->resume(mStream));
+    for (auto& slot : reservations)
+        storage.releaseSlot(optional, kHotLevel, std::move(slot));
+    ASSERT_TRUE(reader->resume(mStream));
+    reader->stopCommitting();
+    auto drop = reader->planCommittedBlockDrop();
+    EXPECT_NE(drop, nullptr);
+    if (drop)
+        drop->drop();
+    reader->close();
+    manager->shutdown();
+}
+
 TEST_F(ReplayCacheTest, ClosingScratchCacheReleasesEverySlotExactlyOnce)
 {
     auto config = makeConfig();
@@ -252,14 +423,14 @@ TEST_F(ReplayCacheTest, OptionalAndPrivateHaveIndependentGroups)
     config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
     auto& encoder = std::get<AttentionLayerConfig>(config.layers.front());
     encoder.slidingWindowSize = 8;
-    encoder.reusePolicy = AttentionReusePolicy::OPTIONAL;
+    encoder.reusePolicy = ReusePolicy::OPTIONAL;
     auto decoder = encoder;
     decoder.layerId = 1;
-    decoder.reusePolicy = AttentionReusePolicy::PRIVATE;
+    decoder.reusePolicy = ReusePolicy::PRIVATE;
     config.layers.emplace_back(decoder);
     auto required = decoder;
     required.layerId = 2;
-    required.reusePolicy = AttentionReusePolicy::REQUIRED;
+    required.reusePolicy = ReusePolicy::REQUIRED;
     config.layers.emplace_back(required);
     config.initialPoolRatio = std::vector<float>{0.25F, 0.5F, 0.25F};
     auto manager = std::make_shared<KvCacheManager>(config);
@@ -302,7 +473,7 @@ TEST_F(ReplayCacheTest, OptionalWindowClaimsSurviveIndependentPageRemoval)
             config.commitMinSnapshot = true;
             for (int id = 1; id <= 2; ++id)
             {
-                addWindow(config, id, id == 1 ? c.window : 3, AttentionReusePolicy::OPTIONAL, id == 1 ? c.sinks : 0);
+                addWindow(config, id, id == 1 ? c.window : 3, ReusePolicy::OPTIONAL, id == 1 ? c.sinks : 0);
             }
             auto manager = std::make_shared<KvCacheManager>(config);
             auto const encoder = manager->getLayerGroupId(LayerId{1});
@@ -381,7 +552,7 @@ TEST_F(ReplayCacheTest, IndependentOptionalDropPreservesMigrationPeer)
     auto config = makeConfig();
     for (int i = 1; i <= 2; ++i)
     {
-        addWindow(config, i, i == 1 ? 4 : 2, AttentionReusePolicy::OPTIONAL);
+        addWindow(config, i, i == 1 ? 4 : 2, ReusePolicy::OPTIONAL);
     }
     auto manager = std::make_shared<KvCacheManager>(config);
     auto const encoder = manager->getLayerGroupId(LayerId{1});
@@ -418,7 +589,7 @@ TEST_F(ReplayCacheTest, DecliningOptionalClaimReleasesCapacityBeforeAllocation)
 {
     auto config = makeConfig();
     config.maxUtilForResume = 1.0f;
-    addWindow(config, 1, 4, AttentionReusePolicy::OPTIONAL);
+    addWindow(config, 1, 4, ReusePolicy::OPTIONAL);
     auto manager = std::make_shared<KvCacheManager>(config);
     auto const encoder = manager->getLayerGroupId(LayerId{1});
     auto const tokens = makeTokens(8);
@@ -451,7 +622,7 @@ TEST_F(ReplayCacheTest, DecliningOptionalClaimReleasesCapacityBeforeAllocation)
 TEST_F(ReplayCacheTest, OptionalCommitAcceptsGlobalRebase)
 {
     auto config = makeConfig();
-    addWindow(config, 1, 4, AttentionReusePolicy::OPTIONAL);
+    addWindow(config, 1, 4, ReusePolicy::OPTIONAL);
     auto manager = std::make_shared<KvCacheManager>(config);
     auto const encoder = manager->getLayerGroupId(LayerId{1});
     auto const tokens = makeTokens(8);

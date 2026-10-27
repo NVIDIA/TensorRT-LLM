@@ -56,7 +56,7 @@ DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY = _cpp.DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIO
 
 AggregatedPageDesc = _cpp.AggregatedPageDesc
 AttentionLayerConfig = _cpp.AttentionLayerConfig
-AttentionReusePolicy = _cpp.AttentionReusePolicy
+ReusePolicy = _cpp.ReusePolicy
 AttnLifeCycle = _cpp.AttnLifeCycle
 BatchDesc = _cpp.BatchDesc
 # BatchDesc is also consumed via dataclasses.replace(): MambaCacheManager's
@@ -216,7 +216,7 @@ def typed_range(*args: int) -> range:
 __all__ = [
     "AggregatedPageDesc",
     "AttentionLayerConfig",
-    "AttentionReusePolicy",
+    "ReusePolicy",
     "BAD_PAGE_INDEX",
     "CACHE_LEVEL1",
     "BatchDesc",

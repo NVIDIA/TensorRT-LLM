@@ -973,7 +973,7 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(
     auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch);
     // Content-divergence depth is measured before page or recurrent-snapshot pruning.
     int const numReusableTokensBeforePruning = numMatchedTokens(rawMatched, mTokensPerBlock);
-    auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
+    auto const ssmLcId = mLifeCycles.requiredSsmLifeCycleId();
     // Page requirements depend on the final endpoint. Back off before pruning
     // so SWA coverage and recurrent snapshots are validated at that endpoint.
     if (backoff > 0)

@@ -227,7 +227,7 @@ def test_automatic_pool_sizing_defaults_to_half_max_seq_len(make_manager):
 def test_native_common_reuse_and_window_retention(make_manager, policy, reused_tokens):
     manager = make_manager(config=mixed_config(block_reuse_config={"policy": policy}))
     config = manager.kv_cache_manager_py_config
-    assert [layer.reuse_policy for layer in config.layers] == [kv.AttentionReusePolicy.REQUIRED] * 2
+    assert [layer.reuse_policy for layer in config.layers] == [kv.ReusePolicy.REQUIRED] * 2
     assert (config.layers[1].num_sink_tokens, config.layers[1].sliding_window_size) == (1, 66)
     assert config.commit_min_snapshot == (policy == "per_request")
     native = manager.impl

@@ -178,8 +178,8 @@ inline void validateNoDuplicateBufferRoles(std::vector<BufferConfig> const& buff
 
 } // namespace detail
 
-//! Controls whether an attention lifecycle participates in prefix matching and page reuse.
-enum class AttentionReusePolicy
+//! Controls whether a layer lifecycle participates in prefix matching and page reuse.
+enum class ReusePolicy
 {
     //! Commit reusable pages and require live-window coverage when matching a prefix.
     REQUIRED = 0,
@@ -205,7 +205,7 @@ struct AttentionLayerConfig
     std::optional<int> numSinkTokens;
 
     // Private working pages never constrain prefix matching or enter the tree.
-    AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
+    ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
 
     [[nodiscard]] std::optional<int> windowSize() const noexcept
     {
@@ -235,6 +235,7 @@ struct SsmLayerConfig
 
     LayerId layerId = 0;
     std::vector<BufferConfig> buffers;
+    ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
 
     void validate() const
     {

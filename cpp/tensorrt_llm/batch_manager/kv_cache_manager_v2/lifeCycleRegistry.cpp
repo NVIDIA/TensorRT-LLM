@@ -36,7 +36,7 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, int tokensPerBlock)
             using T = std::decay_t<decltype(cfg)>;
             if constexpr (std::is_same_v<T, SsmLayerConfig>)
             {
-                return SsmLifeCycle{};
+                return SsmLifeCycle{cfg.reusePolicy};
             }
             else
             {
@@ -64,7 +64,7 @@ LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
             mLifeCycleList.push_back(lc);
             mLifeCycleIdMap[lc] = id;
             if (std::holds_alternative<SsmLifeCycle>(lc))
-                mSsmLifeCycleId = id;
+                mSsmLifeCycleIds.push_back(id);
         }
     }
     check();
