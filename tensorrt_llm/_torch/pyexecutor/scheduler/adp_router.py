@@ -22,7 +22,8 @@ new requests across ADP ranks.
 Protocol:
     1. Each rank builds its local RankState
     2. All ranks exchange RankState via allgather
-    3. ADPRouter.route_requests() distributes new requests
+    3. ADPRouter.pop_requests() pops the requests to admit and may plan their ranks
+    4. ADPRouter.route_requests() distributes them, following that plan
 
 Includes:
     - DefaultADPRouter: load-balanced min-heap routing; with
@@ -210,8 +211,9 @@ class ADPRouter(ABC):
     the scope of this class.
 
     Interface:
-        Input:  list[RankState], list[Request]
-        Output: dict[rank, list[Request]]
+        pop_requests:   WaitingQueue, list[RankState] -> list[Request], planned ranks
+        route_requests: list[RankState], list[Request], planned ranks
+                        -> dict[rank, list[Request]]
     """
 
     needs_prefix_matches: bool = False
@@ -346,8 +348,8 @@ class ADPRouter(ABC):
         max_new_requests: int,
         max_num_active_requests: int,
         kv_balance: bool = True,
-    ) -> list[RequestQueueItem]:
-        """Pop the requests to admit, for ``route_requests``; FIFO by default.
+    ) -> Tuple[List[RequestQueueItem], Dict[int, int]]:
+        """Pop the requests to admit; FIFO by default.
 
         Every rank sees the same queue and rank states, so all ranks pop the same
         requests.
@@ -358,14 +360,19 @@ class ADPRouter(ABC):
             max_new_requests: Maximum number of requests to admit.
             max_num_active_requests: Maximum active requests per rank.
             kv_balance: Whether the router may admit by KV load.
+
+        Returns:
+            The requests to admit, and the ranks planned for them (request id ->
+            rank) to pass to ``route_requests``; empty when no ranks are planned.
         """
-        return get_from_waiting_queue(
+        requests = get_from_waiting_queue(
             waiting_queue,
             max_new_requests,
             enable_attention_dp=True,
             max_num_active_requests=max_num_active_requests,
             all_ranks_num_active_requests=[s.num_active_requests for s in all_rank_states],
         )
+        return requests, {}
 
     @staticmethod
     def _assign_explicit_dp_ranks(
@@ -425,6 +432,7 @@ class ADPRouter(ABC):
         all_rank_states: list[RankState],
         new_requests: list[RequestQueueItem],
         max_num_active_requests: int,
+        placement: Optional[Dict[int, int]] = None,
     ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
         """Assign new requests to ranks based on gathered rank states.
 
@@ -432,6 +440,9 @@ class ADPRouter(ABC):
             all_rank_states: State of all ranks (from allgather).
             new_requests: New RequestQueueItems to distribute.
             max_num_active_requests: Maximum active requests per rank.
+            placement: Ranks planned by ``pop_requests`` (request id -> rank).
+                When not empty, it covers every request in ``new_requests``.
+                Routers whose ``pop_requests`` plans no ranks ignore it.
 
         Returns:
             Tuple of:
@@ -462,8 +473,8 @@ class DefaultADPRouter(ADPRouter):
     ``KV_BALANCE_WINDOW`` queued requests are all such requests,
     ``pop_requests`` plans admission and placement together
     (``plan_kv_balanced_admission``, ordered by ``WaitingQueue.admission_groups``)
-    and ``route_requests`` places them as planned. A single rank, warmup and the
-    benchmark fill phase admit in queue order.
+    and returns the planned ranks, which ``route_requests`` follows. A single
+    rank, warmup and the benchmark fill phase admit in queue order.
     """
 
     def __init__(
@@ -476,8 +487,6 @@ class DefaultADPRouter(ADPRouter):
         self.kv_balanced_admission = kv_balanced_admission
         # Request id -> admitting rounds it was passed over in the window.
         self._kv_balance_skipped_rounds: Dict[int, int] = {}
-        # Request id -> planned rank, until route_requests places it.
-        self._kv_balanced_placement: Dict[int, int] = {}
 
     def create_rank_state(
         self,
@@ -501,8 +510,7 @@ class DefaultADPRouter(ADPRouter):
         max_new_requests: int,
         max_num_active_requests: int,
         kv_balance: bool = True,
-    ) -> list[RequestQueueItem]:
-        self._kv_balanced_placement = {}
+    ) -> Tuple[List[RequestQueueItem], Dict[int, int]]:
         # A single rank has no placement to choose.
         if (
             not (self.kv_balanced_admission and kv_balance)
@@ -531,8 +539,8 @@ class DefaultADPRouter(ADPRouter):
             candidate_groups=waiting_queue.admission_groups(window),
         )
         chosen = [window[idx] for idx in sorted(idx for idx, _ in plan)]
-        self._kv_balanced_placement = {window[idx].id: rank for idx, rank in plan}
-        chosen_ids = set(self._kv_balanced_placement)
+        placement = {window[idx].id: rank for idx, rank in plan}
+        chosen_ids = set(placement)
         if chosen_ids:
             # Pop the window and put the rest back in order (no remove_by_ids).
             popped = [waiting_queue.pop_request() for _ in window]
@@ -545,13 +553,14 @@ class DefaultADPRouter(ADPRouter):
             for item in window
             if item.id not in chosen_ids
         }
-        return chosen
+        return chosen, placement
 
     def route_requests(
         self,
         all_rank_states: list[RankState],
         new_requests: list[RequestQueueItem],
         max_num_active_requests: int,
+        placement: Optional[Dict[int, int]] = None,
     ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
         tp_size = len(all_rank_states)
         all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
@@ -560,9 +569,8 @@ class DefaultADPRouter(ADPRouter):
         all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
         all_ranks_num_active_tokens = [s.num_active_tokens for s in all_rank_states]
 
-        placement, self._kv_balanced_placement = self._kv_balanced_placement, {}
-        if new_requests and all(item.id in placement for item in new_requests):
-            # Popped by KV-balanced admission: place them as planned.
+        if placement:
+            # Admitted by KV-balanced admission: place them as planned.
             for item in new_requests:
                 rank = placement[item.id]
                 all_ranks_new_requests[rank].append(item)
@@ -841,7 +849,9 @@ class KVCacheAwareADPRouter(ADPRouter):
         all_rank_states: list[RankState],
         new_requests: list[RequestQueueItem],
         max_num_active_requests: int,
+        placement: Optional[Dict[int, int]] = None,
     ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
+        # placement is unused: this router's pop_requests plans no ranks.
         tp_size = len(all_rank_states)
         all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
             s.rank: [] for s in all_rank_states
@@ -1099,7 +1109,9 @@ class ConversationAwareADPRouter(ADPRouter):
         all_rank_states: list[RankState],
         new_requests: list[RequestQueueItem],
         max_num_active_requests: int,
+        placement: Optional[Dict[int, int]] = None,
     ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
+        # placement is unused: this router's pop_requests plans no ranks.
         tp_size = len(all_rank_states)
         all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
             s.rank: [] for s in all_rank_states

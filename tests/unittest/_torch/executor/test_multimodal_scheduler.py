@@ -925,7 +925,7 @@ def test_mm_admission_does_not_charge_ready_active_request():
     waiting = FCFSWaitingQueue([_waiting_item(2, [8])])
     executor = _executor_for_mm_admission([active])
 
-    admitted = executor._pop_from_waiting_queue(waiting, 1)
+    admitted, _ = executor._pop_from_waiting_queue(waiting, 1)
 
     assert [item.id for item in admitted] == [2]
     assert not waiting
@@ -943,7 +943,7 @@ def test_mm_admission_charges_only_eligible_active_items(chunk_unit, eager, expe
     executor.scheduler.context_chunk_unit_size = chunk_unit
     executor.scheduler.prepares_future_items = eager
 
-    admitted = executor._pop_from_waiting_queue(waiting, 1)
+    admitted, _ = executor._pop_from_waiting_queue(waiting, 1)
 
     assert [item.id for item in admitted] == expected_admitted
     assert [item.id for item in waiting] == ([] if expected_admitted else [2])
@@ -960,7 +960,7 @@ def test_mm_admission_charges_next_chunk_after_context_advance() -> None:
     executor = _executor_for_mm_admission([active], max_batch_size=1, max_num_tokens=4)
     executor.scheduler.context_chunk_unit_size = 2
 
-    admitted = executor._pop_from_waiting_queue(waiting, 1)
+    admitted, _ = executor._pop_from_waiting_queue(waiting, 1)
 
     assert not admitted
     assert [item.id for item in waiting] == [2, 3]
@@ -970,7 +970,7 @@ def test_mm_admission_passes_oversized_request_to_validation():
     waiting = FCFSWaitingQueue([_waiting_item(1, [9]), _waiting_item(2, None)])
     executor = _executor_for_mm_admission([], max_num_tokens=8)
 
-    admitted = executor._pop_from_waiting_queue(waiting, 0)
+    admitted, _ = executor._pop_from_waiting_queue(waiting, 0)
 
     assert [item.id for item in admitted] == [1, 2]
     assert not waiting
@@ -982,7 +982,7 @@ def test_mm_admission_uses_active_request_state_snapshot():
     waiting = FCFSWaitingQueue([_waiting_item(2, [4])])
     executor = _executor_for_mm_admission([active])
 
-    admitted = executor._pop_from_waiting_queue(waiting, 1)
+    admitted, _ = executor._pop_from_waiting_queue(waiting, 1)
 
     assert [item.id for item in admitted] == [2]
     assert not waiting
@@ -994,7 +994,7 @@ def test_mm_admission_passes_malformed_metadata_to_validation():
     waiting = FCFSWaitingQueue([malformed, _waiting_item(2, [8])])
     executor = _executor_for_mm_admission([])
 
-    admitted = executor._pop_from_waiting_queue(waiting, 0)
+    admitted, _ = executor._pop_from_waiting_queue(waiting, 0)
 
     assert [item.id for item in admitted] == [1, 2]
     assert not waiting
@@ -1004,7 +1004,7 @@ def test_mm_admission_respects_encoder_batch_size():
     waiting = FCFSWaitingQueue([_waiting_item(1, [1, 1]), _waiting_item(2, [1])])
     executor = _executor_for_mm_admission([], max_batch_size=1)
 
-    admitted = executor._pop_from_waiting_queue(waiting, 0)
+    admitted, _ = executor._pop_from_waiting_queue(waiting, 0)
 
     assert [item.id for item in admitted] == [1]
     assert [item.id for item in waiting] == [2]
