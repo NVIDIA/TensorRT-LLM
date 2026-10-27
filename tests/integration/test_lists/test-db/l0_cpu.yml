@@ -232,6 +232,8 @@ l0_cpu:
   - unittest/llmapi/apps/test_request_metrics.py::test_unpopulated_kv_transfer_timestamps_stay_absent
   - unittest/llmapi/apps/test_responses_custom_tools.py
   - unittest/llmapi/apps/test_responses_input_preprocess.py
+  - unittest/llmapi/apps/test_responses_store_replay.py
+  - unittest/llmapi/apps/test_responses_stream_final_consistency.py
   - unittest/llmapi/apps/test_responses_streaming_events.py
   - unittest/llmapi/apps/test_responses_streaming_tool_calls.py
   - unittest/llmapi/apps/test_responses_usage.py
@@ -249,6 +251,8 @@ l0_cpu:
   - unittest/llmapi/test_llm_args.py
   - unittest/llmapi/test_mx_args.py
   - unittest/llmapi/test_custom_tokenizer_aliases.py
+  # Reads the Muse Spark Open tokenizer files from LLM_MODELS_ROOT.
+  - unittest/llmapi/test_musespark_open_tokenizer.py
   - unittest/llmapi/test_llm_quant.py
   - unittest/llmapi/test_llm_telemetry.py
   - unittest/llmapi/test_llm_utils.py

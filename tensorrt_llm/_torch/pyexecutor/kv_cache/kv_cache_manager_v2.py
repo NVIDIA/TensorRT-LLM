@@ -132,6 +132,7 @@ from ..resource_manager import (
     _project_max_attention_window_vec,
     get_pp_layers,
     request_context,
+    scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
 
@@ -6970,14 +6971,8 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
         for layer_id, buffer in self._iter_cache_buffers_for_invalid_check():
-            # process in chunks of 256 pages to avoid OoM
-            for i in range(0, buffer.shape[0], 256):
-                buffer_slice = buffer[i : i + 256]
-                try:
-                    has_invalid_values.logical_or_(torch.isnan(buffer_slice).any())
-                    has_invalid_values.logical_or_(torch.isinf(buffer_slice).any())
-                except NotImplementedError:
-                    some_checks_unavailable = True
+            if scan_kv_buffer_for_invalid_values(buffer, has_invalid_values):
+                some_checks_unavailable = True
             if fill_with_zero:
                 buffer.zero_()
                 # warmup runs this with fill_with_zero=True to scrub the cache
