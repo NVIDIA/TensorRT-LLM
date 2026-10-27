@@ -413,11 +413,6 @@ class LTX23RetakePipeline(LTX23Pipeline):
         sample_rate = audio.sample_rate
         if sample_rate <= 0:
             raise ValueError(f"sample_rate must be positive, got {sample_rate}")
-        # The shared encoder uses -shortest; trailing silence preserves all video frames.
-        required_samples = math.ceil(video.shape[1] * sample_rate / output_shape.fps)
-        missing_samples = required_samples - audio_tensor.shape[-1]
-        if missing_samples > 0:
-            audio_tensor = torch.nn.functional.pad(audio_tensor, (0, missing_samples))
         return timer.fill(
             PipelineOutput(
                 video=video,

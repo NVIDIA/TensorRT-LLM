@@ -5,6 +5,7 @@
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from safetensors.torch import save_file
@@ -14,6 +15,7 @@ from tensorrt_llm._torch.visual_gen import models  # noqa: F401
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.models.ltx23.pipeline_ltx23 import LTX23Pipeline
 from tensorrt_llm._torch.visual_gen.models.ltx23.pipeline_ltx23_retake import LTX23RetakePipeline
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline
 from tensorrt_llm.visual_gen.args import VisualGenArgs
@@ -95,6 +97,24 @@ def test_ltx23_config_rejects_unknown_workflow(ltx23_checkpoint: str) -> None:
     args = VisualGenArgs(model=ltx23_checkpoint, pipeline_config={"workflow": "unknown"})
     with pytest.raises(ValueError, match="LTX-2.3 workflow must be"):
         DiffusionPipelineConfig.from_pretrained(ltx23_checkpoint, args=args, device="cpu")
+
+
+@pytest.mark.parametrize("pipeline_class", [LTX23Pipeline, LTX23RetakePipeline])
+@pytest.mark.parametrize("cfg_size", [1, 2])
+def test_ltx23_config_requires_cfg_size_one(
+    ltx23_checkpoint: str, pipeline_class: type, cfg_size: int
+) -> None:
+    """Reject CFG parallelism before initializing components; keep cfg_size=1 valid."""
+    args = VisualGenArgs(model=ltx23_checkpoint, parallel_config={"cfg_size": cfg_size})
+    config = DiffusionPipelineConfig.from_pretrained(ltx23_checkpoint, args=args, device="cpu")
+    with patch.object(BasePipeline, "__init__", return_value=None) as initialize:
+        if cfg_size == 1:
+            pipeline_class(config)
+            initialize.assert_called_once_with(config)
+        else:
+            with pytest.raises(NotImplementedError, match=r"requires parallel\.cfg_size=1"):
+                pipeline_class(config)
+            initialize.assert_not_called()
 
 
 @pytest.mark.parametrize(

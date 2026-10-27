@@ -23,10 +23,7 @@ Usage:
 """
 
 import argparse
-from dataclasses import replace
 from pathlib import Path
-
-import torch.nn.functional as F
 
 from tensorrt_llm import VisualGen, VisualGenArgs
 from tensorrt_llm._torch.visual_gen.models.ltx23.checkpoint import LTX23_MODEL_ID
@@ -104,16 +101,7 @@ def main() -> None:
             f"post_denoise={metrics.post_denoise:.3f}s"
         )
 
-    output_to_save = output
-    if output.video is not None and output.audio is not None:
-        if output.frame_rate is None or output.audio_sample_rate is None:
-            raise ValueError("LTX-2.3 audio/video output must carry frame and sample rates.")
-        audio_samples = round(output.video.shape[-4] * output.audio_sample_rate / output.frame_rate)
-        padding = max(0, audio_samples - output.audio.shape[-1])
-        if padding:
-            # Pad only the saved copy; preserve the generated waveform for scoring.
-            output_to_save = replace(output, audio=F.pad(output.audio, (0, padding)))
-    output_to_save.save(args.output_path)
+    output.save(args.output_path)
     print(f"Saved: {args.output_path}")
 
 

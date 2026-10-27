@@ -8,7 +8,7 @@ import math
 import os
 import weakref
 from dataclasses import fields, replace
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 
@@ -40,6 +40,9 @@ from .ltx23_core.connector import (
 from .ltx23_core.modality import LTX23Modality
 from .ltx23_core.video_vae import LTX23VideoDecoderConfigurator
 from .transformer_ltx23 import LTX23Model
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 
 
 class _LTX23CUDAGraphRunner(_LTX2CUDAGraphRunner):
@@ -181,6 +184,11 @@ class LTX23Pipeline(BasePipeline):
     # Connectors share the transformer prefix but load as separate components.
     _TRANSFORMER_PREFIX = LTX2Pipeline._TRANSFORMER_PREFIX
     _TRANSFORMER_EXCLUDE_PREFIXES = LTX2Pipeline._TRANSFORMER_EXCLUDE_PREFIXES
+
+    def __init__(self, pipeline_config: "DiffusionPipelineConfig") -> None:
+        if pipeline_config.parallel.cfg_size != 1:
+            raise NotImplementedError("LTX-2.3 generation requires parallel.cfg_size=1.")
+        super().__init__(pipeline_config)
 
     @classmethod
     def resolve_variant(cls, config):
