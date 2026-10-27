@@ -136,9 +136,21 @@ def _layer_norm_fwd_1pass_kernel(
 # shape (thousands of 128-element rows) one row per CTA leaves the kernel
 # launch-limited; 4 rows with 4 warps reproduces the single-row kernel's
 # reduction order (bitwise-identical output) at ~2x the throughput.
+# From _MULTIROW_LARGE_TILE_MIN_ROWS rows, each program takes enough rows for
+# every thread to load whole 16-byte vectors of x and z; the reduction order
+# then differs from the 4-row launch, so outputs may differ by rounding.
 _MULTIROW_ROWS = 4
 _MULTIROW_NUM_WARPS = 4
 _MULTIROW_MAX_N = 256
+_MULTIROW_LARGE_TILE_MIN_ROWS = 32768
+
+
+def _multirow_rows(M: int, N: int, element_size: int) -> int:
+    """Rows per program of the multi-row kernel for an [M, N] input."""
+    if M < _MULTIROW_LARGE_TILE_MIN_ROWS:
+        return _MULTIROW_ROWS
+    num_threads = 32 * _MULTIROW_NUM_WARPS
+    return max(_MULTIROW_ROWS, num_threads * (16 // element_size) // N)
 
 
 @functools.lru_cache(maxsize=None)
@@ -283,7 +295,8 @@ def rms_norm_gated_token_major(
         return y
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     out = torch.empty_like(x, dtype=out_dtype)
-    grid_size = triton.cdiv(M, _MULTIROW_ROWS)
+    rows = _multirow_rows(M, N, x.element_size())
+    grid_size = triton.cdiv(M, rows)
     device_index = x.device.index
     launch_with_pdl = _multirow_pdl(grid_size, device_index)
     with torch.cuda.device(device_index):
@@ -300,7 +313,7 @@ def rms_norm_gated_token_major(
             M,
             eps,
             N=N,
-            ROWS=_MULTIROW_ROWS,
+            ROWS=rows,
             HEADS_PER_TOK=heads,
             GATE_SIGMOID=gate_sigmoid,
             WEIGHT_IS_DELTA=False,
@@ -374,7 +387,8 @@ def _layer_norm_fwd(
     rstd = torch.empty((ngroups * M, ), dtype=torch.float32, device=x.device)
     if _multirow_gated_rmsnorm_eligible(group_size, ngroups, bias, z,
                                         norm_before_gate, is_rms_norm):
-        grid_size = triton.cdiv(M, _MULTIROW_ROWS)
+        rows = _multirow_rows(M, group_size, x.element_size())
+        grid_size = triton.cdiv(M, rows)
         device_index = x.device.index
         launch_with_pdl = _multirow_pdl(grid_size, device_index)
         with torch.cuda.device(device_index):
@@ -391,7 +405,7 @@ def _layer_norm_fwd(
                 M,
                 eps,
                 N=group_size,
-                ROWS=_MULTIROW_ROWS,
+                ROWS=rows,
                 HEADS_PER_TOK=1,
                 GATE_SIGMOID=gate_sigmoid,
                 WEIGHT_IS_DELTA=weight_is_delta,
