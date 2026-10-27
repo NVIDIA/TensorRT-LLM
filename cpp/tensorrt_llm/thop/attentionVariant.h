@@ -306,6 +306,12 @@ private:
     /// whichever init hook comes first.
     void initShared();
 
+    /// The FP8 output scale, which only FP8 context FMHA quantizes the output with.
+    [[nodiscard]] float* getOutQuantScale(FmhaParams const& p) const
+    {
+        return mFP8ContextFMHA ? p.getOutQuantScale() : nullptr;
+    }
+
     bool mPagedKVCache = true;
     bool mFP8ContextFMHA = false;
 
@@ -406,6 +412,14 @@ private:
     [[nodiscard]] size_t getWorkspaceSizeForContext(FmhaParams const& p) const;
     [[nodiscard]] size_t getWorkspaceSizeForGeneration(FmhaParams const& p) const noexcept;
     [[nodiscard]] size_t getFmhaMultiCtasKvScratchSize() const noexcept;
+
+    /// The FP8 output scale, which only FP8 context FMHA quantizes the output with.
+    [[nodiscard]] float* getOutQuantScale(FmhaParams const& p) const
+    {
+        bool const fp8ContextFmha
+            = is_fp8_out || (quant_mode.hasFp8KvCache() && paged_context_fmha) || sageAttnRequested();
+        return fp8ContextFmha ? p.getOutQuantScale() : nullptr;
+    }
 
     tensorrt_llm::kernels::MlaMetaParams mMLAParams{};
     bool mIsGenerationMLA = false;

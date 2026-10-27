@@ -49,26 +49,6 @@ _FORWARD_ARG_NAMES = frozenset(field.name for field in fields(AttentionForwardAr
 _SPARSE_ARG_NAMES = frozenset(field.name for field in fields(SparseRuntimeParams))
 
 
-# ``AttentionForwardArgs`` fields that this backend does not consume.
-# Sync test (test_attention_op_sync.py) requires every other field to map to a
-# kwarg name, a @property on the dataclass, or a field that some @property
-# transitively reads; entries here are exempt.
-_THOP_EXCLUDED_FIELDS: frozenset = frozenset(
-    {
-        "sparse_backend_args",  # consumed by sparse prediction before the attention op
-        "block_sparse_inputs",  # consumed by the selected block-sparse FMHA
-        "attention_mask_data",  # custom-mask code path
-        "out_scale_sf",  # promoted into ``out_scale`` in ``TrtllmAttention.forward`` for NVFP4 path
-        "skip_mla_rope_generation",  # handled in ``TrtllmAttention.forward`` for the test-only MLA path
-        "timestep",  # consumed by sparse prediction before FMHA dispatch
-        "sparse_attn_phase",  # host-resolved sparse phase, consumed before FMHA dispatch
-        "qk_fp8_per_tensor",  # per-tensor FP8 recipe flag, consumed by FMHA selection and the PrimTS FMHA
-        "v_fp8_per_tensor",  # per-tensor FP8 recipe flag, consumed by FMHA selection and the PrimTS FMHA
-        "sage_quantized",  # for libraries taking quantized Sage inputs; the op quantizes its own
-    }
-)
-
-
 def _legacy_forward_args(
     arguments: Mapping[str, object], **overrides: object
 ) -> AttentionForwardArgs:
@@ -644,8 +624,6 @@ class FallbackFmha(PhasedFmha):
             params.num_gen_tokens = num_gen_tokens
             thop.run_generation(params)
 
-    # Keep nanobind calls eager, including when CombinedFmha delegates individual phases.
-    @torch.compiler.disable
     def prepare_workspace(
         self,
         q: torch.Tensor,
@@ -663,6 +641,7 @@ class FallbackFmha(PhasedFmha):
                 key="fallback_fmha_sage_attn_smooth_v",
             )
 
+    # Keep nanobind calls eager, including when CombinedFmha delegates individual phases.
     @torch.compiler.disable
     def run_context(self, params: FmhaParams) -> None:
         thop.run_context(params)

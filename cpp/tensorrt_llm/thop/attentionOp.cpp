@@ -1083,7 +1083,7 @@ int MHA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
     decoder_params.removePadding = remove_padding;
     decoder_params.attentionMaskType = mask_type;
     decoder_params.fmhaTileCounter = workspaceViews.fmhaTileCounter;
-    decoder_params.quantScaleO = p.getOutQuantScale();
+    decoder_params.quantScaleO = getOutQuantScale(p);
     decoder_params.dequantScaleQkv = p.getKvScaleQuantOrig();
     decoder_params.separateQkvScales = quant_mode.hasFp4KvCache();
     decoder_params.fmhaHostBmm1Scale = 1.0f / (sqrtf(getHeadSize() * 1.0f) * q_scaling);
@@ -1854,7 +1854,7 @@ int MHA::enqueueGeneration(FmhaParams const& p, cudaStream_t stream)
     dispatch_params.ia3_value_weights = ia3_value_weights;
     dispatch_params.qkv_scale_out = qkv_scale_out;
     dispatch_params.fp8_context_fmha = mFP8ContextFMHA;
-    dispatch_params.attention_out_scale = p.getOutQuantScale();
+    dispatch_params.attention_out_scale = getOutQuantScale(p);
     dispatch_params.quant_option = quant_option;
     dispatch_params.multi_block_mode = enable_multi_block;
     dispatch_params.max_seq_len_tile = max_num_seq_len_tiles;
@@ -3320,7 +3320,7 @@ int MLA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
     decoder_params.removePadding = remove_padding;
     decoder_params.attentionMaskType = mask_type;
     decoder_params.fmhaTileCounter = workspaceViews.fmhaTileCounter;
-    decoder_params.quantScaleO = p.getOutQuantScale();
+    decoder_params.quantScaleO = getOutQuantScale(p);
     decoder_params.dequantScaleQkv = p.getKvScaleQuantOrig();
     decoder_params.separateQkvScales = quant_mode.hasFp4KvCache();
     decoder_params.fmhaHostBmm1Scale = 1.0f / (sqrtf(getHeadSize() * 1.0f) * q_scaling);
@@ -3366,7 +3366,7 @@ int MLA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
         mla.v_token_stride_elements = vStrideInBytes / static_cast<int64_t>(sizeof(T));
     }
     // Set additional scales for context phase
-    mla.quant_scale_o = p.getOutQuantScale();
+    mla.quant_scale_o = getOutQuantScale(p);
     mla.quant_scale_q = p.getKvScaleOrigQuant();
     mla.quant_scale_kv = p.getKvScaleOrigQuant();
     mla.dequant_scale_q = p.getKvScaleQuantOrig();
@@ -3551,7 +3551,7 @@ int MLA::enqueueGeneration(FmhaParams const& p, cudaStream_t stream)
 
     void* scratchPtr = params.workspace;
 
-    params.quant_scale_o = p.getOutQuantScale();
+    params.quant_scale_o = getOutQuantScale(p);
     params.quant_scale_q = p.getKvScaleOrigQuant();
     params.quant_scale_kv = p.getKvScaleOrigQuant();
     params.dequant_scale_q = p.getKvScaleQuantOrig();
