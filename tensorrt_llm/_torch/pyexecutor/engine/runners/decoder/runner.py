@@ -211,7 +211,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._dummy_requests = self._make_dummy_requests()
         self._init_decoder_state()
         self._inputs = self._make_input_preparer(mm_item_scheduler)
-        self.runtime_hooks = runtime_hooks_of(self.model)
+        self.runtime_hooks = runtime_hooks_of(self._model)
         self._inputs.decode_prologue = self.runtime_hooks.decode_prologue
         self._graphs = self._make_cuda_graphs()
         self._initialize_moe_workspace_reclaimer()
