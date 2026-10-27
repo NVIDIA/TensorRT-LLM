@@ -180,6 +180,21 @@ class KvCacheConnectorWorker(ABC):
     # Opt in only when transfers, endpoints and completion are owner-local,
     # and the backend can safely share compatible cache content across owners.
     supports_attention_dp: bool = False
+    #: The connector stores and offers KV by whole blocks starting at the local
+    #: prefix match, so that match must end on a block boundary.
+    #: `KVCacheManagerV2` reads it only when a one-model draft's lookahead backoff
+    #: is in effect and partial reuse is off, and then aligns every local match
+    #: down to `tokens_per_block`. Only an explicit True counts. May be set per
+    #: instance in `__init__`, since the manager is built after the connector.
+    #: Must be the same on every rank.
+    requires_block_aligned_reuse: bool = False
+    #: The connector prefers whole local matches to backed-off ones. The target
+    #: `KVCacheManagerV2` then drops the one-model draft lookahead backoff; the
+    #: draft KV at the tail of a reused block may belong to a different next
+    #: token, which can lower draft acceptance but never changes the output.
+    #: Only an explicit True counts. May be set per instance. Must be the same
+    #: on every rank.
+    drops_reuse_match_backoff: bool = False
 
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args

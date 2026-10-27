@@ -385,6 +385,7 @@ def _make_manager_for_cache_tier_test(
     vocab_size: int | None = 16,
     dtype: DataType = DataType.HALF,
     layer_specs: list[KVCacheLayerSpec] | None = None,
+    kv_connector_manager: object | None = None,
 ) -> tuple[KVCacheManagerV2, Mock]:
     impl_constructor = Mock(side_effect=impl_side_effect)
     if mapping is None:
@@ -456,6 +457,7 @@ def _make_manager_for_cache_tier_test(
             vocab_size=vocab_size,
             execution_stream=Mock(),
             cold_page_codec_provider=cold_page_codec_provider,
+            kv_connector_manager=kv_connector_manager,
         )
     return manager, impl_constructor
 
@@ -1226,6 +1228,98 @@ def test_one_model_prompt_lookahead_configures_reuse_backoff(
     assert core_config.layers[0].sliding_window_size == expected_windows[0]
     assert core_config.reuse_match_backoff == 1
     assert replace(core_config, commit_min_snapshot=True).reuse_match_backoff == 1
+
+
+@pytest.mark.parametrize(
+    (
+        "requires",
+        "drops",
+        "capacity_only",
+        "is_draft",
+        "expected_backoff",
+        "expected_alignment",
+        "expected_windows",
+    ),
+    [
+        (False, False, False, False, 1, 1, [6]),
+        (True, False, False, False, 1, TOKENS_PER_BLOCK, [6]),
+        # A dropped backoff has no rewind, so the SWA window is not widened.
+        (True, True, False, False, 0, 1, [5]),
+        (True, True, True, False, 1, 1, [6]),
+        # A paired draft pool keeps its backoff but aligns with the target.
+        (True, True, False, True, 1, TOKENS_PER_BLOCK, [6]),
+    ],
+    ids=["no_declaration", "align", "drop", "capacity_only", "joint_draft"],
+)
+@pytest.mark.parametrize(
+    "spec_config",
+    [
+        Eagle3DecodingConfig(
+            max_draft_len=1,
+            speculative_model="draft-model",
+        ),
+        MTPDecodingConfig(max_draft_len=1),
+    ],
+    ids=["eagle3_one_model", "mtp_eagle_one_model"],
+)
+def test_kv_connector_reuse_declarations_shape_the_core_match(
+    spec_config: Eagle3DecodingConfig | MTPDecodingConfig,
+    requires: bool,
+    drops: bool,
+    capacity_only: bool,
+    is_draft: bool,
+    expected_backoff: int,
+    expected_alignment: int,
+    expected_windows: list[int | None],
+) -> None:
+    """A whole-block connector's declarations reach the real core config."""
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        enable_partial_reuse=False,
+        max_gpu_total_bytes=16 << 20,
+        max_attention_window=[5, MAX_SEQ_LEN, MAX_SEQ_LEN - 1],
+    )
+    connector = SimpleNamespace(
+        capacity_only=capacity_only,
+        worker=SimpleNamespace(
+            requires_block_aligned_reuse=requires,
+            drops_reuse_match_backoff=drops,
+        ),
+    )
+    manager, _ = _make_manager_for_cache_tier_test(
+        kv_cache_config,
+        [Mock()],
+        spec_config=spec_config,
+        is_draft=is_draft,
+        joint_reuse=is_draft,
+        kv_connector_manager=connector,
+    )
+
+    assert manager.reuse_match_backoff == expected_backoff
+    # The raw lookahead stays for the lender and the public property.
+    assert manager.draft_prompt_lookahead == 1
+    assert manager.max_attention_window_vec == expected_windows
+    if expected_backoff == 0:
+        # Without the backoff the lookup stops one token short of the prompt,
+        # exactly as it does without a draft.
+        prompt = list(range(65))
+        request = SimpleNamespace(
+            multimodal_hashes=None,
+            multimodal_positions=None,
+            multimodal_lengths=None,
+        )
+        manager._reuse_token_source = lambda _: prompt
+        assert list(manager._context_reuse_tokens(request)) == prompt[:-1]
+
+    core_config = manager._build_base_config(
+        kv_cache_config,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 30)],
+    )
+    assert core_config.reuse_match_backoff == expected_backoff
+    assert core_config.reuse_match_alignment == expected_alignment
+    rebuilt = replace(core_config, commit_min_snapshot=True)
+    assert rebuilt.reuse_match_alignment == expected_alignment
 
 
 @pytest.mark.parametrize(

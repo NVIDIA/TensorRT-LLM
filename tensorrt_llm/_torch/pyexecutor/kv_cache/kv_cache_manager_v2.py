@@ -2015,9 +2015,18 @@ class KVCacheManagerV2(BaseResourceManager):
         # check needs this raw value even where a subclass opts out of reuse-match backoff:
         # a block's reuse key covers no token past its end.
         self._draft_prompt_lookahead = draft_prompt_lookahead(spec_config) or 0
-        # Unsupported adapters keep their main-like reuse endpoint.
+        # Unsupported adapters keep their main-like reuse endpoint, and so does
+        # a manager whose KV connector asks for whole local matches instead.
         self.reuse_match_backoff = self._draft_prompt_lookahead
         if not self._supports_reuse_match_backoff:
+            self.reuse_match_backoff = 0
+        elif self.reuse_match_backoff and self._connector_drops_reuse_match_backoff():
+            logger.info(
+                "[KVCacheManager] The KV connector takes whole local prefix matches: "
+                f"dropping the {self.reuse_match_backoff}-token one-model draft reuse "
+                "backoff. Draft KV at the tail of a reused block may belong to another "
+                "continuation, which affects draft acceptance only."
+            )
             self.reuse_match_backoff = 0
         self.enable_partial_reuse = _effective_partial_reuse(
             kv_cache_config.enable_partial_reuse,
@@ -3796,7 +3805,10 @@ class KVCacheManagerV2(BaseResourceManager):
             # Keep the lookahead evidence and its backoff in the same tree match.
             # A paired scheduler caps the claim by retaining D evidence past the
             # common usable depth, so this still trims exactly once.
+            # The alignment is applied in the same tree match after the backoff,
+            # so the probe, the claim and the paired probes all trim once too.
             reuse_match_backoff=self.reuse_match_backoff,
+            reuse_match_alignment=self._connector_reuse_match_alignment(),
             enable_stats=self.enable_stats,
             swa_scratch_reuse=scratch_reuse_config,
             commit_min_snapshot=(
@@ -3870,6 +3882,61 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
+
+    def _kv_connector_declares(self, capability: str) -> bool:
+        """Whether the attached KV connector's worker declares ``capability`` exactly True.
+
+        Read through ``getattr``: partially built managers may bind no connector, or a
+        connector without a worker, and only an explicit True counts, so a mock's truthy
+        attribute leaves reuse unchanged. A capacity-only connector serves nothing, so it
+        never reshapes local reuse.
+
+        Args:
+            capability: Name of a ``KvCacheConnectorWorker`` declaration, such as
+                ``"requires_block_aligned_reuse"``.
+
+        Returns:
+            True only when a serving connector's worker sets ``capability`` to True.
+        """
+        connector = getattr(self, "kv_connector_manager", None)
+        if connector is None or getattr(connector, "capacity_only", False) is True:
+            return False
+        return getattr(getattr(connector, "worker", None), capability, False) is True
+
+    def _connector_drops_reuse_match_backoff(self) -> bool:
+        """Whether the attached KV connector asks for local matches without backoff.
+
+        A connector that serves from block boundaries can prefer reusing whole local
+        blocks to aligning a backed-off match down and loading the trimmed block itself;
+        see `_connector_reuse_match_alignment`. The draft KV at the end of such a block may
+        then belong to a different next token, which affects draft acceptance only. A
+        draft manager never drops its own backoff.
+
+        Returns:
+            True when this target manager should drop the one-model draft backoff.
+        """
+        return not self.is_draft and self._kv_connector_declares("drops_reuse_match_backoff")
+
+    def _connector_reuse_match_alignment(self) -> int:
+        """Alignment a whole-block KV connector needs of every local prefix match.
+
+        Such a connector serves only from a block boundary, and the local match is where
+        its offer starts. Disabling partial radix matching is not enough on its own: a
+        one-model draft's lookahead backoff trims a match of whole blocks to one or more
+        tokens short of a boundary, which would leave the connector nothing to offer for
+        any request with a local hit. Aligning trades the trimmed block for the connector
+        serving it and everything after it. Any other configuration keeps token-granular
+        reuse.
+
+        Returns:
+            The ledger ``tokens_per_block`` when a backoff is in effect, partial reuse is
+            off and the connector requires block-aligned reuse; otherwise 1.
+        """
+        if self.reuse_match_backoff <= 0 or self.enable_partial_reuse:
+            return 1
+        if not self._kv_connector_declares("requires_block_aligned_reuse"):
+            return 1
+        return self._ledger_tokens_per_block
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Exclude empty buffers before creating the runtime storage pools."""
