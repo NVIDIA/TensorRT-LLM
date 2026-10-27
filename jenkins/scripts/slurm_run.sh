@@ -213,8 +213,12 @@ if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
     echo "Rank${SLURM_PROCID} Perf check finished execution with exit code $perf_check_exit_code"
 fi
 
+# Evidence for the TOT waive refresh in L0_Test.groovy: "<pytest> <perf> <ntasks>"
+# then the compute capability. Only rank 0's results are reported, so the
+# pipeline waives only single-task jobs, where rank 0 saw every test outcome.
 if [ "${SLURM_PROCID:-0}" -eq 0 ] && [ "$pytest_exit_code" -eq 1 ]; then
-    printf '%s %s\n' "$pytest_exit_code" "$perf_check_exit_code" > "$jobWorkspace/pytest_exit_codes.txt"
+    printf '%s %s %s\n' "$pytest_exit_code" "$perf_check_exit_code" "${SLURM_NTASKS:-1}" \
+        > "$jobWorkspace/pytest_exit_codes.txt"
     if command -v nvidia-smi > /dev/null; then
         timeout 10s nvidia-smi --query-gpu=compute_cap --format=csv,noheader \
             >> "$jobWorkspace/pytest_exit_codes.txt" || true

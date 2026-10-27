@@ -567,6 +567,19 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
     ]
 }
 
+// Shard test lists this stage ran. The TOT waive refresh uses them to prove that
+// no test was left unexecuted after a crash or timeout before waiving it.
+def getShardTestLists(preprocessedLists) {
+    def lists = []
+    if (preprocessedLists?.regularCount > 0) {
+        lists.add(preprocessedLists.regular)
+    }
+    if (preprocessedLists?.isolateCount > 0) {
+        lists.add(preprocessedLists.isolate)
+    }
+    return lists
+}
+
 def finishIsolatedTestStage(pipeline, preprocessedLists, isolatedResult, llmSrc, stageName) {
     if (!isolatedResult.rerunFailed && !isolatedResult.hasUnrerunFailure &&
             !isolatedResult.hasUnfinishedTests) {
@@ -577,36 +590,26 @@ def finishIsolatedTestStage(pipeline, preprocessedLists, isolatedResult, llmSrc,
         generateRerunReport(stageName, llmSrc)
     }
     def unfinishedTests = generateTimeoutTestResultXml(pipeline, stageName)
-    def reportPath = "${WORKSPACE}/${stageName}/waive_refresh/report.json"
-    def reportExisted = fileExists(reportPath)
-    def allFailuresWaived = refreshFailedTestWaives(llmSrc, stageName)
-    def isolatedFailuresWaived = allFailuresWaived
-    if (allFailuresWaived) {
+    // One refresh covers the regular and isolated reports; the caller reuses its verdict.
+    def refresh = refreshFailedTestWaives(llmSrc, stageName, [
+        expectedTestLists: getShardTestLists(preprocessedLists),
+        isolatedTestList: preprocessedLists.isolate,
+    ])
+    def report = refresh.report
+    if (refresh.allFailuresWaived) {
         unfinishedTests = false
-    } else if (!reportExisted && fileExists(reportPath)) {
-        def report = readJSON(text: readFile(reportPath), returnPojo: true)
-        if (report.stage_name == stageName && report.all_failures_waived == false &&
-                report.remaining_failures instanceof List && report.waived instanceof List) {
-            def isolatedTests = readFile(preprocessedLists.isolate).readLines().collect {
-                it.replaceAll(/(?:\s+(?:TIMEOUT\s*\(\d+\)|ISOLATION))+\s*$/, '').trim()
-            }.findAll { it }.toSet()
-            def remaining = report.remaining_failures
-            def hasWaivedIsolatedTests = report.waived.any { isolatedTests.contains(it.test) }
-            isolatedFailuresWaived = hasWaivedIsolatedTests && !remaining.any {
-                isolatedTests.contains(it.test) || !it.test?.contains('::') || it.file == 'results-stage.xml'
-            }
-            unfinishedTests = remaining.any {
-                it.file in ['results-timeout.xml', 'unfinished_test.txt']
-            }
-        }
+    } else if (report != null) {
+        unfinishedTests = report.has_unfinished_failures == true
     }
 
-    if (!isolatedFailuresWaived) {
+    // Retained regular-test failures are reported by the caller; only mark this
+    // stage red when an isolated failure (or an unattributable one) remains.
+    if (!refresh.allFailuresWaived && report?.isolated_failures_waived != true) {
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
             error "Some isolated tests still failed or terminated unexpectedly after the TOT waive check, please check the test report."
         }
     }
-    return [refreshAttempted: true, allFailuresWaived: allFailuresWaived,
+    return [refreshAttempted: true, allFailuresWaived: refresh.allFailuresWaived,
             unfinishedTests: unfinishedTests]
 }
 
@@ -1873,6 +1876,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     // an intermediate attempt and passes on retry leaves the build UNSTABLE.
     def caughtStageError = null
     Throwable primaryError = null
+    // Rendered test list, kept only when the job runs it unsplit: the TOT waive
+    // refresh needs it to prove that every test ran.
+    String unsplitTestListLocal = null
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -1958,6 +1964,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
                 String clusterNameForDurations = useClusterDurations ? partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_') : null
                 def testListPathLocal = renderTestDB(pipeline, testList, llmSrcLocal, stageName, makoOptsJson, clusterNameForDurations)
+                if (splits.toString() == "1") {
+                    unsplitTestListLocal = testListPathLocal
+                }
                 // Copy the test list atomically. A retry that reuses a still-active job
                 // re-copies over ${testListPathNode} while that job may be reading it via
                 // --test-list; scp truncates-then-streams, so a concurrent read could see a
@@ -2808,21 +2817,31 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             throw classified
                         }
                     }
-                    if (slurmState == "FAILED" && jobExit == "1" && !infraDryRun) {
+                    // pytest also exits 1 when pytest-timeout kills it, including during a
+                    // test's setup (which leaves no unfinished-test record), and this path
+                    // does not rerun the tests left unexecuted. The refresh therefore needs
+                    // the whole rendered test list to prove that every test ran; a split
+                    // job's shard is chosen on the node, so it cannot be proven here.
+                    if (slurmState == "FAILED" && jobExit == "1" && !infraDryRun && unsplitTestListLocal) {
                         def exitCodesPath = "${WORKSPACE}/${stageName}/pytest_exit_codes.txt"
                         int copied = Utils.exec(pipeline,
                             script: scpFromRemoteCmd(remote, "${jobWorkspace}/pytest_exit_codes.txt", exitCodesPath),
                             returnStatus: true, retryOnFail: false)
                         if (copied == 0) {
                             def exitCodeLines = readFile(exitCodesPath).readLines()
-                            // Only pytest's identified test failures may be waived. A
-                            // separate perf check or worker failure remains a failure.
-                            if (exitCodeLines && exitCodeLines[0].trim() == "1 0") {
+                            // "<pytest> <perf> <ntasks>" from slurm_run.sh rank 0. A perf
+                            // check failure is never waived, and multi-task jobs are
+                            // excluded because only rank 0's test outcomes are reported.
+                            if (exitCodeLines && exitCodeLines[0].trim().tokenize() == ["1", "0", "1"]) {
                                 def smVersion = (exitCodeLines.size() > 1 &&
                                     (exitCodeLines[1].trim() ==~ /\d+\.\d+/)) ?
                                     exitCodeLines[1].trim().replace(".", "") : ""
                                 generateTimeoutTestResultXml(pipeline, stageName)
-                                if (refreshFailedTestWaives(llmSrcLocal, stageName, smVersion)) {
+                                def refresh = refreshFailedTestWaives(llmSrcLocal, stageName, [
+                                    smVersion: smVersion,
+                                    expectedTestLists: [unsplitTestListLocal],
+                                ])
+                                if (refresh.allFailuresWaived) {
                                     return
                                 }
                             }
@@ -4952,10 +4971,27 @@ def mergeWaivesTxt(pipeline, llmSrc, stageName) {
     }
 }
 
-boolean refreshFailedTestWaives(String llmSrc, String stageName, String smVersion="") {
+/**
+ * Re-check failed tests against waives added to the target branch since this
+ * PR's waive list was merged, and turn newly waived failures into skips.
+ *
+ * options:
+ *   smVersion          compute capability without the dot (e.g. "100"); detected locally when empty
+ *   expectedTestLists  shard test lists this stage ran; without them an unfinished
+ *                      (crashed/timed-out) test is never waived, since the tests after
+ *                      it may not have run
+ *   isolatedTestList   isolated test list, used to attribute failures to the isolated stage
+ *
+ * Returns [allFailuresWaived: boolean, report: Map or null]. The report is only
+ * returned when it was written by this call and agrees with the exit status
+ * (0 = all waived, 1 = failure retained, anything else = refresh unavailable).
+ */
+Map refreshFailedTestWaives(String llmSrc, String stageName, Map options = [:]) {
+    def notWaived = [allFailuresWaived: false, report: null]
     if (isInfraDryRun()) {
-        return false
+        return notWaived
     }
+    def status = null
     try {
         def targetBranch = env.gitlabTargetBranch
         if (!targetBranch && env.globalVars) {
@@ -4964,10 +5000,11 @@ boolean refreshFailedTestWaives(String llmSrc, String stageName, String smVersio
         }
         if (!targetBranch || !env.gitlabCommit) {
             echo "TOT waive refresh unavailable for ${stageName}: missing target branch or PR commit"
-            return false
+            return notWaived
         }
         def initialWaivesUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives_TOT_initial_${env.gitlabCommit}.txt"
-        int status
+        def reportPath = "${WORKSPACE}/${stageName}/waive_refresh/report.json"
+        boolean staleReport = fileExists(reportPath)
         withEnv([
             "WAIVE_REFRESH_SCRIPT=${llmSrc}/jenkins/scripts/refresh_test_waives.py",
             "WAIVE_REFRESH_RESULTS=${WORKSPACE}/${stageName}",
@@ -4975,7 +5012,9 @@ boolean refreshFailedTestWaives(String llmSrc, String stageName, String smVersio
             "WAIVE_REFRESH_INITIAL_URL=${initialWaivesUrl}",
             "WAIVE_REFRESH_BRANCH=${targetBranch}",
             "WAIVE_REFRESH_COMMIT=${env.gitlabCommit ?: ''}",
-            "WAIVE_REFRESH_SM=${smVersion}",
+            "WAIVE_REFRESH_SM=${options.smVersion ?: ''}",
+            "WAIVE_REFRESH_EXPECTED=${(options.expectedTestLists ?: []).join(':')}",
+            "WAIVE_REFRESH_ISOLATED=${options.isolatedTestList ?: ''}",
         ]) {
             status = sh(returnStatus: true, script: '''
                 python3 "$WAIVE_REFRESH_SCRIPT" \
@@ -4984,17 +5023,34 @@ boolean refreshFailedTestWaives(String llmSrc, String stageName, String smVersio
                     --initial-waives-url "$WAIVE_REFRESH_INITIAL_URL" \
                     --target-branch "$WAIVE_REFRESH_BRANCH" \
                     --pr-commit "$WAIVE_REFRESH_COMMIT" \
-                    ${WAIVE_REFRESH_SM:+--sm-version "$WAIVE_REFRESH_SM"}
+                    ${WAIVE_REFRESH_SM:+--sm-version "$WAIVE_REFRESH_SM"} \
+                    ${WAIVE_REFRESH_EXPECTED:+--expected-tests "$WAIVE_REFRESH_EXPECTED"} \
+                    ${WAIVE_REFRESH_ISOLATED:+--isolated-tests "$WAIVE_REFRESH_ISOLATED"}
             ''')
         }
-        echo "TOT waive refresh for ${stageName}: ${status == 0 ? 'all failures waived' : 'failure retained'}. " +
-             "Audit: ${stageName}/waive_refresh/report.json in the test-results artifact."
-        return status == 0
+        def verdict = status == 0 ? "all failures waived" :
+            status == 1 ? "failure retained" :
+            "refresh unavailable (exit ${status}), keeping the original failure"
+        echo "TOT waive refresh for ${stageName}: ${verdict}. " +
+             "Audit: ${stageName}/waive_refresh/ in the test-results artifact."
+        if (status != 0 && status != 1) {
+            return notWaived
+        }
+        def report = null
+        if (!staleReport && fileExists(reportPath)) {
+            def parsed = readJSON(text: readFile(reportPath), returnPojo: true)
+            if (parsed instanceof Map && parsed.stage_name == stageName &&
+                    parsed.all_failures_waived == (status == 0)) {
+                report = parsed
+            }
+        }
+        return [allFailuresWaived: status == 0, report: report]
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         echo "TOT waive refresh unavailable for ${stageName}; keeping the original failure: ${e.message}"
-        return false
+        // Exit 0 means the XML reports were already rewritten; keep that verdict.
+        return [allFailuresWaived: status == 0, report: null]
     }
 }
 
@@ -5736,7 +5792,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
         if (!isolatedWaiveResult.refreshAttempted &&
                 (rerunFailed || hasUnrerunFailure || unfinishedTests) && perfRegressionExitCode == null) {
-            if (refreshFailedTestWaives(llmSrc, stageName)) {
+            def refresh = refreshFailedTestWaives(llmSrc, stageName, [
+                expectedTestLists: getShardTestLists(preprocessedLists),
+            ])
+            if (refresh.allFailuresWaived) {
                 rerunFailed = false
                 hasUnrerunFailure = false
                 unfinishedTests = false
