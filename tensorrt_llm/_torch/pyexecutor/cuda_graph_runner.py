@@ -1755,7 +1755,7 @@ class EncoderCUDAGraphRunnerConfig:
     use_fixed_sequence_slots: bool = False
 
     # Feature mode (encoders taking fixed-shape per-request feature tensors,
-    # e.g. Whisper's [480000] fp32 waveform). When feature_shape is set, the
+    # e.g. Whisper's [80, 3000] fp32 log-mel spectrogram). When feature_shape is set, the
     # runner replaces the input_ids/position_ids static tensors with an
     # input_features buffer and the graph key degenerates to
     # (bs, bs * fixed_seq_len, fixed_seq_len).
@@ -2885,22 +2885,39 @@ class EncoderCUDAGraphRunner:
         # satisfied and the host proceeds straight to the fill.
         self._feature_h2d_events[slot].synchronize()
 
-        # Per-request CPU tensors straight from the requests — one copy into
-        # the host mirror, no intermediate packing.
+        # Host rows go straight from the requests into the host mirror, one
+        # copy each, no intermediate packing. Rows that are already on the
+        # device (a client's CUDA spectrogram, or rows the model normalized on
+        # the GPU) are copied device-to-device instead.
         mirror = self._feature_mirrors[slot]
+        static_features = self.shared_static_tensors["input_features"]
         rows = 0
+        host_spans: List[List[int]] = []
         for f in features:
             n = int(f.shape[0])
-            mirror[rows:rows + n].copy_(f)
+            if f.device.type == "cuda":
+                static_features[rows:rows + n].copy_(f, non_blocking=True)
+            else:
+                mirror[rows:rows + n].copy_(f)
+                if host_spans and host_spans[-1][1] == rows:
+                    host_spans[-1][1] = rows + n
+                else:
+                    host_spans.append([rows, rows + n])
             rows += n
         if rows < padded_batch_size:
             mirror[rows:padded_batch_size].zero_()
+            if host_spans and host_spans[-1][1] == rows:
+                host_spans[-1][1] = padded_batch_size
+            else:
+                host_spans.append([rows, padded_batch_size])
 
-        # Eager, stream-ordered H2D: runs after any previously enqueued replay
-        # on this stream, so it cannot race an in-flight graph reading the
-        # single device buffer. Keeping it on this stream is load-bearing.
-        self.shared_static_tensors["input_features"][:padded_batch_size].copy_(
-            mirror[:padded_batch_size], non_blocking=True)
+        # Eager, stream-ordered copies: they run after any previously enqueued
+        # replay on this stream, so they cannot race an in-flight graph reading
+        # the single device buffer. Keeping them on this stream is load-bearing.
+        # An all-host batch is the one H2D of the mirror it always was.
+        for start, end in host_spans:
+            static_features[start:end].copy_(mirror[start:end],
+                                             non_blocking=True)
         self._feature_h2d_events[slot].record()
 
         self.graphs[key].replay()

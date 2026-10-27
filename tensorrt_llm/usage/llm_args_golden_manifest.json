@@ -1125,15 +1125,6 @@
       "path": "moe_tensor_parallel_size"
     },
     {
-      "allowed_values": [
-        "waveform",
-        "spectrogram"
-      ],
-      "capture_policy": "allowlist",
-      "kind": "categorical",
-      "path": "multimodal_config.audio_input_form"
-    },
-    {
       "capture_policy": "int",
       "kind": "value",
       "path": "multimodal_config.encoder_cache_max_bytes"

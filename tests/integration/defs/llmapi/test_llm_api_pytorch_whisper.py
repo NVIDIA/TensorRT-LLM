@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 import soundfile
+import torch
+from transformers import WhisperFeatureExtractor
 
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
@@ -372,6 +374,49 @@ def _assert_cuda_graph_state(llm: LLM, captured: bool, encoder_captured: bool = 
     # once immediately after capturing it, so anything at or below
     # `len(graphs)` is still explainable by warmup alone.
     assert encoder_runner.num_feature_replays > len(encoder_runner.graphs)
+
+
+@pytest.mark.parametrize("encoder_graphs", [False, True], ids=["eager", "encoder-graphs"])
+def test_whisper_pytorch_precomputed_spectrogram(monkeypatch, encoder_graphs):
+    """A request may carry the log-mel spectrogram instead of the audio, next to audio requests.
+
+    Spectrogram requests, numpy or CUDA torch, alone or in one batch with an
+    audio request, must reproduce the pinned fp32 token ids, with the encoder
+    eager and under encoder CUDA graphs. The captured graph input is the
+    spectrogram; audio requests are converted on the GPU before the graph
+    replays, so both kinds of request must replay the same graphs.
+    """
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+
+    model_path = _get_whisper_model_path()
+    wave, sample_rate = soundfile.read(_get_audio_path())
+    extractor = WhisperFeatureExtractor.from_pretrained(model_path)
+    mel = extractor(wave, sampling_rate=sample_rate, truncation=False, return_tensors="np")[
+        "input_features"
+    ]
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=_MAX_NEW_TOKENS)
+
+    def mel_prompt(features):
+        return {"prompt": "", "multi_modal_data": {"audio": {"input_features": features}}}
+
+    llm = _make_llm(
+        model_path,
+        cuda_graph_batch_sizes=[1, 2] if encoder_graphs else None,
+        encoder_graphs=encoder_graphs,
+    )
+    with llm:
+        for prompts in (
+            [mel_prompt(mel)],
+            [mel_prompt(torch.from_numpy(mel).cuda())],
+            [_audio_prompt(wave, sample_rate), mel_prompt(mel)],
+            [mel_prompt(mel[0]), _audio_prompt(wave, sample_rate)],
+        ):
+            for output in llm.generate(prompts, sampling_params):
+                completion = output.outputs[0]
+                assert list(completion.token_ids) == _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS
+                assert _EXPECTED_TRANSCRIPT_FRAGMENT in completion.text.lower()
+
+        _assert_cuda_graph_state(llm, captured=encoder_graphs, encoder_captured=encoder_graphs)
 
 
 # Feature-combination matrix mirroring the T5/BART enc-dec coverage. Cases:

@@ -866,20 +866,6 @@ class MultimodalConfig(StrictBaseModel):
         status="prototype",
     )
 
-    audio_input_form: Literal["waveform", "spectrogram"] = Field(
-        default="waveform",
-        description=(
-            "What the audio item of a Whisper request carries. 'waveform': the "
-            "audio itself (a file path or URL, an (array, sample_rate) tuple, "
-            "or an {'array', 'sampling_rate'} mapping), whose log-mel "
-            "spectrogram the encoder computes. 'spectrogram': the log-mel "
-            "spectrogram the checkpoint's feature extractor returns, as "
-            "{'input_features': ...}. An LLM instance takes one form for all "
-            "its requests; its encoder CUDA graphs are captured for that form. "
-            "Python API only: trtllm-serve decodes its audio inputs to "
-            "waveforms and rejects 'spectrogram'."),
-        status="prototype")
-
     video_pruning_rate: Optional[float] = Field(
         default=None,
         ge=0.0,
@@ -906,23 +892,6 @@ class MultimodalConfig(StrictBaseModel):
                 "mutually exclusive. Disable side-stream MM prefetch or "
                 "disable MM encoder CUDA graphs.")
         return self
-
-
-def multimodal_input_processor_kwargs(
-        multimodal_config: MultimodalConfig) -> Dict[str, Any]:
-    """Keyword arguments to forward to a model's input processor.
-
-    Every place that builds an input processor for one set of LLM args (the
-    LLM, its model engine and the multimodal encoder) goes through this, so
-    they agree on the audio form and the video pruning rate. Only non-default
-    values are forwarded, because most input processors do not take them.
-    """
-    kwargs: Dict[str, Any] = {}
-    if multimodal_config.video_pruning_rate is not None:
-        kwargs["video_pruning_rate"] = multimodal_config.video_pruning_rate
-    if multimodal_config.audio_input_form != "waveform":
-        kwargs["audio_input_form"] = multimodal_config.audio_input_form
-    return kwargs
 
 
 class GuidedDecodingConfig(StrictBaseModel):

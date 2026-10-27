@@ -66,7 +66,6 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           StrictBaseModel, TorchCompileConfig,
                                           TorchLlmArgs,
                                           UserProvidedDecodingConfig,
-                                          multimodal_input_processor_kwargs,
                                           update_llm_args_with_extra_dict,
                                           update_llm_args_with_extra_options)
 # fmt: on
@@ -2045,21 +2044,6 @@ class TestMultimodalConfig:
         assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
         assert MultimodalConfig().encoder_scheduling_policy == "DEFAULT"
         assert MultimodalConfig().video_pruning_rate is None
-
-    def test_input_processor_kwargs_carry_only_non_default_settings(self):
-        # Most input processors take neither argument, so the defaults must
-        # not be forwarded; every non-default setting must be.
-        assert multimodal_input_processor_kwargs(MultimodalConfig()) == {}
-        assert multimodal_input_processor_kwargs(
-            MultimodalConfig(audio_input_form="spectrogram")) == {
-                "audio_input_form": "spectrogram"
-            }
-        assert multimodal_input_processor_kwargs(
-            MultimodalConfig(audio_input_form="spectrogram",
-                             video_pruning_rate=0.5)) == {
-                                 "audio_input_form": "spectrogram",
-                                 "video_pruning_rate": 0.5
-                             }
 
     def test_torch_llm_args_default_multimodal_config(self):
         args = TorchLlmArgs(model=llama_model_path)

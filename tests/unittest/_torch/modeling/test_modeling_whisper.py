@@ -129,13 +129,12 @@ def test_log_mel_frontend_does_not_mutate_input():
     torch.testing.assert_close(batch, snapshot, atol=0.0, rtol=0.0)
 
 
-def _input_processor(num_mel_bins: int = 80, audio_input_form: str = "spectrogram"):
+def _input_processor(num_mel_bins: int = 80):
     """A WhisperInputProcessor over a bare config, without a checkpoint on disk."""
     extractor = WhisperFeatureExtractor(feature_size=num_mel_bins)
     processor = object.__new__(WhisperInputProcessor)
     processor.config = WhisperConfig(num_mel_bins=num_mel_bins)
     processor.processor = SimpleNamespace(feature_extractor=extractor)
-    processor.audio_input_form = audio_input_form
     processor._configure_audio_contract(extractor)
     processor._decoder_prompt = [50258, 50259, 50359, 50363]
     return processor, extractor
@@ -147,6 +146,10 @@ def _waveform_request(waveform, sampling_rate):
 
 def _mel_request(mel):
     return {"prompt": "", "multi_modal_data": {"audio": {"input_features": mel}}}
+
+
+def _features(extra):
+    return extra["multimodal_data"]["audio"]["encoder_input_features"]
 
 
 def test_input_processor_forwards_a_precomputed_log_mel():
@@ -170,7 +173,7 @@ def test_input_processor_forwards_a_precomputed_log_mel():
         with_grad,
     ):
         prompt, extra = processor(_mel_request(item), SamplingParams())
-        features = extra["multimodal_data"]["audio"]["encoder_input_features"]
+        features = _features(extra)
         # A copy: the client may reuse its buffer for the next clip.
         source = (
             item.detach()
@@ -181,11 +184,26 @@ def test_input_processor_forwards_a_precomputed_log_mel():
         audio = extra["multimodal_data"]["audio"]
         assert prompt == processor._decoder_prompt
         assert audio["encoder_output_len"] == processor.config.max_source_positions
-        features = audio["encoder_input_features"]
         assert features.shape == (1, 80, extractor.nb_max_frames)
         assert features.dtype == torch.float32 and features.is_contiguous()
         assert features.device.type == "cpu" and not features.requires_grad
         torch.testing.assert_close(features[0], torch.from_numpy(mel[0]).float())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_a_cuda_log_mel_stays_on_its_device():
+    """A spectrogram computed on the GPU ships as a device-local copy, not a CPU round trip."""
+    processor, extractor = _input_processor()
+    mel = torch.randn(1, 80, extractor.nb_max_frames, device="cuda", dtype=torch.float16)
+    mel.requires_grad_(True)
+
+    _, extra = processor(_mel_request(mel), SamplingParams())
+    features = _features(extra)
+
+    assert features.device == mel.device
+    assert features.dtype == torch.float32 and features.is_contiguous()
+    assert not features.requires_grad and features.data_ptr() != mel.data_ptr()
+    torch.testing.assert_close(features, mel.detach().float())
 
 
 def test_precomputed_log_mel_equals_the_engine_frontend():
@@ -196,16 +214,11 @@ def test_precomputed_log_mel_equals_the_engine_frontend():
         "input_features"
     ]
     _, from_mel = processor(_mel_request(mel), SamplingParams())
-    _, from_wave = _input_processor(audio_input_form="waveform")[0](
-        _waveform_request(waveform, extractor.sampling_rate), SamplingParams()
-    )
+    _, from_wave = processor(_waveform_request(waveform, extractor.sampling_rate), SamplingParams())
     frontend = WhisperLogMelFrontend(processor.config)
 
     torch.testing.assert_close(
-        from_mel["multimodal_data"]["audio"]["encoder_input_features"],
-        frontend(from_wave["multimodal_data"]["audio"]["encoder_input_features"]),
-        atol=1e-4,
-        rtol=1e-4,
+        _features(from_mel), frontend(_features(from_wave)), atol=1e-4, rtol=1e-4
     )
 
 
@@ -230,71 +243,70 @@ def test_input_processor_rejects_a_non_float_log_mel(bad):
         processor(_mel_request(bad), SamplingParams())
 
 
-def test_an_instance_takes_the_configured_audio_form():
-    """audio_input_form fixes the form at construction; the other form is refused."""
-    waveform = _synthetic_waveform_batch(WhisperFeatureExtractor().n_samples)[0]
-    spectrograms, extractor = _input_processor(audio_input_form="spectrogram")
-    mel = extractor(waveform, sampling_rate=extractor.sampling_rate, return_tensors="np")[
-        "input_features"
-    ]
-    with pytest.raises(TypeError, match="audio_input_form='spectrogram'"):
-        spectrograms(_waveform_request(waveform, extractor.sampling_rate), SamplingParams())
-    spectrograms(_mel_request(mel), SamplingParams())
+def test_requests_choose_their_audio_form_per_item():
+    """One processor serves waveform items and spectrogram items alike, request by request."""
+    processor, extractor = _input_processor()
+    waveform = _synthetic_waveform_batch(extractor.n_samples)[0]
+    rate = extractor.sampling_rate
+    batch_feature = extractor(waveform, sampling_rate=rate, return_tensors="np")
+
+    _, from_tuple = processor(_waveform_request(waveform, rate), SamplingParams())
+    _, from_mapping = processor(
+        {"prompt": "", "multi_modal_data": {"audio": {"array": waveform, "sampling_rate": rate}}},
+        SamplingParams(),
+    )
+    _, from_mel = processor(_mel_request(batch_feature["input_features"]), SamplingParams())
     # The extractor's own BatchFeature (a UserDict, not a dict) is accepted as the item.
-    batch_feature = extractor(waveform, sampling_rate=extractor.sampling_rate, return_tensors="np")
-    _, extra = spectrograms(
+    _, from_batch_feature = processor(
         {"prompt": "", "multi_modal_data": {"audio": batch_feature}}, SamplingParams()
     )
-    assert extra["multimodal_data"]["audio"]["encoder_input_features"].shape == (1, 80, 3000)
 
-    waveforms, _ = _input_processor(audio_input_form="waveform")
-    with pytest.raises(TypeError, match="audio_input_form='spectrogram'"):
-        waveforms(_mel_request(mel), SamplingParams())
-    waveforms(_waveform_request(waveform, extractor.sampling_rate), SamplingParams())
-
-
-def test_input_processor_init_takes_and_validates_the_audio_form(monkeypatch):
-    """The real __init__: the option is kept, a bad value is refused."""
-    import tensorrt_llm._torch.models.modeling_whisper as whisper_module
-
-    extractor = WhisperFeatureExtractor(feature_size=80)
-    fake_processor = SimpleNamespace(
-        feature_extractor=extractor,
-        get_decoder_prompt_ids=lambda **kwargs: [(1, 50259), (2, 50359), (3, 50363)],
-    )
-    monkeypatch.setattr(
-        whisper_module,
-        "AutoProcessor",
-        SimpleNamespace(from_pretrained=lambda *a, **k: fake_processor),
-    )
-    config = WhisperConfig(num_mel_bins=80)
-
-    processor = WhisperInputProcessor(
-        "path", config, tokenizer=None, audio_input_form="spectrogram"
-    )
-    assert processor.audio_input_form == "spectrogram"
-    assert (processor.num_mel_bins, processor.n_frames) == (80, 3000)
-    assert WhisperInputProcessor("path", config, tokenizer=None).audio_input_form == "waveform"
-    with pytest.raises(ValueError, match="audio_input_form"):
-        WhisperInputProcessor("path", config, tokenizer=None, audio_input_form="mel")
+    assert _features(from_tuple).shape == _features(from_mapping).shape == (1, extractor.n_samples)
+    assert _features(from_mel).shape == _features(from_batch_feature).shape == (1, 80, 3000)
+    with pytest.raises(TypeError, match="input_features"):
+        processor({"prompt": "", "multi_modal_data": {"audio": object()}}, SamplingParams())
 
 
-def test_encoder_graph_spec_follows_the_audio_form():
+def test_encoder_graph_spec_is_the_spectrogram():
     from tensorrt_llm._torch.models.modeling_whisper import WhisperForConditionalGeneration
 
-    def spec(form):
-        model = object.__new__(WhisperForConditionalGeneration)
-        model.model_config = SimpleNamespace(
-            pretrained_config=WhisperConfig(num_mel_bins=80),
-            multimodal_config=SimpleNamespace(audio_input_form=form),
-        )
-        model.model = SimpleNamespace(
-            encoder=SimpleNamespace(log_mel=SimpleNamespace(n_samples=480000, nb_max_frames=3000))
-        )
-        return model.encoder_graph_spec()
+    model = object.__new__(WhisperForConditionalGeneration)
+    model.model_config = SimpleNamespace(pretrained_config=WhisperConfig(num_mel_bins=80))
+    model.model = SimpleNamespace(
+        encoder=SimpleNamespace(log_mel=SimpleNamespace(n_samples=480000, nb_max_frames=3000))
+    )
 
-    assert spec("waveform") == ((480000,), torch.float32, 1500)
-    assert spec("spectrogram") == ((80, 3000), torch.float32, 1500)
+    assert model.encoder_graph_spec() == ((80, 3000), torch.float32, 1500)
+
+
+def test_normalize_encoder_features_converts_only_the_waveform_rows():
+    """A mixed batch reaches the stem as spectrogram rows: waveforms through the
+    log-mel front-end in one upload, spectrograms untouched and in place."""
+    from tensorrt_llm._torch.models.modeling_whisper import WhisperForConditionalGeneration
+
+    config = WhisperConfig(num_mel_bins=80)
+    frontend = WhisperLogMelFrontend(config)
+    model = object.__new__(WhisperForConditionalGeneration)
+    model.model = SimpleNamespace(encoder=SimpleNamespace(log_mel=frontend))
+    waveforms = torch.from_numpy(_synthetic_waveform_batch(WhisperFeatureExtractor().n_samples)[:2])
+    mel = torch.randn(1, 80, 3000)
+    uploads = []
+
+    def upload(rows):
+        uploads.append([row.data_ptr() for row in rows])
+        return torch.cat(rows, dim=0)
+
+    normalized = model.normalize_encoder_features([waveforms[:1], mel, waveforms[1:2]], upload)
+
+    assert [tuple(row.shape) for row in normalized] == [(1, 80, 3000)] * 3
+    assert normalized[1] is mel
+    expected = frontend(waveforms)
+    torch.testing.assert_close(normalized[0], expected[:1])
+    torch.testing.assert_close(normalized[2], expected[1:2])
+    assert uploads == [[waveforms[:1].data_ptr(), waveforms[1:2].data_ptr()]]
+
+    untouched = model.normalize_encoder_features([mel], upload)
+    assert len(untouched) == 1 and untouched[0] is mel and len(uploads) == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

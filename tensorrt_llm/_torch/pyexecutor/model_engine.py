@@ -25,7 +25,6 @@ from tensorrt_llm.llmapi.llm_args import (
     PrefillCudaGraphBackend,
     TorchCompileConfig,
     TorchLlmArgs,
-    multimodal_input_processor_kwargs,
 )
 
 # isort: split
@@ -248,14 +247,16 @@ class ModelEngine:
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures()
 
-        # The same settings the LLM gave its own input processor, so the two
-        # never disagree on the audio form or the video pruning rate.
+        input_processor_kwargs = {}
+        video_pruning_rate = llm_args.multimodal_config.video_pruning_rate
+        if video_pruning_rate is not None:
+            input_processor_kwargs["video_pruning_rate"] = video_pruning_rate
         self.input_processor = create_input_processor(
             model_path,
             tokenizer=None,
             checkpoint_format=llm_args.checkpoint_format,
             trust_remote_code=llm_args.trust_remote_code,
-            **multimodal_input_processor_kwargs(llm_args.multimodal_config),
+            **input_processor_kwargs,
         )
         return configured_encoder_max_num_tokens
 

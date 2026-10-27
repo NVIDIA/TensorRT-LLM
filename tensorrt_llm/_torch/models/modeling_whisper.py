@@ -21,10 +21,11 @@ convolutional + Transformer audio encoder, and a text decoder attends to the
 encoder output via cross-attention while generating a transcript
 autoregressively.
 
-The request carries the raw 30 s-padded waveform (not the mel): the input
-processor only pads/validates audio on the host, and the encoder computes the
-log-mel spectrogram on GPU inside the engine process (batched across the
-encoder step; see `WhisperLogMelFrontend`).
+A request carries either the raw 30 s-padded waveform or a precomputed log-mel
+spectrogram: the input processor only pads/validates on the host, and the
+encoder step brings every request to the spectrogram on GPU inside the engine
+process (batched; see `WhisperLogMelFrontend` and
+`WhisperForConditionalGeneration.normalize_encoder_features`).
 
 Key differences from BART:
     - Pre-norm (LayerNorm → sub-layer → residual add) instead of post-norm.
@@ -40,7 +41,7 @@ Key differences from BART:
 """
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -386,14 +387,13 @@ class WhisperLogMelFrontend(nn.Module):
         self.n_fft = int(extractor.n_fft)
         self.hop_length = int(extractor.hop_length)
         # The extractor's own padded window length, kept verbatim because
-        # `WhisperInputProcessor` pads every request to exactly this many
-        # samples. `encoder_graph_spec` reports it as the fixed encoder input
-        # shape, so deriving it a second way would risk disagreeing with the
-        # tensors the processor actually produces.
+        # `WhisperInputProcessor` pads every waveform request to exactly this
+        # many samples, so deriving it a second way would risk disagreeing
+        # with the tensors the processor actually produces.
         self.n_samples = int(extractor.n_samples)
         # Frames of one window, the extractor's own number: what
         # `WhisperInputProcessor` validates a precomputed spectrogram against,
-        # and what `encoder_graph_spec` reports for one.
+        # and what `encoder_graph_spec` reports as the fixed encoder input.
         self.nb_max_frames = int(extractor.nb_max_frames)
         # Pre-STFT Gaussian noise, applied where HF applies it; 0.0 (all
         # official checkpoints) disables it.
@@ -488,10 +488,9 @@ class WhisperEncoder(nn.Module):
         input_features: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        # input_features: [batch, n_samples] raw 30 s-padded waveform, or a
-        # precomputed [batch, num_mel_bins, 3000] log-mel spectrogram (a
-        # request whose audio item carries "input_features", or a direct
-        # caller).
+        # input_features: [batch, num_mel_bins, 3000] log-mel spectrogram
+        # (what the engine delivers, see `normalize_encoder_features`), or a
+        # [batch, n_samples] raw 30 s-padded waveform from a direct caller.
         if input_features.dim() == 2:
             input_features = self.log_mel(input_features)
         input_features = input_features.to(self.conv1.weight.dtype)
@@ -586,12 +585,14 @@ class WhisperInputProcessor(InputProcessor):
 
     Validates and zero-pads `multi_modal_data["audio"]` to the fixed 30 s
     window (the log-mel spectrogram itself is computed on GPU inside the
-    engine, see `WhisperLogMelFrontend`), or, when the instance was created
-    with `multimodal_config.audio_input_form="spectrogram"`, validates a
-    log-mel spectrogram the client already computed (`{"input_features":
-    ...}`, the key and shape the checkpoint's feature extractor returns),
-    and returns the forced decoder prompt as the request's token ids. An empty text prompt selects
-    the checkpoint default
+    engine, see `WhisperLogMelFrontend`), or, for a request whose audio item
+    is `{"input_features": ...}`, validates the log-mel spectrogram the
+    client already computed (the key and shape the checkpoint's feature
+    extractor returns). Each request picks its form by its item; the engine
+    brings a batch to one shape (see
+    `WhisperForConditionalGeneration.normalize_encoder_features`). The forced
+    decoder prompt is returned as the request's token ids. An empty text
+    prompt selects the checkpoint default
     (`<|startoftranscript|>[<|en|>][<|transcribe|>]<|notimestamps|>`); a
     non-empty text prompt is tokenized verbatim as the decoder prompt, which
     is how language/task are overridden, e.g.
@@ -615,26 +616,10 @@ class WhisperInputProcessor(InputProcessor):
     def supported_modalities(self) -> frozenset[str]:
         return frozenset({"audio"})
 
-    def __init__(
-        self,
-        model_path,
-        config,
-        tokenizer,
-        trust_remote_code: bool = True,
-        audio_input_form: str = "waveform",
-        **kwargs,
-    ):
+    def __init__(self, model_path, config, tokenizer, trust_remote_code: bool = True, **kwargs):
         self.model_path = model_path
         self.config = config
         self.tokenizer = tokenizer
-        if audio_input_form not in ("waveform", "spectrogram"):
-            raise ValueError(
-                f"audio_input_form must be 'waveform' or 'spectrogram', got {audio_input_form!r}."
-            )
-        # Fixed per instance (multimodal_config.audio_input_form): the encoder
-        # packs concurrent requests into one tensor and captures its CUDA
-        # graphs for one input shape, so the two forms cannot mix.
-        self.audio_input_form = audio_input_form
         # No decoder-side placeholder tokens exist to hash against; skip the
         # multimodal-hashing probe (the registry then always uses this
         # processor directly).
@@ -759,11 +744,9 @@ class WhisperInputProcessor(InputProcessor):
         else:
             raise TypeError(
                 "Unsupported audio item for Whisper: expected a file "
-                "path/URL, an (array, sample_rate) tuple, or a dict with "
-                f"'array'/'sampling_rate'; got {type(item).__name__}. A "
-                "precomputed spectrogram ({'input_features': ...}) needs an "
-                "instance created with "
-                "multimodal_config.audio_input_form='spectrogram'."
+                "path/URL, an (array, sample_rate) tuple, a dict with "
+                "'array'/'sampling_rate', or a precomputed log-mel spectrogram "
+                f"as {{'input_features': ...}}; got {type(item).__name__}."
             )
 
         if int(sample_rate) != self.sampling_rate:
@@ -792,13 +775,6 @@ class WhisperInputProcessor(InputProcessor):
         `WhisperFeatureExtractor` returns for one window (its `BatchFeature`
         is accepted as is), with or without the batch axis of 1.
         """
-        if not (isinstance(item, Mapping) and "input_features" in item):
-            raise TypeError(
-                "Unsupported audio item for a Whisper instance that takes "
-                "precomputed spectrograms (multimodal_config.audio_input_form="
-                "'spectrogram'): expected {'input_features': ...}, as the "
-                f"checkpoint's feature extractor returns it; got {type(item).__name__}."
-            )
         features = item["input_features"]
         if isinstance(features, torch.Tensor):
             if not features.is_floating_point():
@@ -806,11 +782,14 @@ class WhisperInputProcessor(InputProcessor):
                     "Whisper input_features must be a floating-point log-mel "
                     f"spectrogram; got dtype {features.dtype}."
                 )
-            # Same path as a waveform: a fresh fp32 CPU copy without autograd
-            # history, whatever device the client computed it on, that the
-            # client's buffer cannot change afterwards.
+            # A fresh fp32 copy without autograd history that the client's
+            # buffer cannot change afterwards, on the device the client
+            # computed it: a CUDA spectrogram stays on the GPU (the copy is
+            # ordered on the current stream, and the request transport
+            # carries that ordering to the engine), a CPU one is staged like
+            # a waveform.
             features = features.detach().to(
-                "cpu", torch.float32, copy=True, memory_format=torch.contiguous_format
+                dtype=torch.float32, copy=True, memory_format=torch.contiguous_format
             )
         else:
             array = np.asarray(features)
@@ -867,10 +846,10 @@ class WhisperInputProcessor(InputProcessor):
             sampling_params.max_tokens = decoder_budget
 
         audio_item = audio_items[0]
-        if self.audio_input_form == "spectrogram":
+        if isinstance(audio_item, Mapping) and "input_features" in audio_item:
             # A spectrogram the client already computed, shipped as fp32
-            # [1, num_mel_bins, frames]; the encoder skips its log-mel
-            # front-end for a 3-D input. The leading dim of 1 keeps the C++
+            # [1, num_mel_bins, frames]: the engine skips its log-mel
+            # front-end for such a row. The leading dim of 1 keeps the C++
             # request's encoder-input-length bookkeeping the same as below.
             input_features = self._load_mel(audio_item)
         else:
@@ -1004,12 +983,11 @@ class WhisperForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
     def encoder_graph_spec(self) -> Tuple[Tuple[int, ...], torch.dtype, int]:
         """Fixed-shape encoder contract for enc-dec encoder CUDA graphs.
 
-        Every Whisper encoder request is an fp32 waveform zero-padded by
-        `WhisperInputProcessor` to the extractor's window, or, for an instance
-        created with ``multimodal_config.audio_input_form="spectrogram"``, the
-        fp32 log-mel spectrogram of that window; either yields exactly
-        ``max_source_positions`` encoder positions — so the encoder graph key
-        degenerates to the batch size.
+        Every Whisper encoder request reaches the stem as the fp32 log-mel
+        spectrogram of one extractor window (a waveform request is converted
+        on the GPU by `normalize_encoder_features` before the graph input is
+        filled), which yields exactly ``max_source_positions`` encoder
+        positions — so the encoder graph key degenerates to the batch size.
 
         The window is read from the feature extractor rather than recomputed.
         ``max_source_positions * 2 * hop_length`` inverts the conv stem
@@ -1024,14 +1002,35 @@ class WhisperForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
         """
         fixed_seq_len = int(self.config.max_source_positions)
         log_mel = self.model.encoder.log_mel
-        multimodal_config = getattr(self.model_config, "multimodal_config", None)
-        if getattr(multimodal_config, "audio_input_form", "waveform") == "spectrogram":
-            return (
-                (int(self.config.num_mel_bins), int(log_mel.nb_max_frames)),
-                torch.float32,
-                fixed_seq_len,
-            )
-        return ((int(log_mel.n_samples),), torch.float32, fixed_seq_len)
+        return (
+            (int(self.config.num_mel_bins), int(log_mel.nb_max_frames)),
+            torch.float32,
+            fixed_seq_len,
+        )
+
+    def normalize_encoder_features(
+        self,
+        features: List[torch.Tensor],
+        upload: Callable[[List[torch.Tensor]], torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """Bring one encoder batch's per-request inputs to the shape the stem consumes.
+
+        Requests arrive as ``[1, n_samples]`` waveforms or
+        ``[1, num_mel_bins, frames]`` spectrograms, in any mix. The waveform
+        rows are uploaded together through ``upload`` (the runner's packed
+        host-to-device copy) and run through the GPU log-mel front-end;
+        spectrogram rows pass through untouched, on whichever device they
+        arrived. The result is one ``[1, num_mel_bins, frames]`` row per
+        request, in request order: the shape ``encoder_graph_spec`` promises.
+        """
+        waveform_rows = [index for index, row in enumerate(features) if row.dim() == 2]
+        if not waveform_rows:
+            return features
+        mels = self.model.encoder.log_mel(upload([features[index] for index in waveform_rows]))
+        normalized = list(features)
+        for index, mel in zip(waveform_rows, mels.unbind(0)):
+            normalized[index] = mel.unsqueeze(0)
+        return normalized
 
     def forward(
         self,
