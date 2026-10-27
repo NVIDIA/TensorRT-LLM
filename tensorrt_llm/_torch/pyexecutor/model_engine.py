@@ -1045,7 +1045,7 @@ class ModelEngine:
         if not self.llm_args.enable_autotuner:
             return
         ceiling = self.max_num_tokens
-        if self._is_encoder_decoder_model():
+        if getattr(self.model.model_config, "is_encoder_decoder", False):
             ceiling = max(ceiling, self.encoder_max_num_tokens)
         AllReduceRunner.configure_tuning_buckets(ceiling)
 

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import gc
+import os
 import unittest
 import weakref
 from ast import literal_eval
@@ -28,6 +29,8 @@ from _torch.pyexecutor.engine_test_utils import (
 
 import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
+from tensorrt_llm._torch.distributed import ops as distributed_ops
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
@@ -1053,6 +1056,60 @@ def test_pcg_fx_fallback_policy_is_model_specific(
 
 
 class TestWarmupCleanup(unittest.TestCase):
+    @pytest.mark.cpu_only
+    def test_allreduce_tuning_uses_model_configuration(self) -> None:
+        """Exercise the real engine helper without stubbing engine methods."""
+        engine = object.__new__(ModelEngine)
+        engine.llm_args = SimpleNamespace(enable_autotuner=True)
+        engine.max_num_tokens = 40000
+        engine.encoder_max_num_tokens = 65536
+        for config, expected in (
+            (SimpleNamespace(), 40000),
+            (SimpleNamespace(is_encoder_decoder=False), 40000),
+            (SimpleNamespace(is_encoder_decoder=True), 65536),
+        ):
+            with (
+                self.subTest(config=config),
+                patch.object(AllReduceRunner, "configure_tuning_buckets") as configure,
+            ):
+                engine.model = SimpleNamespace(model_config=config)
+                engine._configure_allreduce_tuning()
+                configure.assert_called_once_with(expected)
+        engine.llm_args.enable_autotuner = False
+        with patch.object(AllReduceRunner, "configure_tuning_buckets") as configure:
+            engine._configure_allreduce_tuning()
+            configure.assert_not_called()
+
+    @pytest.mark.cpu_only
+    def test_allreduce_forward_routes_tuning_and_inference(self) -> None:
+        """Select Python profiling or native dispatch without executing a collective."""
+        layer = object.__new__(distributed_ops.AllReduce)
+        torch.nn.Module.__init__(layer)
+        layer.mapping = SimpleNamespace(tp_size=2, tp_group=[0, 1])
+        layer.strategy = distributed_ops.AllReduceStrategy.AUTO
+        layer.symm_mem_allreduce = None
+        layer.mnnvl_allreduce = None
+        layer._disable_mpi = False
+        layer.workspace = None
+        inputs = torch.ones(2, 4)
+        output = torch.zeros_like(inputs)
+        with (
+            patch.dict(os.environ, {"TLLM_DISABLE_ALLREDUCE_AUTOTUNE": "0"}),
+            patch.object(distributed_ops, "_ALLREDUCE_AUTOTUNER_TUNING_MODE", False),
+            patch.object(torch.ops.trtllm, "tunable_allreduce", return_value=[output]) as tunable,
+            patch.object(torch.ops.trtllm, "autotuned_allreduce", return_value=[output]) as native,
+        ):
+            for tuning in (True, False):
+                with self.subTest(tuning=tuning):
+                    tunable.reset_mock()
+                    native.reset_mock()
+                    distributed_ops.set_allreduce_autotuner_tuning_mode(tuning)
+                    self.assertIs(layer.forward(inputs), output)
+                    selected, unused = (tunable, native) if tuning else (native, tunable)
+                    selected.assert_called_once()
+                    self.assertIs(selected.call_args.kwargs["input"], inputs)
+                    unused.assert_not_called()
+
     @pytest.mark.cpu_only
     def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self) -> None:
         """Verify a no-KV-cache runner rejects an allocated KV cache before warmup."""

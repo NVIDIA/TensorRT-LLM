@@ -465,7 +465,7 @@ int check_lazy_bucket_lifecycle() {
         method = next(
             node
             for cls in tree.body
-            if isinstance(cls, ast.ClassDef) and cls.name == "PyTorchModelEngine"
+            if isinstance(cls, ast.ClassDef) and cls.name == "ModelEngine"
             for node in cls.body
             if getattr(node, "name", "") == "_configure_allreduce_tuning"
         )
@@ -479,11 +479,11 @@ int check_lazy_bucket_lifecycle() {
             llm_args=SimpleNamespace(enable_autotuner=True, max_num_tokens=8192),
             max_num_tokens=40000,
             encoder_max_num_tokens=65536,
-            _is_encoder_decoder_model=lambda: False,
+            model=SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False)),
         )
         namespace[method.name](engine)
         self.assertEqual(configured, [40000])
-        engine._is_encoder_decoder_model = lambda: True
+        engine.model.model_config.is_encoder_decoder = True
         namespace[method.name](engine)
         self.assertEqual(configured, [40000, 65536])
         engine.encoder_max_num_tokens = 4096
@@ -501,7 +501,7 @@ int check_lazy_bucket_lifecycle() {
         method = next(
             node
             for cls in tree.body
-            if isinstance(cls, ast.ClassDef) and cls.name == "PyTorchModelEngine"
+            if isinstance(cls, ast.ClassDef) and cls.name == "ModelEngine"
             for node in cls.body
             if getattr(node, "name", "") == "_warmup_impl"
         )
