@@ -233,6 +233,8 @@ def store_retained_rows(
         ROW_WIDTH=row_width,
         ROPE_DIM=rope_dim,
         BLOCK_SIZE=_block_size(row_width),
+        # Separate roundings like the append kernel; FMA contraction would flip FP8 bits.
+        enable_fp_fusion=False,
     )
 
 
