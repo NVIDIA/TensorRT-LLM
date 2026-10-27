@@ -810,12 +810,18 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             num_accepted_tokens, original_all_rank_num_tokens, accepted_tokens,
             pre_draft_seq_lens)
 
-    def _forward_linear_draft_loop(self, inputs, attn_metadata, spec_metadata,
-                                   draft_model, draft_kv_cache_manager,
-                                   num_contexts, batch_size,
+    def _forward_linear_draft_loop(self,
+                                   inputs,
+                                   attn_metadata,
+                                   spec_metadata,
+                                   draft_model,
+                                   draft_kv_cache_manager,
+                                   num_contexts,
+                                   batch_size,
                                    num_accepted_tokens,
                                    original_all_rank_num_tokens,
-                                   accepted_tokens, pre_draft_seq_lens):
+                                   accepted_tokens=None,
+                                   pre_draft_seq_lens=None):
         """Linear draft loop, unified for Eagle3 and MTP Eagle."""
         from ..attention.backends.sparse.dsa import is_dsa_cache_manager
 

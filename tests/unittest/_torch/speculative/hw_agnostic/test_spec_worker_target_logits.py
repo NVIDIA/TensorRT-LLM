@@ -168,6 +168,7 @@ def test_the_spec_model_hands_the_workers_target_logits_to_its_forward():
     model.model = lambda **kwargs: hidden
     model.layer_idx = -1
     model.spec_worker = Worker()
+    model.spec_decode_fast_paths = False
     model.lm_head, model.logits_processor, model.draft_model = "lm_head", "processor", "drafter"
     spec_metadata = SimpleNamespace(is_layer_capture=lambda layer: False, gather_ids=gather_ids)
     attn_metadata = SimpleNamespace(padded_num_tokens=None, num_tokens=4)
