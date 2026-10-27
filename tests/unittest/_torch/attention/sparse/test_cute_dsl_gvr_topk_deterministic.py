@@ -16,9 +16,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
-    gvr_topk_decode_self_sampling_host as ss,
-)
+from tensorrt_llm._torch.kernels.blackwell.top_k import gvr_topk_decode_self_sampling_host as ss
 from tensorrt_llm._utils import get_sm_version
 
 skip_not_sm100 = pytest.mark.skipif(

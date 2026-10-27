@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # TensorRT-LLM Perf Sanity Test (`test_perf_sanity.py`)
 
 Performance sanity testing scripts for TensorRT-LLM with configuration-driven test cases supporting single-node, multi-node aggregated, and multi-node disaggregated architectures.
@@ -31,6 +34,8 @@ For the underlying regression pipeline architecture (three-layer design, baselin
 
 A newly added gated metric has no baseline history, and `check_regression` skips any metric whose baseline is absent or non-positive (`continue`), so the median cannot fail a build until enough runs accrue.
 
+**History floor for the gen_only device step time**: in the gen_only modes, the baseline of every `d_*_gen_worker_per_iter_device_step_time` statistic is computed only from rows created at or after `GEN_ONLY_DEVICE_STEP_TIME_HISTORY_FLOOR_MS` (`GEN_ONLY_METRIC_HISTORY_FLOORS_MS`, passed to `process_and_upload_test_results`). That is when the gen_only modes switched from the modal `num_generation_tokens` bucket to the expected steady-state bucket (step 3 below). Where a run has two near-tied buckets -- a full-batch wave and a short tail wave, as when `ceil(concurrency / dp)` exceeds `max_batch_size` -- the two definitions publish values up to ~3x apart for the same run, so mixing them in one baseline flags every current run. `e2e` still uses the modal bucket, so its series is not floored. The floor stops filtering anything on 2026-12-31, when the 90-day window starts after it; remove it then. If the bucket rule changes again, move the floor in the same change.
+
 #### `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (gen_only, e2e)
 
 Uploaded for every mode in `DEVICE_STEP_TIME_MODES`, but **gated only in `gen_only`** (see the override above). In `e2e` the gen workers do pure decode — the ctx workers do the prefill — so the statistic means the same thing it does in `gen_only`, and it is there to attribute an `e2e` throughput or TTFT regression to the device side rather than to declare one. `ctx_only` is excluded by construction: it runs the *aggregated* runtime from a disagg YAML with no gen worker, so there is no `gen_server_*.log` to read; TTFT is the prefill signal there.
@@ -50,7 +55,7 @@ The device value reported at iter `N` is the device step time of iter `N-1` (dev
 2. Per file (per segment), collect the `prev_device_step_time` of every *usable* iteration. A row is usable when all of the following hold:
    - `iter >= 5` — iter 0/1 include KV-cache transfer wait time, and iters 2-4 are warmup that has not yet reached steady state. Lines where `prev_device_step_time = N/A` (e.g. iter 1) do not match the parser and are skipped anyway.
    - Its immediately preceding iteration did **not** report `num_scheduled_requests = 0`. Such an iteration did no GPU work, so its loop period is pure idle (waiting on KV-cache transfer) — and because the device runs async, that idle period is what the *next* row's `prev_device_step_time` reports. One such row inflated this mean by 19% on nvbugs 6627789 while the steady-state iterations were unchanged at ~7.3 ms. The `nsr = 0` row itself is kept: its own value describes the previous iteration, which did do work. The exclusion requires the predecessor's iter number to be exactly `cur_iter - 1`; if it is not adjacent, or did not parse, the row is kept (failing toward inclusion rather than silently dropping real data). "Predecessor" is tracked **per emitting rank** (`global_rank`, read off the same line), so ranks interleaved in one file are never read as each other's predecessor. `py_executor.py` logs only rank 0 unless `TLLM_PROFILE_LOG_RANKS` is set and no lane sets it today — but a single shared predecessor slot would fail in the *wrong* direction on a mixed-rank file, letting a foreign rank's nonzero `num_scheduled_requests` mask the idle iteration so the exclusion quietly stops excluding while still looking armed.
-3. Per file, bucket the usable rows by `num_generation_tokens` and keep only the **mode** bucket (ties → the larger token count). Concurrency ramps down at the tail of a run, so the trailing iterations do less work per step and are not comparable to the plateau. A file with no parseable `num_generation_tokens` anywhere falls back to all of its usable rows (nvbugs 6487036 / 6487040: the field rendered as `tensor(256)` and matched nothing).
+3. Per file, bucket the usable rows by `num_generation_tokens` and keep one bucket. In the gen_only modes that is the expected steady-state bucket from `expected_gen_only_ngen`, `min(ceil(concurrency / (num_gen_servers * dp)), max_batch_size, max_num_tokens // (1 + max_draft_len)) * (1 + max_draft_len)`, provided it holds at least half as many rows as the mode; otherwise, and in `e2e`, it is the **mode** bucket (ties → the larger token count). Concurrency ramps down at the tail of a run, so the trailing iterations do less work per step and are not comparable to the plateau. A file with no parseable `num_generation_tokens` anywhere falls back to all of its usable rows (nvbugs 6487036 / 6487040: the field rendered as `tensor(256)` and matched nothing).
 4. Compute mean, median, stdev (ddof=1, `0.0` for fewer than two samples), P75 and P99 of that bucket per file, then average each statistic across files (unweighted) → the per-client metric values. Averaging a median across workers is not itself a median of the pooled sample; it is the same unweighted per-file rule the mean has always used, kept for consistency and continuity of baselines.
 5. Because the percentiles and stdev need the whole sample, the scan retains rows rather than streaming; retention is capped per worker (`_MAX_RETAINED_ITER_ROWS`) so a pathological log cannot grow it without bound.
 6. The per-client values are appended to `trtllm-benchmark.{server_idx}.{client_idx}.log`, one statistic per line:
@@ -225,9 +230,23 @@ There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (
 
 **File Naming**: `xxx.yaml` (can contain `-` hyphen).
 
-**Example**: `deepseek-r1-fp4_1k1k_ctx1_gen1_dep8_bs768_eplb0_mtp0_ccb-UCX.yaml`
+**Example**: `gb200_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL.yaml`
 
 **Use Case**: Disaggregated architecture where model runs across multiple nodes with separate context (prefill) and generation (decode) servers.
+
+Keep valid default-based settings in both `worker_config.ctx` and
+`worker_config.gen`, for example:
+
+```yaml
+cache_transceiver_config:
+  backend: DEFAULT
+```
+
+The standard PyTorch loading path currently resolves this to NIXL/Python
+under normal defaults. Tests of a specific backend/runtime may select it
+explicitly. Set `max_tokens_in_buffer` only on workers with `pipeline_parallel_size > 1`,
+where the generation executor still uses it as the KV transfer admission window. NIXL may still use
+UCX as its underlying transport; `ccb-NIXL` identifies the transceiver backend.
 
 **Optional `benchmark_config` keys**: `benchmark_client` selects a non-default load
 generator (see [Benchmark Clients](#benchmark-clients)); `client_env_var` passes
@@ -557,7 +576,7 @@ Config files live in `tests/scripts/perf-sanity/disaggregated/`. The filename en
 {gpu_type}_{model}-{precision}_{ISL}k{OSL}k_con{concurrency}_ctx{ctx_count}_tp{ctx_tp}_gen{gen_count}_{gen_parallelism}_eplb{N}_mtp{N}_ccb-{transport}.yaml
 ```
 
-Example: `gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX.yaml`
+Example: `gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL.yaml`
 
 The **base name** (filename without `.yaml`) is used as the test case ID in the test-db.
 
@@ -607,17 +626,22 @@ Each disagg test line in the test-db file follows one of these formats:
 
 ```yaml
 # gen_only test:
-- perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-{config_base_name}] TIMEOUT (120)
+- perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-{config_base_name}] TIMEOUT ({minutes})
 
 # e2e test:
-- perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-{config_base_name}] TIMEOUT (120)
+- perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-{config_base_name}] TIMEOUT ({minutes})
 
 # ctx_only test (placed in aggregated test-db files, not disagg ones):
-- perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-{config_base_name}] TIMEOUT (120)
+- perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-{config_base_name}] TIMEOUT ({minutes})
 ```
 
 - If the test line already exists but is **commented out** (prefixed with `# `), remove the `# ` prefix.
 - If the test line does not exist, add it to the `tests` list.
+- Set `TIMEOUT` from the case's measured runtime: the slowest passing run plus 25%
+  (at least 15 minutes), rounded up to a multiple of 5 and no lower than 30 minutes.
+  Take the slowest run from CI (`l_e2e_time_ms` in the `test_info` index) or, for a new
+  case, from its validation run. A fixed large value hides a hang for hours, and the
+  sbatch session also has to hold the install and launch.
 - Count the total number of **active (uncommented) tests** in the file — you will need this count for Step 5.
 
 ### Step 5: Update `jenkins/L0_Test.groovy`
@@ -653,13 +677,13 @@ Search `tests/integration/test_lists/waives.txt` for the exact test case string.
 
 ### Worked Example
 
-Adding back `qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX` as a gen_only test:
+Checking the existing `qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL` gen_only test, or re-enabling it if it has been disabled:
 
-1. Config file: `tests/scripts/perf-sanity/disaggregated/gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX.yaml`
+1. Config file: `tests/scripts/perf-sanity/disaggregated/gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL.yaml`
 2. From config: `gpus_per_node=4`, `ctx_tp=1`, `gen_tp=4`, `num_ctx=1`, `num_gen=1`
 3. Nodes per ctx = `ceil(1/4)=1`, nodes per gen = `ceil(4/4)=1`, total nodes = 2, total GPUs = 8
 4. Test-db file: `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml`
-5. Uncomment the line: `- perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX] TIMEOUT (120)`
-6. Count active tests in that file (now 4)
-7. In `L0_Test.groovy`, find the existing `buildStageConfigs` for `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4`, update `testCount` from 3 to 4
-8. Check `waives.txt` — no matching entry, done
+5. Locate `perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL]`. It is currently active with `TIMEOUT (30)`; do not add a duplicate. Uncomment it only if it has been disabled.
+6. Recount the active tests after any edits.
+7. In `L0_Test.groovy`, find the `buildStageConfigs` for `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4` and set `testCount` to that count, preserving it if unchanged.
+8. Check `waives.txt` for the exact test ID before enabling the test.

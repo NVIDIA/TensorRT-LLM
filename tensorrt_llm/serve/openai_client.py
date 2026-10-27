@@ -14,6 +14,7 @@
 
 # yapf: disable
 import asyncio
+import errno
 import json
 import os
 import traceback
@@ -50,6 +51,8 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse,
     CompletionRequest,
     CompletionResponse,
+    ResponsesRequest,
+    ResponsesResponse,
     UCompletionRequest,
     UCompletionResponse,
 )
@@ -75,6 +78,18 @@ from tensorrt_llm.serve.router import Router
 _msgpack_encoder = msgspec.msgpack.Encoder()
 MSGPACK_HEADERS = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
 
+# A Responses stream opens with these events before the model emits anything.
+_RESPONSES_OPENING_EVENTS = frozenset((b"response.created", b"response.in_progress"))
+
+
+def _has_responses_output_event(chunk: bytes) -> bool:
+    """Whether an SSE chunk of a Responses stream carries an event past its opening."""
+    return any(
+        line.startswith(b"event: ")
+        and line[len(b"event: ") :].strip() not in _RESPONSES_OPENING_EVENTS
+        for line in chunk.split(b"\n")
+    )
+
 
 # post_json's request and response are ordinary pydantic models, but not the
 # UCompletion* union: it carries auxiliary payloads such as count-tokens. The
@@ -82,7 +97,20 @@ MSGPACK_HEADERS = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
 # returned object to the type the caller asked for, so a mismatch is a type
 # error rather than an Any that silently propagates.
 class _SerializableRequest(Protocol):
-    def model_dump(self, *, mode: str = ..., exclude_unset: bool = ...) -> dict: ...
+    def model_dump(
+        self, *, mode: str = ..., exclude_unset: bool = ..., by_alias: bool = ...
+    ) -> dict: ...
+
+
+def _encode_request_body(request: _SerializableRequest) -> bytes:
+    """Encode a request forwarded to a worker.
+
+    Fields go out under their wire names, e.g. ``schema``, which the model
+    holds as ``schema_``.
+    """
+    return _msgpack_encoder.encode(
+        request.model_dump(mode="json", exclude_unset=True, by_alias=True)
+    )
 
 
 _ResponseT = TypeVar("_ResponseT", bound=BaseModel)
@@ -112,6 +140,10 @@ class OpenAIClient(ABC):
                 server,
                 hooks,
                 req_id,
+            )
+        elif isinstance(request, ResponsesRequest):
+            return await self._send_request(
+                "v1/responses", request, ResponsesResponse, server, hooks, req_id
             )
         else:
             raise ValueError(f"Invalid request type: {type(request)}")
@@ -151,6 +183,16 @@ class OpenAIClient(ABC):
         touch the router's in-flight accounting: it is for side endpoints such
         as token counting, which need a worker's tokenizer but no KV transfer.
         """
+        ...
+
+    @abstractmethod
+    async def get_json(
+        self,
+        endpoint: str,
+        response_type: Type[_ResponseT],
+        server: str,
+    ) -> _ResponseT:
+        """GET a worker endpoint, outside routing state, like post_json."""
         ...
 
     async def shutdown(self) -> None: ...
@@ -235,9 +277,29 @@ class OpenAIHttpClient(OpenAIClient):
         # same way -- hence the same msgpack transport as _send_request. The
         # worker decodes it because _MsgspecRoute is the app's route_class, so
         # it covers every route rather than just the completion ones.
-        body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
+        body = _encode_request_body(request)
         headers = dict(MSGPACK_HEADERS)
         async with self._session.post(url, data=body, headers=headers) as response:
+            if response.status >= 400:
+                error_body = await response.text()
+                raise aiohttp.ClientResponseError(
+                    response.request_info,
+                    response.history,
+                    status=response.status,
+                    message=f"{response.reason}: {error_body[:2048]}",
+                    headers=response.headers,
+                )
+            return response_type(**await response.json())
+
+    async def get_json(
+        self,
+        endpoint: str,
+        response_type: Type[_ResponseT],
+        server: str,
+    ) -> _ResponseT:
+        server_url = server if server.startswith("http") else f"http://{server}"
+        url = f"{server_url.rstrip('/')}/{endpoint}"
+        async with self._session.get(url) as response:
             if response.status >= 400:
                 error_body = await response.text()
                 raise aiohttp.ClientResponseError(
@@ -390,7 +452,7 @@ class OpenAIHttpClient(OpenAIClient):
             # Serialize once on the orchestrator's single event-loop thread.
             # Content-Type stays application/json so FastAPI still routes the
             # body through Request.json(); the header picks the decoder.
-            body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
+            body = _encode_request_body(request)
             headers = dict(MSGPACK_HEADERS)
             if self._request_perf_metrics:
                 headers[RETURN_METRICS_HEADER] = "1"
@@ -477,15 +539,16 @@ class OpenAIHttpClient(OpenAIClient):
                         traceback.format_exc(),
                     )
                     raise
-                # Selective retry budget: ServerDisconnectedError and
-                # ConnectionResetError are transient TCP races (typically at
-                # burst start when client keepalive vs server keepalive race).
-                # Give them an extended retry budget while preserving the
-                # original fail-fast for genuine upstream errors.
+                # ServerDisconnectedError and connection resets can result from
+                # transient TCP races, such as client/server keepalive races at
+                # burst start. Give them an extended retry budget to recover
+                # while preserving the original fail-fast for other errors.
+                # aiohttp can wrap an OS connection reset in ClientOSError
+                # rather than a ConnectionResetError subclass.
                 is_transient_tcp = isinstance(
                     e,
                     (aiohttp.ServerDisconnectedError, ConnectionResetError),
-                )
+                ) or (isinstance(e, aiohttp.ClientOSError) and e.errno == errno.ECONNRESET)
                 effective_max = max_retries
                 if is_transient_tcp:
                     effective_max = max(max_retries, _TRANSIENT_TCP_BUDGET)
@@ -526,13 +589,18 @@ class OpenAIHttpClient(OpenAIClient):
         try:
             last_token_time = start_time
             chunk_count = 0
+            # The first token of a Responses stream is the first frame after
+            # its opening events, which the worker sends before generating.
+            awaiting_output = isinstance(request, ResponsesRequest)
             marker = f"event: {SSE_METRICS_EVENT}\n".encode()
             event_delimiter = b"\n\n"
             pending = b""
             metrics_event = b""
             async for chunk in http_response.content.iter_any():
                 now_time = get_steady_clock_now_in_seconds()
-                if chunk:
+                if awaiting_output and chunk:
+                    awaiting_output = not _has_responses_output_event(chunk)
+                if chunk and not awaiting_output:
                     if chunk_count == 0 and hooks:
                         hooks.on_first_token(server, request)
                     latency = now_time - last_token_time

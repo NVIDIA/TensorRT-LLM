@@ -87,7 +87,9 @@ class Arch(str, enum.Enum):
     architecture is one edit that every entry's declaration is checked against.
     """
 
+    SM_100 = "sm_100"
     SM_103 = "sm_103"
+    SM_107 = "sm_107"
 
 
 @dataclass(frozen=True)

@@ -34,7 +34,18 @@ __all__ = [
 
 def __getattr__(name):
     if name in __all__:
-        from ..attention import attention
+        try:
+            from ..attention import attention
+        except AttributeError as e:
+            # An AttributeError escaping the module is a bug inside it, not a
+            # missing name here. Raised as is, hasattr() and getattr() with a
+            # default would hide it, and ``from ... import`` would run the
+            # module twice (losing the cause unless the name is a submodule).
+            raise ImportError(
+                f"cannot import {name!r} from {__name__!r}: importing "
+                f"tensorrt_llm._torch.visual_gen.attention.attention raised {e!r}",
+                name=__name__,
+            ) from e
 
         return getattr(attention, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
