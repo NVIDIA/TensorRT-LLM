@@ -177,6 +177,11 @@ def _stream_handle(stream: Optional[torch.cuda.Stream]) -> int:
 class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     """Moves KV pages between this rank's GPU cache and the Mooncake pool."""
 
+    #: Registering pages drops the automatic host tier, and a prefix restore is
+    #: chosen only after the final batch, so on a disaggregated server the
+    #: pages each admitted request needs to finish have to stay free.
+    requires_completion_reservation = True
+
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
 

@@ -29,7 +29,11 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import valid_page_slots
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    LlmRequest,
+    SamplingConfig,
+    rewind_context_after_cache_drop,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -186,6 +190,21 @@ def make_request(request_id=1, prompt_len=PROMPT_LEN):
 def schedule(manager, request, num_tokens=None):
     """One scheduling pass: prepare the cache and size it for the chunk."""
     assert manager.prepare_context(request)
+    if num_tokens is None:
+        num_tokens = request.context_remaining_length
+    return manager.resize_context(request, num_tokens)
+
+
+def schedule_reserving(manager, request, num_tokens=None):
+    """One scheduling pass that first reserves completion headroom, as the V2 scheduler does.
+
+    A deferred first chunk is rolled back like ``release_context_admission``.
+    """
+    assert manager.prepare_context(request)
+    if not manager.reserve_context_completion(request):
+        manager.free_resources(request)
+        rewind_context_after_cache_drop(request, manager.tokens_per_block)
+        return False
     if num_tokens is None:
         num_tokens = request.context_remaining_length
     return manager.resize_context(request, num_tokens)
@@ -890,8 +909,6 @@ def test_token_budget_rejection_releases_real_cache(
 def test_reserved_prefix_tracks_range_and_allocation(
     manager: KVCacheManagerV2, connector: FakeConnectorManager
 ) -> None:
-    from tensorrt_llm._torch.pyexecutor.llm_request import rewind_context_after_cache_drop
-
     connector.prefix_reservations_enabled = True
     connector.num_matched = PROMPT_LEN
     request = make_request()
@@ -996,4 +1013,102 @@ def test_real_kv_pressure_rejects_reserved_prefix_without_transmission() -> None
     finally:
         if blocker is not None:
             blocker.close()
+        manager.shutdown()
+
+
+# -- disaggregated completion reservation -----------------------------------------
+
+
+@pytest.mark.parametrize("enable_block_reuse", [False, True])
+@pytest.mark.parametrize("reserve_completion", [False, True])
+def test_connector_prefill_admission_preserves_full_restore_under_pressure(
+    reserve_completion: bool, enable_block_reuse: bool
+) -> None:
+    """Two first chunks fit, but both stored prefixes do not fit at once.
+
+    The control, whose worker does not declare ``requires_completion_reservation``, keeps
+    main's admission and shows a truncated restore against real device pools. The reservation
+    must defer the second request before the connector is asked, keep room for a short
+    request, and honor the full offer once the first request releases its KV.
+    """
+    connector = FakeConnectorManager()
+    connector.worker = SimpleNamespace(requires_completion_reservation=reserve_completion)
+    manager = make_manager(
+        connector,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=enable_block_reuse,
+            host_cache_size=0,
+            max_gpu_total_bytes=4 << 20,
+            max_util_for_resume=1.0,
+        ),
+        max_seq_len=65536,
+        max_num_tokens=TOKENS_PER_BLOCK,
+        is_disagg=True,
+    )
+    try:
+        assert bool(manager._disagg_completion_pool_counts) is reserve_completion
+        total_blocks = manager.get_kv_cache_stats().max_num_blocks
+        prompt_len = (total_blocks // 2 + 1) * TOKENS_PER_BLOCK
+        assert 3 * TOKENS_PER_BLOCK < prompt_len < manager.max_seq_len
+        connector.num_matched = prompt_len - TOKENS_PER_BLOCK
+        first = make_request(1001, prompt_len)
+        second = make_request(1002, prompt_len)
+        short = make_request(1003, TOKENS_PER_BLOCK)
+
+        assert schedule_reserving(manager, first, TOKENS_PER_BLOCK)
+        # Reserving future growth must not allocate it.
+        assert manager.kv_cache_map[first.py_request_id].capacity < prompt_len
+        assert connector.queries == []
+        assert schedule_reserving(manager, second, TOKENS_PER_BLOCK) is not reserve_completion
+        if reserve_completion:
+            assert second.py_request_id not in manager.kv_cache_map
+            assert second.py_request_id not in manager._disagg_completion_limits
+            assert schedule_reserving(manager, short, TOKENS_PER_BLOCK)
+            run(manager, first)
+        else:
+            run(manager, first, second)
+        assert connector.commits[0] == (first.py_request_id, connector.num_matched, False)
+        if not reserve_completion:
+            assert connector.commits[1][1] < connector.num_matched
+            return
+
+        assert connector.queries == [(first.py_request_id, 0)]
+        manager.free_resources(first)
+        assert first.py_request_id not in manager._disagg_completion_limits
+        assert schedule_reserving(manager, second, TOKENS_PER_BLOCK)
+        run(manager, second)
+        assert connector.commits[-1] == (second.py_request_id, connector.num_matched, False)
+        assert second.context_current_position == connector.num_matched
+        slots = manager.get_page_indices_by_layer_group(second)
+        assert all(index != BAD_PAGE_INDEX for group in slots for index in group)
+        manager.free_resources(second)
+        manager.free_resources(short)
+        assert not manager._disagg_completion_limits
+        assert manager.get_kv_cache_stats().free_num_blocks == total_blocks
+    finally:
+        manager.shutdown()
+
+
+def test_refuted_connector_chunk_releases_unused_completion_reservation() -> None:
+    """Returning a first chunk to the queue must not retain a hidden quota."""
+    connector = FakeConnectorManager()
+    connector.worker = SimpleNamespace(requires_completion_reservation=True)
+    manager = make_manager(
+        connector,
+        kv_cache_config=KvCacheConfig(max_tokens=2048, enable_block_reuse=True, host_cache_size=0),
+        is_disagg=True,
+    )
+    request = make_request(1004)
+    try:
+        assert schedule_reserving(manager, request, TOKENS_PER_BLOCK)
+        assert request.py_request_id in manager._disagg_completion_limits
+        assert manager.revert_allocate_context(request)
+        assert request.py_request_id not in manager._disagg_completion_limits
+        assert connector.queries == []
+        assert schedule_reserving(manager, request, TOKENS_PER_BLOCK)
+        run(manager, request)
+        assert connector.commits == [(request.py_request_id, OFFER_TOKENS, False)]
+        manager.free_resources(request)
+        assert not manager._disagg_completion_limits
+    finally:
         manager.shutdown()

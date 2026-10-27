@@ -789,6 +789,14 @@ def test_format_diagnosis_reports_the_value_mooncake_read(
     assert "nvidia_peermem is not loaded, so every range fails" in report
 
 
+# ---- worker declarations ----
+
+
+def test_worker_declares_completion_reservation():
+    """A disaggregated server keeps completion headroom only for a connector that asks."""
+    assert MooncakeStoreConnectorWorker.requires_completion_reservation is True
+
+
 # ---- worker registration ----
 
 

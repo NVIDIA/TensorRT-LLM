@@ -238,6 +238,17 @@ class KvCacheConnectorWorker(ABC):
     #: KVCacheManagerV2, and the final-batch query path (prefix reservations
     #: off). Only an explicit True counts.
     reports_failed_loads: bool = False
+    #: Opt in to completion headroom on a disaggregated server whose
+    #: `KVCacheManagerV2` has no tier below GPU. The manager then admits a
+    #: request only while the pages every admitted request still needs to
+    #: finish fit -- a decode its output, a connector prefill the rest of its
+    #: prompt -- so a restore chosen after the final batch is not starved by
+    #: other requests' chunks. Only an explicit True counts, and a
+    #: `capacity_only` worker's is ignored. Read from the worker, which every
+    #: rank holds, so every rank sees it; may be set per instance in
+    #: `__init__`, since the manager is built after the connector. Must be the
+    #: same on every rank.
+    requires_completion_reservation: bool = False
 
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
