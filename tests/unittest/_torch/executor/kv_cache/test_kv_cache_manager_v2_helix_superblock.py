@@ -25,8 +25,10 @@ sampler advances ``py_decoding_iter``.
 import math
 import types
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -336,18 +338,17 @@ def test_kv_pool_rebalance_rejected_under_helix(is_disagg: bool) -> None:
 @pytest.mark.parametrize(
     "config_kwargs, connector, match",
     [
-        ({"host_cache_size": 1 << 30}, None, "cache tiers below GPU"),
-        ({"disk_cache_size": 1 << 30, "disk_cache_path": "/tmp"}, None, "cache tiers below GPU"),
+        ({"disk_cache_size": 1 << 30, "disk_cache_path": "/tmp"}, None, "disk cache tier"),
         ({}, SimpleNamespace(capacity_only=True), "KV cache connector"),
     ],
-    ids=["host_tier", "disk_tier", "connector"],
+    ids=["disk_tier", "connector"],
 )
-def test_lower_tier_and_connector_rejected_under_agg_helix(
+def test_disk_tier_and_connector_rejected_under_agg_helix(
     config_kwargs: dict, connector: object, match: str
 ) -> None:
-    """Aggregated helix relieves pool pressure only by preemption, which makes
-    the same decisions on every CP rank; lower cache tiers and connectors are
-    rejected at construction."""
+    """Suspending to disk and connector loads, saves and deferred preemptions
+    are not validated to make the same decisions on every CP rank, so aggregated
+    helix rejects them at construction."""
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
     from tensorrt_llm.mapping import CpType, Mapping
 
@@ -366,6 +367,39 @@ def test_lower_tier_and_connector_rejected_under_agg_helix(
             kv_connector_manager=connector,
             is_disagg=False,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="allocates real KV cache pools")
+@pytest.mark.parametrize("host_cache_size", [None, 1 << 28], ids=["auto", "explicit"])
+def test_host_tier_allowed_under_agg_helix(host_cache_size: Optional[int]) -> None:
+    """Aggregated helix keeps the host tier, automatic or explicit, so a
+    suspended request has somewhere to be evicted to."""
+    from unittest.mock import Mock, patch
+
+    from tensorrt_llm._torch.distributed.communicator import Distributed
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import CpType, Mapping
+
+    distributed = Mock()
+    distributed.allreduce.side_effect = lambda value, op: value
+    distributed.local_world_size = 1
+    mapping = Mapping(world_size=2, rank=0, cp_size=2, cp_config={"cp_type": CpType.HELIX})
+    with patch.object(Distributed, "get", return_value=distributed):
+        manager = KVCacheManagerV2(
+            KvCacheConfig(
+                max_tokens=256, host_cache_size=host_cache_size, enable_block_reuse=False
+            ),
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            tokens_per_block=32,
+            max_seq_len=1024,
+            max_batch_size=1,
+            mapping=mapping,
+            is_disagg=False,
+        )
+    assert manager.has_cache_tier_below_gpu
 
 
 def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
@@ -399,7 +433,9 @@ def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
     assert c._skip_est is False
 
 
-def _failing_gen_scheduler(enable_recompute_pause: bool, ladder_calls: list) -> SimpleNamespace:
+def _failing_gen_scheduler(
+    enable_recompute_pause: bool, ladder_calls: list, has_cache_tier_below_gpu: bool = False
+) -> SimpleNamespace:
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 
     sched = SimpleNamespace(
@@ -408,6 +444,7 @@ def _failing_gen_scheduler(enable_recompute_pause: bool, ladder_calls: list) -> 
         kv_cache_manager=SimpleNamespace(
             try_allocate_generation=lambda req: False,
             is_request_active=lambda request_id: True,
+            has_cache_tier_below_gpu=has_cache_tier_below_gpu,
         ),
         draft_kv_cache_manager=None,
         enable_joint_kv_cache_reuse=False,
@@ -456,22 +493,31 @@ def _gen_request() -> SimpleNamespace:
         get_beam_width_by_iter=lambda for_next_iteration: 1,
         py_draft_tokens=None,
         py_batch_idx=3,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
     )
 
 
-def test_scheduler_allocation_failure_raises_under_disagg_helix() -> None:
+@pytest.mark.parametrize("has_cache_tier_below_gpu", [False, True], ids=["gpu_only", "host_tier"])
+def test_scheduler_allocation_failure_raises_under_disagg_helix(
+    has_cache_tier_below_gpu: bool,
+) -> None:
     """A disaggregated helix generation server cannot replay a prefill, so a
-    generation allocation failure raises instead of entering eviction."""
+    generation allocation failure raises instead of entering eviction, even
+    with a host tier to suspend to."""
     ladder_calls = []
-    sched = _failing_gen_scheduler(enable_recompute_pause=False, ladder_calls=ladder_calls)
+    sched = _failing_gen_scheduler(
+        enable_recompute_pause=False,
+        ladder_calls=ladder_calls,
+        has_cache_tier_below_gpu=has_cache_tier_below_gpu,
+    )
     with pytest.raises(RuntimeError, match="cannot preempt"):
         _schedule_failing_gen(sched, _gen_request())
     assert ladder_calls == []
 
 
 def test_scheduler_allocation_failure_preempts_under_agg_helix() -> None:
-    """Aggregated helix can replay a prefill and has a single hot GPU pool,
-    where suspending frees nothing, so a generation allocation failure goes
+    """Aggregated helix can replay a prefill, and without a tier below GPU
+    suspending frees nothing, so a generation allocation failure goes
     straight to recompute-pause. The request sits out the step without being
     suspended, so its stale batch index must still be cleared."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import ScheduleAction
@@ -483,6 +529,90 @@ def test_scheduler_allocation_failure_preempts_under_agg_helix() -> None:
     assert action is ScheduleAction.STOP
     assert ladder_calls == ["recompute_pause"]
     assert req.py_batch_idx is None
+
+
+def test_scheduler_allocation_failure_suspends_under_agg_helix_with_host_tier() -> None:
+    """With a host tier, a failed generation allocation tries evict first; when
+    evict and recompute-pause both fail, the requester suspends itself."""
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import ScheduleAction
+
+    ladder_calls = []
+    sched = _failing_gen_scheduler(
+        enable_recompute_pause=True, ladder_calls=ladder_calls, has_cache_tier_below_gpu=True
+    )
+    action, *_ = _schedule_failing_gen(sched, _gen_request())
+    assert action is ScheduleAction.STOP
+    assert ladder_calls == ["evict", "recompute_pause", "self_suspend"]
+
+
+def _host_tier_preempt_scheduler(preempted: list) -> SimpleNamespace:
+    """Agg helix scheduler with a host tier, where every request holds pages."""
+    sched = SimpleNamespace(
+        has_cp_helix=True,
+        enable_recompute_pause=True,
+        kv_cache_manager=SimpleNamespace(
+            has_cache_tier_below_gpu=True,
+            is_request_active=lambda request_id: True,
+        ),
+    )
+    sched._is_recompute_pause_candidate = lambda req, inflight_request_ids: True
+    sched._preempt_or_defer = lambda victim, recompute_paused: preempted.append(victim) or True
+    return sched
+
+
+def _try_preempt_for_pages(sched: SimpleNamespace, requests_list: list) -> bool:
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
+    return KVCacheV2Scheduler._try_preempt_for_pages(
+        sched,
+        requests_list,
+        protected_ids={requests_list[0].py_request_id},
+        inflight_request_ids=set(),
+        recompute_paused=[],
+        preempted_ids=set(),
+        requester_idx=0,
+    )
+
+
+def _preempt_req(request_id: int, in_generation: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        py_request_id=request_id,
+        request_id=request_id,
+        is_generation_in_progress_state=in_generation,
+        state=LlmRequestState.GENERATION_IN_PROGRESS
+        if in_generation
+        else LlmRequestState.CONTEXT_INIT,
+    )
+
+
+def test_context_preempt_waits_for_decode_under_agg_helix_with_host_tier() -> None:
+    """With a host tier, a blocked context request waits while a decode request
+    holds GPU pages, since the generation path can suspend it to the host tier
+    instead of anyone paying a re-prefill."""
+    preempted = []
+    sched = _host_tier_preempt_scheduler(preempted)
+    requests_list = [
+        _preempt_req(1, in_generation=False),
+        _preempt_req(2, in_generation=True),
+        _preempt_req(3, in_generation=False),
+    ]
+    assert not _try_preempt_for_pages(sched, requests_list)
+    assert preempted == []
+
+
+def test_context_preempt_falls_back_under_agg_helix_with_host_tier() -> None:
+    """With a host tier but every running request mid-prefill, no decode
+    request is left for the generation path to suspend, so the blocked context
+    request recompute-pauses the newest request behind it."""
+    preempted = []
+    sched = _host_tier_preempt_scheduler(preempted)
+    requests_list = [
+        _preempt_req(1, in_generation=False),
+        _preempt_req(2, in_generation=False),
+        _preempt_req(3, in_generation=False),
+    ]
+    assert _try_preempt_for_pages(sched, requests_list)
+    assert [r.py_request_id for r in preempted] == [3]
 
 
 def _context_resize_mgr(is_disagg: bool, resizes: list) -> SimpleNamespace:

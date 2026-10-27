@@ -1482,15 +1482,12 @@ class KVCacheManagerV2(BaseResourceManager):
                     "kv_cache_config.enable_kv_pool_rebalance=False."
                 )
             if not is_disagg:
-                if (kv_cache_config.host_cache_size or 0) > 0 or (
-                    kv_cache_config.disk_cache_size or 0
-                ) > 0:
+                if (kv_cache_config.disk_cache_size or 0) > 0:
                     raise ValueError(
-                        "KVCacheManagerV2 does not support cache tiers below "
-                        "GPU with aggregated helix context parallelism: "
-                        "suspending to a lower tier is not validated to make "
-                        "the same decisions on every CP rank. Set "
-                        "kv_cache_config.host_cache_size=0 and "
+                        "KVCacheManagerV2 does not support a disk cache tier "
+                        "with aggregated helix context parallelism: suspending "
+                        "to disk is not validated to make the same decisions "
+                        "on every CP rank. Set "
                         "kv_cache_config.disk_cache_size=0."
                     )
                 if kv_connector_manager is not None:
@@ -1730,16 +1727,7 @@ class KVCacheManagerV2(BaseResourceManager):
         connector_registers_pages = (
             kv_connector_manager is not None and not kv_connector_manager.capacity_only
         )
-        if self._has_cp_helix and not is_disagg:
-            # Aggregated helix runs GPU-only (lower tiers are rejected above),
-            # so pool pressure is relieved by preemption, as in the connector
-            # case.
-            host_quota = 0
-            logger.info(
-                "KV cache manager v2 host tier disabled: aggregated helix runs "
-                "GPU-only and relieves KV pressure by recompute pause."
-            )
-        elif connector_registers_pages and kv_cache_config.host_cache_size is None:
+        if connector_registers_pages and kv_cache_config.host_cache_size is None:
             # A connector holds device addresses for its pages, and evicting a
             # page to another tier reassigns its GPU slot underneath it. The
             # automatic host tier only exists to give MAX_UTILIZATION somewhere
@@ -1845,8 +1833,8 @@ class KVCacheManagerV2(BaseResourceManager):
             if isinstance(self.event_manager, StreamingKVCacheEventManager)
             else self.event_manager
         )
-        # Aggregated helix runs GPU-only but its CP ranks still need a common
-        # verdict: a rank that fails to allocate would otherwise leave its peers
+        # Aggregated helix CP ranks need a common verdict even without a host
+        # tier: a rank that fails to allocate would otherwise leave its peers
         # waiting in the first collective.
         sync_init_status = has_host_cache_tier or (self._has_cp_helix and not is_disagg)
         if not sync_init_status:
@@ -4210,6 +4198,10 @@ class KVCacheManagerV2(BaseResourceManager):
     def _retention_config_for_request(self, req: LlmRequest) -> KvCacheRetentionConfig | None:
         config = req.kv_cache_retention_config
         if config is None or not self._has_cp_helix:
+            return config
+        if not self.is_disagg:
+            # Aggregated helix holds the full prompt on every rank, so the
+            # ranges are already in global tokens, the ledger's units.
             return config
         # Retention ranges use rank-local physical tokens; native ordinals use CP super-blocks.
         prompt_blocks = (req.prompt_len + self.tokens_per_block - 1) // self.tokens_per_block
