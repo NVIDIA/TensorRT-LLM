@@ -120,6 +120,8 @@ def _manager(pools=2, rows=4, max_blocks=16):
     rows_of = {}
     m.index_mapper = types.SimpleNamespace(rows=rows_of, get_index=rows_of.__getitem__)
     m.max_beam_width = 1
+    m.max_seq_len = 4096
+    m.max_attention_window_vec = [None]
     m.enable_swa_scratch_reuse = False
     m.enable_block_reuse = False
     m._use_per_layer_page_tables = False
@@ -148,6 +150,18 @@ def test_block_key_sees_a_reallocated_last_block():
     assert m.batch_block_table_key([5, 7]) is None  # unknown request
     m.enable_block_reuse = True
     assert m.batch_block_table_key([5, 6]) is None
+
+
+@pytest.mark.parametrize("change", ["window", "beams"])
+def test_block_key_unavailable_where_earlier_blocks_or_other_beams_change(change):
+    m = _manager()
+    _add(m, 5, 0, [7, 8, 9])
+    assert m.batch_block_table_key([5]) is not None
+    if change == "window":
+        m.max_attention_window_vec = [None, 1024]
+    else:
+        m.max_beam_width = 2
+    assert m.batch_block_table_key([5]) is None
 
 
 def _request(rid, slot, **overrides):
