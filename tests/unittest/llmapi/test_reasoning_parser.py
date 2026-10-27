@@ -1343,6 +1343,30 @@ _GLM_CASES = [
      "<tool_call>exec" + _ARGS, "Done."),
     ("glm47", None, "Plan.<tool_call>exec" + _ARGS, "<tool_call>exec" + _ARGS,
      "Plan."),
+    # A block a call ended still owes `</think>`: the first one outside a call
+    # is dropped, wherever it stands.
+    ("glm", None, "Plan.<tool_call>f</tool_call></think>",
+     "<tool_call>f</tool_call>", "Plan."),
+    ("glm", None, "Plan.<tool_call>f</tool_call>\n</think>\nDone.",
+     "<tool_call>f</tool_call>\n\nDone.", "Plan."),
+    ("glm", None, "P<tool_call>a</tool_call><tool_call>b</tool_call></think>c",
+     "<tool_call>a</tool_call><tool_call>b</tool_call>c", "P"),
+    ("glm", None, "P<tool_call>a</tool_call>More.</think><tool_call>b",
+     "<tool_call>a</tool_call>More.<tool_call>b", "P"),
+    ("glm47", None, "Plan.<tool_call>exec" + _ARGS + "</think>",
+     "<tool_call>exec" + _ARGS, "Plan."),
+    ("glm45", None, "<think>plan<tool_call>f</tool_call></think>Done.",
+     "<tool_call>f</tool_call>Done.", "plan"),
+    # Only one is owed, a call cut off keeps its text, and a block closed by
+    # `</think>` owes nothing.
+    ("glm", None, "P<tool_call>a</tool_call></think></think>",
+     "<tool_call>a</tool_call></think>", "P"),
+    ("glm", None, "P<tool_call>f<arg_value>a</think>b",
+     "<tool_call>f<arg_value>a</think>b", "P"),
+    ("glm", None, "p</think><tool_call>f</tool_call></think>",
+     "<tool_call>f</tool_call></think>", "p"),
+    ("glm47", _OFF, "<tool_call>f</tool_call></think>",
+     "<tool_call>f</tool_call></think>", ""),
     # With thinking off the template closed the block in the prompt.
     ("glm47", _OFF, "Paris.", "Paris.", ""),
     ("glm_moe_dsa", _OFF, "</think>Paris.</think><tool_call>f",
