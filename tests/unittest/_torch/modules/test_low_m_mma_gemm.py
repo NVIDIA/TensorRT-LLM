@@ -234,16 +234,26 @@ def test_shared_expert_module_path(inter, monkeypatch, m=7):
     blk._shared_expert_low_m = blk._shared_expert_low_m_weights()
     assert blk._shared_expert_low_m_forward(x) is None  # the race has not picked the warp-MMA GEMM
 
-    monkeypatch.setattr(
-        LowMGemmDispatcher,
-        "warp_mma_tactic",
-        lambda self, rows, weight, *args, **kwargs: L.default_tactic(
-            rows, weight.shape[0], weight.shape[1]
-        ),
-    )
+    # Each lookup names the race the plain projection ran: a BF16 or an E4M3 input.
+    plain_fp8_input = {}
+    for proj in (mlp.gate_up_proj, mlp.down_proj):
+        proj.register_forward_pre_hook(
+            lambda mod, args: plain_fp8_input.__setitem__(
+                mod.weight.data_ptr(), args[0].dtype == torch.float8_e4m3fn
+            )
+        )
+    mlp(x)
+    looked_up = {}
+
+    def warp_mma_tactic(self, rows, weight, *args, quantize=True, **kwargs):
+        looked_up[weight.data_ptr()] = not quantize
+        return L.default_tactic(rows, weight.shape[0], weight.shape[1])
+
+    monkeypatch.setattr(LowMGemmDispatcher, "warp_mma_tactic", warp_mma_tactic)
     out, logits = blk._shared_expert_low_m_forward(x)
     _assert_close(out, ref_out)
     _assert_close(logits, ref_gate)
+    assert looked_up == plain_fp8_input
 
 
 @pytest.mark.parametrize("tp16,n,pad", [(False, 1, False), (True, 4, False), (False, 2, True)])

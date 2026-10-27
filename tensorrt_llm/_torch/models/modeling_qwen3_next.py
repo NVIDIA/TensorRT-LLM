@@ -588,8 +588,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         gate_up_tactic = dispatcher.warp_mma_tactic(m, gate_up.weight,
                                                     gate_up.weight_scale,
                                                     gate_up_scale)
-        down_tactic = dispatcher.warp_mma_tactic(m, down.weight,
-                                                 down.weight_scale, down_scale)
+        # down_proj takes the E4M3 SwiGLU output, as in the plain MLP.
+        down_tactic = dispatcher.warp_mma_tactic(m,
+                                                 down.weight,
+                                                 down.weight_scale,
+                                                 down_scale,
+                                                 quantize=False)
         if gate_up_tactic is None or down_tactic is None:
             return None
         k_warps, n_tiles, ksplit, swap, min_blocks = gate_up_tactic
