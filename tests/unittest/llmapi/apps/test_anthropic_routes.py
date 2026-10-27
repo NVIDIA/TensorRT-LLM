@@ -17,17 +17,20 @@
 import asyncio
 import json
 import time
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import aiohttp
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
+from tensorrt_llm.executor.utils import RequestError, context_length_exceeded_message
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
 from tensorrt_llm.serve import openai_server as openai_server_module
+from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -324,12 +327,12 @@ class _ModelConfig:
     vocab_size = 1024
 
 
-async def _chat_stream(monkeypatch, generation):
-    """The body of a streamed /v1/chat/completions response, and the server.
+def _chat_server(monkeypatch, generation):
+    """A server whose real chat handlers run over ``generation``.
 
-    The real ``openai_chat`` handler runs on a server built with
-    ``object.__new__``; prompt rendering and the engine are stubbed, and the
-    engine's output is already post-processed into SSE frames.
+    The server is built with ``object.__new__``; prompt rendering and the
+    engine are stubbed, and the engine's output is already post-processed into
+    SSE frames.
     """
 
     async def render(**kwargs):
@@ -360,6 +363,12 @@ async def _chat_stream(monkeypatch, generation):
     )
     server.await_disconnected = AsyncMock()
     server._extract_metrics = AsyncMock()
+    return server
+
+
+async def _chat_stream(monkeypatch, generation):
+    """The body of a streamed /v1/chat/completions response, and the server."""
+    server = _chat_server(monkeypatch, generation)
     request = ChatCompletionRequest(
         model=MODEL, messages=[{"role": "user", "content": "hi"}], stream=True
     )
@@ -448,6 +457,280 @@ def test_chat_stream_logs_a_failure_and_raises_it(monkeypatch, server_logger):
 
     server_logger.error.assert_called_once()
     assert "engine failed" in server_logger.error.call_args.args[0]
+
+
+# ---------------------------------------------------------------------------
+# A prompt longer than the context
+# ---------------------------------------------------------------------------
+
+# The engine's rejection of a 210000-token prompt against a 200000-token context.
+_OVER_LENGTH = context_length_exceeded_message(max_context_length=200000, num_prompt_tokens=210000)
+
+# Anthropic's answer to such a prompt, the one Claude Code compacts its history on.
+_PROMPT_TOO_LONG = {
+    "type": "error",
+    "error": {
+        "type": "invalid_request_error",
+        "message": "prompt is too long: 210000 tokens > 199999 maximum",
+    },
+}
+
+
+class _GatedGeneration(_StreamedGeneration):
+    """A ``_StreamedGeneration`` whose first step waits for ``gate``, like a slow prefill."""
+
+    def __init__(self, steps, gate, **kwargs):
+        super().__init__(steps, **kwargs)
+        self._gate = gate
+
+    async def __anext__(self):
+        await self._gate.wait()
+        return await super().__anext__()
+
+
+def _reply_steps():
+    """A one-word reply as post-processed chat frames, one engine step each."""
+    chunks = [
+        ChatCompletionStreamResponse(
+            model=MODEL,
+            choices=[{"index": 0, "delta": {"role": "assistant", "content": "hello"}}],
+        ),
+        ChatCompletionStreamResponse(
+            model=MODEL,
+            choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            usage=UsageInfo(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+        ),
+    ]
+    return [[f"data: {chunk.model_dump_json()}\n\n"] for chunk in chunks]
+
+
+async def _messages_response(server, stream):
+    """The response of ``server`` to a /v1/messages request, its body not read yet."""
+    return await server.anthropic_messages(
+        AnthropicMessagesRequest(**_request(stream=stream)),
+        SimpleNamespace(state=SimpleNamespace(), headers={}),
+    )
+
+
+async def _read(response):
+    """The body of ``response``, read to its end."""
+    if isinstance(response, StreamingResponse):
+        return "".join([frame async for frame in response.body_iterator])
+    return response.body.decode()
+
+
+async def _messages(server, stream):
+    """The response of ``server`` to a /v1/messages request, and its body."""
+    response = await _messages_response(server, stream)
+    return response, await _read(response)
+
+
+@pytest.fixture
+def short_admission_wait(monkeypatch):
+    """Shorten how long a streamed request waits for a rejection before it starts."""
+    monkeypatch.setattr(
+        "tensorrt_llm.serve.anthropic_adapter.STREAM_ADMISSION_WAIT_S", 0.01, raising=False
+    )
+
+
+def _rejecting_engine(where, stream):
+    """``generate_async`` of an engine that rejects the prompt as too long.
+
+    An engine in this process rejects it when the request is submitted; one in
+    a worker process (the default) rejects it as the first result, which a
+    streamed request reads as the failure of its first frame.
+    """
+    error = RequestError(_OVER_LENGTH)
+    if where == "in_process":
+        return Mock(side_effect=error)
+    if stream:
+        return Mock(return_value=_StreamedGeneration([], then=error))
+    return Mock(
+        return_value=SimpleNamespace(
+            prompt_token_ids=[1, 2, 3], aresult=AsyncMock(side_effect=error)
+        )
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("where", ["in_worker", "in_process"])
+def test_over_length_prompt_is_answered_as_anthropic_answers_it(monkeypatch, where, stream):
+    """An HTTP 400 invalid_request_error in Anthropic's wording, with no stream.
+
+    Claude Code compacts its conversation when a request fails that way. A
+    stream that opens and then fails, or OpenAI's wording, reads to it as some
+    other error.
+    """
+    server = _chat_server(monkeypatch, generation=None)
+    server.generator.generate_async = _rejecting_engine(where, stream)
+
+    response, body = asyncio.run(_messages(server, stream))
+
+    assert not isinstance(response, StreamingResponse)
+    assert response.status_code == 400
+    assert json.loads(body) == _PROMPT_TOO_LONG
+
+
+def test_stream_starts_without_waiting_for_a_slow_first_token(monkeypatch, short_admission_wait):
+    """The wait for a rejection is bounded; a long prefill does not hold the stream back."""
+
+    async def run():
+        gate = asyncio.Event()
+        server = _chat_server(monkeypatch, _GatedGeneration(_reply_steps(), gate))
+        response = await _messages_response(server, stream=True)
+        # Started while the first token is still pending.
+        assert isinstance(response, StreamingResponse)
+        gate.set()
+        return await _read(response)
+
+    body = asyncio.run(run())
+
+    assert body.startswith("event: message_start\n")
+    assert '"text":"hello"' in body
+    assert body.rstrip().endswith('data: {"type":"message_stop"}')
+
+
+def test_rejection_after_the_wait_ends_the_stream_in_the_same_wording(
+    monkeypatch, short_admission_wait
+):
+    """A rejection slower than the wait still says the prompt is too long."""
+
+    async def run():
+        gate = asyncio.Event()
+        generation = _GatedGeneration([], gate, then=RequestError(_OVER_LENGTH))
+        response = await _messages_response(_chat_server(monkeypatch, generation), stream=True)
+        assert isinstance(response, StreamingResponse)
+        gate.set()
+        return await _read(response)
+
+    body = asyncio.run(run())
+
+    # The stream has started, so the error event has the type every stream failure has.
+    event, data = body.strip().split("\n")
+    assert event == "event: error"
+    assert json.loads(data[len("data: ") :])["error"] == {
+        "type": "api_error",
+        "message": _PROMPT_TOO_LONG["error"]["message"],
+    }
+
+
+def test_other_failures_before_the_first_token_stay_in_the_stream(monkeypatch):
+    """Only an over-length rejection turns into a 400; other failures are reported as before."""
+    generation = _StreamedGeneration([], then=RequestError("engine failed"))
+    server = _chat_server(monkeypatch, generation)
+
+    response, body = asyncio.run(_messages(server, stream=True))
+
+    assert isinstance(response, StreamingResponse)
+    assert response.status_code == 200
+    assert body == (
+        "event: error\n"
+        'data: {"type":"error","error":{"type":"api_error","message":"Internal server error"}}\n\n'
+    )
+
+
+def test_client_gone_before_the_first_token_leaves_nothing_running(
+    monkeypatch, server_logger, short_admission_wait
+):
+    """A disconnect cancels the read the stream is waiting on, and logs no error."""
+
+    async def run():
+        server = _chat_server(monkeypatch, _StreamedGeneration([], hang=True))
+        response = await _messages_response(server, stream=True)
+        consumer = asyncio.ensure_future(response.body_iterator.__anext__())
+        await asyncio.sleep(0.05)
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+        return [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+
+    assert asyncio.run(run()) == []
+    server_logger.error.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("message", "reply"),
+    [
+        pytest.param(
+            context_length_exceeded_message(8192, 8192),
+            "prompt is too long: 8192 tokens > 8191 maximum",
+            id="prompt_fills_the_context",
+        ),
+        pytest.param(
+            f"Generation failed: {context_length_exceeded_message(8192, 9000)}",
+            "prompt is too long: 9000 tokens > 8191 maximum",
+            id="wrapped_rejection",
+        ),
+    ],
+)
+@pytest.mark.parametrize("server_kind", ["standard", "disagg"])
+def test_prompt_too_long_carries_the_counts(server_kind, message, reply):
+    """N and M are the prompt and the longest prompt the server accepts, so N > M holds."""
+    client, _ = _make_route_client(server_kind, OpenAIServer.create_error_response(message))
+
+    response = client.post("/v1/messages", json=_request(stream=True))
+
+    assert response.status_code == 400
+    assert response.json()["error"] == {"type": "invalid_request_error", "message": reply}
+
+
+def _relayed_by_disagg_frontend(worker_response):
+    """What the disaggregated frontend hands its routes for a worker's error response."""
+    frontend = object.__new__(OpenAIDisaggServer)
+    frontend._perf_metrics_collector = SimpleNamespace(
+        http_exceptions=SimpleNamespace(inc=Mock()),
+        internal_errors=SimpleNamespace(inc=Mock()),
+    )
+    upstream = aiohttp.ClientResponseError(
+        request_info=Mock(),
+        history=(),
+        status=worker_response.status_code,
+        message=f"Bad Request: {worker_response.body.decode()}",
+    )
+    try:
+        return frontend._handle_exception(upstream)
+    except HTTPException as e:
+        return e
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("message", "status", "error"),
+    [
+        pytest.param(_OVER_LENGTH, 400, _PROMPT_TOO_LONG["error"], id="over_length"),
+        pytest.param(
+            "`max_tokens` (0) must be greater than 0",
+            400,
+            {"type": "invalid_request_error", "message": "`max_tokens` (0) must be greater than 0"},
+            id="other_client_error",
+        ),
+        pytest.param(
+            "engine overloaded",
+            503,
+            {"type": "api_error", "message": "engine overloaded"},
+            id="server_error",
+        ),
+    ],
+)
+def test_disagg_route_answers_a_worker_rejection(stream, message, status, error):
+    """A context worker's rejection reaches the client before any stream, streamed or not.
+
+    The context phase never streams, so the frontend holds the worker's error
+    before it starts a response, as a response for an over-length prompt and
+    as an HTTPException for anything else.
+    """
+    worker_response = OpenAIServer.create_error_response(message, status_code=HTTPStatus(status))
+    relayed = _relayed_by_disagg_frontend(worker_response)
+    client, backend = _make_route_client("disagg", None)
+    if isinstance(relayed, HTTPException):
+        backend.side_effect = relayed
+    else:
+        backend.return_value = relayed
+
+    response = client.post("/v1/messages", json=_request(stream=stream))
+
+    assert response.status_code == status
+    assert response.json() == {"type": "error", "error": error}
 
 
 @pytest.fixture
