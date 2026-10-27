@@ -270,7 +270,11 @@ def top_p_renorm_probs_op(
     probs: torch.Tensor,
     top_p: torch.Tensor,
 ) -> torch.Tensor:
-    renormed: torch.Tensor = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    # Deterministic: every TP rank runs this sampler on its own and must get bit-identical probs (the default
+    # mode aggregates with order-dependent float atomics, so near-threshold accept/sample decisions can differ).
+    renormed: torch.Tensor = flashinfer.sampling.top_p_renorm_probs(
+        probs, top_p, is_deterministic=True
+    )
     return renormed
 
 
@@ -293,7 +297,7 @@ def compute_probs_from_logits_op(
         logits, temperatures, enable_pdl=get_env_enable_pdl()
     )
     if top_p is not None:
-        probs = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+        probs = flashinfer.sampling.top_p_renorm_probs(probs, top_p, is_deterministic=True)
     return probs
 
 
