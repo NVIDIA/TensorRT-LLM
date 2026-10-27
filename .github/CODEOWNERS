@@ -387,9 +387,9 @@
 # Individual handles rather than a team, like SCAFFOLDING: this is one bounded
 # experiment with named owners, not a standing domain.
 /tensorrt_llm/_torch/_experimental/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
-# What every modeling_v2 family library shares (discovery, common/ macros, the
-# contract surface): the modeling_v2 owners, and the kernels owners because it is
-# CUDA and links against the stock libraries.
+# What every modeling_v2 family library shares (the discovery and the common/
+# macros): the modeling_v2 owners, and the kernels owners because it is CUDA and
+# links against the stock libraries.
 /cpp/tensorrt_llm/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @NVIDIA/trt-llm-kernels-devs
 /cpp/cmake/modules/modeling_v2.cmake @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @NVIDIA/trt-llm-kernels-devs
 /tests/unittest/_torch/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju

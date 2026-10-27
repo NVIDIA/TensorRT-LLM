@@ -18,7 +18,6 @@ about the tree a PR changes, C++ included, not about an installed wheel.
 from __future__ import annotations
 
 import ast
-import fnmatch
 import re
 import shutil
 import subprocess
@@ -29,7 +28,7 @@ import pytest
 from tensorrt_llm._torch._experimental.modeling_v2._native import identifier, torch_namespace
 
 _REPO = Path(__file__).resolve().parents[4]
-# What every family shares: discovery, common/ macros, contractSurface.txt.
+# What every family shares: the discovery and the common/ macros.
 _INFRA = _REPO / "cpp/tensorrt_llm/modeling_v2"
 _PY = _REPO / "tensorrt_llm/_torch/_experimental/modeling_v2"
 _MODELS = _PY / "models"
@@ -112,11 +111,6 @@ def _units() -> list[tuple[str, str | None, Path]]:
 
 def _native_files(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix in _NATIVE_SUFFIXES)
-
-
-def _contract_surface() -> list[str]:
-    lines = (_INFRA / "contractSurface.txt").read_text().splitlines()
-    return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
 
 
 # --- Layout ------------------------------------------------------------------
@@ -215,8 +209,10 @@ def test_declared_archs_cover_the_sm_in_the_target_name():
 _INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
 
 
-def test_native_code_includes_only_its_own_code_and_the_contract_surface():
-    surface = _contract_surface()
+def test_native_code_includes_no_other_target_or_family():
+    """Native code may include stock headers, but of modeling_v2 only its own
+    target's csrc/, its family's csrc/ and common/: a target never reaches a
+    sibling or another family."""
     python_families = {p.name for p in _MODELS.iterdir() if (p / "__init__.py").is_file()}
     problems = []
     for family, target, csrc in _units():
@@ -230,21 +226,11 @@ def test_native_code_includes_only_its_own_code_and_the_contract_surface():
                 if head in python_families or include.startswith("tensorrt_llm/modeling_v2/"):
                     if not include.startswith(tuple(allowed)):
                         problems.append(f"{where} reaches another target or family")
-                elif include.startswith("tensorrt_llm/"):
-                    if not any(fnmatch.fnmatch(include, p) for p in surface):
-                        problems.append(f"{where} is not in contractSurface.txt")
                 elif ".." in include or "/" not in include and (csrc / include).exists():
                     problems.append(
                         f'{where}: include the family\'s code from models/, "{family}/..."'
                     )
     assert not problems, "\n".join(problems)
-
-
-def test_contract_surface_patterns_name_existing_headers():
-    for pattern in _contract_surface():
-        assert any((_REPO / root).glob(pattern) for root in ("cpp/include", "cpp")), (
-            f"contractSurface.txt pattern {pattern!r} matches no header"
-        )
 
 
 _RAW_REGISTRATION = re.compile(r"\bTORCH_LIBRARY(?:_FRAGMENT|_IMPL)?\s*\(")

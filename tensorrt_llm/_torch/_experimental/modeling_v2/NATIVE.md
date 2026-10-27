@@ -206,10 +206,10 @@ sibling targets can share file and function names.
 - Its own target's `csrc/` and its family's `csrc/`, written from `models/`:
   `"foo/foo_nvfp4__sm_103__tp4/csrc/x.h"`, `"foo/csrc/y.h"`.
 - `tensorrt_llm/modeling_v2/common/` (the macros).
-- The stock headers listed in `cpp/tensorrt_llm/modeling_v2/contractSurface.txt`.
-  Adding one widens what stock changes can affect targets, so the header's stock
-  owners review it.
-- System, CUDA, torch and cutlass headers.
+- Any stock header (`cpp/include/`, `cpp/`), and system, CUDA, torch and cutlass
+  headers.
+
+It may not include another target's or another family's code.
 
 It links against `libtensorrt_llm.so` (logger, `TllmException`, mcast registry
 and other singletons stay there), `th_utils` and torch. **When a target needs
@@ -241,8 +241,8 @@ installs the library only when that list is not empty.
 The narrowing is safe because family libraries are never in the stock
 libraries, and the CPU checks that keep it so run in every scope:
 `test_modeling_v2_native_claims.py` (native code only in `csrc/`, stock never
-names a family, includes stay within the target, its family, `common/` and the
-contract surface, every op has a fake, license headers),
+names a family, no include reaches another target or family, every op has a
+fake, license headers),
 `test_modeling_v2_native_loader.py` and `test_modeling_v2_rank_agreement.py`.
 Keep a family's pre-merge entry to one short test on hardware matching its SM;
 the accuracy matrix goes post-merge.

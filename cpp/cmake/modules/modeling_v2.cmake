@@ -31,7 +31,7 @@ libtensorrt_llm.so or libth_common.so; the Python loader
 (tensorrt_llm/_torch/_experimental/modeling_v2/_native.py) opens it only when
 routing picks one of the family's targets. modeling_v2/NATIVE.md is the guide
 for authors; cpp/tensorrt_llm/modeling_v2/ holds only what every family shares
-(this discovery, common/ macros, contractSurface.txt).
+(this discovery, the common/ macros).
 
 A family's csrc/CMakeLists.txt uses three functions; names are the Python
 package names:

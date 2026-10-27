@@ -68,7 +68,7 @@ from .docs import is_docs_path
 
 _PY_ROOT = "tensorrt_llm/_torch/_experimental/modeling_v2/"
 _PY_MODELS = _PY_ROOT + "models/"
-# What every family library shares: discovery, common/ macros, contractSurface.txt.
+# What every family library shares: the discovery and the common/ macros.
 _CPP_ROOT = "cpp/tensorrt_llm/modeling_v2/"
 # The native build module: shared by every family library.
 _CPP_BUILD_FILES = frozenset({"cpp/cmake/modules/modeling_v2.cmake"})

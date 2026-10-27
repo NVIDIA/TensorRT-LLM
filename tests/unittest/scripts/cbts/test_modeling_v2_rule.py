@@ -82,7 +82,7 @@ def test_claims_python_and_native_sources_but_not_docs_or_stock():
         f"{_PY}/models/gpt_oss/gpt_oss_120b__sm_10x__default/csrc/swizzleBlockScales.cu"
     )
     assert _is_mv2_claim(f"{_PY}/models/gpt_oss/csrc/CMakeLists.txt")
-    assert _is_mv2_claim(f"{_CPP}/contractSurface.txt")
+    assert _is_mv2_claim(f"{_CPP}/common/namespace.h")
     assert _is_mv2_claim("cpp/cmake/modules/modeling_v2.cmake")
     assert not _is_mv2_claim(f"{_CPP}/README.md")
     assert not _is_mv2_claim("cpp/tensorrt_llm/thop/attentionOp.cpp")
@@ -131,7 +131,6 @@ def test_two_families_union(rule):
         f"{_PY}/catalog/_op.py",
         f"{_PY}/_native.py",
         f"{_CPP}/common/torchLibrary.h",
-        f"{_CPP}/contractSurface.txt",
         f"{_CPP}/CMakeLists.txt",
         "cpp/cmake/modules/modeling_v2.cmake",
     ],

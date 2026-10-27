@@ -17,4 +17,3 @@ changes nothing here:
 | `CMakeLists.txt` | Finds every `models/<family>/csrc/CMakeLists.txt` and builds the family libraries (`cpp/cmake/modules/modeling_v2.cmake`). |
 | `common/namespace.h`, `common/torchLibrary.h` | The per-unit C++ and torch namespace macros native code registers through. |
 | `common/familyLibrary.version` | The version script: a family library exports no symbol. |
-| `contractSurface.txt` | The stock headers native code may include. Adding one is reviewed by the header's stock owners. |
