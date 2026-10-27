@@ -119,8 +119,9 @@ from tensorrt_llm.serve.postprocess_handlers import (
 from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        UnsupportedRenderError,
                                        mount_render_endpoints,
-                                       prepare_chat_request, render_chat,
-                                       render_chat_for_length,
+                                       prepare_chat_request,
+                                       prompt_tokens_excluded_from_usage,
+                                       render_chat, render_chat_for_length,
                                        render_conversation)
 from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
                                                 ResponsesStreamingProcessor,
@@ -2289,12 +2290,10 @@ class OpenAIServer(_VideoRoutesMixin):
             self._apply_spec_decode_stats_opt_in(postproc_args)
             # Some models' prompt-token accounting excludes trailing rendered
             # tokens (kimi_k3: the generation channel opener); the model still
-            # sees the full prompt. The extension decides from the request; a
-            # server-level chat template may end differently, so report
-            # unadjusted usage when one is configured.
-            excluded_tokens = extension.prompt_tokens_excluded_from_usage(
-                request)
-            if excluded_tokens and self.chat_template is None:
+            # sees the full prompt. count_tokens leaves out the same tokens.
+            excluded_tokens = prompt_tokens_excluded_from_usage(
+                request, render_resources)
+            if excluded_tokens:
                 postproc_args.num_prompt_tokens_offset = excluded_tokens
             if dynamic_tool_params:
                 # The tool parser must see dynamic tools to recognize their
@@ -2356,7 +2355,12 @@ class OpenAIServer(_VideoRoutesMixin):
             else:
                 # Render (and append the forced named-tool prefix, see
                 # ``_build_forced_tool_call_decoding``) while the media loads.
-                # Tokenization stays with the engine's input processor.
+                # Tokenization stays with the engine's input processor, except
+                # that a tokenizer-native renderer's own ids are taken: it
+                # keeps control-token strings in message content as text, and
+                # encoding its rendered string would not. Only for text-only
+                # prompts, since the input processor expands media placeholders
+                # in the text.
                 render_task = render_conversation(
                     render_resources,
                     conversation=conversation,
@@ -2369,6 +2373,10 @@ class OpenAIServer(_VideoRoutesMixin):
                     injected_chat_template_kwargs=request.
                     injected_chat_template_kwargs,
                     forced_prefix=forced_tool_begin_prefix,
+                    prefer_native_ids=not any(
+                        message.get("media") for message in conversation),
+                    add_special_tokens=request.add_special_tokens,
+                    truncate_prompt_tokens=request.truncate_prompt_tokens,
                 )
                 rendered, (mm_data, mm_embeddings) = await asyncio.gather(
                     render_task, mm_coroutines)
@@ -2616,7 +2624,11 @@ class OpenAIServer(_VideoRoutesMixin):
                     # Media, an own-processor model or an unconvertible Harmony
                     # request: count the text, tools and template without the media.
                     rendered = render_chat_for_length(chat_request, resources)
-                return len(rendered.token_ids)
+                # Reported like the chat route's prompt usage, which leaves out
+                # the rendered tokens the model extension excludes from it.
+                excluded = prompt_tokens_excluded_from_usage(
+                    chat_request, resources)
+                return len(rendered.token_ids) - excluded
 
             input_tokens = await asyncio.to_thread(_count)
         except Exception:

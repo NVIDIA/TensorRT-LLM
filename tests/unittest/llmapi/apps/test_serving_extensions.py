@@ -470,6 +470,30 @@ class TestOpenAIChatIntegration:
         postproc_params = rendered["create_chat_response"].call_args.args[1]
         assert postproc_params.postproc_args.num_prompt_tokens_offset == 5
 
+    def test_a_server_chat_template_leaves_the_usage_unadjusted(self, chat_client) -> None:
+        # A server-level template may end differently from the model's own prompt.
+        client, _events, rendered = chat_client
+        client.app.state.server.chat_template = "{{ messages }}"
+
+        class HookExtension(ServingExtension):
+            def prompt_tokens_excluded_from_usage(self, request) -> int:
+                return 5
+
+        serving_extensions._BY_MODEL_TYPE[self.MODEL_KEY] = HookExtension()
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 4,
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        postproc_params = rendered["create_chat_response"].call_args.args[1]
+        assert postproc_params.postproc_args.num_prompt_tokens_offset == 0
+
     @pytest.fixture(params=["nemotron_h_omni", "nemotron_h"])
     def required_chat_client(self, chat_client, monkeypatch, request):
         from tensorrt_llm.serve.render import chat as render_chat_module

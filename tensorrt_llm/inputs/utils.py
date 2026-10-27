@@ -629,6 +629,24 @@ def _has_python_chat_template(tokenizer: PreTrainedTokenizerBase) -> bool:
             is not PreTrainedTokenizerBase.apply_chat_template)
 
 
+def uses_tokenizer_native_renderer(tokenizer: Union[TransformersTokenizer,
+                                                    TokenizerBase],
+                                   processor: ProcessorMixin,
+                                   chat_template: Optional[str]) -> bool:
+    """Whether `apply_chat_template` renders with the tokenizer's own renderer.
+
+    It does when no Jinja template is declared anywhere (the call, the
+    processor or the tokenizer) and the tokenizer overrides
+    `apply_chat_template` in Python, as the kimi_k3 checkpoint tokenizer does.
+    """
+    if isinstance(tokenizer, TransformersTokenizer):
+        tokenizer = tokenizer.tokenizer
+    return (chat_template is None
+            and getattr(processor, "chat_template", None) is None
+            and getattr(tokenizer, "chat_template", None) is None
+            and _has_python_chat_template(tokenizer))
+
+
 def resolve_hf_chat_template(
     tokenizer: TokenizerBase,
     processor: ProcessorMixin,
@@ -789,10 +807,7 @@ def apply_chat_template(
     if isinstance(tokenizer, TransformersTokenizer):
         tokenizer = tokenizer.tokenizer  # we need the TokenizerBase for apply_chat_template
 
-    if (chat_template is None
-            and getattr(processor, "chat_template", None) is None
-            and getattr(tokenizer, "chat_template", None) is None
-            and _has_python_chat_template(tokenizer)):
+    if uses_tokenizer_native_renderer(tokenizer, processor, chat_template):
         native_kwargs = dict(chat_template_kwargs or {})
         if documents is not None:
             native_kwargs["documents"] = documents
