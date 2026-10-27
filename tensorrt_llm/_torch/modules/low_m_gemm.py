@@ -3,15 +3,22 @@
 
 import functools
 import os
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
 
-from ..autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig
+from ..autotuner import (
+    AutoTuner,
+    DistributedTuningStrategy,
+    DynamicTensorSpec,
+    TunableRunner,
+    TuningConfig,
+)
 from ..flashinfer_utils import get_env_enable_pdl
+from . import low_m_mma_gemm
 
 _BACKEND_ENV = "TRTLLM_LOW_M_GEMM_BACKEND"
 
@@ -40,6 +47,7 @@ _M_DIM_SPEC = DynamicTensorSpec(
 _MAX_M = 32
 
 _AUTOTUNER_OP_NAME = "trtllm::low_m_bf16_gemm"
+_FP8_AUTOTUNER_OP_NAME = "trtllm::low_m_fp8_gemm"
 
 # A module that holds a plain [N, K] BF16 weight but is not a Linear -- a
 # hand-written MoE router gate, say -- opts into the race by setting this
@@ -306,6 +314,141 @@ class _SplitKGemmRunner(TunableRunner):
 
 
 # ---------------------------------------------------------------------------
+# TunableRunners for the SM10x warp-MMA GEMM (BF16, and FP8 per-tensor weights)
+# ---------------------------------------------------------------------------
+
+
+def _warp_mma_tactics(m: int, k: int, n: int, fp8: bool) -> List[Any]:
+    if not low_m_mma_gemm.warp_mma_supported() or k % 64 or n % 8 or not 1 <= m <= _MAX_M:
+        return []
+    return low_m_mma_gemm.candidate_tactics(m, n, k, fp8)
+
+
+class _WarpMmaGemmRunner(TunableRunner):
+    """AutoTuner runner for the warp-MMA kernel (``modules/low_m_mma_gemm.py``) in the BF16 race.
+
+    It prefetches each CTA's weight tiles into registers and splits K over warps (optionally over a CTA
+    cluster); tactics are ``(k_warps, n_tiles, ksplit, swap_ab, min_blocks)`` around its heuristic.
+
+    inputs: ``[a [M,K] BF16, b_t [K,N] col-major BF16]``; no bias.
+    """
+
+    def unique_id(self) -> tuple:
+        return ("warp_mma",)
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: Any,
+        **kwargs: Any,
+    ) -> List[Any]:
+        if kwargs.get("bias") is not None:
+            return []
+        a, b_t = inputs[0], inputs[1]
+        return _warp_mma_tactics(int(a.shape[0]), int(a.shape[1]), int(b_t.shape[1]), fp8=False)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        *,
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        a, b_t = inputs[0], inputs[1]
+        return low_m_mma_gemm.low_m_mma_gemm(
+            x16=a, w_bf16=b_t.t(), tactic_bf16=None if tactic == -1 else tuple(tactic)
+        )
+
+
+class _CuBLASFp8GemmRunner(TunableRunner):
+    """Baseline of the FP8 race: what ``FP8QDQLinearMethod`` runs, the static per-tensor quantization of a BF16
+    input (``quantize``) then cuBLAS scaled-mm.
+
+    inputs: ``[a [M,K] BF16 or E4M3, w [N,K] E4M3, weight_scale, input_scale]``; ``out_dtype`` kwarg.
+    """
+
+    _TACTIC = ("cublas",)
+
+    def __init__(self, *, quantize: bool) -> None:
+        self.quantize = quantize
+
+    def unique_id(self) -> tuple:
+        return ("cublas_fp8", self.quantize)
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: Any,
+        **kwargs: Any,
+    ) -> List[Any]:
+        return [self._TACTIC]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        *,
+        tactic: Any = None,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        a, w, weight_scale, input_scale = inputs
+        if self.quantize:
+            a, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(a, input_scale)
+        return torch.ops.trtllm.cublas_scaled_mm(
+            a,
+            w.t(),
+            scale_a=input_scale,
+            scale_b=weight_scale,
+            bias=None,
+            out_dtype=kwargs.get("out_dtype", torch.bfloat16),
+        )
+
+
+class _WarpMmaFp8GemmRunner(TunableRunner):
+    """AutoTuner runner for the warp-MMA kernel in the FP8 race: E4M3 activations, or BF16 activations
+    quantized in registers with the static input scale (``quantize``), bitwise the baseline's quantization.
+
+    inputs: as ``_CuBLASFp8GemmRunner``.
+    """
+
+    def __init__(self, *, quantize: bool) -> None:
+        self.quantize = quantize
+
+    def unique_id(self) -> tuple:
+        return ("warp_mma_fp8", self.quantize)
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: Any,
+        **kwargs: Any,
+    ) -> List[Any]:
+        a, w = inputs[0], inputs[1]
+        return _warp_mma_tactics(int(a.shape[0]), int(a.shape[1]), int(w.shape[0]), fp8=True)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        *,
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        a, w, weight_scale, input_scale = inputs
+        return low_m_mma_gemm.low_m_mma_gemm(
+            x16=a if self.quantize else None,
+            x8=None if self.quantize else a,
+            w_fp8=w,
+            weight_scale=weight_scale,
+            input_scale=input_scale,
+            fp8_act="quant" if self.quantize else "fp8",
+            out_dtype=kwargs.get("out_dtype", torch.bfloat16),
+            tactic=None if tactic == -1 else tuple(tactic),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -314,9 +457,9 @@ class _SplitKGemmRunner(TunableRunner):
 LOW_M_GEMM_ACTIVE = _parse_enabled()
 
 
-def _should_apply_low_m_gemm(input: torch.Tensor) -> bool:
-    """Fast pre-filter: check the global enable flag and M upper bound only."""
-    if not LOW_M_GEMM_ACTIVE:
+def _should_apply_low_m_gemm(input: torch.Tensor, module: Optional[torch.nn.Module] = None) -> bool:
+    """Fast pre-filter: the global enable flag (or a dispatcher attached to ``module``) and the M upper bound."""
+    if not LOW_M_GEMM_ACTIVE and getattr(module, "_low_m_gemm_dispatcher", None) is None:
         return False
     if input.ndim < 1:
         return False
@@ -354,6 +497,10 @@ class LowMGemmDispatcher:
         # Direct (SIMT register-prefetch) runner — no-bias only; cuBLAS handles
         # biased calls when neither low-M kernel wins.
         self._direct: Optional[_DirectGemmRunner] = None
+        # Warp-MMA runner (no bias) and the FP8 race's runners, keyed by
+        # whether the input is quantized in the kernel (BF16 input).
+        self._warp_mma: Optional[_WarpMmaGemmRunner] = None
+        self._fp8_runners: dict = {}
         # cuBLAS runners compete in every AutoTuner race as a safety baseline.
         self._cublas_no_bias: Optional[_CuBLASGemmRunner] = None
         self._cublas_with_bias: Optional[_CuBLASGemmRunner] = None
@@ -420,16 +567,29 @@ class LowMGemmDispatcher:
         self._runner_with_bias = _SplitKGemmRunner(has_bias=True, pdl=pdl)
         # Direct SIMT runner: no-bias only; wins for M=1 with narrow N on K=8192.
         self._direct = _DirectGemmRunner(pdl=pdl)
+        self._warp_mma = _WarpMmaGemmRunner()
         # cuBLAS runners — always included as competitors so the AutoTuner can
         # fall back to cuBLAS for shapes where neither custom kernel is fastest.
         self._cublas_no_bias = _CuBLASGemmRunner(has_bias=False)
         self._cublas_with_bias = _CuBLASGemmRunner(has_bias=True)
+        # cuBLAS first: the cache-miss fallback (runners[0]) is the stock path.
+        self._fp8_runners = {
+            quantize: [
+                _CuBLASFp8GemmRunner(quantize=quantize),
+                _WarpMmaFp8GemmRunner(quantize=quantize),
+            ]
+            for quantize in (False, True)
+        }
         self._tuning_config = TuningConfig(
             dynamic_tensor_specs=(_M_DIM_SPEC,),
             use_cold_l2_cache=True,
             # Use CUDA-graph-based profiling when PDL is off; PDL and CUDA-graph
             # capture conflict so we fall back to standard timing in that case.
             use_cuda_graph=not pdl,
+            # Every rank of the group runs the winner of rank 0's race: ranks
+            # timing the same shape differently would run different kernels,
+            # and the slowest rank sets the pace of each collective.
+            distributed_tuning_strategy=DistributedTuningStrategy.BROADCAST,
         )
         # Mark prepared only after all runners and the tuning config exist so the
         # invariant "_prepared implies runners are non-None" always holds.
@@ -514,7 +674,7 @@ class LowMGemmDispatcher:
                 that activate it via a mechanism other than the env var (e.g. a
                 future ``use_low_m_low_latency_gemm`` LLM arg).
         """
-        if not LOW_M_GEMM_ACTIVE and not force_active:
+        if not LOW_M_GEMM_ACTIVE and not (force_active or self._force):
             return None
         if not self._prepared:
             # Unit tests and direct callers that bypass ModelEngine / attach().
@@ -537,10 +697,11 @@ class LowMGemmDispatcher:
         cublas_runner = self._cublas_with_bias if has_bias else self._cublas_no_bias
         runners: List = [cublas_runner, splitk_runner]
         if not has_bias:
-            # Include the direct SIMT runner for unbiased calls; it silently
-            # returns [] for biased inputs so it is safe to always pass, but
-            # excluding it for biased calls keeps the race concise.
+            # Include the direct SIMT and warp-MMA runners for unbiased calls;
+            # they return [] for biased inputs so it is safe to always pass,
+            # but excluding them for biased calls keeps the race concise.
             runners.append(self._direct)
+            runners.append(self._warp_mma)
         best_runner, best_tactic = AutoTuner.get().choose_one(
             _AUTOTUNER_OP_NAME,
             runners,
@@ -585,6 +746,113 @@ class LowMGemmDispatcher:
         if not is_capturing:
             return out_view.clone()
         return out_view
+
+    def _fp8_choice(
+        self,
+        input_2d: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+    ):
+        """(runner, tactic, inputs) of the FP8 race for this call, or None when the shape is no candidate."""
+        if not self._prepared:
+            self._init_runners()
+        k = int(input_2d.shape[-1])
+        if (
+            torch.is_grad_enabled()
+            or input_2d.dim() != 2
+            or not 1 <= int(input_2d.shape[0]) <= _MAX_M
+            or input_2d.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+            or weight.dtype != torch.float8_e4m3fn
+            or int(weight.shape[1]) != k
+            or not input_2d.is_contiguous()
+            or not weight.is_contiguous()
+            or not low_m_mma_gemm.warp_mma_supported()
+        ):
+            return None
+        quantize = input_2d.dtype != torch.float8_e4m3fn
+        inputs = [input_2d, weight, weight_scale, input_scale]
+        runner, tactic = AutoTuner.get().choose_one(
+            _FP8_AUTOTUNER_OP_NAME,
+            self._fp8_runners[quantize],
+            self._tuning_config,
+            inputs,
+            out_dtype=out_dtype,
+        )
+        return runner, tactic, inputs
+
+    def apply_fp8(
+        self,
+        input_tensor: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        """``input @ weight.T`` for an FP8 per-tensor (static input scale) projection from the FP8 race, or None
+        for the normal path. A BF16 input is quantized with ``input_scale``."""
+        if not LOW_M_GEMM_ACTIVE and not self._force:
+            return None
+        input_2d = input_tensor.reshape(-1, input_tensor.shape[-1])
+        choice = self._fp8_choice(input_2d, weight, weight_scale, input_scale, out_dtype)
+        if choice is None:
+            return None
+        runner, tactic, inputs = choice
+        out = runner(inputs, tactic=tactic, out_dtype=out_dtype)
+        return out.view(*input_tensor.shape[:-1], weight.shape[0])
+
+    def warp_mma_tactic(
+        self,
+        num_rows: int,
+        weight: torch.Tensor,
+        weight_scale: Optional[torch.Tensor] = None,
+        input_scale: Optional[torch.Tensor] = None,
+        quantize: bool = True,
+    ) -> Optional[Tuple[int, ...]]:
+        """The warp-MMA tactic this dispatcher's race picked for ``num_rows`` rows of the projection ``weight``
+        (the FP8 race for an E4M3 weight, with a BF16 input when ``quantize``; else the BF16 race), or None:
+        another runner won, the shape was not tuned, or the race is being tuned (callers then run the plain
+        projection, which tunes it).
+
+        Fused users launch the warp-MMA kernel with this tactic, so they run where the plain projection would,
+        with its summation order.
+        """
+        tuner = AutoTuner.get()
+        if (not LOW_M_GEMM_ACTIVE and not self._force) or tuner.is_tuning_mode:
+            return None
+        if not 1 <= num_rows <= _MAX_M or not low_m_mma_gemm.warp_mma_supported():
+            return None
+        if not self._prepared:
+            self._init_runners()
+        n, k = int(weight.shape[0]), int(weight.shape[1])
+        if weight.dtype == torch.float8_e4m3fn:
+            op, runners = _FP8_AUTOTUNER_OP_NAME, self._fp8_runners[quantize]
+            shapes = (
+                torch.Size((num_rows, k)),
+                weight.shape,
+                weight_scale.shape,
+                input_scale.shape,
+            )
+        else:
+            op = _AUTOTUNER_OP_NAME
+            runners = [self._cublas_no_bias, self._runner_no_bias, self._direct, self._warp_mma]
+            shapes = (torch.Size((num_rows, k)), torch.Size((k, n)))
+        hit, runner_id, tactic, _ = tuner.profiling_cache.search_cache(
+            op, runners, shapes, self._tuning_config
+        )
+        if not hit or runners[runner_id] is not runners[-1] or tactic == -1:
+            return None
+        return tuple(tactic)
+
+
+def low_m_gemm_dispatcher(module: torch.nn.Module) -> Optional[LowMGemmDispatcher]:
+    """The dispatcher of ``module`` (attached by ``prepare_low_m_gemm``), the process-global one when
+    ``TRTLLM_LOW_M_GEMM_BACKEND`` activates it, else None."""
+    dispatcher = getattr(module, "_low_m_gemm_dispatcher", None)
+    if dispatcher is None and LOW_M_GEMM_ACTIVE:
+        dispatcher = _DISPATCHER
+    return dispatcher
 
 
 # Process-global fallback dispatcher used by callers that bypass
@@ -651,5 +919,6 @@ __all__ = [
     "LOW_M_GEMM_OPT_IN_ATTR",
     "_MAX_M",
     "apply_low_m_gemm",
+    "low_m_gemm_dispatcher",
     "prepare_low_m_gemm",
 ]

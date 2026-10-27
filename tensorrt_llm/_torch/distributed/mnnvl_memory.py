@@ -1132,6 +1132,26 @@ class HelixCpMnnvlMemory(MnnvlMemory):
         )
 
 
+class TpMnnvlMemory(MnnvlMemory):
+    """MNNVL memory shared by the ranks of a tensor-parallel group (ordered by TP rank).
+
+    Per-class state is separate from MnnvlMemory's, as for HelixCpMnnvlMemory.
+    """
+
+    @classmethod
+    def comm_process_group(cls, mapping: Mapping) -> Optional[Any]:
+        """ProcessGroup equivalent of comm_split_color_key for the non-MPI path."""
+        return mapping.tp_group_pg
+
+    @classmethod
+    def comm_split_color_key(cls, mapping: Mapping) -> tuple[int, int]:
+        """Group ranks by PP+CP, ordering each group by TP rank."""
+        return (
+            mapping.pp_rank * mapping.cp_size + mapping.cp_rank,
+            mapping.tp_rank,
+        )
+
+
 def init_helix_cp_comm(mapping: Mapping) -> None:
     """Pre-initialize the Helix CP communicator.
 

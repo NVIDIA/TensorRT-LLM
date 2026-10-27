@@ -78,6 +78,19 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
     }
     else if (aType == CUDA_R_8F_E4M3 && compType == CUBLAS_COMPUTE_32F)
     {
+        if (tensorrt_llm::common::getSMVersion(/*queryRealSmArch=*/true) == 103)
+        {
+            // Configs for an exact m take precedence on the architecture they were tuned on.
+            if (auto exact_iter = cublas_lut::sm103_fp8_exact_m_algo_list.find({m, k, n});
+                exact_iter != cublas_lut::sm103_fp8_exact_m_algo_list.end())
+            {
+                check_cuda_error(cublasLtMatmulAlgoInit(cublasWrapper->getCublasLtHandle(), compType, scaleType, aType,
+                    bType, outType, outType, exact_iter->second[0], &algo));
+                set_algo_attr(algo, exact_iter->second);
+                TLLM_LOG_DEBUG("Found exact-m cublasLt algo for m=%d, k=%d, n=%d\n", m, k, n);
+                return true;
+            }
+        }
         algo_list = &cublas_lut::fp8_algo_list;
     }
     else
