@@ -34,7 +34,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 import torch
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheManagerV2,
+    Role,
+    _BasePageTableMaterializer,
+)
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -335,6 +339,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     # Virtual attention-op pools for dense target and shared draft layers:
     # (attention_op_pool_id, source_storage_pool_id) plus their copy parameters.
     _draft_op_pools: Tuple[Tuple[int, int], ...] = ()
+    _draft_page_table_materializers: Tuple[_BasePageTableMaterializer, ...] = ()
     _draft_index_scales: Optional[torch.Tensor] = None
     _draft_kv_offsets: Optional[torch.Tensor] = None
     # Extra page sizes trtllm-gen may use with this manager (see
@@ -739,6 +744,16 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             self.kv_cache_pool_pointers, self.kv_cache_pool_mapping, self.num_pools, geometry
         )
         self._draft_op_pools = tuple(op_pools)
+        if self._page_table_materializer.uses_device_expansion:
+            self._draft_page_table_materializers = tuple(
+                _BasePageTableMaterializer(
+                    self.host_kv_cache_block_offsets[source_pool_id : source_pool_id + 1],
+                    self._stream,
+                    self._draft_index_scales[i : i + 1],
+                    self._draft_kv_offsets[i : i + 1],
+                )
+                for i, (_, source_pool_id) in enumerate(op_pools)
+            )
         self.num_attention_op_pools = self.num_pools + len(op_pools)
         logger.info(
             f"[unified-kv] native attention layers {native_layers} share the target KV cache manager; "
@@ -775,8 +790,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             if guard.skip(*args):
                 return
             guard.record(*args)
+        # The base materializer owns only the storage-pool output rows; virtual
+        # draft pools are filled below with their own conversion metadata.
+        base_dst = dst_tensor[: self.num_pools] if self._draft_op_pools else dst_tensor
         super().copy_batch_block_offsets(
-            dst_tensor, request_ids, beam_width, num_contexts, num_seqs, max_blocks=max_blocks
+            base_dst, request_ids, beam_width, num_contexts, num_seqs, max_blocks=max_blocks
         )
         if not self._draft_op_pools:
             return
@@ -784,6 +802,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # layer's scale.
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         for i, (op_pool_id, source_pool_id) in enumerate(self._draft_op_pools):
+            if self._draft_page_table_materializers:
+                self._draft_page_table_materializers[i].copy_block_offsets_to(
+                    dst_tensor[op_pool_id : op_pool_id + 1], copy_idx
+                )
+                continue
             copy_batch_block_offsets_to_device(
                 self.host_kv_cache_block_offsets[source_pool_id : source_pool_id + 1],
                 dst_tensor[op_pool_id : op_pool_id + 1],
@@ -1321,6 +1344,12 @@ class MiniMaxM3DraftKVCacheView:
         self.host_kv_cache_block_offsets = manager.host_kv_cache_block_offsets[
             source_pool : source_pool + 1
         ]
+        self._page_table_materializer = _BasePageTableMaterializer(
+            self.host_kv_cache_block_offsets,
+            manager._stream,
+            self.index_scales,
+            self.kv_offset,
+        )
 
     def _check_layer(self, local_layer_idx: int) -> None:
         if local_layer_idx != self._local_layer_idx:
@@ -1376,6 +1405,9 @@ class MiniMaxM3DraftKVCacheView:
             self._unchanged_copy.record(*args)
         copy_idx = manager.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         assert copy_idx.shape[0] == num_seqs
+        if self._page_table_materializer.uses_device_expansion:
+            self._page_table_materializer.copy_block_offsets_to(dst_tensor, copy_idx)
+            return
         copy_batch_block_offsets_to_device(
             self.host_kv_cache_block_offsets,
             dst_tensor,

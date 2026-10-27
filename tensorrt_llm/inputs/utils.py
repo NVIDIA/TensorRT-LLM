@@ -25,7 +25,6 @@ from tensorrt_llm.inputs.content_format import (ContentFormat,
 from tensorrt_llm.inputs.data import prompt_inputs
 from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, VideoMediaIO,
                                           _decode_base64_with_limit,
-                                          _get_aiohttp_session,
                                           _load_and_convert_image,
                                           _normalize_file_uri,
                                           _safe_aiohttp_get, _safe_request_get)
@@ -106,8 +105,7 @@ async def async_load_image(
     parsed_url = urlparse(image)
 
     if parsed_url.scheme in ["http", "https"]:
-        session = await _get_aiohttp_session()
-        content = await _safe_aiohttp_get(image, session=session)
+        content = await _safe_aiohttp_get(image)
         image = await asyncio.to_thread(_load_and_convert_image,
                                         BytesIO(content))
     elif parsed_url.scheme == "data":
@@ -194,8 +192,7 @@ async def async_load_video(video: str,
                             extract_audio=extract_audio)
     parsed_url = urlparse(video)
     if parsed_url.scheme in ["http", "https"]:
-        session = await _get_aiohttp_session()
-        video_data = await _safe_aiohttp_get(video, session=session)
+        video_data = await _safe_aiohttp_get(video)
         return await asyncio.to_thread(video_io.load_bytes, video_data)
     elif parsed_url.scheme == "data":
         decoded_video = await asyncio.to_thread(load_base64_video, video)
@@ -241,8 +238,7 @@ async def async_load_audio(
     parsed_url = urlparse(audio)
 
     if parsed_url.scheme in ["http", "https"]:
-        session = await _get_aiohttp_session()
-        audio_data = await _safe_aiohttp_get(audio, session=session)
+        audio_data = await _safe_aiohttp_get(audio)
         audio = BytesIO(audio_data)
     elif parsed_url.scheme in ("", "file"):
         audio = _normalize_file_uri(
