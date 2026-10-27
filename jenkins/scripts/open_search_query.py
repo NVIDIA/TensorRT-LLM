@@ -22,9 +22,9 @@
 # skip redundant test execution in subsequent runs.
 #
 # Main functionality:
-# - queryJobEvents: Queries OpenSearch for job events with pagination support
-# - getPassedTestList: Retrieves and deduplicates passed test names
-# - writeTestListToFile: Writes test list to a file for further processing
+# - query_job_events: Queries distinct names with cursor pagination
+# - get_passed_test_list: Retrieves a sorted, deduplicated passed-test list
+# - write_test_list_to_file: Writes test list to a file for further processing
 #
 # =============================================================================
 
@@ -35,87 +35,98 @@ import sys
 
 from open_search_db import OpenSearchDB
 
+PARTIAL_QUERY_EXIT_CODE = 3
 
-def queryJobEvents(commitID="", stageNamePattern="", onlySuccess=True):
-    """Query OpenSearch database for job events with pagination.
 
-    Args:
-        commitID: Git commit SHA to filter by (optional)
-        stageNamePattern: Non-empty regular-expression stage-name pattern to filter by
-        onlySuccess: If True, only return PASSED tests (default: True)
+class _IncompleteQueryError(RuntimeError):
+    def __init__(self, message: str, test_names: list[str]) -> None:
+        super().__init__(message)
+        self.test_names = test_names
 
-    Returns:
-        List of all matching test result records
-    """
-    mustConditions = []
-    if commitID:
-        mustConditions.append({"term": {"s_trigger_mr_commit": commitID}})
-    if not stageNamePattern:
-        raise ValueError("stageNamePattern cannot be empty")
-    mustConditions.append({"regexp": {"s_stage_name": stageNamePattern}})
-    if onlySuccess:
-        mustConditions.append({"term": {"s_status": "PASSED"}})
 
-    all_results = []
+def query_job_events(commit_id="", stage_name_pattern="", only_success=True) -> list[str]:
+    """Query distinct test names using composite aggregation pagination."""
+    must_conditions = []
+    if commit_id:
+        must_conditions.append({"term": {"s_trigger_mr_commit": commit_id}})
+    if not stage_name_pattern:
+        raise ValueError("stage_name_pattern cannot be empty")
+    must_conditions.append({"regexp": {"s_stage_name": stage_name_pattern}})
+    if only_success:
+        must_conditions.append({"term": {"s_status": "PASSED"}})
+
+    test_set = set()
     page_size = 1000
-    from_index = 0
+    after_key = None
+    try:
+        while True:
+            composite = {
+                "size": page_size,
+                "sources": [{"test_name": {"terms": {"field": "s_turtle_name", "order": "asc"}}}],
+            }
+            if after_key is not None:
+                composite["after"] = after_key
+            request_body = {
+                "query": {"bool": {"must": must_conditions}},
+                "size": 0,
+                "aggs": {"passed_tests": {"composite": composite}},
+            }
+            formatted_request_body = json.dumps(request_body)
+            response = OpenSearchDB.queryFromOpenSearchDB(
+                formatted_request_body, "swdl-trtllm-infra-ci-prod-test_info"
+            )
+            if response is None:
+                raise RuntimeError("OpenSearch passed-test query failed")
+            data = response.json()
+            if data.get("timed_out") or data.get("_shards", {}).get("failed", 0):
+                raise RuntimeError("OpenSearch passed-test query timed out or had failed shards")
 
-    while True:
-        requestBody = {
-            "query": {"bool": {"must": mustConditions}},
-            "_source": [
-                "s_job_name",
-                "s_status",
-                "s_build_id",
-                "s_turtle_name",
-                "s_test_name",
-                "s_gpu_type",
-            ],
-            "size": page_size,
-            "from": from_index,
-        }
+            aggregation = data["aggregations"]["passed_tests"]
+            buckets = aggregation["buckets"]
+            if not buckets:
+                break
+            next_after_key = aggregation.get("after_key")
+            if (
+                after_key is not None
+                and next_after_key
+                and next_after_key["test_name"] <= after_key["test_name"]
+            ):
+                raise RuntimeError("OpenSearch passed-test pagination cursor did not advance")
+            page_names = {bucket["key"]["test_name"] for bucket in buckets}
+            test_set.update(page_names)
+            print(f"Fetched {len(test_set)} distinct passed test names...")
 
-        formattedRequestBody = json.dumps(requestBody)
-        response = OpenSearchDB.queryFromOpenSearchDB(
-            formattedRequestBody, "swdl-trtllm-infra-ci-prod-test_info"
-        )
-        if response is None:
-            print("Failed to query from OpenSearchDB")
-            break
-        data = response.json()
+            if not next_after_key:
+                break
+            after_key = next_after_key
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError) as error:
+        raise _IncompleteQueryError(str(error), sorted(test_set)) from error
 
-        hits = data["hits"]["hits"]
-        if not hits:
-            break
-
-        all_results.extend(hits)
-        from_index += page_size
-
-        print(f"Fetched {len(all_results)} records...")
-
-    return all_results
+    return sorted(test_set)
 
 
-def writeTestListToFile(testList, fileName):
-    os.makedirs(os.path.dirname(fileName), exist_ok=True)
+def write_test_list_to_file(test_list, file_name):
+    os.makedirs(os.path.dirname(file_name), exist_ok=True)
 
-    with open(fileName, "w") as f:
-        for test in testList:
+    with open(file_name, "w") as f:
+        for test in test_list:
             f.write(test + "\n")
 
 
-def getPassedTestList(commitID, stageNamePattern, outputFile):
-    hits = queryJobEvents(
-        commitID=commitID,
-        stageNamePattern=stageNamePattern,
-        onlySuccess=True,
-    )
-    # Use set to automatically remove duplicates
-    testSet = set()
-    for hit in hits:
-        testSet.add(hit["_source"]["s_turtle_name"])
-    testList = list(testSet)
-    writeTestListToFile(testList, outputFile)
+def get_passed_test_list(commit_id, stage_name_pattern, output_file) -> bool:
+    """Write confirmed passed tests and return whether the query was complete."""
+    try:
+        test_list = query_job_events(commit_id, stage_name_pattern)
+    except _IncompleteQueryError as error:
+        write_test_list_to_file(error.test_names, output_file)
+        print(
+            f"WARNING: OpenSearch query incomplete; retained {len(error.test_names)} "
+            f"test names from successful pages: {error}",
+            file=sys.stderr,
+        )
+        return False
+    write_test_list_to_file(test_list, output_file)
+    return True
 
 
 if __name__ == "__main__":
@@ -130,8 +141,9 @@ if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
     if not args.stage_name_pattern:
         parser.error("--stage-name-pattern cannot be empty")
-    getPassedTestList(
-        commitID=args.commit_id,
-        stageNamePattern=args.stage_name_pattern,
-        outputFile=args.output_file,
+    complete = get_passed_test_list(
+        commit_id=args.commit_id,
+        stage_name_pattern=args.stage_name_pattern,
+        output_file=args.output_file,
     )
+    sys.exit(0 if complete else PARTIAL_QUERY_EXIT_CODE)
