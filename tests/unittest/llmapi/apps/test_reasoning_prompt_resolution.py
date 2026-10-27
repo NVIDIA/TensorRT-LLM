@@ -164,8 +164,7 @@ def test_context_worker_stamps_the_resolved_mode(
     template_kwargs: dict[str, bool] | None, expected: bool, parser_name: str
 ) -> None:
     """Calls the real handler, so dropping the stamp fails this test."""
-    args = build_args(render(template_kwargs), template_kwargs)
-    args.reasoning_parser = parser_name
+    args = build_args(render(template_kwargs), template_kwargs, reasoning_parser=parser_name)
 
     response = chat_response_post_processor(_FakeResult("hidden</think>visible"), args)
 
