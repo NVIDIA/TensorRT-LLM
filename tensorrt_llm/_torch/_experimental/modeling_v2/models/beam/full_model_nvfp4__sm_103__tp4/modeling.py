@@ -41,8 +41,10 @@ embedding and vocabulary-parallel head are views of the target's own TP vocabula
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import struct
 import types
 from typing import Optional
 
@@ -222,6 +224,48 @@ class VerifyTarget(_Target):
         )
 
 
+# Version of the disaggregated handoff: the cache identity both workers compare and the
+# context-request record (``ModelingV2BeamFullModelNvfp4Sm103Tp4.export_disagg_context_request``).
+DISAGG_HANDOFF_VERSION = 1
+
+# Checkpoint files whose bytes define the target's weights layout, quantization recipe and
+# vocabulary; hashed once per worker, never the weights themselves.
+_TARGET_MANIFEST_FILES = ("config.json", "hf_quant_config.json", "model.safetensors.index.json")
+_TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "generation_config.json")
+
+
+def _canonical_sha256(value) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _files_sha256(directory: str, names) -> str:
+    """One digest over the named files of ``directory`` (name, size and bytes of each)."""
+    h = hashlib.sha256()
+    for name in names:
+        with open(os.path.join(directory, name), "rb") as f:
+            data = f.read()
+        h.update(name.encode() + b"\0" + str(len(data)).encode() + b"\0" + data)
+    return h.hexdigest()
+
+
+def _safetensors_manifest_sha256(directory: str) -> str:
+    """Digest of a checkpoint's safetensors manifests: the index when there is one, else each
+    file's size and header (tensor names, dtypes, shapes and offsets), not the tensor bytes."""
+    names = sorted(n for n in os.listdir(directory) if n.endswith(".safetensors"))
+    if os.path.exists(os.path.join(directory, "model.safetensors.index.json")):
+        return _files_sha256(directory, ["model.safetensors.index.json"])
+    h = hashlib.sha256()
+    for name in names:
+        path = os.path.join(directory, name)
+        with open(path, "rb") as f:
+            (header_len,) = struct.unpack("<Q", f.read(8))
+            header = f.read(header_len)
+        h.update(name.encode() + b"\0" + str(os.path.getsize(path)).encode() + b"\0" + header)
+    return h.hexdigest()
+
+
 def kv_cache_quant_algo(model_config: ModelConfig) -> Optional[QuantAlgo]:
     """The configured KV-cache algorithm: None (BF16) or FP8; raise ValueError on any other."""
     algo = getattr(model_config.quant_config, "kv_cache_quant_algo", None)
@@ -264,6 +308,7 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
         self.use_separate_draft_kv_cache = False
         self.extra_kv_tokens = 0
         self.draft_load_record: Optional[dict] = None
+        self._disagg_identity: Optional[dict] = None
         if self.spec_config is not None:
             self._build_dflash(model_config, checkpoint_config)
         logger.info(
@@ -473,6 +518,188 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
             "vocab_interval": list(self.model.vocab_interval),
         }
         logger.info(f"[modeling_v2] DFlash drafter loaded: {self.draft_load_record}")
+
+    # ------------------------------------------------------------ disaggregated handoff
+
+    @property
+    def transfers_draft_kv_cache(self) -> bool:
+        """Whether a disaggregated handoff must carry the drafter's context: its K/V live in
+        the engine's separate draft KV cache manager, built from the target's prefill."""
+        return self.spec_worker is not None and self.use_separate_draft_kv_cache
+
+    def disagg_cache_identity(self) -> dict:
+        """What both disaggregated workers must agree on before any KV moves between them.
+
+        Rank-independent digests of: the target checkpoint's manifests (configuration,
+        quantization recipe, weight index), the tokenizer files, the cache layout (layers,
+        windows, heads per rank, head size, cache dtype), the per-layer FP8 scales actually
+        applied (FP32 values, for target and drafter), the speculation settings, the drafter
+        checkpoint's manifests and the handoff contract (version, transferred managers,
+        draft transport-layer base). Digests only, so no scale or weight leaves the worker.
+        Requires a completed load; computed once.
+        """
+        if self._disagg_identity is not None:
+            return self._disagg_identity
+        if self.load_record is None or self.kv_cache_record is None:
+            raise RuntimeError("the disaggregated cache identity needs a completed target load")
+        component = self.model
+        layout = {
+            "layers": NUM_LAYERS,
+            "world_size": self.model_config.mapping.world_size,
+            "kv_heads_per_rank": component.local_kv_heads,
+            "head_dim": component.head_dim,
+            "windows": [
+                component.window if component.schedule.is_sliding(layer) else None
+                for layer in range(NUM_LAYERS)
+            ],
+            "kv_cache_dtype": self.kv_cache_record["dtype"],
+        }
+        scales = {
+            key: None if values is None else [float(v).hex() for v in values]
+            for key, values in (
+                ("target", self.kv_cache_record.get("target_scales")),
+                ("draft", self.kv_cache_record.get("draft_scales")),
+            )
+        }
+        parts = {
+            "target_manifest": _files_sha256(self.checkpoint_dir, _TARGET_MANIFEST_FILES),
+            "tokenizer": _files_sha256(
+                self.checkpoint_dir,
+                [
+                    n
+                    for n in _TOKENIZER_FILES
+                    if os.path.exists(os.path.join(self.checkpoint_dir, n))
+                ],
+            ),
+            "layout": _canonical_sha256(layout),
+            "kv_cache_scales": _canonical_sha256(scales),
+            "handoff": _canonical_sha256(
+                {
+                    "version": DISAGG_HANDOFF_VERSION,
+                    "members": ["target", "draft"] if self.transfers_draft_kv_cache else ["target"],
+                    "draft_transport_layer_base": NUM_LAYERS
+                    if self.transfers_draft_kv_cache
+                    else None,
+                }
+            ),
+        }
+        if self.spec_config is None:
+            parts["speculation"] = _canonical_sha256(None)
+        else:
+            spec = self.spec_config
+            parts["speculation"] = _canonical_sha256(
+                {
+                    "mode": "dflash",
+                    "max_draft_len": int(spec.max_draft_len),
+                    "tokens_per_gen_step": int(spec.tokens_per_gen_step),
+                    "target_layer_ids": [int(i) for i in spec.target_layer_ids],
+                    "mask_token_id": getattr(spec, "mask_token_id", None),
+                }
+            )
+            drafter_dir = spec.speculative_model
+            parts["drafter_manifest"] = _files_sha256(drafter_dir, ["config.json"])
+            parts["drafter_weights"] = _safetensors_manifest_sha256(drafter_dir)
+        self._disagg_identity = {"version": DISAGG_HANDOFF_VERSION, "parts": parts}
+        logger.info(f"[modeling_v2] disaggregated cache identity: {self._disagg_identity}")
+        return self._disagg_identity
+
+    def _disagg_identity_digest(self) -> str:
+        return _canonical_sha256(self.disagg_cache_identity())
+
+    def export_disagg_context_request(self, req) -> dict:
+        """The handoff record a finished context-only request leaves its generation worker.
+
+        Called by the cache transceiver after the context forward, before the request's
+        drafter slot can be recycled; it travels in the request's auxiliary slot of the same
+        transfer session as the KV pages (``native.auxiliary.encode_handoff_record``). It
+        binds the transfer to this worker's identity, the request's transfer id and prompt
+        length and, with a drafter, the draft-context cursor whose K/V travel as draft
+        KV cache manager pages (``DFlashWorker.export_disagg_context``).
+        """
+        from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
+
+        return {
+            "version": DISAGG_HANDOFF_VERSION,
+            "identity": self._disagg_identity_digest(),
+            "transfer_id": int(get_unique_rid(req)),
+            "prompt_len": int(req.prompt_len),
+            "draft": (
+                self.spec_worker.export_disagg_context(req.py_request_id)
+                if self.spec_worker is not None
+                else None
+            ),
+        }
+
+    def validate_disagg_generation_request(self, req) -> Optional[str]:
+        """None when ``req``'s received handoff record fits this worker, else why it does not.
+
+        Runs on the generation worker once the transfer session completes and before the
+        request is handed to generation: the record must come from a worker with this
+        identity, belong to this request's transfer and prompt and, with a drafter, describe
+        a draft context covering the whole prompt. Anything else fails the request before
+        any received state is read.
+        """
+        record = getattr(req, "py_disagg_handoff", None)
+        if record is None:
+            return "no context handoff record arrived with the request"
+        if record.get("version") != DISAGG_HANDOFF_VERSION:
+            return (
+                f"handoff record version {record.get('version')!r}, expected "
+                f"{DISAGG_HANDOFF_VERSION}"
+            )
+        identity = record.get("identity") or ""
+        if not identity or not self._disagg_identity_digest().startswith(identity):
+            return "the context worker's cache identity differs from this worker's"
+        params = getattr(req, "context_phase_params", None)
+        expected_id = None if params is None else params.req_id
+        if record.get("transfer_id") != expected_id:
+            return (
+                f"the record belongs to transfer {record.get('transfer_id')}, the request to "
+                f"{expected_id}"
+            )
+        if record.get("prompt_len") != req.prompt_len:
+            return (
+                f"the record describes a {record.get('prompt_len')}-token prompt, the request "
+                f"has {req.prompt_len}"
+            )
+        draft = record.get("draft")
+        if self.transfers_draft_kv_cache:
+            if draft is None:
+                return "the context worker stored no draft context for this request"
+            if (
+                draft.get("draft_ctx_len") != req.prompt_len
+                or draft.get("next_position") != req.prompt_len
+            ):
+                return (
+                    f"the draft context covers {draft.get('draft_ctx_len')} positions (next "
+                    f"position {draft.get('next_position')}); the prompt has {req.prompt_len}"
+                )
+        elif draft is not None:
+            return "the context worker drafted but this worker has no drafter"
+        return None
+
+    def prepare_disagg_generation_request(self, req) -> None:
+        """Hand a received request's draft-context cursor to the DFlash worker.
+
+        Called by the executor once the request's KV (target and draft pages) has arrived and
+        before its first generation step; the record was validated on arrival.
+        """
+        if self.spec_worker is None:
+            return
+        record = getattr(req, "py_disagg_handoff", None)
+        if record is None or record.get("draft") is None:
+            raise RuntimeError(
+                f"request {req.py_request_id}: no validated draft-context record to import"
+            )
+        draft = record["draft"]
+        self.spec_worker.import_disagg_context(
+            req.py_request_id, draft["draft_ctx_len"], draft["next_position"]
+        )
+
+    def release_request_state(self, request_id: int) -> None:
+        """Drop a received draft-context cursor that was never bound to a drafter slot."""
+        if self.spec_worker is not None:
+            self.spec_worker.release_request_state(request_id)
 
     def forward(
         self,

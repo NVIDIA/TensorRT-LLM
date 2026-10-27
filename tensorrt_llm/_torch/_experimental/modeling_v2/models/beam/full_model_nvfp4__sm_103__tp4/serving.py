@@ -32,6 +32,13 @@ at a time). It owns no scheduler, sampler, route or evaluator::
 per-layer scales of ``--kv-cache-scales`` (``weights.read_kv_cache_scales``); the default keeps
 both BF16. The launcher logs the selected mode and the table's digest.
 
+``--server-role {context,generation}`` serves one worker of a disaggregated deployment behind
+``trtllm-serve disaggregated``: the explicit Python NIXL cache transceiver
+(``--kv-transfer-timeout-ms``, default 60000) moves each request's KV cache from the context
+worker to the generation worker and, with a drafter, the drafter's prompt context in the draft
+KV cache with it; both workers check each other's model, cache-format and scale identity before
+any transfer.
+
 ``--draft-checkpoint`` adds DFlash speculative decoding with that DFlash 2 drafter: the native
 one-model DFlash worker with ``max_draft_len`` 7 (a verification block of eight rows), TRTLLM
 draft attention over the engine's paged draft KV pool and strict greedy verification; the
@@ -226,6 +233,7 @@ def llm_args(
     draft_checkpoint: Optional[str] = None,
     kv_cache_dtype: str = "auto",
     kv_cache_scales: Optional[str] = None,
+    kv_transfer_timeout_ms: Optional[int] = None,
 ) -> dict:
     """Native LLM API arguments of the supported deployment for ``checkpoint``.
 
@@ -237,8 +245,12 @@ def llm_args(
     with the per-layer scales of the JSON table ``kv_cache_scales``
     (``weights.read_kv_cache_scales``), which it requires; ``"auto"`` (default) keeps them BF16
     and takes no table.
+    ``kv_transfer_timeout_ms`` makes the engine one worker of a disaggregated deployment: the
+    Python NIXL cache transceiver moves each request's KV cache (and, with a drafter, the
+    drafter's context in its draft KV cache) between context and generation workers, and a
+    transfer that has not completed within the timeout fails its request.
     """
-    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
 
     from .model import MAX_NUM_TOKENS
     from .weights import BeamNvfp4CheckpointLoader, read_kv_cache_scales
@@ -279,6 +291,16 @@ def llm_args(
     }
     if draft_checkpoint is not None:
         args["speculative_config"] = dflash_config(draft_checkpoint)
+    if kv_transfer_timeout_ms is not None:
+        if kv_transfer_timeout_ms <= 0:
+            raise ValueError(
+                f"kv_transfer_timeout_ms must be positive, got {kv_transfer_timeout_ms}"
+            )
+        args["cache_transceiver_config"] = CacheTransceiverConfig(
+            backend="NIXL",
+            transceiver_runtime="PYTHON",
+            kv_transfer_timeout_ms=kv_transfer_timeout_ms,
+        )
     return args
 
 
@@ -312,9 +334,23 @@ def main(argv: Optional[list] = None) -> None:
         default=None,
         help="JSON per-layer scale table of the FP8 KV caches (required with --kv-cache-dtype fp8)",
     )
+    ap.add_argument(
+        "--server-role",
+        choices=("context", "generation"),
+        default=None,
+        help="serve as the context or the generation worker of a disaggregated deployment "
+        "(behind trtllm-serve disaggregated); omitted: an aggregated server",
+    )
+    ap.add_argument(
+        "--kv-transfer-timeout-ms",
+        type=int,
+        default=60000,
+        help="with --server-role: a KV transfer not completed within this time fails its request",
+    )
     args = ap.parse_args(argv)
 
     from tensorrt_llm.commands.serve import launch_server
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
     from tensorrt_llm.logger import logger
 
     # The capacity is the explicit max_tokens above; no estimation pass on a dry-run cache.
@@ -330,6 +366,7 @@ def main(argv: Optional[list] = None) -> None:
         draft_checkpoint=args.draft_checkpoint,
         kv_cache_dtype=args.kv_cache_dtype,
         kv_cache_scales=args.kv_cache_scales,
+        kv_transfer_timeout_ms=args.kv_transfer_timeout_ms if args.server_role else None,
     )
     scales = deployment["checkpoint_loader"].kv_cache_scales
     logger.info(
@@ -339,6 +376,12 @@ def main(argv: Optional[list] = None) -> None:
             if scales is not None
             else "BF16"
         )
+        + (
+            f"; disaggregated {args.server_role} worker, Python NIXL cache transceiver, "
+            f"transfer timeout {args.kv_transfer_timeout_ms} ms"
+            if args.server_role
+            else ""
+        )
     )
     launch_server(
         args.host,
@@ -347,6 +390,7 @@ def main(argv: Optional[list] = None) -> None:
         chat_template=template,
         served_model_name=args.served_model_name,
         multi_frontend_enabled=False,
+        server_role=ServerRole[args.server_role.upper()] if args.server_role else None,
     )
 
 

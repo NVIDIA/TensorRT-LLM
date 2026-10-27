@@ -3,7 +3,7 @@
 
 from abc import ABC, abstractmethod
 from os import getenv
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -118,8 +118,17 @@ def create_kv_cache_transceiver(
     kv_cache_manager: KVCacheManager | KVCacheManagerV2,
     attention_type: AttentionTypeCpp,
     cache_transceiver_config: CacheTransceiverConfig,
-    mamba_cache_manager: Optional[BaseMambaCacheManager] = None
+    mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
+    draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+    cache_identity: Optional[dict] = None,
+    context_state_exporter: Optional[Callable[[LlmRequest],
+                                              Optional[bytes]]] = None,
+    context_state_validator: Optional[Callable[[LlmRequest],
+                                               Optional[str]]] = None,
 ) -> Optional["KvCacheTransceiver"]:
+    """``draft_kv_cache_manager``, ``cache_identity`` and the context-state exporter and
+    validator are supported by the Python (V2) transceiver only; see
+    ``KvCacheTransceiverV2``."""
     resolve_cache_transceiver_config(cache_transceiver_config)
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
@@ -205,11 +214,28 @@ def create_kv_cache_transceiver(
             )
         from tensorrt_llm._torch.disaggregation.transceiver import \
             KvCacheTransceiverV2
-        logger.info("Using KvCacheTransceiverV2")
+        logger.info(
+            "Using KvCacheTransceiverV2"
+            f"{' with the draft KV cache' if draft_kv_cache_manager is not None else ''}"
+        )
         # MambaHybridCacheManagerV2 contains both the KV and Mamba pools.
-        return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
-                                    cache_transceiver_config)
+        return KvCacheTransceiverV2(
+            mapping,
+            dist,
+            kv_cache_manager,
+            cache_transceiver_config,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+            cache_identity=cache_identity,
+            context_state_exporter=context_state_exporter,
+            context_state_validator=context_state_validator)
 
+    if (draft_kv_cache_manager is not None or cache_identity is not None
+            or context_state_exporter is not None
+            or context_state_validator is not None):
+        raise ValueError(
+            "draft KV cache transfer, cache identity validation and context "
+            "state export need transceiver_runtime='PYTHON' with backend='NIXL'"
+        )
     # Explicit legacy runtime: transceiver_runtime is None or "CPP".
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
                                   attention_type, cache_transceiver_config,

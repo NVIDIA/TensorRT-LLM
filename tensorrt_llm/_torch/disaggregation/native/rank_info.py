@@ -49,6 +49,10 @@ class RankInfo:
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
     bounded_replay_on_generation: bool = False
+    # Semantic identity of the cached state (model, layout, cache format, scales and the
+    # transferred managers), compared by the peer registrar before any transfer; None for
+    # peers that declare none. Carries digests only, never scale values or weights.
+    cache_identity: Optional[dict] = None
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -70,7 +74,12 @@ class RankInfo:
         kv_cache_manager: KVCacheManager,
         device_id: int,
         aux_buffer_meta: Optional[AuxBufferMeta] = None,
+        page_table: Optional[KVCachePageTable] = None,
+        cache_identity: Optional[dict] = None,
     ) -> "RankInfo":
+        """``page_table`` replaces the one built from ``kv_cache_manager`` when the transfer
+        covers more than that manager (``build_composite_page_table``); every member must share
+        its geometry, which ``attention`` describes from ``kv_cache_manager``."""
         m = kv_cache_manager.mapping
         kvm = kv_cache_manager
         enable_attention_dp = m.enable_attention_dp
@@ -112,8 +121,9 @@ class RankInfo:
                 is_mla=kvm.kv_factor == 1,
             ),
             aux_meta=aux_buffer_meta,
-            page_table=build_page_table_from_manager(kvm),
+            page_table=page_table if page_table is not None else build_page_table_from_manager(kvm),
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
+            cache_identity=cache_identity,
         )
 
     @classmethod

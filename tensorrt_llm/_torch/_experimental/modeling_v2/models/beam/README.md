@@ -94,7 +94,8 @@ match the target's greedy choice on the verification logits; independent ordinar
 and speculative runs can still diverge at near ties when GEMM/collective shapes
 change. The GSM8K result below is for ordinary decoding, not DFlash2.
 
-CUDA graphs, overlap scheduling, and disaggregated serving remain future work.
+CUDA graphs and overlap scheduling remain future work. Disaggregated serving is
+covered separately below.
 The bounded eager timing measurements are not a production throughput claim.
 
 ## Optional FP8 KV cache
@@ -131,6 +132,53 @@ initial diagnostic probe also has a reconstructed-source provenance limitation.
 No FP8-KV GSM8K result or general answer-quality equivalence is claimed. Evaluate
 quality and performance for the intended workload before promoting FP8 to a
 recommended default.
+
+## Disaggregated serving with DFlash2 and prefix reuse
+
+The qualified deployment uses **two nodes with four GB300 GPUs each**: one TP4
+context worker and one TP4 generation worker, both running the same target,
+drafter, tokenizer and FP8 KV scale table. The Python NIXL transceiver moves both
+target and draft KV caches, plus the draft-context cursor. The generation worker
+continues from that state without replaying the target prompt. Peer checks compare
+checkpoint manifests, layout and scale digests; they do not hash all weight bytes,
+so provision identical checkpoint contents on both workers.
+
+On the context node, launch:
+
+```bash
+python -m tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.serving \
+  --checkpoint /path/to/target-checkpoint \
+  --draft-checkpoint /path/to/dflash2-checkpoint \
+  --kv-cache-dtype fp8 --kv-cache-scales /path/to/kv-scales.json \
+  --served-model-name beam-nvfp4 --server-role context \
+  --host 0.0.0.0 --port 8001 \
+  --max-seq-len 8192 --max-num-tokens 8192 --max-batch-size 1 \
+  --kv-transfer-timeout-ms 60000
+```
+
+On the generation node, use the same command with `--server-role generation`
+and `--port 8002`. Both nodes need matching native libraries and network access
+for NIXL and the worker endpoints. Omit `--draft-checkpoint` on both workers for
+ordinary decoding. Route client requests through `trtllm-serve disaggregated -c
+disagg_config.yaml`, using the context and generation worker addresses as described
+in the [disaggregated serving guide](../../../../../../docs/source/features/disagg-serving.md).
+The same streaming/non-streaming chat-completions request format applies.
+
+Independent qualification covered ordinary decoding, DFlash2, shared-prefix reuse,
+stops and completion budgets, request isolation, cancellation and transfer failures.
+The fresh DFlash2 checks matched all 24 executed requests to the co-located FP8
+reference; all 1,464 matched verifier rows were bitwise equal. KV transfer checks
+compared 70,792,704 logical bytes with no mismatches. The configuration remains eager,
+TP4/EP1/PP1 per worker, with no attention DP, overlap, graphs or chunked prefill.
+
+**Limits:** batch-four ordinary and speculative runs can produce different tokens
+from the co-located schedule. This was accepted as a documented limitation, not
+exact-parity success; the differing operation remains unlocalized. Greedy verification
+against each step's actual target logits passed. Context-side timeout observation
+can be delayed while its loop is idle; the configured transfer deadline is not a
+hard wall-clock response guarantee. These checks do not establish disaggregated
+GSM8K accuracy, a throughput gain, other layouts or arbitrary feature combinations.
+The inherited FP8 numerical exception remains in force, and BF16 stays the default.
 
 ## Validation and regression coverage
 
@@ -189,6 +237,6 @@ registered by this change.
   ModelingV2 target, not to that built-in model path.
 
 Other GPU architectures, parallel layouts, other speculative modes,
-CUDA graphs, overlap scheduling, chunked prefill, tool calling, and disaggregated
-serving are not qualified by this implementation. Subsequent feature/performance
+CUDA graphs, overlap scheduling, chunked prefill and tool calling are not
+qualified by this implementation. Subsequent feature/performance
 work should preserve this functional and accuracy baseline in follow-up PRs.

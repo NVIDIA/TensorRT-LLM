@@ -7538,20 +7538,26 @@ class TorchLlmArgs(BaseLlmArgs):
             if isinstance(self.speculative_config, DFlashDecodingConfig):
                 if (self.cache_transceiver_config is not None
                         and self.cache_transceiver_config.backend is not None):
-                    # The transceiver moves the target KV cache, but the
-                    # drafter's context is built from target hidden states
-                    # during prefill and is not transferred with it, so a
-                    # generation server drafts without the prompt. Drafts are
-                    # verified against the target, so this costs acceptance
-                    # rather than correctness: warn, do not reject.
+                    # The drafter's context is built from target hidden states
+                    # during prefill. Only a model that declares a
+                    # disaggregated handoff (its cache identity and draft
+                    # context record, e.g. the Beam ModelingV2 target) has the
+                    # Python NIXL transceiver move its separate draft KV cache
+                    # with the target's; elsewhere the generation server
+                    # drafts without the prompt. Drafts are verified against
+                    # the target either way, so the missing context changes
+                    # proposals and acceptance, not the greedy verification
+                    # rule: warn, do not reject.
                     logger.warning(
-                        "DFlash acceptance is degraded under disaggregated "
-                        "serving: the cache transceiver moves the target KV "
-                        "cache, but the drafter's context is built during "
-                        "prefill and is not transferred, so a generation "
-                        "server drafts without the prompt context. Output is "
-                        "unaffected; expect a lower acceptance rate than the "
-                        "same configuration run aggregated.")
+                        "DFlash under disaggregated serving: the drafter's "
+                        "prompt context reaches the generation server only "
+                        "for models that declare a disaggregated handoff, "
+                        "with transceiver_runtime='PYTHON', backend='NIXL' "
+                        "and the separate draft KV cache. Otherwise the "
+                        "generation server drafts without the prompt "
+                        "context; expect a lower acceptance rate and "
+                        "different speculative trajectories than the same "
+                        "configuration run aggregated.")
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
                 # A Hugging Face repo id is not readable yet: both calls below
                 # then run without the drafter's config.json (the budget check

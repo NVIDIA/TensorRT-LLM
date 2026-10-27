@@ -56,6 +56,7 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
 )
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_composite_page_table
 from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_slot_bytes
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor import hang_detector
@@ -239,7 +240,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         dist: Distributed,
         kv_cache_manager: KVCacheManagerV2,
         cache_transceiver_config: CacheTransceiverConfig,
+        draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+        cache_identity: Optional[dict] = None,
+        context_state_exporter: Optional[Callable[[LlmRequest], Optional[bytes]]] = None,
+        context_state_validator: Optional[Callable[[LlmRequest], Optional[str]]] = None,
     ):
+        """``draft_kv_cache_manager`` makes every transfer carry the draft manager's pages for
+        the same request alongside the target's, in one session (``build_composite_page_table``);
+        both managers keep owning their allocation, reuse and history. ``cache_identity`` is
+        the semantic identity peers must match before any transfer.
+        ``context_state_exporter`` returns the model's handoff record for a finished context
+        request (a dict, see ``native.auxiliary.encode_handoff_record``); it travels in the
+        request's auxiliary slot, inside the same transfer session as the KV pages.
+        ``context_state_validator`` checks the received record on the generation side once
+        the session completes, before the request becomes transmission-complete, and
+        returns an error message to fail the request, else None.
+        """
         if not isinstance(kv_cache_manager, KVCacheManagerV2):
             raise ValueError(
                 "KvCacheTransceiverV2 does not support KV cache manager V1. "
@@ -277,6 +293,39 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             _retirement_executor_comm(mapping) if enforce_physical_ownership else None
         )
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
+        self._draft_kv_cache_manager = draft_kv_cache_manager
+        self._context_state_exporter = context_state_exporter
+        self._context_state_validator = context_state_validator
+        # Every session then moves the auxiliary slot, which carries the handoff record.
+        self._transfer_handoff_aux = (
+            context_state_exporter is not None or context_state_validator is not None
+        )
+        # Transfer members in transport order: (manager, its reuse adapter). The
+        # composite page table maps each transport layer group to (member, native group).
+        self._members = [(kv_cache_manager, self._reuse_adapter)]
+        composite_page_table = None
+        self._group_owner = None
+        if draft_kv_cache_manager is not None:
+            if not isinstance(draft_kv_cache_manager, KVCacheManagerV2):
+                raise ValueError(
+                    "the draft cache transfer needs a KVCacheManagerV2 draft manager, got "
+                    f"{type(draft_kv_cache_manager).__name__}"
+                )
+            if isinstance(kv_cache_manager, MambaHybridCacheManagerV2):
+                raise ValueError("the draft cache transfer supports attention-only targets")
+            if mapping.pp_size != 1 or mapping.cp_size != 1:
+                raise ValueError(
+                    "the draft cache transfer is qualified for pp_size == 1 and cp_size == 1, "
+                    f"got pp_size={mapping.pp_size}, cp_size={mapping.cp_size}"
+                )
+            self._members.append(
+                (draft_kv_cache_manager, create_cache_reuse_adapter(draft_kv_cache_manager))
+            )
+            # Draft transport layer ids follow the target's whole (all-PP) layer range, so
+            # they are collision-free and identical on every rank.
+            composite_page_table, self._group_owner = build_composite_page_table(
+                [(kv_cache_manager, 0), (draft_kv_cache_manager, kv_cache_manager.num_layers)]
+            )
 
         self._device_id = torch.cuda.current_device()
         logger.info(f"device_id: {self._device_id} in KvCacheTransceiverV2")
@@ -325,6 +374,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     else 0
                 ),
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
+                page_table=composite_page_table,
+                cache_identity=cache_identity,
+                transfer_handoff_aux=self._transfer_handoff_aux,
             )
         )
         if enforce_physical_ownership:
@@ -412,7 +464,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
-        layer_num = len(self._kv_cache_manager.pp_layers)
+        # Transport layers on this PP rank: every member's local layers.
+        layer_num = sum(len(manager.pp_layers) for manager, _ in self._members)
         layer_num_per_pp = cast(list, getattr(self._dist, "pp_allgather")(layer_num))
         self._transfer_worker.populate_instance_and_rank_info(
             endpoints=endpoints, layer_num_per_pp=layer_num_per_pp
@@ -550,11 +603,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             excluded_pool_views = exclude(self._page_table, remote_tail_split)
 
         is_gen_only = req.is_generation_only_request
-        cached_per_lg = (
-            adapter.get_cached_token_count_per_layer_group(req, layer_groups)
-            if is_gen_only
-            else [0] * len(layer_groups)
+        # Each transport layer group belongs to one member manager and is that manager's
+        # native group ``native_idx``; its ordinals and reused prefix come from that member.
+        owners = (
+            self._group_owner
+            if self._group_owner is not None
+            else [(0, idx) for idx in range(len(layer_groups))]
         )
+        cached_per_lg = [0] * len(layer_groups)
+        if is_gen_only:
+            for member_idx, (_, member_adapter) in enumerate(self._members):
+                member_groups = [idx for idx, (m, _) in enumerate(owners) if m == member_idx]
+                cached = member_adapter.get_cached_token_count_per_layer_group(
+                    req, [layer_groups[idx] for idx in member_groups]
+                )
+                for idx, tokens in zip(member_groups, cached):
+                    cached_per_lg[idx] = tokens
 
         empty = np.array([], dtype=np.int64)
         groups = []
@@ -567,7 +631,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # Block lists carry beam 0 only (beam-search attention reads
                 # prompt positions through beam 0's block table), so the
                 # positional path applies to every beam width.
-                ordinals = adapter.get_block_ordinals(req, idx, lg)
+                member_idx, native_idx = owners[idx]
+                ordinals = self._members[member_idx][1].get_block_ordinals(req, native_idx, lg)
                 group = self._positional_window(ordinals, prompt_blocks, cached_per_lg[idx] // tpb)
             groups.append(group)
 
@@ -657,6 +722,27 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
             return False
         return True
+
+    def _accept_context_state(self, session, req: LlmRequest) -> bool:
+        """Read a completed session's handoff record into ``req`` and validate it.
+
+        Runs once the session (KV pages and auxiliary slot) has completed and before the
+        request becomes transmission-complete, so a record that does not fit fails the
+        request before any received state is used. Every rank receives the same record from
+        its peer rank and checks it against the same local state.
+        """
+        if not getattr(self, "_transfer_handoff_aux", False):
+            return True
+        session.unpack_handoff(req)
+        validator = getattr(self, "_context_state_validator", None)
+        error = validator(req) if validator is not None else None
+        if error is None:
+            return True
+        logger.error(
+            f"Disagg generation request {req.py_request_id}: rejecting the received context "
+            f"handoff before decoding: {error}"
+        )
+        return False
 
     def _ctx_consensus(self, local_ids: list) -> list:
         # TP consensus: ensure all TP ranks have peer info
@@ -976,7 +1062,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Pack aux and set context phase params. Call after the last slice."""
         rid = get_unique_rid(req)
         assert rid is not None
-        if self._need_aux_transfer(req):
+        handoff_aux = getattr(self, "_transfer_handoff_aux", False)
+        if handoff_aux:
+            # Frozen now, after the context forward and before the request's model-side
+            # state can be recycled; the generation worker validates it on arrival.
+            exporter = self._context_state_exporter
+            req.py_disagg_handoff = exporter(req) if exporter is not None else None
+        if self._need_aux_transfer(req) or handoff_aux:
             session.pack_aux(req)
             session.send_aux()
         req.context_phase_params = ContextPhaseParams(
@@ -1133,7 +1225,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._recv_reqs[rid] = req
             result = session.wait_complete(blocking=True)
 
-            if result == WaitResult.COMPLETED:
+            if result == WaitResult.COMPLETED and not self._accept_context_state(session, req):
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            elif result == WaitResult.COMPLETED:
                 # Verified-range reuse admission (local verdict; this
                 # blocking path has no cross-rank outcome consensus).
                 req.py_kv_transfer_verified = session.kv_write_verified()
@@ -1349,6 +1443,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
                 req = self._recv_reqs[rid]
+                if not self._accept_context_state(session, req):
+                    # Received, but the handoff record does not fit: fail the request
+                    # through the consensus below rather than decode from it.
+                    failed.append(rid)
+                    continue
                 if session.transfer_end_time is not None:
                     req.set_kv_cache_transfer_end(session.transfer_end_time)
                 if session.kv_cache_size_bytes > 0:
@@ -1483,17 +1582,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             prompt_len = getattr(req, "prompt_len", None)
         if not prompt_len or prompt_len <= 0:
             return
-        history = self._kv_cache_manager.get_history_length(req)
-        if history is None:
-            # Cache was already released (e.g., cancelled mid-transfer); nothing to verify.
-            return
-        if history < prompt_len:
-            raise RuntimeError(
-                f"req {req.py_request_id}: kv_cache.history_length={history} "
-                f"< prompt_len={prompt_len} at TRANS_COMPLETE boundary. "
-                f"V2 scheduler must call prepare_disagg_gen_init() in "
-                f"_try_schedule_disagg_gen_init."
-            )
+        # Every transfer member received the prompt range, so each declares it.
+        for manager, _ in self._members:
+            history = manager.get_history_length(req)
+            if history is None:
+                # Cache was already released (e.g., cancelled mid-transfer); nothing to verify.
+                continue
+            if history < prompt_len:
+                raise RuntimeError(
+                    f"req {req.py_request_id}: kv_cache.history_length={history} "
+                    f"< prompt_len={prompt_len} at TRANS_COMPLETE boundary in the "
+                    f"{'draft' if manager is self._draft_kv_cache_manager else 'target'} "
+                    "manager. The V2 scheduler must declare the incoming prompt in every "
+                    "transferred manager in _try_schedule_disagg_gen_init."
+                )
 
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
@@ -1647,7 +1749,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 "destination on every rank)"
             )
             return
-        self._reuse_adapter.commit_blocks_for_reuse(req)
+        # The verification covers every member's pages, so each member commits its own.
+        for _, adapter in self._members:
+            adapter.commit_blocks_for_reuse(req)
 
     def get_context_state(self):
         raise NotImplementedError("get_context_state is not implemented")

@@ -162,8 +162,77 @@ class PeerRegistrar:
                 f"peer={peer_ri.bounded_replay_on_generation})."
             )
 
+    @staticmethod
+    def validate_cache_identity_compatible(self_ri: RankInfo, peer_ri: RankInfo) -> None:
+        """Require both peers to declare the same semantic cache identity, or neither.
+
+        Byte-compatible layouts can still hold different state: another checkpoint, another
+        FP8 scale table, a cache that is BF16 on one side, or a drafter present on only one
+        side all keep descriptor sizes intact. A declared identity names each such part by a
+        digest; any differing part, or a declaration on one side only, rejects the peer before
+        a transfer is admitted. The message names the parts, never their values.
+        """
+        mine, theirs = self_ri.cache_identity, peer_ri.cache_identity
+        if mine is None and theirs is None:
+            return
+        if mine is None or theirs is None:
+            side = "peer" if theirs is None else "local rank"
+            raise ValueError(
+                f"cache identity declared on one side only: the {side} declares none, so the "
+                "transferred state cannot be validated"
+            )
+        if mine.get("version") != theirs.get("version"):
+            raise ValueError(
+                f"cache identity versions differ (local={mine.get('version')}, "
+                f"peer={theirs.get('version')})"
+            )
+        my_parts, peer_parts = mine.get("parts", {}), theirs.get("parts", {})
+        differing = sorted(
+            name
+            for name in set(my_parts) | set(peer_parts)
+            if my_parts.get(name) != peer_parts.get(name)
+        )
+        if differing:
+            raise ValueError(f"cache identity parts differ between peers: {differing}")
+
+    def validate_complete_coverage(self, peer_ri: RankInfo) -> None:
+        """Require every local pool view to pair with a peer view holding exactly its layers.
+
+        Generic peer matching tolerates layers present on one side only (one-sided MTP
+        layers, PP slices). A peer that declares a cache identity transfers a fixed set of
+        managers whose state is all required, so a missing group is an error, not a skip.
+        """
+        if self._ri.cache_identity is None:
+            return
+        self_pt = self._self_ext_cache.page_table
+        peer_pt = peer_ri.page_table
+        if self_pt is None or peer_pt is None:
+            raise ValueError("cache identity requires page tables on both peers")
+        mapping = self.get_pool_mapping(peer_ri)
+        for self_lg_idx, self_lg in enumerate(self_pt.layer_groups):
+            for self_pi, self_pv in enumerate(self_lg.pool_views):
+                self_ids = sorted(get_pool_view_global_layer_ids(self_pv, self_lg))
+                if not self_ids:
+                    continue
+                peer_key = mapping.get((self_lg_idx, self_pi))
+                if peer_key is None:
+                    raise ValueError(
+                        f"layer group {self_lg_idx} pool view {self_pi} (transport layers "
+                        f"{self_ids[0]}..{self_ids[-1]}) has no counterpart on the peer"
+                    )
+                peer_lg = peer_pt.layer_groups[peer_key[0]]
+                peer_ids = sorted(
+                    get_pool_view_global_layer_ids(peer_lg.pool_views[peer_key[1]], peer_lg)
+                )
+                if peer_ids != self_ids:
+                    raise ValueError(
+                        f"layer group {self_lg_idx} pool view {self_pi} covers transport layers "
+                        f"{self_ids}, its peer view {peer_key} covers {peer_ids}"
+                    )
+
     def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
         self.validate_bounded_replay_compatible(peer_ri)
+        self.validate_cache_identity_compatible(self._ri, peer_ri)
         if not self._get_policy(CacheKind.PAGED).check_peer_compatible(peer_ri):
             return False
 
@@ -180,6 +249,7 @@ class PeerRegistrar:
             peer_ri.page_table,
         )
         AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
+        self.validate_complete_coverage(peer_ri)
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)

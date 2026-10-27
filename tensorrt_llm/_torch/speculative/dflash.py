@@ -607,21 +607,36 @@ class DFlashSpecMetadata(SpecMetadata):
 
             # A disagg generation worker receives prompt KV instead of
             # prefilling, so _store_prefill_context -- the only other assigner --
-            # never runs and every request would land on the dummy slot.
+            # never runs and every request would land on the dummy slot. A
+            # request whose draft context arrived with it (import_disagg_context)
+            # resumes from the imported cursor; any other starts empty.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
+            imported_updates = {}
             for rid in self.request_ids[num_contexts:]:
                 if (
                     rid != ATTENTION_DP_DUMMY_REQUEST_ID
                     and rid < worker._graph_dummy_id_floor
                     and rid not in worker._req_to_slot
                 ):
-                    if worker._assign_slot(rid) is None:
+                    imported = worker._pending_disagg_imports.pop(rid, None)
+                    slot = worker._assign_slot(rid, updates=imported_updates)
+                    if slot is None:
+                        if imported is not None:
+                            raise RuntimeError(
+                                f"DFlash: no free drafter slot for generation request {rid}, "
+                                "whose transferred draft context needs one"
+                            )
                         # Not fatal -- spec dec is lossless, so the dummy-slot
                         # fallback only costs acceptance. Warn so it is not silent.
                         logger.warning(
                             f"DFlash: no free drafter slot for generation request {rid}; "
                             "it shares the dummy slot and will draft poorly."
                         )
+                    elif imported is not None:
+                        draft_ctx_len, next_position = imported
+                        imported_updates[slot] = draft_ctx_len
+                        worker._req_ctx_pos[rid] = next_position
+            worker._write_ctx_len(imported_updates)
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
             # to dummy slot to avoid corrupting real request's context
@@ -774,6 +789,9 @@ class DFlashWorker(SpecWorkerBase):
         self._free_slots = deque()  # available slot indices
         self._dummy_slot = None  # for cudagraph padding or warmup dummy requests
         self._graph_dummy_id_floor = 1 << 62
+        # Draft-context cursors received with a disaggregated request's KV
+        # (import_disagg_context), bound to a slot at the request's first step.
+        self._pending_disagg_imports: dict[int, tuple[int, int]] = {}
 
         # Opt-in acceptance-statistics recorder (None unless
         # TLLM_DFLASH_ACCEPT_STATS_DIR is set; see accept_stats.py). Only
@@ -1360,6 +1378,39 @@ class DFlashWorker(SpecWorkerBase):
             self._req_to_slot[req_id] = slot
             clear(slot)
         return self._req_to_slot[req_id]
+
+    def export_disagg_context(self, request_id: int) -> Optional[dict]:
+        """The draft-context cursor a finished context request leaves for disaggregated decode.
+
+        The context K/V themselves are the draft KV cache manager's pages, which the cache
+        transceiver moves with the target's. What makes them readable is this cursor: the
+        slot-local length stored for the request and the target position the next store
+        starts at. None when the request stored no context here (no free slot, an
+        overflowing prompt, or a step that did not draft), which the receiver must reject.
+        Valid until the next ``prepare`` recycles the request's slot.
+        """
+        if not self._ctx_buf_inited:
+            return None
+        slot = self._req_to_slot.get(request_id)
+        if slot is None:
+            return None
+        ctx_len = int(self._ctx_len_host[slot])
+        return {
+            "draft_ctx_len": ctx_len,
+            "next_position": int(self._req_ctx_pos.get(request_id, ctx_len)),
+        }
+
+    def import_disagg_context(self, request_id: int, draft_ctx_len: int, next_position: int):
+        """Queue a received draft-context cursor for ``request_id``.
+
+        Its slot is bound at the request's first generation step (``prepare``), after the
+        draft pages it describes have arrived in this engine's draft KV cache manager.
+        """
+        self._pending_disagg_imports[request_id] = (int(draft_ctx_len), int(next_position))
+
+    def release_request_state(self, request_id: int) -> None:
+        """Drop an import that was never bound (a request released before its first step)."""
+        self._pending_disagg_imports.pop(request_id, None)
 
     def _ctx_activation_dtype(self) -> torch.dtype:
         """Dtype the drafter computes context K/V in before they are stored.

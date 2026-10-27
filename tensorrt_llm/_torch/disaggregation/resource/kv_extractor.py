@@ -514,3 +514,61 @@ def build_page_table_from_manager(manager: KVCacheManagerV2) -> KVCachePageTable
     if not isinstance(manager, KVCacheManagerV2):
         raise ValueError("Python KV cache transfer requires KVCacheManagerV2; V1 is unsupported.")
     return _build_page_table_v2(manager)
+
+
+def build_composite_page_table(
+    members: List[Tuple[KVCacheManagerV2, int]],
+) -> Tuple[KVCachePageTable, List[Tuple[int, int]]]:
+    """Describe several independently owned V2 managers as one transfer page table.
+
+    ``members`` lists ``(manager, transport_layer_id_base)`` in transfer order. Each manager's
+    own table is built unchanged and appended: its pool groups follow the previous members',
+    its layer groups keep their native windows, pool views and local layer ids, and only the
+    transport layer ids are shifted by the member's base so that layers of different managers
+    never collide in peer matching. The managers keep their allocation, reuse and history
+    ownership; the table only tells the transport where each member's pages live.
+
+    Returns the table and, per transport layer group, ``(member index, member-local layer
+    group id)``.
+    """
+    if not members:
+        raise ValueError("a composite page table needs at least one manager")
+    tables = [build_page_table_from_manager(manager) for manager, _ in members]
+    tokens_per_block = tables[0].tokens_per_block
+    layer_groups: List[LayerGroup] = []
+    pool_groups: List[PhysicalPoolGroup] = []
+    provenance: List[Tuple[int, int]] = []
+    seen_ids: Dict[int, int] = {}
+    for member_idx, ((_, base), table) in enumerate(zip(members, tables)):
+        if table.tokens_per_block != tokens_per_block:
+            raise ValueError(
+                f"composite member {member_idx} pages {table.tokens_per_block} tokens per block, "
+                f"member 0 pages {tokens_per_block}; one transfer needs one page size"
+            )
+        pool_group_offset = len(pool_groups)
+        pool_groups.extend(table.pool_groups)
+        for local_lg_idx, lg in enumerate(table.layer_groups):
+            shifted = [
+                LocalLayer(
+                    local_layer_id=ll.local_layer_id, global_layer_id=ll.global_layer_id + base
+                )
+                for ll in lg.local_layers
+            ]
+            for ll in shifted:
+                if ll.global_layer_id in seen_ids:
+                    raise ValueError(
+                        f"transport layer id {ll.global_layer_id} of composite member "
+                        f"{member_idx} collides with member {seen_ids[ll.global_layer_id]}; "
+                        "give each member a disjoint transport_layer_id_base"
+                    )
+                seen_ids[ll.global_layer_id] = member_idx
+            lg.local_layers = shifted
+            lg.pool_group_idx += pool_group_offset
+            layer_groups.append(lg)
+            provenance.append((member_idx, local_lg_idx))
+    return (
+        KVCachePageTable(
+            tokens_per_block=tokens_per_block, layer_groups=layer_groups, pool_groups=pool_groups
+        ),
+        provenance,
+    )

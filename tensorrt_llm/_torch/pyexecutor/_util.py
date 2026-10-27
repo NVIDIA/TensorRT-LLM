@@ -4523,9 +4523,33 @@ def create_py_executor_instance(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
+    # A model that declares a disaggregated handoff contributes its semantic cache
+    # identity, the record it freezes for each finished context request and, when its
+    # drafter's state lives in the separate draft manager, that manager's pages to every
+    # transfer. Models without one keep the target-only transfer.
+    transfer_kwargs = {}
+    cache_identity_fn = getattr(model_engine.model, "disagg_cache_identity",
+                                None)
+    if (cache_identity_fn is not None and cache_transceiver_config is not None
+            and cache_transceiver_config.backend is not None):
+        transfer_kwargs["cache_identity"] = cache_identity_fn()
+        transfer_kwargs["context_state_exporter"] = getattr(
+            model_engine.model, "export_disagg_context_request", None)
+        transfer_kwargs["context_state_validator"] = getattr(
+            model_engine.model, "validate_disagg_generation_request", None)
+        if getattr(model_engine.model, "transfers_draft_kv_cache", False):
+            draft_for_transfer = resources.get(
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+            if draft_for_transfer is None:
+                raise ValueError(
+                    "the model's drafter state lives in the separate draft KV cache, "
+                    "which this engine did not create; it cannot be transferred"
+                )
+            transfer_kwargs["draft_kv_cache_manager"] = draft_for_transfer
+
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+        cache_transceiver_config, mamba_cache_manager, **transfer_kwargs)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

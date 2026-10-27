@@ -4349,6 +4349,10 @@ class PyExecutor:
         self.disagg.poll_gen_transfers()
         self._activate_completed_remote_tails()
         self.disagg.check_transfer_timeouts()
+        # Before scheduling, on every rank alike: no forward or response pass
+        # reaches a generation request that has not been handed to generation.
+        self._cancel_pending_gen_receives()
+        self._finish_exhausted_gen_receives()
         # After the polls so a transfer that completed this iteration releases
         # its parked failure before scheduling can admit the request.
         self._sweep_transfer_held_failures()
@@ -8157,6 +8161,135 @@ class PyExecutor:
             req.py_kv_transfer_start_time = None
             req.py_kv_transfer_timed_out = False
 
+    @staticmethod
+    def _awaits_gen_handoff(request: LlmRequest) -> bool:
+        """Whether a generation-only request has not been handed to generation:
+        its KV receive is pending, in flight or completed but not yet scheduled."""
+        return (request.is_disagg_generation_init_state
+                or request.is_disagg_generation_transmission_in_progress
+                or request.is_disagg_generation_transmission_complete)
+
+    def _cancel_pending_gen_receives(self) -> None:
+        """Apply aborts and expired transfer deadlines to requests awaiting handoff.
+
+        Such a request is not schedulable, so neither a forward nor the
+        response pass reaches it: an abort or an expired
+        ``kv_transfer_timeout_ms`` would otherwise only be applied after the
+        receive completes and the request has decoded. The transceiver cancels
+        the receive and notifies the sender. A request ends only once that
+        reports its destination safe to free and is retried on the next
+        iteration until then. A receive that completed after its deadline is
+        failed rather than decoded. With in-flight cancellation enabled the
+        coordinator owns this instead.
+        """
+        if (self.kv_cache_transceiver is None
+                or self.disagg.inflight_cancel_active()):
+            return
+        canceled_ids = set(self.canceled_req_ids)
+        cancelled, timed_out = [], []
+        for request in self.active_requests:
+            if not self._awaits_gen_handoff(request):
+                continue
+            req_id = (request.parent_request_id
+                      if request.is_child else request.py_request_id)
+            if req_id in canceled_ids:
+                if self._try_cancel_request(request):
+                    cancelled.append(request)
+            elif request.py_kv_transfer_timed_out:
+                if self.disagg.request_cancellation(request):
+                    # The receive is abandoned; leaving the in-transmission
+                    # state lets the failure release the request at once.
+                    request.state = LlmRequestState.DISAGG_TRANS_ERROR
+                    timed_out.append(request)
+        for request in cancelled:
+            request.py_kv_transfer_timed_out = False
+            request.finish_by_reason(FinishReason.CANCELLED)
+            request.decoding_iter = request.py_decoding_iter
+            response = request.create_response()
+            if response is not None:
+                response.result.cached_tokens = request.cached_tokens
+                self._pending_transfer_responses.append(
+                    (request.py_request_id, response))
+            self._pending_response_terminations.append(request)
+        if cancelled:
+            self.active_requests[:] = [
+                request for request in self.active_requests
+                if not any(request is done for done in cancelled)
+            ]
+            still_active = {
+                request.parent_request_id
+                if request.is_child else request.py_request_id
+                for request in self.active_requests
+            }
+            done_ids = {
+                request.parent_request_id
+                if request.is_child else request.py_request_id
+                for request in cancelled
+            }
+            self.canceled_req_ids[:] = [
+                req_id for req_id in self.canceled_req_ids
+                if req_id not in done_ids or req_id in still_active
+            ]
+        self.disagg.fail_timed_out(timed_out)
+
+    def _finish_exhausted_gen_receives(self) -> None:
+        """Finish received requests whose first token, produced by the context
+        worker, already ends them.
+
+        That token counts toward ``max_new_tokens``; when it is the last one
+        the request may emit (e.g. ``max_tokens=1``), or it is the end id, a
+        generation step would emit a token past the end. Such a request is
+        finished at receive completion with that single token instead of being
+        scheduled. Same order as the sampler's stop criteria: end id, then
+        length.
+        """
+        if self.kv_cache_transceiver is None:
+            return
+        finished = []
+        for request in self.active_requests:
+            if (not request.is_disagg_generation_transmission_complete
+                    or request.py_beam_width != 1
+                    or getattr(request, "py_csa2_remote_tail_mode",
+                               None) == "destination"):
+                continue
+            params = request.context_phase_params
+            first_gen_tokens = None if params is None else params.first_gen_tokens
+            if not first_gen_tokens:
+                continue
+            token = first_gen_tokens[0]
+            num_tokens = request.get_num_tokens(0) + 1
+            if token == request.py_end_id:
+                reason = FinishReason.END_ID
+            elif (num_tokens - request.py_orig_prompt_len
+                  >= request.py_max_new_tokens
+                  or (self.max_seq_len is not None
+                      and num_tokens >= self.max_seq_len)):
+                reason = FinishReason.LENGTH
+            else:
+                continue
+            if not self.disagg.try_finish_gen_receive(request):
+                continue
+            request.add_new_token(token, 0)
+            request.decoding_iter = 1
+            request.py_decoding_iter = 1
+            request.finish_by(reason, 0)
+            self._maybe_prepend_logprobs_and_logits(request, 1)
+            if request.return_perf_metrics:
+                request.update_perf_metrics(self.iter_counter)
+            response = request.create_response()
+            if response is not None:
+                response.result.cached_tokens = request.cached_tokens
+                self._maybe_attach_ctx_usage(request, response)
+                self._pending_transfer_responses.append(
+                    (request.py_request_id, response))
+            self._pending_response_terminations.append(request)
+            finished.append(request)
+        if finished:
+            self.active_requests[:] = [
+                request for request in self.active_requests
+                if not any(request is done for done in finished)
+            ]
+
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
         cache_trans_complete_requests = [
@@ -9481,6 +9614,10 @@ class PyExecutor:
 
                 is_cancelled = self.disagg.request_cancellation(request)
                 if is_cancelled:
+                    if self._awaits_gen_handoff(request):
+                        # As in _cancel_pending_gen_receives: the abandoned
+                        # receive no longer holds the request's blocks.
+                        request.state = LlmRequestState.DISAGG_TRANS_ERROR
                     # _handle_errors enters response collectives under ADP.
                     # Defer it until the rank-uniform vote below.
                     timed_out_requests.append(request)

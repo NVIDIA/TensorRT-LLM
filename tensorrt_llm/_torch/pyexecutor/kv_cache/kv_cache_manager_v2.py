@@ -4403,11 +4403,21 @@ class KVCacheManagerV2(BaseResourceManager):
         # Deliberately no claim cap here: a disagg generation-init request
         # receives its prompt KV from the context worker and never runs a
         # prefill forward on this engine, so there is no drafter hidden state
-        # to recover. Spec decode on a disagg engine is guard-refused anyway
-        # (disagg_dflash_error).
+        # to recover.
         if self.enable_block_reuse:
             _settle_context_cursor(req, reused, self.tokens_per_block)
+        return self.declare_disagg_gen_receive(req)
 
+    def declare_disagg_gen_receive(self, req: LlmRequest) -> bool:
+        """Size a claimed generation-init cache for its incoming prompt and declare it.
+
+        The cache must already be claimed (``prepare_context_cache``) and the shared cursor
+        settled; a paired target/draft admission claims both pools at one depth first and
+        then declares each. Allocates the full prompt (+ draft) capacity, sets
+        ``history_length`` to the incoming prompt length, and records the readiness event
+        that receive publication waits for. Returns False when the resize is refused (the
+        cache is suspended); the caller rolls the admission back.
+        """
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
             return False
@@ -4434,7 +4444,10 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
         self._fill_fresh_kv_pages(req.py_request_id)
         self._log_window_crossing(req, kv_cache, pre_cap, capacity, "disagg_gen_init")
-        req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
+        if not self.is_draft:
+            # The request's single rollback record belongs to the target; a paired draft
+            # admission is rolled back by releasing it (see the scheduler).
+            req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         # RDMA cannot observe cache-stream ordering. Capture readiness here so
         # receive publication waits for admission's copies and recycled-slot
         # dependencies without waiting for later execution-stream work.
@@ -5126,6 +5139,17 @@ class KVCacheManagerV2(BaseResourceManager):
         # separate draft engine still uses the legacy draft request view.
         with request_context(not self.enable_joint_kv_cache_reuse, scheduled_batch):
             for req in scheduled_batch.context_requests:
+                existing = self.kv_cache_map.get(req.py_request_id)
+                if (
+                    req.is_disagg_generation_init_state
+                    and existing is not None
+                    and existing.is_active
+                    and existing.history_length >= req.prompt_len
+                ):
+                    # Admitted with the target by the scheduler's paired generation-init
+                    # admission: already sized and its incoming prompt declared. Resizing
+                    # here would be a second, fallible allocation.
+                    continue
                 kv_cache = self._mirror_draft_kv_cache(req)
                 if kv_cache is None:
                     # Pre-existing behaviour, kept deliberately: skipping does NOT buy a

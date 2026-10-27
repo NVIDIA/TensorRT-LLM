@@ -838,14 +838,37 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         Returns ``(action, tokens)``.  *tokens* is 0 because disagg requests
         don't participate in the forward pass token budget.
+
+        With a joint draft pool, both pools receive the prompt: they are claimed at
+        one common reusable depth (one settled cursor), then each declares the
+        incoming prompt as history and records its own readiness event. A refusal
+        in either pool releases both claims and their readiness events, rewinds
+        the cursor and returns SKIP, leaving the request retryable without
+        pinning target pages while it waits for draft capacity.
         """
-        # Cache-transceiver mode disables the separate one-model draft manager,
-        # so disagg generation init has no paired-reuse path. Supporting one
-        # would also require draft KV transfer and history_length=prompt_len.
-        if not self.kv_cache_manager.prepare_disagg_gen_init(req):
-            logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
+        draft_manager = self._joint_draft_manager
+        if draft_manager is None:
+            if not self.kv_cache_manager.prepare_disagg_gen_init(req):
+                logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
+                return ScheduleAction.SKIP, 0
+            return ScheduleAction.SCHEDULED, 0
+
+        from ..llm_request import rewind_context_after_cache_drop
+
+        if not self._prepare_context_pair(req):
+            logger.debug("paired disagg gen-init claim refused for request %s", req.py_request_id)
             return ScheduleAction.SKIP, 0
-        return ScheduleAction.SCHEDULED, 0
+        if self.kv_cache_manager.declare_disagg_gen_receive(
+            req
+        ) and draft_manager.declare_disagg_gen_receive(req):
+            return ScheduleAction.SCHEDULED, 0
+        logger.debug(
+            "paired disagg gen-init allocation refused for request %s; releasing both pools",
+            req.py_request_id,
+        )
+        self._free_kv_caches(req)
+        rewind_context_after_cache_drop(req, self.kv_cache_manager.tokens_per_block)
+        return ScheduleAction.SKIP, 0
 
     def _try_schedule_context(
         self,
