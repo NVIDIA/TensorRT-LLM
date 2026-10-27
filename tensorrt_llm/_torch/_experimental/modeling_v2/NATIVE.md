@@ -116,7 +116,7 @@ The gpt_oss files are the example for each step.
    ```python
    from tensorrt_llm._torch._experimental.modeling_v2._native import namespace_of
 
-   _NS = namespace_of(__package__)
+   _NS = namespace_of(__name__)
 
    @torch.library.register_fake(f"{_NS}::my_op")
    def _(x):
@@ -149,7 +149,7 @@ add_modeling_v2_target(foo foo_nvfp4__sm_100__tp8 ARCHS 100f)
 ```
 
 - **Fakes** of the shared ops go in the family's `models/foo/fake_ops.py`,
-  with `torch_namespace(family_of(__name__))`; the loader imports it when it
+  with `namespace_of(__name__)` as in a target's; the loader imports it when it
   opens the library.
 - **Callers** anywhere in the family use
   `load_family_ops(__name__).my_op(...)`.

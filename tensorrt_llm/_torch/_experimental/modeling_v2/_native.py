@@ -7,37 +7,33 @@ Native code of a model family lives with its Python code, in ``models/<family>/c
 (a target's own), and builds into one torch-op library,
 ``libth_modeling_v2_<family>.so``, installed next to ``libth_common.so``. Nothing of
 it is in the stock libraries, and nothing loads it until routing picks a target of
-the family: a target package that has native code starts with::
+the family. The API is four names:
 
-    from tensorrt_llm._torch._experimental.modeling_v2._native import load_target_ops
+* :func:`load_target_ops` -- a target package with native code starts with
+  ``native_ops = load_target_ops(__name__)``;
+* :func:`load_family_ops` -- the family's shared ops, ``load_family_ops(__name__)``
+  from any module of the family;
+* :func:`namespace_of` -- the torch namespace a ``fake_ops.py`` registers its fakes
+  in, ``namespace_of(__name__)``;
+* :class:`NativeLoadError` -- a library that is installed but broken.
 
-    native_ops = load_target_ops(__name__)  # torch.ops.mv2_<family>_<target>
+``route`` imports a target only on the branch that returns it, so loading is part of
+routing, and it follows how the stock code treats its optional native modules
+(``flash_mla``, ``deep_ep``): a library this installation does not have, or a target
+it did not build (it answers ``torch.ops.mv2_<family>.built_targets()``), is a
+:class:`NoTarget`, so ``auto`` keeps the built-in model; a library that fails to
+load, or lacks an op a ``fake_ops.py`` declares, is a :class:`NativeLoadError`,
+never a fallback. The family's ``fake_ops.py`` registers when the library opens, a
+target's when the target is found in it.
 
-``route`` imports the target only on the branch that returns it, so loading is part
-of routing, and it follows how the stock code treats its optional native modules
-(``flash_mla``, ``deep_ep``):
-
-* a library this installation does not have is a feature that is not there:
-  :class:`NoTarget`, so ``auto`` keeps the built-in model and ``require`` says why;
-* a library that is there but fails to load is an error, :class:`NativeLoadError`,
-  never a fallback;
-* which targets a library carries it answers itself,
-  ``torch.ops.mv2_<family>.built_targets()``, the way ``th_common`` answers feature
-  queries; a target it does not carry is :class:`NoTarget`;
-* the family's ``fake_ops.py`` (its shared ops) registers right after the library
-  opens, and the target's ``fake_ops.py`` right after the target is found in it;
-  either fails if an op it declares is missing from the library.
-
-Ops of a family's shared code are in ``torch.ops.mv2_<family>``; code of the family
-reaches them through :func:`load_family_ops`.
-
-The "Native code" section of the modeling_v2 README is the guide for authors.
+``NATIVE.md`` next to this module is the guide for authors.
 """
 
 from __future__ import annotations
 
 import importlib
 import importlib.util
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, Optional, Tuple
@@ -57,57 +53,47 @@ _family_ops: Dict[str, Any] = {}
 class NativeLoadError(RuntimeError):
     """A family library is installed but cannot be used.
 
-    Raised when the library fails to open or an op the target's ``fake_ops.py``
-    declares is missing from it. It is deliberately not a :class:`NoTarget`, so
-    ``auto`` does not hide a broken installation behind the built-in model.
+    Raised when the library fails to open or an op a ``fake_ops.py`` declares is
+    missing from it. It is deliberately not a :class:`NoTarget`, so ``auto`` does
+    not hide a broken installation behind the built-in model.
     """
+
+
+def namespace_of(module: str) -> str:
+    """The torch namespace of the ops a module's ``fake_ops.py`` fakes.
+
+    ``mv2_<family>_<target>`` for a module of a target package, ``mv2_<family>`` for
+    a module of the family itself (its shared ops). Target directories are named
+    ``<checkpoint>__<sm>__<parallel>``, so the module path tells the two apart.
+    """
+    return _namespace(*_split(module))
 
 
 # --- Naming (mirrors cpp/cmake/modules/modeling_v2.cmake) --------------------
 
 
-def identifier(name: str) -> str:
+def _identifier(name: str) -> str:
     """``name`` with ``__`` collapsed, usable as a C++ or torch identifier."""
-    while "__" in name:
-        name = name.replace("__", "_")
-    return name
+    return re.sub("_{2,}", "_", name)
 
 
-def torch_namespace(family: str, target: Optional[str] = None) -> str:
-    """The torch namespace of a target's ops, or of the family's shared ops."""
-    if target is None:
-        return f"mv2_{family}"
-    return f"mv2_{family}_{identifier(target)}"
+def _namespace(family: str, target: Optional[str] = None) -> str:
+    return f"mv2_{family}" if target is None else f"mv2_{family}_{_identifier(target)}"
 
 
-def library_name(family: str) -> str:
-    """The file name of a family's library."""
+def _library_name(family: str) -> str:
     return f"libth_modeling_v2_{family}.so"
 
 
-def split_target_package(package: str) -> Tuple[str, str]:
-    """``(family, target)`` of a target package name."""
+def _split(module: str) -> Tuple[str, Optional[str]]:
+    """``(family, target)`` of a module under ``models.<family>``; ``target`` is None
+    for a module of the family itself."""
     prefix = f"{_MODELS_PACKAGE}."
-    if not package.startswith(prefix):
-        raise ValueError(f"{package!r} is not a modeling_v2 target package")
-    parts = package[len(prefix) :].split(".")
-    if len(parts) != 2:
-        raise ValueError(f"{package!r} is not a models.<family>.<target> package")
-    return parts[0], parts[1]
-
-
-def family_of(module: str) -> str:
-    """The family of a module anywhere under ``models.<family>``."""
-    prefix = f"{_MODELS_PACKAGE}."
-    family = module[len(prefix) :].partition(".")[0] if module.startswith(prefix) else ""
-    if not family:
+    parts = module[len(prefix) :].split(".") if module.startswith(prefix) else []
+    if not parts or not parts[0]:
         raise ValueError(f"{module!r} is not a module of a modeling_v2 family")
-    return family
-
-
-def namespace_of(package: str) -> str:
-    """The torch namespace of the target package ``package``, e.g. for its fake_ops.py."""
-    return torch_namespace(*split_target_package(package))
+    target = parts[1] if len(parts) > 1 and "__" in parts[1] else None
+    return parts[0], target
 
 
 # --- Loading ------------------------------------------------------------------
@@ -122,7 +108,7 @@ def _import_fakes(module: str, family: str) -> None:
         importlib.import_module(module)
     except (AttributeError, RuntimeError, ValueError) as error:
         raise NativeLoadError(
-            f"{module} does not match the ops in {library_name(family)}: {error}"
+            f"{module} does not match the ops in {_library_name(family)}: {error}"
         ) from None
 
 
@@ -131,21 +117,17 @@ def _open_library(path: Path, family: str) -> FrozenSet[str]:
     import torch
 
     torch.ops.load_library(str(path))
-    answer = getattr(torch.ops, torch_namespace(family)).built_targets()
+    answer = getattr(torch.ops, _namespace(family)).built_targets()
     return frozenset(t for t in answer.split(",") if t)
 
 
-def load_family_library(family: str) -> FrozenSet[str]:
-    """Open ``libth_modeling_v2_<family>.so`` and return the targets it carries.
-
-    Idempotent, and independent of the device, so it can run anywhere the stock
-    libraries load. :func:`load_target_ops` adds the target-level checks.
-    """
+def _load_family_library(family: str) -> FrozenSet[str]:
+    """Open ``libth_modeling_v2_<family>.so`` once and return the targets it carries."""
     if family in _built_targets:
         return _built_targets[family]
     if sys.platform == "win32":
         raise NoTarget("modeling_v2 native code is not built on Windows")
-    path = _LIBS_DIR / library_name(family)
+    path = _LIBS_DIR / _library_name(family)
     if not path.is_file():
         raise NoTarget(
             f"this installation has no {path.name}: the build compiles a family's library "
@@ -169,20 +151,21 @@ def load_target_ops(package: str) -> Any:
     :class:`NoTarget` when this installation does not carry the target and
     :class:`NativeLoadError` when its library is broken.
     """
-    family, target = split_target_package(package)
-    built = load_family_library(family)
+    family, target = _split(package)
+    if target is None or package != f"{_MODELS_PACKAGE}.{family}.{target}":
+        raise ValueError(f"{package!r} is not a models.<family>.<target> package")
+    built = _load_family_library(family)
     if target not in built:
         carried = ", ".join(sorted(built)) or "none"
         raise NoTarget(
-            f"{library_name(family)} does not carry {target}: this build did not compile "
+            f"{_library_name(family)} does not carry {target}: this build did not compile "
             f"it (its ARCHS miss the build's, a REQUIRES is unmet, or "
             f"TRTLLM_MODELING_V2_TARGETS excluded it); it carries {carried}"
         )
-
     _import_fakes(f"{package}.fake_ops", family)
     import torch
 
-    return getattr(torch.ops, torch_namespace(family, target))
+    return getattr(torch.ops, _namespace(family, target))
 
 
 def load_family_ops(module: str) -> Any:
@@ -191,14 +174,14 @@ def load_family_ops(module: str) -> Any:
 
     Call it with ``__name__`` from any module of the family, where the op is used;
     after the first call it is a dictionary lookup. Raises like
-    :func:`load_family_library`. Whether a target is carried is
-    :func:`load_target_ops`'s check, which the target's ``__init__.py`` runs first.
+    :func:`load_target_ops`, whose target check the target's ``__init__.py`` runs
+    first.
     """
     ops = _family_ops.get(module)
     if ops is None:
-        family = family_of(module)
-        load_family_library(family)
+        family = _split(module)[0]
+        _load_family_library(family)
         import torch
 
-        ops = _family_ops[module] = getattr(torch.ops, torch_namespace(family))
+        ops = _family_ops[module] = getattr(torch.ops, _namespace(family))
     return ops

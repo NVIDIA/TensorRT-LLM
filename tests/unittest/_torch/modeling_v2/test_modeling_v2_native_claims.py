@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import identifier, torch_namespace
+from tensorrt_llm._torch._experimental.modeling_v2 import _native
 
 _REPO = Path(__file__).resolve().parents[4]
 # What every family shares: the discovery and the common/ macros.
@@ -491,9 +491,9 @@ def test_cmake_and_python_agree_on_names_and_architectures(tmp_path):
         ["cmake", "-P", str(script)], capture_output=True, text=True, check=True
     ).stdout
     for name in names:
-        assert f"name {name} {identifier(name)}" in output, output
+        assert f"name {name} {_native._identifier(name)}" in output, output
     assert "archs 90a-real;100f-real;103a-real" in output, output
     # The family namespace the build registers is the loader's.
-    assert torch_namespace("gpt_oss", "gpt_oss_120b__sm_10x__default") == (
+    assert _native._namespace("gpt_oss", "gpt_oss_120b__sm_10x__default") == (
         "mv2_gpt_oss_gpt_oss_120b_sm_10x_default"
     )

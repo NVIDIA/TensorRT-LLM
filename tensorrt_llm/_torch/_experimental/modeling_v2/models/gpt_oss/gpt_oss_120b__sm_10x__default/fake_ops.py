@@ -10,7 +10,7 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2._native import namespace_of
 
-_NS = namespace_of(__package__)
+_NS = namespace_of(__name__)
 
 
 @torch.library.register_fake(f"{_NS}::swizzle_block_scales")

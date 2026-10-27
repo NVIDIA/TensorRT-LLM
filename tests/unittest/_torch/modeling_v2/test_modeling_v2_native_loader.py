@@ -28,23 +28,16 @@ import pytest
 from tensorrt_llm._torch._experimental.modeling_v2 import _native
 from tensorrt_llm._torch._experimental.modeling_v2._native import (
     NativeLoadError,
-    family_of,
-    identifier,
-    library_name,
-    load_family_library,
     load_family_ops,
     load_target_ops,
     namespace_of,
-    split_target_package,
-    torch_namespace,
 )
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
 
 pytestmark = pytest.mark.cpu_only
 
-_TARGET = (
-    "tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.gpt_oss_120b__sm_10x__default"
-)
+_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss"
+_TARGET = f"{_FAMILY}.gpt_oss_120b__sm_10x__default"
 
 
 @pytest.fixture
@@ -59,7 +52,7 @@ def libs(monkeypatch, tmp_path):
 def _install(libs: Path, monkeypatch, opens) -> None:
     """Put a gpt_oss library in `libs`; `opens` stands in for dlopen, and no
     fake_ops module is imported, since the stand-in defines no op."""
-    (libs / library_name("gpt_oss")).write_bytes(b"")
+    (libs / "libth_modeling_v2_gpt_oss.so").write_bytes(b"")
     monkeypatch.setattr(_native, "_open_library", lambda path, family: opens())
     monkeypatch.setattr(_native, "_import_fakes", lambda module, family: None)
 
@@ -67,18 +60,32 @@ def _install(libs: Path, monkeypatch, opens) -> None:
 # --- Naming ----------------------------------------------------------------------
 
 
-def test_names_of_libraries_and_namespaces():
-    assert library_name("minimax_m3") == "libth_modeling_v2_minimax_m3.so"
-    assert identifier("gpt_oss_120b__sm_10x__default") == "gpt_oss_120b_sm_10x_default"
-    assert torch_namespace("gpt_oss") == "mv2_gpt_oss"
-    assert namespace_of(_TARGET) == "mv2_gpt_oss_gpt_oss_120b_sm_10x_default"
-    assert split_target_package(_TARGET) == ("gpt_oss", "gpt_oss_120b__sm_10x__default")
+@pytest.mark.parametrize(
+    "module, namespace",
+    [
+        (_TARGET, "mv2_gpt_oss_gpt_oss_120b_sm_10x_default"),
+        (f"{_TARGET}.fake_ops", "mv2_gpt_oss_gpt_oss_120b_sm_10x_default"),
+        (f"{_TARGET}.ops.moe.entry", "mv2_gpt_oss_gpt_oss_120b_sm_10x_default"),
+        (f"{_FAMILY}.fake_ops", "mv2_gpt_oss"),
+        (f"{_FAMILY}.ops.comm.entry", "mv2_gpt_oss"),
+    ],
+)
+def test_namespace_of_a_target_or_family_module(module, namespace):
+    assert namespace_of(module) == namespace
+
+
+@pytest.mark.parametrize(
+    "module", ["tensorrt_llm._torch.models", "tensorrt_llm._torch._experimental.modeling_v2.models"]
+)
+def test_namespace_of_rejects_modules_outside_a_family(module):
     with pytest.raises(ValueError):
-        split_target_package("tensorrt_llm._torch.models")
-    assert family_of(f"{_TARGET}.weights") == "gpt_oss"
-    assert family_of(_TARGET.rpartition(".")[0] + ".fake_ops") == "gpt_oss"
-    with pytest.raises(ValueError):
-        family_of("tensorrt_llm._torch._experimental.modeling_v2.models")
+        namespace_of(module)
+
+
+@pytest.mark.parametrize("package", [_FAMILY, f"{_TARGET}.weights"])
+def test_load_target_ops_takes_a_target_package_only(package):
+    with pytest.raises(ValueError, match="models.<family>.<target>"):
+        load_target_ops(package)
 
 
 # --- Decisions -----------------------------------------------------------------
@@ -112,8 +119,8 @@ def test_a_library_opens_once(libs, monkeypatch):
         return frozenset({"gpt_oss_120b__sm_10x__default"})
 
     _install(libs, monkeypatch, opens)
-    assert load_family_library("gpt_oss") == {"gpt_oss_120b__sm_10x__default"}
-    assert load_family_library("gpt_oss") == {"gpt_oss_120b__sm_10x__default"}
+    assert _native._load_family_library("gpt_oss") == {"gpt_oss_120b__sm_10x__default"}
+    assert _native._load_family_library("gpt_oss") == {"gpt_oss_120b__sm_10x__default"}
     assert len(opened) == 1
 
 
@@ -158,7 +165,7 @@ def test_family_ops_of_a_family_this_installation_lacks_are_no_target(libs):
 def test_windows_has_no_native_targets(libs, monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
     with pytest.raises(NoTarget, match="Windows"):
-        load_family_library("gpt_oss")
+        _native._load_family_library("gpt_oss")
 
 
 # --- The installed wheel ---------------------------------------------------------
@@ -170,7 +177,7 @@ _LOAD_ONE_FAMILY = textwrap.dedent(
     import tensorrt_llm  # noqa: F401 -- loads libth_common.so
     from tensorrt_llm._torch._experimental.modeling_v2 import _native
 
-    built = sorted(_native.load_family_library(sys.argv[1]))
+    built = sorted(_native._load_family_library(sys.argv[1]))
     schemas = sorted(s.name for s in torch._C._jit_get_all_schemas() if s.name.startswith("mv2_"))
     print(json.dumps({"built": built, "ops": schemas}))
     """
@@ -198,7 +205,7 @@ def test_every_installed_family_library_loads():
             assert (models / family / target / "__init__.py").is_file(), (
                 f"{library.name} carries {target}, which has no Python target package"
             )
-            prefix = f"{torch_namespace(family, target)}::"
+            prefix = f"{_native._namespace(family, target)}::"
             target_ops = [op[len(prefix) :] for op in report["ops"] if op.startswith(prefix)]
             fake_ops = models / family / target / "fake_ops.py"
             text = fake_ops.read_text() if fake_ops.is_file() else ""
