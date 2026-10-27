@@ -103,19 +103,19 @@ def _restore_spec_decode_capture_state(
 
 @dataclass
 class CUDAGraphRunnerConfig:
-    """Configuration for the CUDAGraphRunner, passed from the ModelEngine."""
+    """Configuration for the CUDAGraphRunner, passed from the decoder runner."""
     use_cuda_graph: bool
     """
     Master switch controlling the model's execution path.
 
     This flag determines one of three distinct execution paths for the
-    model engine:
+    decoder runner:
 
     1.  **`False` (Pure Eager Path):**
         * Forces all execution to be in eager mode.
         * The `CUDAGraphRunner` instance is mostly dormant
         * Methods like `maybe_get_cuda_graph` and `pad_batch`
-            will return immediately, signaling the model engine to
+            will return immediately, signaling the decoder runner to
             run in eager mode.
 
     2.  **`True` (Eager Fallback Path):**
@@ -128,10 +128,10 @@ class CUDAGraphRunnerConfig:
         * The runner finds an eligible batch and a matching graph.
         * The graph is then captured (if new) or replayed.
 
-    Note: As of this implementation, the model engine *always* calls
+    Note: As of this implementation, the decoder runner *always* calls
     `cuda_graph_runner.pad_batch` and `cuda_graph_runner.maybe_get_cuda_graph`
     even when this is `False`. This could be refactored in the future
-    so that the engine bypasses the `CUDAGraphRunner` entirely in Case 1.
+    so that the decoder runner bypasses the `CUDAGraphRunner` entirely in Case 1.
     """
     cuda_graph_padding_enabled: bool
     cuda_graph_batch_sizes: list[int]
@@ -151,17 +151,17 @@ class CUDAGraphRunnerConfig:
     enable_encoder_decoder_mixed_cuda_graph: bool = False
     enable_in_graph_sampling: bool = False
     static_input_ids: Optional[torch.Tensor] = None
-    """The engine's own int32 input-id buffer. When given (with
+    """The decoder runner's own int32 input-id buffer. When given (with
     ``static_position_ids``), the graphs' static inputs are views of the
-    engine's buffers: every write the engine makes is already the graphs'
-    input, and replay copies nothing. For engines that rewrite every token's
+    decoder runner's buffers: every write the runner makes is already the graphs'
+    input, and replay copies nothing. For runners that rewrite every token's
     input each step."""
     static_position_ids: Optional[torch.Tensor] = None
 
 
 class CUDAGraphRunner:
     """
-    Manages the lifecycle and execution of CUDA graphs for the model engine.
+    Manages the lifecycle and execution of CUDA graphs for the decoder runner.
 
     This unified class handles high-level orchestration (padding, eligibility)
     and low-level execution (capturing, resource management, replaying) for
@@ -184,16 +184,16 @@ class CUDAGraphRunner:
         self.enable_encoder_decoder_mixed_cuda_graph = (
             config.enable_encoder_decoder_mixed_cuda_graph)
         self.enable_in_graph_sampling = config.enable_in_graph_sampling
-        # Set by the engine while capturing an in-graph sampling tier pass.
+        # Set by DecoderCudaGraphs while capturing an in-graph sampling tier pass.
         self._capture_sample_type: Optional[SampleType] = None
-        # Resolves a runtime batch to its tier; registered by the engine so the
+        # Resolves a runtime batch to its tier; registered through the decoder runner so the
         # graph runner does not need to know about the sampler.
         self._sample_type_resolver: Optional[Callable[
             [ScheduledRequests, Optional[SampleType]], SampleType]] = None
         # Called just before each replay, after the static input buffers are
         # filled. For state a model computes inside its own forward and a graph
         # therefore captures the address of: a replay runs no Python, so nothing
-        # else refreshes it. Registered by the engine on the model's behalf.
+        # else refreshes it. Registered by the model.
         self._pre_replay_hooks: List[Callable[
             [KeyType, int, Dict[str, Any], Dict[str, Any]], None]] = []
         self._pre_replay_position_ids: Optional[torch.Tensor] = None
@@ -335,7 +335,7 @@ class CUDAGraphRunner:
         """Select the sparse-attention graph family for the execution view.
 
         ``promoted_context_request_ids`` contains semantic final-context rows
-        that the model engine temporarily placed in the generation list. It is
+        that the decoder runner temporarily placed in the generation list. It is
         empty for the existing generation-only path.
         """
         if (isinstance(self.sparse_config, SeqLenAwareSparseAttentionConfig)
@@ -490,7 +490,7 @@ class CUDAGraphRunner:
         selects -- match the pre-tier engine.
 
         Only resolves; the buffers the in-graph step reads are staged later, by
-        the engine, once it has settled which batch the forward runs on. The
+        the decoder runner, once it has settled which batch the forward runs on. The
         tier has to be known here because it is part of the key that decides
         which graph is replayed.
         """
@@ -839,7 +839,7 @@ class CUDAGraphRunner:
                 f"replay() got {seqlen} tokens for key {key}, but the graph "
                 f"was captured for {expected_num_tokens} tokens. A shorter "
                 "input_ids leaves the tail of the static input buffer stale.")
-        # With the engine's buffers as the static inputs (static_input_ids)
+        # With the decoder runner's buffers as the static inputs (static_input_ids)
         # the source is the static view itself, and there is nothing to copy.
         static_input_ids = static_tensors["input_ids"][:seqlen]
         if input_ids.data_ptr() != static_input_ids.data_ptr():
@@ -872,7 +872,7 @@ class CUDAGraphRunner:
                                                       non_blocking=True)
             else:
                 # Omission means every slot reads the dummy seq slot's
-                # permanently-zero delta (model_engine.py's mrope_dummy_seq_slot
+                # permanently-zero delta (DecoderInputPreparer's mrope_dummy_seq_slot
                 # fast path). Fill explicitly instead of leaving stale values.
                 logger.debug(
                     "replay() got no mrope_delta_read_seq_slots for a "
@@ -942,7 +942,7 @@ class CUDAGraphRunner:
     def _max_padded_batch_size(self) -> int:
         """Largest padded batch size ``_get_padded_batch`` may choose.
 
-        ``max_supported_batch_size`` bounds the captured graphs; the engine's
+        ``max_supported_batch_size`` bounds the captured graphs; the decoder runner's
         own ``batch_size`` bounds concurrent requests, and the padded size is
         exactly ``padding_size + batch.batch_size``, so both apply to the
         padded size itself.
@@ -1230,7 +1230,7 @@ class CUDAGraphRunner:
     def preallocate_padding_dummies(self,
                                     resource_manager: ResourceManager) -> None:
         """Eagerly allocates the padding dummies while the KV cache still has
-        free blocks (called at the end of ModelEngine.warmup, after graph
+        free blocks (called during DecoderWarmup, after graph
         capture).
 
         _get_padded_batch otherwise allocates the dummies lazily at the first
