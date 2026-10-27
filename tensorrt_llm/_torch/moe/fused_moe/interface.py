@@ -773,12 +773,6 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         return bool(self.layer_load_balancer
                     and self.layer_load_balancer.produces_replica_plan)
 
-    def _load_balancer_replica_plan(self):
-        """Return the plan produced by the most recent route, if this mode has one."""
-        if not self._load_balancer_uses_replica_plan():
-            return None
-        return self.layer_load_balancer.require_replica_plan()
-
     def _load_balancer_start_set_cpu_stage(self, is_last_call: bool):
         """Start CPU stage in load balancer."""
         # A per-layer dynamic EPLB layer plans every chunk and releases that

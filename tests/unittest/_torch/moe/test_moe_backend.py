@@ -2473,7 +2473,7 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(monkeypatch, requ
         calls.append(("default", sf_vec_size, sf_use_ue8m0, is_sf_swizzled))
         return outputs(x)
 
-    def sm_budget(x, scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled, *, reserved_sms):
+    def sm_budget(x, scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled, reserved_sms):
         calls.append(("sm_budget", sf_vec_size, sf_use_ue8m0, is_sf_swizzled, reserved_sms))
         return outputs(x)
 

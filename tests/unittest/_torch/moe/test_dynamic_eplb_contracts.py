@@ -1005,6 +1005,9 @@ class _Routes:
     def is_contiguous(self):
         return self._contiguous
 
+    def get_device(self):
+        return int(self.device.split(":")[1]) if self.device.startswith("cuda:") else -1
+
     def record_stream(self, stream):
         self.trace.append(("lifetime", stream.cuda_stream))
 
@@ -1302,6 +1305,8 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
             "wait_value", stream, address, value, flags
         ),
     )
+    group._wait_value_geq = group._driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ
+    group._cuda_success = group._driver.CUresult.CUDA_SUCCESS
     outputs = SimpleNamespace(physical_slot_ids=_Routes(8192, trace))
 
     launch_bounds = []
@@ -1851,8 +1856,8 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(has_sm_budget):
         calls.append(("default", *args[1:]))
         return "x_fp4", Activation(3, 4)
 
-    def sm_budget(*args, reserved_sms):
-        calls.append(("sm_budget", *args[1:], reserved_sms))
+    def sm_budget(*args):
+        calls.append(("sm_budget", *args[1:]))
         return "x_fp4", Activation(3, 4)
 
     if has_sm_budget:
@@ -2411,7 +2416,14 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     scheduler_cls = _extract_class(source, "FusedCommMoEScheduler", {"_forward_chunk"}, namespace)
 
     plan = SimpleNamespace(reserved_sms=4)
-    layer = None if mode == "off" else SimpleNamespace(produces_replica_plan=mode != "standard")
+    layer = (
+        None
+        if mode == "off"
+        else SimpleNamespace(
+            produces_replica_plan=mode != "standard",
+            require_replica_plan=lambda: plan,
+        )
+    )
 
     def route(routes, use_dp):
         trace.append(("route", routes.name))
@@ -2435,14 +2447,13 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
             )
         ),
         _maybe_get_perfect_router_expert_ids=lambda routes: routes,
-        _load_balancer_start_wait_gpu_stage=lambda is_first_call: None,
-        _load_balancer_done_wait_gpu_stage=lambda is_first_call: None,
+        _load_balancer_start_wait_gpu_stage=lambda is_first_call: trace.append("start_wait_gpu"),
+        _load_balancer_done_wait_gpu_stage=lambda is_first_call: trace.append("done_wait_gpu"),
         _load_balancer_update_statistic=lambda routes, *args, **kwargs: trace.append(
             ("update_statistic", routes.name)
         ),
         _load_balancer_uses_replica_plan=lambda: mode == "per_layer_dynamic",
         _load_balancer_route=route,
-        _load_balancer_replica_plan=lambda: plan if mode == "per_layer_dynamic" else None,
         _load_balancer_start_set_cpu_stage=lambda is_last_call: trace.append("start_set_cpu"),
         _load_balancer_done_set_cpu_stage=lambda is_last_call: trace.append("done_set_cpu"),
         backend=SimpleNamespace(
@@ -2468,32 +2479,41 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     if mode == "per_layer_dynamic":
         # The planner consumes the logical routes the calibrator records or
         # replays, and quantization leaves the plan's SMs to its copy kernel.
+        # The layer has no CPU stage or host statistics, so only the post-MoE
+        # hook that releases its plan runs.
         expected = [
-            ("update_statistic", "logical"),
             ("statistic", "logical"),
             ("calibrator", "logical"),
             ("route", "replayed logical"),
             ("quantize", {"reserved_sms": 4}),
             ("bucket", 6),
             ("run_moe", "physical", plan),
+            "start_set_cpu",
         ]
     elif mode == "standard":
         expected = [
+            "start_wait_gpu",
+            "done_wait_gpu",
             ("update_statistic", "logical"),
             ("route", "logical"),
             ("statistic", "slots"),
             ("calibrator", "slots"),
             *tail,
             ("run_moe", "replayed slots", None),
+            "start_set_cpu",
+            "done_set_cpu",
         ]
     else:
         expected = [
+            "start_wait_gpu",
             ("statistic", "logical"),
             ("calibrator", "logical"),
             *tail,
             ("run_moe", "replayed logical", None),
+            "start_set_cpu",
+            "done_set_cpu",
         ]
-    assert trace == expected + ["start_set_cpu", "done_set_cpu"]
+    assert trace == expected
 
 
 def test_base_worker_finalizes_rank_follower_pyexecutor():

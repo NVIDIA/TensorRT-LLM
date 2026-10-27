@@ -205,6 +205,9 @@ class RebalanceSlotSchedulerGroup:
         self.scheduler_stream = self.copy_stream
         self._stream_handle = int(self.copy_stream.cuda_stream)
         self._driver = driver
+        # The route wait runs once per layer; resolve its driver constants once.
+        self._wait_value_geq = driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ
+        self._cuda_success = driver.CUresult.CUDA_SUCCESS
         error, cu_device = driver.cuDeviceGet(self.device)
         supported = 0
         if error == driver.CUresult.CUDA_SUCCESS:
@@ -309,12 +312,9 @@ class RebalanceSlotSchedulerGroup:
 
     def _wait_route_epoch(self, stream_handle: int) -> None:
         (error,) = self._driver.cuStreamWaitValue64(
-            stream_handle,
-            self._route_epoch_ptr,
-            self._route_target,
-            self._driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ,
+            stream_handle, self._route_epoch_ptr, self._route_target, self._wait_value_geq
         )
-        if error != self._driver.CUresult.CUDA_SUCCESS:
+        if error != self._cuda_success:
             raise RuntimeError(f"cuStreamWaitValue64(rebalance) failed: {error!r}")
 
     def plan_schedule(self, logical_expert_ids: torch.Tensor) -> Tuple[Any, int]:
@@ -341,7 +341,8 @@ class RebalanceSlotSchedulerGroup:
             or logical_expert_ids.shape[1] != self.topk
             or logical_expert_ids.dtype != torch.int32
             or not logical_expert_ids.is_contiguous()
-            or logical_expert_ids.device != self.scheduler.device
+            # -1 for a CPU tensor; cheaper than building and comparing torch.device objects.
+            or logical_expert_ids.get_device() != self.device
         ):
             raise ValueError("Routes must be contiguous CUDA int32 [tokens, topk] on this device")
         num_tokens = int(logical_expert_ids.shape[0])
@@ -374,8 +375,11 @@ class RebalanceSlotSchedulerGroup:
     def plan_finish(
         self, part: Tuple[Any, int], *, defer_wait: bool = False
     ) -> Tuple[torch.Tensor, int]:
-        """Lend routes until finish(); optionally defer their device dependency."""
-        self._check_owner()
+        """Lend routes until finish(); optionally defer their device dependency.
+
+        It queues no device work itself: plan_schedule() checked the owner of
+        this pending plan, and the route wait checks it again.
+        """
         if part is not self._plan_part or part is None:
             raise RuntimeError("plan_finish requires this group's pending plan")
         outputs, num_tokens = part

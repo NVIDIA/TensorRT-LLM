@@ -65,6 +65,8 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         self.repeated_count = int(repeated_count)
 
         self._arena: Optional[Any] = None
+        # The arena's READY terminal view, resolved once the runtime is bound.
+        self._ready_flags: Optional[torch.Tensor] = None
         self._scheduler_group: Optional[Any] = None
         self._bound_backend_ref: Optional[weakref.ReferenceType[Any]] = None
         self._pending_replica_plan: Optional[Any] = None
@@ -170,6 +172,7 @@ class PerLayerDynamicMoeLayerLoadBalancer:
             raise ValueError("scheduler H/S geometry does not match the EPLB layer")
 
         self._arena = arena
+        self._ready_flags = arena.terminal_flags_tensor()
         self._scheduler_group = scheduler_group
         self.manager._register_runtime(self)
 
@@ -317,7 +320,7 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         plan = MoEReplicaPlan(
             resident_experts_per_rank=self.resident_experts_per_rank,
             compute_slots_per_rank=self.compute_slots_per_rank,
-            ready_flags=self._arena.terminal_flags_tensor(),
+            ready_flags=self._ready_flags,
             ready_generation=generation,
             reserved_sms=self.manager.auxiliary_sms,
             _wait_for_routes=self._scheduler_group.wait_for_routes,
@@ -356,4 +359,5 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         self._pending_replica_plan = None
         self._scheduler_group = None
         self._arena = None
+        self._ready_flags = None
         self._bound_backend_ref = None

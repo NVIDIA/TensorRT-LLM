@@ -1492,7 +1492,10 @@ class FusedCommMoEScheduler(MoEScheduler):
         quantize -> ``run_moe`` -> ``start_set_cpu_stage`` ->
         ``done_set_cpu_stage``. ``start/done_set_cpu_stage`` are placed
         AFTER ``run_moe``; otherwise dynamic-EPLB weight migration would
-        race with the fused kernel using those weights.
+        race with the fused kernel using those weights. A per-layer dynamic
+        EPLB layer has no CPU stage and no host statistics: it only gets
+        ``route`` and the post-``run_moe`` ``start_set_cpu_stage``, which
+        releases its replica plan.
         """
         moe = self.moe
         assert not moe.apply_router_weight_on_input, (
@@ -1521,10 +1524,15 @@ class FusedCommMoEScheduler(MoEScheduler):
             _leading_rows(input_ids, num_tokens) if input_ids is not None else None
         )
 
+        # Per-layer dynamic EPLB plans on the GPU; the CPU-stage and
+        # statistics hooks below are no-ops for it, so it skips them.
+        uses_replica_plan = moe._load_balancer_uses_replica_plan()
+
         # ----- EPLB: drain previous CPU rebalance -----
         # Static EPLB early-returns inside the helper; only the dynamic
         # balancer actually waits.
-        moe._load_balancer_start_wait_gpu_stage(is_first_call)
+        if not uses_replica_plan:
+            moe._load_balancer_start_wait_gpu_stage(is_first_call)
 
         # ----- routing -----
         # int32 matches the EPLB stats kernel contract used by the external-comm
@@ -1567,27 +1575,27 @@ class FusedCommMoEScheduler(MoEScheduler):
         # Per-layer dynamic EPLB plans from the routes that the layer-wise
         # calibrator records or replays, so they are recorded before the route;
         # otherwise the recorded routes are the slots routed to.
-        uses_replica_plan = moe._load_balancer_uses_replica_plan()
-        if moe.layer_load_balancer:
-            moe._load_balancer_done_wait_gpu_stage(is_first_call)
-            # ignore_allreduce=False: the fused kernel has no side channel
-            # for an external stats gather. The base helper runs its own
-            # EP-wide AllReduce, gated to is_last_call=True.
-            moe._load_balancer_update_statistic(
-                token_selected_experts,
-                is_first_call,
-                is_last_call,
-                ignore_allreduce=False,
-            )
-            if uses_replica_plan:
-                token_selected_experts = _record_routes(moe, token_selected_experts)
+        if uses_replica_plan:
+            token_selected_experts = _record_routes(moe, token_selected_experts)
             token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
+            replica_plan = moe.layer_load_balancer.require_replica_plan()
         else:
-            token_selected_slots = token_selected_experts
-
-        if not uses_replica_plan:
+            if moe.layer_load_balancer:
+                moe._load_balancer_done_wait_gpu_stage(is_first_call)
+                # ignore_allreduce=False: the fused kernel has no side channel
+                # for an external stats gather. The base helper runs its own
+                # EP-wide AllReduce, gated to is_last_call=True.
+                moe._load_balancer_update_statistic(
+                    token_selected_experts,
+                    is_first_call,
+                    is_last_call,
+                    ignore_allreduce=False,
+                )
+                token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
+            else:
+                token_selected_slots = token_selected_experts
             token_selected_slots = _record_routes(moe, token_selected_slots)
-        replica_plan = moe._load_balancer_replica_plan() if uses_replica_plan else None
+            replica_plan = None
 
         # ----- quantize / prepare -----
         if getattr(moe.backend, "supports_fused_prepare", lambda: False)():
@@ -1639,7 +1647,8 @@ class FusedCommMoEScheduler(MoEScheduler):
         # start_set before run_moe would let dynamic-EPLB migration race the
         # kernel.
         moe._load_balancer_start_set_cpu_stage(is_last_call)
-        moe._load_balancer_done_set_cpu_stage(is_last_call)
+        if not uses_replica_plan:
+            moe._load_balancer_done_set_cpu_stage(is_last_call)
 
         return out
 

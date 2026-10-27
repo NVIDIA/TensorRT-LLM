@@ -1255,13 +1255,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Leave a replica plan's SMs to its concurrent HALO-Q/TMA kernel. The
         # default overload remains unchanged without a plan.
         if reserved_sms > 0 and _fp4_quantize_has_sm_budget():
+            # Positional: a keyword argument costs the op dispatch about a microsecond.
             x_fp4, x_sf = torch.ops.trtllm.fp4_quantize.sm_budget(
-                x_bf16,
-                self.fc31_input_scale,
-                16,
-                False,
-                False,
-                reserved_sms=reserved_sms,
+                x_bf16, self.fc31_input_scale, 16, False, False, reserved_sms
             )
         else:
             x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
