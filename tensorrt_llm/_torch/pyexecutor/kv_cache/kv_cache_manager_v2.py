@@ -4687,11 +4687,19 @@ class KVCacheManagerV2(BaseResourceManager):
     def _request_locality_domain_id(self, req: LlmRequest) -> int | None:
         """Return the request-owned locality domain id after validating the invariant."""
         locality_domain_id = getattr(req, "py_locality_domain_id", None)
+        # The target manager places the request, and a separate draft manager can
+        # resolve a different domain count on its own slot sizes and quota. The
+        # draft sub-forward then runs unpartitioned, so the draft only needs a
+        # valid, stable id of its own.
+        # TODO: resolve one domain count for the target and draft managers at
+        # initialization, then drop the is_draft cases here.
         if self.num_locality_domains <= 1:
-            assert locality_domain_id is None or locality_domain_id == 0, (
+            assert locality_domain_id is None or locality_domain_id == 0 or self.is_draft, (
                 "Non-localized requests must not use a nonzero locality_domain_id"
             )
             return None
+        if locality_domain_id is None and self.is_draft:
+            locality_domain_id = req.py_request_id % self.num_locality_domains
         assert locality_domain_id is not None, (
             f"Request {req.py_request_id} must carry py_locality_domain_id "
             "before localized KV-cache placement"
