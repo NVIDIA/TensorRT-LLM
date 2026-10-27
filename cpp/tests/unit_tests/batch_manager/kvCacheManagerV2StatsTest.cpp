@@ -290,6 +290,18 @@ TEST_F(ReplayCacheTest, MixedSsmPoliciesRestoreStateAndCopyEveryBeam)
         EXPECT_THROW(
             reader->resume(mStream, std::nullopt, std::vector<LifeCycleId>{privateGroup}), std::invalid_argument);
         ASSERT_TRUE(reader->resume(mStream, std::nullopt, std::vector<LifeCycleId>{optional}));
+        reader->commitPendingStats();
+        auto const snapshotStats = manager->getAndResetSsmSnapshotIterationStats();
+        ASSERT_EQ(snapshotStats.size(), 2);
+        for (auto group : {required, optional})
+        {
+            ASSERT_EQ(snapshotStats.count(group), 1);
+            auto const& stats = snapshotStats.at(group);
+            EXPECT_EQ(stats.iterSnapshotLookups, 1);
+            EXPECT_EQ(stats.iterSnapshotHits, 1);
+            EXPECT_EQ(stats.iterSnapshotMisses, 0);
+            EXPECT_EQ(stats.iterReusedTokens, length);
+        }
         for (int layer : {1, 2, 4})
         {
             check(*reader, layer, "state", 0, 10 + layer);
@@ -311,6 +323,8 @@ TEST_F(ReplayCacheTest, MixedSsmPoliciesRestoreStateAndCopyEveryBeam)
         reader->suspend();
         ASSERT_TRUE(reader->resume(mStream));
         reader->setBeamWidth(BeamIndex{1});
+        reader->commitPendingStats();
+        EXPECT_TRUE(manager->getAndResetSsmSnapshotIterationStats().empty());
         reader->close();
         source->close();
         manager->shutdown();
@@ -348,8 +362,12 @@ TEST_F(ReplayCacheTest, OptionalSsmRequiresExactEndpointAndDoesNotLimitAttention
             // Unselected OPTIONAL and PRIVATE state both get writable request-local storage.
             ASSERT_TRUE(reader->resume(mStream));
             EXPECT_GE(reader->getSsmBlockBaseIndex(group), 0);
+            reader->commitPendingStats();
+            EXPECT_TRUE(manager->getAndResetSsmSnapshotIterationStats().empty());
             reader->suspend();
             ASSERT_TRUE(reader->resume(mStream));
+            reader->commitPendingStats();
+            EXPECT_TRUE(manager->getAndResetSsmSnapshotIterationStats().empty());
             reader->close();
         }
         manager->shutdown();
