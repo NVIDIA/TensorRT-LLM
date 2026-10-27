@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Packed attention-DP executor state exchange (TLLM_ADP_PACKED_SYNC).
+"""Packed attention-DP executor state exchange (attention_dp_config.enable_packed_sync).
 
 The disaggregated attention-DP executor loops replace per-iteration object
 collectives with two fixed-width int64 tensor all-gathers: the loop-head group
@@ -27,7 +27,6 @@ collectives):
   callers outside the loop -- warmup, KV-cache estimation -- gather as before,
 * stashes never outlive a pass or an executor instance,
 * the gate is config-derived and the knob-off path is byte-identical to today,
-* verify mode raises on a mismatch or an unconsumed stash,
 * TorchDist's fixed-width int64 gathers ride the single-kernel CPU-tensor path
   when the object-collective groups exist and fall back to the base path
   otherwise.
@@ -131,8 +130,6 @@ class _FakeGroup:
 
 @pytest.fixture(autouse=True)
 def _knob_env(monkeypatch):
-    monkeypatch.setenv("TLLM_ADP_PACKED_SYNC", "1")
-    monkeypatch.delenv("TLLM_ADP_PACKED_SYNC_VERIFY", raising=False)
     # The in-flight cancel helper caches its env lookup; pin the gate's view.
     monkeypatch.setattr(executor_module, "is_disagg_inflight_cancel_enabled", lambda: False)
 
@@ -195,7 +192,7 @@ class _Coordinator:
         self.failed_synced.append(list(requests))
 
 
-def _make_executor(group, rank, *, active_requests, coordinator=None, runner=None, verify=False):
+def _make_executor(group, rank, *, active_requests, coordinator=None, runner=None):
     ex = object.__new__(PyExecutor)
     ex.dist = group.dist(rank)
     ex.enable_attention_dp = True
@@ -205,7 +202,6 @@ def _make_executor(group, rank, *, active_requests, coordinator=None, runner=Non
     ex._fetch_hint_enabled = False
     ex.iter_counter = 7
     ex._packed_sync_enabled = True
-    ex._packed_sync_verify = verify
     ex._prefetched_rank_states = None
     ex._packed_can_queue = None
     coordinator = coordinator or _Coordinator()
@@ -340,22 +336,6 @@ def test_loop_head_timeout_vote_fails_drained_buffer_on_every_rank():
         assert ex._prefetched_rank_states is not None
 
 
-def test_loop_head_verify_mode_issues_legacy_collectives_and_agrees():
-    group = _FakeGroup(2)
-    executors = [
-        _make_executor(group, 0, active_requests=[_req(1)], verify=True),
-        _make_executor(group, 1, active_requests=[_req(2, error=True)], verify=True),
-    ]
-    _run_loop_head(group, executors)
-    for rank in range(2):
-        assert group.ops[rank] == [
-            "allgather_ints",
-            "tp_allgather",
-            "tp_allgather_int64",
-            "tp_allgather",
-        ]
-
-
 # ---------------------------------------------------------------------------
 # Post-schedule group
 # ---------------------------------------------------------------------------
@@ -394,11 +374,11 @@ def test_post_schedule_exchange_stashes_can_queue_and_padding_hint():
 
 
 # ---------------------------------------------------------------------------
-# Stash lifecycle, verify mode, gate
+# Stash lifecycle, gate
 # ---------------------------------------------------------------------------
 
 
-def test_end_of_pass_clear_drops_every_stash_and_verify_flags_leftovers():
+def test_end_of_pass_clear_drops_every_stash():
     group = _FakeGroup(1)
     runner = _make_runner(group, 0)
     ex = _make_executor(group, 0, active_requests=[], runner=runner)
@@ -410,32 +390,16 @@ def test_end_of_pass_clear_drops_every_stash_and_verify_flags_leftovers():
     assert ex._packed_can_queue is None
     assert runner._adp_graph_batch_hint is None
 
-    ex._packed_sync_verify = True
-    ex._packed_can_queue = (True, True)
-    with pytest.raises(RuntimeError, match="can_queue stash not consumed"):
-        ex._adp_clear_packed_sync_state()
-    ex._packed_can_queue = (True, True)
-    ex._adp_clear_packed_sync_state(check=False)  # cleanup path never raises
-    assert ex._packed_can_queue is None
-
     # Pre-warmup reset drops a leftover hint on the shared runner.
     runner._adp_graph_batch_hint = [(True, 1, 0)]
     ex._reset_adp_packed_sync_for_warmup()
     assert runner._adp_graph_batch_hint is None
 
 
-def test_packed_sync_check_raises_on_mismatch():
-    ex = object.__new__(PyExecutor)
-    ex.dist = SimpleNamespace(rank=1)
-    ex.iter_counter = 3
-    ex._packed_sync_check("f", [1], [1])
-    with pytest.raises(RuntimeError, match="f mismatch on rank 1"):
-        ex._packed_sync_check("f", [1], [2])
-
-
 def _gate_executor(monkeypatch, **overrides):
     ex = object.__new__(PyExecutor)
     ex.dist = SimpleNamespace(rank=0, world_size=2, tp_size=2, pp_size=1, cp_size=1)
+    ex.llm_args = SimpleNamespace(attention_dp_config=SimpleNamespace(enable_packed_sync=True))
     ex.enable_attention_dp = True
     ex.kv_cache_transceiver = object()
     ex.kv_connector_manager = None
@@ -454,10 +418,11 @@ def _gate_executor(monkeypatch, **overrides):
 
 def test_gate_is_config_derived(monkeypatch):
     assert _gate_executor(monkeypatch)._resolve_packed_sync_enabled() is True
-    monkeypatch.setenv("TLLM_ADP_PACKED_SYNC", "0")
-    assert _gate_executor(monkeypatch)._resolve_packed_sync_enabled() is False
-    monkeypatch.setenv("TLLM_ADP_PACKED_SYNC", "1")
     for override in (
+        dict(llm_args=SimpleNamespace(attention_dp_config=None)),
+        dict(
+            llm_args=SimpleNamespace(attention_dp_config=SimpleNamespace(enable_packed_sync=False))
+        ),
         dict(enable_attention_dp=False),
         dict(kv_cache_transceiver=None),
         dict(kv_connector_manager=object()),
