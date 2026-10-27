@@ -1211,9 +1211,8 @@ class MNNVLAllReduce(nn.Module):
         None (the library op runs it)."""
         fused = self.fused_norm
         outputs = self._FUSED_NORM_OUTPUTS.get(params.fusion_op)
-        if (fused is None or outputs is None or params.fp8_payload
-                or input.dim() != 2 or input.shape[-1] != fused.hidden
-                or params.bias is not None
+        if (fused is None or outputs is None or input.dim() != 2
+                or input.shape[-1] != fused.hidden or params.bias is not None
                 or num_tokens * fused.hidden * self.mapping.tp_size *
                 input.element_size() > _MNNVL_ONE_SHOT_THRESHOLD_BYTES
                 or not fused.supports_rows(num_tokens)):
@@ -1262,9 +1261,8 @@ class MNNVLAllReduce(nn.Module):
         one launch, or None. ``gemm_tactic``: the low-M GEMM tactic of the projection (k_warps, n_tiles, ksplit)."""
         gemm = self.gemm_norm
         outputs = self._FUSED_NORM_OUTPUTS.get(params.fusion_op)
-        if (gemm is None or outputs is None or params.fp8_payload
-                or input.dim() != 2 or weight.shape[0] != gemm.hidden
-                or params.bias is not None):
+        if (gemm is None or outputs is None or input.dim() != 2
+                or weight.shape[0] != gemm.hidden or params.bias is not None):
             return None
         tactic = gemm.tactic(input.shape[0], input.shape[1], *gemm_tactic)
         if tactic is None:

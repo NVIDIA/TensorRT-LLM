@@ -191,19 +191,22 @@ def _gemm_norm_cases(tp, k=1024):
         residual = _rand((m, H), 11 * m)
         ref_norm, ref_res = _ref_norm(sum(outs), residual, norm_weight)
         x, w = args
-        params = AllReduceParams(
-            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-            residual=residual,
-            norm_weight=norm_weight,
-            eps=EPS,
-        )
-        out = ar.gemm_allreduce_norm(
-            x, w, weight_scale, input_scale, params, default_tactic(m, H, k)[:3]
-        )
-        assert out is not None, ("GEMM + all-reduce + norm declined", m)
-        norm, res = out
-        _check(norm, ref_norm, ("gemm norm", m))
-        _check(res, ref_res, ("gemm residual", m))
+        # fp8_payload only changes two-shot calls; this one-launch kernel exchanges BF16 either way.
+        for fp8_payload in (False, True):
+            params = AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=norm_weight,
+                eps=EPS,
+                fp8_payload=fp8_payload,
+            )
+            out = ar.gemm_allreduce_norm(
+                x, w, weight_scale, input_scale, params, default_tactic(m, H, k)[:3]
+            )
+            assert out is not None, ("GEMM + all-reduce + norm declined", m, fp8_payload)
+            norm, res = out
+            _check(norm, ref_norm, ("gemm norm", m, fp8_payload))
+            _check(res, ref_res, ("gemm residual", m, fp8_payload))
 
 
 def _meta_init_cases(tp):
