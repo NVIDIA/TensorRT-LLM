@@ -225,7 +225,7 @@ def test_callable_ids_with_uniform_resource_marks(splitter: ModuleType, tmp_path
 def test_bad_markers_and_selectors_are_skipped(
     splitter: ModuleType,
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
+    capfd: pytest.CaptureFixture[str],
     source: str,
     selector: str,
     message: str,
@@ -246,7 +246,7 @@ def test_bad_markers_and_selectors_are_skipped(
     assert skipped[0]["line"] == 2
     assert skipped[0]["entry"] == f"test_cases.py::{selector}"
     assert message in skipped[0]["reason"]
-    assert f"skipped test_cases.py::{selector}" in capsys.readouterr().err
+    assert f"skipped test_cases.py::{selector}" in capfd.readouterr().err
 
 
 def test_inherited_class_mark_order_and_class_pytestmark(
