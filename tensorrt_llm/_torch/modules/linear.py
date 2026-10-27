@@ -3422,7 +3422,7 @@ class MXFP8LinearMethod(LinearMethodBase):
         super().__init__()
         self.use_cutlass = _mxfp8_cutlass_op_available()
         self.backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
-        # Only PyTorchModelEngine owns the startup tuning lifecycle. Keep
+        # Only ModelEngine owns the startup tuning lifecycle. Keep
         # standalone modules and engine paths that skip warmup (for example,
         # Helix CP) on the direct native op instead of leaving Python
         # AutoTuner dispatch armed indefinitely.
