@@ -1272,9 +1272,19 @@ class DisaggTransferCoordinator:
     def fail_timed_out(self, requests: List[LlmRequest]) -> None:
         """Fail generation requests whose transfer timed out.
 
-        Under multi-rank ADP the error response enters a collective, so it is
-        deferred to ``handle_timeouts_synced``.
+        Callers pass only requests whose transfer no longer touches their
+        blocks, either because ``cancel_request`` returned True or because the
+        transfer already finished. Under multi-rank ADP the error response
+        enters a collective, so it is deferred to ``handle_timeouts_synced``.
         """
+        for req in requests:
+            # cancel_request does not change the state. Left in progress,
+            # PyExecutor._handle_errors would park the failure for a transfer
+            # that no longer exists (_transfer_owns_request_blocks), and
+            # _sweep_transfer_held_failures would drop it without a response
+            # because the request has already left active_requests.
+            if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
         if self._enable_attention_dp and self._dist.world_size != 1:
             self._pending_timed_out_requests.extend(requests)
             return
