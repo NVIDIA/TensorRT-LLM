@@ -2214,6 +2214,90 @@ def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
     quant_method.cache_derived_state.assert_called_once_with(moe)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tuning_mode, capturing", [(True, False), (False, False), (True, True)])
+def test_megamoe_deepgemm_primes_reachable_tiles_before_staging(
+    monkeypatch, tuning_mode, capturing
+):
+    moe = MegaMoEDeepGemm.__new__(MegaMoEDeepGemm)
+    torch.nn.Module.__init__(moe)
+    moe.max_num_tokens = 8
+    moe.hidden_size = 4
+    moe.ep_size = 8
+    moe.num_slots = 384
+    moe.dtype = torch.bfloat16
+    moe.routing_method = SimpleNamespace(experts_per_token=2)
+    moe.dg_activation = "swiglu"
+    moe.act_clamp = 10.0
+    moe.act_alpha = None
+    moe.act_beta = None
+    moe.fast_math = True
+    moe._t_l1 = ("fc1", "sf1")
+    moe._t_l2 = ("fc2", "sf2")
+    moe._kernels_primed = False
+    buf = SimpleNamespace(
+        x=torch.ones((12, 4)),
+        x_sf=torch.ones((12, 1)),
+        topk_idx=torch.zeros((12, 2), dtype=torch.int64),
+        topk_weights=torch.ones((12, 2)),
+        num_max_tokens_per_rank=12,
+    )
+    moe._symm_buffer = buf
+    tiles = [16, 32, 16, 64, 32, 32, 32, 128, 192]
+    launches = []
+
+    def launch(output, first_weights, second_weights, buffer, **kwargs):
+        assert first_weights == moe._t_l1
+        assert second_weights == moe._t_l2
+        assert buffer is buf
+        assert kwargs == dict(
+            activation="swiglu",
+            activation_clamp=10.0,
+            fast_math=True,
+            situ_beta=None,
+            situ_linear_beta=None,
+        )
+        assert output.dtype == torch.bfloat16
+        launches.append((output.shape[0], buf.topk_idx.clone()))
+        output.zero_()
+
+    moe._dg = SimpleNamespace(
+        get_block_m_for_mega_moe=MagicMock(side_effect=lambda *args: tiles[args[3]]),
+        fp8_fp4_mega_moe=launch,
+    )
+    monkeypatch.setattr(AutoTuner, "get", lambda: SimpleNamespace(is_tuning_mode=tuning_mode))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    ctx = SimpleNamespace(
+        x=torch.full((2, 4), 3.0),
+        x_sf=torch.full((2, 1), 4.0),
+        token_selected_experts=torch.tensor([[1, 2], [3, 4]]),
+        token_final_scales=torch.full((2, 2), 0.5),
+        output_dtype=torch.float32,
+    )
+
+    output = moe.run_moe(ctx)
+    moe.run_moe(ctx)
+
+    assert output.shape == (2, 4)
+    assert output.dtype == torch.float32
+    if tuning_mode and not capturing:
+        assert [count for count, _ in launches] == [0, 1, 3, 7, 8, 2, 2]
+        assert all(torch.all(routes == -1) for _, routes in launches[:-2])
+        assert moe._kernels_primed
+        assert moe._dg.get_block_m_for_mega_moe.call_count == 9
+        for token_count, query in enumerate(moe._dg.get_block_m_for_mega_moe.call_args_list):
+            assert query.args == (8, 384, 12, token_count, 2, "fp8xfp4")
+    else:
+        assert [count for count, _ in launches] == [2, 2]
+        assert not moe._kernels_primed
+        moe._dg.get_block_m_for_mega_moe.assert_not_called()
+    assert torch.equal(buf.x[:2], ctx.x)
+    assert torch.equal(buf.x_sf[:2], ctx.x_sf)
+    assert torch.equal(buf.topk_idx[:2], ctx.token_selected_experts)
+    assert torch.equal(buf.topk_weights[:2], ctx.token_final_scales)
+    assert all(torch.equal(routes[:2], ctx.token_selected_experts) for _, routes in launches[-2:])
+
+
 def test_megamoe_deepgemm_mpi_bootstrap_replaces_outer_launcher_world(monkeypatch):
     """A launcher env describing another world must not seed this MPI world.
 
