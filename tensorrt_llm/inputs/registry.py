@@ -1130,6 +1130,12 @@ def create_input_processor(
             if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
                     and input_processor_cls.supports_tokenization_cache):
                 kwargs["enable_tokenization_cache"] = enable_tokenization_cache
+            elif enable_tokenization_cache:
+                logger.warning_once(
+                    f"enable_tokenization_cache is ignored: "
+                    f"{input_processor_cls.__name__} does not support the "
+                    "prefix tokenization cache.",
+                    key="tokenization_cache_unsupported_processor")
             # Input processors build an AutoTokenizer/AutoProcessor with
             # trust_remote_code; doing so copies the checkpoint's .py files
             # into the shared HF module cache non-atomically, and a rank that
