@@ -158,7 +158,7 @@ class _FakeResult:
 )
 @pytest.mark.parametrize(
     "parser_name",
-    ["poolside_v1", "nemotron-v3", "nano-v3", "k-exaone", "glm", "glm47", "glm_moe_dsa"],
+    ["poolside_v1", "nemotron-v3", "nano-v3", "k-exaone", "glm", "glm45", "glm47", "glm_moe_dsa"],
 )
 def test_context_worker_stamps_the_resolved_mode(
     template_kwargs: dict[str, bool] | None, expected: bool, parser_name: str
