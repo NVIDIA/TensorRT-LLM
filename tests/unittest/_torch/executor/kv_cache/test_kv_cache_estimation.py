@@ -41,7 +41,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerSpec as KVCacheStorageLayerSpec,
 )
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.bindings import DataType
@@ -242,7 +242,7 @@ class _ModelEngine:
     _mm_item_scheduler: object | None = None
     mm_encoder_item_scheduling_enabled: bool = False
     bytes_per_mm_encoder_embedding: int = 8
-    mm_encoder_cache = PyTorchModelEngine.mm_encoder_cache
+    mm_encoder_cache = ModelEngine.mm_encoder_cache
 
 
 def _make_reserve_creator(
