@@ -46,7 +46,12 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    BAD_PAGE_INDEX,
+    KVCacheManagerV2,
+    Role,
+)
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, MTPDecodingConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -1067,13 +1072,28 @@ def test_fp4_mla_manager_v2_registers_native_cache_and_hp_roles(monkeypatch) -> 
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="FP4 MLA (NVFP4 KV cache) requires Blackwell or newer",
 )
-def test_fp4_mla_manager_v2_copies_per_pool_block_offsets(monkeypatch) -> None:
+@pytest.mark.parametrize("device_page_table", ["0", "1"])
+def test_fp4_mla_manager_v2_copies_per_pool_block_offsets(monkeypatch, device_page_table) -> None:
+    if device_page_table == "0" and not prefer_pinned():
+        pytest.skip("Native page-table expansion requires GPU-addressable host memory")
+    monkeypatch.setenv("TLLM_KVCM_V2_DEVICE_PAGE_TABLE", device_page_table)
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     seq_lens = [FP4_MLA_TOKENS_PER_BLOCK + 1, 3]
     manager = _create_fp4_mla_v2_manager(max_tokens=1024, max_seq_len=512, max_batch_size=2)
     try:
         manager.add_dummy_requests(list(range(len(seq_lens))), seq_lens)
         assert manager._use_per_layer_page_tables is False
+        assert manager.uses_device_page_table is (device_page_table == "1")
+        if device_page_table == "0":
+            assert all(
+                tensor.is_pinned()
+                for tensor in (
+                    manager.host_kv_cache_block_offsets,
+                    manager.index_scales,
+                    manager.kv_offset,
+                    manager.index_mapper.get_copy_index([0, 1], 0, 1),
+                )
+            )
         page_spec = manager.get_fp4_mla_page_table_spec(0)
         assert page_spec.cache_page_index_scale == 1
         dst = torch.full(
@@ -1093,6 +1113,28 @@ def test_fp4_mla_manager_v2_copies_per_pool_block_offsets(monkeypatch) -> None:
                 dst[page_spec.cache_pool_id, seq_idx, 0, :num_blocks].tolist()
                 == block_ids[seq_idx][:num_blocks]
             )
+
+        # Check every lifecycle pool and both planes, including padding, after
+        # reordering and shrinking the batch. Reuse a capacity-sized output so
+        # that rows beyond the active batch must remain untouched.
+        for request_ids in ([1, 0], [1]):
+            dst.fill_(-1)
+            copy_idx = manager.index_mapper.get_copy_index(request_ids, 0, 1).long()
+            base = manager.host_kv_cache_block_offsets[:, copy_idx, 0, :]
+            scaled = base * manager.index_scales[:, None, None]
+            expected = torch.stack(
+                (
+                    torch.where(base == BAD_PAGE_INDEX, 0, scaled),
+                    torch.where(
+                        base == BAD_PAGE_INDEX, 0, scaled + manager.kv_offset[:, None, None]
+                    ),
+                ),
+                dim=2,
+            )
+            manager.copy_batch_block_offsets(dst, request_ids, 1, 0, len(request_ids))
+            torch.cuda.synchronize()
+            torch.testing.assert_close(dst[:, : len(request_ids)].cpu(), expected)
+            assert torch.all(dst[:, len(request_ids) :] == -1)
     finally:
         manager.shutdown()
 
