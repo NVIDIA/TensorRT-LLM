@@ -135,6 +135,7 @@ def test_bind_step_buffers_uses_manager_layer_views(replay: bool) -> None:
     state.intermediate_indices = _t(SLOTS, dtype=torch.int32)
     manager = Qwen4ExpHybridCacheManager.__new__(Qwen4ExpHybridCacheManager)
     manager.spec_config = SimpleNamespace(tokens_per_gen_step=2)
+    manager._state_layout = SimpleNamespace(slot_capacity_bound=None)
     manager._speculative_state = state
     manager.mamba_layer_offsets = {3: 1, 7: 0}
     manager.all_conv_states = [_conv(), _conv()]
