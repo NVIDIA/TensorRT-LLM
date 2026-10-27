@@ -92,6 +92,7 @@ MODEL_PATH_DICT = {
     # GLM-5.2 NVFP4 (MoE, MLA + DSA on the DeepSeek-V3.2 code path)
     "glm_5.2_fp4": "GLM-5.2-NVFP4",
     "glm_5.3_flash_fp8": "GLM-5.3-Flash",
+    "glm_5.3_flash_nvfp4": "GLM-5.3-Flash-NVFP4",
     # MiniMax-M3 NVFP4: MXFP8 base layers with NVFP4 routed experts
     # (the MXFP8 checkpoint is registered as "minimax_m3_mxfp8" above).
     "minimax_m3_fp4": "MiniMax-M3-NVFP4",
