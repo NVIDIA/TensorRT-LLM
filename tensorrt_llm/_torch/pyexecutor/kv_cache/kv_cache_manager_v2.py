@@ -3223,6 +3223,14 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         if extra_turns <= 0 or widest is None:
             return []
+        if kv_cache_config.enable_kv_pool_rebalance:
+            # The pools stay correct, but the rebalancer may shrink them back.
+            logger.warning_once(
+                "kv_cache_config.enable_kv_pool_rebalance retunes the KV pools for one "
+                "window per request, so it can shrink the windowed pools sized here for "
+                f"{extra_turns + 1} retained conversation turns.",
+                key="kvcm2_rebalance_retained_turns",
+            )
         block = self._ledger_tokens_per_block
         capacity = (math.ceil(widest / block) + 1) * block
         history_length = capacity - block // 2 - 1
