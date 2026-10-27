@@ -1279,6 +1279,15 @@ class KimiK3ReasoningParser(BaseReasoningParser):
                              "response")
     _VALUE_FOLLOWER_TAGS = (_CALL_CLOSE, TOOLS_END, _THINK_CLOSE,
                             CLOSE + "response" + SEP, MESSAGE_END, EOM)
+    # What may follow the close tag of a call: the next call, a think block,
+    # or the end of the section.
+    _CALL_FOLLOWER_OPENS = ("call", "think")
+    # Close tags that can only end structure: a run of them (with framing
+    # and whitespace) up to the end of the generation is the model closing
+    # its message, whatever it left open.
+    _CLOSE_RUN_TAGS = (CLOSE + "argument" + SEP, CLOSE + "json" + SEP,
+                       _CALL_CLOSE, TOOLS_END, CLOSE + "response" + SEP,
+                       MESSAGE_END, EOM)
 
     @dataclass(frozen=True)
     class XtmlElement:
@@ -1299,7 +1308,9 @@ class KimiK3ReasoningParser(BaseReasoningParser):
         ``kind`` is ``"call"`` (a complete call block: ``attrs`` and
         ``elements`` filled in), ``"think"`` (a think block between calls,
         body at ``body_start:body_end``) or ``"gap"`` (anything else:
-        whitespace, prose, a malformed or cut-off call).
+        whitespace, prose, a malformed or cut-off call). ``recovered`` names
+        the close tags a call was read without (see ``_scan_call``); empty
+        for a call written in full.
         """
         kind: str
         start: int
@@ -1308,6 +1319,7 @@ class KimiK3ReasoningParser(BaseReasoningParser):
         elements: tuple = ()
         body_start: int = 0
         body_end: int = 0
+        recovered: str = ""
 
         @property
         def deliverable(self) -> bool:
@@ -1453,35 +1465,173 @@ class KimiK3ReasoningParser(BaseReasoningParser):
         return None if undecided else False
 
     @classmethod
-    def _value_end(cls, text: str, start: int, close: str,
-                   final: bool) -> Optional[int]:
-        """Find the close tag that ends the value starting at `start`.
+    def _close_run(cls, text: str, pos: int, final: bool) -> Optional[bool]:
+        """Whether ``text[pos:]`` is close tags and whitespace up to the end.
 
-        Returns its index, -1 if the text ends inside the value, or None if
-        undecided.
+        Such a run ending the generation is the model closing its message,
+        whatever it left open. It must hold at least one tag.
+        """
+        n = len(text)
+        m = pos
+        seen = False
+        while True:
+            while m < n and text[m].isspace():
+                m += 1
+            if m == n:
+                return seen if final else None
+            undecided = False
+            for tag in cls._CLOSE_RUN_TAGS:
+                found = cls._match_prefix(text, m, tag, final)
+                if found:
+                    m += len(tag)
+                    seen = True
+                    break
+                undecided = undecided or found is None
+            else:
+                return None if undecided else False
+
+    @classmethod
+    def _call_close_ends_call(cls, text: str, pos: int,
+                              final: bool) -> Optional[bool]:
+        """Whether the call close tag ending at `pos` ends an unclosed value.
+
+        Only where a call can end: before the next call or a think block, at
+        the end of the section, or before a run of close tags that ends the
+        generation.
+        """
+        n = len(text)
+        m = pos
+        while m < n and text[m].isspace():
+            m += 1
+        if m == n:
+            return True if final else None
+        found = cls._open_name_at(text, m, cls._CALL_FOLLOWER_OPENS, final)
+        if found:
+            return True
+        undecided = found is None
+        for tag in (cls.TOOLS_END, ) + cls._SECTION_BREAKS:
+            match = cls._match_prefix(text, m, tag, final)
+            if match:
+                return True
+            undecided = undecided or match is None
+        return None if undecided else False
+
+    @classmethod
+    def _value_end(cls, text: str, start: int, close: str,
+                   final: bool) -> Optional[Any]:
+        """Find where the value starting at `start` ends, and how.
+
+        Returns ``(index, how)``. ``how`` is ``"close"`` when the value's own
+        close tag ends it, ``"call"`` when the model went straight on to the
+        call's close tag, and ``"run"`` when it closed its message instead (a
+        run of close tags that ends the generation). Returns -1 if the text
+        ends inside the value, or None if undecided.
+
+        A close tag ends the value only where structure follows it. The value's
+        own tag must be followed by the next element, the end of the call or
+        an enclosing tag; the call's tag must be where a call can end. Any
+        other close tag in the value is part of it.
         """
         search = start
         while True:
-            end = text.find(close, search)
-            if end == -1:
+            at = text.find(cls.CLOSE, search)
+            if at == -1:
                 return -1 if final else None
-            closes = cls._followed_by_structure(text, end + len(close), final)
-            if closes is None:
+            if text.startswith(close, at):
+                ends = cls._followed_by_structure(text, at + len(close), final)
+                how = "close"
+            elif text.startswith(cls._CALL_CLOSE, at):
+                ends = cls._call_close_ends_call(text,
+                                                 at + len(cls._CALL_CLOSE),
+                                                 final)
+                how = "call"
+            else:
+                ends = cls._close_run(text, at, final)
+                how = "run"
+            if ends is None:
                 return None
-            if closes:
+            if ends:
+                return at, how
+            search = at + 1
+
+    @classmethod
+    def _past_stray_closes(cls, text: str, pos: int,
+                           final: bool) -> Optional[int]:
+        """Where a call read without its close tags ends: past stray close tags.
+
+        A model that left a value or a call open often closes its message
+        with close tags of things it never opened, ``<|close|>response<|sep|>``
+        after a call. When those tags run to the end of the generation they
+        belong to the malformed call, not to the content after the section.
+        The section's own close tag and the message framing are left to the
+        section and the framing.
+        """
+        run = cls._close_run(text, pos, final)
+        if run is None:
+            return None
+        if not run:
+            return pos
+        stray = (cls.CLOSE + "argument" + cls.SEP, cls.CLOSE + "json" + cls.SEP,
+                 cls._CALL_CLOSE, cls.CLOSE + "response" + cls.SEP)
+        n = len(text)
+        end = pos
+        while True:
+            m = end
+            while m < n and text[m].isspace():
+                m += 1
+            tag = next((tag for tag in stray if text.startswith(tag, m)), None)
+            if tag is None:
                 return end
-            search = end + 1
+            end = m + len(tag)
+
+    @classmethod
+    def _unclosed_call_end(cls, text: str, pos: int,
+                           final: bool) -> Optional[Any]:
+        """Where a call whose last element is complete ends without its close tag.
+
+        Before a run of close tags that ends the generation it ends past the
+        stray ones. Before the next call, a think block, the end of the
+        section or message-level structure, it ends where that structure
+        starts. Returns the end, False where the call grammar is broken
+        instead, or None if undecided.
+        """
+        found = cls._open_name_at(text, pos, cls._CALL_FOLLOWER_OPENS, final)
+        if found:
+            return pos
+        undecided = found is None
+        # Whether stray close tags are absorbed depends on whether they run to
+        # the end of the generation, so that is settled first.
+        run = cls._close_run(text, pos, final)
+        if run is None:
+            return None
+        if run:
+            return cls._past_stray_closes(text, pos, final)
+        for tag in (cls.TOOLS_END, ) + cls._SECTION_BREAKS:
+            match = cls._match_prefix(text, pos, tag, final)
+            if match:
+                return pos
+            undecided = undecided or match is None
+        return None if undecided else False
 
     @classmethod
     def _scan_call(cls, text: str, pos: int, final: bool) -> Optional[Any]:
         """Read the call block whose header starts at `pos`.
 
+        A call is also read when the model left out close tags. The outcome is
+        not in doubt in three cases, recorded in ``XtmlItem.recovered``:
+        - a value followed directly by the call's close tag;
+        - a value or a call left open by a run of close tags that ends the
+          generation;
+        - a call whose last element is complete, followed by the next call,
+          a think block, the end of the section or message-level structure.
+        A generation that simply stops inside a call is still not a call:
+        the cut-off value may be incomplete.
+
         Returns:
-            An ``XtmlItem`` for a complete, well-formed call; an int, the
-            position where the call grammar broke (``len(text)`` when the
-            text ends inside the call) - everything from `pos` up to it is
-            not a call; None if undecided; False if no call header starts
-            at `pos`.
+            An ``XtmlItem`` for a complete call; an int, the position where
+            the call grammar broke (``len(text)`` when the text ends inside
+            the call) - everything from `pos` up to it is not a call; None
+            if undecided; False if no call header starts at `pos`.
         """
         header = cls._open_tag_at(text, pos, ("call", ), final)
         if not header:
@@ -1489,6 +1639,16 @@ class KimiK3ReasoningParser(BaseReasoningParser):
         _, attrs, cursor = header
         n = len(text)
         elements = []
+
+        def call(end: int,
+                 recovered: str = "") -> "KimiK3ReasoningParser.XtmlItem":
+            return cls.XtmlItem("call",
+                                pos,
+                                end,
+                                attrs=attrs,
+                                elements=tuple(elements),
+                                recovered=recovered)
+
         # A call body is one json block or any number of arguments.
         allowed = ("argument", "json")
         while True:
@@ -1499,26 +1659,42 @@ class KimiK3ReasoningParser(BaseReasoningParser):
                 return n if final else None
             closed = cls._match_prefix(text, m, cls._CALL_CLOSE, final)
             if closed:
-                return cls.XtmlItem("call",
-                                    pos,
-                                    m + len(cls._CALL_CLOSE),
-                                    attrs=attrs,
-                                    elements=tuple(elements))
+                return call(m + len(cls._CALL_CLOSE))
             tag = cls._open_tag_at(text, m, allowed,
                                    final) if allowed else False
             if tag is None or (closed is None and not tag):
                 return None
             if not tag:
-                return m
+                if not elements:
+                    return m
+                end = cls._unclosed_call_end(text, m, final)
+                if end is None:
+                    return None
+                if end is False:
+                    return m
+                return call(end, f"no {cls._CALL_CLOSE}")
             kind, element_attrs, value_start = tag
             close = cls.CLOSE + kind + cls.SEP
-            value_end = cls._value_end(text, value_start, close, final)
-            if value_end is None:
+            found = cls._value_end(text, value_start, close, final)
+            if found is None:
                 return None
-            if value_end == -1:
+            if found == -1:
                 return n
+            value_end, how = found
             elements.append(
                 cls.XtmlElement(kind, element_attrs, value_start, value_end))
+            if how == "call":
+                end = cls._past_stray_closes(text,
+                                             value_end + len(cls._CALL_CLOSE),
+                                             final)
+                if end is None:
+                    return None
+                return call(end, f"no {close}")
+            if how == "run":
+                end = cls._past_stray_closes(text, value_end, final)
+                if end is None:
+                    return None
+                return call(end, f"no {close} or {cls._CALL_CLOSE}")
             cursor = value_end + len(close)
             allowed = ("argument", ) if kind == "argument" else ()
 

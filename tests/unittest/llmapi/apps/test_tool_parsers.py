@@ -6477,14 +6477,83 @@ K3_CORPUS = {
         f'{K3_OPEN}argument key="input"',
         [("exec", '{"input": "ls"}')],
     ),
+    # The call's close tag is missing, but its argument is complete and the
+    # section closes right after it: the model cannot have meant anything
+    # else, so it is the call.
     "call_missing_close_call": (
         _k3_think("t") + _k3_response("") + K3_BOT +
         f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
         _k3_argument("input", "string", "ls") + K3_EOT + K3_MESSAGE_END,
         True,
         "t",
-        K3_BOT + f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
-        _k3_argument("input", "string", "ls") + K3_EOT,
+        "",
+        [("exec", '{"input": "ls"}')],
+    ),
+    # More close tags the model left out where its intent is not in doubt.
+    # A value followed straight by the call's close tag, where the
+    # generation ends.
+    "argument_missing_close_at_the_call_close": (
+        _k3_think("t") + _k3_response("Checking:") + K3_BOT +
+        f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        f'{K3_OPEN}argument key="input" type="string"{K3_SEP}const r = 1;' +
+        f"{K3_CLOSE}call{K3_SEP}",
+        True,
+        "t",
+        "Checking:",
+        [("exec", '{"input": "const r = 1;"}')],
+    ),
+    "argument_missing_close_before_the_next_call": (
+        _k3_think("t") + _k3_response("") + K3_BOT +
+        f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        f'{K3_OPEN}argument key="input" type="string"{K3_SEP}pwd'
+        f'{K3_CLOSE}call{K3_SEP}' + _k3_exec(2, "ls") + K3_EOT + K3_MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("exec", '{"input": "pwd"}'), ("exec", '{"input": "ls"}')],
+    ),
+    # The model closed its response and its message with a value still open.
+    "message_closed_inside_a_value": (
+        _k3_think("t") + _k3_response("Checking:") + K3_BOT +
+        f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        f'{K3_OPEN}argument key="input" type="string"{K3_SEP}const r = 2;' +
+        f"{K3_CLOSE}response{K3_SEP}" + K3_MESSAGE_END + K3_EOM,
+        True,
+        "t",
+        "Checking:",
+        [("exec", '{"input": "const r = 2;"}')],
+    ),
+    "call_missing_close_before_the_next_call": (
+        _k3_think("t") + _k3_response("") + K3_BOT +
+        f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        _k3_argument("input", "string", "ls") +
+        _k3_call("write_stdin", 2, _k3_argument("session_id", "number", "5")) +
+        K3_EOT + K3_MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("exec", '{"input": "ls"}'), ("write_stdin", '{"session_id": 5}')],
+    ),
+    "call_left_open_by_a_response_close": (
+        _k3_think("t") + _k3_response("") + K3_BOT +
+        f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        _k3_argument("input", "string", "ls") + f"{K3_CLOSE}response{K3_SEP}" +
+        K3_MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("exec", '{"input": "ls"}')],
+    ),
+    # The message framing alone does not end a value: the generation stopped
+    # inside the call, which stays in the channel it was written in.
+    "framing_after_an_open_value_in_think": (
+        "reasoning" + K3_BOT + f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        f'{K3_OPEN}argument key="input" type="string"{K3_SEP}ls' +
+        K3_MESSAGE_END + K3_EOM,
+        True,
+        "reasoning" + K3_BOT + f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        f'{K3_OPEN}argument key="input" type="string"{K3_SEP}ls',
+        "",
         [],
     ),
     "call_without_tool_attr": (
@@ -7091,6 +7160,34 @@ class TestKimiK3StreamingMatchesWholeParse:
                                                    _k3_exec_args("ls -la"))])
         warnings = [str(call.args[0]) for call in log.warning.call_args_list]
         assert any("never closed" in message for message in warnings)
+
+    def test_a_call_read_without_its_close_tags_is_logged(self):
+        content = (K3_BOT + f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+                   _k3_argument("input", "string", "ls") + K3_EOT)
+
+        with patch("tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser.logger"
+                   ) as log:
+            reading = _k3_tool_parity(content)
+
+        assert reading == ("", [(0, "exec", '{"input": "ls"}')])
+        warnings = [str(call.args[0]) for call in log.warning.call_args_list]
+        assert any("read without its close tags" in message
+                   for message in warnings)
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            # The generation stops inside the value: it may be incomplete.
+            "",
+            # A call close tag followed by prose is part of the value.
+            f"{K3_CLOSE}call{K3_SEP} and then more",
+        ])
+    def test_a_value_cut_off_or_followed_by_prose_is_not_a_call(self, tail):
+        content = (K3_BOT + f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+                   f'{K3_OPEN}argument key="input" type="string"{K3_SEP}rm -r' +
+                   tail)
+
+        assert _k3_tool_parity(content) == (content, [])
 
     def test_literal_argument_close_inside_a_value_does_not_cut_it(self):
         """A value's own close tag ends it only where more structure follows."""
