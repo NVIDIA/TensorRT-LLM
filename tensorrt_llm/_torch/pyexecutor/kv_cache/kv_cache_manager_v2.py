@@ -1463,9 +1463,7 @@ class KVCacheManagerV2(BaseResourceManager):
     low_precision_dtype: Optional[DataType] = None
     high_layers: dict[int, int] = {}
     high_precision_dtype: Optional[DataType] = None
-    # Declared by each manager implementation that hosts retained-token twins and
-    # inherited by its per-model subclasses; the base's own declaration covers only
-    # the plain dense manager (see _mixed_precision_kv_supported).
+    # Inherited by per-model subclasses; the base's own applies to the base only.
     _supports_mixed_precision_kv = True
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
@@ -1571,8 +1569,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if len(set(self.pp_layers)) != len(self.pp_layers):
                 raise ValueError(f"layer-spec global layer ids must be unique: {self.pp_layers}")
             self.num_layers = max(num_layers, max(self.pp_layers, default=-1) + 1)
-        # Draft layers appended to this manager keep a plain cache. They follow
-        # the model's own layers, with or without an explicit layer mask.
+        # Appended draft layers keep a plain cache.
         self._first_spec_layer_id: Optional[int] = None
         if spec_config is not None:
             from tensorrt_llm._torch.speculative import get_num_spec_layers

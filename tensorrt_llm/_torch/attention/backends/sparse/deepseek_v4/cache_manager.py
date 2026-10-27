@@ -1065,7 +1065,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             return float("inf")
         return self._max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
 
-    # Mixed-precision KV: each COMPRESS layer gains a twin holding its retained rows at mixed.high.
+    # One high-precision twin per compressed layer.
     _supports_mixed_precision_kv = True
 
     def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:

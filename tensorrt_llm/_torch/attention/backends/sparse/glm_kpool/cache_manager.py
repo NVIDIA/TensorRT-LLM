@@ -59,7 +59,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     """
 
     kda_context_only = False
-    # Mixed-precision KV has not been validated with the sparse MLA and index-key pools.
+    # Its sparse MLA backend has no retained-row hooks.
     _supports_mixed_precision_kv = False
 
     @override

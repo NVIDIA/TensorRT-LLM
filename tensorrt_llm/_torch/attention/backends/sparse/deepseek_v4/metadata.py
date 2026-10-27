@@ -307,8 +307,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self._compress_ratios_sorted
             if is_compress_layer(compress_ratio)
         }
-        # Mixed-precision KV: one retained-twin page table per compression ratio (the twins of
-        # the two ratios have different page sizes), -1 where a page is not retained.
+        # One twin page table per compression ratio; -1 = not retained.
         manager = self.kv_cache_manager
         if getattr(manager, "high_layers", None):
             self._retained_table_layers = {}
@@ -541,7 +540,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         if self.retained_block_table is not None:
             manager = self.kv_cache_manager
             for compress_ratio, high_table in self.retained_block_table.items():
-                # Any twin of this ratio: all of them share one pool and page scale.
+                # Any twin of this ratio shares the pool.
                 layer_idx = self._retained_table_layers[compress_ratio]
                 table = torch.full(
                     (self.num_seqs, high_table.shape[1]),
