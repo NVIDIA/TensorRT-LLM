@@ -32,6 +32,7 @@ store SDK
 | `backend.py` | `BlobBackend`, `BlobAttempt`, `BlobConfig`, `DriverCallLimit`, `RegionBinding`, `ConstructionRejected` |
 | `store.py` | the driver boundary: `StoreDriver`, the optional `RegistersRegionsTogether`, `RowBatch`, `RowIO`, `OnChange`, `RowStatus`, `DriverCapabilities`, `DriverRejected`, `RegistrationError` |
 | `keys.py` | the store key encoding |
+| `mooncake.py` | `MooncakeDriver`, a `StoreDriver` over a set-up Mooncake 0.3.13 SDK client |
 | `../testing/` | what a driver's own CI imports from the wheel: the conformance suite, the in-memory store and drivers, the broken drivers that prove every check bites |
 
 ## Running the tests
@@ -52,6 +53,8 @@ All of it is CPU-only. The files, top down:
   rule it guards.
 - `test_blob_format.py`: keys, spans, layouts, row batches, the object trailer.
 - `test_testing_isolation.py`: no engine module imports the test tooling.
+- `test_mooncake_driver.py`: the Mooncake driver over a fake SDK (`fake_mooncake.py`) that
+  answers as 0.3.13 does, the conformance suite included.
 
 ## Writing a driver
 
