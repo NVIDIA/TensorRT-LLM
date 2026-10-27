@@ -587,9 +587,10 @@ class LowMGemmDispatcher:
         self._tuning_config = TuningConfig(
             dynamic_tensor_specs=(_M_DIM_SPEC,),
             use_cold_l2_cache=True,
-            # Use CUDA-graph-based profiling when PDL is off; PDL and CUDA-graph
-            # capture conflict so we fall back to standard timing in that case.
-            use_cuda_graph=not pdl,
+            # Time device work as the decode CUDA graphs replay it, PDL launches
+            # included: eager timing adds each runner's host launch cost, which
+            # exceeds these kernels' device time and the graphs never pay.
+            use_cuda_graph=True,
             # Every rank of the group runs the winner of rank 0's race: ranks
             # timing the same shape differently would run different kernels,
             # and the slowest rank sets the pace of each collective. Under

@@ -5,13 +5,16 @@
 # Apply ``_skip_no_cuda`` / ``_skip_non_sm10x`` to tests that actually
 # invoke the kernel hardware rather than the Python dispatch logic.
 
+import dataclasses
 import sys
+import time
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 import tensorrt_llm._torch.modules.low_m_gemm as _mod
+from tensorrt_llm._torch.autotuner import AutoTuner, TunableRunner, autotune
 from tensorrt_llm._torch.modules.low_m_gemm import (
     _BACKEND_ENV,
     LOW_M_GEMM_OPT_IN_ATTR,
@@ -432,3 +435,61 @@ def test_runner_get_valid_tactics_returns_serialisable_tuples(monkeypatch) -> No
     for t in tactics:
         assert isinstance(t, tuple) and len(t) == 4
         assert all(isinstance(v, int) for v in t)
+
+
+# ---------------------------------------------------------------------------
+# Race timing
+# ---------------------------------------------------------------------------
+
+
+class _HostDeviceCostRunner(TunableRunner):
+    """Returns its input after ``host_s`` of host work and a ``cycles`` device sleep."""
+
+    def __init__(self, name: str, host_s: float, cycles: int) -> None:
+        self.name, self.host_s, self.cycles = name, host_s, cycles
+
+    def unique_id(self) -> tuple:
+        return (self.name,)
+
+    def get_valid_tactics(self, inputs, profile, **kwargs):
+        return [0]
+
+    def forward(self, inputs, *, tactic=-1, do_preparation=False, **kwargs):
+        time.sleep(self.host_s)
+        torch.cuda._sleep(self.cycles)
+        return inputs[0]
+
+
+@_skip_no_cuda
+@pytest.mark.parametrize("pdl", ["1", "0"])
+@torch.inference_mode()
+def test_race_times_device_work_not_host_launch(pdl: str, monkeypatch) -> None:
+    """The decode CUDA graphs pay device time only, so the race times inside a CUDA graph, PDL on or off: a
+    runner with a slow host launch and a short kernel beats one with a fast launch and a longer kernel. Eager
+    timing (positive control) picks the other one."""
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", pdl)
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
+    dispatcher = LowMGemmDispatcher()
+    dispatcher._init_runners()
+    config = dispatcher._tuning_config
+    assert config.use_cuda_graph
+    # ~2 us vs ~40 us of device sleep at ~1-2 GHz; 2 ms of host time per launch.
+    slow_launch = _HostDeviceCostRunner("slow_launch", host_s=2e-3, cycles=2_000)
+    slow_kernel = _HostDeviceCostRunner("slow_kernel", host_s=0.0, cycles=60_000)
+    x = torch.zeros((4, 128), dtype=torch.bfloat16, device="cuda")
+    w_t = torch.zeros((128, 64), dtype=torch.bfloat16, device="cuda")
+    tuner = AutoTuner.get()
+    winners = {}
+    for graph in (True, False):
+        tuner.clear_cache()
+        with autotune(skip_dynamic_tuning_buckets=True):
+            runner, _ = tuner.choose_one(
+                f"test::low_m_race_timing_{graph}",
+                [slow_kernel, slow_launch],
+                dataclasses.replace(config, use_cuda_graph=graph),
+                [x, w_t],
+            )
+        winners[graph] = runner
+    tuner.clear_cache()
+    assert winners[True] is slow_launch
+    assert winners[False] is slow_kernel

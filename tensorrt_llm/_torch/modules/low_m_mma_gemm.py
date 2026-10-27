@@ -97,22 +97,34 @@ def default_tactic(m: int, n: int, k: int, fp8: bool = True, even_tiles: bool = 
 
 
 def candidate_tactics(m: int, n: int, k: int, fp8: bool) -> List[Tactic]:
-    """The tactics the low-M GEMM race times for a plain projection: the heuristic, the same with K split over a
-    cluster of two CTAs, with twice the tiles per CTA, and with A and B swapped (m <= 8)."""
+    """The tactics the low-M GEMM race times for a plain projection, heuristic first: half, the same and twice
+    the heuristic's warps over K, times 1, 2 or 4 tiles per CTA and K split over a cluster of 1, 2, 4 or 8 CTAs
+    (while the grid fits one CTA per SM), each also with A and B swapped (m <= 8, even tiles); a lane
+    prefetches at most 512 B of weights."""
     try:
         base = default_tactic(m, n, k, fp8)
     except ValueError:
         return []
-    k_warps, n_tiles, _, _, min_blocks = base
     chunks = k // 64
-    out = [base]
-    if chunks % (2 * k_warps) == 0:
-        out.append((k_warps, n_tiles, 2, 0, min_blocks))
-    if n_tiles < 4 and n % (16 * n_tiles) == 0:
-        out.append((k_warps, 2 * n_tiles, 1, 0, min_blocks))
-    if m <= 8 and n_tiles % 2 == 0:
-        out.append((k_warps, n_tiles, 1, 1, min_blocks))
-    return out
+    per_chunk = 16 if fp8 else 32
+    out = {base: None}
+    for ksplit in (1, 2, 4, 8):
+        for n_tiles in (1, 2, 4):
+            ctas = n // (8 * n_tiles)
+            if n % (8 * n_tiles) or (ksplit > 1 and ctas * ksplit > _num_sms()):
+                continue
+            for k_warps in (base[0] // 2, base[0], 2 * base[0]):
+                split = k_warps * ksplit
+                if (
+                    not 1 <= k_warps <= 32
+                    or chunks % split
+                    or chunks // split * n_tiles * per_chunk > 512
+                ):
+                    continue
+                out[(k_warps, n_tiles, ksplit, 0, 1)] = None
+                if m <= 8 and n_tiles % 2 == 0:
+                    out[(k_warps, n_tiles, ksplit, 1, 1)] = None
+    return list(out)
 
 
 _DUMMIES: dict = {}
