@@ -11,6 +11,7 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.vsa import (
 )
 
 
+@pytest.mark.cpu_only
 def test_h3_vsa_geometry():
     metadata = build_h3_vsa_metadata((7, 5, (5, 5, 7)), 0.9, "cpu")
     valid = metadata.source >= 0
