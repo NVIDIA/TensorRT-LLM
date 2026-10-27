@@ -1024,7 +1024,6 @@
     },
     {
       "allowed_values": [
-        "default",
         "off",
         "auto",
         "require"

@@ -286,6 +286,7 @@ def test_explicit_request_still_respects_hardware(mnnvl_capable_hardware, monkey
     assert not ops.MNNVLAllReduce.is_mnnvl(mapping, torch.int8, explicitly_requested=True)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("tp_size", [4, 8])
 @pytest.mark.parametrize("kind", ["mc_allreduce", "shard_accept", "sampled_accept"])
 @pytest.mark.parametrize("setup_succeeds", [True, False])

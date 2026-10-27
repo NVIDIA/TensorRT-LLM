@@ -7187,10 +7187,9 @@
       "title": "Model Kwargs"
     },
     "modeling_v2": {
-      "default": "default",
-      "description": "Whether to build the model from a modeling_v2 target (experimental) instead of the built-in implementation. 'default' behaves as 'auto' on the deployments the architecture's routing module enables by default and as 'off' everywhere else. 'off' never does. 'auto' uses a target when one claims this deployment and falls back to the built-in implementation otherwise. 'require' raises instead of falling back.",
+      "default": "off",
+      "description": "Whether to build the model from a modeling_v2 target (experimental) instead of the built-in implementation. 'off' never does. 'auto' uses a target when one claims this deployment and falls back to the built-in implementation otherwise. 'require' raises instead of falling back.",
       "enum": [
-        "default",
         "off",
         "auto",
         "require"

@@ -88,7 +88,7 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
             except NoTarget as why:
                 # A modeling_v2 target refuses, at construction, a runtime that
                 # routing does not see (set by engine arguments). Under auto
-                # (and default) that falls back to the built-in implementation,
+                # that falls back to the built-in implementation,
                 # as a refusal in routing does; under require it is the error.
                 target = config.modeling_v2_target
                 if cls is not target or resolved_mode(
