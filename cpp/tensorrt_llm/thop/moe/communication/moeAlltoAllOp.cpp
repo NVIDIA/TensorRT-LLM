@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/moe/communication/moeAlltoAllCftManager.h"
 #include "tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllLamport.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include "tensorrt_llm/thop/moe/communication/moeAlltoAllMeta.h"
@@ -32,6 +33,7 @@
 #include <torch/extension.h>
 #include <torch/types.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -269,6 +271,225 @@ torch::Tensor moeA2AGetWorkspaceLayoutOp(int64_t epSize, int64_t maxNumTokens, i
     return metainfo;
 }
 
+// ============================================================================
+// Lamport transport: workspace regions
+// ============================================================================
+
+namespace lamport = tensorrt_llm::kernels::moe_comm::lamport;
+
+// Bytes of one row of a Lamport payload format: the payload (landing and receive rows), its
+// scales as received, and its scales on the wire (MXFP8 scale bytes travel as 16-bit lanes).
+struct LamportRowBytes
+{
+    int64_t payload;
+    int64_t scale;
+    int64_t wireScale;
+};
+
+LamportRowBytes lamportRowBytes(int64_t payloadFormat, int64_t hiddenSize)
+{
+    // Row bytes are kernel ints: hidden sizes beyond this bound are rejected, not wrapped.
+    TORCH_CHECK(hiddenSize > 0 && hiddenSize <= (1 << 24), "Invalid Lamport hidden size ", hiddenSize);
+    switch (payloadFormat)
+    {
+    case lamport::kBf16:
+        TORCH_CHECK(hiddenSize % 8 == 0, "Lamport BF16 rows need hidden_size % 8 == 0, got ", hiddenSize);
+        return {2 * hiddenSize, 0, 0};
+    case lamport::kMxfp8:
+        TORCH_CHECK(hiddenSize % 256 == 0, "Lamport MXFP8 rows need hidden_size % 256 == 0, got ", hiddenSize);
+        return {hiddenSize, hiddenSize / 32, hiddenSize / 16};
+    case lamport::kFp8Block128:
+        TORCH_CHECK(hiddenSize % 512 == 0, "Lamport FP8 block-128 rows need hidden_size % 512 == 0, got ", hiddenSize);
+        return {hiddenSize, hiddenSize / 32, hiddenSize / 32};
+    case lamport::kNvfp4:
+        TORCH_CHECK(hiddenSize % 256 == 0, "Lamport NVFP4 rows need hidden_size % 256 == 0, got ", hiddenSize);
+        return {hiddenSize / 2, hiddenSize / 16, hiddenSize / 16};
+    default: TORCH_CHECK(false, "Unknown Lamport payload format ", payloadFormat);
+    }
+    return {};
+}
+
+// Dispatch blocks per token slot: one per kNumThreads 16-byte vectors of the wire row.
+int64_t lamportDispatchBlocksPerToken(LamportRowBytes const& row)
+{
+    int64_t const vectors = (row.payload + row.wireScale) / 16;
+    return (vectors + lamport::kNumThreads - 1) / lamport::kNumThreads;
+}
+
+// Round state at LAMPORT_STATE_OFFSET_INDEX: int32 words (RoundStateWord) on their own cache line,
+// then the uint64 receive-source mask of every token slot.
+constexpr int64_t kLamportSourceMaskOffset = CACHELINE_ALIGNMENT;
+
+// Bytes of the Lamport regions of one rank for maxNumTokens tokens per source rank: the round
+// state, the landing rows (one set of payload, scale and weight rows, two sets of expert-id
+// rows), the combine landing rows and the receive buffers. Each region and each landing row
+// group starts on a kWorkspaceAlignment boundary.
+struct LamportRegionBytes
+{
+    int64_t state;
+    int64_t payload, scale, weights, idsSet; // landing row groups
+    int64_t landing;                         // all of them
+    int64_t combine;
+    int64_t recv;
+};
+
+LamportRegionBytes lamportRegionBytes(
+    int64_t epSize, int64_t maxNumTokens, int64_t topK, LamportRowBytes const& row, int64_t hiddenSize)
+{
+    auto aligned = [](int64_t bytes) { return static_cast<int64_t>(alignOffset(bytes, kWorkspaceAlignment)); };
+    int64_t const rows = epSize * maxNumTokens; // (source rank, token)
+    int64_t const topkRowBytes = 16 * lamport::topk_row_vectors(topK);
+    LamportRegionBytes bytes{};
+    bytes.state = kLamportSourceMaskOffset + maxNumTokens * static_cast<int64_t>(sizeof(uint64_t));
+    bytes.payload = aligned(rows * row.payload);
+    bytes.scale = aligned(rows * row.wireScale);
+    bytes.weights = aligned(rows * topkRowBytes);
+    bytes.idsSet = aligned(rows * topkRowBytes);
+    bytes.landing = bytes.payload + bytes.scale + bytes.weights + 2 * bytes.idsSet;
+    bytes.combine = aligned(rows * 2 * hiddenSize);
+    // Payload, scale, expert-id and weight rows, each starting on its own cache line.
+    bytes.recv = rows * (row.payload + row.scale + 2 * topK * static_cast<int64_t>(sizeof(int32_t)))
+        + tensorrt_llm::kernels::moe_comm::kMaxPayloads * static_cast<int64_t>(CACHELINE_ALIGNMENT);
+    return bytes;
+}
+
+// Lamport workspace bytes per (source rank, token) row, alignment padding aside: what the token
+// limit multiplies.
+int64_t lamportBytesPerRow(int64_t topK, LamportRowBytes const& row, int64_t hiddenSize)
+{
+    int64_t const topkRowBytes = 16 * lamport::topk_row_vectors(topK);
+    int64_t const landing = row.payload + row.wireScale + 3 * topkRowBytes;
+    int64_t const recv = row.payload + row.scale + 2 * topK * static_cast<int64_t>(sizeof(int32_t));
+    return landing + 2 * hiddenSize + recv;
+}
+
+// Append the Lamport regions for steps of at most maxNumTokens tokens per rank to `layout`, after
+// every other region (whose offsets do not change).
+void appendLamportRegions(
+    MoeA2AWorkspaceLayout& layout, int64_t maxNumTokens, int64_t payloadFormat, int64_t hiddenSize)
+{
+    int64_t const epSize = layout[EP_SIZE_INDEX];
+    int64_t const topK = layout[TOP_K_INDEX];
+    TORCH_CHECK(layout[LAMPORT_MAX_NUM_TOKENS_INDEX] == 0, "The workspace layout already has Lamport regions");
+    TORCH_CHECK(
+        epSize <= lamport::kMaxRanks, "The Lamport transport supports at most ", lamport::kMaxRanks, " EP ranks");
+    TORCH_CHECK(topK <= lamport::kMaxTopK, "The Lamport transport supports top_k <= ", lamport::kMaxTopK);
+    TORCH_CHECK(
+        maxNumTokens > 0 && maxNumTokens <= lamport::kMaxTokensPerRank && maxNumTokens <= layout[MAX_NUM_TOKENS_INDEX],
+        "Lamport token capacity must be in [1, min(", lamport::kMaxTokensPerRank, ", max_num_tokens)], got ",
+        maxNumTokens);
+    auto const bytes
+        = lamportRegionBytes(epSize, maxNumTokens, topK, lamportRowBytes(payloadFormat, hiddenSize), hiddenSize);
+
+    int64_t offset = layout[WORKSPACE_SIZE_INDEX];
+    auto reserve = [&](MoeA2AMetaInfoIndex index, int64_t size)
+    {
+        TORCH_CHECK(offset >= 0 && offset <= std::numeric_limits<int64_t>::max() - kWorkspaceAlignment,
+            "Workspace layout alignment overflows int64");
+        offset = static_cast<int64_t>(alignOffset(offset, kWorkspaceAlignment));
+        TORCH_CHECK(
+            size >= 0 && size <= std::numeric_limits<int64_t>::max() - offset, "Workspace layout size overflows int64");
+        layout[index] = offset;
+        offset += size;
+    };
+    reserve(LAMPORT_STATE_OFFSET_INDEX, bytes.state);
+    reserve(LAMPORT_LANDING_OFFSET_INDEX, bytes.landing);
+    reserve(LAMPORT_COMBINE_LANDING_OFFSET_INDEX, bytes.combine);
+    reserve(LAMPORT_RECV_OFFSET_INDEX, bytes.recv);
+    layout[LAMPORT_RECV_SIZE_INDEX] = bytes.recv;
+
+    layout[LAMPORT_MAX_NUM_TOKENS_INDEX] = maxNumTokens;
+    layout[LAMPORT_PAYLOAD_FORMAT_INDEX] = payloadFormat;
+    layout[LAMPORT_HIDDEN_SIZE_INDEX] = hiddenSize;
+    layout[WORKSPACE_SIZE_INDEX] = offset;
+}
+
+// Landing regions of a layout with Lamport regions, as the kernels address them.
+lamport::LandingLayout lamportLandingLayout(MoeA2AWorkspaceLayout const& layout)
+{
+    int64_t const hiddenSize = layout[LAMPORT_HIDDEN_SIZE_INDEX];
+    auto const bytes = lamportRegionBytes(layout[EP_SIZE_INDEX], layout[LAMPORT_MAX_NUM_TOKENS_INDEX],
+        layout[TOP_K_INDEX], lamportRowBytes(layout[LAMPORT_PAYLOAD_FORMAT_INDEX], hiddenSize), hiddenSize);
+    lamport::LandingLayout landing{};
+    landing.payload_offset = layout[LAMPORT_LANDING_OFFSET_INDEX];
+    landing.scale_offset = landing.payload_offset + bytes.payload;
+    landing.weights_offset = landing.scale_offset + bytes.scale;
+    landing.ids_offset = landing.weights_offset + bytes.weights;
+    landing.ids_set_bytes = bytes.idsSet;
+    landing.combine_offset = layout[LAMPORT_COMBINE_LANDING_OFFSET_INDEX];
+    return landing;
+}
+
+// Arm this rank's landing rows: expert-id rows with kIdsSentinel bytes, the others with
+// kDataSentinel bytes. The round state stays zero.
+void armLamportRegions(uint8_t* rankWorkspace, MoeA2AWorkspaceLayout const& layout, cudaStream_t stream)
+{
+    auto const landing = lamportLandingLayout(layout);
+    auto memset = [&](int64_t begin, int value, int64_t end)
+    {
+        TORCH_CHECK(cudaMemsetAsync(rankWorkspace + begin, value, end - begin, stream) == cudaSuccess,
+            "cudaMemsetAsync failed");
+    };
+    memset(landing.payload_offset, 0xFF, landing.ids_offset); // payload, scale and weight rows
+    memset(landing.ids_offset, 0x88, landing.ids_offset + 2 * landing.ids_set_bytes);
+    memset(landing.combine_offset, 0xFF, layout[LAMPORT_RECV_OFFSET_INDEX]);
+}
+
+// Workspace slices with a Lamport dispatch not combined yet. A Lamport combine reads routing state
+// only a Lamport dispatch writes, and a Lamport round must end before the next dispatch. The ops
+// run on the host in stream order, also while a CUDA graph is captured.
+std::mutex gOpenLamportRoundsMutex;
+std::unordered_set<uint8_t const*> gOpenLamportRounds;
+
+void setLamportRoundOpen(uint8_t const* rankWorkspace, bool open)
+{
+    std::lock_guard<std::mutex> lock(gOpenLamportRoundsMutex);
+    if (open)
+    {
+        gOpenLamportRounds.insert(rankWorkspace);
+    }
+    else
+    {
+        gOpenLamportRounds.erase(rankWorkspace);
+    }
+}
+
+bool isLamportRoundOpen(uint8_t const* rankWorkspace)
+{
+    std::lock_guard<std::mutex> lock(gOpenLamportRoundsMutex);
+    return gOpenLamportRounds.count(rankWorkspace) != 0;
+}
+
+// Append the Lamport regions to metainfo, a layout from moe_a2a_get_workspace_layout: landing rows
+// for steps of at most maxNumTokens tokens per rank in payloadFormat (lamport::PayloadFormat) at
+// hiddenSize.
+void moeA2ALamportExtendWorkspaceLayoutOp(
+    torch::Tensor& metainfo, int64_t maxNumTokens, int64_t payloadFormat, int64_t hiddenSize)
+{
+    auto layout = readWorkspaceLayout(metainfo);
+    auto const base = calculateWorkspaceLayout(layout[EP_SIZE_INDEX], layout[MAX_NUM_TOKENS_INDEX], layout[TOP_K_INDEX],
+        layout[DISPATCH_PAYLOAD_SIZE_INDEX], layout[COMBINE_INPUT_SIZE_INDEX], layout[COMBINE_RECV_SIZE_INDEX],
+        layout[EPLB_STATS_NUM_EXPERTS_INDEX], layout[CFT_ENABLED_INDEX]);
+    TORCH_CHECK(layout == base, "metainfo must be a layout from moe_a2a_get_workspace_layout");
+    appendLamportRegions(layout, maxNumTokens, payloadFormat, hiddenSize);
+    std::copy(layout.begin(), layout.end(), metainfo.data_ptr<int64_t>());
+}
+
+// Row geometry of a Lamport payload format at hiddenSize, for the per-step choice and the default
+// token limit: (hidden-state row bytes, scale row bytes, dispatch blocks per token slot, workspace
+// bytes per (source rank, token) row). Raises for an unsupported hidden size.
+std::vector<int64_t> moeA2ALamportRowBytesOp(int64_t payloadFormat, int64_t hiddenSize, int64_t topK)
+{
+    auto const row = lamportRowBytes(payloadFormat, hiddenSize);
+    return {row.payload, row.scale, lamportDispatchBlocksPerToken(row), lamportBytesPerRow(topK, row, hiddenSize)};
+}
+
+// Whether the loaded code carries the Lamport kernels for the current device.
+bool moeA2ALamportAvailableOp()
+{
+    return lamport::moe_a2a_lamport_kernels_available();
+}
+
 // Initialize control state after allocation; layout construction itself is CPU-only.
 void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t epRank, int64_t epSize)
 {
@@ -279,9 +500,15 @@ void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& met
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "Invalid EP rank");
     auto const& layout = readWorkspaceLayout(metainfo);
     TORCH_CHECK(layout[EP_SIZE_INDEX] == epSize, "Workspace layout EP size mismatch");
-    auto const expected = calculateWorkspaceLayout(epSize, layout[MAX_NUM_TOKENS_INDEX], layout[TOP_K_INDEX],
+    auto expected = calculateWorkspaceLayout(epSize, layout[MAX_NUM_TOKENS_INDEX], layout[TOP_K_INDEX],
         layout[DISPATCH_PAYLOAD_SIZE_INDEX], layout[COMBINE_INPUT_SIZE_INDEX], layout[COMBINE_RECV_SIZE_INDEX],
         layout[EPLB_STATS_NUM_EXPERTS_INDEX], layout[CFT_ENABLED_INDEX]);
+    bool const hasLamport = layout[LAMPORT_MAX_NUM_TOKENS_INDEX] > 0;
+    if (hasLamport)
+    {
+        appendLamportRegions(expected, layout[LAMPORT_MAX_NUM_TOKENS_INDEX], layout[LAMPORT_PAYLOAD_FORMAT_INDEX],
+            layout[LAMPORT_HIDDEN_SIZE_INDEX]);
+    }
     TORCH_CHECK(layout == expected, "Workspace layout metadata is inconsistent");
     TORCH_CHECK(layout[DISPATCH_PAYLOAD_SIZE_INDEX] > 0 && layout[COMBINE_INPUT_SIZE_INDEX] > 0,
         "Dispatch and combine input payload capacities must be positive");
@@ -294,6 +521,11 @@ void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& met
     uint8_t* rankWorkspace = workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0);
     cudaMemsetAsync(rankWorkspace + layout[RECV_COUNTERS_OFFSET_INDEX], 0xFF,
         2 * static_cast<size_t>(epSize) * sizeof(int32_t), at::cuda::getCurrentCUDAStream());
+    if (hasLamport)
+    {
+        armLamportRegions(rankWorkspace, layout, at::cuda::getCurrentCUDAStream());
+    }
+    setLamportRoundOpen(rankWorkspace, false);
     // Synchronize among ranks. Under a non-MPI orchestrator (Ray) MpiComm throws
     // "MPI is disabled, DON'T USE MPI" from mpiUtils.h, which made the whole
     // NVLinkOneSided strategy unusable there; fall back to the Torch process
@@ -480,6 +712,152 @@ void moeA2ACftReleaseOp(torch::Tensor const& workspace, int64_t epRank)
     g_cft_managers.erase(it);
 }
 
+// ============================================================================
+// Lamport transport: dispatch and combine
+// ============================================================================
+
+// Fills every rank's workspace slice and the round state of a Lamport step's kernels; returns
+// this rank's slice.
+template <typename Params>
+uint8_t* setLamportWorkspace(
+    Params& params, torch::Tensor const& workspace, MoeA2AWorkspaceLayout const& layout, int64_t epRank, int64_t epSize)
+{
+    TORCH_CHECK(layout[LAMPORT_MAX_NUM_TOKENS_INDEX] > 0, "Workspace was allocated without Lamport regions");
+    uint8_t* workspacePtr = workspace.data_ptr<uint8_t>();
+    uint8_t* rankWorkspace = workspacePtr + epRank * workspace.stride(0);
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(rankWorkspace) % CACHELINE_ALIGNMENT == 0, "rankWorkSpacePtr must be ",
+        CACHELINE_ALIGNMENT, "-byte aligned");
+    for (int rank = 0; rank < epSize; ++rank)
+    {
+        params.rank_workspaces[rank] = workspacePtr + rank * workspace.stride(0);
+    }
+    params.landing = lamportLandingLayout(layout);
+    int64_t const state = layout[LAMPORT_STATE_OFFSET_INDEX];
+    params.round_state = reinterpret_cast<int32_t*>(rankWorkspace + state);
+    params.recv_source_mask = reinterpret_cast<uint64_t*>(rankWorkspace + state + kLamportSourceMaskOffset);
+    // The fence path's routing table: a Lamport round fills and reads it like a fence round.
+    params.topk_target_ranks = reinterpret_cast<int32_t*>(rankWorkspace + layout[TOPK_TARGET_RANKS_OFFSET_INDEX]);
+    params.ep_size = static_cast<int>(epSize);
+    params.ep_rank = static_cast<int>(epRank);
+    return rankWorkspace;
+}
+
+// The active-rank mask of a Lamport step: one word, since it has at most 64 ranks.
+uint64_t lamportActiveRankMask(
+    bool enableRankMask, torch::optional<torch::Tensor> const& activeRankMask, int64_t epRank)
+{
+    if (!enableRankMask)
+    {
+        TORCH_CHECK(!hasActiveRankMask(activeRankMask), "active_rank_mask requires enable_rank_mask=True");
+        return ~uint64_t{0};
+    }
+    uint64_t mask[tensorrt_llm::kernels::moe_comm::kRankMaskWords];
+    resolveActiveRankMask(activeRankMask, epRank, mask);
+    return mask[0];
+}
+
+// A Lamport dispatch. inputPayloads = hidden states, [scales,] expert ids, [weights] (the expert
+// ids at expertIdPayloadIndex); recvOffsets = their receive buffers in the Lamport receive region.
+void lamportDispatch(torch::Tensor const& tokenSelectedExperts, std::vector<torch::Tensor> const& inputPayloads,
+    int64_t expertIdPayloadIndex, torch::Tensor const& workspace, MoeA2AWorkspaceLayout const& layout,
+    std::vector<size_t> const& recvOffsets, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize,
+    int64_t topK, int64_t numExperts, int64_t invalidExpertId, bool enableRankMask,
+    torch::optional<torch::Tensor> const& activeRankMask)
+{
+    lamport::DispatchParams params{};
+    uint8_t* rankWorkspace = setLamportWorkspace(params, workspace, layout, epRank, epSize);
+    TORCH_CHECK(runtimeMaxTokensPerRank <= layout[LAMPORT_MAX_NUM_TOKENS_INDEX], "A Lamport step takes at most ",
+        layout[LAMPORT_MAX_NUM_TOKENS_INDEX], " tokens per rank, got ", runtimeMaxTokensPerRank);
+    int64_t const payloadFormat = layout[LAMPORT_PAYLOAD_FORMAT_INDEX];
+    auto const row = lamportRowBytes(payloadFormat, layout[LAMPORT_HIDDEN_SIZE_INDEX]);
+    int64_t const numPayloads = static_cast<int64_t>(inputPayloads.size());
+    bool const hasScale = payloadFormat != lamport::kBf16;
+    TORCH_CHECK(expertIdPayloadIndex == (hasScale ? 2 : 1) && numPayloads >= expertIdPayloadIndex + 1
+            && numPayloads <= expertIdPayloadIndex + 2,
+        "A Lamport dispatch carries hidden states, ", (hasScale ? "their scales, " : ""),
+        "expert ids and optional weights, in this order");
+    auto rowBytes = [](torch::Tensor const& t) { return t.size(1) * t.element_size(); };
+    TORCH_CHECK(
+        rowBytes(inputPayloads[0]) == row.payload, "Hidden states do not match the workspace's Lamport payload format");
+    if (hasScale)
+    {
+        TORCH_CHECK(rowBytes(inputPayloads[1]) == row.scale,
+            "Hidden-state scales do not match the workspace's Lamport payload format");
+    }
+    torch::Tensor const& expertIds = inputPayloads[expertIdPayloadIndex];
+    TORCH_CHECK(expertIds.data_ptr() == tokenSelectedExperts.data_ptr(),
+        "The expert-id payload must be token_selected_experts");
+    bool const hasWeights = numPayloads == expertIdPayloadIndex + 2;
+    if (hasWeights)
+    {
+        torch::Tensor const& weights = inputPayloads[expertIdPayloadIndex + 1];
+        TORCH_CHECK(weights.element_size() == 4 && weights.size(1) == topK,
+            "Lamport routing weights must be 4-byte [local_num_tokens, top_k]");
+    }
+    TORCH_CHECK(numExperts % epSize == 0, "The Lamport transport needs num_experts divisible by ep_size");
+    TORCH_CHECK(static_cast<uint32_t>(invalidExpertId) != lamport::kIdsSentinel,
+        "invalid_expert_id must differ from the Lamport expert-id sentinel");
+
+    params.hidden_states = static_cast<uint8_t const*>(inputPayloads[0].data_ptr());
+    params.hidden_states_scale = hasScale ? static_cast<uint8_t const*>(inputPayloads[1].data_ptr()) : nullptr;
+    params.token_selected_experts = tokenSelectedExperts.data_ptr<int32_t>();
+    params.topk_weights
+        = hasWeights ? static_cast<uint32_t const*>(inputPayloads[expertIdPayloadIndex + 1].data_ptr()) : nullptr;
+    params.recv_hidden_states = rankWorkspace + recvOffsets[0];
+    params.recv_hidden_states_scale = hasScale ? rankWorkspace + recvOffsets[1] : nullptr;
+    params.recv_topk_ids = reinterpret_cast<int32_t*>(rankWorkspace + recvOffsets[expertIdPayloadIndex]);
+    params.recv_topk_weights
+        = hasWeights ? reinterpret_cast<uint32_t*>(rankWorkspace + recvOffsets[expertIdPayloadIndex + 1]) : nullptr;
+    params.num_experts = static_cast<int>(numExperts);
+    params.experts_per_rank = static_cast<int>(numExperts / epSize);
+    params.top_k = static_cast<int>(topK);
+    params.local_num_tokens = static_cast<int>(tokenSelectedExperts.size(0));
+    params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
+    params.has_topk_weights = hasWeights;
+    params.mx_scales = payloadFormat == lamport::kMxfp8;
+    params.payload_row_bytes = static_cast<int>(row.payload);
+    params.scale_row_bytes = static_cast<int>(row.scale);
+    params.wire_scale_row_bytes = static_cast<int>(row.wireScale);
+    params.payload_vectors = static_cast<int>(row.payload / 16);
+    params.wire_scale_vectors = static_cast<int>(row.wireScale / 16);
+    params.blocks_per_token = static_cast<int>(lamportDispatchBlocksPerToken(row));
+    params.invalid_expert_id = static_cast<int32_t>(invalidExpertId);
+    params.active_rank_mask = lamportActiveRankMask(enableRankMask, activeRankMask, epRank);
+    params.timeout_cycles = gTimeoutCycles.load(std::memory_order_relaxed);
+
+    int const payloadKind = payloadFormat == lamport::kBf16 ? lamport::kKindBf16
+        : payloadFormat == lamport::kNvfp4                  ? lamport::kKindNvfp4
+                                                            : lamport::kKindFp8;
+    lamport::moe_a2a_lamport_dispatch_launch(payloadKind, params, enableRankMask, at::cuda::getCurrentCUDAStream());
+}
+
+// A Lamport combine of payload [ep_size, runtimeMaxTokensPerRank, hidden_size] bf16 into output.
+void lamportCombine(torch::Tensor const& payload, int64_t localNumTokens, torch::Tensor const& workspace,
+    MoeA2AWorkspaceLayout const& layout, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK,
+    bool enableRankMask, torch::optional<torch::Tensor> const& activeRankMask, torch::Tensor& output)
+{
+    lamport::CombineParams params{};
+    setLamportWorkspace(params, workspace, layout, epRank, epSize);
+    int64_t const hiddenSize = layout[LAMPORT_HIDDEN_SIZE_INDEX];
+    TORCH_CHECK(runtimeMaxTokensPerRank <= layout[LAMPORT_MAX_NUM_TOKENS_INDEX], "A Lamport step takes at most ",
+        layout[LAMPORT_MAX_NUM_TOKENS_INDEX], " tokens per rank");
+    TORCH_CHECK(payload.scalar_type() == at::kBFloat16, "A Lamport combine takes bf16 expert outputs");
+    TORCH_CHECK(payload.size(2) == hiddenSize, "A Lamport combine takes rows of the workspace's hidden size");
+
+    params.expert_output = static_cast<uint8_t const*>(payload.data_ptr());
+    params.output = static_cast<uint8_t*>(output.data_ptr());
+    params.top_k = static_cast<int>(topK);
+    params.local_num_tokens = static_cast<int>(localNumTokens);
+    params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
+    params.hidden_size = static_cast<int>(hiddenSize);
+    params.row_vectors = static_cast<int>(hiddenSize / 8);
+    params.blocks_per_token = (params.row_vectors + lamport::kNumThreads - 1) / lamport::kNumThreads;
+    params.active_rank_mask = lamportActiveRankMask(enableRankMask, activeRankMask, epRank);
+    params.timeout_cycles = gTimeoutCycles.load(std::memory_order_relaxed);
+
+    lamport::moe_a2a_lamport_combine_launch(params, enableRankMask, at::cuda::getCurrentCUDAStream());
+}
+
 // MoE All-to-All Dispatch Operation
 // This operation dispatches tokens and their associated payloads to different expert ranks.
 //
@@ -499,6 +877,10 @@ void moeA2ACftReleaseOp(torch::Tensor const& workspace, int64_t epRank)
 //   - numExperts: Total number of routing slots (tokenSelectedExperts values are in [0, numExperts))
 //   - eplbStatsNumExperts: Number of experts used for EPLB stats (may be <= numExperts)
 //   - eplbLocalStats: [eplbStatsNumExperts] tensor containing local statistics for EPLB.
+//   - useLamport: run the Lamport transport; the payloads must be the hidden states, their scales (quantized
+//   formats), the expert ids and optionally the weights, in the workspace's Lamport payload format, and
+//   expertIdPayloadIndex / invalidTokenExpertId must be given. Received rows are then (source rank, token), not
+//   compacted, and rows of tokens not routed here carry invalidTokenExpertId.
 //
 // Return values:
 //   - recvTensors: Vector of receive buffers (one tensor per payload), each [ep_size, runtimeMaxTokensPerRank,
@@ -514,7 +896,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
     int64_t epSize, int64_t topK, int64_t numExperts, torch::optional<torch::Tensor> eplbLocalStats,
     bool useCftCountedWrites, torch::optional<int64_t> expertIdPayloadIndex,
-    torch::optional<int64_t> invalidTokenExpertId, bool enableRankMask, torch::optional<torch::Tensor> activeRankMask)
+    torch::optional<int64_t> invalidTokenExpertId, bool enableRankMask, torch::optional<torch::Tensor> activeRankMask,
+    bool useLamport)
 {
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
@@ -529,6 +912,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     TORCH_CHECK(tokenSelectedExperts.size(1) == topK, "tokenSelectedExperts must have topK columns");
 
     auto const& offsets = readWorkspaceLayout(metainfo);
+    TORCH_CHECK(
+        !useLamport || offsets[LAMPORT_MAX_NUM_TOKENS_INDEX] > 0, "Workspace was allocated without Lamport regions");
 
     int64_t localNumTokens = tokenSelectedExperts.size(0);
     TORCH_CHECK(runtimeMaxTokensPerRank > 0, "runtimeMaxTokensPerRank must be positive");
@@ -580,8 +965,10 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     std::vector<int> payloadElementsPerToken;
     std::vector<size_t> payloadRecvBufferOffsets;
 
-    // Start offset for the first payload
-    size_t currentOffset = static_cast<size_t>(offsets[DISPATCH_PAYLOAD_OFFSET_INDEX]);
+    // Start offset for the first payload. A Lamport step receives into its own region.
+    int64_t const recvRegionOffset = offsets[useLamport ? LAMPORT_RECV_OFFSET_INDEX : DISPATCH_PAYLOAD_OFFSET_INDEX];
+    int64_t const recvRegionSize = offsets[useLamport ? LAMPORT_RECV_SIZE_INDEX : DISPATCH_PAYLOAD_SIZE_INDEX];
+    size_t currentOffset = static_cast<size_t>(recvRegionOffset);
     for (auto const& payload : inputPayloads)
     {
         CHECK_CONTIGUOUS(payload);
@@ -636,16 +1023,49 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     TORCH_CHECK(!useCftCountedWrites || offsets[CFT_ENABLED_INDEX], "Workspace was allocated without CFT support");
     TORCH_CHECK(workspace.size(1) >= offsets[WORKSPACE_SIZE_INDEX], "Workspace is smaller than its layout");
     int64_t const combinePayloadOffset = offsets[COMBINE_INPUT_OFFSET_INDEX];
-    int64_t const payloadCapacity = offsets[DISPATCH_PAYLOAD_SIZE_INDEX];
-    TORCH_CHECK(currentOffset <= static_cast<size_t>(offsets[DISPATCH_PAYLOAD_OFFSET_INDEX] + payloadCapacity),
-        "Dispatch payload exceeds its workspace capacity: need ",
-        currentOffset - offsets[DISPATCH_PAYLOAD_OFFSET_INDEX], " bytes, capacity ", payloadCapacity);
+    TORCH_CHECK(currentOffset <= static_cast<size_t>(recvRegionOffset + recvRegionSize),
+        "Dispatch payload exceeds its workspace capacity: need ", currentOffset - recvRegionOffset, " bytes, capacity ",
+        recvRegionSize);
 
     // Get base workspace pointer
     uint8_t* workspacePtr = workspace.data_ptr<uint8_t>();
     uint8_t* rankWorkSpacePtr = workspacePtr + epRank * workspace.stride(0);
     TORCH_CHECK(reinterpret_cast<uintptr_t>(rankWorkSpacePtr) % CACHELINE_ALIGNMENT == 0,
         "rankWorkSpacePtr must be %d-byte aligned", CACHELINE_ALIGNMENT);
+    TORCH_CHECK(!isLamportRoundOpen(rankWorkSpacePtr),
+        "A Lamport dispatch must be followed by its Lamport combine before the next dispatch");
+
+    // Create tensor views for the current rank's receive buffers only
+    auto makeRecvTensors = [&]()
+    {
+        std::vector<torch::Tensor> recvTensors;
+        for (size_t payload_idx = 0; payload_idx < inputPayloads.size(); payload_idx++)
+        {
+            void* recvDataPtr = rankWorkSpacePtr + payloadRecvBufferOffsets[payload_idx];
+            recvTensors.push_back(
+                torch::from_blob(recvDataPtr, {epSize, runtimeMaxTokensPerRank, payloadElementsPerToken[payload_idx]},
+                    inputPayloads[payload_idx].options()));
+        }
+        return recvTensors;
+    };
+
+    if (useLamport)
+    {
+        TORCH_CHECK(!useCftCountedWrites && !enableEplb,
+            "A Lamport dispatch uses neither CFT counted writes nor EPLB statistics");
+        TORCH_CHECK(sanitizeExpertIds,
+            "A Lamport dispatch needs expert_id_payload_index and invalid_token_expert_id: it fills the expert ids of "
+            "rows without a token");
+        lamportDispatch(tokenSelectedExperts, inputPayloads, expertIdPayloadIdx, workspace, offsets,
+            payloadRecvBufferOffsets, runtimeMaxTokensPerRank, epRank, epSize, topK, numExperts, invalidExpertId,
+            enableRankMask, activeRankMask);
+        cudaError_t result = cudaGetLastError();
+        TORCH_CHECK(
+            result == cudaSuccess, "moe_a2a_dispatch Lamport kernel launch failed: ", cudaGetErrorString(result));
+        setLamportRoundOpen(rankWorkSpacePtr, true);
+        return std::make_tuple(
+            makeRecvTensors(), combinePayloadOffset, torch::empty({0}, workspace.options().dtype(torch::kInt32)));
+    }
 
     // Setup payload descriptors for source data
     int num_payloads = static_cast<int>(inputPayloads.size());
@@ -778,16 +1198,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     cudaError_t result = cudaGetLastError();
     TORCH_CHECK(result == cudaSuccess, "moe_a2a_dispatch kernel launch failed: ", cudaGetErrorString(result));
 
-    // Create tensor views for the current rank's receive buffers only
-    std::vector<torch::Tensor> recvTensors;
-    for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
-    {
-        auto const& payload = inputPayloads[payload_idx];
-        void* recvDataPtr = rankWorkSpacePtr + payloadRecvBufferOffsets[payload_idx];
-        auto recvTensor = torch::from_blob(
-            recvDataPtr, {epSize, runtimeMaxTokensPerRank, payloadElementsPerToken[payload_idx]}, payload.options());
-        recvTensors.push_back(recvTensor);
-    }
+    std::vector<torch::Tensor> recvTensors = makeRecvTensors();
 
     torch::Tensor eplbGatheredStats;
     if (enableEplb)
@@ -812,12 +1223,13 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 // region by its address; payloadInWorkspace=true additionally requires that zero-copy path.
 // Other sources, including dispatch payload views, are staged when needed.
 // Fence combine reads from 'combinePayloadOffset'. CFT combine stages the local slice and receives
-// peer slices in a dedicated counted-write region before reduction.
+// peer slices in a dedicated counted-write region before reduction. A Lamport combine (useLamport,
+// after a Lamport dispatch) reads the payload where it is and pushes it.
 torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumTokens, torch::Tensor const& workspace,
     torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK,
     int64_t combinePayloadOffset, bool payloadInWorkspace, bool useLowPrecision = false,
     bool useCftCountedWrites = false, bool enableRankMask = false,
-    torch::optional<torch::Tensor> activeRankMask = torch::nullopt)
+    torch::optional<torch::Tensor> activeRankMask = torch::nullopt, bool useLamport = false)
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2ACombineParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_combine_launch;
@@ -890,12 +1302,28 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     int64_t payloadSize = payload.numel() * payload.element_size();
     TORCH_CHECK(payloadSize <= regionSize, "Combine payload exceeds its fixed workspace region: need ", payloadSize,
         " bytes, capacity ", regionSize);
+    TORCH_CHECK(useLamport == isLamportRoundOpen(rankWorkSpacePtr),
+        useLamport ? "A Lamport combine needs a Lamport dispatch before it"
+                   : "A Lamport dispatch must be followed by a Lamport combine");
 
     // Create output tensor (local on current rank), no need for initialization
     // Typically, newly allocated GPU torch tensors are at least 16-byte aligned.
     // Output dtype always matches the payload dtype: low-precision accumulates FP8 back to payload dtype.
     auto output_options = payload.options();
     torch::Tensor output = torch::empty({localNumTokens, elementsPerToken}, output_options);
+
+    if (useLamport)
+    {
+        TORCH_CHECK(!useLowPrecision && !useCftCountedWrites,
+            "A Lamport combine uses neither the FP8 wire format nor CFT counted writes");
+        lamportCombine(payload, localNumTokens, workspace, offsets, runtimeMaxTokensPerRank, epRank, epSize, topK,
+            enableRankMask, activeRankMask, output);
+        cudaError_t result = cudaGetLastError();
+        TORCH_CHECK(
+            result == cudaSuccess, "moe_a2a_combine Lamport kernel launch failed: ", cudaGetErrorString(result));
+        setLamportRoundOpen(rankWorkSpacePtr, false);
+        return output;
+    }
 
     // Setup combine parameters
     MoeA2ACombineParams params{};
@@ -1096,7 +1524,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "int? expert_id_payload_index=None, "
         "int? invalid_token_expert_id=None, "
         "bool enable_rank_mask=False, "
-        "Tensor? active_rank_mask=None) -> (Tensor(a!)[], int, Tensor(a!))");
+        "Tensor? active_rank_mask=None, "
+        "bool use_lamport=False) -> (Tensor(a!)[], int, Tensor(a!))");
     module.def(
         "moe_a2a_combine(Tensor(a) payload, int local_num_tokens,"
         "Tensor(a!) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
@@ -1105,7 +1534,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "bool use_low_precision=False, "
         "bool use_cft_counted_writes=False, "
         "bool enable_rank_mask=False, "
-        "Tensor? active_rank_mask=None) -> Tensor");
+        "Tensor? active_rank_mask=None, "
+        "bool use_lamport=False) -> Tensor");
     module.def(
         "moe_a2a_cft_initialize(Tensor(a!) workspace, int workspace_mem_handle, "
         "int workspace_size_per_rank, int ep_rank, int ep_size) -> ()");
@@ -1124,6 +1554,13 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "int dispatch_payload_bytes, int combine_input_bytes, int combine_recv_bytes, "
         "int? eplb_stats_num_experts=None, bool can_use_cft_counted_writes=False) -> Tensor",
         &tensorrt_llm::torch_ext::moe_comm::moeA2AGetWorkspaceLayoutOp);
+    module.def(
+        "moe_a2a_lamport_extend_workspace_layout(Tensor(a!) metainfo, int max_num_tokens, int payload_format, "
+        "int hidden_size) -> ()",
+        &tensorrt_llm::torch_ext::moe_comm::moeA2ALamportExtendWorkspaceLayoutOp);
+    module.def("moe_a2a_lamport_row_bytes(int payload_format, int hidden_size, int top_k) -> int[]",
+        &tensorrt_llm::torch_ext::moe_comm::moeA2ALamportRowBytesOp);
+    module.def("moe_a2a_lamport_available() -> bool", &tensorrt_llm::torch_ext::moe_comm::moeA2ALamportAvailableOp);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, module)

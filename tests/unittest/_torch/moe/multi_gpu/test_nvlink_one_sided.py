@@ -1,6 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""NVLinkOneSided path selection and model-shaped round trips with independent references."""
+"""NVLinkOneSided path selection and model-shaped round trips with independent references.
+
+Every round trip runs with the fence, CFT and Lamport transports (``Case.mode``); the Lamport
+transport places received rows at (source rank, token) instead of compacting them, which the
+dispatch check accepts because it identifies tokens by their encoded routing weights.
+"""
 
 from __future__ import annotations
 
@@ -21,10 +26,15 @@ from mpi4py.futures import MPIPoolExecutor
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
     FORCE_CFT_ENV,
+    FORCE_LAMPORT_ENV,
+    LAMPORT_MAX_TOKENS_ENV,
     NVLinkOneSided,
     _cft_device_support_reason,
     _get_nvidia_driver_version,
     cft_driver_is_supported,
+    default_lamport_max_tokens,
+    lamport_payload_format,
+    lamport_row,
 )
 from tensorrt_llm.mapping import Mapping
 
@@ -56,6 +66,15 @@ MODELS = {
             "kimi_k3", 3584, 896, 16, "mxfp8"
         ),  # K3 communicates its latent MoE width, not the model's 7168-wide states.
     )
+}
+
+
+# Lamport payload format of each dispatch format the tests generate.
+LAMPORT_FORMATS = {
+    "bf16": "BF16",
+    "blockwise_fp8": "FP8_BLOCK128",
+    "mxfp8": "MXFP8",
+    "nvfp4": "NVFP4",
 }
 
 
@@ -111,11 +130,14 @@ class Round:
         routing: Strategy used to construct expert IDs; see Routing.
         delay_rank: Rank to delay on the GPU after dispatch, before expert
             computation, to exercise rank skew. -1 disables the delay.
+        delay_before_dispatch_rank: Rank to delay on the GPU before dispatch, so
+            that its peers run ahead into this round. -1 disables the delay.
     """
 
     tokens: tuple[int, ...]
     routing: Routing
     delay_rank: int
+    delay_before_dispatch_rank: int = -1
 
 
 @dataclass(frozen=True)
@@ -126,24 +148,28 @@ class Case:
         model: Expert layout, hidden width, and dispatch payload format.
         rounds: Ordered iterations with no host synchronization between them.
             All token-count tuples must describe the same EP group size.
-        mode: Automatic CFT selection, forced fence, or requested CFT; platform
-            and payload restrictions still apply to CFT.
+        mode: Automatic transport selection (Lamport for small steps, then CFT),
+            forced fence, requested CFT (Lamport off), or requested Lamport with
+            fence for the steps it cannot carry; platform and payload
+            restrictions still apply to CFT and Lamport.
         payload_in_workspace: Copy simulated expert outputs into the communication workspace
             before combine, instead of passing an external tensor.
         fp8_combine: Use FP8 on the combine wire; the returned output remains BF16.
         graph: Capture and replay the entire round sequence in one CUDA graph.
         pdl: Enable programmatic dependent launch for communication kernels.
         eplb: Gather and verify expert-load statistics alongside dispatch.
+        lamport_max_tokens: Token limit of the Lamport transport; None keeps its default.
     """
 
     model: ModelShape
     rounds: tuple[Round, ...]
-    mode: Literal["auto", "fence", "cft"]
+    mode: Literal["auto", "fence", "cft", "lamport"]
     payload_in_workspace: bool
     fp8_combine: bool
     graph: bool
     pdl: bool
     eplb: bool
+    lamport_max_tokens: int | None = None
 
     @property
     def ep_size(self) -> int:
@@ -262,7 +288,11 @@ def _run_worker(case: Case) -> dict:
     import torch
 
     # Selection is read by each communicator constructor, not cached by the MPI pool.
-    os.environ[FORCE_CFT_ENV] = {"auto": "", "fence": "0", "cft": "1"}[case.mode]
+    os.environ[FORCE_CFT_ENV] = {"auto": "", "fence": "0", "cft": "1", "lamport": "0"}[case.mode]
+    os.environ[FORCE_LAMPORT_ENV] = {"auto": "", "fence": "0", "cft": "", "lamport": "1"}[case.mode]
+    os.environ[LAMPORT_MAX_TOKENS_ENV] = (
+        "" if case.lamport_max_tokens is None else str(case.lamport_max_tokens)
+    )
 
     rank = MPI.COMM_WORLD.Get_rank()
     torch.cuda.set_device(rank)
@@ -305,8 +335,26 @@ def _run_worker(case: Case) -> dict:
         payload_in_workspace=case.payload_in_workspace,
         use_low_precision_combine=case.fp8_combine,
         num_experts=case.model.num_experts // 2 if case.eplb else None,
+        lamport_payload_format=LAMPORT_FORMATS[case.model.dispatch_dtype],
     )
     try:
+        # Whether every precondition of the Lamport transport holds, from the case alone.
+        try:
+            lamport_row(
+                LAMPORT_FORMATS[case.model.dispatch_dtype], case.model.hidden_size, case.model.top_k
+            )
+            lamport_shape_ok = True
+        except RuntimeError:
+            lamport_shape_ok = False
+        lamport_expected = (
+            case.mode in ("auto", "lamport")
+            and bool(torch.ops.trtllm.moe_a2a_lamport_available())
+            and lamport_shape_ok
+            and not case.fp8_combine
+            and case.model.num_experts % case.ep_size == 0
+        )
+        if case.mode == "lamport" and not lamport_expected:
+            return {"skip": "the Lamport transport does not support this case on this platform"}
         inputs = [_make_inputs(case, rank, i) for i in range(len(case.rounds))]
         stats = None
         if case.eplb:
@@ -320,14 +368,16 @@ def _run_worker(case: Case) -> dict:
         combine_offsets = []
 
         def record_dispatch(*args, **kwargs):
-            # Record the actual op argument, not just the wrapper's capability.
-            launches.append(("dispatch", bool(args[10])))
+            # Record the actual op arguments, not just the wrapper's capability.
+            use_lamport = args[15] if len(args) > 15 else kwargs.get("use_lamport", False)
+            launches.append(("dispatch", bool(args[10]), bool(use_lamport)))
             result = dispatch_op(*args, **kwargs)
             combine_offsets.append(result[1])
             return result
 
         def record_combine(*args, **kwargs):
-            launches.append(("combine", bool(args[11])))
+            use_lamport = args[14] if len(args) > 14 else kwargs.get("use_lamport", False)
+            launches.append(("combine", bool(args[11]), bool(use_lamport)))
             return combine_op(*args, **kwargs)
 
         def sequence() -> list[dict]:
@@ -336,6 +386,8 @@ def _run_worker(case: Case) -> dict:
                 payload, sf, slots, weights = tensors
                 counts = list(spec.tokens)
                 comm.prepare_dispatch(slots, counts)
+                if rank == spec.delay_before_dispatch_rank:
+                    torch.cuda._sleep(200_000)
                 recv = comm.dispatch(payload, sf, slots, weights, counts, eplb_local_stats=stats)
                 # Combine clears dispatch state; consume statistics at the same
                 # point as the MoE scheduler, before starting expert computation.
@@ -396,6 +448,8 @@ def _run_worker(case: Case) -> dict:
             ],
             "launches": launches,
             "cft_capable": comm.can_use_cft_counted_writes,
+            "lamport_max_tokens": comm.lamport_max_tokens,
+            "lamport_expected": lamport_expected,
         }
         MPI.COMM_WORLD.Barrier()
         return result
@@ -480,15 +534,27 @@ def _assert_results(case: Case, results: list[dict]) -> None:
     for rank in range(case.ep_size):
         result = results[rank]
         assert len(result["outputs"]) == len(case.rounds)
+        lamport_max_tokens = result["lamport_max_tokens"]
+        assert (lamport_max_tokens > 0) == result["lamport_expected"], (
+            f"rank {rank}: Lamport limit {lamport_max_tokens}, expected it "
+            f"{'on' if result['lamport_expected'] else 'off'}"
+        )
+        if case.lamport_max_tokens is not None and lamport_max_tokens:
+            assert lamport_max_tokens == min(
+                case.lamport_max_tokens, case.runtime_max_num_tokens_per_rank
+            )
         expected_launches = []
         for i, spec in enumerate(case.rounds):
             payload, sf, slots, weights = result["inputs"][i]
             verify_combine(case, results, rank, i)
             if result["outputs"][i]["dispatch"] is not None:
                 verify_dispatch(case, results, rank, i)
+            # The Lamport transport takes every step it can carry, ahead of CFT.
+            lamport = max(spec.tokens) <= lamport_max_tokens and not case.eplb
             requested = (
-                result["cft_capable"]
-                and case.mode != "fence"
+                not lamport
+                and result["cft_capable"]
+                and case.mode not in ("fence", "lamport")
                 and (case.mode == "cft" or max(spec.tokens) <= 128)
             )
             # Calculate wire eligibility independently from the production helper.
@@ -499,7 +565,9 @@ def _assert_results(case: Case, results: list[dict]) -> None:
             combine_cft = (
                 requested and case.model.hidden_size * (1 if case.fp8_combine else 2) % 16 == 0
             )
-            expected_launches.extend((("dispatch", dispatch_cft), ("combine", combine_cft)))
+            expected_launches.extend(
+                (("dispatch", dispatch_cft, lamport), ("combine", combine_cft, lamport))
+            )
             if case.eplb:
                 expected = torch.stack(
                     [
@@ -555,6 +623,26 @@ def _run(case: Case, pools: dict[tuple[int, bool], MPIPoolExecutor]) -> None:
         # A failed collective or reference check must not contaminate another case.
         if not healthy:
             pools.pop(key).shutdown(wait=True, cancel_futures=True)
+
+
+def _skew_rounds(ep_size: int, num_rounds: int, lamport_max_tokens: int) -> tuple[Round, ...]:
+    """Rounds with varying, uneven token counts (zero included), every routing pattern, and
+    rotating delays; every eighth round exceeds ``lamport_max_tokens`` on one rank."""
+    rounds = []
+    patterns = (Routing.SPREAD, Routing.LOCAL, Routing.HOTSPOT)
+    for i in range(num_rounds):
+        tokens = [(7 * i + 13 * rank) % (lamport_max_tokens + 1) for rank in range(ep_size)]
+        if i % 8 == 7:
+            tokens[i % ep_size] = lamport_max_tokens + 1 + i % 5
+        rounds.append(
+            Round(
+                tokens=tuple(tokens),
+                routing=patterns[i % len(patterns)],
+                delay_rank=i % ep_size,
+                delay_before_dispatch_rank=(i + 1 + i // ep_size) % ep_size,
+            )
+        )
+    return tuple(rounds)
 
 
 CASES = [
@@ -633,15 +721,46 @@ CASES = [
                 graph=graph,
                 pdl=True,
                 eplb=False,
+                lamport_max_tokens=lamport_max_tokens,
             ),
-            id=f"round-sequence-ep4-{mode}-{'graph' if graph else 'eager'}",
+            id=(
+                f"round-sequence-ep4-{mode}-{'graph' if graph else 'eager'}"
+                + ("" if lamport_max_tokens is None else f"-lamport{lamport_max_tokens}")
+            ),
         )
-        for mode, graph in (
-            ("auto", False),
-            ("auto", True),
-            ("cft", True),
-            ("fence", True),
+        for mode, graph, lamport_max_tokens in (
+            ("auto", False, None),
+            ("auto", True, None),
+            ("cft", True, None),
+            ("fence", True, None),
+            # A Lamport limit of 128 hands the 129-token rounds to CFT (auto) or fence
+            # (lamport), so one sequence and one graph mix the transports.
+            ("auto", True, 128),
+            ("lamport", False, 128),
+            ("lamport", True, 128),
         )
+    ],
+    # Back-to-back Lamport rounds under rank skew: no host synchronization or fence round
+    # between most of them, a rotating rank delayed before dispatch and another before
+    # combine, and every eighth round above the Lamport limit (a fence round). Every round's
+    # combine is checked, so a stale or early landing row in any round shows up.
+    *[
+        pytest.param(
+            Case(
+                model=MODELS[model],
+                rounds=_skew_rounds(ep_size, num_rounds=48, lamport_max_tokens=128),
+                mode="lamport",
+                payload_in_workspace=True,
+                fp8_combine=False,
+                graph=graph,
+                pdl=True,
+                eplb=False,
+                lamport_max_tokens=128,
+            ),
+            id=f"lamport-skew-ep{ep_size}-{model}-{'graph' if graph else 'eager'}",
+        )
+        for ep_size in (4, 8)
+        for model, graph in (("qwen3_5_397b_a17b", False), ("deepseek_r1_nvfp4", True))
     ],
     # Gather rank-distinct EPLB statistics from all four ranks, including the rank
     # with zero input tokens. This checks statistics transport, not expert migration.
@@ -736,6 +855,146 @@ def test_workspace_layout(cft: bool, fp8_combine: bool) -> None:
         torch.ops.trtllm.moe_a2a_get_workspace_layout(
             ep_size, capacity, top_k, (1 << 63) - 512, 1024, 0
         )
+
+
+@pytest.mark.parametrize("payload_format", ["BF16", "MXFP8", "FP8_BLOCK128", "NVFP4"])
+def test_lamport_workspace_layout(payload_format: str) -> None:
+    from tensorrt_llm.bindings import internal as _tllm_internal
+
+    thop = _tllm_internal.thop
+
+    def field(layout: torch.Tensor, name: str) -> int:
+        return int(layout[getattr(thop, f"MOE_A2A_{name}")])
+
+    ep_size, top_k, capacity, hidden_size, lamport_tokens = 8, 8, 256, 7168, 160
+    base = NVLinkOneSided._make_workspace_layout(
+        ep_size, top_k, capacity, hidden_size, torch.bfloat16, None, 0, False, False
+    )
+    for name in ("LAMPORT_MAX_NUM_TOKENS_INDEX", "LAMPORT_RECV_SIZE_INDEX"):
+        assert field(base, name) == 0
+    layout = base.clone()
+    torch.ops.trtllm.moe_a2a_lamport_extend_workspace_layout(
+        layout,
+        lamport_tokens,
+        int(getattr(thop, f"MOE_A2A_LAMPORT_FORMAT_{payload_format}")),
+        hidden_size,
+    )
+    # The other regions keep their offsets; the Lamport regions follow them in order.
+    num_base_fields = int(thop.MOE_A2A_LAMPORT_MAX_NUM_TOKENS_INDEX)
+    assert torch.equal(
+        layout[: int(thop.MOE_A2A_WORKSPACE_SIZE_INDEX)],
+        base[: int(thop.MOE_A2A_WORKSPACE_SIZE_INDEX)],
+    )
+    assert num_base_fields == int(thop.MOE_A2A_WORKSPACE_SIZE_INDEX) + 1
+    starts = [
+        field(layout, f"LAMPORT_{name}_OFFSET_INDEX")
+        for name in ("STATE", "LANDING", "COMBINE_LANDING", "RECV")
+    ]
+    assert field(base, "WORKSPACE_SIZE_INDEX") <= starts[0]
+    assert starts == sorted(starts) and all(start % 256 == 0 for start in starts)
+    row = lamport_row(payload_format, hidden_size, top_k)
+    rows = ep_size * lamport_tokens
+    # One bf16 partial row per (source rank, token), padded to the workspace alignment.
+    assert starts[3] - starts[2] >= rows * hidden_size * 2
+    assert field(layout, "LAMPORT_RECV_SIZE_INDEX") >= rows * (
+        row.hidden_bytes + row.scale_bytes + 2 * top_k * 4
+    )
+    assert field(layout, "WORKSPACE_SIZE_INDEX") == starts[3] + field(
+        layout, "LAMPORT_RECV_SIZE_INDEX"
+    )
+    assert field(layout, "LAMPORT_MAX_NUM_TOKENS_INDEX") == lamport_tokens
+    assert field(layout, "LAMPORT_HIDDEN_SIZE_INDEX") == hidden_size
+
+    with pytest.raises(RuntimeError, match="already has Lamport regions"):
+        torch.ops.trtllm.moe_a2a_lamport_extend_workspace_layout(
+            layout, lamport_tokens, int(thop.MOE_A2A_LAMPORT_FORMAT_BF16), hidden_size
+        )
+    with pytest.raises(RuntimeError, match="token capacity"):
+        torch.ops.trtllm.moe_a2a_lamport_extend_workspace_layout(
+            base.clone(), capacity + 1, int(thop.MOE_A2A_LAMPORT_FORMAT_BF16), hidden_size
+        )
+
+
+def test_lamport_row_geometry() -> None:
+    hidden_size, top_k = 7168, 8
+    # (hidden-state bytes, scale bytes, dispatch blocks per token) per row.
+    assert lamport_row("BF16", hidden_size, top_k)[:3] == (2 * hidden_size, 0, 7)
+    assert lamport_row("MXFP8", hidden_size, top_k)[:3] == (hidden_size, hidden_size // 32, 4)
+    assert lamport_row("FP8_BLOCK128", hidden_size, top_k)[:3] == (
+        hidden_size,
+        hidden_size // 32,
+        4,
+    )
+    assert lamport_row("NVFP4", hidden_size, top_k)[:3] == (hidden_size // 2, hidden_size // 16, 2)
+    # The payload format must split into whole 16-byte vectors.
+    with pytest.raises(RuntimeError, match="hidden_size % 256"):
+        lamport_row("NVFP4", 2880, top_k)
+    with pytest.raises(RuntimeError, match="hidden_size % 8"):
+        lamport_row("BF16", 4100, top_k)
+
+
+@pytest.mark.parametrize(
+    ("payload_format", "hidden_size", "top_k", "ep_size", "expected"),
+    [
+        # Limits FlashInfer's Lamport transport reports on GB300 (152 SMs).
+        pytest.param("BF16", 7168, 8, 8, 159, id="dsv3-bf16-ep8"),
+        pytest.param("NVFP4", 7168, 8, 8, 371, id="dsv3-nvfp4-ep8"),
+        pytest.param("NVFP4", 7168, 8, 16, 185, id="dsv3-nvfp4-ep16"),
+        pytest.param("NVFP4", 7168, 8, 64, 159, id="dsv3-nvfp4-ep64"),
+        pytest.param("MXFP8", 3584, 16, 8, 455, id="kimi-k3-mxfp8-ep8"),
+        pytest.param("MXFP8", 3584, 16, 16, 279, id="kimi-k3-mxfp8-ep16"),
+        pytest.param("NVFP4", 4096, 8, 8, 455, id="qwen3-235b-nvfp4-ep8"),
+        pytest.param("NVFP4", 4096, 8, 16, 323, id="qwen3-235b-nvfp4-ep16"),
+        pytest.param("NVFP4", 6144, 8, 8, 433, id="glm-5.2-nvfp4-ep8"),
+    ],
+)
+def test_default_lamport_max_tokens(
+    payload_format: str, hidden_size: int, top_k: int, ep_size: int, expected: int
+) -> None:
+    row = lamport_row(payload_format, hidden_size, top_k)
+    assert default_lamport_max_tokens(ep_size, 152, row) == expected
+
+
+def test_lamport_payload_format() -> None:
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    assert lamport_payload_format(QuantAlgo.NVFP4) == "NVFP4"
+    assert lamport_payload_format(QuantAlgo.W4A8_MXFP4_MXFP8) == "MXFP8"
+    assert lamport_payload_format(QuantAlgo.MXFP8) == "MXFP8"
+    # FP8 block-scale backends quantize after dispatch.
+    assert lamport_payload_format(QuantAlgo.FP8_BLOCK_SCALES) == "BF16"
+    assert lamport_payload_format(None) == "BF16"
+
+
+def test_lamport_step_selection() -> None:
+    from types import SimpleNamespace
+
+    hidden_size, top_k = 7168, 8
+    comm = SimpleNamespace(
+        _lamport_row=lamport_row("NVFP4", hidden_size, top_k),
+        _lamport_format="NVFP4",
+        lamport_max_tokens=160,
+        top_k=top_k,
+    )
+    tokens = 4
+    hidden = torch.empty((tokens, hidden_size // 2), dtype=torch.uint8)
+    sf = torch.empty((tokens, hidden_size // 16), dtype=torch.uint8)
+    weights = torch.empty((tokens, top_k), dtype=torch.float32)
+
+    def carries(*args) -> bool:
+        return NVLinkOneSided.use_lamport_for_dispatch(comm, *args)
+
+    assert carries(160, hidden, sf, weights, None)
+    assert carries(160, hidden, sf, None, None)
+    assert not carries(161, hidden, sf, weights, None)  # above the token limit
+    assert not carries(1, hidden, sf, weights, torch.zeros(4))  # EPLB statistics
+    assert not carries(1, hidden, None, weights, None)  # no scales
+    assert not carries(
+        1, torch.empty((tokens, hidden_size), dtype=torch.bfloat16), None, weights, None
+    )
+    assert not carries(1, hidden, sf, weights.bfloat16(), None)  # 2-byte weights
+    comm._lamport_row, comm.lamport_max_tokens = None, 0
+    assert not carries(1, hidden, sf, weights, None)
 
 
 # ============================================================================
