@@ -45,7 +45,11 @@ bf16 only when this step takes the sharded selector, and applies the
 drafter's transform otherwise, so every other path (sampled drafts, d2t,
 another layout, any other tensor) gets the built-in transform bit for bit.
 With a transform installed, bf16 draft logits are untransformed ones: the
-transform always returns fp32.
+transform always returns fp32. The tables hold only while the drafter's
+``logit_multiplier`` and ``logit_softcap`` are the ones they were built from;
+a step on which they differ takes the built-in path with the drafter's
+current transform. Each reason a step with a transform installed takes the
+built-in path is logged once, as a warning (``_warn_builtin``).
 
 Installed from the shell's ``load_draft_weights`` (the drafter's selector and
 the borrowed head exist only after the drafter loads), or from the shell's
@@ -81,7 +85,7 @@ from ...ops.spec.draft_path_walk import DraftPathWalk
 from ...ops.spec.draft_shard_topk import CHUNK, FINITE_KEYS, NUM_WARPS, DraftShardTopK
 from ...ops.spec.draft_topk_merge import SORT_SLOTS, DraftTopKMerge
 from . import logit_transform as _logit_transform
-from .logit_transform import DraftLogitTransform, ensure_transformed
+from .logit_transform import DraftLogitTransform
 
 draft_shard_topk = DraftShardTopK()
 draft_topk_merge = DraftTopKMerge()
@@ -98,8 +102,15 @@ OWED_ATTR = "_draft_head_owed"
 SHARD_ATTR = "_draft_head_shard"
 #: Drafter attribute: ``(data_ptr, numel)`` of the logits the deferring transform handed back.
 DEFERRED_ATTR = "_draft_head_deferred"
+#: Drafter attribute: why the deferring transform's last call applied the transform in full.
+DECLINED_ATTR = "_draft_head_declined"
 #: The drafter method the built-in worker calls on the draft logits.
 TRANSFORM_METHOD = "apply_draft_logit_transform"
+
+#: Why a step takes the built-in path: the drafter's transform attributes moved off the tables.
+STALE_TABLES = "the drafter's logit_multiplier or logit_softcap differs from the install's"
+#: Why a step takes the built-in path: its bf16 logits are not the shard the transform deferred.
+NOT_DEFERRED = "the draft logits are not the shard the deferring transform handed back"
 
 #: Largest shard the 16-bit column field of a shard key holds.
 MAX_SHARD = 65536
@@ -119,6 +130,25 @@ PROBE_SEED = 1234
 
 class DraftTransformStateError(RuntimeError):
     """A step kept its draft logits untransformed and no selector applied the transform."""
+
+
+def _warn_builtin(reason: str) -> None:
+    """Warn, once per ``reason``, that a draft step with a transform installed takes the built-in path."""
+    logger.warning_once(
+        "[musespark_open] draft_head: a draft step takes the built-in path, with the drafter's "
+        f"logit transform applied before the top-k ({reason})",
+        key=f"musespark_open.draft_head.builtin.{reason}",
+    )
+
+
+def _builtin_transform(draft_model, logits: torch.Tensor) -> torch.Tensor:
+    """The drafter's class ``apply_draft_logit_transform`` on ``logits``, with its current attributes.
+
+    The call the built-in worker makes on a drafter without the deferring
+    transform: fp32 out when the drafter declares a transform, ``logits``
+    itself when it declares none.
+    """
+    return getattr(type(draft_model), TRANSFORM_METHOD)(draft_model, logits)
 
 
 def gathers_column_shards(lm_head: nn.Module) -> bool:
@@ -275,7 +305,9 @@ class _DeferredTransform:
     ``ShardedDraftHeadDFlashWorker._refine_block_logits`` (``_defers_transform``),
     returns that tensor untouched and records its ``(data_ptr, numel)`` on the
     drafter (``DEFERRED_ATTR``). Every other call returns the drafter's own
-    transform, the built-in computation. Holds weak references only.
+    transform with its current attributes, the built-in computation, records
+    why on the drafter (``DECLINED_ATTR``) and warns once per reason
+    (``_warn_builtin``). Holds weak references only.
     """
 
     def __init__(self, worker, draft_model):
@@ -289,6 +321,7 @@ class _DeferredTransform:
             raise DraftTransformStateError("[musespark_open] draft_head: the drafter is gone")
         transform = None if worker is None else worker.__dict__.get(TRANSFORM_ATTR)
         draft_model.__dict__[DEFERRED_ATTR] = None
+        draft_model.__dict__[DECLINED_ATTR] = None
         # The processor in place now, not the one of the install: a wrapper put
         # around it later records nothing, and the transform then runs here.
         processor = getattr(draft_model, "logits_processor", None)
@@ -296,17 +329,26 @@ class _DeferredTransform:
         if isinstance(processor, ShardDraftLogitsProcessor):
             shard = processor.__dict__.pop(SHARD_ATTR, None)
         if transform is None:
-            return getattr(type(draft_model), TRANSFORM_METHOD)(draft_model, logits)
-        if (
-            shard is not None
-            and shard() is logits
-            and logits.dtype == torch.bfloat16
-            and transform.matches(draft_model)
-            and _defers_transform(type(worker))
-        ):
+            return _builtin_transform(draft_model, logits)
+        if not isinstance(processor, ShardDraftLogitsProcessor):
+            reason = f"the drafter's logits processor is {type(processor).__name__}"
+        elif shard is None or shard() is not logits:
+            reason = "the transformed tensor is not the shard the logits processor returned"
+        elif logits.dtype != torch.bfloat16:
+            reason = f"the drafter's logits processor returned {logits.dtype} logits"
+        elif not transform.matches(draft_model):
+            reason = STALE_TABLES
+        elif not _defers_transform(type(worker)):
+            reason = (
+                f"the worker class {type(worker).__name__} overrides the draft head's "
+                "refinement or selector"
+            )
+        else:
             draft_model.__dict__[DEFERRED_ATTR] = (logits.data_ptr(), logits.numel())
             return logits
-        return transform.real(logits)
+        draft_model.__dict__[DECLINED_ATTR] = reason
+        _warn_builtin(reason)
+        return _builtin_transform(draft_model, logits)
 
 
 def _owner(cls: type, name: str, after: Optional[type] = None) -> Optional[type]:
@@ -381,67 +423,126 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
         rows = ranges[key]
         return ids if rows is None else _drafter_pdl.DraftRowRange(ids, *rows)
 
+    def _shard_reason(self, gen_logits, spec_metadata, full_vocab) -> Optional[str]:
+        """Why the sharded selector cannot take ``gen_logits`` on this step, or None."""
+        if gen_logits.shape[-1] == full_vocab:
+            return "full-vocab draft logits"
+        if gen_logits.dtype != torch.bfloat16:
+            return f"{gen_logits.dtype} draft logits"
+        if (
+            gen_logits.dim() != 3
+            or gen_logits.stride(-1) != 1
+            or gen_logits.shape[-1] * self.mapping.tp_size != full_vocab
+        ):
+            return "draft logits outside the [B, K, shard] layout"
+        if spec_metadata.wants_advanced_draft_sampling:
+            return "sampled drafts"
+        if self._d2t is not None:
+            return "a d2t draft vocab map"
+        return None
+
     def _shard_selector_applies(self, gen_logits, spec_metadata, full_vocab) -> bool:
-        mapping = self.mapping
-        return (
-            gen_logits.dim() == 3
-            and gen_logits.dtype == torch.bfloat16
-            and gen_logits.stride(-1) == 1
-            and gen_logits.shape[-1] * mapping.tp_size == full_vocab
-            and not spec_metadata.wants_advanced_draft_sampling
-            and self._d2t is None
-        )
+        return self._shard_reason(gen_logits, spec_metadata, full_vocab) is None
+
+    def _draft_head_takes(self, draft_model, gen_logits, spec_metadata, full_vocab) -> bool:
+        """Whether the sharded selector drafts this step.
+
+        ``_shard_selector_applies``, and, with a transform installed, tables
+        that still match ``draft_model``. A step it turns down with a transform
+        installed takes the built-in path, where bf16 logits get
+        ``_draft_head_transformed``, and warns once per reason.
+        """
+        reason = self._shard_reason(gen_logits, spec_metadata, full_vocab)
+        transform = self.__dict__.get(TRANSFORM_ATTR)
+        if transform is None:
+            return reason is None
+        if reason is None and not transform.matches(draft_model):
+            reason = STALE_TABLES
+        if reason is None:
+            return True
+        if gen_logits.dtype == torch.bfloat16:
+            # Logits transformed upstream (fp32) were warned for where that happened.
+            _warn_builtin(reason)
+        return False
 
     def _refine_block_logits(self, draft_model, gen_logits, inputs, spec_metadata):
         """The drafter's logit transform, unless this step's sharded selector applies it.
 
         The deferring transform handed back the processor's bf16 shard
         untransformed (``DEFERRED_ATTR``). These logits stay bf16 only when they
-        are that tensor (the reshape keeps its address and size) and this
-        step takes the sharded selector, which then owes the transform
-        (``OWED_ATTR``); any other bf16 logits get the drafter's transform
-        here. Then the next class's refinement, the built-in identity.
+        are that tensor (the reshape keeps its address and size), this step
+        takes the sharded selector and the drafter still declares the
+        transform the tables hold; the selector then owes the transform
+        (``OWED_ATTR``). Any other bf16 logits get the drafter's current
+        transform here, with a one-time warning per reason. Then the next
+        class's refinement, the built-in identity.
         """
         deferred = draft_model.__dict__.pop(DEFERRED_ATTR, None)
+        declined = draft_model.__dict__.pop(DECLINED_ATTR, None)
         self.__dict__[OWED_ATTR] = False
         transform = self.__dict__.get(TRANSFORM_ATTR)
         if transform is not None and gen_logits.dtype == torch.bfloat16:
             full_vocab = draft_model.candidate_selector.predecessor_codebook.shape[0]
-            if (
-                deferred == (gen_logits.data_ptr(), gen_logits.numel())
-                and gen_logits.shape[-1] != full_vocab
-                and self._shard_selector_applies(gen_logits, spec_metadata, full_vocab)
-            ):
+            # A declined call has applied the drafter's current transform already,
+            # which keeps bf16 logits only when that transform is the identity.
+            reason = declined
+            if reason is None and deferred != (gen_logits.data_ptr(), gen_logits.numel()):
+                reason = NOT_DEFERRED
+            if reason is None:
+                reason = self._shard_reason(gen_logits, spec_metadata, full_vocab)
+            if reason is None and not transform.matches(draft_model):
+                reason = STALE_TABLES
+            if reason is None:
                 self.__dict__[OWED_ATTR] = True
             else:
-                gen_logits = ensure_transformed(transform, gen_logits)
+                _warn_builtin(reason)
+                gen_logits = self._draft_head_transformed(draft_model, gen_logits)
         return super()._refine_block_logits(draft_model, gen_logits, inputs, spec_metadata)
 
-    def _draft_head_transform_for(self, gen_logits) -> Optional[DraftLogitTransform]:
-        """The transform the sharded selector applies to ``gen_logits`` (bf16 means untransformed)."""
+    def _draft_head_transform_for(self, draft_model, gen_logits) -> Optional[DraftLogitTransform]:
+        """The transform the sharded selector applies to ``gen_logits`` (bf16 means untransformed).
+
+        For a step ``_draft_head_takes`` admits, which checked that the tables
+        still match ``draft_model``.
+        """
         self.__dict__[OWED_ATTR] = False
         transform = self.__dict__.get(TRANSFORM_ATTR)
-        return transform if gen_logits.dtype == torch.bfloat16 else None
+        if transform is None or gen_logits.dtype != torch.bfloat16:
+            return None
+        if not transform.matches(draft_model):
+            raise DraftTransformStateError(
+                "[musespark_open] draft_head: the sharded selector was asked for tables that no "
+                f"longer hold ({STALE_TABLES})"
+            )
+        return transform
 
-    def _draft_head_transformed(self, gen_logits) -> torch.Tensor:
-        """``gen_logits`` with the drafter's transform applied once, for a built-in selector."""
+    def _draft_head_transformed(self, draft_model, gen_logits) -> torch.Tensor:
+        """``gen_logits`` with the drafter's current transform applied once, for a built-in path.
+
+        With a transform installed, bf16 logits are untransformed or were
+        transformed by an identity: both get the drafter's class method with
+        its current attributes, which is what the built-in worker computes.
+        """
         self.__dict__[OWED_ATTR] = False
-        return ensure_transformed(self.__dict__.get(TRANSFORM_ATTR), gen_logits)
+        if self.__dict__.get(TRANSFORM_ATTR) is None or gen_logits.dtype != torch.bfloat16:
+            return gen_logits
+        return _builtin_transform(draft_model, gen_logits)
 
     def _apply_dflash2_selector(
         self, draft_model, gen_logits, block_hidden_states, anchor_tokens, spec_metadata
     ):
         selector = draft_model.candidate_selector
         full_vocab = selector.predecessor_codebook.shape[0]
+        takes = self._draft_head_takes(draft_model, gen_logits, spec_metadata, full_vocab)
         if gen_logits.shape[-1] == full_vocab:
             return super()._apply_dflash2_selector(
                 draft_model,
-                self._draft_head_transformed(gen_logits),
+                self._draft_head_transformed(draft_model, gen_logits),
                 block_hidden_states,
                 anchor_tokens,
                 spec_metadata,
             )
-        if self._shard_selector_applies(gen_logits, spec_metadata, full_vocab):
+        if takes:
             tokens = selector_draft_tokens(
                 gen_logits,
                 block_hidden_states,
@@ -449,7 +550,7 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
                 selector,
                 self.mapping,
                 self.__dict__.get("_draft_head_allreduce"),
-                transform=self._draft_head_transform_for(gen_logits),
+                transform=self._draft_head_transform_for(draft_model, gen_logits),
             )
             stand_in = tokens.unsqueeze(-1).expand(*tokens.shape, full_vocab)
             setattr(stand_in, TOKENS_ATTR, tokens)
@@ -457,7 +558,7 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
         # The built-in path: the transform, the head's own all-gather and .float(),
         # then the built-in selector.
         full_logits = allgather(
-            self._draft_head_transformed(gen_logits), self.mapping, dim=-1
+            self._draft_head_transformed(draft_model, gen_logits), self.mapping, dim=-1
         ).float()
         return super()._apply_dflash2_selector(
             draft_model, full_logits, block_hidden_states, anchor_tokens, spec_metadata
@@ -745,6 +846,17 @@ def agreed_reason(mapping, reason: str | None, transform: Optional[DraftLogitTra
     return _tp_agreement.agreed_refusal(mapping, reason)
 
 
+def agreed_refusal(mapping, reason: str | None) -> str | None:
+    """``reason`` as every rank of ``mapping``'s TP group agrees (``dispatch.agreed_refusal``).
+
+    Collective over the TP group: every rank calls it at the same point of the
+    install, whatever its own reason.
+    """
+    from ... import dispatch as _tp_agreement
+
+    return _tp_agreement.agreed_refusal(mapping, reason)
+
+
 def installed(llm: nn.Module) -> bool:
     """Whether ``install`` has put the draft head on ``llm``'s DFlash worker."""
     return isinstance(getattr(llm, "spec_worker", None), ShardedDraftHeadDFlashWorker)
@@ -756,9 +868,10 @@ def install(llm: nn.Module, make_allreduce=key_allreduce) -> bool:
     ``make_allreduce(mapping)`` builds the key exchange (collective: every rank
     installs at the same point of the load). A second call on an installed
     ``llm`` changes nothing. Everything is built and checked before anything
-    changes, and the refusal is agreed over the TP group (``agreed_reason``),
-    so a refusing install leaves the worker and the drafter as they were on
-    every rank.
+    changes, and each refusal is agreed over the TP group (``agreed_reason``
+    for the checks, ``agreed_refusal`` for the key exchange ``make_allreduce``
+    built), so a refusing install leaves the worker and the drafter as they
+    were on every rank.
 
     Raises:
         ValueError: when there is no DFlash 2 drafter (no spec worker, or a
@@ -766,8 +879,10 @@ def install(llm: nn.Module, make_allreduce=key_allreduce) -> bool:
             the feature supports, or its logit transform is not one the draft
             head can apply after the top-k (``logit_transform.unsupported_reason``),
             or this torch's ``torch.topk`` orders ties differently from the merge
-            (``tie_order_reason``) -- running the built-in path, or a path whose
-            drafts differ, under the fast path's name would misreport what runs.
+            (``tie_order_reason``), or the key exchange's MNNVL all-reduce could
+            not be built on some rank -- running the built-in path, or a path
+            whose drafts differ, under the fast path's name would misreport what
+            runs.
     """
     if installed(llm):
         return True
@@ -797,10 +912,11 @@ def install(llm: nn.Module, make_allreduce=key_allreduce) -> bool:
         allreduce = make_allreduce(worker.mapping)
         if allreduce is None:
             # The composition's precondition checked the group takes an MNNVL all-reduce.
-            raise ValueError(
-                "the vocab-sharded draft head: the MNNVL FP32 all-reduce of the key exchange "
-                "could not be built on this TP group"
-            )
+            reason = "the MNNVL FP32 all-reduce of the key exchange could not be built"
+    # Building the all-reduce can fail on some ranks only; every rank refuses alike.
+    reason = agreed_refusal(worker.mapping, reason)
+    if reason is not None:
+        raise ValueError(f"[musespark_open] draft_head cannot run here: {reason}")
     worker.__class__ = ShardedDraftHeadDFlashWorker
     if type(draft_model.logits_processor) is LogitsProcessor:
         draft_model.logits_processor = ShardDraftLogitsProcessor(draft_model.logits_processor)

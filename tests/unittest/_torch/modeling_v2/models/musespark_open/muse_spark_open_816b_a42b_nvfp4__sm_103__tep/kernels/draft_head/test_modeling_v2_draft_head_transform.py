@@ -11,7 +11,10 @@ method, all-gathers, runs ``torch.topk`` and the selector. Then every path
 that keeps the built-in computation (sampled drafts, d2t, another layout,
 another tensor, a stale record) gets the built-in transform bit for bit, the
 fold's tail walk takes the same inputs, CUDA-graph replay follows new logits,
-and the install is atomic, idempotent and checked.
+and the install is atomic, idempotent and checked. A drafter whose transform
+attributes change after the install drafts the built-in tokens of its new
+transform through the built-in path, at every point of the step, and each
+reason a step takes the built-in path is warned once.
 
 TP ranks are emulated in one process: each rank's drafter, worker and head
 shard are built here, and the key exchange returns what every rank's kernels
@@ -126,8 +129,9 @@ def spec_metadata(requests=1, advanced=False):
 
 @pytest.fixture
 def single_process(monkeypatch):
-    """The install's TP agreement in one process: each emulated rank agrees with itself."""
+    """The install's TP agreements in one process: each emulated rank agrees with itself."""
     monkeypatch.setattr(draft_head, "agreed_reason", lambda mapping, reason, transform: reason)
+    monkeypatch.setattr(draft_head, "agreed_refusal", lambda mapping, reason: reason)
 
 
 def install_rank(rank, local, full, ranks=TP, config=MUSESPARK, layout="halves"):
@@ -732,3 +736,364 @@ def test_ranks_whose_tables_differ_refuse(monkeypatch):
     assert reason is not None and "differ in their drafter logit transform" in reason
     monkeypatch.setattr(dispatch, "agreed_union", lambda mapping, local: list(local))
     assert draft_head.agreed_reason(object(), None, t) is None
+
+
+def test_an_exchange_one_rank_cannot_build_is_refused_on_every_rank(monkeypatch, single_process):
+    """``make_allreduce``'s refusal is agreed over the TP group: a rank that built it refuses too."""
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+
+    agreed = []
+    elsewhere = (
+        "the MNNVL FP32 all-reduce of the key exchange could not be built (on TP ranks [3] of 8)"
+    )
+
+    def agreed_refusal(mapping, reason):
+        agreed.append(reason)
+        return elsewhere
+
+    monkeypatch.setattr(draft_head, "agreed_refusal", agreed_refusal)
+    shards, _, _ = draft_step(1, K, "gemm3", 9)
+    for built in (object(), None):
+        worker = make_worker(0)
+        drafter = make_drafter(MUSESPARK, StubHead(shards[0], TP))
+        inner = drafter.logits_processor
+        llm = types.SimpleNamespace(spec_worker=worker, draft_model=drafter)
+        with pytest.raises(ValueError, match="could not be built"):
+            draft_head.install(llm, make_allreduce=lambda mapping, built=built: built)
+        assert type(worker) is DFlashWorker and drafter.logits_processor is inner
+        assert "_draft_head_allreduce" not in worker.__dict__
+        assert draft_head.TRANSFORM_ATTR not in worker.__dict__
+        assert draft_head.TRANSFORM_METHOD not in vars(drafter)
+    # This rank's own reason went into the agreement: none, then its own refusal.
+    assert agreed[0] is None and "could not be built" in agreed[1]
+
+
+def test_agreed_refusal_is_the_dispatch_agreement(monkeypatch):
+    from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep import (  # noqa: E501
+        dispatch,
+    )
+
+    seen = []
+
+    def agreed_refusal(mapping, local):
+        seen.append((mapping, local))
+        return "agreed"
+
+    monkeypatch.setattr(dispatch, "agreed_refusal", agreed_refusal)
+    mapping = object()
+    assert draft_head.agreed_refusal(mapping, "mine") == "agreed"
+    assert seen == [(mapping, "mine")]
+
+
+# --------------------------------------------------------------------------- the tables' drafter
+
+
+#: Transforms a drafter may declare after the install, the identity among them.
+CHANGED = {
+    "identity": (1.0, None),
+    "softcap 30": (MUSESPARK[0], 30.0),
+    "multiplier only": (0.5, None),
+    "softcap only": (1.0, MUSESPARK[1]),
+}
+
+
+def staged_step(worker, drafter, hidden, anchor, md, change=None, when=None):
+    """``drafter_step`` up to the selector, with ``change()`` run at ``when``.
+
+    ``when`` is ``before`` (the logits processor), ``after_defer`` (the
+    drafter's transform) or ``after_refine`` (``_refine_block_logits``).
+    Returns what the selector returns.
+    """
+    num_gens = hidden.shape[0] // K
+    if when == "before":
+        change()
+    gen_logits = drafter.logits_processor(hidden, drafter.lm_head, None, True)
+    apply_logit_transform = getattr(drafter, "apply_draft_logit_transform", None)
+    if apply_logit_transform is not None:
+        gen_logits = apply_logit_transform(gen_logits)
+    if when == "after_defer":
+        change()
+    gen_logits = gen_logits.reshape(num_gens, K, gen_logits.shape[-1])
+    gen_logits = worker._refine_block_logits(drafter, gen_logits, {}, md)
+    if when == "after_refine":
+        change()
+    return worker._apply_dflash2_selector(
+        drafter, gen_logits, hidden.reshape(num_gens, K, -1), anchor, md
+    )
+
+
+def patch_builtin_gather(monkeypatch, shards, rank, config, requests):
+    """The head's vocabulary all-gather, checking this rank hands it the built-in transform.
+
+    ``config``'s built-in transform of this rank's shard must reach the
+    all-gather bit for bit (bf16 for the identity, fp32 otherwise); it returns
+    every rank's built-in transform, concatenated. A key exchange fails.
+    """
+    local = builtin_transform(config, shards[rank]).view(requests, K, -1)
+    gathered = torch.cat([builtin_transform(config, s) for s in shards], dim=-1)
+    gathered = gathered.view(requests, K, VOCAB)
+    calls = []
+
+    def allgather(tensor, mapping, dim=-1, sizes=None):
+        assert dim == -1, "a step whose tables do not hold must not exchange shard keys"
+        assert tensor.dtype == local.dtype, (tensor.dtype, local.dtype)
+        assert_same_floats(tensor.float(), local.float())
+        calls.append(dim)
+        return gathered.clone()
+
+    monkeypatch.setattr(draft_head, "allgather", allgather)
+    return calls
+
+
+def _spy_sharded_selector(monkeypatch):
+    calls = []
+    real = draft_head.selector_draft_tokens
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs.get("transform"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(draft_head, "selector_draft_tokens", spy)
+    return calls
+
+
+def _tokens_of(worker, out):
+    """The step's draft tokens off the built-in selector's full-vocab block logits."""
+    assert getattr(out, draft_head.TOKENS_ATTR, None) is None, "the sharded selector drafted"
+    assert not worker.__dict__[draft_head.OWED_ATTR]
+    requests, positions, vocab = out.shape
+    return torch.argmax(out.reshape(-1, vocab), dim=-1).to(torch.int32).view(requests, positions)
+
+
+@pytest.mark.parametrize("when", ["before", "after_defer", "after_refine"])
+@pytest.mark.parametrize("name", list(CHANGED))
+@pytest.mark.parametrize("requests", [1, 3])
+def test_a_changed_transform_drafts_the_builtin_tokens(
+    requests, name, when, monkeypatch, single_process
+):
+    """The drafter's multiplier / softcap changed after the install: no stale tables, built-in drafts."""
+    config = CHANGED[name]
+    rank = 5
+    shards, block_hidden, anchor = draft_step(
+        requests, K, "saturated", seed_of(f"changed{requests}{name}{when}")
+    )
+    full = torch.cat(shards, dim=-1)
+    llm = install_rank(rank, shards[rank], full)
+    worker, drafter = llm.spec_worker, llm.draft_model
+    t = worker.__dict__[draft_head.TRANSFORM_ATTR]
+    expected = builtin_draft_tokens(shards, block_hidden, anchor, config)
+    gathers = patch_builtin_gather(monkeypatch, shards, rank, config, requests)
+    sharded = _spy_sharded_selector(monkeypatch)
+    md = spec_metadata(requests)
+    hidden = block_hidden.view(requests * K, HIDDEN)
+
+    def change():
+        drafter.logit_multiplier, drafter.logit_softcap = config
+
+    out = staged_step(worker, drafter, hidden, anchor, md, change, when)
+    assert not sharded and gathers == [-1]
+    assert torch.equal(_tokens_of(worker, out), expected)
+    # The tables stay installed and serve again once the drafter declares their transform.
+    assert worker.__dict__[draft_head.TRANSFORM_ATTR] is t
+    drafter.logit_multiplier, drafter.logit_softcap = MUSESPARK
+    patch_allgather(monkeypatch, full, TP, t)
+    tokens = worker.sample_draft_tokens(
+        staged_step(worker, drafter, hidden, anchor, md), md, requests, num_contexts=0
+    )
+    assert sharded == [t]
+    assert torch.equal(tokens, builtin_draft_tokens(shards, block_hidden, anchor, MUSESPARK))
+
+
+@pytest.mark.parametrize("when", ["before", "after_refine"])
+@pytest.mark.parametrize("name", ["identity", "softcap 30"])
+def test_a_changed_transform_under_the_fold_tail(name, when, monkeypatch, single_process):
+    """The fold's tail walk turns the step down too: the built-in drafts of the new transform."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.kernels.verify_fold import (  # noqa: E501
+        fold,
+    )
+
+    config = CHANGED[name]
+    requests, rank = 2, 6
+    shards, block_hidden, anchor = draft_step(
+        requests, K, "straddle_up", seed_of(f"fold{name}{when}")
+    )
+    full = torch.cat(shards, dim=-1)
+    llm = install_rank(rank, shards[rank], full)
+    worker, drafter = llm.spec_worker, llm.draft_model
+    assert fold.install(worker, verify_fold=False, path_walk_tail=True)
+    expected = builtin_draft_tokens(shards, block_hidden, anchor, config)
+    gathers = patch_builtin_gather(monkeypatch, shards, rank, config, requests)
+    sharded = _spy_sharded_selector(monkeypatch)
+    md = spec_metadata(requests)
+    hidden = block_hidden.view(requests * K, HIDDEN)
+    g = torch.Generator(device="cuda").manual_seed(4)
+    accepted = torch.randint(0, VOCAB, (requests, K + 1), generator=g, device="cuda").int()
+    num_accepted = torch.randint(1, K + 2, (requests,), generator=g, device="cuda").int()
+    kv_lens = torch.full((requests,), 50, dtype=torch.int32, device="cuda")
+    attn = types.SimpleNamespace(num_contexts=0, num_seqs=requests, kv_lens_cuda=kv_lens)
+    worker._kv_rewind_amount = (1 - num_accepted).int()
+    worker._kv_rewind_pending, worker._kv_rewind_nc, worker._kv_rewind_bs = True, 0, requests
+    step = fold._Step(attn_metadata=attn, spec_metadata=md, draft_model=drafter, warmup=False)
+    step.accepted, step.num_accepted = accepted, num_accepted
+    worker.__dict__["_fold_step"] = step
+
+    def change():
+        drafter.logit_multiplier, drafter.logit_softcap = config
+
+    try:
+        out = staged_step(worker, drafter, hidden, anchor, md, change, when)
+    finally:
+        worker.__dict__["_fold_step"] = None
+    assert not sharded and gathers == [-1] and step.tail is None
+    assert torch.equal(_tokens_of(worker, out), expected)
+
+
+def test_the_selector_refuses_tables_that_do_not_hold(monkeypatch, single_process):
+    shards, _, _, _, worker, drafter, _ = _one_rank(monkeypatch)
+    logits = shards[2].view(1, K, -1)
+    assert worker._draft_head_transform_for(drafter, logits) is not None
+    drafter.logit_softcap = 30.0
+    assert not worker._draft_head_takes(drafter, logits, spec_metadata(), VOCAB)
+    with pytest.raises(draft_head.DraftTransformStateError):
+        worker._draft_head_transform_for(drafter, logits)
+
+
+# --------------------------------------------------------------------------- warnings
+
+
+@pytest.fixture
+def logged_warnings(monkeypatch):
+    """The draft head's warnings logged from here on, with a fresh once-only record."""
+    logged = []
+
+    def log(severity, *msg):
+        message = " ".join(map(str, msg))
+        if severity == draft_head.logger.WARNING and "] draft_head:" in message:
+            logged.append(message)
+
+    monkeypatch.setattr(draft_head.logger, "_appeared_keys", set())
+    monkeypatch.setattr(draft_head.logger, "log", log)
+    return logged
+
+
+def _sampled(worker, drafter, md):
+    md.wants_advanced_draft_sampling = True
+
+
+def _d2t(worker, drafter, md):
+    worker._d2t = torch.zeros(VOCAB, dtype=torch.int64, device="cuda")
+
+
+def _softcap_30(worker, drafter, md):
+    drafter.logit_softcap = 30.0
+
+
+def _identity(worker, drafter, md):
+    drafter.logit_multiplier, drafter.logit_softcap = 1.0, None
+
+
+def _wrapped_processor(worker, drafter, md):
+    class Wrapper(torch.nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+
+        def forward(self, *args):
+            return self.inner(*args)
+
+    drafter.logits_processor = Wrapper(drafter.logits_processor)
+
+
+def _fp32_head(worker, drafter, md):
+    drafter.lm_head.source = drafter.lm_head.source.float()
+
+
+def _class_above(worker, drafter, md):
+    class Above(type(worker)):
+        def _refine_block_logits(self, draft_model, gen_logits, inputs, spec_metadata):
+            return super()._refine_block_logits(draft_model, gen_logits, inputs, spec_metadata)
+
+    worker.__class__ = Above
+
+
+#: Each way a step with the transform installed takes the built-in path: (set-up, message part).
+FALLBACKS = {
+    "sampled": (_sampled, "sampled drafts"),
+    "d2t": (_d2t, "a d2t draft vocab map"),
+    "attributes": (_softcap_30, draft_head.STALE_TABLES),
+    "identity": (_identity, draft_head.STALE_TABLES),
+    "processor": (_wrapped_processor, "the drafter's logits processor is Wrapper"),
+    "fp32 logits": (_fp32_head, "returned torch.float32 logits"),
+    "class above": (_class_above, "the worker class Above overrides"),
+    "not deferred": (None, draft_head.NOT_DEFERRED),
+}
+
+
+@pytest.mark.parametrize("why", list(FALLBACKS))
+def test_a_fallback_warns_once(why, logged_warnings, monkeypatch, single_process):
+    setup, part = FALLBACKS[why]
+    shards, block_hidden, anchor, full, worker, drafter, hidden = _one_rank(monkeypatch)
+    md = spec_metadata()
+    if setup is not None:
+        setup(worker, drafter, md)
+    gathered = builtin_full_logits(shards, 1, K, MUSESPARK)
+    patch_allgather(monkeypatch, full, TP, None, gathered=gathered)
+    for _ in range(3):
+        if why == "sampled":
+            # Sampled drafts leave the step after the refinement, for the built-in sampler.
+            out = drafter.apply_draft_logit_transform(
+                drafter.logits_processor(hidden, drafter.lm_head, None, True)
+            )
+            worker._refine_block_logits(drafter, out.reshape(1, K, -1), {}, md)
+        elif why == "not deferred":
+            # bf16 logits the deferring transform never saw.
+            out = drafter.logits_processor(hidden, drafter.lm_head, None, True).reshape(1, K, -1)
+            refined = worker._refine_block_logits(drafter, out, {}, md)
+            assert_same_floats(refined, builtin_transform(MUSESPARK, out))
+        else:
+            out = staged_step(worker, drafter, hidden, anchor, md)
+            assert getattr(out, draft_head.TOKENS_ATTR, None) is None
+    assert len(logged_warnings) == 1, logged_warnings
+    assert logged_warnings[0].startswith(
+        "[musespark_open] draft_head: a draft step takes the built-in path"
+    )
+    assert part in logged_warnings[0], logged_warnings[0]
+
+
+def test_each_reason_warns_once_and_the_fast_path_never(
+    logged_warnings, monkeypatch, single_process
+):
+    shards, block_hidden, anchor, full, worker, drafter, hidden = _one_rank(monkeypatch)
+    t = worker.__dict__[draft_head.TRANSFORM_ATTR]
+    patch_allgather(monkeypatch, full, TP, t)
+    md = spec_metadata()
+    for _ in range(2):
+        out = staged_step(worker, drafter, hidden, anchor, md)
+        assert getattr(out, draft_head.TOKENS_ATTR, None) is not None
+    assert logged_warnings == []
+    softcap_30 = builtin_full_logits(shards, 1, K, (MUSESPARK[0], 30.0))
+    patch_allgather(monkeypatch, full, TP, None, gathered=softcap_30)
+    drafter.logit_softcap = 30.0
+    for _ in range(2):
+        staged_step(worker, drafter, hidden, anchor, md)
+    worker._d2t = torch.zeros(VOCAB, dtype=torch.int64, device="cuda")
+    drafter.logit_softcap = MUSESPARK[1]
+    musespark = builtin_full_logits(shards, 1, K, MUSESPARK)
+    patch_allgather(monkeypatch, full, TP, None, gathered=musespark)
+    for _ in range(2):
+        staged_step(worker, drafter, hidden, anchor, md)
+    assert len(logged_warnings) == 2, logged_warnings
+    assert draft_head.STALE_TABLES in logged_warnings[0] and "d2t" in logged_warnings[1]
+
+
+def test_without_a_transform_nothing_warns(logged_warnings, monkeypatch, single_process):
+    shards, block_hidden, anchor = draft_step(1, K, "gemm3", 11)
+    full = torch.cat(shards, dim=-1)
+    llm = install_rank(1, shards[1], full, config=(1.0, None))
+    worker, drafter = llm.spec_worker, llm.draft_model
+    worker._d2t = torch.zeros(VOCAB, dtype=torch.int64, device="cuda")
+    gathered = builtin_full_logits(shards, 1, K)
+    patch_allgather(monkeypatch, full, TP, None, gathered=gathered)
+    out = staged_step(worker, drafter, block_hidden.view(K, HIDDEN), anchor, spec_metadata())
+    assert getattr(out, draft_head.TOKENS_ATTR, None) is None
+    assert logged_warnings == []
