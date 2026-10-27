@@ -16,6 +16,12 @@
 # dropped, three env vars main does not read are left out and TLLM_LOG_LEVEL=INFO is
 # added, as in every perf-sanity config. The ctx section (the study's TP2 prefill
 # worker) is not started by gen_only_no_context.
+#
+# modeling_v2 is `auto` on the gen worker. Main has no MiniMax-M3 route, so the
+# built-in model runs (same device step time as with modeling_v2 unset); once a
+# MiniMax-M3 TP4 target is on main, this lane runs it. #20306's TP4 target took
+# 6.15 ms per decode step here against 10.54 ms for the built-in model (same
+# wheel, GB300).
 metadata:
   model_name: minimax_m3_fp4
   precision: fp4
@@ -65,6 +71,7 @@ profiling:
   nsys_on: false
 worker_config:
   gen:
+    modeling_v2: auto
     print_iter_log: true
     max_batch_size: 64
     max_num_tokens: 512

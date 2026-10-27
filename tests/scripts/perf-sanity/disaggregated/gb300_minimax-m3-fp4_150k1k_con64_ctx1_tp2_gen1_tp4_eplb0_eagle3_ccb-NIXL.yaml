@@ -15,6 +15,11 @@
 # not read are left out and TLLM_LOG_LEVEL=INFO is added, as in every perf-sanity
 # config. The ctx section (the study's TP2 prefill worker) is not started by
 # gen_only_no_context.
+#
+# modeling_v2 is pinned `off` on the gen worker: at B=64 #20306's MiniMax-M3 TP4
+# target took 47.5 ms per decode step here against 45.6 ms for the built-in model
+# (median, same wheel, GB300), so this lane keeps the built-in model. The con1
+# lane, where that target is faster, uses `auto`.
 metadata:
   model_name: minimax_m3_fp4
   precision: fp4
@@ -64,6 +69,7 @@ profiling:
   nsys_on: false
 worker_config:
   gen:
+    modeling_v2: 'off'
     print_iter_log: true
     max_batch_size: 64
     max_num_tokens: 512
