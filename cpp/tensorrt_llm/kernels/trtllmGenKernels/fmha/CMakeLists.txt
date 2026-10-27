@@ -68,8 +68,10 @@ target_include_directories(
 add_library(trtllm_gen_fmha OBJECT ${SRC_CPP} ${SRC_CU})
 set_property(TARGET trtllm_gen_fmha PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET trtllm_gen_fmha PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-target_link_libraries(trtllm_gen_fmha PUBLIC trtllm_gen_fmha_interface
-                                             tllm::kernel_attention_mask)
+target_link_libraries(
+  trtllm_gen_fmha
+  PUBLIC trtllm_gen_fmha_interface
+  PRIVATE tllm::kernel_attention_mask)
 target_include_directories(
   trtllm_gen_fmha PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_fmha_export)
 
