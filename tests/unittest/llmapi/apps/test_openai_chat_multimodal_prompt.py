@@ -202,7 +202,9 @@ class _RecordingTokenizer:
         return [1, 2, 3]
 
 
-def _engine_inputs(tmp_path, tokenizer, content, server_chat_template=None, **fields):
+def _engine_inputs(
+    tmp_path, tokenizer, content, server_chat_template=None, tool_parser=None, **fields
+):
     """What ``openai_chat`` hands to the engine for one user message."""
     captured = {}
 
@@ -214,6 +216,10 @@ def _engine_inputs(tmp_path, tokenizer, content, server_chat_template=None, **fi
         tmp_path, "test-vlm", _TestVlmConfig(), generate_async, tokenizer=tokenizer
     )
     server.chat_template = server_chat_template
+    server.tool_parser = tool_parser
+    if tool_parser is not None:
+        # A named tool_choice is decoded under a JSON schema.
+        server.generator.args.guided_decoding_backend = "xgrammar"
     server.await_disconnected = AsyncMock()
     server._create_chat_response = AsyncMock(
         return_value=SimpleNamespace(model_dump=lambda: {"ok": True})
@@ -262,6 +268,35 @@ def test_a_prompt_with_an_image_reaches_the_engine_as_text(tmp_path, test_vlm_pl
     assert prompt["prompt"] == "<image>describe"
     assert "prompt_token_ids" not in prompt
     assert len(prompt["multi_modal_data"]["image"]) == 1
+    assert tokenizer.tokenize_requests == [False]
+
+
+def test_a_forced_tool_call_reaches_the_engine_as_text(tmp_path, test_vlm_placeholders):
+    # The forced call's begin prefix is appended to the rendered text.
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
+
+    tokenizer = _RecordingTokenizer()
+
+    prompt = _engine_inputs(
+        tmp_path,
+        tokenizer,
+        "describe",
+        tool_parser="qwen3",
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                },
+            }
+        ],
+        tool_choice={"type": "function", "function": {"name": "get_weather"}},
+    )
+
+    begin = ToolParserFactory.parsers["qwen3"]().structure_info()("get_weather").begin
+    assert prompt["prompt"] == "describe" + begin
+    assert "prompt_token_ids" not in prompt
     assert tokenizer.tokenize_requests == [False]
 
 
