@@ -1,0 +1,14 @@
+# Set all paths to matching official LTX-2.5 split components.
+attention_config:
+  backend: VANILLA
+cuda_graph_config:
+  enable: false
+torch_compile_config:
+  enable: false
+pipeline_config:
+  text_encoder_path: /models/LTX-2.5/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors
+  video_vae_path: /models/LTX-2.5/vae/ltx-2.5-video-vae-conv-bf16.safetensors
+  audio_vae_path: /models/LTX-2.5/vae/ltx-2.5-audio-vae-bf16.safetensors
+  spatial_upsampler_path: /models/LTX-2.5/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors
+  iclora_path: /models/LTX-2.5/loras/ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors
+  iclora_scale: 1.0

@@ -308,6 +308,15 @@ class AutoPipeline:
         except Exception:
             return None
 
+        transformer_config = config.get("transformer", {})
+        if (
+            transformer_config.get("_class_name") == "AVTransformer3DModel"
+            and transformer_config.get("use_keyframes_abs_pos_embedding") is True
+            and transformer_config.get("cross_attention_adaln") is True
+            and transformer_config.get("ff_bias") is False
+        ):
+            return "LTX25ICLoraPipeline"
+
         if "transformer" in config and ("vae" in config or "audio_vae" in config):
             logger.info(
                 "AutoPipeline: Detected LTX-2 native checkpoint "

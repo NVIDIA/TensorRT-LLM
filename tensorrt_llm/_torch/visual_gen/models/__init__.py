@@ -38,6 +38,7 @@ from .flux import Flux2Pipeline, FluxPipeline
 from .glm_image import GlmImagePipeline
 from .hunyuan_video1_5 import HunyuanVideo15Pipeline
 from .ltx2 import LTX2Pipeline  # noqa: F401
+from .ltx2_5 import LTX25ICLoraPipeline
 from .minimax_h3 import MiniMaxH3Pipeline
 from .qwen_image import QwenImageEditPlusPipeline, QwenImagePipeline
 from .qwen_image_layered import QwenImageLayeredPipeline
@@ -50,6 +51,7 @@ __all__ = [
     "Flux2Pipeline",
     "GlmImagePipeline",
     "MiniMaxH3Pipeline",
+    "LTX25ICLoraPipeline",
     "QwenImageEditPlusPipeline",
     "QwenImageLayeredPipeline",
     "QwenImagePipeline",

@@ -278,6 +278,15 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `nvidia/Cosmos3-Super-Image2Video-4Step` | Image-to-Video (DMD2-distilled, fixed 4-step schedule) |
 | `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
 
+### LTX-2.5 IC-LoRA
+
+`LTX25ICLoraPipeline` is the registered architecture for the single-video BF16
+subset of [Lightricks LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5)
+IC-LoRA editing: half-resolution generation, latent upsampling, and full-resolution
+refinement on a single GPU. This BF16 subset uses dense VANILLA attention;
+quantization, CUDA graphs and distributed execution are unsupported. See the
+[example and validation guide](../../../examples/visual_gen/models/README.ltx2_5.md).
+
 ### Feature Matrix
 
 | Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism |
