@@ -27,6 +27,7 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.exaone_moe_weight_mapper import ExaoneMoeWeightMapper
 from tensorrt_llm._torch.models.modeling_exaone_moe import (
+    ExaoneMoeAttention,
     ExaoneMoeForCausalLM,
     get_exaone_attention_window,
     get_exaone_swiglu_limit,
@@ -47,6 +48,7 @@ from transformers.models.exaone_moe.modeling_exaone_moe import (
 
 WINDOW_SIZE = 4
 NUM_HIDDEN_LAYERS = 4
+ROPE_THETA = 1000000
 
 EXAONE_MOE_CONFIG = {
     "architectures": ["ExaoneMoeForCausalLM"],
@@ -80,8 +82,8 @@ EXAONE_MOE_CONFIG = {
     "num_shared_experts": 1,
     "pad_token_id": 0,
     "rms_norm_eps": 1e-05,
-    "rope_scaling": None,
-    "rope_theta": 1000000,
+    # Same spelling as the released checkpoint: no top-level `rope_theta`.
+    "rope_parameters": {"rope_theta": ROPE_THETA, "rope_type": "default"},
     "routed_scaling_factor": 2.5,
     "scoring_func": "sigmoid",
     "sliding_window": WINDOW_SIZE,
@@ -146,6 +148,20 @@ class TestExaoneMoe(unittest.TestCase):
 
         config.mtp_layer_types = ["full_attention"]
         self.assertIsNone(get_exaone_attention_window(config, NUM_HIDDEN_LAYERS, True))
+
+    def test_rope_follows_rope_parameters(self) -> None:
+        """Sliding layers rotate with the checkpoint's RoPE base; full layers are NoPE."""
+        config = ExaoneMoeConfig.from_dict(deepcopy(EXAONE_MOE_CONFIG))
+        model_config = ModelConfig(pretrained_config=config)
+
+        sliding_attn = ExaoneMoeAttention(model_config, layer_idx=0)
+        self.assertTrue(sliding_attn.is_sliding)
+        self.assertFalse(sliding_attn.skip_rope)
+        self.assertEqual(sliding_attn.pos_embd_params.rope.theta, ROPE_THETA)
+
+        full_attn = ExaoneMoeAttention(model_config, layer_idx=3)
+        self.assertFalse(full_attn.is_sliding)
+        self.assertTrue(full_attn.skip_rope)
 
     @parameterized.expand([None, "FP8"])
     def test_exaone_moe_sanity(self, quant_algo):
@@ -276,6 +292,11 @@ class TestExaoneMoe(unittest.TestCase):
         [
             Scenario(attention_backend="TRTLLM", input_len=WINDOW_SIZE - 2),
             Scenario(attention_backend="TRTLLM", input_len=WINDOW_SIZE - 2, use_cuda_graph=True),
+            # Longer than the window, so the sliding layers must drop old tokens.
+            Scenario(attention_backend="TRTLLM", input_len=3 * WINDOW_SIZE + 1),
+            Scenario(
+                attention_backend="TRTLLM", input_len=3 * WINDOW_SIZE + 1, use_cuda_graph=True
+            ),
         ],
         lambda testcase_func, param_num, param: f"{testcase_func.__name__}[{param.args[0]}]",
     )
@@ -326,7 +347,10 @@ class TestExaoneMoe(unittest.TestCase):
             enable_block_reuse=False,
             enable_partial_reuse=False,
             copy_on_partial_reuse=False,
-            max_attention_window=[int(exaone_moe_config.sliding_window)],
+            max_attention_window=[
+                WINDOW_SIZE if layer_type == "sliding_attention" else max_seq_len
+                for layer_type in exaone_moe_config.layer_types
+            ],
             max_tokens=num_blocks * tokens_per_block,
         )
         kv_cache_manager = KVCacheManagerV2(
