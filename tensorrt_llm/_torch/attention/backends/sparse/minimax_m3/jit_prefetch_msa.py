@@ -284,3 +284,16 @@ class MiniMaxM3MsaDecodeProvider:
 def recorded_launch_classes() -> int:
     with _LOCK:
         return len(_RECORDS)
+
+
+def start_warmup_builds(prefetcher, engine) -> None:
+    """Before warmup's first forward, register the MSA decode provider so it
+    plans each decode launch class as warmup records it, and plan the classes
+    the prewarms already recorded."""
+    prefetcher.register("minimax_m3_msa", MiniMaxM3MsaDecodeProvider(engine.batch_size))
+    # The first warmup's, which keeps the classes it planned.
+    msa_provider = prefetcher.registered("minimax_m3_msa")
+    set_on_new_record(lambda: prefetcher.plan_recorded(msa_provider))
+    if msa_provider:
+        # Launches recorded before the first forward (prewarms).
+        prefetcher.plan_recorded(msa_provider)

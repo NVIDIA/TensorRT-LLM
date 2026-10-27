@@ -393,3 +393,44 @@ class MambaSSDProvider:
             out=out,
             state_dtype=s.state_dtype,
         )
+
+
+def register_providers(prefetcher, engine) -> None:
+    """Register the Mamba2 SSD prefill provider of ``engine``'s model, which
+    also tunes ahead (``tune_batches``); compile ahead plans with it too.
+    Once per process: later calls change nothing."""
+    from tensorrt_llm.logger import logger
+
+    provider = MambaSSDProvider(
+        engine.model,
+        max_num_tokens=engine.max_num_tokens,
+        max_batch_size=engine.batch_size,
+        max_seq_len=engine.max_seq_len,
+    )
+    if provider and prefetcher.register("mamba_ssd", provider):
+        logger.info(
+            f"[JIT prefetch] Mamba SSD provider: {len(provider.shapes)} distinct layer shape(s)"
+        )
+
+
+def tune_ahead_covers_prefill(model) -> bool:
+    """Whether JIT tune ahead covers the autotune keys of the Mamba hybrid
+    warmup's forced-initial-states pass on this rank: every recurrent layer
+    of ``model`` the rank holds is a Mamba2 mixer running the Triton SSD
+    kernels (Nemotron-H), whose variants ``MambaSSDProvider`` compiles and
+    tunes, or it holds none. GDN and KDA layers read the same initial-state
+    metadata and are autotuned on keys no provider tunes ahead."""
+    from tensorrt_llm.logger import logger
+
+    from .jit_prefetch_linear_attn import LinearAttnProvider
+
+    try:
+        shapes = MambaSSDProvider(model).shapes
+        linear_attn = bool(LinearAttnProvider(model))
+    except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
+        logger.warning(
+            "Mamba hybrid warmup kept: cannot tell whether JIT tune ahead covers "
+            f"it. {type(e).__name__}: {e}"
+        )
+        return False
+    return all(s.triton_ssd for s in shapes) and not linear_attn

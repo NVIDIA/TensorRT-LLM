@@ -349,3 +349,14 @@ def recorded_launchers() -> Dict[str, int]:
     """Launch classes recorded per launcher name (for logs and tests)."""
     with _LOCK:
         return {name: len(per_name) for name, per_name in _RECORDS.items()}
+
+
+def register_providers(prefetcher, engine) -> None:
+    """Register the Mamba decode provider at the end of warmup: it plans the
+    decode launch classes warmup recorded (``start_recording``)."""
+    from tensorrt_llm.logger import logger
+
+    decode_provider = MambaDecodeProvider(engine.batch_size)
+    logger.info(f"[JIT prefetch] Mamba decode launches recorded in warmup: {recorded_launchers()}")
+    if decode_provider:
+        prefetcher.register("mamba_decode", decode_provider)

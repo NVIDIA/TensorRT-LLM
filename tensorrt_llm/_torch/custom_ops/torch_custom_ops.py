@@ -2154,37 +2154,6 @@ class Fp8QuantKernelRunner(TunableRunner):
         return a
 
 
-@lru_cache(maxsize=1)
-def _deep_gemm_jit_coverage_pass() -> bool:
-    """Whether warmup keeps its JIT-coverage passes for these ops (JIT
-    compile ahead off, or unable to build DeepGemm kernels here)."""
-    from ..jit_prefetch import warmup_jit_coverage_enabled
-    from ..jit_prefetch_deep_gemm import supported
-    return warmup_jit_coverage_enabled() or not supported()
-
-
-_jit_prefetch_deep_gemm = None
-
-
-def _deep_gemm_jit_tuning_needed() -> bool:
-    """Whether the single-tactic DeepGemm swap-AB ops go through the autotuner.
-
-    Their only tactic needs no tuning; the tuning pass (over
-    ``deep_gemm_jit_warmup_buckets``) exists to compile the DeepGemm layouts
-    during warmup. When JIT prefetch compiles those layouts in CPU-only
-    helpers instead, the ops call their single tactic directly; if those
-    helpers are not running (they did not start, or all exited before
-    serving), the pass compiles the layouts as without prefetch.
-    """
-    global _jit_prefetch_deep_gemm
-    if _deep_gemm_jit_coverage_pass():
-        return True
-    if _jit_prefetch_deep_gemm is None:
-        from .. import jit_prefetch_deep_gemm
-        _jit_prefetch_deep_gemm = jit_prefetch_deep_gemm
-    return not _jit_prefetch_deep_gemm.helpers_running
-
-
 class fp8SwapABGemmRunner(TunableRunner):
     """Runs quantize + DeepGemm FP8 GEMM. Single tactic for JIT warmup."""
 
@@ -2338,7 +2307,7 @@ def fp8_prequantized_swap_ab_gemm(
     disable_ue8m0_cast: bool = False,
 ) -> torch.Tensor:
     runner = Fp8PrequantizedSwapABGemmRunner(output_dtype, disable_ue8m0_cast)
-    if _deep_gemm_jit_tuning_needed():
+    if jit_prefetch_deep_gemm.swap_ab_tuning_needed():
         _, best_tactic = AutoTuner.get().choose_one(
             "trtllm::fp8_prequantized_swap_ab_gemm",
             [runner],
@@ -2394,7 +2363,7 @@ def fp8_swap_ab_gemm(
         disable_ue8m0_cast,
         quant_tactic=quant_tactic,
     )
-    if _deep_gemm_jit_tuning_needed():
+    if jit_prefetch_deep_gemm.swap_ab_tuning_needed():
         _, best_tactic = tuner.choose_one(
             "trtllm::fp8_swap_ab_gemm",
             [gemm_runner],

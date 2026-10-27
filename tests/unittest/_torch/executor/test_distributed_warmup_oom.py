@@ -581,7 +581,11 @@ def test_mamba_warmup_passes_with_prefetch_tune_ahead(
     engine, resource_manager = _mamba_engine()
     engine._dummy_requests.create_warmup_request = mock.Mock(return_value=object())
     engine._forward_warmup = mock.Mock()
-    engine._mamba_prefill_tuned_ahead = mock.Mock(return_value=covered)
+    from tensorrt_llm._torch.modules.mamba import jit_prefetch as mamba_jit_prefetch
+
+    monkeypatch.setattr(
+        mamba_jit_prefetch, "tune_ahead_covers_prefill", mock.Mock(return_value=covered)
+    )
 
     with (
         _no_cuda_side_effects(),

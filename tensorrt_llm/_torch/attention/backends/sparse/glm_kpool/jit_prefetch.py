@@ -203,3 +203,11 @@ class GlmKpoolProvider:
                                      base_row=t["base_row"], rows_per_slot=t["rows_per_slot"],
                                      kpool=t["kpool"], out_width=t["out_width"],
                                      request_ids=req)  # fmt: skip
+
+
+def register_providers(prefetcher, engine) -> None:
+    """Register the kpool provider at the end of warmup, if warmup's forwards
+    launched the kpool kernels (it plans from those launches,
+    ``kernels.KPOOL_LAUNCH_TEMPLATE``)."""
+    if kernels.KPOOL_LAUNCH_TEMPLATE:
+        prefetcher.register("glm_kpool", GlmKpoolProvider(engine.max_num_tokens))

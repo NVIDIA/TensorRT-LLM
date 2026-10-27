@@ -39,17 +39,18 @@ entry points
 (``jit_prefetch_deep_gemm.py``, ``jit_prefetch_cute_dsl.py``). MiniMax-M3's
 MSA ``fmha_sm100`` kernels follow from the engine's geometry alone, so they
 are built from the moment the model is constructed, while its weights load,
-rather than at the end of warmup (:class:`FmhaSm100Builds`,
-``start_model_builds``). So do FlashInfer JIT modules: a module a model's
-layers build in their first forward (the TRTLLM-GEN attention launcher, which
-any model whose attention runs on FlashInfer's TRTLLM-GEN FMHA library builds,
-GLM-5.3-Flash's MLA decode and MiniMax-M3 among them), and the MXFP8 GEMM the
-autotuner warmup tunes for decode graphs (DeepSeek-V4.1's Engram WKV,
-MiniMax-M3; ``start_mxfp8_tune_builds``), from the moment the model is
-constructed, as does the sampling module. The DeepGEMM kernels and
-FlashInfer's low-M BF16 GEMM variants follow from the weight shapes and the
-engine limits; they start once the weights are materialized on the GPU, while
-their values load (``start_weight_load_builds``).
+rather than at the end of warmup (:class:`FmhaSm100Builds`). So do FlashInfer
+JIT modules: a module a model's layers build in their first forward (the
+TRTLLM-GEN attention launcher, which any model whose attention runs on
+FlashInfer's TRTLLM-GEN FMHA library builds, GLM-5.3-Flash's MLA decode and
+MiniMax-M3 among them), and the MXFP8 GEMM the autotuner warmup tunes for
+decode graphs (DeepSeek-V4.1's Engram WKV, MiniMax-M3;
+``modules/jit_prefetch_mxfp8.py``), from the moment the model is constructed,
+as does the sampling module. The DeepGEMM kernels and FlashInfer's low-M BF16
+GEMM variants follow from the weight shapes and the engine limits; they start
+once the weights are materialized on the GPU, while their values load. Which
+providers start in which phase of the engine's startup is decided in
+``jit_prefetch_engine.py``.
 
 For every planned Triton variant, Triton's own binder computes Triton's own
 cache key, which is checked against the kernel's in-memory cache and then the
@@ -85,7 +86,6 @@ listed there is a variant no provider covers.
 from __future__ import annotations
 
 import collections
-import importlib
 import json
 import os
 import queue
@@ -276,7 +276,8 @@ _fi_builds: List[Tuple[Tuple[str, ...], Any]] = []
 # Every module a build has been started for, so none is started twice.
 _fi_started: set = set()
 # The modules among them that a model's layers build in warmup's first
-# forwards (``start_model_builds``), joined before those forwards.
+# forwards (``jit_prefetch_engine.start_model_builds``), joined before those
+# forwards.
 _fi_layer_modules: set = set()
 
 
@@ -302,7 +303,7 @@ def start_flashinfer_build(
     with a cold cache, during which the GPU idles. Warmup builds the sampling
     module (``warmup_sampling_module``) before its first forward; a model's
     layers may build others in warmup's first forwards (``layer``, see
-    ``start_model_builds``). Started ahead of that use, the helper builds the
+    ``jit_prefetch_engine.start_model_builds``). Started ahead of that use, the helper builds the
     modules, one after another in the given order, while the process does
     other work: the sampling module from the beginning of warmup, a layer's
     module while the weights load. Warmup joins the helpers before the use:
@@ -525,302 +526,6 @@ def flashinfer_build_pending(name: str) -> bool:
     return any(name in modules for modules, _ in _fi_builds)
 
 
-def warmup_builds_sampling_module(model, llm_args) -> bool:
-    """Whether the engine ``llm_args`` describes builds FlashInfer's sampling
-    module in warmup, known once ``model`` is constructed: every decoder
-    runner's warmup does (``warmup_sampling_module``), other runners'
-    (encoder, pooling) do not."""
-    from .pyexecutor.engine.runners import DecoderRunner, resolve_runner_type
-
-    return issubclass(resolve_runner_type(model, llm_args), DecoderRunner)
-
-
-def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
-    """Start building, in CPU-only helpers, the JIT kernels ``model``'s layers
-    build in warmup's first forwards, which follow from the model's geometry
-    alone; called once the model is constructed, so the builds run while the
-    weights load instead of inside warmup:
-
-    * FlashInfer JIT modules, one helper each: each provider module that
-      knows of such modules lists them (``fmha_gen``, FlashInfer's TRTLLM-GEN
-      attention launcher, for the layers of any model that run on its FMHA
-      library, GLM-5.3-Flash's MLA decode and MiniMax-M3; the Mamba2 decode's
-      ``selective_state_update``; the TRTLLM-Gen fused MoE launcher of MoE
-      layers on FlashInfer's op backend; FlashInfer's RoPE), which warmup joins
-      before its first forward (``wait_flashinfer_layer_builds``), and the
-      sampling module, if the engine ``llm_args`` describes builds it in
-      warmup (``warmup_builds_sampling_module``; warmup starts it otherwise);
-    * the FlashInfer modules of the autotuner warmup's FlashInfer MXFP8 pass,
-      in a helper of their own, if the engine ``llm_args`` describes will run
-      that pass (``tunes_flashinfer_mxfp8_at_load``: DeepSeek-V4.1's Engram
-      WKV and MiniMax-M3's MXFP8 Linears with decode CUDA graphs). Warmup
-      starts them otherwise (``start_mxfp8_tune_builds``);
-    * the CuTe DSL FP8 blockwise GEMM tactics the autotuner benchmarks
-      (``jit_prefetch_cute_dsl.Fp8GemmProvider``: block-FP8 Linear layers
-      without DeepGEMM, and the batched GEMM of DeepSeek-V4's grouped FP8
-      O-LoRA projection), the NVFP4 dense GEMM tactics the NVFP4 GEMM's
-      autotuner races (``Nvfp4GemmProvider``, M buckets up to the engine's
-      ``max_num_tokens``), the CuTe DSL MoE's NVFP4 grouped GEMM tactics
-      (``MoeGemmProvider``), the KDA prefill kernel (``KdaPrefillProvider``),
-      FlashInfer's CuTe DSL RMSNorm variants (``FlashInferNormProvider``) and,
-      with that MXFP8 pass, FlashInfer's CuTe DSL MXFP8 GEMMs it races
-      (``FlashInferMxfp8GemmProvider``);
-      the CuTe DSL helpers start here, so their start-up overlaps the weight
-      load;
-    * MiniMax-M3's MSA ``fmha_sm100`` kernels (:class:`FmhaSm100Builds`),
-      whose plan also needs the KV cache's page size and dtypes, taken from
-      ``llm_args``. Without it they start at the beginning of warmup instead.
-
-    The DeepGEMM and low-M GEMM kernels start a little later, once the weights
-    are on the GPU (``start_weight_load_builds``).
-
-    Returns False if prefetch is off or nothing was started."""
-    if not prefetch_enabled():
-        return False
-    started = False
-    modules: List[str] = []
-    for provider_module in (
-        "attention.backends.fmha.jit_prefetch",
-        "attention.backends.sparse.glm_kpool.jit_prefetch",
-        "attention.backends.sparse.minimax_m3.jit_prefetch_fmha",
-        "modules.mamba.jit_prefetch_flashinfer",
-        "moe.fused_moe.jit_prefetch_flashinfer",
-        "attention.jit_prefetch_flashinfer_rope",
-    ):
-        try:
-            planner = importlib.import_module(f".{provider_module}", __package__)
-            modules += planner.flashinfer_modules(model)
-        except Exception as e:  # noqa: BLE001 - its modules then build in place
-            logger.warning(
-                f"[JIT prefetch] FlashInfer builds of {provider_module} not planned: "
-                f"{type(e).__name__}: {e}"
-            )
-    # One helper per module, so they build side by side. The layers' modules
-    # are joined before warmup's first forward, which waits for them, so they
-    # build at this process's priority.
-    for name in dict.fromkeys(modules):
-        started = start_flashinfer_build((name,), nice=0, layer=True) or started
-    if llm_args is not None:
-        # Warmup loads the sampling module only before CUDA graph capture.
-        try:
-            if warmup_builds_sampling_module(model, llm_args):
-                started = start_flashinfer_build(("sampling",)) or started
-        except Exception as e:  # noqa: BLE001 - warmup then starts it
-            logger.warning(
-                f"[JIT prefetch] FlashInfer sampling build not planned: {type(e).__name__}: {e}"
-            )
-    mxfp8_pass = False
-    if llm_args is not None:
-        try:
-            mxfp8_pass = tunes_flashinfer_mxfp8_at_load(model, llm_args)
-            started = start_mxfp8_tune_builds(mxfp8_pass) or started
-        except Exception as e:  # noqa: BLE001 - warmup then starts them
-            logger.warning(
-                f"[JIT prefetch] FlashInfer MXFP8 builds not planned: {type(e).__name__}: {e}"
-            )
-    try:
-        from .cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-
-        if IS_CUTLASS_DSL_AVAILABLE:
-            from . import jit_prefetch_cute_dsl as jcd
-
-            # Every later cluster-occupancy query reuses one probe kernel.
-            jcd.install_occupancy_kernel_cache()
-            # They follow from the layers' geometry and are compiled in
-            # warmup's first forwards: the FP8, NVFP4 and MoE grouped GEMM
-            # tactics by the autotuner, the KDA prefill kernel by the first
-            # prefill, the FlashInfer norms by the first forward.
-            gemm_provider = jcd.Fp8GemmProvider(model)
-            nvfp4_provider = jcd.Nvfp4GemmProvider(
-                model, getattr(llm_args, "max_num_tokens", None) or 0
-            )
-            kda_provider = jcd.KdaPrefillProvider(model)
-            norm_provider = jcd.FlashInferNormProvider(model)
-            moe_provider = jcd.MoeGemmProvider(model)
-            # Warmup races FlashInfer's CuTe DSL MXFP8 GEMM in that pass,
-            # except under pipeline parallelism.
-            mapping = getattr(getattr(model, "model_config", None), "mapping", None)
-            mxfp8_provider = jcd.FlashInferMxfp8GemmProvider(
-                model,
-                getattr(llm_args, "max_num_tokens", None) or 0,
-                races=mxfp8_pass and not (mapping is not None and mapping.has_pp()),
-            )
-            providers = (gemm_provider, nvfp4_provider, kda_provider, norm_provider, moe_provider,
-                         mxfp8_provider)  # fmt: skip
-            if any(providers):
-                prefetcher = JitPrefetcher.init(rank)
-                if prefetcher is not None:
-                    # Queued in the order warmup needs them: the norms in the
-                    # first forward, ahead of the rest.
-                    if norm_provider:
-                        started = prefetcher.enable_flashinfer_norm(norm_provider) or started
-                    if gemm_provider:
-                        started = prefetcher.enable_fp8_gemm(gemm_provider) or started
-                    if kda_provider:
-                        started = prefetcher.enable_cute_dsl(kda_provider) or started
-                    if nvfp4_provider:
-                        started = prefetcher.enable_nvfp4_gemm(nvfp4_provider) or started
-                    if moe_provider:
-                        started = prefetcher.enable_moe_gemm(moe_provider) or started
-                    if mxfp8_provider:
-                        started = prefetcher.enable_fi_mxfp8_gemm(mxfp8_provider) or started
-    except Exception as e:  # noqa: BLE001 - the kernels then compile in place
-        logger.warning(f"[JIT prefetch] CuTe DSL builds not planned: {type(e).__name__}: {e}")
-    if llm_args is not None and FmhaSm100Builds.get() is None:
-        try:
-            from .attention.backends.sparse.minimax_m3.jit_prefetch_fmha import (
-                MiniMaxM3FmhaProvider,
-                kv_cache_geometry,
-            )
-
-            geometry = kv_cache_geometry(model, llm_args)
-            if geometry is not None:
-                started = FmhaSm100Builds.start(MiniMaxM3FmhaProvider(model, geometry)) or started
-        except Exception as e:  # noqa: BLE001 - the kernels then build in place
-            logger.warning(f"[JIT prefetch] fmha_sm100 builds not started: {type(e).__name__}: {e}")
-    return started
-
-
-def start_weight_load_builds(model, rank: int, deep_gemm_limits) -> bool:
-    """Start, in CPU-only helpers, the GEMM kernels ``model``'s first warmup
-    forwards and the autotuner warmup build, once its weights are
-    materialized on the GPU and while their values load from the checkpoint:
-
-    * the DeepGEMM FP8 Linear and MoE kernels (``start_deep_gemm_builds``);
-    * FlashInfer's low-M BF16 direct GEMM variants the low-M dispatcher's
-      AutoTuner race benchmarks (``jit_prefetch_cute_dsl.LowMDirectGemmProvider``).
-
-    ``deep_gemm_limits`` are the engine limits the providers plan from
-    (``max_num_tokens``, ``priority_ms``, ``first_ms``). Returns False if
-    prefetch is off or nothing was started."""
-    if not prefetch_enabled():
-        return False
-    started = start_deep_gemm_builds(model, rank, **deep_gemm_limits)
-    try:
-        from .cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-
-        if IS_CUTLASS_DSL_AVAILABLE:
-            from . import jit_prefetch_cute_dsl as jcd
-
-            lowm_provider = jcd.LowMDirectGemmProvider(model, deep_gemm_limits["max_num_tokens"])
-            if lowm_provider:
-                prefetcher = JitPrefetcher.init(rank)
-                if prefetcher is not None:
-                    started = prefetcher.enable_lowm_direct_gemm(lowm_provider) or started
-    except Exception as e:  # noqa: BLE001 - the kernels then compile in place
-        logger.warning(f"[JIT prefetch] low-M GEMM builds not planned: {type(e).__name__}: {e}")
-    return started
-
-
-def start_deep_gemm_builds(
-    model, rank: int, max_num_tokens: int, priority_ms=(), first_ms=()
-) -> bool:
-    """Start the DeepGEMM helpers on the FP8 Linear and MoE kernels of
-    ``model`` while its weights load.
-
-    The variants follow from the weight shapes and the engine limits, which
-    is everything ``FP8LinearDeepGemmProvider`` and ``DeepGemmMoEProvider``
-    read. Started here, the ~10 s start-up of the helpers and the first
-    layouts the first warmup forwards need (``first_ms``, then ``priority_ms``,
-    then M = 1..16) are done by the time the weights are in; started at
-    warmup, the first forward waits for them. Shapes created by weight loading itself
-    come from the model's ``jit_prefetch_fp8_weight_read_shapes`` where it
-    names them, and are otherwise added at warmup
-    (``JitPrefetcher.refresh_deep_gemm``). Once per process; returns False if
-    prefetch is off or nothing was started."""
-    if not prefetch_enabled():
-        return False
-    try:
-        from .._utils import get_sm_version
-        from . import jit_prefetch_deep_gemm as jdg
-
-        if get_sm_version() not in (100, 103) or not jdg.supported():
-            return False
-        prefetcher = JitPrefetcher.init(rank)
-        if prefetcher is None or prefetcher.deep_gemm_enabled():
-            return False
-        dg_provider = jdg.FP8LinearDeepGemmProvider(
-            model, max_num_tokens=max_num_tokens, priority_ms=priority_ms, first_ms=first_ms
-        )
-        dg_moe = jdg.DeepGemmMoEProvider(model)
-        if not (dg_provider or dg_moe):
-            return False
-        return prefetcher.enable_deep_gemm(dg_provider, dg_moe)
-    except Exception as e:  # noqa: BLE001 - the helpers then start at warmup
-        logger.warning(
-            f"[JIT prefetch] DeepGEMM helpers not started at model load: {type(e).__name__}: {e}"
-        )
-        return False
-
-
-# FlashInfer modules the autotuner warmup's FlashInfer MXFP8 pass builds the
-# first time it tunes ``mm_mxfp8`` on an SM100-family GPU, in the order it
-# needs them: the delay kernel FlashInfer's autotuner times with (seconds),
-# then the CUTLASS MXFP8 GEMM (over a minute).
-FLASHINFER_MXFP8_TUNE_MODULES = ("trtllm_utils", "mxfp8_gemm_cutlass")
-
-
-def start_mxfp8_tune_builds(tunes_flashinfer_mxfp8: bool) -> bool:
-    """Start building, in a CPU-only helper, the FlashInfer modules the
-    autotuner warmup's FlashInfer MXFP8 pass builds; called with whether this
-    engine runs that pass, once the model is constructed
-    (``start_model_builds``, which predicts it from the engine's arguments)
-    and again at the start of warmup, where the engine decides it. The GEMM
-    module is a ~75-100 s nvcc build, which then overlaps the weight load, or
-    at least the warmup forwards before the autotuner; the pass waits on
-    FlashInfer's file lock, held by the helper, instead of compiling it
-    itself. Returns False if prefetch is off, the pass does not run, or there
-    is nothing to build (the modules are built, or a helper is on them)."""
-    if not prefetch_enabled() or not tunes_flashinfer_mxfp8:
-        return False
-    from tensorrt_llm._utils import is_sm_100f
-
-    if not is_sm_100f():
-        return False
-    return start_flashinfer_build(FLASHINFER_MXFP8_TUNE_MODULES)
-
-
-def decode_batches_compiled(model, llm_args) -> bool:
-    """Whether ``torch.compile`` runs the decode batches of ``model`` in the
-    engine ``llm_args`` describes, as ``PyTorchModelEngine`` decides it: with
-    a ``torch_compile_config``, unless piecewise prefill CUDA graphs confine
-    a decoder model's compiled graph to prefill (the engine's
-    ``_torch_compile_prefill_only``)."""
-    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
-
-    from .models.modeling_utils import DecoderModelForCausalLM
-
-    compile_cfg = llm_args.torch_compile_config
-    if compile_cfg is None:
-        return False
-    return not (
-        isinstance(model, DecoderModelForCausalLM)
-        and llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
-        and (compile_cfg.compile_only_piecewise_graphs or not model.use_fx_for_pcg_fallback)
-    )
-
-
-def tunes_flashinfer_mxfp8_at_load(model, llm_args) -> bool:
-    """Whether the engine ``llm_args`` describes will run the autotuner
-    warmup's FlashInfer MXFP8 pass on ``model``, known once the model is
-    constructed: the decoder runner's own selection
-    (``DecoderRunner.flashinfer_mxfp8_pass_selected``) on the settings
-    ``PyTorchModelEngine`` derives from ``llm_args``. False if the engine
-    runs another runner (encoder, pooling), which has no such pass."""
-    from .pyexecutor.engine.runners import DecoderRunner, resolve_runner_type
-
-    runner_cls = resolve_runner_type(model, llm_args)
-    if not issubclass(runner_cls, DecoderRunner):
-        return False
-    return runner_cls.flashinfer_mxfp8_pass_selected(
-        model,
-        model.model_config.mapping,
-        enable_autotuner=llm_args.enable_autotuner,
-        cuda_graphs=llm_args.cuda_graph_config is not None,
-        compile_all_batches=decode_batches_compiled(model, llm_args),
-    )
-
-
 # ---------------------------------------------------------------------------
 # MSA fmha_sm100 kernels built from the start of warmup
 # ---------------------------------------------------------------------------
@@ -835,8 +540,8 @@ class FmhaSm100Builds:
     forwards and the rest in the first serving steps that reach a new
     context-row class. Every one of them is known from the engine's geometry
     (``minimax_m3/jit_prefetch_fmha.py``), so this pool starts building all of
-    them once the model is constructed (``start_model_builds``; at the start
-    of warmup if it was not started then), in ``jit_prefetch_fmha_sm100_helper.py``
+    them once the model is constructed (``jit_prefetch_fmha.start_model_builds``;
+    at the start of warmup if it was not started then), in ``jit_prefetch_fmha_sm100_helper.py``
     processes with no visible GPU, into the directories ``fmha_sm100`` loads
     from, while the weights load and the warmup forwards run. A forward that needs a
     kernel a helper is building waits on the per-kernel file lock that build
@@ -2073,7 +1778,7 @@ class JitPrefetcher:
         reach in the CuTe DSL helpers, and have the GEMM and batched-GEMM
         runners load them.
 
-        Called right after the model is constructed (``start_model_builds``),
+        Called right after the model is constructed (``jit_prefetch_cute_dsl.start_model_builds``),
         before warmup: the autotuner's first pass compiles every tactic it
         benchmarks, and the helpers compile them while the weights load. A
         tactic whose export is missing when the runner needs it compiles in
@@ -2098,7 +1803,7 @@ class JitPrefetcher:
         """Compile the CuTe DSL NVFP4 dense GEMM tactics the model's NVFP4
         layers reach in the CuTe DSL helpers, and have the runner load them.
 
-        Called right after the model is constructed (``start_model_builds``):
+        Called right after the model is constructed (``jit_prefetch_cute_dsl.start_model_builds``):
         the autotuner's first pass compiles every tactic it benchmarks, and
         the helpers compile them while the weights load. A tactic whose
         export is missing when the runner needs it compiles in place; one a
@@ -2126,7 +1831,7 @@ class JitPrefetcher:
         routing tile size) in the CuTe DSL helpers, and have the runners load
         them.
 
-        Called right after the model is constructed (``start_model_builds``):
+        Called right after the model is constructed (``jit_prefetch_cute_dsl.start_model_builds``):
         the autotuner's first pass compiles every tactic it benchmarks, and
         the helpers compile them while the weights load. A tactic whose
         export is missing when a runner needs it compiles in place; one a
@@ -2152,7 +1857,7 @@ class JitPrefetcher:
         """Compile FlashInfer's CuTe DSL MXFP8 GEMM kernels that the MXFP8
         Linears' warmup pass races (one per default tactic and output dtype)
         in the CuTe DSL helpers, and have FlashInfer's compile load them.
-        Called right after the model is constructed (``start_model_builds``).
+        Called right after the model is constructed (``jit_prefetch_cute_dsl.start_model_builds``).
         """
         from . import jit_prefetch_cute_dsl as jcd
 
@@ -2175,7 +1880,7 @@ class JitPrefetcher:
         have FlashInfer's compiled-kernel getter load them.
 
         Called once the weights are materialized on the GPU
-        (``start_weight_load_builds``), before warmup: the race's first pass
+        (``jit_prefetch_cute_dsl.start_weight_load_builds``), before warmup: the race's first pass
         compiles every (M bucket, Linear shape, direct tactic) on the executor
         thread, ~1 s each and hundreds of them on a low-latency generation
         worker. A variant whose export is missing when the race needs it
@@ -2201,7 +1906,7 @@ class JitPrefetcher:
         """Compile FlashInfer's CuTe DSL norm variants in the CuTe DSL helpers
         and have FlashInfer's compiled-kernel getters load them.
 
-        Called once the model is constructed (``start_model_builds``), so the
+        Called once the model is constructed (``jit_prefetch_cute_dsl.start_model_builds``), so the
         helpers start, and build these variants, while the weights load; and
         again at the end of warmup, which queues only variants not queued
         before. Returns whether anything was queued."""

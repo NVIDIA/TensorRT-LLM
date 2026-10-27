@@ -124,3 +124,16 @@ class MiniMaxM3TritonProvider:
                             ),
                         )
         return list(rec)
+
+
+def register_providers(prefetcher, engine) -> None:
+    """Register MiniMax-M3's sparse-attention Triton provider and its MSA
+    decode provider at the end of warmup."""
+    from .jit_prefetch_msa import MiniMaxM3MsaDecodeProvider
+
+    m3_provider = MiniMaxM3TritonProvider(engine.model, engine.max_seq_len)
+    if m3_provider:
+        prefetcher.register("minimax_m3_triton", m3_provider)
+    msa_provider = MiniMaxM3MsaDecodeProvider(engine.batch_size)
+    if msa_provider:
+        prefetcher.register("minimax_m3_msa", msa_provider)

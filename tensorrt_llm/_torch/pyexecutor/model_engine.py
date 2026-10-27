@@ -7,7 +7,6 @@ import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
-from types import SimpleNamespace
 from typing import (Any, Callable, Dict, Hashable, List, Optional, Tuple, Type,
                     Union)
 
@@ -18,7 +17,7 @@ import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
-from tensorrt_llm._utils import get_sm_version, release_gc
+from tensorrt_llm._utils import release_gc
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           create_input_processor)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
@@ -36,6 +35,7 @@ from ..attention.backends.utils import get_attention_backend
 from ..compilation.backend import Backend
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
+from ..jit_prefetch_engine import EngineJitAhead
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
@@ -164,12 +164,9 @@ def _configure_deep_gemm_pdl() -> None:
 
 
 class PyTorchModelEngine(ModelEngine):
-    # Set by _init_jit_prefetch: the next forward outside warmup binds the
-    # JIT prefetcher's executor thread (JIT stats count from there), and
-    # serving forwards then report the JIT compiles of paths no launch hook
-    # observes.
-    _jit_bind_pending = False
-    _jit_report_compiles = False
+    # Installed at the end of warmup by JIT compile ahead and tune ahead
+    # (``_jit_ahead``): run by each forward outside warmup, for the JIT stats.
+    _jit_serving_forward: Optional[Callable[[], None]] = None
 
     def __init__(
         self,
@@ -301,10 +298,9 @@ class PyTorchModelEngine(ModelEngine):
                 model_weights_memory_tag=model_weights_memory_tag,
                 model_weights_restore_mode=model_weights_restore_mode,
             )
-            # With JIT prefetch on, the loader starts the DeepGEMM helpers
-            # from these limits once the weights are materialized on the GPU.
-            self.model_loader.deep_gemm_limits = (
-                self._load_time_deep_gemm_limits())
+            # JIT compile ahead (TLLM_JIT_AHEAD=1) starts building kernels
+            # while the weights load.
+            self.model_loader.jit_ahead = self._jit_ahead
             # Open checkpoint and load the LLM module object.
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
@@ -1022,6 +1018,12 @@ class PyTorchModelEngine(ModelEngine):
             outputs["encoder_seq_lens"],
         )
 
+    @functools.cached_property
+    def _jit_ahead(self) -> EngineJitAhead:
+        """JIT compile ahead and tune ahead (``TLLM_JIT_AHEAD``) of this
+        engine's model loading and warmup."""
+        return EngineJitAhead(self)
+
     @with_warmup_flag
     @warmup_with_kv_cache_cleanup
     def warmup(self,
@@ -1042,424 +1044,10 @@ class PyTorchModelEngine(ModelEngine):
         assert resource_manager is not None, (
             "scheduled warmup requires a resource manager")
         assert isinstance(self._runner, ScheduledModelRunner)
-        from ..jit_prefetch import prefetch_enabled
-        record_decode = prefetch_enabled()
-        record_msa = record_decode and self._uses_minimax_m3_sparse()
-        if record_decode:
-            # The Mamba and MSA decode providers plan from the launches
-            # warmup makes.
-            from ..modules.mamba import jit_prefetch_decode
-            jit_prefetch_decode.start_recording(self.model)
-        if record_msa:
-            from ..attention.backends.sparse.minimax_m3 import jit_prefetch_msa
-            jit_prefetch_msa.start_recording()
-            if self._uses_minimax_m3_msa():
-                self._start_msa_fmha_builds(resource_manager)
-        # The DeepGEMM helpers start once the runner's pre-JIT prewarms are
-        # done, before its first warmup forward: started earlier, their
-        # start-up competes with those in-process nvcc builds for the CPU.
-        # Each warmup forward's batch is then planned before it runs.
-        early_start = record_decode and hasattr(
-            self._runner, "before_warmup_forwards_callable")
-        if early_start:
-            self._runner.before_warmup_forwards_callable = (
-                self._before_warmup_forwards)
-            self._runner.warmup_batch_callable = self._plan_warmup_batch
-        try:
+        # JIT compile ahead and tune ahead start builds around and inside
+        # warmup.
+        with self._jit_ahead.warmup(self._runner, resource_manager):
             self._runner.warmup(resource_manager)
-        finally:
-            if early_start:
-                self._runner.before_warmup_forwards_callable = None
-                self._runner.warmup_batch_callable = None
-                from ..modules.top_k import TopK
-                TopK.on_first_forward = None
-            if record_decode:
-                jit_prefetch_decode.stop_recording()
-            if record_msa:
-                jit_prefetch_msa.stop_recording()
-        try:
-            self._init_jit_prefetch(resource_manager)
-        except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
-            logger.warning(
-                f"[JIT prefetch] setup failed, serving without prefetch: "
-                f"{type(e).__name__}: {e}")
-
-    def _uses_minimax_m3_sparse(self) -> bool:
-        sparse_cfg = getattr(self.llm_args, "sparse_attention_config", None)
-        return getattr(sparse_cfg, "algorithm", None) == "minimax_m3"
-
-    def _uses_minimax_m3_msa(self) -> bool:
-        sparse_cfg = getattr(self.llm_args, "sparse_attention_config", None)
-        return self._uses_minimax_m3_sparse() and getattr(
-            sparse_cfg, "implementation", None) == "msa"
-
-    def _start_msa_fmha_builds(self, resource_manager: ResourceManager) -> None:
-        """Start building MiniMax-M3's MSA fmha_sm100 kernels in CPU-only
-        helpers, before the first warmup forward needs them (see
-        ``jit_prefetch.FmhaSm100Builds``). Every kernel follows from the
-        engine's geometry; once per process."""
-        from ..jit_prefetch import FmhaSm100Builds
-        if FmhaSm100Builds.get() is not None:
-            return
-        try:
-            from ..attention.backends.sparse.minimax_m3.jit_prefetch_fmha import \
-                MiniMaxM3FmhaProvider
-            provider = MiniMaxM3FmhaProvider(
-                self.model,
-                resource_manager.get_resource_manager(
-                    self.kv_cache_manager_key))
-            FmhaSm100Builds.start(provider)
-        except Exception as e:  # noqa: BLE001 - kernels then build in place
-            logger.warning(f"[JIT prefetch] fmha_sm100 builds not started: "
-                           f"{type(e).__name__}: {e}")
-
-    def _before_warmup_forwards(self) -> None:
-        """Start what JIT compile ahead builds before warmup's first forward
-        (the runner calls this once its pre-JIT prewarms are done)."""
-        self._start_deep_gemm_prefetch()
-        self._start_warmup_triton_builds()
-
-    def _start_warmup_triton_builds(self) -> None:
-        """Register the Triton providers that follow from the model and the
-        engine limits alone before warmup's first forward, so they plan the
-        warmup forwards' batches (``_plan_warmup_batch``), and queue the
-        batches tune ahead will run at the end of warmup
-        (``JitPrefetcher.queue_early_batches``). The radix top-k and CSA2
-        candidate-publication variants start here too, and MiniMax-M3's MSA
-        decode provider is registered: it plans each decode launch class as
-        warmup records it (``JitPrefetcher.plan_recorded``)."""
-        try:
-            from ..jit_prefetch import JitPrefetcher
-            prefetcher = JitPrefetcher.get()
-            if prefetcher is None:
-                return
-            self._register_tune_ahead_providers(prefetcher)
-            prefetcher.queue_early_batches()
-            self._start_cute_dsl_topk_builds(prefetcher)
-            if self._uses_minimax_m3_sparse():
-                from ..attention.backends.sparse.minimax_m3 import \
-                    jit_prefetch_msa
-                prefetcher.register(
-                    "minimax_m3_msa",
-                    jit_prefetch_msa.MiniMaxM3MsaDecodeProvider(
-                        self.batch_size))
-                # The first warmup's, which keeps the classes it planned.
-                msa_provider = prefetcher.registered("minimax_m3_msa")
-                jit_prefetch_msa.set_on_new_record(
-                    lambda: prefetcher.plan_recorded(msa_provider))
-                if msa_provider:
-                    # Launches recorded before the first forward (prewarms).
-                    prefetcher.plan_recorded(msa_provider)
-        except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
-            logger.warning(
-                f"[JIT prefetch] Triton providers not started before warmup: "
-                f"{type(e).__name__}: {e}")
-
-    def _plan_warmup_batch(self, batch: ScheduledRequests) -> None:
-        """Queue the not yet compiled variants of a warmup forward's batch for
-        the JIT helpers before it runs (``JitPrefetcher.plan_warmup_batch``).
-        A batch without context requests is skipped: warmup's generation
-        batches reach no provider that plans warmup batches."""
-        ctx = batch.context_requests
-        if not ctx:
-            return
-        try:
-            from ..jit_prefetch import JitPrefetcher
-            from ..modules.mamba.mamba2_metadata import Mamba2Metadata
-            prefetcher = JitPrefetcher.get()
-            if prefetcher is None:
-                return
-            # The facts _prepare_tp_inputs and Mamba2Metadata.prepare derive:
-            # each request's chunk length, and whether a request has a cached
-            # prefix (initial states), which Mamba's warmup can force.
-            any_cached = Mamba2Metadata._warmup_force_initial_states or any(
-                r.context_current_position - r.py_num_compressed_tokens > 0
-                for r in ctx)
-            gen_tokens = sum(1 + len(getattr(r, "py_draft_tokens", None) or [])
-                             for r in batch.generation_requests)
-            prefetcher.plan_warmup_batch(
-                SimpleNamespace(
-                    ctx_chunk_lens=[r.context_chunk_size for r in ctx],
-                    any_ctx_cached=any_cached,
-                    gen_tokens=gen_tokens))
-        except Exception as e:  # noqa: BLE001 - prefetch must never fail warmup
-            logger.warning_once(
-                f"[JIT prefetch] warmup batch not planned: "
-                f"{type(e).__name__}: {e}",
-                key="jitp_engine_warmup_batch")
-
-    def _start_deep_gemm_prefetch(self) -> None:
-        """Start building the DeepGEMM FP8 Linear and MoE kernels in CPU-only
-        helpers before warmup's first forward, rather than once warmup ends.
-
-        Their variants follow from the weight shapes and the engine limits
-        alone, and with prefetch on warmup no longer sweeps the swap-AB GEMM's
-        M buckets, so warmup's own forwards are the first to reach most M:
-        each CUDA graph shape runs ``batch_size * (1 + draft)`` tokens. Started
-        here, the helpers build those first (``FP8LinearDeepGemmProvider``'s
-        ``priority_ms``) while the eager warmup forwards run, and a warmup
-        launch of a variant a helper has queued waits for its cubin instead of
-        compiling it on the executor. ``_init_jit_prefetch`` then adds the
-        providers that plan from what warmup recorded. Once per process.
-        """
-        try:
-            from .. import jit_prefetch_deep_gemm as jdg
-            from ..jit_prefetch import JitPrefetcher
-            prefetcher = JitPrefetcher.init(rank=self.mapping.rank)
-            if prefetcher is None:
-                return
-            if get_sm_version() not in (100, 103) or not jdg.supported():
-                return
-            dg_provider, dg_moe = self._deep_gemm_providers()
-            if prefetcher.deep_gemm_enabled():
-                # Started by the model loader on the constructed model: add
-                # the shapes weight loading created.
-                prefetcher.refresh_deep_gemm(dg_provider, dg_moe)
-            elif dg_provider or dg_moe:
-                prefetcher.enable_deep_gemm(dg_provider, dg_moe)
-        except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
-            logger.warning(
-                f"[JIT prefetch] DeepGEMM helpers not started early: "
-                f"{type(e).__name__}: {e}")
-
-    def _deep_gemm_limits(self, graph_batch_sizes, draft_tokens: int) -> dict:
-        """The engine limits the DeepGEMM FP8 Linear provider plans from,
-        for CUDA graph batch sizes ``graph_batch_sizes`` and ``draft_tokens``
-        draft tokens per generation request."""
-        # With chunked prefill, MLA runs kv_b_proj over a request's cached
-        # prefix (its earlier chunks, or reused blocks) in loops of up to
-        # chunk_size x chunked_prefill_buffer_batch_size rows, more than
-        # max_num_tokens.
-        rf = self.attn_runtime_features
-        max_m = self.max_num_tokens
-        if rf.chunked_prefill:
-            max_m = max(
-                max_m,
-                int(rf.chunk_size or 0) *
-                int(rf.chunked_prefill_buffer_batch_size or 1))
-        # Built first, as warmup and graph capture launch them all before
-        # serving: every CUDA graph shape's token count. Before those, on
-        # every rank, the token counts of the warmup forwards ahead of graph
-        # capture: the attention warmup's (one generation request, one
-        # context token, both together) and max_num_tokens, the general
-        # warmup's and the autotuner's pure-context shape.
-        tokens_per_request = 1 + self.original_max_total_draft_tokens
-        graph_bs = graph_batch_sizes or []
-        graph_ms = sorted({bs * tokens_per_request
-                           for bs in graph_bs} | set(graph_bs))
-        gen_tokens = 1 + draft_tokens
-        return {
-            "max_num_tokens": max_m,
-            "priority_ms": graph_ms,
-            "first_ms": (gen_tokens, 1, gen_tokens + 1, self.max_num_tokens),
-        }
-
-    def _load_time_deep_gemm_limits(self) -> Optional[dict]:
-        """``_deep_gemm_limits`` from the arguments alone, for the model
-        loader to start the DeepGEMM helpers while the weights load; None
-        with prefetch off or limits not known before the model is loaded
-        (the helpers then start at warmup)."""
-        from ..jit_prefetch import prefetch_enabled
-        if not prefetch_enabled():
-            return None
-        if self.max_num_tokens is None or self.batch_size is None:
-            return None  # set from the model's config once it is loaded
-        try:
-            cuda_graph_config = self.llm_args.cuda_graph_config
-            graph_bs = []
-            if isinstance(cuda_graph_config, CudaGraphConfig):
-                graph_bs = filter_cuda_graph_batch_sizes(
-                    cuda_graph_config.batch_sizes or [], self.batch_size,
-                    self.max_num_tokens,
-                    1 + self.original_max_total_draft_tokens,
-                    cuda_graph_config.enable_padding)
-            # The loaded model can still update the speculative config; the
-            # arguments' draft length is the one known now.
-            return self._deep_gemm_limits(graph_bs,
-                                          self.original_max_total_draft_tokens)
-        except Exception as e:  # noqa: BLE001 - prefetch must never fail startup
-            logger.warning(f"[JIT prefetch] DeepGEMM limits not known at load: "
-                           f"{type(e).__name__}: {e}")
-            return None
-
-    def _deep_gemm_providers(self):
-        """The DeepGEMM FP8 Linear and MoE providers of this engine."""
-        from .. import jit_prefetch_deep_gemm as jdg
-
-        limits = self._deep_gemm_limits(self._cuda_graph_batch_sizes,
-                                        self.max_total_draft_tokens)
-        dg_provider = jdg.FP8LinearDeepGemmProvider(self.model, **limits)
-        return dg_provider, jdg.DeepGemmMoEProvider(self.model)
-
-    def _init_jit_prefetch(self,
-                           resource_manager: Optional[ResourceManager] = None
-                           ) -> None:
-        """Start JIT prefetch / JIT stats after warmup (env-gated, see
-        ``tensorrt_llm/_torch/jit_prefetch.py``)."""
-        from ..jit_prefetch import (JitPrefetcher, prefetch_enabled,
-                                    tune_ahead_enabled)
-        prefetcher = JitPrefetcher.init(rank=self.mapping.rank)
-        self._jit_prefetcher = prefetcher
-        self._jit_bind_pending = prefetcher is not None
-        self._jit_report_compiles = prefetcher is not None and prefetcher.stats_on
-        if prefetcher is not None and get_sm_version() in (100, 103):
-            prefetcher.observe_deep_gemm()
-            if self._uses_minimax_m3_msa():
-                prefetcher.install_fmha_sm100_counter()
-        if prefetcher is None:
-            return
-        if not prefetch_enabled():
-            # Tune ahead alone (TLLM_JIT_TUNE_AHEAD=1 without TLLM_JIT_AHEAD):
-            # no helpers, no planning; only the providers that tune ahead,
-            # whose candidates compile in this process.
-            if tune_ahead_enabled():
-                self._register_tune_ahead_providers(prefetcher)
-                prefetcher.tune()
-            return
-        from .. import jit_prefetch_deep_gemm as jdg
-        if jdg.supported():
-            from ..attention.backends.sparse.dsa import indexer as dsa_indexer
-            has_dsa = (bool(dsa_indexer.DG_INDEXER_VARIANTS)
-                       and jdg.supports_indexer())
-            from ..moe.fused_moe.mega_moe import mega_moe_deepgemm as mmd
-            has_mega = bool(
-                mmd.MEGA_MOE_LAYER_CONFIGS) and jdg.supports_mega_moe()
-            if not prefetcher.deep_gemm_enabled():
-                dg_provider, dg_moe = self._deep_gemm_providers()
-                if dg_provider or dg_moe or has_dsa or has_mega:
-                    prefetcher.enable_deep_gemm(dg_provider, dg_moe)
-            if has_dsa:
-                spec_cfg = getattr(self, "spec_config", None)
-                max_draft = getattr(spec_cfg, "max_draft_len", 0) or 0
-                from tensorrt_llm import deep_gemm as _dg
-                self._jit_dsa_provider = jdg.DsaIndexerProvider(
-                    max_draft, _dg.get_num_sms())
-                prefetcher.add_deep_gemm_specs(
-                    self._jit_dsa_provider.pending_specs(), "dsa_indexer")
-            if has_mega:
-                prefetcher.add_deep_gemm_specs(
-                    jdg.MegaMoEProvider().pending_specs(), "mega_moe")
-        from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-        if IS_CUTLASS_DSL_AVAILABLE and get_sm_version() in (100, 103):
-            from .. import jit_prefetch_cute_dsl as jcd
-            kda_provider = jcd.KdaPrefillProvider(self.model)
-            if kda_provider:
-                prefetcher.enable_cute_dsl(kda_provider)
-            norm_provider = jcd.FlashInferNormProvider(self.model)
-            if norm_provider:
-                prefetcher.enable_flashinfer_norm(norm_provider)
-            self._start_cute_dsl_topk_builds(prefetcher)
-        from ..modules.mamba.jit_prefetch_linear_attn import LinearAttnProvider
-        kv_cache_manager = (resource_manager.get_resource_manager(
-            self.kv_cache_manager_key)
-                            if resource_manager is not None else None)
-        get_ssm_dtype = getattr(kv_cache_manager, "get_mamba_ssm_cache_dtype",
-                                None)
-        la_provider = LinearAttnProvider(
-            self.model,
-            max_num_tokens=self.max_num_tokens,
-            chunk_size=getattr(self.attn_metadata, "mamba_chunk_size", 0)
-            if getattr(self, "attn_metadata", None) is not None else 0,
-            max_batch_size=self.batch_size,
-            ssm_state_dtype=get_ssm_dtype() if get_ssm_dtype else None)
-        if la_provider and prefetcher.register("linear_attn", la_provider):
-            logger.info(f"[JIT prefetch] GDN/KDA provider: "
-                        f"{len(la_provider.shapes)} distinct layer shape(s)")
-        from ..attention.backends.sparse.dsa import kernels as dsa_kernels
-        if dsa_kernels.FUSED_DSA_DECODE_TEMPLATE:
-            from ..attention.backends.sparse.dsa.jit_prefetch import \
-                DsaDecodeMetadataProvider
-            prefetcher.register("dsa_decode_metadata",
-                                DsaDecodeMetadataProvider(self.batch_size))
-        from ..attention.backends.sparse.glm_kpool import \
-            kernels as kpool_kernels
-        if kpool_kernels.KPOOL_LAUNCH_TEMPLATE:
-            from ..attention.backends.sparse.glm_kpool.jit_prefetch import \
-                GlmKpoolProvider
-            prefetcher.register("glm_kpool",
-                                GlmKpoolProvider(self.max_num_tokens))
-        if self._uses_minimax_m3_sparse():
-            from ..attention.backends.sparse.minimax_m3.jit_prefetch import \
-                MiniMaxM3TritonProvider
-            from ..attention.backends.sparse.minimax_m3.jit_prefetch_msa import \
-                MiniMaxM3MsaDecodeProvider
-            m3_provider = MiniMaxM3TritonProvider(self.model, self.max_seq_len)
-            if m3_provider:
-                prefetcher.register("minimax_m3_triton", m3_provider)
-            msa_provider = MiniMaxM3MsaDecodeProvider(self.batch_size)
-            if msa_provider:
-                prefetcher.register("minimax_m3_msa", msa_provider)
-        self._register_tune_ahead_providers(prefetcher)
-        from ..modules.mamba import jit_prefetch_decode
-        decode_provider = jit_prefetch_decode.MambaDecodeProvider(
-            self.batch_size)
-        logger.info(f"[JIT prefetch] Mamba decode launches recorded in warmup: "
-                    f"{jit_prefetch_decode.recorded_launchers()}")
-        if decode_provider:
-            prefetcher.register("mamba_decode", decode_provider)
-        # Helpers were started when the prefetcher was created; make sure
-        # their start-up is paid here, inside warmup, not by a request.
-        prefetcher.wait_ready()
-        # Benchmark the untuned autotune keys the providers reach on the
-        # GPU now (their candidates compiled by the helpers), before the
-        # background enumeration fills the helpers' queue. A no-op unless
-        # tune ahead is on (TLLM_JIT_TUNE_AHEAD, default: TLLM_JIT_AHEAD).
-        prefetcher.tune()
-        prefetcher.start_background()
-
-    def _start_cute_dsl_topk_builds(self, prefetcher) -> None:
-        """Queue the CuTe DSL radix top-k and CSA2 candidate-publication
-        variants for the helpers. They follow from the model and the engine
-        limits, so they start before warmup's first forward, whose top-k
-        launches would otherwise compile them; later calls do nothing."""
-        from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103):
-            return
-        from .. import jit_prefetch_cute_dsl as jcd
-        from ..modules.top_k import TopK
-        spec_cfg = getattr(self, "spec_config", None)
-        draft = getattr(spec_cfg, "max_draft_len", 0) or 0
-        next_ns = sorted({1, 1 + draft})
-        max_num_tokens, max_seq_len = self.max_num_tokens, self.max_seq_len
-        topk_provider = jcd.TopKProvider(self.model,
-                                         max_num_tokens=max_num_tokens,
-                                         max_seq_len=max_seq_len)
-        if topk_provider:
-            prefetcher.enable_cute_dsl_topk(topk_provider, next_ns=next_ns)
-
-        # A sparse backend builds its indexer's TopK in its first forward:
-        # queue that instance's variants as it first runs, ahead of other work.
-        def on_first_forward(mod) -> None:
-            try:
-                provider = jcd.TopKProvider(None,
-                                            max_num_tokens=max_num_tokens,
-                                            max_seq_len=max_seq_len,
-                                            modules=[mod])
-                if provider:
-                    prefetcher.enable_cute_dsl_topk(provider,
-                                                    next_ns=next_ns,
-                                                    urgent=True,
-                                                    background=True)
-            except Exception as e:  # noqa: BLE001 - its variants compile in place
-                logger.warning(f"[JIT prefetch] TopK variants not queued: "
-                               f"{type(e).__name__}: {e}")
-
-        TopK.on_first_forward = on_first_forward
-        publish_provider = jcd.Csa2PublishProvider(self.model, self.max_seq_len)
-        if publish_provider:
-            prefetcher.enable_csa2_publish(publish_provider)
-
-    def _register_tune_ahead_providers(self, prefetcher) -> None:
-        """Register the providers that also tune ahead (``tune_batches``);
-        prefetch plans with them too."""
-        from ..modules.mamba.jit_prefetch import MambaSSDProvider
-        provider = MambaSSDProvider(self.model,
-                                    max_num_tokens=self.max_num_tokens,
-                                    max_batch_size=self.batch_size,
-                                    max_seq_len=self.max_seq_len)
-        if provider and prefetcher.register("mamba_ssd", provider):
-            logger.info(f"[JIT prefetch] Mamba SSD provider: "
-                        f"{len(provider.shapes)} distinct layer shape(s)")
 
     ### Helper methods promoted from the original warmup method ###
 
@@ -1735,11 +1323,8 @@ class PyTorchModelEngine(ModelEngine):
             return self._runner.forward(batch)
         assert resource_manager is not None, (
             "scheduled execution requires a resource manager")
-        if self._jit_bind_pending and not self.is_warmup:
-            self._jit_bind_pending = False
-            self._jit_prefetcher.bind_executor_thread()
-        elif self._jit_report_compiles and not self.is_warmup:
-            self._jit_prefetcher.report_process_compiles()
+        if self._jit_serving_forward is not None and not self.is_warmup:
+            self._jit_serving_forward()
         inputs = make_scheduled_inputs(
             batch,
             new_tensors_device,

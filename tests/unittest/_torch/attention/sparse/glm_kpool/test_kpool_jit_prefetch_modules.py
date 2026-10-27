@@ -29,6 +29,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch import jit_prefetch as jp
+from tensorrt_llm._torch import jit_prefetch_engine
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import GlmKpoolSparseAttention
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import backend as kpool_backend
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.jit_prefetch import flashinfer_modules
@@ -108,7 +109,7 @@ def test_start_model_builds_starts_a_helper_only_with_prefetch(sm, monkeypatch, 
     sm(100)
     monkeypatch.setenv("TLLM_JIT_AHEAD", "1" if prefetch else "0")
     with patch.object(jp, "start_flashinfer_build", return_value=True) as start:
-        started = jp.start_model_builds(_Model())
+        started = jit_prefetch_engine.start_model_builds(_Model())
     assert started is prefetch
     if prefetch:
         # A layer's module: joined before the first forward, at this

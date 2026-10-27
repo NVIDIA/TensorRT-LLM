@@ -720,6 +720,7 @@ def test_start_model_builds_queues_the_gemm_tactics_before_warmup(monkeypatch):
     DeepGEMM, and with prefetch on ``start_model_builds`` hands every tactic
     to the CuTe DSL helpers and installs the runner's loader."""
     from tensorrt_llm._torch import jit_prefetch as jp
+    from tensorrt_llm._torch import jit_prefetch_engine
     from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
     from tensorrt_llm._torch.modules.linear import Linear
     from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -747,11 +748,11 @@ def test_start_model_builds_queues_the_gemm_tactics_before_warmup(monkeypatch):
 
     monkeypatch.setenv("TLLM_JIT_AHEAD", "1")
     monkeypatch.setattr(jp.JitPrefetcher, "init", classmethod(lambda cls, rank: _Prefetcher()))
-    assert jp.start_model_builds(model)
+    assert jit_prefetch_engine.start_model_builds(model)
     assert queued == provider.specs
     monkeypatch.setenv("TLLM_JIT_AHEAD", "0")
     queued.clear()
-    assert not jp.start_model_builds(model)
+    assert not jit_prefetch_engine.start_model_builds(model)
     assert queued == [] and ops.fp8_gemm_loader is None
 
 

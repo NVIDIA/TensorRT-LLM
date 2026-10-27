@@ -315,35 +315,12 @@ class DecoderRunner(ScheduledModelRunner):
     @property
     def before_warmup_forwards_callable(self) -> Callable[[], None] | None:
         """Called once the pre-JIT prewarms are done, before the first warmup
-        forward (the engine starts JIT compile-ahead helpers there)."""
+        forward (the engine starts JIT compile-ahead work there)."""
         return self._warmup.before_warmup_forwards_callable
 
     @before_warmup_forwards_callable.setter
     def before_warmup_forwards_callable(self, value: Callable[[], None] | None) -> None:
         self._warmup.before_warmup_forwards_callable = value
-
-    @classmethod
-    def flashinfer_mxfp8_pass_selected(
-        cls,
-        model: torch.nn.Module,
-        mapping: Mapping,
-        *,
-        enable_autotuner: bool,
-        cuda_graphs: bool,
-        compile_all_batches: bool,
-    ) -> bool:
-        """Whether a runner of this class, on ``model``, runs the autotuner
-        warmup's FlashInfer MXFP8 pass (``DecoderWarmup._tunes_flashinfer_mxfp8``),
-        decided from the engine's settings, so JIT compile ahead can also
-        decide it once the model is constructed."""
-        return DecoderWarmup.flashinfer_mxfp8_pass_selected(
-            model,
-            mapping,
-            enable_autotuner=enable_autotuner,
-            context_warmups_supported=cls._context_warmups_supported,
-            cuda_graphs=cuda_graphs,
-            compile_all_batches=compile_all_batches,
-        )
 
     @property
     def cuda_graph_runner(self) -> CUDAGraphRunner | None:

@@ -33,10 +33,11 @@ up to ``max_num_tokens`` (``enumerate_specs``).
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import time
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -115,6 +116,30 @@ def supports_indexer() -> bool:
     from tensorrt_llm import deep_gemm
 
     return supported() and hasattr(deep_gemm, "compile_only_paged_mqa_logits")
+
+
+@functools.lru_cache(maxsize=1)
+def _jit_coverage_pass() -> bool:
+    """Whether warmup keeps its JIT-coverage passes for the DeepGEMM ops (JIT
+    compile ahead off, or unable to build DeepGEMM kernels here)."""
+    from .jit_prefetch import warmup_jit_coverage_enabled
+
+    return warmup_jit_coverage_enabled() or not supported()
+
+
+def swap_ab_tuning_needed() -> bool:
+    """Whether the single-tactic DeepGEMM swap-AB ops
+    (``trtllm::fp8_swap_ab_gemm``, ``trtllm::fp8_prequantized_swap_ab_gemm``)
+    go through the autotuner.
+
+    Their only tactic needs no tuning; the tuning pass (over
+    ``deep_gemm_jit_warmup_buckets``) exists to compile the DeepGEMM layouts
+    during warmup. When JIT compile ahead compiles those layouts in CPU-only
+    helpers instead, the ops call their single tactic directly; if those
+    helpers are not running (they did not start, or all exited before
+    serving), the pass compiles the layouts as without compile ahead.
+    """
+    return _jit_coverage_pass() or not helpers_running
 
 
 def dsa_indexer_built_ahead() -> bool:
@@ -211,6 +236,14 @@ class DsaIndexerProvider:
     imply, including the ``next_n`` the process has not run yet.
     """
 
+    @staticmethod
+    def reached() -> bool:
+        """Whether this process has run an indexer-logits call (warmup ran
+        the DSA indexer) and DeepGEMM can compile the indexer's variants."""
+        from .attention.backends.sparse.dsa.indexer import DG_INDEXER_VARIANTS
+
+        return bool(DG_INDEXER_VARIANTS) and supports_indexer()
+
     def __init__(self, max_draft_tokens: int, num_sms: int):
         self.next_ns = sorted({1, 1 + max(0, int(max_draft_tokens))})
         self.num_sms = int(num_sms)
@@ -253,6 +286,14 @@ class MegaMoEProvider:
 
     def __init__(self):
         self._done: set = set()
+
+    @staticmethod
+    def reached() -> bool:
+        """Whether this process has run a MegaMoE layer (warmup ran one) and
+        DeepGEMM can compile MegaMoE ahead."""
+        from .moe.fused_moe.mega_moe.mega_moe_deepgemm import MEGA_MOE_LAYER_CONFIGS
+
+        return bool(MEGA_MOE_LAYER_CONFIGS) and supports_mega_moe()
 
     @staticmethod
     def band_token_counts(
@@ -420,3 +461,170 @@ def log_unsupported_once(reason: str) -> None:
     logger.info_once(
         f"[JIT prefetch] DeepGEMM prefetch disabled: {reason}", key="jitp_dg_unsupported"
     )
+
+
+# ---------------------------------------------------------------------------
+# What an engine builds ahead, and when (called from jit_prefetch_engine.py)
+# ---------------------------------------------------------------------------
+
+
+def engine_limits(engine, graph_batch_sizes, draft_tokens: int) -> dict:
+    """The limits ``FP8LinearDeepGemmProvider`` plans from in ``engine`` (a
+    ``PyTorchModelEngine``), for CUDA graph batch sizes ``graph_batch_sizes``
+    and ``draft_tokens`` draft tokens per generation request."""
+    # With chunked prefill, MLA runs kv_b_proj over a request's cached
+    # prefix (its earlier chunks, or reused blocks) in loops of up to
+    # chunk_size x chunked_prefill_buffer_batch_size rows, more than
+    # max_num_tokens.
+    rf = engine.attn_runtime_features
+    max_m = engine.max_num_tokens
+    if rf.chunked_prefill:
+        max_m = max(max_m, int(rf.chunk_size or 0) * int(rf.chunked_prefill_buffer_batch_size or 1))
+    # Built first, as warmup and graph capture launch them all before
+    # serving: every CUDA graph shape's token count. Before those, on every
+    # rank, the token counts of the warmup forwards ahead of graph capture:
+    # the attention warmup's (one generation request, one context token,
+    # both together) and max_num_tokens, the general warmup's and the
+    # autotuner's pure-context shape.
+    tokens_per_request = 1 + engine.original_max_total_draft_tokens
+    graph_bs = graph_batch_sizes or []
+    graph_ms = sorted({bs * tokens_per_request for bs in graph_bs} | set(graph_bs))
+    gen_tokens = 1 + draft_tokens
+    return {
+        "max_num_tokens": max_m,
+        "priority_ms": graph_ms,
+        "first_ms": (gen_tokens, 1, gen_tokens + 1, engine.max_num_tokens),
+    }
+
+
+def load_time_limits(engine) -> Optional[dict]:
+    """``engine_limits`` from ``engine``'s arguments alone, to start the
+    helpers while the weights load (``start_weight_load_builds``); None with
+    prefetch off or limits not known before the model is loaded (the helpers
+    then start at warmup, ``start_warmup_builds``)."""
+    from .jit_prefetch import prefetch_enabled
+
+    if not prefetch_enabled():
+        return None
+    if engine.max_num_tokens is None or engine.batch_size is None:
+        return None  # set from the model's config once it is loaded
+    try:
+        from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
+
+        from .pyexecutor.engine.cuda_graph import filter_cuda_graph_batch_sizes
+
+        cuda_graph_config = engine.llm_args.cuda_graph_config
+        graph_bs = []
+        if isinstance(cuda_graph_config, CudaGraphConfig):
+            graph_bs = filter_cuda_graph_batch_sizes(
+                cuda_graph_config.batch_sizes or [],
+                engine.batch_size,
+                engine.max_num_tokens,
+                1 + engine.original_max_total_draft_tokens,
+                cuda_graph_config.enable_padding,
+            )
+        # The loaded model can still update the speculative config; the
+        # arguments' draft length is the one known now.
+        return engine_limits(engine, graph_bs, engine.original_max_total_draft_tokens)
+    except Exception as e:  # noqa: BLE001 - the helpers then start at warmup
+        logger.warning(f"[JIT prefetch] DeepGEMM limits not known at load: {type(e).__name__}: {e}")
+        return None
+
+
+def engine_providers(engine) -> Tuple[FP8LinearDeepGemmProvider, DeepGemmMoEProvider]:
+    """The FP8 Linear and MoE providers of ``engine``'s loaded model, from
+    its CUDA graph batch sizes and draft length."""
+    limits = engine_limits(engine, engine._cuda_graph_batch_sizes, engine.max_total_draft_tokens)
+    return FP8LinearDeepGemmProvider(engine.model, **limits), DeepGemmMoEProvider(engine.model)
+
+
+def start_weight_load_builds(
+    model, rank: int, max_num_tokens: int, priority_ms=(), first_ms=()
+) -> bool:
+    """Start the DeepGEMM helpers on the FP8 Linear and MoE kernels of
+    ``model`` while its weights load.
+
+    The variants follow from the weight shapes and the engine limits, which
+    is everything ``FP8LinearDeepGemmProvider`` and ``DeepGemmMoEProvider``
+    read. Started here, the ~10 s start-up of the helpers and the first
+    layouts the first warmup forwards need (``first_ms``, then ``priority_ms``,
+    then M = 1..16) are done by the time the weights are in; started at
+    warmup, the first forward waits for them. Shapes created by weight loading itself
+    come from the model's predicted weight-read GEMMs where it names them, and
+    are otherwise added at warmup (``start_warmup_builds``). Once per process;
+    returns False if prefetch is off or nothing was started."""
+    from .jit_prefetch import JitPrefetcher, prefetch_enabled
+
+    if not prefetch_enabled():
+        return False
+    try:
+        from .._utils import get_sm_version
+
+        if get_sm_version() not in (100, 103) or not supported():
+            return False
+        prefetcher = JitPrefetcher.init(rank)
+        if prefetcher is None or prefetcher.deep_gemm_enabled():
+            return False
+        dg_provider = FP8LinearDeepGemmProvider(
+            model, max_num_tokens=max_num_tokens, priority_ms=priority_ms, first_ms=first_ms
+        )
+        dg_moe = DeepGemmMoEProvider(model)
+        if not (dg_provider or dg_moe):
+            return False
+        return prefetcher.enable_deep_gemm(dg_provider, dg_moe)
+    except Exception as e:  # noqa: BLE001 - the helpers then start at warmup
+        logger.warning(
+            f"[JIT prefetch] DeepGEMM helpers not started at model load: {type(e).__name__}: {e}"
+        )
+        return False
+
+
+def start_warmup_builds(prefetcher, engine) -> None:
+    """Start building the FP8 Linear and MoE kernels of ``engine``'s loaded
+    model before warmup's first forward, rather than once warmup ends.
+
+    Their variants follow from the weight shapes and the engine limits
+    alone, and with prefetch on warmup no longer sweeps the swap-AB GEMM's
+    M buckets, so warmup's own forwards are the first to reach most M: each
+    CUDA graph shape runs ``batch_size * (1 + draft)`` tokens. Started here,
+    the helpers build those first (``FP8LinearDeepGemmProvider``'s
+    ``priority_ms``) while the eager warmup forwards run, and a warmup launch
+    of a variant a helper has queued waits for its cubin instead of compiling
+    it on the executor. Helpers started while the weights loaded get the
+    shapes weight loading added instead (``JitPrefetcher.refresh_deep_gemm``).
+    """
+    from .._utils import get_sm_version
+
+    if get_sm_version() not in (100, 103) or not supported():
+        return
+    dg_provider, dg_moe = engine_providers(engine)
+    if prefetcher.deep_gemm_enabled():
+        # Started by the model loader on the constructed model: add the
+        # shapes weight loading created.
+        prefetcher.refresh_deep_gemm(dg_provider, dg_moe)
+    elif dg_provider or dg_moe:
+        prefetcher.enable_deep_gemm(dg_provider, dg_moe)
+
+
+def register_providers(prefetcher, engine) -> None:
+    """At the end of warmup, queue the kernels of the DeepGEMM paths warmup
+    ran that follow from what it recorded: the DSA indexer's
+    (``DsaIndexerProvider``) and MegaMoE's (``MegaMoEProvider``). Starts the
+    helpers first if neither the model loader nor warmup did."""
+    if not supported():
+        return
+    has_dsa = DsaIndexerProvider.reached()
+    has_mega = MegaMoEProvider.reached()
+    if not prefetcher.deep_gemm_enabled():
+        dg_provider, dg_moe = engine_providers(engine)
+        if dg_provider or dg_moe or has_dsa or has_mega:
+            prefetcher.enable_deep_gemm(dg_provider, dg_moe)
+    if has_dsa:
+        from tensorrt_llm import deep_gemm
+
+        spec_cfg = getattr(engine, "spec_config", None)
+        max_draft = getattr(spec_cfg, "max_draft_len", 0) or 0
+        dsa_provider = DsaIndexerProvider(max_draft, deep_gemm.get_num_sms())
+        prefetcher.add_deep_gemm_specs(dsa_provider.pending_specs(), "dsa_indexer")
+    if has_mega:
+        prefetcher.add_deep_gemm_specs(MegaMoEProvider().pending_specs(), "mega_moe")

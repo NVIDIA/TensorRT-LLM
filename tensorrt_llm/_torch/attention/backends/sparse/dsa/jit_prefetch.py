@@ -111,3 +111,11 @@ class DsaDecodeMetadataProvider:
                 )
             calls.extend(rec)
         return calls
+
+
+def register_providers(prefetcher, engine) -> None:
+    """Register the fused DSA decode-metadata provider at the end of warmup,
+    if a warmup forward launched that kernel (it plans from that launch,
+    ``kernels.FUSED_DSA_DECODE_TEMPLATE``)."""
+    if kernels.FUSED_DSA_DECODE_TEMPLATE:
+        prefetcher.register("dsa_decode_metadata", DsaDecodeMetadataProvider(engine.batch_size))

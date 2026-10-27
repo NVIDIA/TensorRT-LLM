@@ -143,10 +143,12 @@ def test_a_launch_finds_the_request_queued_for_its_m_window():
 
 
 @pytest.mark.cpu_only
-def test_start_deep_gemm_builds_is_off_without_prefetch(monkeypatch):
+def test_start_weight_load_builds_is_off_without_prefetch(monkeypatch):
+    from tensorrt_llm._torch import jit_prefetch_engine
+
     monkeypatch.delenv("TLLM_JIT_AHEAD", raising=False)
     monkeypatch.delenv("TLLM_JIT_PREFETCH", raising=False)
-    assert not jp.start_deep_gemm_builds(torch.nn.Module(), 0, max_num_tokens=64)
-    assert not jp.start_weight_load_builds(
+    assert not jdg.start_weight_load_builds(torch.nn.Module(), 0, max_num_tokens=64)
+    assert not jit_prefetch_engine.start_weight_load_builds(
         torch.nn.Module(), 0, {"max_num_tokens": 64, "priority_ms": [7]}
     )

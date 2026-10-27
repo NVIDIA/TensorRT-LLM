@@ -3022,8 +3022,8 @@ class PyExecutor:
         with self.response_cv:
             self.is_shutdown = True
             self.response_cv.notify_all()
-        prefetcher = getattr(getattr(self, "model_engine", None),
-                             "_jit_prefetcher", None)
+        from ..jit_prefetch import JitPrefetcher
+        prefetcher = JitPrefetcher.get()
         if prefetcher is not None:
             prefetcher.shutdown()
         self.shutdown_event.set()

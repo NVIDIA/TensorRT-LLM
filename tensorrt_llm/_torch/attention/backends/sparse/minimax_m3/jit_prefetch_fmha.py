@@ -310,3 +310,28 @@ def kv_cache_geometry(model: Any, llm_args: Any) -> Optional[Any]:
         dtype=dtype,
         indexer_kv_dtype=str(getattr(sparse_cfg, "indexer_kv_dtype", "bf16")),
     )
+
+
+def start_model_builds(model: Any, llm_args: Any) -> bool:
+    """Start building the MSA ``fmha_sm100`` kernels of ``model`` once it is
+    constructed, while its weights load, from the KV cache geometry
+    ``llm_args`` describes (``kv_cache_geometry``). Once per process; returns
+    False if nothing was started (no MSA attention, or a value is missing:
+    they then start at warmup, ``start_warmup_builds``)."""
+    from .....jit_prefetch import FmhaSm100Builds
+
+    if FmhaSm100Builds.get() is not None:
+        return False
+    geometry = kv_cache_geometry(model, llm_args)
+    return geometry is not None and FmhaSm100Builds.start(MiniMaxM3FmhaProvider(model, geometry))
+
+
+def start_warmup_builds(model: Any, kv_cache_manager: Any) -> None:
+    """Start building the MSA ``fmha_sm100`` kernels of ``model`` at the
+    start of warmup, before its first forward needs them, from the engine's
+    KV cache manager, unless they started while the weights loaded. Once per
+    process."""
+    from .....jit_prefetch import FmhaSm100Builds
+
+    if FmhaSm100Builds.get() is None:
+        FmhaSm100Builds.start(MiniMaxM3FmhaProvider(model, kv_cache_manager))

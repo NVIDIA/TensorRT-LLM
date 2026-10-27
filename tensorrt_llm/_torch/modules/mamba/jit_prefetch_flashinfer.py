@@ -20,7 +20,7 @@ a single-token generation step's state update through FlashInfer's
 argument signature, at its first call, in warmup's first generation forward.
 
 ``flashinfer_modules`` names the module of that call, which follows from the
-layer alone, for ``jit_prefetch.start_model_builds`` to build in a CPU-only
+layer alone, for ``jit_prefetch_engine.start_model_builds`` to build in a CPU-only
 helper while the weights load. The name is the module's JitSpec name, which
 spells out every argument of its generator, so the helper rebuilds the spec
 from it (``jit_prefetch_flashinfer_helper``).

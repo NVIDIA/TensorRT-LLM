@@ -371,3 +371,24 @@ class LinearAttnProvider:
                     fused_kda_post_conv(packed, num_heads=s.heads, head_dim=s.head_dim)
             self._gated_norm(t, s.heads, s.head_dim, g_out, False, "sigmoid")
         return list(rec)
+
+
+def register_providers(prefetcher, engine, kv_cache_manager=None) -> None:
+    """Register the GDN / KDA provider of ``engine``'s model at the end of
+    warmup, with the SSM state dtype of its ``kv_cache_manager`` and the
+    Mamba chunk size of its attention metadata."""
+    from tensorrt_llm.logger import logger
+
+    get_ssm_dtype = getattr(kv_cache_manager, "get_mamba_ssm_cache_dtype", None)
+    attn_metadata = getattr(engine, "attn_metadata", None)
+    provider = LinearAttnProvider(
+        engine.model,
+        max_num_tokens=engine.max_num_tokens,
+        chunk_size=getattr(attn_metadata, "mamba_chunk_size", 0),
+        max_batch_size=engine.batch_size,
+        ssm_state_dtype=get_ssm_dtype() if get_ssm_dtype else None,
+    )
+    if provider and prefetcher.register("linear_attn", provider):
+        logger.info(
+            f"[JIT prefetch] GDN/KDA provider: {len(provider.shapes)} distinct layer shape(s)"
+        )

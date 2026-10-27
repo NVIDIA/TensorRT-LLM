@@ -681,6 +681,10 @@ class ModelLoader:
     This class isolates model loading logic from the main execution engine.
     """
     _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION = 1
+    # JIT compile ahead and tune ahead of the engine that loads the model
+    # (jit_prefetch_engine.EngineJitAhead), which starts building JIT kernels
+    # while the weights load; None without one.
+    jit_ahead = None
 
     # Root classes are named rather than held, so this table costs no model-zoo
     # import; qualify() resolves only the profile whose class name matches the
@@ -1004,13 +1008,10 @@ class ModelLoader:
                                           self.llm_args.lm_head_output_dtype)
 
             # With JIT compile ahead on (TLLM_JIT_AHEAD=1), JIT kernels the
-            # model's layers build in warmup (FlashInfer modules, CuTe DSL
-            # FP8 GEMM tactics, MiniMax-M3's MSA kernels) are built in
-            # CPU-only helpers while the weights load.
-            from ..jit_prefetch import start_model_builds
-            start_model_builds(model,
-                               rank=self.mapping.rank,
-                               llm_args=self.llm_args)
+            # model's layers build in warmup are built in CPU-only helpers
+            # while the weights load.
+            if self.jit_ahead is not None:
+                self.jit_ahead.model_constructed(model)
 
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)
@@ -1131,15 +1132,12 @@ class ModelLoader:
             logger.info(
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
             )
-            # With JIT prefetch on, the DeepGEMM and low-M GEMM helpers start
-            # now, once the weights are materialized on the GPU (their dozens
-            # of start-ups would slow that host-side step) and as their values
-            # load from the checkpoint.
-            deep_gemm_limits = getattr(self, "deep_gemm_limits", None)
-            if deep_gemm_limits is not None:
-                from ..jit_prefetch import start_weight_load_builds
-                start_weight_load_builds(model, self.mapping.rank,
-                                         deep_gemm_limits)
+            # With JIT compile ahead on, the DeepGEMM and low-M GEMM helpers
+            # start now, once the weights are materialized on the GPU (their
+            # dozens of start-ups would slow that host-side step) and as their
+            # values load from the checkpoint.
+            if self.jit_ahead is not None:
+                self.jit_ahead.weights_allocated(model)
             weights_preloaded = False
             # Set when either GMS RW or GMS RO branch has already run the
             # post_load_* hooks itself, so the shared post-load block below

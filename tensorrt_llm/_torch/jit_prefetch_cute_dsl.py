@@ -1840,7 +1840,7 @@ class FlashInferMxfp8GemmProvider:
     ``meta`` operands for every power-of-two bucket up to ``max_num_tokens``,
     with the compile capturing its key instead of compiling. ``races`` is
     whether warmup runs that pass with the CuTe DSL backend
-    (``jit_prefetch.tunes_flashinfer_mxfp8_at_load`` and no pipeline
+    (``jit_prefetch_mxfp8.tunes_flashinfer_mxfp8_at_load`` and no pipeline
     parallelism, as warmup decides it).
     """
 
@@ -2288,3 +2288,179 @@ def install_flashinfer_norm_loader(
         setattr(module, name, make())
         wrapped.append(name)
     return wrapped
+
+
+# ---------------------------------------------------------------------------
+# What an engine builds ahead, and when (called from jit_prefetch_engine.py)
+# ---------------------------------------------------------------------------
+
+
+def start_model_builds(model, rank: int, llm_args, mxfp8_pass: bool) -> bool:
+    """Start the CuTe DSL helpers on the kernels ``model``'s layers compile
+    in warmup's first forwards, once the model is constructed, so that the
+    helpers' start-up and these builds overlap the weight load: the FP8
+    blockwise GEMM tactics the autotuner benchmarks (``Fp8GemmProvider``:
+    block-FP8 Linear layers without DeepGEMM, and the batched GEMM of
+    DeepSeek-V4's grouped FP8 O-LoRA projection), the NVFP4 dense GEMM tactics
+    the NVFP4 GEMM's autotuner races (``Nvfp4GemmProvider``, M buckets up to
+    the engine's ``max_num_tokens``), the CuTe DSL MoE's NVFP4 grouped GEMM
+    tactics (``MoeGemmProvider``), the KDA prefill kernel
+    (``KdaPrefillProvider``), FlashInfer's CuTe DSL RMSNorm variants
+    (``FlashInferNormProvider``) and, when the autotuner warmup runs its
+    FlashInfer MXFP8 pass (``mxfp8_pass``), FlashInfer's CuTe DSL MXFP8 GEMMs
+    that pass races (``FlashInferMxfp8GemmProvider``). Returns whether
+    anything was started."""
+    from tensorrt_llm.logger import logger
+
+    started = False
+    try:
+        from .cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+        if not IS_CUTLASS_DSL_AVAILABLE:
+            return False
+        from .jit_prefetch import JitPrefetcher
+
+        # Every later cluster-occupancy query reuses one probe kernel.
+        install_occupancy_kernel_cache()
+        # They follow from the layers' geometry and are compiled in warmup's
+        # first forwards: the FP8, NVFP4 and MoE grouped GEMM tactics by the
+        # autotuner, the KDA prefill kernel by the first prefill, the
+        # FlashInfer norms by the first forward.
+        max_num_tokens = getattr(llm_args, "max_num_tokens", None) or 0
+        gemm_provider = Fp8GemmProvider(model)
+        nvfp4_provider = Nvfp4GemmProvider(model, max_num_tokens)
+        kda_provider = KdaPrefillProvider(model)
+        norm_provider = FlashInferNormProvider(model)
+        moe_provider = MoeGemmProvider(model)
+        # Warmup races FlashInfer's CuTe DSL MXFP8 GEMM in that pass, except
+        # under pipeline parallelism.
+        mapping = getattr(getattr(model, "model_config", None), "mapping", None)
+        mxfp8_provider = FlashInferMxfp8GemmProvider(
+            model,
+            max_num_tokens,
+            races=mxfp8_pass and not (mapping is not None and mapping.has_pp()),
+        )
+        providers = (gemm_provider, nvfp4_provider, kda_provider, norm_provider, moe_provider,
+                     mxfp8_provider)  # fmt: skip
+        if not any(providers):
+            return False
+        prefetcher = JitPrefetcher.init(rank)
+        if prefetcher is None:
+            return False
+        # Queued in the order warmup needs them: the norms in the first
+        # forward, ahead of the rest.
+        if norm_provider:
+            started = prefetcher.enable_flashinfer_norm(norm_provider) or started
+        if gemm_provider:
+            started = prefetcher.enable_fp8_gemm(gemm_provider) or started
+        if kda_provider:
+            started = prefetcher.enable_cute_dsl(kda_provider) or started
+        if nvfp4_provider:
+            started = prefetcher.enable_nvfp4_gemm(nvfp4_provider) or started
+        if moe_provider:
+            started = prefetcher.enable_moe_gemm(moe_provider) or started
+        if mxfp8_provider:
+            started = prefetcher.enable_fi_mxfp8_gemm(mxfp8_provider) or started
+    except Exception as e:  # noqa: BLE001 - the kernels then compile in place
+        logger.warning(f"[JIT prefetch] CuTe DSL builds not planned: {type(e).__name__}: {e}")
+    return started
+
+
+def start_weight_load_builds(model, rank: int, max_num_tokens: int) -> bool:
+    """Start building FlashInfer's low-M BF16 direct GEMM variants the low-M
+    dispatcher's AutoTuner race benchmarks (``LowMDirectGemmProvider``), once
+    ``model``'s weights are materialized on the GPU. Returns whether anything
+    was started."""
+    from tensorrt_llm.logger import logger
+
+    try:
+        from .cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+        if not IS_CUTLASS_DSL_AVAILABLE:
+            return False
+        from .jit_prefetch import JitPrefetcher
+
+        lowm_provider = LowMDirectGemmProvider(model, max_num_tokens)
+        if not lowm_provider:
+            return False
+        prefetcher = JitPrefetcher.init(rank)
+        return prefetcher is not None and prefetcher.enable_lowm_direct_gemm(lowm_provider)
+    except Exception as e:  # noqa: BLE001 - the kernels then compile in place
+        logger.warning(f"[JIT prefetch] low-M GEMM builds not planned: {type(e).__name__}: {e}")
+        return False
+
+
+def _blackwell_cute_dsl() -> bool:
+    """Whether the CuTe DSL kernels the engine's providers plan run here."""
+    from .._utils import get_sm_version
+    from .cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    return IS_CUTLASS_DSL_AVAILABLE and get_sm_version() in (100, 103)
+
+
+def start_topk_builds(prefetcher, engine) -> None:
+    """Queue the CuTe DSL radix top-k (``TopKProvider``) and CSA2
+    candidate-publication (``Csa2PublishProvider``) variants of ``engine``'s
+    model for the helpers. They follow from the model and the engine limits,
+    so they start before warmup's first forward, whose top-k launches would
+    otherwise compile them; later calls queue only what earlier ones did not.
+    A ``TopK`` a sparse backend builds in its first forward has its variants
+    queued then, ahead of other work (``TopK.on_first_forward``, until
+    ``stop_topk_builds``)."""
+    if not _blackwell_cute_dsl():
+        return
+    from tensorrt_llm.logger import logger
+
+    from .modules.top_k import TopK
+
+    spec_cfg = getattr(engine, "spec_config", None)
+    draft = getattr(spec_cfg, "max_draft_len", 0) or 0
+    next_ns = sorted({1, 1 + draft})
+    max_num_tokens, max_seq_len = engine.max_num_tokens, engine.max_seq_len
+    topk_provider = TopKProvider(
+        engine.model, max_num_tokens=max_num_tokens, max_seq_len=max_seq_len
+    )
+    if topk_provider:
+        prefetcher.enable_cute_dsl_topk(topk_provider, next_ns=next_ns)
+
+    # A sparse backend builds its indexer's TopK in its first forward: queue
+    # that instance's variants as it first runs, ahead of other work.
+    def on_first_forward(mod) -> None:
+        try:
+            provider = TopKProvider(
+                None, max_num_tokens=max_num_tokens, max_seq_len=max_seq_len, modules=[mod]
+            )
+            if provider:
+                prefetcher.enable_cute_dsl_topk(
+                    provider, next_ns=next_ns, urgent=True, background=True
+                )
+        except Exception as e:  # noqa: BLE001 - its variants compile in place
+            logger.warning(f"[JIT prefetch] TopK variants not queued: {type(e).__name__}: {e}")
+
+    TopK.on_first_forward = on_first_forward
+    publish_provider = Csa2PublishProvider(engine.model, engine.max_seq_len)
+    if publish_provider:
+        prefetcher.enable_csa2_publish(publish_provider)
+
+
+def stop_topk_builds() -> None:
+    """Stop queueing the variants of the ``TopK`` modules built in a first
+    forward (see ``start_topk_builds``)."""
+    from .modules.top_k import TopK
+
+    TopK.on_first_forward = None
+
+
+def register_providers(prefetcher, engine) -> None:
+    """At the end of warmup, queue the CuTe DSL kernels of ``engine``'s
+    loaded model not queued at model construction: the KDA prefill kernel,
+    the FlashInfer norms and the radix top-k / CSA2 variants."""
+    if not _blackwell_cute_dsl():
+        return
+    kda_provider = KdaPrefillProvider(engine.model)
+    if kda_provider:
+        prefetcher.enable_cute_dsl(kda_provider)
+    norm_provider = FlashInferNormProvider(engine.model)
+    if norm_provider:
+        prefetcher.enable_flashinfer_norm(norm_provider)
+    start_topk_builds(prefetcher, engine)

@@ -255,10 +255,11 @@ _MXFP8_CASE = textwrap.dedent(
     """
     import json, os, time
     from tensorrt_llm._torch import jit_prefetch as jp
+    from tensorrt_llm._torch.modules import jit_prefetch_mxfp8 as mx
     from flashinfer.jit import env as jit_env
 
-    sos = [jit_env.FLASHINFER_JIT_DIR / m / f"{m}.so" for m in jp.FLASHINFER_MXFP8_TUNE_MODULES]
-    started = jp.start_mxfp8_tune_builds(True)
+    sos = [jit_env.FLASHINFER_JIT_DIR / m / f"{m}.so" for m in mx.FLASHINFER_MXFP8_TUNE_MODULES]
+    started = mx.start_mxfp8_tune_builds(True)
     waited = jp.wait_flashinfer_build()
     mtimes = [os.stat(so).st_mtime_ns if so.exists() else None for so in sos]
     from flashinfer.gemm.gemm_base import get_gemm_sm100_module_cutlass_mxfp8
@@ -273,7 +274,7 @@ _MXFP8_CASE = textwrap.dedent(
                       "rebuilt": [so.exists() and os.stat(so).st_mtime_ns != m
                                   for so, m in zip(sos, mtimes)],
                       "load_s": load_s, "runner": hasattr(gemm, "cutlass_mxfp8_gemm_runner"),
-                      "again": [jp.start_mxfp8_tune_builds(True), jp.flashinfer_builds_pending()]}))
+                      "again": [mx.start_mxfp8_tune_builds(True), jp.flashinfer_builds_pending()]}))
     """
 )
 

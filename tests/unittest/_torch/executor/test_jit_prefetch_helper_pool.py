@@ -329,18 +329,17 @@ def test_swap_ab_tuning_pass_runs_without_deep_gemm_helpers(monkeypatch, running
     (they did not start, or all exited during warmup) the pass compiles the
     layouts as without compile ahead."""
     from tensorrt_llm._torch import jit_prefetch_deep_gemm as jdg
-    from tensorrt_llm._torch.custom_ops import torch_custom_ops as ops
 
     for var in _SWITCHES:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("TLLM_JIT_AHEAD", "1")
     monkeypatch.setattr(jdg, "supported", lambda: True)
     monkeypatch.setattr(jdg, "helpers_running", running)
-    ops._deep_gemm_jit_coverage_pass.cache_clear()
+    jdg._jit_coverage_pass.cache_clear()
     try:
-        assert ops._deep_gemm_jit_tuning_needed() is (not running)
+        assert jdg.swap_ab_tuning_needed() is (not running)
     finally:
-        ops._deep_gemm_jit_coverage_pass.cache_clear()
+        jdg._jit_coverage_pass.cache_clear()
 
 
 @pytest.mark.cpu_only
