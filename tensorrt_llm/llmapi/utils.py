@@ -805,15 +805,12 @@ def configure_cpu_affinity(device_id: int) -> None:
     if ((numa_aware_affinity is None and not constrained_affinity)
             or (numa_aware_affinity == "1")):
         numa_cpus = get_numa_aware_cpu_affinity(device_id)
-        # Keep the worker off the CPUs reserved for co-located services. The
-        # request-serving and agent-runner processes of an RL rollout are
-        # pinned to a slice of one socket (NRL_RAY_SERVICE_CPUS); without this
-        # exclusion the TP ranks whose GPUs sit on that socket share those
-        # cores with them and their host path runs 2-3x slower than the other
-        # ranks', so every all-reduce of the iteration waits for them.
-        exclude_spec = os.environ.get(WORKER_AFFINITY_EXCLUDE_ENV)
-        if exclude_spec is None:
-            exclude_spec = os.environ.get("NRL_RAY_SERVICE_CPUS", "")
+        # Keep the worker off the CPUs reserved for co-located services (for
+        # example request-serving and agent-runner processes pinned to a slice
+        # of one socket); without this exclusion the TP ranks whose GPUs sit on
+        # that socket share those cores with them and their host path runs
+        # 2-3x slower than the other ranks', so every all-reduce waits for them.
+        exclude_spec = os.environ.get(WORKER_AFFINITY_EXCLUDE_ENV, "")
         numa_cpus, dropped = exclude_cpus_from_affinity(numa_cpus, exclude_spec)
         bound, attempted = _set_affinity_all_threads(numa_cpus)
         if bound == 0:

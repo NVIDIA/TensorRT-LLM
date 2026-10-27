@@ -1242,8 +1242,7 @@ class DecoderWarmup:
            ``_state_passing_fwd_kernel``, ``_chunk_scan_fwd_kernel``, and
            ``_chunk_state_varlen_kernel``.
 
-        Additionally (gated by ``TLLM_GDN_PREFILL_FAMILY_WARMUP``, default on),
-        covers the remaining Triton int-specialization families of the GDN
+        Additionally, covers the remaining Triton int-specialization families of the GDN
         prefill elementwise kernels (``fuse_elementwise_ops.py``): Triton
         specializes int args (packed prefill token count and the strides equal
         to it) into ``==1`` / ``%16==0`` / other families, and
@@ -1326,8 +1325,8 @@ class DecoderWarmup:
         # count for some draft lengths -- acceptable, since the spec-dec
         # target-verify kernel variants are not covered here anyway. None of
         # these needs the chunk-aligned variant (the two base shapes cover
-        # both alignments). Set TLLM_GDN_PREFILL_FAMILY_WARMUP=0 to disable.
-        if os.environ.get("TLLM_GDN_PREFILL_FAMILY_WARMUP", "1") == "1" and capped_num_tokens >= 32:
+        # both alignments).
+        if capped_num_tokens >= 32:
             mamba_warmup_shapes += [
                 # Prefill %16!=0 family, HAS_DECODE=False.
                 (capped_num_tokens - 4, 0, False, False, False),

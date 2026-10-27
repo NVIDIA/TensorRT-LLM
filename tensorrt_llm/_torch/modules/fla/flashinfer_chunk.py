@@ -50,6 +50,7 @@ from tensorrt_llm._torch.modules.fla.fused_state_io import (
 )
 from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
 from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm.logger import logger
 
 # Indexed pool I/O on the plain SM100/SM103 kernel (see the module docstring).
 # Escape hatch for A/B runs; measured on VR200 / flashinfer 0.6.18 as host
@@ -66,7 +67,8 @@ _INDEXED_STATE_IO = os.environ.get("TLLM_GDN_PREFILL_INDEXED_STATE_IO", "1") == 
 # cheaper than gather + scan + scatter both on the GPU (35-42 vs 52 us for 1-24
 # segments of 32-2048 tokens, fi_indexed_vs_compact_gpu_bench.py) and on the
 # host (two launches fewer per layer, the mixed iterations' critical path).
-_INDEXED_STATE_IO_MAX_SEQS = int(os.environ.get("TLLM_GDN_PREFILL_INDEXED_STATE_IO_MAX_SEQS", "32"))
+# The limit was measured on VR200 with FlashInfer 0.6.18.
+_INDEXED_STATE_IO_MAX_SEQS = 32
 
 
 # The indexed single-launch path calls FlashInfer's Blackwell launcher directly
@@ -75,8 +77,7 @@ _INDEXED_STATE_IO_MAX_SEQS = int(os.environ.get("TLLM_GDN_PREFILL_INDEXED_STATE_
 # of host time), and this adapter had already checked what the kernel needs.
 # Measured on the dev node: adapter 26 us -> ~12 us per scan. The
 # launcher is an internal FlashInfer symbol; when it is missing (other FlashInfer
-# versions) or TLLM_GDN_FI_DIRECT_LAUNCH=0 the public wrapper is used.
-_FI_DIRECT_LAUNCH = os.environ.get("TLLM_GDN_FI_DIRECT_LAUNCH", "1") == "1"
+# versions) the public wrapper is used.
 
 # FlashInfer's SM100 CuTe DSL kernel takes int32 cu_seqlens while the Mamba
 # metadata hands the GDN mixer int64 ("_long") views of per-iteration buffers.
@@ -118,11 +119,10 @@ def _int32_cu_seqlens(cu_seqlens: torch.Tensor) -> torch.Tensor:
 def _sm100_direct_launcher():
     """``chunk_gated_delta_rule_sm100(q, k, v, gate, beta, output, cu_seqlens,
     initial_state, output_state, scale, ..., state_indices=)`` or None."""
-    if not _FI_DIRECT_LAUNCH:
-        return None
     try:
         from flashinfer.gdn_kernels.blackwell.gdn_prefill import chunk_gated_delta_rule_sm100
     except ImportError:
+        logger.warning("FlashInfer's direct GDN launcher is unavailable; using the public wrapper")
         return None
     return chunk_gated_delta_rule_sm100
 

@@ -919,6 +919,12 @@ models:
         default: null
         status: prototype
         required: false
+      token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: null
+        status: prototype
+        required: false
 
   ChatCompletionResponse:
     fields:

@@ -22,14 +22,11 @@ from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import flashinfer_
 from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule_indexed_direct
 from tensorrt_llm._torch.modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update
 from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
-    _can_use_flashinfer_gdn_decode,
     _can_use_flashinfer_gdn_verify,
     _flashinfer_gdn_verify,
-    can_use_gdn_decode_pdl_pair,
     flashinfer_gdn_decode_direct_available,
     flashinfer_gdn_decode_t1,
     fused_sigmoid_gating_delta_rule_update,
-    gdn_decode_pdl_update,
 )
 from tensorrt_llm._torch.modules.fla.utils import tensor_cache
 from tensorrt_llm._utils import (
@@ -44,6 +41,7 @@ from ...attention.backends import AttentionMetadata
 from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
+from ...pyexecutor.kv_cache.mamba_cache_manager.common import _stack_state_views
 from ...speculative import SpecMetadata
 from ...utils import EventType, get_model_extra_attrs, is_gdn_replay_enabled, is_torch_compiling
 from ..linear import FP8QDQLinearMethod, Linear, TensorParallelMode, UnquantizedLinearMethod
@@ -65,9 +63,7 @@ from .recurrent_state_cache import reset_recurrent_state_rows
 # column-parallel Linears run side by side: at decode the pair is two cuBLAS
 # split-K launches on two streams that slow each other down and a cross-stream
 # join before the GDN kernel; the fused [qkvz | ba] weight makes it one launch.
-# Only taken for plain bf16 (unquantized, no bias) projections; TLLM_GDN_FUSED_IN_PROJ=0
-# restores the two-Linear path.
-_GDN_FUSED_IN_PROJ = os.environ.get("TLLM_GDN_FUSED_IN_PROJ", "1") != "0"
+# Only taken for plain bf16 (unquantized, no bias) projections.
 
 
 # FlashInfer GDN prefill is ON by default; set TLLM_USE_FLASHINFER_GDN_PREFILL=0
@@ -128,9 +124,9 @@ def _gdn_prefill_uses_flashinfer() -> bool:
 # plain kernel is also faster on the GPU up to 4096 tokens and ~35 us slower at
 # 8192 (results/_analysis_scratch/gdn_prefill_cp_vs_plain_bench.py). Above the
 # threshold the adapter's default ("auto") leaves the choice to FlashInfer. The
-# pin applies on SM90/SM100/SM103/SM107 only; FlashInfer's prefill path also runs
-# on SM120/SM121, which keep its own "auto" routing.
-_GDN_PREFILL_CP_MIN_TOKENS = int(os.environ.get("TLLM_GDN_PREFILL_CP_MIN_TOKENS", "4096"))
+# pin applies on SM90/SM100/SM103 only; FlashInfer's prefill path also runs on
+# SM120/SM121, which keep its own "auto" routing.
+_GDN_PREFILL_CP_MIN_TOKENS = 4096
 
 
 @functools.lru_cache(maxsize=1)
@@ -152,14 +148,7 @@ def _gdn_prefill_use_cp(num_prefill_tokens: int):
 # prefill kernel. The scan pays 70-110 us per layer for the ~190 one-token
 # sequences a typical mixed iteration carries (gdn_prefill_mixedbatch_bench.py:
 # one 512-token chunk 69 us alone, 143-175 us with 192-256 decode sequences),
-# the decode kernel ~10 us. TLLM_GDN_MIXED_DECODE_RECURRENT=0 restores the
-# single scan for A/B.
-_MIXED_DECODE_RECURRENT = os.environ.get("TLLM_GDN_MIXED_DECODE_RECURRENT", "1") == "1"
-
-
-def _force_deterministic() -> bool:
-    # Deterministic runs always split decode rows off the scan, whatever the A/B switch says.
-    return os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+# the decode kernel ~10 us.
 
 
 def _mixed_scan_prefill_layout(
@@ -232,15 +221,29 @@ def _all_layer_state_pools(kv_cache_manager) -> Optional[Tuple[torch.Tensor, tor
     """``(ssm [layers, slots, ...], conv [layers, slots, ...])`` spanning every local GDN layer.
 
     The C++ hybrid manager keeps both as regular-stride views of one pool
-    (``all_ssm_states`` / ``all_conv_states``); the Python manager keeps them as
-    the ``temporal`` / ``conv`` tensors of its state container. ``None`` when the
-    manager exposes neither, in which case the caller falls back to the
-    per-layer reset.
+    (``all_ssm_states`` / ``all_conv_states``); the V2 manager keeps them as lists of
+    per-layer views, stacked here when their layer spacing is constant; the Python
+    manager keeps them as the ``temporal`` / ``conv`` tensors of its state container.
+    ``None`` when the manager exposes none of these, in which case the caller falls
+    back to the per-layer reset.
     """
     ssm = getattr(kv_cache_manager, "all_ssm_states", None)
     conv = getattr(kv_cache_manager, "all_conv_states", None)
     if isinstance(ssm, torch.Tensor) and isinstance(conv, torch.Tensor):
         return ssm, conv
+    if isinstance(ssm, list) and isinstance(conv, list) and ssm and len(ssm) == len(conv):
+        # The V2 manager keeps one logical-slot-indexed view per layer; stack them when affine.
+        key = (len(ssm), ssm[0].data_ptr(), conv[0].data_ptr())
+        cached = getattr(kv_cache_manager, "_gdn_stacked_pools", None)
+        if cached is None or cached[0] != key:
+            stacked_ssm, stacked_conv = _stack_state_views(ssm), _stack_state_views(conv)
+            pools = (
+                (stacked_ssm, stacked_conv)
+                if stacked_ssm is not None and stacked_conv is not None
+                else None
+            )
+            cached = kv_cache_manager._gdn_stacked_pools = (key, pools)
+        return cached[1]
     impl = getattr(kv_cache_manager, "_impl", None)
     if impl is not None and impl is not kv_cache_manager:
         pools = _all_layer_state_pools(impl)
@@ -436,13 +439,7 @@ class _GdnPrefillScratch:
         )
 
 
-_GDN_PREFILL_SCRATCH = os.environ.get("TLLM_GDN_PREFILL_SCRATCH", "1") == "1"
 _gdn_prefill_scratch = _GdnPrefillScratch()
-# Run the prefill conv on the channel-last (token-major) projection slice and let
-# it write a token-major result: no extract-transpose launch and no transposed
-# copy. TLLM_GDN_CONV_CHANNEL_LAST=0 restores the channel-major kernel with the
-# transpose in front of it.
-_GDN_CONV_CHANNEL_LAST = os.environ.get("TLLM_GDN_CONV_CHANNEL_LAST", "1") == "1"
 # TLLM_PWCG_NVTX_PROBE=1 brackets the eager GDN op body in an NVTX range (host attribution).
 _GDN_NVTX_PROBE = os.environ.get("TLLM_PWCG_NVTX_PROBE", "0") == "1"
 
@@ -556,6 +553,9 @@ def _verify_intermediate_state_indices(
 
 
 class Qwen3NextGatedDeltaNet(nn.Module):
+    # Token-major prefill conv, shared with main's Mamba2 switch (default 1).
+    _token_major_conv = os.environ.get("TRTLLM_MAMBA_TOKEN_MAJOR_CONV", "1") == "1"
+
     def __init__(
         self,
         model_config: ModelConfig[Qwen3NextConfig],
@@ -741,8 +741,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         """The fused weight reproduces exactly the plain bf16 F.linear path of the
         two projections: unquantized, no bias, no LoRA, no cuBLAS/CuTe override,
         no locality-domain shards, both weights of one dtype and K."""
-        if not _GDN_FUSED_IN_PROJ:
-            return False
         projections = (getattr(self, "in_proj_qkvz", None), getattr(self, "in_proj_ba", None))
         if not all(isinstance(lin, Linear) for lin in projections):
             return False
@@ -1151,55 +1149,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 self.head_v_dim,
             )
 
-        # Standard decode (1 token/seq): when the FlashInfer kernel is not
-        # taking this batch, run the conv update and the delta-rule update as a
-        # PDL-overlapped pair -- the update kernel's dominant latency (the SSM
-        # state-pool read) is independent of the conv output, so it executes
-        # concurrently with the conv kernel (measured -1.2 us/layer at bs=64 on
-        # VR200). Disable with TRTLLM_GDN_DISABLE_PDL_DECODE_PAIR=1.
-        num_seqs = query_start_loc_long.numel() - 1
-        # Deterministic runs keep the unpaired kernels so decode rows match the mixed-batch split.
-        if (
-            not _force_deterministic()
-            and not _can_use_flashinfer_gdn_decode(
-                ssm_states, self.head_k_dim, self.head_v_dim, mixed_qkv.shape[0], num_seqs
-            )
-            and can_use_gdn_decode_pdl_pair(
-                ssm_states,
-                mixed_qkv.shape[0],
-                num_seqs,
-                self.head_k_dim,
-                self.head_v_dim,
-                self.activation,
-            )
-        ):
-            mixed_qkv = causal_conv1d_update_triton(
-                mixed_qkv,
-                conv_states,
-                self.conv1d.weight,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=cache_indices,
-                launch_dependent_kernels=True,
-            )
-            return gdn_decode_pdl_update(
-                A_log=self.A_log,
-                a=a,
-                dt_bias=self.dt_bias,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-                mixed_qkv=mixed_qkv,
-                b=b,
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices,
-                num_k_heads=self.num_k_heads_per_tp,
-                num_v_heads=self.num_v_heads_per_tp,
-                head_k_dim=self.head_k_dim,
-                head_v_dim=self.head_v_dim,
-                use_qk_l2norm_in_kernel=True,
-                output=output,
-            )
-
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
@@ -1285,7 +1234,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             g_linear = _gdn_prefill_uses_flashinfer()
         # (post-conv decode rows, a, b) when they take the recurrent kernel instead of the scan.
         decode_recurrent: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
-        # FlashInfer's packed views of the scratch-backed post-conv outputs (None off the scratch).
+        # FlashInfer's packed views of the scratch-backed post-conv outputs.
         packed: Optional[_PackedPostConv] = None
 
         conv_states_to_use = conv_states
@@ -1380,16 +1329,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                         self.num_v_heads_per_tp,
                         self.head_v_dim,
                     )
-            elif _MIXED_DECODE_RECURRENT or _force_deterministic():
+            else:
                 # Prefill rows only; the decode rows go through the recurrent
                 # kernel after the scan (see _mixed_decode_recurrent).
                 decode_recurrent = (mixed_qkv_d, a[num_prefill_tokens:], b[num_prefill_tokens:])
                 query, key, value, g, beta, packed = self._post_conv(
                     mixed_qkv_p_t, None, a[:num_prefill_tokens], b[:num_prefill_tokens], g_linear
-                )
-            else:
-                query, key, value, g, beta, packed = self._post_conv(
-                    mixed_qkv_p_t, mixed_qkv_d, a, b, g_linear
                 )
         else:
             mixed_qkv_t = self._prefill_conv(
@@ -1706,13 +1651,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def _prefill_conv_input(self, mixed_qkv_p: torch.Tensor) -> torch.Tensor:
         """Transposed ``[conv_dim, num_prefill_tokens]`` conv input of the prefill rows."""
         num_tokens, width = mixed_qkv_p.shape
-        out = None
-        if _GDN_PREFILL_SCRATCH:
-            out = _gdn_prefill_scratch.conv_input(
-                width, num_tokens, mixed_qkv_p.dtype, mixed_qkv_p.device
-            )
+        out = _gdn_prefill_scratch.conv_input(
+            width, num_tokens, mixed_qkv_p.dtype, mixed_qkv_p.device
+        )
         return extract_transpose_prefill_slice(
-            mixed_qkv_p, num_tokens, 0, width, out=out, check=out is None
+            mixed_qkv_p, num_tokens, 0, width, out=out, check=False
         )
 
     def _prefill_conv(
@@ -1723,11 +1666,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
     ):
-        """The prefill causal conv. Channel-last: the [tokens, conv_dim] projection
-        slice is handed to the kernel as its transposed view and the result is
-        written token-major into the scratch (no extract-transpose launch, no
-        copy). Returns the ``[conv_dim, tokens]`` conv output view."""
-        if _GDN_CONV_CHANNEL_LAST and _GDN_PREFILL_SCRATCH and mixed_qkv_p.stride(1) == 1:
+        """The prefill causal conv. Token-major (``TRTLLM_MAMBA_TOKEN_MAJOR_CONV``): the
+        [tokens, conv_dim] projection slice is handed to the kernel as its transposed
+        view and the result is written token-major into the scratch (no extract-transpose
+        launch, no copy). Returns the ``[conv_dim, tokens]`` conv output view."""
+        if self._token_major_conv and mixed_qkv_p.stride(1) == 1:
             num_tokens, width = mixed_qkv_p.shape
             out = _gdn_prefill_scratch.conv_out(
                 width, num_tokens, mixed_qkv_p.dtype, mixed_qkv_p.device
@@ -1758,21 +1701,19 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def _post_conv(self, prefill_t: torch.Tensor, decode, a, b, g_linear: bool):
         """fused_gdn_post_conv on scratch-backed outputs (fp32 beta; the scan paths):
         ``(q, k, v, g, beta, packed)`` with ``packed`` the ``_PackedPostConv`` of
-        the same buffers (None without the scratch)."""
-        out = packed = None
-        if _GDN_PREFILL_SCRATCH:
-            num_tokens = prefill_t.shape[1] + (0 if decode is None else decode.shape[0])
-            shape = (
-                num_tokens,
-                self.num_k_heads_per_tp,
-                self.head_k_dim,
-                self.num_v_heads_per_tp,
-                self.head_v_dim,
-                prefill_t.dtype,
-                prefill_t.device,
-            )
-            out = _gdn_prefill_scratch.post_conv(*shape)
-            packed = _gdn_prefill_scratch.post_conv_packed(*shape)
+        the same buffers."""
+        num_tokens = prefill_t.shape[1] + (0 if decode is None else decode.shape[0])
+        shape = (
+            num_tokens,
+            self.num_k_heads_per_tp,
+            self.head_k_dim,
+            self.num_v_heads_per_tp,
+            self.head_v_dim,
+            prefill_t.dtype,
+            prefill_t.device,
+        )
+        out = _gdn_prefill_scratch.post_conv(*shape)
+        packed = _gdn_prefill_scratch.post_conv_packed(*shape)
         q, k, v, g, beta = fused_gdn_post_conv(
             prefill_t,
             decode,
@@ -1786,7 +1727,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             self.head_v_dim,
             g_linear=g_linear,
             out=out,
-            check=out is None,
+            check=False,
         )
         return q, k, v, g, beta, packed
 

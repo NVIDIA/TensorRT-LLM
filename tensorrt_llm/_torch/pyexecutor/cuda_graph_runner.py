@@ -288,7 +288,7 @@ class CUDAGraphRunner:
         # Attention-DP padding hint: the per-rank ``(can_run_cuda_graph,
         # batch_size, sample_tier)`` rows that ``_get_padded_batch`` otherwise
         # gathers itself. The executor stashes them when its packed
-        # post-schedule exchange (TLLM_ADP_PACKED_SYNC) already carried the
+        # post-schedule exchange (enable_packed_sync) already carried the
         # values; the next ``_get_padded_batch`` pops the hint instead of
         # gathering. Set and cleared only by rank-uniform executor code, so on
         # any rank the runner either has a hint or gathers -- never a mix.
@@ -1212,7 +1212,7 @@ class CUDAGraphRunner:
         new_batch_size = batch.batch_size
         if (self.enabled and self.config.enable_attention_dp
                 and self.config.mapping.tp_size > 1):
-            # Stash contract (TLLM_ADP_PACKED_SYNC): use the executor's hint if
+            # Stash contract (enable_packed_sync): use the executor's hint if
             # present, otherwise perform the gather. The hint is popped so it
             # can never be reused by a later forward.
             graph_batch_info = self._adp_graph_batch_hint

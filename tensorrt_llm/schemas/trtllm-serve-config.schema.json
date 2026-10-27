@@ -77,6 +77,12 @@
           "title": "Enable Kv Cache Aware Routing",
           "type": "boolean"
         },
+        "enable_packed_sync": {
+          "default": false,
+          "description": "Pack the per-iteration attention-DP host collectives of the disaggregated executor loops (error and KV-timeout votes, rank state, can-queue and the CUDA-graph padding vector) into two fixed-width all-gathers. Inactive, with an info log naming the reason, in modes the packing does not cover (for example PP or CP, speculative decoding, KV connectors, an aggregated executor). Every rank must see the same value.",
+          "title": "Enable Packed Sync",
+          "type": "boolean"
+        },
         "kv_cache_routing_account_for_in_transfer": {
           "default": false,
           "description": "In-transfer load accounting in KV cache-aware routing. When True, requests still streaming KV to the GEN worker (tracked by the PyExecutor AsyncTransferManager but no longer in active_requests) are folded back into the per-rank load reported via RankState. This can improve balance under heavy disagg traffic but inflates num_active_requests reported upstream, which lets the inference loop's idle-fetch wait expire even when no requests are runnable and causes empty fetch cycles. Default False preserves the prior behaviour (fetch blocks when truly idle). Only used when enable_kv_cache_aware_routing is True.",

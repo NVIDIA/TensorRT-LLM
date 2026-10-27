@@ -1489,7 +1489,7 @@ class ModelEngine:
         """The batch ``forward`` would hand to the CUDA-graph runner.
 
         For the executor's packed attention-DP post-schedule exchange
-        (TLLM_ADP_PACKED_SYNC): evaluated right after scheduling with the
+        (enable_packed_sync): evaluated right after scheduling with the
         same execution-batch transform, spec-decode state and KV cache manager
         the forward uses, so the padding hint it yields equals what the runner
         would gather. Runners without graph-batch promotion return the batch

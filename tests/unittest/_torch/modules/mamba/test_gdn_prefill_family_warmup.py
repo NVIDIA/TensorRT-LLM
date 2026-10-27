@@ -15,7 +15,7 @@
 """Triton specialization-family tripwire for the GDN prefill elementwise kernels.
 
 The GDN-prefill family warmup in ``model_engine._run_mamba_hybrid_warmup``
-(gated by ``TLLM_GDN_PREFILL_FAMILY_WARMUP``) relies on Triton's int-arg
+relies on Triton's int-arg
 specialization policy: kernels re-JIT once per family (``==1`` / ``%16==0`` /
 other) of the packed prefill token count (and the strides equal to it), plus
 the ``HAS_DECODE`` constexpr fork of ``_fused_gdn_post_conv_kernel`` — NOT per

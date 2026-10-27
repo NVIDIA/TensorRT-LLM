@@ -13,7 +13,6 @@ import pytest
 import torch
 from transformers import Qwen3NextConfig
 
-import tensorrt_llm._torch.modules.mamba.gdn_mixer as gdn_mixer
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import copy_weight
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
@@ -53,7 +52,7 @@ def _projections(mixer, x):
 def _pair_path_projections(mixer, x, monkeypatch):
     """Reference: the two separate Linears (fused path switched off)."""
     with monkeypatch.context() as m:
-        m.setattr(gdn_mixer, "_GDN_FUSED_IN_PROJ", False)
+        m.setattr(mixer, "_fused_in_proj_eligible", lambda: False)
         mixer.cache_derived_state()
         assert mixer._in_proj_fused_weight is None
         ref = _projections(mixer, x)

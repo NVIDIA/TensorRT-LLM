@@ -32,7 +32,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-333 captured fields.
+334 captured fields.
 
 | Captured key | Capture policy | Kind | Categorical domain |
 |--------------|----------------|------|--------------------|
@@ -40,6 +40,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `attention_dp_config.batching_wait_iters` | `int` | `value` |  |
 | `attention_dp_config.enable_balance` | `bool` | `value` |  |
 | `attention_dp_config.enable_kv_cache_aware_routing` | `bool` | `value` |  |
+| `attention_dp_config.enable_packed_sync` | `bool` | `value` |  |
 | `attention_dp_config.kv_cache_routing_account_for_in_transfer` | `bool` | `value` |  |
 | `attention_dp_config.kv_cache_routing_cold_start_warmup` | `bool` | `value` |  |
 | `attention_dp_config.kv_cache_routing_conversation_affinity` | `bool` | `value` |  |

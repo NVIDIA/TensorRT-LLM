@@ -9,7 +9,6 @@ import pytest
 import torch
 from transformers import Qwen3NextConfig
 
-import tensorrt_llm._torch.modules.mamba.gdn_mixer as gm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -61,7 +60,7 @@ class _CacheManager:
 @pytest.mark.skipif(not _sm100(), reason="FlashInfer GDN prefill + decode kernels (SM100/SM103)")
 @pytest.mark.parametrize("ctx_lens,n_dec", [([70, 45], 0), ([96, 50], 3), ([130], 5)])
 @torch.no_grad()
-def test_forward_core_channel_last_matches_channel_major(monkeypatch, ctx_lens, n_dec):
+def test_forward_core_channel_last_matches_channel_major(ctx_lens, n_dec):
     dev = "cuda"
     mixer = _make_mixer()
     conv_dim = mixer.conv_dim_per_tp
@@ -78,7 +77,7 @@ def test_forward_core_channel_last_matches_channel_major(monkeypatch, ctx_lens, 
     )
 
     def run(channel_last):
-        monkeypatch.setattr(gm, "_GDN_CONV_CHANNEL_LAST", channel_last)
+        mixer._token_major_conv = channel_last
         conv, ssm = conv0.clone(), ssm0.clone()
         layer_cache = SimpleNamespace(
             conv=conv, temporal=ssm, intermediate_conv_window=None, intermediate_ssm=None

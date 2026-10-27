@@ -41,11 +41,8 @@ keeps ``py_executor.py`` mostly orchestration / thin forwarding while
 isolating the lifecycle logic in this module for review.
 """
 
-import cProfile
 import functools
-import io
 import os
-import pstats
 import time
 import uuid
 import weakref
@@ -99,17 +96,6 @@ def load_iteration_indexes(env_var: str):
                 ) from None
 
     return frozenset(starts), frozenset(stops)
-
-
-@functools.cache
-def _load_cprofile_windows():
-    """Parse TLLM_EXECUTOR_CPROFILE_WINDOWS ("a-b,c-d") into [(a, b), ...]."""
-    spec = os.environ.get("TLLM_EXECUTOR_CPROFILE_WINDOWS", "").strip()
-    windows = []
-    for part in filter(None, (piece.strip() for piece in spec.split(","))):
-        start, _, stop = part.partition("-")
-        windows.append((int(start), int(stop)))
-    return windows
 
 
 class PyExecutorProfileManager:
@@ -595,36 +581,6 @@ class PyExecutorProfileManager:
 
     # ---- per-iteration driver (executor thread) --------------------
 
-    def _cprofile_step(self, windows) -> None:
-        """Start / stop the cProfile window whose bounds match iter_counter
-        (see TLLM_EXECUTOR_CPROFILE_WINDOWS) and log its top functions."""
-        executor = self._executor
-        active = getattr(self, "_cprofile_active", None)
-        if active is None:
-            for start, stop in windows:
-                if executor.iter_counter == start:
-                    prof = cProfile.Profile()
-                    self._cprofile_active = (start, stop, prof)
-                    prof.enable()
-                    return
-            return
-        start, stop, prof = active
-        if executor.iter_counter < stop:
-            return
-        prof.disable()
-        self._cprofile_active = None
-        rank = getattr(executor.dist, "rank", 0)
-        world = getattr(executor.dist, "world_size", 1)
-        if rank not in (0, world - 1):
-            return
-        for sort_key, top in (("cumulative", 60), ("tottime", 45)):
-            buf = io.StringIO()
-            pstats.Stats(prof, stream=buf).sort_stats(sort_key).print_stats(top)
-            logger.info(
-                f"EXECUTOR_CPROFILE rank={rank} iters {start}-{stop} "
-                f"sorted by {sort_key}:\n{buf.getvalue()}"
-            )
-
     @contextmanager
     def profile_step(self):
         """Context manager driving per-iteration profile bookkeeping.
@@ -697,12 +653,6 @@ class PyExecutorProfileManager:
             log_ranks = {int(r) for r in log_ranks_str.split(",")}
 
         calibrator = get_calibrator()
-        # TLLM_EXECUTOR_CPROFILE_WINDOWS="600-800,5000-5200": cProfile the executor
-        # thread over those iteration windows (post-warmup iter_counter) and log
-        # the hottest functions on the first and last rank. Dev diagnostic for
-        # host-bound loops; off unless set.
-        cprofile_windows = _load_cprofile_windows()
-
         # Local helper so the inner closure does not need to call
         # ``self._activities_from_names`` which would force a
         # method-name lookup per iteration.
@@ -715,8 +665,6 @@ class PyExecutorProfileManager:
             nonlocal torch_profiler, active_torch_trace_path
             nonlocal active_enable_torch_trace
             calibrator.post_step(it)
-            if cprofile_windows and not executor.is_warmup:
-                self._cprofile_step(cprofile_windows)
             if executor.iter_counter in executor.profile_stop_iters and not executor.is_warmup:
                 if not enabled:
                     # Happens when stop_profile() was called before
@@ -733,16 +681,18 @@ class PyExecutorProfileManager:
                     )
                     executor.profile_stop_iters.discard(executor.iter_counter)
                 else:
-                    if active_enable_torch_trace and torch_profiler is not None:
-                        torch_profiler.stop()
-                        torch_profiler.export_chrome_trace(active_torch_trace_path)
-                        logger.info(
-                            f"Profiling stopped at iteration "
-                            f"{executor.iter_counter}, "
-                            f"trace saved to {active_torch_trace_path}"
-                        )
-                    torch.cuda.cudart().cudaProfilerStop()
-                    calibrator.stop()
+                    # The trace flush stalls every rank for longer than the hang timeout.
+                    with executor.hang_detector.pause():
+                        if active_enable_torch_trace and torch_profiler is not None:
+                            torch_profiler.stop()
+                            torch_profiler.export_chrome_trace(active_torch_trace_path)
+                            logger.info(
+                                f"Profiling stopped at iteration "
+                                f"{executor.iter_counter}, "
+                                f"trace saved to {active_torch_trace_path}"
+                            )
+                        torch.cuda.cudart().cudaProfilerStop()
+                        calibrator.stop()
                     enabled = False
                     # Reset lazy state so a subsequent start/stop
                     # window can pick up a fresh runtime

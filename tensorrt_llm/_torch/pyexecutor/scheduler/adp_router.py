@@ -402,7 +402,7 @@ class ADPRouter(ABC):
         """``gather_all_rank_states`` with extra per-rank ints on the same allgather.
 
         The executor uses this to fold its other fixed-width per-iteration
-        votes (TLLM_ADP_PACKED_SYNC) into the RankState exchange: ``extra_ints``
+        votes (enable_packed_sync) into the RankState exchange: ``extra_ints``
         is appended to the serialized RankState, the vector rides the same
         int64 tensor transport (``Distributed.allgather_ints``), and the extras
         are stripped again on receipt. Every rank must pass the same number of

@@ -1015,7 +1015,7 @@ class DecoderRunner(ScheduledModelRunner):
         Final one-token context requests are promoted into a decode-shaped
         graph candidate when the engine configuration allows it; otherwise the
         scheduled batch is returned as is with no promoted ids. The executor
-        evaluates it right after scheduling (TLLM_ADP_PACKED_SYNC packs the
+        evaluates it right after scheduling (enable_packed_sync packs the
         runner's attention-DP padding vector into its post-schedule exchange,
         see ``PyTorchModelEngine.make_graph_batch``) and obtains exactly the
         rows the runner would gather in the forward.

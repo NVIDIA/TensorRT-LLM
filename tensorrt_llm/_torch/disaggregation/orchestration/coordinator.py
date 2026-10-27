@@ -802,7 +802,7 @@ class DisaggTransferCoordinator:
     def take_pending_timed_out(self) -> List[LlmRequest]:
         """Drain the ADP timeout buffer without voting.
 
-        For the packed attention-DP exchange (TLLM_ADP_PACKED_SYNC): the
+        For the packed attention-DP exchange (enable_packed_sync): the
         executor reports ``bool(buffer)`` on its loop-head all-gather and,
         on a positive vote, fails the drained requests through
         ``fail_timed_out_synced`` -- the same action ``handle_timeouts_synced``
@@ -828,7 +828,7 @@ class DisaggTransferCoordinator:
     def local_error_vote(self) -> Dict[str, List[int]]:
         """This rank's contribution to the ``handle_errors_synced`` vote.
 
-        For the packed attention-DP exchange (TLLM_ADP_PACKED_SYNC): runs the
+        For the packed attention-DP exchange (enable_packed_sync): runs the
         head of ``handle_errors_synced`` (context sends that failed after
         leaving the transfer manager are marked ``DISAGG_TRANS_ERROR``) and
         returns the vote ids of the local error requests and of those whose
