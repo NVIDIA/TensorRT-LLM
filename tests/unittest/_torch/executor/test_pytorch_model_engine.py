@@ -45,7 +45,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           PrefillCudaGraphBackend,
                                           SeqLenAwareSparseAttentionConfig,
@@ -219,7 +219,7 @@ class DummyLegacyMultimodalIndexModel(MultimodalModelMixin, torch.nn.Module):
         return torch.tensor([90, 91], dtype=torch.int32)
 
 
-class DummyModelEngine(PyTorchModelEngine):
+class DummyModelEngine(ModelEngine):
 
     def __init__(
         self,
@@ -353,8 +353,8 @@ def _make_forward_only_engine(
     graph_key: KeyType | None,
     runner_enabled: bool = True,
     private_decoder: bool = False,
-) -> tuple[PyTorchModelEngine, Mock, Mock, Mock, dict[str, object]]:
-    engine = object.__new__(PyTorchModelEngine)
+) -> tuple[ModelEngine, Mock, Mock, Mock, dict[str, object]]:
+    engine = object.__new__(ModelEngine)
     decoder = object.__new__(DecoderRunner)
     engine.model = decoder._model = SimpleNamespace(
         extra_attrs={},
@@ -514,7 +514,7 @@ def create_model_engine_and_kvcache(
     execution_stream: torch.cuda.Stream | None = None,
     spec_config: DecodingBaseConfig | None = None,
     model: DummyModel | None = None,
-) -> tuple[PyTorchModelEngine, KVCacheManagerV2]:
+) -> tuple[ModelEngine, KVCacheManagerV2]:
     tokens_per_block = 1
     max_tokens = 258  # Atleast 1 more than the max seq len
     num_layers = 1
@@ -618,7 +618,7 @@ def test_cleanup_releases_runner_model_before_release_gc() -> None:
     class Model:
         pass
 
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     model = Model()
     model_ref = weakref.ref(model)
     engine._cleanup_done = False
@@ -672,8 +672,8 @@ class GraphOwnerTeardownTestCase(unittest.TestCase):
             _runner=decoder_runner,
         )
 
-        PyTorchModelEngine._release_cuda_graphs(
-            engine, release_nccl_window_owners=False)
+        ModelEngine._release_cuda_graphs(engine,
+                                         release_nccl_window_owners=False)
 
         clear_blocks_graph.assert_not_called()
         backend.clear_piecewise_cuda_graphs.assert_called_once_with(
@@ -682,7 +682,7 @@ class GraphOwnerTeardownTestCase(unittest.TestCase):
             runner.clear.assert_called_once_with(
                 release_nccl_window_owners=False)
 
-        PyTorchModelEngine._release_model_owned_cuda_graphs(
+        ModelEngine._release_model_owned_cuda_graphs(
             engine, release_nccl_window_owners=False)
 
         clear_blocks_graph.assert_called_once_with(
@@ -694,7 +694,7 @@ class GraphOwnerTeardownTestCase(unittest.TestCase):
                     release_model_owned_graphs=release_model_owned_graphs):
                 engine = Mock()
 
-                PyTorchModelEngine.release_executor_resources(
+                ModelEngine.release_executor_resources(
                     engine,
                     release_model_owned_graphs=release_model_owned_graphs)
 
@@ -1599,7 +1599,7 @@ class DecoderForwardTestCase(unittest.TestCase):
     def _make_engine(
         self,
         model: DummyModel | None = None,
-    ) -> tuple[PyTorchModelEngine, KVCacheManagerV2, ResourceManager, Mock]:
+    ) -> tuple[ModelEngine, KVCacheManagerV2, ResourceManager, Mock]:
         engine, kv_cache_manager = create_model_engine_and_kvcache(model=model)
         self.addCleanup(kv_cache_manager.shutdown)
         resource_manager = ResourceManager(
@@ -1608,7 +1608,7 @@ class DecoderForwardTestCase(unittest.TestCase):
         return engine, kv_cache_manager, resource_manager, graph_runner
 
     @staticmethod
-    def _forward(engine: PyTorchModelEngine,
+    def _forward(engine: ModelEngine,
                  kv_cache_manager: KVCacheManagerV2,
                  resource_manager: ResourceManager,
                  batch: ScheduledRequests,
@@ -2031,7 +2031,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine._metadata.setup_attention.assert_not_called()
 
     def test_breakable_rejects_multimodal_models(self) -> None:
-        engine = object.__new__(PyTorchModelEngine)
+        engine = object.__new__(ModelEngine)
         engine.model = DummyLegacyMultimodalIndexModel()
         engine.input_processor = None
         engine.llm_args = SimpleNamespace(
@@ -2044,7 +2044,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_breakable_allows_text_decoder_with_multimodal_processor(
             self) -> None:
-        engine = object.__new__(PyTorchModelEngine)
+        engine = object.__new__(ModelEngine)
         engine.model = Mock(spec=DecoderModelForCausalLM)
         engine.input_processor = Mock(spec=BaseMultimodalInputProcessor)
         engine.llm_args = SimpleNamespace(
@@ -2056,7 +2056,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_breakable_allows_multimodal_wrapper_in_text_only_mode(
             self) -> None:
-        engine = object.__new__(PyTorchModelEngine)
+        engine = object.__new__(ModelEngine)
         engine.model = DummyLegacyMultimodalIndexModel()
         engine.model.llm = Mock(spec=DecoderModelForCausalLM)
         engine.model.mm_encoder = None
@@ -2095,7 +2095,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         with patch("torch.compiler.reset") as reset, \
                 patch("gc.collect") as collect:
-            PyTorchModelEngine.restore_compiled_model_after_refit(
+            ModelEngine.restore_compiled_model_after_refit(
                 model_engine, resource_manager=object())
 
         model_engine._apply_torch_compile.assert_called_once()
@@ -2111,7 +2111,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             _torch_compile_backend=None,
             _apply_torch_compile=Mock(),
         )
-        PyTorchModelEngine.restore_compiled_model_after_refit(
+        ModelEngine.restore_compiled_model_after_refit(
             model_engine, resource_manager=object())
         model_engine._apply_torch_compile.assert_not_called()
 
@@ -2139,7 +2139,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                     _apply_torch_compile=Mock(),
                 )
                 with patch("gc.collect"):
-                    PyTorchModelEngine.restore_compiled_model_after_refit(
+                    ModelEngine.restore_compiled_model_after_refit(
                         model_engine, resource_manager)
                 resource_manager.get_resource_manager.assert_not_called()
                 self.assertEqual(model_engine._apply_torch_compile.call_count,
@@ -2162,8 +2162,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                     _torch_compile_backend=Mock(),
                     _remove_torch_compile=Mock(),
                 )
-                unwrap_core = (
-                    PyTorchModelEngine.unwrap_compiled_model_for_refit)
+                unwrap_core = (ModelEngine.unwrap_compiled_model_for_refit)
                 with patch("torch.cuda.synchronize"):
                     unwrap_core(model_engine)
                 model_engine._remove_torch_compile.assert_called_once()
@@ -2177,7 +2176,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             _torch_compile_backend=None,
             _remove_torch_compile=Mock(),
         )
-        PyTorchModelEngine.unwrap_compiled_model_for_refit(eager)
+        ModelEngine.unwrap_compiled_model_for_refit(eager)
         eager._remove_torch_compile.assert_not_called()
 
     def test_refit_lifecycle_aliases_point_at_renamed_hooks(self) -> None:
@@ -2186,12 +2185,10 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         Dropping an alias would therefore not raise -- it would silently skip
         the unwrap and reintroduce the refit corruption.
         """
-        self.assertIs(
-            PyTorchModelEngine.release_piecewise_cuda_graphs_for_refit,
-            PyTorchModelEngine.unwrap_compiled_model_for_refit)
-        self.assertIs(
-            PyTorchModelEngine.recapture_piecewise_cuda_graphs_after_refit,
-            PyTorchModelEngine.restore_compiled_model_after_refit)
+        self.assertIs(ModelEngine.release_piecewise_cuda_graphs_for_refit,
+                      ModelEngine.unwrap_compiled_model_for_refit)
+        self.assertIs(ModelEngine.recapture_piecewise_cuda_graphs_after_refit,
+                      ModelEngine.restore_compiled_model_after_refit)
 
     def test_build_request_multimodal_input_skips_when_cache_disabled(
             self) -> None:
@@ -2278,7 +2275,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_runner_engine_shared_entries_skip_decoder_state(self) -> None:
         runner = Mock()
-        engine = object.__new__(PyTorchModelEngine)
+        engine = object.__new__(ModelEngine)
         engine._runner = runner
         engine._torch_compile_backend = None
 
@@ -2292,7 +2289,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         runner.init_cuda_graph_lora_manager.assert_not_called()
 
     def test_decoder_engine_shared_entries_use_decoder_state(self) -> None:
-        engine = object.__new__(PyTorchModelEngine)
+        engine = object.__new__(ModelEngine)
         decoder = object.__new__(DecoderRunner)
         engine._runner = decoder
         engine._torch_compile_backend = None
@@ -3021,8 +3018,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 batch_sizes=[1, 2, 3, 1000000000000000000000000]))
         model_engine = DummyModelEngine(llm_args, torch.half)
 
-        self.assertEqual(model_engine._cuda_graph_batch_sizes,
+        self.assertEqual(model_engine.cuda_graph_batch_sizes,
                          [1, 2, 3, model_engine.max_seq_len])
+        self.assertTrue(model_engine.cuda_graph_padding_enabled)
 
     def test_forward_pass_callable_on_cuda_graph_on(self):
         llm_args = TorchLlmArgs(model="dummy",
