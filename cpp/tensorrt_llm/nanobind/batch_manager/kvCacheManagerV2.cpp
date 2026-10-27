@@ -2102,6 +2102,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("mode"), nb::arg("layer_group_id"), "Per life cycle, which is where the scratch slots live.")
         .def_prop_ro("status", [](kv::KvCache const& kvc) { return kvc.status(); })
         .def_prop_ro("is_active", &kv::KvCache::isActive)
+        // Admission into decode, which the manager no longer marks: beyond setting a flag,
+        // this offloaded sparse history, and the sparse fetch path owns that now. A cache
+        // with no sparse life cycle had nothing to offload, so always admitting is what it
+        // already did. Remove once the full sparse attention support is merged and its
+        // callers drop this; it exists only so this change stands alone.
+        .def(
+            "enter_decode",
+            [](kv::KvCache const& self)
+            {
+                if (!self.isActive())
+                {
+                    throw kv::LogicError("Decode admission requires an active request");
+                }
+                return true;
+            },
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Admit this request into decode. Always true for an active request.")
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
         .def_prop_ro(
             "batch_row",
