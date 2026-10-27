@@ -719,6 +719,8 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
         {
             bool isSsm = mManager->lifeCycles().isSsm(lc);
             auto const& lifeCycle = mManager->lifeCycles()[lc];
+            // Every SSM policy needs one writable state slot. Handle SSM first because private and
+            // unselected optional groups also need fresh state, but must not allocate per-token-block pages.
             if (isSsm)
             {
                 numSlotsNeeded[lc] += 1;
