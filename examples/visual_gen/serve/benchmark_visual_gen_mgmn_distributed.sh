@@ -110,9 +110,7 @@ wait_for_server() {
             echo "Server is ready (took ${elapsed}s)"
             return 0
         fi
-        # Without this the loop polls a dead endpoint for the full timeout, so a
-        # server that exits immediately (bad SERVER_CONFIG, world_size mismatch)
-        # consumes the whole allocation instead of failing in seconds.
+        # A dead server never answers /health; stop once its srun has exited.
         if [ -n "${SERVER_PID:-}" ] && ! kill -0 "${SERVER_PID}" 2>/dev/null; then
             echo "ERROR: server srun (PID ${SERVER_PID}) exited before becoming ready" >&2
             return 1
@@ -186,7 +184,7 @@ SERVER_PID=$!
 trap cleanup EXIT
 echo "  Server srun PID: ${SERVER_PID}"
 
-wait_for_server
+wait_for_server || exit 1
 
 # ---------------------------------------------------------------------------
 # Step 2: Run benchmark (rank-0 node only)
@@ -239,7 +237,7 @@ srun -l \
     --container-image "${CONTAINER_IMAGE}" \
     --container-workdir "${PROJECT_ROOT}" \
     --container-mounts=${MOUNT_DIR}:${MOUNT_DEST} \
-    sh -c 'eval "${BENCHMARK_CMD}"'
+    sh -c 'eval "${BENCHMARK_CMD}"' || exit 1
 
 echo ""
 echo "============================================"
