@@ -16,7 +16,8 @@
 // Prunes SLURM job output that L0_Test keeps on the clusters for debugging:
 // sbatch job workspaces (bloom/scripts/<host>-multi_node_test-*) in which no
 // file has changed within the retention period, and agent job logs
-// (slurm-logs/slurm-<jobid>-<host>-test-*.out) older than it.
+// (slurm-logs/slurm-<jobid>-<host>-test-*.out) older than it. Also reports the
+// size and age of the enroot layer cache, which nothing prunes yet.
 
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
@@ -104,6 +105,18 @@ def pruneCommands(String homeDir, String days, boolean dryRun) {
     ].join(" ; ")
 }
 
+// Reports the enroot layer cache L0_Test imports images through (ENROOT_CACHE_PATH)
+// without changing it: total size, file count and the oldest / newest file by mtime.
+def enrootCacheReportCommands(String homeDir) {
+    def cacheDir = "${homeDir}/.cache/enroot"
+    def summarizeFiles = "awk 'NR == 1 { printf \"  oldest: \"; print } END { if (NR) { printf \"  newest: \"; print } print \"  files: \" NR }'"
+    return [
+        "echo 'enroot cache ${cacheDir}:'",
+        "du -shH ${cacheDir} 2>/dev/null | awk '{ printf \"  size: \"; print }'",
+        "find -H ${cacheDir} -type f -printf '%TY-%Tm-%Td %p\\n' 2>/dev/null | sort | ${summarizeFiles}",
+    ].join(" ; ")
+}
+
 def pruneCluster(String clusterName, String days, boolean dryRun) {
     def cluster = SlurmConfig.clusterConfig[clusterName]
     if (!cluster) {
@@ -118,7 +131,9 @@ def pruneCluster(String clusterName, String days, boolean dryRun) {
             timeout: 0,
             script: Utils.sshUserCmd(
                 remote,
-                Utils.bashWrappedRemoteCmd(pruneCommands(homeDir, days, dryRun))
+                Utils.bashWrappedRemoteCmd(
+                    pruneCommands(homeDir, days, dryRun) + " ; " + enrootCacheReportCommands(homeDir)
+                )
             )
         )
     }
