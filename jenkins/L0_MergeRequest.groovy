@@ -1268,9 +1268,11 @@ def _cbtsEnsureCliDependencies(pipeline)
 {
     try {
         // The preparation pod is Debian; requirements.txt includes Click and PyYAML.
-        sh "apt-get update -qq && apt-get install -y -qq python3-pip"
-        sh "python3 -m pip install --break-system-packages --disable-pip-version-check " +
-           "-r ${LLM_ROOT}/jenkins/scripts/cbts/requirements.txt"
+        trtllm_utils.llmExecStepWithRetry(pipeline,
+            script: "apt-get update -qq && apt-get install -y -qq python3-pip")
+        trtllm_utils.llmExecStepWithRetry(pipeline,
+            script: "python3 -m pip install --break-system-packages --disable-pip-version-check " +
+                    "-r ${LLM_ROOT}/jenkins/scripts/cbts/requirements.txt")
         return true
     } catch (InterruptedException e) {
         throw e
