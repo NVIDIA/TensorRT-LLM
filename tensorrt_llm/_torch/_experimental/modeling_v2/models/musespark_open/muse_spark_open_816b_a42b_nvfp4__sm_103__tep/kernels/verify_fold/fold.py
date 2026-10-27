@@ -513,14 +513,12 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
         if (
             launched.num_gens != num_gens
             or launched.k != spec_metadata.runtime_draft_len
-            or self._ctx_block_tables is not None
             or not has_target_features
         ):
             raise FoldStateError(
                 "[musespark_open] verify_fold + context_kv_fork: the context-K/V side chain was launched for "
                 f"{launched.num_gens} requests and K {launched.k}, the folded step has "
                 f"{num_gens} and K {spec_metadata.runtime_draft_len}"
-                + ("; the arena is paged" if self._ctx_block_tables is not None else "")
                 + ("; the step has no target features" if not has_target_features else "")
             )
         num_ctx = fork.commit(launched, slots, gen_num_accepted)

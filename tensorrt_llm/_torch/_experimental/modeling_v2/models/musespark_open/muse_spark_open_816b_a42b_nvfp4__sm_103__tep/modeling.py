@@ -43,7 +43,7 @@ shell is constructed: all of them,
 or none (``dispatch.NO_PATHS``) when the deployment has no composition, and the
 target then runs only the built-in modules as described above. A missing public
 precondition of a planned fast path is an error, whatever the mode. Over a
-full-length drafter context arena the fast paths written for a windowed one
+full-length or paged drafter context the fast paths written for a windowed arena
 are left out of the plan (``dispatch.WINDOWED_CONTEXT_ARENA_PATHS``); over a
 windowed arena (``TRTLLM_DFLASH_WINDOWED_CTX_ARENA``) the paths that write the
 arena by column (``dispatch.FULL_CONTEXT_ARENA_PATHS``: the context-K/V fork and

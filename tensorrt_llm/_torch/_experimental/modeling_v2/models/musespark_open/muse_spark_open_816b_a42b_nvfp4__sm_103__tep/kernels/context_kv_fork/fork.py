@@ -7,7 +7,7 @@ the ``K + 1`` captured target rows of each generation request (``fc`` then
 ``hidden_norm``: the drafter fc shard's sharded GEMM and fabric gather), turns them into the
 drafter's context K/V for all its layers (``precompute_context_kv``: an fp32
 RMSNorm, the fused K/V GEMM, the K norm and RoPE), and stores all ``K + 1``
-rows into the request's slot of the dense context arena -- after the target's
+rows into the request's context (its dense arena slot or pages) -- after the target's
 LM head, the sampler and the acceptance, and before the drafter. None of that
 reads the verify result: the captured rows are final once the last tapped
 target layer has run, the columns and RoPE positions come from the request's
@@ -40,7 +40,7 @@ side stream.
 
 ``DecodeTarget.forward`` arms the fork with the step's metadata, so only
 decode steps (no context rows) fork; the step must also be one the side chain
-reproduces (``ContextKvFork.plan``: the dense arena, the captured features,
+reproduces (``ContextKvFork.plan``: an allocated context, the captured features,
 ``K + 1`` rows per request), otherwise the worker runs the built-in method.
 If an armed fork point did not fire (another feature replaced the LM head's
 GEMM call), the worker forks at the verify and logs that once.
@@ -66,6 +66,12 @@ advances the lengths; the prepare settles the context (``_settle_context``: the
 compaction and that read) on the main stream after the join: the compaction
 moves the columns the side chain wrote, so it must follow them, and nothing else
 in the step writes ``_ctx_base`` before it.
+
+Over the KV cache manager's pages the side chain first decodes this step's page
+table (``_refresh_ctx_block_tables``, which the worker then skips), and the commit
+is the worker's alone: the rows past the accepted count are not zeroed, since
+their columns are the drafter block append's, which overwrites them in the same
+step before anything reads them.
 """
 
 from __future__ import annotations
@@ -116,6 +122,7 @@ FORK_METHODS = (
     "sample_and_accept_draft_tokens",
     "_lazy_init_ctx_buffers",
     "_ensure_spec_dec_state_restored",
+    "_refresh_ctx_block_tables",
     "_forward_impl",
 )
 
@@ -250,7 +257,7 @@ class ContextKvFork:
         capture = current_capture_id()
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
-            gen_hs = self.side_chain(spec_metadata, num_gens, k)
+            gen_hs = self.side_chain(spec_metadata, attn_metadata, num_gens, k)
         self._launched = Launched(main, capture, num_gens, k, point, gen_hs)
         self.launches[point] += 1
 
@@ -276,7 +283,7 @@ class ContextKvFork:
         self._launched = None
 
     def commit(self, launched: Launched, slots, num_accepted) -> Optional[torch.Tensor]:
-        """Zero the masked rows and commit the context on the side stream; return the drafter's lengths.
+        """Zero a dense arena's masked rows and commit the context on the side stream.
 
         The side stream waits for the main stream's work so far -- the
         acceptance and the prepare's last read of ``_ctx_len`` -- and runs the
@@ -298,7 +305,9 @@ class ContextKvFork:
         base, last = arena_columns(worker)
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
-            if base is None or compacts_after_join(worker):
+            if worker._ctx_paged:
+                num_ctx.copy_(worker._commit_context(slots, num_accepted.long(), rows))
+            elif base is None or compacts_after_join(worker):
                 context_kv_commit(
                     worker._ctx_k_buf,
                     worker._ctx_v_buf,
@@ -350,17 +359,16 @@ class ContextKvFork:
         """``(generation requests, K)`` when the side chain reproduces this step's store, else None.
 
         Host-side reads only (per-capture constants under a CUDA graph): the
-        dense arena (full-length or windowed) is allocated, the step has no context rows and at most
-        ``MAX_REQUESTS`` requests of ``K + 1`` target rows each, the target
-        features were captured and the drafter has ``fc`` + ``hidden_norm``
-        (the built-in's ``has_target_features``).
+        context is allocated (pages, or a BF16 dense arena, full-length or
+        windowed), the step has no context rows and at most ``MAX_REQUESTS``
+        requests of ``K + 1`` target rows each, the target features were captured
+        and the drafter has ``fc`` + ``hidden_norm`` (the built-in's
+        ``has_target_features``).
         """
         worker, drafter = self.worker, self.draft_model
         if (
             not worker._ctx_buf_inited
-            or worker._ctx_paged
-            or worker._ctx_k_buf is None
-            or worker._ctx_k_buf.dtype != torch.bfloat16
+            or (not worker._ctx_paged and worker._ctx_k_buf.dtype != torch.bfloat16)
             or worker._ctx_len is None
             or worker._batch_to_slot is None
         ):
@@ -381,14 +389,15 @@ class ContextKvFork:
             return None
         return num_gens, k
 
-    def side_chain(self, spec_metadata, num_gens: int, k: int) -> torch.Tensor:
+    def side_chain(self, spec_metadata, attn_metadata, num_gens: int, k: int) -> torch.Tensor:
         """The built-in store of the step's context K/V, unmasked; runs on the side stream.
 
-        The worker's ``_store_step_context`` without its mask. Its first launch is a
-        torch index kernel, so the fork is a plain dependency on the main stream's
-        last kernel.
+        The worker's ``_store_step_context`` without its mask, after this step's page
+        table decode over the KV cache manager's pages. Its first launch is a torch
+        kernel, so the fork is a plain dependency on the main stream's last kernel.
         """
         worker = self.worker
+        DFlashWorker._refresh_ctx_block_tables(worker, attn_metadata, num_gens)
         slots = worker._batch_to_slot[:num_gens]
         # The built-in's get_hidden_states(num_tokens)[0 : rows]: the same view.
         gen_hs = spec_metadata.captured_hidden_states[
@@ -437,6 +446,13 @@ class ContextKvForkDFlashWorker(DFlashWorker):
                 "[musespark_open] context_kv_fork: the DFlash context arena was rebuilt while a forked "
                 "side chain was writing the previous one"
             )
+
+    def _refresh_ctx_block_tables(self, attn_metadata, num_seqs: int) -> bool:
+        fork: Optional[ContextKvFork] = self.__dict__.get("_kv_fork")
+        if fork is not None and fork.launched:
+            # The side chain decoded this step's table at the fork point.
+            return self._ctx_block_tables is not None
+        return super()._refresh_ctx_block_tables(attn_metadata, num_seqs)
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
         fork: Optional[ContextKvFork] = self.__dict__.get("_kv_fork")
@@ -488,12 +504,11 @@ class ContextKvForkDFlashWorker(DFlashWorker):
         """The built-in ``prepare_1st_drafter_inputs`` for a step whose store the side chain ran.
 
         Written out from the built-in ``DFlashWorker.prepare_1st_drafter_inputs``
-        for its one path here -- no context rows, captured target features, the
-        dense arena (full-length or windowed) -- with the store moved to the side
-        chain: the bonus token and the query positions as the built-in computes
-        them, then the commit launched on the side stream, the bonus-token
-        embedding on the main stream meanwhile, and the join; over a windowed arena
-        the worker compacts, then the prepare settles the context
+        for its one path here -- no context rows, captured target features -- with
+        the store moved to the side chain: the bonus token and the query positions
+        as the built-in computes them, then the commit launched on the side stream,
+        the bonus-token embedding on the main stream meanwhile, and the join; over
+        a windowed arena the worker compacts, then the prepare settles the context
         (``_settle_context``).
         """
         num_gens = launched.num_gens
@@ -604,12 +619,6 @@ def worker_unsupported_reason(spec_worker, draft_model) -> Optional[str]:
         return f"the spec worker is {type(spec_worker).__name__}, not a DFlashWorker"
     if not isinstance(draft_model, DFlashForCausalLM):
         return f"the drafter is {type(draft_model).__name__}, not a DFlashForCausalLM"
-    backend = getattr(draft_model, "dflash_attention_backend", None)
-    if backend != "VANILLA" or getattr(draft_model, "_paged_ctx_cache", False):
-        return (
-            f"the drafter's context cache is not the dense arena (attention backend {backend}); "
-            "the fork reproduces only the dense arena's store"
-        )
     cls = type(spec_worker)
     for name in FORK_METHODS:
         mine = getattr(ContextKvForkDFlashWorker, name, None)
