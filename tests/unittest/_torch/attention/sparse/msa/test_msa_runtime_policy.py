@@ -412,7 +412,10 @@ def _page_index_views(seed: int):
 
 def _bare_manager() -> MiniMaxM3KVCacheManagerV2:
     """A manager with only the state get_block_ids_per_seq reads (no pools, no V2 base)."""
-    return object.__new__(MiniMaxM3KVCacheManagerV2)
+    manager = object.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.layer_specs = None
+    manager.kv_factor = 2
+    return manager
 
 
 def test_block_ids_from_views_is_off_by_default():
