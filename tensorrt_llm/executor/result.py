@@ -564,6 +564,11 @@ class GenerationResultBase:
     def _handle_response(self,
                          response: Union["PostprocWorker.Output", tllm.Response,
                                          ResponseWrapper, ErrorResponse]):
+        """Update outputs, completion state, and handoff metadata from a response.
+
+        Args:
+            response: Executor or postprocessing result for this request.
+        """
         req_perf_metrics_dict = None
         if isinstance(response, ResponseWrapper):
             req_perf_metrics_dict = response.request_perf_metrics
@@ -681,6 +686,7 @@ class GenerationResultBase:
                     ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
                     remote_tail_start=remote_tail_start,
                     multimodal_embedding_handles=None,
+                    multimodal_input_layout=None,
                 )
 
             finish_reasons = response_result.finish_reasons

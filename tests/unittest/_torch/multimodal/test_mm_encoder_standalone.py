@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import dataclasses
 import functools
 import json
 import os
@@ -22,6 +23,7 @@ from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import Generator
 
+import numpy as np
 import pytest
 import torch
 from utils.llm_data import llm_models_root
@@ -31,6 +33,7 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs import TextPrompt, default_multimodal_input_loader
 from tensorrt_llm.inputs.multimodal import apply_mm_hashes
+from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, DisaggregatedParams,
                                  KvCacheConfig, MoeConfig)
 from tensorrt_llm.llmapi.llm import LLM, SamplingParams
@@ -861,6 +864,78 @@ def test_single_request_chat_multiple_images(
             if hasattr(ref_gen, 'logprobs') and hasattr(test_gen, 'logprobs'):
                 assert ref_gen.logprobs == test_gen.logprobs, \
                     f"Log probabilities don't match for output {i}, generation {j}"
+
+
+@pytest.mark.parametrize("model_dir", [pytest.param(_QWEN_3_VL_DIR)],
+                         indirect=True)
+@pytest.mark.parametrize("pd_disagg", [False], indirect=True)
+@pytest.mark.parametrize("frame_counts", [(8, ), (40, ), (8, 8)])
+@pytest.mark.threadleak(enabled=False)
+def test_video_encoder_handoff_preserves_timestamps(llms_and_encoder,
+                                                    frame_counts):
+    """E/PD must consume the same timestamped prompt as aggregated inference."""
+    (llm, _), encoder = llms_and_encoder
+    videos = []
+    for count in frame_counts:
+        indices = np.linspace(0, 239, count).astype(int).tolist()
+        frames = []
+        for index in indices:
+            frame = np.zeros((224, 224, 3), dtype=np.uint8)
+            frame[:, :, 0 if index < 120 else 2] = 255
+            frames.append(frame)
+        videos.append(
+            VideoData(frames=frames,
+                      metadata={
+                          "fps": 24.0,
+                          "total_num_frames": 240,
+                          "duration": 10.0,
+                          "frames_indices": indices,
+                      }))
+    prompt = llm.tokenizer.apply_chat_template(
+        [{
+            "role":
+            "user",
+            "content": [
+                *({
+                    "type": "video"
+                } for _ in videos),
+                {
+                    "type": "text",
+                    "text": "Describe the events and their times in seconds."
+                },
+            ]
+        }],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    inputs = {
+        "prompt": prompt,
+        "multi_modal_data": {
+            "video": videos
+        },
+        "mm_processor_kwargs": {
+            "do_sample_frames": False
+        }
+    }
+    sampling = SamplingParams(temperature=0, top_k=1, max_tokens=64)
+    reference = llm.generate_async(copy.deepcopy(inputs),
+                                   sampling_params=sampling).result()
+    encoded = encoder.generate_async(copy.deepcopy(inputs)).result()
+    handoff = encoded.disaggregated_params
+    assert handoff.multimodal_input_layout.prompt_token_ids == reference.prompt_token_ids
+    assert handoff.mrope_position_ids_handle["tensor_size"][-1] == len(
+        reference.prompt_token_ids)
+    # Exercise a wire round trip without resending the raw video to prefill.
+    handoff = DisaggregatedParams(
+        **json.loads(json.dumps(dataclasses.asdict(handoff))))
+    handoff.request_type = "context_and_generation"
+    output = llm.generate_async({
+        "prompt": prompt
+    },
+                                sampling_params=sampling,
+                                disaggregated_params=handoff).result()
+    assert output.prompt_token_ids == reference.prompt_token_ids
+    assert output.outputs[0].token_ids == reference.outputs[0].token_ids
 
 
 @pytest.mark.parametrize("model_dir", [pytest.param(_QWEN_3_VL_DIR)],

@@ -38,7 +38,15 @@ from ...inputs import (
     register_input_processor,
     support_multimodal_disaggregated,
 )
-from ...inputs.multimodal import MultimodalItemMetadata, MultimodalItemPartition, MultimodalParams
+from ...inputs.multimodal import (
+    MultimodalInputLayout,
+    MultimodalItemMetadata,
+    MultimodalItemPartition,
+    MultimodalParams,
+    _compute_mm_masks,
+    _find_mm_token_runs_from_mask,
+    _find_mm_token_start_pos_from_masks,
+)
 from ...logger import logger
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
@@ -487,19 +495,93 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # np), the raw side is left at 0-255 and the ViT sees garbage.
         return {"image": {"format": "np"}, "video": {"format": "np"}}
 
+    def get_disagg_prefill_inputs(
+        self, prompt_token_ids: List[int], multimodal_params: MultimodalParams
+    ) -> Optional[MultimodalInputLayout]:
+        """Preserve timestamp text and frame-group boundaries from the encoder.
+
+        Args:
+            prompt_token_ids: Fully expanded encoder prompt, including timestamps
+                and visual placeholders.
+            multimodal_params: Processed media metadata and per-item embedding
+                lengths associated with the prompt.
+
+        Returns:
+            An independent copy of the prompt layout, or None for inputs without
+            multimodal embeddings.
+        """
+        mm_data = multimodal_params.multimodal_data or {}
+        item_metadata = multimodal_params.item_metadata
+        embedding_lengths = (
+            item_metadata.output_embedding_lengths if item_metadata is not None else None
+        )
+        if not embedding_lengths:
+            return None
+        if any(length <= 0 for length in embedding_lengths):
+            raise ValueError("Encoder embedding lengths must be positive")
+
+        mm_input = multimodal_params.multimodal_input
+        if mm_input is not None and item_metadata is not None:
+            return MultimodalInputLayout(
+                prompt_token_ids=list(prompt_token_ids),
+                multimodal_lengths=list(mm_input.multimodal_lengths),
+                multimodal_positions=list(mm_input.multimodal_positions),
+                multimodal_embedding_lengths=list(embedding_lengths),
+                **copy.deepcopy(mm_input.run_metadata()),
+                special_token_offsets=copy.deepcopy(mm_data.get("special_token_offsets")),
+                item_types=[
+                    0 if modality == "image" else 1 for modality, _ in item_metadata.item_refs
+                ],
+            )
+
+        # Layout is still required when content hashing is unavailable.
+        input_ids = torch.tensor(prompt_token_ids, dtype=torch.int32)
+        mm_mask, embed_mask, special_mask = _compute_mm_masks(
+            input_ids,
+            self.get_vocab_size(),
+            self.get_mm_token_ids(),
+            self.get_mm_special_token_ids(),
+        )
+        if int(embed_mask.sum().item()) != sum(embedding_lengths):
+            raise ValueError("Encoder prompt embedding slots do not match embedding lengths")
+        mm_positions = torch.where(mm_mask)[0]
+        embedding_ends = torch.tensor(embedding_lengths).cumsum(0)
+        mm_ends = torch.searchsorted(embed_mask[mm_positions].cumsum(0), embedding_ends) + 1
+        lengths = torch.diff(mm_ends, prepend=mm_ends.new_zeros(1)).tolist()
+        positions, special_offsets = _find_mm_token_start_pos_from_masks(
+            mm_mask, special_mask, lengths
+        )
+        run_offsets, run_positions, run_lengths = _find_mm_token_runs_from_mask(mm_mask, lengths)
+        embedding_starts = torch.cat((embedding_ends.new_zeros(1), embedding_ends[:-1]))
+        first_tokens = input_ids[torch.where(embed_mask)[0][embedding_starts]].tolist()
+        return MultimodalInputLayout(
+            prompt_token_ids=list(prompt_token_ids),
+            multimodal_lengths=lengths,
+            multimodal_positions=positions,
+            multimodal_embedding_lengths=list(embedding_lengths),
+            multimodal_item_run_cu_offsets=run_offsets,
+            multimodal_run_positions=run_positions,
+            multimodal_run_lengths=run_lengths,
+            special_token_offsets=special_offsets or None,
+            item_types=[0 if token == self.config.image_token_id else 1 for token in first_tokens],
+        )
+
     def build_disagg_prefill_multimodal_inputs(
         self,
         inputs: TextPrompt,
         mm_handles: List[Dict[str, Any]],
         *,
         mm_hashes: list[list[int]] | None = None,
+        encoder_inputs: Optional[MultimodalInputLayout] = None,
     ) -> tuple[list[int], MultimodalParams]:
         """
         Build disaggregated prefill inputs from multimodal embedding handles.
 
         Args:
-            inputs: Text prompt input container. Must contain a non-empty prompt string.
+            inputs: Text prompt input container. A prompt string is required when
+                encoder_inputs is absent.
             mm_handles: List of multimodal embedding handles.
+            encoder_inputs: Exact prompt and layout exported by the encoder.
             mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
 
         Returns:
@@ -507,7 +589,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             prompt layout, item metadata, and embedding handles.
         """
         text_prompt = inputs.get("prompt")
-        if not text_prompt:
+        if not text_prompt and encoder_inputs is None:
             raise ValueError("Text prompt is required but not provided")
 
         if not isinstance(mm_handles, list):
@@ -520,11 +602,43 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # feature maps from deepstack layers.
         expected_size = self.config.text_config.hidden_size * (1 + num_deepstack_levels)
         for i, mm_handle in enumerate(mm_handles):
+            if len(mm_handle["tensor_size"]) != 2:
+                raise ValueError(f"Multimodal embedding {i} must be rank 2")
             hidden_size = mm_handle["tensor_size"][1]
             if hidden_size != expected_size:
                 raise RuntimeError(
                     f"Expected multimodal embedding {i} to have hidden size {expected_size}, got {hidden_size}."
                 )
+
+        if encoder_inputs is not None:
+            embedding_lengths = [handle["tensor_size"][0] for handle in mm_handles]
+            if encoder_inputs.multimodal_embedding_lengths != embedding_lengths:
+                raise ValueError("Encoder layout embedding lengths do not match embedding handles")
+            layout = copy.deepcopy(encoder_inputs)
+            if layout.item_types is None or any(
+                item_type not in (0, 1) for item_type in layout.item_types
+            ):
+                raise ValueError("Qwen encoder layout must identify each image or video item")
+            item_refs = []
+            local_counts = {"image": 0, "video": 0}
+            for item_type in layout.item_types:
+                modality = "image" if item_type == 0 else "video"
+                item_refs.append((modality, local_counts[modality]))
+                local_counts[modality] += 1
+            params = MultimodalParams.from_embeddings(
+                mm_handles,
+                MultimodalItemMetadata(
+                    item_refs, output_embedding_lengths=layout.multimodal_embedding_lengths
+                ),
+                multimodal_hashes=mm_hashes,
+                multimodal_lengths=layout.multimodal_lengths,
+                multimodal_positions=layout.multimodal_positions,
+                multimodal_item_run_cu_offsets=layout.multimodal_item_run_cu_offsets,
+                multimodal_run_positions=layout.multimodal_run_positions,
+                multimodal_run_lengths=layout.multimodal_run_lengths,
+                special_token_offsets=layout.special_token_offsets,
+            )
+            return layout.prompt_token_ids, params
 
         input_ids = self.tokenizer(text_prompt, return_tensors="pt").input_ids[0]
 

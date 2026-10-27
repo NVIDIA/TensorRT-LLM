@@ -20,7 +20,7 @@ import threading
 import time
 import weakref
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import (Any, Dict, List, Literal, Optional, Sequence, Tuple, Union,
                     cast)
@@ -871,6 +871,22 @@ class BaseLLM:
                  disaggregated_params,
              )
 
+        if (not self.args.mm_encoder_only and disaggregated_params is not None
+                and disaggregated_params.multimodal_input_layout is not None):
+            disaggregated_params = replace(disaggregated_params,
+                                           multimodal_input_layout=None)
+
+        if (self.args.mm_encoder_only
+                and multimodal_params is not None and isinstance(
+                    self.input_processor, BaseMultimodalInputProcessor)):
+            encoder_layout = self.input_processor.get_disagg_prefill_inputs(
+                prompt_token_ids, multimodal_params)
+            if encoder_layout is not None:
+                disaggregated_params = replace(
+                    disaggregated_params or
+                    DisaggregatedParams(request_type="context_and_generation"),
+                    multimodal_input_layout=encoder_layout)
+
         arrival_time = steady_clock_now(
         ) if self.args.return_perf_metrics else None
 
@@ -974,14 +990,16 @@ class BaseLLM:
                     "Multimodal disaggregated inference is not supported for this model"
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
-            # TODO(TRTLLM-12869): Pass encoder-side MM layout through
-            # DisaggregatedParams so prefill does not rebuild prompt tokens,
-            # positions, lengths, runs, special offsets, and cumsum here.
+            layout_kwargs = {}
+            if disaggregated_params.multimodal_input_layout is not None:
+                layout_kwargs[
+                    "encoder_inputs"] = disaggregated_params.multimodal_input_layout
             prompt_token_ids, multimodal_params = (
                 self.input_processor.build_disagg_prefill_multimodal_inputs(
                     inputs,
                     mm_handles,
-                    mm_hashes=disaggregated_params.multimodal_hashes))
+                    mm_hashes=disaggregated_params.multimodal_hashes,
+                    **layout_kwargs))
             if not isinstance(multimodal_params, MultimodalParams):
                 raise TypeError(
                     "build_disagg_prefill_multimodal_inputs must return "
@@ -995,8 +1013,16 @@ class BaseLLM:
                 # BaseWorker resolves embedding handles to local tensor views.
                 multimodal_data = multimodal_params.multimodal_data
                 if disaggregated_params.mrope_position_ids_handle is not None:
-                    # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.
-                    assert disaggregated_params.mrope_position_deltas_handle is not None
+                    if disaggregated_params.mrope_position_deltas_handle is None:
+                        raise ValueError(
+                            "mRoPE position IDs require position deltas")
+                    shape = disaggregated_params.mrope_position_ids_handle[
+                        "tensor_size"]
+                    if tuple(shape) != (3, 1, len(prompt_token_ids)):
+                        raise ValueError(
+                            f"Encoder mRoPE shape {shape} does not match prefill prompt "
+                            f"length {len(prompt_token_ids)}; preserve the encoder prompt layout"
+                        )
                     mrope_config = {}
                     mrope_config[
                         "mrope_position_ids"] = disaggregated_params.mrope_position_ids_handle
