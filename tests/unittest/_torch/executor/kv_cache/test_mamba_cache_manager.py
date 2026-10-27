@@ -3902,6 +3902,26 @@ def test_v2_kda_replay_refuses_kv_pool_rebalance(kda_replay):
         )
 
 
+@skip_no_cuda
+@pytest.mark.parametrize("conv_state_layout", ["x_b_c", "q_k_v"], ids=["mamba2", "gdn"])
+@pytest.mark.parametrize("use_replay_state_update", [True, False], ids=["replay", "no_replay"])
+def test_v2_replay_refuses_kv_pool_rebalance(conv_state_layout, use_replay_state_update):
+    """The Mamba2 / GDN replay state holds one entry per SSM slot the pool keeps at construction, outside the V2
+    pools, and a KV pool rebalance can grow that pool past it, so the manager refuses enable_kv_pool_rebalance with
+    it; speculative decoding without it keeps the rebalance allowed."""
+    kwargs = dict(
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        use_replay_state_update=use_replay_state_update,
+        conv_state_layout=conv_state_layout,
+        enable_kv_pool_rebalance=True,
+    )
+    if not use_replay_state_update:
+        _build_v2_hybrid_with_mamba_layer(**kwargs).shutdown()
+        return
+    with pytest.raises(ValueError, match="enable_kv_pool_rebalance=False"):
+        _build_v2_hybrid_with_mamba_layer(**kwargs)
+
+
 def _v2_kda_draft_record_manager(kda_draft_records, enable_block_reuse):
     """A V2 hybrid manager stub for _build_cache_config: one KDA layer with the replay caches and one attention
     layer."""
@@ -4481,6 +4501,195 @@ def test_v2_kda_replay_suspend_resume_matches_an_unsuspended_run(slot_taken):
                 actual, expected, atol=2e-2, rtol=2e-2, msg=f"verify round {round_idx}"
             )
     torch.testing.assert_close(states, expected_states, atol=1e-3, rtol=1e-3)
+
+
+_REPLAY_HISTORIES = ("old_x", "old_B", "old_dt", "old_dA_cumsum")
+_REPLAY_LAYOUTS = pytest.mark.parametrize(
+    "conv_state_layout", ["x_b_c", "q_k_v"], ids=["mamba2_replay", "gdn_replay"]
+)
+
+
+def _v2_replay_manager_with_large_slots(conv_state_layout):
+    """_v2_kda_replay_manager_with_large_slots' geometry with the Mamba2 (``x_b_c``) or GDN (``q_k_v``) replay state
+    update in place of the KDA replay caches: an SSM slot (~2.4 MiB) is larger than the 2 MiB allocation grain, so the
+    SSM pool runs out of slots before the attention pages run out."""
+    num_mamba_layers = 6
+    return MambaHybridCacheManagerV2(
+        mamba_d_state=128,
+        mamba_d_conv=4,
+        mamba_num_heads=6,
+        mamba_n_groups=6,
+        mamba_head_dim=128,
+        mamba_num_layers=num_mamba_layers,
+        mamba_layer_mask=[True] * num_mamba_layers + [False],
+        mamba_cache_dtype=torch.bfloat16,
+        mamba_ssm_cache_dtype=torch.float32,
+        kv_cache_config=KvCacheConfig(
+            max_tokens=4096, enable_block_reuse=False, max_util_for_resume=1.0
+        ),
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=1,
+        num_kv_heads=4,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=128,
+        max_batch_size=4,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        layer_mask=[False] * num_mamba_layers + [True],
+        vocab_size=1024,
+        conv_state_layout=conv_state_layout,
+        use_replay_state_update=True,
+    )
+
+
+def _add_generation_request(mgr, request_id):
+    """A generation request holding a slot. add_dummy_requests marks its requests as dummies, which suspend_request
+    leaves alone, so the request is turned into a real one."""
+    (request,) = mgr.add_dummy_requests(
+        [request_id], token_nums=[8], is_gen=True, max_num_draft_tokens=2
+    )
+    request.is_dummy_request = False
+    mgr._setup_state_indices([request], num_contexts=0)
+    return request
+
+
+def _fill_replay_slot(mgr, slot, generator, num_accepted, cache_buf_idx):
+    """Random V2 SSM and conv states and replay histories at ``slot``, with ``num_accepted`` accepted tokens pending
+    in history buffer ``cache_buf_idx``."""
+    for ssm_states, conv_states in zip(mgr.all_ssm_states, mgr.all_conv_states):
+        ssm_states[slot] = torch.randn(ssm_states.shape[1:], generator=generator, device="cuda")
+        conv_states[slot] = torch.randn(
+            conv_states.shape[1:], generator=generator, device="cuda"
+        ).to(conv_states.dtype)
+    mgr.prev_num_accepted_tokens[slot] = num_accepted
+    mgr.cache_buf_idx[slot] = cache_buf_idx
+    for name in _REPLAY_HISTORIES:
+        history = getattr(mgr, name)
+        history[:, slot] = torch.randn(
+            history[:, slot].shape, generator=generator, device="cuda"
+        ).to(history.dtype)
+
+
+def _replay_slot_state(mgr, slot):
+    """The whole recurrent state at ``slot``: the V2 SSM and conv states and the replay state."""
+    torch.cuda.synchronize()
+    return {
+        "ssm": torch.stack([ssm_states[slot] for ssm_states in mgr.all_ssm_states]).clone(),
+        "conv": torch.stack([conv_states[slot] for conv_states in mgr.all_conv_states]).clone(),
+        "prev_num_accepted_tokens": mgr.prev_num_accepted_tokens[slot].clone(),
+        "cache_buf_idx": mgr.cache_buf_idx[slot].clone(),
+        **{name: getattr(mgr, name)[:, slot].clone() for name in _REPLAY_HISTORIES},
+    }
+
+
+def _assert_same_replay_slot_state(actual, expected):
+    for name, value in expected.items():
+        assert torch.equal(actual[name], value), name
+
+
+@skip_no_cuda
+@_REPLAY_LAYOUTS
+@pytest.mark.parametrize("slot_taken", [True, False], ids=["slot_taken", "slot_kept"])
+def test_v2_replay_suspend_resume_keeps_the_replay_state(conv_state_layout, slot_taken):
+    """A generation request is suspended with accepted tokens pending in its replay history and resumes. Its V2 SSM
+    and conv states come back with its SSM page, and its replay state (prev_num_accepted_tokens, cache_buf_idx and both
+    halves of every replay history), which lives outside the V2 pools, comes back with them, bit for bit, in the slot
+    it resumes in.
+
+    slot_taken: while the request is suspended, new caches fill the SSM pool, so the V2 runtime moves its SSM page to
+    the host tier and gives its slot to one of them, whose prefill and verify rounds overwrite the slot; the request
+    resumes in another slot, and the restore leaves the new owner's state alone. slot_kept: nothing else runs while it
+    is suspended."""
+    mgr = _v2_replay_manager_with_large_slots(conv_state_layout)
+    others = []
+    request = None
+    try:
+        request = _add_generation_request(mgr, 1)
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        slot = mgr._request_id_to_state_index[1]
+        _fill_replay_slot(mgr, slot, generator, num_accepted=5, cache_buf_idx=1)
+        expected = _replay_slot_state(mgr, slot)
+
+        mgr.suspend_request(request)
+        if slot_taken:
+            _take_ssm_slot(mgr, slot, others)
+            _fill_replay_slot(mgr, slot, generator, num_accepted=3, cache_buf_idx=0)
+            new_owner_state = _replay_slot_state(mgr, slot)
+        assert mgr.resume_request(request)
+        mgr._setup_state_indices([request], num_contexts=0)
+
+        resumed_slot = mgr._request_id_to_state_index[1]
+        if slot_taken:
+            assert resumed_slot != slot
+            _assert_same_replay_slot_state(_replay_slot_state(mgr, slot), new_owner_state)
+        _assert_same_replay_slot_state(_replay_slot_state(mgr, resumed_slot), expected)
+    finally:
+        for cache in others:
+            cache.close()
+        if request is not None:
+            mgr.free_resources(request)
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@_REPLAY_LAYOUTS
+def test_v2_replay_suspended_request_resumed_as_context_starts_over(conv_state_layout):
+    """A suspended request that comes back as a context request re-prefills: its slot's replay state is reset, and
+    the replay state saved at the suspend is dropped instead of restored, now or at its next generation step."""
+    mgr = _v2_replay_manager_with_large_slots(conv_state_layout)
+    request = None
+    try:
+        request = _add_generation_request(mgr, 1)
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        _fill_replay_slot(
+            mgr, mgr._request_id_to_state_index[1], generator, num_accepted=5, cache_buf_idx=1
+        )
+        mgr.suspend_request(request)
+        assert 1 not in mgr._request_id_to_state_index
+        assert mgr.resume_request(request)
+
+        mgr._setup_state_indices([request], num_contexts=1)
+        mgr._reset_context_mamba_slots(1)
+        assert not mgr._suspended_replay_states
+        mgr._setup_state_indices([request], num_contexts=0)
+
+        state = _replay_slot_state(mgr, mgr._request_id_to_state_index[1])
+        for name in ("prev_num_accepted_tokens", "cache_buf_idx", *_REPLAY_HISTORIES):
+            assert not state[name].any(), name
+    finally:
+        if request is not None:
+            mgr.free_resources(request)
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@_REPLAY_LAYOUTS
+def test_v2_replay_suspend_keeps_nothing_for_freed_or_dummy_requests(conv_state_layout):
+    """The replay state saved at a suspend is released with the request when it is freed while suspended. A dummy
+    request's replay state is never read, so its suspend saves nothing and keeps its slot mapping."""
+    mgr = _v2_replay_manager_with_large_slots(conv_state_layout)
+    request = None
+    dummy = None
+    try:
+        request = _add_generation_request(mgr, 1)
+        mgr.suspend_request(request)
+        assert set(mgr._suspended_replay_states) == {1}
+        mgr.free_resources(request)
+        request = None
+        assert not mgr._suspended_replay_states
+
+        (dummy,) = mgr.add_dummy_requests([2], token_nums=[8], is_gen=True, max_num_draft_tokens=2)
+        slot = mgr._request_id_to_state_index[2]
+        mgr.suspend_request(dummy)
+        assert not mgr._suspended_replay_states
+        assert mgr._request_id_to_state_index[2] == slot
+    finally:
+        for live in (request, dummy):
+            if live is not None:
+                mgr.free_resources(live)
+        mgr.shutdown()
 
 
 @skip_no_cuda

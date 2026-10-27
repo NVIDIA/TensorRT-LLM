@@ -3415,6 +3415,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # update_resources has not recorded yet.
         self._kda_replay_acceptance_pending: set[int] = set()
         self._kda_replay_unseeded: set[int] = set()
+        # Mamba2 / GDN replay state of suspended requests, copied to the host
+        # by suspend_request in the order of _replay_slot_buffers(); the
+        # request's next generation step restores it into the slot it resumes
+        # in.
+        self._suspended_replay_states: dict[int, list[torch.Tensor]] = {}
 
         state_index_capacity = (self.max_batch_size +
                                 self._num_reserved_dummy_slots)
@@ -4214,6 +4219,19 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 "are sized once from the SSM pool's slot count, and a KV pool "
                 "rebalance can grow that pool past them: set "
                 "kv_cache_config.enable_kv_pool_rebalance=False.")
+        if (kv_cache_config.enable_kv_pool_rebalance
+                and self.local_num_mamba_layers > 0
+                and self.replay_step_width is not None):
+            # Likewise, the Mamba2 / GDN replay tensors (old_x, old_B, old_dt,
+            # old_dA_cumsum, cache_buf_idx and prev_num_accepted_tokens) are
+            # allocated once for the SSM pool's slot count, outside the V2
+            # pools, and the replay kernels index them by slot without a bound.
+            raise ValueError(
+                "The Mamba2 / GDN replay state (speculative decoding with the "
+                "replay state update) is sized once from the SSM pool's slot "
+                "count, and a KV pool rebalance can grow that pool past it: "
+                "set kv_cache_config.enable_kv_pool_rebalance=False, or "
+                "TRTLLM_USE_MAMBA_REPLAY=0 to use the non-replay path.")
         cache_tiers = config.cache_tiers
         gpu_quota = cache_tiers[0].quota
         minimum_live_quota = self._minimum_live_gpu_quota()
@@ -4555,15 +4573,28 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
 
     def suspend_request(self, req: LlmRequest) -> None:
-        """Suspend the request's KV cache with its whole KDA state in V2.
+        """Suspend the request's KV cache together with its replay state.
 
-        The drafts the last verify accepted are pending in the slot's KDA
-        replay buffers, and so is the conv window, which the fused verify does
-        not write to the V2 conv state. The pending drafts and the conv window
-        are committed into the slot's SSM and conv states here, before the
-        pages are released, so the suspended state is self-contained in the
-        recurrent state; the request's next generation step re-seeds the
-        replay buffers of whichever slot it resumes in from them.
+        While the request is suspended, V2 may move its SSM page to another
+        tier and give its slot to another cache, so the request can resume in
+        a different slot. Its recurrent state is the slot's V2 SSM and conv
+        states plus, with speculative decoding, the replay state of the
+        accepted tokens not yet folded into the SSM state, which must follow
+        it to the new slot.
+
+        KDA: the pending drafts sit in the slot's KDA replay buffers, and so
+        does the conv window, which the fused verify does not write to the V2
+        conv state. The pending drafts and the conv window are committed into
+        the slot's SSM and conv states here, before the pages are released,
+        so the suspended state is self-contained in the recurrent state; the
+        request's next generation step re-seeds the replay buffers of
+        whichever slot it resumes in from them.
+
+        Mamba2 / GDN replay: the replay state lives in tensors indexed by slot
+        outside the V2 pools (``_replay_slot_buffers``). The slot's entries
+        are copied to the host here, and the request's next generation step
+        copies them into the slot it resumes in, so the state it resumes with
+        is bit for bit the one it was suspended with.
         """
         request_id = req.py_request_id
         kv_cache = self.kv_cache_map.get(request_id)
@@ -4585,7 +4616,89 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 self._commit_kda_pending_drafts(slot)
             del self._request_id_to_state_index[request_id]
             self._kda_replay_suspended.add(request_id)
+        elif (self._has_replay_slot_buffers and slot >= 0
+              and kv_cache is not None and kv_cache.is_active
+              and not req.is_dummy):
+            # Forgetting the slot also keeps a later suspend before the next
+            # generation step from overwriting the copy with the new slot's
+            # entries.
+            self._suspended_replay_states[request_id] = (
+                self._copy_replay_slot_to_host(slot))
+            del self._request_id_to_state_index[request_id]
         super().suspend_request(req)
+
+    @property
+    def _has_replay_slot_buffers(self) -> bool:
+        """Whether this rank keeps Mamba2 / GDN replay state in tensors
+        indexed by state slot outside the V2 pools."""
+        return (not self.use_kda_replay_update
+                and self.prev_num_accepted_tokens is not None)
+
+    def _replay_slot_buffers(self) -> list[tuple[torch.Tensor, int]]:
+        """The Mamba2 / GDN replay tensors, each with its slot dimension.
+
+        ``prev_num_accepted_tokens`` and ``cache_buf_idx`` are ``[slots]``;
+        ``old_x``, ``old_B``, ``old_dt`` and ``old_dA_cumsum`` are
+        ``[layers, slots, 2, ...]``, both halves of the double-buffered
+        history.
+        """
+        buffers = [(self.prev_num_accepted_tokens, 0), (self.cache_buf_idx, 0)]
+        buffers.extend((history, 1)
+                       for history in (self.old_x, self.old_B, self.old_dt,
+                                       self.old_dA_cumsum)
+                       if history is not None)
+        return buffers
+
+    def _copy_replay_slot_to_host(self, slot: int) -> list[torch.Tensor]:
+        """Copy the slot's entries of ``_replay_slot_buffers()`` to new host
+        tensors, in that order.
+
+        Only the current stream (verify, context reset) and the KV caches'
+        stream (``_restore_suspended_replay_states``) write these tensors. The
+        copies run on the KV caches' stream after the current stream's earlier
+        work, which includes the request's last verify, and before its later
+        work and the KV caches' stream's later work, which include whatever
+        the slot's next owner writes to it.
+        """
+        host_entries = []
+        with self._on_kv_cache_stream():
+            for buffer, slot_dim in self._replay_slot_buffers():
+                entry = buffer.select(slot_dim, slot)
+                host_entry = torch.empty(entry.shape,
+                                         dtype=entry.dtype,
+                                         pin_memory=prefer_pinned())
+                host_entry.copy_(entry, non_blocking=True)
+                host_entries.append(host_entry)
+        return host_entries
+
+    def _restore_suspended_replay_states(self, requests: list[LlmRequest],
+                                         num_contexts: int) -> None:
+        """Copy the replay state saved by ``suspend_request`` into the slots
+        the batch's suspended generation requests resume in.
+
+        A suspended request that comes back as a context request starts over,
+        so its saved state is dropped. The copies run on the KV caches'
+        stream, after the copies out of the slots' previous owners and the
+        current stream's earlier work, and before the current stream's later
+        work, which includes the next verify.
+        """
+        if not self._suspended_replay_states:
+            return
+        for request in requests[:num_contexts]:
+            self._suspended_replay_states.pop(request.py_request_id, None)
+        resumed = [(self._suspended_replay_states.pop(request.py_request_id),
+                    self._request_id_to_state_index[request.py_request_id])
+                   for request in requests[num_contexts:]
+                   if request.py_request_id in self._suspended_replay_states]
+        if not resumed:
+            return
+        with self._on_kv_cache_stream():
+            for host_entries, slot in resumed:
+                for (buffer,
+                     slot_dim), host_entry in zip(self._replay_slot_buffers(),
+                                                  host_entries):
+                    buffer.select(slot_dim, slot).copy_(host_entry,
+                                                        non_blocking=True)
 
     @contextmanager
     def _on_kv_cache_stream(self):
@@ -4682,6 +4795,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._kda_replay_suspended.discard(request.py_request_id)
         self._kda_replay_acceptance_pending.discard(request.py_request_id)
         self._kda_replay_unseeded.discard(request.py_request_id)
+        self._suspended_replay_states.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -4747,6 +4861,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         for req, value, dummy in zip(requests, state_values, is_dummy):
             self._request_id_to_state_index[req.py_request_id] = value
             self._request_id_to_is_dummy[req.py_request_id] = dummy
+
+        if self._has_replay_slot_buffers:
+            self._restore_suspended_replay_states(requests, num_contexts)
 
         if self.use_kda_replay_update:
             # A suspended request that comes back as a context request starts
