@@ -24,12 +24,13 @@ family library shares is in `cpp/tensorrt_llm/modeling_v2/` and
 
 Scope — per family, else all of modeling_v2:
 A change confined to one family's directory (`models/<family>/`, its native
-code included) selects that family's test
-entries -- `accuracy/modeling_v2/test_<family>.py` and
-`unittest/_torch/modeling_v2/models/<family>/` -- plus the modeling_v2 CPU
-checks. Any other modeling_v2 change (catalog, resolver, loader, the native
-build module, its discovery and common headers) selects every modeling_v2 entry. Several
-families in one PR union their entries.
+code included) selects the entries that run that family's tests --
+`accuracy/modeling_v2/test_<family>.py`, and any unit entry that collects
+`unittest/_torch/modeling_v2/models/<family>/` (the modeling_v2 directory entry,
+or one under the family's directory) -- plus the modeling_v2 CPU checks. Any
+other modeling_v2 change (catalog, resolver, loader, the native build module, its
+discovery and common headers) selects every modeling_v2 entry. Several families
+in one PR union their entries.
 
 Why no outward fallback is needed: nothing beyond the resolver is imported, and
 no family library is loaded, unless `LLM(modeling_v2=...)` is on -- the model
@@ -95,6 +96,8 @@ _MV2_ENTRY_PATTERNS: tuple[str, ...] = (
 # every scope, because they are what keeps the narrowing sound.
 _MV2_CHECK_ENTRY = re.compile(r"^unittest/_torch/modeling_v2/test_modeling_v2_[\w]+\.py$")
 
+_IGNORE = re.compile(r"--ignore=(\S+)")
+
 
 def _is_mv2_claim(path: str) -> bool:
     """Decide whether ModelingV2Rule claims `path`.
@@ -156,15 +159,23 @@ class ModelingV2Rule(Rule):
         return None
 
     @staticmethod
-    def _entry_in_family(target: str, family: str) -> bool:
+    def _entry_runs_family(entry: str, target: str, family: str) -> bool:
+        """Whether a test-db entry runs tests of `family`.
+
+        Its accuracy gates, or unit tests under its directory, collected by the
+        entry itself or by a directory entry above it that does not `--ignore` it.
+        """
+        path = target.split()[0]  # the target keeps long options such as --ignore
         accuracy = f"accuracy/modeling_v2/test_{family}.py"
+        if path == accuracy or path.startswith(accuracy + "::"):
+            return True
         unit = f"unittest/_torch/modeling_v2/models/{family}"
-        return (
-            target == accuracy
-            or target.startswith(accuracy + "::")
-            or target == unit
-            or target.startswith(unit + "/")
-        )
+        if path == unit or path.startswith(unit + "/"):
+            return True
+        if not unit.startswith(path.rstrip("/") + "/"):
+            return False
+        ignored = (path.rstrip("/") for path in _IGNORE.findall(entry))
+        return not any(unit == path or unit.startswith(path + "/") for path in ignored)
 
     def _select(self, families: Optional[set[str]]):
         """Select the modeling_v2 entries a change runs.
@@ -183,7 +194,7 @@ class ModelingV2Rule(Rule):
                 if not target:
                     continue
                 if families is not None:
-                    owners = {f for f in families if self._entry_in_family(target, f)}
+                    owners = {f for f in families if self._entry_runs_family(entry, target, f)}
                     if not owners and not _MV2_CHECK_ENTRY.match(target):
                         continue
                     matched_families |= owners
@@ -203,8 +214,8 @@ class ModelingV2Rule(Rule):
 
         if not block_filters or unmatched:
             # Do not fabricate stages -- fall back to baseline so the change
-            # still gets coverage. Reachable if a family registers no test
-            # entry, or the subtree's entries leave the test-db.
+            # still gets coverage. Reachable if no entry runs a family's
+            # tests, or the subtree's entries leave the test-db.
             missing = f" for {sorted(unmatched)}" if unmatched else ""
             return RuleResult(
                 handled_files=claimed,

@@ -20,7 +20,7 @@ from __future__ import annotations
 import pytest
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
-from cbts.blocks import Block, Stage, YAMLIndex
+from cbts.blocks import Block, Stage, YAMLIndex, _entry_target
 from cbts.rules.base import PRInputs
 from cbts.rules.modeling_v2 import ModelingV2Rule, _is_mv2_claim
 
@@ -28,12 +28,10 @@ pytestmark = pytest.mark.cpu_only
 
 _PY = "tensorrt_llm/_torch/_experimental/modeling_v2"
 _CPP = "cpp/tensorrt_llm/modeling_v2"
-_CATALOG_UNIT = (
-    "unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm "
-    "--ignore=unittest/_torch/modeling_v2/models TIMEOUT (30)"
-)
-_DEEPSEEK_UNIT = "unittest/_torch/modeling_v2/models/deepseek_v3"
-_GPT_OSS_UNIT = "unittest/_torch/modeling_v2/models/gpt_oss"
+_UNIT = "unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm TIMEOUT (30)"
+_COMM = "unittest/_torch/modeling_v2/comm"
+_KIMI_UNIT = "unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_native.py"
+_DEEPSEEK_ACCURACY = "accuracy/modeling_v2/test_deepseek_v3.py::TestDeepseek::test_gsm8k[tp4]"
 _GPT_OSS_ACCURACY = "accuracy/modeling_v2/test_gpt_oss.py::TestGptOss::test_gsm8k[tp1]"
 _CLAIMS = "unittest/_torch/modeling_v2/test_modeling_v2_claims.py"
 
@@ -48,16 +46,25 @@ def rule() -> ModelingV2Rule:
             condition={},
             tests=[
                 "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4",
-                _CATALOG_UNIT,
-                _DEEPSEEK_UNIT,
-                _GPT_OSS_UNIT,
+                _UNIT,
                 _GPT_OSS_ACCURACY,
             ],
         ),
+        Block(
+            yaml_stem="l0_gb300_multi_gpus",
+            block_index=0,
+            condition={},
+            tests=[_COMM, _DEEPSEEK_ACCURACY],
+        ),
+        Block(yaml_stem="l0_b200", block_index=0, condition={}, tests=[_KIMI_UNIT]),
         Block(yaml_stem="l0_cpu", block_index=0, condition={}, tests=["unittest/tools", _CLAIMS]),
     ]
     stages = {
         "B300-PyTorch-1": Stage("B300-PyTorch-1", "l0_b300", "aarch64", 1, 2),
+        "GB300-4_GPUs-PyTorch-1": Stage(
+            "GB300-4_GPUs-PyTorch-1", "l0_gb300_multi_gpus", "aarch64", 1, 1
+        ),
+        "B200-PyTorch-1": Stage("B200-PyTorch-1", "l0_b200", "x86_64", 1, 1),
         "CPU-Generic-x86-1": Stage("CPU-Generic-x86-1", "l0_cpu", "x86_64", 1, 1),
     }
     return ModelingV2Rule(yaml_index, stages)
@@ -109,11 +116,17 @@ def test_family_of_reads_the_family_directory_native_code_included(rule):
         f"{_PY}/models/gpt_oss/csrc/CMakeLists.txt",
     ],
 )
-def test_a_family_change_selects_that_family_and_the_checks(rule, changed):
+def test_a_family_change_selects_what_runs_that_family_and_the_checks(rule, changed):
+    """The directory entry collects every family's unit tests; comm/ is --ignored."""
     result = _apply(rule, changed)
     assert result.scope == "modelingv2only"
-    assert _selected(result) == {_GPT_OSS_UNIT, _GPT_OSS_ACCURACY, _CLAIMS}
+    assert _selected(result) == {_UNIT, _GPT_OSS_ACCURACY, _CLAIMS}
     assert result.sanity_relevant is False
+
+
+def test_a_family_keeps_its_own_entries_on_other_gpus(rule):
+    result = _apply(rule, f"{_PY}/models/kimi_k3_vl/csrc/k3AttnResDecode.cu")
+    assert _selected(result) == {_UNIT, _KIMI_UNIT, _CLAIMS}
 
 
 def test_two_families_union(rule):
@@ -122,7 +135,26 @@ def test_two_families_union(rule):
         f"{_PY}/models/deepseek_v3/routing.py",
         f"{_PY}/models/gpt_oss/csrc/CMakeLists.txt",
     )
-    assert _selected(result) == {_DEEPSEEK_UNIT, _GPT_OSS_UNIT, _GPT_OSS_ACCURACY, _CLAIMS}
+    assert _selected(result) == {_UNIT, _DEEPSEEK_ACCURACY, _GPT_OSS_ACCURACY, _CLAIMS}
+
+
+@pytest.mark.parametrize(
+    ("entry", "runs"),
+    [
+        ("unittest/_torch/modeling_v2", True),
+        ("unittest/_torch/modeling_v2/ --ignore=unittest/_torch/modeling_v2/comm", True),
+        ("unittest/_torch/modeling_v2/models", True),
+        ("unittest/_torch/modeling_v2/models/gpt_oss/test_x.py::test_y", True),
+        ("unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/models", False),
+        ("unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/models/gpt_oss/", False),
+        ("unittest/_torch/modeling_v2/models/gpt_oss_mini", False),
+        ("unittest/_torch/modeling_v2/comm", False),
+        ("accuracy/modeling_v2/test_gpt_oss.py::TestGptOss", True),
+        ("accuracy/modeling_v2/test_deepseek_v3.py", False),
+    ],
+)
+def test_entry_runs_family(entry, runs):
+    assert ModelingV2Rule._entry_runs_family(entry, _entry_target(entry), "gpt_oss") is runs
 
 
 @pytest.mark.parametrize(
@@ -139,15 +171,17 @@ def test_shared_modeling_v2_code_selects_everything_of_modeling_v2(rule, changed
     result = _apply(rule, changed)
     assert result.scope == "modelingv2only"
     assert _selected(result) == {
-        _CATALOG_UNIT,
-        _DEEPSEEK_UNIT,
-        _GPT_OSS_UNIT,
+        _UNIT,
+        _COMM,
+        _KIMI_UNIT,
+        _DEEPSEEK_ACCURACY,
         _GPT_OSS_ACCURACY,
         _CLAIMS,
     }
 
 
-def test_a_family_with_no_test_entry_falls_back(rule):
+def test_a_family_no_entry_runs_falls_back(rule):
+    rule.yaml_index.blocks[0].tests.remove(_UNIT)
     result = _apply(rule, f"{_PY}/models/minimax_m3/csrc/attnMega.cu")
     assert result.scope is None
     assert "minimax_m3" in result.reason

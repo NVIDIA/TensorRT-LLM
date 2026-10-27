@@ -310,12 +310,14 @@ plus what every family library shares: `cpp/tensorrt_llm/modeling_v2/` and the
 native build module `cpp/cmake/modules/modeling_v2.cmake`.
 
 Scope — per family, else all of modeling_v2: a change confined to one
-family's directory (`models/<family>/`, its native code included) keeps that family's
-entries -- `accuracy/modeling_v2/test_<family>.py` and
-`unittest/_torch/modeling_v2/models/<family>` -- plus the modeling_v2 CPU
-checks (`unittest/_torch/modeling_v2/test_modeling_v2_*.py`). Several
-families union. Any other modeling_v2 change keeps every modeling_v2 entry.
-A claimed family with no entry in any test-db yaml falls back to baseline.
+family's directory (`models/<family>/`, its native code included) keeps the
+entries that run that family's tests -- `accuracy/modeling_v2/test_<family>.py`,
+and any unit entry that collects `unittest/_torch/modeling_v2/models/<family>`
+(the modeling_v2 directory entry, which does not `--ignore` it, or an entry
+under it) -- plus the modeling_v2 CPU checks
+(`unittest/_torch/modeling_v2/test_modeling_v2_*.py`). Several families union.
+Any other modeling_v2 change keeps every modeling_v2 entry. A claimed family
+no entry runs falls back to baseline.
 
 `.md` exclusion carries more weight here than elsewhere: every catalog
 entry ships a contract document, so roughly a fifth of the subtree is
@@ -330,10 +332,10 @@ in `backend: pytorch` blocks beside everything else. A block belongs to
 modeling_v2 iff one of its `tests:` entries matches
 `_MV2_ENTRY_PATTERNS`:
 
-- `unittest/_torch/modeling_v2/` — the op-level catalog matrix (one
-  directory entry with `--ignore` of `comm/` and `models/`, plus `comm/`
-  on `l0_gb300_multi_gpus` for the 4-rank collectives) and one entry per
-  family under `models/<family>`, so a family scope can keep its own.
+- `unittest/_torch/modeling_v2/` — the unit tests: one directory entry
+  (`--ignore` of `comm/`) that collects the catalog matrix and every
+  family's tests under `models/<family>`, plus `comm/` on
+  `l0_gb300_multi_gpus` for the 4-rank collectives.
 - `test_modeling_v2_` — the accuracy gates, and any future unit file.
 
 Both markers are exact by construction rather than by luck: every test

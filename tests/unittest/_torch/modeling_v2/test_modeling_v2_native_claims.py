@@ -424,18 +424,6 @@ def _test_db_entries() -> list[tuple[str, str, str]]:
     return entries
 
 
-def test_test_lists_keep_family_tests_in_their_own_entries():
-    """CBTS selects one family's tests by entry; an entry covering models/ from
-    above would hide a family's unit tests inside the catalog's."""
-    models = "unittest/_torch/modeling_v2/models"
-    for yml, target, options in _test_db_entries():
-        if target in ("unittest/_torch/modeling_v2", "unittest/_torch/modeling_v2/"):
-            assert f"--ignore={models}" in options, (
-                f"{yml}: {target} must carry --ignore={models}; list each family on its own"
-            )
-        assert target != models, f"{yml}: list each family under {models}/ on its own"
-
-
 def test_family_unit_entries_point_at_tests():
     """A family entry naming a directory with no tests is a collection error in CI."""
     for yml, target, _ in _test_db_entries():
@@ -446,14 +434,28 @@ def test_family_unit_entries_point_at_tests():
             )
 
 
-def test_families_with_native_code_have_test_entries():
-    targets = {target for _, target, _ in _test_db_entries()}
+def _runs(target: str, options: str, unit: str) -> bool:
+    """Whether a test-db entry runs tests under the directory ``unit``: it names
+    the directory or something in it, or a directory above it that it does not
+    ``--ignore``."""
+    if target == unit or target.startswith(unit + "/"):
+        return True
+    if not unit.startswith(target.rstrip("/") + "/"):
+        return False
+    ignored = (path.rstrip("/") for path in re.findall(r"--ignore=(\S+)", options))
+    return not any(unit == path or unit.startswith(path + "/") for path in ignored)
+
+
+def test_families_with_native_code_have_tests_a_test_list_runs():
+    entries = _test_db_entries()
     for family in _families():
         unit = f"unittest/_torch/modeling_v2/models/{family}"
         accuracy = f"accuracy/modeling_v2/test_{family}.py"
-        assert any(t == unit or t.startswith((unit + "/", accuracy)) for t in targets), (
-            f"family {family!r} has native code but no test-db entry under {unit} or {accuracy}"
-        )
+        has_unit_tests = any((_REPO / "tests" / unit).rglob("test_*.py"))
+        assert any(
+            target.startswith(accuracy) or (has_unit_tests and _runs(target, options, unit))
+            for _, target, options in entries
+        ), f"family {family!r} has native code but no test-db entry runs {unit} or {accuracy}"
 
 
 def test_accuracy_entries_name_a_family():

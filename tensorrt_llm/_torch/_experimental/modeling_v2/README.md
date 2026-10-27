@@ -207,8 +207,9 @@ Adding native code to target `foo_nvfp4__sm_103__tp4` of family `foo`:
 4. **Fake every op** in the target's `fake_ops.py`, which the loader imports right after
    the library opens: `@torch.library.register_fake(f"{namespace_of(__name__)}::my_op")`.
 
-5. **Test it** under `tests/unittest/_torch/modeling_v2/models/foo/`, and list
-   `unittest/_torch/modeling_v2/models/foo` in the test list of the GPU its SM names.
+5. **Test it** under `tests/unittest/_torch/modeling_v2/models/foo/`. The modeling_v2 entry
+   of `l0_b300.yml` collects it, so a target that runs on GB300 changes no test list; a
+   test for another GPU, or for several GPUs, is listed in that GPU's test list.
 
 Code several targets call goes once in the family's `csrc/`, declared with
 `add_modeling_v2_shared(foo ARCHS ... SOURCES ...)`; its ops are in `torch.ops.mv2_foo`,
