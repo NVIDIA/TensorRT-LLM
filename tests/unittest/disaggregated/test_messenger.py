@@ -1,4 +1,6 @@
+import os
 import socket
+import threading
 import time
 import unittest
 
@@ -361,6 +363,115 @@ def test_signed_dealer_rejects_reply_for_other_recipient_or_from_other_peer(sign
     )
     with pytest.raises(FrameAuthenticationError, match="connected peer"):
         dealer._verify(from_other)
+
+
+def _raw_signed(router, seq, stream_id, payload=(b"TAG",), sender_id=b"tcp://127.0.0.1:40009"):
+    payload = list(payload)
+    return payload + _signer().sign(
+        payload,
+        sender_id=sender_id,
+        recipient_id=router.endpoint.encode(),
+        flow=FrameSigner.FLOW_TO_ROUTER,
+        seq=seq,
+        stream_id=stream_id,
+    )
+
+
+@pytest.fixture
+def replay_router():
+    router = ZMQMessenger("ROUTER", "tcp://127.0.0.1:*", signer=_signer())
+    raw = ZMQMessenger("DEALER", router.endpoint, signer=None)
+    yield router, raw
+    raw.stop()
+    router.stop()
+
+
+def test_replay_rejects_repeated_and_older_seq(replay_router):
+    router, raw = replay_router
+    stream_id = os.urandom(16)
+    message = _raw_signed(router, seq=5, stream_id=stream_id)
+    raw.send(message)
+    raw.send(message)
+    raw.send(_raw_signed(router, seq=4, stream_id=stream_id))
+    assert router.receive(timeout_ms=1000)[1:] == [b"TAG"]
+    for _ in range(2):
+        with pytest.raises(FrameAuthenticationError, match="Replayed message"):
+            router.receive(timeout_ms=1000)
+    assert router.replays_rejected == 2
+
+
+def test_replay_accepts_gaps_and_new_stream_ids(replay_router):
+    router, raw = replay_router
+    first, restarted = os.urandom(16), os.urandom(16)
+    for seq, stream_id in ((5, first), (9, first), (1, restarted)):
+        raw.send(_raw_signed(router, seq=seq, stream_id=stream_id))
+        assert router.receive(timeout_ms=1000)[1:] == [b"TAG"]
+    assert router.replays_rejected == 0
+
+
+def test_replay_state_survives_a_rewritten_sender_id(replay_router):
+    # Changing sender_id to look like a new peer breaks the MAC instead.
+    router, raw = replay_router
+    message = _raw_signed(router, seq=5, stream_id=os.urandom(16))
+    raw.send(message)
+    router.receive(timeout_ms=1000)
+    forged = list(message)
+    forged[-2] = forged[-2][:-1] + b"8"
+    raw.send(forged)
+    with pytest.raises(FrameAuthenticationError, match="MAC mismatch"):
+        router.receive(timeout_ms=1000)
+
+
+def test_listener_drops_replayed_message_and_keeps_running(replay_router):
+    router, raw = replay_router
+    received = []
+    arrived = threading.Event()
+
+    def on_message(frames):
+        received.append(frames[1:])
+        if len(received) == 2:
+            arrived.set()
+
+    router.start_listener(on_message)
+    stream_id = os.urandom(16)
+    message = _raw_signed(router, seq=1, stream_id=stream_id)
+    try:
+        raw.send(message)
+        raw.send(message)
+        raw.send(_raw_signed(router, seq=2, stream_id=stream_id, payload=(b"NEXT",)))
+        assert arrived.wait(timeout=2)
+    finally:
+        # Stop the listener inside the test body; thread-leak checks run
+        # before fixture teardown.
+        router.stop()
+    assert received == [[b"TAG"], [b"NEXT"]]
+    assert router.replays_rejected == 1
+    assert router.auth_failures == 1
+
+
+def test_shared_signed_dealer_keeps_seq_order_across_threads():
+    signer = _signer()
+    with ZMQMessenger("ROUTER", "tcp://127.0.0.1:*", signer=signer) as router:
+        with ZMQMessenger(
+            "DEALER", router.endpoint, signer=signer, identity="tcp://127.0.0.1:40010"
+        ) as dealer:
+            # Frames above 2 KiB make hashlib release the GIL, so without the
+            # send lock threads interleave seq assignment and socket writes.
+            threads, per_thread, blob = 8, 50, bytes(64 * 1024)
+
+            def worker(index):
+                for i in range(per_thread):
+                    dealer.send([b"T", f"{index}-{i}".encode(), blob])
+
+            pool = [threading.Thread(target=worker, args=(i,)) for i in range(threads)]
+            for thread in pool:
+                thread.start()
+            for thread in pool:
+                thread.join()
+            received = {router.receive(timeout_ms=2000)[2] for _ in range(threads * per_thread)}
+    assert len(received) == threads * per_thread
+    assert router.replays_rejected == 0
+    assert router.auth_failures == 0
 
 
 if __name__ == "__main__":

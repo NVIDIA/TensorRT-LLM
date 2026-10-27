@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import os
 import struct
 import time
 from abc import ABC, abstractmethod
@@ -110,6 +111,16 @@ class FrameSigner:
         context: Domain-separation string chosen by the caller. Two protocols
             sharing a key must use different contexts, otherwise a frame valid
             in one verifies in the other.
+
+    Replay protection. Each signed socket draws a random 16-byte stream id
+    and numbers its messages from 1. ``ZMQMessenger`` remembers the last seq
+    per (sender id, stream id) and rejects a message whose seq is not larger,
+    so a captured message cannot be accepted twice. A DEALER-ROUTER pipe
+    delivers in order, so a gap (lost message) is accepted and no sliding
+    window is needed. A restarted peer draws a new stream id and starts again
+    at 1 without being mistaken for a replay. Senders hold a lock around seq
+    assignment and the socket write, so threads sharing a socket cannot
+    reorder their own messages.
     """
 
     MAC_SIZE = 32
@@ -238,9 +249,13 @@ class ZMQMessenger(MessengerInterface):
             its owner's ROUTER, which is how peers address replies to it.
     """
 
-    # Bound on routing ids remembered for replies. Entries are added only
-    # after a MAC verifies, so an unauthenticated sender cannot grow it.
+    # Bounds on routing ids remembered for replies and on replay state.
+    # Entries are added only after a MAC verifies, so an unauthenticated sender
+    # cannot grow them. Evicting the replay state of a long-idle peer socket
+    # forgets its last seq, so its earlier messages would be accepted again;
+    # forged frames still fail the MAC.
     _MAX_PEER_IDS = 4096
+    _MAX_REPLAY_STATE = 4096
     _AUTH_WARNING_INTERVAL_S = 10.0
 
     SOCKET_MODES = {
@@ -295,6 +310,12 @@ class ZMQMessenger(MessengerInterface):
         self._peer_ids_lock = Lock()
         self.auth_failures = 0
         self._last_auth_warning = float("-inf")
+        self._send_lock = Lock()
+        self._stream_id = os.urandom(FrameSigner.STREAM_ID_SIZE)
+        self._next_seq = 1
+        self._last_seq: "OrderedDict[tuple[bytes, bytes], int]" = OrderedDict()
+        self._last_seq_lock = Lock()
+        self.replays_rejected = 0
 
         logger.info(
             f"Initialized ZMQMessenger(mode={mode}, endpoint={self._endpoint}, "
@@ -329,22 +350,31 @@ class ZMQMessenger(MessengerInterface):
             if peer_id is None:
                 # Replies go only to peers that already authenticated to us.
                 raise FrameAuthenticationError("No authenticated peer for this routing id")
-            auth = self._signer.sign(
-                payload,
-                sender_id=self._identity,
-                recipient_id=peer_id,
-                flow=FrameSigner.FLOW_TO_DEALER,
-            )
-            self._socket.send_multipart([routing_id, *payload, *auth])
+            self._send_signed([routing_id], payload, peer_id, FrameSigner.FLOW_TO_DEALER)
         else:
             payload = ([recipient] if recipient else []) + list(messages)
+            self._send_signed(
+                [], payload, self._endpoint.encode("utf-8"), FrameSigner.FLOW_TO_ROUTER
+            )
+
+    def _send_signed(
+        self, envelope: list[bytes], payload: list[bytes], recipient_id: bytes, flow: int
+    ) -> None:
+        # Taking the seq and writing to the socket must be one step: if two
+        # threads interleaved them, the larger seq could reach the peer first
+        # and the smaller one would then look like a replay.
+        with self._send_lock:
+            seq = self._next_seq
+            self._next_seq += 1
             auth = self._signer.sign(
                 payload,
                 sender_id=self._identity,
-                recipient_id=self._endpoint.encode("utf-8"),
-                flow=FrameSigner.FLOW_TO_ROUTER,
+                recipient_id=recipient_id,
+                flow=flow,
+                seq=seq,
+                stream_id=self._stream_id,
             )
-            self._socket.send_multipart([*payload, *auth])
+            self._socket.send_multipart([*envelope, *payload, *auth])
 
     def receive(self, timeout_ms: Optional[int] = None) -> list[bytes]:
         """Receive one message; with a signer, verify and strip its auth frames.
@@ -368,6 +398,7 @@ class ZMQMessenger(MessengerInterface):
             payload, header = self._signer.verify(
                 frames[1:], recipient_id=self._identity, flow=FrameSigner.FLOW_TO_ROUTER
             )
+            self._check_replay(header)
             with self._peer_ids_lock:
                 self._peer_ids[routing_id] = header.sender_id
                 self._peer_ids.move_to_end(routing_id)
@@ -380,7 +411,23 @@ class ZMQMessenger(MessengerInterface):
         # A DEALER talks to exactly one ROUTER: the reply must come from it.
         if header.sender_id != self._endpoint.encode("utf-8"):
             raise FrameAuthenticationError("Reply was not sent by the connected peer")
+        self._check_replay(header)
         return payload
+
+    def _check_replay(self, header: SignedHeader) -> None:
+        # Runs only after the MAC verified, so the state below is keyed by
+        # authenticated (sender id, stream id) pairs.
+        key = (header.sender_id, header.stream_id)
+        with self._last_seq_lock:
+            last = self._last_seq.get(key)
+            if last is None or header.seq > last:
+                self._last_seq[key] = header.seq
+                self._last_seq.move_to_end(key)
+                while len(self._last_seq) > self._MAX_REPLAY_STATE:
+                    self._last_seq.popitem(last=False)
+                return
+            self.replays_rejected += 1
+        raise FrameAuthenticationError(f"Replayed message (seq {header.seq}, last {last})")
 
     def _record_auth_failure(self, error: FrameAuthenticationError) -> None:
         # Drop the frame and keep listening: stopping here would let one forged
@@ -390,7 +437,7 @@ class ZMQMessenger(MessengerInterface):
         if now - self._last_auth_warning >= self._AUTH_WARNING_INTERVAL_S:
             self._last_auth_warning = now
             logger.warning(
-                f"Dropped unauthenticated control message on {self._endpoint}: {error} "
+                f"Dropped control message on {self._endpoint}: {error} "
                 f"(total dropped: {self.auth_failures})"
             )
 
