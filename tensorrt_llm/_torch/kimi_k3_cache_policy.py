@@ -21,9 +21,6 @@ _DEPRECATED_KIMI_K3_BF16_KV_LAYERS_ENV = "TLLM_KIMI_K3_BF16_KV_LAYERS"
 # global layer schedule. Kimi K3's accuracy is most sensitive to KV-cache
 # quantization error in its last MLA layers: an NVFP4 KV cache there
 # measurably lowers accuracy, while an FP8 KV cache for just those layers
-# recovers it at a small memory cost. Kimi K3's accuracy is most sensitive to KV-cache
-# quantization error in its last MLA layers: an NVFP4 KV cache there
-# measurably lowers accuracy, while an FP8 KV cache for just those layers
 # recovers it at a small memory cost.
 _DEFAULT_NUM_FP8_KV_LAYERS = 2
 
