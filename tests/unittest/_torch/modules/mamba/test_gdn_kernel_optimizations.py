@@ -781,6 +781,28 @@ def _late_copy(dst, src):
     _spin_then_copy[(triton.cdiv(dst.numel(), 1024),)](dst, src, dst.numel(), 200_000, BLOCK=1024)
 
 
+@triton.jit
+def _copy_no_wait(src, dst, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
+
+
+def _assert_late_copy_overlaps(src):
+    """Positive control: a PDL dependent launched after ``_late_copy`` without griddepcontrol.wait reads the
+    zeros, so the producer still runs when a dependent starts (else the bitwise checks cannot see a missing wait)."""
+    dst, snap = torch.empty_like(src), torch.empty_like(src)
+    stale = []
+    for _ in range(3):
+        _late_copy(dst, src)
+        _copy_no_wait[(triton.cdiv(src.numel(), 1024),)](
+            dst, snap, src.numel(), BLOCK=1024, launch_pdl=True
+        )
+        torch.cuda.synchronize()
+        stale.append(not torch.equal(snap, src))
+    assert any(stale), "the delayed producer did not overlap a PDL dependent: the test is not valid"
+
+
 @skip_no_cuda
 @pytest.mark.parametrize(
     "conv_dim,num_decodes,draft_token_num",
@@ -820,6 +842,7 @@ def test_conv1d_verify_update_hoist_and_pdl_wait_bitwise(conv_dim, num_decodes, 
 
     ref = run(state0.clone())
     # The hoisted x rows and the PDL wait on a producer that writes the conv state late.
+    _assert_late_copy_overlaps(state0)
     state = torch.empty_like(state0)
     _late_copy(state, state0)
     got = run(state, launch_dependent_kernels=True, launch_with_pdl_wait=True, hoist_x=True)
@@ -988,6 +1011,7 @@ def test_gdn_verify_fused_reads_state_after_pdl_wait():
     n, t = 4, 7
     H, HV, cd, proj, ba, st, mut = _verify_case(False, n, t, 12)
     o_ref, y_ref, m_ref = _verify_fused(H, HV, cd, n, t, proj, ba, st, mut)
+    _assert_late_copy_overlaps(mut["ssm"])
     o, y, m = _verify_fused(
         H, HV, cd, n, t, proj, ba, st, mut, before_launch=lambda m: _late_copy(m["ssm"], mut["ssm"])
     )
