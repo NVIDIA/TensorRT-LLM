@@ -16,6 +16,7 @@
 import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -118,6 +119,8 @@ class _DummyPyExecutor:
 
 class _DummyKvCacheCreator:
     """Mock KV cache creator that builds a dummy KV cache manager with reuse settings."""
+
+    _is_kv_cache_manager_v2 = False
 
     def __init__(self, **kwargs):
         """Initialize with KV cache configuration.
@@ -329,7 +332,10 @@ def _run_create_py_executor(
         py_executor_creator, "get_spec_resource_manager", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(py_executor_creator, "get_spec_drafter", lambda *args, **kwargs: None)
-    monkeypatch.setattr(py_executor_creator, "_adjust_torch_mem_fraction", lambda **kwargs: None)
+    adjust_torch_mem_fraction = Mock()
+    monkeypatch.setattr(
+        py_executor_creator, "_adjust_torch_mem_fraction", adjust_torch_mem_fraction
+    )
     monkeypatch.setattr(py_executor_creator, "log_memory_usage", lambda *args, **kwargs: None)
     monkeypatch.setattr(py_executor_creator, "is_mla", lambda _: is_mla_model)
     monkeypatch.setattr(
@@ -380,6 +386,9 @@ def _run_create_py_executor(
         llm_args=llm_args,
         checkpoint_dir=None,
     )
+    adjust_torch_mem_fraction.assert_called_once_with(
+        use_reclaimable_memory=kv_cache_creator_cls._is_kv_cache_manager_v2
+    )
     kv_cache_manager = py_executor.resource_manager.get_resource_manager(
         ResourceManagerType.KV_CACHE_MANAGER
     )
@@ -388,6 +397,19 @@ def _run_create_py_executor(
         kv_cache_manager.enable_block_reuse,
         py_executor.model_engine.attn_runtime_features.cache_reuse,
         py_executor.model_engine.attn_runtime_features.chunked_prefill,
+    )
+
+
+@pytest.mark.parametrize("is_v2", [False, True], ids=["v1", "v2"])
+def test_allocator_option_follows_resolved_kv_cache_manager(
+    monkeypatch: pytest.MonkeyPatch, is_v2: bool
+) -> None:
+    """Executor creation forwards the resolved manager's allocator option."""
+    monkeypatch.setattr(_DummyKvCacheCreator, "_is_kv_cache_manager_v2", is_v2)
+    _run_create_py_executor(
+        monkeypatch,
+        sm_version=90,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
     )
 
 

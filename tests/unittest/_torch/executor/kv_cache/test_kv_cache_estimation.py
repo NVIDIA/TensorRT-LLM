@@ -2230,14 +2230,19 @@ def test_torch_mem_fraction_leaves_headroom_for_lazy_allocations(
 
 
 @pytest.mark.parametrize(
-    "integrated,available,cgroup,quota,memlock,expected_gib",
+    "integrated,available,cgroup,quota,local_ranks,memlock,expected_gib",
     [
-        (True, 90, None, 81, float("inf"), 4.5),
-        (True, 90, 85, 81, float("inf"), 2),
-        (True, 90, 10, 81, float("inf"), 0),
-        (True, None, None, 27, float("inf"), 1.5),
-        (True, 90, None, 81, 5 * _GiB, 4),
-        (False, 90, None, 81, float("inf"), 15),
+        (True, 90, None, 81, 1, float("inf"), 4.5),
+        (True, 90, 85, 81, 1, float("inf"), 2),
+        (True, 90, 10, 81, 1, float("inf"), 0),
+        (True, None, None, 27, 1, float("inf"), 1.5),
+        (True, 90, None, 81, 1, 5 * _GiB, 4),
+        (False, 90, None, 81, 1, float("inf"), 15),
+        (True, 90, None, 40, 2, float("inf"), 2.5),
+        (True, 90, None, 45, 2, float("inf"), 0),
+        (True, 90, None, 20, 4, float("inf"), 1.25),
+        (True, 90, None, 40, 2, 1.25 * _GiB, 1),
+        (False, 90, None, 40, 2, float("inf"), 7.5),
     ],
 )
 def test_auto_host_tier_uses_shared_memory_budget(
@@ -2245,10 +2250,11 @@ def test_auto_host_tier_uses_shared_memory_budget(
     available: int | None,
     cgroup: int | None,
     quota: int,
+    local_ranks: int,
     memlock: float,
     expected_gib: float,
 ) -> None:
-    """Host sizing reserves the pending device pool once from the same budget."""
+    """Host sizing accounts for every local device pool in the shared budget."""
     with (
         patch("torch.cuda.mem_get_info", return_value=(30 * _GiB, 120 * _GiB)),
         patch(f"{_MANAGER}.os.sysconf", side_effect=[4096, 30 * _GiB // 4096]),
@@ -2264,7 +2270,13 @@ def test_auto_host_tier_uses_shared_memory_budget(
     ):
         available_bytes = _get_available_memory_for_auto_host_tier(integrated)
         host_quota = _compute_auto_host_tier_quota(
-            quota * _GiB, 1, available_bytes, memlock, shares_device_memory=integrated
+            quota * _GiB, local_ranks, available_bytes, memlock, shares_device_memory=integrated
         )
     assert host_quota == expected_gib * _GiB
     assert warn.called == (expected_gib == 0)
+    if integrated:
+        device_bytes = quota * _GiB * local_ranks
+        if device_bytes <= available_bytes:
+            assert device_bytes + host_quota * local_ranks <= available_bytes
+        else:
+            assert host_quota == 0
