@@ -15,6 +15,7 @@
 
 import gc
 import os
+import pickle  # nosec B403
 import sys
 import threading
 import time
@@ -358,6 +359,21 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                 self.engine.wait_shutdown()
 
 
+def _incoming_requests(request_queue: IpcQueue):
+    """Yield the proxy's requests until its shutdown sentinel arrives.
+
+    With TRTLLM_PROXY_BATCH_REQUESTS=1 the proxy sends a burst of requests as
+    one list of pickled requests. ``request_queue.get()`` has already
+    authenticated that message, and with it every payload inside.
+    """
+    while (msg := request_queue.get()) is not None:
+        if isinstance(msg, list):
+            for payload in msg:
+                yield pickle.loads(payload)  # nosec B301
+        else:
+            yield msg
+
+
 @print_traceback_on_error
 def worker_main(
     worker_queues: WorkerCommIpcAddrs,
@@ -630,7 +646,7 @@ def worker_main(
                     worker.engine.set_resource_governor_queue(
                         resource_governor_queue)
 
-                while (req := request_queue.get()) is not None:
+                for req in _incoming_requests(request_queue):
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
                     elif isinstance(req, StartProfileRequest):

@@ -10012,8 +10012,10 @@ class PyExecutor:
                                 f"_enqueue_responses.")
                         gather_responses.extend(resp)
                     responses = gather_responses
-        logger.debug(
-            f'after gather, rank = {self.dist.rank}, responses = {responses}')
+        if logger.is_debug_enabled():
+            logger.debug(
+                f'after gather, rank = {self.dist.rank}, responses = {responses}'
+            )
 
         if self.dist.rank == 0 or self.gather_all_responses:
             with self.response_cv:
@@ -10121,9 +10123,10 @@ class PyExecutor:
         requests_finished_by_transfer = []
         new_active_requests = []
         timed_out_requests = []
-        logger.debug(
-            f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
-        )
+        if logger.is_debug_enabled():
+            logger.debug(
+                f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
+            )
 
         batch_token_time = self.perf_manager.get_timestamp()
         gpu_times_cache = {}

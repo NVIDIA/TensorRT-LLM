@@ -203,6 +203,7 @@ l0_cpu:
   - unittest/executor/test_ipc.py
   - unittest/executor/test_rpc.py
   - unittest/executor/test_multi_frontend_routing.py
+  - unittest/executor/test_proxy_request_sender.py
   - unittest/executor/test_event_loop_error_broadcast.py
   - unittest/executor/test_forward_error_survival.py
   - unittest/executor/test_rpc_worker_mixin.py

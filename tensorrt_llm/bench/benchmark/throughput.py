@@ -36,7 +36,8 @@ from tensorrt_llm.bench.benchmark.utils.general import (ALL_SUPPORTED_BACKENDS,
                                                         get_settings)
 # isort: on
 from tensorrt_llm.bench.benchmark.utils.general import (
-    generate_warmup_dataset, update_sampler_args_with_extra_options)
+    generate_warmup_dataset, measurement_gc,
+    update_sampler_args_with_extra_options)
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
@@ -494,7 +495,7 @@ def throughput_command(
             logger.info("Warmup done.")
 
         iteration_writer = options.iteration_writer
-        with iteration_writer.capture():
+        with iteration_writer.capture(), measurement_gc():
             statistics = asyncio.run(
                 async_benchmark(llm,
                                 sampling_params,
