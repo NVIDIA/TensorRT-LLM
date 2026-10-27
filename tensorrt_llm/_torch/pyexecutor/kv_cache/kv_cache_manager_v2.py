@@ -1252,6 +1252,23 @@ def _spec_recompute_claim_limit(
     return max(0, (req.prompt_len - tail) // tokens_per_block * tokens_per_block)
 
 
+def _draft_page_aligned_claim_limit(depth: int, page_size: int) -> int | None:
+    """Reuse-claim cap that ends a ``depth``-token prefix match on a draft page
+    boundary, or None when it already does.
+
+    A standalone drafter reading an unpaired draft pool (DFlash/DSpark on the
+    TRTLLM backend) has no drafter K/V for a reused prefix and must not read
+    below the first position it stored, which its block table can express only
+    in whole pages: a hit ending inside a page would leave the page's stored
+    tail tokens unread (``DFlashWorker._ctx_base_for_store``). Partial reuse
+    makes such hits common, so the claim stops at the page boundary at or
+    below the match instead and the target recomputes the rest of that page.
+    """
+    if page_size <= 1 or depth % page_size == 0:
+        return None
+    return depth // page_size * page_size
+
+
 class KVCacheManagerV2(BaseResourceManager):
     # Sparse managers attach a metadata batch during initialization.
     sparse_metadata_batch: Batch | None = None
@@ -1262,6 +1279,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # connector-reservation cap read it on instances tests build without
     # running __init__. Zero disables the spec recompute tail.
     _spec_recompute_tail: int = 0
+    # Page size of an unpaired draft pool whose drafter needs this manager's
+    # reuse claims aligned to it (see align_reuse_claims_to_draft_pages);
+    # 0 leaves claims as matched.
+    _spec_claim_alignment: int = 0
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
@@ -3786,6 +3807,47 @@ class KVCacheManagerV2(BaseResourceManager):
             reuse_end = min(reuse_end, evidence_limit)
         return self._augment_tokens_for_block_reuse(all_tokens, req, end=reuse_end)
 
+    def align_reuse_claims_to_draft_pages(self, page_size: int) -> None:
+        """End every local reuse claim on a multiple of ``page_size`` tokens.
+
+        Called by a standalone drafter (``DFlashWorker``) that reads an
+        unpaired draft pool through block tables indexed by target position:
+        it stores no drafter K/V for a reused prefix and can hide it from its
+        reads only in whole pages. 0 or 1 turns the alignment off.
+        """
+        self._spec_claim_alignment = max(int(page_size), 0)
+
+    def _draft_page_aligned_reuse_limit(
+        self, req: LlmRequest, tokens: Sequence[TokenIdExt] | None
+    ) -> int | None:
+        """Claim cap that ends ``req``'s match over ``tokens`` on a draft page
+        boundary (``_draft_page_aligned_claim_limit``), or None for no change.
+
+        Probes the radix tree with the same scope and evidence the claim uses,
+        so the cap is a shorter match the core claims as is: the target
+        recomputes at most ``page_size - 1`` more prompt tokens. Without
+        partial reuse a match ends on a block boundary, which is page aligned
+        whenever the block is a whole number of pages. A disaggregated
+        generation request receives its prompt KV and never prefills it, so
+        its match is left alone.
+        """
+        page_size = self._spec_claim_alignment
+        if (
+            page_size <= 1
+            or self.is_draft
+            or req.is_dummy
+            or req.is_disagg_generation_init_state
+            or tokens is None
+            or len(tokens) == 0
+            or (not self.enable_partial_reuse and self.tokens_per_block % page_size == 0)
+        ):
+            return None
+        depth = self.impl.probe_reuse(
+            ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt)),
+            tokens,
+        )
+        return _draft_page_aligned_claim_limit(int(depth), page_size)
+
     def _record_branch_snapshot_point(
         self, req: LlmRequest, kv_cache: _KVCache, num_lookup_tokens: Optional[int]
     ) -> None:
@@ -3823,6 +3885,9 @@ class KVCacheManagerV2(BaseResourceManager):
                     # Empty (not None) for a zero limit: lookup is off, but
                     # newly computed blocks may still be committed.
                     tokens = self._context_reuse_tokens(req, reuse_limit)
+                    aligned_limit = self._draft_page_aligned_reuse_limit(req, tokens)
+                    if aligned_limit is not None:
+                        tokens = self._context_reuse_tokens(req, aligned_limit)
                 else:
                     tokens = None
                 # Taken from the augmented sequence rather than derived as
