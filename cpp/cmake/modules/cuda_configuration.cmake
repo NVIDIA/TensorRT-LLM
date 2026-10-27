@@ -60,8 +60,8 @@ Functions
     Falls back to ``all`` if detection fails.
 
   ``all`` or unset
-    Resolves to architectures TensorRT-LLM is optimized for and the
-    compiler supports (80, 86, 89, 90, 100, 103, 107, 120 depending on CUDA version).
+    Resolves to all architectures TensorRT-LLM is optimized for, and the
+    current platform and compiler supports.
 
   ``all-major``
     Unsupported. Results in a fatal error.
