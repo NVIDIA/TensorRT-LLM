@@ -14,6 +14,6 @@
 # limitations under the License.
 """Shared helpers for the architecture-neutral kernels.
 
-Nothing is re-exported from this file on purpose: importing one kernel must
-not drag in the others, several of which are arch-gated.
+Nothing is re-exported from this file on purpose, so that importing one
+helper module does not drag in any other.
 """

@@ -722,13 +722,11 @@ def test_mistral_item_metadata_separates_patch_and_embedding_units():
     processor = object.__new__(MistralHFInputProcessor)
     processor._vision_geometry = lambda: (14, 2, 3, 1024)
 
-    metadata = processor.get_mm_encoder_item_metadata(
-        [], {"image": {"image_sizes": [[28, 56], [56, 56]]}}
-    )
+    metadata = processor.get_mm_item_metadata([], {"image": {"image_sizes": [[28, 56], [56, 56]]}})
 
-    assert metadata.item_refs == [("image", 0), ("image", 1)]
-    assert metadata.encoder_token_lengths == [8, 16]
-    assert metadata.output_embedding_lengths == [2, 4]
+    assert metadata.item_refs == (("image", 0), ("image", 1))
+    assert metadata.encoder_token_lengths == (8, 16)
+    assert metadata.output_embedding_lengths == (2, 4)
 
 
 @pytest.mark.parametrize("budget", [1024, 4096, 8192])
