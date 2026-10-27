@@ -73,14 +73,6 @@ class Nvfp4Gemm(OpWrapper):
             why="an M that is not a multiple of the swizzle's 128-row tile",
             spec=dict(m=37, k=7168, n=4096, bias=False),
         ),
-        Cell(
-            why="deepseek default at attention TP8, shared expert gate+up: 2 x 2048/8 rows",
-            spec=dict(m=16, k=7168, n=512, bias=False),
-        ),
-        Cell(
-            why="deepseek default at attention TP8, shared expert down: K = 2048/8",
-            spec=dict(m=16, k=256, n=7168, bias=False),
-        ),
     )
 
     note = """

@@ -7,12 +7,17 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
+    Fp4BlockScaleMoeRunner,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
     fp4_block_scale_moe_runner as moe,
 )
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import certifying, validating  # noqa: E402,F401 — needs the path declared above
 
 assert torch.cuda.is_available(), "fp4_block_scale_moe_runner requires a CUDA device"
@@ -2328,7 +2333,99 @@ def _cell_layer(spec: dict):
     return _dsr1_at(key[2])
 
 
-@pytest.mark.parametrize("cell", moe.CELLS, ids=[c.why[:44] for c in moe.CELLS])
+# qwen4_exp's (Qwen3.8-Flash-Next) routed geometry: many small experts, a
+# top_k past 8, an intermediate width of 640, all 512 experts local. Its
+# router renormalizes the top-10 softmax weights to sum to 1 before the
+# call (`routing="renormalized"`, a test axis rather than an op argument;
+# the R1 cells draw uniform [0, 1) weights). Nothing is padded:
+# H % 256, 2I % 128, H/16 % 4 and I/16 % 4 are all zero.
+_QWEN4_EXP = dict(
+    hidden=2560,
+    intermediate=640,
+    num_experts=512,
+    top_k=10,
+    local_expert_offset=0,
+    local_num_experts=512,
+    routing="renormalized",
+)
+
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
+        Cell(
+            why="deepseek default at tp2: all 256 experts, intermediate split 2 ways (1024)",
+            spec=dict(
+                tokens=64,
+                local_expert_offset=0,
+                local_num_experts=256,
+                **dict(Fp4BlockScaleMoeRunner.R1, intermediate=1024),
+            ),
+        ),
+        Cell(
+            why="deepseek default at tp4: all 256 experts, intermediate split 4 ways (512)",
+            spec=dict(
+                tokens=64,
+                local_expert_offset=0,
+                local_num_experts=256,
+                **dict(Fp4BlockScaleMoeRunner.R1, intermediate=512),
+            ),
+        ),
+        Cell(
+            why="deepseek default at tp8: all 256 experts, intermediate split 8 ways (256)",
+            spec=dict(
+                tokens=64,
+                local_expert_offset=0,
+                local_num_experts=256,
+                **dict(Fp4BlockScaleMoeRunner.R1, intermediate=256),
+            ),
+        ),
+        Cell(
+            why="deepseek default at ep8 (tp8 + ep8 and dep8): the last 32-wide window",
+            spec=dict(
+                tokens=64,
+                local_expert_offset=224,
+                local_num_experts=32,
+                **Fp4BlockScaleMoeRunner.R1,
+            ),
+        ),
+        Cell(
+            why="deepseek default at dep16: a 16-wide window",
+            spec=dict(
+                tokens=64,
+                local_expert_offset=112,
+                local_num_experts=16,
+                **Fp4BlockScaleMoeRunner.R1,
+            ),
+        ),
+    ),
+    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1": (
+        Cell(
+            why="qwen4_exp decode: one token over 512 experts, top-10 renormalized, H 2560 / I 640",
+            spec=dict(tokens=1, **_QWEN4_EXP),
+        ),
+        Cell(
+            why="qwen4_exp at 4 rows: the last count the pre-routed path's static-block "
+            "permutation kernel takes",
+            spec=dict(tokens=4, **_QWEN4_EXP),
+        ),
+        Cell(
+            why="qwen4_exp at 5 rows: the first count on the single-cluster permutation "
+            "kernel (the dynamic-block one stops at 256 experts)",
+            spec=dict(tokens=5, **_QWEN4_EXP),
+        ),
+        Cell(
+            why="qwen4_exp prefill: 8192 rows, the single-cluster kernel's cap and the top "
+            "of the certified column",
+            spec=dict(tokens=8192, **_QWEN4_EXP),
+        ),
+    ),
+}
+
+CELLS = certified_cells(moe, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell, certifying):  # noqa: F811
     """Drive every configuration the entry claims, through the entry's own
     reference and its own gate.
