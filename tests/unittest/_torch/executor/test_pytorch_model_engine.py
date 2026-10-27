@@ -1933,14 +1933,14 @@ class DecoderForwardTestCase(unittest.TestCase):
                           context_prompt_lookahead=None)
         host.lists.generation_requests.extend(requests)
 
-        preparer._pack_generation_requests(host, frozenset(), None)
+        generation_mrope_positions = preparer._pack_generation_requests(
+            host, frozenset(), None)
         host.total_num_tokens = len(host.lists.position_ids)
-        preparer._copy_position_ids_to_device(host)
+        preparer._copy_position_ids_to_device(host, generation_mrope_positions)
 
         # Both deltas take the batched scalar path, one row per beam.
-        self.assertEqual(
-            [row for row, _, _ in host.lists.generation_mrope_positions],
-            [0, 1, 2, 3])
+        self.assertEqual([row for row, _, _ in generation_mrope_positions],
+                         [0, 1, 2, 3])
         self.assertEqual(host.lists.mrope_position_ids, [])
         # Without a previous tensor the past length is num_tokens - 1.
         expected_row = [
@@ -1969,7 +1969,8 @@ class DecoderForwardTestCase(unittest.TestCase):
 
         def run(
             delta_dtypes: tuple[torch.dtype, torch.dtype]
-        ) -> tuple[HostInputs, torch.Tensor]:
+        ) -> tuple[HostInputs, list[tuple[int, int, torch.Tensor]],
+                   torch.Tensor]:
             requests = []
             for seq_slot, (num_tokens, delta, dtype) in enumerate(
                     zip((4, 7), (10, -3), delta_dtypes)):
@@ -1993,23 +1994,24 @@ class DecoderForwardTestCase(unittest.TestCase):
                               extra_inputs=preparer._new_extra_inputs(),
                               context_prompt_lookahead=None)
             host.lists.generation_requests.extend(requests)
-            preparer._pack_generation_requests(host, frozenset(), None)
+            generation_mrope_positions = preparer._pack_generation_requests(
+                host, frozenset(), None)
             host.total_num_tokens = len(host.lists.position_ids)
             preparer._buffers.mrope_position_ids_cuda.fill_(sentinel)
-            preparer._copy_position_ids_to_device(host)
-            return host, preparer._buffers.mrope_position_ids_cuda.clone()
+            preparer._copy_position_ids_to_device(host,
+                                                  generation_mrope_positions)
+            positions = preparer._buffers.mrope_position_ids_cuda.clone()
+            return host, generation_mrope_positions, positions
 
-        mixed_host, mixed = run((torch.int32, torch.int64))
-        fallback_host, fallback = run((torch.int64, torch.int64))
+        mixed_host, mixed_updates, mixed = run((torch.int32, torch.int64))
+        _, fallback_updates, fallback = run((torch.int64, torch.int64))
 
-        self.assertEqual(
-            [row for row, _, _ in mixed_host.lists.generation_mrope_positions],
-            [0])
+        self.assertEqual([row for row, _, _ in mixed_updates], [0])
         self.assertEqual(
             [(start, end)
              for start, end, _ in mixed_host.lists.mrope_position_ids],
             [(1, 2)])
-        self.assertEqual(fallback_host.lists.generation_mrope_positions, [])
+        self.assertEqual(fallback_updates, [])
         torch.testing.assert_close(mixed, fallback, atol=0, rtol=0)
         self.assertTrue(torch.all(mixed[:, :, 2:] == sentinel).item())
 
