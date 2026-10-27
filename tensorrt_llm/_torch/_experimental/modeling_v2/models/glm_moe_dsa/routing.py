@@ -3,17 +3,17 @@
 """Where a GlmMoeDsaForCausalLM config lands. Read this file and you know.
 
 ``route`` is one forward-reading decision: the facts that fix which code runs,
-compared against the deployments the target below was written for. When none
+compared against the deployments the targets below were written for. When none
 fits, ``route`` raises ``NoTarget`` stating those facts. In ``auto`` the engine
 then uses the built-in GlmMoeDsa implementation; in ``require`` it raises that
 error.
 
-One target, ``glm_5_2_nvfp4__sm_103__default``, serves one checkpoint on one GPU
-architecture at the layouts below; it picks the fast paths of each layout when
-it is built. The fast paths are built for the checkpoint's operand shapes and
-layer pattern, the ranks and the rows per request (the target token and its
-draft tokens), so each of those facts is a routing criterion rather than a
-runtime branch. A layout is admitted only once it has passed its gate:
+``glm_5_2_nvfp4__sm_103__default`` serves one checkpoint on GB300 (sm103) at the
+layouts below; it picks the fast paths of each layout when it is built. The
+fast paths are built for the checkpoint's operand shapes and layer pattern, the
+ranks and the rows per request (the target token and its draft tokens), so each
+of those facts is a routing criterion rather than a runtime branch. A layout is
+admitted only once it has passed its gate:
 
 * tp8: attention and experts tensor-parallel over eight ranks, five draft
   tokens. The fast paths were designed and tuned for this layout;
@@ -24,11 +24,15 @@ runtime branch. A layout is admitted only once it has passed its gate:
   more facts fix what its fast paths serve, the KV-cache dtype and the MoE
   backend; the target checks both when it is built, since ``route`` does not see
   the MoE backend.
+
+``glm_5_2_nvfp4__sm_107__tp16`` serves GLM-5.2-NVFP4 on 16 Rubin GPUs (sm107) at
+tp16, with one-model MTP-Eagle as a linear chain or no speculative decoding, and
+an fp8 latent KV cache.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -38,9 +42,13 @@ from tensorrt_llm.quantization.modelopt_config import (
     read_modelopt_quant_config,
 )
 
-from ..._router_index import NoTarget
+from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
 
-# The one GPU architecture the fast paths are built and validated for.
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+# The GPU architecture the GB300 target's fast paths are built and validated for.
 _SM = (10, 3)
 
 # The checkpoint's config shape; see the gpt_oss routing module for what
@@ -221,22 +229,58 @@ def _layout_and_speculation(mapping: Any, spec_config: Optional[Any]) -> bool:
     return False
 
 
+# (layers, hidden, routed experts, q_lora_rank) of the Rubin tp16 target. Shape-sniffing
+# also matches fine-tunes of the same shape; the accuracy gate pins identity.
+_TP16_SHAPE = (78, 6144, 256, 2048)
+
+
+def _tp16(m: Any) -> bool:
+    """Attention heads and the expert intermediate dimension sharded over 16 ranks, no
+    attention DP, no expert parallelism.
+
+    A weight-layout question, which is why it selects a target rather than a runtime branch.
+    """
+    return (
+        m.world_size == 16
+        and m.tp_size == 16
+        and m.moe_ep_size == 1
+        and m.moe_tp_size == 16
+        and not m.enable_attention_dp
+        and m.pp_size == 1
+        and m.cp_size == 1
+    )
+
+
+def _mtp_eagle_or_none(spec_config: Optional[Any]) -> bool:
+    """The Rubin tp16 target drives the checkpoint's one MTP module through the one-model
+    MTP-Eagle loop as a linear chain, at any draft length, or runs without speculative
+    decoding."""
+    return spec_config is None or (
+        isinstance(spec_config, MTPDecodingConfig)
+        and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+        and not getattr(spec_config, "use_dynamic_tree", False)
+        and getattr(spec_config, "eagle_choices", None) is None
+        and spec_config.max_total_draft_tokens == spec_config.max_draft_len
+    )
+
+
+@routes("GlmMoeDsaForCausalLM")
 def route(
-    pretrained_config: Any,
-    mapping: Any,
-    compute_capability: Tuple[int, int],
-    spec_config: Optional[Any],
-    kv_cache_quant_algo: Optional[Any],
+    model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
-    ``kv_cache_quant_algo`` is the KV-cache algorithm the engine will run with. It
-    selects the fast paths of a dep deployment, which the target checks together
-    with the MoE backend when it is built, so ``route`` only reports it.
+    The KV-cache algorithm the engine will run with selects the fast paths of a
+    GB300 dep deployment, which that target checks together with the MoE backend
+    when it is built.
 
-    The target is imported where it is returned, so declining costs no import
+    Each target is imported where it is returned, so declining costs no import
     of modeling code.
     """
+    pretrained_config = model_config.pretrained_config
+    mapping = model_config.mapping
+    spec_config = model_config.spec_config
+    kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
     # A GlmMoeDsa config without one of these fields is another assembly: it reads as
     # None and the shape does not match.
     shape = tuple(getattr(pretrained_config, name, None) for name in _SHAPE_FIELDS)
@@ -255,14 +299,35 @@ def route(
 
             return ModelingV2Glm52Nvfp4Sm103Default
 
+    # GLM-5.2-NVFP4 on 16 Rubin GPUs (sm107), tp16, MTP-Eagle or no speculation.
+    if (
+        compute_capability == (10, 7)
+        and shape[:4] == _TP16_SHAPE
+        and _tp16(mapping)
+        and _mtp_eagle_or_none(spec_config)
+        and kv_cache_quant_algo == QuantAlgo.FP8
+    ):
+        # One line on purpose: the claims suite reads the routed targets off
+        # `from .<target>.modeling import <Class>` lines.
+        # fmt: off
+        # isort: off
+        from .glm_5_2_nvfp4__sm_107__tp16.modeling import ModelingV2Glm52Nvfp4Sm107Tp16
+        # isort: on
+        # fmt: on
+        return ModelingV2Glm52Nvfp4Sm107Tp16
+
     raise NoTarget(
-        f"compute capability {compute_capability}, config shape {shape}, quantization "
-        f"{quantization}, parallel ws={mapping.world_size} tp={mapping.tp_size} "
+        f"compute capability {compute_capability}, config shape {shape[:4]}, layer pattern "
+        f"{shape[4:]}, quantization {quantization}, parallel "
+        f"world_size={mapping.world_size} tp={mapping.tp_size} "
         f"pp={mapping.pp_size} cp={mapping.cp_size} moe_tp={mapping.moe_tp_size} "
         f"moe_ep={mapping.moe_ep_size} attention_dp={mapping.enable_attention_dp} "
         f"lm_head_tp_in_adp={mapping.enable_lm_head_tp_in_adp}, "
         f"speculative decoding {_speculation(spec_config)}, KV cache "
-        f"{kv_cache_quant_algo or 'bf16'}; the glm_moe_dsa target is "
+        f"{kv_cache_quant_algo or 'bf16'}; the glm_moe_dsa targets are "
+        "GLM-5.2-NVFP4 on sm107 at tp16 (16 ranks, tensor-parallel attention and experts, no "
+        "attention DP) with one-model MTP-Eagle as a linear chain or no speculative decoding "
+        "and an fp8 latent KV cache, and "
         "the GLM-5.2 modelopt NVFP4 checkpoint (bf16 MTP layer) on sm103, with one-model "
         "MTP-Eagle as a linear chain, without the suffix-automaton enhancer or relaxed "
         "acceptance, at tp8 (8 ranks of tensor-parallel attention and experts) or tep (4 or 8 "

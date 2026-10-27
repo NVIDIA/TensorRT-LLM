@@ -14,9 +14,11 @@
 # limitations under the License.
 """deferred_input_prep: inter-iteration decode input preparation in one launch.
 
-The target declares one ``PrepStager`` to the engine as its step-input stager and one
-``SamplerStoreWriter`` as its sampler store writer (``runtime.make_runtime_hooks``);
-``compat`` describes the three parts. Entry points (``dispatch.get_impl``):
+``PrepStager`` stages the step's inputs and ``SamplerStoreWriter`` writes the speculative
+sampler's store; ``compat`` describes the three parts. The engine has no step-input stager or
+sampler store writer hook to declare them to, so no target serves ``deferred_input_prep`` or
+``sampler_store`` and ``runtime.make_runtime_hooks`` declares neither. Entry points
+(``dispatch.get_impl``):
 
 * ``prep_stager``: the ``PrepStager`` class.
 """

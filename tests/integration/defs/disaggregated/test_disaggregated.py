@@ -30,6 +30,7 @@ from typing import Any, Optional
 import aiohttp
 import numpy as np
 import pytest
+import requests
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.common import (get_ucx_tls, parse_gsm8k_output,
@@ -106,6 +107,38 @@ _FATAL_LOG_PATTERNS = (
     "Hang detected on rank",
     "out of memory",
 )
+
+
+def archive_process_logs(work_dir, log_output_dir):
+    """Copy the cluster's saved log files into log_output_dir for CI upload.
+
+    In CI, log_output_dir is pytest's --output-dir (the stage directory), which
+    is tarred and uploaded to Artifactory as results-<stage>.tar.gz, so logs
+    copied here survive the test and are downloadable from the CI job. Each
+    test gets its own subdirectory, named after PYTEST_CURRENT_TEST.
+
+    Returns the destination directory, or None if nothing was copied.
+    """
+    if not log_output_dir or not os.path.isdir(work_dir):
+        return None
+    test_name = os.environ.get("PYTEST_CURRENT_TEST", "disagg")
+    test_name = test_name.split("::")[-1].split(" ")[0]
+    test_name = re.sub(r"[^A-Za-z0-9._-]+", "_", test_name)[:200]
+    dest = os.path.join(log_output_dir, "disagg-logs", test_name)
+    os.makedirs(dest, exist_ok=True)
+    copied = 0
+    for name in sorted(os.listdir(work_dir)):
+        if not name.endswith(".log"):
+            continue
+        try:
+            shutil.copy2(os.path.join(work_dir, name), dest)
+            copied += 1
+        except OSError as e:
+            print(f"Could not archive {name}: {e}")
+    if copied == 0:
+        return None
+    print(f"Archived {copied} disagg log file(s) to {dest}", flush=True)
+    return dest
 
 
 def scan_logs_for_fatal_errors(processes):
@@ -415,6 +448,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp1_gentp4_qwen3_32b_fp8.yaml",
         "gpt_oss_120b_harmony":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_gptoss_tllm.yaml",
+        "gpt_oss_20b_kv_cache_aware":
+        f"{test_configs_root}/disagg_config_cache_reuse.yaml",
         "cancel_stress_test":
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
         "qwen3_8b":
@@ -456,6 +491,15 @@ ClientTestSet = namedtuple('ClientTestSet', [
 def get_client_test_set(test_desc):
     """Get the set of client tests to run for a given test description."""
     if test_desc == "tool_calls":
+        return ClientTestSet(completion=False,
+                             completion_streaming=False,
+                             chat=True,
+                             chat_streaming=False,
+                             verify_completion=False,
+                             verify_streaming_completion=False,
+                             verify_chat=False,
+                             verify_streaming_chat=False)
+    if test_desc == "gpt_oss_20b_kv_cache_aware":
         return ClientTestSet(completion=False,
                              completion_streaming=False,
                              chat=True,
@@ -758,6 +802,8 @@ def setup_disagg_cluster(
     ctx_env: dict[str, str] | None = None,
     gen_env: dict[str, str] | None = None,
     share_gpu: bool = False,
+    config_overrides: dict[str, Any] | None = None,
+    log_output_dir: str | None = None,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch workers + disagg server, wait for ready.
@@ -771,12 +817,23 @@ def setup_disagg_cluster(
         disagg_cluster_overrides: Entries merged over
             get_default_disagg_cluster_config(), e.g. PRODUCTION_CLUSTER_TIMINGS
             for stress runs (cluster_uri/minimal_instances are still derived below)
+        config_overrides: Entries merged into the config (a dict value is merged into the
+            section), e.g. {"model": "m", "context_servers": {"router": {"type": "kv_cache_aware"}}}
+        save_log: Redirect each worker's and the server's output to a file in
+            work_dir instead of the inherited stdout
+        log_output_dir: With save_log, directory the logs are copied to if
+            startup fails (CI's --output-dir, so they get uploaded)
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
     """
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
+    for key, value in (config_overrides or {}).items():
+        if isinstance(value, dict):
+            config.setdefault(key, {}).update(value)
+        else:
+            config[key] = value
 
     if perf_metrics_output_dir is not None:
         config["perf_metrics_output_dir"] = perf_metrics_output_dir
@@ -1030,12 +1087,14 @@ def setup_disagg_cluster(
         print(
             f"[startup] cluster_launch_to_ready: done in {time.perf_counter() - cluster_start:.3f}s",
             flush=True)
-    except Exception:
+    except BaseException:
         print(
             f"[startup] cluster_launch_to_ready: failed after {time.perf_counter() - cluster_start:.3f}s",
             flush=True)
         terminate(*ctx_workers, *gen_workers, disagg_server)
-        if not save_log:
+        if save_log:
+            archive_process_logs(work_dir, log_output_dir)
+        else:
             shutil.rmtree(work_dir, ignore_errors=True)
         raise
 
@@ -1058,7 +1117,8 @@ def run_disaggregated_test(example_dir,
                            gen_env=None,
                            share_gpu=False,
                            server_start_timeout=300,
-                           assert_ctx_log_contains=None):
+                           assert_ctx_log_contains=None,
+                           config_overrides=None):
     """Run disaggregated test using service discovery instead of MPI.
 
     If assert_ctx_log_contains or assert_gen_log_contains is set, worker logs are captured and,
@@ -1092,7 +1152,8 @@ def run_disaggregated_test(example_dir,
                              save_log=assert_worker_logs,
                              perf_metrics_output_dir=perf_metrics_output_dir,
                              ctx_env=ctx_run_env, gen_env=gen_run_env,
-                             share_gpu=share_gpu)
+                             share_gpu=share_gpu,
+                             config_overrides=config_overrides)
 
     server_host = config.get("hostname", "localhost")
 
@@ -2500,7 +2561,8 @@ def run_disaggregated_aiperf(config_file,
                              cancellation_delay=None,
                              max_error_rate=0.05,
                              env=None,
-                             cwd=None):
+                             cwd=None,
+                             log_output_dir=None):
     """Run disaggregated test with genai-perf for performance/stress testing.
 
     Args:
@@ -2521,6 +2583,8 @@ def run_disaggregated_aiperf(config_file,
             errors recorded by aiperf exceeds this (None disables the gate)
         env: Environment variables dict
         cwd: Working directory
+        log_output_dir: If set, the full worker/server logs are copied there
+            when the run fails (pass the output_dir fixture so CI uploads them)
     """
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
@@ -2531,11 +2595,13 @@ def run_disaggregated_aiperf(config_file,
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
                              server_start_timeout=server_start_timeout,
                              save_log=True,
+                             log_output_dir=log_output_dir,
                              disagg_cluster_overrides=PRODUCTION_CLUSTER_TIMINGS)
 
     server_host = config.get("hostname", "localhost")
     artifact_dir = os.path.join(cwd or ".", "benchmark-results")
 
+    failed = False
     try:
         # Wait for server to be ready
         if not wait_for_server(
@@ -2681,7 +2747,7 @@ def run_disaggregated_aiperf(config_file,
                     "Fatal error patterns detected in disaggregated "
                     f"worker/server logs after accuracy run:\n{summary}")
 
-    except Exception:
+    except BaseException:
         # Print the context around the first fatal-pattern match (the root
         # cause, e.g. an OOM traceback) and the tail of each captured
         # worker/server log to aid triage.
@@ -2699,9 +2765,14 @@ def run_disaggregated_aiperf(config_file,
                             logger.error(line.rstrip())
             except OSError:
                 pass
+        failed = True
         raise
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
+        if failed:
+            # The log writers are closed now, so the files are complete. Copy
+            # them into the CI output directory before work_dir is removed.
+            archive_process_logs(work_dir, log_output_dir)
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
@@ -2921,6 +2992,63 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                            env=env,
                            model_path=model_dir,
                            cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=600)
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device(2)
+@pytest.mark.parametrize("model_path", ['gpt_oss/gpt-oss-20b'])
+def test_disaggregated_gpt_oss_20b_kv_cache_aware(disaggregated_test_root,
+                                                  disaggregated_example_root,
+                                                  llm_venv, model_path):
+    """gpt-oss (Harmony) behind kv_cache_aware routers serves a chat request."""
+    model_dir = f"{llm_models_root()}/{model_path}"
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    env = llm_venv._new_env.copy()
+    tiktoken_vocab = os.path.join(llm_models_root(), "datasets",
+                                  "tiktoken_vocab")
+    env["TIKTOKEN_RS_CACHE_DIR"] = tiktoken_vocab
+    env["TIKTOKEN_ENCODINGS_BASE"] = tiktoken_vocab
+
+    def chat_and_fingerprints(server_url: str) -> None:
+        reply = requests.post(f"{server_url}/v1/chat/completions",
+                              json={
+                                  "model":
+                                  model_path,
+                                  "messages": [{
+                                      "role":
+                                      "user",
+                                      "content":
+                                      "Say hi in three words."
+                                  }],
+                                  "max_tokens":
+                                  32,
+                                  "temperature":
+                                  0
+                              },
+                              timeout=120)
+        assert reply.status_code == 200, reply.text
+        message = reply.json()["choices"][0]["message"]
+        assert message.get("content") or message.get("reasoning_content")
+        info = requests.get(f"{server_url}/cluster_info", timeout=30).json()
+        for role in ("context", "generation"):
+            assert info["render_fingerprints"][role], role
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "gpt_oss_20b_kv_cache_aware",
+                           env=env,
+                           model_path=model_dir,
+                           cwd=llm_venv.get_working_directory(),
+                           post_client_test=chat_and_fingerprints,
+                           config_overrides={
+                               "model": model_path,
+                               "context_servers": {
+                                   "router": {
+                                       "type": "kv_cache_aware"
+                                   }
+                               }
+                           },
                            server_start_timeout=600)
 
 
@@ -3268,7 +3396,7 @@ def _check_deepseek_v41_gsm8k(server_url: str, model_dir: str, tokenizer,
 def test_disaggregated_stress_test(disaggregated_test_root,
                                    disaggregated_example_root, llm_venv,
                                    test_config, input_tokens, output_tokens,
-                                   concurrency):
+                                   concurrency, output_dir):
     # Unpack configuration from dataclass
     model_path = test_config.model_path
     test_desc = test_config.test_desc
@@ -3325,7 +3453,8 @@ def test_disaggregated_stress_test(disaggregated_test_root,
                              cancellation_rate=test_config.cancellation_rate,
                              cancellation_delay=test_config.cancellation_delay,
                              env=llm_venv._new_env,
-                             cwd=llm_venv.get_working_directory())
+                             cwd=llm_venv.get_working_directory(),
+                             log_output_dir=output_dir)
 
 
 def run_cancel_stress_test(server_url: str,

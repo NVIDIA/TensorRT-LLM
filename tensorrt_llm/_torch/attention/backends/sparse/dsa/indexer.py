@@ -1240,18 +1240,6 @@ class Indexer(nn.Module):
         metadata.host_slot_mapping_fp8[:total_new_kv_tokens] = fp8_flat_indices
         metadata.host_slot_mapping_scale[:total_new_kv_tokens] = scale_flat_indices
 
-        stager = getattr(metadata, "step_input_stager", None)
-        if stager is not None:
-            # Staged write; see the window banner in DecoderRunner._forward_decoder.
-            stager.copy(
-                metadata.slot_mapping_fp8[:total_new_kv_tokens],
-                metadata.host_slot_mapping_fp8[:total_new_kv_tokens],
-            )
-            stager.copy(
-                metadata.slot_mapping_scale[:total_new_kv_tokens],
-                metadata.host_slot_mapping_scale[:total_new_kv_tokens],
-            )
-            return
         metadata.slot_mapping_fp8[:total_new_kv_tokens].copy_(
             metadata.host_slot_mapping_fp8[:total_new_kv_tokens], non_blocking=True
         )
@@ -1526,13 +1514,7 @@ class Indexer(nn.Module):
         if num_generations > 0:
             # Prepare schedule metadata for fp8_paged_mqa_logits
             # This is a preprocessing step that computes scheduling information for the kernel
-            # Staged write; see the window banner in DecoderRunner._forward_decoder.
-            stager = getattr(metadata, "step_input_stager", None)
-            if stager is None:
-                Indexer.prepare_scheduler_metadata(metadata)
-            elif not stager.scheduler_metadata(metadata):
-                # Reads staged KV lengths: run right after the staged launch.
-                stager.defer(lambda: Indexer.prepare_scheduler_metadata(metadata))
+            Indexer.prepare_scheduler_metadata(metadata)
 
     def _update_k_cache(
         self, k_fp8: torch.Tensor, k_scale: torch.Tensor, metadata: DSAtrtllmAttentionMetadata

@@ -43,6 +43,13 @@ During each iteration of its background loop, the `PyExecutor` performs the foll
 - Output Handling: Updates the partial outputs for ongoing requests and finalizes the results for any requests that have reached completion, returning them to the user.
 
 
+## Multimodal Requests
+
+Multimodal input preparation and execution share `MultimodalParams`. The executor
+owns request cache references; encoder and LLM forwards use separate execution views.
+See the [multimodal developer guide](multimodal.md) for the data contracts,
+process boundaries, and encoder/prefill handoff.
+
 ## Runtime Optimizations
 
 TensorRT LLM enhances inference throughput and reduces latency by integrating a suite of runtime optimizations, including CUDA Graph, [Overlap Scheduler](../features/overlap-scheduler.md), [Speculative decoding](../features/speculative-decoding.md), etc.

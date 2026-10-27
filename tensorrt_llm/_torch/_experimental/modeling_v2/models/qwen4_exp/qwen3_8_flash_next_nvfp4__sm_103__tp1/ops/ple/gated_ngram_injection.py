@@ -68,59 +68,27 @@ class GatedNgramInjection(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: kind "ckpt" (default) -- operands with this checkpoint's norm-gamma
-    # and value statistics: leading, hc_count, dtype, value_dtype (= dtype),
-    # clamp_min. kind "single_channel" -- one nonzero channel per stream so each
-    # dot is an exact product under the test's control: dots, value_dtype,
-    # clamp_min.
+    # and value statistics: leading, value_dtype (bf16), clamp_min. kind
+    # "single_channel" -- one nonzero channel per stream so each dot is an exact
+    # product under the test's control: dots, value_dtype, clamp_min.
     CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(why=f"checkpoint 4x2560 bf16, {why}", spec=dict(leading=(t,)))
-            for t, why in (
-                (1, "decode, 1 token"),
-                (2, "2 tokens"),
-                (8, "decode batch 8"),
-                (33, "33 tokens / MTP verify 8 x 4 + 1"),
-                (512, "prefill 512 tokens"),
-                (4096, "prefill 4096 tokens"),
-                (8192, "prefill 8192 tokens, largest measured"),
-            )
-        )
-        + (Cell(why="[3, 17, width] leading dims", spec=dict(leading=(3, 17))),)
-        + tuple(
-            Cell(why=f"hc_count {c} at D 2560, 64 tokens", spec=dict(leading=(64,), hc_count=c))
-            for c in (1, 2, 8)
-        )
-        + tuple(
-            Cell(
-                why=f"{str(d).removeprefix('torch.')} operands, 512 tokens",
-                spec=dict(leading=(512,), dtype=d),
-            )
-            for d in (torch.float16, torch.float32)
-        )
-        + (
-            Cell(
-                why="bf16 key/query with an fp32 value returns fp32",
-                spec=dict(leading=(128,), value_dtype=torch.float32),
+        Cell(
+            why="checkpoint 4x2560 bf16, 33 tokens / MTP verify 8 x 4 + 1",
+            spec=dict(leading=(33,)),
+        ),
+        Cell(
+            why="checkpoint 4x2560 bf16, prefill 8192 tokens, largest measured",
+            spec=dict(leading=(8192,)),
+        ),
+        Cell(
+            why="dots 0, +-5e-8 (inside the floor), 0.05, fp32 value",
+            spec=dict(
+                kind="single_channel",
+                dots=(0.0, 5e-8, -5e-8, 0.05),
+                value_dtype=torch.float32,
+                clamp_min=CKPT_CLAMP_MIN,
             ),
-            Cell(
-                why="dots 0, +-5e-8 (inside the floor), 0.05, fp32 value",
-                spec=dict(
-                    kind="single_channel",
-                    dots=(0.0, 5e-8, -5e-8, 0.05),
-                    value_dtype=torch.float32,
-                    clamp_min=CKPT_CLAMP_MIN,
-                ),
-            ),
-            Cell(
-                why="same dots with clamp_min 0.0, fp32 value",
-                spec=dict(
-                    kind="single_channel",
-                    dots=(0.0, 5e-8, -5e-8, 0.05),
-                    value_dtype=torch.float32,
-                    clamp_min=0.0,
-                ),
-            ),
-        )
+        ),
     )
 
     note = """

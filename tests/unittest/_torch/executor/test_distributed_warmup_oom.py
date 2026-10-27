@@ -16,6 +16,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
     DecoderWarmup,
     WarmupAgreement,
 )
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 
 pytestmark = pytest.mark.cpu_only
@@ -441,7 +442,6 @@ _KV_ALLOC_ERROR = "Can't allocate new blocks for window size 8"
 
 def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[DecoderWarmup, object]:
     engine = _engine(world_size=world_size, dwdp_size=dwdp_size)
-    engine.kv_cache_manager_key = "kv"
     engine._config = SimpleNamespace(
         **vars(engine._config),
         max_num_tokens=8,
@@ -462,7 +462,9 @@ def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[DecoderWa
 
     cache_manager = _StandInMambaCacheManager()
     resource_manager = SimpleNamespace(
-        get_resource_manager=lambda key: cache_manager if key == "kv" else None
+        get_resource_manager=lambda key: (
+            cache_manager if key == ResourceManagerType.KV_CACHE_MANAGER else None
+        )
     )
     return engine, resource_manager
 

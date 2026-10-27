@@ -27,6 +27,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 from .config import (
@@ -200,6 +201,7 @@ class Fp4MlaV2CacheLayoutPolicy:
             "_role_encoded_page_capacity",
             "_role_view",
             "get_fp4_mla_cache_buffers",
+            "get_fp4_mla_cache_pool_bases",
             "_iter_fp4_mla_physical_pool_views",
             "_all_layer_role_view",
             "_role_pool_base_view",
@@ -211,7 +213,8 @@ class Fp4MlaV2CacheLayoutPolicy:
             "get_mla_v_packed_page_offset",
             "get_fp4_mla_hp_pool",
             "get_disagg_role_mapper_kinds",
-            "get_disagg_transfer_roles",
+            "get_disagg_ignored_roles",
+            "rebuild_disagg_imported_cache",
             "get_disagg_global_layer_ids",
             "_get_runtime_cache_size_layer_components",
             "_get_generation_request_capacity",
@@ -703,6 +706,45 @@ class Fp4MlaV2CacheLayoutPolicy:
         )
         return kv_cache, sf_cache
 
+    def get_fp4_mla_cache_pool_bases(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return K and K-scale views spanning the pages of every FP4 MLA layer.
+
+        All FP4 layers share one coalesced page geometry, so page ``p`` of the
+        ``get_fp4_mla_cache_buffers`` views of compact layer ``c`` is page
+        ``p + get_mla_v_scale_page_offset(c)`` of these views.
+        """
+        cache_key = ("cache_pool_bases",)
+        cached = self._fp4_mla_view_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        local_layer = self._fp4_mla_compact_to_local[0]
+        cache_layer = self._cache_manager_layer_ids[0]
+        storage_head_dim = self._storage_head_dim(local_layer)
+        kv_cache = self._role_pool_base_view(
+            cache_layer,
+            Role.KEY,
+            torch.uint8,
+            (self.kv_factor, self.tokens_per_block, 1, storage_head_dim // 2),
+        )
+        sf_cache = self._role_pool_base_view(
+            cache_layer,
+            Role.KEY_BLOCK_SCALE,
+            torch.uint8,
+            (self.tokens_per_block, storage_head_dim // FP4_BLOCK_SIZE),
+        )
+        for compact_layer, local_layer in enumerate(self._fp4_mla_compact_to_local):
+            layer_kv, layer_sf = self.get_fp4_mla_cache_buffers(self.pp_layers[local_layer])
+            page_offset = self.get_mla_v_scale_page_offset(compact_layer)
+            expected_kv_ptr = kv_cache.data_ptr() + page_offset * kv_cache.stride(0)
+            expected_sf_ptr = sf_cache.data_ptr() + page_offset * sf_cache.stride(0)
+            if (layer_kv.data_ptr(), layer_sf.data_ptr()) != (expected_kv_ptr, expected_sf_ptr):
+                raise RuntimeError(
+                    "FP4 MLA V2 cache views of local layer "
+                    f"{local_layer} do not match their pool base and page offset {page_offset}."
+                )
+        self._fp4_mla_view_cache[cache_key] = (kv_cache, sf_cache)
+        return kv_cache, sf_cache
+
     def _iter_fp4_mla_physical_pool_views(self) -> Iterable[torch.Tensor]:
         """Yield page-major views spanning each physical MLA pool once."""
         local_layer = self._fp4_mla_compact_to_local[0]
@@ -894,8 +936,21 @@ class Fp4MlaV2CacheLayoutPolicy:
             Role.MLA_HP_TAIL: MapperKind.REPLICATED,
         }
 
-    def get_disagg_transfer_roles(self) -> Optional[frozenset[DataRole]]:
-        return frozenset((Role.KEY, Role.KEY_BLOCK_SCALE, Role.MLA_HP_TAIL))
+    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
+        # V scales and packed V derive from K and K scales; the generation
+        # worker rebuilds them locally in rebuild_disagg_imported_cache.
+        return frozenset((Role.MLA_V_SCALE, Role.MLA_V_PACKED))
+
+    def rebuild_disagg_imported_cache(self, requests: Iterable["LlmRequest"]) -> None:
+        """Rebuild the derived V sidecars of requests whose prompt KV was imported."""
+        from .v_cache import rebuild_fp4_mla_disagg_imported_cache
+
+        requests = list(requests)
+        rebuild_fp4_mla_disagg_imported_cache(
+            self,
+            [request.py_request_id for request in requests],
+            [request.prompt_len for request in requests],
+        )
 
     def get_disagg_global_layer_ids(self, layer_group_id: int) -> list[int]:
         local_layer_ids = list(self.impl.layer_grouping[layer_group_id])

@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, ClassVar, List, Optional, Protocol, Type
+from typing import TYPE_CHECKING, List, Optional, Protocol, Type
 
 import torch
 from packaging.version import Version
@@ -37,7 +37,6 @@ from ..pyexecutor.resource_manager import ResourceManagerType
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
     from ..pyexecutor.llm_request import LlmRequest
-    from ..pyexecutor.runtime_hooks import StepInputStager
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -143,8 +142,8 @@ def draft_prompt_lookahead(spec_config) -> Optional[int]:
         return None
     spec_mode = spec_config.spec_dec_mode
     if not spec_mode.use_one_engine():
-        # Two-model drafting runs the draft as its own engine over its own
-        # request view, so nothing here is shifted against the target prompt.
+        # Drafter-based modes keep no draft KV in the target's request view,
+        # so nothing here is shifted against the target prompt.
         return None
     if spec_mode.is_mtp_vanilla():
         # Known limitation: an internal chunk lacks target_hidden[i + k], so reuse
@@ -237,7 +236,7 @@ def get_force_num_accepted_tokens() -> int:
     variable as an integer.
 
     Used by speculative decoding paths that operate on Python lists/slices and
-    therefore require an integer count (e.g. the two-model path in
+    therefore require an integer count (e.g. draft-token verification in
     ``TorchSampler``). For the one-model path, see
     :func:`get_force_num_accepted_tokens_float`, which supports fractional
     synthetic acceptance rates.
@@ -460,8 +459,6 @@ class SpecMetadata:
     """
     Metadata for speculative decoding.
     """
-    # A step-input stager while it records this metadata's writes, else None.
-    step_input_stager: ClassVar[Optional["StepInputStager"]] = None
     # The max number of requests in a single batch.
     max_num_requests: int
     # The number of draft layers. (Also the number of draft tokens for the linear tree.)
@@ -492,8 +489,6 @@ class SpecMetadata:
     host_position_ids: Optional[torch.Tensor] = None
     # The gather ids for logits.
     gather_ids: Optional[torch.Tensor] = None
-    # The number of accepted draft tokens for each request.
-    num_accepted_draft_tokens: Optional[torch.Tensor] = None
     # The number of tokens for speculative model/layer
     num_tokens: int = 0
     # The number of tokens for speculative model/layer of different rank
@@ -884,16 +879,16 @@ class SpecMetadata:
                                        device='cuda')
 
         def _upload(dst: torch.Tensor, values: list[int]) -> None:
-            if self.step_input_stager is not None:
-                # Staged write; see the window banner in DecoderRunner._forward_decoder.
-                self.step_input_stager.copy(
-                    dst[:len(values)], torch.tensor(values, dtype=torch.int64))
-                return
             dst[:len(values)].copy_(torch.tensor(values,
                                                  dtype=torch.int64,
                                                  pin_memory=prefer_pinned()),
                                     non_blocking=True)
 
+        # An all-greedy batch runs the argmax graph, which reads none of these
+        # buffers. The offset windows above still advance, so skipping the
+        # copies changes no later batch's streams.
+        if self.is_all_greedy_sample:
+            return
         _upload(self.request_seeds, request_seeds)
         _upload(self.request_offsets, request_offsets)
         _upload(self.seeds, flat_seeds)
@@ -1710,6 +1705,25 @@ class SpecWorkerBase(nn.Module, ABC):
     @abstractmethod
     def _forward_impl(self, *args, **kwargs):
         """Worker-specific forward logic, called by SpecWorkerBase.forward."""
+
+    def target_logits(self, hidden_states: torch.Tensor, lm_head,
+                      logits_processor, attn_metadata, spec_metadata,
+                      draft_model) -> torch.Tensor:
+        """The target logits of the gathered rows ``hidden_states``, which
+        the model hands to ``forward`` as ``logits``: fp32 [rows, vocab].
+
+        A worker whose acceptance reads another layout overrides this. If its
+        ``forward`` then returns this TP rank's vocabulary shard as
+        ``"logits"``, it also returns ``"logits_vocab_shard": True``, and the
+        engine gathers the logits (on every TP rank together, so not under
+        attention DP) before any logits post-processor sees them; the
+        post-processors get a read-only view, since the acceptance already
+        ran inside ``forward``. Such a worker applies a guided decoder's
+        bitmask to its shard at the shard's column offset, or rejects guided
+        decoding.
+        """
+        return logits_processor.forward(hidden_states, lm_head, attn_metadata,
+                                        True)
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
         """Restore attn-metadata spec-dec state if a failure skipped it.

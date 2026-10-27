@@ -139,15 +139,20 @@ add_th_common_family(
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
   virtualMemoryAllocator.cpp
-  fusedGemmAllreduceOp.cpp)
+  fusedGemmAllreduceOp.cpp
+  dwdpFabricGatherOp.cpp)
 
 add_th_common_family(th_common_sequence causalConv1dOp.cpp mambaConv1dOp.cpp
                      mamba2MTPSSMCacheOp.cpp selectiveScanOp.cpp)
 
 add_th_common_family(
-  th_common_visual_gen fusedAdaptiveLayerNormOp.cpp fusedDiTQKNormRopeOp.cpp
-  fusedDiTSplitQKNormRopeOp.cpp fusedDiTSplitNormOp.cpp
-  fusedDiTGateResidNormShiftScaleOp.cpp)
+  th_common_visual_gen
+  fusedAdaptiveLayerNormOp.cpp
+  fusedDiTQKNormRopeOp.cpp
+  fusedDiTSplitQKNormRopeOp.cpp
+  fusedDiTSplitNormOp.cpp
+  fusedDiTGateResidNormShiftScaleOp.cpp
+  sageQuantizeOp.cpp)
 
 add_th_common_family(
   th_common_decoding
@@ -164,9 +169,8 @@ add_th_common_family(
 
 add_th_common_family(th_common_glm_moe_dsa)
 
-# GLM-MoE-DSA torch ops live in glmMoeDsa/ (kernels in
-# cpp/tensorrt_llm/kernels/glmMoeDsa/); that directory adds them to
-# th_common_glm_moe_dsa with target_sources().
+# GLM bindings keep their existing family targets; source lists live with the
+# model. The GLM-5.2 GB300 target's torch ops go to th_common_glm_moe_dsa.
 add_subdirectory(glmMoeDsa)
 
 add_library(

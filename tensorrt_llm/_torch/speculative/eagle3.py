@@ -40,9 +40,8 @@ def _reset_mtp_index_share(attn_metadata: MTPIndexShareMetadata) -> None:
 
 class Eagle3ResourceManager(BaseResourceManager):
     """
-    Eagle3 needs to save the hidden states for the draft model. When using
-    Eagle3TwoModel, there will be two model engines, one for the target model
-    and one for the draft model. Use this class to manage the hidden states.
+    Eagle3 needs to save the hidden states for the draft model. Use this class
+    to manage the hidden states.
     """
 
     def __init__(self,
@@ -144,11 +143,10 @@ class Eagle3ResourceManager(BaseResourceManager):
 
     def add_dummy_requests(self, request_ids: List[int]):
         for rid in request_ids:
-            # In two-model speculation the target and draft engines share this
-            # resource manager, and each registers its own padding dummy under
-            # the same draft-length-derived request ID. Reserve the slot once
-            # and share it between them; dummy outputs are discarded, so the
-            # slot contents never matter (mirrors SuffixAutomatonManager).
+            # A padding dummy can be registered more than once under the same
+            # draft-length-derived request ID. Reserve the slot once and share
+            # it; dummy outputs are discarded, so the slot contents never
+            # matter (mirrors SuffixAutomatonManager).
             if self.slot_manager.get_slot(rid) is None:
                 self.slot_manager.add_slot(rid)
         if self.sa_manager is not None:
@@ -348,13 +346,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                      dtype=torch.int,
                                      device='cpu',
                                      pin_memory=prefer_pinned())
-        if self.step_input_stager is not None:
-            # Staged write; see the window banner in DecoderRunner._forward_decoder.
-            self.step_input_stager.copy(self.batch_indices_cuda[:num_seqs],
-                                        batch_indices)
-        else:
-            self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
-                                                     non_blocking=True)
+        self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
+                                                 non_blocking=True)
         # Snapshot the real (unpadded) scheduled token count before the decrement
         # below. maybe_capture_hidden_states runs during the target forward and
         # must bound the capture by this count; self.num_tokens is about to be

@@ -16,9 +16,8 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-from ..pyexecutor.config_utils import (is_nemotron_hybrid,
+from ..pyexecutor.config_utils import (is_glm5_next, is_nemotron_hybrid,
                                        match_nemotron_h_layer_types)
-from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..speculative.interface import SpecMetadata
 from .dflash import DFlashSpecMetadata, DFlashWorker
@@ -542,7 +541,7 @@ def seat_pool_or_none(model_engine) -> Optional[int]:
     return getattr(model_engine, "max_num_seq_slots", None)
 
 
-def get_spec_resource_manager(model_engine, draft_model_engine=None):
+def get_spec_resource_manager(model_engine):
     spec_config = model_engine.spec_config
     if spec_config is None:
         return None
@@ -678,11 +677,7 @@ def get_spec_decoder(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
 
-def get_spec_drafter(model_engine,
-                     draft_model_engine,
-                     sampler,
-                     spec_resource_manager,
-                     guided_decoder: Optional[GuidedDecoder] = None):
+def get_spec_drafter(model_engine, spec_resource_manager):
     spec_config = model_engine.spec_config
     if spec_config is None:
         return None
@@ -825,6 +820,12 @@ def update_spec_config_from_model_config(spec_config,
             and architectures[0] in _GEMMA4_SHARED_KV_TARGET_ARCHITECTURES):
         spec_config._use_shared_kv_cache = (
             spec_config.spec_dec_mode.is_mtp_eagle_one_model())
+    if is_glm5_next(model_config):
+        # The glm_kpool slot tables live in the recurrent metadata and are not
+        # switched by draft_kv_cache_context. Keep the MTP layers in the
+        # target KV cache manager so that one table is valid for both target
+        # and draft layers.
+        spec_config._allow_separate_draft_kv_cache = False
 
     # The target implementation owns the contract for its MTP drafter. Some one-model MTP
     # implementations construct `MTPForCausalLM` from the target config, and optionally load a
@@ -934,7 +935,7 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
     """
     Get the appropriate draft length for the given batch size using binary search.
 
-    This is a standalone function that can be used by both the drafter (two-model path)
+    This is a standalone function that can be used by both drafters (e.g. NGram)
     and the model engine / spec workers (one-model path).
 
     New semantics: Keys represent specific batch sizes (transition points).
@@ -1048,16 +1049,13 @@ def update_draft_len(model_engine: "ModelEngine",
                      scheduled_batch: "ScheduledRequests",
                      *,
                      draft_len: Optional[int] = None,
-                     speculation_permanently_disabled: bool = False) -> None:
-    """Resolve this batch's draft length and store it on the engine.
+                     speculation_permanently_disabled: bool = False) -> int:
+    """Synchronize this batch's draft buffers and return its draft length.
 
     Normal iterations must call this before ``prepare_resources`` so KV cache
     allocation uses the selected draft length.
     """
-    if not hasattr(model_engine, 'max_draft_len'):
-        return
-
-    model_engine.runtime_draft_len = resolve_draft_len(
+    return resolve_draft_len(
         model_engine.spec_config,
         scheduled_batch,
         max_draft_len=model_engine.max_draft_len,

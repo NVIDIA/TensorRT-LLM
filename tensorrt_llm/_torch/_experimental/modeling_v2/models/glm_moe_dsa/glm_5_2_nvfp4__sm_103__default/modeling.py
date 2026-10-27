@@ -110,8 +110,14 @@ _KERNEL_MODULES = {
 }
 _NO_LAYERS: frozenset = frozenset()
 
-#: tp8: every fast path of the family, with the family's tables.
-TP8_PATHS = dispatch.TargetPaths(kernel_modules=_KERNEL_MODULES)
+# The step input staging and the sampler store writer have no engine hook to run from, so
+# no deployment serves them.
+_UNHOOKED_PATHS = frozenset({"deferred_input_prep", "sampler_store"})
+
+#: tp8: every hooked fast path of the family, with the family's tables.
+TP8_PATHS = dispatch.TargetPaths(
+    served=frozenset(dispatch.FAST_PATH_NAMES) - _UNHOOKED_PATHS, kernel_modules=_KERNEL_MODULES
+)
 
 # tep at four ranks: the attention operands, the attention output and the post-MoE hop are
 # outside the kernels' shapes (sixteen local heads, a four-rank output projection, a
@@ -130,8 +136,6 @@ _TEP4_PATHS = frozenset(
         "draft_tail",
         "draft_loop",
         "decode_prologue",
-        "deferred_input_prep",
-        "sampler_store",
         "execution_stream_loop",
         "host_page_retention",
     }
@@ -154,7 +158,9 @@ TEP_PATHS = {
         uncovered={"post_attention_hop": ("does not use MNNVL",)},
     ),
     8: dispatch.TargetPaths(
-        served=frozenset(dispatch.FAST_PATH_NAMES) - frozenset(_ROUTED_MOE_PACKAGES)
+        served=frozenset(dispatch.FAST_PATH_NAMES)
+        - frozenset(_ROUTED_MOE_PACKAGES)
+        - _UNHOOKED_PATHS
     ),
 }
 

@@ -15,10 +15,11 @@
 """deferred_input_prep's executor-loop domain of its store writer, and its debug level.
 
 deferred_input_prep has three parts, each a fast path of the plan
-(``dispatch.PART_PATHS``) that ``runtime.make_runtime_hooks`` declares to the engine:
-the staged input preparation (``prep``, the step-input stager), the sampler store
-writer (``store``) and the overlap executor loop on the execution stream (``stream``).
-``TRTLLM_STAIRCASE_GLM_LL_DISABLE`` turns each of them off.
+(``dispatch.PART_PATHS``): the staged input preparation (``prep``, the step-input
+stager), the sampler store writer (``store``) and the overlap executor loop on the
+execution stream (``stream``). ``runtime.make_runtime_hooks`` declares only ``stream``
+to the engine; no target serves the other two, which have no engine hook.
+``TRTLLM_STAIRCASE_GLM_LL_DISABLE`` turns each served part off.
 
 deferred_input_prep's sampler store writer is validated only in the overlap executor
 loop of an executor without attention data parallelism. The target's executor events
