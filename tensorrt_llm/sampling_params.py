@@ -380,14 +380,18 @@ class SamplingParams:
         Executor class of C++ runtime, the LLM API disallows such combination.
         """
         if self.bad_token_ids is not None:
+            # bool is a subclass of int, so exclude it explicitly.
+            def _is_token_id(t) -> bool:
+                return isinstance(t, int) and not isinstance(t, bool)
+
+            if not isinstance(self.bad_token_ids, (list, tuple)):
+                raise ValueError(
+                    f"bad_token_ids must be a list, got {type(self.bad_token_ids).__name__}"
+                )
             for word in self.bad_token_ids:
-                if isinstance(word, int):
+                if _is_token_id(word):
                     continue
-                if (
-                    isinstance(word, (list, tuple))
-                    and len(word) > 0
-                    and all(isinstance(t, int) for t in word)
-                ):
+                if isinstance(word, list) and word and all(_is_token_id(t) for t in word):
                     continue
                 raise ValueError(
                     "bad_token_ids entries must be an int or a non-empty list "
