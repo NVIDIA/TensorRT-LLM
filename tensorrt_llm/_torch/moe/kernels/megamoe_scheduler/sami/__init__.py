@@ -14,7 +14,6 @@ from ._util import Comm
 from .geometry import BundleLayout, Plane, PlaneViewLayout
 from .hierarchical import (
     BoundHierarchicalLiveWeightArena,
-    HierarchicalCopyTicket,
     HierarchicalLiveWeightArena,
     HierarchicalLiveWeightArenaProvider,
     HierarchicalSamiWeightBroadcast,
@@ -26,7 +25,6 @@ __all__ = [
     "BoundLiveWeightArena",
     "BundleLayout",
     "Comm",
-    "HierarchicalCopyTicket",
     "HierarchicalLiveWeightArena",
     "HierarchicalLiveWeightArenaProvider",
     "HierarchicalSamiWeightBroadcast",

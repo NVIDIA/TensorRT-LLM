@@ -350,8 +350,9 @@ class PerLayerDynamicMoeLayerLoadBalancer:
             raise RuntimeError("attempted to finish a different replica plan")
         assert self._scheduler_group is not None
         # Also makes cleanup safe when input preparation failed before the
-        # backend reached its first route consumer.
-        pending.wait_for_routes()
+        # backend reached its first route consumer. This is the plan's route
+        # wait, called on the group directly.
+        self._scheduler_group.wait_for_routes()
         self._scheduler_group.finish(completion_event=completion_event)
         self._pending_replica_plan = None
 

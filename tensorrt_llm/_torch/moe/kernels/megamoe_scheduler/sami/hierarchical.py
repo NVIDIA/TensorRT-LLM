@@ -182,13 +182,6 @@ def _event_handle(event: object | None) -> int:
     return int(getattr(event, "cuda_event", event))
 
 
-@dataclass(frozen=True)
-class HierarchicalCopyTicket:
-    generation: int
-    terminal_flags: torch.Tensor = field(repr=False)
-    command_count: int
-
-
 class HierarchicalSamiWeightBroadcast:
     """One-rank HALO-Q copy endpoint with a single C hot-path context."""
 
@@ -658,7 +651,7 @@ class HierarchicalSamiWeightBroadcast:
         route_target: int,
         *,
         spin_cycles: int,
-    ) -> HierarchicalCopyTicket:
+    ) -> int:
         """Enqueue the bound scheduler and this GPU-direct copy as one kernel.
 
         The kernel runs on the bound stream after the work already queued on
@@ -666,7 +659,8 @@ class HierarchicalSamiWeightBroadcast:
         adds one to the bound route epoch once its routes are written, which
         makes it reach ``route_target``; the copy and its READY publication
         follow in the same CTAs. ``spin_cycles`` bounds the launch's
-        cross-rank waits and its wait for the route epoch.
+        cross-rank waits and its wait for the route epoch. Returns the
+        launched generation.
         """
 
         with self._lock:
@@ -685,13 +679,9 @@ class HierarchicalSamiWeightBroadcast:
             except BaseException:
                 self._handoff_aborted = True
                 raise
-            ticket = HierarchicalCopyTicket(
-                generation=self._generation,
-                terminal_flags=self.terminal_flags,
-                command_count=1,
-            )
-            self._generation += 1
-            return ticket
+            generation = self._generation
+            self._generation = generation + 1
+            return generation
 
     def close(self) -> None:
         """Release the native copy context after all device work is drained."""
@@ -719,7 +709,6 @@ class HierarchicalSamiWeightBroadcast:
 
 __all__ = [
     "BoundHierarchicalLiveWeightArena",
-    "HierarchicalCopyTicket",
     "HierarchicalLiveWeightArena",
     "HierarchicalLiveWeightArenaProvider",
     "HierarchicalSamiWeightBroadcast",

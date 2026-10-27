@@ -11,7 +11,6 @@ from .cuda_scheduler import (
 )
 from .sami import (
     BoundHierarchicalLiveWeightArena,
-    HierarchicalCopyTicket,
     HierarchicalLiveWeightArena,
     HierarchicalLiveWeightArenaProvider,
     HierarchicalSamiWeightBroadcast,
@@ -35,7 +34,6 @@ __all__ = [
     "BundleLayout",
     "Comm",
     "LivePlaneView",
-    "HierarchicalCopyTicket",
     "HierarchicalLiveWeightArena",
     "HierarchicalLiveWeightArenaProvider",
     "HierarchicalSamiWeightBroadcast",

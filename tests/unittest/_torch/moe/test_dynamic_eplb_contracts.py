@@ -242,12 +242,6 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
     torch = SimpleNamespace(
         ops=SimpleNamespace(trtllm=SimpleNamespace(moe_rebalance_tma_submit_fused=submit_fused)),
     )
-    ticket_cls = _extract_class(
-        source,
-        "HierarchicalCopyTicket",
-        None,
-        {"dataclass": dataclasses.dataclass, "field": dataclasses.field},
-    )
     event_handle = _extract_function(source, "_event_handle", {})
     broadcast_cls = _extract_class(
         source,
@@ -260,7 +254,6 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
         },
         {
             "torch": torch,
-            "HierarchicalCopyTicket": ticket_cls,
             "_event_handle": event_handle,
             "check_cuda": lambda result, operation: result,
         },
@@ -295,12 +288,12 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
         cuStreamWaitEvent=lambda stream, event, flags: native.append(("wait", stream, event))
     )
 
-    ticket = broadcast.submit_fused(outputs, "routes", 8, spin_cycles=12345)
+    generation = broadcast.submit_fused(outputs, "routes", 8, spin_cycles=12345)
 
     # One native call orders the launch after the current stream and enqueues
     # it on the bound copy stream; Python switches no stream.
     assert native == [("launch", 4242, "routes", 8, 12345)]
-    assert (ticket.generation, ticket.command_count) == (1, 1)
+    assert generation == 1
     assert (broadcast._active_generation, broadcast._generation) == (1, 2)
     # The bank stays leased until the consumer of generation 1 is proven done.
     with pytest.raises(RuntimeError, match="still leased"):
@@ -323,8 +316,7 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
         broadcast.release_generation_after(1)
     broadcast.mark_collective_reuse_safe(authority, 1)
     assert broadcast._collective_safe_generation == 1
-    ticket = broadcast.submit_fused(outputs, "routes", 16, spin_cycles=12345)
-    assert ticket.generation == 2
+    assert broadcast.submit_fused(outputs, "routes", 16, spin_cycles=12345) == 2
 
     # A caller-recorded consumer event is waited for on the copy stream instead.
     native.clear()
@@ -1309,7 +1301,7 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
         generation = group._scheduled_generation
         trace.append(("FUSED", routes.shape[0], target, generation))
         launch_bounds.append(spin_cycles)
-        return SimpleNamespace(generation=generation)
+        return generation
 
     group.scheduler = SimpleNamespace(device="cuda:0", outputs=outputs)
     group.broadcaster = SimpleNamespace(
@@ -1369,7 +1361,7 @@ def test_fused_submit_orders_generations_and_defers_the_route_wait(auxiliary_sms
     # and the group refuses further plans rather than let the allocator reuse them.
     group._pending_release = None
     group._spin_bound = SimpleNamespace(cycles=lambda: _SERVING_SPIN_CYCLES)
-    group.broadcaster.submit_fused = lambda *args, **kwargs: SimpleNamespace(generation=99)
+    group.broadcaster.submit_fused = lambda *args, **kwargs: 99
     stuck = _Routes(8, trace)
     with pytest.raises(RuntimeError, match="generation mismatch"):
         group.plan_schedule(stuck)

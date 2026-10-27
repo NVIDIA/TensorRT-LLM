@@ -360,16 +360,16 @@ class RebalanceSlotSchedulerGroup:
         self._routes_in_flight = logical_expert_ids
         # The launch follows the MAIN work queued so far, which wrote the
         # routes; no host synchronization is needed.
-        ticket = self.broadcaster.submit_fused(
+        generation = self.broadcaster.submit_fused(
             outputs,
             logical_expert_ids,
             route_target,
             spin_cycles=self._spin_bound.cycles(),
         )
-        if int(ticket.generation) != self._scheduled_generation:
+        if generation != self._scheduled_generation:
             raise RuntimeError("TMA and HALO-Q generation mismatch")
         self._route_target = route_target
-        self._generation = int(ticket.generation)
+        self._generation = generation
         part = (outputs, num_tokens)
         self._plan_part = part
         return part
