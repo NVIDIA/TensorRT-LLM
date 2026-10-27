@@ -1233,10 +1233,17 @@ class MNNVLAllReduce(nn.Module):
                 and hidden_size == self.fused_norm.hidden
                 and self.fused_norm.supports_rows(num_tokens))
 
-    def _moe_fold_call(self, fc2: torch.Tensor,
-                       params: MoEAllReduceParams) -> Tuple[torch.Tensor, ...]:
-        """``finalize(fc2) + sigmoid(gate) * shared`` all-reduced, + residual, RMSNorm (``params.fusion_op``)."""
-        quant, norm_out = self._FUSED_NORM_OUTPUTS[params.fusion_op]
+    def _moe_fold_call(
+            self, fc2: torch.Tensor,
+            params: MoEAllReduceParams) -> Optional[Tuple[torch.Tensor, ...]]:
+        """``finalize(fc2) + sigmoid(gate) * shared`` all-reduced, + residual, RMSNorm (``params.fusion_op``), or
+        None where the fold does not apply."""
+        outputs = self._FUSED_NORM_OUTPUTS.get(params.fusion_op)
+        shared = params.shared_expert_output
+        if (outputs is None or shared is None or
+                not self.supports_moe_fold(shared.shape[0], shared.shape[-1])):
+            return None
+        quant, norm_out = outputs
         return self.fused_norm(params.residual,
                                params.norm_weight,
                                params.eps,

@@ -45,7 +45,9 @@ pytestmark = [
 
 H = 4096
 EPS = 1e-6
-# Slot launch below 64 rows, two-shot above; consecutive calls also cycle the Lamport buffers.
+# Kernel launch: slot below 64 rows, two-shot from 64. ``ar(...)`` takes the CuTe kernels only up to the 1 MiB
+# one-shot message (rows * H * tp * 2 bytes), the library op above, so the two-shot rows are also checked through
+# ``ar.fused_norm`` directly. Consecutive calls also cycle the Lamport buffers.
 ROWS = (1, 7, 32, 63, 64, 96, 200)
 
 
@@ -109,12 +111,24 @@ def _norm_cases(tp):
         norm, res = ar(xs[rank], all_reduce_params=params)
         _check(norm, ref_norm, ("norm", m))
         _check(res, ref_res, ("residual", m))
+        norm, res = ar.fused_norm(residual, norm_weight, EPS, x=xs[rank])
+        _check(norm, ref_norm, ("kernel norm", m))
+        _check(res, ref_res, ("kernel residual", m))
         norm, fp8, res = ar.fused_norm(
             residual, norm_weight, EPS, x=xs[rank], scale=scale, norm_out=True
         )
         _check(norm, ref_norm, ("norm with fp8", m))
         # E4M3 holds 3 mantissa bits: half an ulp is 6.25 % relative.
         _check(fp8.float() * scale, ref_norm.clamp(-448 * 0.05, 448 * 0.05), ("fp8", m), rtol=7e-2)
+    # More rows than two CTAs per SM: the two-shot kernel takes several tokens per CTA.
+    m = 2 * torch.cuda.get_device_properties(rank).multi_processor_count + 8
+    assert ar.fused_norm.supports_rows(m), m
+    xs = [_rand((m, H), 100 * m + r) for r in range(tp)]
+    residual = _rand((m, H), 7 * m)
+    ref_norm, ref_res = _ref_norm(sum(x.float() for x in xs), residual, norm_weight)
+    norm, res = ar.fused_norm(residual, norm_weight, EPS, x=xs[rank])
+    _check(norm, ref_norm, ("kernel norm", m))
+    _check(res, ref_res, ("kernel residual", m))
 
 
 def _moe_fold_cases(tp, top_k=10):

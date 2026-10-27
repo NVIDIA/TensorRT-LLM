@@ -1017,6 +1017,9 @@ def run_fp8_payload_single_rank(tensor_parallel_size, input, residual,
     except Exception:
         traceback.print_exc()
         raise
+    finally:
+        # The pool worker is reused: later tests must not see the MNNVL override.
+        os.environ.pop("TLLM_TEST_MNNVL", None)
     return True
 
 
