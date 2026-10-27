@@ -120,11 +120,19 @@ def compute_deterministic_mamba_seed(counter: int, slot: int, rank_offset: int) 
 
 
 def allocate_mamba_seed_buffer(
-    cache_size: int, rank_offset: int, device: torch.device
+    cache_size: int,
+    rank_offset: int,
+    device: torch.device,
+    existing: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Allocate the graph-stable per-slot Philox seed buffer."""
+    """Grow per-slot seeds when necessary, retaining seeds for existing slots."""
+    if existing is not None and existing.numel() >= cache_size:
+        return existing
     seeds = [compute_deterministic_mamba_seed(0, slot, rank_offset) for slot in range(cache_size)]
-    return torch.tensor(seeds, dtype=torch.int64, device=device)
+    result = torch.tensor(seeds, dtype=torch.int64, device=device)
+    if existing is not None:
+        result[: existing.numel()].copy_(existing)
+    return result
 
 
 def _reset_mamba_seed_buffer(
@@ -194,7 +202,7 @@ class GDNIntermediateState(MambaStateStorage):
 
         device = ssm_states[0].device
 
-        if context.spec_config is not None:
+        if context.spec_config is not None and self.intermediate_indices is None:
             tokens_per_step = context.spec_config.tokens_per_gen_step
             common_shape = [
                 len(context.mamba_pp_layers),
@@ -342,15 +350,21 @@ class GDNReplayState(MambaStateStorage):
             context.max_batch_size,
             tokens_per_step,
         ]
-        self.intermediate_conv = torch.zeros(
-            common_intermediate_shape + list(context.conv_state_shape),
-            dtype=context.conv_state_dtype,
-            device=device,
+        if self.intermediate_indices is None:
+            self.intermediate_conv = torch.zeros(
+                common_intermediate_shape + list(context.conv_state_shape),
+                dtype=context.conv_state_dtype,
+                device=device,
+            )
+            self.intermediate_indices = torch.arange(
+                context.max_batch_size, dtype=torch.int32, device=device
+            )
+        self.rand_seed = allocate_mamba_seed_buffer(
+            context.slot_capacity_bound or cache_size,
+            self._seed_rank_offset,
+            device,
+            self.rand_seed,
         )
-        self.intermediate_indices = torch.arange(
-            context.max_batch_size, dtype=torch.int32, device=device
-        )
-        self.rand_seed = allocate_mamba_seed_buffer(cache_size, self._seed_rank_offset, device)
 
         if self.pool_layers is None:
             num_heads, head_dim, d_state = context.ssm_state_shape

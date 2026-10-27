@@ -598,6 +598,7 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         self._ple_conv_state_dtype = default_state_dtype
         self._ple_conv_states: dict[int, torch.Tensor] = {}
         self._ple_ngram_contexts: dict[int, torch.Tensor] = {}
+        self._ple_kernel_caches: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         if params is None:
             return
         if len(params.ple_layer_mask) != total_layers:
@@ -657,6 +658,10 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
                 )
             self._ple_conv_states[layer_id] = conv_state
             self._ple_ngram_contexts[layer_id] = ngram_context
+            self._ple_kernel_caches[layer_id] = (
+                self._kernel_state_view(conv_state),
+                self._kernel_state_view(ngram_context),
+            )
         logger.info(
             "PLE state views bound to V2 lifecycle buffers for local layers "
             f"{sorted(self._ple_conv_states)}: conv "
@@ -667,11 +672,7 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
 
     def ple_layer_cache(self, layer_idx: int) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """Return persistent ``(conv_state, ngram_context)`` pools for a layer."""
-        conv = self._ple_conv_states.get(layer_idx)
-        ngram = self._ple_ngram_contexts.get(layer_idx)
-        if conv is None or ngram is None:
-            return None
-        return conv, ngram
+        return self._ple_kernel_caches.get(layer_idx)
 
     def _ple_buffer_configs(self) -> list[BufferConfig]:
         if not self._ple_layer_ids:
@@ -745,6 +746,7 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
     def shutdown(self) -> None:
         self._ple_conv_states.clear()
         self._ple_ngram_contexts.clear()
+        self._ple_kernel_caches.clear()
         super().shutdown()
 
     @override

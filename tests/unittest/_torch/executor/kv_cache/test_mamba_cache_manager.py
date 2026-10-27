@@ -3970,24 +3970,142 @@ def test_v2_kda_replay_policy_supports_attention_only_pp_rank():
         mgr.shutdown()
 
 
+def _rebalance_ssm_fraction(mgr, fraction):
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
+
+    groups = mgr.impl.pool_group_descs
+    ssm_group = next(
+        i
+        for i, group in enumerate(groups)
+        if any(v.layer_group_id == mgr.ssm_layer_group_id for v in group.slot_desc.variants)
+    )
+    assert len(groups) == 2
+    target = [1 - fraction, 1 - fraction]
+    target[ssm_group] = fraction
+    _introspection.set_num_sampled_kv_caches(mgr.impl, 2001)
+    _introspection.set_last_adjustment_time(mgr.impl, 0.0)
+    _introspection.set_target_ratio_list_gpu(mgr.impl, target)
+    mgr.impl.adjust()
+    mgr.refresh_state_views()
+
+
 @skip_no_cuda
-@pytest.mark.parametrize("kda_replay", [True, False], ids=["kda_replay", "no_replay"])
-def test_v2_kda_replay_refuses_kv_pool_rebalance(kda_replay):
-    """The KDA replay caches and prev_num_accepted_tokens hold one entry per SSM slot the pool keeps at construction,
-    and a KV pool rebalance can grow that pool past them, so the manager refuses enable_kv_pool_rebalance with them;
-    without them the rebalance stays allowed."""
-    if not kda_replay:
-        _build_v2_hybrid_with_mamba_layer(enable_kv_pool_rebalance=True).shutdown()
-        return
-    with pytest.raises(ValueError, match="enable_kv_pool_rebalance=False"):
-        _build_v2_hybrid_with_mamba_layer(
-            spec_config=MTPDecodingConfig(max_draft_len=2),
-            conv_state_layout="q_k_v",
-            mamba_n_groups=4,
-            mamba_ssm_cache_dtype=torch.float32,
-            kda_replay_num_spec=2,
-            enable_kv_pool_rebalance=True,
+@pytest.mark.parametrize(
+    "manager_cls",
+    [
+        KimiK3HybridCacheManager,
+        Glm5NextCacheManager,
+        NemotronHybridCacheManager,
+        Qwen35HybridCacheManager,
+        Qwen4ExpHybridCacheManager,
+    ],
+)
+@pytest.mark.parametrize("replay", [False, True])
+def test_v2_hybrid_graph_survives_pool_rebalance(manager_cls, replay):
+    """An existing graph addresses newly backed slots and relocated state after shrink."""
+    from tensorrt_llm._torch.modules.mamba.recurrent_state_cache import reset_recurrent_state_rows
+
+    is_kda = manager_cls in (KimiK3HybridCacheManager, Glm5NextCacheManager)
+    options = dict(
+        model_manager_cls=manager_cls,
+        enable_kv_pool_rebalance=True,
+        max_tokens=None,
+        max_gpu_total_bytes=32 << 20,
+        host_cache_size=64 << 20,
+    )
+    if is_kda and replay:
+        mgr = _build_kda_replay_manager(**options)
+    else:
+        mgr = _build_v2_hybrid_with_mamba_layer(
+            spec_config=MTPDecodingConfig(max_draft_len=2) if replay else None,
+            use_replay_state_update=replay,
+            conv_state_layout="x_b_c" if manager_cls is NemotronHybridCacheManager else "q_k_v",
+            **options,
         )
+    graph = torch.cuda.CUDAGraph()
+    caches = []
+    try:
+        _rebalance_ssm_fraction(mgr, 0.2)
+        initial_slots = mgr.get_ssm_states(0).shape[0]
+        cache = mgr.mamba_layer_cache(0)
+        seed = mgr._speculative_state.rand_seed if mgr._speculative_state is not None else None
+        stream = torch.cuda.current_stream().cuda_stream
+        kv = mgr.impl.create_kv_cache()
+        caches.append(kv)
+        assert kv.resume(stream)
+        slot = kv.get_ssm_block_base_index(mgr.ssm_layer_group_id)
+        indices = torch.tensor([slot], dtype=torch.int32, device="cuda")
+        has_initial = torch.zeros(1, dtype=torch.bool, device="cuda")
+        fields = [cache.temporal, cache.conv]
+        if replay:
+            fields += [
+                getattr(cache, spec.name)
+                for spec in mgr._speculative_state.pool_buffer_specs(mgr._state_layout)
+            ]
+        outputs = [torch.empty_like(field[:1]) for field in fields]
+
+        def run():
+            reset_recurrent_state_rows(cache.temporal, indices, has_initial, cache.conv)
+            for number, (field, output) in enumerate(zip(fields, outputs)):
+                if number >= 2:
+                    field.index_fill_(0, indices.long(), number)
+                torch.index_select(field, 0, indices, out=output)
+            if seed is not None:
+                seed.add_(1)
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            run()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        with torch.cuda.graph(graph):
+            run()
+        torch.cuda.synchronize()
+        kv.suspend()
+        _rebalance_ssm_fraction(mgr, 0.8)
+        assert mgr.get_ssm_states(0).shape[0] > initial_slots
+        assert kv.resume(stream)
+        # Hold lower slots until KVCM allocates one beyond the captured live extent.
+        while slot < initial_slots:
+            kv = mgr.impl.create_kv_cache()
+            caches.append(kv)
+            assert kv.resume(stream)
+            slot = kv.get_ssm_block_base_index(mgr.ssm_layer_group_id)
+        assert slot >= initial_slots
+        for other in caches[:-1]:
+            other.close()
+        caches = [kv]
+        for fraction in (None, 0.2):
+            if fraction is not None:
+                torch.cuda.synchronize()
+                kv.suspend()
+                _rebalance_ssm_fraction(mgr, fraction)
+                assert kv.resume(stream)
+                slot = kv.get_ssm_block_base_index(mgr.ssm_layer_group_id)
+                assert slot < initial_slots
+            current = mgr.mamba_layer_cache(0)
+            assert current.temporal.shape == cache.temporal.shape
+            assert current.temporal.data_ptr() == cache.temporal.data_ptr()
+            if seed is not None:
+                assert mgr._speculative_state.rand_seed is seed
+            mgr.get_ssm_states(0)[slot].fill_(19)
+            mgr.get_conv_states(0)[slot].fill_(19)
+            indices.fill_(slot)
+            graph.replay()
+            torch.cuda.synchronize()
+            for number, output in enumerate(outputs):
+                torch.testing.assert_close(
+                    output, torch.full_like(output, number if number >= 2 else 0)
+                )
+            # The reset kernel must have written the current physical slot, too.
+            assert torch.count_nonzero(mgr.get_ssm_states(0)[slot]) == 0
+            assert torch.count_nonzero(mgr.get_conv_states(0)[slot]) == 0
+        assert mgr.get_ssm_states(0).shape[0] == initial_slots
+    finally:
+        graph.reset()
+        for kv in caches:
+            kv.close()
+        mgr.shutdown()
 
 
 def _v2_kda_draft_record_manager(kda_draft_records, enable_block_reuse):

@@ -90,6 +90,7 @@ class MambaStateLayout:
     spec_config: object | None
     conv_section_dims: tuple[int, ...] = field(default_factory=tuple)
     conv_state_layout: Literal["x_b_c", "q_k_v"] = "x_b_c"
+    slot_capacity_bound: int | None = None
 
     def with_slot_capacity(self, slot_capacity: int) -> "MambaStateLayout":
         """Return the post-allocation context for tensor-view binding."""

@@ -70,11 +70,19 @@ def compute_deterministic_mamba_seed(counter: int, slot: int, rank_offset: int) 
 
 
 def allocate_mamba_seed_buffer(
-    cache_size: int, rank_offset: int, device: torch.device
+    cache_size: int,
+    rank_offset: int,
+    device: torch.device,
+    existing: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Allocate the graph-stable per-slot Philox seed buffer."""
+    """Grow per-slot seeds when necessary, retaining seeds for existing slots."""
+    if existing is not None and existing.numel() >= cache_size:
+        return existing
     seeds = [compute_deterministic_mamba_seed(0, slot, rank_offset) for slot in range(cache_size)]
-    return torch.tensor(seeds, dtype=torch.int64, device=device)
+    result = torch.tensor(seeds, dtype=torch.int64, device=device)
+    if existing is not None:
+        result[: existing.numel()].copy_(existing)
+    return result
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -325,7 +333,7 @@ class KDAIntermediateState(MambaStateStorage):
 
         device = ssm_states[0].device
 
-        if context.spec_config is not None:
+        if context.spec_config is not None and self.intermediate_indices is None:
             tokens_per_step = context.spec_config.tokens_per_gen_step
             common_shape = [
                 len(context.mamba_pp_layers),
@@ -600,16 +608,18 @@ class KDAReplayState(MambaStateStorage):
             )
             for name, value in fields.items():
                 setattr(self, name, value)
-        self.intermediate_indices = torch.arange(
-            context.max_batch_size,
-            dtype=torch.int32,
-            device=device,
-        )
+        if self.intermediate_indices is None:
+            self.intermediate_indices = torch.arange(
+                context.max_batch_size,
+                dtype=torch.int32,
+                device=device,
+            )
         if self._stochastic_rounding:
             self.rand_seed = allocate_mamba_seed_buffer(
-                cache_size,
+                context.slot_capacity_bound or cache_size,
                 self._seed_rank_offset,
                 device,
+                self.rand_seed,
             )
         logger.info(f"Mamba Cache (kda-replay) is allocated for {cache_size} state slots")
 

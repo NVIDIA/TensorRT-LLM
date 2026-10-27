@@ -599,15 +599,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     @override
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         kv_cache_config = self.kv_cache_config
-        if (
-            self._speculative_state is not None
-            and self._speculative_state.pool_buffer_specs(self._state_layout)
-            and kv_cache_config.enable_kv_pool_rebalance
-        ):
-            raise ValueError(
-                "Replay pool views require stable capacity; set "
-                "kv_cache_config.enable_kv_pool_rebalance=False."
-            )
         cache_tiers = config.cache_tiers
         gpu_quota = cache_tiers[0].quota
         minimum_live_quota = self._minimum_live_gpu_quota()
@@ -694,6 +685,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _setup_state_pool(self) -> None:
         """Resolve logical slots, bind base views, then initialize model state."""
+        self._kernel_layer_caches: dict[int, MambaLayerCache] = {}
         self.mamba_layer_offsets = {
             layer_id: offset for offset, layer_id in enumerate(self.mamba_pp_layers)
         }
@@ -742,6 +734,21 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     "KV cache budget or allocate a larger Mamba pool_ratio."
                 )
             self._state_layout = self._state_layout.with_slot_capacity(num_ssm_slots)
+            if self.kv_cache_config.enable_kv_pool_rebalance:
+                group = next(
+                    group
+                    for group in self.impl.pool_group_descs
+                    if any(
+                        variant.layer_group_id == self.ssm_layer_group_id
+                        for variant in group.slot_desc.variants
+                    )
+                )
+                # Ratios change during adjust(), but the total GPU quota does
+                # not. No allocation can exceed this many slots in this group.
+                slot_bytes = sum(pool.slot_bytes for pool in group.pools)
+                capacity_bound = int(self.impl.get_quota(0)) // slot_bytes
+                assert capacity_bound >= num_ssm_slots
+                self._state_layout = replace(self._state_layout, slot_capacity_bound=capacity_bound)
             self._setup_states()
         else:
             self.ssm_layer_group_id = None
@@ -751,6 +758,38 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._state_layout = self._state_layout.with_slot_capacity(0)
 
         self._setup_model_state()
+
+    def refresh_state_views(self) -> None:
+        """Refresh live views after rebalance, while all requests are suspended.
+
+        Kernel views retain the fixed-quota bound and stable addresses/strides,
+        so existing CUDA graphs remain valid. Never iterate or clear an entire
+        kernel view: only slots allocated by KVCM have physical backing.
+        """
+        if not self.mamba_pp_layers:
+            return
+        first_layer = self.layer_offsets[self.mamba_pp_layers[0]]
+        pages = self.impl.get_page_index_upper_bound(LayerId(first_layer), MambaRole.SSM_STATE)
+        slots = (pages + self._ssm_page_index_scale - 1) // self._ssm_page_index_scale
+        if slots == self._state_layout.slot_capacity:
+            return
+        bound = self._state_layout.slot_capacity_bound
+        if bound is not None and slots > bound:
+            raise RuntimeError("SSM capacity exceeded the fixed GPU quota used for CUDA graphs")
+        self._state_layout = self._state_layout.with_slot_capacity(slots)
+        self._setup_states()
+        self._setup_model_state()
+        self._kernel_layer_caches.clear()
+
+    def _kernel_state_view(self, view: torch.Tensor) -> torch.Tensor:
+        """Borrow a slot-indexed execution view with a rebalance-invariant bound."""
+        capacity = self._state_layout.slot_capacity_bound
+        if capacity is None:
+            return view
+        shape = [capacity, *view.shape[1:]]
+        span = 1 + sum((size - 1) * stride for size, stride in zip(shape, view.stride()))
+        raw = convert_to_torch_tensor(TensorWrapper(view.data_ptr(), view.dtype, [span]))
+        return raw.as_strided(shape, view.stride())
 
     def _get_state_buffer(
         self, local_layer_idx: int, role, dtype: torch.dtype, state_shape: List[int]
@@ -864,15 +903,29 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def mamba_layer_cache(self, layer_idx: int) -> MambaLayerCache:
+        bound = self._state_layout.slot_capacity_bound
+        if bound is not None and layer_idx in self._kernel_layer_caches:
+            return self._kernel_layer_caches[layer_idx]
+        conv = self.get_conv_states(layer_idx)
+        temporal = self.get_ssm_states(layer_idx)
         if self._speculative_state is not None and self.spec_config is not None:
-            return self._speculative_state.make_layer_cache(
-                self.mamba_layer_offsets[layer_idx],
-                self.get_conv_states(layer_idx),
-                self.get_ssm_states(layer_idx),
+            cache = self._speculative_state.make_layer_cache(
+                self.mamba_layer_offsets[layer_idx], conv, temporal
             )
-        return MambaLayerCache(
-            conv=self.get_conv_states(layer_idx), temporal=self.get_ssm_states(layer_idx)
-        )
+        else:
+            cache = MambaLayerCache(conv=conv, temporal=temporal)
+        if bound is not None:
+            names = {"conv", "temporal"}
+            if self._speculative_state is not None:
+                names.update(
+                    spec.name
+                    for spec in self._speculative_state.pool_buffer_specs(self._state_layout)
+                )
+            cache = replace(
+                cache, **{name: self._kernel_state_view(getattr(cache, name)) for name in names}
+            )
+            self._kernel_layer_caches[layer_idx] = cache
+        return cache
 
     def _attention_cache_bytes_per_token(self) -> int:
         # Mamba layers have zero KV heads, so the generic calculation naturally
@@ -1471,6 +1524,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def shutdown(self):
         if self._speculative_state is not None:
             self._speculative_state.shutdown()
+        if hasattr(self, "_kernel_layer_caches"):
+            self._kernel_layer_caches.clear()
         self._recurrent_buffers.clear()
         self.all_ssm_states = []
         self.all_conv_states = []
