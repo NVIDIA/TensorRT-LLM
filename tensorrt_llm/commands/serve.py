@@ -2575,7 +2575,9 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
             "TRTLLM_DISAGG_SHARED_DRAFT_KV") == "1":
         raise click.UsageError(
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires {blocker}.")
-    os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = ("0" if blocker else "1")
+    if os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") in (None, "auto"):
+        os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = ("0"
+                                                       if blocker else "auto")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.

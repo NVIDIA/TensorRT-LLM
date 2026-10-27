@@ -14,6 +14,7 @@
 # limitations under the License.
 """Selection of the unified target+DFlash KV cache layout."""
 
+import os
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -353,3 +354,30 @@ def test_launcher_accepts_eligible_shared_cache_config(monkeypatch, tmp_path):
             {"speculative_config": spec, "enable_attention_dp": True},
             {"speculative_config": spec, "enable_attention_dp": True},
         )
+
+
+@pytest.mark.parametrize(
+    "request_mode,draft_heads,expected_mode",
+    [("0", 8, "0"), (None, 4, "auto")],
+    ids=["explicit_opt_out", "auto_fallback"],
+)
+def test_launcher_preserves_opt_out_and_allows_layout_fallback(
+    monkeypatch, tmp_path, request_mode, draft_heads, expected_mode
+) -> None:
+    if request_mode is None:
+        monkeypatch.delenv(_SHARED_DRAFT_KV_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, request_mode)
+    config = {"speculative_config": {"decoding_type": "DFlash", "attention_backend": "TRTLLM"}}
+
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(monkeypatch, tmp_path, config, config)
+
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == expected_mode
+    creator = _creator(
+        is_disagg=True,
+        target=_model_config(kv_heads=8, head_dim=128),
+        draft=_model_config(kv_heads=draft_heads, head_dim=128),
+    )
+    creator._check_shared_draft_kv_request()
+    assert not creator._should_unify_dflash_kv_cache()

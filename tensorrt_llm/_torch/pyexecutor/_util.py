@@ -2248,12 +2248,14 @@ class KvCacheCreator:
         """Whether this run can place target and DFlash or standalone DSpark
         layers in one V2 manager.
 
-        Disaggregated serving shares only when TRTLLM_DISAGG_SHARED_DRAFT_KV=1.
+        Disaggregated serving shares only when TRTLLM_DISAGG_SHARED_DRAFT_KV
+        is "1" or "auto".
         """
         if self._dflash_unify_blocker() is not None:
             return False
         return not (self._is_disagg
-                    and os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") != "1")
+                    and os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV")
+                    not in ("1", "auto"))
 
     def _check_shared_draft_kv_request(self) -> None:
         """Fail at startup when TRTLLM_DISAGG_SHARED_DRAFT_KV=1 cannot be honored."""
