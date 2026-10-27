@@ -38,6 +38,7 @@ only when all ranks line up on the same iteration.
 
 from __future__ import annotations
 
+import json
 import types
 from unittest.mock import MagicMock, patch
 
@@ -49,7 +50,12 @@ from tensorrt_llm._torch.pyexecutor.adp_iter_stats import (
     ADPIterStatsBuffer,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankIterStatsPayload, RankState
-from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats, SpecDecodingStats
+from tensorrt_llm.bindings.executor import (
+    InflightBatchingStats,
+    IterationStats,
+    KvCacheStats,
+    SpecDecodingStats,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -767,6 +773,79 @@ def _build_adp_stats_buffer(pending_stats, *, is_rank0=True):
     return buffer
 
 
+def _make_kv_cache_snapshot(offset: int) -> KvCacheStats:
+    """Build distinct native counters for a rank's cache.
+
+    Args:
+        offset: Value distinguishing each rank and cache pool.
+
+    Returns:
+        A native KV snapshot with a fractional hit rate.
+    """
+    stats = KvCacheStats()
+    stats.max_num_blocks = 100 + 2 * offset
+    stats.free_num_blocks = 80 + offset
+    stats.used_num_blocks = 20 + offset
+    stats.tokens_per_block = 16 + offset
+    stats.alloc_total_blocks = 50 + offset
+    stats.alloc_new_blocks = 30 + offset
+    stats.reused_blocks = 12 + offset
+    stats.missed_blocks = 7 + offset
+    # Deliberately distinct from reused / (reused + missed): preserve the
+    # measured float, rather than recomputing or truncating it in transport.
+    stats.cache_hit_rate = 0.375 + offset / 256
+    return stats
+
+
+@pytest.mark.parametrize("include_kv_cache_load", [False, True])
+def test_attention_dp_fanout_preserves_rank_local_kv_snapshots(
+    include_kv_cache_load: bool,
+) -> None:
+    """Transport all native KV fields without copying rank 0 or later mutations."""
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    states = []
+    expected = []
+    for rank, buffer in enumerate(buffers):
+        stats = _make_adp_iteration_stats(iter_id=9, num_gen_requests=rank + 1)
+        stats.kv_cache_stats = _make_kv_cache_snapshot(rank * 10)
+        stats.cross_kv_cache_stats = _make_kv_cache_snapshot(rank * 10 + 30)
+        expected.append(json.loads(stats.to_json_str()))
+        buffer.queue(stats, is_rank0=rank == 0)
+        # The queued payload must own primitive values, not native references.
+        stats.kv_cache_stats.used_num_blocks = 99
+        stats.kv_cache_stats.cache_hit_rate = 0.0
+        stats.cross_kv_cache_stats.alloc_total_blocks = 999
+        stats.kv_cache_stats = _make_kv_cache_snapshot(50)
+        stats.cross_kv_cache_stats = _make_kv_cache_snapshot(60)
+        payload = buffer.next_payload()
+        payload.kv_used_blocks = 70 + rank
+        payload.kv_total_blocks = 700 + rank
+        payload.kv_load_timestamp_ns = 123 + rank
+        state = RankState(rank=rank, iter_stats=payload)
+        states.append(RankState.deserialize(state.serialize(include_kv_cache_load)))
+
+    records = buffers[0].finalize(states, is_rank0=True)
+
+    assert len(records) == 2
+    for rank, record in enumerate(records):
+        exported = json.loads(record.stats.to_json_str())
+        assert record.attention_dp_rank == rank
+        assert record.stats.inflight_batching_stats.num_gen_requests == rank + 1
+        assert exported["kvCacheStats"] == expected[rank]["kvCacheStats"]
+        # IterationStats JSON omits the cross-cache object; check its native fields.
+        cross = record.stats.cross_kv_cache_stats
+        expected_cross = _make_kv_cache_snapshot(rank * 10 + 30)
+        assert cross.max_num_blocks == expected_cross.max_num_blocks
+        assert cross.free_num_blocks == expected_cross.free_num_blocks
+        assert cross.used_num_blocks == expected_cross.used_num_blocks
+        assert cross.tokens_per_block == expected_cross.tokens_per_block
+        assert cross.alloc_total_blocks == expected_cross.alloc_total_blocks
+        assert cross.alloc_new_blocks == expected_cross.alloc_new_blocks
+        assert cross.reused_blocks == expected_cross.reused_blocks
+        assert cross.missed_blocks == expected_cross.missed_blocks
+        assert cross.cache_hit_rate == expected_cross.cache_hit_rate
+
+
 def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     """Verify ADP fanout emits one rank-local row per rank with queue on rank 0."""
     # Rank 0 emits one stats row per ADP rank. Scheduled fields stay
@@ -844,7 +923,7 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert rank1_ifb.num_paused_requests == 2
     assert rank1_ifb.num_paused_kv_tokens == 25
     assert rank1_ifb.num_scheduled_requests == 7
-    # Expected to be zero/None because queued/request/KV stats are reported
+    # Expected to be zero/None because queued/request/KV iteration deltas are reported
     # only on rank 0.
     assert rank1_ifb.num_queued_context_requests == 0
     assert rank1_ifb.num_queued_ctx_tokens == 0
@@ -931,6 +1010,7 @@ def test_attention_dp_fanout_clears_when_rank0_stats_object_missing():
 def test_attention_dp_fanout_aligns_non_rank0_to_rank0_iter():
     """Verify non-rank0 buffers synthesize zero payloads to align to rank 0."""
     rank1_stats = _make_adp_iteration_stats(iter_id=10, num_context_requests=3)
+    rank1_stats.kv_cache_stats = _make_kv_cache_snapshot(10)
     buffer = _build_adp_stats_buffer(rank1_stats, is_rank0=False)
     rank0_state = RankState(
         rank=0,
@@ -948,12 +1028,45 @@ def test_attention_dp_fanout_aligns_non_rank0_to_rank0_iter():
     next_payload = buffer.next_payload()
     assert next_payload.iter_stats_iter == 9
     assert next_payload.num_context_requests == 0
+    assert next_payload.kv_cache_stats is None
+    assert next_payload.cross_kv_cache_stats is None
     assert 9 in buffer._synthetic_iters
     assert 10 in buffer._payloads
 
+    rank0_stats = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
+    rank0_stats.kv_cache_stats = _make_kv_cache_snapshot(0)
+    rank0_stats.cross_kv_cache_stats = _make_kv_cache_snapshot(30)
+    rank0_buffer = _build_adp_stats_buffer(rank0_stats)
+    # A measured rank uses the snapshot framing while the idle rank stays compact.
+    states = [
+        RankState.deserialize(state.serialize())
+        for state in (
+            RankState(rank=0, iter_stats=rank0_buffer.next_payload()),
+            RankState(rank=1, iter_stats=next_payload),
+        )
+    ]
+    records = rank0_buffer.finalize(states, is_rank0=True)
+    assert len(records) == 2
+    assert records[0].stats.kv_cache_stats.used_num_blocks == 20
+    assert records[0].stats.cross_kv_cache_stats.used_num_blocks == 50
+    assert records[0].stats.inflight_batching_stats.num_context_requests == 1
+    idle_row = records[1].stats
+    assert idle_row.kv_cache_stats is None
+    assert idle_row.cross_kv_cache_stats is None
+    assert idle_row.inflight_batching_stats.num_context_requests == 0
+    assert idle_row.inflight_batching_stats.num_scheduled_requests == 0
+    assert buffer._payloads[10].kv_cache_stats.max_num_blocks == 120
+
+    # A measured payload replaces the synthetic placeholder for the same iter.
+    measured = _make_adp_iteration_stats(iter_id=9)
+    measured.kv_cache_stats = _make_kv_cache_snapshot(5)
+    buffer.queue(measured, is_rank0=False)
+    assert buffer.next_payload().kv_cache_stats.max_num_blocks == 110
+    assert 9 not in buffer._synthetic_iters
+
 
 def test_attention_dp_fanout_copy_lists_cover_iteration_stats_fields():
-    """Guard the hardcoded field lists used when cloning rank-0 stats."""
+    """Guard the copied and rank-local field lists against native schema drift."""
     actual_fields = {
         field
         for field in dir(IterationStats())
@@ -962,7 +1075,7 @@ def test_attention_dp_fanout_copy_lists_cover_iteration_stats_fields():
     copied_fields = (
         set(_ITERATION_STATS_SCALAR_FIELDS)
         | set(_ITERATION_STATS_OPTIONAL_FIELDS)
-        | {"inflight_batching_stats"}
+        | {"inflight_batching_stats", "kv_cache_stats", "cross_kv_cache_stats"}
     )
 
     assert copied_fields == actual_fields
