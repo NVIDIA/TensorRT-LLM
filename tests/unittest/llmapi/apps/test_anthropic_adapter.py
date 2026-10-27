@@ -121,6 +121,8 @@ def test_thinking_controls_reach_the_chat_template(
         {"type": "adaptive", "budget_tokens": 2048},
         {"type": "disabled", "budget_tokens": 2048},
         {"type": "unknown"},
+        {"type": "adaptive", "display": "verbose"},
+        {"type": "enabled", "budget_tokens": 2048, "display": "full"},
     ],
 )
 def test_invalid_thinking_config_rejected(thinking):
@@ -133,6 +135,27 @@ def test_invalid_thinking_config_rejected(thinking):
     """
     with pytest.raises(ValidationError):
         make_request(max_tokens=4096, thinking=thinking)
+
+
+@pytest.mark.parametrize("display", ["summarized", "omitted", "updates"])
+@pytest.mark.parametrize(
+    "thinking",
+    [{"type": "adaptive"}, {"type": "enabled", "budget_tokens": 2048}],
+    ids=["adaptive", "enabled"],
+)
+def test_thinking_display_is_accepted_and_changes_nothing_generated(thinking, display):
+    """`display` says what the client wants shown of the reasoning, nothing more.
+
+    Claude Code sends {"type": "adaptive", "display": "updates"}. The model is
+    asked for exactly what it would be asked for without the field.
+    """
+    plain = convert_anthropic_request(make_request(max_tokens=4096, thinking=thinking))
+    shown = convert_anthropic_request(
+        make_request(max_tokens=4096, thinking={**thinking, "display": display})
+    )
+
+    assert shown.thinking_token_budget == plain.thinking_token_budget
+    assert shown.chat_template_kwargs == plain.chat_template_kwargs
 
 
 def test_thinking_budget_must_be_less_than_max_tokens():
