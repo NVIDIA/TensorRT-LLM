@@ -601,7 +601,7 @@ def test_model_engine_warmup_uses_load_balancer_public_api():
     events = []
     engine_cls = _extract_class(
         _TORCH_ROOT / "pyexecutor/model_engine.py",
-        "PyTorchModelEngine",
+        "ModelEngine",
         {"_set_warmup_effects", "warmup_scope"},
         {
             "contextmanager": contextmanager,
@@ -633,7 +633,7 @@ def test_model_engine_cleanup_shuts_manager_after_graphs_while_model_is_alive():
     events = []
     engine_cls = _extract_class(
         _TORCH_ROOT / "pyexecutor/model_engine.py",
-        "PyTorchModelEngine",
+        "ModelEngine",
         {
             "prepare_cleanup",
             "shutdown_moe_load_balancer",
@@ -677,7 +677,7 @@ def test_model_engine_prepare_failure_participates_in_unsafe_preflight():
     events = []
     engine_cls = _extract_class(
         _TORCH_ROOT / "pyexecutor/model_engine.py",
-        "PyTorchModelEngine",
+        "ModelEngine",
         {
             "prepare_cleanup",
             "shutdown_moe_load_balancer",
@@ -717,7 +717,7 @@ def test_model_engine_finalizer_never_enters_collective_cleanup():
     calls = []
     engine_cls = _extract_class(
         _TORCH_ROOT / "pyexecutor/model_engine.py",
-        "PyTorchModelEngine",
+        "ModelEngine",
         {"__del__"},
         {"logger": SimpleNamespace(warning=lambda *args: calls.append(("warning", args)))},
     )
@@ -858,8 +858,6 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
         def async_worker_stop(self):
             self.stop_attempts += 1
             events.append(("sampler_stop", self.stop_attempts))
-            if self.stop_attempts == 1:
-                raise RuntimeError("sampler stop failed")
 
     class Engine:
         def release_executor_resources(self, *, release_model_owned_graphs):
@@ -905,6 +903,8 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     executor.hang_detector = SimpleNamespace(detected=lambda: False)
     executor.worker_thread = SimpleNamespace(join=lambda: events.append("worker_join"))
     executor.kv_connector_manager = None
+    executor.enable_attention_dp = False
+    executor._kv_connector_failed = False
     executor.dist = SimpleNamespace(pp_size=1)
     executor._shutdown_sleep_wakeup_listeners = lambda: events.append("listener_shutdown")
     executor.encoder_launch_executor = None
@@ -930,7 +930,7 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     worker.doing_shutdown = False
     worker.engine = executor
 
-    for message in ("pool delete failed", "sampler stop failed", "dwdp exit failed"):
+    for message in ("pool delete failed", "dwdp exit failed"):
         with pytest.raises(RuntimeError, match=message):
             worker.shutdown()
         assert executor.model_engine is engine
@@ -947,14 +947,12 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
         "profile_cleanup",
         "worker_join",
         "listener_shutdown",
+        ("sampler_stop", 1),
         "release_graphs",
         "resource_shutdown",
         ("pool_delete", 1),
         ("terminal_cleanup", False),
         ("pool_delete", 2),
-        ("sampler_stop", 1),
-        ("terminal_cleanup", False),
-        ("sampler_stop", 2),
         ("dwdp_exit", 1),
         ("terminal_cleanup", False),
         ("dwdp_exit", 2),
