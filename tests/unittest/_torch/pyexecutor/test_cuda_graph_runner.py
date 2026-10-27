@@ -389,8 +389,8 @@ def test_token_encoder_padding_survives_context_exit_without_mutating_inputs() -
 
 
 def test_feature_replay_stages_host_rows_and_zero_fills_padding() -> None:
-    """Host rows are copied through the mirror into the static buffer in one span,
-    padding rows included, and the graph replays afterwards."""
+    """Host rows reach the static buffer through the mirror, padding rows are
+    zero-filled, and the graph replays afterwards with the mirror rotated."""
     fixed_seq_len = 1_500
     runner = _feature_encoder_runner([1, 2, 4], fixed_seq_len)
     key = (4, 4 * fixed_seq_len, fixed_seq_len)

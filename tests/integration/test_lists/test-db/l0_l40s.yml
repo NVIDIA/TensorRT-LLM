@@ -63,6 +63,7 @@ l0_l40s:
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v2-encoder-graphs-on-greedy]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_precomputed_spectrogram[eager]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_precomputed_spectrogram[encoder-graphs]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_precomputed_spectrogram[eager-worker-process]
 - condition:
     ranges:
       system_gpu_count:

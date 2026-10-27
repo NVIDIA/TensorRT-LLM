@@ -273,8 +273,8 @@ request picks its form by its item, so audio and spectrogram requests share one
 instance and one batch: the engine runs its log-mel front-end on the audio rows
 and feeds every row to the encoder as a spectrogram, and encoder CUDA graphs,
 the decoder prompt, the `max_tokens` cap and every other setting work the same
-way for both. A torch tensor on a GPU is copied on that device, not through the
-host. The spectrogram must come from the same extractor configuration as the
+way for both. With a single rank, a torch tensor on a GPU is copied on that device, not
+through the host. The spectrogram must come from the same extractor configuration as the
 checkpoint, since nothing can check that on the server side, and it must have
 `config.num_mel_bins` bins. The length check moves to the client as well: the
 extractor truncates longer audio to one window by default, so pass
@@ -290,7 +290,7 @@ mel = extractor(
     wave, sampling_rate=sample_rate, truncation=False, return_tensors="np"
 )["input_features"]
 
-# Inside the `with LLM(...) as llm:` block above; the two requests form one batch.
+# Inside the `with LLM(...) as llm:` block above; one instance serves both forms.
 results = llm.generate(
     [
         {"prompt": "", "multi_modal_data": {"audio": [(wave, sample_rate)]}},

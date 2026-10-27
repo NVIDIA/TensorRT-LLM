@@ -1009,6 +1009,8 @@ class MultimodalParams:
         elif method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
             cpu_keys = {'tensor_size', 'storage_handle', 'manager_handle'}
             return cpu_keys.issubset(obj.keys())
+        elif method_key == _SharedTensorRebuildMethodRegistry.REBUILD_LOCAL:
+            return {'local_token', 'producer_pid'}.issubset(obj.keys())
 
         return False
 
@@ -1082,8 +1084,10 @@ class MultimodalParams:
                     # Import here to avoid circular imports
                     from tensorrt_llm._torch.shared_tensor import \
                         SharedTensorContainer
+                    local = bool(kwargs.get("local",
+                                            False)) and input_data.is_cuda
                     return SharedTensorContainer.from_tensor(
-                        input_data).dump_to_dict()
+                        input_data, local=local).dump_to_dict()
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to convert tensor to shared tensor: {e}")
@@ -1112,11 +1116,17 @@ class MultimodalParams:
         self.multimodal_data = self._apply_tensor_operation(
             self.multimodal_data, "release_handles")
 
-    def to_handle(self, element: str) -> None:
+    def to_handle(self, element: str, local: bool = False) -> None:
         """Move specified multimodal data element to shared tensor.
 
         Args:
             element: Element to move (only "multimodal_data" is supported)
+            local: The consumer runs in this process (an in-process executor
+                worker). CUDA tensors are then kept in the process-local
+                store instead of being exported as CUDA IPC handles, which
+                cannot be reopened in the exporting process; such a handle
+                is consumed once, by this process only. CPU tensors still
+                use shared-memory handles, which work in any process.
 
         Raises:
             ValueError: If element is not "multimodal_data"
@@ -1131,7 +1141,9 @@ class MultimodalParams:
         if data is None:
             return  # Nothing to convert
 
-        transformed_data = self._apply_tensor_operation(data, "to_handle")
+        transformed_data = self._apply_tensor_operation(data,
+                                                        "to_handle",
+                                                        local=local)
         setattr(self, element, transformed_data)
 
     def to_tensor(self, element: str) -> None:

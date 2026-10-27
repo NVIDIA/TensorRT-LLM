@@ -376,17 +376,25 @@ def _assert_cuda_graph_state(llm: LLM, captured: bool, encoder_captured: bool = 
     assert encoder_runner.num_feature_replays > len(encoder_runner.graphs)
 
 
-@pytest.mark.parametrize("encoder_graphs", [False, True], ids=["eager", "encoder-graphs"])
-def test_whisper_pytorch_precomputed_spectrogram(monkeypatch, encoder_graphs):
+@pytest.mark.parametrize(
+    "encoder_graphs,single_process",
+    [(False, True), (True, True), (False, False)],
+    ids=["eager", "encoder-graphs", "eager-worker-process"],
+)
+def test_whisper_pytorch_precomputed_spectrogram(monkeypatch, encoder_graphs, single_process):
     """A request may carry the log-mel spectrogram instead of the audio, next to audio requests.
 
     Spectrogram requests, numpy or CUDA torch, alone or in one batch with an
     audio request, must reproduce the pinned fp32 token ids, with the encoder
     eager and under encoder CUDA graphs. The captured graph input is the
     spectrogram; audio requests are converted on the GPU before the graph
-    replays, so both kinds of request must replay the same graphs.
+    replays, so both kinds of request must replay the same graphs. The CUDA
+    spectrogram crosses to the worker as a process-local tensor in
+    single-process mode and as a CUDA IPC handle with a worker process; the
+    third case covers the latter (and cannot introspect the engine).
     """
-    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    if single_process:
+        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
     model_path = _get_whisper_model_path()
     wave, sample_rate = soundfile.read(_get_audio_path())
@@ -416,7 +424,8 @@ def test_whisper_pytorch_precomputed_spectrogram(monkeypatch, encoder_graphs):
                 assert list(completion.token_ids) == _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS
                 assert _EXPECTED_TRANSCRIPT_FRAGMENT in completion.text.lower()
 
-        _assert_cuda_graph_state(llm, captured=encoder_graphs, encoder_captured=encoder_graphs)
+        if single_process:
+            _assert_cuda_graph_state(llm, captured=encoder_graphs, encoder_captured=encoder_graphs)
 
 
 # Feature-combination matrix mirroring the T5/BART enc-dec coverage. Cases:

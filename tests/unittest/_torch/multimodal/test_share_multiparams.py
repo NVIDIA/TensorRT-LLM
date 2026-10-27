@@ -207,5 +207,38 @@ class TestMultimodalParamsDeviceTransfer(unittest.TestCase):
         )
 
 
+@pytest.mark.cpu_only
+def test_to_handle_local_keeps_cuda_tensors_for_an_in_process_consumer():
+    """local=True stashes CUDA tensors in the process-local store, which an
+    in-process executor worker needs since a CUDA IPC handle cannot be reopened
+    in the exporting process, and to_tensor hands back the very same tensor;
+    CPU tensors keep their shared-memory handle, which works in any process."""
+    cpu = torch.randn(1, 80, 3000)
+    data = {
+        "audio": {
+            "encoder_input_features": cpu,
+            "encoder_output_len": 1500
+        }
+    }
+    if torch.cuda.is_available():
+        data["image"] = {"pixel_values": torch.randn(2, 3, device="cuda")}
+    params = MultimodalParams(multimodal_data=data)
+
+    params.to_handle("multimodal_data", local=True)
+    cpu_handle = params.multimodal_data["audio"]["encoder_input_features"]
+    assert isinstance(cpu_handle, dict) and "local_token" not in cpu_handle
+    assert params.multimodal_data["audio"]["encoder_output_len"] == 1500
+    if torch.cuda.is_available():
+        cuda_handle = params.multimodal_data["image"]["pixel_values"]
+        assert isinstance(cuda_handle, dict) and "local_token" in cuda_handle
+
+    params.to_tensor("multimodal_data")
+    torch.testing.assert_close(
+        params.multimodal_data["audio"]["encoder_input_features"], cpu)
+    if torch.cuda.is_available():
+        assert params.multimodal_data["image"]["pixel_values"] is data["image"][
+            "pixel_values"]
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -175,12 +175,12 @@ def test_input_processor_forwards_a_precomputed_log_mel():
         prompt, extra = processor(_mel_request(item), SamplingParams())
         features = _features(extra)
         # A copy: the client may reuse its buffer for the next clip.
-        source = (
-            item.detach()
+        source_ptr = (
+            item.data_ptr()
             if isinstance(item, torch.Tensor)
-            else torch.from_numpy(np.ascontiguousarray(item))
+            else item.__array_interface__["data"][0]
         )
-        assert features.data_ptr() != source.data_ptr()
+        assert features.data_ptr() != source_ptr
         audio = extra["multimodal_data"]["audio"]
         assert prompt == processor._decoder_prompt
         assert audio["encoder_output_len"] == processor.config.max_source_positions
@@ -265,6 +265,13 @@ def test_requests_choose_their_audio_form_per_item():
     assert _features(from_mel).shape == _features(from_batch_feature).shape == (1, 80, 3000)
     with pytest.raises(TypeError, match="input_features"):
         processor({"prompt": "", "multi_modal_data": {"audio": object()}}, SamplingParams())
+    both = {
+        "array": waveform,
+        "sampling_rate": rate,
+        "input_features": batch_feature["input_features"],
+    }
+    with pytest.raises(ValueError, match="not both"):
+        processor({"prompt": "", "multi_modal_data": {"audio": both}}, SamplingParams())
 
 
 def test_encoder_graph_spec_is_the_spectrogram():

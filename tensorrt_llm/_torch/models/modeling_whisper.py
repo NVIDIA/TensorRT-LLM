@@ -784,13 +784,18 @@ class WhisperInputProcessor(InputProcessor):
                 )
             # A fresh fp32 copy without autograd history that the client's
             # buffer cannot change afterwards, on the device the client
-            # computed it: a CUDA spectrogram stays on the GPU (the copy is
-            # ordered on the current stream, and the request transport
-            # carries that ordering to the engine), a CPU one is staged like
-            # a waveform.
+            # computed it: a CUDA spectrogram stays on the GPU, a CPU one is
+            # staged like a waveform. The engine reads a device copy on its
+            # own encoder stream, which has no ordering with the client's, so
+            # wait for this one copy here (the only host wait on the path) so
+            # the request leaves with its features complete.
             features = features.detach().to(
                 dtype=torch.float32, copy=True, memory_format=torch.contiguous_format
             )
+            if features.is_cuda:
+                copied = torch.cuda.Event()
+                copied.record(torch.cuda.current_stream(features.device))
+                copied.synchronize()
         else:
             array = np.asarray(features)
             if not np.issubdtype(array.dtype, np.floating):
@@ -847,6 +852,11 @@ class WhisperInputProcessor(InputProcessor):
 
         audio_item = audio_items[0]
         if isinstance(audio_item, Mapping) and "input_features" in audio_item:
+            if "array" in audio_item:
+                raise ValueError(
+                    "A Whisper audio item carries either the audio ('array') or "
+                    "its log-mel spectrogram ('input_features'), not both."
+                )
             # A spectrogram the client already computed, shipped as fp32
             # [1, num_mel_bins, frames]: the engine skips its log-mel
             # front-end for such a row. The leading dim of 1 keeps the C++
