@@ -735,6 +735,7 @@ def test_rank_state_appends_forward_counts_without_changing_legacy_stats() -> No
             state.num_active_requests,
             state.num_active_tokens,
             state.num_retiring_requests,
+            state.num_pending_new_requests,
             *state.iter_stats.serialize(),
         ]
     )
