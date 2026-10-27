@@ -198,6 +198,14 @@ class AnthropicToolChoice(AnthropicBaseModel):
 # ---------------------------------------------------------------------------
 
 
+# How much of the reasoning the client wants shown: a summary ("summarized"),
+# none of it ("omitted"), or progress notes between tool calls ("updates").
+# It changes nothing the model generates. This server returns the reasoning as
+# the model wrote it for every value: it has no summarizer, and a client sends
+# the reasoning back on the next turn, where the chat template renders it.
+AnthropicThinkingDisplay = Literal["summarized", "omitted", "updates"]
+
+
 class AnthropicThinkingEnabled(AnthropicBaseModel):
     """Extended thinking with an explicit budget.
 
@@ -208,6 +216,7 @@ class AnthropicThinkingEnabled(AnthropicBaseModel):
 
     type: Literal["enabled"] = "enabled"
     budget_tokens: int = Field(ge=1024)
+    display: Optional[AnthropicThinkingDisplay] = None
 
 
 class AnthropicThinkingAdaptive(AnthropicBaseModel):
@@ -221,6 +230,7 @@ class AnthropicThinkingAdaptive(AnthropicBaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     type: Literal["adaptive"] = "adaptive"
+    display: Optional[AnthropicThinkingDisplay] = None
 
 
 class AnthropicThinkingDisabled(AnthropicBaseModel):

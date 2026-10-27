@@ -147,14 +147,13 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         """
         check = getattr(self._llm, "_check_health", None)
         if callable(check):
-            # Only the engine's own failure modes mean "not ready". A TypeError
-            # or AttributeError here is _check_health's contract drifting, and
-            # reporting that as an unhealthy engine is the worst answer a health
-            # endpoint can give: it looks like the thing it is meant to detect.
             try:
                 return bool(check())
             except (RuntimeError, ValueError, OSError) as error:
                 logger.warning(f"OpenEngine health check reported a failure: {error}")
+                return False
+            except (TypeError, AttributeError) as error:
+                logger.error(f"OpenEngine health check contract failed: {error}")
                 return False
         executor = getattr(self._llm, "_executor", None)
         return executor is not None and not executor.is_shutdown()
@@ -416,7 +415,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         if self._frontend is not None:
             try:
                 status = await self._frontend.request("status")
-                model_ready = model_ready and status["ready"]
+                model_ready = model_ready and status["ready"] and not status["stopping"]
             except CoordinationError:
                 model_ready = False
         checks.append(

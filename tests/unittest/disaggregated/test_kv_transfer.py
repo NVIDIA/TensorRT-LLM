@@ -15,10 +15,13 @@
 """Test KV Transfer with KVCacheManagerV2."""
 
 import ast
+import gc
 import os
 import random
+import threading
 import time
 import uuid
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -726,6 +729,7 @@ def create_transfer_worker_setup(
         )
 
     return {
+        "device_id": device_id,
         "ctx_transfer_workers": ctx_transfer_workers,
         "ctx_kv_cache_managers": ctx_kv_cache_managers,
         "gen_transfer_workers": gen_transfer_workers,
@@ -748,6 +752,17 @@ def create_transfer_worker_setup(
         "request_len": request_len,
         "max_attention_window_vec": max_attention_window_vec,
     }
+
+
+def _shutdown_transfer_worker_setup(setup: dict) -> None:
+    """Close cache managers on their CUDA device after stopping transfer workers."""
+    for side in ("ctx", "gen"):
+        for worker in setup[f"{side}_transfer_workers"]:
+            worker.shutdown()
+    torch.cuda.set_device(setup["device_id"])
+    for side in ("ctx", "gen"):
+        for manager in setup[f"{side}_kv_cache_managers"]:
+            manager.shutdown()
 
 
 def get_block_data(
@@ -1252,10 +1267,7 @@ def test_transfer_worker_v2(ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_e
         add_and_verify_request(setup, 2, 3, request_len, send_first=True)
         add_and_verify_request(setup, 4, 5, request_len * 2, send_first=False)
     finally:
-        for worker in setup["ctx_transfer_workers"]:
-            worker.shutdown()
-        for worker in setup["gen_transfer_workers"]:
-            worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(120)
@@ -1288,10 +1300,7 @@ def test_transfer_worker_v2_with_window(
         add_and_verify_request(setup, 2, 3, request_len=32, send_first=True)
         add_and_verify_request(setup, 4, 5, request_len=64, send_first=False)
     finally:
-        for worker in setup["ctx_transfer_workers"]:
-            worker.shutdown()
-        for worker in setup["gen_transfer_workers"]:
-            worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(120)
@@ -1442,8 +1451,7 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
         torch.cuda.current_stream().synchronize()
         for kv in ctx_kv_caches + gen_kv_caches:
             kv.close()
-        ctx_tw.shutdown()
-        gen_tw.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(60)
@@ -1507,8 +1515,7 @@ def test_session_cancel_before_send():
         assert not rx_session.is_completed()
         rx_session.close()
     finally:
-        ctx_transfer_worker.shutdown()
-        gen_transfer_worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(60)
@@ -1563,7 +1570,7 @@ def test_session_cancel_after_send():
         assert tx_session.wait_complete() == WaitResult.FAILED
         tx_session.close()
     finally:
-        ctx_transfer_worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 def _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len):
@@ -1737,8 +1744,7 @@ def test_session_cancel_twice():
         assert not rx_session.has_transferring_tasks()
         rx_session.close()
     finally:
-        ctx_transfer_worker.shutdown()
-        gen_transfer_worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(60)
@@ -1809,8 +1815,7 @@ def test_session_has_transferring_tasks_false():
         assert not rx_session.has_transferring_tasks()
         rx_session.close()
     finally:
-        ctx_transfer_worker.shutdown()
-        gen_transfer_worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(120)
@@ -1930,11 +1935,8 @@ def test_incompatible_peer_fails_only_affected_requests(
         add_and_verify_request(setup_good, 0, 1, setup_good["request_len"], send_first=True)
         assert setup_good["ctx_info_endpoint"] in receiver._sender_ep_instance_map
     finally:
-        for s in (setup_good, setup_bad):
-            for worker in s["ctx_transfer_workers"]:
-                worker.shutdown()
-            for worker in s["gen_transfer_workers"]:
-                worker.shutdown()
+        for setup in (setup_good, setup_bad):
+            _shutdown_transfer_worker_setup(setup)
 
 
 def add_and_verify_pipelined_request(
@@ -2028,10 +2030,7 @@ def test_transfer_worker_pipelined(
         add_and_verify_pipelined_request(setup, 0, 1, request_len, chunk_size_blocks=chunk_size)
         add_and_verify_pipelined_request(setup, 2, 3, request_len * 2, chunk_size_blocks=chunk_size)
     finally:
-        for worker in setup["ctx_transfer_workers"]:
-            worker.shutdown()
-        for worker in setup["gen_transfer_workers"]:
-            worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(120)
@@ -2075,10 +2074,7 @@ def test_transfer_worker_pipelined_ctx_prefix_reuse(
             prepopulated_blocks=prepopulated_blocks,
         )
     finally:
-        for worker in setup["ctx_transfer_workers"]:
-            worker.shutdown()
-        for worker in setup["gen_transfer_workers"]:
-            worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(120)
@@ -2122,10 +2118,36 @@ def test_transfer_worker_pipelined_unaligned_chunk_boundaries(
             boundary_offset_tokens=1,
         )
     finally:
-        for worker in setup["ctx_transfer_workers"]:
-            worker.shutdown()
-        for worker in setup["gen_transfer_workers"]:
-            worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
+
+
+@pytest.mark.timeout(120)
+def test_shutdown_setup_allows_collection_without_worker_cuda_context() -> None:
+    """Collecting a closed setup on a worker must not poison other managers."""
+    healthy = create_transfer_worker_setup(
+        ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
+    )
+    try:
+        setup = create_transfer_worker_setup(
+            ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
+        )
+        pending = setup["ctx_kv_cache_managers"] + setup["gen_kv_cache_managers"]
+        released_managers = [weakref.ref(manager) for manager in pending]
+        _shutdown_transfer_worker_setup(setup)
+        del setup
+
+        def collect_on_worker() -> None:
+            pending.clear()
+            gc.collect()
+
+        worker = threading.Thread(target=collect_on_worker)
+        worker.start()
+        worker.join(timeout=30)
+        assert not worker.is_alive()
+        assert all(reference() is None for reference in released_managers)
+        add_and_verify_request(healthy, 0, 1, healthy["request_len"], send_first=True)
+    finally:
+        _shutdown_transfer_worker_setup(healthy)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,8 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager, PeftCacheManager, ResourceManager, ResourceManagerType,
     _get_minimum_blocks_per_window, _merge_kv_cache_pool_pointers,
-    _warn_if_unsupported_v1_kv_cache_event_hash_algo)
+    _warn_if_unsupported_v1_kv_cache_event_hash_algo,
+    scan_kv_buffer_for_invalid_values)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import binding_to_str_dtype
 from tensorrt_llm.bindings import LayerType
@@ -1263,6 +1264,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=self.create_peft_cache_config(),
             lora_config=LoraConfig(lora_ckpt_source=server_ckpt_source),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
         peft_cache_manager.impl = MagicMock()
         peft_cache_manager.impl.is_task_cached.return_value = False
@@ -1783,6 +1785,49 @@ class TestRequestBudget(unittest.TestCase):
                    ) as mock_logger:
             executor._warn_if_kv_block_budget_unchecked()
         mock_logger.warning_once.assert_not_called()
+
+
+def _scan(buffer: torch.Tensor) -> Tuple[bool, bool]:
+    has_invalid_values = torch.tensor([False],
+                                      dtype=torch.bool,
+                                      device=buffer.device)
+    skipped = scan_kv_buffer_for_invalid_values(buffer, has_invalid_values)
+    return bool(has_invalid_values), skipped
+
+
+@pytest.mark.parametrize("dtype",
+                         [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_scan_kv_buffer_finds_invalid_value_in_any_slice(
+        monkeypatch, dtype, value):
+    # Three rows per slice, so the buffer spans several slices and a short
+    # last one.
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.resource_manager."
+        "_INVALID_VALUE_SCAN_ELEMS", 3 * 4 * 8)
+    pool = torch.zeros(10, 2, 4, 8, dtype=dtype, device="cuda")
+    assert _scan(pool) == (False, False)
+    for row in (0, 5, 9):
+        pool.zero_()
+        pool[row, 1, 3, 7] = value
+        # A per-layer view of a shared pool is strided along dim 0.
+        assert _scan(pool[:, 1]) == (True, False), f"row {row}"
+        assert _scan(pool[:, 0]) == (False, False), f"row {row}"
+
+
+def test_scan_kv_buffer_keeps_checking_after_unsupported_check(monkeypatch):
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.resource_manager."
+        "_INVALID_VALUE_SCAN_ELEMS", 2 * 16)
+    # isinf is not implemented for float8_e4m3fn, isnan is.
+    buffer = torch.zeros(9, 16, dtype=torch.float8_e4m3fn, device="cuda")
+    assert _scan(buffer) == (False, True)
+    buffer[8, 15] = float("nan")
+    assert _scan(buffer) == (True, True)
+
+
+def test_scan_kv_buffer_accepts_empty_buffer():
+    assert _scan(torch.zeros(0, 8, device="cuda")) == (False, False)
 
 
 if __name__ == "__main__":

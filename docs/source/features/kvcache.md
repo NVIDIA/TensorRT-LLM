@@ -77,11 +77,14 @@ scheduler_config:
 ### Selecting the KV Cache Manager
 
 TensorRT LLM ships two KV cache manager implementations. `use_kv_cache_manager_v2`
-selects between them and defaults to `auto`, which adopts the model's own
-preference and falls back to the V1 C++ manager for models that do not declare
-one. Set it to `true` or `false` to override the model default.
+selects between them and defaults to `true`, which selects the V2 manager. Set it
+to `false` to select the V1 C++ manager for models that support it. Set it to
+`auto` to adopt the model's own preference instead; `auto` falls back to the V1
+C++ manager for models that do not declare one. With `auto`, disaggregated
+serving keeps a V2 preference only with the Python NIXL transceiver
+(`transceiver_runtime: PYTHON`, `backend: NIXL`) and otherwise falls back to V1.
 
-Models that select the V2 manager by default:
+Models whose preference selects the V2 manager when the setting is `auto`:
 
 | Model | Reason |
 | --- | --- |

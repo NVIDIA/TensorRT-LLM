@@ -18,7 +18,7 @@ TRT-LLM PyTorch-backend flow (``LLM(model=<ckpt>) -> generate``):
 
 Caching
 -------
-KDA states use ``MambaHybridCacheManagerV2`` with the ``KvCacheConfig``
+KDA states use ``KimiK3HybridCacheManager`` with the ``KvCacheConfig``
 default ``use_kv_cache_manager_v2=True`` (selected in ``pyexecutor/_util.py``).
 Setting this field to ``"auto"`` falls back to V1 for
 ``KimiLinearForCausalLM``, which declares no V2 model preference.
@@ -1590,8 +1590,8 @@ class KimiK3MoERuntime(nn.Module):
             # memory, frees the originals, and rebinds param.data to a
             # composite VA view.  K3's packed-checkpoint streaming produces
             # exactly those tensors, so the two are compatible -- but only on
-            # the backends that declare supports_dwdp, which is the CuteDSL
-            # family (fused_moe_cute_dsl.py) and NVFP4 only.
+            # the NVFP4 CuteDSL leaves that declare supports_dwdp (CUTEDSL,
+            # CUTEDSL_FC12).
             #
             # MEGAMOE_CUTEDSL is excluded deliberately rather than by
             # oversight: its process_weights_after_loading packs into the mega

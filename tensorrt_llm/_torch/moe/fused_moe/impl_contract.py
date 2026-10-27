@@ -401,6 +401,30 @@ def check_quant_matches_identity(cls: type, p: "MoEProblem") -> Optional[MoEElig
     return None
 
 
+def activation_rejection_detail(cls: type, p: "MoEProblem") -> Optional[str]:
+    """Why ``cls.activation_support`` cannot carry ``p``'s activation, or ``None``."""
+    support = getattr(cls, "activation_support", None)
+    if support is None:
+        return None
+    return support.rejection_detail(
+        cls.__name__,
+        p.activation_type,
+        clamp_after_silu=p.clamp_after_silu,
+        constants=p.activation_constants,
+    )
+
+
+def check_activation_support(cls: type, p: "MoEProblem") -> Optional[MoEEligibility]:
+    """Reject an activation ``cls.activation_support`` does not cover.
+
+    Resolution runs the same check; this one answers a direct ``can_implement`` call.
+    """
+    detail = activation_rejection_detail(cls, p)
+    if detail is None:
+        return None
+    return MoEEligibility.no(MoERejectReason.ACTIVATION_UNSUPPORTED, detail)
+
+
 def require_layer_quant_format(impl: "MoEImplBase", expected: str) -> None:
     """Raise unless ``impl``'s final ``quant_config`` is the format ``expected``.
 

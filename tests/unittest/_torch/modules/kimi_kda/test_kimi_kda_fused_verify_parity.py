@@ -234,14 +234,12 @@ def _rep(name, a, b):
 
 def _make_kvcm_replay_manager(num_heads):
     """A V2 hybrid manager whose KVCM pools hold the KDA states and replay caches, with a host tier to offload to."""
-    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-        MambaHybridCacheManagerV2,
-    )
+    from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
     from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
     from tensorrt_llm.mapping import Mapping
 
-    return MambaHybridCacheManagerV2(
+    return KimiK3HybridCacheManager(
         mamba_d_state=K,
         mamba_d_conv=W,
         mamba_num_heads=num_heads,
@@ -396,7 +394,7 @@ def test_fused_vs_sequential_two_rounds(
         ssm_pool_fused = cache_fused.temporal
         conv_pool_fused.index_copy_(0, fused_slots.long(), conv_pool_seq)
         ssm_pool_fused.index_copy_(0, fused_slots.long(), ssm_pool_seq)
-        replay_manager.seed_kda_replay_caches_for_disagg_gen(request_ids)
+        replay_manager.on_state_transfer_complete(request_ids)
 
     gen = torch.Generator(device="cuda").manual_seed(3)
 

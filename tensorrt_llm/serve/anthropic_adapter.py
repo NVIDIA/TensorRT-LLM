@@ -24,6 +24,8 @@ The adapter is a pure protocol layer: it never touches the tokenizer,
 chat templates, or the engine.
 """
 
+import base64
+import hashlib
 import json
 import re
 import traceback
@@ -50,6 +52,7 @@ from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicMessagesResponse,
     AnthropicMessageStartEvent,
     AnthropicMessageStopEvent,
+    AnthropicSignatureDelta,
     AnthropicStopReason,
     AnthropicTextBlock,
     AnthropicTextDelta,
@@ -612,6 +615,21 @@ def convert_usage(usage: Optional[UsageInfo]) -> AnthropicUsage:
     return anthropic_usage
 
 
+def thinking_signature(thinking: str) -> str:
+    """The signature of a thinking block this server generated.
+
+    Anthropic clients replay a thinking block in later turns only together
+    with its signature, and some turn an unsigned one into a text block -- the
+    pi coding agent does -- so the model then reads its own reasoning back as
+    an answer it gave. Anthropic signs with an encrypted proof of origin; this
+    signature is only the base64 SHA-256 digest of the text. It proves nothing
+    and the server does not check it on replay. It exists so that a thinking
+    block round-trips as thinking.
+    """
+    digest = hashlib.sha256(thinking.encode("utf-8")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
 def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMessagesResponse:
     """Translate a non-streaming chat completion into an Anthropic message."""
     content: List[Any] = []
@@ -623,7 +641,9 @@ def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMes
         message = choice.message
         reasoning = message.reasoning_content or message.reasoning
         if reasoning:
-            content.append(AnthropicThinkingBlock(thinking=reasoning))
+            content.append(
+                AnthropicThinkingBlock(thinking=reasoning, signature=thinking_signature(reasoning))
+            )
         if message.content and message.content.strip():
             content.append(AnthropicTextBlock(text=message.content))
         for tool_call in message.tool_calls:
@@ -723,6 +743,8 @@ class AnthropicStreamReframer:
         self.message_started = False
         self.block_index = -1
         self.open_block_type: Optional[str] = None
+        # Text of the open thinking block, signed when the block closes.
+        self.thinking_parts: List[str] = []
         # Upstream index of the tool call whose block is currently open.
         self.open_tool_key: Optional[Any] = None
         # Per-upstream-index tool call state. Insertion order is preserved and
@@ -750,10 +772,23 @@ class AnthropicStreamReframer:
     def _close_block(self) -> List[str]:
         if self.open_block_type is None:
             return []
-        event = AnthropicContentBlockStopEvent(index=self.block_index)
+        frames = []
+        if self.open_block_type == "thinking":
+            # As Anthropic streams it: the signature is the thinking block's
+            # last delta, once its whole text is known.
+            signature = thinking_signature("".join(self.thinking_parts))
+            self.thinking_parts = []
+            frames.append(
+                anthropic_sse(
+                    AnthropicContentBlockDeltaEvent(
+                        index=self.block_index, delta=AnthropicSignatureDelta(signature=signature)
+                    )
+                )
+            )
+        frames.append(anthropic_sse(AnthropicContentBlockStopEvent(index=self.block_index)))
         self.open_block_type = None
         self.open_tool_key = None
-        return [anthropic_sse(event)]
+        return frames
 
     def _open_block(self, block: Any, block_type: str) -> List[str]:
         if block_type != "text":
@@ -780,7 +815,11 @@ class AnthropicStreamReframer:
         if block_type == "text":
             frames.extend(self._open_block(AnthropicTextBlock(text=""), "text"))
         elif block_type == "thinking":
-            frames.extend(self._open_block(AnthropicThinkingBlock(thinking=""), "thinking"))
+            # The signature arrives as the block's last delta; the opening block
+            # carries it empty, as a thinking block always has the field.
+            frames.extend(
+                self._open_block(AnthropicThinkingBlock(thinking="", signature=""), "thinking")
+            )
         else:
             raise ValueError(f"unexpected block type {block_type}")
         return frames
@@ -939,6 +978,7 @@ class AnthropicStreamReframer:
             reasoning_delta = delta.reasoning_content or delta.reasoning
             if reasoning_delta:
                 frames.extend(self._ensure_block("thinking"))
+                self.thinking_parts.append(reasoning_delta)
                 frames.append(
                     anthropic_sse(
                         AnthropicContentBlockDeltaEvent(

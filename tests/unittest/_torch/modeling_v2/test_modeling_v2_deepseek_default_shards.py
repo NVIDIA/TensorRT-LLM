@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import math
 import zlib
+from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
@@ -49,6 +50,18 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nv
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _limit_cpu_threads() -> Iterator[None]:
+    """Keep small tensor transforms within CPU-constrained workers' thread budget."""
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(min(previous_threads, 2))
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous_threads)
+
 
 _LAYOUTS = sorted(routing._DEFAULT_LAYOUTS)
 _MTP_LAYOUTS = sorted(routing._MTP_LAYOUTS)

@@ -384,6 +384,7 @@ def _make_forward_only_engine(
     decoder._get_runtime_tokens_per_gen_step = get_runtime_tokens_per_gen_step
     engine.iter_states = decoder._iter_states = {}
     decoder.forward_pass_callable = None
+    decoder.start_beam_histories_callable = None
     decoder._stage_in_graph_sampling = None
     decoder._moe_load_balancer = None
     engine._runner = decoder
@@ -3029,6 +3030,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                     enable_padding=True, ))
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(
             llm_args)
+        self.addCleanup(kv_cache_manager.shutdown)
 
         mock_callable = Mock()
         model_engine.register_forward_pass_callable(mock_callable)
@@ -3048,6 +3050,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_forward_pass_callable_on_cuda_graph_off(self):
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        self.addCleanup(kv_cache_manager.shutdown)
 
         mock_callable = Mock()
         model_engine.register_forward_pass_callable(mock_callable)
@@ -3067,6 +3070,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_foward_pass_callable_off(self):
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        self.addCleanup(kv_cache_manager.shutdown)
         self.assertTrue(model_engine._runner.forward_pass_callable is None,
                         "forward_pass_callback should be None by default")
 
@@ -3084,6 +3088,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
     def test_foward_pass_callable_backward_compat(self):
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        self.addCleanup(kv_cache_manager.shutdown)
         self.assertTrue(model_engine._runner.forward_pass_callable is None,
                         "forward_pass_callback should be None by default")
 

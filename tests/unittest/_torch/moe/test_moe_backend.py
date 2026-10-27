@@ -69,6 +69,13 @@ from tensorrt_llm._torch.moe.fused_moe.communication import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
+    TrtllmCutedslDenseGemmNvfp4Impl,
+    TrtllmCutedslGroupedGemmBf16Impl,
+    TrtllmCutedslGroupedGemmNvfp4Impl,
+)
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12 import CuteDslFc12FusedMoENvfp4Runner
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import CuteDslFusedMoENvfp4Runner
 from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     CUTLASS_LEAVES,
     TrtllmCutlassFp8Impl,
@@ -78,18 +85,11 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmCutlassW4a16Nvfp4Impl,
     TrtllmTritonFp8BlockScalesImpl,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
-    CuteDslFusedMoE,
-    CuteDslFusedMoENvfp4Runner,
-)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
     CuteDslB12xNvfp4FusedMoE,
     CuteDslB12xW4a16Nvfp4FusedMoE,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
-    CuteDslFc12FusedMoE,
-    CuteDslFc12FusedMoENvfp4Runner,
-)
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
@@ -451,7 +451,7 @@ def test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts(
     monkeypatch: pytest.MonkeyPatch, use_direct_expert_metadata: bool
 ) -> None:
     monkeypatch.setattr(
-        "tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl.get_sm_version", lambda: 100
+        "tensorrt_llm._torch.moe.fused_moe.cutedsl.runners.get_sm_version", lambda: 100
     )
     forward_impl = MagicMock(return_value=torch.empty(1))
     runner = CuteDslFusedMoENvfp4Runner(
@@ -545,7 +545,7 @@ def test_cutedsl_deep_ep_direct_metadata_disable_env(
         "model_config": ModelConfig(skip_create_weights_in_init=True),
     }
 
-    backend = CuteDslFusedMoE(**constructor_kwargs)
+    backend = TrtllmCutedslGroupedGemmNvfp4Impl(**constructor_kwargs)
     assert backend.disable_deep_ep_direct_metadata is expected_disabled
 
 
@@ -646,26 +646,20 @@ def test_deep_ep_adapter_free_cache_miss_rejected_during_capture(
 
 
 @pytest.mark.parametrize(
-    "disabled,has_nvfp4,supports_post_quant,expected",
+    "disabled,supports_post_quant,expected",
     [
-        (False, True, True, True),
-        (True, True, True, False),
-        (False, False, True, False),
-        (False, True, False, False),
+        (False, True, True),
+        (True, True, False),
+        (False, False, False),
     ],
 )
 def test_scheduler_selects_cutedsl_deep_ep_direct_metadata(
-    disabled: bool, has_nvfp4: bool, supports_post_quant: bool, expected: bool
+    disabled: bool, supports_post_quant: bool, expected: bool
 ) -> None:
-    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend = TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl)
     backend.disable_deep_ep_direct_metadata = disabled
     backend.use_fused_finalize = True
     backend._weights_created = True
-    backend.quant_config = SimpleNamespace(
-        layer_quant_mode=SimpleNamespace(
-            has_nvfp4=MagicMock(return_value=has_nvfp4),
-        ),
-    )
     assert backend.can_use_deep_ep_direct_metadata(supports_post_quant) is expected
 
 
@@ -675,30 +669,20 @@ def test_other_backend_rejects_deep_ep_direct_metadata() -> None:
 
 
 def test_cutedsl_rejects_direct_metadata_without_fused_finalize() -> None:
-    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend = TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl)
     backend.disable_deep_ep_direct_metadata = False
     backend.use_fused_finalize = False
     backend._weights_created = True
-    backend.quant_config = SimpleNamespace(
-        layer_quant_mode=SimpleNamespace(
-            has_nvfp4=MagicMock(return_value=True),
-        ),
-    )
     assert backend.can_use_deep_ep_direct_metadata(True) is False
 
 
 def test_cutedsl_direct_metadata_request_fails_without_fused_finalize() -> None:
-    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend = TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl)
     backend.activation_type = ActivationType.Swiglu
     backend._locality_domain_runtime = None
     backend.use_fused_finalize = False
     backend.hidden_size = 4
     backend._weights_created = True
-    backend.quant_config = SimpleNamespace(
-        layer_quant_mode=SimpleNamespace(
-            has_nvfp4=MagicMock(return_value=True),
-        ),
-    )
     token_selected_experts = torch.full((2, 1), -1, dtype=torch.int32)
     token_final_scales = torch.ones((2, 1), dtype=torch.float32)
 
@@ -727,15 +711,10 @@ def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(
         "expert_capacity": expert_capacity,
     }
     comm.enable_postquant_alltoall = False
-    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend = TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl)
     backend.disable_deep_ep_direct_metadata = disabled
     backend.use_fused_finalize = True
     backend._weights_created = True
-    backend.quant_config = SimpleNamespace(
-        layer_quant_mode=SimpleNamespace(
-            has_nvfp4=MagicMock(return_value=True),
-        ),
-    )
     scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
     scheduler.moe = SimpleNamespace(
         backend=backend,
@@ -791,7 +770,7 @@ def test_scheduler_quantizes_input_async_only_under_multi_stream(
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
     scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
     scheduler.moe = SimpleNamespace(
-        backend=CuteDslFusedMoE.__new__(CuteDslFusedMoE),
+        backend=TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl),
         comm=object() if has_comm else None,
         apply_router_weight_on_input=router_weight_on_input,
     )
@@ -805,7 +784,7 @@ def test_scheduler_skips_async_quantization_without_backend_support(monkeypatch)
     monkeypatch.setattr(moe_scheduler, "do_multi_stream", lambda: True)
     scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
     scheduler.moe = SimpleNamespace(
-        backend=CutlassFusedMoE.__new__(CutlassFusedMoE),
+        backend=TrtllmCutlassNvfp4Impl.__new__(TrtllmCutlassNvfp4Impl),
         comm=None,
         apply_router_weight_on_input=False,
     )
@@ -1579,6 +1558,227 @@ def test_marlin_refuses_a_pre_quant_activation_scale(act_scale):
             method.transform_weights(module)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "leaf_cls,run_fn",
+    [
+        (TrtllmCutedslGroupedGemmNvfp4Impl, "run_moe_nvfp4"),
+        (TrtllmCutedslGroupedGemmBf16Impl, "run_moe_bf16"),
+        (CuteDslFc12FusedMoE, "run_moe_nvfp4"),
+    ],
+    ids=["grouped_gemm_nvfp4", "grouped_gemm_bf16", "fused_fc12"],
+)
+def test_cutedsl_finalize_weights_once_with_the_router_weight_on_the_input(leaf_cls, run_fn):
+    """The scheduler folds the top-1 weight into ``x`` and passes no scales.
+
+    The finalize epilogue multiplies by per-token scales regardless, so it gets ones.
+    """
+    captured = {}
+    backend = SimpleNamespace(
+        apply_router_weight_on_input=True,
+        _build_local_weight_view=lambda: None,
+        **{run_fn: lambda **kwargs: captured.update(kwargs)},
+    )
+    ctx = SimpleNamespace(
+        x=torch.zeros(2, 8),
+        x_sf=None,
+        x_ready_event=None,
+        token_selected_experts=torch.tensor([[3], [1]], dtype=torch.int32),
+        token_final_scales=None,
+        comm_plan=SimpleNamespace(
+            moe_output=None,
+            enable_alltoall=False,
+            recv_expert_count=None,
+            deep_ep_expert_capacity=None,
+            use_deep_ep_direct_metadata=False,
+        ),
+    )
+    leaf_cls.run_moe(backend, ctx)
+    torch.testing.assert_close(captured["token_final_scales"], torch.ones(2, 1))
+
+    backend.apply_router_weight_on_input = False
+    with pytest.raises(AssertionError, match="apply_router_weight_on_input"):
+        leaf_cls.run_moe(backend, ctx)
+
+
+# The CuteDSL NVFP4 leaves all bind the shared ``quantize_input_nvfp4``.
+_CUTEDSL_NVFP4_LEAVES = pytest.mark.parametrize(
+    "leaf_cls",
+    [TrtllmCutedslGroupedGemmNvfp4Impl, CuteDslFc12FusedMoE, TrtllmCutedslDenseGemmNvfp4Impl],
+    ids=["grouped_gemm", "fused_fc12", "dense_gemm"],
+)
+
+
+def _nvfp4_input_quantizer_state(
+    act_scale: torch.Tensor | None, hidden_size: int = 32
+) -> SimpleNamespace:
+    """The backend attributes ``quantize_input`` reads, and nothing else."""
+    return SimpleNamespace(
+        hidden_size=hidden_size,
+        scaling_vector_size=16,
+        fc31_input_scale=torch.ones(()),
+        fc31_act_scale=act_scale,
+    )
+
+
+def _fake_fp4_quantize(x, global_scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled):
+    """A CPU ``fp4_quantize`` with the real op's output shapes."""
+    num_rows, k = x.shape
+    return (
+        torch.zeros(num_rows, k // 2, dtype=torch.uint8),
+        torch.zeros(num_rows * k // sf_vec_size, dtype=torch.uint8),
+    )
+
+
+@pytest.mark.cpu_only
+@_CUTEDSL_NVFP4_LEAVES
+def test_cutedsl_nvfp4_scale_width_survives_an_empty_micro_batch(leaf_cls, monkeypatch):
+    """``view(0, -1)`` cannot infer a width from zero rows, so it is spelled out."""
+    hidden_size = 32
+    monkeypatch.setattr(torch.ops.trtllm, "fp4_quantize", _fake_fp4_quantize)
+    _, x_sf = leaf_cls.quantize_input(
+        _nvfp4_input_quantizer_state(None, hidden_size),
+        torch.empty(0, hidden_size, dtype=torch.bfloat16),
+        post_quant_comm=False,
+    )
+
+    assert x_sf.shape == (0, hidden_size // 16)
+
+
+@pytest.mark.cpu_only
+def test_cutedsl_dense_gemm_returns_an_empty_output_for_an_empty_micro_batch():
+    """The leaf returns before ``swizzle_sf``, which cannot lay out zero rows."""
+    hidden_size, num_experts = 32, 4
+    backend = SimpleNamespace(has_nvfp4=True, hidden_size=hidden_size)
+    output = TrtllmCutedslDenseGemmNvfp4Impl.run_moe_nvfp4(
+        backend,
+        x=torch.empty(0, hidden_size // 2, dtype=torch.uint8),
+        token_selected_experts=torch.empty(0, num_experts, dtype=torch.int32),
+        token_final_scales=torch.empty(0, num_experts, dtype=torch.float32),
+        x_sf=torch.empty(0, hidden_size // 16, dtype=torch.uint8),
+    )
+    assert output.shape == (0, hidden_size)
+    assert output.dtype == torch.bfloat16
+
+
+@skip_pre_blackwell
+def test_cutedsl_nvfp4_pre_quant_scale_matches_cutlass():
+    """CuteDSL and CUTLASS agree on an NVFP4_AWQ layer, and both match the reference.
+
+    The checkpoint is calibrated on ``x * pre_quant_scale``, which is what the
+    reference runs FC1 on. The last check is the control: the same output
+    against the reference on the unsmoothed input must fail, or this test could
+    not tell a dropped scale apart.
+    """
+    model_config = MoeModelConfig(8, 2, 512, 512)
+    seq_len = 16
+    dtype = torch.bfloat16
+    verdict = TrtllmCutedslGroupedGemmNvfp4Impl.can_implement(
+        MoEProblem(
+            quant=QuantAlgo.NVFP4.value,
+            dtype_act=dtype,
+            hidden_size=model_config.hidden_size,
+            intermediate_size=model_config.intermediate_size,
+            num_experts=model_config.num_experts,
+            top_k=model_config.top_k,
+        ),
+        MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=model_config.num_experts,
+            env=collect_moe_environment(),
+        ),
+    )
+    if not verdict.eligible:
+        pytest.skip(verdict.detail)
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+
+        routing_method = RenormalizeMoeRoutingMethod(top_k=model_config.top_k)
+        x = torch.randn((seq_len, model_config.hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, model_config.num_experts), dtype=dtype, device="cuda")
+        # Per-channel factors in [1/e, e]: dropping them moves FC1's input far
+        # past the comparison tolerance.
+        pre_quant_scale = (
+            torch.empty(model_config.hidden_size, device="cuda").uniform_(-1, 1).exp().to(dtype)
+        )
+        x_smoothed = x * pre_quant_scale
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x_smoothed, MoeBackendType.CUTEDSL
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=model_config.num_experts,
+            dtype=dtype,
+            intermediate_size=model_config.intermediate_size,
+            hidden_size=model_config.hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=False,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            swiglu_limit=None,
+            activation_type=ActivationType.Swiglu,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+        for expert_id in range(model_config.num_experts):
+            weights[f"{expert_id}.w1.pre_quant_scale"] = pre_quant_scale
+            weights[f"{expert_id}.w3.pre_quant_scale"] = pre_quant_scale
+
+        outputs = {}
+        for backend_type in (MoeBackendType.CUTLASS, MoeBackendType.CUTEDSL):
+            backend = create_test_backend(
+                backend_type=backend_type,
+                routing_method=routing_method,
+                num_experts=model_config.num_experts,
+                hidden_size=model_config.hidden_size,
+                intermediate_size=model_config.intermediate_size,
+                dtype=dtype,
+                quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4_AWQ),
+                mapping=mapping,
+            )
+            backend.load_weights([weights])
+            backend.post_load_weights()
+            backend.cuda()
+            assert backend.fc31_act_scale is not None
+            with torch.inference_mode():
+                token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+                x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+                outputs[backend_type] = run_backend_moe(
+                    backend,
+                    backend_type,
+                    x_quantized,
+                    x_sf,
+                    token_selected_experts,
+                    token_final_scales,
+                    dtype,
+                    router_logits,
+                )
+
+        ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x_smoothed, router_logits)
+            unsmoothed_ref_output = ref_fused_moe.forward(x, router_logits)
+
+        cutlass_output = outputs[MoeBackendType.CUTLASS]
+        cutedsl_output = outputs[MoeBackendType.CUTEDSL]
+        ref_fused_moe.check_accuracy(cutlass_output, ref_output)
+        ref_fused_moe.check_accuracy(cutedsl_output, ref_output)
+        ref_fused_moe.check_accuracy(cutedsl_output, cutlass_output)
+        with pytest.raises(Exception, match="Mismatch percentage"):
+            ref_fused_moe.check_accuracy(cutedsl_output, unsmoothed_ref_output)
+
+
 def _marlin_model_config(quant_algo=QuantAlgo.NVFP4):
     cfg = ModelConfig()
     cfg.moe_backend = "MARLIN"
@@ -2175,6 +2375,18 @@ def test_deepgemm_rejects_post_silu_clamp_materialization():
         )
 
 
+@pytest.mark.cpu_only
+def test_cutedsl_bf16_refuses_a_clamp_at_materialization():
+    """The BF16 leaf's declaration refuses the clamp its FC1 op would otherwise drop."""
+    with pytest.raises(ValueError, match="take no activation clamp"):
+        materialize_activation_params(
+            SwigluActivation(clamp=7.0),
+            TrtllmCutedslGroupedGemmBf16Impl.activation_support,
+            num_local_experts=2,
+            owner="TrtllmCutedslGroupedGemmBf16Impl",
+        )
+
+
 def test_post_silu_clamp_mode_requires_limit():
     with pytest.raises(ValueError, match="requires a clamp value"):
         SwigluActivation(clamp_after_silu=True)
@@ -2738,7 +2950,7 @@ def _make_cutedsl_sibling_for_quantize_input_test(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "backend_cls",
-    [CuteDslFusedMoE, CuteDslFc12FusedMoE, DenseGEMMFusedMoE],
+    [TrtllmCutedslGroupedGemmNvfp4Impl, CuteDslFc12FusedMoE, DenseGEMMFusedMoE],
     ids=["grouped_gemm", "fused_fc12", "dense_gemm"],
 )
 @pytest.mark.parametrize("has_pre_quant_scale", [False, True], ids=["nvfp4", "nvfp4_awq"])
@@ -2787,7 +2999,7 @@ def test_cutedsl_quantize_input_applies_pre_quant_scale(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "backend_cls",
-    [CuteDslFusedMoE, CuteDslFc12FusedMoE, DenseGEMMFusedMoE],
+    [TrtllmCutedslGroupedGemmNvfp4Impl, CuteDslFc12FusedMoE, DenseGEMMFusedMoE],
     ids=["grouped_gemm", "fused_fc12", "dense_gemm"],
 )
 def test_cutedsl_quantize_input_rejects_prequantized_awq_input(backend_cls: type) -> None:
@@ -5072,7 +5284,9 @@ def _deployment_at_moe_tp(moe_tp_size: int) -> MoEDeployment:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "backend_cls", [TrtllmCutlassNvfp4Impl, CuteDslFusedMoE], ids=["cutlass", "cutedsl"]
+    "backend_cls",
+    [TrtllmCutlassNvfp4Impl, TrtllmCutedslGroupedGemmNvfp4Impl],
+    ids=["cutlass", "cutedsl"],
 )
 @pytest.mark.parametrize(
     "intermediate_size,activation,moe_tp_size,rejected",
@@ -5123,7 +5337,7 @@ def test_w4a16_nvfp4_fc1_row_alignment_gate(moe_tp_size, rejected):
 
 @pytest.mark.parametrize(
     "backend_cls",
-    [TrtllmCutlassNvfp4Impl, CuteDslFusedMoE, CuteDslFc12FusedMoE],
+    [TrtllmCutlassNvfp4Impl, TrtllmCutedslGroupedGemmNvfp4Impl, CuteDslFc12FusedMoE],
     ids=["cutlass", "cutedsl", "cutedsl_fc12"],
 )
 def test_situ_survives_resolution_not_just_construction(backend_cls):
@@ -5145,9 +5359,14 @@ def test_situ_survives_resolution_not_just_construction(backend_cls):
     assert rejection is None, f"{backend_cls.__name__} refuses SiTU at resolution: {rejection}"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("sm", [100, 103, 107])
 def test_cutedsl_nvfp4_situ_admitted_on_blackwell_and_rubin(sm):
-    """CuteDSL NVFP4 SiTU is eligible on SM100/SM103 and on Rubin (SM107)."""
+    """The NVFP4 grouped-GEMM leaf admits SiTU on SM100/SM103 and on Rubin (SM107).
+
+    Kimi K3 runs NVFP4 SiTU on ``CUTEDSL`` without degradation, so a gate here
+    would fail it at construction rather than fall back.
+    """
     deps = (MoEDep.CUTEDSL_RUBIN,) if sm == 107 else ()
     deployment = MoEDeployment(
         ep_size=1,
@@ -5157,8 +5376,10 @@ def test_cutedsl_nvfp4_situ_admitted_on_blackwell_and_rubin(sm):
         num_slots=256,
         env=MoEEnvironment(sm=sm, available_deps=deps),
     )
-    verdict = CuteDslFusedMoE.can_implement(_nvfp4_problem(2048, "SiTu"), deployment)
-    assert verdict.reject_reason is not MoERejectReason.ACTIVATION_UNSUPPORTED, verdict.detail
+    verdict = TrtllmCutedslGroupedGemmNvfp4Impl.can_implement(
+        _nvfp4_problem(2048, "SiTu"), deployment
+    )
+    assert verdict.eligible, verdict.detail
 
 
 def test_cutedsl_fc12_refuses_relu2_at_resolution():

@@ -571,6 +571,13 @@ class PyExecutor:
                 sampler.stage_in_graph_sampling)
             model_engine.register_sample_in_graph_callable(
                 self._sample_in_graph)
+        # Under beam search a request's per-beam token lists are not the
+        # hypotheses the beams hold; the sampler rebuilds those for the engine's
+        # logits post-processors.
+        if (hasattr(model_engine, "register_beam_histories_callable")
+                and hasattr(sampler, "start_beam_histories")):
+            model_engine.register_beam_histories_callable(
+                sampler.start_beam_histories)
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
@@ -8186,21 +8193,11 @@ class PyExecutor:
         self.resource_manager.resource_managers[
             ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(requests)
         self._setup_sampler_step(requests)
-        # KDA fused-verify replay caches: the ctx->gen state transfer
-        # populates only the base mamba conv/ssm pools; with one-model
-        # spec decoding (e.g. SA) the first forward for these requests
-        # takes the fused verify path, which reads the per-slot
-        # kda_conv_* replay caches instead of the conv pool. Seed them
-        # from the transferred conv states before the first step
-        # (otherwise the recurrent state is permanently contaminated by
-        # a zero/stale conv window; K3 SA-in-disagg GSM8K -0.6pp).
         if self.enable_spec_decode:
             kv_mgr = self.resource_manager.resource_managers.get(
                 ResourceManagerType.KV_CACHE_MANAGER)
-            seed = getattr(kv_mgr, 'seed_kda_replay_caches_for_disagg_gen',
-                           None)
-            if seed is not None:
-                seed([
+            if isinstance(kv_mgr, BaseMambaCacheManager):
+                kv_mgr.on_state_transfer_complete([
                     req.py_request_id for req in cache_trans_complete_requests
                 ])
         # Cache state that the generation worker derives from the imported KV
