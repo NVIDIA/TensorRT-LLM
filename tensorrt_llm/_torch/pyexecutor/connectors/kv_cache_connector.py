@@ -65,6 +65,27 @@ _SchedulerResult = TypeVar("_SchedulerResult")
 AllocationFence = Callable[[Iterable[int]], None]
 
 
+def _is_dummy_request(request: LlmRequest) -> bool:
+    """Whether ``request`` is a placeholder with no prompt of its own.
+
+    Attention DP pads idle ranks with these, and they carry nothing a connector
+    could load or save. Reads ``is_dummy_request``, which the C++ ``LlmRequest``
+    binds and so is readable on the base class some callers hand over, and the
+    Python-only ``is_attention_dp_dummy``. Each is compared against True, since
+    a mock request answers every attribute truthily and is not a dummy.
+
+    Args:
+        request: The request to classify.
+
+    Returns:
+        True when either dummy flag is set.
+    """
+    return (
+        getattr(request, "is_dummy_request", False) is True
+        or getattr(request, "is_attention_dp_dummy", False) is True
+    )
+
+
 # Used to store data for a single inflight request.
 @dataclass
 class RequestData:
@@ -698,8 +719,7 @@ class KvCacheConnectorSchedulerOutputRequest:
 
 
 class KvCacheConnectorSchedulerOutputManager:
-    def __init__(self, *, enable_attention_dp: bool = False) -> None:
-        self.enable_attention_dp = enable_attention_dp
+    def __init__(self) -> None:
         self.requests = defaultdict(KvCacheConnectorSchedulerOutputRequest)
         self.external_loads = dict()
 
@@ -712,7 +732,7 @@ class KvCacheConnectorSchedulerOutputManager:
         scheduler_output = SchedulerOutput()
 
         for req in scheduled_batch.context_requests:
-            if self.enable_attention_dp and req.is_dummy_request:
+            if _is_dummy_request(req):
                 continue
             if req.request_id in new_async_requests.loading_ids:
                 continue
@@ -733,7 +753,7 @@ class KvCacheConnectorSchedulerOutputManager:
                 scheduler_output.cached_requests.append(request_data)
 
         for req in scheduled_batch.generation_requests:
-            if self.enable_attention_dp and req.is_dummy_request:
+            if _is_dummy_request(req):
                 continue
             request_data = self.requests[req.request_id].update_and_build_data(
                 req, kv_cache_manager
@@ -813,9 +833,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         self._scheduler_output = None
         self._allocation_fence: Optional[AllocationFence] = None
-        self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager(
-            enable_attention_dp=enable_attention_dp
-        )
+        self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
         self.prefix_reservations_enabled = False
         self._prefix_capability = None
         self._next_prefix_reservation_id = 1
@@ -920,9 +938,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def reserve_prefix(self, request: LlmRequest, local_end: int) -> Optional[PrefixReservation]:
         """Query once per pending attempt and protect the promised source range."""
-        if not self.prefix_reservations_enabled or (
-            self.enable_attention_dp and request.is_dummy_request
-        ):
+        if not self.prefix_reservations_enabled or _is_dummy_request(request):
             return None
         if local_end < 0:
             raise ValueError("A prefix reservation cannot start before the prompt")
@@ -1123,7 +1139,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         ``KVCacheManagerV2`` holds the Python subclass where it is a method, so
         no single spelling of the check reads correctly in both.
         """
-        if self.enable_attention_dp and request.is_dummy_request:
+        if _is_dummy_request(request):
             return 0, False
         if self.capacity_only:
             # No page of this cache is registered, so nothing can be loaded
@@ -1165,7 +1181,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         ``cancel_load``, and a parked request carries no honoured count into
         ``build_connector_meta``.
         """
-        if self.enable_attention_dp and request.is_dummy_request:
+        if _is_dummy_request(request):
             return
         if self.capacity_only:
             # Only `build_scheduler_output` consumes `external_loads`, and this
@@ -1440,7 +1456,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             free_resources on the request.
         """
 
-        if self.enable_attention_dp and req.is_dummy_request:
+        if _is_dummy_request(req):
             return False
 
         if req.request_id in self.finished_async_loading_requests:
@@ -1616,11 +1632,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         block_ids: List[int],
         block_ids_by_layer_group: Optional[List[List[int]]] = None,
     ) -> None:
-        if (
-            self.scheduler is None
-            or self.capacity_only
-            or (self.enable_attention_dp and req.is_dummy_request)
-        ):
+        if self.scheduler is None or self.capacity_only or _is_dummy_request(req):
             return
         # A cache that reports per layer group is reported that way, whatever
         # the group count -- including one empty list per group for a request
