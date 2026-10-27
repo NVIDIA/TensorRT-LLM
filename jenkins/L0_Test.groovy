@@ -4507,9 +4507,9 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     if (stageName.startsWith('CPU-Generic-WaiveRefresh-')) {
         def testList = "${llmSrc}/waive_refresh_validation_${stageName}.txt"
         def isolated = stageName.contains('-Isolated-') ? ' ISOLATION' : ''
-        writeFile file: testList, text:
-            "unittest/llmapi/test_mpi_session.py::test_remote_mpi_session${isolated}\n" +
-            'unittest/llmapi/test_mpi_session.py::test_mpi_session_basic\n'
+        sh """printf '%s\\n' \
+            'unittest/llmapi/test_mpi_session.py::test_remote_mpi_session${isolated}' \
+            'unittest/llmapi/test_mpi_session.py::test_mpi_session_basic' > '${testList}'"""
         echo "[WAIVE-VALIDATION] Two explicit pytest cases for ${stageName}: ${testList}"
         return testList
     }
