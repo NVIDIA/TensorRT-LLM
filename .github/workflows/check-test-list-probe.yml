@@ -13,24 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Probe whether the Jenkins "Check Test List" stage can run on a GitHub runner,
-# comparing the NVIDIA-hosted CPU runner with the GitHub-hosted one.
-# Reports, without gating anything:
-#   - runner resources: CPUs, memory, disk, sudo, docker
-#   - whether container jobs work (needed to reuse LLM_DOCKER_IMAGE)
-#   - network reach to urm/artifactory (trt-test-db, CI images) and public indexes
-#   - install time, disk use and collection result for the full requirements-dev
-#     set with CPU or CUDA torch, and for a reduced set without GPU-only packages
-#   - whether collection touches CUDA user-space libraries (the CI image ships
-#     them; a plain runner has none, and the Jenkins pod has no GPU driver)
+# Probe how long the Jenkins "Check Test List" stage takes on a GitHub-hosted
+# runner with CUDA torch, the full requirements-dev set and a pip cache.
 name: Check Test List Probe
 on:
   pull_request:
     paths:
       - '.github/workflows/check-test-list-probe.yml'
-  push:
-    branches:
-      - 'user/*/check-test-list-probe*'
   workflow_dispatch:
 
 concurrency:
@@ -39,97 +28,13 @@ concurrency:
 
 env:
   TORCH_VERSION: '2.14.0'
-  TORCH_CPU_INDEX: https://download.pytorch.org/whl/cpu
-  TRT_PYPI_INDEX: https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple
+  TORCH_INDEX: https://download.pytorch.org/whl/cu132
 
 jobs:
-  runner-env:
-    name: Runner resources and network (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["linux-amd64-cpu4", "ubuntu-latest"]') }}
-    timeout-minutes: 15
-    steps:
-      - name: Resources
-        run: |
-          {
-            echo "## Runner resources (${{ matrix.runner }})"
-            echo '```'
-            echo "runner: ${RUNNER_NAME:-unknown}  user: $(id -un)  nproc: $(nproc)"
-            grep PRETTY_NAME /etc/os-release || true
-            free -h
-            df -h / "${RUNNER_TEMP}" "${GITHUB_WORKSPACE}" 2>/dev/null | sort -u
-            echo "python3: $(python3 --version 2>&1 || echo missing)"
-            echo "git: $(git --version 2>&1 || echo missing)"
-            if sudo -n true 2>/dev/null; then echo "sudo: yes"; else echo "sudo: no"; fi
-            if command -v docker >/dev/null 2>&1; then
-              echo "docker: $(docker version --format '{{.Server.Version}}' 2>&1)"
-              docker info --format 'docker root: {{.DockerRootDir}}  driver: {{.Driver}}' 2>&1 || true
-            else
-              echo "docker: missing"
-            fi
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Network reach
-        run: |
-          probe() {
-            local url=$1
-            local host=${url#https://}; host=${host%%/*}
-            local ip
-            ip=$(getent hosts "$host" | awk '{print $1}' | head -1)
-            local result
-            result=$(curl -s -m 20 -o /dev/null -w '%{http_code} %{time_total}s' "$url" 2>&1 || true)
-            printf '| %s | %s | %s |\n' "$url" "${ip:-no DNS}" "$result"
-          }
-          {
-            echo "## Network reach from ${{ matrix.runner }} (401 on /v2/ means the registry is reachable)"
-            echo "| URL | IP | HTTP / time |"
-            echo "|---|---|---|"
-            probe "${TRT_PYPI_INDEX}/trt-test-db/"
-            probe https://urm.nvidia.com/v2/
-            probe https://artifactory.nvidia.com/v2/
-            probe https://pypi.org/simple/pip/
-            probe "${TORCH_CPU_INDEX}/torch/"
-            probe https://download.pytorch.org/whl/cu132/torch/
-            probe https://github.com/LMCache/LMBenchmark
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-
-  container-job:
-    name: Container job support (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["linux-amd64-cpu4", "ubuntu-latest"]') }}
-    timeout-minutes: 15
-    container:
-      image: python:3.12-slim
-    steps:
-      - name: Inside container
-        run: |
-          {
-            echo "## Container job (${{ matrix.runner }})"
-            echo '```'
-            echo "container jobs work: $(python3 --version)"
-            df -h / | tail -1
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-
   collect:
-    name: Collect (${{ matrix.deps }} deps, ${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["linux-amd64-cpu4", "ubuntu-latest"]') }}
-        # full: requirements-dev.txt as Jenkins installs it, but with CPU torch.
-        # full-cuda: same with CUDA torch, which pulls the CUDA runtime wheels.
-        # reduced: drop GPU-only packages to see what collection needs.
-        deps: [full, full-cuda, reduced]
+    name: Collect (full-cuda deps, ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       # Same layout as the Jenkins stage: the source lives in a subdirectory and
       # check_test_list.py is invoked by absolute path from the workspace root.
@@ -138,90 +43,37 @@ jobs:
           path: llm
 
       - uses: actions/setup-python@v6
+        id: python
         with:
           python-version: '3.12'
-
-      - name: Disk before install
-        run: |
-          echo "DISK_BEFORE_KB=$(df -k --output=used / | tail -1)" >> "$GITHUB_ENV"
-          df -h /
+          cache: 'pip'
+          cache-dependency-path: |
+            llm/requirements.txt
+            llm/requirements-dev.txt
+            llm/constraints.txt
 
       - name: Install torch
         run: |
-          index="${TORCH_CPU_INDEX}"
-          if [ "${{ matrix.deps }}" = "full-cuda" ]; then
-            index=https://download.pytorch.org/whl/cu132
-          fi
           start=$SECONDS
           python -m pip install --upgrade pip
-          python -m pip install --index-url "$index" "torch==${TORCH_VERSION}" torchvision
+          python -m pip install --index-url "${TORCH_INDEX}" "torch==${TORCH_VERSION}" torchvision
           echo "TORCH_SECONDS=$((SECONDS - start))" >> "$GITHUB_ENV"
-
-      - name: Build requirement file
-        working-directory: llm
-        run: |
-          printf 'torch==%s\n' "${TORCH_VERSION}" > "${RUNNER_TEMP}/torch-pin.txt"
-          if [ "${{ matrix.deps }}" != "reduced" ]; then
-            cp requirements-dev.txt "${RUNNER_TEMP}/probe-requirements.txt"
-            sed -i "s|^-r requirements.txt|-r $PWD/requirements.txt|" "${RUNNER_TEMP}/probe-requirements.txt"
-          else
-            python - "${RUNNER_TEMP}/probe-requirements.txt" <<'EOF'
-          import re
-          import sys
-          from pathlib import Path
-
-          # GPU-only or CUDA-runtime packages; torch/torchvision are preinstalled.
-          # mpi4py stays: tensorrt_llm/_utils.py imports mpi4py.MPI at module level.
-          drop = re.compile(
-              r"^(torch([<>=!~;\[ ]|$)|torchvision|triton|nvidia-(?!ml-py)|nccl4py|cuda-tile|cupti-python|"
-              r"flashinfer|flash-attn|flash-linear-attention|fla-core|quack-kernels|"
-              r"torch-c-dlpack-ext|apache-tvm-ffi|mooncake|nixl|PyNvVideoCodec)",
-              re.IGNORECASE)
-          kept, dropped = [], []
-          for name in ("requirements.txt", "requirements-dev.txt"):
-              for raw in Path(name).read_text().splitlines():
-                  line = raw.split(" #")[0].strip()
-                  if not line or line.startswith("#") or line.startswith(("-r ", "--extra-index-url")):
-                      continue
-                  if line.startswith("-c "):
-                      kept.append(f"-c {Path(line[3:].strip()).resolve()}")
-                  elif drop.match(line):
-                      dropped.append(line)
-                  else:
-                      kept.append(line)
-          Path(sys.argv[1]).write_text("\n".join(kept) + "\n")
-          print("Dropped:\n  " + "\n  ".join(dropped))
-          EOF
-          fi
-          cat "${RUNNER_TEMP}/probe-requirements.txt"
 
       # mpi4py loads libmpi when mpi4py.MPI is imported. The CI image ships
       # HPC-X OpenMPI; on a plain runner the openmpi wheel provides it.
       - name: Install requirements
-        id: install
-        continue-on-error: true
-        run: |
-          start=$SECONDS
-          python -m pip install --extra-index-url "${TORCH_CPU_INDEX}" \
-            -c "${RUNNER_TEMP}/torch-pin.txt" -r "${RUNNER_TEMP}/probe-requirements.txt" openmpi
-          echo "REQ_SECONDS=$((SECONDS - start))" >> "$GITHUB_ENV"
-
-      - name: Install trt-test-db
-        id: trt_test_db
-        continue-on-error: true
         working-directory: llm
         run: |
-          version=$(sed -n 's/^TRT_TEST_DB_VERSION=//p' jenkins/ci_versions.properties)
+          printf 'torch==%s\n' "${TORCH_VERSION}" > "${RUNNER_TEMP}/torch-pin.txt"
           start=$SECONDS
-          python -m pip install --extra-index-url "${TRT_PYPI_INDEX}" --ignore-installed "trt-test-db==${version}"
-          echo "TTDB_SECONDS=$((SECONDS - start))" >> "$GITHUB_ENV"
-          echo "TTDB_SOURCE=urm" >> "$GITHUB_ENV"
+          python -m pip install --extra-index-url "${TORCH_INDEX}" \
+            -c "${RUNNER_TEMP}/torch-pin.txt" -r requirements-dev.txt openmpi
+          echo "REQ_SECONDS=$((SECONDS - start))" >> "$GITHUB_ENV"
 
       # urm.nvidia.com does not resolve from GitHub-hosted runners. check_test_list
       # only runs `trt-test-db -d DIR --test-names --output FILE`, which lists every
       # test name in DIR/*.yml; this stand-in produces the same set from the YAML.
-      - name: Fall back to a trt-test-db stand-in
-        if: steps.trt_test_db.outcome == 'failure'
+      - name: Install a trt-test-db stand-in
         run: |
           mkdir -p "${RUNNER_TEMP}/bin"
           cat > "${RUNNER_TEMP}/bin/trt-test-db" <<'EOF'
@@ -249,39 +101,8 @@ jobs:
           EOF
           chmod +x "${RUNNER_TEMP}/bin/trt-test-db"
           echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
-          echo "TTDB_SOURCE=stand-in" >> "$GITHUB_ENV"
-
-      - name: CUDA libraries visible
-        run: |
-          {
-            echo "## CUDA libraries (${{ matrix.deps }} deps, ${{ matrix.runner }})"
-            echo '```'
-            python - <<'EOF'
-          import ctypes
-          import glob
-          import site
-
-          import torch
-
-          print(f"torch {torch.__version__} cuda={torch.version.cuda} "
-                f"cuda.is_available={torch.cuda.is_available()}")
-          for lib in ("libcuda.so.1", "libcudart.so.13", "libnvrtc.so.13", "libnccl.so.2"):
-              try:
-                  ctypes.CDLL(lib)
-                  print(f"{lib}: on default loader path")
-              except OSError:
-                  print(f"{lib}: not on default loader path")
-          wheels = sorted({p.split("/nvidia/")[1].split("/")[0]
-                           for d in site.getsitepackages()
-                           for p in glob.glob(f"{d}/nvidia/*/lib/*.so*")})
-          print("pip nvidia/* lib dirs:", ", ".join(wheels) or "none")
-          EOF
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Run check_test_list
-        id: collect
-        continue-on-error: true
         env:
           NVIDIA_TRITON_SERVER_VERSION: '26.09'
         run: |
@@ -289,9 +110,7 @@ jobs:
           start=$SECONDS
           # Dependencies were installed by the steps above; skip the script's own
           # pip install so the measured set is exactly the one under test.
-          set -o pipefail
-          rc=0
-          python - 2>&1 <<'EOF' | tee "${RUNNER_TEMP}/collect.log" || rc=$?
+          python - <<'EOF'
           import importlib.util
           import os
           import sys
@@ -306,27 +125,17 @@ jobs:
           module.main()
           EOF
           echo "COLLECT_SECONDS=$((SECONDS - start))" >> "$GITHUB_ENV"
-          exit $rc
 
       - name: Summary
         if: always()
         run: |
-          used_kb=$(( $(df -k --output=used / | tail -1) - ${DISK_BEFORE_KB:-0} ))
           {
-            echo "## Collect with ${{ matrix.deps }} deps on ${{ matrix.runner }}"
-            echo "| Step | Result | Seconds |"
-            echo "|---|---|---|"
-            echo "| torch | done | ${TORCH_SECONDS:-} |"
-            echo "| requirements | ${{ steps.install.outcome }} | ${REQ_SECONDS:-} |"
-            echo "| trt-test-db from urm | ${{ steps.trt_test_db.outcome }} | ${TTDB_SECONDS:-} |"
-            echo "| trt-test-db used | ${TTDB_SOURCE:-none} | |"
-            echo "| check_test_list | ${{ steps.collect.outcome }} | ${COLLECT_SECONDS:-} |"
+            echo "## Collect with full-cuda deps on ubuntu-latest"
+            echo "pip cache restored: ${{ steps.python.outputs.cache-hit }}; size now: $(du -sh "$(python -m pip cache dir)" | cut -f1)"
             echo
-            echo "Disk added by installs: $(( used_kb / 1024 )) MiB; free now: $(df -h --output=avail / | tail -1)"
-            echo
-            echo "Collection errors mentioning missing modules or shared libraries:"
-            echo '```'
-            grep -hoE "(ModuleNotFoundError|ImportError|OSError).{0,200}|lib[a-z0-9_]+\.so[.0-9]*.{0,80}(cannot open|not found|No such file)" \
-              "${RUNNER_TEMP}/collect.log" 2>/dev/null | sort | uniq -c | sort -rn | head -40 || true
-            echo '```'
+            echo "| Step | Seconds |"
+            echo "|---|---|"
+            echo "| torch | ${TORCH_SECONDS:-} |"
+            echo "| requirements | ${REQ_SECONDS:-} |"
+            echo "| check_test_list | ${COLLECT_SECONDS:-} |"
           } | tee -a "$GITHUB_STEP_SUMMARY"
