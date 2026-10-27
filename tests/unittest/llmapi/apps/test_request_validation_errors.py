@@ -32,6 +32,7 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig
 from tensorrt_llm.serve import openai_disagg_server
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
@@ -54,6 +55,7 @@ def _chat_body(**extra):
 
 @pytest.fixture(scope="module")
 def client():
+    previous_media_executor = BaseMediaIO._executor
     with (
         patch.object(OpenAIServer, "_init_llm"),
         patch.object(OpenAIServer, "register_routes"),
@@ -65,6 +67,11 @@ def client():
             server_role=None,
             metadata_server_cfg=None,
         )
+    # The constructor publishes its media-decode pool process-wide: put the
+    # previous one back and retire the server's pool, as
+    # openai_server_stub.make_stub_openai_server does.
+    BaseMediaIO.set_executor(previous_media_executor)
+    server._media_load_executor.shutdown(wait=False)
     server.app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
     server.app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
     return TestClient(server.app)
