@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import io
 import pickle
 import sys
 import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -444,6 +446,84 @@ def test_session_overlaps_materialization_and_cancels_tail(tmp_path, monkeypatch
 
     assert stopped.is_set()
     assert loader.last_checkpoint_io_status.effective == "rank_striped_read_ahead"
+
+
+def test_node_major_page_faults_reads_vmstat(monkeypatch):
+    assert isinstance(read_ahead.node_major_page_faults(), int)
+
+    vmstat = "pgpgin 1\npgmajfault 1234\npgrefill 5\n"
+    monkeypatch.setattr(
+        read_ahead, "open", lambda *args, **kwargs: io.StringIO(vmstat), raising=False
+    )
+    assert read_ahead.node_major_page_faults() == 1234
+
+    def unavailable(*args, **kwargs):
+        raise FileNotFoundError("/proc/vmstat")
+
+    monkeypatch.setattr(read_ahead, "open", unavailable, raising=False)
+    assert read_ahead.node_major_page_faults() is None
+
+
+def _two_file_session(tmp_path, monkeypatch, fault_counts):
+    """Build a one-rank session over two files whose node fault counts the test controls."""
+    paths = []
+    for name in ("a.safetensors", "b.safetensors"):
+        path = tmp_path / name
+        path.write_bytes(b"\1" * 8)
+        paths.append(str(path))
+    plan = read_ahead.ReadAheadPlan(
+        tuple(read_ahead.ReadAheadExtent(path, 0, 8) for path in paths), workers=2
+    )
+    reads = []
+    real_read_extent = read_ahead.RankStripedReadAheadSession._read_extent
+
+    def recording_read_extent(session, extent):
+        completed = real_read_extent(session, extent)
+        reads.append(extent.path)
+        return completed
+
+    monkeypatch.setattr(read_ahead, "_RESIDENCY_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(read_ahead, "node_major_page_faults", fault_counts)
+    monkeypatch.setattr(
+        read_ahead.RankStripedReadAheadSession, "_read_extent", recording_read_extent
+    )
+    return read_ahead.RankStripedReadAheadSession(None, None, plan), paths, reads
+
+
+def _wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "condition not reached"
+        time.sleep(0.01)
+
+
+def test_major_faults_after_first_pass_reread_the_extents(tmp_path, monkeypatch):
+    # The first count is the baseline taken after the first pass. The next poll
+    # sees enough new major faults to mean the cache dropped pages; the count
+    # then stays flat, so exactly one re-read pass follows.
+    counts = iter([0])
+    session, paths, reads = _two_file_session(
+        tmp_path, monkeypatch, lambda: next(counts, read_ahead._REFRESH_MAJOR_FAULTS)
+    )
+    session.start()
+    _wait_until(lambda: len(reads) >= 4)
+
+    assert session.finish(None) is None
+    assert sorted(reads[:2]) == sorted(paths)
+    assert sorted(reads[2:]) == sorted(paths)
+
+
+def test_no_major_faults_after_first_pass_reads_nothing_more(tmp_path, monkeypatch):
+    counts = iter([7])
+    session, paths, reads = _two_file_session(
+        tmp_path, monkeypatch, lambda: next(counts, 7 + read_ahead._REFRESH_MAJOR_FAULTS - 1)
+    )
+    session.start()
+    _wait_until(lambda: len(reads) == 2)
+    time.sleep(0.2)
+
+    assert session.finish(None) is None
+    assert sorted(reads) == sorted(paths)
 
 
 def test_advisory_read_failure_keeps_materialized_weights(tmp_path, monkeypatch):

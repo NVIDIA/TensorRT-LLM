@@ -106,7 +106,10 @@ checkpoint bytes reach host memory:
 - `rank_striped_read_ahead` divides SafeTensors files into fixed extents.
   Node-local ranks issue disjoint background `pread` requests into the Linux
   page cache while the existing mapping, transformation, and H2D path runs.
-  After every rank finishes materialization, speculative read-ahead work that
+  The page cache can drop those pages before materialization reads them (for
+  example, when a Lustre client cancels aged DLM locks); when the node then
+  takes major page faults during materialization, the readers re-read their
+  extents. After every rank finishes materialization, speculative read-ahead work that
   is still queued or active can no longer improve first-token latency and is
   stopped. A worker already blocked in a synchronous `pread` must finish its
   current 8 MiB read before shutdown, so degraded storage can delay the join.
