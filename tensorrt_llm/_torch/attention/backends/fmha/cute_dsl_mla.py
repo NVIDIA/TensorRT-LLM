@@ -569,6 +569,12 @@ class CuteDslMlaFmha(PhasedFmha):
         params: FmhaParams,
         kernel_dtype: torch.dtype,
     ) -> None:
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+            KVCacheManagerV2,
+            Role,
+        )
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
         attn = params.attn
         meta = params.meta
 
@@ -649,6 +655,20 @@ class CuteDslMlaFmha(PhasedFmha):
         )
         if layers_in_pool > 1:
             page_table = page_table + layer_in_pool
+        elif (
+            isinstance(meta.kv_cache_manager, KVCacheManagerV2)
+            and meta.kv_cache_manager._use_per_layer_page_tables
+        ):
+            # V2 per-layer indices include the layer offset, but get_buffers()
+            # already starts at this layer's KEY buffer. Apply the offset once.
+            converter = meta.kv_cache_manager.impl.get_page_index_converter(
+                local_layer_idx, Role.KEY
+            )
+            layer_offset = int(converter.layer_offset)
+            if layer_offset:
+                page_table = torch.where(
+                    page_table == BAD_PAGE_INDEX, page_table, page_table - layer_offset
+                )
 
         # KVCacheManager exposes NHD pages as [num_pages, 1, page_size, 1, head_dim].
         # The CuTe DSL kernel consumes a paged [page_size, dim, num_pages] view
