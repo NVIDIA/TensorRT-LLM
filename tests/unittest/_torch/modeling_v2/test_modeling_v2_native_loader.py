@@ -3,9 +3,9 @@
 """What ``_native`` decides, and that the installed family libraries load.
 
 The first tests drive the loader's decisions without opening anything: which
-outcomes are ``NativeCodeNotBuilt`` (this installation does not carry the
-target; a ``NoTarget``, so ``auto`` keeps the built-in model) and which are
-``NativeLoadError`` (an installed library is broken, which is never a fallback).
+outcomes are ``NoTarget`` (this installation does not carry the target, so
+``auto`` keeps the built-in model) and which are ``NativeLoadError`` (an
+installed library is broken, which is never a fallback).
 
 The last is the load smoke test of the installed wheel: every family library in
 ``tensorrt_llm/libs`` opens in a fresh process, names the targets it carries, and
@@ -27,7 +27,6 @@ import pytest
 
 from tensorrt_llm._torch._experimental.modeling_v2 import _native
 from tensorrt_llm._torch._experimental.modeling_v2._native import (
-    NativeCodeNotBuilt,
     NativeLoadError,
     load_family_ops,
     load_target_ops,
@@ -70,8 +69,7 @@ def test_names():
 
 
 def test_what_is_not_built_and_what_is_broken(libs):
-    assert issubclass(NativeCodeNotBuilt, NoTarget)  # what makes `auto` fall back
-    with pytest.raises(NativeCodeNotBuilt, match="has no libth_modeling_v2_gpt_oss.so"):
+    with pytest.raises(NoTarget, match="has no libth_modeling_v2_gpt_oss.so"):
         load_target_ops(_TARGET)
 
     def fail():
@@ -82,7 +80,7 @@ def test_what_is_not_built_and_what_is_broken(libs):
         load_target_ops(_TARGET)
 
     libs.install(lambda: frozenset({"other__sm_90__default"}))
-    with pytest.raises(NativeCodeNotBuilt, match="does not carry gpt_oss_120b__sm_10x__default"):
+    with pytest.raises(NoTarget, match="does not carry gpt_oss_120b__sm_10x__default"):
         load_target_ops(_TARGET)
 
 

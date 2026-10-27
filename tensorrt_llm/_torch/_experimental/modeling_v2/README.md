@@ -217,13 +217,12 @@ reached with `load_family_ops(__name__)` and faked in `models/foo/fake_ops.py`. 
 with no code of its own declares no `SOURCES`.
 
 - **`ARCHS`** (`NN`, `NNa`, `NNf`) is intersected with the build's architectures; a target
-  with none is not built, and is a `NativeCodeNotBuilt` at run time. `REQUIRES` (`MULTI_DEVICE`,
+  with none is not built, and is a `NoTarget` at run time. `REQUIRES` (`MULTI_DEVICE`,
   `NVSHMEM`) and `DEPS` (a closed list) are the other keywords; a per-file compile option
   goes on the file with `set_source_files_properties`.
 - **Loading**: a library this installation does not carry, or a target it did not build,
-  is a `NativeCodeNotBuilt`, a `NoTarget` (`auto` keeps the built-in model); one that is
-  installed but fails to load, or lacks an op a `fake_ops.py` declares, is a
-  `NativeLoadError`.
+  is a `NoTarget` (`auto` keeps the built-in model); one that is installed but fails to
+  load, or lacks an op a `fake_ops.py` declares, is a `NativeLoadError`.
 - **Building only your family**: `build_wheel.py -D "TRTLLM_MODELING_V2_TARGETS=foo/*"`, and
   after an edit `cmake --build cpp/build --target th_modeling_v2_foo`.
 - `test_modeling_v2_native_claims.py` checks these rules on CPU; run it before sending the PR.
