@@ -378,6 +378,15 @@ commands:
         is_flag: true
         flags:
         - "--openengine-enable-load-metrics"
+      openengine_grpc_server:
+        type: Choice(['grpcio', 'pygrpc-native'])
+        default: grpcio
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--openengine-grpc-server"
       otlp_traces_endpoint:
         type: str
         default: null
