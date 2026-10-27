@@ -20,8 +20,8 @@ import signal
 import socket
 import traceback
 import uuid
-from contextlib import asynccontextmanager
-from typing import Callable, Optional
+from contextlib import aclosing, asynccontextmanager
+from typing import Any, AsyncGenerator, Callable, Optional
 
 import aiohttp
 import uvicorn
@@ -439,17 +439,23 @@ class OpenAIDisaggServer:
                     raw_req, self._perf_metrics_collector.queue_latency_seconds,
                     self._collect_perf_metrics)
                 response_or_generator = await entry_point(req, hooks)
-                self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
                     stream = response_or_generator
                     if isinstance(req, ResponsesRequest):
-                        # A relayed Responses stream that fails early ends with
-                        # an `error` event; other protocols end on a sentinel.
+                        # A relayed Responses stream that fails ends with an
+                        # `error` event, even before its first frame.
                         stream = guard_responses_stream(stream,
                                                         stream_error_event)
+                    # Hold the headers until the first chunk: a chat or
+                    # completion stream that fails before it (e.g. a generation
+                    # server's KV-cache transfer error) becomes an HTTP error,
+                    # not a 200 whose body is cut off.
+                    stream = await self._start_stream(stream)
+                    self._perf_metrics_collector.total_responses.inc()
                     return StreamingResponse(
                         content=stream,
                         media_type="text/event-stream")
+                self._perf_metrics_collector.total_responses.inc()
                 # by_alias: e.g. text.format.schema goes out under its wire name.
                 return JSONResponse(
                     content=response_or_generator.model_dump(by_alias=True))
@@ -458,6 +464,39 @@ class OpenAIDisaggServer:
                 # carry a machine-readable code (context_length_exceeded).
                 return self._handle_exception(e)
         return wrapper
+
+    @staticmethod
+    async def _start_stream(
+            stream: AsyncGenerator[Any, None]) -> AsyncGenerator[Any, None]:
+        """Pull a relayed stream's first chunk before the response headers go out.
+
+        A worker that fails before its first chunk then raises here and becomes an
+        HTTP error response instead of a 200 whose body is cut off. The returned
+        relay is already started, so closing it before its first chunk still closes
+        ``stream`` and releases the request's routing state.
+
+        Args:
+            stream: The relayed response stream from the disaggregated service.
+
+        Returns:
+            ``stream`` itself when it is already exhausted; otherwise a started
+            relay that yields the first chunk and then the rest of ``stream``.
+        """
+        try:
+            first_chunk = await anext(stream)
+        except StopAsyncIteration:
+            return stream
+
+        async def relay() -> AsyncGenerator[Any, None]:
+            async with aclosing(stream):
+                yield None  # Consumed below.
+                yield first_chunk
+                async for chunk in stream:
+                    yield chunk
+
+        relayed = relay()
+        await anext(relayed)
+        return relayed
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
