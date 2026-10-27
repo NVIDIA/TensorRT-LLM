@@ -3054,10 +3054,12 @@ def test_video_timing_is_forwarded_to_the_processor(monkeypatch):
         {"fps": 0, "frames_indices": [0, 1]},
         {"fps": float("nan"), "frames_indices": [0, 1]},
         {"fps": float("inf"), "frames_indices": [0, 1]},
+        {"fps": "10", "frames_indices": [0, 1]},
         {"fps": 10.0},
         {"fps": 10.0, "frames_indices": []},
         {"fps": 10.0, "frames_indices": [0]},
         {"fps": 10.0, "frames_indices": [0, 5, 9]},
+        {"fps": 10.0, "frames_indices": [0, None]},
     ],
     ids=[
         "frame_list",
@@ -3065,10 +3067,12 @@ def test_video_timing_is_forwarded_to_the_processor(monkeypatch):
         "zero_fps",
         "nan_fps",
         "inf_fps",
+        "string_fps",
         "no_frame_indices",
         "empty_frame_indices",
         "fewer_frame_indices_than_frames",
         "more_frame_indices_than_frames",
+        "none_frame_index",
     ],
 )
 def test_video_without_timing_passes_no_metadata(monkeypatch, metadata):

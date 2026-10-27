@@ -14,6 +14,7 @@ features produced by the tower.
 from __future__ import annotations
 
 import math
+import numbers
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -2058,8 +2059,8 @@ class MiniMaxM3VLInputProcessor:
         ``VideoData.metadata`` carries the source ``fps`` and the indices of
         the sampled frames. With both, the processor writes a
         ``]<]{t} seconds[>[`` timestamp before each temporal group. A video
-        without usable timing (no metadata, ``fps`` missing, not finite or
-        not positive, or not one frame index per delivered frame) gets
+        without usable timing (no metadata, ``fps`` missing or not a finite
+        positive number, or not one integer frame index per delivered frame) gets
         ``fps=None`` and no timestamps. Only the keys transformers'
         ``VideoMetadata`` accepts are passed, and ``total_num_frames`` is the
         number of frames delivered, because the media loader has already
@@ -2070,11 +2071,15 @@ class MiniMaxM3VLInputProcessor:
         fps = metadata.get("fps")
         frames_indices = metadata.get("frames_indices")
         if (
-            fps is None
+            not isinstance(fps, numbers.Real)
+            or isinstance(fps, bool)
             or not math.isfinite(fps)
             or fps <= 0
             or frames_indices is None
             or len(frames_indices) != num_frames
+            or not all(
+                isinstance(i, numbers.Integral) and not isinstance(i, bool) for i in frames_indices
+            )
         ):
             fps, frames_indices = None, range(num_frames)
         return {
