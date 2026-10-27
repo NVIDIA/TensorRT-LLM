@@ -2747,6 +2747,10 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         return kv_cache_pool_pointers, kv_cache_pool_mapping
 
+    def _get_page_table_layers(self, pool_id: int) -> Sequence[LayerId]:
+        """Return layers whose strides constrain this pool's page-table layout."""
+        return self.impl.layer_grouping[pool_id]
+
     def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
         # Keep role-dependent checks in this default page-table initializer:
         # custom layouts such as DeepSeek V4 override it with their own roles.
@@ -2759,13 +2763,11 @@ class KVCacheManagerV2(BaseResourceManager):
             len(
                 {
                     self.impl.get_page_stride(layer_id, self._get_pool_roles(pool_id)[0])
-                    for layer_id in layer_ids
-                    # Auxiliary layers do not supply model page-table pointers.
-                    if int(layer_id) < self.num_local_layers
+                    for layer_id in self._get_page_table_layers(pool_id)
                 }
             )
             > 1
-            for pool_id, layer_ids in enumerate(self.impl.layer_grouping)
+            for pool_id in range(len(self.impl.layer_grouping))
         )
         if self.layer_specs is not None:
             storage_layouts = {(layer.dtype, layer.kv_factor) for layer in self.layer_specs}

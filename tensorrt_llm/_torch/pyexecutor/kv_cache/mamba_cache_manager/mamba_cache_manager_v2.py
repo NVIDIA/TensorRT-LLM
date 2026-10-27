@@ -683,6 +683,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             commit_min_snapshot=True,
         )
 
+    @override
+    def _get_page_table_layers(self, pool_id: int) -> Sequence[LayerId]:
+        # Replay layers share SSM slots but expose no core SSM/attention role.
+        replay_layers = set(self._replay_layer_ids.values())
+        return [
+            layer for layer in super()._get_page_table_layers(pool_id) if layer not in replay_layers
+        ]
+
     def _setup_state_pool(self) -> None:
         """Resolve logical slots, bind base views, then initialize model state."""
         self._kernel_layer_caches: dict[int, MambaLayerCache] = {}
