@@ -1,5 +1,8 @@
 --extra-index-url https://download.pytorch.org/whl/cu132
 -c constraints.txt
+# Patched filelock requires Python 3.11; 3.20.3 predates the affected lock implementations.
+filelock==3.20.3; python_version < "3.11"
+filelock>=4.2.1; python_version >= "3.11"
 accelerate>=1.7.0
 build
 colored
