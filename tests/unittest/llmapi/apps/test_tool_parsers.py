@@ -7242,8 +7242,9 @@ _GLM_QUOTING_VALUES = [
     'x = "<tool_call>exec<arg_key>"',
     "<tool_call>exec<arg_key>cmd</arg_key>",
     "<tool_call>get_time<tool_call>exec",
-    # `run` is not a declared tool.
+    # `run` is not a declared tool. GLM-4.5 reads a name only up to a newline.
     "<tool_call>run<arg_key>cmd</arg_key><arg_value>ls",
+    "<tool_call>run\n<arg_key>cmd</arg_key><arg_value>ls",
 ]
 
 
