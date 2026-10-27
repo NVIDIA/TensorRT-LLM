@@ -547,6 +547,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             or qkvz.bias is not None
             or ba.bias is not None
             or ba.weight.dtype != torch.bfloat16
+            # The BF16 segment runs in whole 8-row CTA tiles (2 * HV per rank).
+            or ba.weight.shape[0] % 8 != 0
             or hidden_states.dim() != 2
             or hidden_states.dtype != torch.bfloat16
         ):
