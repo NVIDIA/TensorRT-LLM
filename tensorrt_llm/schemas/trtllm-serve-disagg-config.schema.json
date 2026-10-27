@@ -2486,10 +2486,9 @@
           "title": "Model Kwargs"
         },
         "modeling_v2": {
-          "default": "default",
-          "description": "Whether to build the model from a modeling_v2 target (experimental) instead of the built-in implementation. 'default' behaves as 'auto' on the deployments the architecture's routing module enables by default and as 'off' everywhere else. 'off' never does. 'auto' uses a target when one claims this deployment and falls back to the built-in implementation otherwise. 'require' raises instead of falling back.",
+          "default": "off",
+          "description": "Whether to build the model from a modeling_v2 target (experimental) instead of the built-in implementation. 'off' never does. 'auto' uses a target when one claims this deployment and falls back to the built-in implementation otherwise. 'require' raises instead of falling back.",
           "enum": [
-            "default",
             "off",
             "auto",
             "require"
@@ -4793,6 +4792,13 @@
           "description": "The class name of the worker within the module.",
           "title": "Connector Worker Class"
         },
+        "control_grace_sec": {
+          "default": 60.0,
+          "description": "Grace period in seconds for pending ADP KV connector transfers after cancellation or shutdown. Can only shorten the existing transfer deadline. Expiration fails all ADP owners and requires process restart. Unused without attention DP.",
+          "exclusiveMinimum": 0,
+          "title": "Control Grace Sec",
+          "type": "number"
+        },
         "mooncake_store": {
           "anyOf": [
             {
@@ -4817,6 +4823,13 @@
           "default": null,
           "description": "URL for an external connector server (e.g. 'tcp://localhost:5555'). Connectors that run in multi-process mode use this to reach the cache server.",
           "title": "Server Url"
+        },
+        "transfer_timeout_sec": {
+          "default": 600.0,
+          "description": "Deadline in seconds for an outstanding ADP KV connector transfer. Checked at polling gates; cannot interrupt blocking callbacks. Expiration fails all ADP owners and requires process restart. Unused without attention DP.",
+          "exclusiveMinimum": 0,
+          "title": "Transfer Timeout Sec",
+          "type": "number"
         }
       },
       "title": "KvCacheConnectorConfig",
@@ -8863,10 +8876,9 @@
       "title": "Model Kwargs"
     },
     "modeling_v2": {
-      "default": "default",
-      "description": "Whether to build the model from a modeling_v2 target (experimental) instead of the built-in implementation. 'default' behaves as 'auto' on the deployments the architecture's routing module enables by default and as 'off' everywhere else. 'off' never does. 'auto' uses a target when one claims this deployment and falls back to the built-in implementation otherwise. 'require' raises instead of falling back.",
+      "default": "off",
+      "description": "Whether to build the model from a modeling_v2 target (experimental) instead of the built-in implementation. 'off' never does. 'auto' uses a target when one claims this deployment and falls back to the built-in implementation otherwise. 'require' raises instead of falling back.",
       "enum": [
-        "default",
         "off",
         "auto",
         "require"

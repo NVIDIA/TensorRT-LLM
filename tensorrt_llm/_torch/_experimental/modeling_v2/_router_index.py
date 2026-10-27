@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import enum
 import os
-import sys
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
 
 from tensorrt_llm.logger import logger
@@ -105,8 +104,6 @@ def step_contract_enabled() -> bool:
 class ModelingV2Mode(str, enum.Enum):
     """What to do when a deployment reaches the modeling_v2 resolver."""
 
-    #: ``auto`` on the deployments the routing module enables by default, ``off`` everywhere else.
-    DEFAULT = "default"
     OFF = "off"
     AUTO = "auto"
     REQUIRE = "require"
@@ -125,32 +122,6 @@ class NoTarget(ValueError):
     (for a refusal at construction, ``AutoModelForCausalLM.from_config`` does);
     under ``require`` it becomes the error the user sees.
     """
-
-
-class DeploymentRole(str, enum.Enum):
-    """What this engine serves: both phases, or one side of disaggregated serving."""
-
-    AGGREGATED = "aggregated"
-    CONTEXT = "context"
-    GENERATION = "generation"
-    #: Disaggregated, but the launcher did not say which side.
-    UNKNOWN = "unknown"
-
-
-#: Set by ``trtllm-serve`` on disaggregated workers (``context`` or ``generation``; legacy ``ctx*`` / ``gen*``).
-DISAGG_ROLE_ENV = "TRTLLM_DISAGG_ROLE"
-
-
-def deployment_role(llm_args: "TorchLlmArgs") -> DeploymentRole:
-    """The role of this engine, known before the model is built: no cache transceiver means aggregated serving."""
-    if llm_args.cache_transceiver_config is None:
-        return DeploymentRole.AGGREGATED
-    role = os.environ.get(DISAGG_ROLE_ENV, "").strip().lower()
-    if role == "context" or role.startswith("ctx"):
-        return DeploymentRole.CONTEXT
-    if role == "generation" or role.startswith("gen"):
-        return DeploymentRole.GENERATION
-    return DeploymentRole.UNKNOWN
 
 
 # The mode each target class was last resolved under (the loader builds the class right after resolving it).
@@ -228,10 +199,6 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     for the architecture, or when that ``route`` raises ``NoTarget``.
     In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
 
-    ``default`` resolves as ``auto`` and then keeps the target only where the
-    routing module's ``enabled_by_default(target, role)`` returns None (a reason
-    string declines it). An architecture whose routing module has no
-    ``enabled_by_default`` is not routed at all under ``default``.
     """
     mode = ModelingV2Mode.of(llm_args)
     if mode is ModelingV2Mode.OFF:
@@ -241,17 +208,6 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     if not getattr(pretrained_config, "architectures", None):
         return None
     arch = pretrained_config.architectures[0]
-
-    if mode is ModelingV2Mode.DEFAULT:
-        route = registered_routes().get(arch)
-        # The family's ``routing.py`` declares ``enabled_by_default`` next to its ``route``.
-        enabled_by_default = (
-            None
-            if route is None
-            else getattr(sys.modules[route.__module__], "enabled_by_default", None)
-        )
-        if enabled_by_default is None:
-            return None
 
     try:
         route = registered_routes().get(arch)
@@ -266,20 +222,6 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
         )
         return None
-    if target is not None and mode is ModelingV2Mode.DEFAULT:
-        role = deployment_role(llm_args)
-        why = enabled_by_default(target, role)
-        if why is not None:
-            logger.info(
-                f"modeling_v2: {target.__name__} fits {arch!r} but is not enabled by default for this deployment "
-                f"({why}); using the built-in implementation. Set modeling_v2='auto' to use the target."
-            )
-            return None
-        logger.info(
-            f"modeling_v2: {target.__name__} is enabled by default for {arch!r} ({role.value}); "
-            "set modeling_v2='off' to use the built-in implementation"
-        )
-        mode = ModelingV2Mode.AUTO
     if target is not None:
         _RESOLVED_MODES[target] = mode
     return target

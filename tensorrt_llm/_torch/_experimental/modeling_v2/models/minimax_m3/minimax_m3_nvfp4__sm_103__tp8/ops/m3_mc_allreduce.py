@@ -89,21 +89,18 @@ class McAllReduceWorkspace:
     @classmethod
     def create(cls, mapping, hidden: int, max_tokens: int = 8) -> "McAllReduceWorkspace":
         from tensorrt_llm._torch.distributed.ops import (
+            _get_mnnvl_workspace_comm,
             _make_mnnvl_mcast_buffer,
             _mnnvl_workspace_all_succeeded,
         )
-        from tensorrt_llm._utils import mpi_comm
+        from tensorrt_llm._utils import mpi_disabled
 
-        session = mpi_comm()
-        session_group = session.Get_group()
-        group = session_group.Incl(mapping.tp_group)
-        session_group.Free()
-        comm = session.Create_group(group)
-        group.Free()
+        comm = _get_mnnvl_workspace_comm(mapping)
         words = 4 * max_tokens * mapping.tp_size * (hidden // 2)  # two exchange sets of two halves
         ok = not torch.cuda.is_current_stream_capturing()
         if not _mnnvl_workspace_all_succeeded(comm, ok):
-            comm.Free()
+            if not mpi_disabled():
+                comm.Free()
             raise RuntimeError(
                 "McAllReduceWorkspace.create must run outside CUDA-graph capture on every rank"
             )

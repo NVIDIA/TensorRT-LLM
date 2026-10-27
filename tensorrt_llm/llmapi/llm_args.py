@@ -2730,6 +2730,23 @@ class KvCacheConnectorConfig(StrictBaseModel):
         "set, trtllm-serve provisions the pool during bringup instead of "
         "requiring MOONCAKE_CONFIG_PATH from an external script.")
 
+    transfer_timeout_sec: float = Field(
+        default=600.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Deadline in seconds for an outstanding ADP KV connector "
+        "transfer. Checked at polling gates; cannot interrupt blocking callbacks. "
+        "Expiration fails all ADP owners and requires process restart. Unused without attention DP."
+    )
+    control_grace_sec: float = Field(
+        default=60.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Grace period in seconds for pending ADP KV connector "
+        "transfers after cancellation or shutdown. Can only shorten the "
+        "existing transfer deadline. Expiration fails all ADP owners and requires process restart. "
+        "Unused without attention DP.")
+
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":
         from tensorrt_llm._torch.pyexecutor.connectors.registry import (
@@ -7090,20 +7107,16 @@ class TorchLlmArgs(BaseLlmArgs):
     def quant_config(self, value: QuantConfig):
         self._quant_config = value
 
-    modeling_v2: Literal["default", "off", "auto", "require"] = Field(
-        default="default",
+    modeling_v2: Literal["off", "auto", "require"] = Field(
+        default="off",
         status="prototype",
         description=
         "Whether to build the model from a modeling_v2 target (experimental) "
-        "instead of the built-in implementation. 'default' behaves as 'auto' "
-        "on the deployments the architecture's routing module enables by "
-        "default and as 'off' everywhere else. 'off' never does. 'auto' "
+        "instead of the built-in implementation. 'off' never does. 'auto' "
         "uses a target when one claims this deployment and falls back to the "
         "built-in implementation otherwise. 'require' raises instead of "
         "falling back.",
-        json_schema_extra={
-            "type": "Literal['default', 'off', 'auto', 'require']"
-        })
+        json_schema_extra={"type": "Literal['off', 'auto', 'require']"})
 
     # TODO: remove backend later
     backend: Literal["pytorch"] = Field(

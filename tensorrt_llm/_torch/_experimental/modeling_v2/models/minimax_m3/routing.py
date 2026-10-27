@@ -17,8 +17,6 @@ The checkpoint declares the vision-language wrapper, and the language model's
 shape lives in its ``text_config``, so that is what this tree reads. The
 targets are text-only: they load no vision tower and refuse image input.
 
-Under ``modeling_v2='default'`` a target that ``route`` returns is used only
-where ``enabled_by_default`` allows it: the serving roles it was measured in.
 """
 
 from __future__ import annotations
@@ -29,7 +27,7 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple
 from tensorrt_llm.llmapi.llm_args import EagleDecodingConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._router_index import DeploymentRole, NoTarget, engine_kv_cache_quant_algo, routes
+from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -274,23 +272,3 @@ def route(
         "(Rubin) with 2, 4 or 8 ranks, of tensor-parallel attention and experts, with one-model Eagle3 or no "
         "speculative decoding, and an FP8 or NVFP4 KV cache"
     )
-
-
-# The serving roles each target is enabled in under modeling_v2='default': the deployments it was measured in.
-_DEFAULT_ROLES = {
-    # GB300: the generation side of disaggregated serving.
-    "ModelingV2MiniMaxM3Nvfp4Sm103Tp4": (DeploymentRole.GENERATION,),
-    "ModelingV2MiniMaxM3Nvfp4Sm103Tp8": (DeploymentRole.GENERATION,),
-}
-
-
-def enabled_by_default(target: type, role: DeploymentRole) -> Optional[str]:
-    """Why ``target`` stays off under ``modeling_v2='default'`` for an engine in ``role``, or None when it is on.
-
-    ``auto`` and ``require`` still reach a target wherever ``route`` returns it.
-    """
-    roles = _DEFAULT_ROLES.get(target.__name__, ())
-    if role in roles:
-        return None
-    measured = " or ".join(r.value for r in roles) or "no role"
-    return f"{role.value} serving; {target.__name__} is enabled by default for {measured} serving"

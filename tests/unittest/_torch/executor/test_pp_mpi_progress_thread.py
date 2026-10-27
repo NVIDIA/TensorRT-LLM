@@ -196,6 +196,8 @@ def _executor(monkeypatch, pp_size: int) -> PyExecutor:
     executor.hang_detector = Mock()
     executor.hang_detector.detected.return_value = False
     executor.kv_connector_manager = None
+    executor.enable_attention_dp = False
+    executor._kv_connector_failed = False
     executor._shutdown_sleep_wakeup_listeners = Mock()
     executor.model_engine = None
     executor.draft_model_engine = None

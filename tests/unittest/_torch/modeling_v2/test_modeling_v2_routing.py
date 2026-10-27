@@ -33,11 +33,8 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     _RESOLVED_MODES,
-    DISAGG_ROLE_ENV,
-    DeploymentRole,
     ModelingV2Mode,
     NoTarget,
-    deployment_role,
     modeling_v2_resolve,
     resolved_mode,
 )
@@ -186,8 +183,7 @@ _MTP3 = MTPDecodingConfig(max_draft_len=3)
 
 @pytest.mark.parametrize("mode", [None, "off"], ids=["default", "off"])
 def test_off_resolves_nothing(mode):
-    """The default must be indistinguishable from modeling_v2 not existing for an architecture whose routing module
-    enables nothing by default.
+    """The default must be indistinguishable from modeling_v2 not existing.
 
     Leaving the argument alone and an explicit "off" have to behave
     identically: the common case is that nobody has heard of this package.
@@ -461,36 +457,13 @@ def test_an_unknown_mode_is_rejected_when_the_arguments_are_built():
         _llm_args("yes")
 
 
-def test_the_default_mode_is_default():
-    assert TorchLlmArgs(model=_DUMMY_MODEL).modeling_v2 == "default"
+def test_the_default_mode_is_off():
+    assert TorchLlmArgs(model=_DUMMY_MODEL).modeling_v2 == "off"
 
 
 def test_no_target_is_a_value_error():
     """A refusal is the ValueError ``require`` has always raised, so callers that catch ValueError still do."""
     assert issubclass(NoTarget, ValueError)
-
-
-@pytest.mark.parametrize(
-    ("transceiver", "env", "role"),
-    [
-        (False, None, DeploymentRole.AGGREGATED),
-        (False, "generation", DeploymentRole.AGGREGATED),
-        (True, "generation", DeploymentRole.GENERATION),
-        (True, "gen0", DeploymentRole.GENERATION),
-        (True, "context", DeploymentRole.CONTEXT),
-        (True, "ctx1", DeploymentRole.CONTEXT),
-        (True, None, DeploymentRole.UNKNOWN),
-        (True, "coordinator", DeploymentRole.UNKNOWN),
-    ],
-)
-def test_deployment_role(monkeypatch, transceiver, env, role):
-    """No cache transceiver is aggregated serving; a disaggregated worker's side is the launcher's role variable."""
-    if env is None:
-        monkeypatch.delenv(DISAGG_ROLE_ENV, raising=False)
-    else:
-        monkeypatch.setenv(DISAGG_ROLE_ENV, env)
-    kwargs = dict(cache_transceiver_config=CacheTransceiverConfig()) if transceiver else {}
-    assert deployment_role(_llm_args(**kwargs)) is role
 
 
 class _RefusingTarget:
@@ -954,59 +927,24 @@ def test_minimax_m3_kv_cache_dtype_overrides_the_checkpoint(monkeypatch):
     assert target.__name__ == "ModelingV2MiniMaxM3Nvfp4Sm103Tp4"
 
 
-def _m3_default_args(monkeypatch, role, kv_dtype="nvfp4"):
-    """modeling_v2 left at its default, for an engine serving ``role``."""
-    if role == "aggregated":
-        monkeypatch.delenv(DISAGG_ROLE_ENV, raising=False)
-        return _llm_args("default", kv_cache_config=dict(dtype=kv_dtype))
-    if role is None:
-        monkeypatch.delenv(DISAGG_ROLE_ENV, raising=False)
-    else:
-        monkeypatch.setenv(DISAGG_ROLE_ENV, role)
-    return _llm_args(
-        "default",
-        kv_cache_config=dict(dtype=kv_dtype),
-        cache_transceiver_config=CacheTransceiverConfig(),
-    )
-
-
 @pytest.mark.usefixtures("_minimax_m3_sm")
 @pytest.mark.parametrize("tp", [4, 8])
-def test_minimax_m3_default_enables_the_generation_side(monkeypatch, tp):
-    """With modeling_v2 left alone, the GB300 targets serve the generation side of disaggregated serving, the
-    deployment they were measured in, and record ``auto`` (so a later refusal falls back)."""
+@pytest.mark.parametrize("role", ["aggregated", "context", "generation"])
+def test_minimax_m3_requires_explicit_opt_in(monkeypatch, tp: int, role: str) -> None:
+    """Every serving role stays on the built-in model unless modeling_v2 is requested."""
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
 
     monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
     config = _m3_resolve_config(_m3_sparse(), None, tp)
-    target = modeling_v2_resolve(config, _m3_default_args(monkeypatch, "generation"))
-    assert target.__name__ == f"ModelingV2MiniMaxM3Nvfp4Sm103Tp{tp}"
-    assert resolved_mode(target) is ModelingV2Mode.AUTO
-
-
-@pytest.mark.usefixtures("_minimax_m3_sm")
-@pytest.mark.parametrize(
-    "role", ["aggregated", "context", None], ids=["aggregated", "context", "unknown"]
-)
-def test_minimax_m3_default_keeps_other_roles_on_the_builtin_model(monkeypatch, role):
-    """Aggregated serving, the context side and a disaggregated worker of unknown side build the built-in model
-    by default; ``auto`` still takes the target there."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
-
-    monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
-    config = _m3_resolve_config(_m3_sparse(), None)
-    assert modeling_v2_resolve(config, _m3_default_args(monkeypatch, role)) is None
-    assert modeling_v2_resolve(config, _m3_llm_args("auto", "nvfp4")) is not None
-
-
-@pytest.mark.usefixtures("_minimax_m3_sm")
-def test_minimax_m3_default_falls_back_where_route_declines(monkeypatch):
-    """By default a deployment no target fits (here a BF16 KV cache) builds the built-in model, as under auto."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
-
-    monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
-    config = _m3_resolve_config(_m3_sparse(fuse_qkv_index_projection=False), None)
-    assert modeling_v2_resolve(config, _m3_default_args(monkeypatch, "generation", "auto")) is None
+    kwargs = dict(kv_cache_config=dict(dtype="nvfp4"))
+    if role != "aggregated":
+        kwargs["cache_transceiver_config"] = CacheTransceiverConfig()
+    assert modeling_v2_resolve(config, TorchLlmArgs(model=_DUMMY_MODEL, **kwargs)) is None
+    for mode in ("auto", "require"):
+        target = modeling_v2_resolve(config, _llm_args(mode, **kwargs))
+        assert target.__name__ == f"ModelingV2MiniMaxM3Nvfp4Sm103Tp{tp}"
+        assert resolved_mode(target) is ModelingV2Mode(mode)
 
 
 # --- qwen4_exp: one-model MTP-Eagle over a linear chain, one rank ---------------

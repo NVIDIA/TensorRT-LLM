@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for warmup-cleanup behavior in PyTorchModelEngine.warmup().
+"""Unit tests for warmup-cleanup behavior in ModelEngine.warmup().
 
 Locks in that gc.collect() + torch.cuda.empty_cache() fire immediately after
 _run_autotuner_warmup (step b) to release autotuner exploration leftovers.
@@ -42,7 +42,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import Decoder
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS
@@ -151,9 +151,9 @@ def test_pcg_fx_fallback_policy_is_model_specific(
     monkeypatch.setattr(
         model_engine_module.MultimodalItemScheduler, "maybe_create", Mock(return_value=None)
     )
-    monkeypatch.setattr(PyTorchModelEngine, "_validate_breakable_cuda_graph_compatibility", Mock())
-    monkeypatch.setattr(PyTorchModelEngine, "_init_model_capacity", Mock())
-    monkeypatch.setattr(PyTorchModelEngine, "__del__", lambda self: None)
+    monkeypatch.setattr(ModelEngine, "_validate_breakable_cuda_graph_compatibility", Mock())
+    monkeypatch.setattr(ModelEngine, "_init_model_capacity", Mock())
+    monkeypatch.setattr(ModelEngine, "__del__", lambda self: None)
     backend_factory = Mock()
     backend_factory.Streams = list
     monkeypatch.setattr(model_engine_module, "Backend", backend_factory)
@@ -167,9 +167,9 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         "get_attention_backend",
         Mock(side_effect=RuntimeError("compile setup complete")),
     )
-    engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
+    engine = ModelEngine.__new__(ModelEngine)
     with torch_compiling(False), pytest.raises(RuntimeError, match="compile setup complete"):
-        PyTorchModelEngine.__init__(
+        ModelEngine.__init__(
             engine,
             model_path="dummy",
             mapping=mapping,
@@ -644,7 +644,7 @@ class _DummyModel(torch.nn.Module):
         return {"logits": torch.randn((batch_size, 10), device="cuda")}
 
 
-class _DummyModelEngine(PyTorchModelEngine):
+class _DummyModelEngine(ModelEngine):
     def __init__(self, llm_args: TorchLlmArgs, dtype: torch.dtype):
         mapping = Mapping(
             world_size=tensorrt_llm.mpi_world_size(),
@@ -1007,7 +1007,7 @@ class TestWarmupCleanup(unittest.TestCase):
     @pytest.mark.cpu_only
     def test_no_kv_cache_warmup_delegates_runner_lifecycle(self):
         """Verify no-KV-cache warmup delegates warmup and graph capture to the runner."""
-        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine = object.__new__(ModelEngine)
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
         model_engine._metrics = {}
@@ -1026,7 +1026,7 @@ class TestWarmupCleanup(unittest.TestCase):
     @pytest.mark.cpu_only
     def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self):
         """Verify a no-KV-cache runner rejects an allocated KV cache before warmup."""
-        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine = object.__new__(ModelEngine)
         model_engine._metrics = {}
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
@@ -1056,7 +1056,7 @@ class TestWarmupCleanup(unittest.TestCase):
         warmup._config = SimpleNamespace(
             dtype=torch.float16, cuda_graph_batch_sizes=[1, 4], enable_in_graph_sampling=False
         )
-        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine = object.__new__(ModelEngine)
         model_engine._metrics = warmup._metrics = {}
         model_engine.moe_load_balancer = None
         model_engine._warmup_depth = 0
@@ -1130,7 +1130,7 @@ class TestWarmupCleanup(unittest.TestCase):
         )
 
     def test_encoder_decoder_encoder_warmup_delegates_runner_lifecycle(self):
-        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine = object.__new__(ModelEngine)
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=True))
         model_engine.moe_load_balancer = None
         model_engine._warmup_depth = 0
