@@ -929,15 +929,6 @@ def test_ref2va_tensor_parallel_text_encoder_rejects_vision_inputs() -> None:
         pipeline._encode_reference_text_tokens([11], {"pixel_values": torch.zeros(1)})
 
 
-def test_minimax_rejects_dit_tensor_parallelism() -> None:
-    config = SimpleNamespace(
-        mapping=SimpleNamespace(world_size=2, tp_size=2),
-        parallel=ParallelConfig(tp_size=2),
-    )
-    with pytest.raises(NotImplementedError, match="DiT tensor parallelism"):
-        MiniMaxH3Pipeline(config)
-
-
 def test_default_generation_steps_match_reference_app() -> None:
     pipeline = _SyntheticMiniMaxH3Pipeline()
     assert pipeline.default_generation_params["num_inference_steps"] == 28

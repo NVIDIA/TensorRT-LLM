@@ -199,12 +199,6 @@ class MiniMaxH3Pipeline(BasePipeline):
         return torch.Generator().manual_seed(seed)
 
     def __init__(self, pipeline_config: DiffusionPipelineConfig) -> None:
-        if pipeline_config.mapping.tp_size != 1:
-            raise NotImplementedError(
-                "MiniMax-H3 DiT tensor parallelism is not supported yet. Set "
-                "parallel_config.tp_size=1. text_encoder_tp_size may still be "
-                "used to tensor-shard the MiniMax-H3 Qwen text encoder."
-            )
         self.text_encoder_tp_size = int(
             getattr(getattr(pipeline_config, "parallel", None), "text_encoder_tp_size", 1)
         )
