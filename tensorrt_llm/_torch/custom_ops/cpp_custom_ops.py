@@ -719,6 +719,38 @@ def _register_fake():
         return hidden_states.new_empty((num_tokens, out_hidden_size),
                                        dtype=torch.bfloat16)
 
+    @torch.library.register_fake("trtllm::mxe2m1_moe_routing_workspace")
+    def _(num_tokens: int, num_experts: int, top_k: int, tile_tokens_dim: int,
+          like: torch.Tensor) -> List[torch.Tensor]:
+        # Mirrors mxRoutingWorkspaceSpecs in mxFp4BlockScaleMoe.cpp.
+        expanded = num_tokens * top_k
+        max_ctas = min(num_experts, expanded)
+        if expanded > max_ctas:
+            max_ctas += (expanded - max_ctas) // tile_tokens_dim
+        max_padded = max_ctas * tile_tokens_dim
+        shapes = [
+            ((num_tokens, top_k), torch.int32),
+            ((max(num_experts * 2, 512), ), torch.int32),
+            ((), torch.int32),
+            ((expanded, ), torch.int32),
+            ((max_padded + 1, ), torch.int32),
+            ((num_tokens, top_k), torch.bfloat16),
+            ((num_experts, ), torch.int32),
+            ((max_ctas, ), torch.int32),
+            ((max_ctas, ), torch.int32),
+            ((), torch.int32),
+        ]
+        return [like.new_empty(shape, dtype=dtype) for shape, dtype in shapes]
+
+    @torch.library.register_fake("trtllm::mxe2m1_moe_routing")
+    def _(routing_logits: torch.Tensor, routing_bias: Optional[torch.Tensor],
+          workspace: List[torch.Tensor], num_experts: int, top_k: int,
+          n_group: Optional[int], topk_group: Optional[int],
+          local_expert_offset: int, local_num_experts: int,
+          routed_scaling_factor: Optional[float], tile_tokens_dim: int,
+          routing_method_type: int) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::calculate_nvfp4_global_scale")
     def _(input: torch.Tensor, tokens_per_batch: Optional[torch.Tensor]):
         return input.new_empty((input.shape[:-1], 1), dtype=torch.float32)

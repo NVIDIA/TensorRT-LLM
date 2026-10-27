@@ -138,6 +138,11 @@ from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
     os.environ.get("TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", "0") == "1"
 )
+# Multi-stream decode: run the MoE router GEMM on its own stream, beside the
+# latent down projection, and start the shared experts after it (read once at
+# import). With KIMI_K3_MOE_PRE_ROUTING=1 the routing kernel of the MXFP4
+# TRTLLM-Gen MoE also runs on the router stream (see trtllm_gen_custom_ops).
+_KIMI_K3_MOE_ROUTER_STREAM = os.environ.get("KIMI_K3_MOE_ROUTER_STREAM", "0") == "1"
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -1405,6 +1410,8 @@ class KimiK3MoERuntime(nn.Module):
         # active (CUDA graphs on); otherwise both run in order on the default
         # stream.
         self.shared_expert_stream = aux_stream_dict[AuxStreamType.MoeShared]
+        self.moe_router_stream = aux_stream_dict.get(AuxStreamType.MoeRouter)
+        self.moe_router_event = torch.cuda.Event() if self.moe_router_stream is not None else None
         self.moe_main_event = torch.cuda.Event()
         self.moe_shared_event = torch.cuda.Event()
         self.moe_routed_event = torch.cuda.Event() if self._defer_shared_allreduce else None
@@ -1696,8 +1703,100 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = True
         return routed_model_config
 
+    def _use_router_stream(self, hidden_states: torch.Tensor) -> bool:
+        return (
+            self.moe_router_stream is not None
+            and self.shared_expert_stream is not None
+            and self.latent_down_stream is None
+            and not self._defer_shared_allreduce
+            and do_multi_stream()
+            and not torch.compiler.is_compiling()
+            and not self._can_fuse_router_down(hidden_states)
+        )
+
+    def _pre_routing_prepare(self, hidden_states: torch.Tensor):
+        """``(gemm1 weights, prepared routing)`` for the routed MoE op, or None.
+
+        None unless pre-routing is enabled, the routed experts are the MXFP4
+        TRTLLM-Gen op, and that op has already run this token count.
+        """
+        from ..custom_ops.trtllm_gen_custom_ops import (
+            mxe2m1_pre_routing_enabled,
+            mxe2m1_pre_routing_prepare,
+        )
+
+        if not mxe2m1_pre_routing_enabled() or hidden_states.ndim != 2:
+            return None
+        weight = getattr(self.routed_experts, "w3_w1_weight", None)
+        if not isinstance(weight, torch.Tensor):
+            return None
+        prepared = mxe2m1_pre_routing_prepare(weight, hidden_states.shape[0])
+        return None if prepared is None else (weight, prepared)
+
+    def _forward_router_stream(
+        self, hidden_states: torch.Tensor, all_rank_num_tokens=None
+    ) -> torch.Tensor:
+        """Router GEMM (and pre-routing) on the router stream.
+
+        Router stream: router GEMM -> router event [-> routing kernel ->
+        routing event]. Shared-expert stream: wait router event -> shared
+        experts (with their all-reduce) -> shared event. Main stream: latent
+        down projection -> wait router event (pre-routing: the MoE op waits for
+        the routing event after quantizing its input instead) -> routed MoE ->
+        wait shared event -> routed all-reduce and latent up projection. Same
+        kernels on the same inputs as the single-router path, and the shared
+        all-reduce still completes before the routed one starts.
+        """
+        identity = hidden_states
+        pre_routing = self._pre_routing_prepare(hidden_states)
+        self.moe_main_event.record()
+        with torch.cuda.stream(self.moe_router_stream):
+            self.moe_main_event.wait()
+            router_logits = self.gate.compute_logits(hidden_states)
+            self.moe_router_event.record()
+            if pre_routing is not None:
+                from ..custom_ops.trtllm_gen_custom_ops import mxe2m1_pre_routing_launch
+
+                mxe2m1_pre_routing_launch(pre_routing[1], pre_routing[0], router_logits)
+        with torch.cuda.stream(self.shared_expert_stream):
+            self.moe_router_event.wait()
+            shared_out = self.shared_experts(identity)
+            self.moe_shared_event.record()
+        routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
+        if pre_routing is None:
+            self.moe_router_event.wait()
+        routed_out = self.routed_experts(
+            routed_in,
+            router_logits,
+            all_rank_num_tokens=all_rank_num_tokens,
+        )
+        if not self._reduce_routed_output:
+            routed_out = self.routed_expert_norm(routed_out)
+            routed_out = self._routed_projection(routed_out, self.routed_expert_up_proj)
+        self.moe_shared_event.wait()
+        if self._reduce_routed_output:
+            routed_out = self._reduce_routed_latent(routed_out)
+        return routed_out + shared_out
+
+    def _reduce_routed_latent(self, routed_out: torch.Tensor) -> torch.Tensor:
+        # RMSNorm folded into the routed all-reduce (RMS_NORM fusion): the
+        # MNNVL kernel normalizes straight out of the lamport buffer, so
+        # the reduced row never round-trips through HBM for a norm kernel.
+        # Strategies without the fusion fall back inside AllReduce.
+        routed_latent = self.routed_experts.all_reduce(
+            routed_out,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RMS_NORM,
+                norm_weight=self.routed_expert_norm.weight,
+                eps=float(self.routed_expert_norm.variance_epsilon),
+            ),
+        )
+        return self._routed_projection(routed_latent, self.routed_expert_up_proj)
+
     def forward(self, hidden_states: torch.Tensor, all_rank_num_tokens=None) -> torch.Tensor:
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
+        if self._use_router_stream(hidden_states):
+            return self._forward_router_stream(hidden_states, all_rank_num_tokens)
         identity = hidden_states
         projected_input = None
         early_routed_in = None
@@ -1724,7 +1823,6 @@ class KimiK3MoERuntime(nn.Module):
                 # blocks until capture ends): both tensors are read on main only
                 # after the join, and later work on this stream forks from main.
             router_logits = self.gate.compute_logits(hidden_states)
-        moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
         overlap_shared_allreduce = (
             self._defer_shared_allreduce
             and do_multi_stream()
@@ -1800,19 +1898,7 @@ class KimiK3MoERuntime(nn.Module):
         if self._defer_shared_allreduce and not overlap_shared_allreduce:
             shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
         if self._reduce_routed_output:
-            # RMSNorm folded into the routed all-reduce (RMS_NORM fusion): the
-            # MNNVL kernel normalizes straight out of the lamport buffer, so
-            # the reduced row never round-trips through HBM for a norm kernel.
-            # Strategies without the fusion fall back inside AllReduce.
-            routed_latent = moe_all_reduce(
-                routed_out,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RMS_NORM,
-                    norm_weight=self.routed_expert_norm.weight,
-                    eps=float(self.routed_expert_norm.variance_epsilon),
-                ),
-            )
-            routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
+            routed_out = self._reduce_routed_latent(routed_out)
         return routed_out + shared_out
 
 
@@ -2187,6 +2273,8 @@ class KimiLinearModel(DecoderModel):
             AuxStreamType.MoeBalancer: aux_stream_list[2],
             AuxStreamType.MoeOutputMemset: aux_stream_list[3],
         }
+        if _KIMI_K3_MOE_ROUTER_STREAM:
+            self.aux_stream_dict[AuxStreamType.MoeRouter] = torch.cuda.Stream()
 
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
         self.layers = nn.ModuleList(
