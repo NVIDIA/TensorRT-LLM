@@ -181,7 +181,9 @@ are not supported. See the
 [2-GPU TP config](../../../examples/visual_gen/configs/minimax-h3-bf16-tp2.yaml).
 
 - FastH3 uses the MiniMax-H3 pipeline and transformer architecture with a
-  distilled 4-step checkpoint. Dense attention and model-specific VSA are supported.
+  distilled 4-step checkpoint. Model-specific VSA is the supported inference path
+  for this checkpoint. Dense attention is a comparison-only path: it does not use
+  the trained compression gate and is not equivalent to the checkpoint's VSA inference.
   For single-GPU text-to-video with audio, enable VSA using
   `fasth3-bf16-trtllm-vsa-1gpu.yaml`. To use CUTEDSL instead, set
   `attention_config.backend: CUTEDSL` in that config.
