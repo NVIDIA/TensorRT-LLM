@@ -277,6 +277,9 @@ l0_b200:
   - unittest/_torch/speculative/test_lilicorr_loading.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_rmsnorm_rope.py
+  # Fused strict acceptance and DFlash paged-latent drafter bookkeeping vs
+  # their eager paths.
+  - unittest/_torch/speculative/test_spec_tail_kernels.py
   # On-device suffix-automaton spec-dec kernel tests (CUDA graph capture;
   # cuda-availability skipif like the sibling KDA parity tests; relocated
   # from tests/torch/ which test-db cannot list).
@@ -295,6 +298,8 @@ l0_b200:
   - unittest/_torch/speculative/test_fused_accept.py
   - unittest/_torch/executor/test_steady_spec_prepare.py
   - unittest/_torch/modules/test_mxfp8_draft_head.py
+  # Vocab-parallel token selection kernels on a single shard.
+  - unittest/_torch/speculative/test_vocab_parallel.py
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel

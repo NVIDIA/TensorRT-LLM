@@ -1886,7 +1886,73 @@ def test_v2_hybrid_snapshot_sizing_scales_with_pp_and_explicit_rules():
         mamba_state_config=MambaStateConfig(periodic_snapshot_interval=48),
     )
     assert mgr._num_ssm_states_per_typical_request(47, periodic_config) == 1
-    assert mgr._num_ssm_states_per_typical_request(48, periodic_config) == 1
+    assert mgr._num_ssm_states_per_typical_request(48, periodic_config) == 2
+
+
+@pytest.mark.parametrize(
+    "capacity, interval, from_start, from_end, reuse, branch, expected_states",
+    [
+        (128, 0, [], [], True, False, 1),
+        (128, 256, [], [], True, False, 1),
+        (47, 48, [], [], True, False, 1),
+        # At the endpoint, the snapshot and live state have identical values but
+        # separate storage so decoding can update the live state independently.
+        (48, 48, [], [], True, False, 2),
+        (49, 48, [], [], True, False, 2),
+        (128, 48, [], [], True, False, 3),
+        (128, 64, [], [], True, False, 3),
+        # Capacity models a typical length, not a hard limit: offset 129 is
+        # excluded from the from-start estimate. Each unique from-end offset
+        # counts separately, even if it coincides with another modeled point
+        # or needs a longer actual prompt to produce a positive position.
+        (128, 0, [64, 64, 128, 129], [0, 64, 128], True, False, 6),
+        (128, 64, [64, 64, 128, 129], [0, 32, 64, 128], True, False, 7),
+        (128, 48, [64, 96], [0, 32, 64], True, False, 7),
+        # Identical from-end offsets always coincide, regardless of prompt length.
+        (128, 0, [], [0, 64, 64, 128, 129], True, False, 5),
+        # max_seq_len is 256: reachable offsets above capacity still count,
+        # but offsets at or above the maximum cannot yield a positive position.
+        (128, 0, [], [128, 255, 255, 256, 4096], True, False, 3),
+        (128, 0, [], [256], True, False, 1),
+        (128, 0, [], [4096], True, False, 1),
+        (128, 0, [], [256, 4096], True, True, 2),
+        (128, 64, [32], [0], False, False, 1),
+        # Even a zero length estimate reserves space for configured from-end rules.
+        (0, 64, [32], [0], True, False, 2),
+        (128, 0, [], [], True, True, 2),
+        (128, 256, [], [], True, True, 2),
+        (128, 64, [], [], True, True, 3),
+        (128, 0, [32], [], True, True, 2),
+        (128, 0, [], [0], True, True, 2),
+    ],
+)
+def test_v2_hybrid_typical_state_count(
+    capacity: int,
+    interval: int,
+    from_start: list[int],
+    from_end: list[int],
+    reuse: bool,
+    branch: bool,
+    expected_states: int,
+) -> None:
+    config = KvCacheConfig(
+        max_gpu_total_bytes=32 << 20,
+        host_cache_size=0,
+        avg_seq_len=max(1, capacity),
+        enable_block_reuse=reuse,
+        block_reuse_config=BlockReuseConfig(enable_branch_snapshot=branch),
+        mamba_state_config=MambaStateConfig(
+            periodic_snapshot_interval=interval,
+            additional_snapshot_offsets_from_start=from_start,
+            additional_snapshot_offsets_from_end=from_end,
+        ),
+    )
+
+    # The conservative estimate can exceed runtime placement for a particular
+    # prompt length; expected_states includes one live state plus snapshots.
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.max_seq_len = 256
+    assert mgr._num_ssm_states_per_typical_request(capacity, config) == expected_states
 
 
 def test_cpp_mamba_estimator_handles_disabled_snapshots_without_attention():
@@ -2149,7 +2215,11 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     assert isinstance(config.layers[1], AttentionLayerConfig)
     assert int(config.layers[1].layer_id) == int(base_layers[1].layer_id)
     assert config.typical_step == BatchDesc(
-        [KVCacheDesc(capacity=32, history_length=31)] * 6
+        (
+            [KVCacheDesc(capacity=20, history_length=19)]
+            + [KVCacheDesc(capacity=19, history_length=18)] * 4
+        )
+        * 2
         + [KVCacheDesc(capacity=0, history_length=0)]
     )
     # The caller-provided constraint keeps its dummy-slot padding.
@@ -2176,6 +2246,84 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     assert not hasattr(config.typical_step.kv_caches[0], "num_ssm_slots")
 
 
+@skip_no_cuda
+@pytest.mark.parametrize("pool_ratio", [None, [0.25, 0.75]])
+@pytest.mark.parametrize(
+    "interval, reuse, states_per_request, runtime_snapshots",
+    [(0, True, 3, 2), (48, True, 5, 3), (192, True, 3, 2), (48, False, 1, 0)],
+)
+def test_v2_hybrid_typical_batch_accounts_for_snapshot_retention(
+    pool_ratio: list[float] | None,
+    interval: int,
+    reuse: bool,
+    states_per_request: int,
+    runtime_snapshots: int,
+) -> None:
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=2,
+        max_num_tokens=128,
+        kv_cache_config=KvCacheConfig(
+            max_gpu_total_bytes=32 << 20,
+            host_cache_size=0,
+            enable_block_reuse=reuse,
+            pool_ratio=pool_ratio,
+            avg_seq_len=96,
+            mamba_state_config=MambaStateConfig(
+                periodic_snapshot_interval=interval,
+                additional_snapshot_offsets_from_start=[32],
+                additional_snapshot_offsets_from_end=[0],
+            ),
+        ),
+    )
+    try:
+        config = mgr.kv_cache_manager_py_config
+        assert isinstance(config.layers[0], SsmLayerConfig)
+        assert isinstance(config.layers[1], AttentionLayerConfig)
+        assert config.initial_pool_ratio == pool_ratio
+        if pool_ratio is None:
+            capacity_per_state, remainder = divmod(96, states_per_request)
+            capacities = [
+                capacity_per_state + int(i < remainder) for i in range(states_per_request)
+            ]
+            assert config.typical_step == BatchDesc(
+                [
+                    KVCacheDesc(capacity=capacity, history_length=capacity - 1)
+                    for capacity in capacities
+                ]
+                * 2
+                + [KVCacheDesc(capacity=0, history_length=0)]
+            )
+            assert sum(kv.capacity for kv in config.typical_step.kv_caches) == 2 * 96
+            assert (
+                BatchDesc(
+                    [
+                        KVCacheDesc(capacity=128, history_length=0),
+                        KVCacheDesc(capacity=0, history_length=0),
+                    ]
+                )
+                in config.constraints
+            )
+        else:
+            assert config.typical_step is None
+
+        # Snapshot retention affects the typical batch, not the feasibility floors.
+        assert BatchDesc([KVCacheDesc(capacity=0, history_length=0)] * 3) in config.constraints
+        assert len(config.constraints) == (2 if pool_ratio is None else 1)
+        assert mgr.all_ssm_states[0].shape[0] >= 3
+
+        request = LlmRequest(
+            request_id=1,
+            max_new_tokens=1,
+            input_tokens=list(range(96)),
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        mgr.prepare_expect_snapshot_points([request])
+        assert len(request.expect_snapshot_points) == runtime_snapshots
+    finally:
+        mgr.shutdown()
+
+
 def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.max_seq_len = 4096
@@ -2192,6 +2340,24 @@ def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
     assert "kv_cache_config.avg_seq_len" in warnings_seen[0]
     assert "max_seq_len / 2=2048" in warnings_seen[0]
     assert "workload's average total sequence length" in warnings_seen[0]
+
+
+@skip_no_cuda
+def test_v2_hybrid_fallback_warns_about_snapshot_retention(monkeypatch) -> None:
+    warnings_seen = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2.logger.warning",
+        lambda message: warnings_seen.append(message),
+    )
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        kv_cache_config=KvCacheConfig(max_gpu_total_bytes=32 << 20, host_cache_size=0),
+    )
+    try:
+        assert len(warnings_seen) == 1
+        assert "snapshot retention" in warnings_seen[0]
+        assert "prompt-length upper bound" in warnings_seen[0]
+    finally:
+        mgr.shutdown()
 
 
 def test_v2_hybrid_rejects_quota_below_live_state_floor():
@@ -2226,6 +2392,57 @@ def test_v2_hybrid_rejects_quota_below_live_state_floor():
 
     with pytest.raises(ValueError, match="too small for live recurrent states"):
         mgr._build_cache_config(base_config)
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "spec_config",
+    [
+        None,
+        MTPDecodingConfig(
+            max_draft_len=4,
+            acceptance_rate_window_size=8,
+            acceptance_rate_threshold=0.5,
+        ),
+    ],
+)
+def test_v2_hybrid_snapshot_retention_preserves_live_state_floor(
+    spec_config: MTPDecodingConfig | None,
+) -> None:
+    minimum_quotas = []
+    for interval in (0, 32):
+        mgr = _build_v2_hybrid_with_mamba_layer(
+            max_batch_size=2,
+            max_num_tokens=128,
+            spec_config=spec_config,
+            kv_cache_config=KvCacheConfig(
+                max_gpu_total_bytes=32 << 20,
+                host_cache_size=0,
+                enable_partial_reuse=False,
+                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=interval),
+            ),
+        )
+        try:
+            minimum_quotas.append(mgr._minimum_live_gpu_quota())
+            dummy_slots = 1 if spec_config is None else 2
+            assert mgr._num_reserved_dummy_slots == dummy_slots
+            assert mgr.all_ssm_states[0].shape[0] >= 2 + dummy_slots
+        finally:
+            mgr.shutdown()
+
+    assert minimum_quotas[0] == minimum_quotas[1]
+    with pytest.raises(ValueError, match="too small for live recurrent states"):
+        _build_v2_hybrid_with_mamba_layer(
+            max_batch_size=2,
+            max_num_tokens=128,
+            spec_config=spec_config,
+            kv_cache_config=KvCacheConfig(
+                max_gpu_total_bytes=minimum_quotas[0] - 1,
+                host_cache_size=0,
+                enable_partial_reuse=False,
+                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=32),
+            ),
+        )
 
 
 def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():
@@ -2524,6 +2741,63 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
     assert high_mamba_allocation[1] < low_mamba_allocation[1]
 
 
+@skip_no_cuda
+def test_v2_hybrid_snapshot_retention_changes_automatic_pool_allocation() -> None:
+    def allocated_memory(
+        pool_ratio: list[float] | None, interval: int = 64
+    ) -> tuple[list[int], list[float]]:
+        # State demand must exceed the GPU allocation granularity for the
+        # automatic pool-ratio difference to be observable.
+        mgr = _build_v2_hybrid_with_mamba_layer(
+            max_batch_size=2,
+            max_num_tokens=128,
+            mamba_d_state=128,
+            mamba_head_dim=128,
+            mamba_num_heads=32,
+            kv_cache_config=KvCacheConfig(
+                max_gpu_total_bytes=64 << 20,
+                host_cache_size=0,
+                pool_ratio=pool_ratio,
+                avg_seq_len=96,
+                enable_partial_reuse=False,
+                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=interval),
+            ),
+        )
+        try:
+            assert mgr.kv_cache_manager_py_config.initial_pool_ratio == pool_ratio
+            statistics = mgr.impl.get_storage_statistics()
+            allocated_bytes = [
+                int(stats.total) * sum(int(size) for size in stats.slot_sizes)
+                for stats in statistics
+            ]
+            pool_groups = mgr.impl.get_life_cycle_pool_group_indices(0)
+            ratios = _introspection.current_gpu_ratio(mgr.impl)
+            return (
+                [allocated_bytes[int(group)] for group in pool_groups],
+                [ratios[int(group)] for group in pool_groups],
+            )
+        finally:
+            mgr.shutdown()
+
+    low_mamba_allocation, low_actual_ratio = allocated_memory([0.25, 0.75])
+    high_mamba_allocation, high_actual_ratio = allocated_memory([0.75, 0.25])
+
+    # Physical page sizes make the realized byte ratios approximate.
+    assert low_actual_ratio == pytest.approx([0.25, 0.75], abs=0.01)
+    assert high_actual_ratio == pytest.approx([0.75, 0.25], abs=0.01)
+    assert high_mamba_allocation[0] > low_mamba_allocation[0]
+    assert high_mamba_allocation[1] < low_mamba_allocation[1]
+
+    assert allocated_memory([0.25, 0.75], interval=0) == (
+        low_mamba_allocation,
+        low_actual_ratio,
+    )
+    no_periodic_allocation, _ = allocated_memory(None, interval=0)
+    periodic_allocation, _ = allocated_memory(None, interval=32)
+    assert periodic_allocation[0] > no_periodic_allocation[0]
+    assert periodic_allocation[1] < no_periodic_allocation[1]
+
+
 # ---------------------------------------------------------------------------
 # Cpp/V2 Mamba hybrid managers: recurrent-state allocation and reuse
 #
@@ -2623,7 +2897,11 @@ def _build_v2_hybrid_with_mamba_layer(
     enable_stats=False,
     model_manager_cls=None,
     supports_inforward_snapshot=None,
-):
+    kv_cache_config: KvCacheConfig | None = None,
+    mamba_d_state: int = 8,
+    mamba_head_dim: int = 8,
+    max_num_tokens: int = 8192,
+) -> MambaHybridCacheManagerV2:
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
     attn_mask = [False] * num_mamba_layers + [True] * num_attention_layers
@@ -2635,26 +2913,29 @@ def _build_v2_hybrid_with_mamba_layer(
             pp_size=1,
             enable_attention_dp=enable_attention_dp,
         )
-    kv_cache_config = KvCacheConfig(
-        max_tokens=max_tokens,
-        max_gpu_total_bytes=max_gpu_total_bytes,
-        enable_block_reuse=enable_block_reuse,
-        enable_partial_reuse=enable_partial_reuse,
-        block_reuse_config=BlockReuseConfig(
-            policy=block_reuse_policy,
-            max_num_turns=max_num_turns,
-            enable_branch_snapshot=enable_branch_snapshot,
-        ),
-        enable_swa_scratch_reuse=enable_swa_scratch_reuse,
-        mamba_state_config=MambaStateConfig(
-            periodic_snapshot_interval=periodic_snapshot_interval,
-            additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end or []),
-        ),
-        dtype=kv_cache_dtype,
-        enable_kv_pool_rebalance=enable_kv_pool_rebalance,
-        cold_tier_offload_min_priority=cold_tier_offload_min_priority,
-        host_cache_size=host_cache_size,
-    )
+    if kv_cache_config is None:
+        kv_cache_config = KvCacheConfig(
+            max_tokens=max_tokens,
+            max_gpu_total_bytes=max_gpu_total_bytes,
+            enable_block_reuse=enable_block_reuse,
+            enable_partial_reuse=enable_partial_reuse,
+            block_reuse_config=BlockReuseConfig(
+                policy=block_reuse_policy,
+                max_num_turns=max_num_turns,
+                enable_branch_snapshot=enable_branch_snapshot,
+            ),
+            enable_swa_scratch_reuse=enable_swa_scratch_reuse,
+            mamba_state_config=MambaStateConfig(
+                periodic_snapshot_interval=periodic_snapshot_interval,
+                additional_snapshot_offsets_from_end=list(
+                    additional_snapshot_offsets_from_end or []
+                ),
+            ),
+            dtype=kv_cache_dtype,
+            enable_kv_pool_rebalance=enable_kv_pool_rebalance,
+            cold_tier_offload_min_priority=cold_tier_offload_min_priority,
+            host_cache_size=host_cache_size,
+        )
     if speculative_state is None and kda_replay_num_spec is not None:
         speculative_state = KDAReplayState(kda_replay_num_spec, draft_records=kda_draft_records)
     model_cls = (
@@ -2688,11 +2969,11 @@ def _build_v2_hybrid_with_mamba_layer(
         ModelStateManager._supports_inforward_snapshot = supports_inforward_snapshot
     manager_cls = ModelStateManager
     return manager_cls(
-        mamba_d_state=8,
+        mamba_d_state=mamba_d_state,
         mamba_d_conv=mamba_d_conv,
         mamba_num_heads=mamba_num_heads,
         mamba_n_groups=mamba_n_groups,
-        mamba_head_dim=8,
+        mamba_head_dim=mamba_head_dim,
         mamba_num_layers=num_mamba_layers,
         mamba_layer_mask=mamba_mask,
         mamba_cache_dtype=torch.float16,
@@ -2704,6 +2985,7 @@ def _build_v2_hybrid_with_mamba_layer(
         head_dim=64,
         tokens_per_block=32,
         max_seq_len=128,
+        max_num_tokens=max_num_tokens,
         max_batch_size=max_batch_size,
         mapping=mapping,
         spec_config=spec_config,
