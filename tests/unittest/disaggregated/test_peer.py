@@ -408,6 +408,136 @@ def _make_peer_registrar(self_rankinfo):
     return reg
 
 
+def _make_per_view_page_table(head_counts, mapper_kind):
+    """Two-token K/V buffers with four bytes per token/head."""
+    views = []
+    pools = []
+    for layer, heads in enumerate(head_counts):
+        buffer_bytes = 8 * heads
+        views.append(
+            PoolView(
+                pool_idx=layer,
+                buffer_entries=np.array(
+                    [(layer, 0, buffer_bytes), (layer, buffer_bytes, buffer_bytes)],
+                    dtype=BUFFER_ENTRY_DTYPE,
+                ),
+                mapper_kind=mapper_kind,
+                num_kv_heads=heads,
+            )
+        )
+        pools.append(
+            PhysicalPool(
+                base_address=0x1000 * (layer + 1), slot_bytes=2 * buffer_bytes, num_slots=8
+            )
+        )
+    return KVCachePageTable(
+        tokens_per_block=2,
+        layer_groups=[
+            AttentionLayerGroup(
+                pool_group_idx=0,
+                kv_head_num_per_rank=head_counts[0],
+                sliding_window_size=None,
+                local_layers=[LocalLayer(layer, layer) for layer in range(len(head_counts))],
+                pool_views=views,
+            )
+        ],
+        pool_groups=[PhysicalPoolGroup(pools=pools)],
+    )
+
+
+@pytest.mark.parametrize("mapper_kind", [MapperKind.INDEXED, MapperKind.NHD])
+def test_per_view_heads_select_correct_transfer_bytes(mapper_kind):
+    # TP4 -> TP1: the eight-head view shards all ranks, while the two-head
+    # view duplicates each head on two ranks. Rank 2 sends its second head.
+    self_ri = make_rankinfo(
+        tp_size=4,
+        tp_rank=2,
+        kv_heads_per_rank=2,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([2, 1], mapper_kind),
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=1,
+        kv_heads_per_rank=8,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([8, 2], mapper_kind),
+    )
+    reg = _make_peer_registrar(self_ri)
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    mapper = reg.get_kv_map(peer_ri, (0, 1), (0, 1))
+    pair = mapper.map(
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=16)),
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([2000]), bytes_per_region=32)),
+    )
+
+    if mapper_kind == MapperKind.NHD:
+        assert isinstance(mapper, NHDHeadMismatchMapper)
+        assert pair.src.memory.ptrs.tolist() == [1000, 1004, 1008, 1012]
+        assert pair.dst.memory.ptrs.tolist() == [2004, 2012, 2020, 2028]
+        assert pair.src.memory.bytes_per_region == 4
+    else:
+        assert isinstance(mapper, HNDHeadMismatchMapper)
+        assert pair.src.memory.ptrs.tolist() == [1000, 1008]
+        assert pair.dst.memory.ptrs.tolist() == [2008, 2024]
+        assert pair.src.memory.bytes_per_region == 8
+    assert pair.dst.memory.bytes_per_region == pair.src.memory.bytes_per_region
+
+
+def test_per_view_head_duplication_elects_senders_independently():
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=1,
+        kv_heads_per_rank=8,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([8, 2], MapperKind.INDEXED),
+    )
+    ownership = [[], []]
+    for rank in range(4):
+        self_ri = make_rankinfo(
+            tp_size=4,
+            tp_rank=rank,
+            kv_heads_per_rank=2,
+            tokens_per_block=2,
+            dims_per_head=2,
+            page_table=_make_per_view_page_table([2, 1], MapperKind.INDEXED),
+        )
+        reg = _make_peer_registrar(self_ri)
+        overlap = reg.get_peer_overlap(peer_ri, peer_dp_rank=0)
+        assert overlap.duplicate_head_factor == 1
+        assert overlap.duplicate_head_factors_for((0, 0)) == (1, 1)
+        assert overlap.duplicate_head_factors_for((0, 1)) == (2, 1)
+        for view in range(2):
+            ownership[view].append(reg.should_send_pool(overlap, peer_ri, 0, view))
+
+    assert ownership == [[True, True, True, True], [True, False, True, False]]
+
+
+def test_per_view_missing_heads_rejects_incompatible_legacy_geometry():
+    self_ri = make_rankinfo(
+        tp_size=4,
+        kv_heads_per_rank=2,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([2, 1], MapperKind.INDEXED),
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=1,
+        kv_heads_per_rank=8,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([8, 2], MapperKind.INDEXED),
+    )
+    peer_ri.page_table.layer_groups[0].pool_views[1].num_kv_heads = None
+    reg = _make_peer_registrar(self_ri)
+    with pytest.raises(ValueError, match="both peers must publish per-view KV-head counts"):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
 @pytest.mark.parametrize(
     ("local_replay", "peer_replay"),
     [(False, False), (True, True), (False, True), (True, False)],

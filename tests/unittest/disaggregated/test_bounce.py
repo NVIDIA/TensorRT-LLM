@@ -285,6 +285,28 @@ def test_fanin_bounce_safe_gate() -> None:
     )
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "view_factors,expected", [((1, 1), True), ((2, 1), False), ((1, 2), False)]
+)
+def test_fanin_bounce_checks_per_view_head_duplication(view_factors, expected):
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap
+
+    overlap = PeerOverlap(
+        duplicate_head_factor=1,
+        overlap_pp_size=1,
+        ranks=[0, 1],
+        view_duplicate_head_factors={(0, 1): view_factors},
+    )
+    assert (
+        tfr.Receiver._fanin_bounce_safe(
+            overlap, SimpleNamespace(layer_num_per_pp=[2], page_table=None), None
+        )
+        is expected
+    )
+
+
 # --------------------------------------------------------------------------- #
 # NoBounceTransport — disabled no-op fallback
 # --------------------------------------------------------------------------- #
