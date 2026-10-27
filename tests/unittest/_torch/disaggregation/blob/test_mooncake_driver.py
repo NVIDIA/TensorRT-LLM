@@ -1378,6 +1378,43 @@ def test_backend_round_trip_over_the_fake_store() -> None:
     reader.close()
 
 
+@pytest.mark.parametrize("direction", ["publish", "fetch"])
+def test_a_view_naming_one_key_twice_goes_in_two_calls_and_never_faults(direction: str) -> None:
+    """The backend cuts a group at a repeated object key, so no operation names a key twice. With
+    one worker the second put finds the object the first one committed; running alongside it, it
+    would find the key held by this driver's put and be NOT_READY, never a fault."""
+    fake = FakeMooncakeStore()
+    slots = ["S0", "S1", "S2"]
+    endpoint = Endpoint(MooncakeDriver(fake, workers=1), slots)
+    keys = "ABA"
+    payload = {name: name.encode() * SLOT for name in set(keys)}
+    view = CpuView(
+        [Rows(0, np.stack([object_key(name) for name in keys]), endpoint.region.slots(0, 1, 2), 0)]
+    )
+    if direction == "publish":
+        for slot, name in zip(slots, keys):
+            endpoint.write(slot, payload[name])
+        attempt = endpoint.backend.publish(view, None)
+    else:
+        for name, data in payload.items():
+            fake.pool.objects[store_key(name)] = data
+        attempt = endpoint.backend.fetch(view, None)
+    outcome = endpoint.wait_outcome(attempt)
+    assert outcome.fault is None
+    assert outcome.delivered_masks[0].tolist() == [True, True, True]
+    first_call = PUT_START if direction == "publish" else GET
+    assert [call.args[0] for call in fake.calls_to(first_call)] == [
+        [store_key("A"), store_key("B")],
+        [store_key("A")],
+    ]
+    if direction == "publish":
+        assert {name: fake.pool.objects[store_key(name)] for name in "AB"} == payload
+    else:
+        assert [endpoint.read(slot) for slot in slots] == [payload[name] for name in keys]
+    endpoint.wait_quiesced(attempt)
+    endpoint.close()
+
+
 @pytest.fixture
 def work_per_row_or_thread(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, int]]:
     """Every key or row a ``RowBatch`` builds and every thread started, each with the thread that

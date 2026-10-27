@@ -103,7 +103,8 @@ class Stores:
         self.backends = []
 
     def open_driver(self):
-        """A driver that moves each row in a call of its own, several at once."""
+        """A driver that moves every row on its own, several at once: the in-memory one takes one
+        row per operation, Mooncake cuts each operation into one-row parts for two workers."""
         if self._store is not None:
             driver = MemoryDriver(self._store, capabilities=ONE_ROW_PER_CALL, background=True)
             driver.set_cancel_effective(self._cancel_effective)
