@@ -463,6 +463,9 @@ EQUIV_TEXTS = [
     ),
     f" to=user{MS_M}Plain answer with a < b | c and <|odd|> bits{MS_EOT}",
     f" to=user{MS_M}No tools here.{MS_EOT}",
+    f" to=self{MS_M}think{MS_EOM}{MS_S}assistant to=user{MS_M}Hi{MS_EOT}",
+    f"{MS_S}assistant to=user{MS_M}Hi{MS_EOM}{MS_S}assistant to=self{MS_M}secret{MS_EOT}",
+    f" to=commentary{MS_M}Checking.{MS_EOM}{MS_S}assistant to=user{MS_M}Done.{MS_EOT}",
 ]
 
 
@@ -481,6 +484,23 @@ def test_musespark_stream_matches_detect_and_parse(seed, text, musespark_sample_
     )
     assert normal.strip() == expected.normal_text
     assert [(i, n, json.loads(a)) for i, n, a in calls] == musespark_calls_as_dicts(expected.calls)
+
+
+@pytest.mark.parametrize("text", EQUIV_TEXTS)
+def test_musespark_one_delta_matches_detect_and_parse(text, musespark_sample_tools):
+    """A delta can hold several whole messages.
+
+    A larger stream interval, or speculative decoding accepting many tokens at
+    once, coalesces messages into one delta; every header in it, including a
+    later `` to=self``, is still stripped.
+    """
+    expected = MuseSparkToolParser().detect_and_parse(text, musespark_sample_tools)
+    normal, calls = musespark_stream_chunks(
+        MuseSparkToolParser(), musespark_sample_tools, text, [len(text)]
+    )
+    assert normal.strip() == expected.normal_text
+    assert [(i, n, json.loads(a)) for i, n, a in calls] == musespark_calls_as_dicts(expected.calls)
+    assert "think" not in normal and "secret" not in normal and "to=" not in normal
 
 
 @pytest.mark.parametrize("seed", range(10))

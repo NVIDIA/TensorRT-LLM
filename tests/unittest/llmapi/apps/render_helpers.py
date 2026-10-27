@@ -18,7 +18,8 @@ The tests use the tokenizers of real models from ``llm_models_root()``; a test w
 not there is skipped. ``real_tokenizer`` returns a shared object: do not change it.
 ``make_tokenizer`` returns a shallow copy, which may get another chat template or attribute
 (the encoding stays the real one); ``copy_of`` returns a deep copy for the tests that change
-the encoding itself.
+the encoding itself. ``byte_level_tokenizer`` needs no model files, for the tests that only
+read the prompt back.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from __future__ import annotations
 import copy
 import functools
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from utils.llm_data import llm_datasets_root, llm_models_root
@@ -78,6 +80,22 @@ def make_tokenizer(chat_template=_KEEP, name: str = QWEN3):
 def copy_of(name: str = QWEN3):
     """A deep copy of the real tokenizer, for tests that change its encoding."""
     return copy.deepcopy(real_tokenizer(name))
+
+
+def byte_level_tokenizer(chat_template: str):
+    """A Hugging Face tokenizer built in memory, with ``chat_template`` as its template.
+
+    Every byte is one token, so decoding the ids gives back the exact prompt.
+    """
+    from tokenizers import Tokenizer, decoders, pre_tokenizers
+    from tokenizers.models import BPE
+    from transformers import PreTrainedTokenizerFast
+
+    alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
+    backend = Tokenizer(BPE(vocab={char: i for i, char in enumerate(alphabet)}, merges=[]))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+    backend.decoder = decoders.ByteLevel()
+    return PreTrainedTokenizerFast(tokenizer_object=backend, chat_template=chat_template)
 
 
 @functools.lru_cache(maxsize=None)
@@ -146,3 +164,20 @@ def resources(tokenizer, **overrides) -> RenderResources:
     fields = {"tokenizer": tokenizer, "model_type": "render-test-model"}
     fields.update(overrides)
     return RenderResources(**fields)
+
+
+async def responses_prompt(request, tokenizer, *, model_type: str) -> str:
+    """The prompt the Responses route renders for a text-only ``request``, read back from its ids."""
+    from tensorrt_llm.serve.responses_utils import _create_input_tokens
+
+    token_ids = await _create_input_tokens(
+        request=request,
+        prev_response=None,
+        prev_msgs=[],
+        conversation_store=None,
+        enable_store=False,
+        tokenizer=tokenizer,
+        model_config=SimpleNamespace(model_type=model_type),
+        processor=None,
+    )
+    return tokenizer.decode(token_ids)

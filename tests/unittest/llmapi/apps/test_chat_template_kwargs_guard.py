@@ -23,6 +23,9 @@ from tensorrt_llm.inputs.chat_template_guard import (
 )
 from tensorrt_llm.inputs.utils import apply_chat_template, rendered_hf_chat_template_source
 from tensorrt_llm.serve.render import RenderResources, render_chat
+from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
+from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
+from tensorrt_llm.tokenizer.deepseek_v41 import DeepseekV41Tokenizer
 
 
 def render_chat_request_for_tokenizer(request, tokenizer):
@@ -304,6 +307,15 @@ class TestApplyChatTemplateWiring:
 
 class TestRenderedChatTemplateSource:
     """Kwarg-constructing code must see the same template the render uses."""
+
+    @pytest.mark.parametrize(
+        "tokenizer_cls", [DeepseekV32Tokenizer, DeepseekV4Tokenizer, DeepseekV41Tokenizer]
+    )
+    def test_deepseek_tokenizers_have_no_source(self, tokenizer_cls):
+        # They render with their own Python encoders, so there is no Jinja
+        # source for the referenced-kwargs analysis to read.
+        tokenizer = tokenizer_cls.__new__(tokenizer_cls)
+        assert rendered_hf_chat_template_source(tokenizer=tokenizer, processor=None) is None
 
     def test_jinja_tokenizer_source_returned(self):
         tokenizer = _FakeJinjaTokenizer(TEMPLATE_WITH_TOGGLE)

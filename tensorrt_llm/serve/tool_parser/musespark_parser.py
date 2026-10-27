@@ -322,10 +322,11 @@ class MuseSparkToolParser(BaseToolParser):
                     if safe:
                         parts, consumed, entered_reasoning = self._strip_header(safe)
                         content_parts.extend(parts)
-                        if consumed > 0:
-                            self._buffer = self._buffer[consumed:]
                         if entered_reasoning:
                             self._in_reasoning_block = True
+                        if consumed > 0:
+                            # One delta can hold several messages; rescan the rest.
+                            self._buffer = self._buffer[consumed:]
                             continue
                     break
 
@@ -354,40 +355,32 @@ class MuseSparkToolParser(BaseToolParser):
             return StreamingParseResult()
 
     def _strip_header(self, safe: str) -> Tuple[List[str], int, bool]:
-        """Split ``safe`` into content parts, dropping routing headers.
+        """Split the front of ``safe`` into content, through its first routing header.
 
         Returns ``(parts, consumed, entered_reasoning)``; ``consumed`` is how
-        much of the buffer front is settled (0 = hold everything).
+        much of the buffer front is settled (0 = hold everything). At most one
+        header is consumed per call and the caller rescans what follows it: a
+        delta can hold several messages, and every header in it, including a
+        later `` to=self``, must be stripped.
         """
         parts: List[str] = []
         start_pos = safe.find(self.START)
-        if start_pos >= 0:
-            msg_pos = safe.find(self.MESSAGE, start_pos)
-            if msg_pos < 0:
-                if start_pos > 0:
-                    parts.append(safe[:start_pos])
-                return parts, start_pos, False
-            header = safe[start_pos : msg_pos + len(self.MESSAGE)]
-            if start_pos > 0:
-                parts.append(safe[:start_pos])
-            m = self._HEADER_RE.fullmatch(header)
-            if m is not None and m.group(2) == "self":
-                return parts, msg_pos + len(self.MESSAGE), True
-            rest = safe[msg_pos + len(self.MESSAGE) :]
-            if rest:
-                parts.append(rest)
-            return parts, len(safe), False
-
         m = self._HEADER_RE.search(safe)
-        if m is not None:
+        if m is not None and (start_pos < 0 or m.start() <= start_pos):
+            # The first message after the generation prompt has no <|start|>
+            # (`` to=X<|message|>``); a later one includes it in the match.
             if m.start() > 0:
                 parts.append(safe[: m.start()])
-            if m.group(2) == "self":
-                return parts, m.end(), True
-            rest = safe[m.end() :]
-            if rest:
-                parts.append(rest)
-            return parts, len(safe), False
+            return parts, m.end(), m.group(2) == "self"
+        if start_pos >= 0:
+            # A <|start|> whose header is not a recipient header: drop the
+            # header once its <|message|> arrives, hold it until then.
+            if start_pos > 0:
+                parts.append(safe[:start_pos])
+            msg_pos = safe.find(self.MESSAGE, start_pos)
+            if msg_pos < 0:
+                return parts, start_pos, False
+            return parts, msg_pos + len(self.MESSAGE), False
 
         tail = self._HEADER_TAIL_RE.search(safe)
         if tail is not None:

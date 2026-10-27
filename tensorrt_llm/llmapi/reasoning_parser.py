@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import json
 from abc import ABC, abstractmethod
 from collections.abc import KeysView
@@ -1393,8 +1394,21 @@ class KimiK3ReasoningParser(BaseReasoningParser):
         return ReasoningParserResult()
 
 
-# Model-specific parsers live in tensorrt_llm.llmapi.reasoning; importing the
-# module runs its register_reasoning_parser decorators, and the name is
-# re-exported here so callers can import every parser from this module.
-from tensorrt_llm.llmapi.reasoning.musespark import (  # noqa: E402,F401  isort: skip
-    MuseSparkReasoningParser)
+# Model-specific parsers live in tensorrt_llm.llmapi.reasoning; importing a
+# module runs its register_reasoning_parser decorators. It is imported by
+# module rather than by name: a model module imported first imports this one,
+# and a from-import would then ask the half-initialized model module for a
+# class it has not defined yet. The classes are re-exported lazily below so
+# callers can import every parser from this module.
+_MODEL_REASONING_PARSERS = {
+    "MuseSparkReasoningParser": "tensorrt_llm.llmapi.reasoning.musespark",
+}
+for _module in set(_MODEL_REASONING_PARSERS.values()):
+    importlib.import_module(_module)
+
+
+def __getattr__(name: str) -> Any:
+    module = _MODEL_REASONING_PARSERS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(importlib.import_module(module), name)

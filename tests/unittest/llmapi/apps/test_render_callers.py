@@ -813,7 +813,9 @@ class TestResponsesInputTokens:
         monkeypatch.setattr(
             responses_utils, "_get_chat_completion_function_tools", lambda tools: []
         )
-        monkeypatch.setattr(responses_utils, "reasoning_chat_template_kwargs", lambda request: {})
+        monkeypatch.setattr(
+            responses_utils, "reasoning_chat_template_kwargs", lambda request, **kwargs: {}
+        )
         monkeypatch.setattr(
             responses_utils, "reasoning_injected_chat_template_keys", lambda request: set()
         )

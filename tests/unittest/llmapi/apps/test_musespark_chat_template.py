@@ -59,10 +59,15 @@ TOOL_CALL_MESSAGES = [
 
 @pytest.fixture(scope="module")
 def resources():
-    path = os.path.join(llm_models_root(), CHECKPOINT)
+    root = llm_models_root()
+    if root is None:
+        pytest.skip("LLM_MODELS_ROOT is not available")
+    path = os.path.join(root, CHECKPOINT)
     if not os.path.isdir(path) or not os.listdir(path):
         pytest.skip(f"{CHECKPOINT} is not under LLM_MODELS_ROOT")
-    return RenderResources.from_tokenizer(load_hf_tokenizer(path), model_type="muse_spark")
+    tokenizer = load_hf_tokenizer(path)
+    assert tokenizer is not None, f"could not load a tokenizer from {path}"
+    return RenderResources.from_tokenizer(tokenizer, model_type="muse_spark")
 
 
 def _render(resources, **overrides) -> str:

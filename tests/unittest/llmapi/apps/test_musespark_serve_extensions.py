@@ -30,6 +30,7 @@ import pytest
 from pydantic import ValidationError
 
 from tensorrt_llm.inputs.chat_template_guard import validate_chat_template_kwargs
+from tensorrt_llm.serve import responses_utils
 from tensorrt_llm.serve.anthropic_adapter import convert_anthropic_request
 from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 from tensorrt_llm.serve.harmony_adapter import maybe_transform_reasoning_effort
@@ -44,6 +45,8 @@ from tensorrt_llm.serve.serving_extensions import (
     apply_model_chat_extensions,
     structured_output_format_for,
 )
+
+from .render_helpers import byte_level_tokenizer, responses_prompt
 
 # The L0 CPU stage invokes registered files with `-m cpu_only`; without this
 # marker every test is deselected and pytest exits with code 5.
@@ -358,6 +361,39 @@ class TestResponsesReasoningKwargsInjection:
             req, template_source=TEMPLATE_EFFORT_ONLY, model_type="muse_spark"
         )
         assert kwargs == {"reasoning_effort": "HIGH", "thinking": True}
+
+
+class TestResponsesRenderedEffort:
+    """`_create_input_tokens` renders with the normalized effort, only where the template reads it."""
+
+    @staticmethod
+    async def render(template: str, monkeypatch):
+        """The rendered prompt and the kwargs the render got, for `reasoning.effort="none"`."""
+        captured = {}
+        render_conversation = responses_utils.render_conversation
+
+        async def spy(*args, **kwargs):
+            captured.update(kwargs)
+            return await render_conversation(*args, **kwargs)
+
+        monkeypatch.setattr(responses_utils, "render_conversation", spy)
+        request = make_responses_request(reasoning={"effort": "none"})
+        prompt = await responses_prompt(
+            request, byte_level_tokenizer(template), model_type="muse_spark"
+        )
+        return prompt, captured["chat_template_kwargs"]
+
+    @pytest.mark.asyncio
+    async def test_effort_reaching_the_template_is_normalized(self, monkeypatch):
+        prompt, kwargs = await self.render(TEMPLATE_EFFORT_ONLY, monkeypatch)
+        assert kwargs == {"reasoning_effort": EFFORT_CONTRACT["none"], "thinking": True}
+        assert prompt == f"Reasoning: {EFFORT_CONTRACT['none']}.hello"
+
+    @pytest.mark.asyncio
+    async def test_template_that_reads_no_effort_is_not_given_one(self, monkeypatch):
+        prompt, kwargs = await self.render(TEMPLATE_PLAIN, monkeypatch)
+        assert kwargs == {"thinking": True}
+        assert prompt == "hello"
 
 
 class TestHarmonyTransformCoversExtendedScale:

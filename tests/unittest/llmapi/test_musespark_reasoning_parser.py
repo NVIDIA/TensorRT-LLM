@@ -14,7 +14,9 @@
 # limitations under the License.
 """Tests for the MuseSpark header/message reasoning format."""
 
+import importlib
 import random
+import sys
 
 import pytest
 
@@ -457,3 +459,29 @@ def test_musespark_registry_and_flag():
     assert ReasoningParserFactory.needs_raw_special_tokens("musespark")
     assert MuseSparkReasoningParser.needs_raw_special_tokens is True
     assert isinstance(musespark_make_parser(), MuseSparkReasoningParser)
+
+
+def test_importing_the_model_module_first_registers_the_parser(monkeypatch):
+    """Importing the parser's own module first still registers it.
+
+    The registry imports the model module and the model module imports the
+    registry, so whichever is imported second sees the other half-initialized.
+    """
+    import tensorrt_llm.llmapi
+    import tensorrt_llm.llmapi.reasoning
+
+    for name in ("tensorrt_llm.llmapi.reasoning_parser", "tensorrt_llm.llmapi.reasoning.musespark"):
+        monkeypatch.delitem(sys.modules, name)
+    # The parent packages cache the submodules as attributes; restore those too.
+    monkeypatch.setattr(
+        tensorrt_llm.llmapi, "reasoning_parser", tensorrt_llm.llmapi.reasoning_parser
+    )
+    monkeypatch.setattr(
+        tensorrt_llm.llmapi.reasoning, "musespark", tensorrt_llm.llmapi.reasoning.musespark
+    )
+
+    model_module = importlib.import_module("tensorrt_llm.llmapi.reasoning.musespark")
+    registry = sys.modules["tensorrt_llm.llmapi.reasoning_parser"]
+    parser_cls = model_module.MuseSparkReasoningParser
+    assert registry.ReasoningParserFactory._parsers["musespark"][0] is parser_cls
+    assert registry.MuseSparkReasoningParser is parser_cls

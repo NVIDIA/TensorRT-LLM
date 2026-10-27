@@ -27,7 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm.serve.openai_protocol import NamespacedFunctionToolParam
+from tensorrt_llm.serve.openai_protocol import NamespacedFunctionToolParam, ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
     CUSTOM_TOOL_INPUT_ARG,
     _get_chat_completion_function_tools,
@@ -38,6 +38,8 @@ from tensorrt_llm.serve.responses_utils import (
     _tool_resolution,
     _tools_for_chat_template,
 )
+
+from .render_helpers import byte_level_tokenizer, responses_prompt
 
 # The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
 # test in the file is deselected, which pytest reports as exit code 5 and the
@@ -658,3 +660,55 @@ def test_sdk_validated_tools_keep_defer_loading():
     send, read = entry["tools"]
     assert "defer_loading" not in send
     assert read["defer_loading"] is False
+
+
+# Renders tools the way the native template revision does: a namespace member without its
+# own defer_loading inherits the namespace's.
+NATIVE_RENDER_TEMPLATE = (
+    "{%- set deferred_render_mode = deferred_render_mode"
+    " | default('tool_name_and_description') -%}"
+    "{%- for tool in tools -%}"
+    "{%- if tool.type == 'namespace' -%}"
+    "{%- for member in tool.tools -%}"
+    "[{{ tool.name }}.{{ member.name }}"
+    " deferred={{ member.defer_loading | default(tool.defer_loading) }}]"
+    "{%- endfor -%}"
+    "{%- else -%}[{{ tool.function.name }}]{%- endif -%}"
+    "{%- endfor -%}"
+    "{%- for message in messages %}{{ message.content }}{%- endfor -%}"
+)
+
+
+@pytest.mark.asyncio
+async def test_responses_prompt_renders_the_namespace_deferral():
+    """Both deferral forms reach the prompt the Responses route renders.
+
+    ``send`` inherits the namespace's deferral and ``read`` opts out explicitly; the
+    flattened view would render both eagerly.
+    """
+    request = ResponsesRequest(
+        model="test-model",
+        input="hi",
+        tools=[
+            {
+                "type": "namespace",
+                "name": "slack",
+                "description": "Slack tools.",
+                "defer_loading": True,
+                "tools": [
+                    {"type": "function", "name": "send", "description": "s", "parameters": None},
+                    {
+                        "type": "function",
+                        "name": "read",
+                        "description": "r",
+                        "parameters": None,
+                        "defer_loading": False,
+                    },
+                ],
+            }
+        ],
+    )
+    prompt = await responses_prompt(
+        request, byte_level_tokenizer(NATIVE_RENDER_TEMPLATE), model_type="test-model"
+    )
+    assert prompt == "[slack.send deferred=True][slack.read deferred=False]hi"
