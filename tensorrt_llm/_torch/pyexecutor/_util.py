@@ -2206,6 +2206,7 @@ class KvCacheCreator:
         spec_config = self._speculative_config
         if (spec_config is None or not spec_config.spec_dec_mode.is_dflash()
                 or spec_config.attention_backend != "TRTLLM"
+                or self._tokens_per_block not in (16, 32, 64)
                 or not spec_config._allow_separate_draft_kv_cache
                 or spec_config.draft_len_schedule is not None
                 or self._draft_config is None or self._mapping.pp_size != 1
