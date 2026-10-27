@@ -18,3 +18,13 @@ l0_cpu_musespark:
   - unittest/llmapi/apps/test_musespark_serve_extensions.py
   # Picked up on l0_cpu through the unittest/_torch/modeling directory entry.
   - unittest/_torch/modeling/test_modeling_musespark_open_preprocess.py
+  # The cpu_only tests of DFlash on the TRTLLM attention backend, the shared target/draft KV
+  # cache and the disaggregated KV transfer; l0_gb300_musespark.yml runs the rest.
+  - unittest/_torch/speculative/hw_agnostic/test_dflash_draft_kv.py
+  - unittest/_torch/speculative/hw_agnostic/test_dflash_ctx_block_tables.py
+  - unittest/_torch/executor/kv_cache/test_dflash_unified_kv_gate.py
+  - unittest/llmapi/test_disagg_dflash_guard.py
+  - unittest/disaggregated/test_kv_transfer.py
+  - unittest/disaggregated/test_peer.py
+  - unittest/disaggregated/test_rank_info.py
+  - unittest/disaggregated/test_transfer_ownership_regressions.py

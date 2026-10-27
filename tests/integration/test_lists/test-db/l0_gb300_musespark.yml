@@ -40,19 +40,13 @@ l0_gb300_musespark:
   - unittest/_torch/modeling/test_musespark_open_finalize_local.py
   # DFlash on the TRTLLM attention backend, the shared target/draft KV cache, and the
   # disaggregated KV transfer that carries it. Pre-merge CI on this branch runs only the
-  # MuseSpark stages, and these files are listed on no other MuseSpark stage.
+  # MuseSpark stages, and these files are listed on no other MuseSpark stage. This stage
+  # deselects cpu_only tests; those files are on l0_cpu_musespark.yml.
   - unittest/_torch/speculative/hw_agnostic/test_dflash_trtllm_window.py
-  - unittest/_torch/speculative/hw_agnostic/test_dflash_draft_kv.py
-  - unittest/_torch/speculative/hw_agnostic/test_dflash_ctx_block_tables.py
   - unittest/_torch/speculative/hw_agnostic/test_dflash_dummy_slot.py
   - unittest/_torch/speculative/hw_agnostic/test_dflash_worker.py
   - unittest/_torch/speculative/hw_agnostic/test_dflash2_semantics.py
-  - unittest/_torch/executor/kv_cache/test_dflash_unified_kv_gate.py
   - unittest/_torch/executor/kv_cache/test_kv_cache_v2_attention_op_tables.py
-  - unittest/llmapi/test_disagg_dflash_guard.py
   - unittest/disaggregated/test_kv_transfer.py
-  - unittest/disaggregated/test_peer.py
-  - unittest/disaggregated/test_rank_info.py
   - unittest/disaggregated/test_bounce.py
-  - unittest/disaggregated/test_transfer_ownership_regressions.py
   - accuracy/test_disaggregated_serving.py::TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv
