@@ -52,6 +52,11 @@ def test_tools_preamble_keeps_its_blank_lines():
     )
 
     assert "## Tools\n\nYou have access to a set of tools" in prompt
+    # Seven blank lines separate the preamble's paragraphs and examples; losing
+    # any of them, as the vendored copy once did, changes the prompt.
+    preamble = prompt[prompt.index("## Tools") : prompt.index("<functions>")]
+    assert preamble.count("\n\n") == 7
+    assert "\n\n\n" not in preamble
 
 
 @pytest.mark.parametrize(
