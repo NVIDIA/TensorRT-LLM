@@ -24,7 +24,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import (
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.speculative.ragged_helpers import ragged_gather_index_lists
 
 
@@ -374,7 +374,7 @@ def test_model_engine_delegates_ragged_state_to_decoder_owner() -> None:
     inputs.fit_ragged_verify_lens = lambda *args, **kwargs: (args, kwargs)
     worker = object()
     runner._model = SimpleNamespace(spec_worker=worker)
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._cleanup_done = True
     engine._runner = runner
 
@@ -394,7 +394,7 @@ def test_model_engine_delegates_ragged_state_to_decoder_owner() -> None:
 
 
 def test_model_engine_non_decoder_keeps_confidence_inactive() -> None:
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._cleanup_done = True
     engine._runner = SimpleNamespace()
 
@@ -705,11 +705,7 @@ def test_overlap_offsets_follow_the_packed_prefix(
         is_dummy=False,
     )
 
-    inputs, gather_ids, draft_len = (
-        prepared.kwargs,
-        prepared.gather_ids,
-        prepared.runtime_draft_len,
-    )
+    inputs, draft_len = prepared.kwargs, prepared.runtime_draft_len
     lengths = [1 + window if trims else 4 for window in windows]
     prefix_len, *previous_lengths = lengths
     expected = [0] * prefix_len + [3] * previous_lengths[0] + [4] * previous_lengths[1]
@@ -723,7 +719,7 @@ def test_overlap_offsets_follow_the_packed_prefix(
     assert inputs["input_ids"].numel() == sum(lengths)
     assert metadata.seq_lens.tolist() == lengths
     assert metadata.kv_cache_params.num_extra_kv_tokens == 2
-    assert gather_ids.tolist() == list(range(sum(lengths)))
+    assert decoder._gather_ids_buffer.tensor[: sum(lengths)].tolist() == list(range(sum(lengths)))
     assert draft_len == 3
     assert gather_calls == (
         [(prefix_len, prefix_len, 1)] if use_fused_gather and previous_lengths == [4, 4] else []
