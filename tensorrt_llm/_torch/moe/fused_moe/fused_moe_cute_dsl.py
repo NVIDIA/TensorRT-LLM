@@ -342,7 +342,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                  scaling_vector_size: int = 16,
                  use_direct_expert_metadata: bool = False,
                  use_locality_domain: bool = False,
-                 workload_identity: Optional[Tuple] = None):
+                 workload_identity: Optional[Tuple] = None,
+                 do_finalize: bool = True):
         super().__init__()
         self.forward_impl = forward_impl
         self.num_experts = num_experts
@@ -353,6 +354,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.enable_alltoall = enable_alltoall
         self.use_direct_expert_metadata = use_direct_expert_metadata
         self.use_locality_domain = use_locality_domain
+        # False: forward_impl returns the unfinalized triple.
+        self.do_finalize = do_finalize
 
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
@@ -374,6 +377,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             identity += (self.workload_identity, )
         if self.use_direct_expert_metadata:
             identity += ("direct_expert_metadata", )
+        if not self.do_finalize:
+            identity += ("unfinalized", )
         return identity
 
     def get_valid_tactics(
@@ -478,6 +483,10 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             recv_expert_count=recv_expert_count,
             deep_ep_expert_capacity=deep_ep_expert_capacity,
             use_count_native_expert_metadata=self.use_direct_expert_metadata)
+        if not self.do_finalize:
+            # Only run_moe_nvfp4_impl takes it; run_moe_nvfp4 refuses the
+            # locality-domain and count-native paths before building this.
+            count_native_kwargs["do_finalize"] = False
         return self.forward_impl(*forward_inputs,
                                  enable_alltoall=self.enable_alltoall,
                                  tile_size=tile_size,
@@ -996,6 +1005,69 @@ class CuteDslFusedMoE(MoEImplBase):
         return self.has_nvfp4 or (not self.has_any_quant
                                   and get_sm_version() == 107)
 
+    def supports_unfinalized_output(self) -> bool:
+        """NVFP4 on SM100/SM103 honors ``do_finalize=False``.
+
+        FC2 then runs the plain grouped GEMM instead of the fused-finalize
+        epilogue, and ``run_moe`` returns ``(gemm2_output, token_final_scales,
+        expanded_idx_to_permuted_idx)``. The index map comes from ``moe_sort``,
+        which runs the same routing kernel as TRTLLM-Gen, so the layout matches
+        that backend's triple: token-major ``[num_tokens, top_k]`` int32 rows of
+        ``gemm2_output``, ``-1`` for a slot whose expert is not local.
+
+        Declined where finalize is always fused: SM107 (no plain NVFP4 grouped
+        GEMM), the locality-domain split, and unquantized BF16. Reads the quant
+        config rather than ``has_nvfp4`` so it can be asked before
+        ``create_weights``.
+        """
+        quant_config = self.quant_config
+        return (quant_config is not None
+                and quant_config.layer_quant_mode.has_nvfp4()
+                and get_sm_version() != 107 and not self.uses_locality_domain)
+
+    def forward_fake(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        *,
+        do_finalize: bool = True,
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """Meta shapes, including the unfinalized triple.
+
+        ``gemm2_output`` has the rows ``moe_sort`` pads for the largest tile;
+        the tactic's actual tile size is picked at run time.
+        """
+        if do_finalize:
+            return super().forward_fake(
+                x,
+                router_logits,
+                do_finalize=do_finalize,
+                output_dtype=output_dtype,
+                all_rank_num_tokens=all_rank_num_tokens,
+                use_dp_padding=use_dp_padding,
+                **kwargs,
+            )
+        num_tokens = x.shape[0]
+        top_k = self.routing_method.experts_per_token
+        helper = GroupedGemmInputsHelper(
+            num_experts=self.num_experts,
+            top_k=top_k,
+            num_local_experts=self.expert_size_per_partition,
+            local_expert_offset=self.slot_start,
+            tile_size=max(CuteDslFusedMoENvfp4Runner._tile_sizes()),
+        )
+        num_permuted_tokens = helper.get_max_num_permuted_tokens(num_tokens)
+        return [
+            x.new_empty((num_permuted_tokens, self.hidden_size),
+                        dtype=torch.bfloat16),
+            x.new_empty((num_tokens, top_k), dtype=torch.float32),
+            x.new_empty((num_tokens, top_k), dtype=torch.int32),
+        ]
+
     def can_use_deep_ep_direct_metadata(
             self, supports_post_quant_dispatch: bool) -> bool:
         """Report complete runtime eligibility for adapter-free DeepEP metadata."""
@@ -1067,7 +1139,8 @@ class CuteDslFusedMoE(MoEImplBase):
         recv_expert_count: Optional[torch.Tensor] = None,
         deep_ep_expert_capacity: Optional[int] = None,
         use_deep_ep_direct_metadata: bool = False,
-    ) -> torch.Tensor:
+        do_finalize: bool = True,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """NVFP4 MoE computation.
 
         Uses the single-tensor ``run_moe_nvfp4_impl`` path. (The former
@@ -1079,6 +1152,9 @@ class CuteDslFusedMoE(MoEImplBase):
             weight_view: Bundled weight tensors. Must not be None.
             use_deep_ep_direct_metadata: Use adapter-free, count-native DeepEP
                 metadata. The scheduler sets this only for the supported path.
+            do_finalize: False returns the unfinalized ``(gemm2_output,
+                token_final_scales, expanded_idx_to_permuted_idx)`` triple
+                and leaves ``moe_output`` untouched.
         """
         assert self.has_nvfp4
         assert weight_view is not None
@@ -1111,7 +1187,36 @@ class CuteDslFusedMoE(MoEImplBase):
                     "DeepEP direct metadata was requested without dispatch metadata"
                 )
 
-        if moe_output is None:
+        if not do_finalize:
+            # ``supports_unfinalized_output`` declines these configurations;
+            # refuse them here by name too, because ``do_finalize`` is a
+            # forward argument.
+            if use_locality_domain:
+                raise NotImplementedError(
+                    "CuteDslFusedMoE do_finalize=False is not supported with the "
+                    "locality-domain split, which only fuses finalize")
+            if use_deep_ep_direct_metadata or recv_expert_count is not None:
+                raise NotImplementedError(
+                    "CuteDslFusedMoE do_finalize=False is not supported with "
+                    "count-native DeepEP metadata: the expert-major rows have no "
+                    "token-major index map")
+            if get_sm_version() == 107:
+                raise NotImplementedError(
+                    "CuteDslFusedMoE do_finalize=False needs the plain NVFP4 "
+                    "grouped GEMM, which SM107 does not have")
+            if token_selected_experts.size(0) == 0:
+                return (
+                    torch.empty((0, self.hidden_size),
+                                dtype=output_dtype,
+                                device=x.device),
+                    token_final_scales,
+                    torch.empty(tuple(token_selected_experts.shape),
+                                dtype=torch.int32,
+                                device=x.device),
+                )
+            # Nothing writes moe_output, so none is allocated or checked.
+            moe_output = None
+        elif moe_output is None:
             moe_output = torch.empty(
                 (token_final_scales.size(0), self.hidden_size),
                 dtype=output_dtype,
@@ -1162,11 +1267,12 @@ class CuteDslFusedMoE(MoEImplBase):
             top_k=effective_top_k,
             num_local_experts=weight_view.expert_size_per_partition,
             local_expert_offset=weight_view.slot_start,
-            enable_finalize_fusion=self.use_fused_finalize,
+            enable_finalize_fusion=self.use_fused_finalize and do_finalize,
             enable_alltoall=enable_alltoall,
             workload_identity=workload_identity,
             use_direct_expert_metadata=use_direct_expert_metadata,
             use_locality_domain=use_locality_domain,
+            do_finalize=do_finalize,
         )
 
         if use_direct_expert_metadata:
@@ -1192,11 +1298,23 @@ class CuteDslFusedMoE(MoEImplBase):
         recv_expert_count: Optional[torch.Tensor] = None,
         deep_ep_expert_capacity: Optional[int] = None,
         use_count_native_expert_metadata: bool = False,
-    ) -> torch.Tensor:
-        """Non-DWDP NVFP4 MoE implementation using single-tensor ops."""
+        do_finalize: bool = True,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Non-DWDP NVFP4 MoE implementation using single-tensor ops.
+
+        ``do_finalize=False`` skips the output memset and the
+        finalize: FC2 is the plain grouped GEMM and the result is the
+        ``(gemm2_output, token_final_scales, expanded_idx_to_permuted_idx)``
+        triple, with ``moe_output`` ignored.
+        """
         output_dtype = torch.bfloat16
         sm_version = get_sm_version()
         use_rubin = (sm_version == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE)
+        # Finalize fusion needs a finalize to fuse.
+        use_fused_finalize = self.use_fused_finalize and do_finalize
+        if not do_finalize and use_count_native_expert_metadata:
+            raise NotImplementedError(
+                "do_finalize=False has no count-native (expert-major) variant")
 
         effective_top_k = token_selected_experts.size(1)
         esp = weight_view.expert_size_per_partition
@@ -1247,7 +1365,7 @@ class CuteDslFusedMoE(MoEImplBase):
             )
 
         has_aux_streams = self._has_moe_output_memset_aux_stream()
-        if self.use_fused_finalize and has_aux_streams:
+        if use_fused_finalize and has_aux_streams:
             memset_stream = self._moe_output_memset_run_stream()
             self.event_dict[EventType.Main].record()
             moe_output.record_stream(memset_stream)
@@ -1324,7 +1442,7 @@ class CuteDslFusedMoE(MoEImplBase):
 
         x, x_sf = gather_act_op(**gather_act_kwargs)
 
-        if self.use_fused_finalize:
+        if use_fused_finalize:
             if has_aux_streams:
                 self.event_dict[EventType.MoeOutputMemset].wait()
             elif use_count_native_expert_metadata:
@@ -1415,6 +1533,10 @@ class CuteDslFusedMoE(MoEImplBase):
                 tile_size=tile_size,
                 output_dtype=output_dtype,
             )
+            if not do_finalize:
+                # Rows are the permuted, tile-padded expert outputs; only the
+                # ones the index map names are written (-1 = not local).
+                return x, token_final_scales, expanded_idx_to_permuted_idx
             torch.ops.trtllm.moe_unpermute_inplace(
                 permuted_input=x,
                 output=moe_output,
@@ -1979,7 +2101,7 @@ class CuteDslFusedMoE(MoEImplBase):
         ctx: MoERunContext,
         *,
         workspace: Optional[dict] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Run MoE computation with CuteDSL backend.
 
@@ -1987,7 +2109,9 @@ class CuteDslFusedMoE(MoEImplBase):
         quantization schemes (fp8_block_scales, nvfp4, and unquantized BF16).
 
         Returns:
-            final_hidden_states tensor.
+            final_hidden_states tensor, or for ``ctx.do_finalize=False`` (NVFP4
+            only) the unfinalized ``(gemm2_output,
+            token_final_scales, expanded_idx_to_permuted_idx)`` triple.
         """
         del workspace  # CuteDSL kernels allocate their own intermediates.
         plan = require_comm_plan(self, ctx)
@@ -1997,6 +2121,9 @@ class CuteDslFusedMoE(MoEImplBase):
         x_sf = ctx.x_sf
         moe_output = plan.moe_output
         enable_alltoall = plan.enable_alltoall
+        if not ctx.do_finalize and not self.has_nvfp4:
+            raise NotImplementedError(
+                "CuteDslFusedMoE returns the unfinalized output for NVFP4 only")
 
         # Execute MoE computation
         if self.has_nvfp4:
@@ -2012,6 +2139,7 @@ class CuteDslFusedMoE(MoEImplBase):
                 recv_expert_count=plan.recv_expert_count,
                 deep_ep_expert_capacity=plan.deep_ep_expert_capacity,
                 use_deep_ep_direct_metadata=plan.use_deep_ep_direct_metadata,
+                do_finalize=ctx.do_finalize,
             )
         elif self.has_deepseek_fp8_block_scales:
             result = self.run_moe_fp8_block_scales(
