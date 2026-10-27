@@ -244,7 +244,7 @@
 /cpp/tensorrt_llm/batch_manager/cacheTransferLayer* @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/disagg* @NVIDIA/trt-llm-disagg-devs
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
-/examples/disaggregated/slurm/benchmark @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-perf-devs
+/examples/disaggregated/slurm/benchmark @NVIDIA/trt-llm-disagg-devs @NVIDIA/trtllm-bench-reviewers
 /tensorrt_llm/_torch/disaggregation @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/serve/openai_disagg_server.py @NVIDIA/trt-llm-disagg-devs
@@ -316,6 +316,10 @@
 /cpp/tests/unit_tests/kernels/ropeTest.cu @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tests/unit_tests/kernels/sparseAttentionKernelsTest.cpp @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
+# The sparse-attention cache managers belong to the KV cache manager team. This
+# rule must stay below the directory rule above, so it cannot live in the KV
+# CACHE MANAGER section.
+/tensorrt_llm/_torch/attention/backends/sparse/*/cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/modules/fla @NVIDIA/trt-llm-torch-attention-devs
 /tests/microbenchmarks/cute_dsl_kernels/paged_mqa_logits @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
@@ -381,38 +385,6 @@
 # ===== SCAFFOLDING =====
 /tensorrt_llm/scaffolding @WeiHaocheng @dc3671
 /tests/unittest/scaffolding @WeiHaocheng @dc3671
-
-## TensorRT-LLM LLM Disaggregated
-/examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
-/examples/disaggregated/slurm/benchmark @NVIDIA/trt-llm-disagg-devs @NVIDIA/trtllm-bench-reviewers
-/tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/cacheFormatter.cpp @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/cacheFormatter.h @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/cacheTransBuffer.cpp @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/cacheTransBuffer.h @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/cacheTransceiver.cpp @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/dataTransceiver.h @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/dataTransceiverImpl.cpp @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/dataTransceiverImpl.h @NVIDIA/trt-llm-disagg-devs
-/tensorrt_llm/serve/openai_disagg_server.py @NVIDIA/trt-llm-disagg-devs
-
-## TensorRT-LLM - KV Cache Manager
-/cpp/tensorrt_llm/batch_manager/kvCacheManager.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/batch_manager/kvCacheEventManager.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/batch_manager/kvCacheTransferManager.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/batch_manager/evictionPolicy.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/include/tensorrt_llm/batch_manager/kvCacheManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/include/tensorrt_llm/batch_manager/kvCacheEventManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/include/tensorrt_llm/batch_manager/kvCacheTransferManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/include/tensorrt_llm/batch_manager/evictionPolicy.h @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tests/unit_tests/batch_manager/kvCacheManagerTest.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tests/unit_tests/batch_manager/kvCacheUtilsTest.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
-/tensorrt_llm/_torch/attention/backends/sparse/*/cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
-/tensorrt_llm/_torch/pyexecutor/kv_cache @NVIDIA/trt-llm-kv-cache-manager-devs
-/tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManager.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
 # of the NVIDIA/trt-llm-committed-api-review-committee or NVIDIA/trt-llm-noncommitted-api-review-committee team.
