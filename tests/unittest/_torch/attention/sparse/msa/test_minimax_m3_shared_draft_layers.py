@@ -423,14 +423,17 @@ def test_default_sparse_layers_log_a_fallback_that_ignores_the_config(monkeypatc
 def test_index_k_cache_follows_the_config_sparse_layers(
     monkeypatch: pytest.MonkeyPatch, implementation: str
 ) -> None:
-    """Every layer the config makes sparse gets an index-K view, and only those."""
+    """Every layer the config makes sparse gets an index-K buffer and view, and only those."""
     resolved = []
+    registered = {}
 
     def fake_base_init(self, *args, **kwargs):
         self.is_disagg = False
         self.dtype = DataType.BF16
         # Five target layers and the shared Eagle3 layer appended after them.
         self.layer_offsets = {layer: layer for layer in range(6)}
+        # The base _build_base_config registers the extra pool buffers here.
+        registered.update(self._extra_buffers_per_layer(tokens_per_block=32))
 
     def fake_get_index_k_buffer(self, layer_idx, **kwargs):
         resolved.append(layer_idx)
@@ -458,6 +461,9 @@ def test_index_k_cache_follows_the_config_sparse_layers(
     assert manager._shared_draft_layer_ids == [5]
     assert manager.sparse_layer_ids == [0, 2, 3]
     assert manager.disable_index_value_layer_ids == {0, 2, 3}
+    assert sorted(registered) == [0, 2, 3]
+    for buffers in registered.values():
+        assert [buffer.role for buffer in buffers] == [Role.INDEX_KEY]
     assert resolved == [0, 2, 3]
     for layer in (0, 2, 3):
         assert manager.get_index_k_buffer(layer) is not None
