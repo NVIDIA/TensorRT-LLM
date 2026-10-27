@@ -20,7 +20,11 @@ else:
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     MambaLayerCache,
+    MambaStateBuffer,
     MambaStateLayout,
+    MambaStateStorage,
+    _get_local_mamba_cache_layout,
+    _mamba_effective_tp_size,
     _promote_intermediate_states,
     _stack_state_views,
 )
@@ -32,6 +36,20 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 MIN_REPLAY_HISTORY_SIZE = 16
+
+
+def _replay_pool_specs(
+    ssm_shape: tuple[int, ...], groups: int, dtype: torch.dtype, history: int
+) -> tuple[MambaStateBuffer, ...]:
+    heads, dim, state = ssm_shape
+    return (
+        MambaStateBuffer("old_x", dtype, (2, history, heads, dim)),
+        MambaStateBuffer("old_B", dtype, (2, history, groups, state)),
+        MambaStateBuffer("old_dt", torch.float32, (2, heads, history)),
+        MambaStateBuffer("old_dA_cumsum", torch.float32, (2, heads, history)),
+        MambaStateBuffer("prev_num_accepted_tokens", torch.int32, (4,), shared=True),
+        MambaStateBuffer("cache_buf_idx", torch.int32, (4,), shared=True),
+    )
 
 
 class ReplayStateUpdateMetadata(NamedTuple):
@@ -149,7 +167,7 @@ def mamba_seed_rank_offset(mapping: Mapping) -> int:
     return mapping.tp_rank * 1_000_003 + mapping.pp_rank * 1_000_033 + mapping.rank * 1_009
 
 
-class Mamba2State:
+class Mamba2State(MambaStateStorage):
     """Intermediate promotion plus Mamba2 stochastic-rounding seeds."""
 
     uses_replay = False
@@ -263,7 +281,7 @@ class Mamba2State:
         )
 
 
-class ReplayHistory:
+class ReplayHistory(MambaStateStorage):
     """Own Mamba2 replay history, seeds, bookkeeping, and conv promotion."""
 
     @property
@@ -271,6 +289,7 @@ class ReplayHistory:
         return None
 
     def __init__(self, tokens_per_gen_step: int) -> None:
+        self.pool_layers: list[dict[str, torch.Tensor]] | None = None
         self._ssm_states: tuple[torch.Tensor, ...] = ()
         self._conv_states: tuple[torch.Tensor, ...] = ()
         self._stacked_conv: torch.Tensor | None = None
@@ -297,6 +316,29 @@ class ReplayHistory:
             raise ValueError("Mamba2 replay requires speculative decoding")
         if context.n_groups_per_rank <= 0 and context.mamba_pp_layers:
             raise ValueError("Mamba2 replay requires at least one state group per rank")
+
+    @override
+    def pool_buffer_specs(self, context: MambaStateLayout) -> tuple[MambaStateBuffer, ...]:
+        if not context.mamba_pp_layers:
+            return ()
+        return _replay_pool_specs(
+            context.ssm_state_shape,
+            context.n_groups_per_rank,
+            context.conv_state_dtype,
+            self.replay_history_size,
+        )
+
+    @override
+    def bind_pool_buffers(
+        self, layers: list[dict[str, torch.Tensor]], shared: dict[str, torch.Tensor]
+    ) -> None:
+        self.pool_layers = layers
+        self.prev_num_accepted_tokens = shared["prev_num_accepted_tokens"][..., 0]
+        self.cache_buf_idx = shared["cache_buf_idx"][..., 0]
+        self.old_x = _stack_state_views([layer["old_x"] for layer in layers])
+        self.old_B = _stack_state_views([layer["old_B"] for layer in layers])
+        self.old_dt = _stack_state_views([layer["old_dt"] for layer in layers])
+        self.old_dA_cumsum = _stack_state_views([layer["old_dA_cumsum"] for layer in layers])
 
     def bind(
         self,
@@ -334,26 +376,30 @@ class ReplayHistory:
         )
         self.rand_seed = allocate_mamba_seed_buffer(cache_size, self._seed_rank_offset, device)
 
-        num_heads, head_dim, d_state = context.ssm_state_shape
-        common_replay_shape = [len(context.mamba_pp_layers), cache_size, 2]
-        self.prev_num_accepted_tokens = torch.zeros(cache_size, dtype=torch.int32, device=device)
-        self.cache_buf_idx = torch.zeros(cache_size, dtype=torch.int32, device=device)
-        self.old_x = torch.zeros(
-            common_replay_shape + [self.replay_history_size, num_heads, head_dim],
-            dtype=context.conv_state_dtype,
-            device=device,
-        )
-        self.old_B = torch.zeros(
-            common_replay_shape + [self.replay_history_size, context.n_groups_per_rank, d_state],
-            dtype=context.conv_state_dtype,
-            device=device,
-        )
-        self.old_dt = torch.zeros(
-            common_replay_shape + [num_heads, self.replay_history_size],
-            dtype=torch.float32,
-            device=device,
-        )
-        self.old_dA_cumsum = torch.zeros_like(self.old_dt)
+        if self.pool_layers is None:
+            num_heads, head_dim, d_state = context.ssm_state_shape
+            common_replay_shape = [len(context.mamba_pp_layers), cache_size, 2]
+            self.prev_num_accepted_tokens = torch.zeros(
+                cache_size, dtype=torch.int32, device=device
+            )
+            self.cache_buf_idx = torch.zeros(cache_size, dtype=torch.int32, device=device)
+            self.old_x = torch.zeros(
+                common_replay_shape + [self.replay_history_size, num_heads, head_dim],
+                dtype=context.conv_state_dtype,
+                device=device,
+            )
+            self.old_B = torch.zeros(
+                common_replay_shape
+                + [self.replay_history_size, context.n_groups_per_rank, d_state],
+                dtype=context.conv_state_dtype,
+                device=device,
+            )
+            self.old_dt = torch.zeros(
+                common_replay_shape + [num_heads, self.replay_history_size],
+                dtype=torch.float32,
+                device=device,
+            )
+            self.old_dA_cumsum = torch.zeros_like(self.old_dt)
 
     def _layer_cache_fields(self, layer_offset: int) -> dict[str, torch.Tensor | None]:
         return {
@@ -361,10 +407,26 @@ class ReplayHistory:
             "intermediate_conv_window": self.intermediate_conv[layer_offset],
             "prev_num_accepted_tokens": self.prev_num_accepted_tokens,
             "cache_buf_idx": self.cache_buf_idx,
-            "old_x": self.old_x[layer_offset],
-            "old_B": self.old_B[layer_offset],
-            "old_dt": self.old_dt[layer_offset],
-            "old_dA_cumsum": self.old_dA_cumsum[layer_offset],
+            "old_x": (
+                self.pool_layers[layer_offset]["old_x"]
+                if self.pool_layers is not None
+                else self.old_x[layer_offset]
+            ),
+            "old_B": (
+                self.pool_layers[layer_offset]["old_B"]
+                if self.pool_layers is not None
+                else self.old_B[layer_offset]
+            ),
+            "old_dt": (
+                self.pool_layers[layer_offset]["old_dt"]
+                if self.pool_layers is not None
+                else self.old_dt[layer_offset]
+            ),
+            "old_dA_cumsum": (
+                self.pool_layers[layer_offset]["old_dA_cumsum"]
+                if self.pool_layers is not None
+                else self.old_dA_cumsum[layer_offset]
+            ),
         }
 
     def make_layer_cache(
@@ -384,8 +446,13 @@ class ReplayHistory:
             return
         self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
         self.cache_buf_idx.index_fill_(0, slots, 0)
-        for buffer in (self.old_x, self.old_B, self.old_dt, self.old_dA_cumsum):
-            buffer.index_fill_(1, slots, 0)
+        if self.pool_layers is not None:
+            for layer in self.pool_layers:
+                for buffer in layer.values():
+                    buffer.index_fill_(0, slots, 0)
+        else:
+            for buffer in (self.old_x, self.old_B, self.old_dt, self.old_dA_cumsum):
+                buffer.index_fill_(1, slots, 0)
         if self.rand_seed is not None:
             self._seed_request_counter += 1
             _reset_mamba_seed_buffer(
@@ -421,6 +488,7 @@ class ReplayHistory:
         )
 
     def shutdown(self) -> None:
+        self.pool_layers = None
         self._ssm_states = ()
         self._conv_states = ()
         self._stacked_conv = None
@@ -476,10 +544,46 @@ def select_mamba2_state(
     )
 
 
+def estimate_mamba2_replay_bytes(model_config, mapping, **kwargs) -> int:
+    spec_config = kwargs.get("spec_config")
+    if spec_config is None:
+        return 0
+    params, local_layers, _ = _get_local_mamba_cache_layout(
+        model_config,
+        mapping,
+        spec_config=spec_config,
+        is_draft=kwargs.get("is_draft", False),
+        use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
+    )
+    if not local_layers:
+        return 0
+    requested = kwargs.get("use_replay_state_update")
+    if requested is not None:
+        state = create_mamba2_state(spec_config=spec_config, use_replay=requested)
+    else:
+        state = select_mamba2_state(
+            spec_config=spec_config,
+            ssm_cache_dtype=params.mamba_ssm_cache_dtype or params.dtype,
+            stochastic_rounding=getattr(
+                model_config.quant_config, "mamba_ssm_stochastic_rounding", False
+            ),
+        )
+    if not state.uses_replay:
+        return 0
+    tp = _mamba_effective_tp_size(mapping)
+    specs = _replay_pool_specs(
+        (params.num_heads // tp, params.head_dim, params.state_size),
+        params.n_groups // tp,
+        params.dtype,
+        state.replay_history_size,
+    )
+    return sum(spec.size_bytes * (1 if spec.shared else local_layers) for spec in specs)
+
+
 class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
     """Nemotron/Mamba2 geometry, replay selection and seed ownership."""
 
-    _speculative_state: Mamba2State | ReplayHistory
+    _speculative_state: Mamba2State | ReplayHistory | None
 
     @override
     def __init__(self, *args, use_replay_state_update: bool | None = None, **kwargs) -> None:
@@ -489,7 +593,7 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
         super().__init__(*args, **kwargs)
 
     @override
-    def _initialize_spec_state(self) -> Mamba2State | ReplayHistory:
+    def _initialize_spec_state(self) -> Mamba2State | ReplayHistory | None:
         if self._requested_replay is not None:
             state = create_mamba2_state(
                 spec_config=self.spec_config,
@@ -515,12 +619,22 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
             state.validate(self._state_layout)
         return state
 
+    @classmethod
+    @override
+    def _extra_state_bytes_per_rank(cls, model_config, mapping, **kwargs) -> int:
+        return estimate_mamba2_replay_bytes(model_config, mapping, **kwargs)
+
+    @override
+    def _extra_scratch_bytes_per_slot(self) -> int:
+        state = self._speculative_state
+        return 8 if isinstance(state, ReplayHistory) else 0
+
     def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
         state = self._speculative_state
         return state.get_replay_metadata() if isinstance(state, ReplayHistory) else None
 
     def get_mamba_ssm_rand_seed(self) -> torch.Tensor | None:
-        return self._speculative_state.rand_seed
+        return self._speculative_state.rand_seed if self._speculative_state is not None else None
 
 
 def get_nemotron_cache_params(config, *, spec_config=None, quant_config=None):

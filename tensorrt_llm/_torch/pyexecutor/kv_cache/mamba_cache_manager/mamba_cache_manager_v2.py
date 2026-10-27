@@ -108,6 +108,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     the PyTorch Mamba kernels.
     """
 
+    _speculative_state: MambaState | None = None
+
     _supports_additional_snapshot_offsets = True
     # Recurrent snapshots use their own commit/history endpoints without draft backoff.
     _supports_reuse_match_backoff = False
@@ -417,19 +419,53 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return ((pages + scale - 1) // scale) * bytes_per_slot
 
     def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
-        """Declare all buffers sharing one recurrent layer's slot lifecycle."""
+        """Declare the model layer's persistent recurrent state."""
         return [
             BufferConfig(role=MambaRole.SSM_STATE, size=self.ssm_bytes),
             BufferConfig(role=MambaRole.CONV_STATE, size=self.conv_bytes),
         ]
 
+    def _get_replay_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
+        """Declare replay storage for a separate logical SSM layer."""
+        if self._speculative_state is None:
+            return []
+        return [
+            BufferConfig(role=DataRole(spec.name), size=spec.size_bytes)
+            for spec in self._speculative_state.pool_buffer_specs(self._state_layout)
+            if not spec.shared or global_layer_id == self.mamba_pp_layers[0]
+        ]
+
+    def get_disagg_global_layer_ids(self, layer_group_id: int) -> list[int]:
+        """Keep model IDs unchanged and give replay layers distinct, PP-stable IDs."""
+        replay_global_ids = {
+            int(local_id): len(self._mamba_layer_mask) + global_id
+            for global_id, local_id in self._replay_layer_ids.items()
+        }
+        return [
+            self.pp_layers[int(layer_id)]
+            if int(layer_id) < len(self.pp_layers)
+            else replay_global_ids[int(layer_id)]
+            for layer_id in self.impl.layer_grouping[layer_group_id]
+        ]
+
+    @override
+    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
+        roles = super().get_disagg_ignored_roles()
+        if self._speculative_state is not None:
+            roles |= frozenset(
+                DataRole(spec.name)
+                for spec in self._speculative_state.pool_buffer_specs(self._state_layout)
+            )
+        return roles
+
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
-        return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
+        if local_layer_idx < len(self.pp_layers):
+            return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
+        return local_layer_idx in self._replay_layer_ids.values()
 
     @override
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
-        layer_id = int(self.impl.layer_grouping[pool_id][0])
-        if self._is_local_mamba_layer(layer_id):
+        if (pool_id, MambaRole.SSM_STATE) in self._pool_layer_ids_by_role:
             return MambaRole.SSM_STATE, None
         return super()._get_pool_roles(pool_id)
 
@@ -441,7 +477,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return sum(
             buffer.size
             for layer_id in self.mamba_pp_layers
-            for buffer in self._get_recurrent_buffer_configs(layer_id)
+            for buffer in (
+                *self._get_recurrent_buffer_configs(layer_id),
+                *self._get_replay_buffer_configs(layer_id),
+            )
         )
 
     def _num_ssm_snapshots_for_capacity(
@@ -560,6 +599,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     @override
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         kv_cache_config = self.kv_cache_config
+        if (
+            self._speculative_state is not None
+            and self._speculative_state.pool_buffer_specs(self._state_layout)
+            and kv_cache_config.enable_kv_pool_rebalance
+        ):
+            raise ValueError(
+                "Replay pool views require stable capacity; set "
+                "kv_cache_config.enable_kv_pool_rebalance=False."
+            )
         cache_tiers = config.cache_tiers
         gpu_quota = cache_tiers[0].quota
         minimum_live_quota = self._minimum_live_gpu_quota()
@@ -576,6 +624,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # Register pool-owned roles here, then bind their typed views in
         # _get_state_buffer. Model scratch must not participate in warmup cleanup.
         self._recurrent_buffers: dict[tuple[int, DataRole], torch.Tensor | None] = {}
+        self._replay_layer_ids: dict[int, LayerId] = {}
         for local_layer_idx, global_layer_idx in enumerate(self.pp_layers):
             if self._mamba_layer_mask[global_layer_idx]:
                 layer_id = LayerId(local_layer_idx)
@@ -586,6 +635,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     layer_id=layer_id,
                     buffers=buffers,
                 )
+
+        for global_layer_id in self.mamba_pp_layers:
+            buffers = self._get_replay_buffer_configs(global_layer_id)
+            if not buffers:
+                continue
+            replay_layer_id = LayerId(len(layers))
+            self._replay_layer_ids[global_layer_id] = replay_layer_id
+            for buffer in buffers:
+                self._recurrent_buffers[int(replay_layer_id), buffer.role] = None
+            layers.append(SsmLayerConfig(layer_id=replay_layer_id, buffers=buffers))
 
         dummy_requests = [
             KVCacheDesc(capacity=0, history_length=0) for _ in range(self._num_reserved_dummy_slots)
@@ -736,9 +795,57 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _setup_model_state(self) -> None:
         """Bind views only after layout, pool and slot capacity are final."""
         if self._speculative_state is not None:
+            self._bind_speculative_pool_buffers()
             self._speculative_state.bind(
                 self._state_layout, self.all_ssm_states, self.all_conv_states
             )
+
+    def _bind_speculative_pool_buffers(self) -> None:
+        state = self._speculative_state
+        specs = state.pool_buffer_specs(self._state_layout)
+        if not specs or not self.mamba_pp_layers:
+            return
+        required = {
+            (self.layer_offsets[layer_id], str(role))
+            for layer_id in self.mamba_pp_layers
+            for role in (MambaRole.SSM_STATE, MambaRole.CONV_STATE)
+        }
+        required.update(
+            (int(self._replay_layer_ids[layer_id]), spec.name)
+            for layer_id in self.mamba_pp_layers
+            for spec in specs
+            if not spec.shared or layer_id == self.mamba_pp_layers[0]
+        )
+        if not any(
+            required.issubset(
+                {
+                    (int(buffer_id.layer_id), str(buffer_id.role))
+                    for coalesced in variant.coalesced_buffers
+                    for buffer_id in coalesced.buffer_ids
+                }
+            )
+            for group in self.impl.pool_group_descs
+            for variant in group.slot_desc.variants
+        ):
+            raise RuntimeError("Replay and recurrent buffers must share one KVCM slot lifecycle")
+        layers = []
+        shared = {}
+        for layer_id in self.mamba_pp_layers:
+            views = {}
+            for spec in specs:
+                if spec.shared and layer_id != self.mamba_pp_layers[0]:
+                    continue
+                view = self._get_state_buffer(
+                    self._replay_layer_ids[layer_id],
+                    DataRole(spec.name),
+                    spec.dtype,
+                    list(spec.shape),
+                )
+                if view.shape[0] != self._state_layout.slot_capacity:
+                    raise RuntimeError(f"Replay buffer {spec.name} has a different slot capacity")
+                (shared if spec.shared else views)[spec.name] = view
+            layers.append(views)
+        state.bind_pool_buffers(layers, shared)
 
     @property
     def intermediate_state_indices(self) -> torch.Tensor | None:
@@ -959,7 +1066,30 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._on_state_slots_relocated(old_state_values, new_state_values)
 
     def _on_state_slots_relocated(self, old_slots: list[int], new_slots: list[int]) -> None:
-        """Allow model-owned scratch state to follow the updated slot mapping."""
+        """Initialize new resident slots without resetting restored replay state."""
+        fresh_slots = [new for old, new in zip(old_slots, new_slots) if old < 0]
+        if fresh_slots and self._speculative_state is not None:
+            slots = torch.tensor(
+                fresh_slots, dtype=torch.long, device=self.cuda_state_indices.device
+            )
+            self._speculative_state.reset_slots(slots, fresh_slots)
+
+    @override
+    def on_state_transfer_complete(self, request_ids: list[int]) -> None:
+        if self._speculative_state is None:
+            return
+        host_slots = sorted(
+            {
+                self._request_id_to_state_index[rid]
+                for rid in request_ids
+                if rid in self._request_id_to_state_index
+            }
+        )
+        if host_slots:
+            slots = torch.tensor(
+                host_slots, dtype=torch.long, device=self.cuda_state_indices.device
+            )
+            self._speculative_state.reset_slots(slots, host_slots)
 
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         if num_contexts and self._speculative_state is not None:

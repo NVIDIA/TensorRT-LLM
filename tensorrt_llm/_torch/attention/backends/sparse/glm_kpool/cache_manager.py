@@ -31,7 +31,6 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAIntermediateState,
     KDAReplayState,
     _is_disagg_context_server,
-    bind_kda_replay_pool,
     get_kda_replay_num_spec,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -126,42 +125,6 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         return self._kda_replay is not None
 
     @override
-    def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
-        buffers = super()._get_recurrent_buffer_configs(global_layer_id)
-        if self._kda_replay is not None:
-            buffers.extend(
-                self._kda_replay.pool_buffer_configs(self._state_layout, global_layer_id)
-            )
-        return buffers
-
-    @override
-    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
-        roles = super().get_disagg_ignored_roles()
-        if self._kda_replay is not None:
-            roles |= self._kda_replay.disagg_ignored_roles(self._state_layout)
-        return roles
-
-    @override
-    def _setup_model_state(self) -> None:
-        if self._kda_replay is not None:
-            bind_kda_replay_pool(self._kda_replay, self)
-        super()._setup_model_state()
-
-    @override
-    def _build_cache_config(self, config):
-        if (
-            self._kda_replay is not None
-            and self.local_num_mamba_layers > 0
-            and self.kv_cache_config.enable_kv_pool_rebalance
-        ):
-            raise ValueError(
-                "KDA replay caches are sized once from the SSM pool's slot count, "
-                "and a rebalance can grow that pool past them: set "
-                "kv_cache_config.enable_kv_pool_rebalance=False."
-            )
-        return super()._build_cache_config(config)
-
-    @override
     def suspend_request(self, request) -> None:
         replay = self._kda_replay
         request_id = request.py_request_id
@@ -245,6 +208,8 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     @classmethod
     @override
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
+        if _is_disagg_context_server(kwargs.get("is_disagg", False)):
+            return 0
         return KDAReplayState.estimate_bytes_per_slot(model_config, mapping, **kwargs)
 
     @override

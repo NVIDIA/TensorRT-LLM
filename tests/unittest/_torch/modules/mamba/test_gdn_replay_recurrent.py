@@ -221,6 +221,19 @@ def test_gdn_replay_vs_legacy_and_ref(H, HV, K, V, T, HIST, iters, pool_dtype, f
     old_beta = torch.zeros(slots, 2, HV, HIST, device=device, dtype=torch.float32)
     buf_idx = torch.zeros(slots, dtype=torch.int32, device=device)
     pnat = torch.zeros(slots, dtype=torch.int32, device=device)
+    if strided_pool:
+
+        def padded_history(tensor):
+            shape = tensor.shape
+            width = tensor[0].numel()
+            backing = tensor.new_full((shape[0], width + 32), 19)
+            view = backing[:, :width].view(shape)
+            view.copy_(tensor)
+            return view
+
+        old_v, old_k, old_g = (padded_history(t) for t in (old_v, old_k, old_g))
+        buf_idx = torch.zeros(slots, 4, dtype=torch.int32, device=device)[:, 0]
+        pnat = torch.zeros(slots, 8, dtype=torch.int32, device=device)[:, 0]
     # Non-identity slot mapping
     state_indices = torch.arange(1, N + 1, dtype=torch.int32, device=device)
 
@@ -454,6 +467,14 @@ def test_gdn_cached_replay_all_layer_commit_matches_reference(state_layout):
         * 0.1,
         dim=-1,
     )
+
+    # Pool storage interleaves layers within each slot.
+    def interleave_history(tensor):
+        view = torch.empty_like(tensor.transpose(0, 1).contiguous()).transpose(0, 1)
+        view.copy_(tensor)
+        return view
+
+    old_u, old_k, old_G = (interleave_history(t) for t in (old_u, old_k, old_G))
 
     positions = torch.arange(N, device=device, dtype=torch.int32)
     cache_slots = positions + 1

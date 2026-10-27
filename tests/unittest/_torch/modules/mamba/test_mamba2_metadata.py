@@ -369,7 +369,8 @@ class TestMamba2Metadata:
         assert actual[0, REPLAY_WORK_CACHE_BUF_IDX] == 1
 
     @pytest.mark.parametrize("num_decodes", [16, 17, 40, 255, 256])
-    def test_replay_work_items_triton_matches_torch(self, num_decodes):
+    @pytest.mark.parametrize("counter_stride", [1, 4, 8])
+    def test_replay_work_items_triton_matches_torch(self, num_decodes, counter_stride):
         """The two builders must agree everywhere the dispatch may pick either.
 
         num_decodes 17 and 255 are not powers of two, so the kernel runs with
@@ -379,6 +380,18 @@ class TestMamba2Metadata:
         num_slots = num_decodes + 7
         prev_num_accepted_tokens = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 21
         cache_buf_idx = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 2
+        for name in ("prev_num_accepted_tokens", "cache_buf_idx"):
+            values = (
+                prev_num_accepted_tokens if name == "prev_num_accepted_tokens" else cache_buf_idx
+            )
+            backing = torch.full(
+                (num_slots, counter_stride), -123, dtype=torch.int32, device="cuda"
+            )
+            backing[:, 0].copy_(values)
+            if name == "prev_num_accepted_tokens":
+                prev_num_accepted_tokens = backing[:, 0]
+            else:
+                cache_buf_idx = backing[:, 0]
         state_indices = torch.randperm(num_slots, device="cuda")[:num_decodes].to(torch.int32)
 
         triton_items = torch.zeros(num_decodes, 4, dtype=torch.int32, device="cuda")

@@ -238,8 +238,7 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     (the kernel addresses them by `history_size`, so 16-deep buffers called at 12
     read other slots' entries); history buffers, `prev_num_accepted_tokens` or
     `cache_buf_idx` covering fewer slots than `ssm_states` (a slot of the pool past
-    their end is read and written out of bounds); a strided `prev_num_accepted_tokens`
-    or `cache_buf_idx` (read at element `slot`). A strided `state_indices` is
+    their end is read and written out of bounds); nonpositive counter strides. A strided `state_indices` is
     harmless: the entry's input guard makes it contiguous.
 
     Not certified: pre-gated `g`/`beta` (`A_log=None`); `use_qk_l2norm_in_kernel=
@@ -490,7 +489,7 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
             ("prev_num_accepted_tokens", prev_num_accepted_tokens),
             ("cache_buf_idx", cache_buf_idx),
         ):
-            assert tensor.dim() == 1 and tensor.is_contiguous() and tensor.shape[0] >= pool_slots, (
+            assert tensor.dim() == 1 and tensor.stride(0) > 0 and tensor.shape[0] >= pool_slots, (
                 f"{name} has shape {tuple(tensor.shape)} and stride {tensor.stride()}; the kernel "
                 f"reads one element per slot of the {pool_slots}-slot pool, at the slot's index"
             )

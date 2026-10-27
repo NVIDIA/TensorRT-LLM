@@ -110,6 +110,32 @@ class MambaAcceptanceBatch:
     is_dummy_request: torch.Tensor | None
 
 
+@dataclass(frozen=True)
+class MambaStateBuffer:
+    """Physical per-slot storage; shared buffers belong to the first local layer."""
+
+    name: str
+    dtype: torch.dtype
+    shape: tuple[int, ...]
+    shared: bool = False
+
+    @property
+    def size_bytes(self) -> int:
+        return math.prod(self.shape) * self.dtype.itemsize
+
+
+class MambaStateStorage:
+    """Storage contract shared by otherwise independent recurrent algorithms."""
+
+    def pool_buffer_specs(self, context: MambaStateLayout) -> tuple[MambaStateBuffer, ...]:
+        return ()
+
+    def bind_pool_buffers(
+        self, layers: list[dict[str, torch.Tensor]], shared: dict[str, torch.Tensor]
+    ) -> None:
+        """Borrow typed pool views before binding algorithm-specific state."""
+
+
 class MambaState(Protocol):
     """Model-selected recurrent state; persistent views remain pool-owned."""
 
@@ -121,6 +147,12 @@ class MambaState(Protocol):
 
     @property
     def intermediate_conv(self) -> torch.Tensor | None: ...
+
+    def pool_buffer_specs(self, context: MambaStateLayout) -> tuple[MambaStateBuffer, ...]: ...
+
+    def bind_pool_buffers(
+        self, layers: list[dict[str, torch.Tensor]], shared: dict[str, torch.Tensor]
+    ) -> None: ...
 
     def bind(
         self,
@@ -652,6 +684,8 @@ __all__ = [
     "MambaHybridCacheManager",
     "MambaLayerCache",
     "MambaStateLayout",
+    "MambaStateBuffer",
+    "MambaStateStorage",
     "MambaAcceptanceBatch",
     "MambaRole",
     "use_py_mamba_cache_manager",

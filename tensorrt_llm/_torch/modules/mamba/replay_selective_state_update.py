@@ -201,10 +201,12 @@ def _replay_precompute_impl(
     # Double-buffer index (per cache slot) — selects this step's "active"
     # buffer (= where the historical inputs for this step live).
     cache_buf_idx_ptr,
+    stride_cache_buf_idx,
     # Per-request accepted-tokens count (already-cached old tokens at
     # [0, PNAT) of the active buffer; new tokens this step go after them
     # on no-replay-write steps).
     prev_num_accepted_tokens_ptr,
+    stride_prev_num_accepted_tokens,
     state_batch_indices_ptr,
     # Dimensions
     T: tl.constexpr,
@@ -286,8 +288,10 @@ def _replay_precompute_impl(
     #       active = the one we just wrote.  PNAT_next = accepted.  The
     #       previous active-buffer history is folded into state by replay
     #       before the caller flips to the staging buffer.
-    buf_active = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
-    prev_num_accepted_tokens = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
+    buf_active = tl.load(cache_buf_idx_ptr + cache_batch_idx * stride_cache_buf_idx).to(tl.int32)
+    prev_num_accepted_tokens = tl.load(
+        prev_num_accepted_tokens_ptr + cache_batch_idx * stride_prev_num_accepted_tokens
+    )
     if needs_checkpoint_write:
         write_buf = 1 - buf_active
         write_offset = 0
@@ -457,7 +461,9 @@ def _rectangle_precompute_impl(
     old_dt_ptr,
     old_dA_cumsum_ptr,
     cache_buf_idx_ptr,
+    stride_cache_buf_idx,
     prev_num_accepted_tokens_ptr,
+    stride_prev_num_accepted_tokens,
     state_batch_indices_ptr,
     # Dimensions
     T: tl.constexpr,
@@ -522,8 +528,10 @@ def _rectangle_precompute_impl(
     cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
 
     # Nowrite-only: write_buf = active, write_offset = PNAT.  No flip after.
-    buf_active = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
-    prev_num_accepted_tokens = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
+    buf_active = tl.load(cache_buf_idx_ptr + cache_batch_idx * stride_cache_buf_idx).to(tl.int32)
+    prev_num_accepted_tokens = tl.load(
+        prev_num_accepted_tokens_ptr + cache_batch_idx * stride_prev_num_accepted_tokens
+    )
     write_buf = buf_active
     write_offset = prev_num_accepted_tokens
 
@@ -808,7 +816,9 @@ def _dynamic_precompute_kernel(
     old_dt_ptr,
     old_dA_cumsum_ptr,
     cache_buf_idx_ptr,
+    stride_cache_buf_idx,
     prev_num_accepted_tokens_ptr,
+    stride_prev_num_accepted_tokens,
     state_batch_indices_ptr,
     # Dimensions
     T: tl.constexpr,
@@ -876,7 +886,9 @@ def _dynamic_precompute_kernel(
     pid_b = tl.program_id(axis=0)
     cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
 
-    pnat_local = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
+    pnat_local = tl.load(
+        prev_num_accepted_tokens_ptr + cache_batch_idx * stride_prev_num_accepted_tokens
+    )
     needs_write_runtime = pnat_local + T > MAX_REPLAY_BUFFER_LENGTH
     # Replay precompute uses a per-slot write predicate; use rectangle only
     # for no-write slots when enabled.
@@ -893,7 +905,9 @@ def _dynamic_precompute_kernel(
             old_dt_ptr,
             old_dA_cumsum_ptr,
             cache_buf_idx_ptr,
+            stride_cache_buf_idx,
             prev_num_accepted_tokens_ptr,
+            stride_prev_num_accepted_tokens,
             state_batch_indices_ptr,
             T,
             dstate,
@@ -952,7 +966,9 @@ def _dynamic_precompute_kernel(
             old_dt_ptr,
             old_dA_cumsum_ptr,
             cache_buf_idx_ptr,
+            stride_cache_buf_idx,
             prev_num_accepted_tokens_ptr,
+            stride_prev_num_accepted_tokens,
             state_batch_indices_ptr,
             T,
             MAX_REPLAY_BUFFER_LENGTH,
@@ -1779,7 +1795,9 @@ def _persistent_main_kernel(
     old_dt_ptr,
     old_dA_cumsum_ptr,
     prev_num_accepted_tokens_ptr,
+    stride_prev_num_accepted_tokens,
     cache_buf_idx_ptr,
+    stride_cache_buf_idx,
     x_ptr,
     C_ptr,
     D_ptr,
@@ -1970,8 +1988,12 @@ def _persistent_main_kernel(
         if IS_DYNAMIC:
             pid_b = work_item_idx
             cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
-            active_buf = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
-            pnat = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
+            active_buf = tl.load(cache_buf_idx_ptr + cache_batch_idx * stride_cache_buf_idx).to(
+                tl.int32
+            )
+            pnat = tl.load(
+                prev_num_accepted_tokens_ptr + cache_batch_idx * stride_prev_num_accepted_tokens
+            )
         else:
             work_item_base = replay_work_items_ptr + work_item_idx * _REPLAY_WORK_ITEM_WIDTH
             pid_b = tl.load(work_item_base + _REPLAY_WORK_POSITION_IN_DECODE_BATCH)
@@ -4124,7 +4146,9 @@ def replay_selective_state_update(
             old_dt,
             old_dA_cumsum,
             cache_buf_idx,
+            cache_buf_idx.stride(0),
             prev_num_accepted_tokens,
+            prev_num_accepted_tokens.stride(0),
             state_batch_indices,
             T,
             max_window,
@@ -4238,7 +4262,9 @@ def replay_selective_state_update(
             old_dt,
             old_dA_cumsum,
             prev_num_accepted_tokens,
+            prev_num_accepted_tokens.stride(0),
             cache_buf_idx,
+            cache_buf_idx.stride(0),
             x,
             C,
             D,
@@ -4365,7 +4391,9 @@ def replay_selective_state_update(
             old_dt,
             old_dA_cumsum,
             prev_num_accepted_tokens,
+            prev_num_accepted_tokens.stride(0),
             cache_buf_idx,
+            cache_buf_idx.stride(0),
             x,
             C,
             D,

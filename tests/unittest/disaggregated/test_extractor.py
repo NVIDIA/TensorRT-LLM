@@ -605,6 +605,7 @@ def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
         pool_group_descs=[recurrent_pg, attention_pg],
     )
     manager.pp_layers = [0, 1, 2]
+    manager._replay_layer_ids = {}
     manager._mamba_layer_mask = [True, True, False]
     manager.local_num_mamba_layers = 2
     manager.num_kv_heads_per_layer = [1, 1, 1]

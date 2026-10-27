@@ -210,10 +210,22 @@ def test_replay_tma_strided_state_layout_matches_contiguous(rectangle_for_nowrit
     dense_old_B = old_B.clone()
     dense_old_dt = old_dt.clone()
     dense_old_dA_cumsum = old_dA_cumsum.clone()
-    strided_old_x = old_x.clone()
-    strided_old_B = old_B.clone()
-    strided_old_dt = old_dt.clone()
-    strided_old_dA_cumsum = old_dA_cumsum.clone()
+
+    def padded_history(tensor):
+        shape = tensor.shape
+        width = tensor[0].numel()
+        backing = tensor.new_full((shape[0], width + 32), 19)
+        view = backing[:, :width].view(shape)
+        view.copy_(tensor)
+        return view
+
+    strided_old_x, strided_old_B, strided_old_dt, strided_old_dA_cumsum = (
+        padded_history(t) for t in (old_x, old_B, old_dt, old_dA_cumsum)
+    )
+    strided_prev = torch.zeros(cache_size, 4, dtype=torch.int32, device=device)[:, 0]
+    strided_prev.copy_(prev_tokens)
+    strided_buf = torch.zeros(cache_size, 8, dtype=torch.int32, device=device)[:, 0]
+    strided_buf.copy_(cache_buf_idx)
 
     common_kwargs = dict(
         prev_num_accepted_tokens=prev_tokens,
@@ -255,9 +267,9 @@ def test_replay_tma_strided_state_layout_matches_contiguous(rectangle_for_nowrit
         strided_old_B,
         strided_old_dt,
         strided_old_dA_cumsum,
-        cache_buf_idx.clone(),
+        strided_buf,
         out=strided_out,
-        **common_kwargs,
+        **{**common_kwargs, "prev_num_accepted_tokens": strided_prev},
     )
 
     torch.testing.assert_close(strided_out, dense_out, rtol=0, atol=0)

@@ -41,6 +41,7 @@ from tensorrt_llm._torch.modules.mamba.cache_manager import (
     _advance_replay_state,
 )
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
     _create_kv_cache_manager,
@@ -109,6 +110,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheDesc,
     KVCacheManagerConfig,
     LayerId,
+    PageIndexMode,
     SsmLayerConfig,
     _introspection,
 )
@@ -4020,6 +4022,7 @@ def _v2_kda_draft_record_manager(kda_draft_records, enable_block_reuse):
     # Layer 1's 256-byte pages of 32 tokens (_base_attention_layer_configs; layer 0 becomes the SSM layer).
     mgr._attention_cache_bytes_per_token = lambda: 8
     mgr._kda_replay = KDAReplayState(2, draft_records=kda_draft_records)
+    mgr._speculative_state = mgr._kda_replay
     # The replay buffers count in each slot's state bytes (_mamba_state_bytes_per_slot); the drafts' records are,
     # per draft, vn, beta * k and the decay, fp32 [H, K] each (24 KiB here).
     mgr.ssm_state_shape = [8, 256, 256]
@@ -5735,9 +5738,9 @@ def test_v2_kda_draft_records_size_with_the_ssm_pool(pool_sizing):
     pool_ratio = [0.5, 0.5] if pool_sizing == "pool_ratio" else None
     built = mgr._build_cache_config(_kda_draft_record_build_config(quota, pool_ratio))
     assert built.cache_tiers[0].quota == quota
-    ssm_buffers = {str(buffer.role): buffer.size for buffer in built.layers[0].buffers}
-    assert ssm_buffers["kda_state_tok"] == records
-    assert not set(ssm_buffers) & set(_KDA_REPLAY_BUFFERS[3:])
+    replay_buffers = {str(buffer.role): buffer.size for buffer in built.layers[2].buffers}
+    assert replay_buffers["kda_state_tok"] == records
+    assert not set(replay_buffers) & set(_KDA_REPLAY_BUFFERS[3:])
     with pytest.raises(ValueError, match="too small for live recurrent states"):
         mgr._build_cache_config(_kda_draft_record_build_config(mgr._minimum_live_gpu_quota() - 1))
 
@@ -5845,39 +5848,90 @@ def _build_kda_replay_manager(**kwargs):
 
 
 @skip_no_cuda
-@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
-def test_v2_kda_replay_buffers_are_kvcm_state_buffers(manager_cls):
-    """Replay caches and the accepted-draft count are registered as SSM-layer buffers, counted in the per-slot state
-    bytes, and kept out of disaggregated transfers."""
-    mgr = _build_kda_replay_manager(model_manager_cls=manager_cls)
-    try:
-        layout = _kda_replay_layout(2, 6, 8, 3)
-        replay_roles = {str(DataRole(name)) for name in layout}
-        for layer in mgr.mamba_pp_layers:
-            local_layer_id = mgr.layer_offsets[layer]
-            roles = {
-                str(buffer_id.role)
-                for pool_group in mgr.impl.pool_group_descs
-                for variant in pool_group.slot_desc.variants
-                for coalesced in variant.coalesced_buffers
-                for buffer_id in coalesced.buffer_ids
-                if int(buffer_id.layer_id) == local_layer_id
-            }
-            assert replay_roles <= roles
-            assert ("prev_num_accepted_tokens" in roles) == (layer == mgr.mamba_pp_layers[0])
-        layer_bytes = sum(dtype.itemsize * math.prod(shape) for dtype, shape in layout.values())
-        assert mgr._mamba_state_bytes_per_slot() == (
-            2 * (mgr.ssm_bytes + mgr.conv_bytes) + 2 * layer_bytes + 16
+@pytest.mark.parametrize(
+    "manager_cls,kda_draft_records",
+    [
+        (KimiK3HybridCacheManager, False),
+        (KimiK3HybridCacheManager, True),
+        (Glm5NextCacheManager, False),
+        (NemotronHybridCacheManager, False),
+        (Qwen35HybridCacheManager, False),
+        (Qwen4ExpHybridCacheManager, False),
+    ],
+)
+def test_v2_replay_buffers_have_separate_ssm_layers(manager_cls, kda_draft_records):
+    """Replay layers bind the kernel payloads while sharing core-state slots and staying out of transfers."""
+    is_kda = manager_cls in (KimiK3HybridCacheManager, Glm5NextCacheManager)
+    if is_kda:
+        mgr = _build_kda_replay_manager(
+            model_manager_cls=manager_cls, kda_draft_records=kda_draft_records
         )
+        replay_roles = set(_KDA_REPLAY_BUFFERS[:3]) | (
+            {"kda_state_tok"} if kda_draft_records else set(_KDA_REPLAY_BUFFERS[3:])
+        )
+        shared_roles = {"prev_num_accepted_tokens"}
+    else:
+        mgr = _build_v2_hybrid_with_mamba_layer(
+            num_mamba_layers=2,
+            spec_config=MTPDecodingConfig(max_draft_len=2),
+            use_replay_state_update=True,
+            model_manager_cls=manager_cls,
+            conv_state_layout="x_b_c" if manager_cls is NemotronHybridCacheManager else "q_k_v",
+        )
+        replay_roles = {"old_x", "old_B", "old_dt", "old_dA_cumsum"}
+        shared_roles = {"prev_num_accepted_tokens", "cache_buf_idx"}
+    try:
+        config = mgr.impl.init_config
+        replay_layers = config.layers[mgr.num_local_layers :]
+        assert len(replay_layers) == len(mgr.mamba_pp_layers)
+        for offset, (global_id, replay_layer) in enumerate(zip(mgr.mamba_pp_layers, replay_layers)):
+            core_id = mgr.layer_offsets[global_id]
+            core_roles = {str(buffer.role) for buffer in config.layers[core_id].buffers}
+            assert core_roles == {str(MambaRole.SSM_STATE), str(MambaRole.CONV_STATE)}
+            assert isinstance(replay_layer, SsmLayerConfig)
+            roles = {str(buffer.role) for buffer in replay_layer.buffers}
+            assert roles == replay_roles | (shared_roles if offset == 0 else set())
+            assert mgr.impl.get_layer_group_id(
+                replay_layer.layer_id
+            ) == mgr.impl.get_layer_group_id(core_id)
+            payload = mgr.mamba_layer_cache(global_id)
+            for name in roles:
+                assert getattr(payload, name).data_ptr() == mgr.impl.get_mem_pool_base_address(
+                    replay_layer.layer_id, DataRole(name), PageIndexMode.SHARED
+                )
         ignored = {str(role) for role in mgr.get_disagg_ignored_roles()}
-        assert replay_roles | {"prev_num_accepted_tokens"} <= ignored
+        assert replay_roles | shared_roles <= ignored
+        table = build_page_table_from_manager(mgr)
+        for group in table.layer_groups:
+            for view in group.pool_views:
+                assert not set(view.pool_role) & (replay_roles | shared_roles)
     finally:
         mgr.shutdown()
 
 
 @skip_no_cuda
-def test_v2_kda_replay_acceptance_and_cuda_graph():
-    mgr = _build_kda_replay_manager()
+@pytest.mark.parametrize(
+    "manager_cls",
+    [
+        KimiK3HybridCacheManager,
+        Glm5NextCacheManager,
+        NemotronHybridCacheManager,
+        Qwen35HybridCacheManager,
+        Qwen4ExpHybridCacheManager,
+    ],
+)
+def test_v2_replay_acceptance_and_cuda_graph(manager_cls):
+    is_kda = manager_cls in (KimiK3HybridCacheManager, Glm5NextCacheManager)
+    if is_kda:
+        mgr = _build_kda_replay_manager(model_manager_cls=manager_cls)
+    else:
+        mgr = _build_v2_hybrid_with_mamba_layer(
+            num_mamba_layers=2,
+            spec_config=MTPDecodingConfig(max_draft_len=2),
+            use_replay_state_update=True,
+            model_manager_cls=manager_cls,
+            conv_state_layout="x_b_c" if manager_cls is NemotronHybridCacheManager else "q_k_v",
+        )
     try:
         requests = [_make_v2_conversation_request(i, list(range(8)), str(i)) for i in (101, 102)]
         for req in requests:
@@ -5901,10 +5955,13 @@ def test_v2_kda_replay_acceptance_and_cuda_graph():
         with torch.cuda.graph(graph):
             mgr.update_mamba_states(metadata, accepted, state_indices=slots)
         accepted[0] = 2
+        if not is_kda:
+            counts[slots[0]] = 14
+            mgr.mamba_layer_cache(0).cache_buf_idx[slots[0]] = 0
         graph.replay()
         for layer_id in range(2):
             assert mgr.mamba_layer_cache(layer_id).prev_num_accepted_tokens[slots].tolist() == [
-                1,
+                1 if is_kda else 2,
                 1,
             ]
     finally:
@@ -5951,19 +6008,49 @@ def test_v2_kda_worker_role_cache(monkeypatch, role, is_disagg, manager_cls):
 
 
 @skip_no_cuda
-@pytest.mark.parametrize("kda_draft_records", [False, True], ids=["replay_caches", "draft_records"])
+@pytest.mark.parametrize(
+    "manager_cls,kda_draft_records",
+    [
+        (KimiK3HybridCacheManager, False),
+        (KimiK3HybridCacheManager, True),
+        (Glm5NextCacheManager, False),
+        (NemotronHybridCacheManager, False),
+        (Qwen35HybridCacheManager, False),
+        (Qwen4ExpHybridCacheManager, False),
+    ],
+)
 @pytest.mark.parametrize("snapshot", [False, True])
-def test_v2_kda_replay_survives_cache_lifecycle(snapshot, kda_draft_records):
-    """KVCM moves the replay caches, or the drafts' records in their place, with the recurrent state through
-    suspend, offload to host and snapshot reuse."""
-    mgr = _build_kda_replay_manager(
+def test_v2_replay_survives_cache_lifecycle(snapshot, manager_cls, kda_draft_records):
+    """Replay state follows its recurrent checkpoint through offload and snapshot reuse."""
+    is_kda = manager_cls in (KimiK3HybridCacheManager, Glm5NextCacheManager)
+    options = dict(
         host_cache_size=16 << 20,
         enable_stats=True,
-        kda_draft_records=kda_draft_records,
         enable_block_reuse=True,
+        model_manager_cls=manager_cls,
     )
-    replay_fields = (*mgr._kda_replay_layout(), "prev_num_accepted_tokens")
-    assert ("kda_state_tok" in replay_fields) == kda_draft_records
+    if is_kda:
+        mgr = _build_kda_replay_manager(kda_draft_records=kda_draft_records, **options)
+        replay_fields = (
+            *mgr._kda_replay.pool_layout(mgr._state_layout),
+            "prev_num_accepted_tokens",
+        )
+    else:
+        mgr = _build_v2_hybrid_with_mamba_layer(
+            num_mamba_layers=2,
+            spec_config=MTPDecodingConfig(max_draft_len=2),
+            use_replay_state_update=True,
+            conv_state_layout="x_b_c" if manager_cls is NemotronHybridCacheManager else "q_k_v",
+            **options,
+        )
+        replay_fields = (
+            "old_x",
+            "old_B",
+            "old_dt",
+            "old_dA_cumsum",
+            "prev_num_accepted_tokens",
+            "cache_buf_idx",
+        )
     assert mgr.reuse_match_backoff == 0
     kv = None
     reused = None
@@ -5982,7 +6069,11 @@ def test_v2_kda_replay_survives_cache_lifecycle(snapshot, kda_draft_records):
             for offset, name in enumerate((*replay_fields, "conv", "temporal")):
                 tensor = getattr(cache, name)
                 # Accepted counts describe the request and are shared across layers.
-                value = offset + 1 if name == "prev_num_accepted_tokens" else offset + layer_id + 1
+                value = (
+                    offset + 1
+                    if name in ("prev_num_accepted_tokens", "cache_buf_idx")
+                    else offset + layer_id + 1
+                )
                 tensor[slot].fill_(value)
                 fields[name] = tensor[slot].clone()
             expected.append(fields)
@@ -6092,12 +6183,14 @@ def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
         gen.shutdown()
 
 
-def _kda_cache_budget(monkeypatch, available, model, mapping, **kwargs):
+def _kda_cache_budget(
+    monkeypatch, available, model, mapping, *, manager_cls=KimiK3HybridCacheManager, **kwargs
+):
     from tensorrt_llm._torch.modules.kimi_kda import _kda_kernels
 
     monkeypatch.setattr(_kda_kernels, "is_kda_mtp_verify_available", lambda: available)
     monkeypatch.setattr(_kda_kernels, "kda_mtp_max_num_spec", lambda: 7)
-    return KimiK3HybridCacheManager.get_cache_size_per_token(model, mapping, **kwargs)
+    return manager_cls.get_cache_size_per_token(model, mapping, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -6111,14 +6204,16 @@ def _kda_cache_budget(monkeypatch, available, model, mapping, **kwargs):
     ],
 )
 @pytest.mark.parametrize("interval,replay_slope", [(0, 0), (32, 95), (33, 92), (48, 63), (256, 0)])
+@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
 def test_kda_cache_budget_accounts_for_replay_role(
-    monkeypatch, role, is_disagg, available, interval, replay_slope
+    monkeypatch, role, is_disagg, available, interval, replay_slope, manager_cls
 ):
     if role is None:
         monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
     else:
         monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
     model = _kimi_model_config()
+    model.pretrained_config.index_head_dim = 8
     spec_config = MTPDecodingConfig(max_draft_len=2)
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     kwargs = dict(
@@ -6132,8 +6227,12 @@ def test_kda_cache_budget_accounts_for_replay_role(
         spec_config=spec_config,
         is_disagg=is_disagg,
     )
-    baseline = _kda_cache_budget(monkeypatch, False, model, mapping, **kwargs)
-    result = _kda_cache_budget(monkeypatch, available, model, mapping, **kwargs)
+    baseline = _kda_cache_budget(
+        monkeypatch, False, model, mapping, manager_cls=manager_cls, **kwargs
+    )
+    result = _kda_cache_budget(
+        monkeypatch, available, model, mapping, manager_cls=manager_cls, **kwargs
+    )
     if available and not (is_disagg and role == "context"):
         # Two layers: three BF16 [5,32] conv windows, two BF16 and one
         # FP32 [2,32] histories and BF16 [2,8] padded beta per layer;
@@ -6255,3 +6354,33 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
 
 
 _KDA_REPLAY_FIELDS = (*_KDA_REPLAY_BUFFERS, "prev_num_accepted_tokens")
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "manager_cls",
+    [NemotronHybridCacheManager, Qwen35HybridCacheManager, Qwen4ExpHybridCacheManager],
+)
+def test_v2_replay_context_worker_state(monkeypatch, manager_cls):
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=2,
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        use_replay_state_update=True,
+        model_manager_cls=manager_cls,
+        is_disagg=True,
+        conv_state_layout="x_b_c" if manager_cls is NemotronHybridCacheManager else "q_k_v",
+    )
+    try:
+        req = _make_v2_conversation_request(123, list(range(8)), "context")
+        _run_v2_hybrid_context(mgr, req, state_value=3)
+        assert mgr.get_replay_state_update_metadata() is not None
+        assert mgr.intermediate_conv_states is not None
+        assert mgr.intermediate_ssm_states is None
+        slot = mgr.get_state_indices([123])[0]
+        for layer in range(2):
+            cache = mgr.mamba_layer_cache(layer)
+            assert torch.all(cache.conv[slot] == 3)
+            assert torch.all(cache.temporal[slot] == 3)
+    finally:
+        mgr.shutdown()

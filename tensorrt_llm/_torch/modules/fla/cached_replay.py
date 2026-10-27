@@ -24,6 +24,15 @@ _L2_STREAMING_HEAD_TILES = 8192
 CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE = 16
 
 
+def _validate_history_inner_strides(tensor: torch.Tensor, slot_dims: int) -> None:
+    """History entries are dense within a slot; pool slot/layer strides may vary."""
+    stride = 1
+    for dim in range(tensor.ndim - 1, slot_dims - 1, -1):
+        if tensor.shape[dim] > 1 and tensor.stride(dim) != stride:
+            raise ValueError("Replay history must be dense within each slot")
+        stride *= tensor.shape[dim]
+
+
 def _default_cached_replay_block_v(
     use_tuned_bf16_mapping: bool,
     head_tiles: int,
@@ -81,6 +90,11 @@ def _cached_replay_kernel(
     pnat,
     scale,
     pool_stride_slot,
+    old_u_stride_slot,
+    old_k_stride_slot,
+    old_G_stride_slot,
+    pnat_stride,
+    buffer_stride,
     g_stride_row,
     beta_stride_row,
     A_log,
@@ -126,19 +140,19 @@ def _cached_replay_kernel(
 
     slot = tl.load(h0_indices + i_n)
     if slot >= 0:
-        b_pnat = tl.load(pnat + slot)
-        b_buf = tl.load(cache_buf_idx + slot)
+        b_pnat = tl.load(pnat + slot * pnat_stride)
+        b_buf = tl.load(cache_buf_idx + slot * buffer_stride)
         is_write = (b_pnat + T) > HIST
         w_buf = tl.where(is_write, 1 - b_buf, b_buf)
         w_off = tl.where(is_write, 0, b_pnat)
         is_hist = (o_hist < b_pnat) & mask_hist_capacity
 
-        hk_base = old_k + (slot.to(tl.int64) * 2 + b_buf) * HIST * H * K + i_h * K
-        hu_base = old_u + (slot.to(tl.int64) * 2 + b_buf) * HIST * HV * V + i_hv * V
-        hG_base = old_G + ((slot.to(tl.int64) * 2 + b_buf) * HV + i_hv) * HIST
-        wk_base = old_k + (slot.to(tl.int64) * 2 + w_buf) * HIST * H * K + i_h * K
-        wu_base = old_u + (slot.to(tl.int64) * 2 + w_buf) * HIST * HV * V + i_hv * V
-        wG_base = old_G + ((slot.to(tl.int64) * 2 + w_buf) * HV + i_hv) * HIST
+        hk_base = old_k + slot.to(tl.int64) * old_k_stride_slot + b_buf * HIST * H * K + i_h * K
+        hu_base = old_u + slot.to(tl.int64) * old_u_stride_slot + b_buf * HIST * HV * V + i_hv * V
+        hG_base = old_G + slot.to(tl.int64) * old_G_stride_slot + (b_buf * HV + i_hv) * HIST
+        wk_base = old_k + slot.to(tl.int64) * old_k_stride_slot + w_buf * HIST * H * K + i_h * K
+        wu_base = old_u + slot.to(tl.int64) * old_u_stride_slot + w_buf * HIST * HV * V + i_hv * V
+        wG_base = old_G + slot.to(tl.int64) * old_G_stride_slot + (w_buf * HV + i_hv) * HIST
 
         if USE_L2_SHARED_INPUTS:
             b_kh = tl.load(
@@ -401,6 +415,9 @@ def _cached_replay_layered_commit_kernel(
     pool_stride_layer,
     pool_stride_slot,
     old_u_stride_layer,
+    old_u_stride_slot,
+    old_k_stride_slot,
+    old_G_stride_slot,
     old_k_stride_layer,
     old_G_stride_layer,
     HIST: tl.constexpr,
@@ -452,12 +469,25 @@ def _cached_replay_layered_commit_kernel(
         is_hist = (o_hist < b_pnat) & (o_hist < HIST)
 
         hk_base = (
-            old_k + layer_i64 * old_k_stride_layer + (slot * 2 + b_buf) * HIST * H * K + i_h * K
+            old_k
+            + layer_i64 * old_k_stride_layer
+            + slot * old_k_stride_slot
+            + b_buf * HIST * H * K
+            + i_h * K
         )
         hu_base = (
-            old_u + layer_i64 * old_u_stride_layer + (slot * 2 + b_buf) * HIST * HV * V + i_hv * V
+            old_u
+            + layer_i64 * old_u_stride_layer
+            + slot * old_u_stride_slot
+            + b_buf * HIST * HV * V
+            + i_hv * V
         )
-        hG_base = old_G + layer_i64 * old_G_stride_layer + ((slot * 2 + b_buf) * HV + i_hv) * HIST
+        hG_base = (
+            old_G
+            + layer_i64 * old_G_stride_layer
+            + slot * old_G_stride_slot
+            + (b_buf * HV + i_hv) * HIST
+        )
 
         if USE_L2_SHARED_INPUTS:
             b_kh = tl.load(
@@ -592,7 +622,8 @@ def commit_gdn_cached_replay_history_layers(
     assert old_u.shape[0] == num_layers and old_u.shape[-2:] == (HV, V)
     assert old_k.shape[0] == num_layers and old_k.shape[-1] == K
     assert old_G.shape[0] == num_layers and old_G.shape[-2:] == (HV, history_size)
-    assert old_u.is_contiguous() and old_k.is_contiguous() and old_G.is_contiguous()
+    for tensor in (old_u, old_k, old_G):
+        _validate_history_inner_strides(tensor, 2)
     assert replay_work_items.ndim == 2 and replay_work_items.shape[1] == 4
     assert replay_work_items.dtype == torch.int32
     assert n_writes.dtype == torch.int32 and n_writes.numel() == 1
@@ -657,6 +688,9 @@ def commit_gdn_cached_replay_history_layers(
         n_writes=n_writes,
         pool_stride_layer=pool_stride_layer,
         pool_stride_slot=pool_stride_slot,
+        old_u_stride_slot=old_u.stride(1),
+        old_k_stride_slot=old_k.stride(1),
+        old_G_stride_slot=old_G.stride(1),
         old_u_stride_layer=old_u.stride(0),
         old_k_stride_layer=old_k.stride(0),
         old_G_stride_layer=old_G.stride(0),
@@ -821,7 +855,7 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
     s_h0_0, s_h0_1, s_h0_2, s_h0_3 = ssm_states.stride()
     assert s_h0_3 == 1 and s_h0_2 == K and s_h0_1 == V * K
     for name, tensor in (("old_u", old_u), ("old_k", old_k), ("old_G", old_G)):
-        assert tensor.is_contiguous(), f"{name} must be contiguous"
+        _validate_history_inner_strides(tensor, 1)
     if (replay_work_items is None) != (n_writes is None):
         raise ValueError("replay_work_items and n_writes must either both be set or both be None")
     if replay_work_items is not None:
@@ -864,6 +898,11 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
             pnat=prev_num_accepted_tokens,
             scale=scale,
             pool_stride_slot=s_h0_0,
+            old_u_stride_slot=old_u.stride(0),
+            old_k_stride_slot=old_k.stride(0),
+            old_G_stride_slot=old_G.stride(0),
+            pnat_stride=prev_num_accepted_tokens.stride(0),
+            buffer_stride=cache_buf_idx.stride(0),
             g_stride_row=g.stride(1),
             beta_stride_row=beta.stride(1),
             A_log=A_log,

@@ -43,6 +43,8 @@ def _prepare_gdn_replay_work_items_kernel(
     work_items,
     n_writes_output,
     num_decodes,
+    pnat_stride: tl.constexpr,
+    buffer_stride: tl.constexpr,
     replay_step_width: tl.constexpr,
     replay_history_size: tl.constexpr,
     work_item_width: tl.constexpr,
@@ -56,8 +58,12 @@ def _prepare_gdn_replay_work_items_kernel(
     offsets = tl.arange(0, BLOCK_SIZE)
     active = offsets < num_decodes
     slots = tl.load(state_indices + offsets, mask=active, other=0)
-    pnat = tl.load(prev_num_accepted_tokens + slots, mask=active, other=0)
-    active_buffer = tl.load(cache_buf_idx + slots, mask=active, other=0)
+    pnat = tl.load(prev_num_accepted_tokens + slots * pnat_stride,
+                   mask=active,
+                   other=0)
+    active_buffer = tl.load(cache_buf_idx + slots * buffer_stride,
+                            mask=active,
+                            other=0)
     writes = active & (pnat + replay_step_width > replay_history_size)
     writes_i32 = writes.to(tl.int32)
     inclusive_write_offsets = tl.cumsum(writes_i32, axis=0)
@@ -91,6 +97,8 @@ def _build_replay_work_items_triton(state_indices, prev_num_accepted_tokens,
         work_items,
         n_writes,
         num_decodes,
+        pnat_stride=prev_num_accepted_tokens.stride(0),
+        buffer_stride=cache_buf_idx.stride(0),
         replay_step_width=replay_step_width,
         replay_history_size=replay_history_size,
         work_item_width=REPLAY_WORK_ITEM_WIDTH,

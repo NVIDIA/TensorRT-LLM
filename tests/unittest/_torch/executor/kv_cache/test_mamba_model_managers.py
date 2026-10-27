@@ -326,16 +326,11 @@ def test_k3_initializes_only_the_selected_state(
     manager._state_layout = object()
     manager.all_ssm_states, manager.all_conv_states = [], []
     pool_bind = Mock()
-    monkeypatch.setitem(
-        manager_cls._setup_model_state.__globals__, "bind_kda_replay_pool", pool_bind
-    )
+    monkeypatch.setattr(manager, "_bind_speculative_pool_buffers", pool_bind)
     bind = Mock()
     monkeypatch.setattr(state, "bind", bind)
     manager._setup_model_state()
-    if num_spec is not None:
-        pool_bind.assert_called_once_with(state, manager)
-    else:
-        pool_bind.assert_not_called()
+    pool_bind.assert_called_once_with()
     bind.assert_called_once_with(
         manager._state_layout, manager.all_ssm_states, manager.all_conv_states
     )
@@ -415,6 +410,7 @@ def test_common_manager_consumes_model_state_contract(state, monkeypatch):
     manager.all_ssm_states = views.all_ssm_states
     manager.all_conv_states = views.all_conv_states
     manager.mamba_layer_offsets = {42: 0}
+    monkeypatch.setattr(manager, "_bind_speculative_pool_buffers", Mock())
     manager._setup_model_state()
     assert manager.intermediate_state_indices is state.intermediate_indices
     assert manager.intermediate_ssm_states is state.intermediate_ssm
@@ -481,6 +477,7 @@ def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
     monkeypatch.setattr(state, "reset_slots", reset)
     monkeypatch.setattr(state, "update", update)
     monkeypatch.setattr(state, "make_layer_cache", layer_cache)
+    monkeypatch.setattr(manager, "_bind_speculative_pool_buffers", Mock())
     manager._setup_model_state()
     bind.assert_called_once_with(
         manager._state_layout, manager.all_ssm_states, manager.all_conv_states
@@ -623,6 +620,7 @@ def test_warmup_cleanup_clears_registered_persistent_roles_only(
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     manager._setup_states()
     manager._speculative_state = GDNReplayState(3) if replay else GDNIntermediateState()
+    monkeypatch.setattr(manager, "_bind_speculative_pool_buffers", Mock())
     manager._setup_model_state()
     state = manager._speculative_state
     scratch_before = {}
@@ -1051,16 +1049,13 @@ def test_mamba2_seed_lifecycle_does_not_require_speculative_decoding():
 
 
 def test_replay_and_intermediate_are_independent_algorithms():
-    assert KDAIntermediateState.__bases__ == (object,)
-    assert GDNIntermediateState.__bases__ == (object,)
-    assert KDAReplayState.__bases__ == (object,)
-    assert ReplayHistory.__bases__ == (object,)
-    assert GDNReplayState.__bases__ == (object,)
+    assert not issubclass(KDAReplayState, KDAIntermediateState)
+    assert not issubclass(GDNReplayState, GDNIntermediateState)
+    assert not issubclass(ReplayHistory, Mamba2State)
     assert not issubclass(GDNReplayState, ReplayHistory)
     assert ReplayHistory.__module__.endswith("modules.mamba.cache_manager")
     assert GDNReplayState.__module__.endswith("modules.fla.cache_manager")
     assert not any("modules.mamba" in cls.__module__ for cls in GDNReplayState.__mro__)
-    assert Mamba2State.__bases__ == (object,)
     assert not issubclass(ReplayHistory, GDNIntermediateState)
     assert not issubclass(GDNReplayState, Mamba2State)
     assert ReplayHistory(3).intermediate_ssm is None

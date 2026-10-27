@@ -23,8 +23,9 @@ else:
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     MambaLayerCache,
-    MambaRole,
+    MambaStateBuffer,
     MambaStateLayout,
+    MambaStateStorage,
     _get_local_mamba_cache_layout,
     _mamba_effective_tp_size,
     _promote_intermediate_states,
@@ -35,7 +36,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_man
 )
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 
 _MAMBA_SSM_SEED_MASK = (1 << 62) - 1
 _MAMBA_SSM_UINT64_MASK = (1 << 64) - 1
@@ -296,7 +297,7 @@ class KDAIntermediateLayerCache(MambaLayerCache):
     intermediate_ssm: torch.Tensor | None = None
 
 
-class KDAIntermediateState:
+class KDAIntermediateState(MambaStateStorage):
     """Own conventional speculative intermediate states and promotion."""
 
     def __init__(self) -> None:
@@ -383,7 +384,7 @@ class KDAIntermediateState:
         )
 
 
-class KDAReplayState:
+class KDAReplayState(MambaStateStorage):
     """Own all V2 state used by the KDA fused multi-token verifier."""
 
     @property
@@ -462,21 +463,30 @@ class KDAReplayState:
             draft_records=self.draft_records,
         )
 
-    def pool_buffer_configs(self, context: MambaStateLayout, layer_id: int) -> list[BufferConfig]:
+    @override
+    def pool_buffer_specs(self, context: MambaStateLayout) -> tuple[MambaStateBuffer, ...]:
         layout = self.pool_layout(context)
-        buffers = [
-            BufferConfig(role=DataRole(name), size=dtype.itemsize * math.prod(shape))
-            for name, (dtype, shape) in layout.items()
-        ]
-        if layout and layer_id == context.mamba_pp_layers[0]:
-            buffers.append(BufferConfig(role=_KDA_REPLAY_COUNT_ROLE, size=_KDA_REPLAY_COUNT_BYTES))
-        return buffers
+        if not layout:
+            return ()
+        return (
+            *(
+                MambaStateBuffer(name, dtype, tuple(shape))
+                for name, (dtype, shape) in layout.items()
+            ),
+            MambaStateBuffer(str(_KDA_REPLAY_COUNT_ROLE), torch.int32, (4,), shared=True),
+        )
 
-    def disagg_ignored_roles(self, context: MambaStateLayout) -> frozenset[DataRole]:
-        roles = {DataRole(name) for name in self.pool_layout(context)}
-        if roles:
-            roles.add(_KDA_REPLAY_COUNT_ROLE)
-        return frozenset(roles)
+    @override
+    def bind_pool_buffers(
+        self, layers: list[dict[str, torch.Tensor]], shared: dict[str, torch.Tensor]
+    ) -> None:
+        self.pool_layers = []
+        for views in layers:
+            layer = dict(views)
+            for name in _KDA_REPLAY_CONV_ROLES:
+                layer[name] = layer[name].transpose(-1, -2)
+            self.pool_layers.append(layer)
+        self.prev_num_accepted_tokens = shared[str(_KDA_REPLAY_COUNT_ROLE)][..., 0]
 
     def _layer_bytes_per_slot(self, section_dim: int, committed_window: int, num_heads: int) -> int:
         extended_window = committed_window + self.num_speculative_tokens
@@ -513,8 +523,6 @@ class KDAReplayState:
     @classmethod
     def estimate_bytes_per_slot(cls, model_config, mapping: Mapping, **kwargs) -> int:
         """Estimate rank-local replay storage using the runtime replay gate and geometry."""
-        if _is_disagg_context_server(kwargs.get("is_disagg", False)):
-            return 0
         spec_config = kwargs.get("spec_config")
         num_spec = kwargs.get("kda_replay_num_spec")
         if num_spec is None:
@@ -564,6 +572,12 @@ class KDAReplayState:
         self._conv_section_dims = context.conv_section_dims
         self._ssm_states = tuple(ssm_states)
         self._conv_states = tuple(conv_states)
+        if self.pool_layers is not None:
+            for layer in self.pool_layers:
+                if "kda_beta_cache" in layer:
+                    layer["kda_beta_cache"] = layer["kda_beta_cache"][
+                        ..., : context.ssm_state_shape[0]
+                    ]
         self._committed_window = context.conv_state_shape[1] if conv_states else 0
         states = ssm_states
         if not states:
@@ -812,56 +826,6 @@ class KDAReplayState:
         self.rand_seed = None
 
 
-def bind_kda_replay_pool(state: KDAReplayState, manager: MambaHybridCacheManagerV2) -> None:
-    """Bind model-owned KDA replay roles to views of the manager's native pools."""
-    layout = state.pool_layout(manager._state_layout)
-    if not layout:
-        return
-    required = {
-        (manager.layer_offsets[layer_id], str(role))
-        for layer_id in manager.mamba_pp_layers
-        for role in (MambaRole.SSM_STATE, MambaRole.CONV_STATE, *layout)
-    }
-    required.add((manager.layer_offsets[manager.mamba_pp_layers[0]], str(_KDA_REPLAY_COUNT_ROLE)))
-    if not any(
-        required.issubset(
-            {
-                (int(buffer_id.layer_id), str(buffer_id.role))
-                for coalesced in variant.coalesced_buffers
-                for buffer_id in coalesced.buffer_ids
-            }
-        )
-        for group in manager.impl.pool_group_descs
-        for variant in group.slot_desc.variants
-    ):
-        raise RuntimeError(
-            "KDA replay and recurrent-state buffers must share one KVCM "
-            "pool group and lifecycle to reuse the same logical slot index"
-        )
-
-    state.pool_layers = []
-    for layer_id in manager.mamba_pp_layers:
-        layer = {}
-        for name, (dtype, shape) in layout.items():
-            view = manager._get_state_buffer(
-                manager.layer_offsets[layer_id], DataRole(name), dtype, shape
-            )
-            if name in _KDA_REPLAY_CONV_ROLES:
-                view = view.transpose(-1, -2)
-            elif name == "kda_beta_cache":
-                view = view[..., : manager.ssm_state_shape[0]]
-            if view.shape[0] != manager._state_layout.slot_capacity:
-                raise RuntimeError(f"KDA replay buffer {name} has a different slot capacity")
-            layer[name] = view
-        state.pool_layers.append(layer)
-    state.prev_num_accepted_tokens = manager._get_state_buffer(
-        manager.layer_offsets[manager.mamba_pp_layers[0]],
-        _KDA_REPLAY_COUNT_ROLE,
-        torch.int32,
-        [_KDA_REPLAY_COUNT_BYTES // torch.int32.itemsize],
-    )[..., 0]
-
-
 def select_kda_replay_state(
     *,
     spec_config: object | None,
@@ -962,42 +926,6 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         return self._kda_replay.pool_layout(self._state_layout)
 
     @override
-    def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
-        buffers = super()._get_recurrent_buffer_configs(global_layer_id)
-        if self._kda_replay is not None:
-            buffers.extend(
-                self._kda_replay.pool_buffer_configs(self._state_layout, global_layer_id)
-            )
-        return buffers
-
-    @override
-    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
-        roles = super().get_disagg_ignored_roles()
-        if self._kda_replay is not None:
-            roles |= self._kda_replay.disagg_ignored_roles(self._state_layout)
-        return roles
-
-    @override
-    def _setup_model_state(self) -> None:
-        if self._kda_replay is not None:
-            bind_kda_replay_pool(self._kda_replay, self)
-        super()._setup_model_state()
-
-    @override
-    def _build_cache_config(self, config):
-        if (
-            self._kda_replay is not None
-            and self.local_num_mamba_layers > 0
-            and self.kv_cache_config.enable_kv_pool_rebalance
-        ):
-            raise ValueError(
-                "KDA replay views are bound once to the SSM pool's slot count, "
-                "and a rebalance can grow that pool past them: set "
-                "kv_cache_config.enable_kv_pool_rebalance=False."
-            )
-        return super()._build_cache_config(config)
-
-    @override
     def suspend_request(self, request) -> None:
         replay = self._kda_replay
         request_id = request.py_request_id
@@ -1079,6 +1007,8 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     @classmethod
     @override
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
+        if _is_disagg_context_server(kwargs.get("is_disagg", False)):
+            return 0
         return KDAReplayState.estimate_bytes_per_slot(model_config, mapping, **kwargs)
 
     @override
@@ -1251,7 +1181,6 @@ __all__ = [
     "KDAReplayLayerCache",
     "KimiK3HybridCacheManager",
     "allocate_kda_replay_fields",
-    "bind_kda_replay_pool",
     "get_kda_replay_num_spec",
     "get_kimi_cache_params",
     "resolve_kimi_ssm_cache_dtype",

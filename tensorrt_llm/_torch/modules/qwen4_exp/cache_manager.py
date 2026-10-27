@@ -30,6 +30,7 @@ from tensorrt_llm._torch.modules.fla.cache_manager import (
     GDNReplayState,
     ReplayStateUpdateMetadata,
     create_gdn_state,
+    estimate_gdn_replay_bytes,
     validate_gdn_layout,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import resolve_hf_torch_dtype
@@ -687,7 +688,7 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         ]
 
     @override
-    def _initialize_spec_state(self) -> GDNIntermediateState | GDNReplayState:
+    def _initialize_spec_state(self) -> GDNIntermediateState | GDNReplayState | None:
         state = create_gdn_state(self, self._requested_replay)
 
         validate_gdn_layout(self, state)
@@ -730,7 +731,9 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
             is_draft=False,
             use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
         )
-        return _qwen4_exp_ple_state_bytes_per_rank(
+        return estimate_gdn_replay_bytes(
+            model_config, mapping, **kwargs
+        ) + _qwen4_exp_ple_state_bytes_per_rank(
             model_config,
             params,
             mapping,
@@ -743,6 +746,10 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
         self._ple_conv_states.clear()
         self._ple_ngram_contexts.clear()
         super().shutdown()
+
+    @override
+    def _extra_scratch_bytes_per_slot(self) -> int:
+        return 8 if isinstance(self._speculative_state, GDNReplayState) else 0
 
     def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
         state = self._speculative_state
