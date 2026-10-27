@@ -102,6 +102,7 @@ from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
 from ..moe.fused_moe.moe_op_backend import TRTLLMOpBackend
+from ..pyexecutor.dwdp import get_global_dwdp_manager, set_global_dwdp_manager
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel
@@ -1959,10 +1960,20 @@ class MuseSparkOpenMoE(nn.Module):
             and (self.mapping.moe_tp_size == self.mapping.tp_size)
             and not self.mapping.enable_attention_dp
         )
-        if not (pure_ep or pure_tp):
+        # DWDP: every rank -- an attention-DP rank, or a TP1 context worker --
+        # is a complete replica (Mapping forces MoE TP = EP = 1) that
+        # prefetches its peers' experts, so the MoE has no comm and forward
+        # finalizes locally with no reduce.
+        self._dwdp_local = (
+            getattr(self.mapping, "dwdp_enabled", False)
+            and self.mapping.moe_ep_size == 1
+            and self.mapping.moe_tp_size == 1
+            and (self.mapping.enable_attention_dp or self.mapping.tp_size == 1)
+        )
+        if not (pure_ep or pure_tp or self._dwdp_local):
             raise ValueError(
                 "MuseSparkOpen requires MoE EP == attention TP with MoE TP == 1, "
-                "or pure MoE TP without attention DP, got "
+                "pure MoE TP without attention DP, or DWDP, got "
                 f"moe_tp_size={self.mapping.moe_tp_size}, "
                 f"moe_ep_size={self.mapping.moe_ep_size}, "
                 f"tp_size={self.mapping.tp_size}, "
@@ -2025,6 +2036,8 @@ class MuseSparkOpenMoE(nn.Module):
         # triple on every layer, and the generic BF16 fallback
         # (CutlassFusedMoE) does not provide it. The MEGAMOE families have no
         # BF16 member at all, so those requests also drop to TRTLLM here.
+        # So do CUTEDSL requests: CuteDslFusedMoE's BF16 path is SM107-only,
+        # so on SM100/SM103 a BF16 layer would fall back to Cutlass.
         layer_model_config = model_config
         layer_quant_config = None
         global_quant_config = model_config.quant_config
@@ -2041,30 +2054,59 @@ class MuseSparkOpenMoE(nn.Module):
             if str(getattr(model_config, "moe_backend", "")).upper() in (
                 "MEGAMOE_CUTEDSL",
                 "MEGAMOE_DEEPGEMM",
+                "CUTEDSL",
             ):
                 layer_model_config = copy.copy(model_config)
                 layer_model_config._frozen = False
                 layer_model_config.moe_backend = "TRTLLM"
                 layer_model_config._frozen = True
-        self.experts = create_moe(
-            routing_method=MuseSparkOpenRoutingMethod(
-                top_k=self.top_k,
+        # DWDP: this rank is a complete replica that only ever sees its own
+        # tokens, so the experts are built on a mapping without attention DP --
+        # no comm strategy (the factory would pick an all-to-all for moe_ep 1
+        # under attention DP) and no DP-padding truncation, which would slice
+        # the unfinalized triple. The NVFP4-excluded BF16 layers have no DWDP
+        # backend: hide the manager while they are built, or MoE.__init__
+        # would shrink them to this rank's num_experts_per_worker slots with
+        # nothing to prefetch the rest.
+        dwdp_manager = get_global_dwdp_manager() if self._dwdp_local else None
+        if dwdp_manager is not None:
+            layer_model_config = copy.copy(layer_model_config)
+            layer_model_config._frozen = False
+            layer_model_config.mapping = Mapping(
+                **{**self.mapping.to_dict(), "enable_attention_dp": False}
+            )
+            layer_model_config._frozen = True
+        hide_dwdp = dwdp_manager is not None and layer_quant_config is not None
+        if hide_dwdp:
+            set_global_dwdp_manager(None)
+        try:
+            self.experts = create_moe(
+                routing_method=MuseSparkOpenRoutingMethod(
+                    top_k=self.top_k,
+                    num_experts=self.num_experts,
+                    callable_e_score_correction_bias=lambda: self.expert_bias,
+                    renorm_eps=config.router_score_division_eps,
+                ),
                 num_experts=self.num_experts,
-                callable_e_score_correction_bias=lambda: self.expert_bias,
-                renorm_eps=config.router_score_division_eps,
-            ),
-            num_experts=self.num_experts,
-            hidden_size=self.expert_hidden_size,
-            intermediate_size=config.intermediate_size,
-            dtype=config.torch_dtype,
-            # The per-expert post-norm has to run before the combine, so the
-            # partial sums are reduced by this module, not inside the backend.
-            reduce_results=False,
-            model_config=layer_model_config,
-            aux_stream_dict=aux_stream_dict,
-            layer_idx=layer_idx,
-            override_quant_config=layer_quant_config,
-        )
+                hidden_size=self.expert_hidden_size,
+                intermediate_size=config.intermediate_size,
+                dtype=config.torch_dtype,
+                # The per-expert post-norm has to run before the combine, so the
+                # partial sums are reduced by this module, not inside the backend.
+                reduce_results=False,
+                model_config=layer_model_config,
+                aux_stream_dict=aux_stream_dict,
+                layer_idx=layer_idx,
+                override_quant_config=layer_quant_config,
+            )
+        finally:
+            if hide_dwdp:
+                set_global_dwdp_manager(dwdp_manager)
+        if hide_dwdp:
+            logger.info(
+                f"MuseSparkOpen layer {layer_idx}: BF16 experts have no DWDP "
+                f"backend, so every rank keeps all {self.num_experts} of them"
+            )
         # Under attention DP the MoE layer acquires a cross-rank combine
         # between the expert GEMM and this module, and no combine can carry an
         # unfinalized expert output. Hand the scheduler this module's finalize
@@ -2384,8 +2426,10 @@ class MuseSparkOpenMoE(nn.Module):
                 router_logits,
                 do_finalize=False,
                 output_dtype=hidden_states.dtype,
+                # DWDP experts run on a non-DP mapping (see __init__) and
+                # see only this rank's tokens.
                 all_rank_num_tokens=attn_metadata.all_rank_num_tokens
-                if attn_metadata is not None
+                if attn_metadata is not None and not self._dwdp_local
                 else None,
                 use_dp_padding=False,
             )
