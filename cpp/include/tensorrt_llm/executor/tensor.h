@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,13 +18,13 @@
 
 #include "tensorrt_llm/executor/types.h"
 
-#include "tensorrt_llm/common/arrayView.h"
 #include "tensorrt_llm/common/assert.h"
 
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <span>
 #include <type_traits>
 #include <vector>
 
@@ -48,14 +48,13 @@ using DimType64 = int64_t;
 } // namespace detail
 
 // A thin wrapper around span that supports constructions with an initializer list.
-class Shape : public tensorrt_llm::common::ArrayView<detail::DimType64 const>
+class Shape : public std::span<detail::DimType64 const>
 {
 public:
-    using Base = tensorrt_llm::common::ArrayView<detail::DimType64 const>;
+    using Base = std::span<detail::DimType64 const>;
     using DimType64 = typename std::remove_cv_t<Base::value_type>;
 
-    Shape()
-        : Base{nullptr, 0} {};
+    Shape() = default;
 
     Shape(DimType64 const* data, Base::size_type size)
         : Base{data, size}

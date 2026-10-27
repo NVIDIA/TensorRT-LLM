@@ -7,12 +7,14 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm as op
-from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4.ops.quantization.fp4_quantize import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (  # noqa: E501
     fp4_quantize,
 )
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import (  # noqa: E402 — needs the path declared above
     ULP,
     assert_within_ulp,
@@ -50,7 +52,25 @@ def _operand(rows, k, seed):
     return packed, sf, gs
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
+        Cell(
+            why="deepseek default at attention TP8, shared expert gate+up: 2 x 2048/8 rows",
+            spec=dict(m=16, k=7168, n=512, bias=False),
+        ),
+        Cell(
+            why="deepseek default at attention TP8, shared expert down: K = 2048/8",
+            spec=dict(m=16, k=256, n=7168, bias=False),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell) -> None:
     spec = cell.spec
     seed = zlib.crc32(cell.why.encode()) % 2**31

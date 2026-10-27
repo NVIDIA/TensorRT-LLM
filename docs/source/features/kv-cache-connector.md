@@ -76,12 +76,16 @@ These methods run on the leader process and drive the connector's behavior.
 
     | Set | Models it covers |
     |---|---|
-    | per-layer-group | every model, VSWA included |
+    | per-layer-group | single-layer-group models and VSWA with KVCacheManagerV2 |
     | flat | non-VSWA, non-hybrid only |
 
-    A set is complete when both of its methods are defined. Mixing the two — one method from each — is rejected during executor bring-up, naming the method that is missing. An existing flat connector needs no change on the models it already covers: with a single layer group the base per-layer-group implementation folds back to the flat call. Hybrid / linear-attention models are not enabled for the connector yet; the per-layer-group set is the shape their cache will need. See [Running under VSWA](#running-under-vswa).
+    A set is complete when both of its methods are defined. An existing flat connector needs no change on the models it already covers: with a single layer group the base per-layer-group implementation folds back to the flat call. Hybrid / linear-attention models are not enabled for the connector yet; the per-layer-group set is the shape their cache will need. See [Running under VSWA](#running-under-vswa).
 
 ##### Running under VSWA
+
+KVCacheManagerV2 supports multiple layer groups with a connector implementing the grouped APIs below. KVCacheManagerV1 registers a single primary pool and cannot describe VSWA to a connector. Single-window SWA remains allowed with either manager.
+
+With V2, a connector that transfers KV rejects requests carrying `KvCacheRetentionConfig` when the cache has multiple layer groups: `RequestData.priorities` is a single list and cannot describe priorities per group. This is a request validation error; the service can start and process requests without an explicit retention config. Capacity-only connectors are exempt from this restriction because they do not transfer KV or emit this priority metadata. Native V2 retention without a connector remains supported across layer groups.
 
 Under variable sliding-window attention the KV cache allocates one pool per attention window size, and a page index only means something inside its own layer group. A single tensor and a single flat block list cannot describe that, so three methods have to be implemented together:
 
@@ -93,7 +97,7 @@ Under variable sliding-window attention the KV cache allocates one pool per atte
 
 Implementing the per-layer-group form of a pair is enough — the flat method it replaces does not also have to be defined.
 
-All three are checked during executor bring-up, before any request is admitted. `register_kv_cache_layout` refuses there, naming the group and region counts it could not describe, and the two scheduler methods are checked alongside it. Nothing is deferred to the first request, so a partial implementation costs a start-up failure rather than one after the model is loaded.
+The executor checks that both per-layer-group scheduler callbacks are implemented during bring-up for a multi-group cache. The worker then receives the layout through `register_kv_cache_layout`; its default implementation rejects multiple groups if only flat registration is implemented.
 
 `examples/llm-api/llm_kv_cache_connector_vswa.py` is a worked connector for this case. A VSWA connector has to do five things:
 
@@ -208,9 +212,9 @@ Two `RequestData` fields can be reported empty depending on the cache configurat
 | Field | When empty | Consequence |
 |---|---|---|
 | `block_hashes` | `[]` | No block-hash accessor exists on this path. Nothing in the runtime reads the field, and neither example connector uses it — both hash the token sequence themselves. A connector that keys its external store on `block_hashes` gets no key and therefore no hits and no saves; it does not mis-address a transfer. |
-| `priorities` | `None` | `KvCacheRetentionConfig` is not honoured, so every page carries the default priority. A warning is logged the first time a request carrying a retention config is reported. The gap is wider than the connector: the retention config has no effect either way in that configuration. |
+| `priorities` | `None` when the request has no explicit `KvCacheRetentionConfig` | Priority metadata is omitted; this does not imply that reused pages have default priority. For a single-group V2 cache, requests with an explicit retention config report native page priorities aligned with `new_block_ids`. Multi-group retention requests are rejected as described above. |
 
-Both are gaps to be closed rather than intended behaviour.
+The missing V2 block hashes remain a gap. Omitting priority metadata for requests without an explicit retention config is intentional.
 
 ##### Blocks with no page
 
@@ -456,7 +460,7 @@ says only what the engine then does with the pool.
 | `both` | yes | yes | An aggregated server, or a context server in a disaggregated deployment |
 | `producer` | no | yes | A server that fills the pool for others |
 | `consumer` | yes | no | A server that only replays what others stored |
-| `capacity` | no | no | A generation server: it lends memory and moves no KV |
+| `capacity` | no | no | A generation server: it lends memory and needs no GPUDirect RDMA |
 
 `capacity` is the right role for a disaggregated generation server. Generated tokens are rarely a
 reused prefix, and prompt KV reaches decode over the cache transceiver rather than through the
@@ -494,9 +498,48 @@ sliding-window attention, and `sparse_attention_config` with an index-V cache un
 `sparse_disable_index_value=True`; it bypasses individual requests that carry a LoRA adapter or
 multimodal content without hashes, leaving the rest of the deployment served.
 
-### How pages reach the pool
+### GPUDirect RDMA
 
-Every page passes through a pinned host buffer. `stage_through_host` defaults to `true` and is the
-only supported value today, so `false` is ignored with a warning; registering the KV pools with
-Mooncake instead is planned for a later release. Staging costs a copy each way and needs no
-GPUDirect RDMA. A `capacity` server stages nothing, holding no KV in the pool.
+By default the connector registers the KV pools with Mooncake so the NIC reads and writes pages in
+GPU memory directly. A KV cache manager V2 pool is many `cuMemCreate` allocations mapped back to back,
+and no registration may cross two of them, so the connector registers one allocation at a time.
+Which registration path Mooncake then takes is decided by `WITH_NVIDIA_PEERMEM`, and each path has
+its own preconditions:
+
+| `WITH_NVIDIA_PEERMEM` | Mooncake calls | Requires | Typical failure |
+|---|---|---|---|
+| unset or nonzero (default) | `ibv_reg_mr` | the `nvidia_peermem` kernel module, and KV pools allocated with `gpuDirectRDMACapable=1` | `EFAULT` ("Bad address") |
+| `0` | `ibv_reg_dmabuf_mr` | dma-buf support in the driver and NIC stack | `EINVAL` |
+
+Under `ibv_reg_mr`, a missing module and memory without `gpuDirectRDMACapable` both fail with the
+same `EFAULT` as a range crossing two allocations, so the error code alone does not say which. The
+cache manager asks for `gpuDirectRDMACapable` and logs a warning when the platform refuses it and it
+falls back to memory without it; `nvidia_peermem` cannot register such memory, while dma-buf can.
+
+Hosts with the open kernel modules and no `nvidia_peermem`, common on GB200 and GB300, need the
+dma-buf path. When the protocol is `rdma`, `WITH_NVIDIA_PEERMEM` is unset, neither `nvidia_peermem`
+nor the legacy `nv_peer_mem` module is loaded, and every visible device reports dma-buf support, the
+connector sets `WITH_NVIDIA_PEERMEM=0` itself and logs a warning saying so. A value the deployment
+sets is never overridden.
+
+Mooncake reads `WITH_NVIDIA_PEERMEM` once per process, when the first Mooncake client starts, so the
+connector only chooses for that first client. A later client that registers the KV pools over RDMA
+fails at startup when the path Mooncake already read is not the one it needs, for example after a
+TCP client started first on a host without `nvidia_peermem`. In a process that starts more than one
+Mooncake client, export the variable before the first one.
+
+A failed registration fails startup with a report of what the driver says about each range. At
+debug log level (`TLLM_LOG_LEVEL=debug`) the same report is logged before registering.
+
+The pools are registered once, at startup, and stay registered until shutdown. That is only valid
+while the memory behind them stays mapped, which is why `enable_kv_pool_rebalance` is
+[ignored under a connector](#kv-cache-tiers-are-gpu-only-under-a-connector): a rebalance remaps
+pool memory, and every range would have to be unregistered before it is unmapped and registered
+again afterwards.
+
+### Without GPUDirect RDMA
+
+A host without `nvidia_peermem` usually needs only `WITH_NVIDIA_PEERMEM=0`, which the connector
+selects on its own where it can. When neither path is available, set `stage_through_host: true` to
+copy pages through a pinned host buffer instead, at the cost of a copy each way. A `capacity` server
+needs neither, since it registers no pages.

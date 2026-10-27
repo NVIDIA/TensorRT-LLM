@@ -24,10 +24,15 @@ catch regressions in the FP4 plumbing without needing GPU memory:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import indexer as dsv4_module
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import get_token_bytes
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.indexer import DeepseekV4Indexer
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import DeepseekV4AttentionType
 from tensorrt_llm.llmapi.llm_args import (
     DeepSeekSparseAttentionConfig,
@@ -125,3 +130,90 @@ def test_v4_has_no_separate_indexer_k_cache_dtype_field():
     ``indexer_k_cache_dtype`` knob has been removed."""
     cfg = DeepSeekV4SparseAttentionConfig()
     assert "indexer_k_cache_dtype" not in cfg.model_fields
+
+
+# ---------------------------------------------------------------------------
+# Indexer-Q stream scheduling
+# ---------------------------------------------------------------------------
+
+
+def test_fused_indexer_q_uses_serial_prepare(monkeypatch):
+    """Without a pre-launched aux half, fused Indexer-Q must not overlap the compressor."""
+    monkeypatch.setattr(dsv4_module, "do_multi_stream", lambda: True)
+    calls = []
+
+    def serial_prepare(*_args, **_kwargs):
+        calls.append("serial")
+        return object(), object(), None, None, object()
+
+    def overlapped_prepare(*_args, **_kwargs):
+        raise AssertionError("fused Indexer-Q must not use aux-stream overlap")
+
+    indexer = SimpleNamespace(
+        aux_stream=object(),
+        _is_fused_project_mxfp4_enabled=lambda _dtype: True,
+        _run_serial_indexer_prepare=serial_prepare,
+        _run_overlapped_indexer_prepare=overlapped_prepare,
+    )
+    metadata = SimpleNamespace(empty_topk_indices_buffer=torch.full((4, 2), -1))
+    qr = torch.empty((2, 4), dtype=torch.bfloat16)
+    hidden_states = torch.empty_like(qr)
+    position_ids = torch.arange(2)
+
+    result = DeepseekV4Indexer.forward(
+        indexer,
+        qr,
+        hidden_states,
+        metadata,
+        position_ids,
+    )
+
+    assert calls == ["serial"]
+    assert torch.equal(result, metadata.empty_topk_indices_buffer[:2])
+
+
+def test_overlapped_prepare_records_aux_outputs_on_consumer_stream(monkeypatch):
+    class Recordable:
+        def __init__(self):
+            self.streams = []
+
+        def record_stream(self, stream):
+            self.streams.append(stream)
+
+    class Event:
+        def record(self):
+            return None
+
+        def wait(self):
+            return None
+
+    consumer_stream = object()
+    weights = Recordable()
+    k_fp8 = Recordable()
+    k_scale = Recordable()
+    indexer = SimpleNamespace(
+        aux_stream=object(),
+        indexer_start_event=Event(),
+        weights_proj_event=Event(),
+        k_cache_update_event=Event(),
+        _project_and_quantize_q=lambda _qr, _position_ids: ("q", "q_scale"),
+        weights_proj=lambda _hidden_states: weights,
+        compressor=lambda _hidden_states, _metadata: (k_fp8, k_scale),
+        _update_k_cache_if_needed=lambda *_args: None,
+        _apply_weight_scale=lambda value, _scale: value,
+    )
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: consumer_stream)
+
+    result = DeepseekV4Indexer._run_overlapped_indexer_prepare(
+        indexer,
+        object(),
+        object(),
+        object(),
+        object(),
+    )
+
+    assert result == ("q", "q_scale", k_fp8, k_scale, weights)
+    assert weights.streams == [consumer_stream]
+    assert k_fp8.streams == [consumer_stream]
+    assert k_scale.streams == [consumer_stream]

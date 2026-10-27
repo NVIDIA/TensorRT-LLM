@@ -66,6 +66,7 @@ from ..modules.layer_norm import LayerNorm
 from ..modules.linear import TensorParallelMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.mlp import MLP
+from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
 from .modeling_utils import PostInitCaller, register_auto_model
 
 if TYPE_CHECKING:
@@ -163,6 +164,7 @@ class WhisperCrossAttention(CrossAttention):
 # ---------------------------------------------------------------------------
 
 
+@nccl_window_tensor_scoped_module
 class WhisperEncoderLayer(nn.Module):
     """Whisper encoder layer (pre-norm): LN → self-attn → add → LN → MLP → add."""
 
@@ -238,6 +240,7 @@ class WhisperEncoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+@nccl_window_tensor_scoped_module
 class WhisperDecoderLayer(nn.Module):
     """Whisper decoder layer (pre-norm): self-attn → cross-attn → MLP."""
 
@@ -429,6 +432,7 @@ class WhisperLogMelFrontend(nn.Module):
         return (log_spec + 4.0) / 4.0
 
 
+@nccl_window_tensor_scoped_module
 class WhisperEncoder(nn.Module):
     """Whisper audio encoder: log-mel front-end + 2x Conv1d stem + positions +
     self-attn layers."""
@@ -501,6 +505,7 @@ class WhisperEncoder(nn.Module):
         return hidden_states
 
 
+@nccl_window_tensor_scoped_module
 class WhisperDecoder(nn.Module):
     """Whisper text decoder: token + positional embedding + decoder layers."""
 

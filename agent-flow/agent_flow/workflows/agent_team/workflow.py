@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import shutil
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+
+import anyio
 
 from agent_flow import (
     CLAUDE_CODE_DEFAULT_MODEL,
@@ -12,9 +16,21 @@ from agent_flow import (
     SessionConfig,
 )
 from agent_flow.console import print_message, print_rule
+from agent_flow.jobs.kinds import KINDS
+from agent_flow.jobs.registry import JobRegistry
 from agent_flow.logger import get_logger
+from agent_flow.orchestration import (
+    ExecutionGraph,
+    GraphState,
+    IsolationProvider,
+    NodeScheduler,
+    NodeState,
+    NoOpIsolation,
+)
+from agent_flow.orchestration.invalidation import invalidation_set
 
 from . import mcpless
+from .node_workspace import NODES_DIRNAME, node_dir_slug
 from .progress import (
     BUILD_STAGE,
     PLAN_STAGE,
@@ -57,17 +73,145 @@ def _make_agent(
     model: str = CLAUDE_CODE_DEFAULT_MODEL,
     session_mode: str = "persistent",
     human_input_enabled: bool = False,
+    cwd: str | Path | None = None,
 ) -> AgentLayer:
     return AgentLayer(
         AgentLayerConfig(
             name=name,
             system_prompt=system_prompt,
-            backend=BackendConfig(kind=backend_kind, model=model, tools=tools),
+            backend=BackendConfig(
+                kind=backend_kind,
+                model=model,
+                tools=tools,
+                # ``None`` keeps the process CWD, which is what the linear path
+                # has always used. The concurrent path passes each node's
+                # worktree so the model edits code there, not in the shared
+                # checkout.
+                cwd=Path(cwd) if cwd is not None else None,
+            ),
             session=SessionConfig(mode=session_mode),
             required_tools=tuple(required_tools or ()),
             human_input_enabled=human_input_enabled,
         )
     )
+
+
+@dataclass(frozen=True)
+class _DefaultNodePolicy:
+    """Workflow-agnostic default gate policy for the ``--concurrent`` path.
+
+    agent_team assigns no meaning to a node's opaque ``type``, so its default
+    treats every type the same: a ``coder ⇄ reviewer`` node that runs no QA and
+    is not a replan unit. It structurally satisfies node_runner's ``_NodePolicy``
+    Protocol (``runs_qa`` / ``is_replan_unit``) without importing any concrete
+    workflow's policy table — modeling_bringup injects its own stage/goal policy.
+    """
+
+    node_type: str
+    runs_qa: bool = False
+    is_replan_unit: bool = False
+
+
+def _default_policy_for_type(node_type: str) -> _DefaultNodePolicy:
+    """Return the workflow-agnostic default policy for ``node_type``.
+
+    Every type maps to the same "coder ⇄ reviewer, no QA, not a replan unit"
+    policy; the concrete meaning of a type is a wrapping workflow's concern.
+    """
+    return _DefaultNodePolicy(node_type=node_type)
+
+
+# --------------------------------------------------------------------------
+# Per-turn prompt protocol blocks
+#
+# The role *system* prompts are transport-neutral and get their tool names from
+# the pluggable ``MCP_TOOLS_EXTENSIONS`` (see ``PromptBundle``). The per-turn
+# prompts below must obey the same split, or ``--no-mcp-tools`` runs order a
+# role to call a tool the run never registered: the turn body says WHAT this
+# turn reads and records, and the mechanism comes from either this table (MCP
+# mode) or ``mcpless.build_recording_preamble`` (no-MCP mode), never both.
+#
+# Keyed by prompt *kind* rather than role, because the PlanDrafter's draft and
+# replan turns read different things. The ``human`` / ``replan_human`` turns
+# have no entry: ``ask_human`` requires an in-process MCP server, so those
+# modes are rejected at construction under ``--no-mcp-tools`` and only ever run
+# with tools present.
+# --------------------------------------------------------------------------
+
+_PROTOCOL_HEADER = (
+    "=== RECORDING PROTOCOL: in-process MCP tools ===\n"
+    "Use these tools for the reads and the recording described above:\n"
+)
+
+_LINEAR_MCP_PROTOCOL: dict[str, str] = {
+    "plan_drafter_draft": _PROTOCOL_HEADER
+    + (
+        '- `read_latest_progress` with `agent: "plan_reviewer"` — the latest '
+        "REJECT feedback, when this is a re-draft.\n"
+        "Before completing your turn, call `append_plan_drafter_progress` with "
+        'the `summary` and `decision: "DRAFT_READY"` described above.\n'
+        "Do NOT call `ask_human` in this phase."
+    ),
+    "plan_drafter_replan": _PROTOCOL_HEADER
+    + (
+        "- `read_latest_build_progress` (no agent filter, `iterations: 1`) — "
+        "the latest coder/reviewer/qa entries.\n"
+        "- `read_human_feedback` — any user-supplied guidance.\n"
+        '- `read_latest_progress` with `agent: "plan_reviewer"` — the '
+        "PlanReviewer's REJECT feedback, when your previous revision was "
+        "rejected.\n"
+        "Before completing your turn, call `append_plan_drafter_progress` "
+        "exactly once, with the decision described above."
+    ),
+    "plan_reviewer": _PROTOCOL_HEADER
+    + (
+        '- `read_latest_progress` with `agent: "plan_drafter"` — the '
+        "PlanDrafter's latest summary.\n"
+        # Deliberately generic: the turn body is what marks a replan as
+        # feedback-driven, and repeating that phrase here would leak the
+        # marker into every plan-review turn.
+        "- `read_human_feedback` — any user-supplied guidance this turn "
+        "points you at.\n"
+        "Before completing your turn, call `append_plan_reviewer_progress` "
+        "with the `summary` and `decision` described above."
+    ),
+    "coder": _PROTOCOL_HEADER
+    + (
+        "- `read_status` — the rolling status.md scratchpad.\n"
+        "- `read_latest_progress` with `iterations: 2` — the Reviewer's and "
+        "QA's latest REJECT feedback.\n"
+        "- `read_human_feedback` — direct user guidance recorded via "
+        "`--feedback`.\n"
+        "Before completing your turn, call **both** required tools: "
+        "`append_coder_progress` (with the `summary`) and `update_status` "
+        "(overwriting status.md with the snapshot described above)."
+    ),
+    "reviewer": _PROTOCOL_HEADER
+    + (
+        "- `read_status` — the rolling status.md scratchpad.\n"
+        '- `read_latest_progress` with `agent: "coder"` — the Coder\'s latest '
+        "summary.\n"
+        "- `read_human_feedback` — direct user guidance recorded via "
+        "`--feedback`.\n"
+        "Before completing your turn, call **both** required tools: "
+        "`append_reviewer_progress` (with the `summary` and `decision`) and "
+        "`update_status` (overwriting status.md as described above)."
+    ),
+    "qa": _PROTOCOL_HEADER
+    + (
+        "- `read_human_feedback` — direct user guidance recorded via "
+        "`--feedback`.\n"
+        "Before completing your turn, call the `append_qa_progress` tool with "
+        "the `summary`, `decision`, and `weighted_score` described above."
+    ),
+}
+
+
+def _with_protocol(body: str, kind: str, use_in_process_tools: bool) -> str:
+    """Append the MCP protocol block to ``body`` when this run has MCP tools."""
+    if not use_in_process_tools:
+        return body
+    return f"{body}\n\n{_LINEAR_MCP_PROTOCOL[kind]}"
 
 
 class AgentTeamWorkflow:
@@ -93,6 +237,11 @@ class AgentTeamWorkflow:
         feedback: str | Path | None = None,
         prompts: PromptBundle | None = None,
         use_in_process_tools: bool = True,
+        concurrent: bool = False,
+        isolation: IsolationProvider | None = None,
+        policy_for_type: Callable[[str], object] | None = None,
+        max_parallel: int = 8,
+        max_replan_rounds: int = 3,
     ) -> None:
         self.workspace = workspace
         # Prompt bundles are transport-neutral. The MCP-tool protocol block
@@ -124,6 +273,8 @@ class AgentTeamWorkflow:
                 "an in-process MCP server. Rerun without those flags, or "
                 "without --no-mcp-tools."
             )
+        # Concurrent-mode scheduler checkpoint (written by ``_run_concurrent_build``).
+        self.graph_state_path = workspace / ".graph_state.json"
         self.num_iterations = num_iterations
         self.coder_context_reset_interval = coder_context_reset_interval
         self.reviewer_context_reset_interval = reviewer_context_reset_interval
@@ -159,6 +310,37 @@ class AgentTeamWorkflow:
         # with another ``--feedback`` adds another entry.
         self.pending_feedback = feedback
 
+        # The backend every role agent runs on. Mirrors ``_make_agent``'s
+        # defaults so the ``--concurrent`` path builds its per-node agents on
+        # the same backend/model the linear role agents use; keep these in sync
+        # with ``_make_agent`` if the workflow's backend ever changes.
+        self.backend_kind = "claude-code"
+        self.model = CLAUDE_CODE_DEFAULT_MODEL
+
+        # Opt-in concurrent DAG execution (Task 13). When enabled, the build
+        # loop is replaced by ``_run_concurrent_build``: the plan's
+        # ``## Execution Graph`` is run through the ``NodeScheduler`` with a
+        # ``make_run_node`` per-node loop and an injected isolation provider.
+        # Defaults are supplied only in this mode so the linear path stays
+        # entirely inert: a git-free ``NoOpIsolation`` rooted at the workspace,
+        # and a workflow-agnostic policy that runs every node type through the
+        # ``coder ⇄ reviewer`` loop with no QA. A wrapping workflow
+        # (modeling_bringup) injects its own isolation/policy instead.
+        self.concurrent = concurrent
+        self.max_parallel = max_parallel
+        # Bound on concurrent-mode replan rounds: after a scheduler pass ends with
+        # FAILED nodes (and --replan-on-qa), the PlanDrafter may replan the failed
+        # subtree and the graph re-runs, at most this many times, so a repeatedly-
+        # failing subtree cannot loop forever.
+        self.max_replan_rounds = max_replan_rounds
+        self._isolation = isolation
+        self._policy_for_type = policy_for_type
+        if self.concurrent:
+            if self._isolation is None:
+                self._isolation = NoOpIsolation(base_cwd=self.workspace)
+            if self._policy_for_type is None:
+                self._policy_for_type = _default_policy_for_type
+
         self.workspace.mkdir(parents=True, exist_ok=True)
         if clean:
             # Wipe the workflow's managed files so the constructor
@@ -170,8 +352,19 @@ class AgentTeamWorkflow:
                 self.acceptance_criteria_path,
                 self.progress_path,
                 self.status_path,
+                # Concurrent-mode derived state: the NodeScheduler checkpoint.
+                # Without this a ``--clean --concurrent`` rerun would silently
+                # resume the prior (possibly crashed) graph instead of starting
+                # over from the plan phase.
+                self.graph_state_path,
             ):
                 path.unlink(missing_ok=True)
+            # Concurrent-mode per-node sub-workspaces (``<workspace>/nodes/``)
+            # are workflow-managed derived state too — remove them so a rerun
+            # re-plans from scratch rather than reading a prior run's per-node
+            # progress/contexts. (Git worktrees + ``node/*`` branches are the
+            # isolation provider's state and are NOT torn down here.)
+            shutil.rmtree(self.workspace / NODES_DIRNAME, ignore_errors=True)
 
         # Resume is auto-detected from the checkpoint's presence;
         # ``--clean`` has just wiped it if the user wanted to start over.
@@ -432,6 +625,15 @@ class AgentTeamWorkflow:
             if state.stage in _PLAN_STAGES:
                 self._run_plan_phase(state, log)
 
+            # ----- CONCURRENT BUILD PHASE (opt-in) -----
+            # When ``--concurrent`` is set, the plan's ``## Execution Graph`` is
+            # run through the DAG scheduler INSTEAD of the linear single-cursor
+            # build loop below. The linear loop stays byte-for-byte unchanged;
+            # this branch is purely additive.
+            if self.concurrent:
+                self._run_concurrent_build(state)
+                return
+
             # ----- BUILD PHASE -----
             for i in range(state.next_iteration_index, self.num_iterations):
                 iteration = i + 1
@@ -535,6 +737,221 @@ class AgentTeamWorkflow:
                 log,
             )
             raise
+
+    def _run_concurrent_build(self, state: WorkflowState) -> None:
+        """Run the plan's Execution Graph through the DAG scheduler.
+
+        The ``--concurrent`` replacement for the linear build loop. Reads
+        ``plan.md``, extracts its ``## Execution Graph`` block, and drives every
+        node through :func:`~agent_flow.workflows.agent_team.node_runner.make_run_node`
+        under a :class:`~agent_flow.orchestration.NodeScheduler`, isolated by the
+        injected :class:`~agent_flow.orchestration.IsolationProvider`. Nodes whose
+        dependencies are all ``DONE`` run in parallel (up to ``max_parallel``);
+        the scheduler checkpoints to ``<workspace>/.graph_state.json`` so a crash
+        resumes without re-running finished nodes.
+
+        After the run, the orchestrator renders the DERIVED global observation
+        window — the whole-DAG ``status.md`` rollup and the node-tagged
+        ``progress.yaml`` timeline — from the final node states plus each node's
+        private files (single-writer aggregation, Task 14).
+
+        Raises:
+            ValueError: If ``plan.md`` has no ``## Execution Graph`` block — the
+                concurrent path requires the planner to declare the DAG.
+        """
+        # Imported lazily: ``node_runner`` imports ``_make_agent`` from this
+        # module, so a top-level import here would be circular.
+        from .aggregation import render_global_progress, render_global_status
+        from .execution_graph import extract_execution_graph
+        from .node_runner import make_run_node
+
+        log = get_logger().console
+
+        # ``run_node`` is graph-independent, so build it once and reuse it across
+        # replan rounds; the graph itself is re-extracted each round because a
+        # replan may have revised ``plan.md`` (and its ``## Execution Graph``).
+        run_node = make_run_node(
+            workspace=self.workspace,
+            prompts=self.prompts,
+            policy_for_type=self._policy_for_type,
+            num_iterations=self.num_iterations,
+            backend_kind=self.backend_kind,
+            model=self.model,
+            use_in_process_tools=self.use_in_process_tools,
+        )
+
+        # Pre-scheduler feedback replan. A ``--feedback`` concurrent resume folds
+        # the new feedback into ``plan.md`` BEFORE the first scheduler pass, so a
+        # stage the drafter adds dispatches in the SAME pass — in parallel with a
+        # node that was in flight when the run was stopped (``RUNNING`` → ``PENDING``
+        # on resume). The old behavior only replanned AFTER a scheduler pass drained,
+        # folding feedback into a *failed* subtree; that could not run added work
+        # concurrently with an in-flight node, and silently dropped the feedback when
+        # the pass finished with no failure. This mirrors the linear path's
+        # ``STAGE_REPLAN`` re-entry (feedback re-plans, then builds). Additive only:
+        # DONE nodes stay DONE via the checkpoint and no subtree is reset here — the
+        # post-scheduler loop below still handles genuine QA failures.
+        if state.feedback_replan:
+            print_rule(
+                "[bold cyan]Replan (pending --feedback, before scheduler)[/bold cyan]",
+                log,
+            )
+            self._run_plan_drafter(
+                iteration=0,
+                mode="replan",
+                feedback_triggered=True,
+            )
+            state.feedback_replan = False
+            self._checkpoint(state)
+
+        # Bounded replan loop. Each round: re-extract the (possibly revised) graph,
+        # run the scheduler (resuming from .graph_state.json). Under ``--replan-on-qa``
+        # the scheduler PAUSES on the first failure (healthy in-flight nodes →
+        # INTERRUPTED); the PlanDrafter then replans, and only the invalidation
+        # frontier (failed ∪ changed ∪ their dependents) is reset via
+        # :meth:`_apply_invalidation` before the next round resumes from the checkpoint
+        # (DONE preserved, INTERRUPTED re-attached). Without ``--replan-on-qa`` (or with
+        # no failures/pause) it is a single pass, exactly the prior behavior.
+        # ``max_replan_rounds`` caps the loop so a repeatedly-failing subtree cannot
+        # spin forever.
+        for replan_round in range(self.max_replan_rounds + 1):
+            plan_text = self.plan_path.read_text(encoding="utf-8")
+            graph = extract_execution_graph(plan_text)
+            if graph is None:
+                raise ValueError(
+                    '--concurrent requires an "## Execution Graph" block in plan.md '
+                    "(none found). Provide a plan whose graph the scheduler can run, "
+                    "or drop --concurrent to use the linear build loop."
+                )
+            scheduler = NodeScheduler(
+                graph,
+                run_node,
+                self._isolation,
+                max_parallel=self.max_parallel,
+                checkpoint_path=self.graph_state_path,
+                pause_on_failure=self.replan_on_qa,
+            )
+
+            print_rule("[bold cyan]Concurrent build (Execution Graph)[/bold cyan]", log)
+            result = anyio.run(scheduler.run)
+
+            # Render the orchestrator-owned global observation window: a whole-DAG
+            # rollup + a node-tagged timeline derived from the final node states and
+            # each node's private files. The orchestrator is the only writer of the
+            # top-level status.md / progress.yaml on the concurrent path.
+            node_ids = list(result.states.keys())
+            render_global_status(
+                workspace=self.workspace,
+                node_states=result.states,
+                node_ids=node_ids,
+            )
+            render_global_progress(workspace=self.workspace, node_ids=node_ids)
+
+            for node_id, node_state in result.states.items():
+                print_message(f"[bold]• node {node_id}: {node_state.value}[/bold]", log)
+            if result.succeeded:
+                print_message("[bold green]✔ all graph nodes DONE[/bold green]", log)
+                break
+            print_message(
+                "[bold yellow]⚠ graph finished with non-DONE nodes: "
+                f"failed={list(result.failed_ids)} blocked={list(result.blocked_ids)}"
+                "[/bold yellow]",
+                log,
+            )
+
+            # Pause/failure with replan enabled: replan synchronously against the
+            # frozen snapshot, then reset only the invalidation frontier and resume
+            # (re-attach). No replan requested, or nothing FAILED/paused → stop.
+            if not self.replan_on_qa or not (result.failed_ids or result.paused):
+                break
+            if replan_round == self.max_replan_rounds:
+                print_message(
+                    "[bold yellow]⚠ replan budget (--max-replan-rounds) exhausted[/bold yellow]",
+                    log,
+                )
+                break
+
+            print_rule("[bold cyan]Replan (pause → invalidate → resume)[/bold cyan]", log)
+            old_graph = graph
+            self._run_plan_drafter(
+                iteration=replan_round + 1,
+                mode="replan",
+                feedback_triggered=state.feedback_replan,
+            )
+            state.feedback_replan = False
+            if self._latest_plan_drafter_decision() == "DONE":
+                print_message(
+                    "[bold green]✔ plan_drafter DONE — accepting the outcome[/bold green]",
+                    log,
+                )
+                break
+            new_graph = extract_execution_graph(self.plan_path.read_text(encoding="utf-8"))
+            if new_graph is None:
+                raise ValueError('replan produced no "## Execution Graph" block')
+            # A FAILED node is always a retry candidate (the replan revises it — and a
+            # prose-only revision is invisible to the structural invalidation_set), so
+            # it must always be in the frontier. invalidation_set ADDS the downstream
+            # consumers of any node whose graph definition (depends_on/kind/added)
+            # changed. A healthy INTERRUPTED node that was NOT changed stays OUT of the
+            # frontier → its nodes/<id>/ + jobs.json survive and re-attach on resume.
+            frontier = set(result.failed_ids) | invalidation_set(old_graph, new_graph)
+            print_message(f"[cyan]invalidation frontier: {sorted(frontier)}[/cyan]", log)
+            self._apply_invalidation(frontier, new_graph)
+
+        # The loop exits either all-DONE, on PlanDrafter DONE, or on budget/flag —
+        # mark the run done so a bare rerun does not auto-resume into it.
+        state.done = True
+        self._checkpoint(state)
+
+    def _cancel_node_jobs(self, node_id: str, *, kinds: dict | None = None) -> None:
+        """Best-effort ``scancel`` of every job a node recorded before resetting it.
+
+        An invalidated node's in-flight job would produce a stale result, so kill
+        it (rather than orphan it) before its ``nodes/<id>/`` — which holds
+        ``jobs.json`` — is removed. Missing file, unknown kind, or a cancel error
+        are all swallowed: a dead/absent job must never crash the replan. ``kinds``
+        defaults to the module-level ``KINDS`` registry, resolved at call time so a
+        test's monkeypatch of it is honored.
+        """
+        if kinds is None:
+            kinds = KINDS
+        jobs_path = self.workspace / NODES_DIRNAME / node_dir_slug(node_id) / "jobs.json"
+        if not jobs_path.is_file():
+            return
+        for entry in JobRegistry(jobs_path).all():
+            kind = kinds.get(entry.kind)
+            if kind is None:
+                continue
+            try:
+                kind.cancel(entry.handle)
+            except Exception:
+                continue
+
+    def _apply_invalidation(self, invalid_ids: set[str], graph: ExecutionGraph) -> None:
+        """Reset exactly the invalidation frontier: scancel jobs, drop state, rmtree, reclaim.
+
+        Unlike the old reset-all-failed path, this touches ONLY ``invalid_ids``
+        (changed nodes ∪ their transitive dependents), so a healthy paused
+        (INTERRUPTED) node keeps its ``nodes/<id>/`` + ``jobs.json`` and its
+        still-running job — a later resume re-attaches it. DONE nodes are never in
+        the frontier and never touched.
+        """
+        if not invalid_ids:
+            return
+        graph_state = GraphState.load(self.graph_state_path)
+        for node_id in invalid_ids:
+            self._cancel_node_jobs(node_id)
+            graph_state.states[node_id] = NodeState.PENDING
+            graph_state.worktrees.pop(node_id, None)
+        graph_state.save(self.graph_state_path)
+        for node_id in invalid_ids:
+            shutil.rmtree(
+                self.workspace / NODES_DIRNAME / node_dir_slug(node_id),
+                ignore_errors=True,
+            )
+            node = graph.by_id.get(node_id)
+            if node is not None:
+                anyio.run(self._isolation.reclaim, node)
 
     def _run_plan_phase(self, state: WorkflowState, log) -> None:
         """Drive the plan phase to completion.
@@ -870,6 +1287,27 @@ class AgentTeamWorkflow:
                 state.stage = STAGE_REPLAN
                 state.feedback_replan = True
                 self._checkpoint(state)
+            # Concurrent --feedback resume: the concurrent build has no linear
+            # STAGE_REPLAN; the flag is consumed by ``_run_concurrent_build``, which
+            # replans the pending feedback into ``plan.md`` BEFORE its first scheduler
+            # pass (so an added stage runs in parallel with any resumed in-flight
+            # node, not after). So a --feedback resume on the concurrent path just
+            # flags it (no separate --trigger-replan-with-feedback needed). Requires
+            # --replan-on-qa (the build loop's gate), past the plan phase.
+            elif (
+                self.concurrent
+                and self.replan_on_qa
+                and self.pending_feedback is not None
+                and state.stage not in _PLAN_STAGES
+            ):
+                print_message(
+                    "[bold cyan]→ --feedback on a concurrent resume: replanning it "
+                    "into plan.md before the next scheduler pass.[/bold cyan]",
+                    log,
+                )
+                state.done = False
+                state.feedback_replan = True
+                self._checkpoint(state)
             if self.preset_plan is not None or self.preset_acceptance_criteria is not None:
                 print_message(
                     "[bold yellow]⚠ --plan / --acceptance-criteria "
@@ -1173,30 +1611,33 @@ class AgentTeamWorkflow:
         """
         self._progress_ctx.current_iteration = iteration
         if mode == "draft":
-            prompt = (
-                f"Workspace: {self.workspace}\n"
-                f"Plan iteration: {iteration}\n"
-                f"Phase: **draft** (PlanReviewer will check your work; do "
-                f"NOT call ask_human in this phase).\n\n"
-                f"Read `{self.task_path}` for the original task.\n"
-                f"Read the current contents of `{self.plan_path}` and "
-                f"`{self.acceptance_criteria_path}` — either may already "
-                f"hold user-supplied content you should preserve or "
-                f"refine; the other will be empty for you to draft from "
-                f"scratch.\n"
-                f"If this is a re-draft, call `read_latest_progress` with "
-                f'`agent: "plan_reviewer"` to fetch the latest REJECT '
-                f"feedback and address every item.\n\n"
-                f"Write your complete implementation plan to "
-                f"`{self.plan_path}` and your acceptance-criteria "
-                f"checklist (`- [ ] ...`) to "
-                f"`{self.acceptance_criteria_path}`. Both files must end "
-                f"this turn populated and coherent with each other and "
-                f"with `task.yaml`.\n\n"
-                f"Before completing your turn, call "
-                f"`append_plan_drafter_progress` with `summary` describing "
-                f"what you wrote/changed in **both** files and "
-                f'`decision: "DRAFT_READY"`.'
+            prompt = _with_protocol(
+                (
+                    f"Workspace: {self.workspace}\n"
+                    f"Plan iteration: {iteration}\n"
+                    f"Phase: **draft** (PlanReviewer will check your work; do "
+                    f"NOT seek human sign-off in this phase).\n\n"
+                    f"Read `{self.task_path}` for the original task.\n"
+                    f"Read the current contents of `{self.plan_path}` and "
+                    f"`{self.acceptance_criteria_path}` — either may already "
+                    f"hold user-supplied content you should preserve or "
+                    f"refine; the other will be empty for you to draft from "
+                    f"scratch.\n"
+                    f"If this is a re-draft, take in the PlanReviewer's "
+                    f"latest REJECT feedback and address every item.\n\n"
+                    f"Write your complete implementation plan to "
+                    f"`{self.plan_path}` and your acceptance-criteria "
+                    f"checklist (`- [ ] ...`) to "
+                    f"`{self.acceptance_criteria_path}`. Both files must end "
+                    f"this turn populated and coherent with each other and "
+                    f"with `task.yaml`.\n\n"
+                    f"Before completing your turn, record a PlanDrafter "
+                    f"progress entry whose `summary` describes what you "
+                    f"wrote/changed in **both** files, with "
+                    f'`decision: "DRAFT_READY"`.'
+                ),
+                "plan_drafter_draft",
+                self.use_in_process_tools,
             )
         elif mode in ("human", "replan_human"):
             if mode == "human":
@@ -1259,17 +1700,15 @@ class AgentTeamWorkflow:
             if self._replan_was_rejected():
                 rejected_block = (
                     "Your previous replan revision was REJECTed by the "
-                    "PlanReviewer. Call `read_latest_progress` with "
-                    '`agent: "plan_reviewer"` to fetch the REJECT '
-                    "feedback and address every item in this revision "
-                    "before deciding again.\n\n"
+                    "PlanReviewer. Take in that REJECT feedback and address "
+                    "every item in this revision before deciding again.\n\n"
                 )
             feedback_note = (
                 "**Feedback-triggered replan**: this replan turn was "
                 "forced by fresh human feedback "
                 "(`--trigger-replan-with-feedback`), NOT by a QA verdict "
                 "— the QA data below predates the feedback and may be "
-                "stale. Call `read_human_feedback` FIRST; the newest "
+                "stale. Take in the human feedback FIRST; the newest "
                 "entry is this turn's driver. Restructure the plan so "
                 "the very next Coder turn acts on that feedback: you may "
                 "preempt in-progress work per your protocol's "
@@ -1281,7 +1720,7 @@ class AgentTeamWorkflow:
                 if feedback_triggered
                 else ""
             )
-            prompt = (
+            prompt = _with_protocol(
                 f"Workspace: {self.workspace}\n"
                 f"Build iteration: {iteration}\n"
                 f"Phase: **replan** (PlanDrafter is re-invoked after every "
@@ -1297,11 +1736,9 @@ class AgentTeamWorkflow:
                 f"Read `{self.task_path}` (ground truth), the current "
                 f"`{self.plan_path}`, and "
                 f"`{self.acceptance_criteria_path}` (the pass/fail "
-                f"checklist QA just used). Call "
-                f"`read_latest_build_progress` (no agent filter, "
-                f"`iterations: 1`) to fetch the latest coder/reviewer/qa "
-                f"entries. Call `read_human_feedback` for any "
-                f"user-supplied guidance.\n\n"
+                f"checklist QA just used). Take in the latest "
+                f"coder/reviewer/qa entries from the build phase, and any "
+                f"user-supplied human feedback.\n\n"
                 f"Revise `{self.plan_path}` and "
                 f"`{self.acceptance_criteria_path}` where the build phase "
                 f"surfaced a real gap — sharpen vague guidance, fold in "
@@ -1309,9 +1746,8 @@ class AgentTeamWorkflow:
                 f"one is solid. Do NOT relax a criterion to make a "
                 f"failing QA pass; if a criterion no longer reflects "
                 f"`task.yaml`, justify the change in your `summary`.\n\n"
-                f"Before completing your turn, call "
-                f"`append_plan_drafter_progress` exactly once. Decision "
-                f"map:\n"
+                f"Before completing your turn, record exactly one "
+                f"PlanDrafter progress entry. Decision map:\n"
                 f"  - `DONE` — every acceptance item verified at runtime, "
                 f"score >= min_score, no new stage to push to. Workflow "
                 f"ends.\n"
@@ -1325,7 +1761,9 @@ class AgentTeamWorkflow:
                 f"Make `summary` self-contained: name the build-phase "
                 f"finding that motivated the revision, list the concrete "
                 f"changes to each file, and (for `DRAFT_READY`) justify "
-                f"every acceptance-criteria change."
+                f"every acceptance-criteria change.",
+                "plan_drafter_replan",
+                self.use_in_process_tools,
             )
         else:
             raise ValueError(f"unknown plan_drafter mode: {mode!r}")
@@ -1362,8 +1800,8 @@ class AgentTeamWorkflow:
         feedback_note = (
             "This replan turn was **feedback-triggered** "
             "(`--trigger-replan-with-feedback`): the PlanDrafter was "
-            "responding to fresh human feedback, not a QA verdict. Call "
-            "`read_human_feedback` to see the feedback the revision must "
+            "responding to fresh human feedback, not a QA verdict. Take in "
+            "that human feedback to see what the revision must "
             "serve. Where your prompt extension defines "
             "feedback-triggered edit rights (e.g. preempting in-progress "
             "work), judge the revision under those rules; still REJECT "
@@ -1384,16 +1822,15 @@ class AgentTeamWorkflow:
             if phase == "replan"
             else ""
         )
-        prompt = (
+        prompt = _with_protocol(
             f"Workspace: {self.workspace}\n"
             f"{iter_label}: {iteration}\n\n"
             f"{phase_note}"
             f"Read `{self.task_path}` (the user's original intent), "
             f"`{self.plan_path}` (the PlanDrafter's plan), and "
             f"`{self.acceptance_criteria_path}` (the pass/fail checklist "
-            f"QA will verify). Call `read_latest_progress` with "
-            f'`agent: "plan_drafter"` to fetch the PlanDrafter\'s '
-            f"latest summary.\n\n"
+            f"QA will verify). Take in the PlanDrafter's latest "
+            f"summary.\n\n"
             "Decide APPROVE or REJECT covering **both** plan-phase "
             "outputs as a unit: the plan must satisfy task.yaml and be "
             "concrete enough for the Coder to execute, and the "
@@ -1401,11 +1838,13 @@ class AgentTeamWorkflow:
             "checkable items faithful to task.yaml. Do NOT build, run, or "
             "test code — that belongs to the build-phase Reviewer. This "
             "is a paper review.\n\n"
-            "Before completing your turn, call "
-            "`append_plan_reviewer_progress` with `summary` and `decision` "
-            "(exactly `APPROVE` or `REJECT`). On REJECT, list specific "
-            "actionable items the PlanDrafter must address, naming the "
-            "file (`plan.md` or `acceptance-criteria.md`) for each item."
+            "Before completing your turn, record a PlanReviewer progress "
+            "entry with a `summary` and a `decision` of exactly `APPROVE` or "
+            "`REJECT`. On REJECT, list specific actionable items the "
+            "PlanDrafter must address, naming the file (`plan.md` or "
+            "`acceptance-criteria.md`) for each item.",
+            "plan_reviewer",
+            self.use_in_process_tools,
         )
         self._invoke_agent(
             "plan_reviewer",
@@ -1417,31 +1856,31 @@ class AgentTeamWorkflow:
 
     def _run_coder(self, iteration: int) -> None:
         self._progress_ctx.current_iteration = iteration
-        prompt = (
+        prompt = _with_protocol(
             f"Workspace: {self.workspace}\n"
             f"Iteration: {iteration}\n\n"
-            f"Start by calling `read_status` to load the rolling "
-            f"`status.md` scratchpad — that is your fastest way to pick up "
-            f"where the previous turn left off.\n\n"
+            f"Start by loading the rolling `status.md` scratchpad — that is "
+            f"your fastest way to pick up where the previous turn left "
+            f"off.\n\n"
             f"Read `{self.task_path}` for the original task from the user, "
             f"`{self.plan_path}` for the build plan, and "
             f"`{self.acceptance_criteria_path}` for the pass/fail "
-            f"checklist QA will verify (your definition of done). Call "
-            f"`read_latest_progress` with `iterations: 2` to fetch the "
-            f"Reviewer's latest REJECT feedback (if any) and the QA's "
-            f"latest REJECT report (if any). These are what you must "
-            f"address this iteration.\n\n"
-            f"Also call `read_human_feedback` to fetch any direct user "
-            f"guidance recorded via `--feedback`. Treat those entries as "
-            f"high-priority guidance from the human and address every "
-            f"unaddressed point this turn.\n\n"
+            f"checklist QA will verify (your definition of done). Take in "
+            f"the Reviewer's latest REJECT feedback (if any) and the QA's "
+            f"latest REJECT report (if any) from the last 2 iterations. "
+            f"These are what you must address this iteration.\n\n"
+            f"Also take in any direct user guidance recorded via "
+            f"`--feedback`. Treat those entries as high-priority guidance "
+            f"from the human and address every unaddressed point this "
+            f"turn.\n\n"
             "Implement or refine the code to address the feedback and "
             "satisfy every acceptance criterion. Before completing your "
-            "turn, call **both** required tools: `append_coder_progress` "
-            "(with a `summary` of what you built or changed) and "
-            "`update_status` (overwriting status.md with a short, clean "
-            "snapshot — current status, execution path, what's been tried, "
-            "what worked, what didn't, pointers for the next step)."
+            "turn, record a Coder progress entry with a `summary` of what "
+            "you built or changed, and refresh status.md with a short, "
+            "clean snapshot — current status, execution path, what's been "
+            "tried, what worked, what didn't, pointers for the next step.",
+            "coder",
+            self.use_in_process_tools,
         )
         self._invoke_agent("coder", self.coder, prompt, iteration)
 
@@ -1453,22 +1892,19 @@ class AgentTeamWorkflow:
         # modes). The default agent-team Reviewer prompt ignores the
         # line; no behavior change for callers that don't opt in.
         replan_mode = "enabled" if self.replan_on_qa else "disabled"
-        prompt = (
+        prompt = _with_protocol(
             f"Workspace: {self.workspace}\n"
             f"Iteration: {iteration}\n"
             f"Replan mode: {replan_mode}.\n\n"
-            f"Start by calling `read_status` to load the rolling "
-            f"`status.md` scratchpad so you know what the Coder claims "
-            f"the current state is.\n\n"
+            f"Start by loading the rolling `status.md` scratchpad so you "
+            f"know what the Coder claims the current state is.\n\n"
             f"Read `{self.plan_path}` for the build plan and "
             f"`{self.acceptance_criteria_path}` for the pass/fail "
-            f"checklist. Call `read_latest_progress` with "
-            f'`agent: "coder"` to fetch the Coder\'s latest summary.\n\n'
-            f"Also call `read_human_feedback` to fetch any direct user "
-            f"guidance recorded via `--feedback`. When you decide "
-            f"APPROVE/REJECT, verify the Coder has actually addressed "
-            f"every unaddressed point — if not, REJECT and call them out "
-            f"by name.\n\n"
+            f"checklist. Take in the Coder's latest summary.\n\n"
+            f"Also take in any direct user guidance recorded via "
+            f"`--feedback`. When you decide APPROVE/REJECT, verify the "
+            f"Coder has actually addressed every unaddressed point — if "
+            f"not, REJECT and call them out by name.\n\n"
             "Work closely with the Coder: inspect the changed files, then "
             "**build the code, run it, and execute the relevant tests** "
             "against the plan and the acceptance criteria. APPROVE only "
@@ -1479,13 +1915,14 @@ class AgentTeamWorkflow:
             "runtime behavior contradicts the plan, or any acceptance "
             "criterion is clearly unmet. Keep the loop tight: skip long "
             "benchmarks and full-suite stress runs (those belong to QA).\n\n"
-            "Before completing your turn, call **both** required tools: "
-            "`append_reviewer_progress` (with `summary` and `decision`, "
-            "exactly `APPROVE` or `REJECT` — cite the commands you ran "
-            "and what you observed in the summary) and `update_status` "
-            "(overwriting status.md to reflect the post-review state, "
-            "what was actually tested, and what the Coder must address "
-            "next on REJECT)."
+            "Before completing your turn, record a Reviewer progress entry "
+            "with a `summary` and a `decision` of exactly `APPROVE` or "
+            "`REJECT` — cite the commands you ran and what you observed in "
+            "the summary — and refresh status.md to reflect the post-review "
+            "state, what was actually tested, and what the Coder must "
+            "address next on REJECT.",
+            "reviewer",
+            self.use_in_process_tools,
         )
         self._invoke_agent("reviewer", self.reviewer, prompt, iteration)
 
@@ -1500,7 +1937,7 @@ class AgentTeamWorkflow:
                 f"Do not pad the score — if the artifact is not yet that "
                 f"good, say REJECT and list the gaps."
             )
-        prompt = (
+        prompt = _with_protocol(
             f"Workspace: {self.workspace}\n"
             f"Iteration: {iteration}\n\n"
             f"Read `{self.task_path}` (the user's stated intent — "
@@ -1513,8 +1950,8 @@ class AgentTeamWorkflow:
             f"those two specs and the actual code you build and "
             f"run. On any conflict between the criteria and "
             f"`task.yaml`, `task.yaml` wins — call out the gap.\n\n"
-            f"Call `read_human_feedback` to fetch any direct user "
-            f"guidance recorded via `--feedback`. Human feedback is "
+            f"Take in any direct user guidance recorded via "
+            f"`--feedback`. Human feedback is "
             f"the user's own voice, not a downstream agent's, so "
             f"treat it on par with `task.yaml`: APPROVE requires that "
             f"every unaddressed feedback point has been resolved at "
@@ -1523,8 +1960,8 @@ class AgentTeamWorkflow:
             "Discover the code under the workspace yourself (ls, grep, "
             "etc.), build it, run tests, and verify every acceptance "
             "criterion at runtime. Do not rely on code review alone.\n\n"
-            "Before completing your turn, call the `append_qa_progress` "
-            "tool with:\n"
+            "Before completing your turn, record a QA progress entry "
+            "with:\n"
             "- `summary`: per-criterion pass/fail with runtime "
             "evidence, evaluation-criterion scores, strengths, "
             "weaknesses, recommendation\n"
@@ -1532,7 +1969,9 @@ class AgentTeamWorkflow:
             "- `weighted_score`: the weighted average in [0, 10]\n\n"
             "APPROVE ends the workflow (subject to the score floor). "
             "REJECT sends the work back to the Coder; put the gaps they "
-            "must fix in `summary`." + gate_hint
+            "must fix in `summary`." + gate_hint,
+            "qa",
+            self.use_in_process_tools,
         )
         self._invoke_agent("qa", self.qa, prompt, iteration)
 

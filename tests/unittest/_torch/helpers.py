@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -236,9 +239,12 @@ def reference_block_scale_moe_torch(
     return results.view_as(x)
 
 
-def create_mock_cuda_graph_runner(batch_size: int,
-                                  use_mrope: bool = False,
-                                  max_num_tokens: int = 1):
+def create_mock_cuda_graph_runner(
+        batch_size: int,
+        use_mrope: bool = False,
+        max_num_tokens: int = 1,
+        static_input_ids: Optional[torch.Tensor] = None,
+        static_position_ids: Optional[torch.Tensor] = None):
     config = CUDAGraphRunnerConfig(
         use_cuda_graph=True,
         cuda_graph_padding_enabled=False,
@@ -251,12 +257,13 @@ def create_mock_cuda_graph_runner(batch_size: int,
         spec_config=None,
         cuda_graph_mem_pool=None,
         enable_attention_dp=False,
-        original_max_draft_len=0,
         original_max_total_draft_tokens=0,
         is_encoder_decoder=False,
         mapping=Mapping(),
         dist=None,
-        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER)
+        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
+        static_input_ids=static_input_ids,
+        static_position_ids=static_position_ids)
     return CUDAGraphRunner(config)
 
 

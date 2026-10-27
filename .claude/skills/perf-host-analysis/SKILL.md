@@ -147,7 +147,7 @@ Format using the template in [references/output-format.md](references/output-for
 
 **Next Steps:**
 - **If YES** -> Proceed to Phase 2 (Root Cause) below, then use `perf-host-optimization` skill
-- **If NO** -> Use `perf-nsight-compute-analysis` for kernel SOL% or `trace-interpretation` for full classification
+- **If NO** -> Use `perf-nsight-compute-analysis` for kernel SOL% or `perf-analysis` for full classification
 
 ---
 

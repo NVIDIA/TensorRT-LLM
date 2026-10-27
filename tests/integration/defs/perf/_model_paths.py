@@ -71,6 +71,8 @@ MODEL_PATH_DICT = {
     "qwen3.8_max_fp4_mtp": "Inferact-Qwen3.8-2.4T-A95B-NVFP4",
     "qwen3.8_flash_next_fp8_mtp": "Qwen3.8-Flash-Next-FP8",
     "qwen3.8_flash_next_fp4_mtp": "Inferact-Qwen3.8-Flash-Next-NVFP4",
+    # The NVFP4 checkpoint the CI accuracy gates load.
+    "qwen3.8_flash_next_fp4": "Qwen3.8-Flash-Next-NVFP4",
     # DeepSeek V4
     "deepseek_v4_pro_fp4": "DeepSeek-V4-Pro",
     "deepseek_v4_pro_base_fp8": "DeepSeek-V4-Pro-Base",
@@ -83,10 +85,13 @@ MODEL_PATH_DICT = {
     # DSpark draft stages are embedded in this checkpoint, so it is also the
     # `speculative_model` of the DSpark perf-sanity cases.
     "deepseek_v41_flash": "DeepSeek-V4.1-Flash",
+    "deepseek_v41_flash_nvfp4": "DeepSeek-V4.1-Flash-NVFP4",
+    "deepseek_v41_flash_nvfp4_dspark": "DeepSeek-V4.1-Flash-NVFP4",
     # GLM-5 FP8 (MoE)
     "glm_5_fp8": "GLM-5-FP8",
     # GLM-5.2 NVFP4 (MoE, MLA + DSA on the DeepSeek-V3.2 code path)
     "glm_5.2_fp4": "GLM-5.2-NVFP4",
+    "glm_5.3_flash_fp8": "GLM-5.3-Flash",
     # MiniMax-M3 NVFP4: MXFP8 base layers with NVFP4 routed experts
     # (the MXFP8 checkpoint is registered as "minimax_m3_mxfp8" above).
     "minimax_m3_fp4": "MiniMax-M3-NVFP4",
@@ -94,6 +99,10 @@ MODEL_PATH_DICT = {
     "kimi_k2.5_fp4": "Kimi-K2.5-NVFP4",
     # Kimi K3 (KDA linear attention + MLA MoE, MXFP4 routed experts)
     "kimi_k3": "Kimi-K3",
+    # Kimi K3 NVFP4 requant (MIXED_PRECISION routed experts). Its DSpark drafter
+    # is the separate Inferact-Kimi-K3-DSpark checkpoint, given per config as
+    # `speculative_model`.
+    "kimi_k3_nvfp4": "Kimi-K3-NVFP4",
     # Keys below are sanity-side aliases; some point to the same weights as
     # entries above but are kept under sanity's historical naming.
     "deepseek_v32_fp4": "DeepSeek-V3.2-Exp-FP4-v2",

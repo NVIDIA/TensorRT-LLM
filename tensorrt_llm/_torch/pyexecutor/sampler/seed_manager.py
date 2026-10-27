@@ -65,8 +65,6 @@ class _SeedManager:
         self._slot_seeded: list[bool] = [False] * max_num_sequences
         # Offset of the next unseeded row.
         self._unseeded_offset = UNSEEDED_OFFSET_BASE
-        # Whether the batch observed in the current step is a draft batch.
-        self._batch_is_draft = False
 
     def observe(self, requests: list[LlmRequest]) -> None:
         """Seed any slot whose occupant changed.
@@ -76,20 +74,7 @@ class _SeedManager:
         the offset on ownership change is what makes a seeded request start at
         the beginning of its stream instead of wherever the slot's previous
         occupant left off.
-
-        Draft batches are not recorded per slot. A drafter allocates draft slots
-        from its own ``SeqSlotManager`` over the same numeric range, so a draft
-        request can occupy a slot number that a live target request owns here.
-        Observing it would look like a change of occupant and reset that
-        target's offset, making it replay a stretch of its Philox stream. Draft
-        rows draw as unseeded rows instead.
         """
-        # Batches are homogeneous (see TorchSampler._is_draft_batch), so the
-        # first request decides for the whole batch.
-        self._batch_is_draft = bool(requests) and requests[0].py_is_draft
-        if self._batch_is_draft:
-            return
-
         for request in requests:
             seq_slot = request.py_seq_slot
             if seq_slot is None:
@@ -118,7 +103,7 @@ class _SeedManager:
         num_rows = len(slots_per_row)
         # Calls without a seeded row are the common case; build them on the
         # device, without a per-row loop or a host-to-device copy.
-        if self._batch_is_draft or not any(map(self._slot_seeded.__getitem__, slots_per_row)):
+        if not any(map(self._slot_seeded.__getitem__, slots_per_row)):
             start = self._unseeded_offset
             self._unseeded_offset += num_rows
             return RequestSeeds(
@@ -128,7 +113,7 @@ class _SeedManager:
         seeds: list[int] = []
         offsets: list[int] = []
         for slot in slots_per_row:
-            if self._batch_is_draft or not self._slot_seeded[slot]:
+            if not self._slot_seeded[slot]:
                 seeds.append(self._global_seed)
                 offsets.append(self._unseeded_offset)
                 self._unseeded_offset += 1

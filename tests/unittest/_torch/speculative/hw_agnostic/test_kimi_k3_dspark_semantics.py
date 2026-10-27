@@ -1727,8 +1727,14 @@ def test_mla_dspark_auto_does_not_degrade_to_the_eager_reference(monkeypatch):
     ``_auto_fallback_attention_backend = None``.
     """
     from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models import modeling_dspark
     from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
 
+    # AUTO's pick is CUTEDSL; make it unavailable, and TRTLLM too, so a
+    # degrade to either kernel backend would also be caught.
+    monkeypatch.setattr(
+        modeling_dspark, "cute_dsl_mla_decode_unavailability_reason", lambda: "probe says no"
+    )
     monkeypatch.setattr(MLADSparkForCausalLM, "_mla_decode_op", staticmethod(lambda: None))
     model_config = ModelConfig(pretrained_config=_tiny_mla_config(), attn_backend="VANILLA")
     with pytest.raises(ValueError, match="does not degrade"):

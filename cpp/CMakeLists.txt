@@ -54,7 +54,6 @@ option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
-option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
 option(COMPRESS_FATBIN "Compress everything in fatbin" ON)
 option(TIMING_NVCC "Enable nvcc build timing report" OFF)
 option(ENABLE_MULTI_DEVICE
@@ -135,11 +134,6 @@ endif()
 if(FAST_BUILD)
   add_compile_definitions("FAST_BUILD")
   message(WARNING "Skip some kernels to accelerate compilation")
-endif()
-
-if(INDEX_RANGE_CHECK)
-  add_compile_definitions("INDEX_RANGE_CHECK")
-  message(WARNING "Check index range to detect OOB accesses")
 endif()
 
 # Read the project version
@@ -663,13 +657,38 @@ if(ENABLE_UCX)
     if(DEFINED ENV{GITHUB_MIRROR} AND NOT "$ENV{GITHUB_MIRROR}" STREQUAL "")
       if(EXISTS "${ucxx_source_dir}/fetch_rapids.cmake")
         file(READ "${ucxx_source_dir}/fetch_rapids.cmake" FILE_CONTENTS)
+        # use GITHUB_MIRROR to download RAPIDS.cmake
         string(
           REPLACE "https://raw.githubusercontent.com/rapidsai/rapids-cmake"
                   "$ENV{GITHUB_MIRROR}/rapidsai/rapids-cmake/raw/refs/heads"
                   FILE_CONTENTS "${FILE_CONTENTS}")
+        # RAPIDS.cmake downloads the rapids-cmake archive from github.com unless
+        # rapids-cmake-url is set.
+        if(NOT FILE_CONTENTS MATCHES "rapids-cmake-url"
+           AND FILE_CONTENTS MATCHES
+               "rapids-cmake/raw/refs/heads/([^/]+)/RAPIDS\\.cmake")
+          string(
+            PREPEND
+            FILE_CONTENTS
+            "set(rapids-cmake-url \"$ENV{GITHUB_MIRROR}/rapidsai/rapids-cmake/archive/refs/heads/${CMAKE_MATCH_1}.zip\")\n"
+          )
+        endif()
         file(WRITE "${ucxx_source_dir}/fetch_rapids.cmake" "${FILE_CONTENTS}")
         message(WARNING "Replace UCXX fetch_rapids.cmake with internal mirror")
       endif()
+      # rapids-cmake downloads CPM.cmake from github.com unless the file exists.
+      # Version and MD5 follow rapids-cmake's cpm/detail/download.cmake. If an
+      # upgraded rapids-cmake uses another CPM version, it ignores this file and
+      # downloads its own, no side effect.
+      #
+      # Update the version and MD5 when the ucxx git_tag in
+      # 3rdparty/fetch_content.json changes.
+      set(ucxx_cpm_file "${CMAKE_BINARY_DIR}/ucxx/build/cmake/CPM_0.40.0.cmake")
+      file(
+        DOWNLOAD
+        "$ENV{GITHUB_MIRROR}/cpm-cmake/CPM.cmake/releases/download/v0.40.0/CPM.cmake"
+        "${ucxx_cpm_file}"
+        EXPECTED_MD5 6c9866a0aa0f804a36fe8c3866fb8a2c)
     endif()
     # installing ucxx via add_subdirectory results in strange cudart linking
     # error, thus using their installation script to isolate the installation

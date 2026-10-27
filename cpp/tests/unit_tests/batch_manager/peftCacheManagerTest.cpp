@@ -502,8 +502,8 @@ TEST_F(PeftCacheManagerTest, gptManagerSim)
                             *ITensor::wrap(weightsInPtr, ITensor::makeShape({v.inSize})), runtime::MemoryType::kCPU);
                         TensorPtr hostWeightsOut = mManager->copyFrom(
                             *ITensor::wrap(weightsOutPtr, ITensor::makeShape({v.outSize})), runtime::MemoryType::kCPU);
-                        float* hostWeightsInPtr = bufferCast<float>(*hostWeightsIn);
-                        float* hostWeightsOutPtr = bufferCast<float>(*hostWeightsOut);
+                        float* hostWeightsInPtr = hostWeightsIn->getBufferPtr<float>();
+                        float* hostWeightsOutPtr = hostWeightsOut->getBufferPtr<float>();
 
                         float* targetWeightsInPtr = reinterpret_cast<float*>(targetValue.weightsInPointer);
                         float* targetWeightsOutPtr = reinterpret_cast<float*>(targetValue.weightsOutPointer);

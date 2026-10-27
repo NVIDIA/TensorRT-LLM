@@ -18,6 +18,7 @@ l0_gb200_multi_gpus:
       backend: pytorch
   tests:
   - unittest/_torch/moe/multi_gpu/test_moe_a2a_workspace.py TIMEOUT (10)
+  - unittest/kv_cache_manager_v2_tests/test_host_numa_placement.py ISOLATION
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_mhc.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
@@ -66,6 +67,9 @@ l0_gb200_multi_gpus:
   - accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_a_uniform]
   - accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_b_overlap]
   - accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_a_uniform_contention_opt]
+  - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy
+  - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt
+  - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_mode_b_overlap
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_nccl_ep_capability_e2e
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_nccl_ep_cuda_graph_replay_uses_updated_routing
@@ -101,6 +105,7 @@ l0_gb200_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_4gpu[tep4]
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[dep4-trtllm]
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_2gpu_mtp_ar
+  - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_2gpu_mtp_ar_flashinfer_ring_replay
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-tp2pp2-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-low_precision_combine=False-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=2-tp4-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-low_precision_combine=False-torch_compile=False]

@@ -26,9 +26,13 @@ all three into one pass, writing into an optional output buffer or updating
 `final_hidden_states` in-place.
 """
 
+from typing import Optional
+
 import torch
 import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
+
+from ..utils import is_torch_compiling
 
 
 @triton.jit
@@ -110,6 +114,32 @@ def fused_sigmoid_gate_mul_add(
     if num_tokens == 0:
         return output
 
+    if is_torch_compiling():
+        # Route through an opaque custom op: a raw @triton.jit launcher traced
+        # by dynamo becomes a triton_kernel_wrapper HOP whose functionalization
+        # clones the mutated buffer on every call (plus an AOT copy-back), and
+        # those DtoD copies get baked into CUDA graphs. The mutated tensor is
+        # passed exactly once (aliased op arguments violate the custom-op
+        # contract), so the addend becomes an optional second input for the
+        # out-of-place form.
+        torch.ops.trtllm.fused_sigmoid_gate_mul_add_(
+            output,
+            gate_logits,
+            shared_expert_output,
+            None if output is final_hidden_states else final_hidden_states,
+        )
+        return output
+
+    _launch_sigmoid_gate_mul_add(output, final_hidden_states, shared_expert_output, gate_logits)
+    return output
+
+
+def _launch_sigmoid_gate_mul_add(
+    output: torch.Tensor,
+    final_hidden_states: torch.Tensor,
+    shared_expert_output: torch.Tensor,
+    gate_logits: torch.Tensor,
+) -> None:
     # The kernel only requires the last dimension to be contiguous (stride==1).
     # `allocate_output` may return symmetric-heap buffers whose row stride is
     # padded beyond `hidden`, so do NOT require fully-contiguous tensors.
@@ -153,4 +183,35 @@ def fused_sigmoid_gate_mul_add(
         num_warps=num_warps,
         num_stages=3,
     )
-    return output
+
+
+@torch.library.custom_op(
+    "trtllm::fused_sigmoid_gate_mul_add_",
+    mutates_args=("output",),
+    device_types="cuda",
+)
+def _fused_sigmoid_gate_mul_add_op(
+    output: torch.Tensor,
+    gate_logits: torch.Tensor,
+    shared_expert_output: torch.Tensor,
+    add_input: Optional[torch.Tensor] = None,
+) -> None:
+    """output = add_input + sigmoid(gate) * shared, in place into ``output``.
+
+    ``add_input=None`` means the in-place form: ``output`` holds the addend
+    and is overwritten with the result. The addend is a separate argument
+    (rather than passing ``output`` twice) because custom-op arguments must
+    not alias each other.
+    """
+    final = add_input if add_input is not None else output
+    _launch_sigmoid_gate_mul_add(output, final, shared_expert_output, gate_logits)
+
+
+@_fused_sigmoid_gate_mul_add_op.register_fake
+def _(
+    output: torch.Tensor,
+    gate_logits: torch.Tensor,
+    shared_expert_output: torch.Tensor,
+    add_input: Optional[torch.Tensor] = None,
+) -> None:
+    return None

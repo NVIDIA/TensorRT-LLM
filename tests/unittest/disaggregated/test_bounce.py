@@ -504,6 +504,22 @@ class TestFanInReserve:
         t = _make_transport(monkeypatch, block_bytes_per_group=[1000], capacity=500)
         assert t.reserve(_recv_req([2]), num_writers=1) is False  # total 2000 > cap 500
 
+    def test_reserve_does_not_wait_for_recv_space(self, monkeypatch):
+        # The receiver reserves on the executor thread, so a full recv region must fall back to
+        # the per-fragment path at once instead of waiting for space to free up.
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        timeouts = []
+
+        def full_region(size, timeout=None):
+            timeouts.append(timeout)
+            return None
+
+        monkeypatch.setattr(t._recv_alloc, "reserve", full_region)
+        req = _recv_req([2])
+        assert t.reserve(req, num_writers=1) is False
+        assert timeouts == [0.0]
+        assert req.bounce_dst_base is None
+
     def test_reserve_state_group_fanin_falls_back(self, monkeypatch):
         # STATE groups (None bytes) with num_writers > 1 must disable bounce even
         # when extra_bytes == 0: the representative sender may have no mamba
@@ -928,6 +944,12 @@ class TestSlotAllocator:
         a = self._alloc(monkeypatch, cap=512)  # single slot
         a.reserve(512)
         assert a.reserve(512, timeout=0.05) is None  # full -> times out
+
+    def test_zero_timeout_does_not_wait_when_full(self, monkeypatch):
+        a = self._alloc(monkeypatch, cap=512)  # single slot
+        a.reserve(512)
+        monkeypatch.setattr(a._cv, "wait", lambda *args, **kwargs: pytest.fail("reserve waited"))
+        assert a.reserve(512, timeout=0.0) is None
 
 
 # --------------------------------------------------------------------------- #

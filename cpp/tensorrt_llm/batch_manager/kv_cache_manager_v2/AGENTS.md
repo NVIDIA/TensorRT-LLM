@@ -176,8 +176,15 @@ Eviction controller
 `- prioritized LRU lists (strong ownership of droppable Pages)
 ```
 
-- Follow the existing `SharedPtr`/`WeakPtr` conventions in `utils/sharedPtr.h`.
-  Treat every ownership edge as intentional; do not replace weak edges with
+- Avoid shared ownership unless it is needed; prefer values, `std::unique_ptr`,
+  or documented raw observers. When it is needed, prefer the non-atomic
+  `SharedPtr`/`WeakPtr` in `utils/sharedPtr.h` over `std::shared_ptr`: atomic
+  refcounts are costly on ARM (Grace). `SharedPtr` is fine across threads when
+  the manager's API lock serializes every copy and release. Reserve
+  `std::shared_ptr` for process-wide resources or references released outside
+  that lock (for example, from Python). This overrides the generic `shared_ptr`
+  advice in `CODING_GUIDELINES.md`.
+- Treat every ownership edge as intentional; do not replace weak edges with
   strong ones merely to simplify access.
 - `KvCache` keeps its `KvCacheManager` alive. The manager's registry of living
   caches must not create the reverse strong-reference cycle.
@@ -206,16 +213,54 @@ Eviction controller
   Every `KvCache` must be closed before manager shutdown so this deferred cleanup
   runs while `StorageManager` is still alive.
 
+### Beam-search pages
+
+Prefill normally runs at beam width 1. Expanding the beam width does not
+physically duplicate the whole prompt; ownership splits at the prompt tail:
+
+- `_appendBeams` starts at block `floor(expectedPromptLength / tokensPerBlock)`.
+  Full prompt-prefix blocks before that ordinal stay on beam 0, and other beams
+  read that shared prefix through attention cache indirection.
+- The partially filled prompt tail, if any, gets a private writable page per
+  beam, copied from beam 0. Preallocated uncommitted generation blocks are
+  handled the same way. Newly allocated decode blocks have one row per beam.
+  Already committed blocks remain canonical on beam 0, even when the
+  prompt-length hint is conservative.
+- Raw page-index rows of non-leading beams contain `BAD_PAGE_INDEX` for the
+  shared prefix. `getAggregatedPageIndices()` and `Batch` publication expose the
+  actual storage rows. Cache indirection resolves shared attention history; do
+  not duplicate beam-0 pages into every raw row.
+- `getPagePriorities(layerGroupId, beamIndex)` preserves block ordinals. For a
+  block with one shared row it reads beam 0; otherwise it reads the requested
+  beam's private row. A missing lifecycle page yields `kPriorityDefault`.
+- Commit canonicalizes a reusable block to a single beam-0 row and releases the
+  alternative beam rows.
+- The wrapper disables `enablePartialCommit` when `maxBeamWidth > 1`, and
+  changing the beam width while partial commit is enabled is rejected.
+  Full-block reuse remains enabled. Partial reuse is also allowed: on resume,
+  a matched partial prefix is copied into a private uncommitted page before
+  beams expand.
+- SSM current state lives separately in `mSsmBlocks` and is copied per beam on
+  expansion. It is per-beam writable state, not a shared attention prefix.
+
 ## Correctness invariants
 
+- `ReuseScope::salt` is an optional string used directly by scope equality and
+  root/block-key hashing. Hash its complete bytes, including embedded NULs, and
+  preserve the distinction between an absent salt and an empty string. Integer
+  conversion is confined to the V1 event hash format and must agree with the router.
+- `Block::root` is a non-owning back-pointer for reading scope metadata while
+  attached. Set it from the parent on construction and attachment; clear it with
+  `prev` on detachment. Stored events copy the root's salt while it is valid.
 - Block keys are SHA-256 digests over the reuse scope and the token sequence.
   They are a security boundary for cross-request reuse. Do not replace,
   truncate, or use a non-cryptographic hash unless prefix matching also gains a
   token-content equality check.
 - `knownNoDigest=true` is an external guarantee (for example `text_only`), not
   a hint derived by scanning tokens. Passing it incorrectly corrupts key hashes.
-- The radix tree owns child blocks and a child never outlives its parent. Preserve
-  parent/child attachment order when replacing or removing blocks.
+- The radix tree owns attached child blocks. Detach subtrees leaf-first; live
+  caches may retain orphan blocks after their former root is destroyed. Restore
+  `prev` and `root` when reattaching them, before publishing stored events.
 - Root removal is deferred through `proposeToEraseEmptyRoot()` and drained only
   at tree safe points. Do not erase roots directly from a destructor chain.
 - Pages are immutable after commit. Locking and CUDA events establish when their
@@ -293,7 +338,8 @@ the manager, the storage manager, or the radix tree.
   (`setCapacity` -> `resize`, or the cached-token attribution drop methods ->
   `markStatsDirty`/`clearStatsDirty`) does not take it either.
 - Internal statistics accumulators (`commitStats`, `commitSsmSnapshotIterationStats`,
-  `commitReusedBlocksByLevel`, `commitCachedTokensByLevel`, and `recordDiskPrefetchBlocks`)
+  `commitReusedBlocksByLevel`, `commitConnectorReusedBlocks`, `commitCachedTokensByLevel`,
+  `commitConnectorCachedTokens`, and `recordDiskPrefetchBlocks`)
   use the caller's exclusive lock. `commitPendingStats()` and `prefetch()` provide it;
   direct C++ callers, including tests, must do the same.
 - `std::shared_mutex` is not recursive, but public APIs call each other freely

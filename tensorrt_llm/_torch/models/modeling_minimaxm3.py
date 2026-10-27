@@ -30,6 +30,8 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -38,7 +40,10 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.fmha.fallback import FallbackFmha
+from ..attention.backends.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from ..attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
+from ..attention.backends.fmha.registry import get_enabled_fmha_lib_classes
 from ..attention.backends.interface import (
     AttentionForwardArgs,
     PositionalEmbeddingParams,
@@ -52,6 +57,7 @@ from ..attention.backends.sparse.minimax_m3 import (
 )
 from ..attention.backends.sparse.minimax_m3.common import index_head_range
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
+from ..attention.backends.trtllm import TrtllmAttention
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -67,25 +73,32 @@ from ..modules.linear import (
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, create_moe
-from ..moe.fused_moe.interface import MoESchedulerKind
+from ..peft.lora.ownership import DecoderLoraOwner
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, ModelConfig, filter_weights, register_auto_model
+from .modeling_utils import (
+    DecoderModel,
+    ModelConfig,
+    filter_weights,
+    layerwise_moe_quant_config,
+    register_auto_model,
+)
 
-# Dense layers use SDPA with non-contiguous Q/K/V and a bool attn_mask.
-# Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
-# and flash SDPA does not accept attn_mask.
+# Legacy dense fallback: cuDNN cannot consume this SDPA layout.
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
 
 def _moe_routed_output_is_global(experts: nn.Module) -> bool:
-    """Return whether the selected MoE backend performs fused communication."""
-    backend = getattr(experts, "backend", experts)
-    return getattr(backend, "scheduler_kind", None) == MoESchedulerKind.FUSED_COMM
+    """Return whether the MoE layer hands back an already-combined routed output.
+
+    ``VanillaMoE`` is not an ``MoE`` subclass; it owns its communication, so
+    its output is always a rank partial.
+    """
+    return getattr(experts, "returns_global_routed_output", False)
 
 
 class MiniMaxM3QKVIndexerLinear(Linear):
@@ -550,6 +563,35 @@ def _build_swiglu_oai_dense_mlp(
     )
 
 
+ROUTER_BF16_SPLIT_TERMS = 3
+"""int: BF16 terms the FP32 router weight is split into for the tensor-core router GEMM."""
+
+
+def split_router_weight_bf16(
+    weight: torch.Tensor, terms: int = ROUTER_BF16_SPLIT_TERMS
+) -> torch.Tensor:
+    """Split the FP32 router weight into BF16 terms laid side by side along K.
+
+    ``weight`` [num_experts, hidden] FP32 becomes [num_experts, terms * hidden] BF16 with
+    ``weight ~= sum_t result[:, t * hidden:(t + 1) * hidden]``; each term is the BF16
+    rounding of what the previous terms left over (three terms carry 24 mantissa bits). A
+    BF16 activation ``y`` then gets FP32-grade logits from one tensor-core GEMM with FP32
+    accumulation, ``cat([y] * terms, -1) @ result.t()``, since BF16 x BF16 products are
+    exact in FP32. This is the multi-term emulation of CUTLASS's 3xTF32 GEMMs and of
+    cuBLAS's BF16x9 FP32 mode, with only the weight split because the activation is
+    already BF16.
+    """
+    if weight.dim() != 2 or weight.dtype != torch.float32:
+        raise ValueError("router weight must be a 2-D FP32 tensor")
+    pieces = []
+    remainder = weight
+    for _ in range(terms):
+        piece = remainder.to(torch.bfloat16)
+        pieces.append(piece)
+        remainder = remainder - piece.float()
+    return torch.cat(pieces, dim=1).contiguous()
+
+
 class MiniMaxM3Gate(nn.Module):
     """MiniMax-M3 router gate: float32 sigmoid scoring + per-expert bias correction.
 
@@ -581,10 +623,35 @@ class MiniMaxM3Gate(nn.Module):
             torch.empty((num_experts,), dtype=torch.float32),
             requires_grad=False,
         )
+        # ``weight`` as BF16 terms along K (split_router_weight_bf16) for the
+        # tensor-core GEMM on BF16 inputs; built by ``load_weights``, else None.
+        self.register_buffer("split_weight", None, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Router runs in fp32 to match SGLang.
-        return torch.nn.functional.linear(hidden_states.to(torch.float32), self.weight)
+        """FP32 router logits ``hidden_states @ weight.t()``.
+
+        BF16 inputs with a split weight run one BF16 tensor-core GEMM over the
+        replicated input and the BF16 terms of the weight, with FP32 accumulation
+        and output. Otherwise the router runs in fp32 to match SGLang: cublas_mm
+        always computes with CUBLAS_COMPUTE_32F, whereas F.linear follows torch's
+        fp32 matmul precision, which is TF32 under TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
+        (set in the NGC PyTorch based containers) and then flips near-tied top-k
+        choices.
+        """
+        if self.split_weight is not None and hidden_states.dtype == torch.bfloat16:
+            terms = self.split_weight.shape[1] // self.hidden_size
+            return torch.ops.trtllm.cublas_mm(
+                torch.cat([hidden_states] * terms, dim=-1),
+                self.split_weight.t(),
+                bias=None,
+                out_dtype=torch.float32,
+            )
+        return torch.ops.trtllm.cublas_mm(
+            hidden_states.to(torch.float32).contiguous(),
+            self.weight.t(),
+            bias=None,
+            out_dtype=torch.float32,
+        )
 
     def load_weights(self, weights: List[Dict]):
         """Load the router weight and the e_score_correction_bias.
@@ -602,6 +669,12 @@ class MiniMaxM3Gate(nn.Module):
         w = weights[0]
         if "weight" in w:
             self.weight.copy_(w["weight"][:].to(self.weight.dtype))
+            split = split_router_weight_bf16(self.weight)
+            if self.split_weight is None:
+                self.split_weight = split
+            else:
+                # In place, so a CUDA graph that captured the buffer reads the new weight.
+                self.split_weight.copy_(split)
         if "e_score_correction_bias" in w:
             self.e_score_correction_bias.copy_(
                 w["e_score_correction_bias"][:].to(self.e_score_correction_bias.dtype)
@@ -668,7 +741,12 @@ class MiniMaxM3MoE(nn.Module):
             return QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         if getattr(model_config, "quant_config_dict", None) is None:
             return quant_config
-        return model_config.quant_config_dict.get(experts_name, quant_config)
+        experts_quant_config = layerwise_moe_quant_config(
+            model_config.quant_config_dict, experts_name
+        )
+        if experts_quant_config is None:
+            return quant_config
+        return experts_quant_config
 
     def __init__(
         self,
@@ -726,6 +804,10 @@ class MiniMaxM3MoE(nn.Module):
             layer_idx=layer_idx,
             override_quant_config=experts_quant_config,
             activation=self.moe_activation,
+            # Lets a FUSED_COMM backend return its globally combined routed
+            # output; ``routed_output_is_global`` then keeps it out of the
+            # external all-reduce.
+            accepts_global_routed_output=True,
         )
         self.routed_output_is_global = _moe_routed_output_is_global(self.experts)
         # Shared expert: dense MLP fused into MoE output. Constructed
@@ -1125,6 +1207,10 @@ class MiniMaxM3Attention(Attention):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.is_sparse_attention_layer = bool(is_sparse_attention_layer)
+        if not self.is_sparse_attention_layer and isinstance(
+            self.attn, MiniMaxM3SparseRuntimeBackend
+        ):
+            self._init_native_dense_attention(model_config)
         self.disable_index_value = bool(disable_index_value)
         sparse_runtime_cfg = getattr(model_config, "sparse_attention_config", None)
         self.enable_fused_qkv_index_projection = bool(
@@ -1209,6 +1295,43 @@ class MiniMaxM3Attention(Attention):
                 dtype=config.torch_dtype,
                 use_gemma=self.use_gemma_norm,
             )
+
+    def _init_native_dense_attention(self, model_config: ModelConfig) -> None:
+        """Use native attention for unquantized KV when TRTLLM-Gen is preferred."""
+        # FP8 native FMHA also quantizes Q; SDPA preserves the activation dtype.
+        # NVFP4 requires independent block-scale strides in its virtual pools.
+        if self.main_kv_is_fp8 or self.main_kv_is_nvfp4:
+            return
+        enabled_libs = get_enabled_fmha_lib_classes()
+        if FlashInferTrtllmGenFmha not in enabled_libs:
+            return
+        if FallbackFmha in enabled_libs and enabled_libs.index(FallbackFmha) < enabled_libs.index(
+            FlashInferTrtllmGenFmha
+        ):
+            # A fallback-first policy cannot serve P128 cached prefill safely.
+            return
+        if not FlashInferTrtllmGenFmha.is_environment_available():
+            return
+        if get_sm_version() == 107:
+            # SM107 admits the library only for the KV manager's extra page sizes
+            # (the Eagle3 draft layers at 128-token pages). Dense layers keep SDPA
+            # there, as before SM107 was admitted.
+            return
+        # Q/K norm and partial RoPE run in the model before backend dispatch.
+        native_attn = TrtllmAttention(
+            self.layer_idx,
+            self.num_heads,
+            self.head_dim,
+            num_kv_heads=self.num_key_value_heads,
+            quant_config=self.quant_config,
+            q_scaling=self.q_scaling,
+            pos_embd_params=None,
+            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+        )
+        if not FlashInferTrtllmGenFmha.is_available(native_attn):
+            return
+        self.attn = native_attn
+        self.support_fused_qkv = self.attn.support_fused_qkv()
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-head Gemma RMSNorm on the main attention Q/K.
@@ -1700,39 +1823,7 @@ class MiniMaxM3Attention(Attention):
         all_reduce_params: Optional[AllReduceParams] = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Dense MiniMax-M3 attention for layers 0-2.
-
-        Mirrors :meth:`_sparse_forward` minus the index branch and minus
-        the per-block top-k selection. Bypasses ``self.attn`` because the
-        LLM API constructs ``MiniMaxM3SparseRuntimeBackend`` for every
-        layer when ``sparse_attention_config=MiniMaxM3SparseAttentionConfig()``
-        is set (the only way to get the matching :class:`MiniMaxM3KVCacheManagerV2`
-        through the standard ``_create_kv_cache_manager`` factory), and
-        that backend's ``forward`` strictly requires the M3 index branch
-        and metadata which dense layers cannot supply.
-
-        Steps:
-          1. Project Q/K/V via fused ``qkv_proj``.
-          2-3. Apply per-head Gemma RMSNorm and partial RoPE to Q/K, fused
-             into one kernel by :meth:`_fused_qk_norm_rope` when it applies.
-          4. Pull the paged main K/V cache from the M3 cache manager.
-          5. Read the pre-built :class:`MiniMaxM3SparseAttentionMetadata`
-             from ``attn_metadata.minimax_m3``. Production code paths
-             build this attachment in
-             :meth:`MiniMaxM3AttentionMetadata.prepare` (called by the
-             pyexecutor outside any CUDA-graph capture window); test
-             code paths attach it directly. The forward path **never**
-             builds metadata itself and **never** migrates tensors
-             between devices — both would trigger
-             ``cudaErrorStreamCaptureUnsupported`` for the
-             ``cuda_graph=True`` hard-path runs.
-          6. Write new K/V to ``out_cache_loc`` slots.
-          7. Gather per-request K/V padded to ``[batch, max_k]`` using
-             :func:`_gather_paged_batched` and run standard dense GQA
-             via :func:`torch.nn.functional.scaled_dot_product_attention`
-             (causal for prefill, no-causal for decode).
-          8. Apply ``o_proj``.
-        """
+        """Apply MiniMax Q/K norm and partial RoPE, then dispatch dense attention."""
         if attn_metadata is None:
             raise RuntimeError(
                 f"MiniMax-M3 dense forward (layer {self.layer_idx}) requires "
@@ -1799,17 +1890,8 @@ class MiniMaxM3Attention(Attention):
         k_view = k.view(num_tokens, self.num_key_value_heads, self.head_dim)
         v_view = v.view(num_tokens, self.num_key_value_heads, self.head_dim)
 
-        # 4. Paged-block main K/V pool. Keep the multi-dim view (do not
-        # reshape) so writes propagate to the underlying pool storage:
-        # ``kv_pool[:, 0]`` is a non-contiguous view (its dim-0 stride
-        # is 2× the contiguous stride because dim 1 separates K from
-        # V), so reshaping to ``[-1, num_kv_heads, head_dim]`` silently
-        # forks a copy. Writing to the copy and then discarding it is
-        # exactly the bug that drove dense layer-0 decode attention to
-        # near-zero output: the next forward call would read zeros for
-        # the prefilled positions because the pool was never updated.
-        # Pass the 4-D view directly; the helpers below address slots
-        # via ``(page, within)`` fancy indexing.
+        # Preserve the strided pool view so writes update the backing cache.
+        # Flattening it can allocate a copy; the helpers address (page, slot).
         kv_pool = kv_cache_manager.get_buffers(self.layer_idx)
         k_cache_view = kv_pool[:, 0]
         v_cache_view = kv_pool[:, 1]
@@ -1859,13 +1941,8 @@ class MiniMaxM3Attention(Attention):
             v_cache_view, m3_meta.req_to_token, m3_meta.slot_ids, max_k
         )
 
-        # GQA via repeat_interleave on the KV head axis: each KV head is
-        # shared by ``num_heads / num_kv_heads`` Q heads. SDPA does not
-        # support GQA natively pre-PyTorch-2.4 on every backend, so we
-        # expand K/V to match Q's head count. The expansion is O(num_q *
-        # num_kv) memory; for the M3 geometry (Q=8, KV=1 per TP=8 rank)
-        # it adds ~7x KV memory transiently — acceptable for the smoke
-        # decode.
+        # SDPA expands KV heads to query heads for prefill. Decode processes
+        # one KV head at a time to bound the temporary GQA expansion.
         if self.num_heads % max(self.num_key_value_heads, 1) != 0:
             raise RuntimeError(
                 f"Dense GQA expects num_heads ({self.num_heads}) divisible "
@@ -2002,13 +2079,14 @@ class MiniMaxM3Attention(Attention):
     ) -> torch.Tensor:
         """Route the attention core to the configured backend.
 
-        self.attn is either a :class:`MiniMaxM3MsaSparseAttention`, which
-        handles both dense and sparse layers, or a
-        :class:`MiniMaxM3SparseRuntimeBackend` (Triton).
+        MSA handles both dense and sparse layers. The Triton configuration
+        uses MiniMaxM3SparseRuntimeBackend for sparse layers and
+        TrtllmAttention for unquantized dense layers when TRTLLM-Gen is available.
+        FP8 and NVFP4 KV caches retain the SDPA dense path.
 
         * MSA → :meth:`_msa_attention_core`
         * Triton sparse → :meth:`_triton_sparse_attention_core`
-        * SDPA dense → :meth:`_sdpa_dense_attention_core`
+        * Dense → generic TRTLLM paged attention
         """
         if isinstance(self.attn, MiniMaxM3MsaSparseAttention):
             return self._msa_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
@@ -2017,7 +2095,24 @@ class MiniMaxM3Attention(Attention):
             assert idx_q is not None and idx_k is not None
             return self._triton_sparse_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
         assert idx_q is None and idx_k is None
-        return self._sdpa_dense_attention_core(q, k, v, attn_metadata, output)
+        if isinstance(self.attn, MiniMaxM3SparseRuntimeBackend):
+            return self._sdpa_dense_attention_core(q, k, v, attn_metadata, output)
+        if attn_metadata.kv_cache_manager is not None and attn_metadata.kv_cache_manager.dtype in (
+            DataType.FP8,
+            DataType.NVFP4,
+        ):
+            raise ValueError(
+                "MiniMax-M3 native dense attention requires an unquantized KV cache; "
+                "the model quantization config and KV cache manager disagree."
+            )
+        # TRTLLM-Gen self-attention requires packed QKV when updating the cache.
+        # Pack only current tokens; separate K/V inputs are not supported.
+        # Historical K/V stays in the paged cache and is never gathered here.
+        qkv = torch.cat((q, k, v), dim=-1)
+        self.attn.forward(
+            qkv, None, None, attn_metadata, forward_args=AttentionForwardArgs(output=output)
+        )
+        return output
 
     def _msa_attention_core(
         self,
@@ -2996,8 +3091,10 @@ def _build_minimax_m3_vl_input_processor_registration():
         model_type="minimax_m3_vl",
         placeholder_metadata=MultimodalPlaceholderMetadata(
             placeholder_map={
-                "image": "]<]start of image[>[]<]image[>[]<]end of image[>[",
-                "video": "]<]start of image[>[]<]video[>[]<]end of image[>[",
+                # The bare per-item markers the M3 chat template renders; the
+                # HF processor adds the start/end-of-image framing.
+                "image": "]<]image[>[",
+                "video": "]<]video[>[",
             },
             placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
             content_format=ContentFormat.STRING,
@@ -3019,6 +3116,8 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
     ``multi_modal_projector.*`` and ``patch_merge_mlp.*`` checkpoint
     blobs under that namespace.
     """
+
+    lora_owner = DecoderLoraOwner(module_path="model")
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         # Capture the raw VL config before ``super().__init__`` swaps in
@@ -3167,6 +3266,16 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
                     vid.get("pixel_values_videos") is not None
                     or vid.get("pixel_values") is not None
                 )
+                # A request whose placeholder rows are all cached or beyond
+                # this chunk needs no vision forward; dropping it here keeps
+                # the tower calls and the embedding rows to the active params.
+                # This skip must stay ahead of the append: ``find_input_mm_embeds``
+                # below advances its row cursor once per entry of
+                # ``mm_params_with_data``, so the list that feeds the vision
+                # tower has to be the list whose rows it slices.
+                runtime = getattr(param, "multimodal_runtime", None)
+                if runtime is not None and runtime.num_mm_tokens_in_chunk == 0:
+                    continue
                 if has_image_pv or has_video_pv:
                     mm_params_with_data.append(param)
 
@@ -3188,7 +3297,7 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
             # ``input_ids`` for ``mm_token_ids`` — exactly the right
             # semantics for visual-input requests.
             from .modeling_minimaxm3_vl import extract_multimodal_items_in_request_order
-            from .modeling_multimodal_utils import fuse_input_embeds
+            from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
 
             # Walk ``multimodal_params`` in left-to-right request order
             # and produce ``mm_embeds`` per-item so the concatenated rows
@@ -3213,15 +3322,30 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
             # device for the fuse path (registry buffer device follows
             # ``model.to(device)`` automatically, but the standalone
             # unit-test path may use a different device).
-            fused_ids, fused_embeds = fuse_input_embeds(
-                embedding_layer=embed_tokens,
-                input_ids=flat_ids,
-                mm_embeds=mm_embeds,
-                mm_token_ids=self.mm_token_ids.to(flat_ids.device),
-                **kwargs,
-            )
-            input_ids = fused_ids
-            inputs_embeds = fused_embeds
+            # With KV-cache reuse or chunked prefill, part of a request's
+            # placeholder span may already be cached or lie beyond the
+            # current chunk; keep only the embedding rows whose tokens are in
+            # this forward (``multimodal_runtime`` carries the counts). The
+            # list is pre-concatenated in request order so one cursor covers
+            # multi-image requests.
+            mm_embeds = find_input_mm_embeds([torch.cat(mm_embeds, dim=0)], mm_params_with_data)
+            if mm_embeds:
+                fused_ids, fused_embeds = fuse_input_embeds(
+                    embedding_layer=embed_tokens,
+                    input_ids=flat_ids,
+                    mm_embeds=mm_embeds,
+                    mm_token_ids=self.mm_token_ids.to(flat_ids.device),
+                    **kwargs,
+                )
+                input_ids = fused_ids
+                inputs_embeds = fused_embeds
+                # ``fuse_input_embeds`` returns ``input_ids=None`` once the
+                # embeddings are materialised. The speculative-decoding
+                # workers (DSpark/DFlash, MTP, Eagle) still need the
+                # per-position token ids of the fused batch;
+                # ``SpecDecOneEngineForCausalLM`` reads them from
+                # ``orig_input_ids`` when ``input_ids`` is None.
+                kwargs["orig_input_ids"] = flat_ids
 
         return super().forward(
             attn_metadata=attn_metadata,

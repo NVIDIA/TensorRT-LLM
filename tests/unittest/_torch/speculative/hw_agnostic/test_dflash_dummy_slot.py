@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata, DFlashWorker
 
 pytestmark = pytest.mark.skipif(
@@ -47,7 +48,7 @@ def _worker(lengths):
         _max_ctx=1000,
         _ctx_len=torch.tensor(lengths, dtype=torch.long, device="cuda"),
         _ctx_len_host=list(lengths),
-        _batch_to_slot=torch.zeros(8, dtype=torch.long, device="cuda"),
+        _batch_to_slot_buffer=DeviceCopyBuffer(torch.zeros(8, dtype=torch.long, device="cuda")),
     )
     w._write_ctx_len = partial(DFlashWorker._write_ctx_len, w)
     w._advance_ctx_len = partial(DFlashWorker._advance_ctx_len, w)
@@ -62,6 +63,7 @@ def _prepare(worker, request_ids, num_generations):
         batch_indices_cuda=torch.zeros(8, dtype=torch.int, device="cuda"),
         _dflash_worker=worker,
     )
+    meta._batch_indices_buffer = DeviceCopyBuffer(meta.batch_indices_cuda)
     DFlashSpecMetadata.prepare(meta)
     torch.cuda.synchronize()
 
@@ -74,7 +76,7 @@ def test_padded_steps_keep_the_dummy_slot_empty():
     worker = _worker([40, 300, 7, 0, 0])
     # Three requests in a graph of five.
     _prepare(worker, [11, 12, 13, FLOOR + 1, FLOOR + 1], num_generations=5)
-    slots = worker._batch_to_slot[:5].clone()
+    slots = worker._batch_to_slot_buffer.tensor[:5].clone()
     assert slots.tolist() == [0, 1, 2, 4, 4]
     for step in range(1, 5):
         worker._advance_ctx_len(slots, _cuda([8] * 5))

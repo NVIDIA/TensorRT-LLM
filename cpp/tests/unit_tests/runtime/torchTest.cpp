@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -58,7 +58,7 @@ void checkFilled(IBuffer& buffer, int fillValue)
 {
     if (DType == buffer.getDataType())
     {
-        EXPECT_THAT(BufferRange<typename DataTypeTraits<DType>::type>(buffer), ::testing::Each(fillValue));
+        EXPECT_THAT(buffer.getBufferRange<typename DataTypeTraits<DType>::type>(), ::testing::Each(fillValue));
     }
 }
 } // namespace

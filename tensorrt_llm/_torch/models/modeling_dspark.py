@@ -2844,10 +2844,13 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # head, head_dim 576) would fail both. The backend NAME still selects, via
     # _mla_block_decode_variant below.
     _uses_worker_attention_backend = False
-    # Selectable but not the default: needs a cute_dsl_mla_decode_fp16_blackwell
-    # taking per-token kv_bounds, absent on this branch. Worth 35.7% off the
-    # drafter region (947.50 -> 608.95 us/iter, jobs 3006025/3006026).
-    _default_attention_backend = "TRTLLM"
+    # CUTEDSL by default: one cute-dsl pass over context and block through the
+    # per-token kv_bounds of cute_dsl_mla_decode_fp16_blackwell, with no
+    # upper-triangle fixup -- 35.7% off the drafter region (947.50 -> 608.95
+    # us/iter) at unchanged acceptance and accuracy. It does not degrade (see
+    # _auto_fallback_attention_backend): a build without the kernel raises in
+    # __init__ with the reason from cute_dsl_mla_decode_unavailability_reason.
+    _default_attention_backend = "CUTEDSL"
     _supported_attention_backends = ("VANILLA", "TRTLLM", "CUTEDSL")
     # No AUTO degrade. This drafter needs a 288 GB Blackwell part to hold the
     # target at all, so a build that cannot run its kernels cannot run the
@@ -3033,8 +3036,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 f"attention_backend='CUTEDSL' cannot serve this shape: batch={batch}, "
                 f"block_size={block_size}, page_size={page_size}, "
                 f"num_heads={self._num_heads}, dtype={dtype}. Use "
-                f"attention_backend='TRTLLM', or set kv_cache_config.tokens_per_block "
-                f"to a divisor of 128 other than 1."
+                f"attention_backend='TRTLLM'."
             )
         self._cute_dsl_checked_shape = key
 

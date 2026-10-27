@@ -10,7 +10,7 @@ import os
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, cast
+from typing import Any
 
 import torch
 from torch import nn
@@ -29,6 +29,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     EncoderCUDAGraphRunner,
     EncoderCUDAGraphRunnerConfig,
@@ -60,7 +61,7 @@ from .interface import PackedInputs, PackedModelRunner, PreparedInputs, RunnerCo
 
 
 @dataclass(frozen=True, kw_only=True)
-class EncoderConfigMixin:
+class EncoderConfig(RunnerConfig):
     """Encoder-specific fields shared by runner configuration types."""
 
     enable_autotuner: bool
@@ -93,7 +94,6 @@ class EncoderConfigMixin:
         max_beam_width: int,
         without_logits: bool,
         attention_backend: type[AttentionBackend],
-        attention_runtime_features: AttentionRuntimeFeatures,
         enable_autotuner: bool,
         is_encoder_decoder: bool,
     ) -> Self:
@@ -194,7 +194,6 @@ class EncoderConfigMixin:
             max_beam_width=max_beam_width,
             without_logits=without_logits,
             attention_backend=attention_backend,
-            attention_runtime_features=attention_runtime_features,
             enable_autotuner=enable_autotuner,
             cuda_graph_enabled=cuda_graph_enabled,
             cuda_graph_padding_enabled=enable_padding,
@@ -221,7 +220,7 @@ class EncoderConfigMixin:
 
 
 @dataclass(frozen=True)
-class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
+class EncoderRunnerConfig(EncoderConfig):
     """Configuration for the EncoderOnly model runner."""
 
     @classmethod
@@ -237,7 +236,6 @@ class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
         max_beam_width: int,
         without_logits: bool,
         attention_backend: type[AttentionBackend],
-        attention_runtime_features: AttentionRuntimeFeatures,
         enable_autotuner: bool,
     ) -> Self:
         return super().create(
@@ -250,7 +248,6 @@ class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
             max_beam_width=max_beam_width,
             without_logits=without_logits,
             attention_backend=attention_backend,
-            attention_runtime_features=attention_runtime_features,
             enable_autotuner=enable_autotuner,
             is_encoder_decoder=False,
         )
@@ -275,17 +272,19 @@ class EncoderMixin:
     def _initialize_encoder(
         self,
         model: nn.Module,
-        config: EncoderConfigMixin,
+        config: EncoderConfig,
         *,
         mapping: Mapping,
         dist: Distributed | None,
         moe_load_balancer: MoeLoadBalancer | None,
+        attention_runtime_features: AttentionRuntimeFeatures,
     ) -> None:
         self._model = model
         self._mapping = mapping
         self._dist = dist
         self._moe_load_balancer = moe_load_balancer
-        self._config = cast(RunnerConfig, config)
+        self._attention_runtime_features = attention_runtime_features
+        self._config = config
         self._encoder_config = config
         self._initialize_encoder_cuda_graph()
 
@@ -340,7 +339,7 @@ class EncoderMixin:
         *,
         cache_indirection: torch.Tensor | None = None,
         enable_context_mla_with_cached_kv: bool | None = None,
-        num_heads_per_kv: int | None = None,
+        max_num_heads_per_kv: int | None = None,
     ) -> AttentionMetadata:
         metadata = build_attention_metadata(
             self._model.model_config,
@@ -348,12 +347,12 @@ class EncoderMixin:
             max_num_tokens=self._config.max_num_tokens,
             max_beam_width=self._config.max_beam_width,
             attention_backend=self._config.attention_backend,
-            attention_runtime_features=self._config.attention_runtime_features,
+            attention_runtime_features=self._attention_runtime_features,
             mapping=self._mapping,
             cache_indirection=cache_indirection,
             kv_cache_manager=None,
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
-            num_heads_per_kv=num_heads_per_kv,
+            max_num_heads_per_kv=max_num_heads_per_kv,
         )
         metadata.block_ids_per_seq = None
         metadata.kv_block_ids_per_seq = None
@@ -524,7 +523,13 @@ class EncoderMixin:
                 prepared = prepare_tokens(sequence_lengths)
             if prepared is None:
                 continue
-            execute(prepared)
+            if runner.is_warmup_only:
+                with discard_nccl_window_tensor_outputs(
+                    (runner.shared_static_tensors, prepared.kwargs)
+                ):
+                    execute(prepared)
+            else:
+                execute(prepared)
             torch.cuda.synchronize()
             num_processed += 1
         logger.info(f"Completed encoder CUDA graph {operation} for {num_processed} graph shape(s).")
@@ -553,8 +558,8 @@ class EncoderMixin:
         with MoeLoadBalancerIterContext(moe_load_balancer):
             return runner.replay(key, prepared.kwargs)
 
-    def release_graphs(self) -> None:
-        self._encoder_cuda_graph_runner.clear()
+    def release_graphs(self, *, release_nccl_window_owners: bool = True) -> None:
+        self._encoder_cuda_graph_runner.clear(release_nccl_window_owners=release_nccl_window_owners)
 
 
 class EncoderRunner(EncoderMixin, PackedModelRunner):
@@ -573,6 +578,7 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
         dist: Distributed | None,
         moe_load_balancer: MoeLoadBalancer | None,
         model_caller: ModelCaller,
+        attention_runtime_features: AttentionRuntimeFeatures,
     ) -> None:
         self._model_caller = model_caller
         if config.is_encoder_decoder:
@@ -585,7 +591,12 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
             use_cache_indirection=config.attention_backend.Metadata is TrtllmAttentionMetadata,
         )
         self._initialize_encoder(
-            model, config, mapping=mapping, dist=dist, moe_load_balancer=moe_load_balancer
+            model,
+            config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=moe_load_balancer,
+            attention_runtime_features=attention_runtime_features,
         )
         self._attn_metadata: AttentionMetadata | None = None
 
@@ -805,7 +816,7 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
             return False
         return True
 
-    def prepare_inputs(self, batch: PackedInputs) -> EncoderPreparedInputs:
+    def _prepare_inputs(self, batch: PackedInputs) -> EncoderPreparedInputs:
         """Prepare a batch the caller already packed."""
         model_inputs = batch.model_inputs
         self._reject_unsupported_model_inputs(model_inputs)
@@ -987,7 +998,10 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
                         f"bs={batch_size}, nt={num_tokens}, sl={max_seq_len}"
                     )
                     prepared = self._prepare_capture_inputs(sequence_lengths)
-                    self._execute_prepared(prepared)
+                    with discard_nccl_window_tensor_outputs(
+                        (self._buffers.input_ids_cuda, prepared.kwargs)
+                    ):
+                        self._execute_prepared(prepared)
                     torch.cuda.synchronize()
                 except torch.OutOfMemoryError:
                     if self._is_distributed_forward():
@@ -1014,7 +1028,10 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
             )
             if sequence_lengths is not None:
                 prepared = self._prepare_capture_inputs(sequence_lengths)
-                self._execute_prepared(prepared)
+                with discard_nccl_window_tensor_outputs(
+                    (self._buffers.input_ids_cuda, prepared.kwargs)
+                ):
+                    self._execute_prepared(prepared)
                 torch.cuda.synchronize()
 
         logger.info(
@@ -1059,7 +1076,7 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
         inputs: PackedInputs,
     ) -> dict[str, Any]:
         """Execute packed inputs with their requested output options."""
-        prepared = self.prepare_inputs(inputs)
+        prepared = self._prepare_inputs(inputs)
         return self._execute_prepared(
             prepared,
             gather_context_logits=inputs.gather_context_logits,

@@ -43,7 +43,7 @@ from openai.types.responses import (
     ResponseReasoningTextDoneEvent, ResponseStatus, ResponseTextConfig,
     ResponseWebSearchCallCompletedEvent, ResponseWebSearchCallInProgressEvent,
     ResponseWebSearchCallSearchingEvent)
-from openai.types.responses.response import ToolChoice
+from openai.types.responses.response import IncompleteDetails, ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
@@ -328,6 +328,8 @@ class DisaggregatedParams(OpenAIBaseModel):
     # worker read off the prompt it rendered. The generation worker only sees
     # prompt_token_ids, so it cannot resolve this for itself.
     resolved_thinking: Optional[bool] = None
+    # Orchestrator -> generation worker: seconds since arrival at the orchestrator.
+    orig_elapsed_s: Optional[float] = None
 
     @model_validator(mode="after")
     def validate_multimodal_spans(self) -> "DisaggregatedParams":
@@ -724,7 +726,6 @@ class CompletionRequest(OpenAIBaseModel):
                            gather_generation_logits: bool = False,
                            backend: Optional[str] = None) -> SamplingParams:
         sampling_logprobs = None
-        return_log_probs = False
         if self.logprobs:
             if backend == "pytorch" or gather_generation_logits:
                 sampling_logprobs = self.logprobs
@@ -732,8 +733,6 @@ class CompletionRequest(OpenAIBaseModel):
                 raise ValueError(
                     "`logprobs` must be 1 or `gather_generation_logits` must be `True` to use `logprobs` > 1"
                 )
-            else:
-                return_log_probs = True
 
         sampling_params = SamplingParams(
             best_of=self.best_of,
@@ -777,8 +776,6 @@ class CompletionRequest(OpenAIBaseModel):
             # completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if return_log_probs:
-            sampling_params._return_log_probs = True
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
@@ -1090,6 +1087,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     response_format: Optional[ResponseFormat] = None
     seed: Optional[int] = Field(None)
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
+    # Standard OpenAI field, accepted for compatibility and otherwise ignored:
+    # the server keeps no copy of a chat completion, so there is nothing to
+    # store or to leave unstored.
+    store: Optional[bool] = None
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
     temperature: Optional[float] = None
@@ -1253,7 +1254,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                            reasoning_parser: Optional[str] = None,
                            backend: Optional[str] = None) -> SamplingParams:
         sampling_logprobs = None
-        return_log_probs = False
         if self.logprobs:
             logprobs = 1 if not self.top_logprobs else self.top_logprobs
             if backend == "pytorch" or gather_generation_logits:
@@ -1262,8 +1262,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 raise ValueError(
                     "`gather_generation_logits` must be `True` to use `top_logprobs`"
                 )
-            else:
-                return_log_probs = True
 
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
@@ -1307,8 +1305,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
             # chat-completion-extra-params
             add_special_tokens=self.add_special_tokens,
         )
-        if return_log_probs:
-            sampling_params._return_log_probs = True
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
 
@@ -1640,6 +1636,59 @@ class ResponsesRequest(OpenAIBaseModel):
             "through out the inference process and return in response."),
     )
 
+    # doc: begin-responses-extra-params
+    # TensorRT-LLM extensions carrying the disaggregated-serving handoff between
+    # the orchestrator and the workers; clients do not set them.
+    disaggregated_params: Optional[DisaggregatedParams] = Field(
+        default=None,
+        description=("Parameters for disaggregated serving"),
+    )
+    conversation_params: Optional[ConversationParams] = Field(
+        default=None,
+        description=("Parameters for multi-turn conversation routing"),
+    )
+    # The context worker's tokenized prompt, so the generation worker does not
+    # render it again; the _b64 form is a base64 int32 buffer.
+    prompt_token_ids: Optional[List[int]] = None
+    prompt_token_ids_b64: Optional[str] = None
+
+    # doc: end-responses-extra-params
+
+    @field_validator("prompt_token_ids_b64")
+    @classmethod
+    def _check_prompt_token_ids_b64(cls, value: Optional[str]) -> Optional[str]:
+        # Decoded during routing and preprocessing, after validation; a bad
+        # value must be a 400 here rather than an internal error there.
+        if not value:
+            return value
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except ValueError as error:
+            raise ValueError(
+                "prompt_token_ids_b64 is not valid base64") from error
+        if len(raw) % 4:
+            raise ValueError(
+                "prompt_token_ids_b64 is not a buffer of int32 token ids")
+        return value
+
+    def relayed_prompt_token_ids(self) -> Optional[List[int]]:
+        """The prompt the orchestrator relayed from the context worker, if any.
+
+        Only a generation-only handoff carries one. On any other request the
+        fields are ignored, so the prompt is rendered from the request and the
+        response echoes what was actually prefilled.
+        """
+        params = self.disaggregated_params
+        if params is None or params.request_type != "generation_only":
+            return None
+        if self.prompt_token_ids is not None:
+            return self.prompt_token_ids
+        if not self.prompt_token_ids_b64:
+            return None
+        import numpy as np
+        return np.frombuffer(base64.b64decode(self.prompt_token_ids_b64),
+                             dtype=np.int32).tolist()
+
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
         "top_p": 1.0,
@@ -1694,6 +1743,38 @@ class ResponsesRequest(OpenAIBaseModel):
         if not isinstance(data, dict):
             return data
         return {k: v for k, v in data.items() if v is not None}
+
+    @model_validator(mode="before")
+    @classmethod
+    def hoist_additional_tools(cls, data: Any) -> Any:
+        """Move the tools of an ``additional_tools`` input item into ``tools``.
+
+        Codex declares its tools that way; hoisted here, they are validated as
+        tools and resolve when the reply's calls are parsed. Malformed shapes
+        are left in place for validation to reject.
+        """
+        if not isinstance(data, dict):
+            return data
+        items = data.get("input")
+        tools = data.get("tools")
+        if not isinstance(items, list) or not isinstance(
+                tools, (list, type(None))):
+            return data
+        hoisted = []
+        kept = []
+        for item in items:
+            if (isinstance(item, dict)
+                    and item.get("type") == "additional_tools"
+                    and isinstance(item.get("tools"), list)):
+                hoisted.extend(item["tools"])
+            else:
+                kept.append(item)
+        if not hoisted:
+            return data
+        data = dict(data)
+        data["input"] = kept
+        data["tools"] = list(data.get("tools") or []) + hoisted
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -1759,12 +1840,19 @@ StreamingResponsesResponse: TypeAlias = Union[
     ResponseCodeInterpreterCallCompletedEvent,
 ]
 
+_RESPONSES_HANDOFF_FIELDS = (
+    "disaggregated_params",
+    "prompt_token_ids",
+    "prompt_token_ids_b64",
+    "finish_reason",
+)
+
 
 class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{str(uuid.uuid4().hex)}")
     created_at: int = Field(default_factory=lambda: int(time.time()))
     # error: Optional[ResponseError] = None
-    # incomplete_details: Optional[IncompleteDetails] = None
+    incomplete_details: Optional[IncompleteDetails] = None
     instructions: Optional[str] = None
     metadata: Optional[Metadata] = None
     model: str
@@ -1788,6 +1876,26 @@ class ResponsesResponse(OpenAIBaseModel):
     truncation: Literal["auto", "disabled"]
     usage: Optional[ResponseUsage] = None
     user: Optional[str] = None
+
+    # TensorRT-LLM extensions, set only on a context-only response: the
+    # disaggregated handoff, and the engine's raw finish reason, which tells the
+    # orchestrator whether a generation phase is pending ("length" and
+    # "not_finished" both map to status "incomplete").
+    disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
+    prompt_token_ids: Optional[List[int]] = None
+    prompt_token_ids_b64: Optional[str] = None
+    finish_reason: Optional[str] = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_handoff(self, handler: Any) -> Any:
+        # The handoff fields are unset on every response a client sees, so they
+        # are left out rather than serialized as null in each body and event.
+        data = handler(self)
+        if isinstance(data, dict):
+            for key in _RESPONSES_HANDOFF_FIELDS:
+                if data.get(key, ...) is None:
+                    data.pop(key)
+        return data
 
     @classmethod
     def from_request(
@@ -2025,6 +2133,7 @@ def to_llm_disaggregated_params(
         remote_tail_start=disaggregated_params.remote_tail_start,
         multimodal_positions=disaggregated_params.multimodal_positions,
         multimodal_lengths=disaggregated_params.multimodal_lengths,
+        orig_elapsed_s=disaggregated_params.orig_elapsed_s,
     )
 
 

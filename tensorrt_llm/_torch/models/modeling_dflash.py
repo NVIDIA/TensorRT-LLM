@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm.llmapi.llm_args import is_dflash2_checkpoint, is_lilicorr_checkpoint
 from tensorrt_llm.logger import logger
 
 from ...functional import RotaryScalingType
@@ -62,25 +63,10 @@ def dspark_layer_window_size(
     return (swa_window - 1, swa_window - 1)
 
 
-def _is_dflash2_architecture(config: PretrainedConfig) -> bool:
-    """Whether a draft checkpoint advertises itself as a DFlash 2 drafter.
-
-    Matches on the "dflash2" stem (released drafters use ``DFlash2DraftModel``)
-    so per-target variants of the label are picked up too.
-    """
-    return any(
-        "dflash2" in str(arch).lower().replace("_", "").replace("-", "")
-        for arch in (getattr(config, "architectures", None) or [])
-    )
-
-
 def declares_lilicorr(config: PretrainedConfig) -> bool:
     """Whether the checkpoint requires the LiLiCorr candidate scorer."""
-    settings = getattr(config, "dflash_config", None) or {}
-    return bool(
-        settings.get("projector_type") == "lilicorr"
-        or settings.get("lilicorr_enabled", False)
-        or "LiLiCorrDraftModel" in (getattr(config, "architectures", None) or [])
+    return is_lilicorr_checkpoint(
+        getattr(config, "architectures", None), getattr(config, "dflash_config", None) or {}
     )
 
 
@@ -549,10 +535,8 @@ class DFlashForCausalLM(nn.Module):
         self._dflash2_selector_rank = int(dflash_config.get("selector_rank", 0) or 0)
         self._dflash2_selector_top_k = int(dflash_config.get("selector_top_k", 0) or 0)
         # LiLiCorr supplies its own scorer and permits convolution-free checkpoints.
-        self._is_dflash2 = not self._uses_lilicorr and (
-            self._dflash2_conv_taps > 0
-            or self._dflash2_selector_rank > 0
-            or _is_dflash2_architecture(pretrained_config)
+        self._is_dflash2 = not self._uses_lilicorr and is_dflash2_checkpoint(
+            getattr(pretrained_config, "architectures", None), dflash_config
         )
         if self._is_dflash2:
             self._validate_dflash2_config()

@@ -22,17 +22,15 @@ max_num_tokens: 256
 max_seq_len: 9236
 kv_cache_config:
   enable_block_reuse: false      # mandatory for K3 (KDA state)
-  tokens_per_block: 64           # mandatory for K3 MLA kernels
+  tokens_per_block: 64           # historical: older TRTLLM-Gen MLA kernels required 64
   # Proven by the aggregated DEP16 SA evals on GB300; bounds decode
   # concurrency x seq-len. Tune upward once the deployment is stable.
   free_gpu_memory_fraction: 0.25
 cache_transceiver_config:
   backend: NIXL
-  # Mandatory for K3: `auto` resolves to the C++ transceiver, which
-  # throws for K3's MixedMambaHybridCacheManager.
+  # K3's model preference selects Python during standard auto resolution.
+  # Keep this recipe explicit for MixedMambaHybridCacheManager.
   transceiver_runtime: PYTHON
-  # Must be >= the target max ISL and match the ctx side.
-  max_tokens_in_buffer: 8448
   # Fabric-VMM bounce buffer (recv side); must match the ctx server.
   # Without it, cross-node V2 pool-to-pool transfers fall back to
   # ~0.4 GB/s host-staged tcp; 512 MiB measured at ~455 GB/s/GPU.

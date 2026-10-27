@@ -18,6 +18,8 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import (
+    append_paged_state_rows,
+    compact_sparse_rows,
     kpool_expand,
     kpool_score,
     kpool_update,
@@ -128,7 +130,7 @@ def _reference_scores(q, w, pool, tables, kv_lens, *, num_pools_max, q_scale, w_
     return out
 
 
-@pytest.mark.parametrize("precision", ["ieee", "tf32"])
+@pytest.mark.parametrize("precision", ["ieee", "tf32", "bf16"])
 def test_pool_scores_generation_rows(precision):
     gen = torch.Generator(device="cuda").manual_seed(1)
     n, heads, slots, pages = 6, 4, 64, 8
@@ -147,9 +149,17 @@ def test_pool_scores_generation_rows(precision):
     want = _reference_scores(q, w, pool, tables, kv_lens, **kwargs)
     visible = want > FP32_MIN
     assert torch.equal(got <= FP32_MIN, ~visible)
-    # bf16 inputs are exact in tf32, so both precisions are fp32 accumulations
-    # of exact products.
+    # bf16 x bf16 products are exact in fp32, so every precision is an fp32
+    # accumulation of exact products.
     torch.testing.assert_close(got[visible], want[visible], atol=2e-3, rtol=2e-3)
+    if precision == "bf16":
+        # FP32 queries are not exact in bf16, so they keep the tf32 dot.
+        q32 = torch.randn(n, heads, HD, generator=gen, device="cuda")
+        args = (q32, w, pool, tables, kv_lens, TPB)
+        assert torch.equal(
+            kpool_score(*args, head_dim=HD, kpool=KPOOL, precision="bf16", **kwargs),
+            kpool_score(*args, head_dim=HD, kpool=KPOOL, precision="tf32", **kwargs),
+        )
 
 
 @pytest.mark.parametrize("layout", ["generation", "prefill_shared", "prefill_boundary"])
@@ -208,42 +218,70 @@ def test_pool_scores_strided_head_weights(layout, weight_head_stride):
     )
 
 
-def test_pool_scores_packed_context_rows_share_tables():
+@pytest.mark.parametrize("bounded", [False, True], ids=["full_capacity", "max_kv_len"])
+def test_pool_scores_packed_context_rows_share_tables(bounded, monkeypatch):
     """rows_per_program=16 with request_ids: the packed query tokens
     of several requests, in position order, including a group straddling two
-    requests (per-row gather branch)."""
+    requests (per-row gather branch). With max_kv_len, only pools some row can
+    see are launched; columns past the bound are left unwritten."""
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import kernels
+
     gen = torch.Generator(device="cuda").manual_seed(2)
-    heads, slots, pages = 3, 64, 8
-    pool = _strided_index_pool(slots, gen)
-    tables = _paged_tables(2, pages, slots, gen)
-    # Request 0: 21 query tokens (positions 0..20), request 1: 19 (0..18).
-    lens = [21, 19]
+    heads, num_pools_max = 3, 520
+    pages = num_pools_max * KPOOL // TPB
+    pool = _strided_index_pool(2 * pages + 8, gen)
+    tables = _paged_tables(2, pages, 2 * pages + 8, gen)
+    # Request 0: 21 query tokens after 250 cached ones, request 1: 19 (0..18).
+    lens, cached = [21, 19], [250, 0]
     request_ids = torch.cat(
         [torch.full((length,), i, dtype=torch.int32) for i, length in enumerate(lens)]
     ).cuda()
-    kv_lens = torch.cat([torch.arange(1, length + 1) for length in lens]).cuda()
+    kv_lens = torch.cat([torch.arange(c + 1, c + n + 1) for c, n in zip(cached, lens)]).cuda()
     n = kv_lens.shape[0]
     q = torch.randn(n, heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
     w = torch.rand(n, heads, generator=gen, device="cuda").to(torch.bfloat16)
-    kwargs = dict(num_pools_max=8, q_scale=HD**-0.5, w_scale=1.0)
+    kwargs = dict(num_pools_max=num_pools_max, q_scale=HD**-0.5, w_scale=1.0)
 
-    got = kpool_score(
-        q,
-        w,
-        pool,
-        tables,
-        kv_lens,
-        TPB,
-        head_dim=HD,
-        kpool=KPOOL,
-        rows_per_program=16,
-        request_ids=request_ids,
-        **kwargs,
-    )
+    def score(rows, max_kv_len):
+        return kpool_score(
+            q[rows],
+            w[rows],
+            pool,
+            tables,
+            kv_lens[rows],
+            TPB,
+            head_dim=HD,
+            kpool=KPOOL,
+            rows_per_program=16,
+            request_ids=request_ids[rows],
+            max_kv_len=max_kv_len,
+            **kwargs,
+        )
+
+    got = score(slice(None), int(kv_lens.max()) if bounded else None)
     want = _reference_scores(q, w, pool, tables[request_ids.long()], kv_lens, **kwargs)
     visible = want > FP32_MIN
-    assert torch.equal(got <= FP32_MIN, ~visible)
     torch.testing.assert_close(got[visible], want[visible], atol=2e-3, rtol=2e-3)
+    if not bounded:
+        assert torch.equal(got <= FP32_MIN, ~visible)
+        return
+    # The indexer's pool top-k scans kv_len // kpool columns, so poisoning the
+    # rest changes no selection (rows without a complete pool select nothing).
+    indexer, num_cand = _meta_indexer(), (kv_lens // KPOOL).to(torch.int32)
+
+    def select(scores):
+        out = torch.empty(n, indexer.select_k, dtype=torch.int32, device="cuda")
+        indexer.pool_top_k(
+            scores, out, is_prefill=False, sequence_lengths=num_cand, scan_lengths=num_cand
+        )
+        return out.sort(dim=-1).values
+
+    selected = select(got.masked_fill(~visible, float("inf")))
+    assert torch.equal(selected, select(want))
+    assert (selected[num_cand == 0] == -1).all()
+    # The first rows of request 1 complete no pool, so nothing is launched.
+    monkeypatch.setattr(kernels, "_kpool_score_kernel", None)
+    score(slice(lens[0], lens[0] + KPOOL - 1), KPOOL - 1)
 
 
 def test_pool_scores_broadcast_table_single_context_request():
@@ -421,8 +459,20 @@ def test_fp8_cache_storage_helpers_preserve_coalesced_pages(context):
 @pytest.mark.skipif(
     get_sm_version() not in (100, 103), reason="native sparse MLA requires SM100/103"
 )
-@pytest.mark.parametrize("rows,width", [(1, 64), (8, 2052)])
-def test_native_sparse_decode_coalesced_rows_and_graph_replay(rows: int, width: int) -> None:
+@pytest.mark.parametrize(
+    "rows,width,heads,cache_dtype",
+    [
+        (1, 64, 16, torch.bfloat16),
+        (8, 2052, 16, torch.bfloat16),
+        (8, 2052, 16, torch.float8_e4m3fn),
+        (256, 128, 16, torch.float8_e4m3fn),
+        (8, 2052, 32, torch.float8_e4m3fn),
+        (64, 256, 64, torch.float8_e4m3fn),
+    ],
+)
+def test_native_sparse_decode_coalesced_rows_and_graph_replay(
+    rows: int, width: int, heads: int, cache_dtype: torch.dtype
+) -> None:
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.backend import latent_pool_rows
@@ -433,13 +483,15 @@ def test_native_sparse_decode_coalesced_rows_and_graph_replay(rows: int, width: 
     generator = torch.Generator(device="cuda").manual_seed(6810832)
     # Only the middle subpage belongs to this layer. Other subpages contain NaN
     # to expose wrong physical addressing instead of accidentally valid values.
-    storage = torch.full((32, 3, 32, 512), float("nan"), dtype=torch.bfloat16, device="cuda")
+    storage = torch.full((32, 3, 32, 512), float("nan"), dtype=cache_dtype, device="cuda")
     latent = storage[:, 1]
     latent.copy_(
-        torch.randn(latent.shape, dtype=latent.dtype, device=latent.device, generator=generator)
+        torch.randn(latent.shape, dtype=torch.bfloat16, device=latent.device, generator=generator)
     )
     kv_rows, base, stride = latent_pool_rows(latent)
-    q_storage = torch.randn(rows, 32, 512, dtype=torch.bfloat16, device="cuda", generator=generator)
+    q_storage = torch.randn(
+        rows, heads * 2, 512, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
     q = q_storage[:, ::2]
     indices_storage = torch.empty(rows, width + 7, dtype=torch.int32, device="cuda")
     indices = indices_storage[:, :width]
@@ -449,27 +501,47 @@ def test_native_sparse_decode_coalesced_rows_and_graph_replay(rows: int, width: 
     indices[:, ::5] = -1
     runner = GlmKpoolNativeDecode()
     metadata = SimpleNamespace(effective_workspace=torch.empty(0, dtype=torch.int8, device="cuda"))
-    runner.prepare_workspace(q, metadata)
+    runner.prepare_workspace(q, metadata, max_query_rows=max(rows, 8), query_dtype=cache_dtype)
     scale = 256**-0.5
-    runner(q, kv_rows, indices, scale, metadata)
+    fp8 = cache_dtype == torch.float8_e4m3fn
+    kv_scale = torch.tensor([0.75], device="cuda") if fp8 else 1.0
+    runner(q, kv_rows, indices, scale, metadata, kv_scale=kv_scale)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = runner(q, kv_rows, indices, scale, metadata)
+        actual = runner(q, kv_rows, indices, scale, metadata, kv_scale=kv_scale)
     for replay in range(3):
         q.copy_(torch.randn(q.shape, dtype=q.dtype, device=q.device, generator=generator))
+        if fp8 and replay == 2:
+            q[:, 0, 0] = 1024
+            q[:, 0, 1] = -1024
         indices.copy_(physical.roll(replay, dims=1))
         indices[:, replay::5] = -1
         if replay == 1:
             indices[-1] = -1
         graph.replay()
         valid = indices >= 0
-        selected = kv_rows[indices.clamp_min(0).long(), 0].float()
+        selected = kv_rows.float()[indices.clamp_min(0).long(), 0] * kv_scale
         selected.masked_fill_(~valid[:, :, None], 0)
-        logits = torch.einsum("rhd,rkd->rhk", q.float(), selected) * scale
+        query = q.clamp(-448, 448).to(cache_dtype).float() if fp8 else q.float()
+        logits = torch.einsum("rhd,rkd->rhk", query, selected) * scale
         logits.masked_fill_(~valid[:, None, :], float("-inf"))
         probabilities = torch.nan_to_num(logits.softmax(dim=-1))
         expected = torch.einsum("rhk,rkd->rhd", probabilities, selected).to(q.dtype)
-        torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+        if fp8:
+            # Match the FP8 sparse-MLA tests' energy-normalized error metric.
+            a, b = actual.float(), expected.float()
+            diff = (a - b).square().sum() / (a.square().sum() + b.square().sum())
+            assert diff < 1e-3
+            torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
+            if replay < 2:
+                # The reference above quantizes the query as well; also bound the
+                # FP8 query's own error against BF16-query attention.
+                logits = torch.einsum("rhd,rkd->rhk", q.float(), selected) * scale
+                logits.masked_fill_(~valid[:, None, :], float("-inf"))
+                c = torch.einsum("rhk,rkd->rhd", torch.nan_to_num(logits.softmax(dim=-1)), selected)
+                assert (a - c).square().sum() / (a.square().sum() + c.square().sum()) < 1e-3
+        else:
+            torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
 
 
 def test_pool_scores_offsets_beyond_int32() -> None:
@@ -533,13 +605,12 @@ def test_pool_scores_offsets_beyond_int32() -> None:
         torch.testing.assert_close(out[-32:, :64], expected, rtol=0, atol=0)
 
 
-def test_pool_topk_without_cute_dsl_replays_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+def _meta_indexer():
+    """A GLM-5.3-Flash indexer (meta weights) exposing its pool top-k."""
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch import cute_dsl_utils
     from tensorrt_llm._torch.models.modeling_glm5_next import Glm5NextIndexer
 
-    monkeypatch.setattr(cute_dsl_utils, "IS_CUTLASS_DSL_AVAILABLE", False)
     config = SimpleNamespace(
         hidden_size=256,
         q_lora_rank=128,
@@ -550,7 +621,14 @@ def test_pool_topk_without_cute_dsl_replays_graph(monkeypatch: pytest.MonkeyPatc
         index_kpool_always_select_tail=True,
     )
     with torch.device("meta"):
-        indexer = Glm5NextIndexer(config, layer_idx=0)
+        return Glm5NextIndexer(config, layer_idx=0)
+
+
+def test_pool_topk_without_cute_dsl_replays_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch import cute_dsl_utils
+
+    monkeypatch.setattr(cute_dsl_utils, "IS_CUTLASS_DSL_AVAILABLE", False)
+    indexer = _meta_indexer()
     scores = torch.arange(520, dtype=torch.float32, device="cuda").repeat(3, 1)
     lengths = torch.tensor([0, 3, 513], dtype=torch.int32, device="cuda")
     selected = torch.empty(3, 512, dtype=torch.int32, device="cuda")
@@ -573,3 +651,151 @@ def test_pool_topk_without_cute_dsl_replays_graph(monkeypatch: pytest.MonkeyPatc
             expected = torch.arange(max(0, count - 512), count, dtype=torch.int32)
             assert torch.equal(valid, expected)
             assert int((actual == -1).sum()) == 512 - min(count, 512)
+
+
+@pytest.mark.parametrize("latent_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("tokens_per_request", [1, 4])
+def test_append_paged_state_rows_matches_indexed_writes(latent_dtype, tokens_per_request):
+    """One launch writes the latent (quantized for FP8) and packed state of each
+    generation row into its paged slot, bit-exact with indexed writes."""
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import paged_slot_indices
+
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    requests, pages, slots, latent_dim = 6, 6, 40, 512
+    table = _paged_tables(requests, pages, slots, gen)
+    first = torch.randint(
+        0, pages * TPB - tokens_per_request, (requests, 1), generator=gen, device="cuda"
+    )
+    positions = first + torch.arange(tokens_per_request, device="cuda")
+    # Strided rows, like slices of a fused projection output.
+    latent = (
+        torch.randn(requests, tokens_per_request, latent_dim + 64, generator=gen, device="cuda")
+        * 50
+    ).to(torch.bfloat16)[..., :latent_dim]
+    packed = torch.randn(requests, tokens_per_request, 2 * HD, generator=gen, device="cuda").to(
+        torch.bfloat16
+    )
+    scale = torch.tensor([0.7], device="cuda")
+
+    def pools():
+        # Coalesced layer pages: foreign buffers sit between this layer's slots.
+        latent_pool = torch.zeros(slots, 2, TPB, latent_dim, device="cuda").to(latent_dtype)[:, 0]
+        index_pool = torch.zeros(slots, 3, TPB, 3 * HD, device="cuda", dtype=torch.bfloat16)[:, 1]
+        return latent_pool, index_pool
+
+    want_latent, want_index = pools()
+    page, offset = paged_slot_indices(table, positions, TPB)
+    if latent_dtype == torch.float8_e4m3fn:
+        quantized = (latent.float() * scale).clamp(-448, 448).to(latent_dtype)
+        want_latent.view(torch.uint8)[page, offset] = quantized.view(torch.uint8)
+    else:
+        want_latent[page, offset] = latent
+    want_index[page, offset, : 2 * HD] = packed
+
+    got_latent, got_index = pools()
+    append_paged_state_rows(latent, packed, positions, table, got_latent, got_index, TPB, scale)
+    assert torch.equal(got_latent.view(torch.uint8), want_latent.view(torch.uint8))
+    assert torch.equal(got_index, want_index)
+
+
+def test_generation_append_uses_generation_tables_in_mixed_batch():
+    """Generation rows of a mixed batch write through the generation slice of the block
+    tables, leaving the context requests' pages untouched."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import (
+        GlmKpoolSparseAttention,
+        paged_slot_indices,
+    )
+
+    gen = torch.Generator(device="cuda").manual_seed(12)
+    num_contexts, num_generations, pages, slots, latent_dim = 2, 3, 4, 40, 512
+    tokens_per_request = 4
+    tables = _paged_tables(num_contexts + num_generations, pages, slots, gen)
+    first = torch.randint(
+        0, pages * TPB - tokens_per_request, (num_generations, 1), generator=gen, device="cuda"
+    )
+    positions = first + torch.arange(tokens_per_request, device="cuda")
+    latent = (
+        torch.randn(num_generations, tokens_per_request, latent_dim, generator=gen, device="cuda")
+        * 50
+    ).to(torch.bfloat16)
+    packed = torch.randn(
+        num_generations, tokens_per_request, 2 * HD, generator=gen, device="cuda"
+    ).to(torch.bfloat16)
+    scale = torch.tensor([0.7], device="cuda")
+
+    def pools():
+        latent_pool = torch.zeros(slots, TPB, latent_dim, device="cuda", dtype=torch.bfloat16)
+        index_pool = torch.zeros(slots, TPB, 3 * HD, device="cuda", dtype=torch.bfloat16)
+        return latent_pool, index_pool
+
+    want_latent, want_index = pools()
+    page, offset = paged_slot_indices(tables[num_contexts:], positions, TPB)
+    want_latent[page, offset] = latent
+    want_index[page, offset, : 2 * HD] = packed
+
+    got_latent, got_index = pools()
+    backend = object.__new__(GlmKpoolSparseAttention)
+    backend.kv_scale_orig_quant = scale
+    backend._cache_state = Mock(
+        return_value=SimpleNamespace(
+            latent_pool=got_latent,
+            index_pool=got_index,
+            tokens_per_block=TPB,
+            num_contexts=num_contexts,
+            block_tables=tables,
+        )
+    )
+    backend.append_paged_state(latent, packed, positions, object())
+
+    assert torch.equal(got_latent, want_latent)
+    assert torch.equal(got_index, want_index)
+    context_slots = tables[:num_contexts].flatten()
+    assert not got_latent[context_slots].any()
+    assert not got_index[context_slots].any()
+
+
+@pytest.mark.parametrize("tokens_per_request", [2, 4])
+def test_pool_key_refresh_draft_positions_match_sequential_updates(tokens_per_request):
+    """[N, T] draft positions in one launch equal T ordered single-position updates."""
+    gen = torch.Generator(device="cuda").manual_seed(8)
+    requests, pages, slots = 5, 6, 40
+    pool = _strided_index_pool(slots, gen)
+    table = _paged_tables(requests, pages, slots, gen)
+    first = torch.randint(
+        0, pages * TPB - tokens_per_request, (requests, 1), generator=gen, device="cuda"
+    )
+    positions = first + torch.arange(tokens_per_request, device="cuda")
+    ape = torch.randn(KPOOL, HD, generator=gen, device="cuda").to(torch.bfloat16)
+
+    sequential = pool.clone()
+    for step in range(tokens_per_request):
+        kpool_update(
+            sequential, table, positions[:, step].contiguous(), ape, TPB, head_dim=HD, kpool=KPOOL
+        )
+    batched = pool.clone()
+    kpool_update(batched, table, positions, ape, TPB, head_dim=HD, kpool=KPOOL)
+    assert torch.equal(batched, sequential)
+
+
+@pytest.mark.parametrize("width", [5, 64, 2052])
+def test_compact_sparse_rows_tail_and_empty_rows(width):
+    """Valid indices move to the front with a -1 tail; empty rows get one dummy index."""
+    gen = torch.Generator(device="cuda").manual_seed(9)
+    rows = 7
+    indices = torch.randint(
+        -1, 1000, (rows, width), generator=gen, device="cuda", dtype=torch.int32
+    )
+    indices[3] = -1
+    packed, lengths, nonempty = compact_sparse_rows(indices)
+    for row in range(rows):
+        values = indices[row][indices[row] >= 0]
+        expected = torch.full((packed.shape[1],), -1, dtype=torch.int32, device="cuda")
+        expected[: values.numel()] = values
+        if values.numel() == 0:
+            expected[0] = 0
+        assert torch.equal(packed[row], expected)
+        assert int(lengths[row]) == max(values.numel(), 1)
+        assert bool(nonempty[row]) == (values.numel() > 0)

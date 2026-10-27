@@ -72,6 +72,9 @@ class WaitingQueue(ABC):
         """
         pass
 
+    def mark_admitted(self, requests: Iterable[RequestQueueItem]) -> None:
+        """Called with the popped requests that were admitted, not put back."""
+
     @abstractmethod
     def remove_by_ids(self, request_ids: set[int]) -> None:
         """Remove requests with the given IDs."""
@@ -265,15 +268,26 @@ class PriorityWaitingQueue(WaitingQueue):
 
 def create_waiting_queue(
     policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
+    gen_admission=None,
 ) -> WaitingQueue:
     """Create a waiting queue based on the specified policy.
 
     Args:
         policy: The scheduling policy to use.
+        gen_admission: Optional ``GenAdmissionConfig``; overrides ``policy`` when enabled.
 
     Returns:
         A WaitingQueue instance.
     """
+    if gen_admission is not None and gen_admission.enabled:
+        from .gen_admission_queue import GenAdmissionWaitingQueue
+
+        if policy != WaitingQueuePolicy.FCFS:
+            logger.warning(
+                f"[gen_admission] {gen_admission.describe()} overrides "
+                f"waiting_queue_policy={policy}; request priorities are ignored."
+            )
+        return GenAdmissionWaitingQueue(gen_admission)
     if policy == WaitingQueuePolicy.FCFS:
         return FCFSWaitingQueue()
     elif policy == WaitingQueuePolicy.PRIORITY:

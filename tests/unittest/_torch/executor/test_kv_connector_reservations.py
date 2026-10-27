@@ -400,3 +400,22 @@ def test_invalid_reservation_answer_is_rejected(manager, req, monkeypatch, answe
     with pytest.raises(ValueError):
         manager.reserve_prefix(req, 32)
     assert manager.get_prefix_reservation(req) is None
+
+
+def test_allocation_fence_is_the_cache_managers(manager):
+    waited = []
+
+    def wait_allocation_fences(request_ids):
+        waited.append(list(request_ids))
+
+    cache_manager = SimpleNamespace(wait_allocation_fences=wait_allocation_fences)
+    manager.build_scheduler_output(ScheduledRequests(), cache_manager)
+    assert manager.worker.get_allocation_fence() is None
+    manager.handle_metadata()
+    manager.worker.get_allocation_fence()([3])
+    assert waited == [[3]]
+
+    # A manager that offers no fence leaves nothing for the worker to wait on.
+    manager.build_scheduler_output(ScheduledRequests(), None)
+    manager.handle_metadata()
+    assert manager.worker.get_allocation_fence() is None

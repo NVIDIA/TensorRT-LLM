@@ -18,28 +18,14 @@ class CublasMm(OpWrapper):
     is -- the targets pass `weight.t()` and no transpose kernel runs.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # Both targets use this for every dense projection, so the cells are the
-    # three argument shapes that differ in kind rather than in size: fused bias
-    # (gpt-oss carries one on qkv, o and the router), no bias (deepseek's
+    # Both targets use this for every dense projection. This entry's test
+    # carries their three argument shapes that differ in kind rather than in size: fused
+    # bias (gpt-oss carries one on qkv, o and the router), no bias (deepseek's
     # projections), and an out_dtype that is not the input's (deepseek's router
     # asks for fp32 logits).
     CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="gpt-oss qkv with fused bias: hidden 2880 -> (64 + 8 + 8) * 64",
-            spec=dict(m=16, k=2880, n=5120, dtype=torch.bfloat16, bias=True, out_dtype=None),
-        ),
-        Cell(
-            why="deepseek q_a, no bias: hidden 7168 -> q_lora 1536",
-            spec=dict(m=16, k=7168, n=1536, dtype=torch.bfloat16, bias=False, out_dtype=None),
-        ),
-        Cell(
-            why="deepseek router: bf16 in, fp32 logits out, 256 experts",
-            spec=dict(
-                m=16, k=7168, n=256, dtype=torch.bfloat16, bias=False, out_dtype=torch.float32
-            ),
-        ),
         Cell(
             why="decode-shaped: one token, the shape every projection sees per step",
             spec=dict(m=1, k=7168, n=1536, dtype=torch.bfloat16, bias=False, out_dtype=None),

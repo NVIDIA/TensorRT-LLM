@@ -56,7 +56,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | SOL-Attn |
+| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism\* | SOL-Attn |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **FLUX.1** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **FLUX.2** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
@@ -67,11 +67,13 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | Yes |
 | **MiniMax-H3** | Yes | Yes | No | No | No | No | Yes | Yes | No | Yes | Yes | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
-| **Qwen-Image-Layered** | No | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
-| **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | No | No | Yes | Yes | Yes | No | No | No | No |
+| **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
+| **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
 | **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
 | **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
+
+\* Wan 2.1 and Wan 2.2 (not VSA) also support a token-sharded TP layout (prototype), enabled with `parallel_config.tp_layout: token_sharded`; see [Multi-GPU Parallelism](#multi-gpu-parallelism).
 
 SOL-Attn is a runtime sparse-attention feature of the `TRTLLM` and `CUTEDSL` backends (bfloat16 self-attention with `head_dim=128` on SM100/SM103); it needs no dedicated checkpoint. Video Sparse Attention (VSA) requires a VSA-fine-tuned checkpoint and is therefore listed as its own model, `Wan 2.1 VSA`. See [VisualGen Sparse Attention](../features/visualgen-sparse-attention.md) for both.
 
@@ -289,7 +291,7 @@ args = VisualGenArgs(
 
 The loader accepts safetensors adapters that use Comfy/Kohya-style `lora_down` / `lora_up` keys or PEFT-style `lora_A` / `lora_B` keys. It applies `.alpha` tensors when present, and reads `lora_alpha` from a colocated `adapter_config.json` for PEFT adapters. `scale` multiplies the resulting alpha/rank factor.
 
-By default, `strict=True` raises when adapter tensors cannot be matched, have unsupported shapes, or partially apply to the selected transformer component. Set `target_components` explicitly for pipelines with multiple transformer components. Runtime LoRA is not supported with VisualGen weight quantization, and startup fusion does not support per-request adapter switching.
+By default, `strict=True` raises when adapter tensors cannot be matched, have unsupported shapes, or partially apply to the selected transformer component. Set `target_components` explicitly for pipelines with multiple transformer components. Runtime LoRA cannot target a transformer component with weight quantization enabled, and startup fusion does not support per-request adapter switching.
 
 ### Quantized Attention
 
@@ -389,18 +391,67 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
 
 - **CFG Parallelism** (`cfg_size: 2`): Splits positive/negative guidance prompts across GPUs. FLUX uses embedded guidance without a separate negative prompt path; CFG parallelism is not applicable to FLUX or the distilled FastWan 2.2 model.
 - **Ulysses Parallelism** (`ulysses_size: N`): Splits the sequence dimension across GPUs for longer sequences.
-    - **Async Ulysses A2A pipeline** (`async_ulysses: true` in `parallel_config`): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires `ulysses_size > 1` and an NVLink-connected GPU domain (uses PyTorch `_SymmetricMemory` with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN and LTX-2 self-attention.
+    - **Async Ulysses A2A pipeline** (`async_ulysses: true` in `parallel_config`): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires `ulysses_size > 1` and an NVLink-connected GPU domain (uses PyTorch `_SymmetricMemory` with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN, LTX-2 and MiniMax-H3 self-attention. MiniMax-H3 async is validated in BF16 only; FP8/NVFP4 combinations remain unvalidated.
 - **Parallel VAE** (`parallel_vae_size: N`): Parallelizes the final VAE decode (constraint: `parallel_vae_size ≤ world_size`). WAN/Cosmos3 shard along a spatial axis; LTX-2 and MiniMax-H3 distribute independent tiles.
 - **Context Parallel (CP)** — Partitions the sequence into shards so that each rank computes partial attention. Requires an LSE-capable attention backend (`FA4` or `CUTEDSL`). CP can be composed with Ulysses, giving a total sequence-parallel (SP) degree = `cp_size · ulysses_size`. The CP degree depends on the implementation below:
     - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (CP degree = `N · M`; total SP degree = `N · M · ulysses_size`).
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
+    - **Token-sharded TP** (`tp_layout: token_sharded` in `parallel_config`, prototype): Keeps the residual stream sharded by tokens across the TP group, so each all-reduce becomes a reduce-scatter plus an all-gather and the norms, modulation and quantization between projections run on `1/tp_size` of the tokens. Requires `tp_size > 1`; composes with CFG parallelism, not with Ulysses, Ring Attention, Attention2D or VSA. Supported for Wan 2.1 and Wan 2.2.
 
 For multi-node execution, VisualGen relies on the external launcher to terminate
 the remaining ranks when any rank exits. `torchrun` provides this behavior. With
 SLURM, launch the VisualGen rank group with `srun --kill-on-bad-exit=1`; without
 this option, surviving ranks can continue running and retain GPU memory after a
 peer or the coordinator exits.
+
+## Experimental Features
+
+### Sleep/Wake for VisualGen Models (currently supported for MiniMax H3)
+
+Sleep/wake lets a worker switch between large checkpoints on one GPU without
+keeping every model's weights on the device or repeatedly loading checkpoints
+from disk. An idle MiniMax-H3 pipeline backs its persistent GPU allocations in
+host RAM and releases their GPU memory. Wake restores them at their original
+addresses without reloading or requantizing the checkpoint.
+
+This feature is disabled by default and available only through the internal,
+single-GPU H3 pipeline. Support for other VisualGen models may be added in the
+future. It is not exposed through public `VisualGen`, HTTP, or Dynamo controls.
+Enable it explicitly during loading:
+
+```python
+pipeline = PipelineLoader(args).load(sleep_restore_mode="PINNED")
+pipeline.sleep()
+pipeline.wake_up()
+```
+
+`CPU` uses pageable host backing; `PINNED` uses pinned host backing. Host backups
+remain allocated after wake and are reused on later sleeps. Budget host RAM for
+each instance's captured allocation pool, which can include cached loading and
+quantization buffers in addition to weights. This is process-local offload:
+the process, CUDA context, host memory, and node must remain alive.
+
+Sleep rejects new generation and waits for the active call to finish before
+releasing memory. Sleep/wake transitions are serialized per instance; overlapping
+generation calls are rejected rather than queued. A failed transition prevents
+further generation and requires restarting the worker. Callers manage external
+request queues and must not access model tensors directly during transitions.
+Warmup and inference allocations are outside the captured pool; live outputs and
+the CUDA context remain on the GPU, so sleep does not reduce GPU usage to zero.
+
+Sleep/wake requires `world_size=1`. H3 already rejects CUDA graphs, CPU stage
+offload, and cache acceleration; sleep additionally rejects runtime LoRA because
+that combination has not been validated. Other pipelines retain their ordinary
+loading behavior and reject explicit sleep requests unless they implement the
+internal loading hook and generation coordination.
+
+Validation covers lifecycle and allocator regressions, unchanged default loading
+for tiny Wan/FLUX checkpoints, and checkpoint-backed H3 restoration of video,
+audio, and parameter addresses. Full-model sleep coverage is FP8 text-to-video/audio
+with pinned backing; keyframe-conditioned, Ref2VA, and non-FP8 sleep configurations remain
+unvalidated. The checkpoint-backed regression is
+`tests/integration/defs/visual_gen/test_minimax_h3_sleep.py`.
 
 ## Developer Guide
 

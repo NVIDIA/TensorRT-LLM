@@ -200,7 +200,7 @@ def test_mpi_pool_flashinfer_isolation_respects_unified_cache_configuration(
     if isolate and not explicit_workspace:
         assert captured["python_args"] == [
             "-c",
-            mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
+            mpi_session._WORKER_ENV_BOOTSTRAP + mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
             workspace_root,
         ]
         assert "FLASHINFER_WORKSPACE_BASE" not in worker_env
@@ -208,5 +208,8 @@ def test_mpi_pool_flashinfer_isolation_respects_unified_cache_configuration(
         expected_workspace = (
             str(tmp_path / "explicit-flashinfer") if explicit_workspace else workspace_root
         )
-        assert captured["python_args"] is None
+        assert captured["python_args"] == [
+            "-c",
+            mpi_session._WORKER_ENV_BOOTSTRAP + mpi_session._WORKER_SERVER_MAIN,
+        ]
         assert worker_env["FLASHINFER_WORKSPACE_BASE"] == expected_workspace
