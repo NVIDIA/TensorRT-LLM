@@ -48,6 +48,9 @@ class DisaggregatedParams:
          usage accounting on the generation server.
         remote_tail_start (int): Prompt-token boundary transferred by a remote-tail
          context worker. The generation worker replays the suffix starting here.
+        draft_ctx_state (List[int]): Context-first only: the standalone drafter's context-window
+         decision ``[ctx_len, ctx_base, ok]`` for the generation request (not ``opaque_state``,
+         which carries the C++ DataTransceiverState).
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
         multimodal_positions (List[int]): Prompt-token offset of each multimodal item.
@@ -69,6 +72,7 @@ class DisaggregatedParams:
     schedule_style: Optional[DisaggScheduleStyle] = None
     ctx_usage: Optional[Dict[str, Any]] = None
     remote_tail_start: Optional[int] = None
+    draft_ctx_state: Optional[List[int]] = None
     multimodal_positions: Optional[List[int]] = None
     multimodal_lengths: Optional[List[int]] = None
 

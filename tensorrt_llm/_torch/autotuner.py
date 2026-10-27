@@ -271,6 +271,14 @@ class TunableRunner(ABC):
         """
         return tuple(self.__dict__.values())
 
+    def tactic_name(self, tactic: Any) -> Optional[str]:
+        """A name of ``tactic`` that stays the same across builds (e.g. its kernel or config), or None.
+
+        Tactic caches shipped with a model key entries by this name rather than by the tactic value, which may be
+        an index into a list that a rebuild reorders. None means the runner has no such name.
+        """
+        return None
+
 
 @contextlib.contextmanager
 def autotune(tune_mode: bool = True,
@@ -471,6 +479,11 @@ class AutoTunerProfilingCache:
         # from choose_one when an excluded op is first seen.
         self.excluded_op: Set[str] = set()
 
+        # Entries loaded from a name-keyed tactic bundle that have not been
+        # looked up yet: cache key -> the tactic's name (TunableRunner.tactic_name).
+        # The first lookup checks the stored tactic against the name.
+        self.bundled_names: Dict[Tuple, str] = dict()
+
         # Cache metadata for local storage and validation
         self.lib_version = tensorrt_llm.__version__
         self.creation_timestamp = time.time()
@@ -491,6 +504,7 @@ class AutoTunerProfilingCache:
         self.cache.clear()
         self.independent_op.clear()
         self.excluded_op.clear()
+        self.bundled_names.clear()
 
     def fallback_entry(self) -> Tuple:
         # runner_id = 0, tactic = -1
@@ -938,6 +952,9 @@ class AutoTuner:
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
+        # Told about bundled entries no tactic matches and about shapes a bundle
+        # did not cover (``unresolved(cache_key, name)`` / ``retune(custom_op, shapes)``).
+        self.bundle_reporter: Optional[Any] = None
         self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
@@ -1162,6 +1179,20 @@ class AutoTuner:
                     input_shapes,
                     tuning_config,
                     apply_map_to_tuning_buckets=True))
+            if is_cache_hit and self.profiling_cache.bundled_names:
+                cache_key = self.profiling_cache.get_cache_key(
+                    custom_op,
+                    runners[best_runner_id],
+                    input_shapes,
+                    tuning_config,
+                    apply_map_to_tuning_buckets=True)
+                if self._resolve_bundled(cache_key, runners[best_runner_id],
+                                         inputs, **kwargs):
+                    best_tactic = self.profiling_cache.cache[cache_key][1]
+                else:
+                    is_cache_hit = False
+                    best_runner_id, best_tactic, min_time = (
+                        self.profiling_cache.fallback_entry())
 
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
@@ -1214,13 +1245,24 @@ class AutoTuner:
                 tuning_config.distributed_tuning_strategy):
             for p in profiles:
                 tensors = self._prepare_input_tensors(p, inputs)
-                is_cache_hit, *_ = self.profiling_cache.search_cache(
+                is_cache_hit, hit_runner_id, *_ = self.profiling_cache.search_cache(
                     custom_op,
                     runners,
                     p.get_opt_shapes(),
                     tuning_config,
                     apply_map_to_tuning_buckets=False,
                 )
+                if is_cache_hit and self.profiling_cache.bundled_names:
+                    cache_key = self.profiling_cache.get_cache_key(
+                        custom_op,
+                        runners[hit_runner_id],
+                        p.get_opt_shapes(),
+                        tuning_config,
+                        apply_map_to_tuning_buckets=False)
+                    is_cache_hit = self._resolve_bundled(
+                        cache_key, runners[hit_runner_id], inputs, **kwargs)
+                if not is_cache_hit and self.bundle_reporter is not None:
+                    self.bundle_reporter.retune(custom_op, p.get_opt_shapes())
                 if not is_cache_hit:
                     # Initialize runner and tactic as None in case of no valid tactic or runners are found
                     with nvtx_range(f"{custom_op}, shape {p.get_opt_shapes()}"):
@@ -1317,6 +1359,37 @@ class AutoTuner:
                     f"[Autotuner] Priming cached tactic failed for custom_op={custom_op}, "
                     f"runner={type(runner).__name__}, tactic={tactic}, "
                     f"shapes={profile.get_opt_shapes()}. Error: {e}")
+
+    def _resolve_bundled(self, cache_key: Tuple, runner: TunableRunner,
+                         inputs: List[torch.Tensor], **kwargs) -> bool:
+        """Check a cache entry loaded from a name-keyed bundle on its first lookup.
+
+        True when the stored tactic still carries the bundled name, or when another valid tactic of ``runner``
+        does (that tactic replaces the stored one). Otherwise the entry is dropped, the reporter is told, and
+        False sends the caller to the miss path (tuning, or the fallback outside tuning).
+        """
+        name = self.profiling_cache.bundled_names.pop(cache_key, None)
+        if name is None or cache_key not in self.profiling_cache.cache:
+            return cache_key in self.profiling_cache.cache
+
+        def name_of(tactic: Any) -> Optional[str]:
+            try:
+                return runner.tactic_name(tactic)
+            except (RuntimeError, IndexError, ValueError, TypeError):
+                return None
+
+        runner_id, tactic, min_time = self.profiling_cache.cache[cache_key]
+        if name_of(tactic) == name:
+            return True
+        for candidate in runner.get_valid_tactics(inputs, None, **kwargs):
+            if name_of(candidate) == name:
+                self.profiling_cache.cache[cache_key] = (runner_id, candidate,
+                                                         min_time)
+                return True
+        del self.profiling_cache.cache[cache_key]
+        if self.bundle_reporter is not None:
+            self.bundle_reporter.unresolved(cache_key, name)
+        return False
 
     def _profile_runners(
         self,

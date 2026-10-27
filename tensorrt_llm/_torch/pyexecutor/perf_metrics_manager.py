@@ -8,16 +8,127 @@ and per-request metric bookkeeping.  Extracted from PyExecutor to improve
 readability and separation of concerns.
 """
 
+import os
 from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
-from tensorrt_llm._utils import get_steady_clock_now_in_seconds
+from tensorrt_llm._utils import get_steady_clock_now_in_seconds, prefer_pinned
 from tensorrt_llm.logger import logger
 
 from .llm_request import PerfTimingInfo
+
+# GPU timestamps for the executor's timing events (the per-request perf metrics, the iteration log's device step):
+# a model opt-in armed process-wide (arm_gpu_timestamps; the MiniMax-M3.1 sm_107 routing arms it). Kill switch
+# TRTLLM_M31_DISABLE_GPU_TIMESTAMPS=1. Needs the native stamp op (trtllm::minimax_m31_globaltimer_stamp).
+_GPU_TIMESTAMPS = False
+_STAMP_OP = None
+
+
+def _native_stamp_op():
+    try:
+        return torch.ops.trtllm.minimax_m31_globaltimer_stamp
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def arm_gpu_timestamps() -> bool:
+    """Time the executor with GpuTimestamp in this process, unless killed or the native stamp op is missing."""
+    global _GPU_TIMESTAMPS, _STAMP_OP
+    if os.environ.get("TRTLLM_M31_DISABLE_GPU_TIMESTAMPS", "0") == "1":
+        _GPU_TIMESTAMPS = False
+    else:
+        _STAMP_OP = _native_stamp_op()
+        # The stamp lands in pinned host memory with a non-blocking copy; without pinned memory (Confidential
+        # Compute) that copy would block the host, so keep timed events there.
+        _GPU_TIMESTAMPS = _STAMP_OP is not None and prefer_pinned()
+    logger.info(
+        f"[M31] executor timing: {'GPU timestamps' if _GPU_TIMESTAMPS else 'timed CUDA events'}"
+    )
+    return _GPU_TIMESTAMPS
+
+
+def timing_event() -> Union[torch.cuda.Event, "GpuTimestamp"]:
+    """A GPU timing event for the executor: a GpuTimestamp when armed, else a timed CUDA event."""
+    if _GPU_TIMESTAMPS:
+        return GpuTimestamp()
+    return torch.cuda.Event(enable_timing=True)
+
+
+class GpuTimestamp:
+    """The torch.cuda.Event surface the executor's timing uses (record, query, synchronize, elapsed_time), measured
+    with %globaltimer.
+
+    A timed event record waits for its stream to drain before it takes its timestamp, and while one is in flight the
+    next decode graph's launch waits behind it (a few microseconds per record on Rubin, at every step boundary).
+    record() instead makes this timestamp's own non-blocking follower stream wait for the recording stream, then
+    stores %globaltimer there into a device word, copies it to pinned host memory and records an untimed event, all
+    on the follower. The stamp is taken when the follower passes the recording stream's position, as a timed record's
+    timestamp is. Each timestamp has its own follower, so stamps recorded at one position do not queue behind each
+    other. Under stream capture record() records nothing. Ported from dongfengy/tekit 5f03c8e89 (GLM-5), with the
+    stamp as a native op.
+    """
+
+    def __init__(self):
+        self._follower: Optional[torch.cuda.Stream] = None
+        self._stamp: Optional[torch.Tensor] = None
+        self._host: Optional[torch.Tensor] = None
+        self._done: Optional[torch.cuda.Event] = None
+        self._recorded = False
+
+    @staticmethod
+    def _new_stream(device: torch.device) -> torch.cuda.Stream:
+        """A non-blocking stream of its own (not one of PyTorch's pooled streams, which can alias the timed one)."""
+        from tensorrt_llm._utils import CUASSERT
+
+        try:
+            from cuda.bindings import runtime as cudart
+        except ImportError:
+            from cuda import cudart
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        with torch.cuda.device(index):
+            handle = CUASSERT(cudart.cudaStreamCreateWithFlags(cudart.cudaStreamNonBlocking))[0]
+        return torch.cuda.ExternalStream(int(handle), device=torch.device("cuda", index))
+
+    @staticmethod
+    def _write_stamp(out: torch.Tensor) -> None:
+        (_STAMP_OP or _native_stamp_op())(out)
+
+    def record(self, stream: Optional[torch.cuda.Stream] = None) -> None:
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        if torch.cuda.is_current_stream_capturing():
+            return
+        if self._follower is None:
+            self._follower = self._new_stream(stream.device)
+        follower = self._follower
+        follower.wait_stream(stream)
+        with torch.cuda.stream(follower):
+            if self._stamp is None:
+                self._stamp = torch.empty(1, dtype=torch.int64, device=stream.device)
+                self._host = torch.empty(1, dtype=torch.int64, pin_memory=prefer_pinned())
+                self._done = torch.cuda.Event()
+            self._write_stamp(self._stamp)
+            self._host.copy_(self._stamp, non_blocking=True)
+            self._done.record(follower)
+        self._recorded = True
+
+    def query(self) -> bool:
+        return not self._recorded or self._done.query()
+
+    def synchronize(self) -> None:
+        if self._recorded:
+            self._done.synchronize()
+
+    def elapsed_time(self, end_event: "GpuTimestamp") -> float:
+        """Milliseconds from this stamp to ``end_event``'s, once both landed."""
+        if not (self._recorded and end_event._recorded):
+            raise RuntimeError("GpuTimestamp.elapsed_time: a timestamp was not recorded")
+        self.synchronize()
+        end_event.synchronize()
+        return (int(end_event._host[0]) - int(self._host[0])) / 1e6
 
 
 class PerfMetricsManager:
@@ -56,8 +167,8 @@ class PerfMetricsManager:
             return None, None, None
         if self._perf_events is None:
             self._perf_events = [
-                tuple(torch.cuda.Event(enable_timing=True) for _ in range(3)),
-                tuple(torch.cuda.Event(enable_timing=True) for _ in range(3)),
+                tuple(timing_event() for _ in range(3)),
+                tuple(timing_event() for _ in range(3)),
             ]
             self._perf_event_idx = 0
         events = self._perf_events[self._perf_event_idx % 2]
@@ -68,7 +179,7 @@ class PerfMetricsManager:
         """Borrow a forward-only pair when the ping-pong perf events are unavailable."""
         if self._forward_event_pool:
             return self._forward_event_pool.pop()
-        return (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        return (timing_event(), timing_event())
 
     def release_forward_timing_events(self, start_event, end_event) -> None:
         if start_event is not None and end_event is not None:

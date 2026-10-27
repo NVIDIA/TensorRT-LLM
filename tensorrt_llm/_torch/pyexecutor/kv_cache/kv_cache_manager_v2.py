@@ -16,6 +16,7 @@ import hashlib
 import math
 import os
 import sys
+import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -558,6 +559,28 @@ def max_admissible_sequences(
     return max_num_sequences * (2 if needs_extra_leases else 1)
 
 
+def _m31_killed(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() in ("1", "true", "on", "yes")
+
+
+# DRAFT_KV_RESERVE: the draft KV cache manager reserves the DFlash / DSpark drafter's block width per
+# generation step (see _get_generation_kv_capacity). DRAFT_KV_GUARD: a DFlash / DSpark draft KV cache
+# manager reserves the guard page (page 0) (see KVCacheManagerV2.__init__); TRTLLM_KV_GUARD_PAGE, when
+# set, still wins. Both are a model opt-in (RuntimeHooks.draft_kv_reserve_guard), armed process-wide by
+# the KV-cache creator before any sizing (arm_draft_kv_reserve_guard). Kill switches
+# TRTLLM_M31_DISABLE_DRAFT_KV_RESERVE=1 / TRTLLM_M31_DISABLE_DRAFT_KV_GUARD=1.
+_DRAFT_KV_RESERVE = False
+_DRAFT_KV_GUARD = False
+
+
+def arm_draft_kv_reserve_guard() -> None:
+    """Take the drafter block-width reserve and the guard page in this process
+    (RuntimeHooks.draft_kv_reserve_guard), unless their kill switches are set."""
+    global _DRAFT_KV_RESERVE, _DRAFT_KV_GUARD
+    _DRAFT_KV_RESERVE = not _m31_killed("TRTLLM_M31_DISABLE_DRAFT_KV_RESERVE")
+    _DRAFT_KV_GUARD = not _m31_killed("TRTLLM_M31_DISABLE_DRAFT_KV_GUARD")
+
+
 def _get_generation_kv_capacity(spec_config, *, is_draft: bool) -> tuple[int, int]:
     """Return draft-token reserve and total capacity headroom over history."""
     from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
@@ -576,6 +599,20 @@ def _get_generation_kv_capacity(spec_config, *, is_draft: bool) -> tuple[int, in
     headroom = (
         get_num_extra_kv_tokens(spec_config) + spec_config.tokens_per_gen_step + dynamic_reserve
     )
+    if (
+        is_draft
+        and _DRAFT_KV_RESERVE
+        and (spec_config.spec_dec_mode.is_dflash() or spec_config.spec_dec_mode.is_dspark())
+    ):
+        # A DFlash / DSpark drafter writes its per-step block K/V after its just-advanced context,
+        # max_draft_len rows that can run past the max_total_draft_tokens reserve. The cpp KV-v2
+        # block-offset copy writes an unallocated entry as page 0, which another request owns, so
+        # requests that overflow in the same append launch race on that page and the drafted
+        # tokens differ run to run (M3.1 K3 agg, more than 8 requests). Reserving the block width
+        # keeps every drafter write inside its own pages; unaccepted slots are reclaimed after the
+        # step as before.
+        reserve += spec_config.max_draft_len
+        headroom += spec_config.max_draft_len
     return reserve, headroom
 
 
@@ -636,6 +673,38 @@ def _resolve_v2_max_attention_window_vec(
     clamped_window_pattern = _clamp_max_attention_window_vec(max_attention_window_vec, max_seq_len)
     local_windows = _project_max_attention_window_vec(clamped_window_pattern, pp_layers)
     return [None if window == max_seq_len else window for window in local_windows]
+
+
+# The standalone-drafter pool fixes (_resize_draft_context, the committed-history hints and the ceil(heads / tp) cost):
+# a model opt-in (RuntimeHooks.draft_pool_fixes), armed process-wide by the KV-cache creator before any sizing
+# (arm_draft_pool_fixes). Off, the previous resize and cost behavior.
+_DRAFT_POOL_FIXES = False
+
+
+def arm_draft_pool_fixes() -> None:
+    """Take the standalone-drafter pool fixes in this process (RuntimeHooks.draft_pool_fixes)."""
+    global _DRAFT_POOL_FIXES
+    _DRAFT_POOL_FIXES = True
+
+
+def _draft_pool_fixes() -> bool:
+    return _DRAFT_POOL_FIXES
+
+
+def _resize_draft_context(kv_cache, capacity: int, history: int) -> bool:
+    """Resize a draft mirror for a context chunk, releasing its stale window pages before allocating.
+
+    KvCache::resize keeps the pages it drops out of the window held (for rollback) until it returns, and
+    allocates the new chunk while they are still held. With a host tier they are offloaded to make room; when
+    the GPU is the last cache level (host_cache_size=0) held pages cannot be evicted, so a windowed pool funded
+    for its window plus one chunk per mirror fails the resize ("Impossible to meet free-slot goal"). Committing
+    the history first, at the current capacity, allocates nothing and frees those pages on return; the chunk
+    then needs only the window plus itself. The end state is the same single resize's.
+    """
+    if kv_cache.history_length < history <= kv_cache.capacity < capacity:
+        if not kv_cache.resize(kv_cache.capacity, history_length=history):
+            return False
+    return kv_cache.resize(capacity, history_length=history)
 
 
 def _extend_swa_windows_for_reuse(
@@ -729,7 +798,15 @@ def _get_static_cache_size_layer_components(
         head_dim = getattr(config, "head_dim", None)
         if not isinstance(head_dim, int):
             head_dim = config.hidden_size // config.num_attention_heads
-        head_dim = head_dim * num_key_value_heads // tp_size
+        if is_external_draft and isinstance(num_key_value_heads, int) and _draft_pool_fixes():
+            # A standalone drafter's pool is allocated with ceil(heads / tp) heads per rank (__init__'s
+            # num_kv_heads_per_layer): with fewer KV heads than ranks every rank keeps one whole head. Its windowed
+            # pool is funded in tokens and converted to bytes with this cost, so costing heads / tp instead funded
+            # a 4-head drafter at TP8 for half the tokens it holds ("Draft KV cache context resize failed").
+            # Per-layer head lists (averaged above) keep the floor formula below; no standalone drafter uses them.
+            head_dim = head_dim * ((num_key_value_heads + tp_size - 1) // tp_size)
+        else:
+            head_dim = head_dim * num_key_value_heads // tp_size
         kv_factor = 2
 
     cache_size_per_token = kv_factor * head_dim
@@ -1255,6 +1332,14 @@ def _spec_recompute_claim_limit(
 class KVCacheManagerV2(BaseResourceManager):
     # Sparse managers attach a metadata batch during initialization.
     sparse_metadata_batch: Batch | None = None
+    # A standalone draft pool on a disagg generation worker that sizes gen-init requests for the
+    # window behind the prompt end; the callback seeds the drafter's empty window
+    # (engage_disagg_gen_init_window). Declared on the class so instances built without __init__
+    # keep the plain mirror path.
+    _disagg_gen_init_window: Optional[Callable[[int, int, int], None]] = None
+    # The same pool also receives the drafter context window over the cache transceiver
+    # (engage_disagg_draft_kv_receive): its gen-init pages are then RDMA destinations.
+    _disagg_draft_kv_receive: bool = False
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
@@ -1292,6 +1377,17 @@ class KVCacheManagerV2(BaseResourceManager):
     _block_offset_host: Optional[np.ndarray] = None
     block_offset_copies: int = 0
     block_offset_skips: int = 0
+    # With skip_unchanged_block_offsets, opt-in (RuntimeHooks.patch_unchanged_draft_block_offsets): a decode-only copy
+    # whose destination view and rows equal the last copy's and whose rows' page indices differ in at most
+    # BLOCK_OFFSET_PATCH_MAX entries rewrites those rows from host-transformed values with one host-to-device row
+    # copy per pool instead of the copy kernel (see _patch_block_offsets).
+    patch_unchanged_block_offsets: bool = False
+    BLOCK_OFFSET_PATCH_MAX = 64
+    BLOCK_OFFSET_PATCH_SLOTS = 8
+    _block_offset_patch_ring: Optional[list] = None
+    _block_offset_images: Optional[dict] = None
+    block_offset_patches: int = 0
+    block_offset_patch_ns: int = 0
 
     def __init__(
         self,
@@ -1481,6 +1577,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self._kv_reserve_draft_tokens, self._generation_kv_capacity_headroom = (
             _get_generation_kv_capacity(spec_config, is_draft=self.is_draft)
         )
+        if self.is_draft and spec_config is not None:
+            logger.info(
+                f"KVCacheManagerV2 (draft): generation reserve {self._kv_reserve_draft_tokens} tokens, "
+                f"DRAFT_KV_RESERVE {'on' if _DRAFT_KV_RESERVE else 'off'}"
+            )
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.enable_stats = enable_stats
@@ -1953,6 +2054,21 @@ class KVCacheManagerV2(BaseResourceManager):
         # set; with neither set nothing here changes any allocation, any page
         # content or any reported count.
         self._guard_page_fill = os.environ.get("TRTLLM_KV_GUARD_PAGE", "").strip().lower()
+        if (
+            not self._guard_page_fill
+            and self.is_draft
+            and _DRAFT_KV_GUARD
+            and spec_config is not None
+            and (spec_config.spec_dec_mode.is_dflash() or spec_config.spec_dec_mode.is_dspark())
+        ):
+            # DRAFT_KV_GUARD: the cpp block-offset copy writes an unallocated entry as page 0. A
+            # DFlash / DSpark drafter writes its per-step block through the tables of padding rows and
+            # of rows past their allocation, so page 0 is written every step; when page 0 belongs to
+            # a request, its drafter K/V is clobbered and the write order decides the drafts (M3.1
+            # K3 agg c56). The guard page is reserved at
+            # init, before any request, so page 0 is owned by no request. Draft manager only: the
+            # target manager keeps its pages and CUDA-graph warmups unchanged.
+            self._guard_page_fill = "zero"
         self._guard_page_value = _parse_kv_fill_value(self._guard_page_fill, "TRTLLM_KV_GUARD_PAGE")
         self._guard_page_by_layer: dict[int, int] = {}
         self._fresh_page_fill = _parse_kv_fill_value(
@@ -3997,7 +4113,11 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
 
         target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
-        return kv_cache.resize(max(kv_cache.capacity, target))
+        if not _draft_pool_fixes():
+            return kv_cache.resize(max(kv_cache.capacity, target))
+        # Same committed-history hint as the unpaired path (_prepare_draft_resources).
+        history = max(kv_cache.history_length, req.context_current_position)
+        return _resize_draft_context(kv_cache, max(kv_cache.capacity, target), history)
 
     def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
         """Prepare KV cache for a disagg generation init request.
@@ -4709,6 +4829,51 @@ class KVCacheManagerV2(BaseResourceManager):
             f"windows={self.max_attention_window_vec}, gpu_max_tokens={self._gpu_max_tokens}]"
         )
 
+    def engage_disagg_gen_init_window(self, on_gen_init: Callable[[int, int, int], None]) -> None:
+        """Size disagg gen-init requests' draft mirrors for the window behind the prompt end.
+
+        ``on_gen_init(request_id, prompt_len, tokens_per_block)`` runs for each such request; the
+        drafter worker seeds its empty window there (DFlashWorker.seed_disagg_empty_window).
+        """
+        assert self.is_draft, "only a draft KV cache manager sizes the drafter window"
+        self._disagg_gen_init_window = on_gen_init
+
+    def engage_disagg_draft_kv_receive(self) -> None:
+        """Receive the drafter context window into the gen-init window (cache transceiver only).
+
+        The window sizing (``engage_disagg_gen_init_window``) is engaged first, for the same model.
+        """
+        assert self.is_draft, "only a draft KV cache manager receives the drafter context window"
+        assert self._disagg_gen_init_window is not None, (
+            "the drafter window transfer needs the gen-init window sizing engaged"
+        )
+        self._disagg_draft_kv_receive = True
+
+    def _prepare_disagg_gen_init_draft(self, req: LlmRequest, kv_cache) -> None:
+        """Hold the drafter window behind the prompt for a disagg gen-init request.
+
+        Mirrors ``prepare_disagg_gen_init``: capacity for the prompt plus the draft tokens, and
+        ``history_length = prompt_len``, so a windowed pool keeps only the pages behind the prompt
+        end (the window the context side ships) instead of the whole prompt, which its funding
+        never covered. Its drafter starts from an empty window at the prompt end unless the window
+        arrives. When it can arrive, a readiness event joins the target's receive fence: RDMA cannot
+        observe the stream order of the recycled pages.
+        """
+        target = req.prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
+        capacity = max(kv_cache.capacity, target)
+        if not kv_cache.resize(capacity, history_length=req.prompt_len):
+            raise RuntimeError(
+                f"Draft KV cache disagg gen-init resize failed for request "
+                f"{req.py_request_id}: could not resize to {capacity} tokens"
+                f"{self._draft_pool_diagnostic()}"
+            )
+        self._after_shrink(req.py_request_id, kv_cache)
+        self._disagg_gen_init_window(req.py_request_id, req.prompt_len, self.tokens_per_block)
+        if self._disagg_draft_kv_receive:
+            ready = torch.cuda.Event()
+            ready.record(self._stream)
+            self._disagg_receive_ready[req.py_request_id] = ready
+
     def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
         """Create/resize KV caches in the draft V2 manager for scheduled requests.
 
@@ -4748,6 +4913,9 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise RuntimeError(
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
                     )
+                if self._disagg_gen_init_window is not None and req.is_disagg_generation_init_state:
+                    self._prepare_disagg_gen_init_draft(req, kv_cache)
+                    continue
                 draft_len = get_draft_token_length(req) if req.is_last_context_chunk else 0
                 capacity = (
                     req.context_current_position
@@ -4775,7 +4943,11 @@ class KVCacheManagerV2(BaseResourceManager):
                     # plus the generation headroom the pool is funded for,
                     # instead of one prompt-sized chunk that exceeds it.
                     history = max(history, req.context_current_position + req.context_chunk_size)
-                if not kv_cache.resize(capacity, history):
+                if not (
+                    _resize_draft_context(kv_cache, capacity, history)
+                    if _draft_pool_fixes()
+                    else kv_cache.resize(capacity, history)
+                ):
                     raise self._mirror_resize_error(req, "context", capacity)
                 self._after_shrink(req.py_request_id, kv_cache)
 
@@ -5695,7 +5867,11 @@ class KVCacheManagerV2(BaseResourceManager):
                         ):
                             release_resources(req, free_draft_resources=True)
                             return None
-                        success = draft_kv_cache.resize(new_capacity)
+                        success = (
+                            draft_kv_cache.resize(new_capacity, history_length=history_hint)
+                            if _draft_pool_fixes()
+                            else draft_kv_cache.resize(new_capacity)
+                        )
                         if not success:
                             release_resources(req, free_draft_resources=True)
                             return None
@@ -6640,6 +6816,8 @@ class KVCacheManagerV2(BaseResourceManager):
         storage = dst_tensor.untyped_storage().data_ptr()
         if num_contexts != 0:
             guard.pop(storage, None)
+            if self._block_offset_images is not None:
+                self._block_offset_images.pop(storage, None)
             return self._count_block_offset_copy(skipped=False)
         rows = copy_idx.tolist()
         key = (
@@ -6653,10 +6831,115 @@ class KVCacheManagerV2(BaseResourceManager):
             host = self._block_offset_host = self.host_kv_cache_block_offsets.numpy()
         current = host[:, rows, 0, :]
         last = guard.get(storage)
-        if last is not None and last[0] == key and np.array_equal(last[1], current):
-            return self._count_block_offset_copy(skipped=True)
+        if last is not None and last[0] == key:
+            changed = last[1] != current
+            if not changed.any():
+                return self._count_block_offset_copy(skipped=True)
+            if (
+                self.patch_unchanged_block_offsets
+                and np.count_nonzero(changed) <= self.BLOCK_OFFSET_PATCH_MAX
+                and self._patch_block_offsets(dst_tensor, storage, last[1], current, changed)
+            ):
+                guard[storage] = (key, current)
+                self.block_offset_patches += 1
+                if self.block_offset_patches == 1:
+                    logger.info(
+                        "[M3 host] BLOCKOFF_PATCH engaged: a draft block-table copy was patched with one row copy "
+                        "(first patch on this rank)"
+                    )
+                return self._count_block_offset_copy(skipped=True)
         guard[storage] = (key, current)
+        if self._block_offset_images is not None:
+            self._block_offset_images.pop(storage, None)
         return self._count_block_offset_copy(skipped=False)
+
+    def _block_offset_transform(self, values: np.ndarray, pools: np.ndarray) -> tuple:
+        """The copy kernel's K / V entries for field-0 page indices ``values`` of pools ``pools`` (int32 arrays of one
+        shape): K = 0 if v == BAD_PAGE_INDEX (-1) else index_scales[p] * v, V = 0 if v == -1 else K + kv_offset[p],
+        in int32 with two's-complement wrap, as kvCacheManagerV2Utils.cu writes them."""
+        scales = self.index_scales.numpy().astype(np.int32, copy=False)[pools]
+        offsets = self.kv_offset.numpy().astype(np.int32, copy=False)[pools]
+        bad = values == -1
+        with np.errstate(over="ignore"):
+            key_index = np.where(bad, np.int32(0), scales * values).astype(np.int32, copy=False)
+            value_index = np.where(bad, np.int32(0), key_index + offsets).astype(
+                np.int32, copy=False
+            )
+        return key_index, value_index
+
+    def _patch_block_offsets(
+        self,
+        dst_tensor: torch.Tensor,
+        storage: int,
+        previous: np.ndarray,
+        current: np.ndarray,
+        changed: np.ndarray,
+    ) -> bool:
+        """Rewrite the copied rows of ``dst_tensor`` (field-0 page indices ``previous`` -> ``current``, ``changed``
+        where they differ) as one host-to-device copy per pool; False (the caller launches the copy kernel) when it
+        cannot.
+
+        The rows' device image is kept on the host per destination storage: built once from ``previous`` with the copy
+        kernel's int32 transform (_block_offset_transform) when the destination was last written by the kernel, then
+        updated in only the changed entries, so the bytes it holds are the ones the kernel would write for
+        ``current``. The image is staged into one of BLOCK_OFFSET_PATCH_SLOTS pinned slots, each reused only after its
+        previous copy's event (one per slot, recorded again) completed, and copied over dst[p, :rows] on the manager's
+        stream. Used only when the destination is contiguous and no capture is in progress.
+        """
+        start = time.perf_counter_ns()
+        if not dst_tensor.is_contiguous() or torch.cuda.is_current_stream_capturing():
+            return False
+        pools, rows, width = current.shape
+        if (
+            dst_tensor.dim() != 4
+            or tuple(dst_tensor.shape[2:]) != (2, width)
+            or dst_tensor.shape[1] < rows
+        ):
+            return False
+        images = self._block_offset_images
+        if images is None:
+            images = self._block_offset_images = {}
+        image = images.get(storage)
+        if image is None or image.shape != (pools, rows, 2, width):
+            image = np.empty((pools, rows, 2, width), dtype=np.int32)
+            pool_ids = np.arange(pools, dtype=np.intp).reshape(pools, 1, 1)
+            key_index, value_index = self._block_offset_transform(
+                previous.astype(np.int32, copy=False), np.broadcast_to(pool_ids, previous.shape)
+            )
+            image[:, :, 0, :] = key_index
+            image[:, :, 1, :] = value_index
+            images[storage] = image
+        pool, row, column = np.nonzero(changed)
+        key_index, value_index = self._block_offset_transform(
+            current[pool, row, column].astype(np.int32, copy=False), pool
+        )
+        image[pool, row, 0, column] = key_index
+        image[pool, row, 1, column] = value_index
+        ring = self._block_offset_patch_ring
+        if ring is None:
+            ring = self._block_offset_patch_ring = [None] * self.BLOCK_OFFSET_PATCH_SLOTS
+        entry = ring[self.block_offset_patches % self.BLOCK_OFFSET_PATCH_SLOTS]
+        if entry is None or entry[0].shape != (pools, rows, 2, width):
+            staging = torch.empty(
+                (pools, rows, 2, width), dtype=torch.int32, pin_memory=prefer_pinned()
+            )
+            entry = [staging, staging.numpy(), torch.cuda.Event(), False]
+            ring[self.block_offset_patches % self.BLOCK_OFFSET_PATCH_SLOTS] = entry
+        elif entry[3]:
+            entry[2].synchronize()
+        np.copyto(entry[1], image)
+        stream = self._stream
+        if stream == torch.cuda.current_stream():
+            for p in range(pools):
+                dst_tensor[p, :rows].copy_(entry[0][p], non_blocking=True)
+        else:
+            with torch.cuda.stream(stream):
+                for p in range(pools):
+                    dst_tensor[p, :rows].copy_(entry[0][p], non_blocking=True)
+        entry[2].record(stream)
+        entry[3] = True
+        self.block_offset_patch_ns += time.perf_counter_ns() - start
+        return True
 
     def _count_block_offset_copy(self, skipped: bool) -> bool:
         """Count one guarded copy (``skipped``: not issued) and log the counts whenever the calls reach a power of
@@ -6669,6 +6952,12 @@ class KVCacheManagerV2(BaseResourceManager):
         if calls & (calls - 1) == 0:
             logger.info(
                 f"[M3 host] block-offset copies skipped when unchanged: {self.block_offset_skips} of {calls}"
+                + (
+                    f", patched {self.block_offset_patches} "
+                    f"({self.block_offset_patch_ns / max(self.block_offset_patches, 1) / 1e3:.1f} us host each)"
+                    if self.patch_unchanged_block_offsets
+                    else ""
+                )
             )
         return skipped
 
@@ -6811,6 +7100,46 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         scope = ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt))
         return self.impl.probe_first_new_block_key(scope, tokens)
+
+    def prefetch_to_gpu(self, req) -> int:
+        """Migrate a waiting context request's reusable prefix to the GPU tier ahead of its admission.
+
+        Uses a transient, never-resumed cache, as prefetch_for_context_tokens does: it takes no
+        IndexMapper slot, the migrated pages stay evictable (admission and max_util_for_resume are
+        unaffected) and the copies run on the cache manager's temporary streams, never on the
+        execution stream. Returns the bytes of the prefix that were off the GPU (0 when nothing
+        had to move); a request admitted later then finds its pages ready instead of making the
+        whole step wait for the copy.
+        """
+        if not self.enable_block_reuse:
+            return 0
+        tokens = self._context_reuse_tokens(req)
+        reuse_salt = self._derive_reuse_salt(req.cache_salt)
+        kv_cache = self.impl.create_kv_cache(
+            ReuseScope(lora_id=req.lora_task_id, salt=reuse_salt),
+            tokens,
+        )
+        try:
+            # Reused tokens per cache level (the coldest page of each block), taken when the match
+            # is made. A held, never-resumed cache exposes no page levels in its page storage
+            # snapshot (only active caches do), so these counts are what tell where it lives.
+            off_tokens = sum(kv_cache.cached_tokens_by_level[GPU_LEVEL + 1 :])
+            if off_tokens == 0:
+                return 0
+            if not kv_cache.prefetch(GPU_LEVEL):
+                return 0
+            return off_tokens * self._kv_token_bytes_estimate()
+        finally:
+            kv_cache.close()
+
+    def _kv_token_bytes_estimate(self) -> int:
+        """KV bytes of one token over the local layers (for the prefetch hold length only)."""
+        if getattr(self, "_kv_token_bytes", None) is None:
+            try:
+                self._kv_token_bytes = max(1, int(self.get_cache_bytes_per_token()))
+            except Exception:  # noqa: BLE001 - a rough size is enough here
+                self._kv_token_bytes = 32 << 10
+        return self._kv_token_bytes
 
     def prefetch_for_context_tokens(self, requests: list) -> bool:
         """Prefetch radix-tree blocks from disk→host for upcoming context requests.

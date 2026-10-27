@@ -60,6 +60,7 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     DEFAULT_RUNTIME_HOOKS,
     MsaRuntimePolicy,
     RuntimeHooks,
+    hook_work,
     runtime_hooks_of,
 )
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
@@ -375,6 +376,7 @@ class DecoderRunner(ScheduledModelRunner):
         self.guided_decoder: CapturableGuidedDecoder | None = None
         self.lora_model_config: LoraModelConfig | None = None
         self.runtime_hooks = runtime_hooks_of(model)
+        self._tactic_pins_installed = False
         self._h2d_cache = (
             H2DSkipCache(changed_span=self.runtime_hooks.h2d_changed_span)
             if self.runtime_hooks.skip_unchanged_h2d
@@ -386,6 +388,8 @@ class DecoderRunner(ScheduledModelRunner):
                 parallel_scatter=self.runtime_hooks.pack_parallel_scatter,
                 in_graph=self.runtime_hooks.pack_in_graph,
                 early_copy=self.runtime_hooks.pack_early_copy,
+                step_epoch=self.runtime_hooks.pack_step_epoch,
+                prologue_op=self.runtime_hooks.pack_prologue_op,
             )
             if self.runtime_hooks.pack_step_inputs
             else None
@@ -398,9 +402,19 @@ class DecoderRunner(ScheduledModelRunner):
             logger.info(
                 "[M3 host] step-input pack: window uploaded ahead of the replay on a side copy stream"
             )
+        if self._step_pack is not None and self._step_pack.epoch is not None:
+            logger.info(
+                "[M3 host] step epoch: one device counter bumped by the decode graph's prologue"
+            )
+        if self._step_pack is not None and self._step_pack.prologue_op is not None:
+            logger.info(
+                "[M3 host] step-input pack: the decode graph's prologue is one launch (scatter, header, epoch)"
+            )
         if self._h2d_cache is not None and self._h2d_cache.changed_span:
             logger.info("[M3 host] changed metadata uploads stage only each row's changed span")
 
+        self.guided_decoder: CapturableGuidedDecoder | None = None
+        self.lora_model_config: LoraModelConfig | None = None
         self.forward_pass_callable = None
         # Optional in-graph sampling hook, registered by PyExecutor. Called at
         # the tail of _forward_step -- i.e. right after the LM head, and inside
@@ -1743,6 +1757,9 @@ class DecoderRunner(ScheduledModelRunner):
                     AutoTuner.get().clean_pp_flag()
             return ran_forward
 
+        if self.runtime_hooks.install_tactic_pins is not None and not self._tactic_pins_installed:
+            self._tactic_pins_installed = True
+            self.runtime_hooks.install_tactic_pins(self.mapping.rank)
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
         ran_native_forward = run_autotuner_pass(
             autotune(cache_path=cache_path), synchronize_trtllm_cache=True
@@ -1757,6 +1774,15 @@ class DecoderRunner(ScheduledModelRunner):
             # serving different tactics for one shape: keep the fastest everywhere.
             # Collective; before the native MXFP8 cache below registers the tactics.
             AutoTuner.get().post_tune_merge_tactics()
+        if (
+            self.runtime_hooks.persist_flashinfer_mxfp8_tactics
+            and ran_flashinfer_forward
+            and cache_path is not None
+        ):
+            # The FlashInfer MXFP8 pass tunes after the native pass's autotune() context saved the cache:
+            # save again so its tactics persist across starts instead of being re-profiled every start.
+            autotuner = AutoTuner.get()
+            autotuner.profiling_cache.save_cache(cache_path, autotuner.mapping.rank)
 
         if enable_flashinfer_mxfp8_autotuner:
             if ran_flashinfer_forward:
@@ -2155,6 +2181,18 @@ class DecoderRunner(ScheduledModelRunner):
                         # Tactics tuned while warming the decode graphs agree across
                         # ranks before the capture pass reads them.
                         AutoTuner.get().post_tune_merge_tactics()
+                    cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+                    if (
+                        self.runtime_hooks.persist_flashinfer_mxfp8_tactics
+                        and is_warmup_only
+                        and flashinfer_methods
+                        and cache_path is not None
+                    ):
+                        # The decode-graph pass tunes after the warmup's autotune() context saved the
+                        # cache: save again so these tactics (merged above when the model asks) persist
+                        # across starts instead of being re-profiled on every server start.
+                        autotuner = AutoTuner.get()
+                        autotuner.profiling_cache.save_cache(cache_path, autotuner.mapping.rank)
                     self._capture_additional_cuda_graphs(resource_manager)
         # Piecewise graphs have separate capture machinery and do not use the
         # whole-model attention workspace. Capture them only on the second pass.
@@ -2907,6 +2945,12 @@ class DecoderRunner(ScheduledModelRunner):
         if not draft_kv_cache_manager.skip_unchanged_block_offsets:
             draft_kv_cache_manager.skip_unchanged_block_offsets = True
             logger.info("[M3 host] draft block-offset copy skipped when unchanged")
+        if (
+            self.runtime_hooks.patch_unchanged_draft_block_offsets
+            and not draft_kv_cache_manager.patch_unchanged_block_offsets
+        ):
+            draft_kv_cache_manager.patch_unchanged_block_offsets = True
+            logger.info("[M3 host] draft block-offset changes patched with one row copy")
 
     def _arm_msa_policy(self, kv_cache_manager: Any) -> None:
         """Hand the model's MiniMax-M3 MSA preparation choices to the metadata and the KV cache."""
@@ -2932,6 +2976,7 @@ class DecoderRunner(ScheduledModelRunner):
         kv_cache_manager.configure_decode_shortcuts(
             skip_unchanged_block_offsets=msa.skip_unchanged_block_offsets,
             reuse_pool_views=msa.reuse_pool_views,
+            block_ids_from_views=msa.block_ids_from_views,
         )
 
     def _set_up_spec_metadata(
@@ -3013,11 +3058,13 @@ class DecoderRunner(ScheduledModelRunner):
         # RuntimeHooks.kv_lens_update_once, a step that corrects the KV lengths below (and then calls it again) calls
         # it only there: the second call rewrites everything the first one writes, and nothing reads the metadata
         # in between.
-        if attn_meta is not None and not (
-            self.runtime_hooks.kv_lens_update_once
-            and self._kv_lens_corrected_in_preprocess(inputs, enable_spec_decode)
-        ):
-            attn_meta.on_update_kv_lens()
+        if attn_meta is not None:
+            if self.runtime_hooks.kv_lens_update_once and self._kv_lens_corrected_in_preprocess(
+                inputs, enable_spec_decode
+            ):
+                hook_work("KV_LENS_ONCE")
+            else:
+                attn_meta.on_update_kv_lens()
 
         if enable_spec_decode and not self._config.disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
@@ -3033,7 +3080,25 @@ class DecoderRunner(ScheduledModelRunner):
                 num_ctx_tokens = inputs["attn_metadata"].num_ctx_tokens
                 num_chunked_ctx_requests = inputs["attn_metadata"].num_chunked_ctx_requests
                 previous_batch_tokens = inputs["input_ids"].shape[0] - num_ctx_tokens
-                if inputs["position_ids"].ndim == 3:  # mrope: [3, 1, N]
+                # RuntimeHooks.spec_offsets_op: both corrections of a generation-row step in one launch.
+                fused_offsets = (
+                    self.runtime_hooks.spec_offsets_op is not None
+                    and inputs["position_ids"].ndim != 3
+                    and hasattr(inputs["attn_metadata"], "kv_lens_cuda")
+                    and not (
+                        num_ctx_requests >= num_chunked_ctx_requests
+                        and num_chunked_ctx_requests > 0
+                    )
+                    and self.runtime_hooks.spec_offsets_op(
+                        inputs["position_ids"][0, num_ctx_tokens:],
+                        self.previous_pos_id_offsets_cuda[:previous_batch_tokens],
+                        inputs["attn_metadata"].kv_lens_cuda[num_ctx_requests:num_seqs],
+                        self.previous_kv_lens_offsets_cuda[:num_gen_requests],
+                    )
+                )
+                if fused_offsets:
+                    pass
+                elif inputs["position_ids"].ndim == 3:  # mrope: [3, 1, N]
                     inputs["position_ids"][:, :, num_ctx_tokens:] += (
                         self.previous_pos_id_offsets_cuda[:previous_batch_tokens]
                     )
@@ -3043,7 +3108,9 @@ class DecoderRunner(ScheduledModelRunner):
                     ]
 
                 if hasattr(inputs["attn_metadata"], "kv_lens_cuda"):
-                    if (
+                    if fused_offsets:
+                        pass
+                    elif (
                         num_ctx_requests >= num_chunked_ctx_requests
                         and num_chunked_ctx_requests > 0
                     ):
@@ -4227,19 +4294,20 @@ class DecoderRunner(ScheduledModelRunner):
         if num_draft_tokens > 0:
             draft_tokens = torch.tensor(draft_tokens, dtype=torch.int, pin_memory=prefer_pinned())
             self.draft_tokens_cuda[: len(draft_tokens)].copy_(draft_tokens, non_blocking=True)
-        if (
-            self._config.is_spec_decode
-            and len(num_accepted_draft_tokens) > 0
-            and not self.runtime_hooks.skip_accepted_draft_upload
-        ):
-            num_accepted_draft_tokens = torch.tensor(
-                num_accepted_draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
-            )
-            copy_h2d_if_changed(
-                self.num_accepted_draft_tokens_cuda[: len(num_accepted_draft_tokens)],
-                num_accepted_draft_tokens,
-                pack=self.runtime_hooks.spec_small_h2d,
-            )
+        if self._config.is_spec_decode and len(num_accepted_draft_tokens) > 0:
+            if self.runtime_hooks.skip_accepted_draft_upload:
+                hook_work("SKIP_ACCEPTED_UPLOAD")
+            else:
+                num_accepted_draft_tokens = torch.tensor(
+                    num_accepted_draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
+                )
+                if self.runtime_hooks.spec_small_h2d:
+                    hook_work("SMALL_H2D")
+                copy_h2d_if_changed(
+                    self.num_accepted_draft_tokens_cuda[: len(num_accepted_draft_tokens)],
+                    num_accepted_draft_tokens,
+                    pack=self.runtime_hooks.spec_small_h2d,
+                )
         step_fold = self.runtime_hooks.spec_step_fold if self._config.is_spec_decode else None
         fold_rows = None
         fold_staged = False

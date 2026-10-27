@@ -12,6 +12,7 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  - unittest/others/test_m31_draft_bf16.py
   - disaggregated/test_aiperf_gate.py::test_fires_on_error_storm
   - disaggregated/test_aiperf_gate.py::test_passes_healthy_run_with_cancellations
   - disaggregated/test_aiperf_gate.py::test_missing_export_raises
@@ -54,9 +55,12 @@ l0_cpu:
   - unittest/_torch/peft
   - unittest/_torch/memory
   - unittest/_torch/modeling
-  # modeling_v2 routing and routing-table claims: config shapes and a monkeypatched
-  # compute capability, no device. The rest of unittest/_torch/modeling_v2 needs a GPU.
+  # modeling_v2 routing, routing-table claims, the MiniMax-M3.1 tactic pins and the sm_107 targets' shared opt-ins:
+  # config shapes, a monkeypatched compute capability, stub runners and source parsing, no device. The rest of
+  # unittest/_torch/modeling_v2 needs a GPU.
   - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
+  - unittest/_torch/modeling_v2/test_m31_pins.py
+  - unittest/_torch/modeling_v2/test_m31_sm107_shared_opt_ins.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
@@ -117,6 +121,8 @@ l0_cpu:
   - unittest/_torch/speculative/hw_agnostic
   # l0_h100 selects with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
+  - unittest/_torch/test_cute_aot.py
+  - unittest/_torch/test_flashinfer_autotune_cache.py
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
@@ -166,6 +172,7 @@ l0_cpu:
   - unittest/executor/test_fatal_error_health_check.py
   - unittest/executor/test_ipc.py
   - unittest/executor/test_rpc.py
+  - unittest/executor/test_proxy_aget_stats_async.py
   - unittest/executor/test_multi_frontend_routing.py
   - unittest/executor/test_event_loop_error_broadcast.py
   - unittest/executor/test_rpc_worker_mixin.py

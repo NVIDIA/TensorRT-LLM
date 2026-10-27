@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Route the MiniMax-M3.1 sm_103 TP4/TP8 targets; other shapes decline."""
+"""Route the MiniMax-M3.1 sm_103 TP4/TP8 and sm_107 TP2/TP4/TP8 targets; other shapes decline."""
 
 from __future__ import annotations
 
@@ -8,12 +8,14 @@ import json
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._router_index import NoTarget
 
 TEXT_ONLY = True
 _SM = (10, 3)
+_SM_RUBIN = (10, 7)
 _SHAPE = (60, 6144, 128, 3072, 64, 4)
 _M31_ROPE_THETA = 10_000_000
 _M31_SPARSE_ATTENTION_FREQ = (1,) * 60
@@ -91,10 +93,10 @@ def _parallel(m) -> Optional[str]:
 
     Attention is head-split and the routed experts are tensor-parallel with
     every expert on every rank: the expert split decides which expert weights
-    each rank loads and into which shapes (per-rank expert widths 768 at TP4 and 384 at TP8),
+    each rank loads and into which shapes (per-rank expert widths 1536 at TP2, 768 at TP4 and 384 at TP8),
     so it selects a target rather than a runtime branch.
     """
-    for tp in (4, 8):
+    for tp in (2, 4, 8):
         if (
             m.world_size == tp
             and m.tp_size == tp
@@ -106,6 +108,14 @@ def _parallel(m) -> Optional[str]:
         ):
             return f"tp{tp}"
     return None
+
+
+def _m31_tp2_routed() -> bool:
+    """Whether the MiniMax-M3.1 sm_107 TP2 decode target takes its topology. On by default;
+    ``TRTLLM_M31_DISABLE_TP2=1`` keeps the built-in model."""
+    from .minimax_m31_nvfp4__sm_107__tp2.m31_switches import m31_disabled
+
+    return not m31_disabled("TP2")
 
 
 def _m31_speculation_mismatch(spec_config: Optional[Any]) -> Optional[str]:
@@ -140,6 +150,36 @@ def _m31_speculation_mismatch(spec_config: Optional[Any]) -> Optional[str]:
         if field(name) != want:
             return f"drafter {name} {field(name)}, not {want}"
     return None
+
+
+def arm_sm107_shared_opt_ins() -> None:
+    """Arm, process-wide and before the model is built, the shared paths the MiniMax-M3.1 sm_107 targets take: the
+    shipped ahead-of-time CuTe DSL objects, the drafter KV reserve and guard page, the host-tier KV prefetch, the
+    context-only int32 prompt tokens, the BF16X / E4M3X sparse-prefill fork, the indexer proxy max-score buffer reuse,
+    the context one-hot index_fill, the DFlash host-side context allocation and GPU timestamps for the executor's
+    timing events. Each keeps its kill switch. The MSA context paths and warmup stay the ones these targets run
+    (msa_indexer.arm_sm107_msa_paths), and CUDA-graph padding rows stay zeroed
+    (interface.arm_sm107_spec_paths). Armed here
+    rather than in a target's RuntimeHooks so that the target directories (the AOT objects' source digests) are not
+    edited."""
+    from tensorrt_llm._torch import cute_aot
+    from tensorrt_llm._torch.attention.backends.fmha import msa_prefill
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_indexer
+    from tensorrt_llm._torch.pyexecutor import llm_request, perf_metrics_manager, py_executor
+    from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
+    from tensorrt_llm._torch.speculative import dflash, interface
+
+    cute_aot.arm()
+    kv_cache_manager_v2.arm_draft_kv_reserve_guard()
+    py_executor.arm_kv_gpu_prefetch()
+    llm_request.arm_context_token_array()
+    msa_prefill.arm_prefill_fork()
+    msa_indexer.arm_proxy_ms_reuse()
+    msa_indexer.arm_sm107_msa_paths()
+    interface.arm_onehot_index_fill()
+    interface.arm_sm107_spec_paths()
+    dflash.arm_host_ctx_alloc()
+    perf_metrics_manager.arm_gpu_timestamps()
 
 
 def route(
@@ -198,8 +238,45 @@ def route(
 
         return ModelingV2MiniMaxM31Nvfp4Sm103Tp8
 
+    # The same export on 2, 4 or 8 Rubin GPUs (sm_107), on the same terms (TP2: moe_tp 2, every expert on both ranks).
+    if (
+        compute_capability == _SM_RUBIN
+        and shape == _SHAPE
+        and m31_miss is None
+        and parallel in ("tp2", "tp4", "tp8")
+        and (parallel != "tp2" or _m31_tp2_routed())
+        and m31_spec_miss is None
+        and kv_cache
+    ):
+        from .fake_ops import register
+
+        register()
+        arm_sm107_shared_opt_ins()
+        logger.info(
+            "M3.1 DSpark MXDRAFT projection counts describe registered hooks, not executed GEMVs. "
+            "Row-parallel projections can bypass those hooks via the BF16 NCCL-window path."
+        )
+        if parallel == "tp2":
+            from ...catalog.gemm.m31_router_half_pin import arm_router_half_pin
+
+            arm_router_half_pin()
+            from ...catalog.spec_decode.m31_draft_bf16 import arm_draft_bf16
+
+            arm_draft_bf16()
+            from .minimax_m31_nvfp4__sm_107__tp2.modeling import ModelingV2MiniMaxM31Nvfp4Sm107Tp2
+
+            return ModelingV2MiniMaxM31Nvfp4Sm107Tp2
+        if parallel == "tp4":
+            from .minimax_m31_nvfp4__sm_107__tp4.modeling import ModelingV2MiniMaxM31Nvfp4Sm107Tp4
+
+            return ModelingV2MiniMaxM31Nvfp4Sm107Tp4
+        from .minimax_m31_nvfp4__sm_107__tp8.modeling import ModelingV2MiniMaxM31Nvfp4Sm107Tp8
+
+        return ModelingV2MiniMaxM31Nvfp4Sm107Tp8
+
     raise NoTarget(
-        f"MiniMax-M3.1 requires sm_103 TP4 or TP8/EP1, shape {_SHAPE}, MXFP8/NVFP4 experts, "
+        f"MiniMax-M3.1 requires sm_103 TP4 or TP8/EP1 or sm_107 TP2, TP4 or TP8/EP1, shape {_SHAPE}, "
+        "MXFP8/NVFP4 experts, "
         f"FP8 or NVFP4 KV, and standalone MiniMax DSpark or no speculation; "
         f"got SM={compute_capability}, shape={shape}, topology={parallel}, "
         f"KV={kv_cache_quant_algo}, checkpoint={m31_miss}, speculation={m31_spec_miss}"

@@ -683,6 +683,8 @@ class GenerationResultBase:
                     ctx_dp_rank=context_phase_params.ctx_dp_rank,
                     ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
                     remote_tail_start=remote_tail_start,
+                    draft_ctx_state=getattr(response_result, "draft_ctx_state",
+                                            None),
                     multimodal_embedding_handles=None,
                 )
 

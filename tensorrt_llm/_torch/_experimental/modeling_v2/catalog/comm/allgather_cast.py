@@ -20,9 +20,12 @@ from __future__ import annotations
 import importlib
 import os
 import threading
+from pathlib import Path
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import torch
+
+from tensorrt_llm._torch import cute_aot
 
 from .._op import Arch, Cell, OpWrapper
 
@@ -58,14 +61,42 @@ def _kernel_module():
 # world size, the rows and the device only, so every rank picks the same grid.
 GRID_BY_ROWS = ((4, 96), (8, 128), (12, 152), (16, 128), (32, 152))
 GRID_BY_WORLD_ROWS = {4: ((4, 96), (8, 128), (32, 152)), 8: GRID_BY_ROWS}
+# Rubin (sm_107, compute capability 10.7) overrides by world size, measured at 96 / 128 / 152 CTAs, us per call.
+# TP8 over two trays: 4 rows 14.53 / 14.51 / 14.75, 8 rows 18.99 / 16.20 / 16.27, 16 rows 23.62 / 21.57 / 22.18,
+# 24 rows 30.61 / 26.54 / 25.59, 32 rows 33.92 / 33.63 / 29.61, 40 rows 41.34 / 35.96 / 36.09, 48 rows 43.76 / 40.06 /
+# 39.27, 56 rows 50.02 / 46.92 / 42.70, 64 rows 53.02 / 50.12 / 48.51. TP4 on one tray: 4 rows 14.46 / 13.33 / 13.41,
+# 8 rows 16.66 / 15.78 / 15.84, 16 rows 21.61 / 21.54 / 19.97, 24 rows 26.78 / 24.93 / 24.20, 32 rows 31.26 / 29.63 /
+# 28.96, 40 rows 36.60 / 34.14 / 33.17, 48 rows 41.00 / 39.50 / 37.89, 56 rows 47.02 / 43.53 / 41.05, 64 rows 49.86 /
+# 47.30 / 46.15. Every grid is bitwise at every row count; the fastest grid per row count is kept, ties within 0.5 us
+# going to the smaller grid. World sizes without a Rubin row keep the tables above.
+GRID_BY_WORLD_ROWS_SM107 = {4: ((8, 128), (64, 152)), 8: ((16, 128), (64, 152))}
+
+
+def configure_capacity(rows: int) -> None:
+    """Set the workspace's rows per call for this process (``MAX_ROWS``; ``MAX_ROWS_FP32`` follows at half): a
+    target whose verify steps exceed 64 rows (the TP2 agg steps) raises it before its first ``workspace_args``.
+    Every rank of the TP group must call it with the same value; once a workspace exists the capacity is fixed (its
+    slot layout and the compiled shapes depend on it), and a different value raises."""
+    global MAX_ROWS, MAX_ROWS_FP32
+    rows = int(rows)
+    if rows <= 0 or rows % 2:
+        raise ValueError(f"allgather_cast: capacity must be a positive even row count, got {rows}")
+    if rows == MAX_ROWS:
+        return
+    if _workspaces:
+        raise RuntimeError(
+            f"allgather_cast: capacity {MAX_ROWS} is fixed once a workspace exists (asked {rows})"
+        )
+    MAX_ROWS, MAX_ROWS_FP32 = rows, rows // 2
 
 
 def pick_grid(rows: int, device=None, world: int = 8) -> int:
     """CTAs for a call of ``rows`` rows over ``world`` ranks (capped by the SM count and MAX_GRID)."""
-    sms = torch.cuda.get_device_properties(
-        device if device is not None else torch.cuda.current_device()
-    ).multi_processor_count
+    dev = device if device is not None else torch.cuda.current_device()
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
     table = GRID_BY_WORLD_ROWS.get(world, GRID_BY_ROWS)
+    if tuple(torch.cuda.get_device_capability(dev)) == (10, 7):
+        table = GRID_BY_WORLD_ROWS_SM107.get(world, table)
     grid = next((g for bound, g in table if rows <= bound), MAX_GRID)
     return min(MAX_GRID, sms, grid)
 
@@ -219,8 +250,12 @@ def _kernel_for(
         with _lock:
             fn = _compiled.get(key)
             if fn is None:
-                fn = _compiled[key] = cute.compile(
-                    kern.allgather_cast, *args, int(rank), *consts, use_pdl, stream
+                fn = _compiled[key] = cute_aot.compile_or_load(
+                    f"allgather_cast {key}",
+                    lambda: cute.compile(
+                        kern.allgather_cast, *args, int(rank), *consts, use_pdl, stream
+                    ),
+                    sources=cute_aot.py_files(str(Path(__file__).resolve().parent)),
                 )
     return fn, args, stream
 
@@ -379,7 +414,7 @@ class AllgatherCast(OpWrapper):
     rows, S and grid, in the same order.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     # MiniMax-M3.1's target LM head at TP8 over two GB300 trays: vocabulary 200064 (shard 25008), K3 verify rows
     # B * (K + 1): K3 at batches 1..16, K7 at batches 1..8.
@@ -471,7 +506,7 @@ class AllgatherF32(OpWrapper):
     (0 picks). ``pdl``: as ``allgather_cast``'s. A collective, as ``allgather_cast``.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     # MiniMax-M3.1's DSpark drafter at TP8 over two GB300 trays: the rejection sampler's draft logits, B * K rows of
     # the 25008-column vocabulary shard.

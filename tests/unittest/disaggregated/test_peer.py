@@ -836,6 +836,26 @@ def test_replicated_mapper_ignores_kv_head_mismatch():
     assert isinstance(mapper, ReplicatedMapper)
 
 
+@pytest.mark.parametrize("peer_block_bytes", [1024, 512])
+def test_peer_registrar_rejects_replicated_role_of_another_size(peer_block_bytes):
+    """An index-key side cache stored in another format on the peer (e.g. FP8 vs NVFP4)."""
+    self_pt = make_page_table(global_layer_ids=[0])
+    peer_pt = make_page_table(global_layer_ids=[0], block_bytes=[peer_block_bytes])
+    for page_table in (self_pt, peer_pt):
+        view = page_table.layer_groups[0].pool_views[0]
+        view.pool_role = frozenset({"index_key"})
+        view.mapper_kind = MapperKind.REPLICATED
+    reg = _make_peer_registrar(make_rankinfo(instance_name="local", page_table=self_pt))
+    peer_ri = make_rankinfo(
+        instance_name="peer", instance_rank=3, layer_num_per_pp=[1], page_table=peer_pt
+    )
+    if peer_block_bytes == 1024:
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        return
+    with pytest.raises(ValueError, match="replicated roles differ in bytes per layer"):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
 @pytest.mark.parametrize("peer_dp_rank", [0, 1, 3, 7])
 def test_replicated_pool_owner_rotates_by_destination_dp_rank(peer_dp_rank):
     """Exactly one owner per fan-in group, rotated by destination DP rank.

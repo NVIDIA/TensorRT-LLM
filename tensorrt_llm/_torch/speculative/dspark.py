@@ -177,6 +177,10 @@ class DSparkSpecMetadata(SpecMetadata):
     captured_hidden_states: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        # Preserve the initial slot capacity across CUDA graph copies, whose
+        # max_num_requests is narrowed to the captured graph bucket.
+        self.num_seq_slots = self.num_seq_slots or self.max_num_requests
+
         self.batch_indices_cuda = torch.empty(
             [self.max_num_requests],
             dtype=torch.int,
@@ -1242,6 +1246,20 @@ class DSparkWorker(DFlashWorker):
         shift_label = getattr(draft_model, "_dspark_shift_label", False)
         return dflash_draft_slot_ids(
             num_gens, block_size, num_draft_tokens, shift_label, device="cuda"
+        )
+
+    def _try_fused_draft_head_and_refine(
+        self, draft_model, hidden, attn_metadata, inputs, spec_metadata, num_gens, k
+    ):
+        # Only the M3.1 SM107 TP2 target's explicit A1 processor opts into this adapter.
+        if not type(self).__module__.endswith("minimax_m31_nvfp4__sm_107__tp2.dspark"):
+            return None
+        from .._experimental.modeling_v2.catalog.spec_decode.m31_draft_bf16 import (
+            try_head_and_refine,
+        )
+
+        return try_head_and_refine(
+            self, draft_model, hidden, attn_metadata, inputs, spec_metadata, num_gens, k
         )
 
     def _refine_block_logits(

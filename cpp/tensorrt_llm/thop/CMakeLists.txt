@@ -76,14 +76,24 @@ add_th_common_family(
   nvfp4MlaKvCacheGatherOp.cpp
   trtllmGenQKVProcessOp.cpp)
 
-# MiniMax-M3.1 GB300 native dependencies; explicit to avoid duplicate
+# MiniMax-M3.1 GB300 / Rubin native dependencies; explicit to avoid duplicate
 # registrations.
 target_sources(
   th_common_attention
   PRIVATE minimaxM31/minimaxM31ChainSpecSamplingMcOp.cpp
+          minimaxM31/minimaxM31DsparkGlueOp.cpp
+          minimaxM31/minimaxM31F3ArOp.cpp
+          minimaxM31/minimaxM31FcShardGemmOp.cpp
+          minimaxM31/minimaxM31GlobaltimerStampOp.cpp
+          minimaxM31/minimaxM31MarkovEpilogueOp.cpp
+          minimaxM31/minimaxM31MoeFinalizeOp.cpp
+          minimaxM31/minimaxM31S1bFoldOp.cpp
+          minimaxM31/minimaxM31S2MoeTailOp.cpp
           minimaxM31/minimaxM31Sm103CtxNormMxfp8Op.cpp
           minimaxM31/minimaxM31Sm103SelectPrefillTileOp.cpp
           minimaxM31/minimaxM31SoftmaxMcOp.cpp
+          minimaxM31/minimaxM31SoftmaxPathBOp.cpp
+          minimaxM31/minimaxM31SwigluOaiVecOp.cpp
           minimaxM31/minimaxM31ToppRenormDetOp.cpp
           minimaxM31/minimaxM31ToppRenormDetV3Op.cpp
           minimaxM31/minimaxM31Tp4SparseDecodeLcOp.cpp
@@ -108,9 +118,55 @@ target_sources(
           minimaxM3/minimaxM3Tp8SparseDecodeLc8Op.cpp
           minimaxM3/stepInputsScatterOp.cpp)
 
+# MiniMax-M3.1 Rubin (sm_107) TP2 / TP4 / TP8 decode ops; their kernels are the
+# sm_107-only minimaxM3Sm107Tp{2,4,8} object library.
+target_sources(
+  th_common_attention
+  PRIVATE minimaxM3/minimaxM3Sm107Tp2DenseQkNormRopeFp8Op.cpp
+          minimaxM3/minimaxM3Sm107Tp2DraftStepOp.cpp
+          minimaxM3/minimaxM3Sm107Tp2DrafterRopeFp8KvOp.cpp
+          minimaxM3/minimaxM3Sm107Tp2FoldTailOp.cpp
+          minimaxM3/minimaxM3Sm107Tp2FullCtxReduceOp.cpp
+          minimaxM3/minimaxM3Sm107Tp2McAllreduceNormOp.cpp
+          minimaxM3/minimaxM3Sm107Tp2ProducerPwOp.cpp
+          minimaxM3/minimaxM3Sm107Tp2SampledAcceptOp.cpp
+          minimaxM3/minimaxM3Sm107Tp2SelectLongOp.cpp
+          minimaxM3/minimaxM3Sm107Tp2SiluAndMulOp.cpp
+          minimaxM3/minimaxM3Sm107Tp2SparseDecodeLc2Op.cpp
+          minimaxM3/minimaxM3Sm107Tp2SpecOffsetsOp.cpp
+          minimaxM3/minimaxM3Sm107Tp2StepPrologueOp.cpp
+          minimaxM3/minimaxM3Sm107Tp2SwigluOaiOp.cpp
+          minimaxM3/minimaxM3Sm107Tp4DenseQkNormRopeFp8Op.cpp
+          minimaxM3/minimaxM3Sm107Tp4DraftStepOp.cpp
+          minimaxM3/minimaxM3Sm107Tp4DrafterRopeFp8KvOp.cpp
+          minimaxM3/minimaxM3Sm107Tp4FoldTailOp.cpp
+          minimaxM3/minimaxM3Sm107Tp4FullCtxReduceOp.cpp
+          minimaxM3/minimaxM3Sm107Tp4McAllreduceNormOp.cpp
+          minimaxM3/minimaxM3Sm107Tp4ProducerPwOp.cpp
+          minimaxM3/minimaxM3Sm107Tp4SampledAcceptOp.cpp
+          minimaxM3/minimaxM3Sm107Tp4SelectLongOp.cpp
+          minimaxM3/minimaxM3Sm107Tp4SiluAndMulOp.cpp
+          minimaxM3/minimaxM3Sm107Tp4SparseDecodeLcOp.cpp
+          minimaxM3/minimaxM3Sm107Tp4SpecOffsetsOp.cpp
+          minimaxM3/minimaxM3Sm107Tp4StepPrologueOp.cpp
+          minimaxM3/minimaxM3Sm107Tp4SwigluOaiOp.cpp
+          minimaxM3/minimaxM3Sm107Tp8DraftStepOp.cpp
+          minimaxM3/minimaxM3Sm107Tp8DrafterRopeFp8KvOp.cpp
+          minimaxM3/minimaxM3Sm107Tp8FoldTailOp.cpp
+          minimaxM3/minimaxM3Sm107Tp8FullCtxReduceOp.cpp
+          minimaxM3/minimaxM3Sm107Tp8McAllreduceNormOp.cpp
+          minimaxM3/minimaxM3Sm107Tp8ProducerPwOp.cpp
+          minimaxM3/minimaxM3Sm107Tp8SampledAcceptOp.cpp
+          minimaxM3/minimaxM3Sm107Tp8SiluAndMulOp.cpp
+          minimaxM3/minimaxM3Sm107Tp8SparseDecodeLc8Op.cpp
+          minimaxM3/minimaxM3Sm107Tp8SpecOffsetsOp.cpp
+          minimaxM3/minimaxM3Sm107Tp8StepPrologueOp.cpp
+          minimaxM3/minimaxM3Sm107Tp8SwigluOaiOp.cpp)
+
 add_th_common_family(
   th_common_gemm_quant
   cutlassScaledMM.cpp
+  m31RouterHalfPinOp.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp

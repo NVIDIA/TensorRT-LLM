@@ -1849,3 +1849,10 @@ def _register_fake():
         out_shape = shape if shape is not None else list(like.shape)
         dtype = out_dtype if out_dtype is not None else like.dtype
         return like.new_empty(out_shape, dtype=dtype), output_buffer_kind, 0
+
+    # The MiniMax-M3 / M3.1 ops' fakes live with the targets that call them; register them with the rest.
+    from .._experimental.modeling_v2.catalog.fakes import m31_fake_ops
+    from .._experimental.modeling_v2.models.minimax_m3 import \
+        fake_ops as minimax_m3_fake_ops
+    m31_fake_ops.register()
+    minimax_m3_fake_ops.register()

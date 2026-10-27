@@ -542,6 +542,13 @@ class FP4BlockScaleMoERunner(TunableRunner):
 
         return tactics
 
+    def tactic_name(self, tactic: List[int]) -> Optional[str]:
+        """The gemm1 / gemm2 kernel names of a ``[tileN, config]`` tactic; "fallback" for the default."""
+        tile_n, config = (int(v) for v in tactic)
+        if tile_n == -1 or config == -1:
+            return "fallback"
+        return self.get_runner().get_config_name(tile_n, config)
+
     @classmethod
     def get_dynamic_tensor_specs(
             cls,

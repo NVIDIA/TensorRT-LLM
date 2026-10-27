@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 import threading
-from typing import List, Optional, Union
+from typing import AsyncIterator, List, Optional, Union
 
 from ..llmapi.mpi_session import (MpiPoolSession, MpiSession,
                                   validate_session_world_size)
@@ -22,7 +23,7 @@ from ..llmapi.utils import logger_debug, print_colored
 from ..logger import logger
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
-from .proxy import _check_collective_rpc_guard
+from .proxy import _ASYNC_STATS_RPC, _check_collective_rpc_guard
 from .result import IterationResult
 from .rpc.rpc_common import RPCError
 from .rpc_proxy_mixin import RpcExecutorMixin
@@ -164,14 +165,16 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             logger.warning(f"Error fetching startup metrics via RPC: {e}")
             return None
 
-    def aget_stats(self, timeout: float) -> IterationResult:
+    def aget_stats(
+            self,
+            timeout: float) -> Union[IterationResult, AsyncIterator[dict]]:
         """Get iteration statistics from the runtime via RPC (async).
 
         Args:
             timeout (float): Max wait time in seconds for the RPC call.
 
         Returns:
-            IterationResult: An async iterable object containing runtime stats.
+            An async iterable object containing runtime stats.
         """
         self._maybe_initialize_iteration_results()
 
@@ -180,6 +183,10 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
                           "yellow")
             from .executor import empty_async_iterable
             return empty_async_iterable()
+
+        self._iter_stats_result.set_timeout(timeout)
+        if _ASYNC_STATS_RPC:
+            return self._aiter_stats(timeout)
 
         # Fetch stats via RPC and populate the result
         try:
@@ -191,8 +198,23 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         for stat in stats:
             self._iter_stats_result.queue.put(stat)
 
-        self._iter_stats_result.set_timeout(timeout)
         return self._iter_stats_result
+
+    async def _aiter_stats(self, timeout: float) -> AsyncIterator[dict]:
+        # Await the stats RPC instead of blocking the caller's event loop
+        # (see GenerationExecutorProxy._aiter_stats).
+        try:
+            stats = await asyncio.wrap_future(
+                self.rpc_client.fetch_stats_wait_async(
+                    timeout=timeout).remote_future())
+        except Exception:
+            stats = []
+
+        for stat in stats:
+            self._iter_stats_result.queue.put(stat)
+
+        async for stat in self._iter_stats_result:
+            yield stat
 
     def get_kv_events(self, timeout: float) -> List[dict]:
         """Get iteration KV events from the runtime via RPC.

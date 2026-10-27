@@ -31,6 +31,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from . import step_inputs
+from .runtime_hooks import hook_work
 
 
 class H2DSkipCache:
@@ -129,6 +130,7 @@ class H2DSkipCache:
             return False
         for row, lo, hi in spans:
             step_inputs.copy_(dst[row, lo:hi], src[row, lo:hi])
+        hook_work("H2D_CHANGED_SPAN")
         self.span_uploads += 1
         self.span_bytes += staged * dst.element_size()
         self.span_full_bytes += dst.numel() * dst.element_size()

@@ -25,6 +25,7 @@ from typing import NamedTuple, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import to_e4m3
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
 from .msa_utils import check_decode_span_shape
@@ -278,7 +279,7 @@ def minimax_m3_trtllm_gen_dense_decode(
     # q/k/v, so an FP8 pool needs FP8 Q. M3 stores unscaled E4M3, so this is a
     # plain cast and a no-op when the fused producer already emitted FP8.
     if kv_pool.dtype == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
-        q = q.to(torch.float8_e4m3fn)
+        q = to_e4m3(q)
 
     reserve = torch.cuda.is_current_stream_capturing()
     workspace_size = _workspace(q.dtype, num_heads, int(q.shape[2]), int(kv_pool.shape[1]))

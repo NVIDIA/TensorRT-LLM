@@ -22,10 +22,13 @@ module-scope import here would close a cycle.
 from __future__ import annotations
 
 import functools
+import inspect
 import sys
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
+
+from tensorrt_llm.logger import logger
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
@@ -475,6 +478,319 @@ def _nvfp4_sparse_attention_into(
     return True
 
 
+_TP2CTX_Q8KV4_STATE: dict = {}
+
+
+def _tp2ctx_q8kv4_run():
+    """fmha_sm100.prefill_q8kv4.run_prefill (overlay v3, forward_only) when TP2CTX_Q8KV4 may run, else None.
+
+    Option value, opt-in only: TRTLLM_M31_ENABLE_TP2CTX_Q8KV4=1 turns it on, and
+    TRTLLM_M31_DISABLE_TP2CTX_Q8KV4=1 (read per call) keeps it off regardless. The package probe is cached.
+    """
+    import inspect
+    import os
+
+    if os.environ.get("TRTLLM_M31_ENABLE_TP2CTX_Q8KV4", "0") != "1":
+        return None
+    if os.environ.get("TRTLLM_M31_DISABLE_TP2CTX_Q8KV4", "0") == "1":
+        return None
+    if "run" not in _TP2CTX_Q8KV4_STATE:
+        run = None
+        if torch.cuda.get_device_capability() in ((10, 3), (10, 7)):
+            try:
+                from fmha_sm100.prefill_q8kv4 import run_prefill as run
+
+                if "forward_only" not in inspect.signature(run).parameters:
+                    run = None  # an overlay older than v3 would combine without C1 / C2
+            except ImportError:
+                run = None
+        _TP2CTX_Q8KV4_STATE["run"] = run
+    return _TP2CTX_Q8KV4_STATE["run"]
+
+
+def _run_tp2ctx_q8kv4(
+    run,
+    q,
+    k_paged,
+    v_paged,
+    scale_buffers,
+    metadata,
+    batch,
+    cu_q,
+    cu_kv,
+    k2q_row_ptr,
+    schedule,
+    sm_scale,
+    topk,
+    k_global_scale,
+    v_global_scale,
+    out,
+    in_place,
+    mxfp8_sink,
+) -> None:
+    """TP2CTX_Q8KV4: the Q8KV4 forward into split partials, then the installed combine as the DSL path calls it."""
+    from src.sm100.fwd.combine import combine
+
+    if not _TP2CTX_Q8KV4_STATE.get("logged"):
+        _TP2CTX_Q8KV4_STATE["logged"] = True
+        logger.info(
+            "[M3 dispatch] TP2CTX_Q8KV4: Q8KV4 C++ sparse prefill forward (E4M3 Q) + installed combine"
+        )
+    q8 = q if q.dtype == torch.float8_e4m3fn else q.to(torch.float8_e4m3fn)
+    o_partial, lse_partial = run(
+        q8,
+        (k_paged.view(torch.uint8), v_paged.view(torch.uint8)),
+        (scale_buffers[:, 0].view(torch.uint8), scale_buffers[:, 1].view(torch.uint8)),
+        kv_indices=metadata.msa_block_table[:batch],
+        kv_indptr=None,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_kv,
+        k2q_row_ptr=k2q_row_ptr,
+        schedule=schedule,
+        sm_scale=sm_scale,
+        topk=topk,
+        seqused_k=metadata.msa_seq_lens_cuda[:batch],
+        k_global_scale=k_global_scale,
+        v_global_scale=v_global_scale,
+        forward_only=True,
+    )
+    write_in_place = (
+        in_place
+        and out.dtype == torch.bfloat16
+        and out.dim() == 3
+        and out.is_contiguous()
+        and not any(_overlaps(out, other) for other in (q, k_paged, v_paged))
+    )
+    o_out = (
+        out
+        if write_in_place
+        else torch.empty(
+            (int(q.shape[0]), int(q.shape[1]), int(q.shape[2])),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+    )
+    kwargs = dict(
+        cu_seqlens=cu_q, split_counts=schedule.split_counts, use_pdl=True
+    )  # no output_scale: vg is in K1
+    mxfp8 = None
+    if (
+        mxfp8_sink is not None
+        and int(out.shape[0]) >= getattr(mxfp8_sink, "min_rows", 0)
+        and write_in_place
+        and out.shape[-1] == 128
+        and _combine_takes(combine, "o_fp8")
+    ):
+        rows, width = int(out.shape[0]), int(out.shape[1] * out.shape[2])
+        rows_padded = (rows + 127) // 128 * 128
+        # The combine writes the live rows' scales; the padding rows' scale bytes must be zero (MSA contract).
+        # A mixed-step caller owns C+G buffers and supplies only their context slices here.
+        # Returning None declines the sink (for example inside a breakable graph boundary).
+        allocate = getattr(mxfp8_sink, "allocate", None)
+        if allocate is not None:
+            mxfp8 = allocate(out.view(rows, width))
+        else:
+            mxfp8 = (
+                torch.empty((rows, width), dtype=torch.uint8, device=out.device),
+                torch.zeros((rows_padded * width // 32,), dtype=torch.uint8, device=out.device),
+            )
+        if mxfp8 is not None:
+            kwargs.update(o_fp8=mxfp8[0], sf_out=mxfp8[1])
+    combine(o_partial, lse_partial, o_out, None, **kwargs)
+    if not write_in_place:
+        out.copy_(o_out)
+    elif mxfp8 is not None:
+        mxfp8_sink(out.view(out.shape[0], -1), mxfp8[0].view(torch.float8_e4m3fn), mxfp8[1])
+
+
+@functools.lru_cache(maxsize=None)
+def _combine_takes(fn, name: str) -> bool:
+    """Whether the installed combine accepts keyword ``name`` (C1's o_fp8 / sf_out)."""
+    import inspect
+
+    return name in inspect.signature(fn).parameters
+
+
+_TP2CTX_BF16X_STATE: dict = {"taken": 0, "skip": {}, "q8kv4_taken": 0, "e4m3x_taken": 0}
+
+# The BF16X / E4M3X fork is a model opt-in (RuntimeHooks.msa_prefill_fork), armed by the executor (arm_prefill_fork).
+_PREFILL_FORK_ARMED = False
+
+
+def arm_prefill_fork() -> None:
+    """Let the MSA NVFP4 sparse prefill take the BF16X / E4M3X fork in this process (RuntimeHooks.msa_prefill_fork)."""
+    global _PREFILL_FORK_ARMED
+    _PREFILL_FORK_ARMED = True
+
+
+def _tp2ctx_bf16x_run():
+    """(run, reason): fmha_sm100.prefill_bf16x.run_prefill (BF16X fork m3b) when TP2CTX_BF16X may run here, else None.
+
+    Armed by a model opt-in; TRTLLM_M31_DISABLE_TP2CTX_BF16X=1 (read per call) keeps the CuTe-DSL forward. The probe
+    is cached.
+    """
+    import os
+
+    if not _PREFILL_FORK_ARMED:
+        return None, "not_armed"
+    if os.environ.get("TRTLLM_M31_DISABLE_TP2CTX_BF16X", "0") == "1":
+        return None, "disabled_by_env"
+    if "run" not in _TP2CTX_BF16X_STATE:
+        run, reason = None, None
+        if torch.cuda.get_device_capability() != (10, 7):  # certified on VR
+            reason = "not_sm107"
+        else:
+            try:
+                from fmha_sm100.prefill_bf16x import run_prefill as run
+            except ImportError:
+                run, reason = None, "no_prefill_bf16x_package"
+        _TP2CTX_BF16X_STATE["run"] = (run, reason)
+    return _TP2CTX_BF16X_STATE["run"]
+
+
+def _tp2ctx_counters_atexit() -> None:
+    """Register the exit-time final-count lines once per process."""
+    if not _TP2CTX_BF16X_STATE.get("atexit"):
+        import atexit
+
+        _TP2CTX_BF16X_STATE["atexit"] = True
+        atexit.register(_tp2ctx_bf16x_final)
+
+
+def _tp2ctx_e4m3x_ok():
+    """None when TP2CTX_E4M3X may take an fp8-q call, else the skip reason.
+
+    TRTLLM_M31_DISABLE_TP2CTX_E4M3X=1 (read per call) keeps the CuTe-DSL fp8 forward. The loaded fork must be an E4M3X
+    build (its E4M3 path the exact DSL transcription), else the upstream Q8KV4 kernel would run: probed once.
+    """
+    import os
+
+    if os.environ.get("TRTLLM_M31_DISABLE_TP2CTX_E4M3X", "0") == "1":
+        return "e4m3x_disabled_by_env"
+    if "e4m3x_build" not in _TP2CTX_BF16X_STATE:
+        try:
+            from fmha_sm100.prefill_bf16x import jit as _bf16x_jit
+
+            _TP2CTX_BF16X_STATE["e4m3x_build"] = bool(getattr(_bf16x_jit, "_E4M3X", False))
+        except ImportError:
+            _TP2CTX_BF16X_STATE["e4m3x_build"] = False
+    return None if _TP2CTX_BF16X_STATE["e4m3x_build"] else "fork_not_e4m3x"
+
+
+def _tp2ctx_e4m3x_count() -> None:
+    """TP2CTX_E4M3X calls that returned, logged at counts 1, 2, 4, 8, ..."""
+    _tp2ctx_counters_atexit()
+    _TP2CTX_BF16X_STATE["e4m3x_taken"] += 1
+    n = _TP2CTX_BF16X_STATE["e4m3x_taken"]
+    if n & (n - 1) == 0:
+        logger.info(f"[M3 dispatch] TP2CTX_E4M3X taken n={n}")
+
+
+def _tp2ctx_q8kv4_count() -> None:
+    """TP2CTX_Q8KV4 calls that returned, logged at counts 1, 2, 4, 8, ..."""
+    _tp2ctx_counters_atexit()
+    _TP2CTX_BF16X_STATE["q8kv4_taken"] += 1
+    n = _TP2CTX_BF16X_STATE["q8kv4_taken"]
+    if n & (n - 1) == 0:
+        logger.info(f"[M3 dispatch] TP2CTX_Q8KV4 taken n={n}")
+
+
+def _tp2ctx_bf16x_count(reason=None) -> None:
+    """Taken (after the call returned) / skip counters, logged at counts 1, 2, 4, 8, ...
+
+    The last power-of-two line is a lower bound of the final count; the exact one is the exit line, which a killed
+    process may not log.
+    """
+    _tp2ctx_counters_atexit()
+    if reason is None:
+        _TP2CTX_BF16X_STATE["taken"] += 1
+        n = _TP2CTX_BF16X_STATE["taken"]
+        if n & (n - 1) == 0:
+            logger.info(f"[M3 dispatch] TP2CTX_BF16X taken n={n}")
+        return
+    skips = _TP2CTX_BF16X_STATE["skip"]
+    skips[reason] = n = skips.get(reason, 0) + 1
+    if n & (n - 1) == 0:
+        logger.info(f"[M3 skip] TP2CTX_BF16X reason={reason} n={n}")
+
+
+def _tp2ctx_bf16x_final() -> None:
+    """At process exit: the exact final taken / skip counts (the power-of-two lines only bound them)."""
+    logger.info(
+        f"[M3.1 prefill-fwd] TP2CTX_BF16X final taken={_TP2CTX_BF16X_STATE['taken']} "
+        f"skip={dict(sorted(_TP2CTX_BF16X_STATE['skip'].items()))}"
+    )
+    logger.info(f"[M3.1 prefill-fwd] TP2CTX_Q8KV4 final taken={_TP2CTX_BF16X_STATE['q8kv4_taken']}")
+    logger.info(f"[M3.1 prefill-fwd] TP2CTX_E4M3X final taken={_TP2CTX_BF16X_STATE['e4m3x_taken']}")
+
+
+def _tp2ctx_fwd_path_log(q8kv4_run, bf16x_run, bf16x_reason) -> None:
+    """Once per process: which sparse prefill forward this process runs by default."""
+    if _TP2CTX_BF16X_STATE.get("path_logged"):
+        return
+    _TP2CTX_BF16X_STATE["path_logged"] = True
+    if q8kv4_run is not None:
+        path = "Q8KV4 (opt-in TRTLLM_M31_ENABLE_TP2CTX_Q8KV4=1)"
+    elif bf16x_run is not None:
+        path = (
+            "BF16X for bf16 q / E4M3X for fp8 q (default; TRTLLM_M31_DISABLE_TP2CTX_BF16X=1 or "
+            "TRTLLM_M31_DISABLE_TP2CTX_E4M3X=1 keeps the DSL)"
+        )
+    else:
+        path = f"DSL (BF16X off: {bf16x_reason})"
+    logger.info(f"[M3.1 prefill-fwd] active path: {path}")
+
+
+def _run_tp2ctx_bf16x(
+    run,
+    q,
+    k_paged,
+    v_paged,
+    scale_buffers,
+    metadata,
+    batch,
+    cu_q,
+    cu_kv,
+    k2q_row_ptr,
+    schedule,
+    sm_scale,
+    topk,
+    k_global_scale,
+    v_global_scale,
+    out,
+    write_in_place,
+    mxfp8=None,
+    mxfp8_sink=None,
+) -> None:
+    """TP2CTX_BF16X: the BF16X forward into split partials + the installed combine (output_scale = v_global_scale).
+
+    ``mxfp8`` (TP2CTX_COMBINE_MXFP8 on the E4M3X / BF16X fork, in-place output only): the fork's run_prefill forwards
+    ``o_fp8`` / ``sf_out`` to the combine, which also writes the MXFP8 copy of the final output (bitwise
+    ``mxfp8_quantize(out.view(rows, -1), True)``); the pair is then handed to ``mxfp8_sink`` for o_proj."""
+    result, _ = run(
+        q,
+        (k_paged.view(torch.uint8), v_paged.view(torch.uint8)),
+        (scale_buffers[:, 0].view(torch.uint8), scale_buffers[:, 1].view(torch.uint8)),
+        kv_indices=metadata.msa_block_table[:batch],
+        kv_indptr=None,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_kv,
+        k2q_row_ptr=k2q_row_ptr,
+        schedule=schedule,
+        sm_scale=sm_scale,
+        topk=topk,
+        seqused_k=metadata.msa_seq_lens_cuda[:batch],
+        k_global_scale=k_global_scale,
+        v_global_scale=v_global_scale,
+        out=out if write_in_place else None,
+        **({"o_fp8": mxfp8[0], "sf_out": mxfp8[1]} if mxfp8 is not None else {}),
+    )
+    if not write_in_place:
+        out.copy_(result)
+    elif mxfp8 is not None:
+        mxfp8_sink(out.view(out.shape[0], -1), mxfp8[0].view(torch.float8_e4m3fn), mxfp8[1])
+
+
 def run_msa_nvfp4_sparse_gqa(
     q: torch.Tensor,
     k_paged: torch.Tensor,
@@ -488,6 +804,9 @@ def run_msa_nvfp4_sparse_gqa(
     v_global_scale: torch.Tensor,
     num_rows: Optional[int] = None,
     out: torch.Tensor,
+    in_place: bool = False,
+    schedule_order: Optional[str] = None,
+    mxfp8_sink: Optional[Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None]] = None,
 ) -> None:
     """Run sparse attention over M3's packed NVFP4 cache with the MSA CSR kernel.
 
@@ -495,6 +814,19 @@ def run_msa_nvfp4_sparse_gqa(
     tiles 128 query rows at a time. num_rows narrows it to the leading batch
     rows, so a mixed step can hand its generation suffix to the Triton NVFP4
     decode and size this worklist from the context prefix alone.
+
+    in_place (an attention layer opts in with ``msa_sparse_out_in_place``): the
+    MSA combine writes the result into ``out`` itself when the loaded build
+    accepts a caller-owned output, instead of returning a tensor this copies.
+
+    schedule_order (an attention layer opts in with ``msa_k2q_schedule_order``): the order of the k2q CSR schedule's
+    work items, passed to the MSA build_k2q_csr when it accepts it (e.g. ``"lpt"``: heaviest item first). The order
+    only changes which CTA runs which item, never what an item computes or where it writes, so the output is the same.
+
+    mxfp8_sink (an attention layer opts in with ``msa_sparse_out_mxfp8_sink``; requires the in-place output): the MSA
+    combine also writes the output as MXFP8 (E4M3 [rows, heads * dim] + swizzled 128x4 K32 UE8M0 scales, bitwise
+    ``mxfp8_quantize(out.view(rows, -1), True)``) when the loaded build accepts ``o_fp8`` / ``sf_out``, and the pair is
+    handed to ``mxfp8_sink(out_2d, o_fp8, sf_out)`` so the MXFP8 o_proj can skip its own quantize (COMBINE_MXFP8).
     """
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
         MSA_REQUIRED_TOPK,
@@ -535,52 +867,211 @@ def run_msa_nvfp4_sparse_gqa(
             )
     cu_q = metadata.msa_cu_q_lens[: batch + 1]
     cu_kv = metadata.msa_cu_kv_lens[: batch + 1]
-    q2k = kv_block_indexes.permute(1, 0, 2).contiguous()
-    topk = int(q2k.shape[-1])
+    topk = int(kv_block_indexes.shape[-1])
     page_size = int(k_paged.shape[2])
     if topk != MSA_REQUIRED_TOPK:
         raise ValueError(f"MiniMax-M3 MSA NVFP4 requires topK={MSA_REQUIRED_TOPK}, got {topk}")
 
-    k2q_row_ptr, k2q_q_indices, schedule = _k2q_csr_with_schedule(
-        sparse,
-        q2k,
-        cu_q,
-        cu_kv,
-        page_size,
-        total_k=total_k,
-        max_seqlen_k=max_kv_len,
-        max_seqlen_q=max_q_len,
-        total_rows=total_k_rows,
-        qhead_per_kv=int(q.shape[1]) // int(k_paged.shape[1]),
-        metadata=metadata,
-    )
+    # A short pure-prefill step hands every layer the same identity selection (staged once per step by the
+    # backend), so its k2q CSR worklist is layer-invariant: build it for the first layer and reuse it.
+    identity = metadata._msa_prefill_identity
+    csr_key = (batch, int(kv_block_indexes.shape[0]))
+    cached = metadata._msa_identity_csr
+    if (
+        identity is not None
+        and cached is not None
+        and cached[0] is identity
+        and cached[1] == csr_key
+    ):
+        k2q_row_ptr, k2q_q_indices, schedule = cached[2]
+    else:
+        q2k = kv_block_indexes.permute(1, 0, 2).contiguous()
+        if schedule_order is None:
+            k2q_row_ptr, k2q_q_indices, schedule = _k2q_csr_with_schedule(
+                sparse,
+                q2k,
+                cu_q,
+                cu_kv,
+                page_size,
+                total_k=total_k,
+                max_seqlen_k=max_kv_len,
+                max_seqlen_q=max_q_len,
+                total_rows=total_k_rows,
+                qhead_per_kv=int(q.shape[1]) // int(k_paged.shape[1]),
+                metadata=metadata,
+            )
+        else:
+            k2q_row_ptr, k2q_q_indices, schedule = sparse.build_k2q_csr(
+                q2k,
+                cu_q,
+                cu_kv,
+                page_size,
+                total_k=total_k,
+                max_seqlen_k=max_kv_len,
+                max_seqlen_q=max_q_len,
+                total_rows=total_k_rows,
+                qhead_per_kv=int(q.shape[1]) // int(k_paged.shape[1]),
+                return_schedule=True,
+                **(
+                    {"schedule_order": schedule_order}
+                    if schedule_order is not None and _csr_builder_takes_order(sparse.build_k2q_csr)
+                    else {}
+                ),
+            )
+        if identity is not None:
+            metadata._msa_identity_csr = (identity, csr_key, (k2q_row_ptr, k2q_q_indices, schedule))
     k_data = k_paged.view(torch.uint8)
     v_data = v_paged.view(torch.uint8)
     k_scale = scale_buffers[:, 0].view(torch.uint8)
     v_scale = scale_buffers[:, 1].view(torch.uint8)
     page_table = metadata.msa_block_table[:batch]
     seqused_k = metadata.msa_seq_lens_cuda[:batch]
-    if _nvfp4_sparse_attention_into(
-        q,
-        k_data,
-        v_data,
-        k_scale,
-        v_scale,
-        k_global_scale,
-        v_global_scale,
-        k2q_row_ptr,
-        k2q_q_indices,
-        schedule,
-        topk,
-        cu_seqlens_q=cu_q,
-        cu_seqlens_k=cu_kv,
-        max_seqlen_q=max_q_len,
-        blk_kv=page_size,
-        softmax_scale=sm_scale,
-        page_table=page_table,
-        seqused_k=seqused_k,
-        out=out,
-        metadata=metadata,
+    q8kv4_run = _tp2ctx_q8kv4_run()
+    bf16x_run, bf16x_reason = _tp2ctx_bf16x_run()
+    _tp2ctx_fwd_path_log(q8kv4_run, bf16x_run, bf16x_reason)
+    if (
+        q8kv4_run is not None
+        and page_size == 128
+        and int(q.shape[1]) == 16 * int(k_paged.shape[1])
+        and int(q.shape[2]) == 128
+    ):
+        _run_tp2ctx_q8kv4(
+            q8kv4_run,
+            q,
+            k_paged,
+            v_paged,
+            scale_buffers,
+            metadata,
+            batch,
+            cu_q,
+            cu_kv,
+            k2q_row_ptr,
+            schedule,
+            sm_scale,
+            topk,
+            k_global_scale,
+            v_global_scale,
+            out,
+            in_place,
+            mxfp8_sink,
+        )
+        _tp2ctx_q8kv4_count()
+        return
+    write_in_place = in_place and _sparse_func_takes_out(sparse.sparse_atten_nvfp4_kv_func)
+    if in_place and not _SPARSE_OUT_LOGGED:
+        _SPARSE_OUT_LOGGED.append(True)
+        logger.info(
+            "[M3.1 tp2ctx] SPARSE_OUT in-place: "
+            f"{'on' if write_in_place else 'off (the loaded MSA build takes no out=)'}"
+        )
+    mxfp8 = None
+    # TP2CTX_COMBINE_MXFP8: the old NVFP4 sparse func and the E4M3X / BF16X fork (run_prefill o_fp8 / sf_out,
+    # forwarded to the combine) each take the MXFP8 sink only when their loaded build accepts it. With a fork loaded the
+    # sink follows the fork: a fork without o_fp8 keeps the call on the fork (o_proj then quantizes as stock) instead of
+    # falling off to the slower DSL path for the sink.
+    sink_old = _sparse_func_takes(sparse.sparse_atten_nvfp4_kv_func, "o_fp8")
+    sink_fork = bf16x_run is not None and _combine_takes(bf16x_run, "o_fp8")
+    sink_ok = sink_fork if bf16x_run is not None else sink_old
+    # A sink may set ``min_rows``: shorter calls skip the MXFP8 copy (the extra combine epilogue costs more than
+    # o_proj's quantize saves there) and o_proj quantizes as stock.
+    if (
+        mxfp8_sink is not None
+        and int(out.shape[0]) >= getattr(mxfp8_sink, "min_rows", 0)
+        and write_in_place
+        and out.dtype == torch.bfloat16
+        and out.dim() == 3
+        and out.shape[-1] == 128
+        and out.is_contiguous()
+        and sink_ok
+    ):
+        rows, width = int(out.shape[0]), int(out.shape[1] * out.shape[2])
+        rows_padded = (rows + 127) // 128 * 128
+        # The combine writes the live rows' scales; the padding rows' scale bytes must be zero (MSA contract).
+        allocate = getattr(mxfp8_sink, "allocate", None)
+        if allocate is not None:
+            mxfp8 = allocate(out.view(rows, width))
+        else:
+            mxfp8 = (
+                torch.empty((rows, width), dtype=torch.uint8, device=out.device),
+                torch.zeros((rows_padded * width // 32,), dtype=torch.uint8, device=out.device),
+            )
+    if write_in_place:
+        # The combine writes out after the forward has read q and the paged K/V; an out that shares their memory
+        # (a view of a fused QKV buffer) would depend on that kernel order, so it is refused.
+        for name, other in (("q", q), ("K", k_paged), ("V", v_paged)):
+            if _overlaps(out, other):
+                raise ValueError(f"MiniMax-M3 NVFP4 in-place sparse output aliases {name}")
+    if bf16x_run is not None:
+        if mxfp8 is not None and not sink_fork:
+            bf16x_reason = "c1_mxfp8_sink"
+        elif q.dtype == torch.float8_e4m3fn and _tp2ctx_e4m3x_ok() is not None:
+            bf16x_reason = _tp2ctx_e4m3x_ok()
+        elif q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            bf16x_reason = "q_dtype"
+        elif page_size != 128 or int(q.shape[2]) != 128:
+            bf16x_reason = "page_or_head_dim"
+        elif int(q.shape[1]) != 16 * int(k_paged.shape[1]):
+            bf16x_reason = "not_16_q_heads_per_kv"
+        else:
+            bf16x_reason = None
+            _run_tp2ctx_bf16x(
+                bf16x_run,
+                q,
+                k_paged,
+                v_paged,
+                scale_buffers,
+                metadata,
+                batch,
+                cu_q,
+                cu_kv,
+                k2q_row_ptr,
+                schedule,
+                sm_scale,
+                topk,
+                k_global_scale,
+                v_global_scale,
+                out,
+                write_in_place,
+                mxfp8=mxfp8,
+                mxfp8_sink=mxfp8_sink,
+            )
+            if q.dtype == torch.float8_e4m3fn:
+                _tp2ctx_e4m3x_count()
+            else:
+                _tp2ctx_bf16x_count()
+            return
+    _tp2ctx_bf16x_count(bf16x_reason)
+    if mxfp8 is not None and not sink_old:
+        mxfp8 = None
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import (
+        PREFILL_HOST_TRIMS,
+    )
+
+    if (
+        PREFILL_HOST_TRIMS
+        and mxfp8 is None
+        and _nvfp4_sparse_attention_into(
+            q,
+            k_data,
+            v_data,
+            k_scale,
+            v_scale,
+            k_global_scale,
+            v_global_scale,
+            k2q_row_ptr,
+            k2q_q_indices,
+            schedule,
+            topk,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_kv,
+            max_seqlen_q=max_q_len,
+            blk_kv=page_size,
+            softmax_scale=sm_scale,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            out=out,
+            metadata=metadata,
+        )
     ):
         return
     result = sparse.sparse_atten_nvfp4_kv_func(
@@ -606,8 +1097,77 @@ def run_msa_nvfp4_sparse_gqa(
         page_table=page_table,
         seqused_k=seqused_k,
         schedule=schedule,
+        **({"out": out} if write_in_place else {}),
+        **({"o_fp8": mxfp8[0], "sf_out": mxfp8[1]} if mxfp8 is not None else {}),
     )
-    out.copy_(result)
+    if not write_in_place:
+        out.copy_(result)
+    elif mxfp8 is not None:
+        mxfp8_sink(out.view(out.shape[0], -1), mxfp8[0].view(torch.float8_e4m3fn), mxfp8[1])
+
+
+def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether the byte ranges a and b span intersect (host-side pointer arithmetic)."""
+
+    def span(t):
+        start = t.data_ptr()
+        extent = (
+            1 + sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+            if t.numel()
+            else 0
+        )
+        return start, start + extent * t.element_size()
+
+    a0, a1 = span(a)
+    b0, b1 = span(b)
+    return a0 < b1 and b0 < a1
+
+
+_SPARSE_OUT_LOGGED: list = []  # one engagement line per process (an attention layer opted in)
+_SPARSE_FUNC_TAKES_OUT: dict = {}
+
+
+_SPARSE_FUNC_TAKES: dict = {}
+
+
+def _sparse_func_takes(func, name: str) -> bool:
+    """Whether the loaded MSA sparse_atten_nvfp4_kv_func accepts the keyword ``name`` (decided once per function)."""
+    key = (func, name)
+    takes = _SPARSE_FUNC_TAKES.get(key)
+    if takes is None:
+        try:
+            takes = name in inspect.signature(func).parameters
+        except (TypeError, ValueError):
+            takes = False
+        _SPARSE_FUNC_TAKES[key] = takes
+    return takes
+
+
+def _sparse_func_takes_out(func) -> bool:
+    """Whether the loaded MSA sparse_atten_nvfp4_kv_func accepts a caller-owned ``out`` (decided once per function)."""
+    takes = _SPARSE_FUNC_TAKES_OUT.get(func)
+    if takes is None:
+        try:
+            takes = "out" in inspect.signature(func).parameters
+        except (TypeError, ValueError):
+            takes = False
+        _SPARSE_FUNC_TAKES_OUT[func] = takes
+    return takes
+
+
+_CSR_BUILDER_TAKES_ORDER: dict = {}
+
+
+def _csr_builder_takes_order(func) -> bool:
+    """Whether the loaded MSA build_k2q_csr accepts ``schedule_order`` (decided once per function)."""
+    takes = _CSR_BUILDER_TAKES_ORDER.get(func)
+    if takes is None:
+        try:
+            takes = "schedule_order" in inspect.signature(func).parameters
+        except (TypeError, ValueError):
+            takes = False
+        _CSR_BUILDER_TAKES_ORDER[func] = takes
+    return takes
 
 
 def run_msa_prefill_gqa(
@@ -664,6 +1224,9 @@ def run_msa_prefill_gqa(
             v_global_scale=v_scale,
             num_rows=num_rows,
             out=out_view,
+            in_place=getattr(attn, "msa_sparse_out_in_place", False),
+            schedule_order=getattr(attn, "msa_k2q_schedule_order", None),
+            mxfp8_sink=getattr(attn, "msa_sparse_out_mxfp8_sink", None),
         )
         return
 

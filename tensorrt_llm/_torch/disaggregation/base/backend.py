@@ -106,6 +106,13 @@ class Chunk:
 
     excluded_pool_views: Set[Tuple[int, int]] = field(default_factory=set)
 
+    draft_block_ids_per_layer_groups: Optional[List[np.ndarray]] = None
+    """The standalone drafter's context window, positional like the target's (one list per draft
+    layer group, ``ceil(prompt_len / draft_tpb)`` entries), or None when no draft set travels.
+
+    Only the last piece carries it: a windowed draft pool releases the pages an earlier piece would
+    name. There is no cached-prefix mask: the draft pool is never paired with block reuse."""
+
     def __post_init__(self):
         if len(self.kind_per_layer_group) != len(self.block_ids_per_layer_groups):
             raise ValueError(

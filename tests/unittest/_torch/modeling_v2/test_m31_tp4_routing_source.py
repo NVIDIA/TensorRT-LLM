@@ -82,7 +82,8 @@ def inputs():
 
 class TestM31Tp4RoutingSource(unittest.TestCase):
     def test_declines_outside_scope(self):
-        cases = [("chip", (10, 0)), ("chip", (10, 7))]
+        # SM107 (10, 7) is in scope: it routes to the sm_107 targets (their own routing tests).
+        cases = [("chip", (10, 0)), ("chip", (12, 0))]
         cases += [
             (name, value)
             for name, value in (
@@ -226,12 +227,14 @@ class TestM31Tp4RoutingSource(unittest.TestCase):
             # A route rejected after the parent import can still choose the built-in model.
             config, mapping = inputs()
             with self.assertRaises(NoTarget):
-                route()(config, mapping, (10, 7), None, Quant.NVFP4)
+                route()(config, mapping, (12, 0), None, Quant.NVFP4)
             load_file(catalog_name, SOURCE / "catalog/fakes/m31_fake_ops.py")
             fake_module = load_file(
                 family_name + ".fake_ops", SOURCE / "models/minimax_m3/fake_ops.py"
             )
-            self.assertEqual(len(fake_module.FAKES), 7)
+            # The sm_103 entries plus the sm_107 targets' (producer_pw and mc_allreduce_norm per TP width, and the
+            # four dense qk-norm-rope ops).
+            self.assertEqual(len(fake_module.FAKES), 7 + 3 * 2 + 4)
             names = list(fake_module.FAKES)
             for name in names:
                 setattr(native, name, object())
@@ -239,9 +242,9 @@ class TestM31Tp4RoutingSource(unittest.TestCase):
             previous_fake = object()
             installed["trtllm::" + names[1]] = previous_fake
             fake_module.register()
-            self.assertEqual(len(calls), 5)
+            self.assertEqual(len(calls), len(names) - 2)
             fake_module.register()
-            self.assertEqual(len(calls), 5)
+            self.assertEqual(len(calls), len(names) - 2)
             self.assertIs(installed["trtllm::" + names[1]], previous_fake)
             self.assertEqual(installed["trtllm::" + names[0]], "Meta")
 

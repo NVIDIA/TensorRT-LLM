@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import atexit
 import concurrent.futures
 import json
@@ -22,7 +23,7 @@ import threading
 import time
 import weakref
 from queue import Empty
-from typing import Dict, List, Optional, Union
+from typing import AsyncIterator, Dict, List, Optional, Union
 
 import torch
 import zmq
@@ -58,6 +59,13 @@ __all__ = [
     "GenerationExecutorProxy",
     "GenerationExecutorFrontendProxy",
 ]
+
+# TRTLLM_M31_DISABLE_A4_ASYNC_STATS=1 restores the blocking stats RPC in aget_stats.
+# By default the RPC is awaited, so trtllm-serve's event loop (which also sends
+# every response and token) does not stall while it waits up to `timeout` for a
+# stats record. Same records, same order either way.
+_ASYNC_STATS_RPC = os.environ.get("TRTLLM_M31_DISABLE_A4_ASYNC_STATS",
+                                  "0") != "1"
 
 # Methods that are explicitly implemented for multi-rank MPI/IPC executor
 # deployments and may be called via collective_rpc even when world_size > 1.
@@ -1372,14 +1380,16 @@ class GenerationExecutorProxy(GenerationExecutor):
             logger.warning(f"Error fetching startup metrics via RPC: {e}")
             return None
 
-    def aget_stats(self, timeout: float) -> IterationResult:
+    def aget_stats(
+            self,
+            timeout: float) -> Union[IterationResult, AsyncIterator[dict]]:
         """Get iteration statistics from the runtime via RPC (async).
 
         Args:
             timeout (float): Max wait time in seconds for the RPC call.
 
         Returns:
-            IterationResult: An async iterable object containing runtime stats.
+            An async iterable object containing runtime stats.
         """
         # Initialize iteration result if needed
         self._maybe_initialize_iteration_results()
@@ -1388,6 +1398,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             logger.warning("Iteration statistics are not available yet.")
             from .executor import empty_async_iterable
             return empty_async_iterable()
+
+        self._iter_stats_result.set_timeout(timeout)
+        if _ASYNC_STATS_RPC:
+            return self._aiter_stats(timeout)
 
         # Fetch stats via RPC and populate the result
         try:
@@ -1400,8 +1414,25 @@ class GenerationExecutorProxy(GenerationExecutor):
         for stat in stats:
             self._iter_stats_result.queue.put(stat)
 
-        self._iter_stats_result.set_timeout(timeout)
         return self._iter_stats_result
+
+    async def _aiter_stats(self, timeout: float) -> AsyncIterator[dict]:
+        # The RPC waits up to `timeout` for a stats record. Await it instead of
+        # blocking the caller's event loop, which in trtllm-serve also sends
+        # every response.
+        try:
+            stats = await asyncio.wrap_future(
+                self.rpc_client.fetch_stats_wait_async(
+                    timeout=timeout).remote_future())
+        except Exception as e:
+            logger.debug(f"Error fetching stats via RPC: {e}")
+            stats = []
+
+        for stat in stats:
+            self._iter_stats_result.queue.put(stat)
+
+        async for stat in self._iter_stats_result:
+            yield stat
 
     def get_kv_events(self, timeout: float) -> List[dict]:
         """Get iteration KV events from the runtime via RPC.

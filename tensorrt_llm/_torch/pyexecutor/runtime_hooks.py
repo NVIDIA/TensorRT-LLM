@@ -14,8 +14,9 @@ own deployment; none is a general default.
 
 from __future__ import annotations
 
+import atexit
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, Tuple
 
 if TYPE_CHECKING:
     import torch
@@ -144,6 +145,25 @@ class MsaRuntimePolicy:
     skip_unchanged_block_offsets: bool = False
     # Build each KV pool view once per pool geometry instead of on every attention call.
     reuse_pool_views: bool = False
+    # Fill the per-request block-id table by slice-copying each request's page-index view instead of
+    # building a Python list of the whole padded row (max_seq_len / tokens_per_block entries) first.
+    block_ids_from_views: bool = False
+    # Expand the sub-page block table on the device inside the forward and invalidate the unused out-cache-loc tail
+    # there too, instead of between the decode graphs in prepare(); the tables a forward reads are the same.
+    forward_staging: bool = False
+    # Prefill indexer proxy plan (the max-score fmha_sm100 pass). Max-score plans need no split merge, so every option
+    # below gives the same score table bits. prefill_proxy_qo_tile: maxscore_qo_tile for a step whose longest planned
+    # query span exceeds 128 rows, when the loaded planner accepts it; prefill_proxy_kv_splits is then that plan's
+    # num_kv_splits. prefill_proxy_kv_splits_by_rows: ((max_rows, top_split, min_kv_pages_per_split), ...) in ascending
+    # max_rows: the first entry covering the step's longest planned query span gives S and F, and the plan takes S
+    # halved until ceil(max kv_len / page) / S >= F (down to 1), over every planned request. A span of at most 128 rows
+    # takes it under the planner's own tile; a longer span takes it only with the tile.
+    prefill_proxy_qo_tile: Optional[int] = None
+    prefill_proxy_kv_splits: Optional[int] = None
+    prefill_proxy_kv_splits_by_rows: Optional[Tuple[Tuple[int, int, int], ...]] = None
+    # Diagnostic, off by default: also score every proxy span under the plain plan (num_kv_splits 1, the planner's
+    # tile) and count the score and selection mismatches against the planned pass.
+    prefill_proxy_oracle: bool = False
 
 
 @dataclass(frozen=True)
@@ -163,6 +183,13 @@ class RuntimeHooks:
     # previous graph still runs, so the prologue only waits on that copy and scatters device to device (no host copy
     # at the head of the replay).
     pack_early_copy: bool = False
+    # With pack_in_graph: the pack keeps a step epoch, one int64 device counter the graph's prologue increments once per
+    # replay and never resets, so in-graph per-step flags can be tagged with it instead of cleared between steps.
+    pack_step_epoch: bool = False
+    # With pack_early_copy: the model's one-launch prologue, called inside the capture as
+    # ``op(window, epoch_or_None, max_desc)``. It writes the window's host copies, then its device copies, zeroes the
+    # window's header and increments the epoch, which the default prologue does with two scatter launches and a fill.
+    pack_prologue_op: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], int], None]] = None
     # Skip host-to-device metadata copies whose values the destination already holds.
     skip_unchanged_h2d: bool = False
     # With skip_unchanged_h2d: a changed packed 2-D upload stages only each row's changed column span (a page table that
@@ -172,12 +199,71 @@ class RuntimeHooks:
     # after the forward's KV-length correction, instead of also before it: the first pass's device writes are all
     # rewritten by the second.
     kv_lens_update_once: bool = False
+    # The overlap scheduler's speculative step correction (position_ids += position offsets, kv_lens += KV-length
+    # offsets) as the model's one launch, called as ``op(positions, position_offsets, kv_lens, kv_lens_offsets)`` on the
+    # generation rows; it returns False to decline (the two in-tree adds run).
+    spec_offsets_op: Optional[
+        Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], bool]
+    ] = None
     # Run the overlap executor loop with the execution stream current, so the
     # loop's own stream work and the forward are ordered on one stream.
     loop_on_execution_stream: bool = False
     # After autotuning, keep the fastest profiled tactic per shape on every
     # tensor-parallel rank, so the ranks capture the same kernels.
     merge_tuned_tactics_across_ranks: bool = False
+    # Called once with this process's rank before the warmup tuning pass, to preload tuned tactics (the model's
+    # bundled pin files) into the autotuner; shapes it covers are served instead of profiled.
+    install_tactic_pins: Optional[Callable[[int], Any]] = None
+    # With TLLM_AUTOTUNER_CACHE_PATH set, save the autotuner cache again after the
+    # FlashInfer MXFP8 passes (warmup and the decode-graph pass) tune, so their
+    # tactics persist across starts instead of being re-profiled on every start.
+    persist_flashinfer_mxfp8_tactics: bool = False
+    # Streaming: also emit a response on decoding iterations 2..N, so the first
+    # counted text reaches the client one step after the first token instead of
+    # one stream interval later (a reasoning parser holds a leading reasoning
+    # tag back, so the iteration-1 chunk can carry no content). Emission only;
+    # tokens are unchanged. 1 keeps the stock schedule.
+    first_content_emit_iters: int = 1
+    # On SM107, run FlashInfer's CuTe DSL MXFP8 GEMM above 32 rows at the pinned tuned tactics of
+    # custom_ops/mxfp8_cute_pinned_tactics (bitwise the default tactic's output, faster). The GEMM runner does not
+    # know the model, so the executor arms the table process-wide when the model opts in.
+    mxfp8_pinned_tactics: bool = False
+    # After warmup, log every CuTe DSL / Triton compile as a late compile (tensorrt_llm/_torch/late_compile.py).
+    late_compile_detect: bool = False
+    # Saturate the MSA backend's E4M3 cache writes and dense-decode query cast to +-448, as the CUDA FP8 writers do
+    # (bitwise the plain cast for every finite in-range value). Armed process-wide by the executor.
+    fp8_saturating_casts: bool = False
+    # MiniMax-M3 MSA KV cache: zero the KV pools once at allocation and price the manager's real per-token footprint
+    # in the pre-allocation estimate (attention/backends/sparse/minimax_m3/cache_manager.py). Armed process-wide by
+    # the KV-cache creator before any sizing.
+    msa_kv_cache_fixes: bool = False
+    # Standalone-drafter KV pool: ceil(heads / tp) per-rank cost and the history-first context resize
+    # (kv_cache_manager_v2.py). Armed process-wide by the KV-cache creator before any sizing.
+    draft_pool_fixes: bool = False
+    # DFlash / DSpark draft KV manager: reserve the drafter's block width per generation step and keep page 0 as an
+    # unowned guard page, so drafter writes through unallocated block-table entries cannot land in another request's
+    # page (kv_cache_manager_v2.py). Armed process-wide by the KV-cache creator before any sizing. Kill switches
+    # TRTLLM_M31_DISABLE_DRAFT_KV_RESERVE / TRTLLM_M31_DISABLE_DRAFT_KV_GUARD.
+    draft_kv_reserve_guard: bool = False
+    # KV cache manager V2 with block reuse: prefetch waiting context requests' host-tier prefix to the GPU and admit
+    # them after a short rank-agreed hold (py_executor.py). Kill switch TRTLLM_M31_DISABLE_KV_GPU_PREFETCH.
+    kv_gpu_prefetch: bool = False
+    # Hand a context-only request's prompt tokens to LlmRequest as the executor request's int32 array instead of a
+    # list (llm_request.py). Kill switch TRTLLM_M31_DISABLE_L1_TOKEN_ARRAY.
+    context_token_array: bool = False
+    # On SM107, run the MSA NVFP4 sparse prefill through the fmha_sm100 BF16X / E4M3X fork when it is installed and
+    # the geometry matches (attention/backends/fmha/msa_prefill.py). Kill switch TRTLLM_M31_DISABLE_TP2CTX_BF16X.
+    msa_prefill_fork: bool = False
+    # Reuse the step's MSA indexer proxy max-score buffer across sparse layers (msa_indexer.py). Kill switch
+    # TRTLLM_M31_DISABLE_PROXY_MS_REUSE.
+    proxy_ms_reuse: bool = False
+    # Write the context one-hot draft-prob rows with index_fill_ instead of an advanced-index put that synchronizes
+    # the host (speculative/interface.py; the same elements). Kill switch TRTLLM_M31_DISABLE_ONEHOT_INDEX_FILL.
+    context_onehot_index_fill: bool = False
+    # DFlash / DSpark: compute a context chunk's draft allocation on the host when the draft block table counts full
+    # rows, instead of reading it back from the device (speculative/dflash.py). Kill switch
+    # TRTLLM_DFLASH_DISABLE_HOST_CTX_ALLOC.
+    dflash_host_ctx_alloc: bool = False
     # Skip the per-step Philox seed and offset uploads on all-greedy
     # one-model speculative batches (the argmax path never reads them).
     skip_greedy_rng_upload: bool = False
@@ -204,12 +290,20 @@ class RuntimeHooks:
     # Copy the one-model speculative sampler's per-slot store to the host on the sampler's D2H side
     # stream, so those copies overlap the next step's input staging instead of preceding it.
     sampler_d2h_side_stream: bool = False
+    # Time the iteration log's device step with one timing event per iteration boundary, recorded on a side
+    # stream that waits for the current stream, instead of an end and a start event back to back on the
+    # current stream (the same instant, with no GPU work between them). The reported step times are unchanged.
+    iteration_timing_one_event: bool = False
     # MiniMax-M3 MSA metadata preparation.
     msa: MsaRuntimePolicy = MsaRuntimePolicy()
     # A separate draft KV cache manager (KVCacheManagerV2) skips a decode-only block-table copy whose destination,
     # copied rows and those rows' page indices equal the previous copy's (the standalone DSpark drafter's table is
     # unchanged on most decode steps; see KVCacheManagerV2._block_offsets_unchanged).
     skip_unchanged_draft_block_offsets: bool = False
+    # With skip_unchanged_draft_block_offsets: a decode-only draft block-table copy whose rows changed in a few page
+    # indices (the drafter's sliding window: a tail page allocated or re-allocated, a front page released) rewrites the
+    # rows with one host-to-device row copy instead of the copy kernel (KVCacheManagerV2._patch_block_offsets).
+    patch_unchanged_draft_block_offsets: bool = False
     # The one-model speculative sampler's tail bookkeeping without its no-op launches, bitwise the same outputs
     # (copied to spec_metadata.tail_bookkeep): at one decode request the draft block reads its sampling parameters as
     # views of the per-token buffers, a draft block with no d2t map skips the int32 -> int64 -> int32 round trip, and
@@ -253,3 +347,45 @@ def runtime_hooks_of(model: object) -> RuntimeHooks:
             f"{type(model).__name__}.runtime_hooks must be a RuntimeHooks, got {type(hooks).__name__}"
         )
     return hooks
+
+
+# Work counters (log-only) for the step-loop items above. The code that does an armed hook's work calls
+# ``hook_work(ITEM)`` on the path where the hook is taken (not where the flag is merely read); the hot-path cost is one
+# dict increment. Counts are per process, in host code: under CUDA graphs a count is host executions (eager steps and
+# captures; graph replays run no host code and are not counted), and every line says so.
+HOOK_WORK_COUNTS: dict[str, int] = {}
+HOOK_WORK_HOST_COUNT = (
+    "host executions: eager steps + CUDA-graph captures, graph replays not counted"
+)
+_hook_work_exit = [False, False]  # [atexit registered, final lines logged]
+
+
+def _hook_work_log(message: str) -> None:
+    from tensorrt_llm._utils import mpi_rank
+    from tensorrt_llm.logger import logger
+
+    logger.info(f"{message} (rank {mpi_rank()}; {HOOK_WORK_HOST_COUNT})")
+
+
+def hook_work(item: str) -> None:
+    """Count one unit of ``item``'s work in this process.
+
+    Logs ``[M3 host] <ITEM> engaged: work N`` at the first count and at every power of two, and (once per process, at
+    exit) ``[M3 host] <ITEM> engaged: final work N``. Log-only: no device work, no synchronization.
+    """
+    count = HOOK_WORK_COUNTS.get(item, 0) + 1
+    HOOK_WORK_COUNTS[item] = count
+    if count & (count - 1) == 0:
+        if not _hook_work_exit[0]:
+            _hook_work_exit[0] = True
+            atexit.register(log_hook_work_final)
+        _hook_work_log(f"[M3 host] {item} engaged: work {count}")
+
+
+def log_hook_work_final() -> None:
+    """Log every counted item's final count, once per process (registered at exit by the first ``hook_work``)."""
+    if _hook_work_exit[1]:
+        return
+    _hook_work_exit[1] = True
+    for item, count in sorted(HOOK_WORK_COUNTS.items()):
+        _hook_work_log(f"[M3 host] {item} engaged: final work {count}")

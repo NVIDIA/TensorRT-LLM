@@ -44,10 +44,19 @@ namespace minimaxM31
 //! bits); larger buckets take the global passes.
 //! pdl: launched as a programmatic dependent; everything that reads probs, top_p or the workspace waits for the
 //! preceding grid, and dependents are released once the workspace is ready for the next launch.
+//! listPath (V4): pass 0 also lists the elements >= 2^-12 (at most 4096 in a row summing to 1; 2^-12 is a pass-0 bucket
+//! edge). When the list is complete and the selected pass-0 bucket lies at or above 2^-12, every kept element is in
+//! it: after that single barrier every CTA runs the remaining radix passes on the list (the same integer histograms),
+//! rebuilds FlashInfer's 1024 chain sums from the kept members (chain c = the kept values at indices c, c + 1024, ...
+//! in ascending order), reduces them with the same cub block sum and writes its own slice. Otherwise the radix path
+//! above. Pass-0 histograms and lists are double-buffered by launch parity (from the grow-only pass-0 counter), so no
+//! later barrier has to clear them.
+//! wideHist (K8): 8 privatized pass histograms per CTA instead of 4, each bucket's mantissa sum kept as two 32-bit
+//! shared counters (hi / lo bits) while d / ctasPerRow < 2^20 (integer merges, so the same bits).
 //! Workspace: toppRenormDetV3WorkspaceBytesPerRow() x rows bytes, ZERO-initialized once before the first launch,
-//! then reused as is (CUDA-graph safe). Launches sharing one workspace must be stream-ordered.
+//! then reused as is (CUDA-graph safe) by any mix of the flags. Launches sharing one workspace must be stream-ordered.
 cudaError_t invokeToppRenormDetV3(float const* probs, float* out, float const* topP, int rows, int d, int ctasPerRow,
-    void* workspace, int* keptOut, bool pdl, bool candidateList, cudaStream_t stream);
+    void* workspace, int* keptOut, bool pdl, bool candidateList, bool listPath, bool wideHist, cudaStream_t stream);
 
 //! Workspace bytes per row of invokeToppRenormDetV3.
 size_t toppRenormDetV3WorkspaceBytesPerRow();

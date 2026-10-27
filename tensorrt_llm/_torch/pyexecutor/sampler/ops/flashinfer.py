@@ -303,6 +303,24 @@ def top_k_renorm_probs_op(
     return renormed
 
 
+# Deterministic top-p renorm: every TP rank runs this sampler on its own and must get bit-identical probs (the default
+# mode aggregates with order-dependent float atomics, so near-threshold accept/sample decisions can differ). The
+# MiniMax-M3.1 sm_107 routing turns it off (arm_sm107_top_p_renorm), keeping FlashInfer's default mode there.
+TOP_P_RENORM_DETERMINISTIC = True
+
+
+def arm_sm107_top_p_renorm() -> None:
+    """Keep FlashInfer's default top-p renorm mode in this process, as the MiniMax-M3.1 sm_107 targets run it."""
+    global TOP_P_RENORM_DETERMINISTIC
+    TOP_P_RENORM_DETERMINISTIC = False
+
+
+def _top_p_renorm_probs(probs: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:
+    if TOP_P_RENORM_DETERMINISTIC:
+        return flashinfer.sampling.top_p_renorm_probs(probs, top_p, is_deterministic=True)
+    return flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+
+
 @_compiler_disable
 def top_p_renorm_probs_op(
     probs: torch.Tensor,
@@ -312,11 +330,7 @@ def top_p_renorm_probs_op(
         overridden = _TOP_P_RENORM_OVERRIDE(probs, top_p)
         if overridden is not None:
             return overridden
-    # Deterministic: every TP rank runs this sampler on its own and must get bit-identical probs (the default
-    # mode aggregates with order-dependent float atomics, so near-threshold accept/sample decisions can differ).
-    renormed: torch.Tensor = flashinfer.sampling.top_p_renorm_probs(
-        probs, top_p, is_deterministic=True
-    )
+    renormed: torch.Tensor = _top_p_renorm_probs(probs, top_p)
     return renormed
 
 
@@ -345,11 +359,7 @@ def compute_probs_from_logits_op(
         overridden = (
             _TOP_P_RENORM_OVERRIDE(probs, top_p) if _TOP_P_RENORM_OVERRIDE is not None else None
         )
-        probs = (
-            overridden
-            if overridden is not None
-            else flashinfer.sampling.top_p_renorm_probs(probs, top_p, is_deterministic=True)
-        )
+        probs = overridden if overridden is not None else _top_p_renorm_probs(probs, top_p)
     return probs
 
 

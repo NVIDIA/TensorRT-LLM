@@ -1200,8 +1200,6 @@ class GmemQKVResource(MemoryResource):
                 if cutlass.const_expr(self.cfg.has_uniform_varlen):
                     seqlen_k = Int32(self.cfg.uniform_seq_len_k)
                 else:
-                    from .helpers_paged import _load_runtime_seq_len_kv
-
                     seqlen_k = _load_runtime_seq_len_kv(
                         self.seqlens_kv, self.max_seq_len_kv, batch_coord
                     )
@@ -1224,8 +1222,6 @@ class GmemQKVResource(MemoryResource):
                     kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
                     kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
                 else:
-                    from .helpers_paged import _load_block_table_row_bounds
-
                     kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                         Int32(self.block_table_row_stride),
                         self.cfg,
@@ -1301,13 +1297,9 @@ class GmemQKVResource(MemoryResource):
             kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
             kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
         else:
-            from .helpers_paged import _load_runtime_seq_len_kv
-
             cached_seqlen_kv = _load_runtime_seq_len_kv(
                 self.seqlens_kv, self.max_seq_len_kv, batch_coord
             )
-            from .helpers_paged import _load_block_table_row_bounds
-
             kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                 Int32(self.block_table_row_stride),
                 self.cfg,
@@ -1744,8 +1736,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
         kv_request_begin: Int32,
         kv_page_idx_ub: Int32,
     ) -> None:
-        from .helpers_paged import _resolve_kv_tile_idx_context
-
         cfg = self.cfg
         # Context's K/V tile index is kv_tile_start + loop_offset; for V the
         # producer runs one tile ahead in TAIL, so reuse the same expression
@@ -1836,8 +1826,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
         tile_offset: cutlass.Constexpr[int] = 0,
     ) -> cutlass.Array:
         """Retain one tile's page IDs after its SMEM window is released."""
-        from .helpers_paged import _resolve_kv_tile_idx_context
-
         tile_idx = _resolve_kv_tile_idx_context(
             stage_info, kv_tile_start, tile_offset=tile_offset
         )
@@ -5798,3 +5786,14 @@ class GmemOResource(MemoryResource):
                 prims.cp_async_bulk_commit_group()
                 if cutlass.const_expr(self.cfg.gmem_o_store_wait_after_write):
                     prims.cp_async_bulk_wait_group(0, read=True)
+
+
+# helpers_paged imports FmhaConfig from this module, so it is imported here,
+# after FmhaConfig is defined. The methods above call these helpers while being
+# traced inside the kernel's runtime loops, where the CuTe DSL rejects a first
+# import of a module; importing at module scope keeps those calls import-free.
+from .helpers_paged import (
+    _load_block_table_row_bounds,
+    _load_runtime_seq_len_kv,
+    _resolve_kv_tile_idx_context,
+)

@@ -15,17 +15,22 @@
 
 """Task-scheduled paged decode with a FlashInfer-style plan/run lifecycle."""
 
+from ._worktile_scope import with_scalar_work_tile_info
 from collections.abc import Callable, Sequence
+import dataclasses
 from dataclasses import dataclass
 import functools
 import math
 import numbers
 import struct
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
 
 import torch
 
 from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
+
+from tensorrt_llm._torch import cute_aot
 
 from . import _q_token_kv_block_sparse_policy as _sparse_policy
 from ._block_sparse.common import _num_sparse_pattern_heads
@@ -1510,6 +1515,7 @@ def _make_decode_compile_spec(
 
 
 @functools.cache
+@with_scalar_work_tile_info
 def _get_compiled_decode(
     compile_spec: _DecodeCompileSpec,
 ):
@@ -1903,67 +1909,79 @@ def _get_compiled_decode(
             ),
         )
 
+    # The device index does not change the compiled code: one shipped object serves every device.
+    aot_spec = dataclasses.replace(compile_spec, device_index=0)
     with torch.cuda.device(device_index):
-        compiled_main = cute.compile(
-            main_tensor_adapter,
-            q_fake,
-            k_fake,
-            v_fake,
-            k_sf_fake,
-            v_sf_fake,
-            out_fake,
-            seq_lens_fake,
-            cu_seqlens_q_fake,
-            block_table_fake,
-            q_token_kv_block_sparse_page_memberships_fake,
-            partial_o_fake,
-            partial_stats_fake,
-            counter_fake,
-            attention_sinks_fake,
-            Int64(1),
-            Int64(1),
-            Int64(1),
-            Int64(1),
-            Int64(1),
-            Int64(1),
-            Int64(1),
-            Float32(1.0),
-            Float32(1.0),
-            direct_q1_fake,
-            stream_fake,
-            cfg,
-            seq_len_q,
-            num_qo_heads,
-            num_kv_heads,
-            head_dim,
-            max_kv_len,
-            max_active_clusters,
-            static_full_split_prefix,
-            static_native_uniform_kv,
-            options=_COMPILE_OPTIONS,
-        )
-        compiled_reducer = None
-        if cfg.use_separate_reduction_kernel:
-            assert reduction_tensor_adapter is not None
-            compiled_reducer = cute.compile(
-                reduction_tensor_adapter,
+        compiled_main = cute_aot.compile_or_load(
+            f"prims_ts_decode.main {aot_spec!r}",
+            lambda: cute.compile(
+                main_tensor_adapter,
+                q_fake,
+                k_fake,
+                v_fake,
+                k_sf_fake,
+                v_sf_fake,
                 out_fake,
                 seq_lens_fake,
                 cu_seqlens_q_fake,
+                block_table_fake,
+                q_token_kv_block_sparse_page_memberships_fake,
                 partial_o_fake,
                 partial_stats_fake,
+                counter_fake,
                 attention_sinks_fake,
+                Int64(1),
+                Int64(1),
+                Int64(1),
+                Int64(1),
+                Int64(1),
+                Int64(1),
+                Int64(1),
                 Float32(1.0),
                 Float32(1.0),
                 direct_q1_fake,
                 stream_fake,
                 cfg,
+                seq_len_q,
                 num_qo_heads,
                 num_kv_heads,
                 head_dim,
                 max_kv_len,
+                max_active_clusters,
                 static_full_split_prefix,
+                static_native_uniform_kv,
                 options=_COMPILE_OPTIONS,
+            ),
+            sources=_aot_sources(),
+            tvm_ffi=True,
+        )
+        compiled_reducer = None
+        if cfg.use_separate_reduction_kernel:
+            assert reduction_tensor_adapter is not None
+            compiled_reducer = cute_aot.compile_or_load(
+                f"prims_ts_decode.reducer {aot_spec!r}",
+                lambda: cute.compile(
+                    reduction_tensor_adapter,
+                    out_fake,
+                    seq_lens_fake,
+                    cu_seqlens_q_fake,
+                    partial_o_fake,
+                    partial_stats_fake,
+                    attention_sinks_fake,
+                    Float32(1.0),
+                    Float32(1.0),
+                    direct_q1_fake,
+                    stream_fake,
+                    cfg,
+                    num_qo_heads,
+                    num_kv_heads,
+                    head_dim,
+                    max_kv_len,
+                    static_full_split_prefix,
+                    options=_COMPILE_OPTIONS,
+                ),
+                sources=_aot_sources(),
+                tvm_ffi=True,
             )
 
     return compiled_main, compiled_reducer
@@ -4519,3 +4537,9 @@ __all__ = [
     "validate_q_token_kv_block_sparse_group_size",
     "prepare_prims_ts_batch_decode_with_kv_cache",
 ]
+
+
+def _aot_sources():
+    """The Python files the PrimTS decode kernels are traced from: the ``sources`` of their shipped AOT objects."""
+    return cute_aot.py_files(str(Path(__file__).resolve().parent))
+

@@ -31,6 +31,8 @@ load this module, so trtllm's import chain does not come back here.
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
 from typing import NamedTuple, Optional, Tuple
 
@@ -42,8 +44,9 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, Trtll
 from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
 from tensorrt_llm._torch.pyexecutor.h2d_cache import copy_h2d_if_changed
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
-from tensorrt_llm._utils import maybe_pin_memory
+from tensorrt_llm._utils import maybe_pin_memory, mpi_rank
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .common import (
@@ -64,7 +67,32 @@ from .kernels.trtllm_gen_dense_decode import (
     uniform_subpages_per_slot,
     write_subpage_block_table,
 )
-from .msa_indexer import MsaIndexer, cutedsl_score_runner, segmented_proxy_plan
+from .msa_indexer import MsaIndexer, cutedsl_score_runner, proxy_plan_kwargs, segmented_proxy_plan
+
+# NVFP4_STEP_CACHE (AGG_NVFP4_INDEXK): run_indexer builds the NVFP4 compact page tables once per step, not per
+# layer.
+_NVFP4_STEP_CACHE_OFF = os.environ.get("TRTLLM_M31_DISABLE_NVFP4_STEP_CACHE", "0") == "1"
+# MIX_NVFP4_READER (not bitwise): on a mixed step with an NVFP4 index-K cache the generation rows
+# are scored from the NVFP4 pages by the Q8KV4 decode reader (the one every pure-decode step uses: exact FP16
+# dequant) instead of the FP8 scorer on the step's gathered E4M3 copy, so only the context rows' pages are gathered
+# (microbench: -5.8..-7.3 ms per c56 mixed step). Kill switch: TRTLLM_M31_DISABLE_MIX_NVFP4_READER=1.
+_MIX_NVFP4_READER = os.environ.get("TRTLLM_M31_DISABLE_MIX_NVFP4_READER", "0") != "1"
+
+
+_MIX_NVFP4_READER_LOGGED = False
+
+
+def _log_mix_reader_taken(ctx_rows: int, gen_rows: int, query_len: int) -> None:
+    """Report the first executed mixed-step reader call in each rank process."""
+    global _MIX_NVFP4_READER_LOGGED
+    if not _MIX_NVFP4_READER_LOGGED:
+        _MIX_NVFP4_READER_LOGGED = True
+        print(
+            f"[M31 MIXR] taken rank={mpi_rank()} ctx_reqs={ctx_rows} "
+            f"gen_rows={gen_rows} query_len={query_len}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _cache_device(meta) -> torch.device:
@@ -120,6 +148,15 @@ def _host_prefix_sum(lens_cpu: torch.Tensor, dtype: torch.dtype) -> torch.Tensor
     """[0, cumsum(lens)...] as a pinned host tensor of ``dtype``."""
     sums = torch.cumsum(lens_cpu.to(torch.int64), 0)
     return maybe_pin_memory(torch.cat([sums.new_zeros(1), sums]).to(dtype))
+
+
+# SUBPAGE_IN_GRAPH: the sub-page block table is expanded from msa_block_table on the device inside the forward, once,
+# by the first dense layer that reads it (msa_subpage_rows), so the block table can join the step-input pack and the
+# step boundary issues no expansion; otherwise prepare() expands it after an unpacked block-table upload.
+# TAIL_FILL_IN_FORWARD: prepare() records where msa_out_cache_loc's live slots end and the forward invalidates the rest
+# (on_update_kv_lens, which opens every forward, so a captured forward fills its own tail at each replay) instead of an
+# eager fill between the decode graphs; otherwise prepare() fills it.
+# Both are taken only for a model that opts in (MsaRuntimePolicy.forward_staging); otherwise prepare() keeps both.
 
 
 def _fill_unused_slots(buf: torch.Tensor, start: int) -> None:
@@ -207,6 +244,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # factor, or 0 where the pool has no single one; see msa_subpage_rows.
     msa_subpage_block_table: Optional[torch.Tensor] = None
     _msa_subpages_per_slot: int = 0
+    # SUBPAGE_IN_GRAPH: the rows prepare() staged for the forward to expand (0: none), and whether this forward did.
+    _msa_subpage_rows: int = 0
+    _msa_subpage_expanded: bool = False
+    # TAIL_FILL_IN_FORWARD: the first msa_out_cache_loc row past this step's live slots (None: prepare() filled it).
+    _msa_tail_start: Optional[int] = None
     # Inputs for on_update_kv_lens: each query token's request row and offset
     # within the request, and the kv_lens prepare() staged (the upper bound the
     # correction is clamped to). The write slots are re-derived from
@@ -227,6 +269,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # layer.
     _msa_prefill_proxy_plan: Optional[tuple] = None
     _msa_prefill_proxy_kv_indices: Optional[torch.Tensor] = None
+    # The plain proxy plan (num_kv_splits 1, the planner's tile) over the same rows, built only for
+    # MsaRuntimePolicy.prefill_proxy_oracle.
+    _msa_prefill_proxy_plan_ref: Optional[tuple] = None
     _msa_prefill_gqa_plan: Optional[tuple] = None
     _msa_prefill_dense_plan: Optional[tuple] = None
     # Per-token valid-block count for the prefill-side indexer proxy. It is
@@ -324,6 +369,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # whatever rows the CuTe DSL scorer did not take. See _msa_attn_plan_rows
     # and _msa_proxy_plan_rows.
     @property
+    def msa_prefill_proxy_plan_ref(self) -> Optional[tuple]:
+        """The oracle's plain proxy plan for this step (MsaRuntimePolicy.prefill_proxy_oracle), else None."""
+        return self._msa_prefill_proxy_plan_ref
+
+    @property
     def msa_prefill_proxy_plan(self) -> Optional[tuple]:
         """Prebuilt indexer proxy plan for this step's fmha_sm100 rows."""
         return self._msa_prefill_proxy_plan
@@ -396,6 +446,15 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         table = self.msa_subpage_block_table
         if table is None:
             return None, 0
+        rows = self._msa_subpage_rows
+        if rows > 0 and not self._msa_subpage_expanded:
+            # Once per forward (on_update_kv_lens, which opens every forward, resets it), from the block table the
+            # pack landed, over the rows prepare() staged; a captured forward records it once, so every replay
+            # expands its own rows.
+            write_subpage_block_table(
+                self.msa_block_table[:rows], self._msa_subpages_per_slot, table[:rows]
+            )
+            self._msa_subpage_expanded = True
         return table[row_first:row_last], self._msa_subpages_per_slot
 
     def _msa_main_kv_is_fp8(self) -> bool:
@@ -840,6 +899,19 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         span = self._msa_decode_span
         return span is not None and span.row_first == 0
 
+    def _msa_proxy_plan_kwargs(
+        self,
+        fmha_sm100,
+        qo_lens_cpu: torch.Tensor,
+        kv_lens_cpu: torch.Tensor,
+        rows: Optional[Tuple[int, int]],
+        page_size: int,
+    ) -> dict:
+        """Prefill proxy arguments shared with the inline planner through proxy_plan_kwargs."""
+        return proxy_plan_kwargs(
+            self.msa_policy, fmha_sm100, qo_lens_cpu, kv_lens_cpu, rows, page_size
+        )
+
     def _msa_proxy_plan_rows(self) -> Optional[Tuple[int, int]]:
         """Batch rows this step's fmha_sm100 indexer proxy plan must cover.
 
@@ -872,7 +944,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         casts Q to the cache dtype, so the cache decides what the scorer sees.
         """
         indexer_kv_dtype = str(getattr(self.kv_cache_manager, "indexer_kv_dtype", "bf16"))
-        return torch.float8_e4m3fn if indexer_kv_dtype == "fp8" else torch.bfloat16
+        # NVFP4 index-K is scored as E4M3: the scorers read its gathered FP8 copy (run_indexer).
+        return torch.float8_e4m3fn if indexer_kv_dtype in ("fp8", "nvfp4") else torch.bfloat16
 
     def _cutedsl_indexer_supported(
         self, *, num_index_heads: int, page_size: int, decode_query_len: int
@@ -908,6 +981,18 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             or (runtime_features is not None and runtime_features.has_speculative_draft_tokens)
         )
 
+    def _fill_tail_in_forward(self) -> None:
+        """TAIL_FILL_IN_FORWARD: -1 over msa_out_cache_loc past the live slots prepare() staged (see the prepare()
+        comment on padded rows), before anything in the forward reads it."""
+        start = self._msa_tail_start
+        buf = self.msa_out_cache_loc
+        if start is not None and buf is not None and start < buf.shape[0]:
+            logger.info_once(
+                "[M3 host] MSA out_cache_loc tail filled inside the forward",
+                key="msa_tail_fill_in_forward",
+            )
+            buf[start:].fill_(-1)
+
     def on_update_kv_lens(self) -> None:
         """Re-derive lengths, slots and valid-block counts from the corrected kv_lens_cuda.
 
@@ -927,6 +1012,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         extend_ctx promotes speculative generation rows into the context prefix.
         Staged host bounds remain valid upper bounds as lengths shrink.
         """
+        # A new forward: the first dense layer that reads the sub-page table expands it again (msa_subpage_rows).
+        self._msa_subpage_expanded = False
+        self._fill_tail_in_forward()
         super().on_update_kv_lens()
         if not self._msa_fields_ready or not self._msa_kv_lens_dynamic:
             return
@@ -1015,6 +1103,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         """
         self._msa_prefill_proxy_plan = None
         self._msa_prefill_proxy_kv_indices = None
+        self._msa_prefill_proxy_plan_ref = None
         self._msa_prefill_gqa_plan = None
         self._msa_prefill_dense_plan = None
         self._msa_prefill_n_valid_blocks = None
@@ -1063,7 +1152,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # flag.
         use_fp8 = self._msa_main_kv_is_fp8()
 
-        def plan_for(rows: Optional[Tuple[int, int]], **plan_kwargs) -> Optional[tuple]:
+        def plan_for(
+            rows: Optional[Tuple[int, int]], num_kv_splits: int = 1, **plan_kwargs
+        ) -> Optional[tuple]:
             """Plan one site over the given rows, or None where it has none.
 
             Slicing keeps the length tensors' pinned backing, so a single-phase
@@ -1078,7 +1169,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 kv_lens_cpu if whole else kv_lens_cpu[first:last],
                 qo_offset=qo_offset_cpu if whole else qo_offset_cpu[first:last],
                 page_size=page_size,
-                num_kv_splits=1,
+                num_kv_splits=num_kv_splits,
                 causal=True,
                 **plan_kwargs,
             )
@@ -1114,6 +1205,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 num_qo_heads=num_index_heads,
                 num_kv_heads=1,
                 output_maxscore=True,
+                **self._msa_proxy_plan_kwargs(
+                    fmha_sm100, qo_lens_cpu, kv_lens_cpu, proxy_rows, page_size
+                ),
+            )
+        if self.msa_policy.prefill_proxy_oracle and self._msa_prefill_proxy_plan is not None:
+            self._msa_prefill_proxy_plan_ref = plan_for(
+                proxy_rows, num_qo_heads=num_index_heads, num_kv_heads=1, output_maxscore=True
             )
         attn_rows = self._msa_attn_plan_rows()
         # Sparse layers: kv_block_num=topk limits attention to top-k blocks.
@@ -1153,6 +1251,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         decoding the inputs for on_update_kv_lens are staged as well.
         """
         self._msa_fields_ready = False
+        # Set again below once this step's live slots are staged; until then the forward fills nothing.
+        self._msa_tail_start = None
         if not self._msa_buffers_ready:
             return
         request_ids = self.request_ids
@@ -1230,7 +1330,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # would make its shape dynamic, and a negative slot is what makes those
         # rows cache-write no-ops instead. Invalidate the unwritten tail so they
         # cannot reuse the previous step's live slots, which address real pages.
-        _fill_unused_slots(self.msa_out_cache_loc, total_new_tokens)
+        if self.msa_policy.forward_staging:
+            self._msa_tail_start = total_new_tokens
+        else:
+            self._msa_tail_start = None
+            _fill_unused_slots(self.msa_out_cache_loc, total_new_tokens)
         if kv_indices is not None:
             step_inputs.copy_(self.msa_kv_indices[: int(kv_indices.shape[0])], kv_indices)
 
@@ -1241,8 +1345,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         block_table_changed = copy_h2d_if_changed(
             self.msa_block_table[:batch_size, :block_table_cols],
             maybe_pin_memory(block_ids_cpu.to(torch.int32)),
-            # write_subpage_block_table below reads it on the device before the replay.
-            pack=self.msa_subpage_block_table is None,
+            # A prepare-time write_subpage_block_table below reads it on the device before the replay; with
+            # SUBPAGE_IN_GRAPH nothing does, so it can join the pack.
+            pack=self.msa_subpage_block_table is None or self.msa_policy.forward_staging,
         )
         # Packed only when the device scan below (h2d_cache off) does not read it before the replay.
         if h2d_cache.enabled():
@@ -1314,7 +1419,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # Sub-page expansion for the trtllm-gen dense layers, staged once here
         # instead of once per layer, outside capture into a graph-stable
         # buffer as with the slot table above.
-        if self.msa_subpage_block_table is not None and block_table_changed:
+        # With SUBPAGE_IN_GRAPH the forward expands this step's rows instead (msa_subpage_rows).
+        self._msa_subpage_expanded = False
+        self._msa_subpage_rows = batch_size if self.msa_policy.forward_staging else 0
+        if (
+            not self.msa_policy.forward_staging
+            and self.msa_subpage_block_table is not None
+            and block_table_changed
+        ):
             write_subpage_block_table(
                 self.msa_block_table[:batch_size],
                 self._msa_subpages_per_slot,
@@ -1605,8 +1717,17 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         # scorer and cache writer below both honor their source strides.
         idx_q_view = idx_q.view(num_tokens, config.num_index_heads, config.sparse_index_dim)
         idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
-        configured_for_fp8 = self.indexer_kv_dtype == "fp8"
-        expected_cache_dtype = torch.float8_e4m3fn if configured_for_fp8 else torch.bfloat16
+        configured_for_nvfp4 = self.indexer_kv_dtype == "nvfp4"
+        # NVFP4 index-K takes the FP8 indexer's contract (E4M3 index-Q, a cache the fused producer populated) and
+        # is scored through its gathered FP8 copy below.
+        configured_for_fp8 = self.indexer_kv_dtype == "fp8" or configured_for_nvfp4
+        expected_cache_dtype = (
+            torch.uint8
+            if configured_for_nvfp4
+            else torch.float8_e4m3fn
+            if configured_for_fp8
+            else torch.bfloat16
+        )
         if idx_k_cache.dtype != expected_cache_dtype:
             raise ValueError(
                 "MiniMax-M3 index-K cache dtype does not match indexer_kv_dtype="
@@ -1649,11 +1770,58 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             # Short pure-prefill step: every token selects all its valid blocks (staged once per step).
             num_kv_heads = int(self.indexer.config.num_kv_heads)
             return identity.unsqueeze(1).expand(num_tokens, num_kv_heads, int(identity.shape[1]))
+        # NVFP4 replaces both page tables with ones addressing its gathered copy; the stock path reads them as staged.
+        step_block_table = None
+        kv_indices = metadata.msa_prefill_proxy_kv_indices
+        if configured_for_nvfp4:
+            # AGG_NVFP4_INDEXK: gather the step's NVFP4 pages into contiguous E4M3 pages (the keys vLLM's NVFP4
+            # prefill indexer scores) and point both page tables at that copy; the scorers below run unchanged.
+            # Eager only: a captured pure-decode step scores NVFP4 pages directly in the model's decode target.
+            from .kernels import nvfp4_index_k
+
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "MiniMax-M3 NVFP4 index-K: run_indexer gathers pages eagerly and cannot run under CUDA graph "
+                    "capture; the model's decode target must score NVFP4 pages itself"
+                )
+            rows = int(metadata.num_seqs)
+            # MIX_NVFP4_READER: a mixed step gathers only its context rows' pages (they are the prefix of the
+            # flattened page order the proxy plan addresses); the generation rows read the NVFP4 pages below.
+            mix_reader = _MIX_NVFP4_READER and span is not None and span.row_first > 0
+            nvfp4_pages = idx_k_cache
+            if mix_reader:
+                rows = int(span.row_first)
+            # NVFP4_STEP_CACHE: the compact page list, its tables and the gather buffer depend on the step only
+            # (block table, lengths, rows), not the layer: build them for the first sparse layer of the step and
+            # reuse them; each layer still gathers its own cache into the buffer. Keyed by the host lengths object
+            # itself (prepare() stages a new one every step, and the cache holds it, so its identity is not reused)
+            # plus rows and the block table buffer, whose only writer is prepare(); inference tensors carry no
+            # version counter. Kill switch: TRTLLM_M31_DISABLE_NVFP4_STEP_CACHE=1 (per-layer build, as before).
+            bt, kvl = metadata.msa_block_table, metadata.msa_kv_lens_cpu
+            key = (rows, bt.data_ptr())
+            cached = None if _NVFP4_STEP_CACHE_OFF else getattr(metadata, "_nvfp4_step_pages", None)
+            if cached is None or cached[0] is not kvl or cached[1] != key:
+                page_ids, kv_indices, step_block_table = nvfp4_index_k.compact_step_pages(
+                    bt, kvl, rows
+                )
+                gather_out = torch.empty(
+                    (int(page_ids.shape[0]), 1, 128, 128),
+                    dtype=torch.float8_e4m3fn,
+                    device=bt.device,
+                )
+                cached = (kvl, key, page_ids, kv_indices, step_block_table, gather_out)
+                if not _NVFP4_STEP_CACHE_OFF:
+                    metadata._nvfp4_step_pages = cached
+            _, _, page_ids, kv_indices, step_block_table, gather_out = cached
+            idx_k_cache = nvfp4_index_k.gather_fp8(idx_k_cache, page_ids, gather_out)
+        else:
+            mix_reader = False
         block_table = None
         seq_lens_cuda = None
         decode_query_len = None
         gen_first = 0
         ctx_rows = 0
+        gen_scores = None
         if span is not None:
             ctx_rows = span.row_first
             decode_query_len = span.query_len
@@ -1662,7 +1830,11 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             # PhasedFmha derives the attention phase's token offset, so the
             # scorer and the decode kernels agree on the boundary.
             gen_first = num_tokens - decode_query_len * (row_last - ctx_rows)
-            block_table = metadata.msa_block_table[ctx_rows:row_last]
+            block_table = (
+                step_block_table
+                if step_block_table is not None and not mix_reader
+                else metadata.msa_block_table
+            )[ctx_rows:row_last]
             seq_lens_cuda = metadata.msa_seq_lens_cuda[ctx_rows:row_last]
         # One selection path, over the scratch prepare() staged for whichever
         # scorer owns the rows: a span starting at row 0 leaves the CuTe DSL
@@ -1697,15 +1869,36 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                 if span is not None
                 else None
             )
+        if mix_reader:
+            # The generation span's scores in the selector's layout, at the store's tile width; the step workspace
+            # is built once per step (keyed like the page cache).
+            tiles = int(max_score.shape[1])
+            ws_key = (metadata.msa_kv_lens_cpu, ctx_rows, tiles)
+            ws = getattr(metadata, "_mix_nvfp4_ws", None)
+            if ws is None or ws[0] is not ws_key[0] or ws[1:3] != ws_key[1:]:
+                ws = (*ws_key, nvfp4_index_k.decode_history_workspace(seq_lens_cuda, tiles))
+                metadata._mix_nvfp4_ws = ws
+            gen_scores = nvfp4_index_k.score_decode_rows(
+                idx_q_view[gen_first:],
+                nvfp4_pages,
+                block_table[:, :tiles],
+                seq_lens_cuda,
+                decode_query_len,
+                int(config.num_index_heads),
+                ws[3],
+            )
+            _log_mix_reader_taken(ctx_rows, num_tokens - gen_first, decode_query_len)
         return self.indexer.select_blocks(
             idx_q_view,
             idx_k_cache,
             idx_sm_scale=idx_sm_scale,
-            kv_indices=metadata.msa_prefill_proxy_kv_indices,
+            kv_indices=kv_indices,
             qo_lens_cpu=metadata.msa_qo_lens_cpu,
             kv_lens_cpu=metadata.msa_kv_lens_cpu,
             qo_offset_cpu=metadata.msa_qo_offset_cpu,
             proxy_plan=proxy_plan,
+            proxy_plan_ref=metadata.msa_prefill_proxy_plan_ref,
+            proxy_policy=metadata.msa_policy,
             max_score=max_score,
             n_valid_blocks=n_valid_blocks,
             require_cutedsl=span is not None,
@@ -1714,6 +1907,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             decode_query_len=decode_query_len,
             gen_token_first=gen_first,
             ctx_rows=ctx_rows,
+            gen_scores=gen_scores,
         )
 
     def sparse_attn_predict(

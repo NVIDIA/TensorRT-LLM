@@ -11,8 +11,9 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm.logger import logger
 
-from ...functional import RotaryScalingType
+from ...functional import AllReduceFusionOp, RotaryScalingType
 from ..attention.rotary_embedding import RotaryEmbedding
+from ..distributed import AllReduceParams
 
 try:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope
@@ -324,6 +325,30 @@ class DFlash2CandidateSelector(nn.Module):
         )
 
 
+# A row-parallel Linear / GatedMLP call that leaves its partial sum unreduced.
+_NO_ALLREDUCE = AllReduceParams(enable_allreduce=False)
+
+
+def _dflash_ar_residual_norm(linear, partial, residual, norm, op=None):
+    """All-reduce a row-parallel ``linear``'s partial sum, add ``residual`` and RMSNorm with ``norm``'s weight, in one
+    fused launch: a target's ``op`` when it takes the operands (see DFlashWorker.enable_fused_ar_norm_op), else the
+    Linear's own all-reduce. Returns (normed, residual + reduced), as ``norm(x, residual)`` does on the reduced x."""
+    if op is not None:
+        out = op(partial, residual, norm.weight, norm.variance_epsilon)
+        if out is not None:
+            return out
+    out = linear.all_reduce(
+        partial,
+        all_reduce_params=AllReduceParams(
+            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            residual=residual,
+            norm_weight=norm.weight,
+            eps=norm.variance_epsilon,
+        ),
+    )
+    return out[0], out[1]
+
+
 class DFlashForCausalLM(nn.Module):
     """Draft model wrapper for DFlash speculative decoding.
 
@@ -516,6 +541,17 @@ class DFlashForCausalLM(nn.Module):
         self._dflash_fused_qk_norm_rope = None
         self._dflash_fused_qk_norm_rope_append = None
         self._dflash_attn_pdl = False
+        # Fused AR + norm (see DFlashWorker.enable_fused_ar_norm): each row-parallel o_proj / down_proj skips its own
+        # all-reduce and the next add + RMSNorm runs fused into it; the optional op is a target's one-launch variant.
+        self._dflash_fused_ar_norm = False
+        self._dflash_fused_ar_norm_op = None
+        # Windowed decode cap (see DFlashWorker.enable_window_capped_decode): batches of at most this many requests
+        # pass the TRTLLM-Gen decode a window-bounded max_seq_len (0 = off).
+        self._dflash_window_cap_max_batch = 0
+        # fc split (see DFlashWorker.enable_fc_tp_split): (K start, K end, weight shard, all-reduce).
+        self._dflash_fc_split = None
+        # fc column shard: an object with ``applies(fc, rows)`` and ``__call__(x)`` returning ``fc(x)`` bit for bit.
+        self._dflash_fc_shard = None
         self._dflash_trtllm_gen_counters = None
         self.register_buffer("_dflash_batch_indices", None, persistent=False)
         self.register_buffer("_dflash_block_offsets", None, persistent=False)
@@ -731,6 +767,14 @@ class DFlashForCausalLM(nn.Module):
         normalize the per-aux features first by overriding this method.
         """
         hidden_states = hidden_states.to(self.fc.weight.dtype)
+        split = self._dflash_fc_split
+        if split is not None:
+            k0, k1, shard, allreduce = split
+            partial = torch.mm(hidden_states[:, k0:k1], shard.t(), out_dtype=torch.float32)
+            return self.hidden_norm(allreduce(partial).to(self.fc.weight.dtype))
+        shard = self._dflash_fc_shard
+        if shard is not None and shard.applies(self.fc, hidden_states.shape[0]):
+            return self.hidden_norm(shard(hidden_states))
         return self.hidden_norm(self.fc(hidden_states))
 
     def _validate_dflash2_config(self) -> None:
@@ -1065,6 +1109,18 @@ class DFlashForCausalLM(nn.Module):
 
         self._fused_rope_inplace(k.view(N * L, nkv * hd), positions, N, L)
         return k, v
+
+    def _decode_max_seq_len(
+        self, capacity: int, window_left: int, block_size: int, page_size: int, batch: int
+    ) -> int:
+        """max_seq_len for the block decode: the slot capacity, or, with the windowed decode cap on for this batch size
+        and a finite left window, the window plus 64 rows rounded up to a page (the TRTLLM-Gen autotuner sizes the tile
+        and the KV split from it; the attended keys are the window either way)."""
+        limit = self._dflash_window_cap_max_batch
+        if limit <= 0 or batch > limit or window_left < 0 or block_size > 64:
+            return capacity
+        capped = -(-(window_left + 1 + 64) // page_size) * page_size
+        return min(capacity, capped)
 
     def _get_cos_sin_cache(self) -> torch.Tensor:
         """Return the flashinfer-style cos/sin cache for the drafter.
@@ -1633,6 +1689,10 @@ class DFlashForCausalLM(nn.Module):
 
         residual = None
         has_block_conv = self.has_block_conv
+        fuse_ar_norm = self._dflash_fused_ar_norm and not has_block_conv
+        # Fused AR + norm: the previous layer's down_proj, whose partial sum is still to be reduced into this layer's
+        # input_layernorm (or the final norm).
+        pending_ar = None
 
         for layer_idx, layer in enumerate(self.model.layers):
             attn_mod = layer.self_attn
@@ -1644,7 +1704,17 @@ class DFlashForCausalLM(nn.Module):
                 hs_normed_flat = layer.input_layernorm(hs_flat)
             else:
                 res_flat = residual.reshape(-1, residual.shape[-1])
-                hs_normed_flat, res_flat = layer.input_layernorm(hs_flat, res_flat)
+                if pending_ar is not None:
+                    hs_normed_flat, res_flat = _dflash_ar_residual_norm(
+                        pending_ar,
+                        hs_flat,
+                        res_flat,
+                        layer.input_layernorm,
+                        self._dflash_fused_ar_norm_op,
+                    )
+                    pending_ar = None
+                else:
+                    hs_normed_flat, res_flat = layer.input_layernorm(hs_flat, res_flat)
                 residual = res_flat.reshape(B, block_size, -1)
 
             # DFlash 2 wraps each sublayer in a block-local convolution; both
@@ -1810,7 +1880,9 @@ class DFlashForCausalLM(nn.Module):
                         workspace_buffer=self._dflash_trtllm_gen_workspace,
                         block_tables=block_tables,
                         seq_lens=seq_lens_after,
-                        max_seq_len=pages_per_slot * page_size,
+                        max_seq_len=self._decode_max_seq_len(
+                            pages_per_slot * page_size, window_left, block_size, page_size, B
+                        ),
                         bmm1_scale=head_dim**-0.5,
                         bmm2_scale=1.0,
                         window_left=window_left,
@@ -1959,20 +2031,36 @@ class DFlashForCausalLM(nn.Module):
             )
 
             # o_proj (flat 2D, handles all-reduce internally)
-            hidden_out = attn_mod.o_proj(attn_output)
-            if has_block_conv:
-                hidden_out = self.attention_convs[layer_idx].finish(
-                    hidden_out, attn_conv_coefficients, block_size
-                )
-
-            # Post-attention layernorm + MLP (flat 2D)
             res_flat = residual.reshape(-1, residual.shape[-1])
-            hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)
+            if fuse_ar_norm:
+                # The all-reduce runs fused with the post-attention add + RMSNorm below.
+                hidden_out = attn_mod.o_proj(attn_output, all_reduce_params=_NO_ALLREDUCE)
+                hidden_out, res_flat = _dflash_ar_residual_norm(
+                    attn_mod.o_proj,
+                    hidden_out,
+                    res_flat,
+                    layer.post_attention_layernorm,
+                    self._dflash_fused_ar_norm_op,
+                )
+            else:
+                hidden_out = attn_mod.o_proj(attn_output)
+                if has_block_conv:
+                    hidden_out = self.attention_convs[layer_idx].finish(
+                        hidden_out, attn_conv_coefficients, block_size
+                    )
+
+                # Post-attention layernorm + MLP (flat 2D)
+                hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)
             if has_block_conv:
                 hidden_out, mlp_conv_coefficients = self.mlp_convs[layer_idx].prepare(
                     hidden_out, block_size
                 )
-            hidden_out = layer.mlp(hidden_out)
+            if fuse_ar_norm:
+                # down_proj's partial sum is reduced into the next norm (next layer or the final norm).
+                hidden_out = layer.mlp(hidden_out, final_all_reduce_params=_NO_ALLREDUCE)
+                pending_ar = layer.mlp.down_proj
+            else:
+                hidden_out = layer.mlp(hidden_out)
             if has_block_conv:
                 hidden_out = self.mlp_convs[layer_idx].finish(
                     hidden_out, mlp_conv_coefficients, block_size
@@ -1982,6 +2070,15 @@ class DFlashForCausalLM(nn.Module):
             residual = res_flat.reshape(B, block_size, -1)
 
         # Final norm
+        if pending_ar is not None:
+            hidden_states_out, _ = _dflash_ar_residual_norm(
+                pending_ar,
+                hidden_states.reshape(-1, hidden_states.shape[-1]),
+                residual.reshape(-1, residual.shape[-1]),
+                self.model.norm,
+                self._dflash_fused_ar_norm_op,
+            )
+            return hidden_states_out
         hidden_states_out, _ = self.model.norm(
             hidden_states.reshape(-1, hidden_states.shape[-1]),
             residual.reshape(-1, residual.shape[-1]),

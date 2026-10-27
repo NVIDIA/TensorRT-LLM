@@ -691,6 +691,20 @@ void initRequestBindings(nb::module_& m)
         nb::arg("cache_salt") = nb::none()
     ) // clang-format on
         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)
+        .def_prop_ro(
+            "input_token_ids_np",
+            [](tle::Request const& self)
+            {
+                // Owned int32 copy (one memcpy) for LlmRequest(input_tokens=...);
+                // skips the list[int] round trip of input_token_ids.
+                auto const& ids = self.getInputTokenIds();
+                auto* buf = new tle::VecTokens(ids);
+                nb::capsule owner(buf, [](void* p) noexcept { delete static_cast<tle::VecTokens*>(p); });
+                return nb::ndarray<nb::numpy, int32_t, nb::ndim<1>>(buf->data(), {buf->size()}, owner);
+            },
+            // The array owns its copy via the capsule; the property default
+            // (reference_internal) cannot be applied to an owned ndarray.
+            nb::rv_policy::take_ownership)
         .def_prop_ro("num_input_tokens", &tle::Request::getNumInputTokens)
         .def_prop_ro("max_tokens", &tle::Request::getMaxTokens)
         .def_prop_rw("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)

@@ -26,9 +26,55 @@
 #   query_pos_i32     = query_positions.reshape(-1).to(int32)
 # The int64 -> int32 casts keep the low 32 bits, as torch's do. One program writes every output.
 
+import functools
+import os
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
+
+# DSPARK_GLUE_CPP: the C++ op (torch.ops.trtllm.minimax_m31_dspark_indices, kernels/minimaxM31/dsparkGlueSm107.cu,
+# bit for bit this Triton kernel) on SM107 when it is built; the Triton kernel otherwise (other GPUs) or with
+# TRTLLM_M31_DISABLE_DSPARK_GLUE_CPP=1 (read once, at import).
+_GLUE_CPP_OFF = os.environ.get("TRTLLM_M31_DISABLE_DSPARK_GLUE_CPP", "").strip().lower() in (
+    "1",
+    "true",
+    "on",
+    "yes",
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _is_sm107(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) == (10, 7)
+
+
+def _glue_cpp_op(name: str, device: torch.device):
+    """The C++ op, or None with the reason logged once (the Triton kernel runs)."""
+    if _GLUE_CPP_OFF:
+        return _glue_log(name, "killed (TRTLLM_M31_DISABLE_DSPARK_GLUE_CPP=1)")
+    if not _is_sm107(device.index if device.index is not None else torch.cuda.current_device()):
+        return _glue_log(name, "not an sm_107 device")
+    op = getattr(torch.ops.trtllm, name, None)
+    return op if op is not None else _glue_log(name, "the op is not registered")
+
+
+_glue_logged = set()
+
+
+def _glue_log(name: str, why: Optional[str] = None):
+    """Engagement line, once per (op, outcome) per process: "[M3 dispatch] DSPARK_GLUE_CPP taken: <op>" when the C++ op
+    runs, "... not taken: <op>: <why>; Triton kernel" when it falls back. Returns None."""
+    if (name, why) not in _glue_logged:
+        _glue_logged.add((name, why))
+        from tensorrt_llm.logger import logger
+
+        if why is None:
+            logger.info(f"[M3 dispatch] DSPARK_GLUE_CPP taken: {name}")
+        else:
+            logger.info(f"[M3 dispatch] DSPARK_GLUE_CPP not taken: {name}: {why}; Triton kernel")
+    return None
 
 
 @triton.jit
@@ -110,6 +156,14 @@ def forward_indices(
     last = torch.empty(B, **i32)
     append = torch.empty(B * block_size, **i32)
     qflat = torch.empty(B * block_size, **i32)
+    op = _glue_cpp_op("minimax_m31_dspark_indices", num_ctx.device)
+    if op is not None and not (num_ctx.is_contiguous() and batch_idx.is_contiguous()):
+        op = _glue_log("minimax_m31_dspark_indices", "non-contiguous num_ctx / batch_idx")
+    if op is not None:
+        _glue_log("minimax_m31_dspark_indices")
+        op(num_ctx, batch_idx, query_positions, seqlens, batch_out, after, indptr, last, append, qflat, block_size,
+           pages_per_slot, page_size)  # fmt: skip
+        return seqlens, batch_out, after, indptr, last, append, qflat
     _indices_kernel[(1,)](
         num_ctx,
         batch_idx,

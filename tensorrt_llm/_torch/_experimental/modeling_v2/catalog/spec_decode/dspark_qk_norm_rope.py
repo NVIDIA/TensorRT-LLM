@@ -136,9 +136,14 @@ def _qk_norm_rope_kernel(
     i = tl.arange(0, HALF)
     cos = tl.load(cs_ptr + pos * cs_stride + i)
     sin = tl.load(cs_ptr + pos * cs_stride + HALF + i)
-    yf = y.to(tl.float32)
-    x1 = tl.sum(tl.where(d[None, :] == i[:, None], yf[None, :], 0.0), axis=1)
-    x2r = tl.sum(tl.where(d[None, :] == (i[:, None] + HALF), yf[None, :], 0.0), axis=1)
+    # The rotated pair y[i], y[i + HALF], recomputed elementwise from memory with y's own ops (same bits, sign of zero
+    # included; a masked tl.sum over y would add +0.0 terms and turn a -0 element into +0).
+    wa = tl.where(is_q, tl.load(wq_ptr + i), tl.load(wk_ptr + i)).to(tl.float32)
+    wb = tl.where(is_q, tl.load(wq_ptr + HALF + i), tl.load(wk_ptr + HALF + i)).to(tl.float32)
+    x1 = _mul(_mul(tl.load(base + i).to(tl.float32), rstd), wa).to(tl.bfloat16).to(tl.float32)
+    x2r = (
+        _mul(_mul(tl.load(base + HALF + i).to(tl.float32), rstd), wb).to(tl.bfloat16).to(tl.float32)
+    )
     o1 = _fma(x1, cos, _mul(-x2r, sin))
     o2 = _fma(x2r, cos, _mul(x1, sin))
     obase = tl.where(is_q, q_out + t * (HQ * HD) + h * HD, k_out + t * (HKV * HD) + (h - HQ) * HD)

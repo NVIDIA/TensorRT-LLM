@@ -16,8 +16,9 @@
  */
 
 // TOPP_DET v3: toppRenormDetSm103.cu (v1.2) with the redundant selection and an optional programmatic dependent
-// launch. See toppRenormDetV3Sm103.h for the contract (bitwise v1.2's output). Compiled with --use_fast_math (set on
-// this source in kernels/CMakeLists.txt), as FlashInfer's JIT compiles it.
+// launch; V4K8: the one-sync list path and 8 privatized pass histograms (see the header). See toppRenormDetV3Sm103.h
+// for the contract (bitwise v1.2's output). Compiled with --use_fast_math (set on this source in
+// kernels/CMakeLists.txt), as FlashInfer's JIT compiles it.
 
 #include "tensorrt_llm/kernels/minimaxM31/toppRenormDetV3Sm103.h"
 
@@ -26,8 +27,13 @@
 #include <cuda/atomic>
 #include <cuda_runtime.h>
 
+#include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <strings.h>
 
 #include <cub/cub.cuh>
 
@@ -144,13 +150,23 @@ namespace cg = cooperative_groups;
 constexpr int kThreads = 1024;
 constexpr int kBuckets = fa::NUM_BUCKETS; // 2048
 constexpr int kSmemBytes = 32768;
-constexpr int kCopies = 4;                // privatized pass histograms
-constexpr size_t kDynSmemBytes = kCopies * kBuckets * (sizeof(unsigned long long) + sizeof(int)); // 96 KB
+
+// Privatized pass histograms per CTA: kCopies (a kernel template parameter) copies, one per group of warps; 8 (V4K8,
+// default) or 4 (TRTLLM_M31_DISABLE_TOPPDET_K8).
+template <int kCopies>
+constexpr size_t dynSmemBytes()
+{
+    return kCopies * kBuckets * (sizeof(unsigned long long) + sizeof(int));
+}
 
 constexpr int kSyncs = fa::NUM_PASSES<float> + 1; // one per radix pass, then the norm
 // Candidate list: passes 1 .. NUM_PASSES - 1 run locally on the members of pass 0's threshold bucket when it holds at
 // most this many elements (the list lives in the workspace, then in the dynamic shared memory of each CTA).
 constexpr int kCandMax = 4096;
+// V4 list path: pass 0 also lists the elements >= 2^-12 (a pass-0 bucket edge; probabilities summing to 1 hold at most
+// 4096 of them) with their indices; pass-0 histograms and lists are double-buffered by launch parity.
+constexpr int kListMax = 4096;
+constexpr float kListMin = 0.000244140625f; // 2^-12
 
 // One row's persistent state. Zero once; every launch leaves it zeroed except the arrival counters, which only grow.
 struct RowWorkspace
@@ -163,6 +179,12 @@ struct RowWorkspace
     unsigned nCand;                                           // its length, zero between launches
     int kept;
     int pad[2];
+    unsigned long long hist0x[2][kBuckets];
+    int cnt0x[2][kBuckets];
+    float lval[2][kListMax];
+    int lidx[2][kListMax];
+    unsigned nList[2];
+    unsigned pad2[2];
 };
 
 // Arrive at sync `si` and wait until all G CTAs of the row have arrived. The counter is never reset: each CTA adds
@@ -293,7 +315,133 @@ __device__ __forceinline__ void clearPass(RowWorkspace* w, int pass)
     }
 }
 
-template <bool kPdl, bool kCandList>
+// V4 list path, run by every CTA of the row after pass 0 (one barrier so far) when the pass-0 threshold bucket lies at
+// or above 2^-12: then every element of that bucket and above, so every kept element, is in the row's list. The
+// remaining radix passes run on the list (the same integer histograms as v3's candidate passes), FlashInfer's 1024
+// chain sums are rebuilt from the kept members (chain c = the kept values at indices c, c + 1024, ... in ascending
+// order, as v3's chains), reduced by the same cub block sum, and each CTA writes its own slice: zeros, then its kept
+// values.
+template <bool kPdl>
+__device__ __noinline__ void listPath(RowWorkspace* w, int par, int nL, unsigned kbits, float p, float const* in,
+    float* o, int d, int row, int cta, int G, int* keptOut, unsigned long long* hsCopies, int* csCopies,
+    unsigned char* smem, float* sSum, unsigned* sKbits)
+{
+    int const tid = threadIdx.x;
+    float* lv = reinterpret_cast<float*>(hsCopies + kBuckets); // 16 KB
+    int* li = reinterpret_cast<int*>(hsCopies + 2 * kBuckets); // 16 KB
+    for (int i = tid; i < nL; i += kThreads)
+    {
+        lv[i] = __ldcg(&w->lval[par][i]);
+        li[i] = __ldcg(&w->lidx[par][i]);
+    }
+    __syncthreads();
+    for (int lp = 1; lp < fa::NUM_PASSES<float>; ++lp)
+    {
+        for (int i = tid; i < kBuckets; i += kThreads)
+        {
+            hsCopies[i] = 0;
+            csCopies[i] = 0;
+        }
+        __syncthreads();
+        int const lsb = fa::calcStartBit<float>(lp);
+        uint32_t const lmask = fa::calcMask<float>(lp);
+        int const lpsb = fa::calcStartBit<float>(lp - 1);
+        for (int i = tid; i < nL; i += kThreads)
+        {
+            float const x = lv[i];
+            auto const bits = fa::twiddleIn(x, false);
+            if (((bits >> lpsb) << lpsb) == kbits)
+            {
+                int const b = static_cast<int>((bits >> lsb) & lmask);
+                atomicAdd(hsCopies + b, static_cast<unsigned long long>(fa::calcMantissa(x)));
+                atomicAdd(csCopies + b, 1);
+            }
+        }
+        __syncthreads();
+        selectPassOn<false>(hsCopies, csCopies, lp, p, reinterpret_cast<float*>(smem),
+            reinterpret_cast<int*>(smem + kBuckets * sizeof(float)), sSum, sKbits);
+        kbits = *sKbits;
+    }
+    float const thr = fa::twiddleOut<float>(kbits, false);
+    // Compact the kept members (csCopies is free now: 32 KB = 4096 values + 4096 indices).
+    float* kv = reinterpret_cast<float*>(csCopies);
+    int* ki = csCopies + kListMax;
+    __shared__ int nK;
+    if (tid == 0)
+    {
+        nK = 0;
+    }
+    __syncthreads();
+    for (int i = tid; i < nL; i += kThreads)
+    {
+        if (lv[i] >= thr)
+        {
+            int const s = atomicAdd(&nK, 1);
+            kv[s] = lv[i];
+            ki[s] = li[i];
+        }
+    }
+    __syncthreads();
+    int const nKept = nK;
+    // Chain tid: its kept values in ascending index order, accumulated from 0 as v3's chains.
+    float acc = 0.0f;
+    int last = -1;
+    while (true)
+    {
+        int best = INT_MAX;
+        float bv = 0.0f;
+        for (int i = 0; i < nKept; ++i)
+        {
+            int const idx = ki[i];
+            if ((idx & (kThreads - 1)) == tid && idx > last && idx < best)
+            {
+                best = idx;
+                bv = kv[i];
+            }
+        }
+        if (best == INT_MAX)
+        {
+            break;
+        }
+        acc += bv;
+        last = best;
+    }
+    typedef cub::BlockReduce<float, 1024> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp;
+    __shared__ float sNormL;
+    float const totalSum = BlockReduce(temp).Sum(acc);
+    if (tid == 0)
+    {
+        sNormL = (totalSum > 1e-8f) ? (1.0f / totalSum) : 1.0f;
+        if (cta == 0 && keptOut)
+        {
+            keptOut[row] = nKept;
+        }
+    }
+    __syncthreads();
+    if constexpr (kPdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+    float const norm = sNormL;
+    float4* o4 = reinterpret_cast<float4*>(o);
+    int const n4 = d / 4;
+    for (int j = cta * kThreads + tid; j < n4; j += G * kThreads)
+    {
+        o4[j] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+    __syncthreads();
+    for (int i = tid; i < nKept; i += kThreads)
+    {
+        int const idx = ki[i];
+        if (((idx / 4) / kThreads) % G == cta)
+        {
+            o[idx] = kv[i] * norm;
+        }
+    }
+}
+
+template <bool kPdl, bool kCandList, bool kList, int kCopies, bool kChainPf>
 __global__ void __launch_bounds__(kThreads, 1) toppRenormDetV3Kernel(
     float const* __restrict__ probs, float* __restrict__ out, float const* topP, int d, RowWorkspace* ws, int* keptOut)
 {
@@ -323,6 +471,19 @@ __global__ void __launch_bounds__(kThreads, 1) toppRenormDetV3Kernel(
         cudaGridDependencySynchronize();
     }
     __syncthreads();
+    // V4: launch index from the grow-only pass-0 counter (every earlier launch has completed; this launch adds less
+    // than kThreads until all of its CTAs arrive), so every CTA of the row gets the same parity.
+    int const par = static_cast<int>((__ldcg(&w->arrive[0]) / kThreads) & 1ull);
+    // Spread over the row's CTAs (each clears 2048 / G buckets), so no CTA's binning is delayed.
+    for (int i = cta * kThreads + tid; i < kBuckets; i += G * kThreads)
+    {
+        w->hist0x[par ^ 1][i] = 0;
+        w->cnt0x[par ^ 1][i] = 0;
+    }
+    if (cta == 0 && tid == 0)
+    {
+        w->nList[par ^ 1] = 0;
+    }
     float const p = topP[row];
     float4 const* in4 = reinterpret_cast<float4 const*>(in);
     int const n4 = d / 4;
@@ -346,6 +507,13 @@ __global__ void __launch_bounds__(kThreads, 1) toppRenormDetV3Kernel(
         int const copy = (tid >> 5) % kCopies;
         unsigned long long* myHs = hsCopies + copy * kBuckets;
         int* myCs = csCopies + copy * kBuckets;
+        // S32 (with the 8 copies): the 64-bit mantissa-sum space holds two 32-bit sums per bucket instead (hi = m >>
+        // 11, then lo = m & 0x7ff), two cheap shared atomics in place of a contended 64-bit one; the merge rebuilds the
+        // exact sum (hi << 11) + lo. Per copy and bucket at most d / G elements, so both stay below 2^32 while d / G <
+        // 2^20.
+        bool const s32 = kCopies == 8 && d / G < (1 << 20);
+        unsigned* myHi = reinterpret_cast<unsigned*>(hsCopies) + copy * kBuckets;
+        unsigned* myLo = reinterpret_cast<unsigned*>(hsCopies) + kCopies * kBuckets + copy * kBuckets;
         int const sb = fa::calcStartBit<float>(pass);
         uint32_t const mask = fa::calcMask<float>(pass);
         int const psb = pass == 0 ? 0 : fa::calcStartBit<float>(pass - 1);
@@ -361,6 +529,32 @@ __global__ void __launch_bounds__(kThreads, 1) toppRenormDetV3Kernel(
             for (int k = 0; k < 4; ++k)
             {
                 float const x = e[k];
+                if (kList && pass == 0)
+                {
+                    // Warp-aggregated append: one global atomic per warp and element slot (the list's order is
+                    // irrelevant: integer histograms, index-ordered chains).
+                    bool const want = valid && x >= kListMin;
+                    unsigned const m = __ballot_sync(0xffffffffu, want);
+                    if (m)
+                    {
+                        int const leader = __ffs(m) - 1;
+                        unsigned base = 0;
+                        if (lane == leader)
+                        {
+                            base = atomicAdd(&w->nList[par], static_cast<unsigned>(__popc(m)));
+                        }
+                        base = __shfl_sync(0xffffffffu, base, leader);
+                        if (want)
+                        {
+                            unsigned const slot = base + __popc(m & ((1u << lane) - 1u));
+                            if (slot < kListMax)
+                            {
+                                w->lval[par][slot] = x;
+                                w->lidx[par][slot] = 4 * j + k;
+                            }
+                        }
+                    }
+                }
                 auto const bits = fa::twiddleIn(x, false);
                 bool const ok = valid && (pass == 0 || ((bits >> psb) << psb) == kbits);
                 int const b = ok ? static_cast<int>((bits >> sb) & mask) : -1;
@@ -373,17 +567,39 @@ __global__ void __launch_bounds__(kThreads, 1) toppRenormDetV3Kernel(
                 {
                     if (b0 >= 0)
                     {
-                        unsigned const s = __reduce_add_sync(0xffffffffu, m);
-                        if (lane == 0)
+                        if (s32)
                         {
-                            atomicAdd(myHs + b0, static_cast<unsigned long long>(s));
-                            atomicAdd(myCs + b0, 32);
+                            unsigned const sh = __reduce_add_sync(0xffffffffu, m >> 11);
+                            unsigned const sl = __reduce_add_sync(0xffffffffu, m & 0x7ffu);
+                            if (lane == 0)
+                            {
+                                atomicAdd(myHi + b0, sh);
+                                atomicAdd(myLo + b0, sl);
+                                atomicAdd(myCs + b0, 32);
+                            }
+                        }
+                        else
+                        {
+                            unsigned const s = __reduce_add_sync(0xffffffffu, m);
+                            if (lane == 0)
+                            {
+                                atomicAdd(myHs + b0, static_cast<unsigned long long>(s));
+                                atomicAdd(myCs + b0, 32);
+                            }
                         }
                     }
                 }
                 else if (ok)
                 {
-                    atomicAdd(myHs + b, static_cast<unsigned long long>(m));
+                    if (s32)
+                    {
+                        atomicAdd(myHi + b, m >> 11);
+                        atomicAdd(myLo + b, m & 0x7ffu);
+                    }
+                    else
+                    {
+                        atomicAdd(myHs + b, static_cast<unsigned long long>(m));
+                    }
                     atomicAdd(myCs + b, 1);
                 }
             }
@@ -393,10 +609,13 @@ __global__ void __launch_bounds__(kThreads, 1) toppRenormDetV3Kernel(
         {
             unsigned long long h = 0;
             int c = 0;
+            unsigned const* hiS = reinterpret_cast<unsigned const*>(hsCopies);
 #pragma unroll
             for (int k = 0; k < kCopies; ++k)
             {
-                h += hsCopies[k * kBuckets + i];
+                h += s32 ? (static_cast<unsigned long long>(hiS[k * kBuckets + i]) << 11)
+                        + hiS[kCopies * kBuckets + k * kBuckets + i]
+                         : hsCopies[k * kBuckets + i];
                 c += csCopies[k * kBuckets + i];
             }
             hs[i] = h;
@@ -407,21 +626,40 @@ __global__ void __launch_bounds__(kThreads, 1) toppRenormDetV3Kernel(
         {
             if (hs[i] != 0)
             {
-                atomicAdd(&w->hist[pass][i], hs[i]);
+                atomicAdd(pass == 0 ? &w->hist0x[par][i] : &w->hist[pass][i], hs[i]);
             }
             if (cs[i] != 0)
             {
-                atomicAdd(&w->cnt[pass][i], cs[i]);
+                atomicAdd(pass == 0 ? &w->cnt0x[par][i] : &w->cnt[pass][i], cs[i]);
             }
         }
         allArrive(w, G, pass);
-        if (pass > 0)
+        if (pass > 1)
         {
             clearPass(w, pass - 1); // every CTA finished selectPass(pass - 1) before arriving here
         }
-        selectPass(w, pass, p, reinterpret_cast<float*>(smem), reinterpret_cast<int*>(smem + kBuckets * sizeof(float)),
-            &sSum, &sKbits);
+        if (pass == 0)
+        {
+            selectPassOn<true>(w->hist0x[par], w->cnt0x[par], 0, p, reinterpret_cast<float*>(smem),
+                reinterpret_cast<int*>(smem + kBuckets * sizeof(float)), &sSum, &sKbits);
+        }
+        else
+        {
+            selectPass(w, pass, p, reinterpret_cast<float*>(smem),
+                reinterpret_cast<int*>(smem + kBuckets * sizeof(float)), &sSum, &sKbits);
+        }
         kbits = sKbits;
+        if (kList && pass == 0)
+        {
+            unsigned const nL = __ldcg(&w->nList[par]);
+            float const lowEdge = fa::twiddleOut<float>(kbits | ((1u << fa::calcStartBit<float>(0)) - 1u), false);
+            if (nL <= static_cast<unsigned>(kListMax) && lowEdge >= kListMin)
+            {
+                listPath<kPdl>(w, par, static_cast<int>(nL), kbits, p, in, o, d, row, cta, G, keptOut, hsCopies,
+                    csCopies, smem, &sSum, &sKbits);
+                return;
+            }
+        }
         if constexpr (kCandList)
         {
             // Pass 0's threshold bucket count (cached by selectPass) is the same in every CTA of the row, so all of
@@ -448,7 +686,6 @@ __global__ void __launch_bounds__(kThreads, 1) toppRenormDetV3Kernel(
                     }
                 }
                 allArrive(w, G, 1);
-                clearPass(w, 0); // every CTA finished selectPass(0) before arriving here
                 // The list in this CTA's dynamic shared memory (privatized copy 1's space), the local histograms in
                 // copy 0's: the same integer histograms the global passes 1 .. NUM_PASSES - 1 would build.
                 float* candS = reinterpret_cast<float*>(hsCopies + kBuckets);
@@ -499,7 +736,49 @@ __global__ void __launch_bounds__(kThreads, 1) toppRenormDetV3Kernel(
     float* stage = reinterpret_cast<float*>(smem);
     float acc = 0.0f;
     int kept = 0;
-    for (int k0 = 0; k0 < kTotal; k0 += kTile)
+    // TOPP_V6 (kChainPf): each chain loads its own values straight from global memory, kPf loads in flight, and adds
+    // them in the same ascending-k order as the staged loop (the same values, the same fp32 adds and kept counts, so
+    // the same bits); no shared staging and no per-tile barriers. Kill TRTLLM_M31_DISABLE_TOPP_V6=1 (the staged loop).
+    if constexpr (kChainPf)
+    {
+        constexpr int kPf = 16;
+        if (tid < cpc)
+        {
+            int const cbase = c0 + tid;
+            int k = 0;
+            for (; k + kPf <= kTotal; k += kPf)
+            {
+                float v[kPf];
+#pragma unroll
+                for (int u = 0; u < kPf; ++u)
+                {
+                    int const i = cbase + kThreads * (k + u);
+                    v[u] = i < d ? __ldg(in + i) : 0.0f;
+                }
+#pragma unroll
+                for (int u = 0; u < kPf; ++u)
+                {
+                    int const i = cbase + kThreads * (k + u);
+                    if (i < d && v[u] >= thr)
+                    {
+                        acc += v[u];
+                        ++kept;
+                    }
+                }
+            }
+            for (; k < kTotal; ++k)
+            {
+                int const i = cbase + kThreads * k;
+                float const val = i < d ? __ldg(in + i) : 0.0f;
+                if (i < d && val >= thr)
+                {
+                    acc += val;
+                    ++kept;
+                }
+            }
+        }
+    }
+    for (int k0 = 0; !kChainPf && k0 < kTotal; k0 += kTile)
     {
         int const kn = min(kTile, kTotal - k0);
         for (int q = tid; q < kn * cpc; q += kThreads)
@@ -593,8 +872,86 @@ __global__ void __launch_bounds__(kThreads, 1) toppRenormDetV3Kernel(
 
 } // namespace toppv3
 
+namespace
+{
+// TOPP_V6: the chain-prefetch summation on sm_107 devices unless TRTLLM_M31_DISABLE_TOPP_V6 is set to 1 / true / on /
+// yes; other devices run the staged loop. The switch is read once per process and the compute capability once per
+// device.
+bool chainPrefetchOn()
+{
+    static bool const allowed = []
+    {
+        char const* v = std::getenv("TRTLLM_M31_DISABLE_TOPP_V6");
+        if (v == nullptr)
+        {
+            return true;
+        }
+        return !(std::strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 || strcasecmp(v, "on") == 0
+            || strcasecmp(v, "yes") == 0);
+    }();
+    if (!allowed)
+    {
+        return false;
+    }
+    static std::once_flag smOnce[64];
+    static bool sm107[64] = {};
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess)
+    {
+        return false;
+    }
+    std::call_once(smOnce[device % 64],
+        [device]
+        {
+            int major = 0;
+            int minor = 0;
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+            sm107[device % 64] = major == 10 && minor == 7;
+        });
+    return sm107[device % 64];
+}
+
+template <bool kPdl, bool kCandList, bool kList, int kCopies, bool kChainPf>
+cudaError_t launchV3Kernel(cudaLaunchConfig_t& cfg, float const* probs, float* out, float const* topP, int d,
+    toppv3::RowWorkspace* ws, int* keptOut)
+{
+    auto* kernel = toppv3::toppRenormDetV3Kernel<kPdl, kCandList, kList, kCopies, kChainPf>;
+    static cudaError_t const attrErr = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(toppv3::dynSmemBytes<kCopies>()));
+    if (attrErr != cudaSuccess)
+    {
+        return attrErr;
+    }
+    cfg.dynamicSmemBytes = toppv3::dynSmemBytes<kCopies>();
+    return cudaLaunchKernelEx(&cfg, kernel, probs, out, topP, d, ws, keptOut);
+}
+
+template <bool kPdl, bool kCandList, bool kList, int kCopies>
+cudaError_t launchV3(cudaLaunchConfig_t& cfg, float const* probs, float* out, float const* topP, int d,
+    toppv3::RowWorkspace* ws, int* keptOut)
+{
+    return chainPrefetchOn()
+        ? launchV3Kernel<kPdl, kCandList, kList, kCopies, true>(cfg, probs, out, topP, d, ws, keptOut)
+        : launchV3Kernel<kPdl, kCandList, kList, kCopies, false>(cfg, probs, out, topP, d, ws, keptOut);
+}
+
+template <bool kPdl, bool kCandList>
+cudaError_t launchV3Copies(cudaLaunchConfig_t& cfg, bool listPath, bool wideHist, float const* probs, float* out,
+    float const* topP, int d, toppv3::RowWorkspace* ws, int* keptOut)
+{
+    if (listPath)
+    {
+        return wideHist ? launchV3<kPdl, kCandList, true, 8>(cfg, probs, out, topP, d, ws, keptOut)
+                        : launchV3<kPdl, kCandList, true, 4>(cfg, probs, out, topP, d, ws, keptOut);
+    }
+    return wideHist ? launchV3<kPdl, kCandList, false, 8>(cfg, probs, out, topP, d, ws, keptOut)
+                    : launchV3<kPdl, kCandList, false, 4>(cfg, probs, out, topP, d, ws, keptOut);
+}
+} // namespace
+
 cudaError_t invokeToppRenormDetV3(float const* probs, float* out, float const* topP, int rows, int d, int ctasPerRow,
-    void* workspace, int* keptOut, bool pdl, bool candidateList, cudaStream_t stream)
+    void* workspace, int* keptOut, bool pdl, bool candidateList, bool listPath, bool wideHist, cudaStream_t stream)
 {
     using namespace toppv3;
     if (rows <= 0 || d <= 0)
@@ -605,28 +962,9 @@ cudaError_t invokeToppRenormDetV3(float const* probs, float* out, float const* t
     {
         return cudaErrorInvalidValue;
     }
-    static cudaError_t const attrErr = []
-    {
-        for (auto* k : {toppRenormDetV3Kernel<false, false>, toppRenormDetV3Kernel<false, true>,
-                 toppRenormDetV3Kernel<true, false>, toppRenormDetV3Kernel<true, true>})
-        {
-            cudaError_t const e
-                = cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynSmemBytes));
-            if (e != cudaSuccess)
-            {
-                return e;
-            }
-        }
-        return cudaSuccess;
-    }();
-    if (attrErr != cudaSuccess)
-    {
-        return attrErr;
-    }
     cudaLaunchConfig_t cfg{};
     cfg.gridDim = dim3(static_cast<unsigned>(ctasPerRow), static_cast<unsigned>(rows));
     cfg.blockDim = dim3(kThreads);
-    cfg.dynamicSmemBytes = kDynSmemBytes;
     cfg.stream = stream;
     cudaLaunchAttribute attr[1];
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -634,9 +972,13 @@ cudaError_t invokeToppRenormDetV3(float const* probs, float* out, float const* t
     cfg.attrs = attr;
     cfg.numAttrs = 1;
     auto* ws = static_cast<RowWorkspace*>(workspace);
-    auto* kernel = pdl ? (candidateList ? toppRenormDetV3Kernel<true, true> : toppRenormDetV3Kernel<true, false>)
-                       : (candidateList ? toppRenormDetV3Kernel<false, true> : toppRenormDetV3Kernel<false, false>);
-    return cudaLaunchKernelEx(&cfg, kernel, probs, out, topP, d, ws, keptOut);
+    if (pdl)
+    {
+        return candidateList ? launchV3Copies<true, true>(cfg, listPath, wideHist, probs, out, topP, d, ws, keptOut)
+                             : launchV3Copies<true, false>(cfg, listPath, wideHist, probs, out, topP, d, ws, keptOut);
+    }
+    return candidateList ? launchV3Copies<false, true>(cfg, listPath, wideHist, probs, out, topP, d, ws, keptOut)
+                         : launchV3Copies<false, false>(cfg, listPath, wideHist, probs, out, topP, d, ws, keptOut);
 }
 
 size_t toppRenormDetV3WorkspaceBytesPerRow()

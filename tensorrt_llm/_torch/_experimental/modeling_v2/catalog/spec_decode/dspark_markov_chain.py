@@ -39,6 +39,9 @@ MAX_GRID = 152  # capacity: fixed: the workspace's CTAs per rank (all co-residen
 CERTIFIED_BATCH = (
     8  # the largest batch the cells drive (the kernel takes up to the kernel module's MAX_BATCH)
 )
+CERTIFIED_BATCH_TP2 = (
+    12  # the M3.1 TP2 cells' largest batch (that target serves up to 12 requests: S4CAP12)
+)
 
 _lock = threading.Lock()
 _compiled: Dict[tuple, object] = {}
@@ -149,16 +152,29 @@ def _sm_count(device) -> int:
 
 
 def pick_grid(shard: int, block: int, batch: int, device=None) -> int:
-    """CTAs for a (padded) shard: 128 when supported, else the largest supported count up to the SM count; 0 if
-    none."""
+    """CTAs for a (padded) shard: 128 when supported with every markov_w2 row in shared memory, else the largest
+    such count up to the SM count; else (S4STREAM: a shard past the shared-memory capacity) the largest supported
+    count with streamed blocks (fewest rows per CTA); 0 if none."""
     kern = _kernel_module()
     limit = min(MAX_GRID, _sm_count(device if device is not None else torch.cuda.current_device()))
-    if 128 <= limit and kern.supports(shard, 128, block, batch):
+    if 128 <= limit and kern.supports(shard, 128, block, batch) and kern.fits(shard, 128):
         return 128
+    for grid in range(limit, 0, -1):
+        if kern.supports(shard, grid, block, batch) and kern.fits(shard, grid):
+            return grid
     for grid in range(limit, 0, -1):
         if kern.supports(shard, grid, block, batch):
             return grid
     return 0
+
+
+def _fits_all(rows: int, max_batch: int, device) -> bool:
+    kern = _kernel_module()
+    for b in (1, max_batch):
+        grid = pick_grid(rows, MAX_BLOCK, b, device)
+        if grid == 0 or not kern.fits(rows, grid):
+            return False
+    return True
 
 
 def padded_rows(shard: int, max_batch: int, device=None) -> int:
@@ -169,10 +185,23 @@ def padded_rows(shard: int, max_batch: int, device=None) -> int:
     rows = -(-shard // step) * step
     limit = rows + MAX_GRID * step
     while rows <= limit:
-        if all(pick_grid(rows, MAX_BLOCK, b, device) > 0 for b in (1, max_batch)):
+        if _fits_all(rows, max_batch, device):
             return rows
         rows += step
-    return 0
+    # S4STREAM: no padding keeps every row in shared memory: the padding with the fewest rows per CTA (then the
+    # fewest rows) among the even CTA counts the kernel takes, streaming the blocks past the budget.
+    sm = _sm_count(device if device is not None else torch.cuda.current_device())
+    best = None
+    for grid in range(min(MAX_GRID, sm), 1, -1):
+        rc = -(-shard // (grid * step)) * step
+        cand = grid * rc
+        grids = [pick_grid(cand, MAX_BLOCK, b, device) for b in (1, max_batch)]
+        if 0 in grids:
+            continue
+        key = (max(kern.rows_per_cta(cand, g) for g in grids), cand)
+        if best is None or key < best:
+            best = key
+    return best[1] if best is not None else 0
 
 
 def pad_w2_shard(w2_shard: torch.Tensor, rows: int) -> torch.Tensor:
@@ -522,11 +551,12 @@ class DsparkMarkovChain(OpWrapper):
     (B, K), in the same order.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
 
     # MiniMax-M3.1's DSpark drafter: vocabulary 200064, Markov rank 256, K = 3 and 7 draft positions, the decode
     # batches the M3.1 targets serve with it (1..8). TP4 is one GB300 tray, TP8 two.
     _M31 = dict(vocab=200064, batches=tuple(range(1, CERTIFIED_BATCH + 1)))
+    _M31_TP2 = dict(vocab=200064, batches=tuple(range(1, CERTIFIED_BATCH_TP2 + 1)))
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -546,6 +576,12 @@ class DsparkMarkovChain(OpWrapper):
             spec=dict(world=8, block=3, **_M31),
         ),
         Cell(why="M3.1 TP8 over two trays, K = 7", spec=dict(world=8, block=7, **_M31)),
+        Cell(
+            why="M3.1 TP2, K = 7: the 100032-row shard, padded to 101376 = 144 CTAs x 704 rows; S4STREAM"
+            " (5 of 11 blocks per warp read from global memory)",
+            spec=dict(world=2, block=7, **_M31_TP2),
+        ),
+        Cell(why="M3.1 TP2, K = 3 (S4STREAM)", spec=dict(world=2, block=3, **_M31_TP2)),
     )
 
     note = """
@@ -553,8 +589,8 @@ class DsparkMarkovChain(OpWrapper):
     any of those runs the in-tree chain.
 
     The kernel takes batches up to its module's MAX_BATCH (16) and blocks up to MAX_BLOCK (8); the cells certify
-    batches 1..8. Measured: at 16 requests the one-launch chain is 0.93x the in-tree chain's time, so the M3.1
-    targets serve batches up to 8 only.
+    batches 1..8 (1..12 at TP2). Measured: at 16 requests the one-launch chain is 0.93x the in-tree chain's time, so
+    the M3.1 targets serve batches up to 8 only, except TP2 up to 12 (S4CAP12: it still wins at 12 on VR200).
 
     The kernel also computes next_new_tokens, the accepted-row bookkeeping and the target's KV-length rewind of
     the K3 fused verify; this entry passes none of them (one dummy word each) and returns only the tokens.

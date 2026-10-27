@@ -1,0 +1,1644 @@
+{
+ "autotuner": [
+  {
+   "min_time": 0.011449600011110306,
+   "op": "trtllm::fp4_block_scale_moe_runner",
+   "runner": "FP4BlockScaleMoERunner",
+   "runner_id": 0,
+   "runner_key": "(4, 1536, 128, 0)",
+   "shapes": [
+    [
+     -1,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     1,
+     3072
+    ],
+    [
+     -1
+    ],
+    [
+     128,
+     3072,
+     3072
+    ],
+    [
+     128,
+     3072,
+     384
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     6144,
+     768
+    ],
+    [
+     128,
+     6144,
+     96
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     0
+    ],
+    [
+     0
+    ]
+   ],
+   "tactic": [
+    8,
+    346
+   ],
+   "tactic_name": "bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x8x512u2_s5_et128x8_m128x8x128_c1x1x1_rM_TN_transOut_schedS_biasFp32M_bN_tma_tmaSf_rgTma_clmp_swiGlu_dynB_sm107a | bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x8x512_s5_et128x8_m128x8x128_c1x1x1_rM_TN_transOut_schedS_biasFp32M_bN_rgTma_clmp_dynB_sm107a"
+  },
+  {
+   "min_time": 0.10818239450454711,
+   "op": "trtllm::fp4_block_scale_moe_runner",
+   "runner": "FP4BlockScaleMoERunner",
+   "runner_id": 0,
+   "runner_key": "(4, 1536, 128, 0)",
+   "shapes": [
+    [
+     -1,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     1024,
+     3072
+    ],
+    [
+     -1
+    ],
+    [
+     128,
+     3072,
+     3072
+    ],
+    [
+     128,
+     3072,
+     384
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     6144,
+     768
+    ],
+    [
+     128,
+     6144,
+     96
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     0
+    ],
+    [
+     0
+    ]
+   ],
+   "tactic": [
+    128,
+    23
+   ],
+   "tactic_name": "bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x128x512_s3x3x3x3x1x3_et128x32_m256x128x128_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_fCp_bN_ldgsts_ldgstsSf_rgTma_clmp_swiGlu_lbW4_lsfbW4_dynB_sm107a | bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x128x256u2_s6_et128x128_m256x128x128_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm107a"
+  },
+  {
+   "min_time": 0.07978240251541138,
+   "op": "trtllm::fp4_block_scale_moe_runner",
+   "runner": "FP4BlockScaleMoERunner",
+   "runner_id": 0,
+   "runner_key": "(4, 1536, 128, 0)",
+   "shapes": [
+    [
+     -1,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     3072
+    ],
+    [
+     -1
+    ],
+    [
+     128,
+     3072,
+     3072
+    ],
+    [
+     128,
+     3072,
+     384
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     6144,
+     768
+    ],
+    [
+     128,
+     6144,
+     96
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     0
+    ],
+    [
+     0
+    ]
+   ],
+   "tactic": [
+    16,
+    236
+   ],
+   "tactic_name": "bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x16x512u2_s5_et128x16_m256x16x128_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_tma_tmaSf_rgTma_clmp_swiGlu_dynB_sm107a | bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x16x512_s5_et128x16_m256x16x128_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm107a"
+  },
+  {
+   "min_time": 0.049420800805091855,
+   "op": "trtllm::fp4_block_scale_moe_runner",
+   "runner": "FP4BlockScaleMoERunner",
+   "runner_id": 0,
+   "runner_key": "(4, 1536, 128, 0)",
+   "shapes": [
+    [
+     -1,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     16,
+     3072
+    ],
+    [
+     -1
+    ],
+    [
+     128,
+     3072,
+     3072
+    ],
+    [
+     128,
+     3072,
+     384
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     6144,
+     768
+    ],
+    [
+     128,
+     6144,
+     96
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     0
+    ],
+    [
+     0
+    ]
+   ],
+   "tactic": [
+    8,
+    323
+   ],
+   "tactic_name": "bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x8x512u2_s5_et128x8_m128x8x128_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_tma_tmaSf_rgTma_clmp_swiGlu_dynB_sm107a | bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x8x512_s5_et128x8_m128x8x128_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm107a"
+  },
+  {
+   "min_time": 0.5331935882568359,
+   "op": "trtllm::fp4_block_scale_moe_runner",
+   "runner": "FP4BlockScaleMoERunner",
+   "runner_id": 0,
+   "runner_key": "(4, 1536, 128, 0)",
+   "shapes": [
+    [
+     -1,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     16384,
+     3072
+    ],
+    [
+     -1
+    ],
+    [
+     128,
+     3072,
+     3072
+    ],
+    [
+     128,
+     3072,
+     384
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     6144,
+     768
+    ],
+    [
+     128,
+     6144,
+     96
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     0
+    ],
+    [
+     0
+    ]
+   ],
+   "tactic": [
+    256,
+    7
+   ],
+   "tactic_name": "bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x256x256_s4x4x4x4x1x4_et128x64_m256x256x128_c2x1x1_rM_TN_transOut_schPdx3_biasFp32M_fCp_tmOv_bN_ldgsts_ldgstsSf_rgTma_clmp_swiGlu_lbW4_dynB_sm107a | bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x256x256_s5x5x5x5x1x1_et128x64_m256x256x128_c2x1x1_rM_TN_transOut_schPdx3_biasFp32M_fCp_tmOv_bN_rgTma_clmp_dynB_sm107a"
+  },
+  {
+   "min_time": 0.016697600483894348,
+   "op": "trtllm::fp4_block_scale_moe_runner",
+   "runner": "FP4BlockScaleMoERunner",
+   "runner_id": 0,
+   "runner_key": "(4, 1536, 128, 0)",
+   "shapes": [
+    [
+     -1,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     2,
+     3072
+    ],
+    [
+     -1
+    ],
+    [
+     128,
+     3072,
+     3072
+    ],
+    [
+     128,
+     3072,
+     384
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     6144,
+     768
+    ],
+    [
+     128,
+     6144,
+     96
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     0
+    ],
+    [
+     0
+    ]
+   ],
+   "tactic": [
+    8,
+    255
+   ],
+   "tactic_name": "bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x8x256u2_s9_et128x8_m128x8x128_c1x1x1_rM_TN_transOut_schedS_biasFp32M_bN_tma_ldgstsSf_rgTma_clmp_swiGlu_dynB_sm107a | bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x8x256u2_s9_et128x8_m128x8x128_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm107a"
+  },
+  {
+   "min_time": 0.14368640184402465,
+   "op": "trtllm::fp4_block_scale_moe_runner",
+   "runner": "FP4BlockScaleMoERunner",
+   "runner_id": 0,
+   "runner_key": "(4, 1536, 128, 0)",
+   "shapes": [
+    [
+     -1,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     2048,
+     3072
+    ],
+    [
+     -1
+    ],
+    [
+     128,
+     3072,
+     3072
+    ],
+    [
+     128,
+     3072,
+     384
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     6144,
+     768
+    ],
+    [
+     128,
+     6144,
+     96
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     0
+    ],
+    [
+     0
+    ]
+   ],
+   "tactic": [
+    128,
+    23
+   ],
+   "tactic_name": "bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x128x512_s3x3x3x3x1x3_et128x32_m256x128x128_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_fCp_bN_ldgsts_ldgstsSf_rgTma_clmp_swiGlu_lbW4_lsfbW4_dynB_sm107a | bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x128x256u2_s6_et128x128_m256x128x128_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm107a"
+  },
+  {
+   "min_time": 0.09130880236625671,
+   "op": "trtllm::fp4_block_scale_moe_runner",
+   "runner": "FP4BlockScaleMoERunner",
+   "runner_id": 0,
+   "runner_key": "(4, 1536, 128, 0)",
+   "shapes": [
+    [
+     -1,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     256,
+     3072
+    ],
+    [
+     -1
+    ],
+    [
+     128,
+     3072,
+     3072
+    ],
+    [
+     128,
+     3072,
+     384
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     6144,
+     768
+    ],
+    [
+     128,
+     6144,
+     96
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     0
+    ],
+    [
+     0
+    ]
+   ],
+   "tactic": [
+    16,
+    228
+   ],
+   "tactic_name": "bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x16x512u2_s5_et128x16_m256x16x128_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_tma_tmaSf_rgTma_clmp_swiGlu_dynB_sm107a | bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x16x512_s5_et128x16_m256x16x64_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f"
+  },
+  {
+   "min_time": 0.06027519702911377,
+   "op": "trtllm::fp4_block_scale_moe_runner",
+   "runner": "FP4BlockScaleMoERunner",
+   "runner_id": 0,
+   "runner_key": "(4, 1536, 128, 0)",
+   "shapes": [
+    [
+     -1,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     32,
+     3072
+    ],
+    [
+     -1
+    ],
+    [
+     128,
+     3072,
+     3072
+    ],
+    [
+     128,
+     3072,
+     384
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     6144,
+     768
+    ],
+    [
+     128,
+     6144,
+     96
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     0
+    ],
+    [
+     0
+    ]
+   ],
+   "tactic": [
+    8,
+    176
+   ],
+   "tactic_name": "bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x8x256_s9_et128x8_m128x8x128_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_tma_ldgstsSf_rgTma_clmp_swiGlu_dynB_sm107a | bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x8x256_s9_et128x8_m128x8x64_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f"
+  },
+  {
+   "min_time": 0.02431039959192276,
+   "op": "trtllm::fp4_block_scale_moe_runner",
+   "runner": "FP4BlockScaleMoERunner",
+   "runner_id": 0,
+   "runner_key": "(4, 1536, 128, 0)",
+   "shapes": [
+    [
+     -1,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     4,
+     3072
+    ],
+    [
+     -1
+    ],
+    [
+     128,
+     3072,
+     3072
+    ],
+    [
+     128,
+     3072,
+     384
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     6144,
+     768
+    ],
+    [
+     128,
+     6144,
+     96
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     0
+    ],
+    [
+     0
+    ]
+   ],
+   "tactic": [
+    8,
+    143
+   ],
+   "tactic_name": "bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x8x512u2_s5_et128x8_m128x8x64_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_tma_tmaSf_rgTma_clmp_swiGlu_dynB_sm100f | bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x8x256_s9_et128x8_m128x8x128_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm107a"
+  },
+  {
+   "min_time": 0.19847999811172484,
+   "op": "trtllm::fp4_block_scale_moe_runner",
+   "runner": "FP4BlockScaleMoERunner",
+   "runner_id": 0,
+   "runner_key": "(4, 1536, 128, 0)",
+   "shapes": [
+    [
+     -1,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     4096,
+     3072
+    ],
+    [
+     -1
+    ],
+    [
+     128,
+     3072,
+     3072
+    ],
+    [
+     128,
+     3072,
+     384
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     6144,
+     768
+    ],
+    [
+     128,
+     6144,
+     96
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     0
+    ],
+    [
+     0
+    ]
+   ],
+   "tactic": [
+    128,
+    22
+   ],
+   "tactic_name": "bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x128x512_s3x3x3x3x1x3_et128x32_m256x128x128_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_fCp_bN_ldgsts_ldgstsSf_rgTma_clmp_swiGlu_lbW4_lsfbW4_dynB_sm107a | bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x128x256_s6_et128x128_m256x128x128_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm107a"
+  },
+  {
+   "min_time": 0.11694079637527466,
+   "op": "trtllm::fp4_block_scale_moe_runner",
+   "runner": "FP4BlockScaleMoERunner",
+   "runner_id": 0,
+   "runner_key": "(4, 1536, 128, 0)",
+   "shapes": [
+    [
+     -1,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     512,
+     3072
+    ],
+    [
+     -1
+    ],
+    [
+     128,
+     3072,
+     3072
+    ],
+    [
+     128,
+     3072,
+     384
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     6144,
+     768
+    ],
+    [
+     128,
+     6144,
+     96
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     0
+    ],
+    [
+     0
+    ]
+   ],
+   "tactic": [
+    64,
+    2
+   ],
+   "tactic_name": "bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x64x256_s6_et128x64_m256x64x64_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_tma_ldgstsSf_rgTma_clmp_swiGlu_dynB_sm100f | bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x64x512_s4_et128x64_m256x64x128_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm107a"
+  },
+  {
+   "min_time": 0.06737599968910217,
+   "op": "trtllm::fp4_block_scale_moe_runner",
+   "runner": "FP4BlockScaleMoERunner",
+   "runner_id": 0,
+   "runner_key": "(4, 1536, 128, 0)",
+   "shapes": [
+    [
+     -1,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     64,
+     3072
+    ],
+    [
+     -1
+    ],
+    [
+     128,
+     3072,
+     3072
+    ],
+    [
+     128,
+     3072,
+     384
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     6144,
+     768
+    ],
+    [
+     128,
+     6144,
+     96
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     0
+    ],
+    [
+     0
+    ]
+   ],
+   "tactic": [
+    16,
+    234
+   ],
+   "tactic_name": "bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x16x512u2_s5_et128x16_m256x16x128_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_tma_tmaSf_rgTma_clmp_swiGlu_dynB_sm107a | bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x16x256u2_s9_et128x16_m128x16x128_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm107a"
+  },
+  {
+   "min_time": 0.037254399061203,
+   "op": "trtllm::fp4_block_scale_moe_runner",
+   "runner": "FP4BlockScaleMoERunner",
+   "runner_id": 0,
+   "runner_key": "(4, 1536, 128, 0)",
+   "shapes": [
+    [
+     -1,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     8,
+     3072
+    ],
+    [
+     -1
+    ],
+    [
+     128,
+     3072,
+     3072
+    ],
+    [
+     128,
+     3072,
+     384
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     6144,
+     768
+    ],
+    [
+     128,
+     6144,
+     96
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     0
+    ],
+    [
+     0
+    ]
+   ],
+   "tactic": [
+    8,
+    191
+   ],
+   "tactic_name": "bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x8x256_s9_et128x8_m128x8x128_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_tma_ldgstsSf_rgTma_clmp_swiGlu_dynB_sm107a | bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x8x512_s5_et128x8_m128x8x128_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm107a"
+  },
+  {
+   "min_time": 0.32629759311676027,
+   "op": "trtllm::fp4_block_scale_moe_runner",
+   "runner": "FP4BlockScaleMoERunner",
+   "runner_id": 0,
+   "runner_key": "(4, 1536, 128, 0)",
+   "shapes": [
+    [
+     -1,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     8192,
+     3072
+    ],
+    [
+     -1
+    ],
+    [
+     128,
+     3072,
+     3072
+    ],
+    [
+     128,
+     3072,
+     384
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128,
+     6144,
+     768
+    ],
+    [
+     128,
+     6144,
+     96
+    ],
+    [
+     0
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ],
+    [
+     0
+    ],
+    [
+     0
+    ]
+   ],
+   "tactic": [
+    256,
+    7
+   ],
+   "tactic_name": "bmm_E2m1_E2m1E2m1_Fp32_Ab16_Bb16_Cb16_t128x256x256_s4x4x4x4x1x4_et128x64_m256x256x128_c2x1x1_rM_TN_transOut_schPdx3_biasFp32M_fCp_tmOv_bN_ldgsts_ldgstsSf_rgTma_clmp_swiGlu_lbW4_dynB_sm107a | bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x256x256_s5x5x5x5x1x1_et128x64_m256x256x128_c2x1x1_rM_TN_transOut_schPdx3_biasFp32M_fCp_tmOv_bN_rgTma_clmp_dynB_sm107a"
+  },
+  {
+   "min_time": 0.061312001943588254,
+   "op": "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+   "runner": "MXFP8GemmRunner",
+   "runner_id": 0,
+   "runner_key": "(torch.bfloat16, 107)",
+   "shapes": [
+    [
+     16384,
+     1536
+    ],
+    [
+     -1
+    ],
+    [
+     6144,
+     1536
+    ],
+    [
+     294912
+    ],
+    [
+     1
+    ]
+   ],
+   "tactic": 2,
+   "tactic_name": "Cutlass GEMM Tactic\n\tstyle=TMA Warp Specialized\n\tsm: 107\n\ttile shape ID: 128x128x256\n\tcluster shape ID: 4x2x1\n\tdynamic cluster shape ID: undefined\n\tfallback cluster shape ID: undefined\n\tmainloop sched: 0\n\tepi sched: 0\n\tenable cuda kernel: false\n\tepilogue fusion type: 0\n\tswap_ab: false\n"
+  },
+  {
+   "min_time": 0.19057600498199462,
+   "op": "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+   "runner": "MXFP8GemmRunner",
+   "runner_id": 0,
+   "runner_key": "(torch.bfloat16, 107)",
+   "shapes": [
+    [
+     16384,
+     6144
+    ],
+    [
+     -1
+    ],
+    [
+     4992,
+     6144
+    ],
+    [
+     958464
+    ],
+    [
+     1
+    ]
+   ],
+   "tactic": 2,
+   "tactic_name": "Cutlass GEMM Tactic\n\tstyle=TMA Warp Specialized\n\tsm: 107\n\ttile shape ID: 128x128x256\n\tcluster shape ID: 4x2x1\n\tdynamic cluster shape ID: undefined\n\tfallback cluster shape ID: undefined\n\tmainloop sched: 0\n\tepi sched: 0\n\tenable cuda kernel: false\n\tepilogue fusion type: 0\n\tswap_ab: false\n"
+  },
+  {
+   "min_time": 0.007670400291681289,
+   "op": "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+   "runner": "MXFP8GemmRunner",
+   "runner_id": 0,
+   "runner_key": "(torch.bfloat16, 107)",
+   "shapes": [
+    [
+     8,
+     4096
+    ],
+    [
+     -1
+    ],
+    [
+     6144,
+     4096
+    ],
+    [
+     786432
+    ],
+    [
+     1
+    ]
+   ],
+   "tactic": 3,
+   "tactic_name": "Cutlass GEMM Tactic\n\tstyle=TMA Warp Specialized\n\tsm: 107\n\ttile shape ID: 128x128x256\n\tcluster shape ID: 2x4x1\n\tdynamic cluster shape ID: undefined\n\tfallback cluster shape ID: undefined\n\tmainloop sched: 0\n\tepi sched: 0\n\tenable cuda kernel: false\n\tepilogue fusion type: 0\n\tswap_ab: false\n"
+  },
+  {
+   "min_time": 0.016451199352741242,
+   "op": "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+   "runner": "MXFP8GemmRunner",
+   "runner_id": 0,
+   "runner_key": "(torch.bfloat16, 107)",
+   "shapes": [
+    [
+     8,
+     6144
+    ],
+    [
+     -1
+    ],
+    [
+     12288,
+     6144
+    ],
+    [
+     2359296
+    ],
+    [
+     1
+    ]
+   ],
+   "tactic": 3,
+   "tactic_name": "Cutlass GEMM Tactic\n\tstyle=TMA Warp Specialized\n\tsm: 107\n\ttile shape ID: 128x128x256\n\tcluster shape ID: 2x4x1\n\tdynamic cluster shape ID: undefined\n\tfallback cluster shape ID: undefined\n\tmainloop sched: 0\n\tepi sched: 0\n\tenable cuda kernel: false\n\tepilogue fusion type: 0\n\tswap_ab: false\n"
+  },
+  {
+   "min_time": 0.00897279977798462,
+   "op": "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+   "runner": "MXFP8GemmRunner",
+   "runner_id": 0,
+   "runner_key": "(torch.bfloat16, 107)",
+   "shapes": [
+    [
+     8,
+     6144
+    ],
+    [
+     -1
+    ],
+    [
+     4992,
+     6144
+    ],
+    [
+     958464
+    ],
+    [
+     1
+    ]
+   ],
+   "tactic": 3,
+   "tactic_name": "Cutlass GEMM Tactic\n\tstyle=TMA Warp Specialized\n\tsm: 107\n\ttile shape ID: 128x128x256\n\tcluster shape ID: 2x4x1\n\tdynamic cluster shape ID: undefined\n\tfallback cluster shape ID: undefined\n\tmainloop sched: 0\n\tepi sched: 0\n\tenable cuda kernel: false\n\tepilogue fusion type: 0\n\tswap_ab: false\n"
+  },
+  {
+   "min_time": 0.010239999741315842,
+   "op": "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+   "runner": "MXFP8GemmRunner",
+   "runner_id": 0,
+   "runner_key": "(torch.bfloat16, 107)",
+   "shapes": [
+    [
+     8,
+     6144
+    ],
+    [
+     -1
+    ],
+    [
+     6144,
+     6144
+    ],
+    [
+     1179648
+    ],
+    [
+     1
+    ]
+   ],
+   "tactic": 3,
+   "tactic_name": "Cutlass GEMM Tactic\n\tstyle=TMA Warp Specialized\n\tsm: 107\n\ttile shape ID: 128x128x256\n\tcluster shape ID: 2x4x1\n\tdynamic cluster shape ID: undefined\n\tfallback cluster shape ID: undefined\n\tmainloop sched: 0\n\tepi sched: 0\n\tenable cuda kernel: false\n\tepilogue fusion type: 0\n\tswap_ab: false\n"
+  },
+  {
+   "min_time": 0.034483200311660765,
+   "op": "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+   "runner": "MXFP8GemmRunner",
+   "runner_id": 0,
+   "runner_key": "(torch.bfloat16, 107)",
+   "shapes": [
+    [
+     8192,
+     1536
+    ],
+    [
+     -1
+    ],
+    [
+     6144,
+     1536
+    ],
+    [
+     294912
+    ],
+    [
+     1
+    ]
+   ],
+   "tactic": 4,
+   "tactic_name": "Cutlass GEMM Tactic\n\tstyle=TMA Warp Specialized\n\tsm: 107\n\ttile shape ID: 128x128x256\n\tcluster shape ID: 4x4x1\n\tdynamic cluster shape ID: undefined\n\tfallback cluster shape ID: undefined\n\tmainloop sched: 0\n\tepi sched: 0\n\tenable cuda kernel: false\n\tepilogue fusion type: 0\n\tswap_ab: false\n"
+  },
+  {
+   "min_time": 0.10131839513778687,
+   "op": "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+   "runner": "MXFP8GemmRunner",
+   "runner_id": 0,
+   "runner_key": "(torch.bfloat16, 107)",
+   "shapes": [
+    [
+     8192,
+     6144
+    ],
+    [
+     -1
+    ],
+    [
+     4992,
+     6144
+    ],
+    [
+     958464
+    ],
+    [
+     1
+    ]
+   ],
+   "tactic": 4,
+   "tactic_name": "Cutlass GEMM Tactic\n\tstyle=TMA Warp Specialized\n\tsm: 107\n\ttile shape ID: 128x128x256\n\tcluster shape ID: 4x4x1\n\tdynamic cluster shape ID: undefined\n\tfallback cluster shape ID: undefined\n\tmainloop sched: 0\n\tepi sched: 0\n\tenable cuda kernel: false\n\tepilogue fusion type: 0\n\tswap_ab: false\n"
+  }
+ ],
+ "flashinfer": {
+  "cache": {
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((1, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    21
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((1, 4096), (4096, 6144), (-1,), (786432,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    3
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((1, 6144), (6144, 12288), (-1,), (2359296,), (0,), (-1, 12288), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    1
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((1, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    3
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((1, 6144), (6144, 6144), (-1,), (1179648,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    3
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((1024, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    12
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((1024, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    15
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((128, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    6
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((128, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    5
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((1280, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    22
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((1280, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    15
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((1536, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    4
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((1536, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    23
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((16, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    22
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((16, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    3
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((16384, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    18
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((16384, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    18
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((1792, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    14
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((1792, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    14
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((2, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    21
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((2, 4096), (4096, 6144), (-1,), (786432,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    3
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((2, 6144), (6144, 12288), (-1,), (2359296,), (0,), (-1, 12288), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    1
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((2, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    3
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((2, 6144), (6144, 6144), (-1,), (1179648,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    3
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((2048, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    14
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((2048, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    18
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((256, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    20
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((256, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    8
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((2560, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    14
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((2560, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    19
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((3072, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    17
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((3072, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    15
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((32, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    3
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((32, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    8
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((3584, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    14
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((3584, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    17
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((4, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    3
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((4, 4096), (4096, 6144), (-1,), (786432,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    6
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((4, 6144), (6144, 12288), (-1,), (2359296,), (0,), (-1, 12288), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    1
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((4, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    3
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((4, 6144), (6144, 6144), (-1,), (1179648,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    3
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((4096, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    15
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((4096, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    15
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((512, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    4
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((512, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    23
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((64, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    6
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((64, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    9
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((768, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    13
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((768, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    15
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((8, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    3
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((8, 4096), (4096, 6144), (-1,), (786432,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    3
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((8, 6144), (6144, 12288), (-1,), (2359296,), (0,), (-1, 12288), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    1
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((8, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    3
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((8, 6144), (6144, 6144), (-1,), (1179648,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    3
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((8192, 1536), (1536, 6144), (-1,), (294912,), (0,), (-1, 6144), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    18
+   ],
+   "('mxfp8_gemm', 'CutlassMxfp8GemmRunner', ((8192, 6144), (6144, 4992), (-1,), (958464,), (0,), (-1, 4992), (33554432,)), ())": [
+    "CutlassMxfp8GemmRunner",
+    18
+   ],
+   "_generation": "49984fba36679af08bf96ce9bcfab83e78b0570985c165b915f1fac8aec8e550",
+   "_metadata": {
+    "cublas_version": "13.8.0",
+    "cuda_version": "13.4",
+    "cudnn_frontend_version": "1.27.0",
+    "cudnn_version": "92600",
+    "flashinfer_version": "0.6.18",
+    "gpu": "NVIDIA Graphics Device"
+   }
+  },
+  "guard": {
+   "flashinfer-python": "0.6.18",
+   "nvidia-cutlass-dsl": "4.8.0"
+  }
+ },
+ "format": "m31_pin_v1",
+ "native_guard": {
+  "libtensorrt_llm.so": "267a6b9ba701948539a79f5234a26550",
+  "libth_common.so": "78cc74478f0bd79ca835dcf0390197da"
+ }
+}

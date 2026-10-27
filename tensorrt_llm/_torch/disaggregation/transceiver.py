@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from collections import Counter, defaultdict
+from dataclasses import replace
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, cast
 
@@ -34,6 +35,23 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     WaitResult,
     get_unique_rid,
 )
+from tensorrt_llm._torch.disaggregation.draft_kv import (
+    FALLBACK_CTX_LEN_MISMATCH,
+    FALLBACK_CTX_RANK_DIVERGENCE,
+    FALLBACK_NO_STATE,
+    FALLBACK_NO_STORE_EVENT,
+    FALLBACK_PAGE_MISMATCH,
+    FALLBACK_REUSE_BASE,
+    FALLBACK_UNVERIFIED_WRITE,
+    TEST_SEND_BEFORE_EVENT_ENV,
+    DraftKvCounters,
+    decode_draft_ctx_state,
+    draft_dump_dir,
+    draft_receive_disabled_reason,
+    empty_window_state,
+    send_before_draft_ctx_event,
+    write_window_dump,
+)
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     CtxTransferStatus,
     GenTransferStatus,
@@ -50,6 +68,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     RxSession,
     TransferWorker,
     TransferWorkerConfig,
+    draft_window_bytes,
 )
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
@@ -231,6 +250,23 @@ def _validate_fp4_mla_bridge_profile(
 
 
 class KvCacheTransceiverV2(KvCacheTransceiver):
+    # The standalone drafter's context window (disaggregation/draft_kv.py). Class-level defaults
+    # keep a transceiver built without __init__, or without a draft manager, on the target-only path.
+    _draft_kv_cache_manager: Optional[KVCacheManager] = None
+    _draft_reuse_adapter: Optional[CacheReuseAdapter] = None
+    _draft_page_table = None
+    # The speculative worker holding the drafter's per-request context state (DFlashWorker).
+    _draft_ctx_owner: Optional[Any] = None
+    _send_before_draft_ctx_event: bool = False
+    # draft_kv_sent / draft_kv_fallback{reason}: what the context side shipped, and what the
+    # generation side seeded.
+    _draft_kv_ctx_counters: Optional[DraftKvCounters] = None
+    _draft_kv_gen_counters: Optional[DraftKvCounters] = None
+    # Test only (TRTLLM_M31_F0A_DUMP_DIR): draft-window dumps; None is fully inert.
+    _draft_dump_dir: Optional[str] = None
+    _draft_dump_rank: int = 0
+    _draft_dump_heads: int = 0
+
     @property
     def consumes_transfer_buffer(self) -> bool:
         return False
@@ -241,6 +277,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         dist: Distributed,
         kv_cache_manager: KVCacheManager,
         cache_transceiver_config: CacheTransceiverConfig,
+        draft_kv_cache_manager: Optional[KVCacheManager] = None,
+        draft_ctx_owner: Optional[Any] = None,
     ):
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
@@ -261,6 +299,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else None
         )
         self._check_compatible()
+        if draft_kv_cache_manager is not None:
+            if draft_ctx_owner is None or not isinstance(draft_kv_cache_manager, KVCacheManagerV2):
+                raise ValueError(
+                    "the disagg drafter context-window transfer needs a KVCacheManagerV2 draft "
+                    "pool and the speculative worker that owns the drafter context"
+                )
+            if draft_kv_cache_manager.enable_joint_kv_cache_reuse:
+                raise ValueError(
+                    "the disagg drafter context-window transfer requires an unpaired draft pool "
+                    "(enable_joint_kv_cache_reuse=False)"
+                )
         enforce_physical_ownership = _validate_fp4_mla_bridge_profile(
             mapping, kv_cache_manager, cache_transceiver_config
         )
@@ -317,8 +366,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     else 0
                 ),
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
+                draft_kv_cache_manager=draft_kv_cache_manager,
+                draft_receive_disabled=(
+                    self._draft_receive_disabled_reason(mapping)
+                    if draft_kv_cache_manager is not None
+                    else None
+                ),
             )
         )
+        if draft_kv_cache_manager is not None:
+            self._engage_draft_kv(draft_kv_cache_manager, draft_ctx_owner)
+        else:
+            self._count_draft_kv_peer_not_engaged()
         if enforce_physical_ownership:
             logger.info(
                 "FP4 MLA KV ownership bridge ENABLED: "
@@ -365,6 +424,76 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # per-iter tp_allgather when this transceiver never sends/receives.
         self._ever_had_send_session: bool = False
         self._ever_had_recv_session: bool = False
+
+    @staticmethod
+    def _draft_receive_disabled_reason(mapping: Mapping) -> Optional[str]:
+        """``draft_kv.draft_receive_disabled_reason`` for this process's receive path, logged."""
+        from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
+            uses_async_gen_transfer,
+        )
+
+        reason = draft_receive_disabled_reason(mapping, not uses_async_gen_transfer())
+        if reason is not None:
+            logger.warning(
+                f"F0a: this rank receives no drafter context window ({reason}): the synchronous "
+                "generation receive (TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1) has no cross-rank "
+                f"agreement on it under TP {mapping.tp_size} without attention DP; requests "
+                "draft from an empty window and the target transfer is unchanged"
+            )
+        return reason
+
+    def _count_draft_kv_peer_not_engaged(self) -> None:
+        """Count the requests whose drafter window a peer engages but this rank does not.
+
+        Such a peer pair moves the target set only (``peer_not_engaged``); this rank has no drafter
+        context of its own, so its sender and receiver count the affected requests.
+        """
+        self._draft_kv_ctx_counters = DraftKvCounters(f"context, rank {self._mapping.rank}")
+        self._draft_kv_gen_counters = DraftKvCounters(f"generation, rank {self._mapping.rank}")
+        sender = getattr(self._transfer_worker, "_sender", None)
+        if sender is not None:
+            sender._draft_kv_counters = self._draft_kv_ctx_counters
+        receiver = getattr(self._transfer_worker, "_receiver", None)
+        if receiver is not None:
+            receiver._draft_kv_counters = self._draft_kv_gen_counters
+
+    def _engage_draft_kv(self, draft_kv_cache_manager: KVCacheManagerV2, owner: Any) -> None:
+        """Ship the standalone drafter's context window as a second block set."""
+        self._draft_kv_cache_manager = draft_kv_cache_manager
+        self._draft_reuse_adapter = create_cache_reuse_adapter(draft_kv_cache_manager)
+        self._draft_page_table = self._transfer_worker.draft_page_table
+        self._draft_ctx_owner = owner
+        # A generation worker sizes the windowed draft pool for the received window, with a
+        # readiness event merged into the receive fences; a context worker records the
+        # drafter-store event its send waits on.
+        draft_kv_cache_manager.engage_disagg_draft_kv_receive()
+        owner.engage_disagg_draft_kv()
+        self._send_before_draft_ctx_event = send_before_draft_ctx_event()
+        # Per rank: under TP-attention every CTX (and GEN) TP rank counts each request once.
+        self._draft_kv_ctx_counters = DraftKvCounters(f"context, rank {self._mapping.rank}")
+        self._draft_kv_gen_counters = DraftKvCounters(f"generation, rank {self._mapping.rank}")
+        # The sender counts a context TP rank that decided otherwise than the response's rank.
+        self._transfer_worker._sender._draft_kv_counters = self._draft_kv_ctx_counters
+        self._draft_dump_dir = draft_dump_dir()
+        if self._draft_dump_dir is not None:
+            self._draft_dump_rank = self._mapping.rank
+            self._draft_dump_heads = (
+                self._transfer_worker._rank_info.draft_attention.kv_heads_per_rank
+            )
+            logger.warning(
+                f"TRTLLM_M31_F0A_DUMP_DIR={self._draft_dump_dir}: dumping every drafter context "
+                "window shipped or received (G1d; test only, synchronizes per request)"
+            )
+        if self._send_before_draft_ctx_event:
+            logger.warning(
+                f"{TEST_SEND_BEFORE_EVENT_ENV}=1: context KV is published WITHOUT waiting for the "
+                "drafter context store (ordering negative control; test only)"
+            )
+        logger.info(
+            "KvCacheTransceiverV2: shipping the standalone drafter context window "
+            f"({len(self._draft_page_table.layer_groups)} draft layer group(s), "
+            f"tokens_per_block={self._draft_page_table.tokens_per_block})"
+        )
 
     def _fail_unproven_transfer(self, event: QuiescenceFatalEvent) -> None:
         """Fail-stop while the watchdog retains this transceiver's resource roots.
@@ -575,7 +704,36 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             token_range=TokenRange(start=0, end=transfer_len),
             is_last=True,
             excluded_pool_views=excluded_pool_views,
+            draft_block_ids_per_layer_groups=self._describe_draft_local(req),
         )
+
+    def _describe_draft_local(self, req: LlmRequest) -> Optional[List[np.ndarray]]:
+        """The draft pool's blocks for the prompt, one positional list per draft layer group, or
+        None when the drafter context window does not ship.
+
+        ``ceil(prompt_len / draft_tpb)`` entries with -1 where the windowed pool released or never
+        held a page. No cached-prefix mask: the draft pool is never paired with block reuse, so the
+        receiver's window is always written whole.
+        """
+        page_table = self._draft_page_table
+        if page_table is None:
+            return None
+        if (
+            getattr(req, "is_generation_only_request", False) is True
+            and not self._need_aux_transfer(req)
+            and self._received_draft_ctx_state(req) is None
+        ):
+            # Context-first: the context side said in its response that this request's window
+            # does not travel, so neither the request nor the expected bytes name its pages.
+            return None
+        adapter = self._draft_reuse_adapter
+        assert adapter is not None
+        tpb = adapter.tokens_per_block
+        prompt_blocks = (req.prompt_len + tpb - 1) // tpb
+        return [
+            self._positional_window(adapter.get_block_ordinals(req, idx, lg), prompt_blocks, 0)
+            for idx, lg in enumerate(page_table.layer_groups)
+        ]
 
     @staticmethod
     def _positional_window(
@@ -629,7 +787,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 else:
                     # Attention: n blocks, each covering the view's regions.
                     total += n * view_bytes
+        # Read off the class: callers may pass a stand-in carrying only the page tables.
+        total += KvCacheTransceiverV2._draft_chunk_num_bytes(
+            getattr(self, "_draft_page_table", None), chunk
+        )
         return total
+
+    @staticmethod
+    def _draft_chunk_num_bytes(page_table, chunk: Chunk) -> int:
+        """Local-rank bytes of the drafter context window a chunk covers (0 when none travels)."""
+        return draft_window_bytes(
+            page_table, getattr(chunk, "draft_block_ids_per_layer_groups", None)
+        )
 
     @staticmethod
     def _need_aux_transfer(req: LlmRequest) -> bool:
@@ -711,6 +880,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         need_sync: bool,
         locally_quiesced=None,
         locally_verified=None,
+        locally_flagged=None,
     ):
         # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
         # Quiescence and write-verification, when requested, also require
@@ -721,6 +891,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             local_outcome.append(list(locally_quiesced))
         if locally_verified is not None:
             local_outcome.append(list(locally_verified))
+        if locally_flagged is not None:
+            local_outcome.append(list(locally_flagged))
         if not need_sync:
             packed = [local_outcome]
         else:
@@ -751,11 +923,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # the same tokens, so a request counts as write-verified only
             # when EVERY rank verified its local shard.
             all_verified = [p[idx] for p in packed]
+            idx += 1
             global_verified = self._intersection(all_verified, n)
             result.append({rid for rid in to_process if rid in global_verified})
+        if locally_flagged is not None:
+            # Flagged on any rank -> flagged everywhere.
+            global_flagged = self._union([p[idx] for p in packed])
+            result.append({rid for rid in to_process if rid in global_flagged})
         return tuple(result)
 
-    def _gen_consensus_outcome(self, to_process, cancelled, failed, completed, locally_verified):
+    def _gen_consensus_outcome(
+        self, to_process, cancelled, failed, completed, locally_verified, locally_draft_vetoed=None
+    ):
         # A failure/cancellation may be global, but reuse is safe only after
         # every participating rank has drained its local physical accessor.
         locally_retirable = []
@@ -763,25 +942,27 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._recv_sessions[rid]
             if not self._ownership_blocks_retirement(session):
                 locally_retirable.append(rid)
-        new_cancelled, new_failed, new_completed, globally_retirable, verified = (
-            self._consensus_outcome(
-                to_process,
-                cancelled,
-                failed,
-                completed,
-                self._gen_allgather,
-                self._gen_need_sync,
-                locally_retirable,
-                locally_verified,
-            )
+        outcome = self._consensus_outcome(
+            to_process,
+            cancelled,
+            failed,
+            completed,
+            self._gen_allgather,
+            self._gen_need_sync,
+            locally_retirable,
+            locally_verified,
+            locally_draft_vetoed,
         )
+        new_cancelled, new_failed, new_completed, globally_retirable, verified = outcome[:5]
         retirable = set(globally_retirable)
-        return (
+        result = (
             [rid for rid in new_cancelled if rid in retirable],
             [rid for rid in new_failed if rid in retirable],
             new_completed,
             verified,
         )
+        # Only a transceiver shipping the drafter window passes vetoes (and gets them back).
+        return result if locally_draft_vetoed is None else result + (outcome[5],)
 
     def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed, locally_quiesced):
         # TP first, then PP. A local timeout remains nonterminal, so it is
@@ -977,6 +1158,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if self._need_aux_transfer(req):
             session.pack_aux(req)
             session.send_aux()
+        # Context-first: the drafter window decision (req.py_draft_ctx_aux) reaches the generation
+        # request through the response's DisaggregatedParams.draft_ctx_state (LlmRequest
+        # create_response), never opaque_state, which C++ parses as a DataTransceiverState.
         req.context_phase_params = ContextPhaseParams(
             first_gen_tokens=[],
             req_id=rid,
@@ -1053,8 +1237,232 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 token_range=TokenRange(start=chunk_start * tpb, end=chunk_end_token),
                 is_last=is_last_chunk,
                 excluded_pool_views=whole.excluded_pool_views,
+                # The windowed draft pool releases what an earlier piece would name: the window
+                # ships whole with the last piece only.
+                draft_block_ids_per_layer_groups=(
+                    getattr(whole, "draft_block_ids_per_layer_groups", None)
+                    if is_last_chunk
+                    else None
+                ),
             ),
         )
+
+    def _await_draft_ctx(self, req: LlmRequest, extent: CacheExtent) -> CacheExtent:
+        """Order this piece's publication after the drafter's context store, and on the last piece
+        decide whether the request's drafter context window travels.
+
+        The drafter writes the context window on the execution stream inside the forward; RDMA
+        cannot observe stream order, so the event recorded right after that store is waited on
+        before any byte is published. The sampler's own host wait already covers it today, so the
+        wait returns at once; it keeps the guarantee explicit.
+
+        A window that cannot be served exactly falls back to an empty drafter window on the
+        generation side; the request itself never fails. The decision rides the aux slot
+        (generation-first) or the response's ``draft_ctx_state`` (context-first). In context-first
+        the receiver learns it before it asks, so the window's pages are left out of this piece as
+        well; in generation-first the receiver has already asked for them, so they still travel
+        (keeping the byte accounting exact) and are marked unusable.
+        """
+        owner = self._draft_ctx_owner
+        if owner is None:
+            return extent
+        ready = owner.take_disagg_draft_ctx_ready(req.py_request_id)
+        if ready is not None and not self._send_before_draft_ctx_event:
+            ready[0].synchronize()
+        chunk = extent.local
+        if not chunk.is_last:
+            return extent
+        reason = self._draft_ctx_fallback_reason(req, ready, chunk)
+        if reason is None:
+            _, ctx_len, ctx_base = ready
+            req.py_draft_ctx_aux = (int(ctx_len), int(ctx_base), True)
+            self._draft_kv_ctx_counters.record_sent()
+            if self._draft_dump_dir is not None:
+                self._dump_draft_window("ctx", req, get_unique_rid(req), chunk, None)
+            return extent
+        req.py_draft_ctx_aux = (0, 0, False)
+        self._draft_kv_ctx_counters.record_fallback(
+            reason,
+            f"rid={get_unique_rid(req)} prompt_len={req.prompt_len} "
+            f"state={None if ready is None else ready[1:]}",
+        )
+        if self._draft_dump_dir is not None:
+            self._dump_draft_window("ctx", req, get_unique_rid(req), chunk, reason)
+        if self._need_aux_transfer(req):
+            return extent
+        return CacheExtent(
+            name=extent.name, local=replace(chunk, draft_block_ids_per_layer_groups=None)
+        )
+
+    def _draft_ctx_fallback_reason(self, req: LlmRequest, ready, chunk: Chunk) -> Optional[str]:
+        """Why the request's window cannot be served exactly, or None when it can.
+
+        Exactly means the generation side's window holds what the context side stored, read the
+        same way. The drafter stores the whole prompt (``ctx_len == prompt_len``); on a prefix-reuse
+        hit an unpaired draft pool stores only the tail from the reused position on, numbered by
+        target position, and ``ctx_base`` pages below it are never read (the block decode shifts
+        the request's block-table row past them and shortens the context by as much,
+        ``dflash_rebased_ctx_view``). Those pages lie in the request's own draft table like every
+        other, so shipping the window pages and the same ``(ctx_len, ctx_base)`` reproduces the
+        context side's reads. The context side must hold every page the window behind the prompt
+        end covers.
+        """
+        if ready is None:
+            return FALLBACK_NO_STORE_EVENT
+        _, ctx_len, ctx_base = ready
+        if ctx_len != req.prompt_len:
+            return FALLBACK_CTX_LEN_MISMATCH
+        tpb = self._draft_page_table.tokens_per_block
+        if not 0 <= ctx_base <= -(-req.prompt_len // tpb):
+            return FALLBACK_REUSE_BASE
+        draft_ids = chunk.draft_block_ids_per_layer_groups
+        if draft_ids is None:
+            return FALLBACK_PAGE_MISMATCH
+        for block_ids, group in zip(draft_ids, self._draft_page_table.layer_groups):
+            window = getattr(group, "sliding_window_size", None)
+            first = 0 if window is None else max(0, (req.prompt_len + 1 - window) // tpb)
+            if not (np.asarray(block_ids)[first:] >= 0).all():
+                return FALLBACK_PAGE_MISMATCH
+        return None
+
+    def _dump_draft_window(
+        self, side: str, req: LlmRequest, match_id, chunk, reason, state=None
+    ) -> None:
+        """Test only (TRTLLM_M31_F0A_DUMP_DIR): write this side's window for the cross-side window compare."""
+        try:
+            ctx_len, ctx_base = state if state is not None else req.py_draft_ctx_aux[:2]
+            if reason is not None:
+                write_window_dump(
+                    self._draft_dump_dir,
+                    side,
+                    self._draft_dump_rank,
+                    match_id,
+                    request_id=req.py_request_id,
+                    prompt_len=req.prompt_len,
+                    ctx_len=0,
+                    ctx_base=0,
+                    shipped=False,
+                    reason=reason,
+                )
+                return
+            block_ids = (
+                chunk.draft_block_ids_per_layer_groups
+                if chunk is not None
+                else self._describe_draft_local(req)
+            )
+            write_window_dump(
+                self._draft_dump_dir,
+                side,
+                self._draft_dump_rank,
+                match_id,
+                request_id=req.py_request_id,
+                prompt_len=req.prompt_len,
+                ctx_len=ctx_len,
+                ctx_base=ctx_base,
+                shipped=True,
+                page_table=self._draft_page_table,
+                heads_per_rank=self._draft_dump_heads,
+                block_ids_per_group=block_ids,
+            )
+        except Exception as error:  # noqa: BLE001 - a test dump must not take serving down
+            logger.error(f"F0a G1d dump ({side}, id={match_id}) failed: {error}")
+
+    @staticmethod
+    def _received_draft_ctx_state(req: LlmRequest) -> Optional[tuple]:
+        """The ``(ctx_len, ctx_base)`` the context side shipped a window for, or None."""
+        if KvCacheTransceiverV2._need_aux_transfer(req):
+            state = getattr(req, "py_draft_ctx_aux", None)
+        else:
+            params = req.py_disaggregated_params
+            state = decode_draft_ctx_state(getattr(params, "draft_ctx_state", None))
+        if state is None or not state[2]:
+            return None
+        return state[0], state[1]
+
+    def _seed_draft_ctx(self, req: LlmRequest, veto: Optional[str] = None) -> None:
+        """Hand the request's drafter context lengths to the worker, which seeds them on the
+        request's first step (DFlashSpecMetadata.prepare): the received ones, or an empty window
+        when the context side did not ship it or ``veto`` names why the received window cannot be
+        used (``_draft_window_vetoes``)."""
+        owner = self._draft_ctx_owner
+        if owner is None:
+            return
+        state = self._received_draft_ctx_state(req)
+        if veto is not None:
+            # The veto names the cause even when no state arrived (e.g. a peer that does not
+            # engage the window ships none: peer_not_engaged, not no_ctx_state).
+            state = None
+            reason = veto
+        else:
+            reason = FALLBACK_NO_STATE
+        shipped = state is not None
+        if state is None:
+            state = empty_window_state(req.prompt_len, self._draft_page_table.tokens_per_block)
+            self._draft_kv_gen_counters.record_fallback(
+                reason, f"rid={get_unique_rid(req)} prompt_len={req.prompt_len}"
+            )
+        else:
+            self._draft_kv_gen_counters.record_sent()
+        ctx_len, ctx_base = state
+        hook = None
+        if self._draft_dump_dir is not None and shipped:
+            params = req.py_disaggregated_params
+            match_id = params.ctx_request_id
+            if match_id is None:
+                match_id = params.disagg_request_id
+
+            def hook():
+                # At the request's first step: the received rows, read through its block table.
+                self._dump_draft_window("gen", req, match_id, None, None, state=(ctx_len, ctx_base))
+
+        if hook is None:
+            owner.seed_disagg_draft_ctx(req.py_request_id, ctx_len, ctx_base, req.prompt_len)
+        else:
+            owner.seed_disagg_draft_ctx(
+                req.py_request_id, ctx_len, ctx_base, req.prompt_len, on_seed=hook
+            )
+
+    def _note_expected_draft_bytes(self, req: LlmRequest, chunk: Chunk) -> None:
+        """Record the draft bytes this rank asks for, which ``_local_draft_veto`` checks."""
+        if self._draft_ctx_owner is not None:
+            req.py_draft_expected_bytes = KvCacheTransceiverV2._draft_chunk_num_bytes(
+                self._draft_page_table, chunk
+            )
+
+    def _local_draft_veto(self, req: LlmRequest, session) -> Optional[str]:
+        """Why this rank cannot use the request's received drafter window, or None.
+
+        Generation-first: the aux slot this rank's context peer filled says not shipped. Either
+        style: the draft pages this rank asked for were not all attested written (a context TP
+        rank that left its slice out while the response's rank shipped). Flagged on any rank,
+        the window is dropped on every rank (the flags ride the receive consensus).
+        """
+        disabled = getattr(session, "draft_disabled_reason", None)
+        reason = disabled() if callable(disabled) else None
+        if reason is not None:
+            # Registration disabled the window toward this context peer; nothing was asked for.
+            return reason
+        expected = getattr(req, "py_draft_expected_bytes", 0)
+        if expected:
+            verified, total = session.kv_write_byte_counts()
+            if total is None or verified != total:
+                if total is not None and total - verified == expected:
+                    return FALLBACK_CTX_RANK_DIVERGENCE
+                return FALLBACK_UNVERIFIED_WRITE
+        if self._need_aux_transfer(req):
+            state = session.peek_draft_ctx()
+            if state is None or not state[2]:
+                return FALLBACK_NO_STATE
+        return None
+
+    def _draft_window_vetoes(self, completed: List[int]) -> Dict[int, str]:
+        """This rank's ``_local_draft_veto`` of each completed receive that has one."""
+        vetoes = {}
+        for rid in completed:
+            reason = self._local_draft_veto(self._recv_reqs[rid], self._recv_sessions[rid])
+            if reason is not None:
+                vetoes[rid] = reason
+        return vetoes
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest) -> None:
@@ -1090,6 +1498,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     return
             else:
                 extent = self._create_cache_extent(req)
+            extent = self._await_draft_ctx(req, extent)
             chunk = extent.local
             # The handle that comes back is the contract's answer about this piece. What retires
             # the request is the sweep over the session tables, as it was before.
@@ -1125,6 +1534,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             fetches = self._open_peer_source(req)
             # Same submission the asynchronous entry makes; what differs is who waits. The session
             # underneath is read back for the blocking wait, the auxiliary buffer and the close.
+            self._note_expected_draft_bytes(req, extent.local)
             fetches.fetch(extent, expected_write_bytes=self._chunk_num_bytes(extent.local))
             session = self._legacy_session(fetches)
             self._recv_sessions[rid] = session
@@ -1141,6 +1551,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 )
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
+                if self._draft_ctx_owner is not None:
+                    self._seed_draft_ctx(req, self._local_draft_veto(req, session))
                 self._assert_disagg_history_declared(req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             else:
@@ -1202,6 +1614,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         extent = self._create_cache_extent(req)
         chunk_bytes = self._chunk_num_bytes(extent.local)
         req.py_kv_cache_xfer_bytes = chunk_bytes * self._kv_size_rank_factor
+        self._note_expected_draft_bytes(req, extent.local)
         fetches = self._open_peer_source(req)
         # Claimed to be transferring only once there is something to transfer: a builder that
         # raises above leaves the request where it was, not in a state nothing advances.
@@ -1370,9 +1783,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         ]
 
         # All ranks must agree on per-rid outcome to avoid req.state divergence.
-        cancelled, failed, completed, verified = self._gen_consensus_outcome(
-            to_process, cancelled, failed, completed, locally_verified
-        )
+        if self._draft_ctx_owner is None:
+            cancelled, failed, completed, verified = self._gen_consensus_outcome(
+                to_process, cancelled, failed, completed, locally_verified
+            )
+            draft_vetoes, globally_vetoed = {}, set()
+        else:
+            # The drafter-window vetoes ride the same allgather: a window unusable on any rank
+            # is dropped on every rank, so the generation ranks never draft from different ones.
+            draft_vetoes = self._draft_window_vetoes(completed)
+            cancelled, failed, completed, verified, globally_vetoed = self._gen_consensus_outcome(
+                to_process,
+                cancelled,
+                failed,
+                completed,
+                locally_verified,
+                locally_draft_vetoed=list(draft_vetoes),
+            )
 
         cancelled_reqs = []
         for rid in cancelled:
@@ -1407,6 +1834,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
             if self._need_aux_transfer(req):
                 self._apply_aux(session, req)
+            if self._draft_ctx_owner is not None:
+                veto = draft_vetoes.get(rid)
+                if veto is None and rid in globally_vetoed:
+                    veto = FALLBACK_CTX_RANK_DIVERGENCE
+                self._seed_draft_ctx(req, veto)
             self._assert_disagg_history_declared(req)
             self._close_session_or_raise(session, rid, "completed")
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE

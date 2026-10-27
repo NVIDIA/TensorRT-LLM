@@ -3379,7 +3379,7 @@ def flashinfer_mxfp8_decode_graph_capture_active() -> bool:
 @contextmanager
 def flashinfer_mxfp8_autotune() -> Iterator[None]:
     """Tune FlashInfer MXFP8 tactics while enabling auto-dispatched calls."""
-    from flashinfer import autotune
+    from ..flashinfer_autotune_cache import autotune
 
     token = _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.set(True)
     try:
