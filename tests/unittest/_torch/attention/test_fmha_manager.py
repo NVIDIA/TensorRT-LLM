@@ -617,6 +617,34 @@ def test_fmha_cache_separates_block_sparse_mode(block_sparse_first: bool) -> Non
     assert len(manager._cache) == 2
 
 
+@pytest.mark.parametrize("deferred_first", [False, True])
+def test_deferred_prologue_requests_only_reach_libraries_that_declare_support(
+    deferred_first: bool,
+) -> None:
+    """A query that is the raw projection of a deferred prologue must never reach a library that would attend it."""
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    regular_fmha = FakeFmha(attn, "regular", events)
+    deferred_fmha = FakeFmha(attn, "deferred", events)
+    deferred_fmha.supports_deferred_prologue = True
+    manager.fmha_libs = [regular_fmha, deferred_fmha]
+    metadata = _make_metadata(num_contexts=0, num_generations=2)
+    q = torch.empty((2, 4))
+    by_mode = {
+        False: AttentionForwardArgs(kv_append=SimpleNamespace(fold=None)),
+        True: AttentionForwardArgs(kv_append=SimpleNamespace(fold=object())),
+    }
+    order = (True, False) if deferred_first else (False, True)
+
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        selected = {
+            mode: manager.select(attn, q, None, None, metadata, by_mode[mode]) for mode in order
+        }
+
+    assert selected == {False: regular_fmha, True: deferred_fmha}
+    assert len(manager._cache) == 2
+
+
 @pytest.mark.parametrize("speculative_first", [False, True])
 def test_fmha_cache_separates_speculative_decoding(speculative_first: bool) -> None:
     events: list[tuple] = []

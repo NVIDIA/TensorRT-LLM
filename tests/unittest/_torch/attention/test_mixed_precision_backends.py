@@ -131,9 +131,11 @@ def test_optimized_two_pool_prefill_and_decode(
         quant_config=quant_config,
         sparse_attn_hooks=None,
         register_to_config=False,
+        use_gqa_decode_fmha=False,
         _use_quantize_output=lambda: False,
     )
     module._attn_impl = partial(Attention._attn_impl, module)
+    module._use_custom_inplace_op = partial(Attention._use_custom_inplace_op, module)
     decode_graph = None
     native_output = None
 

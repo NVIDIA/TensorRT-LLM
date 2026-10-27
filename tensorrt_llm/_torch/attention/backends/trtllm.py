@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from ...model_config import ModelConfig
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
+    from .fmha.gqa_decode import GqaDecodeFmha, GqaDecodeSetup
     from .sparse.dsa.metadata import TokenMajorGenView
 
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
@@ -129,6 +130,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
     workspace_reclaimable: bool = field(default=True, init=False)
+    # batch_block_table_key of the target / draft KV cache manager at the last
+    # block-offset copy of prepare_steady_decode_step; prepare() clears them.
+    _steady_block_table_keys: tuple = field(default=(None, None),
+                                            init=False,
+                                            repr=False,
+                                            compare=False)
 
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
@@ -987,6 +994,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         super().prepare()
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self._invalidate_mla_scheduler_buffers()
+        self._steady_block_table_keys = (None, None)
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
         if extra_attrs is None:
@@ -1239,6 +1247,69 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             kv_lens=kv_lens,
             prompt_lens_cuda=self.prompt_lens_cuda[:num_seqs],
             prompt_lens_cpu=prompt_lens,
+            host_request_types=self.host_request_types[:num_seqs],
+        )
+
+    @property
+    def supports_steady_decode_step(self) -> bool:
+        """Whether prepare_steady_decode_step may stand in for this metadata's prepare(): no host state of
+        prepare() beyond the KV lengths and block offsets (no FlashMLA, helix, cached-KV context MLA, FP4 MLA,
+        mixed-precision KV or full generation page table) and prepare() is this class's."""
+        return (type(self).prepare is TrtllmAttentionMetadata.prepare
+                and self.kv_cache_manager is not None
+                and not self.enable_flash_mla and not self.enable_helix
+                and not self.enable_context_mla_with_cached_kv
+                and self.fp4_mla_state is None
+                and not self._has_mixed_precision_kv()
+                and not self.kv_cache_params.use_full_generation_page_table)
+
+    def prepare_steady_decode_step(self, kv_lens: List[int]) -> None:
+        """prepare() of a generation-only step that runs the batch of the previous prepare() one step later.
+
+        Requires supports_steady_decode_step and the same requests, prompt lengths, request types and beam width
+        as that prepare(); kv_lens_cuda[:num_seqs] already holds the new lengths on the device. Sets the host
+        state that follows from ``kv_lens`` (KV lengths without the extra speculative tokens) and copies the
+        block offsets of a KV cache manager only when its batch_block_table_key changed. Speculative decoding
+        copies the full table width (max_blocks None), as prepare() does.
+        """
+        AttentionMetadata.prepare(self)
+        self._invalidate_mla_scheduler_buffers()
+        if get_model_extra_attrs() is None:
+            get_global_attrs().attention_metadata = weakref.ref(self)
+        num_seqs = self.num_seqs
+        assert len(kv_lens) == num_seqs and self.num_contexts == 0
+        num_extra_kv_tokens = self.kv_cache_params.num_extra_kv_tokens
+        host_kv_lens = torch.tensor(kv_lens, dtype=torch.int)
+        self.kv_lens[:num_seqs].copy_(host_kv_lens + num_extra_kv_tokens)
+        self.host_total_kv_lens[0] = 0
+        self.host_total_kv_lens[1] = sum(kv_lens)
+        max_kv_len = max(kv_lens) + num_extra_kv_tokens
+        assert max_kv_len <= self.kv_cache_manager.max_seq_len, (
+            f"The max KV cache length of input sequences ({max_kv_len}) "
+            f"exceeds the KV cache manager's maximum supported length "
+            f"({self.kv_cache_manager.max_seq_len}).")
+        keys = []
+        for manager, block_offsets, last_key in zip(
+            (self.kv_cache_manager, self.draft_kv_cache_manager),
+            (self.kv_cache_block_offsets, self.draft_kv_cache_block_offsets),
+                self._steady_block_table_keys):
+            key = None
+            if manager is not None:
+                key = manager.batch_block_table_key(self.request_ids)
+                if key is None or key != last_key:
+                    manager.copy_batch_block_offsets(block_offsets,
+                                                     self.request_ids,
+                                                     self.beam_width,
+                                                     self.num_contexts,
+                                                     num_seqs,
+                                                     max_blocks=None)
+            keys.append(key)
+        self._steady_block_table_keys = tuple(keys)
+        self._bind_runtime_views(
+            kv_lens_cuda=self.kv_lens_cuda[:num_seqs],
+            kv_lens=host_kv_lens,
+            prompt_lens_cuda=self.prompt_lens_cuda[:num_seqs],
+            prompt_lens_cpu=self.prompt_lens_cpu[:num_seqs],
             host_request_types=self.host_request_types[:num_seqs],
         )
 
@@ -1724,6 +1795,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         sparse_params: Optional[SparseParams] = None,
         kv_cache_dtype: str = "auto",
         skip_correction_threshold: float = 0.0,
+        gqa_decode: Optional["GqaDecodeSetup"] = None,
         **kwargs,
     ) -> None:
         """
@@ -1748,6 +1820,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 used by DeepSeek-V4 and DSA on SM120/SM121.
             skip_correction_threshold (float): Runtime MLA threshold. Zero disables
                 skip-correction.
+            gqa_decode (GqaDecodeSetup): Enables the GQA decode FMHA library
+                (fmha/gqa_decode.py) for this layer.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
@@ -1820,6 +1894,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self.local_layer_idx: Optional[int] = None
         self._fmha_manager: FmhaManager
+        self.gqa_decode = gqa_decode
+        # A GQA decode library of this layer, which plans the module's KV append and deferred prologue (set with
+        # the FMHA manager).
+        self.gqa_decode_fmha: Optional["GqaDecodeFmha"] = None
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
@@ -1849,6 +1927,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.has_w4a8_nvfp4_fp8 = self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
             )
         self._fmha_manager = FmhaManager(self)
+        from .fmha.gqa_decode import GqaDecodeFmha
+        self.gqa_decode_fmha = next((fmha
+                                     for fmha in self._fmha_manager.fmha_libs
+                                     if isinstance(fmha, GqaDecodeFmha)), None)
 
     @classmethod
     def runtime_workspace_bytes_per_token(cls, model_config: "ModelConfig",
