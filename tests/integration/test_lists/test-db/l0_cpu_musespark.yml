@@ -18,3 +18,8 @@ l0_cpu_musespark:
   - unittest/llmapi/apps/test_musespark_serve_extensions.py
   # Picked up on l0_cpu through the unittest/_torch/modeling directory entry.
   - unittest/_torch/modeling/test_modeling_musespark_open_preprocess.py
+  # DWDP for MuseSparkOpen context workers: the TCPStore rendezvous, the
+  # manager that uses it, and the setup's decoder and MoE lookups.
+  - unittest/_torch/modules/dwdp/test_dwdp_rendezvous.py
+  - unittest/_torch/modules/dwdp/test_dwdp_manager.py
+  - unittest/_torch/modules/dwdp/test_dwdp_model_lookup.py

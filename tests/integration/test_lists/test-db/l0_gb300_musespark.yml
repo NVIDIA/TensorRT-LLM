@@ -38,3 +38,8 @@ l0_gb300_musespark:
   - unittest/_torch/modeling/test_musespark_open_moe_prepare_overlap.py
   - unittest/_torch/modeling/test_musespark_open_fusion_switches.py
   - unittest/_torch/modeling/test_musespark_open_finalize_local.py
+  # MuseSparkOpen MoE under DWDP (CPU stubs; imports the modeling module).
+  - unittest/_torch/modeling/test_musespark_open_dwdp.py
+  # CuteDSL's unfinalized NVFP4 triple (the MuseSparkOpen per-expert norm input) against
+  # its in-kernel finalize, under DEP4 with the finalize run before the combine.
+  - unittest/_torch/moe/test_moe_module.py::test_unfinalized_combine_fn_matches_in_kernel_finalize_multi_gpu[CUTEDSL]
