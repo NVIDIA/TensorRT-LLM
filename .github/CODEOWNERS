@@ -402,6 +402,81 @@
 /tests/unittest/dynamo/ @NVIDIA/trt-llm-dynamo-devs
 /triton_backend @NVIDIA/trt-llm-triton-backend-devs
 
+# ===== FILE-LEVEL OWNERSHIP EXCEPTIONS =====
+# Files whose owners differ from those the directory rules above give them.
+# Each line overrides those rules, so this section must stay below them;
+# files added to these directories later follow the directory rules.
+/cpp/tensorrt_llm/kernels/moe/cuteDsl/CMakeLists.txt @NVIDIA/trt-llm-kernels-devs
+/cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_lora_grouped_gemm.h @NVIDIA/trt-llm-kernels-devs
+/cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_lora_pointer_expand.h @NVIDIA/trt-llm-kernels-devs
+/cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_lora_problem_builder.h @NVIDIA/trt-llm-kernels-devs
+/cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_lora_slot_expand.h @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/blockScaleMoeActivationTest.cu @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/blockScaleMoeFinalizeTest.cu @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/fusedMoeCommKernelTest.cpp @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/mixtureOfExpertsTest.cu @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/moeLoadBalanceKernelTest.cpp @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/moeLoraPointerExpandTest.cu @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/moeLoraProblemBuilderTest.cu @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/moeLoraSlotExpandTest.cu @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/routing/routingCustomTest.cpp @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/routing/routingDeepSeekTest.cpp @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/routing/routingLlama4Test.cpp @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/routing/routingTest.cpp @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/routing/routingTest.h @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/__init__.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/dspark/attention.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/dspark/attention_kernel.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/dspark_rmsnorm_rope.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/mla/__init__.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp16.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp8.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_helpers.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/__init__.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/clc_tile_scheduler.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/kernel.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/blackwell/blockscaled_contiguous_grouped_gemm.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/blackwell/blockscaled_contiguous_grouped_gemm_swiglu_fusion.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/custom_pipeline.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/inline_ptx.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/manual_mma_128dp.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_gather_grouped_gemm_swiglu_fusion.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_grouped_blockscaled_gemm_finalize_fusion.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_grouped_gemm_finalize_fusion.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/utils.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/__init__.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/dense_blockscaled_implicit_gemm_fprop.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/dense_gemm_persistent_dynamic.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/dense_gemm_persistent_dynamic_preferred_cluster.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/dense_implicit_gemm_fprop.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/pertoken_adaln/__init__.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/pertoken_adaln/pertoken_adaln.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/pertoken_adaln/reduce.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/executor/ray/stub.py @NVIDIA/trt-llm-devs
+/tensorrt_llm/executor/ray/utils.py @NVIDIA/trt-llm-devs
+/tests/unittest/_torch/disaggregation/fake_kv_cache_transceiver.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/disaggregation/test_async_transfer_manager.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/disaggregation/test_kv_cache_transceiver_contract.py @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/disaggregation/test_kv_cache_transceiver_creation.py @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul_fp4_quant.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/kernels/fused_ops/test_rmsnorm_fp4_quant.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/kernels/fused_ops/test_rmsnorm_residual_add.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/kernels/test_custom_pipeline.py @NVIDIA/trt-llm-devs
+/tests/unittest/_torch/moe/test_ep_group_health.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/pyexecutor/kv_cache/test_kv_block_offset_overlap_race.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/pyexecutor/kv_cache/test_kv_cache_manager_v2_device_page_table.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/pyexecutor/kv_cache/test_kv_connector_v2_prefix.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/pyexecutor/kv_cache/test_kv_connector_v2_prefix_real_manager.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/pyexecutor/kv_cache/test_kvv2_host_tier_sizing.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/pyexecutor/kv_cache/test_per_layer_head_dim.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/visual_gen/kernels/parallel/test_fused_dit_gate_resid_norm_shift_scale.py @NVIDIA/trt-llm-kernels-devs
+/tests/unittest/_torch/visual_gen/kernels/parallel/test_fused_dit_layernorm_shift_scale.py @NVIDIA/trt-llm-kernels-devs
+/tests/unittest/_torch/visual_gen/kernels/test_nvfp4_conv3d.py @NVIDIA/trt-llm-devs
+
 # ===== DISAGG BLAST-RADIUS CO-OWNS (Tier-1) =====
 # Last-match cross-cutting: adds disagg-devs to shared files that can silently break disagg e2e.
 /tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs @NVIDIA/trt-llm-disagg-devs
