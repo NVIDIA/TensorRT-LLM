@@ -4,11 +4,15 @@
 
 * ``dflash_window_attention`` and ``dflash_window_attention_wide`` (at each device's split
   geometry) over pages are bitwise their dense calls, the appended block included.
+* ``context_kv_fork``'s commit empties the dummy slot, as the worker's own commit does.
 """
 
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.kernels.context_kv_fork import (  # noqa: E501
+    fork as context_kv_fork,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.spec import (  # noqa: E501
     dflash_window_attention_wide as wide_ops,
 )
@@ -16,6 +20,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_sp
     WINDOW,
     dflash_window_attention,
 )
+from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 
 __extra_import_path__ = ["../../.."]
 from _validating import validating  # noqa: E402 — needs the path declared above
@@ -62,3 +67,27 @@ def test_the_window_ops_over_pages_are_their_dense_calls(sms, append, monkeypatc
     assert torch.equal(paged, dense)
     # The blocks went to the requests' pages as to their slots, and nothing else moved.
     assert torch.equal(k_pages[rows], k_arena) and torch.equal(v_pages[rows], v_arena)
+
+
+@pytest.mark.parametrize("windowed", [False, True], ids=["dense", "sm107_windowed_commit"])
+def test_the_fork_commit_empties_the_dummy_slot(windowed):
+    """The dummy slot, which CUDA-graph padding rows share, is empty after the commit, the DFlash
+    worker's rule: over the dense arena, and after the sm107 windowed commit's own launch."""
+    worker = object.__new__(DFlashWorker)
+    worker._ctx_k_buf = torch.zeros(4, 5, 64, 1, 128, dtype=torch.bfloat16, device="cuda")
+    worker._ctx_v_buf = torch.zeros_like(worker._ctx_k_buf)
+    worker._ctx_len = torch.tensor([5, 0, 0, 6], device="cuda")
+    # A windowed arena without drafter_window_compact: each slot starts at a base.
+    worker._ctx_base = torch.tensor([2, 0, 0, 3], device="cuda") if windowed else None
+    worker._ctx_keep, worker._max_ctx, worker._dummy_slot = (48 if windowed else 0), 64, 3
+    worker._ctx_paged, worker._ctx_block_tables = False, None
+    fork = context_kv_fork.ContextKvFork(worker, None, context_kv_fork.POINT)
+    main = torch.cuda.current_stream()
+    launched = context_kv_fork.Launched(main, None, 2, 7, context_kv_fork.POINT, None)
+    # A request on slot 0 accepts 3 rows, a padding row on the dummy slot 8.
+    accepted = torch.tensor([3, 8], dtype=torch.int32, device="cuda")
+    num_ctx = fork.commit(launched, torch.tensor([0, 3], device="cuda"), accepted)
+    fork.join(launched)
+    assert worker._ctx_len.tolist() == [8, 0, 0, 0]
+    # The lengths the drafter attends: physical over the windowed arena.
+    assert num_ctx.tolist() == ([6, 0] if windowed else [8, 0])
