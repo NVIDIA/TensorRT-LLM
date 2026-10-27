@@ -2462,9 +2462,11 @@ def test_v2_hybrid_fp4_sizing_counts_hp_page_for_snapshot_lineage() -> None:
     assert with_hp_page[1] - without_hp_page[1] == 2 * 7
 
 
-def _fp4_mla_hybrid_manager_stub() -> MambaHybridCacheManagerV2:
+def _fp4_mla_hybrid_manager_stub(
+    manager_cls: type[MambaHybridCacheManagerV2] = MambaHybridCacheManagerV2,
+) -> MambaHybridCacheManagerV2:
     """A hybrid V2 manager with KDA layers 0 and 2 and MLA layers 1 and 3."""
-    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr = object.__new__(manager_cls)
     mgr.pp_layers = [0, 1, 2, 3]
     mgr.layer_offsets = {layer: layer for layer in mgr.pp_layers}
     mgr._mamba_layer_mask = [True, False, True, False]
@@ -2571,11 +2573,14 @@ def test_v2_hybrid_composes_fp8_fallback_with_fp4_mla_and_ssm_layers(
     assert mgr.get_kv_cache_dtype(3) == DataType.FP8
 
 
-def _fp4_mla_hybrid_with_fp8_fallback(monkeypatch: pytest.MonkeyPatch):
+def _fp4_mla_hybrid_with_fp8_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    manager_cls: type[MambaHybridCacheManagerV2] = MambaHybridCacheManagerV2,
+):
     """KDA layers 0 and 2, FP4 MLA layer 1, FP8-fallback MLA layer 3."""
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "3")
-    mgr = _fp4_mla_hybrid_manager_stub()
+    mgr = _fp4_mla_hybrid_manager_stub(manager_cls)
     _configure_fp4_mla_hybrid(
         mgr,
         SimpleNamespace(
@@ -2627,9 +2632,13 @@ def test_v2_hybrid_without_fp4_mla_keeps_its_disagg_role_mapping() -> None:
 def test_v2_hybrid_fp4_disagg_ignores_derived_mla_and_kda_replay_roles(
     monkeypatch: pytest.MonkeyPatch, kda_replay: bool
 ) -> None:
-    mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch)
-    replay_layout = {"kda_conv_q": (torch.bfloat16, [1])} if kda_replay else {}
-    mgr._kda_replay_layout = lambda: replay_layout
+    mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch, KimiK3HybridCacheManager)
+    mgr._state_layout = None
+    mgr._kda_replay = (
+        SimpleNamespace(disagg_ignored_roles=lambda _: frozenset({DataRole("kda_conv_q")}))
+        if kda_replay
+        else None
+    )
 
     ignored = mgr.get_disagg_ignored_roles()
 
@@ -2780,10 +2789,10 @@ def test_v2_hybrid_fp4_disagg_page_table_covers_every_role(
 def test_v2_hybrid_fp4_mla_snapshot_realignment_logs_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tensorrt_llm._torch.pyexecutor.kv_cache import mamba_cache_manager
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import mamba_cache_manager_v2
 
     messages = []
-    monkeypatch.setattr(mamba_cache_manager.logger, "info", messages.append)
+    monkeypatch.setattr(mamba_cache_manager_v2.logger, "info", messages.append)
     mgr = SimpleNamespace(
         _attention_cache_layout_policy=object(),
         tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
@@ -2903,10 +2912,10 @@ def test_v2_hybrid_fp4_invalid_iterator_scans_physical_pools() -> None:
     mgr._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy
     mgr._iter_fp4_mla_physical_pool_views = MagicMock(return_value=iter((physical,)))
     mgr.get_fp4_mla_hp_pool = MagicMock()
-    mgr.all_ssm_states = [ssm]
-    mgr.all_conv_states = [conv]
-    mgr._ple_ngram_contexts = {}
-    mgr._ple_conv_states = {}
+    mgr._recurrent_buffers = {
+        (0, MambaRole.SSM_STATE): ssm,
+        (0, MambaRole.CONV_STATE): conv,
+    }
 
     views = list(MambaHybridCacheManagerV2._iter_cache_buffers_for_invalid_check(mgr))
 
