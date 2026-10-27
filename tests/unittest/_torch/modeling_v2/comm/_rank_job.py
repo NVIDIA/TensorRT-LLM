@@ -95,13 +95,22 @@ def run(entry: str, world_size: int = WORLD_SIZE) -> None:
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices(world_size))
 
     # The ranks import tensorrt_llm absolutely, and a source checkout is not
-    # necessarily installed. tests/unittest/_torch/modeling_v2/comm -> repo root.
+    # necessarily installed. Hand them the checkout only when it is the
+    # tensorrt_llm this process resolves (an in-tree build, or nothing
+    # installed). Otherwise the installed package is already on their path,
+    # and the checkout must not come first: CI runs from an unbuilt checkout,
+    # whose tensorrt_llm/ has no compiled bindings, beside an installed wheel.
+    # tests/unittest/_torch/modeling_v2/comm -> repo root.
     repo_root = Path(__file__).resolve().parents[5]
-    assert (repo_root / "tensorrt_llm").is_dir(), (
-        f"expected the repo root at {repo_root}, found no tensorrt_llm/ there; "
-        f"this file moved without its parents[] index following"
-    )
-    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(repo_root), env.get("PYTHONPATH", "")) if p)
+    installed = importlib.util.find_spec("tensorrt_llm")
+    if installed is None or Path(installed.origin).resolve().parents[1] == repo_root:
+        assert (repo_root / "tensorrt_llm").is_dir(), (
+            f"expected the repo root at {repo_root}, found no tensorrt_llm/ there; "
+            f"this file moved without its parents[] index following"
+        )
+        env["PYTHONPATH"] = os.pathsep.join(
+            p for p in (str(repo_root), env.get("PYTHONPATH", "")) if p
+        )
 
     # Read the budget off the entry rather than restating it: an entry that
     # raises its own deadline would otherwise be killed by this one first,

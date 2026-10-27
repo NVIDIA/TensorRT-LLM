@@ -70,6 +70,8 @@ def _factory_model_engine(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         mapping=SimpleNamespace(has_cp_helix=lambda: helix),
+        cuda_graph_batch_sizes=[],
+        cuda_graph_padding_enabled=False,
         spec_config=None,
         model=SimpleNamespace(
             model_config=SimpleNamespace(

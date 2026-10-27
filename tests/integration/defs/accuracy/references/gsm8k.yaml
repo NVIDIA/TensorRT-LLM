@@ -320,6 +320,16 @@ Qwen/Qwen3.8-Flash-Next:
     kv_cache_quant_algo: NVFP4
     spec_dec_algo: MTP
     accuracy: 95.26
+  # FP8 KV cache, measured on the built-in implementation: TEP4 on GB300, no MTP,
+  # TRTLLM MoE, bf16 Mamba SSM cache.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 95.49
+  # NVFP4 KV cache, measured on the built-in implementation: ADP4 on GB300, no MTP,
+  # TRTLLM MoE, bf16 Mamba SSM cache.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: NVFP4
+    accuracy: 96.02
 moonshotai/Kimi-K2.5:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
