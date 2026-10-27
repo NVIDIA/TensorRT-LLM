@@ -269,6 +269,14 @@ class DisaggTransferCoordinator:
         *,
         current_time: float | None = None,
     ) -> None:
+        """Report and flag an expired transfer without restarting its clock.
+
+        Args:
+            request: Request checked against its existing transfer start time.
+            kind: Context or generation label used in the warning.
+            timeout_ms: Existing executor transfer timeout budget.
+            current_time: Shared sweep timestamp, or None to sample per request.
+        """
         if request.py_kv_transfer_start_time is None:
             return
         if current_time is None:

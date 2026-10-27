@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Deadline arbitration tests; no backend or GPU is needed to advance the clock."""
 
+import re
 import threading
 from functools import partial
 from types import SimpleNamespace
@@ -699,7 +700,7 @@ def test_timeout_progress_reports_mixed_sender_phases_without_advancing_deadline
         "backend_done",
         "in_doubt",
     ):
-        assert f"{phase}=1" in description
+        assert re.search(rf"(?:\[|,){phase}=1(?:,|\])", description), description
     assert "source_pieces=1" in description
     assert "unavailable_tasks=0" in description
     assert before == snapshot_state()
@@ -725,7 +726,8 @@ def test_timeout_progress_reports_publication_not_remote_submission() -> None:
     )
     owner = task._physical_owner
     assert owner is not None
-    owner.record_writer_result(1, True, wait_for_local_completion=True)
+    owner.record_writer_result(1, True)
+    owner.record_writer_in_doubt(2)
 
     def snapshot_state() -> tuple[object, ...]:
         return (
@@ -733,6 +735,7 @@ def test_timeout_progress_reports_publication_not_remote_submission() -> None:
             dict(session._retirement._claims),
             session._logical_outcomes._terminal,
             dict(owner._writer_results),
+            set(owner._in_doubt_writers),
         )
 
     before = snapshot_state()
@@ -745,7 +748,7 @@ def test_timeout_progress_reports_publication_not_remote_submission() -> None:
     assert "publication_may_have_escaped=True" in description
     assert "expected_writer_results=4" in description  # KV and AUX each need two writers.
     assert "received_writer_results=1" in description
-    assert "local_completion_pending=0" in description
+    assert "in_doubt_writers=1" in description
     assert before == snapshot_state()
     clock.assert_not_called()
 

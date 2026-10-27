@@ -32,6 +32,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     GenTransferStatus,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import (
+    RxSession,
     TaskStatus,
     TransferWorker,
     TransferWorkerConfig,
@@ -41,6 +42,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
 
 @dataclass
@@ -316,11 +318,26 @@ def test_context_transfer_status_timeout_retains_session_and_request(monkeypatch
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("context", [False, True])
 def test_timeout_description_selects_local_session_without_polling(context: bool) -> None:
     """Executor timeout attribution uses native session data only when available."""
-    session = _make_tx_session([])
-    session._timeout_progress_description = Mock(return_value="progress_at_observation=tx")
+    session = (
+        _make_tx_session([])
+        if context
+        else RxSession(
+            request_id=16,
+            params=DisaggregatedParams(disagg_request_id=16),
+            receiver=SimpleNamespace(
+                _enforce_physical_ownership=False,
+                setup_session=Mock(),
+                clear_session=Mock(),
+            ),
+        )
+    )
+    progress = f"progress_at_observation={'tx' if context else 'rx'}"
+    session._timeout_progress_description = Mock(return_value=progress)
+    session.wait_complete = Mock(side_effect=AssertionError("timeout description must not poll"))
     transceiver = _make_transceiver({16: session} if context else {})
     transceiver._recv_sessions = {} if context else {16: session}
     req = SimpleNamespace(
@@ -329,14 +346,16 @@ def test_timeout_description_selects_local_session_without_polling(context: bool
         py_disaggregated_params=None,
         is_context_only_request=context,
     )
-    assert transceiver._describe_transfer_timeout(req) == "progress_at_observation=tx"
+    assert transceiver._describe_transfer_timeout(req) == progress
     session._timeout_progress_description.assert_called_once_with()
     transceiver._send_sessions.clear()
     transceiver._recv_sessions.clear()
     assert "unavailable(session_not_found)" in transceiver._describe_transfer_timeout(req)
+    session.wait_complete.assert_not_called()
     assert session.close()
 
 
+@pytest.mark.cpu_only
 def test_context_timeout_snapshot_failure_does_not_release_session(monkeypatch) -> None:
     session = _make_tx_session([_FakeTask(TaskStatus.TRANSFERRING)])
     session._base_args = SimpleNamespace(params=SimpleNamespace(disagg_request_id=16))

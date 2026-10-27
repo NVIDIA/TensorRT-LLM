@@ -3351,7 +3351,6 @@ class RxSession(RxSessionBase):
                 "expected_writer_results",
                 "received_writer_results",
                 "in_doubt_writers",
-                "local_completion_pending",
                 "unavailable_owners",
             ),
             0,
@@ -3369,7 +3368,6 @@ class RxSession(RxSessionBase):
                 counts["expected_writer_results"] += owner._expected_writers or 0
                 counts["received_writer_results"] += len(owner._writer_results)
                 counts["in_doubt_writers"] += len(owner._in_doubt_writers)
-                counts["local_completion_pending"] += owner._local_completion_pending
             finally:
                 owner._lock.release()
         phases = ",".join(f"{name}={count}" for name, count in counts.items())
