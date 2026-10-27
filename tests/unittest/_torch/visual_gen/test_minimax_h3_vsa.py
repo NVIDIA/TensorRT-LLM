@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.vsa import (
     build_h3_vsa_metadata,
     h3_vsa_attention,

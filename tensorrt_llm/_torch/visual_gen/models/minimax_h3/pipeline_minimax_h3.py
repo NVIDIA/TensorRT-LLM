@@ -17,10 +17,12 @@
 
 """TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA and Ref2VA checkpoints."""
 
+import json
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from io import BytesIO
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
@@ -370,9 +372,7 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     @property
     def default_generation_params(self) -> dict:
-        fastvideo_inference = getattr(self.pipeline_config, "extra_attrs", {}).get(
-            "fastvideo_inference", {}
-        )
+        fastvideo_inference = getattr(self, "_fastvideo_inference", {})
         return {
             # MiniMax-H3 derives the default canvas from the first present
             # keyframe, or from 16:9 for T2VA.
@@ -505,6 +505,14 @@ class MiniMaxH3Pipeline(BasePipeline):
     ) -> None:
         del kwargs
         skip_components = skip_components or []
+
+        self._fastvideo_inference = {}
+        fastvideo_inference_path = Path(checkpoint_dir) / "fastvideo_inference.json"
+        if fastvideo_inference_path.exists():
+            with fastvideo_inference_path.open() as f:
+                fastvideo_inference = json.load(f)
+            if str(fastvideo_inference.get("schema_version", "")).startswith("fasth3-"):
+                self._fastvideo_inference = fastvideo_inference
 
         if not _component_skipped(skip_components, PipelineComponent.TOKENIZER):
             self.tokenizer = Qwen2TokenizerFast.from_pretrained(

@@ -950,11 +950,26 @@ def test_default_generation_steps_match_reference_app() -> None:
     assert pipeline.default_generation_params["num_inference_steps"] == 28
 
 
-def test_fasth3_generation_steps_follow_inference_contract() -> None:
+@pytest.mark.parametrize(
+    "manifest, expected_steps",
+    [
+        (None, 28),
+        ({"schema_version": "fasth3-inference-contract-v1", "num_inference_steps": 5}, 5),
+        ({"schema_version": "fasth3-inference-contract-v1"}, 28),
+        ({"schema_version": "other-model-v1", "num_inference_steps": 5}, 28),
+    ],
+)
+def test_fasth3_generation_steps_follow_inference_contract(
+    tmp_path: Path, manifest: dict | None, expected_steps: int
+) -> None:
+    if manifest is not None:
+        (tmp_path / "fastvideo_inference.json").write_text(json.dumps(manifest))
     pipeline = _SyntheticMiniMaxH3Pipeline()
-    pipeline.pipeline_config.extra_attrs = {"fastvideo_inference": {"num_inference_steps": 5}}
+    pipeline.load_standard_components(
+        str(tmp_path), torch.device("cpu"), skip_components=list(PipelineComponent)
+    )
 
-    assert pipeline.default_generation_params["num_inference_steps"] == 5
+    assert pipeline.default_generation_params["num_inference_steps"] == expected_steps
 
 
 def test_hf_download_is_scoped_to_the_supported_h3_components(
@@ -1046,7 +1061,13 @@ def test_fasth3_manifest_metadata_controls_pipeline_defaults(tmp_path: Path) -> 
 
     config = DiffusionPipelineConfig.from_pretrained(str(tmp_path))
 
-    assert config.extra_attrs["fastvideo_inference"]["num_inference_steps"] == 5
+    assert "fastvideo_inference" not in config.extra_attrs
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.pipeline_config = config
+    pipeline.load_standard_components(
+        str(tmp_path), torch.device("cpu"), skip_components=list(PipelineComponent)
+    )
+    assert pipeline.default_generation_params["num_inference_steps"] == 5
 
 
 def test_infer_supports_a_last_frame_without_a_first_frame(

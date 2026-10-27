@@ -183,8 +183,9 @@ are not supported. See the
 - FastH3 uses the MiniMax-H3 pipeline and transformer architecture with a
   distilled 4-step checkpoint. Dense attention and model-specific VSA are supported.
   For single-GPU text-to-video with audio, enable VSA using
-  `fasth3-bf16-trtllm-vsa-1gpu.yaml` or `fasth3-bf16-cutedsl-vsa-1gpu.yaml`.
-  Both preserve the trained compression gate and dense text/audio routes.
+  `fasth3-bf16-trtllm-vsa-1gpu.yaml`. To use CUTEDSL instead, set
+  `attention_config.backend: CUTEDSL` in that config.
+  Both backends preserve the trained compression gate and dense text/audio routes.
   CUTEDSL VSA requires supported Blackwell hardware and at most 4096 tiles;
   unsupported shapes fail explicitly rather than silently running dense attention.
 - Text-to-video (T2VA), first/last-frame-to-video (FL2VA), and reference-to-video
