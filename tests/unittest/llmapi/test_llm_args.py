@@ -1355,7 +1355,7 @@ class TestModelDefaults:
     def test_model_defaults_preserve_private_transceiver_key(self, key):
         config = CacheTransceiverConfig(backend="NIXL",
                                         transceiver_runtime="PYTHON")
-        config._rank_info_auth_key = key
+        config._native_auth_key = key
         args = TorchLlmArgs(model="/tmp/dummy_model",
                             cache_transceiver_config=config)
 
@@ -1363,10 +1363,10 @@ class TestModelDefaults:
             args, {"enable_chunked_prefill": False})
 
         assert applied == {"enable_chunked_prefill": False}
-        assert args.cache_transceiver_config._rank_info_auth_key == key
+        assert args.cache_transceiver_config._native_auth_key == key
         assert args.cache_transceiver_config.backend == "NIXL"
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
-        assert "_rank_info_auth_key" not in args.model_dump(
+        assert "_native_auth_key" not in args.model_dump(
         )["cache_transceiver_config"]
 
     def test_compute_applied_llm_defaults_simple_field(self):

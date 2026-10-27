@@ -6658,7 +6658,7 @@ _CACHE_TRANSCEIVER_BACKEND_ENV_VARS = (
 class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     """Configuration for the cache transceiver."""
 
-    _rank_info_auth_key: Optional[bytes] = PrivateAttr(default=None)
+    _native_auth_key: Optional[bytes] = PrivateAttr(default=None)
 
     backend: Optional[Literal[
         "DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI"]] = Field(

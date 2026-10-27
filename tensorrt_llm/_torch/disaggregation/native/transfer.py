@@ -74,7 +74,12 @@ from tensorrt_llm._torch.disaggregation.native.context_first_profile import (
     validate_context_first_peer,
 )
 from tensorrt_llm._torch.disaggregation.native.extent import Chunk
-from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
+from tensorrt_llm._torch.disaggregation.native.messenger import (
+    FrameAuthenticationError,
+    FrameSigner,
+    ZMQMessenger,
+    decode_message,
+)
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
     AttentionPolicy,
     RingMapper,
@@ -127,15 +132,41 @@ _RANK_INFO_NONCE_BYTES = 32
 _RANK_INFO_AUTH_TAG_BYTES = 32
 _RANK_INFO_CHALLENGE_CACHE_SIZE = 4096
 _RANK_INFO_CHALLENGE_TTL_S = 10.0
+# Control-plane message authentication (ZMQMessenger FrameSigner).
+_NATIVE_CTL_AUTH_CONTEXT = b"trtllm-native-disagg-ctl-v1\0"
+_NATIVE_SUBKEY_CONTEXT = b"trtllm-native-auth-subkey-v1\0"
+_NATIVE_CTL_KEY_ID = 0
+_MIN_NATIVE_AUTH_KEY_BYTES = 16
 
 
-def _validate_rank_info_auth_key(key: Optional[bytes]) -> Optional[bytes]:
-    if key is not None and (not isinstance(key, bytes) or not key):
+def _validate_native_auth_key(key: Optional[bytes]) -> Optional[bytes]:
+    if key is not None and (not isinstance(key, bytes) or len(key) < _MIN_NATIVE_AUTH_KEY_BYTES):
         raise ValueError(
-            "RankInfo authentication keys must be nonempty bytes when configured; "
+            f"Native transfer authentication keys must be at least {_MIN_NATIVE_AUTH_KEY_BYTES} "
+            "bytes when configured (32 random bytes recommended, e.g. `openssl rand -hex 32`); "
             "use the same internal_request_auth_key on communicating peers"
         )
     return key
+
+
+def _derive_native_auth_key(master_key: bytes, purpose: bytes) -> bytes:
+    """Derive the key for one use of internal_request_auth_key.
+
+    Each use (RankInfo handshake, control-plane frames) gets its own key, so a
+    tag computed for one can never verify in another, independently of the
+    context strings those protocols also carry.
+    """
+    return hmac.digest(master_key, _NATIVE_SUBKEY_CONTEXT + purpose, "sha256")
+
+
+def _make_native_frame_signer(master_key: Optional[bytes]) -> Optional[FrameSigner]:
+    if master_key is None:
+        return None
+    return FrameSigner(
+        {_NATIVE_CTL_KEY_ID: _derive_native_auth_key(master_key, b"control-plane")},
+        _NATIVE_CTL_KEY_ID,
+        _NATIVE_CTL_AUTH_CONTEXT,
+    )
 
 
 class RankInfoAuthenticationError(PermissionError):
@@ -681,6 +712,9 @@ class _SessionQuiescence:
 
 
 class Sender(SenderBase):
+    # Class-level default keeps objects built with __new__ (tests) unsigned.
+    _frame_signer: Optional[FrameSigner] = None
+
     # Time-to-live for orphaned RecvReqInfo entries (seconds).
     # In gen-first ADP broadcast, non-assigned DP ranks accumulate
     # RecvReqInfo that never gets consumed.  Entries older than this
@@ -698,9 +732,11 @@ class Sender(SenderBase):
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
         context_first_ownership: bool = False,
+        frame_signer: Optional[FrameSigner] = None,
     ) -> None:
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
+        self._frame_signer = frame_signer
         self._agent = agent
         self._enforce_physical_ownership = enforce_physical_ownership
         self._context_first_ownership = context_first_ownership
@@ -708,7 +744,7 @@ class Sender(SenderBase):
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
-        self._messenger = ZMQMessenger(mode="ROUTER", signer=None)
+        self._messenger = ZMQMessenger(mode="ROUTER", signer=frame_signer)
         self._dealers = {}  # used by listener thread only (single-threaded path)
         self._thread_local = threading.local()  # per-thread DEALER cache for worker threads
         self._sessions = {}  # unique_rid -> TxSession
@@ -1024,8 +1060,17 @@ class Sender(SenderBase):
             dealers = {}
             self._thread_local.dealers = dealers
         if endpoint not in dealers:
-            dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint, signer=None)
+            dealers[endpoint] = self._new_dealer(endpoint)
         return dealers[endpoint]
+
+    def _new_dealer(self, endpoint: str) -> ZMQMessenger:
+        # Signed DEALERs speak for this Sender's ROUTER endpoint.
+        return ZMQMessenger(
+            mode="DEALER",
+            endpoint=endpoint,
+            signer=self._frame_signer,
+            identity=self._messenger.endpoint if self._frame_signer is not None else None,
+        )
 
     def _get_result_dealer(
         self, endpoint: Optional[str], *, legacy_shared: bool = False, owned: bool | None = None
@@ -2323,7 +2368,7 @@ class Sender(SenderBase):
         if endpoint is None:
             raise ValueError("Sender: peer endpoint is None; peer may not have registered yet")
         if endpoint not in self._dealers:
-            self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint, signer=None)
+            self._dealers[endpoint] = self._new_dealer(endpoint)
         return self._dealers[endpoint]
 
     def _save_peer_req_info(self, peer_transfer_req_info: RecvReqInfo):
@@ -3156,6 +3201,9 @@ class KVRecvTask(_LogicalTask):
 
 
 class Receiver(ReceiverBase):
+    # Class-level default keeps objects built with __new__ (tests) unsigned.
+    _frame_signer: Optional[FrameSigner] = None
+
     def __init__(
         self,
         peer_registrar: PeerRegistrar,
@@ -3165,14 +3213,16 @@ class Receiver(ReceiverBase):
         context_first_ownership: bool = False,
         rank_info_auth_key: Optional[bytes] = None,
         rank_info_timeout_s: float = _FALLBACK_TX_OVERALL_TIMEOUT_S,
+        frame_signer: Optional[FrameSigner] = None,
     ):
         self._registrar = peer_registrar
         self._agent = agent
         self._enforce_physical_ownership = enforce_physical_ownership
         self._context_first_ownership = context_first_ownership
         self._retirement_watchdog = retirement_watchdog
-        self._rank_info_auth_key = _validate_rank_info_auth_key(rank_info_auth_key)
+        self._rank_info_auth_key = _validate_native_auth_key(rank_info_auth_key)
         self._rank_info_timeout_s = rank_info_timeout_s
+        self._frame_signer = frame_signer
         self._dealers = {}
         self._sender_ep_instance_map = {}
         # info_endpoint -> diagnostic message for peers that failed the
@@ -3184,7 +3234,7 @@ class Receiver(ReceiverBase):
         # its failures must not poison unrelated requests to the same endpoint.
         self._context_first_incompatible_peers: dict[str, str] = {}
 
-        self._messenger = ZMQMessenger(mode="ROUTER", signer=None)
+        self._messenger = ZMQMessenger(mode="ROUTER", signer=frame_signer)
         self._sessions = {}  # unique_rid -> RxSession
         self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
         # unique_rid -> whether the peer asked, for cancels that arrive before the session exists.
@@ -3544,8 +3594,17 @@ class Receiver(ReceiverBase):
         if endpoint is None:
             raise ValueError("Receiver: peer endpoint is None; peer may not have registered yet")
         if endpoint not in self._dealers:
-            self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint, signer=None)
+            self._dealers[endpoint] = self._new_dealer(endpoint)
         return self._dealers[endpoint]
+
+    def _new_dealer(self, endpoint: str) -> ZMQMessenger:
+        # Signed DEALERs speak for this Receiver's ROUTER endpoint.
+        return ZMQMessenger(
+            mode="DEALER",
+            endpoint=endpoint,
+            signer=self._frame_signer,
+            identity=self._messenger.endpoint if self._frame_signer is not None else None,
+        )
 
     def _get_sender_info(self, params: DisaggregatedParams) -> RankInfo:
         info_endpoint = self._extract_info_endpoint(params)
@@ -3555,7 +3614,7 @@ class Receiver(ReceiverBase):
             raise PeerIncompatibleError(self._incompatible_peers[info_endpoint])
         if self._should_register_peer(params):
             logger.info(f"Registering peer in first request to endpoint '{info_endpoint}'")
-            messenger = ZMQMessenger(mode="DEALER", endpoint=info_endpoint, signer=None)
+            messenger = self._new_dealer(info_endpoint)
             deadline = time.monotonic() + self._rank_info_timeout_s
             try:
                 messenger.send([MessageType.REQUEST_INSTANCE_INFO])
@@ -3604,8 +3663,16 @@ class Receiver(ReceiverBase):
                             "retry the request and verify matching internal_request_auth_key values"
                         )
             except TimeoutError as error:
+                # A peer that signs control messages drops unsigned ones (and
+                # the reverse), so a key mismatch can also surface as a timeout.
                 raise RankInfoAuthenticationError(
-                    "RankInfo exchange timed out; retry the request and verify peer availability"
+                    "RankInfo exchange timed out; retry the request and verify peer availability "
+                    "and that communicating peers use the same internal_request_auth_key"
+                ) from error
+            except FrameAuthenticationError as error:
+                raise RankInfoAuthenticationError(
+                    f"RankInfo reply failed control-plane authentication ({error}): configure "
+                    "the same internal_request_auth_key on communicating peers"
                 ) from error
             finally:
                 messenger.stop()
@@ -4713,16 +4780,17 @@ class RankInfoServer:
         addr: Optional[str] = None,
         port: Optional[int] = None,
         rank_info_auth_key: Optional[bytes] = None,
+        frame_signer: Optional[FrameSigner] = None,
     ):
         self._rank_info = rank_info
-        self._rank_info_auth_key = _validate_rank_info_auth_key(rank_info_auth_key)
+        self._rank_info_auth_key = _validate_native_auth_key(rank_info_auth_key)
         self._rank_info_auth_challenges: OrderedDict[bytes, tuple[bytes, float]] = OrderedDict()
         self._shutdown = False  # must be set before _start_listener() so __del__ is safe
         if addr is None and port is None:
             endpoint = f"tcp://{get_local_ip()}:*"
         else:
             endpoint = f"tcp://{addr}:{port}"
-        self._messenger = ZMQMessenger(mode="ROUTER", endpoint=endpoint, signer=None)
+        self._messenger = ZMQMessenger(mode="ROUTER", endpoint=endpoint, signer=frame_signer)
         if self._rank_info_auth_key is None:
             logger.warning(
                 "Native RankInfo authentication is disabled: internal_request_auth_key is not "
@@ -4884,7 +4952,8 @@ class TransferWorkerConfig:
     # trailing _BYTES, lowercased); dict > env > default. Ignored when
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
-    rank_info_auth_key: Optional[bytes] = field(default=None, repr=False)
+    # internal_request_auth_key as bytes; per-use keys are derived from it.
+    native_auth_key: Optional[bytes] = field(default=None, repr=False)
 
 
 class TransferWorker:
@@ -4901,7 +4970,11 @@ class TransferWorker:
                         "deadline retirement requires finite positive transfer timeouts"
                     )
             self._retirement_watchdog = RetirementWatchdog(self._on_quiescence_fatal)
-        self._rank_info_auth_key = _validate_rank_info_auth_key(config.rank_info_auth_key)
+        master_key = _validate_native_auth_key(config.native_auth_key)
+        self._rank_info_auth_key = (
+            _derive_native_auth_key(master_key, b"rank-info") if master_key is not None else None
+        )
+        self._frame_signer = _make_native_frame_signer(master_key)
         kvm = config.kv_cache_manager
         self._aux_buffer = _make_aux_buffer(
             kvm, config.max_concurrent_sessions, config.max_draft_len
@@ -5008,7 +5081,11 @@ class TransferWorker:
 
     def _setup_peer_infrastructure(self, kvm: KVCacheManagerV2):
         self._rank_info_server = (
-            RankInfoServer(self._rank_info, rank_info_auth_key=self._rank_info_auth_key)
+            RankInfoServer(
+                self._rank_info,
+                rank_info_auth_key=self._rank_info_auth_key,
+                frame_signer=self._frame_signer,
+            )
             if kvm.mapping.rank == 0
             else None
         )
@@ -5049,6 +5126,7 @@ class TransferWorker:
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
                 context_first_ownership=self._config.context_first_ownership,
+                frame_signer=self._frame_signer,
             )
             self._receiver = Receiver(
                 self._peer_registrar,
@@ -5058,6 +5136,7 @@ class TransferWorker:
                 context_first_ownership=self._config.context_first_ownership,
                 rank_info_auth_key=self._rank_info_auth_key,
                 rank_info_timeout_s=self._config.rx_timeout_s or _FALLBACK_TX_OVERALL_TIMEOUT_S,
+                frame_signer=self._frame_signer,
             )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint

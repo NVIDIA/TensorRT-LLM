@@ -634,7 +634,9 @@ def _make_receiver_for_view_validation(
 
     messengers = {}
 
-    def make_messenger(*, mode: str, endpoint: str | None = None) -> Mock:
+    def make_messenger(
+        *, mode: str, endpoint: str | None = None, signer=None, identity=None
+    ) -> Mock:
         messenger = Mock()
         messenger.endpoint = endpoint or "tcp://receiver"
         if endpoint in sender_infos:

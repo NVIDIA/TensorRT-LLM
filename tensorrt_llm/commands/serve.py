@@ -764,7 +764,7 @@ def _refuse_dense_dwdp_on_generation_servers(
                 "settings.")
 
 
-def _set_rank_info_auth_key(llm_args: dict, key: bytes) -> None:
+def _set_native_auth_key(llm_args: dict, key: bytes) -> None:
     """Provision native transfer authentication before executor workers are spawned."""
     config = llm_args.get("cache_transceiver_config")
     if config is None:
@@ -773,7 +773,7 @@ def _set_rank_info_auth_key(llm_args: dict, key: bytes) -> None:
         config = CacheTransceiverConfig(**config)
     else:
         config = config.model_copy(deep=True)
-    config._rank_info_auth_key = key
+    config._native_auth_key = key
     llm_args["cache_transceiver_config"] = config
 
 
@@ -807,8 +807,7 @@ def launch_server(
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
     if internal_disagg_auth_key is not None:
-        _set_rank_info_auth_key(llm_args,
-                                internal_disagg_auth_key.encode("utf-8"))
+        _set_native_auth_key(llm_args, internal_disagg_auth_key.encode("utf-8"))
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
     _check_context_only_settings(llm_args,
@@ -2054,8 +2053,8 @@ def serve(
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
             if internal_disagg_auth_key is not None:
-                _set_rank_info_auth_key(
-                    llm_args, internal_disagg_auth_key.encode("utf-8"))
+                _set_native_auth_key(llm_args,
+                                     internal_disagg_auth_key.encode("utf-8"))
             if grpc_protocol == "smg":
                 if find_spec("smg_grpc_proto") is None:
                     raise ConfigInputError(

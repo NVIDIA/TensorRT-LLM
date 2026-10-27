@@ -23,7 +23,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TransferWorkerConfig,
     WaitResult,
     _rank_info_auth_tag,
-    _validate_rank_info_auth_key,
+    _validate_native_auth_key,
 )
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -61,12 +61,12 @@ def test_transfer_worker_config_repr_omits_auth_key(key):
         kv_cache_manager=Mock(),
         device_id=0,
         instance_name="test-instance",
-        rank_info_auth_key=key,
+        native_auth_key=key,
     )
 
-    assert config.rank_info_auth_key == key
+    assert config.native_auth_key == key
     config_repr = repr(config)
-    assert "rank_info_auth_key" not in config_repr
+    assert "native_auth_key" not in config_repr
     if key is not None:
         assert key.decode("ascii") not in config_repr
     assert "test-instance" in config_repr
@@ -163,12 +163,12 @@ def test_receiver_rank_info_exchange(key):
     messenger.stop.assert_called_once_with()
 
 
-@pytest.mark.parametrize("key", [b"", "not-bytes"])
+@pytest.mark.parametrize("key", [b"", b"too-short", "not-bytes"])
 def test_transfer_worker_rejects_invalid_configured_key_before_native_setup(key):
     with pytest.raises(ValueError, match="internal_request_auth_key"):
         TransferWorker(
             TransferWorkerConfig(
-                kv_cache_manager=Mock(), device_id=0, instance_name="test", rank_info_auth_key=key
+                kv_cache_manager=Mock(), device_id=0, instance_name="test", native_auth_key=key
             )
         )
 
@@ -289,7 +289,7 @@ def test_server_warns_only_when_authentication_is_disabled(key):
             assert "without authentication" in warning.call_args.args[0]
         else:
             warning.assert_not_called()
-        assert _validate_rank_info_auth_key(key) == key
+        assert _validate_native_auth_key(key) == key
         server.shutdown()
 
 
