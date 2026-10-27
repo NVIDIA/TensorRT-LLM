@@ -528,6 +528,9 @@ def apply_model_defaults_to_llm_args(
     user_overrides = llm_args.model_dump(exclude_unset=True)
     base_state = llm_args.model_dump()
     merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
+    # Model defaults cannot change this config; retain its private launcher state,
+    # which is intentionally excluded from model_dump().
+    merged_state["cache_transceiver_config"] = llm_args.cache_transceiver_config
 
     new_args = llm_args.__class__(**merged_state)
 

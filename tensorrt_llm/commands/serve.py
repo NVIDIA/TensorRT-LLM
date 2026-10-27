@@ -58,7 +58,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file,
                                               validate_config_bool)
-from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          MultimodalConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -656,6 +657,19 @@ def _terminate_attached_frontends(children: list) -> None:
             child.kill()
 
 
+def _set_rank_info_auth_key(llm_args: dict, key: bytes) -> None:
+    """Provision native transfer authentication before executor workers are spawned."""
+    config = llm_args.get("cache_transceiver_config")
+    if config is None:
+        return
+    elif isinstance(config, dict):
+        config = CacheTransceiverConfig(**config)
+    else:
+        config = config.model_copy(deep=True)
+    config._rank_info_auth_key = key
+    llm_args["cache_transceiver_config"] = config
+
+
 def launch_server(
         host: str,
         port: int,
@@ -677,6 +691,9 @@ def launch_server(
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
+    if internal_disagg_auth_key is not None:
+        _set_rank_info_auth_key(llm_args,
+                                internal_disagg_auth_key.encode("utf-8"))
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
     # Same hazard the disaggregated fleet guard covers: _spawn_attached_frontends
@@ -1534,8 +1551,6 @@ def serve(
                 "allow_request_chat_template":
                 allow_request_chat_template
                 if allow_request_chat_template else None,
-                "internal_request_auth_key":
-                internal_disagg_auth_key,
                 "metadata_server_config_file":
                 metadata_server_config_file,
                 "server_role":
@@ -1549,6 +1564,9 @@ def serve(
                         f"Argument '{name}' is not supported when running in gRPC mode. "
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
+            if internal_disagg_auth_key is not None:
+                _set_rank_info_auth_key(
+                    llm_args, internal_disagg_auth_key.encode("utf-8"))
             if grpc_protocol == "smg":
                 if find_spec("smg_grpc_proto") is None:
                     raise ValueError(
