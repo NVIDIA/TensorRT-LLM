@@ -44,8 +44,7 @@ def _isolate_flashinfer_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _worker_flashinfer_env() -> tuple[str | None, str | None]:
-    mpi_session.mpi4py.MPI.COMM_WORLD.barrier()
-    return (os.environ.get(_FLASHINFER_WORKSPACE_ENV), os.environ.get(_FLASHINFER_CUBIN_ENV))
+    return os.environ.get(_FLASHINFER_WORKSPACE_ENV), os.environ.get(_FLASHINFER_CUBIN_ENV)
 
 
 def _run_worker_bootstrap(monkeypatch: pytest.MonkeyPatch, workspace_root: Path) -> None:

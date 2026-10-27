@@ -85,9 +85,8 @@ l0_a10:
   # Only files with at least one non-cpu_only test belong here: this stage runs
   # unittests with `-m not cpu_only`, and one pytest invocation is made per
   # entry, so a file whose tests are all cpu_only collects nothing and errors.
-  # The fully-cpu_only ones (test_config_database_sync, test_periodic_junit,
-  # test_prepare_dataset, test_test_to_stage_mapping) are covered by
-  # l0_cpu.yml, which lists unittest/tools as a directory.
+  # Files whose tests are all cpu_only are covered by l0_cpu.yml, which lists
+  # unittest/tools as a directory.
   - unittest/tools/test_host_profiler.py
   - unittest/tools/test_infra_dry_run_pipeline.py
   - unittest/tools/test_infra_dry_run_pytest.py
