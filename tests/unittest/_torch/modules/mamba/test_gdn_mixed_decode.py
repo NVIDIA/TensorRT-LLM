@@ -48,10 +48,17 @@ def prefill_backend(
     gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear()
 
 
+@pytest.fixture(params=["fused_conv", "cuda_conv"])
+def prefill_conv(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    fused = request.param == "fused_conv"
+    monkeypatch.setenv("TRTLLM_GDN_FUSED_CONV", "1" if fused else "0")
+    assert gdn_mixer._use_fused_prefill_conv("silu") is fused
+
+
 @pytest.mark.parametrize("prefill_lengths", [(1,), (127,), (128,), (129,), (7, 129)])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("preallocated", [False, True])
-@pytest.mark.usefixtures("prefill_backend")
+@pytest.mark.usefixtures("prefill_backend", "prefill_conv")
 def test_mixed_decode_matches_decode_only(
     prefill_lengths: tuple[int, ...], state_dtype: torch.dtype, preallocated: bool
 ) -> None:
@@ -158,3 +165,55 @@ def test_mixed_decode_matches_decode_only(
             )
             torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
             torch.testing.assert_close(actual_conv, expected_conv, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_decodes", [0, 3])
+def test_fused_prefill_conv_matches_cuda_conv(
+    monkeypatch: pytest.MonkeyPatch, num_decodes: int
+) -> None:
+    """Chunked prefill (with decode rows in a mixed batch) agrees across the two conv paths."""
+    monkeypatch.delenv("FORCE_DETERMINISTIC", raising=False)
+    torch.manual_seed(42)
+    layer = _make_layer()
+    prefill_lengths = (2, 7, 129)
+    num_prefills, num_slots = len(prefill_lengths), 8
+    prefill_length = sum(prefill_lengths)
+    num_tokens = prefill_length + num_decodes
+    projected = torch.randn(num_tokens, 3072, device="cuda", dtype=torch.bfloat16) * 0.1
+    gates = torch.randn(num_tokens, 16, device="cuda", dtype=torch.bfloat16) * 0.1
+    conv = torch.randn(num_slots, 2048, 3, device="cuda", dtype=torch.bfloat16) * 0.1
+    state = torch.randn(num_slots, 8, 128, 128, device="cuda", dtype=torch.float32) * 0.1
+    indices = torch.tensor([6, 1, 4, 3, 0, 7], device="cuda", dtype=torch.int32)
+    indices = indices[: num_prefills + num_decodes]
+    lengths = [0, *prefill_lengths, *([1] * num_decodes)]
+    positions = torch.tensor(lengths, device="cuda", dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    has_initial_states = [True, False, True] + [True] * num_decodes
+    kwargs = {
+        "a": gates[:, 8:],
+        "b": gates[:, :8],
+        "batch_size": num_prefills + num_decodes,
+        "has_initial_states": torch.tensor(has_initial_states, device="cuda"),
+        "cache_indices": indices,
+        "query_start_loc": positions,
+        "query_start_loc_long": positions.long(),
+        "num_prefill_tokens": prefill_length,
+        "num_decode_tokens": num_decodes,
+        "state_indices_p": indices[:num_prefills],
+        "state_indices_d": indices[num_prefills:],
+        "num_prefill": num_prefills,
+        "num_decodes": num_decodes,
+    }
+
+    def run(fused: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        monkeypatch.setenv("TRTLLM_GDN_FUSED_CONV", fused)
+        conv_states, ssm_states = conv.clone(), state.clone()
+        # The decode conv runs in place on the projection, so give each path its own copy.
+        out = layer.forward_extend(
+            conv_states, ssm_states, mixed_qkv=projected.clone()[:, :2048], **kwargs
+        )
+        return out, conv_states, ssm_states
+
+    (out, conv_states, ssm_states), (ref_out, ref_conv_states, ref_ssm_states) = run("1"), run("0")
+    torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(ssm_states, ref_ssm_states, rtol=1e-2, atol=1e-2)
+    assert torch.equal(conv_states, ref_conv_states)
