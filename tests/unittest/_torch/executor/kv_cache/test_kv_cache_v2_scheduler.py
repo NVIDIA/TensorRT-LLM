@@ -149,6 +149,7 @@ def sparse_offset_manager() -> KVCacheManagerV2:
         )
     manager._use_per_layer_page_tables = False
     manager._copy_batch_block_offsets_per_layer = Mock()
+    manager._page_table_materializer = Mock(uses_device_expansion=False, uses_device_staging=False)
     manager.index_mapper = Mock()
     manager.index_mapper.get_copy_index.return_value = Mock(shape=(2,))
     manager.host_kv_cache_block_offsets = Mock()
@@ -273,6 +274,7 @@ def test_dense_metadata_preparation_uses_existing_offsets() -> None:
     manager.max_copy_beam_width = 1
     manager.kv_cache_type = CacheTypeCpp.SELF
     manager._use_per_layer_page_tables = False
+    manager._page_table_materializer = Mock(uses_device_expansion=False, uses_device_staging=False)
     manager.index_mapper = Mock()
     manager.index_mapper.get_copy_index.return_value = Mock(shape=(1,))
     manager.host_kv_cache_block_offsets = Mock()
