@@ -228,7 +228,80 @@ def test_dummy_requests_never_reach_storage(forbid_connector_collectives: None) 
     batch.context_requests_last_chunk = [dummy]
     batch.generation_requests = [dummy]
     cache = MagicMock(spec=KVCacheManagerV2)
-    output_manager = KvCacheConnectorSchedulerOutputManager(enable_attention_dp=True)
+    output_manager = KvCacheConnectorSchedulerOutputManager()
+    output = output_manager.build_scheduler_output(batch, AsyncRequests({}, {}), cache)
+    assert not output.new_requests and not output.cached_requests
+    assert not output_manager.requests
+    cache.get_page_indices_by_layer_group.assert_not_called()
+
+
+def test_mock_requests_are_not_mistaken_for_dummies(forbid_connector_collectives: None) -> None:
+    """Only an explicit True marks a dummy; a mock answers every attribute truthily."""
+    manager = _manager()
+    request = MagicMock()
+    request.request_id = 5
+    manager.scheduler.request_finished.return_value = True
+    assert manager.request_finished(request, [1])
+    manager.scheduler.request_finished.assert_called_once_with(request, [1])
+
+
+@pytest.mark.parametrize(
+    "is_dummy_request,is_attention_dp_dummy",
+    [(True, False), (False, True)],
+    ids=["is_dummy_request", "is_attention_dp_dummy"],
+)
+def test_tp_manager_skips_dummy_requests(
+    is_dummy_request: bool, is_attention_dp_dummy: bool
+) -> None:
+    """Without attention DP, either dummy flag keeps a request from the connector.
+
+    The early returns sit before the leader broadcast, and every TP rank sees
+    the same flags, so no rank enters a collective the others skip.
+    """
+    worker, scheduler = MagicMock(), MagicMock()
+    dummy = _request(999)
+    dummy.is_dummy_request = is_dummy_request
+    dummy.is_attention_dp_dummy = is_attention_dp_dummy
+    real = _request(7)
+    real.is_attention_dp_dummy = False
+    with (
+        patch(f"{CONNECTOR_MODULE}.mpi_rank", return_value=0),
+        patch(
+            f"{CONNECTOR_MODULE}.mpi_broadcast", side_effect=lambda result, root: result
+        ) as broadcast,
+    ):
+        manager = KvCacheConnectorManager(worker, scheduler)
+        assert not manager.enable_attention_dp
+        assert manager.query_num_new_matched_tokens(dummy, 0) == (0, False)
+        assert manager.get_num_new_matched_tokens(dummy, 0) == 0
+        manager.commit_new_matched_tokens(dummy, 4, True)
+        manager.update_state_after_alloc(dummy, [5])
+        manager.update_state_after_alloc(dummy, [], [[3], [5]])
+        assert not manager.request_finished(dummy, [5])
+        manager.prefix_reservations_enabled = True
+        assert manager.reserve_prefix(dummy, 0) is None
+        manager.prefix_reservations_enabled = False
+        broadcast.assert_not_called()
+
+        # A request with neither flag set still reaches the leader.
+        scheduler.get_num_new_matched_tokens.return_value = (0, False)
+        assert manager.query_num_new_matched_tokens(real, 0) == (0, False)
+        scheduler.get_num_new_matched_tokens.assert_called_once_with(real, 0)
+        broadcast.assert_called_once()
+
+    scheduler.update_state_after_alloc.assert_not_called()
+    scheduler.update_state_after_alloc_by_layer_group.assert_not_called()
+    scheduler.request_finished.assert_not_called()
+    scheduler.request_finished_by_layer_group.assert_not_called()
+    scheduler.reserve_prefix.assert_not_called()
+    assert not manager.scheduler_output_manager.external_loads
+    assert not manager.has_pending_transfers(999)
+
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [dummy]
+    batch.generation_requests = [dummy]
+    cache = MagicMock(spec=KVCacheManagerV2)
+    output_manager = KvCacheConnectorSchedulerOutputManager()
     output = output_manager.build_scheduler_output(batch, AsyncRequests({}, {}), cache)
     assert not output.new_requests and not output.cached_requests
     assert not output_manager.requests
