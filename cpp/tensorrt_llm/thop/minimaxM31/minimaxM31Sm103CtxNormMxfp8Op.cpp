@@ -51,9 +51,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     TORCH_CHECK(weight.is_contiguous() && weight.scalar_type() == at::kBFloat16 && weight.numel() == hidden);
     TORCH_CHECK(hidden % 256 == 0 && hidden / 8 <= 1024, "hidden must be a multiple of 256 and at most 8192");
     at::cuda::CUDAGuard const guard(inter.device());
-    auto const* deviceProperties = at::cuda::getCurrentDeviceProperties();
-    TORCH_CHECK(deviceProperties->major == 10 && deviceProperties->minor == 3,
-        "minimax_m31_ctx_residual_rmsnorm_mxfp8 requires SM103");
     auto const opts = inter.options();
     torch::Tensor normOut = writeNorm ? torch::empty_like(inter) : torch::empty({0}, opts);
     torch::Tensor qOut = torch::empty(inter.sizes(), opts.dtype(at::ScalarType::Float8_e4m3fn));
@@ -77,8 +74,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
         reinterpret_cast<uint64_t*>(qOut.data_ptr()), reinterpret_cast<uint32_t*>(sfOut.data_ptr()),
         fp4 ? reinterpret_cast<uint32_t*>(fp4Out.data_ptr()) : nullptr,
         fp4 ? reinterpret_cast<uint32_t*>(fp4SfOut.data_ptr()) : nullptr,
-        fp4 ? fp4GlobalScale->data_ptr<float>() : nullptr, static_cast<int>(rows), static_cast<int>(hidden),
-        static_cast<float>(eps), enablePdl, at::cuda::getCurrentCUDAStream(inter.get_device()));
+        fp4 ? fp4GlobalScale->data_ptr<float>() : nullptr, /*f32Out=*/nullptr, static_cast<int>(rows),
+        static_cast<int>(hidden), static_cast<float>(eps), enablePdl,
+        at::cuda::getCurrentCUDAStream(inter.get_device()));
     return {normOut, qOut, sfOut, fp4Out, fp4SfOut};
 }
 

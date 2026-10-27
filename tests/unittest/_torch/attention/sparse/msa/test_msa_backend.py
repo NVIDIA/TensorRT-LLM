@@ -134,7 +134,9 @@ def test_msa_import_preserves_cute_compile_option_selection() -> None:
     import cutlass.cute as cute
 
     original_compile = cute.compile
-    from fmha_sm100.cute import interface as sparse_interface
+    from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100.cute import (
+        interface as sparse_interface,
+    )
 
     del sparse_interface
     assert cute.compile is original_compile
@@ -582,7 +584,9 @@ def test_msa_paged_kv_preserves_tma_compatible_outer_stride() -> None:
     if not msa_package_available():
         pytest.skip("fmha_sm100 (MSA) not importable")
 
-    from fmha_sm100.cute import interface as sparse_interface
+    from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100.cute import (
+        interface as sparse_interface,
+    )
 
     pages, roles, heads, page_size, head_dim = 5, 2, 2, 128, 128
     pool = torch.empty(
@@ -624,7 +628,9 @@ def test_msa_paged_hnd_input_materializes_unaligned_outer_stride() -> None:
     if not msa_package_available():
         pytest.skip("fmha_sm100 (MSA) not importable")
 
-    from fmha_sm100.cute import interface as sparse_interface
+    from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100.cute import (
+        interface as sparse_interface,
+    )
 
     pages, heads, page_size, head_dim = 5, 2, 128, 128
     outer_stride = heads * page_size * head_dim + 1
@@ -803,6 +809,11 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
         # indexer takes the proxy path and needs no decode span.
         msa_decode_span = None
         msa_prefill_proxy_plan = (False, 0, 2, {}, None)
+        # Unplanned step state prepare() would otherwise set: no short-prefill identity selection, no runtime
+        # policy, no proxy oracle plan.
+        _msa_prefill_identity = None
+        msa_policy = None
+        msa_prefill_proxy_plan_ref = None
         msa_prefill_n_valid_blocks = torch.ones(2, dtype=torch.int32, device="cuda")
         msa_prefill_proxy_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
         msa_qo_lens_cpu = torch.ones(2, dtype=torch.int32)
@@ -921,6 +932,11 @@ def test_run_indexer_hands_the_indexer_this_steps_generation_span(
 
     class FakeMetadata:
         msa_prefill_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
+        # Unplanned step state prepare() would otherwise set: no short-prefill identity selection, no runtime
+        # policy, no proxy oracle plan.
+        _msa_prefill_identity = None
+        msa_policy = None
+        msa_prefill_proxy_plan_ref = None
         msa_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_worst_case_max_k_tiles = 8
         msa_prefill_proxy_kv_indices = torch.arange(num_tokens, dtype=torch.int32)

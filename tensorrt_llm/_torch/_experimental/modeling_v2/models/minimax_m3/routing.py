@@ -110,6 +110,28 @@ def _parallel(m) -> Optional[str]:
     return None
 
 
+def _tp2ctx(m) -> bool:
+    """The MiniMax-M3.1 disaggregated context worker's topology: 2 ranks of tensor-parallel attention (attention DP
+    off) with the routed experts split over them by expert parallelism (moe_ep 2), as the M3 context worker ran."""
+    return (
+        m.world_size == 2
+        and m.tp_size == 2
+        and m.pp_size == 1
+        and m.cp_size == 1
+        and m.moe_tp_size == 1
+        and m.moe_ep_size == 2
+        and not m.enable_attention_dp
+    )
+
+
+def _tp2ctx_routed() -> bool:
+    """Whether the tp2ctx target takes its topology. On by default; ``TRTLLM_M31_DISABLE_TP2CTX=1`` keeps the
+    built-in model."""
+    from .minimax_m31_nvfp4__sm_107__tp2ctx.m31_switches import m31_disabled
+
+    return not m31_disabled("TP2CTX")
+
+
 def _m31_tp2_routed() -> bool:
     """Whether the MiniMax-M3.1 sm_107 TP2 decode target takes its topology. On by default;
     ``TRTLLM_M31_DISABLE_TP2=1`` keeps the built-in model."""
@@ -274,8 +296,25 @@ def route(
 
         return ModelingV2MiniMaxM31Nvfp4Sm107Tp8
 
+    # MiniMax-M3.1 context (prefill) worker on 2 Rubin GPUs (sm107): tensor-parallel attention, expert-parallel
+    # experts, no speculative decoding or a standalone MiniMax DSpark drafter. Attention DP keeps the built-in model.
+    if (
+        compute_capability == _SM_RUBIN
+        and shape == _SHAPE
+        and m31_miss is None
+        and _tp2ctx(mapping)
+        and m31_spec_miss is None
+        and kv_cache
+        and _tp2ctx_routed()
+    ):
+        from .minimax_m31_nvfp4__sm_107__tp2ctx.modeling import ModelingV2MiniMaxM31Nvfp4Sm107Tp2Ctx
+
+        arm_sm107_shared_opt_ins()
+        return ModelingV2MiniMaxM31Nvfp4Sm107Tp2Ctx
+
     raise NoTarget(
-        f"MiniMax-M3.1 requires sm_103 TP4 or TP8/EP1 or sm_107 TP2, TP4 or TP8/EP1, shape {_SHAPE}, "
+        "MiniMax-M3.1 requires sm_103 TP4 or TP8/EP1 or sm_107 TP2, TP4 or TP8/EP1 (or TP2/EP2, the context worker), "
+        f"shape {_SHAPE}, "
         "MXFP8/NVFP4 experts, "
         f"FP8 or NVFP4 KV, and standalone MiniMax DSpark or no speculation; "
         f"got SM={compute_capability}, shape={shape}, topology={parallel}, "

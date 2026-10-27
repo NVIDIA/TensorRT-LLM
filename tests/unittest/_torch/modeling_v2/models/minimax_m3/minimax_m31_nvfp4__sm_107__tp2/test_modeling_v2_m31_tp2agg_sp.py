@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """TP2AGG_SP on CPU stand-ins: the band, the owned-row split and its 128-row scale-factor tiles (the tp2ctx_ipc
-workspace's split_row / own_sf_slice), the "logits" gather kind, the opt-in dispatch (TRTLLM_M31_ENABLE_TP2AGG_SP=1),
-the residual unshard, the router / finalize reads of the gathered products and the SP_OVL hand-off. The collectives
-and the bitwise boundary are gated on GPU (det + TRTLLM_M31_TP2CTX_SP_CHECK)."""
+workspace's split_row / own_sf_slice), the "logits" gather kind, the default-on dispatch
+(TRTLLM_M31_DISABLE_TP2AGG_SP=1 or TRTLLM_M31_DISABLE_AGG_SP=1 turns it off), the residual unshard, the router /
+finalize reads of the gathered products and the SP_OVL hand-off. The collectives and the bitwise boundary are gated
+on GPU (det + TRTLLM_M31_TP2CTX_SP_CHECK)."""
 
 from types import SimpleNamespace
 
@@ -17,12 +18,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m31
 H = 6144
 
 
-def test_opt_in_with_both_kill_switches() -> None:
-    assert m.TP2AGG_SP == (
-        m.m31_enabled("TP2AGG_SP")
-        and not m.m31_disabled("TP2AGG_SP")
-        and not m.m31_disabled("AGG_SP")
-    )
+def test_default_on_with_both_kill_switches() -> None:
+    assert m.TP2AGG_SP == (not m.m31_disabled("TP2AGG_SP") and not m.m31_disabled("AGG_SP"))
 
 
 @pytest.mark.parametrize("on", [False, True])

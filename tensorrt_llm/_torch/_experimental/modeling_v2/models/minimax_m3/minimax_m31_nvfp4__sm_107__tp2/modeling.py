@@ -299,14 +299,14 @@ R6_DENSE_PREQUANT = _R6_ENABLED and not _R6_DISABLED
 # one kernel for the residual add + RMSNorm that also writes the next MXFP8 projection's activation (and, at a MoE
 # boundary, the routed experts' NVFP4 input), instead of the fused all-reduce + norm followed by the consumers' own
 # quantize passes. The quantized outputs equal mxfp8_quantize / fp4_quantize of the norm bit for bit; the norm itself
-# is not bitwise against the fused all-reduce's (reduction order). Opt-in: TRTLLM_M31_ENABLE_CTXNORMQ=1;
-# TRTLLM_M31_DISABLE_CTXNORMQ=1 wins.
-CTXNORMQ = m31_enabled("CTXNORMQ") and not m31_disabled("CTXNORMQ")
+# is not bitwise against the fused all-reduce's (reduction order). Kill switch:
+# TRTLLM_M31_DISABLE_CTXNORMQ=1.
+CTXNORMQ = os.environ.get("TRTLLM_M31_DISABLE_CTXNORMQ", "0").strip() in ("", "0")
 # TP2AGG_ROUTER_F32 (the tp2ctx NORMQ_F32 router fold): a MoE layer's CTXNORMQ boundary runs the op's _f32
 # variant, which also writes the normed rows widened to fp32 (bit for bit norm.float()); the prefill router reads them
 # instead of m3_fp32_linear's own x.to(float32) cast (~300 us at 16K rows on sm_107). Same GEMM operands, so the
-# logits are bitwise today's. The op comes from the build or the overlay tensorrt_llm/libs/libm31_agg_ctxnormq_f32.so;
-# without it the boundary keeps the base op. Kill switch: TRTLLM_M31_DISABLE_TP2AGG_ROUTER_F32=1.
+# logits are bitwise today's. The op comes from the build; without it the boundary keeps the base op.
+# Kill switch: TRTLLM_M31_DISABLE_TP2AGG_ROUTER_F32=1.
 ROUTER_F32 = not m31_disabled("TP2AGG_ROUTER_F32")
 # F3: on TP2 decode-graph steps of F3_MIN_ROWS..F3_MAX_ROWS rows, the o_proj's MX-TAC pinned GEMM (FlashInfer's
 # dense blockscaled GEMM, epilogue-only fork kernels/m31_f3_gemm) stores its rows straight into the attention
@@ -384,15 +384,13 @@ A1_MIN_ROWS = 1024  # capacity: tp2ctx _CTX_QKV_FUSED_MIN_ROWS (steps above it)
 # owned-only inside such a step and is unsharded before an Eagle3 capture layer and the final norm. At the pre-MoE
 # boundary the router logits of the owned rows (ROUTER_ZC, the fp32 input from TP2AGG_ROUTER_F32) are gathered as a
 # "logits" kind (128 fp32 = 512 B per row) instead of tp2ctx's top-k, since trtllm-gen routes in-kernel. The workspace
-# is catalog/comm/tp2ctx_ipc with the peer ops of libm31_tp2ctx_peer.so, built at weight load (_sp_init, both ranks);
-# without them every step keeps the ordinary boundary ("not taken" logged once). Opt-in: TRTLLM_M31_ENABLE_TP2AGG_SP=1;
+# is catalog/comm/tp2ctx_ipc with the built tp2ctx peer ops, set up at weight load (_sp_init, both ranks);
+# without them every step keeps the ordinary boundary ("not taken" logged once). Enabled by default.
 # TRTLLM_M31_DISABLE_TP2AGG_SP=1 or TRTLLM_M31_DISABLE_AGG_SP=1 disables both boundaries.
 # TRTLLM_M31_DISABLE_AGG_SP_PREMOE=1 keeps only post-MoE SP, gathering the residual before pre-MoE.
 # The per-item ids stay tp2ctx's (TP2CTX_ROUTER_ZC / _SP_ADDNORM / _SP_OVL / _SP_PMOVL).
-TP2AGG_SP = (
-    m31_enabled("TP2AGG_SP") and not m31_disabled("TP2AGG_SP") and not m31_disabled("AGG_SP")
-)
-SP_PREMOE = m31_enabled("AGG_SP_PREMOE") and not m31_disabled("AGG_SP_PREMOE")
+TP2AGG_SP = not m31_disabled("TP2AGG_SP") and not m31_disabled("AGG_SP")
+SP_PREMOE = not m31_disabled("AGG_SP_PREMOE")
 SP_MIN_ROWS = 4097  # capacity: eager agg SP band; the workspace also covers the Lamport overlap
 SP_MAX_ROWS = 16384  # capacity: max_num_tokens of the agg configs
 SP_SF_TILE_ROWS = 128  # rank 1's rows start on a 128-row MXFP8 scale-factor swizzle tile
@@ -401,18 +399,15 @@ _SP_STATE: dict = {}
 # TRTLLM_M31_TP2CTX_SP_CHECK=1 (debug, never timed): each owned reduce-scatter is bit-compared with the all-reduce's
 # rows, and the keyed bf16 view (no data) is filled with NaN, so a consumer reading it instead of the products shows.
 SP_CHECK = os.environ.get("TRTLLM_M31_TP2CTX_SP_CHECK", "0") == "1"
-_SP_LIB = "libm31_tp2ctx_peer.so"
-_SP_NORMQ_OUT_LIB = "libm31_ctx_normq_out.so"
-_SP_ADDNORM_LIB = "libm31_sp_addnorm.so"
 # SP_ADDNORM: the owned-row peer add fused into the NORMQ out= launch (bitwise the two kernels). SP_PMOVL: the pre-MoE
 # products pushed by the peer push kernel on a side stream under the router GEMM (scheduling only). SP_OVL: before a
 # sparse layer whose QKV runs TP2AGG_QKV_A1, the owned MXFP8 rows go by copy engine on a side stream while A1 runs on
 # the own rows (A1 is row-split bitwise; the stock MXFP8 GEMM is not guaranteed, so it waits for the push).
-# Each is opt-in (TRTLLM_M31_ENABLE_<ID>=1); TRTLLM_M31_DISABLE_<ID>=1 wins.
-SP_ADDNORM = m31_enabled("TP2CTX_SP_ADDNORM") and not m31_disabled("TP2CTX_SP_ADDNORM")
-SP_PMOVL = m31_enabled("TP2CTX_SP_PMOVL") and not m31_disabled("TP2CTX_SP_PMOVL")
+# Each is on by default; TRTLLM_M31_DISABLE_<ID>=1 turns it off.
+SP_ADDNORM = not m31_disabled("TP2CTX_SP_ADDNORM")
+SP_PMOVL = not m31_disabled("TP2CTX_SP_PMOVL")
 SP_PMOVL_MIN_ROWS = 12288  # capacity: tp2ctx measurement (A8K +1.6% below it)
-SP_OVL = m31_enabled("TP2CTX_SP_OVL") and not m31_disabled("TP2CTX_SP_OVL")
+SP_OVL = not m31_disabled("TP2CTX_SP_OVL")
 SP_OVL_MIN_ROWS = 12288  # capacity: tp2ctx _SP_OVL_MIN_ROWS
 # GQAMIX: a mixed ctx+gen step's sparse generation rows (MsaDecodeFmha) run the Triton block-sparse decode
 # through ops/gqamix_sparse_decode, a verbatim copy of the in-tree kernel module whose two decode kernels do not
@@ -421,8 +416,8 @@ SP_OVL_MIN_ROWS = 12288  # capacity: tp2ctx _SP_OVL_MIN_ROWS
 # TRTLLM_M31_DISABLE_GQAMIX=1.
 GQAMIX = not m31_disabled("GQAMIX")
 # Eager prefill tile selection uses a deterministic score-descending, block-ascending
-# tie order. Opt-in: TRTLLM_M31_ENABLE_AGG_TSEL=1; TRTLLM_M31_DISABLE_AGG_TSEL=1 restores the built-in selector.
-AGG_TSEL = m31_enabled("AGG_TSEL") and not m31_disabled("AGG_TSEL")
+# tie order. TRTLLM_M31_DISABLE_AGG_TSEL=1 restores the built-in selector.
+AGG_TSEL = not m31_disabled("AGG_TSEL")
 AGG_TSEL_MIN_ROWS = 224
 AGG_TSEL_MAX_BLOCKS = 5856  # the op's shared-memory bound (kMinimaxM3SelectPrefillTileMaxBlocks)
 AGG_TSEL_ORACLE = m31_enabled("AGG_TSEL_ORACLE")
@@ -1511,11 +1506,11 @@ MSA_REUSE_POOL_VIEWS = True
 # RuntimeHooks.block_ids_from_views) instead of building a Python list of the whole padded row; the table is the same.
 MSA_BLOCK_IDS_FROM_VIEWS = True
 # The prefill indexer proxy can use tile 128 and a row/KV-size split ladder. The planner's tile is retained at
-# <=128 rows; larger spans require maxscore_qo_tile support. Both routes are opt-in until the in-model oracle gate:
-# TRTLLM_M31_ENABLE_AGG_PROXY_Q128 / _AGG_PROXY_SPLITS. Matching DISABLE switches override the opt-ins.
+# <=128 rows; larger spans require maxscore_qo_tile support. Both routes are on by default;
+# TRTLLM_M31_DISABLE_AGG_PROXY_Q128 / _AGG_PROXY_SPLITS turn them off.
 # TRTLLM_M31_ENABLE_AGG_PROXY_ORACLE compares valid score bits and the full selected table against the plain plan.
-MSA_PROXY_Q128 = m31_enabled("AGG_PROXY_Q128") and not m31_disabled("AGG_PROXY_Q128")
-MSA_PROXY_SPLITS = m31_enabled("AGG_PROXY_SPLITS") and not m31_disabled("AGG_PROXY_SPLITS")
+MSA_PROXY_Q128 = not m31_disabled("AGG_PROXY_Q128")
+MSA_PROXY_SPLITS = not m31_disabled("AGG_PROXY_SPLITS")
 MSA_PROXY_ORACLE = m31_enabled("AGG_PROXY_ORACLE")
 
 FAST_PATHS: Tuple[RowRange, ...] = (
@@ -2362,18 +2357,10 @@ _SP_LOGITS = m3_prequant.PrequantSlot()
 
 
 def _ctxnormq_op():
-    """``torch.ops.trtllm.minimax_m31_ctx_residual_rmsnorm_mxfp8``, or None. A build without the op in its library
-    loads it from ``tensorrt_llm/libs/libm31_ctxnormq.so`` when that file exists (an overlay); otherwise the boundary
-    keeps the fused all-reduce. Decided once per process."""
+    """``torch.ops.trtllm.minimax_m31_ctx_residual_rmsnorm_mxfp8``, or None; without it the boundary keeps the fused
+    all-reduce. Decided once per process."""
     if "op" not in _CTXNORMQ_STATE:
         op = getattr(torch.ops.trtllm, "minimax_m31_ctx_residual_rmsnorm_mxfp8", None)
-        if op is None:
-            import tensorrt_llm
-
-            lib = os.path.join(os.path.dirname(tensorrt_llm.__file__), "libs", "libm31_ctxnormq.so")
-            if os.path.exists(lib):
-                torch.ops.load_library(lib)
-                op = getattr(torch.ops.trtllm, "minimax_m31_ctx_residual_rmsnorm_mxfp8", None)
         _CTXNORMQ_STATE["op"] = op
         logger.info(
             f"[M3 dispatch] CTXNORMQ prefill boundary norm + quantize: "
@@ -2384,24 +2371,13 @@ def _ctxnormq_op():
 
 def _ctxnormq_f32_op():
     """``torch.ops.trtllm.minimax_m31_ctx_residual_rmsnorm_mxfp8_f32`` (TP2AGG_ROUTER_F32), or None: switched off, or
-    neither the build nor the overlay ``tensorrt_llm/libs/libm31_agg_ctxnormq_f32.so`` has it. Decided once per
-    process."""
+    the op is not built. Decided once per process."""
     if "f32" not in _CTXNORMQ_STATE:
         op = (
             getattr(torch.ops.trtllm, "minimax_m31_ctx_residual_rmsnorm_mxfp8_f32", None)
             if ROUTER_F32
             else None
         )
-        if ROUTER_F32 and op is None:
-            import tensorrt_llm
-
-            lib = os.path.join(
-                os.path.dirname(tensorrt_llm.__file__), "libs", "libm31_agg_ctxnormq_f32.so"
-            )
-            if os.path.exists(lib):
-                torch.ops.load_library(lib)
-                op = getattr(torch.ops.trtllm, "minimax_m31_ctx_residual_rmsnorm_mxfp8_f32", None)
-                m31_fake_ops.register()
         _CTXNORMQ_STATE["f32"] = op
         why = "switched off" if not ROUTER_F32 else "the op is not built"
         logger.info(
@@ -2457,14 +2433,8 @@ def _sp_once(key, message: str) -> None:
         logger.info(message)
 
 
-def _sp_load(op_name: str, lib_name: str):
-    """``torch.ops.trtllm.<op_name>``, loading ``tensorrt_llm/libs/<lib_name>`` first when the build lacks it."""
-    if not hasattr(torch.ops.trtllm, op_name):
-        import tensorrt_llm
-
-        lib = os.path.join(os.path.dirname(tensorrt_llm.__file__), "libs", lib_name)
-        if os.path.exists(lib):
-            torch.ops.load_library(lib)
+def _sp_load(op_name: str):
+    """``torch.ops.trtllm.<op_name>``, or None when the build lacks it."""
     return getattr(torch.ops.trtllm, op_name, None)
 
 
@@ -2476,8 +2446,8 @@ def _sp_init(core) -> None:
     ws, why = None, None
     if getattr(core.mapping, "tp_size", 1) != 2:
         why = f"tp_size {getattr(core.mapping, 'tp_size', None)} != 2"
-    elif _sp_load("minimax_m31_tp2ctx_ipc_barrier", _SP_LIB) is None:
-        why = f"no peer ops (tensorrt_llm/libs/{_SP_LIB})"
+    elif _sp_load("minimax_m31_tp2ctx_ipc_barrier") is None:
+        why = "the peer ops are not built"
     else:
         try:
             from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import tp2ctx_ipc
@@ -2494,10 +2464,10 @@ def _sp_init(core) -> None:
     if ws is None:
         logger.info(f"[M3.1 agg] TP2AGG_SP not taken: {why}")
         return
-    normq_out = _sp_load("minimax_m31_ctx_residual_rmsnorm_mxfp8_out", _SP_NORMQ_OUT_LIB)
+    normq_out = _sp_load("minimax_m31_ctx_residual_rmsnorm_mxfp8_out")
     addnorm = None
     if SP_ADDNORM and normq_out is not None and not SP_CHECK:
-        addnorm = _sp_load("minimax_m31_tp2ctx_peer_add_normq_out", _SP_ADDNORM_LIB)
+        addnorm = _sp_load("minimax_m31_tp2ctx_peer_add_normq_out")
     _SP_STATE["normq_out"], _SP_STATE["addnorm"] = normq_out, addnorm
     logger.info(
         f"[M3.1 agg] TP2AGG_SP workspace ready: NORMQ out= {'on' if normq_out is not None else 'off'}, "
@@ -2933,19 +2903,11 @@ _TSEL_ORACLE_IDLE_S = 15.0
 
 
 def _tsel_op():
-    """``torch.ops.trtllm.minimax_m31_select_prefill_tile`` on sm_107, or None. A build without the op loads it from
-    ``tensorrt_llm/libs/libm31_tsel.so`` when that file exists (an overlay). Decided once per process."""
+    """``torch.ops.trtllm.minimax_m31_select_prefill_tile`` on sm_107, or None. Decided once per process."""
     if "op" not in _TSEL_STATE:
         op = None
         if torch.cuda.get_device_capability() == (10, 7):
             op = getattr(torch.ops.trtllm, "minimax_m31_select_prefill_tile", None)
-            if op is None:
-                import tensorrt_llm
-
-                lib = os.path.join(os.path.dirname(tensorrt_llm.__file__), "libs", "libm31_tsel.so")
-                if os.path.exists(lib):
-                    torch.ops.load_library(lib)
-                    op = getattr(torch.ops.trtllm, "minimax_m31_select_prefill_tile", None)
         _TSEL_STATE["op"] = op
         print(
             f"[M3 dispatch] AGG_TSEL prefill tile select rank {mpi_rank()}: "
@@ -4929,8 +4891,12 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
         Compile and load only, nothing runs: no numerics change. fmha_sm100 keys its cache by its installed sources, so
         a source overlay builds its own variants. Returns the variant names."""
         require_msa_module()
-        from fmha_sm100 import api as fmha_api
-        from fmha_sm100 import jit as fmha_jit
+        from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100 import (
+            api as fmha_api,
+        )
+        from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100 import (
+            jit as fmha_jit,
+        )
 
         only_score, page = 2, 128
         names = []
@@ -5152,9 +5118,9 @@ PREFILL_BRK_PATH = "m3_prefill_brk_attention"
 # hidden, taken on the current stream right after the last boundary. Without it a later write from another stream lands
 # in the returned hidden's memory before the logits processor gathers the verify rows (K7, 8 x ~50K-token decodes with a
 # 3840-row mixed step: up to 8 of 272 sampled requests differ run to run; with the copy 0 of 272). The copy is bitwise
-# the hidden. Opt-in: TRTLLM_M31_ENABLE_PREFILL_OUT_CLONE=1; TRTLLM_M31_DISABLE_PREFILL_OUT_CLONE=1 wins. Read at
+# the hidden. Kill switch TRTLLM_M31_DISABLE_PREFILL_OUT_CLONE=1. Read at
 # import.
-PREFILL_OUT_CLONE = m31_enabled("PREFILL_OUT_CLONE") and not m31_disabled("PREFILL_OUT_CLONE")
+PREFILL_OUT_CLONE = not m31_disabled("PREFILL_OUT_CLONE")
 PREFILL_OUT_CLONE_PATH = "m31_prefill_out_clone"
 
 #: The cores the breakable prefill graphs' eager attention boundary looks up by key: an ``eager_on_graph`` callable
@@ -5311,7 +5277,9 @@ class PrefillTarget:
         if dense:
             act = _dense_swiglu(core, gu)
         else:
-            act = m3_silu_and_mul(gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta)
+            act = _native_swiglu(core, gu, False)
+            if act is None:
+                act = m3_silu_and_mul(gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta)
         out, _ = _linear(core, act, f"{prefix}_dn_w", f"{prefix}_dn_s", low_m_gemm)
         return out
 

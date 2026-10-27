@@ -233,6 +233,17 @@ def inplace_info():
             3: "index_k_cache",
             4: "kv_scale_cache"
         },
+        # The MiniMax-M3.1 sm_107 tp2ctx target's own copies of the two ops
+        # above (registered only when that target is imported); without these
+        # entries the functionalization clones the whole paged caches.
+        "m31_tp2ctx_sm107_attn_custom_op_inplace": {
+            1: "output"
+        },
+        "m31_tp2ctx_sm107_fused_sparse_qkv_producer": {
+            2: "kv_cache",
+            3: "index_k_cache",
+            4: "kv_scale_cache"
+        },
         "fused_sigmoid_mul_inplace": {
             1: "attention_output"
         },

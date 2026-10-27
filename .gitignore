@@ -56,7 +56,6 @@ tensorrt_llm/pg_utils_bindings.*.so
 tensorrt_llm/flash_mla
 tensorrt_llm/flash_mla_cpp_tllm.*.so
 tensorrt_llm/flash_mla_cpp_tllm.pyi
-/3rdparty/fmha_sm100/
 /3rdparty/nccl_extensions/
 tensorrt_llm/scripts
 *docs/cpp_docs*
@@ -131,3 +130,6 @@ examples/kimi_k3/.eval_dflash_runtime.*.yaml
 
 # Media a VisualGen server generates, when it is started from the checkout
 trtllm_generated/
+
+# CUTLASS headers scripts/build_wheel.py stages for the vendored MSA run-time compiles
+/tensorrt_llm/_torch/attention/backends/fmha/msa_kernels/fmha_sm100/cutlass/

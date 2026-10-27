@@ -41,6 +41,7 @@ force-exclude = true
 exclude = [
     "**3rdparty/**",
     "tensorrt_llm/_torch/attention/backends/prims_ts/**",
+    "tensorrt_llm/_torch/attention/backends/fmha/msa_kernels/fmha_sm100/**",
     "tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/sol_attn/**",
     "triton_kernels/**",
     "tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/manual_mma_128dp.py",

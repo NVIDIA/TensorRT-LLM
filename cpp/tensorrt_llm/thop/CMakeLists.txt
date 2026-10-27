@@ -80,22 +80,30 @@ add_th_common_family(
 # registrations.
 target_sources(
   th_common_attention
-  PRIVATE minimaxM31/minimaxM31ChainSpecSamplingMcOp.cpp
+  PRIVATE minimaxM31/minimaxM31AggCtxNormF32Op.cpp
+          minimaxM31/minimaxM31CastBf16Fp32Op.cpp
+          minimaxM31/minimaxM31ChainSpecSamplingMcOp.cpp
           minimaxM31/minimaxM31DsparkGlueOp.cpp
           minimaxM31/minimaxM31F3ArOp.cpp
           minimaxM31/minimaxM31FcShardGemmOp.cpp
           minimaxM31/minimaxM31GlobaltimerStampOp.cpp
           minimaxM31/minimaxM31MarkovEpilogueOp.cpp
           minimaxM31/minimaxM31MoeFinalizeOp.cpp
+          minimaxM31/minimaxM31Mxfp8CublasLtOp.cpp
+          minimaxM31/minimaxM31QkvIndexerProducerRowsOp.cpp
           minimaxM31/minimaxM31S1bFoldOp.cpp
           minimaxM31/minimaxM31S2MoeTailOp.cpp
           minimaxM31/minimaxM31Sm103CtxNormMxfp8Op.cpp
+          minimaxM31/minimaxM31Sm103CtxNormMxfp8OutOp.cpp
           minimaxM31/minimaxM31Sm103SelectPrefillTileOp.cpp
           minimaxM31/minimaxM31SoftmaxMcOp.cpp
           minimaxM31/minimaxM31SoftmaxPathBOp.cpp
+          minimaxM31/minimaxM31SpAddNormqOp.cpp
+          minimaxM31/minimaxM31SwigluOaiMxfp8Op.cpp
           minimaxM31/minimaxM31SwigluOaiVecOp.cpp
           minimaxM31/minimaxM31ToppRenormDetOp.cpp
           minimaxM31/minimaxM31ToppRenormDetV3Op.cpp
+          minimaxM31/minimaxM31Tp2ctxPeerOp.cpp
           minimaxM31/minimaxM31Tp4SparseDecodeLcOp.cpp
           minimaxM31/minimaxM31Tp8SparseDecodeLc8Op.cpp
           chainSpeculativeSamplingOp.cpp
@@ -249,6 +257,17 @@ add_th_common_family(
   mhcOp.cpp
   compressorOp.cpp)
 
+# MiniMax-M3.1 NVFP4 index-K writer / gather (torch.ops.m31idxk): sm_107 only.
+if(107 IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+  add_library(m31_idxk_nvfp4 OBJECT minimaxM31/m31IdxkNvfp4.cu)
+  set_target_properties(
+    m31_idxk_nvfp4 PROPERTIES POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 20
+                              CUDA_STANDARD_REQUIRED ON)
+  set_cuda_architectures(m31_idxk_nvfp4 107)
+  target_compile_options(m31_idxk_nvfp4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+  target_link_libraries(m31_idxk_nvfp4 PRIVATE ${TORCH_LIBRARIES})
+endif()
+
 add_library(
   th_common SHARED
   $<TARGET_OBJECTS:th_common_attention>
@@ -258,6 +277,9 @@ add_library(
   $<TARGET_OBJECTS:th_common_sequence>
   $<TARGET_OBJECTS:th_common_visual_gen>
   $<TARGET_OBJECTS:th_common_decoding>)
+if(TARGET m31_idxk_nvfp4)
+  target_sources(th_common PRIVATE $<TARGET_OBJECTS:m31_idxk_nvfp4>)
+endif()
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
                                                            ON)

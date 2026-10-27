@@ -33,10 +33,11 @@ namespace kernels::minimaxM31Sm103
 //! In place: `inter` (the all-reduce output) becomes `inter + residual`, as in the stock epilogue.
 //! normOut may be null (the BF16 norm output is then not written). With fp4Out (and fp4SfOut / fp4GlobalScale) set,
 //! it also writes fp4_quantize(norm, globalScale, 16, ue8m0 = false, swizzled = false) of the same rows.
-//! hidden % 256 == 0, hidden / 8 <= 1024.
+//! With f32Out set (requires normOut; NVFP4 optional), it also writes normOut widened to FP32 (bit-exact
+//! normOut.float()). hidden % 256 == 0, hidden / 8 <= 1024.
 void invokeCtxResidualRmsNormMxfp8(__nv_bfloat16* inter, __nv_bfloat16 const* residual, __nv_bfloat16 const* weight,
     __nv_bfloat16* normOut, uint64_t* qOut, uint32_t* sfOut, uint32_t* fp4Out, uint32_t* fp4SfOut,
-    float const* fp4GlobalScale, int rows, int hidden, float eps, bool enablePdl, cudaStream_t stream);
+    float const* fp4GlobalScale, float* f32Out, int rows, int hidden, float eps, bool enablePdl, cudaStream_t stream);
 
 } // namespace kernels::minimaxM31Sm103
 

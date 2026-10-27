@@ -88,6 +88,8 @@ reviews:
   path_filters:
     # Vendored/adapted FlashInfer kernels; excluded from review.
     - "!tensorrt_llm/_torch/attention/backends/prims_ts/**"
+    # Vendored MSA (MiniMax fmha_sm100) kernels; excluded from review.
+    - "!tensorrt_llm/_torch/attention/backends/fmha/msa_kernels/fmha_sm100/**"
 
   path_instructions:
     # Production-code coverage review. This is required because tests/** rules

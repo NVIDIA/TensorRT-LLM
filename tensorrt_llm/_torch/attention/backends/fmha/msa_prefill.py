@@ -171,7 +171,7 @@ def _msa_sparse_api():
     sparse = getattr(fmha_sm100, "sparse", None)
     if sparse is None:
         try:
-            from fmha_sm100 import sparse
+            from .msa_kernels.fmha_sm100 import sparse
         except ImportError as exc:
             raise RuntimeError("MiniMax-M3 NVFP4 KV cache requires the Fan MSA sparse API") from exc
     if not hasattr(sparse, "build_k2q_csr") or not hasattr(sparse, "sparse_atten_nvfp4_kv_func"):
@@ -482,10 +482,11 @@ _TP2CTX_Q8KV4_STATE: dict = {}
 
 
 def _tp2ctx_q8kv4_run():
-    """fmha_sm100.prefill_q8kv4.run_prefill (overlay v3, forward_only) when TP2CTX_Q8KV4 may run, else None.
+    """msa_kernels.prefill_q8kv4.run_prefill (forward_only) when TP2CTX_Q8KV4 may run, else None.
 
     Option value, opt-in only: TRTLLM_M31_ENABLE_TP2CTX_Q8KV4=1 turns it on, and
-    TRTLLM_M31_DISABLE_TP2CTX_Q8KV4=1 (read per call) keeps it off regardless. The package probe is cached.
+    TRTLLM_M31_DISABLE_TP2CTX_Q8KV4=1 (read per call) keeps it off regardless. The package probe is cached; that
+    package is not vendored, so the probe finds none and the forward stays the default one.
     """
     import inspect
     import os
@@ -498,7 +499,7 @@ def _tp2ctx_q8kv4_run():
         run = None
         if torch.cuda.get_device_capability() in ((10, 3), (10, 7)):
             try:
-                from fmha_sm100.prefill_q8kv4 import run_prefill as run
+                from .msa_kernels.prefill_q8kv4 import run_prefill as run
 
                 if "forward_only" not in inspect.signature(run).parameters:
                     run = None  # an overlay older than v3 would combine without C1 / C2
@@ -641,7 +642,11 @@ def _tp2ctx_bf16x_run():
             reason = "not_sm107"
         else:
             try:
-                from fmha_sm100.prefill_bf16x import run_prefill as run
+                from .msa_kernels.prefill_bf16x import jit as _bf16x_jit
+                from .msa_kernels.prefill_bf16x import run_prefill as run
+
+                if not _bf16x_jit.prebuilt_available():
+                    run, reason = None, "no_prefill_bf16x_prebuilt"
             except ImportError:
                 run, reason = None, "no_prefill_bf16x_package"
         _TP2CTX_BF16X_STATE["run"] = (run, reason)
@@ -669,7 +674,7 @@ def _tp2ctx_e4m3x_ok():
         return "e4m3x_disabled_by_env"
     if "e4m3x_build" not in _TP2CTX_BF16X_STATE:
         try:
-            from fmha_sm100.prefill_bf16x import jit as _bf16x_jit
+            from .msa_kernels.prefill_bf16x import jit as _bf16x_jit
 
             _TP2CTX_BF16X_STATE["e4m3x_build"] = bool(getattr(_bf16x_jit, "_E4M3X", False))
         except ImportError:
@@ -833,6 +838,7 @@ def run_msa_nvfp4_sparse_gqa(
     )
 
     sparse = _msa_sparse_api()
+
     for name, scale in (("K", k_global_scale), ("V", v_global_scale)):
         if scale.dtype != torch.float32 or scale.numel() != 1:
             raise ValueError(f"MiniMax-M3 NVFP4 {name} dequantization scale must be one FP32 value")

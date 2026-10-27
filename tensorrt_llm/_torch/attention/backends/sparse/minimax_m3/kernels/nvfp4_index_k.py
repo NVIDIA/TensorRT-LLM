@@ -4,7 +4,7 @@
 
 A page is the Q8KV4 decode indexer's packed layout: 8192 bytes of E2M1 codes (token ``t`` at ``t * 64``, low nibble
 = even element) then 1024 bytes of E4M3 16-element scales (``8192 + t * 8 + g``), no global scale; 72 bytes per
-token instead of FP8's 128. The kernels live in ``libm31_idxk_nvfp4.so`` (C++ / CUDA, ``torch.ops.m31idxk``):
+token instead of FP8's 128. The kernels are built into th_common for sm_107 (C++ / CUDA, ``torch.ops.m31idxk``):
 
 * ``write``: the unit-scale NVFP4 quantization of vLLM's fused index-K writer, from E4M3 or bf16 rows, into the
   token's slot; slots < 0 are skipped.
@@ -27,7 +27,6 @@ PAGE = 128
 DIM = 128
 BYTES_PER_TOKEN = DIM // 2 + DIM // 16  # 72
 PAGE_BYTES = PAGE * BYTES_PER_TOKEN  # 9216
-LIB_NAME = "libm31_idxk_nvfp4.so"
 
 _STATE = {"loaded": False, "counts": {}}
 # Default ON; the kill restores the original pageable offset copy for item pricing.
@@ -37,17 +36,16 @@ _COMPACT_NOSYNC = os.environ.get("TRTLLM_M31_DISABLE_NVFP4_COMPACT_NOSYNC", "0")
 def _load() -> None:
     if _STATE["loaded"]:
         return
-    import tensorrt_llm
-
-    path = os.path.join(os.path.dirname(tensorrt_llm.__file__), "libs", LIB_NAME)
-    if not os.path.exists(path):
+    if not all(
+        hasattr(torch.ops.m31idxk, name)
+        for name in ("nvfp4_idxk_write", "nvfp4_idxk_write_from_sink", "nvfp4_idxk_gather_fp8")
+    ):
         raise RuntimeError(
-            f"MiniMax-M3 indexer_kv_dtype='nvfp4' needs {LIB_NAME} in tensorrt_llm/libs ({path} is missing); "
-            "set TRTLLM_M31_DISABLE_AGG_NVFP4_INDEXK=1 to fall back to FP8 index-K"
+            "MiniMax-M3 indexer_kv_dtype='nvfp4' needs the torch.ops.m31idxk kernels, which this build does not "
+            "have (they are built for sm_107); set TRTLLM_M31_DISABLE_AGG_NVFP4_INDEXK=1 to fall back to FP8 index-K"
         )
-    torch.ops.load_library(path)
     _STATE["loaded"] = True
-    logger.info(f"[M3.1] AGG_NVFP4_INDEXK kernels loaded: {path}")
+    logger.info("[M3.1] AGG_NVFP4_INDEXK kernels loaded: in-tree th_common")
 
 
 def _count(kind: str) -> None:
@@ -174,10 +172,12 @@ def score_decode_rows(
     workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Index scores of decode rows straight from NVFP4 index-K pages, [heads, cols, rows * query_len] fp32 in the
-    selector's layout: the Q8KV4 decode reader (fmha_sm100_q8kv8 run_scores_hpr; exact FP16 dequant, FP32
+    selector's layout: the Q8KV4 decode reader (the vendored fmha_sm100_q8kv8 run_scores_hpr; exact FP16 dequant, FP32
     accumulation), the reader every pure-decode step of the agg target uses. History pages are written; a row's local
     and later pages are left as allocated, which the selector never ranks (local blocks are forced)."""
-    from fmha_sm100_q8kv8 import q8_indexer_interface as qi
+    from tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100_q8kv8 import (
+        q8_indexer_interface as qi,
+    )
 
     batch, cols = int(block_table.shape[0]), int(block_table.shape[1])
     device = idx_q.device

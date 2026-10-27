@@ -314,6 +314,12 @@ if(TARGET ${MOONCAKE_WRAPPER_TARGET})
   add_dependencies(${SHARED_TARGET} ${MOONCAKE_WRAPPER_TARGET})
 endif()
 
+# The ahead-of-time MSA fmha_sm100 modules (kernels/minimaxM3Msa) ship in the
+# wheel, so they build with the library the wheel targets build.
+if(TARGET msa_fmha_sm100_aot)
+  add_dependencies(${SHARED_TARGET} msa_fmha_sm100_aot)
+endif()
+
 if(NOT WIN32)
   # Load libraries at $PREFIX/lib from
   # $PREFIX/lib/python3.12/site-packages/tensorrt_llm/libs

@@ -17,6 +17,9 @@ from tensorrt_llm._utils import is_sm_100f, maybe_pin_memory
 
 from .paged_cache import write_kv_slots
 
+# The MSA kernels (MiniMax fmha_sm100) vendored in-tree; see 3rdparty/vendor_sources.lock.yaml.
+MSA_MODULE = "tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100"
+
 # fmha_sm100 ships only head_dim 128 variants and the MiniMax-M3 checkpoint
 # selects topk 16. Callers enforce these early so a misconfiguration fails
 # with a clear message rather than a cryptic shape error inside the kernel.
@@ -51,21 +54,11 @@ def is_msa_layer(attn) -> bool:
 
 
 def _install_msa_cutlass_compatibility() -> None:
-    """Provide legacy CuTe aliases still referenced by the packaged MSA sources."""
-    try:
-        import cutlass.cute as cute
-    except ImportError:
-        return
+    """Provide legacy CuTe aliases still referenced by the packaged MSA sources (see
+    msa_kernels.install_cute_compatibility, which importing the package also runs)."""
+    from tensorrt_llm._torch.attention.backends.fmha.msa_kernels import install_cute_compatibility
 
-    # MSA has not yet migrated these aliases to their newer CUTLASS DSL
-    # names. Keep this shim local to the MSA import path and remove it once the
-    # packaged sources use the top-level thread classes and
-    # cute.make_rmem_tensor directly.
-    for thread_class_name in ("ThrCopy", "ThrMma"):
-        if not hasattr(cute.core, thread_class_name):
-            setattr(cute.core, thread_class_name, getattr(cute, thread_class_name))
-    if not hasattr(cute, "make_fragment"):
-        setattr(cute, "make_fragment", cute.make_rmem_tensor)
+    install_cute_compatibility()
 
 
 @functools.lru_cache(maxsize=1)
@@ -76,7 +69,7 @@ def msa_package_available() -> bool:
     FmhaManager construction checks once per attention layer. Whether the
     package is installed cannot change within a process.
     """
-    if importlib.util.find_spec("fmha_sm100") is None:
+    if importlib.util.find_spec(MSA_MODULE) is None:
         return False
     _install_msa_cutlass_compatibility()
     return True
@@ -91,7 +84,7 @@ def require_msa_module() -> types.ModuleType:
     """
     _install_msa_cutlass_compatibility()
     try:
-        import fmha_sm100
+        fmha_sm100 = importlib.import_module(MSA_MODULE)
     except ImportError as exc:
         raise RuntimeError(
             "MiniMax-M3 MSA attention requires the fmha_sm100 kernels packaged "

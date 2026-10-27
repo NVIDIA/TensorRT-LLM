@@ -31,6 +31,8 @@ def _piecewise_boundary_ops():
         "gdn_custom_op_inplace",
         "mamba2_custom_op_inplace",
         "minimax_m3_attn_custom_op_inplace",
+        # The MiniMax-M3.1 sm_107 tp2ctx target's copy of the op above.
+        "m31_tp2ctx_sm107_attn_custom_op_inplace",
     ]
     return [
         op for op in (get_optional_trtllm_op(op_name) for op_name in op_names)

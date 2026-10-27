@@ -58,13 +58,6 @@ def sanity_check():
             'If you are attempting to use the pip development mode (editable installation), '
             'please execute `scripts/build_wheel.py` first, and then run `pip install -e .`.'
         )
-    if not (Path(__file__).resolve().parent / "3rdparty" /
-            "fmha_sm100").is_dir():
-        raise ImportError(
-            'The `fmha_sm100` package is missing. Please execute '
-            '`scripts/build_wheel.py` first (CMake FetchContent stages it under '
-            '3rdparty/fmha_sm100), or use TRTLLM_USE_PRECOMPILED to extract it '
-            'from a published wheel.')
     if not (tensorrt_llm_path / "grpc" / "openengine" / "_generated" /
             "openengine_pb2.py").is_file():
         raise ImportError(
@@ -184,6 +177,8 @@ else:
         'libs/nvshmem/License.txt',
         'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
         'libs/nvshmem/nvshmem_transport_ibgda.so.103',
+        'libs/msa_fmha_sm100/**/*.so',
+        'libs/msa_cute_aot/**/*',
         'bindings.*.so',
         'deep_ep/LICENSE',
         'deep_ep/*.py',
@@ -208,6 +203,21 @@ package_data += [
     'grpc/openengine/_generated/*.pyi',
     'grpc/openengine/proto/manifest.json',
     'grpc/openengine/proto/openengine/v1/*.proto',
+    # The vendored MSA CuTe DSL modules are imported from cute/ on sys.path, outside the
+    # package tree, so they ship as data.
+    '_torch/attention/backends/fmha/msa_kernels/fmha_sm100/cute/*.py',
+    '_torch/attention/backends/fmha/msa_kernels/fmha_sm100/cute/src/**/*',
+    # Its license and notice, and the sources and CUTLASS headers (staged by
+    # scripts/build_wheel.py) that variants outside the prebuilt set compile from.
+    '_torch/attention/backends/fmha/msa_kernels/fmha_sm100/LICENSE',
+    '_torch/attention/backends/fmha/msa_kernels/fmha_sm100/NOTICE',
+    '_torch/attention/backends/fmha/msa_kernels/fmha_sm100/csrc/**/*',
+    '_torch/attention/backends/fmha/msa_kernels/fmha_sm100/cutlass/**/*',
+    # The licenses and notices of the other vendored MSA packages.
+    '_torch/attention/backends/fmha/msa_kernels/fmha_sm100_q8kv8/LICENSE',
+    '_torch/attention/backends/fmha/msa_kernels/fmha_sm100_q8kv8/NOTICE',
+    '_torch/attention/backends/fmha/msa_kernels/prefill_bf16x/LICENSE',
+    '_torch/attention/backends/fmha/msa_kernels/prefill_bf16x/NOTICE',
 ]
 
 
@@ -236,13 +246,18 @@ def download_precompiled(workspace: str, version: str) -> str:
 def should_skip_precompiled_package_data(filename: str) -> bool:
     """Return True for source-owned package data kept from local checkout.
 
-    Precompiled wheels own native bits. Source owns telemetry schemas and the
-    OpenEngine contract. Skip those wheel files so Python-only edits layer over
-    old wheels and tracked bindings from the current checkout remain authoritative.
+    Precompiled wheels own native bits. Source owns telemetry schemas, the
+    OpenEngine contract and the vendored MSA kernel sources (all but the CUTLASS
+    headers build_wheel.py stages). Skip those wheel files so Python-only edits
+    layer over old wheels and tracked files from the current checkout remain
+    authoritative.
     """
     filename = filename.replace("\\", "/")
     if filename.startswith("tensorrt_llm/usage/schemas/"):
         return filename.endswith(".json")
+    msa = "tensorrt_llm/_torch/attention/backends/fmha/msa_kernels/"
+    if filename.startswith(msa):
+        return not filename.startswith(msa + "fmha_sm100/cutlass/")
     return filename.startswith((
         "tensorrt_llm/grpc/openengine/_generated/",
         "tensorrt_llm/grpc/openengine/proto/",
@@ -419,39 +434,6 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                         os.unlink(dst_file)
                     shutil.copy2(src_file, dst_file)
 
-        source_fmha = os.path.join(precompiled_location, "3rdparty",
-                                   "fmha_sm100")
-        if not os.path.isdir(source_fmha):
-            raise SetupError(
-                f"Precompiled directory {precompiled_location} predates MSA "
-                "packaging and does not contain 3rdparty/fmha_sm100. Use a "
-                "precompiled source built with MSA packaging support.")
-        dst_fmha = os.path.join("3rdparty", "fmha_sm100")
-        if link_artifacts:
-            if os.path.islink(dst_fmha) and os.path.realpath(
-                    dst_fmha) == os.path.realpath(source_fmha):
-                # Already points at this source; leave the shared link alone.
-                print(f"Keeping existing fmha_sm100 symlink: {dst_fmha}")
-            else:
-                # A stale link (pointing at a different source) or a real
-                # directory: replace it so fmha_sm100 tracks the same source
-                # as the other linked artifacts.
-                if os.path.islink(dst_fmha):
-                    os.unlink(dst_fmha)
-                elif os.path.isdir(dst_fmha):
-                    shutil.rmtree(dst_fmha)
-                # copytree() creates the parent below; os.symlink() does not.
-                os.makedirs(os.path.dirname(dst_fmha), exist_ok=True)
-                print(f"Linking fmha_sm100 from local directory: {source_fmha}")
-                os.symlink(source_fmha, dst_fmha)
-        else:
-            print(f"Copying fmha_sm100 from local directory: {source_fmha}")
-            if os.path.islink(dst_fmha):
-                os.unlink(dst_fmha)
-            elif os.path.isdir(dst_fmha):
-                shutil.rmtree(dst_fmha)
-            shutil.copytree(source_fmha, dst_fmha)
-
         source_nccl_extensions = os.path.join(precompiled_location, "3rdparty",
                                               "nccl_extensions")
         if os.path.isdir(source_nccl_extensions):
@@ -518,18 +500,6 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
         wheel_path = precompiled_path
 
     with zipfile.ZipFile(wheel_path) as wheel:
-        dst_fmha = os.path.join("3rdparty", "fmha_sm100")
-        wheel_has_fmha = any(
-            file.filename.startswith("fmha_sm100/") for file in wheel.filelist)
-        if not wheel_has_fmha:
-            raise SetupError(
-                f"Precompiled wheel {wheel_path} predates MSA packaging and "
-                "does not contain fmha_sm100. Use a precompiled wheel built "
-                "with MSA packaging support.")
-        if os.path.islink(dst_fmha):
-            os.unlink(dst_fmha)
-        elif os.path.isdir(dst_fmha):
-            shutil.rmtree(dst_fmha)
         dst_nccl_extensions = os.path.join("3rdparty", "nccl_extensions")
         if os.path.islink(dst_nccl_extensions):
             os.unlink(dst_nccl_extensions)
@@ -545,13 +515,9 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
             if should_skip_precompiled_package_data(file.filename):
                 continue
 
-            # Top-level MSA package in the wheel; stage under 3rdparty for
-            # setuptools package_dir, matching scripts/build_wheel.py.
+            # Older wheels carry a top-level MSA package; the MSA kernels are
+            # now vendored under tensorrt_llm, so it is not staged.
             if file.filename.startswith("fmha_sm100/"):
-                print(
-                    f"Extracting and including {file.filename} from precompiled wheel."
-                )
-                wheel.extract(file, path="3rdparty")
                 continue
 
             # NCCL-EP is a top-level namespace package in the wheel. Stage it
@@ -613,10 +579,7 @@ exclude_package_data = {}
 # internal absolute imports (e.g., "from triton_kernels.foo import bar") work.
 packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 
-# fmha_sm100 is staged under 3rdparty/ by scripts/build_wheel.py from the
-# CMake FetchContent tree (same packaging role as tensorrt_llm/deep_ep).
-package_dirs = {"fmha_sm100": "3rdparty/fmha_sm100"}
-packages += ["fmha_sm100"]
+package_dirs = {}
 
 # NCCL-EP is staged from the source-built nccl-extensions wheel under
 # 3rdparty/. Its ``nccl`` package is a namespace shared with nccl4py, so
@@ -689,17 +652,8 @@ setup(
     license="Apache License 2.0",
     keywords="nvidia tensorrt deeplearning inference",
     package_data={
-        'tensorrt_llm':
-        package_data,
+        'tensorrt_llm': package_data,
         'triton_kernels': ['LICENSE', 'VERSION', 'README.md'],
-        'fmha_sm100': [
-            '*.py',
-            'csrc/**/*',
-            'cute/**/*',
-            'cutlass/include/**/*',
-            'cutlass/tools/util/include/**/*',
-            'cutlass/LICENSE.txt',
-        ],
         **nccl_extensions_package_data,
     },
     license_files=get_license(),

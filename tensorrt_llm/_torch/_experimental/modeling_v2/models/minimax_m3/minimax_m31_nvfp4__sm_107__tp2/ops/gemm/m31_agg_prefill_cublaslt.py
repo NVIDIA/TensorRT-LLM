@@ -1,21 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in pinned cuBLASLt for agg prefill: not bitwise, pending agg quality gates.
+"""Pinned cuBLASLt for agg prefill GEMMs of at least 8192 rows (not bitwise, pending agg quality gates.); on by default.
+TRTLLM_M31_DISABLE_AGG_PREFILL_CUBLASLT=1 keeps the original WIDE dispatch.
 
 Pins and first-use checks reuse the sm_107 tp2ctx implementation.
 The scaled_mm reference certifies cuBLASLt's own numerics, not FlashInfer parity.
 """
 
-import os
 from typing import Callable
 
 import torch
 
 from tensorrt_llm.logger import logger
 
-from ...m31_switches import m31_disabled, m31_enabled
+from ...m31_switches import m31_disabled
 
-ENABLED = m31_enabled("AGG_PREFILL_CUBLASLT") and not m31_disabled("AGG_PREFILL_CUBLASLT")
+ENABLED = not m31_disabled("AGG_PREFILL_CUBLASLT")
 PINS = {
     (6144, 4096): (
         (8192, 12287, (66, 513, 36, 1, 0, 0, 1, 0, 6)),
@@ -35,22 +35,9 @@ def _op() -> (
     Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]], torch.Tensor]
     | None
 ):
-    """Load the handed native op once; absence preserves the original dispatch."""
+    """The built native op, looked up once; absence preserves the original dispatch."""
     if "op" not in _STATE:
-        op = getattr(torch.ops.trtllm, "minimax_m31_mxfp8_cublaslt_gemm", None)
-        if op is None:
-            import tensorrt_llm
-
-            lib = os.path.join(
-                os.path.dirname(tensorrt_llm.__file__), "libs", "libm31_mxfp8_cublaslt.so"
-            )
-            if os.path.exists(lib):
-                try:
-                    torch.ops.load_library(lib)
-                    op = getattr(torch.ops.trtllm, "minimax_m31_mxfp8_cublaslt_gemm", None)
-                except (OSError, RuntimeError) as exc:
-                    logger.warning(f"AGG_PREFILL_CUBLASLT load failed: {exc}")
-        _STATE["op"] = op
+        _STATE["op"] = getattr(torch.ops.trtllm, "minimax_m31_mxfp8_cublaslt_gemm", None)
     return _STATE["op"]
 
 

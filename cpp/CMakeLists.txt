@@ -285,7 +285,7 @@ endif()
 FetchContent_MakeAvailable(nanobind)
 include_directories(${CMAKE_BINARY_DIR}/_deps/nanobind-src/include)
 
-FetchContent_MakeAvailable(cutlass cxxopts flashmla json msa xgrammar)
+FetchContent_MakeAvailable(cutlass cutlass_msa cxxopts flashmla json xgrammar)
 
 # cppzmq (header-only) is the bounce v2 control-plane dependency AND the UCX
 # bootstrap dependency. Make it available whenever NIXL (-> bounce) or UCX is

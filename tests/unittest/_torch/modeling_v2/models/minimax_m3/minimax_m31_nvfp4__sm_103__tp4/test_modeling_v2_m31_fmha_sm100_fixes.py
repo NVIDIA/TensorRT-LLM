@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The two arch-independent fmha_sm100 correctness fixes the M3.1 targets carry in
-3rdparty/patches/msa_strided_paged_kv.patch (from #20629 cf8a77e816), checked on the installed package:
+the vendored MSA tree's patch (3rdparty/vendor_patches/msa-fmha-sm100.patch, from #20629 cf8a77e816), checked on
+the installed package:
 
 1. Sm100FmhaFwdKernelTmaWarpspecialized is PDL-launched, so it must run griddepcontrol.wait before reading any
    input (the upstream wait is commented out: a race with its predecessor; the M3.1 prefill index proxy pass runs it).
@@ -15,7 +16,9 @@ from pathlib import Path
 
 import pytest
 
-_SPEC = importlib.util.find_spec("fmha_sm100")
+_SPEC = importlib.util.find_spec(
+    "tensorrt_llm._torch.attention.backends.fmha.msa_kernels.fmha_sm100"
+)
 pytestmark = pytest.mark.skipif(_SPEC is None, reason="fmha_sm100 is not installed")
 
 

@@ -293,6 +293,57 @@ def _sparse_decode_lc_prepare_fake(anchor, kv_heads):
     return 0
 
 
+def _qkv_indexer_producer_rows_fake(
+    packed,
+    kv_data_cache,
+    kv_scale_cache,
+    index_k_cache,
+    out_cache_loc,
+    kv_quant_scale,
+    num_heads_q,
+    num_heads_kv,
+    num_heads_index,
+    head_dim,
+    rotary_dim,
+    eps,
+    q_weight,
+    k_weight,
+    index_q_weight,
+    index_k_weight,
+    rotary_cos_sin,
+    position_ids,
+):
+    """minimax_m31_nvfp4_qkv_indexer_producer_rows (TP2CTX_QKV_ROWS): FP8 q [T, Hq, 128] and index-q [T, Hidx, 128];
+    the paged caches are written in place."""
+    num_tokens = packed.shape[0]
+    return (
+        packed.new_empty((num_tokens, num_heads_q, head_dim), dtype=torch.float8_e4m3fn),
+        packed.new_empty((num_tokens, num_heads_index, head_dim), dtype=torch.float8_e4m3fn),
+    )
+
+
+def _swiglu_oai_mxfp8_fake(x, q, sf, h):
+    """minimax_m31_swiglu_oai_mxfp8 (TP2CTX_SWIGLU_MXFP8): writes the E4M3 activation, its swizzled UE8M0 scales and
+    (optionally) the bf16 activation into the caller's buffers; returns nothing."""
+    return None
+
+
+def _mxfp8_cublaslt_gemm_fake(act, act_scale, weight, weight_scale, algo):
+    """minimax_m31_mxfp8_cublaslt_gemm (TP2CTX_MXFP8_CUBLASLT / AGG_PREFILL_CUBLASLT): E4M3 act [M, K] times the E4M3
+    weight [N, K]^T with UE8M0 block scales -> a new bf16 [M, N]."""
+    return act.new_empty((act.shape[0], weight.shape[0]), dtype=torch.bfloat16)
+
+
+def _tp2ctx_peer_push_fake(src, dst):
+    """minimax_m31_tp2ctx_peer_push (TP2CTX_SP): copies src into the peer's IPC slot at dst; returns nothing."""
+    return None
+
+
+def _bf16_to_fp32_fake(x):
+    """minimax_m31_bf16_to_fp32 (TP2CTX_GATE_CAST): x.to(torch.float32), same shape."""
+    return x.new_empty(x.shape, dtype=torch.float32)
+
+
 # op name -> fake impl.
 FAKES = {
     "minimax_m31_fc_shard_gemm": _fc_shard_gemm_fake,
@@ -304,6 +355,11 @@ FAKES = {
     "minimax_m31_swiglu_oai": _swiglu_oai_fake,
     "minimax_m31_swiglu_oai_vec": _swiglu_oai_vec_fake,
     "minimax_m31_moe_finalize": _moe_finalize_fake,
+    "minimax_m31_swiglu_oai_mxfp8": _swiglu_oai_mxfp8_fake,
+    "minimax_m31_bf16_to_fp32": _bf16_to_fp32_fake,
+    "minimax_m31_mxfp8_cublaslt_gemm": _mxfp8_cublaslt_gemm_fake,
+    "minimax_m31_tp2ctx_peer_push": _tp2ctx_peer_push_fake,
+    "minimax_m31_nvfp4_qkv_indexer_producer_rows": _qkv_indexer_producer_rows_fake,
     "minimax_m31_topp_renorm_det": _topp_renorm_det_fake,
     "minimax_m31_topp_renorm_det_v3": _topp_renorm_det_v3_fake,
     "minimax_m31_softmax_mc": _softmax_mc_fake,
