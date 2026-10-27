@@ -421,3 +421,26 @@ def recorded_launchers() -> Dict[str, int]:
     """Launch classes recorded per launcher name (for logs and tests)."""
     with _LOCK:
         return {name: len(per_name) for name, per_name in _RECORDS.items()}
+
+
+def start_warmup_builds(prefetcher, engine, kv_cache_manager) -> None:
+    """Before warmup's first forward, register the Mamba decode provider on
+    the native state-update launch each mixer's decode step will make
+    (``seed_native_decode_records``), so the helpers build those variants
+    while warmup's first forwards run."""
+    if seed_native_decode_records(engine.model, kv_cache_manager):
+        prefetcher.register("mamba_decode", MambaDecodeProvider(engine.batch_size))
+
+
+def register_providers(prefetcher, engine) -> None:
+    """Register the Mamba decode provider at the end of warmup, unless it was
+    registered before warmup's first forward: it plans the decode launch
+    classes warmup recorded (``start_recording``)."""
+    from tensorrt_llm.logger import logger
+
+    decode_provider = MambaDecodeProvider(engine.batch_size)
+    if decode_provider:
+        logger.info(
+            f"[JIT prefetch] Mamba decode launches recorded in warmup: {recorded_launchers()}"
+        )
+        prefetcher.register("mamba_decode", decode_provider)

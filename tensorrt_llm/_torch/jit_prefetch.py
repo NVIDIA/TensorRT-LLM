@@ -43,7 +43,7 @@ compile:
   fake tensors and exports it, and the op loads the export where it would
   call ``cute.compile``. These follow from the model's layers alone, so they
   start once the model is constructed, while its weights load
-  (``start_model_builds``).
+  (``jit_prefetch_cute_dsl.start_model_builds``).
 * FlashInfer JIT modules. A provider names the modules a model's layers build
   in their first forward (``flashinfer_modules(model)``); each is built in a
   helper of its own from the moment the model is constructed, and joined
@@ -59,9 +59,8 @@ FlashInfer ``selective_state_update`` module
 (``modules/mamba/jit_prefetch_flashinfer.py``), the TRTLLM-GEN FMHA
 launchers of FlashInfer (``attention/backends/fmha/jit_prefetch.py``), and
 the CuTe DSL NVFP4 dense GEMM and FlashInfer RMSNorm kernels. A model with
-other JIT kernels adds a provider next to them and registers it with the
-engine (``PyTorchModelEngine._register_triton_providers``,
-``_init_jit_prefetch``) or in ``start_model_builds``.
+other JIT kernels adds a provider next to them, and a call to it in the phase
+of the engine's startup that can plan it (``jit_prefetch_engine.py``).
 
 For every planned Triton variant, Triton's own binder computes Triton's own
 cache key, which is checked against the kernel's in-memory cache and then the
@@ -97,7 +96,6 @@ listed there is a variant no provider covers.
 from __future__ import annotations
 
 import collections
-import importlib
 import json
 import os
 import queue
@@ -264,7 +262,8 @@ _fi_builds: List[Tuple[Tuple[str, ...], Any]] = []
 # Every module a build has been started for, so none is started twice.
 _fi_started: set = set()
 # The modules among them that a model's layers build in warmup's first
-# forwards (``start_model_builds``), joined before those forwards.
+# forwards (``jit_prefetch_engine.start_model_builds``), joined before those
+# forwards.
 _fi_layer_modules: set = set()
 
 
@@ -290,7 +289,7 @@ def start_flashinfer_build(
     with a cold cache, during which the GPU idles. Warmup builds the sampling
     module (``warmup_sampling_module``) before its first forward; a model's
     layers may build others in warmup's first forwards (``layer``, see
-    ``start_model_builds``). Started ahead of that use, the helper builds the
+    ``jit_prefetch_engine.start_model_builds``). Started ahead of that use, the helper builds the
     modules, one after another in the given order, while the process does
     other work: the sampling module from the beginning of warmup, a layer's
     module while the weights load. Warmup joins the helpers before the use:
@@ -506,101 +505,6 @@ def flashinfer_layer_builds_pending() -> bool:
 def flashinfer_build_pending(name: str) -> bool:
     """Whether a helper still to be joined builds FlashInfer module ``name``."""
     return any(name in modules for modules, _ in _fi_builds)
-
-
-def warmup_builds_sampling_module(model, llm_args) -> bool:
-    """Whether the engine ``llm_args`` describes builds FlashInfer's sampling
-    module in warmup, known once ``model`` is constructed: every decoder
-    runner's warmup does (``warmup_sampling_module``), other runners'
-    (encoder, pooling) do not."""
-    from .pyexecutor.engine.runners import DecoderRunner, resolve_runner_type
-
-    return issubclass(resolve_runner_type(model, llm_args), DecoderRunner)
-
-
-# Modules (relative to ``tensorrt_llm._torch``) whose ``flashinfer_modules(model)``
-# names the FlashInfer JIT modules a model's layers build in warmup's first
-# forwards.
-FLASHINFER_MODULE_PROVIDERS = (
-    "attention.backends.fmha.jit_prefetch",
-    "modules.mamba.jit_prefetch_flashinfer",
-)
-
-
-def start_model_builds(model, rank: int = 0, llm_args=None) -> bool:
-    """Start building, in CPU-only helpers, the JIT kernels ``model``'s layers
-    build in warmup's first forwards, which follow from the model's geometry
-    alone; called once the model is constructed, so the builds run while the
-    weights load instead of inside warmup:
-
-    * FlashInfer JIT modules, one helper each: the modules each of
-      ``FLASHINFER_MODULE_PROVIDERS`` names (``fmha_gen``, FlashInfer's
-      TRTLLM-GEN attention launcher, for the layers that run on its FMHA
-      library; the Mamba2 decode's ``selective_state_update``), which warmup
-      joins before its first forward (``wait_flashinfer_layer_builds``), and
-      the sampling module, if the engine ``llm_args`` describes builds it in
-      warmup (``warmup_builds_sampling_module``; warmup starts it otherwise);
-    * the CuTe DSL kernels the layers reach: the NVFP4 dense GEMM tactics the
-      NVFP4 GEMM's autotuner races (``jit_prefetch_cute_dsl.Nvfp4GemmProvider``,
-      M buckets up to the engine's ``max_num_tokens``) and FlashInfer's CuTe
-      DSL RMSNorm variants (``FlashInferNormProvider``). The CuTe DSL helpers
-      start here, so their start-up overlaps the weight load.
-
-    Returns False if prefetch is off or nothing was started."""
-    if not prefetch_enabled():
-        return False
-    started = False
-    modules: List[str] = []
-    for provider_module in FLASHINFER_MODULE_PROVIDERS:
-        try:
-            planner = importlib.import_module(f".{provider_module}", __package__)
-            modules += planner.flashinfer_modules(model)
-        except Exception as e:  # noqa: BLE001 - its modules then build in place
-            logger.warning(
-                f"[JIT prefetch] FlashInfer builds of {provider_module} not planned: "
-                f"{type(e).__name__}: {e}"
-            )
-    # One helper per module, so they build side by side. The layers' modules
-    # are joined before warmup's first forward, which waits for them, so they
-    # build at this process's priority.
-    for name in dict.fromkeys(modules):
-        started = start_flashinfer_build((name,), nice=0, layer=True) or started
-    if llm_args is not None:
-        # Warmup loads the sampling module only before CUDA graph capture.
-        try:
-            if warmup_builds_sampling_module(model, llm_args):
-                started = start_flashinfer_build(("sampling",)) or started
-        except Exception as e:  # noqa: BLE001 - warmup then starts it
-            logger.warning(
-                f"[JIT prefetch] FlashInfer sampling build not planned: {type(e).__name__}: {e}"
-            )
-    try:
-        from .cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-
-        if IS_CUTLASS_DSL_AVAILABLE:
-            from . import jit_prefetch_cute_dsl as jcd
-
-            # Every later cluster-occupancy query reuses one probe kernel.
-            jcd.install_occupancy_kernel_cache()
-            # They follow from the layers' geometry and are compiled in
-            # warmup's first forwards: the NVFP4 GEMM tactics by the
-            # autotuner, the FlashInfer norms by the first forward.
-            nvfp4_provider = jcd.Nvfp4GemmProvider(
-                model, getattr(llm_args, "max_num_tokens", None) or 0
-            )
-            norm_provider = jcd.FlashInferNormProvider(model)
-            if nvfp4_provider or norm_provider:
-                prefetcher = JitPrefetcher.init(rank)
-                if prefetcher is not None:
-                    # Queued in the order warmup needs them: the norms in the
-                    # first forward, ahead of the GEMM tactics.
-                    if norm_provider:
-                        started = prefetcher.enable_flashinfer_norm(norm_provider) or started
-                    if nvfp4_provider:
-                        started = prefetcher.enable_nvfp4_gemm(nvfp4_provider) or started
-    except Exception as e:  # noqa: BLE001 - the kernels then compile in place
-        logger.warning(f"[JIT prefetch] CuTe DSL builds not planned: {type(e).__name__}: {e}")
-    return started
 
 
 # ---------------------------------------------------------------------------
@@ -1349,9 +1253,10 @@ class JitPrefetcher:
         """Compile the CuTe DSL NVFP4 dense GEMM tactics the model's NVFP4
         layers reach in the CuTe DSL helpers, and have the runner load them.
 
-        Called right after the model is constructed (``start_model_builds``):
-        the autotuner's first pass compiles every tactic it benchmarks, and
-        the helpers compile them while the weights load. A tactic whose
+        Called right after the model is constructed
+        (``jit_prefetch_cute_dsl.start_model_builds``): the autotuner's first
+        pass compiles every tactic it benchmarks, and the helpers compile them
+        while the weights load. A tactic whose
         export is missing when the runner needs it compiles in place; one a
         helper is compiling is waited for (``_cute_dsl_load``).
         """
@@ -1375,8 +1280,9 @@ class JitPrefetcher:
         """Compile FlashInfer's CuTe DSL norm variants in the CuTe DSL helpers
         and have FlashInfer's compiled-kernel getters load them.
 
-        Called once the model is constructed (``start_model_builds``), so the
-        helpers start, and build these variants, while the weights load; and
+        Called once the model is constructed
+        (``jit_prefetch_cute_dsl.start_model_builds``), so the helpers start,
+        and build these variants, while the weights load; and
         again at the end of warmup, which queues only variants not queued
         before. Returns whether anything was queued."""
         from . import jit_prefetch_cute_dsl as jcd

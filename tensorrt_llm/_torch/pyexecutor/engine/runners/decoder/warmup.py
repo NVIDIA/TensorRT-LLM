@@ -1268,34 +1268,6 @@ class DecoderWarmup:
         if ran_native_forward:
             self._completed_autotuner_warmup_num_tokens = curr_max_num_tokens
 
-    def _mamba_prefill_tuned_ahead(self) -> bool:
-        """True if JIT tune ahead covers the autotune keys of the Mamba
-        warmup's forced-initial-states pass on this rank: every recurrent
-        layer the rank holds is a Mamba2 mixer running the Triton SSD kernels
-        (Nemotron-H), whose variants ``MambaSSDProvider`` compiles and tunes,
-        or it holds none. GDN and KDA layers read the same initial-state
-        metadata and are autotuned on keys no provider tunes ahead."""
-        from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
-        from tensorrt_llm._torch.modules.mamba.jit_prefetch import MambaSSDProvider
-
-        other_mixers: tuple = (Qwen3NextGatedDeltaNet,)
-        try:
-            from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
-
-            other_mixers += (KimiKDALinearAttention,)
-        except ImportError:  # optional dependency (CuTe DSL / FLA)
-            pass
-        try:
-            shapes = MambaSSDProvider(self.model).shapes
-            others = any(isinstance(m, other_mixers) for m in self.model.modules())
-        except Exception as e:  # noqa: BLE001 - JIT compile ahead must never fail startup
-            logger.warning(
-                "Mamba hybrid warmup kept: cannot tell whether JIT tune ahead covers "
-                f"it. {type(e).__name__}: {e}"
-            )
-            return False
-        return all(s.triton_ssd for s in shapes) and not others
-
     def _run_mamba_hybrid_warmup(self, resource_manager: ResourceManager) -> None:
         """Pre-JIT the Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels.
 
@@ -1353,9 +1325,11 @@ class DecoderWarmup:
         # below has nothing left to do. A pipeline stage holds only its own
         # layers, so ranks can disagree; the gate itself only reads the
         # environment, so every rank enters this agreement or none does.
-        tuned_ahead = tune_ahead_enabled() and self._agreement.agree_flag(
-            self._mamba_prefill_tuned_ahead()
-        )
+        tuned_ahead = False
+        if tune_ahead_enabled():
+            from tensorrt_llm._torch.modules.mamba.jit_prefetch import tune_ahead_covers_prefill
+
+            tuned_ahead = self._agreement.agree_flag(tune_ahead_covers_prefill(self.model))
 
         token_num_upper_bound = min(
             self._config.max_num_tokens,

@@ -765,6 +765,10 @@ class ModelLoader:
     This class isolates model loading logic from the main execution engine.
     """
     _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION = 1
+    # JIT compile ahead and tune ahead of the engine that loads the model
+    # (jit_prefetch_engine.EngineJitAhead), which starts building JIT kernels
+    # while the weights load; None without one.
+    jit_ahead = None
 
     # Root classes are named rather than held, so this table costs no model-zoo
     # import; qualify() resolves only the profile whose class name matches the
@@ -1103,10 +1107,8 @@ class ModelLoader:
             # the model's layers build in warmup (FlashInfer modules, CuTe DSL
             # GEMM tactics and norms) are built in CPU-only helpers while the
             # weights load.
-            from ..jit_prefetch import start_model_builds
-            start_model_builds(model,
-                               rank=self.mapping.rank,
-                               llm_args=self.llm_args)
+            if self.jit_ahead is not None:
+                self.jit_ahead.model_constructed(model)
 
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)

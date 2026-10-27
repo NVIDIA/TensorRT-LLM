@@ -585,7 +585,9 @@ def test_mamba_warmup_passes_with_jit_ahead(
     engine, resource_manager = _mamba_engine()
     engine._dummy_requests.create_warmup_request = mock.Mock(return_value=object())
     engine._forward_warmup = mock.Mock()
-    engine._mamba_prefill_tuned_ahead = mock.Mock(return_value=covered)
+    from tensorrt_llm._torch.modules.mamba import jit_prefetch as mamba_plan
+
+    monkeypatch.setattr(mamba_plan, "tune_ahead_covers_prefill", mock.Mock(return_value=covered))
 
     with (
         _no_cuda_side_effects(),
@@ -614,7 +616,7 @@ def test_mamba_warmup_passes_with_jit_ahead(
     ],
     ids=["no_recurrent_layers", "triton_ssd", "flashinfer_ssd", "gdn", "unknown"],
 )
-def test_mamba_prefill_tuned_ahead_needs_every_recurrent_layer_covered(
+def test_tune_ahead_covers_prefill_needs_every_recurrent_layer_covered(
     triton_ssd, gdn, provider_fails, expected, monkeypatch
 ) -> None:
     """Tune ahead stands in for the forced-initial-states pass only when every
@@ -634,6 +636,5 @@ def test_mamba_prefill_tuned_ahead_needs_every_recurrent_layer_covered(
         return SimpleNamespace(shapes=[SimpleNamespace(triton_ssd=t) for t in triton_ssd])
 
     monkeypatch.setattr(mamba_plan, "MambaSSDProvider", provider)
-    engine, _ = _mamba_engine()
-    engine.model = torch.nn.Sequential(torch.nn.Linear(2, 2), *([_Gdn()] if gdn else []))
-    assert engine._mamba_prefill_tuned_ahead() is expected
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), *([_Gdn()] if gdn else []))
+    assert mamba_plan.tune_ahead_covers_prefill(model) is expected

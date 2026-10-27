@@ -216,6 +216,7 @@ def test_start_model_builds_queues_the_nvfp4_gemm_tactics_before_warmup(monkeypa
     ``start_model_builds`` hands every tactic to the CuTe DSL helpers; with
     it off, nothing is queued and no loader is installed."""
     from tensorrt_llm._torch import jit_prefetch as jp
+    from tensorrt_llm._torch import jit_prefetch_engine
     from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops as ops
     from tensorrt_llm._torch.modules.linear import Linear
     from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -237,16 +238,18 @@ def test_start_model_builds_queues_the_nvfp4_gemm_tactics_before_warmup(monkeypa
         def enable_flashinfer_norm(self, p):
             return False
 
-    monkeypatch.setattr(jp, "FLASHINFER_MODULE_PROVIDERS", ())
-    monkeypatch.setattr(jp, "warmup_builds_sampling_module", lambda model, llm_args: False)
+    monkeypatch.setattr(jit_prefetch_engine, "FLASHINFER_MODULE_PROVIDERS", ())
+    monkeypatch.setattr(
+        jit_prefetch_engine, "warmup_builds_sampling_module", lambda model, llm_args: False
+    )
     monkeypatch.setenv("TLLM_JIT_AHEAD", "1")
     monkeypatch.setattr(jp.JitPrefetcher, "init", classmethod(lambda cls, rank: _Prefetcher()))
     llm_args = type("Args", (), {"max_num_tokens": 256})()
-    assert jp.start_model_builds(model, llm_args=llm_args)
+    assert jit_prefetch_engine.start_model_builds(model, llm_args=llm_args)
     assert queued == provider.specs
     monkeypatch.setenv("TLLM_JIT_AHEAD", "0")
     queued.clear()
-    assert not jp.start_model_builds(model, llm_args=llm_args)
+    assert not jit_prefetch_engine.start_model_builds(model, llm_args=llm_args)
     assert queued == [] and ops.nvfp4_gemm_loader is None
 
 

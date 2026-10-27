@@ -596,3 +596,62 @@ def install_flashinfer_norm_loader(
         setattr(module, name, make())
         wrapped.append(name)
     return wrapped
+
+
+# ---------------------------------------------------------------------------
+# What an engine builds ahead, and when (called from jit_prefetch_engine.py)
+# ---------------------------------------------------------------------------
+
+
+def start_model_builds(model, rank: int, llm_args) -> bool:
+    """Start the CuTe DSL helpers on the kernels ``model``'s layers compile
+    in warmup's first forwards, once the model is constructed, so that the
+    helpers' start-up and these builds overlap the weight load: the NVFP4
+    dense GEMM tactics the NVFP4 GEMM's autotuner races
+    (``Nvfp4GemmProvider``, M buckets up to the engine's ``max_num_tokens``)
+    and FlashInfer's CuTe DSL RMSNorm variants (``FlashInferNormProvider``).
+    Returns whether anything was started."""
+    from tensorrt_llm.logger import logger
+
+    started = False
+    try:
+        from .cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+        if not IS_CUTLASS_DSL_AVAILABLE:
+            return False
+        from .jit_prefetch import JitPrefetcher
+
+        # Every later cluster-occupancy query reuses one probe kernel.
+        install_occupancy_kernel_cache()
+        # They follow from the layers' geometry and are compiled in warmup's
+        # first forwards: the NVFP4 GEMM tactics by the autotuner, the
+        # FlashInfer norms by the first forward.
+        nvfp4_provider = Nvfp4GemmProvider(model, getattr(llm_args, "max_num_tokens", None) or 0)
+        norm_provider = FlashInferNormProvider(model)
+        if not (nvfp4_provider or norm_provider):
+            return False
+        prefetcher = JitPrefetcher.init(rank)
+        if prefetcher is None:
+            return False
+        # Queued in the order warmup needs them: the norms in the first
+        # forward, ahead of the GEMM tactics.
+        if norm_provider:
+            started = prefetcher.enable_flashinfer_norm(norm_provider) or started
+        if nvfp4_provider:
+            started = prefetcher.enable_nvfp4_gemm(nvfp4_provider) or started
+    except Exception as e:  # noqa: BLE001 - the kernels then compile in place
+        logger.warning(f"[JIT prefetch] CuTe DSL builds not planned: {type(e).__name__}: {e}")
+    return started
+
+
+def register_providers(prefetcher, engine) -> None:
+    """At the end of warmup, queue the FlashInfer norm variants of
+    ``engine``'s loaded model not queued once the model was constructed."""
+    from .._utils import get_sm_version
+    from .cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103):
+        return
+    norm_provider = FlashInferNormProvider(engine.model)
+    if norm_provider:
+        prefetcher.enable_flashinfer_norm(norm_provider)

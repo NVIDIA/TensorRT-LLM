@@ -71,3 +71,11 @@ class Relu2Provider:
                 for rows in self.ROWS:
                     fused_relu2(torch.empty(rows, width, dtype=dtype, device="meta"))
         return list(rec)
+
+
+def register_providers(prefetcher, engine) -> None:
+    """Register the provider of the relu2 MLP activations of ``engine``'s
+    model. Once per process: later calls change nothing."""
+    provider = Relu2Provider(engine.model)
+    if provider:
+        prefetcher.register("relu2", provider)

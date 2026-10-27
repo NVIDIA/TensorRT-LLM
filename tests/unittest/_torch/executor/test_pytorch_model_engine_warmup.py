@@ -30,6 +30,7 @@ import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner as decoder_r
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup as decoder_warmup_module
 import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
+from tensorrt_llm._torch.jit_prefetch_engine import EngineJitAhead
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM, remove_weights
@@ -2154,8 +2155,10 @@ def _compile_ahead_warmup(monkeypatch, events: list, *, prefetch: bool, sampling
     engine._runner = runner
     engine.model = warmup.model
     engine.mapping = SimpleNamespace(rank=0)
-    monkeypatch.setattr(engine, "_start_warmup_triton_builds", record("start_triton_providers"))
-    monkeypatch.setattr(engine, "_init_jit_prefetch", record("init_jit_prefetch"))
+    monkeypatch.setattr(
+        engine._jit_ahead, "_before_warmup_forwards", record("start_triton_providers")
+    )
+    monkeypatch.setattr(engine._jit_ahead, "_after_warmup", record("init_jit_prefetch"))
     resource_manager = Mock()
     resource_manager.get_resource_manager.return_value = Mock()
     return engine, runner, resource_manager
@@ -2223,6 +2226,7 @@ def test_engine_sets_up_jit_prefetch_after_warmup(monkeypatch, env, initialized:
     JIT stats, and only when one of them is on: the forward that follows is
     then the one that binds the executor thread."""
     from tensorrt_llm._torch import jit_prefetch as jp
+    from tensorrt_llm._torch import jit_prefetch_engine
     from tensorrt_llm._torch.modules.mamba import jit_prefetch_decode
 
     for var in ("TLLM_JIT_AHEAD", "TLLM_JIT_TUNE_AHEAD", "TLLM_JIT_STATS"):
@@ -2240,14 +2244,14 @@ def test_engine_sets_up_jit_prefetch_after_warmup(monkeypatch, env, initialized:
     engine.batch_size = engine.max_num_tokens = engine.max_seq_len = 8
     with (
         patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", False),
-        patch.object(engine, "_register_triton_providers") as register,
+        patch.object(jit_prefetch_engine, "_register_triton_providers") as register,
     ):
         engine._warmup_impl(Mock())
     engine._runner.warmup.assert_called_once()
-    assert engine._jit_bind_pending is initialized
-    assert (engine._jit_prefetcher is prefetcher) is initialized
+    assert (engine._jit_serving_forward is not None) is initialized
+    assert (engine._jit_ahead._prefetcher is prefetcher) is initialized
     if env.get("TLLM_JIT_AHEAD") == "1":
-        register.assert_called_once_with(prefetcher)
+        register.assert_called_once_with(prefetcher, engine)
         prefetcher.wait_ready.assert_called_once_with()
         prefetcher.tune.assert_called_once_with()
         prefetcher.start_background.assert_called_once_with()
@@ -2263,8 +2267,10 @@ def test_first_forward_after_warmup_binds_the_jit_executor_thread() -> None:
     launches; forwards inside a warmup scope never bind it."""
     prefetcher = Mock()
     engine = object.__new__(PyTorchModelEngine)
-    engine._jit_prefetcher = prefetcher
-    engine._jit_bind_pending = True
+    # What the end of warmup sets up (EngineJitAhead._after_warmup).
+    jit_ahead = EngineJitAhead(engine)
+    jit_ahead._prefetcher = prefetcher
+    engine._jit_serving_forward = jit_ahead._serving_forward
     engine._warmup_depth = 1
     engine._runner = object()
     with (
@@ -2278,7 +2284,7 @@ def test_first_forward_after_warmup_binds_the_jit_executor_thread() -> None:
         engine.forward(ScheduledRequests(), Mock())
     prefetcher.bind_executor_thread.assert_called_once_with()
     assert forward_scheduled.call_count == 3
-    assert engine._jit_bind_pending is False
+    assert engine._jit_serving_forward is None
 
 
 @pytest.mark.cpu_only
@@ -2317,16 +2323,16 @@ def test_engine_plans_a_warmup_batch_from_its_requests(monkeypatch, forced: bool
     prefetcher = SimpleNamespace(plan_warmup_batch=planned.append)
     monkeypatch.setattr(jp.JitPrefetcher, "get", classmethod(lambda cls: prefetcher))
     monkeypatch.setattr(Mamba2Metadata, "_warmup_force_initial_states", forced)
-    engine = object.__new__(PyTorchModelEngine)
     ctx = [
         SimpleNamespace(
             context_chunk_size=n, context_current_position=0, py_num_compressed_tokens=0
         )
         for n in (100, 28)
     ]
-    engine._plan_warmup_batch(SimpleNamespace(context_requests=[]))
+    plan = EngineJitAhead(object.__new__(PyTorchModelEngine))._plan_warmup_batch
+    plan(SimpleNamespace(context_requests=[]))
     assert planned == []
-    engine._plan_warmup_batch(SimpleNamespace(context_requests=ctx))
+    plan(SimpleNamespace(context_requests=ctx))
     (batch_ctx,) = planned
     assert batch_ctx.ctx_chunk_lens == [100, 28]
     assert batch_ctx.any_ctx_cached is forced
