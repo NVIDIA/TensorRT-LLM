@@ -729,8 +729,23 @@ def _shapes(messages):
             ],
             ("plan", "Running.\n", ["call_0"]),
         ),
+        # So it is without reasoning, which is what opens a turn otherwise.
+        (
+            [
+                _assistant_item("Run", "msg_1"),
+                _assistant_item("ning.\n", "msg_2"),
+                _function_call_item(0),
+            ],
+            (None, "Running.\n", ["call_0"]),
+        ),
     ],
-    ids=["reasoning_text_call", "reasoning_call_call", "reasoning_text", "split_text"],
+    ids=[
+        "reasoning_text_call",
+        "reasoning_call_call",
+        "reasoning_text",
+        "split_text",
+        "split_text_without_reasoning",
+    ],
 )
 def test_one_assistant_turn_becomes_one_assistant_message(turn, expected):
     calls = sum(item["type"] == "function_call" for item in turn)
