@@ -494,9 +494,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # besides the per-iteration poll the executor also enters it from
             # receive_gen_init, only on ranks that admitted gen-init requests.
             # The CP ranks of one DP group must therefore admit the same requests
-            # in the same iteration. Equal KV capacity is not enough: a client
-            # cancel or transfer timeout retires a request rank-locally, so one
-            # CP rank can have room before its peer. The pp=1 loops intersect
+            # in the same iteration. Equal KV capacity is not enough: a request
+            # retired on one CP rank only (e.g. a rank-local error) gives that
+            # rank room before its peer. The pp=1 loops intersect
             # the admitted ids over CP first
             # (DisaggTransferCoordinator.align_gen_admission_across_cp).
             # The PP loop does not, so _check_compatible rejects attention-DP
@@ -504,8 +504,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             #
             # Non-DP tp x cp gathers over the world behind the same predicate and
             # goes through the same step, which lines up its CP ranks but not its
-            # TP ranks; a rank-local cancel or timeout can still skew those, as it
-            # can without CP.
+            # TP ranks; a request retired on one rank only can still skew those,
+            # as it can without CP.
             self._gen_need_sync = m.pp_size * m.cp_size > 1
             self._gen_allgather: Callable = self._dp_group_allgather
         else:
@@ -523,6 +523,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if m.pp_size > 1:
             gathered = [x for part in self._dist.pp_allgather(gathered) for x in part]
         return gathered
+
+    @property
+    def group_retires_gen_receives(self) -> bool:
+        # The group is the one check_gen_transfer_status gathers over (_init_sync_policy).
+        return self._gen_need_sync
 
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
@@ -1416,10 +1421,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if session.status == SessionStatus.CANCELLED:
                 if self._ownership_blocks_retirement(session):
                     continue
-                # Session cancelled — either by local cancel_request() (user
-                # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
-                # server timeout).  Return the req objects so the caller can
-                # distinguish the two cases and set the appropriate state.
+                # Session cancelled — either by cancel_request() on this rank
+                # (user cancel, or a transfer deadline under gen sync) or by a
+                # remote CANCEL_SESSION message (e.g. CTX server timeout).
+                # Return the req objects so the caller can distinguish a user
+                # cancel from the rest and set the appropriate state.
                 cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
                 req = self._recv_reqs[rid]
@@ -1572,8 +1578,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
 
-        Returns False if any task is mid-write (TRANSFERRING); caller must
-        retry next iteration. Returns True when safe to free KV memory.
+        Returns False if any task is mid-write (TRANSFERRING), or while a
+        group-synced receive waits for check_gen_transfer_status to retire it;
+        caller must retry next iteration. Returns True when safe to free KV memory.
         """
         rid = get_unique_rid(req)
 
@@ -1598,6 +1605,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         if rid in self._recv_sessions:
             self._recv_sessions[rid].cancel()
+            if self.group_retires_gen_receives:
+                # check_gen_transfer_status retires it on every rank of the group.
+                return False
             if self._recv_sessions[rid].has_transferring_tasks():
                 has_transferring = True
             elif self._recv_sessions[rid].close() is False:

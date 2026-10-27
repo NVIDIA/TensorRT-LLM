@@ -243,8 +243,8 @@ class ADPRouter(ABC):
         ``DisaggTransferCoordinator.align_gen_admission_across_cp`` and never
         starts.
 
-        A client cancel or a transfer timeout can retire a request on one CP
-        rank before its peers, so the CP ranks' own loads can differ. With the
+        A request retired on one CP rank only (e.g. a rank-local error) leaves
+        the CP ranks' own loads different. With the
         maximum, every CP rank gathers the same loads over TP, and no CP rank
         goes over ``max_num_active_requests``.
         """

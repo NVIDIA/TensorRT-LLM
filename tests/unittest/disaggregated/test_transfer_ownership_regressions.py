@@ -313,6 +313,7 @@ def test_failed_writer_cannot_authorize_reuse_while_sibling_is_active() -> None:
         py_disaggregated_params=DisaggregatedParams(disagg_request_id=41),
     )
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._gen_need_sync = False
     transceiver._wait_reqs = {}
     transceiver._send_sessions = {}
     transceiver._send_reqs = {}
@@ -1000,6 +1001,7 @@ def test_cancel_request_retains_session_when_close_refuses(direction: str) -> No
         close=Mock(return_value=False),
     )
     transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._gen_need_sync = False
     transceiver._wait_reqs = {}
     transceiver._send_sessions = {rid: session} if direction == "send" else {}
     transceiver._send_reqs = {rid: request} if direction == "send" else {}

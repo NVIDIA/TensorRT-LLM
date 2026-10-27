@@ -243,10 +243,11 @@ class GenTransferStatus(NamedTuple):
     completed_request_ids: List[int]
     # Requests whose KV receive failed during this call.
     error_request_ids: List[int]
-    # Requests whose receive session was cancelled (locally via
-    # ``cancel_request`` or by a remote CANCEL message). Their sessions are
-    # closed; the caller decides the final request state, distinguishing
-    # user cancellation from remote-initiated cancellation.
+    # Requests whose receive session was cancelled (by ``cancel_request`` on
+    # this rank or a group peer, or by a remote CANCEL message). Their
+    # sessions are closed; the caller decides the final request state,
+    # distinguishing a user cancel from a failed transfer (a remote CANCEL or
+    # a transfer deadline).
     cancelled_requests: List[LlmRequest]
 
 
@@ -297,6 +298,19 @@ class KvCacheTransceiver(ABC):
     def consumes_transfer_buffer(self) -> bool:
         """Return whether this runtime consumes the C++ CacheTransBuffer budget."""
         return True
+
+    @property
+    def group_retires_gen_receives(self) -> bool:
+        """Whether only the gen sync group's consensus retires an async receive.
+
+        When True, ``cancel_request`` on a receive cancels this rank's session
+        and returns False. A later ``check_gen_transfer_status`` reports the
+        request cancelled on every rank of the group in the same call, and only
+        then does ``cancel_request`` return True. Callers must therefore not
+        fail or free such a request on one rank alone, e.g. on a rank-local
+        transfer timeout.
+        """
+        return False
 
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest) -> None:
@@ -410,8 +424,10 @@ class KvCacheTransceiver(ABC):
         """Best-effort cancellation of ``req``'s in-flight transfers.
 
         Returns True when the transfers are cancelled and it is safe to
-        release the request's KV resources; False when a task is mid-write
-        and the caller must retry on a later iteration.
+        release the request's KV resources; False when a task is mid-write,
+        or a receive waits for its group consensus (see
+        ``group_retires_gen_receives``), and the caller must retry on a later
+        iteration.
         """
         raise NotImplementedError
 

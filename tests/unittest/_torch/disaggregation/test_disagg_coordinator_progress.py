@@ -127,6 +127,23 @@ def test_timeout_check_is_rank_local(clock) -> None:
     assert [h.dist.calls for h in ranks] == [[], []]
 
 
+def test_timed_out_group_receive_is_cancelled_not_flagged(clock) -> None:
+    """When only the group consensus retires a receive, its deadline cancels
+    this rank's session on every check (the cancel is idempotent) instead of
+    flagging the request for a rank-local failure. Still no collective."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = _ranks(group, kv_transfer_timeout_ms=1000, group_retires_gen_receives=True)
+    requests = [_receiving(h, 1, started_at=clock["t"]) for h in ranks]
+    clock["t"] += 2.0
+
+    for _ in range(2):
+        group.run(lambda rank: ranks[rank].coordinator.check_transfer_timeouts())
+
+    assert not any(req.py_kv_transfer_timed_out for req in requests)
+    assert [h.transceiver.call_log.count("cancel_request:1") for h in ranks] == [2, 2]
+    assert [h.dist.calls for h in ranks] == [[], []]
+
+
 # -- idle progress poll ------------------------------------------------------
 
 
