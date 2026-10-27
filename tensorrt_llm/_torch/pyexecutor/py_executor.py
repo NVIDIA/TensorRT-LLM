@@ -880,11 +880,13 @@ class PyExecutor:
                                          "0") == "1"
         self._check_helix_schedule = (check_requested
                                       and self.dist.mapping.has_cp_helix()
+                                      and self.dist.mapping.pp_size == 1
                                       and self.kv_cache_transceiver is None)
         if check_requested and not self._check_helix_schedule:
             logger.warning(
                 "TLLM_HELIX_AGG_CHECK_SCHEDULE=1 is ignored: the schedule check "
-                "only runs with aggregated helix context parallelism.")
+                "only runs with aggregated helix context parallelism "
+                "and pipeline parallelism disabled.")
         self.sample_stream = torch.cuda.Stream()
         self.finish_sample_event = torch.cuda.Event()
         # Set of request IDs that are currently in flight across all micro batches

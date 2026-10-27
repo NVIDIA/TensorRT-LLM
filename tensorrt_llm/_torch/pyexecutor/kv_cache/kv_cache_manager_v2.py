@@ -1845,7 +1845,11 @@ class KVCacheManagerV2(BaseResourceManager):
             if isinstance(self.event_manager, StreamingKVCacheEventManager)
             else self.event_manager
         )
-        if not has_host_cache_tier:
+        # Aggregated helix runs GPU-only but its CP ranks still need a common
+        # verdict: a rank that fails to allocate would otherwise leave its peers
+        # waiting in the first collective.
+        sync_init_status = has_host_cache_tier or (self._has_cp_helix and not is_disagg)
+        if not sync_init_status:
             candidate = KVCacheManagerPy(
                 config,
                 event_manager=event_sink,
