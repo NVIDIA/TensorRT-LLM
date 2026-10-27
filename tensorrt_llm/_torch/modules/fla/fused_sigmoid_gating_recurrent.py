@@ -72,10 +72,6 @@ def _current_cu_stream(device_index: int):
     return stream
 
 
-# TLLM_GDN_FI_DIRECT_LAUNCH=0 keeps every FlashInfer GDN call on the validating
-# public entries (A/B; shared with the prefill adapter's knob).
-_FI_GDN_DECODE_DIRECT = os.environ.get("TLLM_GDN_FI_DIRECT_LAUNCH", "1") == "1"
-
 # Max per-sequence token count served by the FlashInfer MTP verify kernel; the
 # parity test (test_flashinfer_gdn_verify.py) covers T=1..8 against the Triton
 # reference. Longer drafts fall back to the Triton recurrent kernel.
@@ -250,235 +246,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         i_nh += grid_stride_nh
 
 
-@triton.jit
-def gdn_decode_pdl_update_kernel(
-    A_log,
-    a,
-    dt_bias,
-    softplus_beta,
-    softplus_threshold,
-    xr,  # post-conv mixed_qkv [tokens, >= 2*KEY_DIM + HV*V] (producer output)
-    b,
-    o,
-    h0_source,
-    h0_indices,
-    scale,
-    total_nh,
-    stride_xr,
-    stride_a,
-    stride_b,
-    s_h0_0,
-    h0_dim0,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    KEY_DIM: tl.constexpr,
-    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
-    USE_PDL: tl.constexpr,
-):
-    """T=1 decode specialization of the sigmoid-gating delta-rule update that
-    overlaps with the preceding causal-conv1d update kernel via PDL.
-
-    The pre-wait section performs every load that does not depend on the conv
-    output -- dominated by the SSM state-pool tile (the per-layer bandwidth
-    floor) -- then ``gdc_wait`` blocks until the conv producer grid completes
-    before q/k/v are read from its output. The producer must be launched with
-    ``launch_dependent_kernels=True`` (it fires ``gdc_launch_dependents`` at
-    kernel start) and this kernel with ``launch_pdl=True``.
-
-    Safety: everything read pre-wait (state pool, a/b projections, gating
-    params, slot indices) is produced by ops that complete before the conv
-    kernel *starts*, so reading it concurrently with the conv is race-free.
-    """
-    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    o_k = i_k * BK + tl.arange(0, BK)
-    o_v = i_v * BV + tl.arange(0, BV)
-    mask_k = o_k < K
-    mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
-    grid_stride_nh = tl.num_programs(2)
-
-    while i_nh < total_nh:
-        i_n, i_hv = i_nh // HV, i_nh % HV
-        i_h = i_hv // (HV // H)
-        # Exactly one token per sequence: token index == sequence index.
-        bos = i_n.to(tl.int64)
-        idx = tl.load(h0_indices + i_n).to(tl.int64)
-
-        # ---- pre-wait: loads independent of the conv output ----
-        b_h = tl.zeros([BK, BV], dtype=tl.float32)
-        if idx >= 0:
-            tl.device_assert(idx < h0_dim0,
-                             "idx out of bounds in h0_source load")
-            # Pool layout [slots, HV, V, K] with K innermost (stride 1).
-            p_h0 = (h0_source + idx * s_h0_0 + i_hv * V * K + o_k[:, None] +
-                    o_v[None, :] * K)
-            b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
-        b_b = tl.load(b + bos * stride_b + i_hv).to(tl.float32)
-        b_A_log = tl.load(A_log + i_hv).to(tl.float32)
-        b_a = tl.load(a + bos * stride_a + i_hv).to(tl.float32)
-        b_dt_bias = tl.load(dt_bias + i_hv).to(tl.float32)
-
-        # g = -exp(A_log) * softplus(a + dt_bias); beta = sigmoid(b)
-        x = b_a + b_dt_bias
-        beta_x = softplus_beta * x
-        softplus_x = tl.where(
-            beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
-            x,
-        )
-        b_g = -tl.exp(b_A_log) * softplus_x
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
-        b_h *= tl.exp(b_g)
-
-        # ---- wait for the conv producer, then consume its output ----
-        if USE_PDL:
-            tl.extra.cuda.gdc_wait()
-        p_x = xr + bos * stride_xr
-        b_q = tl.load(p_x + i_h * K + o_k, mask=mask_k,
-                      other=0.0).to(tl.float32)
-        b_k = tl.load(p_x + KEY_DIM + i_h * K + o_k, mask=mask_k,
-                      other=0.0).to(tl.float32)
-        b_v = tl.load(p_x + 2 * KEY_DIM + i_hv * V + o_v,
-                      mask=mask_v,
-                      other=0.0).to(tl.float32)
-
-        if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q)) + 1e-6)
-            b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k)) + 1e-6)
-        b_q = b_q * scale
-
-        b_v -= tl.sum(b_h * b_k[:, None], 0)
-        b_v *= b_beta
-        b_h += b_k[:, None] * b_v[None, :]
-        b_o = tl.sum(b_h * b_q[:, None], 0)
-        tl.store(o + (bos * HV + i_hv) * V + o_v,
-                 b_o.to(o.dtype.element_ty),
-                 mask=mask_v)
-
-        if idx >= 0:
-            p_h0 = (h0_source + idx * s_h0_0 + i_hv * V * K + o_k[:, None] +
-                    o_v[None, :] * K)
-            tl.store(p_h0, b_h.to(h0_source.dtype.element_ty), mask=mask_h)
-
-        i_nh += grid_stride_nh
-
-
-def can_use_gdn_decode_pdl_pair(
-    initial_state_source: Optional[torch.Tensor],
-    num_tokens: int,
-    num_seqs: int,
-    head_k_dim: int,
-    head_v_dim: int,
-    activation: Optional[str],
-) -> bool:
-    """Whether the standard decode step can run as the PDL-overlapped pair
-    (Triton causal-conv1d producer + ``gdn_decode_pdl_update`` consumer).
-
-    Requires PDL hardware (SM >= 90), one token per sequence, a state pool,
-    and silu/swish conv activation. The FlashInfer decode dispatch is checked
-    by the caller first and takes priority where available.
-    """
-    if os.environ.get("TRTLLM_GDN_DISABLE_PDL_DECODE_PAIR", "0") == "1":
-        return False
-    from tensorrt_llm._utils import get_sm_version
-    if get_sm_version() < 90:
-        return False
-    if initial_state_source is None:
-        return False
-    if num_tokens != num_seqs or num_seqs == 0:
-        return False
-    if activation not in ("silu", "swish"):
-        return False
-    if triton.next_power_of_2(head_k_dim) != head_k_dim:
-        return False
-    return True
-
-
-def gdn_decode_pdl_update(
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    dt_bias: torch.Tensor,
-    softplus_beta: float,
-    softplus_threshold: float,
-    mixed_qkv: torch.Tensor,  # post-conv [tokens, >= 2*key_dim + HV*V]
-    b: torch.Tensor,
-    initial_state_source: torch.Tensor,
-    initial_state_indices: torch.Tensor,
-    num_k_heads: int,
-    num_v_heads: int,
-    head_k_dim: int,
-    head_v_dim: int,
-    scale: Optional[float] = None,
-    use_qk_l2norm_in_kernel: bool = False,
-    output: Optional[torch.Tensor] = None,
-    use_pdl: bool = True,
-):
-    """Launch the PDL decode update. ``mixed_qkv`` is the causal-conv1d output
-    laid out [Q | K | V] per token; q/k/v are addressed in-kernel so no view
-    plumbing is needed. Numerics are identical to the fused Triton fallback
-    kernel (measured <= 1-2 bf16 ulp on the stored state, bit-equal conv pool).
-    """
-    H, HV, K, V = num_k_heads, num_v_heads, head_k_dim, head_v_dim
-    N = a.shape[-2]
-
-    if scale is None:
-        scale = K**-0.5
-
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
-    NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
-    assert NK == 1, "NK > 1 is not supported"
-    assert mixed_qkv.stride(-1) == 1
-
-    s_h0_0 = initial_state_source.stride(0)
-    slot_num = initial_state_source.shape[0]
-    # Pool layout [slots, HV, V, K] with K innermost (stride 1).
-    assert initial_state_source.stride(-1) == 1
-    assert initial_state_source.stride(2) == K
-    assert initial_state_source.stride(1) == V * K
-
-    o = (output.view(N, HV, V) if output is not None else mixed_qkv.new_empty(
-        N, HV, V))
-
-    grid = (NK, NV, min(N * HV, 65535))
-    with custom_device_ctx(mixed_qkv.device.index):
-        gdn_decode_pdl_update_kernel[grid](
-            A_log=A_log,
-            a=a,
-            dt_bias=dt_bias,
-            softplus_beta=softplus_beta,
-            softplus_threshold=softplus_threshold,
-            xr=mixed_qkv,
-            b=b,
-            o=o,
-            h0_source=initial_state_source,
-            h0_indices=initial_state_indices,
-            scale=scale,
-            total_nh=N * HV,
-            stride_xr=mixed_qkv.stride(0),
-            stride_a=a.stride(-2),
-            stride_b=b.stride(-2),
-            s_h0_0=s_h0_0,
-            h0_dim0=slot_num,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            BK=BK,
-            BV=BV,
-            KEY_DIM=H * K,
-            USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-            USE_PDL=use_pdl,
-            num_warps=4,
-            num_stages=3,
-            launch_pdl=use_pdl,
-        )
-    return o.view(1, N, HV, V)
-
-
 def _can_use_flashinfer_gdn_decode(
     initial_state_source: Optional[torch.Tensor],
     K: int,
@@ -628,10 +395,8 @@ def flashinfer_gdn_bf16_state_available(pool_dtype: torch.dtype, K: int,
 def flashinfer_gdn_decode_direct_available(pool_dtype: torch.dtype, K: int,
                                            V: int) -> bool:
     """Whether ``flashinfer_gdn_decode_t1`` serves one-token decode batches on a
-    state pool of this dtype and head sizes: the launchers are available and the
-    direct launches are on (TLLM_GDN_FI_DIRECT_LAUNCH)."""
-    return _FI_GDN_DECODE_DIRECT and flashinfer_gdn_bf16_state_available(
-        pool_dtype, K, V)
+    state pool of this dtype and head sizes: the launchers are available."""
+    return flashinfer_gdn_bf16_state_available(pool_dtype, K, V)
 
 
 def flashinfer_gdn_decode_t1(A_log: torch.Tensor, dt_bias: torch.Tensor,
@@ -712,9 +477,9 @@ def _fi_wide_vec_compiled_entry(H: int, HV: int, pool: torch.Tensor,
                                 indices: torch.Tensor, scale: float,
                                 tile_v: int):
     """``(compiled, dummy_intermediate)`` of FlashInfer's wide-vector T=1 decode
-    kernel for this pool geometry / tile, or None when the shortcut is off,
-    FlashInfer's internals are unavailable or the kernel is not compiled yet."""
-    if not _FI_GDN_DECODE_DIRECT or _fi_wide_vec_compiled is None:
+    kernel for this pool geometry / tile, or None when FlashInfer's internals
+    are unavailable or the kernel is not compiled yet."""
+    if _fi_wide_vec_compiled is None:
         return None
     key = (H, HV, pool.shape[0], tuple(pool.stride()), pool.dtype, A_log.dtype,
            dt_bias.dtype, indices.dtype, scale, tile_v)
