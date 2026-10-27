@@ -16,8 +16,8 @@
 // Prunes SLURM job output that L0_Test keeps on the clusters for debugging:
 // sbatch job workspaces (bloom/scripts/<host>-multi_node_test-*) in which no
 // file has changed within the retention period, and agent job logs
-// (slurm-logs/slurm-<jobid>-<host>-test-*.out) older than it. Also reports the
-// size and age of the enroot layer cache, which nothing prunes yet.
+// (slurm-logs/slurm-<jobid>-<host>-test-*.out) older than it. Also prunes the
+// enroot layer cache, which is kept ENROOT_CACHE_EXTRA_RETENTION_DAYS longer.
 
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
@@ -29,6 +29,10 @@ UBUNTU_24_04_IMAGE = "artifactory.pdx.nvidia.com/docker-remote/ubuntu:24.04"
 // Clusters left out of the default list: computelab does not accept
 // svc_tensorrt logins from this job. They can still be named in CLUSTERS.
 DEFAULT_EXCLUDED_CLUSTERS = ["computelab"]
+// enroot keeps a layer's mtime at its first download even when later imports reuse
+// it, so layers of images CI still uses look old too. The extra month lets those
+// be downloaded again at most once a month instead of on every run.
+ENROOT_CACHE_EXTRA_RETENTION_DAYS = 30
 
 def createKubernetesPodConfig(image)
 {
@@ -105,16 +109,29 @@ def pruneCommands(String homeDir, String days, boolean dryRun) {
     ].join(" ; ")
 }
 
-// Reports the enroot layer cache L0_Test imports images through (ENROOT_CACHE_PATH)
-// without changing it: total size, file count and the oldest / newest file by mtime.
-def enrootCacheReportCommands(String homeDir) {
+// Prunes the enroot layer cache L0_Test imports images through (ENROOT_CACHE_PATH):
+// layer blobs and partial downloads, which sit directly in the cache dir, not
+// modified within `days`. Reports the cache before pruning and what is pruned.
+def enrootCachePruneCommands(String homeDir, int days, boolean dryRun) {
     def cacheDir = "${homeDir}/.cache/enroot"
-    def summarizeFiles = "awk 'NR == 1 { printf \"  oldest: \"; print } END { if (NR) { printf \"  newest: \"; print } print \"  files: \" NR }'"
-    return [
+    def findFiles = "find -H ${cacheDir} -maxdepth 1 -type f"
+    def findStale = "${findFiles} ! -mtime -${days}"
+    def listByMtime = "-printf '%TY-%Tm-%Td %p\\n' 2>/dev/null | sort"
+    def summarize = { int oldestCount, String label ->
+        "awk 'NR <= ${oldestCount} { printf \"  oldest: \"; print } END { if (NR) { printf \"  newest: \"; print } print \"  ${label}: \" NR }'"
+    }
+    def pruneLabel = dryRun ? "older than ${days} days to prune" : "older than ${days} days pruned"
+    def commands = [
         "echo 'enroot cache ${cacheDir}:'",
         "du -shH ${cacheDir} 2>/dev/null | awk '{ printf \"  size: \"; print }'",
-        "find -H ${cacheDir} -type f -printf '%TY-%Tm-%Td %p\\n' 2>/dev/null | sort | ${summarizeFiles}",
-    ].join(" ; ")
+        "${findFiles} ${listByMtime} | ${summarize(1, 'files')}",
+        "${findStale} ${listByMtime} | ${summarize(3, pruneLabel)}",
+        "${findStale} -print0 2>/dev/null | du -ch --files0-from=- 2>/dev/null | tail -n 1 | awk '{ printf \"  size ${dryRun ? 'to prune' : 'pruned'}: \"; print }'",
+    ]
+    if (!dryRun) {
+        commands << "${findStale} -delete 2>/dev/null || true"
+    }
+    return commands.join(" ; ")
 }
 
 def pruneCluster(String clusterName, String days, boolean dryRun) {
@@ -132,7 +149,8 @@ def pruneCluster(String clusterName, String days, boolean dryRun) {
             script: Utils.sshUserCmd(
                 remote,
                 Utils.bashWrappedRemoteCmd(
-                    pruneCommands(homeDir, days, dryRun) + " ; " + enrootCacheReportCommands(homeDir)
+                    pruneCommands(homeDir, days, dryRun) + " ; " +
+                        enrootCachePruneCommands(homeDir, days.toInteger() + ENROOT_CACHE_EXTRA_RETENTION_DAYS, dryRun)
                 )
             )
         )
@@ -155,7 +173,7 @@ pipeline {
         string(
             name: 'RETENTION_DAYS',
             defaultValue: '10',
-            description: 'Prune SLURM job output not modified within this many days.')
+            description: "Prune SLURM job output not modified within this many days. The enroot layer cache is kept ${ENROOT_CACHE_EXTRA_RETENTION_DAYS} days longer.")
         string(
             name: 'CLUSTERS',
             defaultValue: '',
