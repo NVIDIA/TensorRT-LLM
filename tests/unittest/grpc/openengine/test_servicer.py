@@ -1648,6 +1648,7 @@ def test_generate_cleanup_preserves_rpc_outcome(failure, expected_status, expect
     async def run():
         entered, release = asyncio.Event(), asyncio.Event()
         outcomes = []
+        recorded = asyncio.Event()
 
         class Reservation:
             aborted = failure == "abort_submission"
@@ -1678,9 +1679,12 @@ def test_generate_cleanup_preserves_rpc_outcome(failure, expected_status, expect
         result = SimpleNamespace(
             prompt_token_ids=[1], outputs=[output], cached_tokens=0, error=None, finished=True
         )
-        metrics = SimpleNamespace(
-            record_outcome=lambda *args: outcomes.append(args), record_result=lambda _: None
-        )
+
+        def record_outcome(*args):
+            outcomes.append(args)
+            recorded.set()
+
+        metrics = SimpleNamespace(record_outcome=record_outcome, record_result=lambda _: None)
         servicer = OpenEngineInferenceServicer(
             _FakeLlm([result]), "test-model", frontend=Frontend(), metrics=metrics
         )
@@ -1713,6 +1717,7 @@ def test_generate_cleanup_preserves_rpc_outcome(failure, expected_status, expect
                         call.cancel()
                 await task
                 assert await call.code() == expected_status
+                await asyncio.wait_for(recorded.wait(), 3)
                 await asyncio.wait_for(server.stop(0), 3)
                 assert outcomes == [("aggregated", expected_outcome)]
         finally:
