@@ -126,10 +126,14 @@ Where tests live:
 | Perf tests | `tests/integration/defs/perf/` |
 | Unit tests (public) | `tests/unittest/visual_gen/` |
 | Unit tests (internal) | `tests/unittest/_torch/visual_gen/` |
+| Component (L2) tests | `tests/unittest/_torch/visual_gen/l2/` ([README](../../../tests/unittest/_torch/visual_gen/l2/README.md)) |
 
 1. **Tiers.** A cheap **sanity** check (content was generated, valid
    shape, non-black frame) runs broadly; the **quality gate** (LPIPS
    against a reference) runs where quality matters.
+   Below E2E, **component tests** compare one model component with a
+   feature on against a same-job reference by rel-L2; thresholds and
+   rationale are in the L2 README.
 2. **Keep E2E cheap.** Reduced denoising steps and resolution are
    typical (FLUX 4 steps, LTX-2 8 steps, 256×256). Variant matrices
    stay offline.
