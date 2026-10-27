@@ -685,6 +685,8 @@ class LowMGemmDispatcher:
         """
         if not LOW_M_GEMM_ACTIVE and not (force_active or self._force):
             return None
+        if torch.compiler.is_compiling():
+            return None
         if not self._prepared:
             # Unit tests and direct callers that bypass ModelEngine / attach().
             # Save force so _init_runners() can honour it.
@@ -803,6 +805,8 @@ class LowMGemmDispatcher:
         for the normal path. A BF16 input is quantized with ``input_scale``."""
         if not LOW_M_GEMM_ACTIVE and not self._force:
             return None
+        if torch.compiler.is_compiling():
+            return None
         input_2d = input_tensor.reshape(-1, input_tensor.shape[-1])
         choice = self._fp8_choice(input_2d, weight, weight_scale, input_scale, out_dtype)
         if choice is None:
@@ -827,6 +831,9 @@ class LowMGemmDispatcher:
         Fused users launch the warp-MMA kernel with this tactic, so they run where the plain projection would,
         with its summation order.
         """
+        # The race is host code that torch.compile cannot trace.
+        if torch.compiler.is_compiling():
+            return None
         tuner = AutoTuner.get()
         if (not LOW_M_GEMM_ACTIVE and not self._force) or tuner.is_tuning_mode:
             return None

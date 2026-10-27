@@ -374,3 +374,24 @@ def test_router_gate_under_compile_matches_eager():
     compiled = torch.compile(gate.forward, backend="aot_eager", fullgraph=True)(x)
     torch.testing.assert_close(eager, ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(compiled, ref, rtol=2e-2, atol=2e-2)
+
+
+def test_dispatcher_declines_inside_torch_compile():
+    """A forced dispatcher whose runners do not exist yet (first use inside a compiled forward) declines
+    while torch.compile traces, so the graph takes the plain projection."""
+    from tensorrt_llm._torch.modules.low_m_gemm import LowMGemmDispatcher
+
+    dispatcher = LowMGemmDispatcher()
+    dispatcher._force = True
+    w = torch.ones(64, 128, dtype=torch.bfloat16, device="cuda")
+
+    def projection(x):
+        tactic = dispatcher.warp_mma_tactic(x.shape[0], w)
+        out = dispatcher.apply(None, x, w, None, force_active=True)
+        return x @ w.t() if tactic is None and out is None else x
+
+    x = torch.ones(4, 128, dtype=torch.bfloat16, device="cuda")
+    torch._dynamo.reset()
+    out = torch.compile(projection, backend="eager", fullgraph=True)(x)
+    torch.testing.assert_close(out, x @ w.t())
+    assert not dispatcher._prepared
