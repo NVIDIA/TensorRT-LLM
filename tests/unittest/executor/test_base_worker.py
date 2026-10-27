@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import time
 import warnings
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -453,4 +454,51 @@ def test_prompt_adapter_rejected_before_loading_or_changing_tokens() -> None:
     # An unsupported adapter must fail before accessing any worker resources.
     with pytest.raises(RequestError, match="Prompt adapters are not supported"):
         BaseWorker._enqueue_request(SimpleNamespace(), request)
+
+    worker = MagicMock(rank=0,
+                       _results={},
+                       _client_id_to_request_id={},
+                       _handle_background_error=None)
+    worker._get_logprob_params.return_value = None
+    worker._enqueue_request.side_effect = lambda req: BaseWorker._enqueue_request(
+        worker, req)
+    with pytest.raises(RequestError, match="Prompt adapters are not supported"):
+        BaseWorker.submit(worker, request)
+    assert worker._results == {}
+    assert worker._client_id_to_request_id == {}
     assert request.prompt_token_ids == [10, 11]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("error_type",
+                         [None, RequestError, ValueError, RuntimeError])
+def test_submit_cleans_up_failed_enqueue(
+        error_type: type[Exception] | None) -> None:
+    request = GenerationRequest(prompt_token_ids=[10, 11],
+                                sampling_params=SamplingParams(max_tokens=1))
+    request.set_id(7)
+    peer_result = object()
+    worker = MagicMock(rank=0,
+                       _results={8: peer_result},
+                       _client_id_to_request_id={8: 80})
+    worker._handle_background_error = MethodType(lambda self: None, worker)
+    worker._get_logprob_params.return_value = None
+    error = error_type("enqueue failed") if error_type else None
+
+    def enqueue(req: GenerationRequest) -> int:
+        assert worker._results[req.id]._generation_request is req
+        if error is not None:
+            raise error
+        return 70
+
+    worker._enqueue_request.side_effect = enqueue
+    if error is not None:
+        with pytest.raises(error_type, match="enqueue failed") as exc_info:
+            BaseWorker.submit(worker, request)
+        assert exc_info.value is error
+        assert worker._results == {8: peer_result}
+        assert worker._client_id_to_request_id == {8: 80}
+    else:
+        result = BaseWorker.submit(worker, request)
+        assert worker._results == {7: result, 8: peer_result}
+        assert worker._client_id_to_request_id == {7: 70, 8: 80}

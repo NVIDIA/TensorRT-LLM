@@ -556,7 +556,13 @@ class BaseWorker(GenerationExecutor):
 
         self._results[client_id] = result
 
-        request_id = self._enqueue_request(request)
+        enqueued = False
+        try:
+            request_id = self._enqueue_request(request)
+            enqueued = True
+        finally:
+            if not enqueued:
+                self._results.pop(client_id, None)
         # request_id returned from backend is necessary for the abort_request method.
         self._client_id_to_request_id[client_id] = request_id
 
