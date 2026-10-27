@@ -21,13 +21,31 @@ def _copy_kv_row(
     dst_ptr,
     dst_row,
     scale_ptr,
+    cos_sin_ptr,
+    cos_sin_stride,
+    position,
     APPLY_SCALE: tl.constexpr,
+    ROTATE: tl.constexpr,
     ROW_WIDTH: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < ROW_WIDTH
-    row = tl.load(src_ptr + src_row.to(tl.int64) * ROW_WIDTH + offsets, mask=mask, other=0.0)
+    src = src_ptr + src_row.to(tl.int64) * ROW_WIDTH
+    row = tl.load(src + offsets, mask=mask, other=0.0)
+    if ROTATE:
+        # RoPE on the trailing k_pe, stored as (x, y) pairs, like the append kernel: rotate in
+        # float and round to the activation dtype before the KV scale.
+        rope = offsets - (ROW_WIDTH - ROPE_DIM)
+        in_rope = mask & (rope >= 0)
+        x = row.to(tl.float32)
+        partner = tl.load(src + (offsets ^ 1), mask=in_rope, other=0.0).to(tl.float32)
+        cos_sin = cos_sin_ptr + position.to(tl.int64) * cos_sin_stride + (rope // 2) * 2
+        cos = tl.load(cos_sin, mask=in_rope, other=1.0)
+        sin = tl.load(cos_sin + 1, mask=in_rope, other=0.0)
+        rotated = tl.where(rope % 2 == 0, x * cos - partner * sin, x * cos + partner * sin)
+        row = tl.where(in_rope, rotated.to(src_ptr.dtype.element_ty), row)
     if APPLY_SCALE:
         # Per-tensor FP8 KV scale, as the native append kernel applies it.
         row = row.to(tl.float32) * tl.load(scale_ptr)
@@ -51,8 +69,12 @@ def _store_retained_rows_kernel(
     num_blocks,
     tokens_per_block,
     scale_ptr,
+    cos_sin_ptr,
+    cos_sin_stride,
     APPLY_SCALE: tl.constexpr,
+    ROTATE: tl.constexpr,
     ROW_WIDTH: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """One program per token: store its row at its position in the retained pool, if held."""
@@ -65,7 +87,19 @@ def _store_retained_rows_kernel(
     if (page >= 0) & (page < num_blocks):
         slot = page.to(tl.int64) * tokens_per_block + position % tokens_per_block
         _copy_kv_row(
-            rows_ptr, token, kv_cache_ptr, slot, scale_ptr, APPLY_SCALE, ROW_WIDTH, BLOCK_SIZE
+            rows_ptr,
+            token,
+            kv_cache_ptr,
+            slot,
+            scale_ptr,
+            cos_sin_ptr,
+            cos_sin_stride,
+            position,
+            APPLY_SCALE,
+            ROTATE,
+            ROW_WIDTH,
+            ROPE_DIM,
+            BLOCK_SIZE,
         )
 
 
@@ -113,8 +147,13 @@ def _overlay_retained_rows_kernel(
                 scratch_ptr,
                 scratch_row,
                 scale_ptr,
+                kv_cache_ptr,
+                0,
+                scratch_row,
                 APPLY_SCALE,
+                False,
                 ROW_WIDTH,
+                0,
                 BLOCK_SIZE,
             )
 
@@ -152,8 +191,13 @@ def store_retained_rows(
     requests: torch.Tensor,
     positions: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
+    rotary_cos_sin: Optional[torch.Tensor] = None,
+    rope_dim: int = 0,
 ) -> None:
-    """Store ``rows`` (RoPE applied) in ``owner``'s retained pool (FP8 pool: ``row * scale``)."""
+    """Store ``rows`` in ``owner``'s retained pool (FP8 pool: ``row * scale``).
+
+    With ``rotary_cos_sin`` the trailing ``rope_dim`` of every row is rotated at its position first.
+    """
     kv_cache = _retained_kv_cache(metadata, owner)
     if kv_cache is None:
         return
@@ -166,6 +210,11 @@ def store_retained_rows(
     assert rows.shape[1] == row_width, (rows.shape, row_width)
     block_table = _retained_block_table(metadata, owner)
     apply_scale = scale is not None and kv_cache.dtype == torch.float8_e4m3fn
+    rotate = rotary_cos_sin is not None
+    if rotate:
+        # (cos, sin) per pair and position; the first rope_dim // 2 pairs are used.
+        rotary_cos_sin = rotary_cos_sin.view(-1, rope_dim, 2)
+        assert rotary_cos_sin.stride(1) == 2 and rotary_cos_sin.stride(2) == 1
     _store_retained_rows_kernel[(rows.shape[0],)](
         rows,
         requests,
@@ -178,8 +227,12 @@ def store_retained_rows(
         kv_cache.shape[0],
         kv_cache.shape[1],
         scale if apply_scale else kv_cache,
+        rotary_cos_sin if rotate else kv_cache,
+        rotary_cos_sin.stride(0) if rotate else 0,
         APPLY_SCALE=apply_scale,
+        ROTATE=rotate,
         ROW_WIDTH=row_width,
+        ROPE_DIM=rope_dim,
         BLOCK_SIZE=_block_size(row_width),
     )
 
@@ -203,33 +256,23 @@ def store_retained_context_rows(attention, metadata, latent_cache: torch.Tensor)
 def store_retained_generation_rows(
     attention, metadata, latent_cache: torch.Tensor, position_ids: torch.Tensor
 ) -> None:
-    """Generation: rotate k_pe like the append kernel (the fused kernel leaves it unrotated)."""
-    if _retained_kv_cache(metadata, attention) is None:
-        return
-    rows = latent_cache.reshape(latent_cache.shape[0], -1)
-    num_rows = rows.shape[0]
+    """Generation: the fused kernel rotates k_pe in-kernel only, so the store rotates it as well."""
+    num_rows = latent_cache.shape[0]
     if num_rows == 0:
         return
     assert position_ids is not None, "the retained-row store needs the generation positions"
     # Generation tokens are the trailing positions whichever slice the caller passes.
     positions = position_ids.reshape(-1)[-num_rows:]
     num_ctx = metadata.num_ctx_tokens
-    rope_dim = attention.mla_params.qk_rope_head_dim
-    rotated = rows.float()
-    k_pe = rotated[:, -rope_dim:].view(num_rows, rope_dim // 2, 2)
-    cos_sin = attention.rotary_cos_sin.view(-1, rope_dim, 2)[positions.long(), : rope_dim // 2]
-    cos, sin = cos_sin[..., 0], cos_sin[..., 1]
-    x, y = k_pe[..., 0].clone(), k_pe[..., 1].clone()
-    k_pe[..., 0] = x * cos - y * sin
-    k_pe[..., 1] = y * cos + x * sin
     store_retained_rows(
         metadata,
         attention,
-        # Round to the activation dtype first, like the append kernel.
-        rotated.to(rows.dtype),
+        latent_cache,
         metadata.req_idx_per_token[num_ctx : num_ctx + num_rows],
         positions,
         attention.kv_scale_orig_quant,
+        attention.rotary_cos_sin,
+        attention.mla_params.qk_rope_head_dim,
     )
 
 
