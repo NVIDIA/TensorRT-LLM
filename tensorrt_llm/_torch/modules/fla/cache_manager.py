@@ -433,11 +433,15 @@ class GDNReplayState(MambaStateStorage):
                 "V2 GDN state views are not affine; using indirect replay checkpoint addressing",
                 key="gdn_cached_replay_v2_indirect_state_layout",
             )
-            self._state_descriptors = torch.tensor(
+            descriptors = torch.tensor(
                 [(state.data_ptr(), state.stride(0)) for state in states],
                 dtype=torch.int64,
                 device=reference.device,
             )
+            if self._state_descriptors is None:
+                self._state_descriptors = descriptors
+            else:
+                self._state_descriptors.copy_(descriptors)
         state_layout = "affine" if self._state_strides is not None else "indirect"
         logger.info_once(
             "Configured GDN cached replay commit mode for V2: small-batch fused, "

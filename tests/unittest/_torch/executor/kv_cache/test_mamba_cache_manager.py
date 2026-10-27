@@ -3991,17 +3991,21 @@ def _rebalance_ssm_fraction(mgr, fraction):
 
 @skip_no_cuda
 @pytest.mark.parametrize(
-    "manager_cls",
+    "manager_cls,replay,tma_write",
     [
-        KimiK3HybridCacheManager,
-        Glm5NextCacheManager,
-        NemotronHybridCacheManager,
-        Qwen35HybridCacheManager,
-        Qwen4ExpHybridCacheManager,
-    ],
+        (manager_cls, replay, None)
+        for manager_cls in (
+            KimiK3HybridCacheManager,
+            Glm5NextCacheManager,
+            NemotronHybridCacheManager,
+            Qwen35HybridCacheManager,
+            Qwen4ExpHybridCacheManager,
+        )
+        for replay in (False, True)
+    ]
+    + [(NemotronHybridCacheManager, True, write) for write in (False, True)],
 )
-@pytest.mark.parametrize("replay", [False, True])
-def test_v2_hybrid_graph_survives_pool_rebalance(manager_cls, replay):
+def test_v2_hybrid_graph_survives_pool_rebalance(manager_cls, replay, tma_write):
     """An existing graph addresses newly backed slots and relocated state after shrink."""
     from tensorrt_llm._torch.modules.mamba.recurrent_state_cache import reset_recurrent_state_rows
 
@@ -4019,6 +4023,7 @@ def test_v2_hybrid_graph_survives_pool_rebalance(manager_cls, replay):
         mgr = _build_v2_hybrid_with_mamba_layer(
             spec_config=MTPDecodingConfig(max_draft_len=2) if replay else None,
             use_replay_state_update=replay,
+            mamba_ssm_cache_dtype=torch.float32,
             conv_state_layout="x_b_c" if manager_cls is NemotronHybridCacheManager else "q_k_v",
             **options,
         )
@@ -4027,13 +4032,15 @@ def test_v2_hybrid_graph_survives_pool_rebalance(manager_cls, replay):
     try:
         _rebalance_ssm_fraction(mgr, 0.2)
         initial_slots = mgr.get_ssm_states(0).shape[0]
+        mgr.check_invalid_values_in_kv_cache(fill_with_zero=True)
         cache = mgr.mamba_layer_cache(0)
-        seed = mgr._speculative_state.rand_seed if mgr._speculative_state is not None else None
+        seed = getattr(mgr._speculative_state, "rand_seed", None)
         stream = torch.cuda.current_stream().cuda_stream
         kv = mgr.impl.create_kv_cache()
         caches.append(kv)
         assert kv.resume(stream)
         slot = kv.get_ssm_block_base_index(mgr.ssm_layer_group_id)
+        assert slot >= 0
         indices = torch.tensor([slot], dtype=torch.int32, device="cuda")
         has_initial = torch.zeros(1, dtype=torch.bool, device="cuda")
         fields = [cache.temporal, cache.conv]
@@ -4052,6 +4059,68 @@ def test_v2_hybrid_graph_survives_pool_rebalance(manager_cls, replay):
                 torch.index_select(field, 0, indices, out=output)
             if seed is not None:
                 seed.add_(1)
+
+        if tma_write is not None:
+            from tensorrt_llm._torch.modules.mamba.replay_selective_state_update import (
+                replay_selective_state_update,
+            )
+
+            _, heads, dim, state_dim = cache.temporal.shape
+            steps, groups = 3, cache.old_B.shape[-2]
+            window = cache.old_x.shape[2]
+            x = torch.full((1, steps, heads, dim), 0.2, device="cuda", dtype=cache.old_x.dtype)
+            dt = torch.full((1, steps, heads, 1), 0.1, device="cuda", dtype=x.dtype).expand_as(x)
+            A = -torch.ones(heads, 1, 1, device="cuda").expand(heads, dim, state_dim)
+            B = torch.full((1, steps, groups, state_dim), 0.3, device="cuda", dtype=x.dtype)
+            C = torch.full_like(B, 0.4)
+            result = torch.empty_like(x)
+            work = torch.tensor(
+                [[0, slot, window if tma_write else 0, 0]], device="cuda", dtype=torch.int32
+            )
+            writes = torch.tensor([int(tma_write)], device="cuda", dtype=torch.int32)
+
+            def replay_step(use_tma=True):
+                # Initialize only the allocated slot; the execution view's
+                # unused virtual range must never be cleared or scanned.
+                for field in fields:
+                    field.index_fill_(0, indices.long(), 0)
+                cache.temporal.index_fill_(0, indices.long(), 1)
+                cache.prev_num_accepted_tokens.index_fill_(
+                    0, indices.long(), window if tma_write else 0
+                )
+                work[:, 1].copy_(indices)
+                replay_selective_state_update(
+                    cache.temporal,
+                    cache.old_x,
+                    cache.old_B,
+                    cache.old_dt,
+                    cache.old_dA_cumsum,
+                    cache.cache_buf_idx,
+                    cache.prev_num_accepted_tokens,
+                    x,
+                    dt,
+                    A,
+                    B,
+                    C,
+                    out=result,
+                    n_writes=writes,
+                    replay_work_items=work,
+                    state_batch_indices=indices,
+                    mode="persistent_dynamic",
+                    rectangle_for_nowrite=False,
+                    use_internal_pdl=False,
+                    _block_size_m=8,
+                    _use_tma_rect_load=False,
+                    _use_tma_replay_write_load=use_tma,
+                    _use_tma_replay_write_store=use_tma,
+                    _use_tma_replay_nowrite_load=use_tma,
+                    _require_tma_state_layout=use_tma,
+                )
+
+            replay_step(use_tma=False)
+            expected_result = result.clone()
+            expected_state = cache.temporal.index_select(0, indices).clone()
+            run = replay_step
 
         warmup_stream = torch.cuda.Stream()
         warmup_stream.wait_stream(torch.cuda.current_stream())
@@ -4093,13 +4162,19 @@ def test_v2_hybrid_graph_survives_pool_rebalance(manager_cls, replay):
             indices.fill_(slot)
             graph.replay()
             torch.cuda.synchronize()
-            for number, output in enumerate(outputs):
+            if tma_write is not None:
+                torch.testing.assert_close(result, expected_result, atol=1e-3, rtol=1e-3)
                 torch.testing.assert_close(
-                    output, torch.full_like(output, number if number >= 2 else 0)
+                    mgr.get_ssm_states(0)[slot : slot + 1], expected_state, atol=1e-3, rtol=1e-3
                 )
-            # The reset kernel must have written the current physical slot, too.
-            assert torch.count_nonzero(mgr.get_ssm_states(0)[slot]) == 0
-            assert torch.count_nonzero(mgr.get_conv_states(0)[slot]) == 0
+            else:
+                for number, output in enumerate(outputs):
+                    torch.testing.assert_close(
+                        output, torch.full_like(output, number if number >= 2 else 0)
+                    )
+                # The reset kernel must have written the current physical slot, too.
+                assert torch.count_nonzero(mgr.get_ssm_states(0)[slot]) == 0
+                assert torch.count_nonzero(mgr.get_conv_states(0)[slot]) == 0
         assert mgr.get_ssm_states(0).shape[0] == initial_slots
     finally:
         graph.reset()
