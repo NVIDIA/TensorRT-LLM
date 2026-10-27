@@ -788,10 +788,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         if state is not None:
             state.is_prefill = True
 
-    def _has_mixed_precision_kv(self) -> bool:
-        # No staging copy: the gather's FP8 scratch already is one; see has_mixed_precision_retained_rows.
-        return False
-
     def prepare(self) -> None:
         self._validate_ragged_verification()
         assert self.kv_cache_manager is not None

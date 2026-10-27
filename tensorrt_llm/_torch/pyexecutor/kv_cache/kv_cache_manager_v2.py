@@ -3560,7 +3560,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.low_precision_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
         self.high_precision_dtype = str_dtype_to_binding(mixed.high)
         # Native NVFP4 pools (sparse MLA) stay the low-precision pool; twins use mixed.high.
-        if dtype != self.high_precision_dtype and not self._has_native_nvfp4_pool(dtype):
+        if dtype != self.high_precision_dtype and dtype != DataType.NVFP4:
             raise ValueError(
                 f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the retained tokens in "
                 f"{mixed.high}, but the model's KV cache dtype resolved to {dtype}."
@@ -3576,10 +3576,6 @@ class KVCacheManagerV2(BaseResourceManager):
                     self._shared_kv_layers.add(
                         first_shared - 1 - source_types[::-1].index(layer_type)
                     )
-
-    def _has_native_nvfp4_pool(self, dtype: DataType) -> bool:
-        """Whether this manager's own pool already is the NVFP4 low-precision pool."""
-        return dtype == DataType.NVFP4
 
     def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
         """Whether this local layer stores its history in the low-precision pool."""

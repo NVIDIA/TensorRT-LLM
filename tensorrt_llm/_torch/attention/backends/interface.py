@@ -353,8 +353,8 @@ class AttentionMetadata:
         """
         self._prepare_mamba_metadata()
 
-    def _has_mixed_precision_kv(self) -> bool:
-        """Whether the KV cache manager holds mixed-precision layers."""
+    def _has_mixed_precision_staging(self) -> bool:
+        """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have
         # no mixed-precision layers.
         high_layers = getattr(self.kv_cache_manager, "high_layers", None)
