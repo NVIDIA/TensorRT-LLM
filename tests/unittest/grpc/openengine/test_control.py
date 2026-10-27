@@ -49,6 +49,8 @@ def test_image_routing_capability_requires_streaming_v2_and_validated_model(mode
     )
     assert supports_image_routing(llm, {"image"}) is (enabled and model_type == "qwen3_vl")
     assert not supports_image_routing(llm, set())
+    llm.args.cache_transceiver_config = object()
+    assert not supports_image_routing(llm, {"image"})
 
 
 class _FakeHandle:

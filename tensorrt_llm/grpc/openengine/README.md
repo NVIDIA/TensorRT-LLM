@@ -73,7 +73,7 @@ The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyT
 
 Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.
 
-Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority metadata. Attention-DP rank hints are validated and used for first-turn placement. With conversation affinity on, the first hint establishes the conversation's rank, and later turns retain that rank even if their hints differ; the request must carry a stable conversation ID. `ServerInfo.extra.trtllm_supports_dp_rank_targeting` advertises this support. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `GetKvEventSources`, `Health` and `Abort`; its LoRA lifecycle and `SubscribeKvEvents` RPCs return `UNIMPLEMENTED`.
+Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority metadata. Attention-DP rank hints are validated and used for first-turn placement. With conversation affinity on, the first hint establishes the conversation's rank, and later turns retain that rank even if their hints differ; the request must carry a stable conversation ID. `ServerInfo.extra.trtllm_supports_dp_rank_targeting` advertises this support. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `GetKvEventSources`, `Health` and `Abort`; its LoRA lifecycle and `SubscribeKvEvents` RPCs return `UNIMPLEMENTED`.
 
 ### Disaggregated serving
 
@@ -117,6 +117,28 @@ kv_cache_config:
 Enable load reporting independently with `--grpc --grpc-protocol openengine --openengine-enable-load-metrics`. Without that flag, `GetLoad` omits KV load fields. Event streaming internally samples per-rank capacity so `GetServerInfo` remains accurate after pool rebalance, but does not expose occupancy through `GetLoad`. Enabling load reporting does not enable event publishing. Clients discover enabled capabilities from the running server rather than duplicating these switches.
 
 For attention DP, each publisher binds `base_port + global_rank`. When event streaming is enabled, OpenEngine collects the live publisher descriptors at executor startup and advertises every rank, including remote nodes. Those hostnames and ports must be reachable from the subscriber. A missing publisher fails startup; an unavailable discovery snapshot fails the RPC rather than synthesizing socket addresses. PP and CP streaming remain unsupported. The extra placement collection is OpenEngine-only; native HTTP serving and OpenEngine with events disabled do not enable it.
+
+### Image routing metadata
+
+`GetModelInfo.extra.trtllm_image_routing_version = 1` advertises image routing
+metadata for aggregated Qwen3-VL with KV cache manager V2 explicitly enabled,
+block reuse enabled, and ZMQ event publishing. Image passthrough separately
+requires `supports_multimodal` and `extra.trtllm_supported_modalities` to advertise
+image support. Video, audio, and disaggregated image routing are not advertised.
+
+For image blocks with caller UUIDs, `BlockStored.trtllm_image_routing` contains
+`version`, `token_id_offset` (the vocabulary size), and `keys`, aligned with the
+stored blocks. Each key carries its native content `hash`, `start_offset`, and
+optional `uuid`. Native image tokens start with a digest and continue with IDs
+above `token_id_offset`; a router can normalize those tokens using identities it
+sent in `MediaItem.uuid`. Native block hashes, parent chains, and removals retain
+their existing meaning. Cache hashing continues to include image content.
+
+The publisher retains at most `max_entries` digest-to-UUID associations and skips
+UUIDs longer than 256 UTF-8 bytes. Eviction can leave UUIDs unavailable. Consumers
+must ignore unmapped image stores while continuing to process removals. Routing
+identities must refer to stable media content. This extension does not change the
+OpenEngine schema.
 
 ### Node-local discovery
 

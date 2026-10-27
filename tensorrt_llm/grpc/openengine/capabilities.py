@@ -75,7 +75,8 @@ def supports_image_routing(llm: Any, modalities: Collection[str]) -> bool:
     cache = getattr(llm.args, "kv_cache_config", None)
     events = getattr(cache, "kv_events_config", None)
     return (
-        getattr(cache, "use_kv_cache_manager_v2", False) is True
+        getattr(llm.args, "cache_transceiver_config", None) is None
+        and getattr(cache, "use_kv_cache_manager_v2", False) is True
         and getattr(cache, "enable_block_reuse", False) is True
         and getattr(events, "enable_kv_cache_events", False) is True
         and getattr(events, "publisher", None) == "zmq"

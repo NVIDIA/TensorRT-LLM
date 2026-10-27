@@ -628,9 +628,7 @@ class _StreamingEventSource:
                             if mm_keys is not None
                             and self._mm_token_id_offset is not None
                             and any(
-                                key.uuid is not None and key.uuid.startswith("dynamo-image-v1:")
-                                for block_keys in mm_keys
-                                for key in block_keys
+                                key.uuid is not None for block_keys in mm_keys for key in block_keys
                             )
                             else None
                         ),

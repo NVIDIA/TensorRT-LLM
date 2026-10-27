@@ -16,8 +16,8 @@ from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 pytestmark = pytest.mark.cpu_only
 
 
-def test_streaming_image_hints_are_bounded_and_content_sensitive(monkeypatch):
-    uuid = "dynamo-image-v1:0123456789abcdef"
+@pytest.mark.parametrize("uuid", ["dynamo-image-v1:0123456789abcdef", "caller-owned"])
+def test_streaming_image_hints_are_bounded_and_content_sensitive(monkeypatch, uuid):
     red = Image.new("RGB", (32, 32), "red")
     blue = Image.new("RGB", (32, 32), "blue")
     hashes = [
