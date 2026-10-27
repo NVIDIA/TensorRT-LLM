@@ -36,6 +36,11 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.attention.backends.parallel import UlyssesAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.ulysses_peer_write import (
+    UlyssesPeerWrite,
+    supports_peer_write,
+)
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
     apply_minimax_h3_qk_norm_rope_bf16,
@@ -667,6 +672,17 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 "MiniMax-H3 initial support is TP=1 only. AdaLN tensor-parallel "
                 "sharding requires a model-specific gather contract."
             )
+        vgm = model_config.visual_gen_mapping
+        self._peer_write_eligible = (
+            vgm is not None
+            and vgm.world_size == 4
+            and vgm.ulysses_size == 4
+            and not model_config.parallel.async_ulysses
+            and not model_config.cuda_graph.enable
+            and model_config.quant_config.quant_algo is None
+        )
+        self._peer_write_supported: Optional[bool] = None
+        self._peer_write_workspace: Optional[UlyssesPeerWrite] = None
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
         # Only VANILLA supports arbitrary padding between packed modalities.
         self._supports_key_padding_mask = self._attn_backend in ("VANILLA", "FA4")
@@ -884,12 +900,58 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
     ) -> MiniMaxH3StaticContext:
         """Project/refine text and build RoPE once for an entire request."""
 
+        self._prepare_peer_write(encoder_hidden_states.shape[0], position_ids.shape[0])
         text_embeds = self.context_embedder(encoder_hidden_states.to(self.context_embedder.dtype))
         text_embeds = self.token_refiner(text_embeds)
         return MiniMaxH3StaticContext(
             text_embeds=text_embeds,
             rotary_emb=self.rope(position_ids),
         )
+
+    @torch.compiler.disable
+    def _prepare_peer_write(self, batch_size: int, sequence_length: int) -> None:
+        """Prepare model-owned buffers shared by sequential DiT blocks only."""
+        if not self.transformer_blocks:
+            return
+        attention = self.transformer_blocks[0].attn.attn
+        if (
+            not self._peer_write_eligible
+            or self._attn_backend != "FA4"
+            or not isinstance(attention, UlyssesAttention)
+            or attention.world_size != 4
+        ):
+            return
+        dtype = self.context_embedder.dtype
+        if self._peer_write_supported is None:
+            self._peer_write_supported = supports_peer_write(attention.process_group, self.device)
+        workspace = None
+        if (
+            self._peer_write_supported
+            and batch_size == 1
+            and dtype == torch.bfloat16
+            and attention.num_heads == attention.num_kv_heads
+            and attention.head_dim == 128
+            and not torch.is_grad_enabled()
+        ):
+            local_length = (sequence_length + attention.world_size - 1) // attention.world_size
+            shape = (batch_size, local_length, attention.num_heads, attention.head_dim)
+            workspace = self._peer_write_workspace
+            if (
+                workspace is None
+                or workspace.shape != shape
+                or workspace.qkv.device != self.device
+                or workspace.stream != torch.cuda.current_stream(self.device).cuda_stream
+            ):
+                workspace = UlyssesPeerWrite(
+                    attention.process_group,
+                    local_length,
+                    attention.num_heads,
+                    attention.head_dim,
+                    self.device,
+                )
+            self._peer_write_workspace = workspace
+        for block in self.transformer_blocks:
+            block.attn.attn.peer_write = workspace
 
     def _validate_layout(
         self,
