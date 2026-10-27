@@ -1082,7 +1082,9 @@ def _rebuild_quant_scales(experts_module: nn.Module, layer_idx: int) -> None:
 def _get_decoder_model(model: nn.Module) -> nn.Module:
     """Navigate from top-level CausalLM to the decoder model with .layers.
 
-    Handles DeepseekV3ForCausalLM -> .model (DeepseekV3Model).
+    Handles DeepseekV3ForCausalLM -> .model (DeepseekV3Model), and multimodal
+    wrappers that hold the text CausalLM as ``.llm``
+    (MuseSparkOpenOmniForConditionalGeneration -> .llm.model).
     Falls back to searching common attribute names.
 
     Args:
@@ -1094,6 +1096,11 @@ def _get_decoder_model(model: nn.Module) -> nn.Module:
     Raises:
         RuntimeError: If the decoder model cannot be found.
     """
+    # Multimodal wrapper: model.llm.model
+    llm = getattr(model, "llm", None)
+    if llm is not None and hasattr(getattr(llm, "model", None), "layers"):
+        return llm.model
+
     # Direct attribute: model.model
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return model.model
@@ -1139,6 +1146,9 @@ def _get_moe_and_experts(
     Kimi K3 spells the same shape differently:
         layer.block_sparse_moe (KimiK3MoERuntime) -> .routed_experts (MoE backend)
 
+    and so does Muse Spark Open:
+        layer.feed_forward (MuseSparkOpenMoE) -> .experts (MoE backend)
+
     Returns:
         Tuple of (moe_module, experts_module) where moe_module is the wrapper
         (e.g. Deepseekv3MoE) and experts_module is the backend (e.g.
@@ -1152,6 +1162,11 @@ def _get_moe_and_experts(
     mlp = getattr(layer, "mlp", None)
     if mlp is None:
         mlp = getattr(layer, "block_sparse_moe", None)
+    if mlp is None:
+        # MuseSparkOpenMoE keeps its expert bias full on the module rather
+        # than on an EP-sharded gate, so _get_gate_module finds nothing to
+        # allgather.
+        mlp = getattr(layer, "feed_forward", None)
     if mlp is None:
         return None, None
 
