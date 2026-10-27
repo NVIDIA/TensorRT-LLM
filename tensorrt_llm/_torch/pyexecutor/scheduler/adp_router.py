@@ -124,9 +124,10 @@ class ADPRouter(ABC):
                 requests in per-rank load.  Ignored by DefaultADPRouter.
 
         Returns:
-            A KVCacheAwareADPRouter if config requests it and the
-            kv_cache_manager has block reuse enabled; DefaultADPRouter
-            otherwise.
+            A ConversationAwareADPRouter if kv_cache_routing_conversation_affinity
+            is set; otherwise a KVCacheAwareADPRouter if enable_kv_cache_aware_routing
+            is set, the kv_cache_manager has block reuse enabled and helix CP is
+            off; otherwise a DefaultADPRouter.
         """
         if (
             attention_dp_config is not None
@@ -150,6 +151,19 @@ class ADPRouter(ABC):
             and kv_cache_manager is not None
             and kv_cache_manager.enable_block_reuse
         ):
+            if dist.has_cp_helix:
+                # Each helix CP rank probes prefix matches in its own slice of the
+                # KV cache, so the CP ranks of a DP group could route one request
+                # to different DP ranks, and that request would never pass
+                # DisaggTransferCoordinator.align_gen_admission_across_cp (see
+                # _use_max_load_across_cp). Only KV cache manager V1 gets here; V2
+                # rejects block reuse under helix CP.
+                logger.warning(
+                    "attention_dp_config.enable_kv_cache_aware_routing is not "
+                    "supported with helix context parallelism; falling back to "
+                    "load-based attention-DP routing."
+                )
+                return DefaultADPRouter(dist=dist, has_seq_slot_headroom=has_seq_slot_headroom)
             return KVCacheAwareADPRouter(
                 dist=dist,
                 has_seq_slot_headroom=has_seq_slot_headroom,
@@ -191,6 +205,10 @@ class ADPRouter(ABC):
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
 
+        Under helix CP, each state's ``num_active_requests`` and
+        ``num_active_tokens`` are that DP rank's maximum across the CP group
+        (see ``_use_max_load_across_cp``).
+
         Args:
             active_requests: Currently active LlmRequests on this rank.
             new_requests: New requests popped from the waiting queue.
@@ -212,8 +230,30 @@ class ADPRouter(ABC):
         local_state.copy_iter_stats_from(iter_stats_payload)
         if forward_work is not None:
             local_state.num_context_requests, local_state.num_generation_requests = forward_work
+        if self.dist.has_cp_helix:
+            self._use_max_load_across_cp(local_state)
         responses = self.dist.tp_allgather(local_state.serialize(include_kv_cache_load))
         return [RankState.deserialize(data=resp) for resp in responses]
+
+    def _use_max_load_across_cp(self, local_state: RankState) -> None:
+        """Replace this DP rank's request and token counts with their CP-group maximum.
+
+        The CP ranks of one DP group must pop and route the same new requests.
+        If they route a request to different DP ranks, it never passes
+        ``DisaggTransferCoordinator.align_gen_admission_across_cp`` and never
+        starts.
+
+        A client cancel or a transfer timeout can retire a request on one CP
+        rank before its peers, so the CP ranks' own loads can differ. With the
+        maximum, every CP rank gathers the same loads over TP, and no CP rank
+        goes over ``max_num_active_requests``.
+        """
+        loads_per_cp_rank = self.dist.cp_allgather_int64(
+            [local_state.num_active_requests, local_state.num_active_tokens]
+        )
+        max_requests, max_tokens = loads_per_cp_rank.max(axis=0)
+        local_state.num_active_requests = int(max_requests)
+        local_state.num_active_tokens = int(max_tokens)
 
     @staticmethod
     def _assign_explicit_dp_ranks(
@@ -451,8 +491,9 @@ class KVCacheAwareADPRouter(ADPRouter):
     ranks (floored at req_tokens) so that both terms remain on the same
     scale regardless of absolute load levels.
 
-    Requires a KV cache manager with enable_block_reuse=True.
-    Falls back to load-based routing when no cache hits exist.
+    Requires a KV cache manager with enable_block_reuse=True. Falls back to
+    load-based routing when no cache hits exist. Not used under helix CP
+    (see ADPRouter.create).
     """
 
     needs_prefix_matches: bool = True
@@ -774,6 +815,17 @@ class ConversationAwareADPRouter(ADPRouter):
     ):
         super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
+        # Uncached-prefill estimate for the V2 scheduler's long-prefill
+        # demotion: within a conversation the prompt only grows and the rank
+        # that served the previous turn caches its prompt, so on that rank
+        # uncached ~= prompt_len - previous prompt_len; on any other rank, and
+        # for an unseen conversation, uncached == prompt_len. Keyed by
+        # conversation_id, not by the routing key: sub-agents that share their
+        # parent's affinity id have prompts of their own. Off until the
+        # scheduler that consumes it turns it on (set_publish_uncached_estimate).
+        self._publish_uncached_estimate_enabled = False
+        # conversation_id -> (prompt_len, rank) of its last turn on its home rank.
+        self._conv_last_prompt: "OrderedDict[str, Tuple[int, int]]" = OrderedDict()
         self._max_sessions = max(1, int(max_sessions))
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
         self._new_conv_placement = (
@@ -820,6 +872,35 @@ class ConversationAwareADPRouter(ADPRouter):
         while len(self._conv_to_rank) > self._max_sessions:
             self._conv_to_rank.popitem(last=False)
 
+    def set_publish_uncached_estimate(self, enabled: bool) -> None:
+        """Publish py_uncached_prefill_tokens only while the scheduler uses it."""
+        self._publish_uncached_estimate_enabled = enabled
+
+    def _publish_uncached_estimate(
+        self, req_item: RequestQueueItem, rank: int, home_rank: Optional[int]
+    ) -> None:
+        """Estimate the request's uncached prefill on ``rank`` and publish it on
+        the request (see __init__). ``home_rank`` is the rank its routing key was
+        bound to before this placement, None for a new binding."""
+        req = req_item.request
+        if not self._publish_uncached_estimate_enabled or req is None:
+            return
+        conversation_params = req.py_conversation_params
+        conv_id = None if conversation_params is None else conversation_params.conversation_id
+        prompt = _num_input_tokens(req)
+        prev = None if conv_id is None else self._conv_last_prompt.get(conv_id)
+        if prev is not None and prev[1] == rank:
+            req.py_uncached_prefill_tokens = max(prompt - prev[0], 0)
+        else:
+            req.py_uncached_prefill_tokens = prompt
+        # An overflow turn's prefix stays off the home rank: keep the home entry
+        # so the next turn back home is measured against what that rank caches.
+        if conv_id is not None and (home_rank is None or rank == home_rank):
+            self._conv_last_prompt[conv_id] = (prompt, rank)
+            self._conv_last_prompt.move_to_end(conv_id)
+            while len(self._conv_last_prompt) > self._max_sessions:
+                self._conv_last_prompt.popitem(last=False)
+
     def _assign_new_conversation_explicit_dp_ranks(
         self,
         requests: List["RequestQueueItem"],
@@ -849,6 +930,7 @@ class ConversationAwareADPRouter(ADPRouter):
                 and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
             ):
                 all_ranks_num_active_requests[target_dp_rank] += 1
+                self._publish_uncached_estimate(req_item, target_dp_rank, None)
                 all_ranks_new_requests[target_dp_rank].append(req_item)
                 if conv_id is not None:
                     self._record_target_rank(conv_id, target_dp_rank)
@@ -940,6 +1022,7 @@ class ConversationAwareADPRouter(ADPRouter):
         for req_item in remaining_unscheduled:
             conv_id = self._conversation_id(req_item)
             rank = None
+            home_rank = None if conv_id is None else self._conv_to_rank.get(conv_id)
 
             if conv_id is not None and conv_id in self._conv_to_rank:
                 target_rank = self._conv_to_rank[conv_id]
@@ -968,6 +1051,7 @@ class ConversationAwareADPRouter(ADPRouter):
                     # Bind this new conversation to its first-turn rank.
                     self._record_target_rank(conv_id, rank)
 
+            self._publish_uncached_estimate(req_item, rank, home_rank)
             all_ranks_new_requests[rank].append(req_item)
             all_ranks_num_active_requests[rank] += 1
             if self._new_conv_placement == "least_tokens":

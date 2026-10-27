@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import grpc
 import pytest
 
+pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
+
 from tensorrt_llm.grpc.openengine import node  # noqa: E402
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     generation_pb2,

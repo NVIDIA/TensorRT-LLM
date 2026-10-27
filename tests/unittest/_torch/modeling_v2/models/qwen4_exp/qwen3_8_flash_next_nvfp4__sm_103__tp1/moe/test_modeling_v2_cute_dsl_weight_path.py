@@ -71,8 +71,12 @@ BACKENDS = ("CUTEDSL", "TRTLLM")
 #: the bf16 rounding of the output is 1e-3 of it, the rest is the reference's fp32 / tie
 #: differences. A wrong layout is ~1; a wrong per-expert scalar is its own relative error.
 REFERENCE_TOLERANCE = 5e-3
-#: The same, between the backends under a uniform `down_proj.input_scale`.
-BACKEND_TOLERANCE = 3e-3
+#: The same, between the backends under a uniform `down_proj.input_scale`. Each backend is
+#: within `REFERENCE_TOLERANCE` of the reference, so the two are within twice that of each
+#: other. Both requantize the SwiGLU output to NVFP4, and an fp32 difference in the last
+#: place moves an element at an e2m1 rounding boundary by a whole code: the token holding
+#: it differs by ~5e-3 while the mean stays near 5e-6. A wrong layout is still ~1.
+BACKEND_TOLERANCE = 2 * REFERENCE_TOLERANCE
 
 
 # ── the checkpoint ────────────────────────────────────────────────────────

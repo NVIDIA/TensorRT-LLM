@@ -350,7 +350,10 @@ def test_serve_openengine_missing_grpc_shows_install_hint(
     )
 
     assert result.exit_code == 1
-    assert 'python -m pip install "grpcio>=1.67.1,<2"' in result.output
+    assert (
+        'python -m pip install "grpcio>=1.73.1,<2" '
+        '"grpcio-health-checking>=1.73.1,<1.82"' in result.output
+    )
 
 
 @pytest.mark.cpu_only
