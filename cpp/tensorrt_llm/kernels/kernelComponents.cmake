@@ -61,7 +61,7 @@ add_tllm_kernel_library(
   tllm::common_environment)
 
 add_tllm_kernel_library(
-  tllm_kernel_rope
+  tllm_kernel_unfused_attention
   SOURCES
   attentionMask.cu
   gptKernels.cu

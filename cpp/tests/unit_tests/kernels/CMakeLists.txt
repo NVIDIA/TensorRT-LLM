@@ -56,7 +56,7 @@ add_tllm_gtest(
   SOURCES
   ropeTest.cu
   LINK_LIBRARIES
-  tllm::kernel_rope
+  tllm::kernel_unfused_attention
   tllm::runtime_buffers
   LABELS
   "unit;kernels;rope;gpu")
@@ -67,7 +67,7 @@ add_tllm_gtest(
   SOURCES
   shiftKCacheKernelTest.cu
   LINK_LIBRARIES
-  tllm::kernel_rope
+  tllm::kernel_unfused_attention
   tllm::runtime_buffers
   LABELS
   "unit;kernels;rope;gpu")
@@ -212,7 +212,7 @@ add_tllm_gtest(
   SOURCES
   sparseKvCacheTest.cu
   LINK_LIBRARIES
-  tllm::kernel_rope
+  tllm::kernel_unfused_attention
   tllm::runtime_buffers
   LABELS
   "unit;kernels;rope;sparse-kv-cache;gpu")
