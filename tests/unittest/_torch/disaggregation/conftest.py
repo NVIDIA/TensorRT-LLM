@@ -13,6 +13,12 @@ def inflight_cancel(monkeypatch):
 
 
 @pytest.fixture
+def no_inflight_cancel(monkeypatch):
+    """Pin the in-flight cancellation opt-in off; the env read is process-cached."""
+    monkeypatch.setattr(coordinator_module, "is_disagg_inflight_cancel_enabled", lambda: False)
+
+
+@pytest.fixture
 def clock(monkeypatch):
     """Freeze the coordinator's ``time.monotonic``; tests advance ``clock["t"]``."""
     now = {"t": 100.0}
