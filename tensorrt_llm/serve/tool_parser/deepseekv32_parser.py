@@ -110,7 +110,10 @@ class DeepSeekV32Parser(BaseToolParser):
         for param_name, param_type, param_value in param_matches:
             # Convert value based on type
             if param_type == "true":  # string type
-                parameters[param_name] = param_value.strip()
+                # Taken as written: the encoder renders a string value verbatim
+                # between the tags, so its whitespace (a file's last newline, a
+                # line's indentation) is part of the value.
+                parameters[param_name] = param_value
             else:
                 # Try to parse as JSON for other types
                 try:
