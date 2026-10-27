@@ -32,7 +32,7 @@ def _get_kimi_k3_text_config(pretrained_config: object) -> object:
     return pretrained_config
 
 
-def _is_kimi_k3(pretrained_config: object) -> bool:
+def is_kimi_k3(pretrained_config: object) -> bool:
     config = _get_kimi_k3_text_config(pretrained_config)
     model_type = getattr(config, "model_type", None)
     architectures = getattr(config, "architectures", None) or getattr(
@@ -48,7 +48,7 @@ def _get_raw_fp8_kv_layer_ids(pretrained_config: object) -> Optional[str]:
     """Read the FP8 layer list, falling back to the deprecated variable."""
     raw_layer_ids = os.environ.get(KIMI_K3_FP8_KV_LAYERS_ENV)
     deprecated_layer_ids = os.environ.get(_DEPRECATED_KIMI_K3_BF16_KV_LAYERS_ENV)
-    if deprecated_layer_ids is None or not _is_kimi_k3(pretrained_config):
+    if deprecated_layer_ids is None or not is_kimi_k3(pretrained_config):
         return raw_layer_ids
     if raw_layer_ids is not None:
         logger.warning_once(
@@ -125,7 +125,7 @@ def get_kimi_k3_fp8_kv_layer_ids(
     elif not nvfp4_enabled:
         return frozenset()
 
-    if not _is_kimi_k3(pretrained_config):
+    if not is_kimi_k3(pretrained_config):
         return frozenset()
 
     config = _get_kimi_k3_text_config(pretrained_config)

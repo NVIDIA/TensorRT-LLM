@@ -921,6 +921,72 @@ def test_dense_fp4_mla_declares_fp8_context_workspace(
     assert requested.get("fp8_context_mla", False) is expected_fp8_context
 
 
+@pytest.mark.parametrize(
+    "model_type, fp8_env, pp_rank, expected_fp8_context",
+    [
+        # The default keeps global MLA layer 7 in FP8, on the second stage.
+        ("kimi_linear", None, 1, True),
+        ("kimi_linear", None, 0, False),
+        # An empty list keeps every MLA layer in NVFP4.
+        ("kimi_linear", "", 1, False),
+        # Other model families have no FP8 fallback layers.
+        ("deepseek_v3", None, 1, False),
+    ],
+    ids=["k3_local_fallback", "k3_remote_fallback", "k3_no_fallback", "non_k3"],
+)
+def test_kimi_k3_fp8_fallback_declares_fp8_context_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    model_type: str,
+    fp8_env,
+    pp_rank: int,
+    expected_fp8_context: bool,
+) -> None:
+    # A sparse config keeps the dense FP4 MLA reservation out, so only the
+    # Kimi K3 FP8 fallback layers can request the FP8 context workspace.
+    if fp8_env is None:
+        monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, fp8_env)
+    monkeypatch.delenv("TLLM_KIMI_K3_BF16_KV_LAYERS", raising=False)
+    monkeypatch.setattr(trtllm_backend, "get_sm_version", lambda: 100)
+    requested = {}
+
+    def workspace_bytes_per_token(**kwargs):
+        requested.update(kwargs)
+        return 7 if kwargs["fp8_context_mla"] else 0
+
+    monkeypatch.setattr(
+        trtllm_backend,
+        "thop",
+        SimpleNamespace(get_context_mla_workspace_bytes_per_token=workspace_bytes_per_token),
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            model_type=model_type,
+            num_hidden_layers=8,
+            linear_attn_config={"full_attn_layers": [2, 4, 6, 8]},
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            qk_nope_head_dim=128,
+            v_head_dim=128,
+            num_attention_heads=16,
+        ),
+        quant_config=SimpleNamespace(
+            quant_mode=SimpleNamespace(
+                has_fp4_kv_cache=lambda: True, has_fp8_kv_cache=lambda: False
+            )
+        ),
+        sparse_attention_config=SimpleNamespace(algorithm="skip_softmax"),
+    )
+
+    rate = trtllm_backend.TrtllmAttention.runtime_workspace_bytes_per_token(
+        model_config, _pp_mapping(2, pp_rank)
+    )
+
+    assert rate == (7 if expected_fp8_context else 0)
+    assert requested.get("fp8_context_mla", False) is expected_fp8_context
+
+
 def _pp_mapping(pp_size: int, rank: int = 0, pp_partition=None) -> Mapping:
     return Mapping(
         world_size=pp_size, tp_size=1, pp_size=pp_size, rank=rank, pp_partition=pp_partition

@@ -41,7 +41,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids
+from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
 from ...pyexecutor.config_utils import is_mla
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
@@ -1910,23 +1910,24 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         has_fp4_kv_cache = (quant_mode is not None and getattr(
             quant_mode, "has_fp4_kv_cache", lambda: False)())
-        fp8_fallback_layers = frozenset()
-        if has_fp4_kv_cache:
+        # Dense FP4 MLA attends the current chunk and every cached-prefix
+        # partition through the FP8 context kernel, even though the
+        # model-wide cache quantization is NVFP4.
+        nvfp4_uses_fp8_context = (has_fp4_kv_cache and
+                                  model_config.sparse_attention_config is None)
+        if has_fp4_kv_cache and is_kimi_k3(config):
+            # Kimi K3 with an NVFP4 KV cache keeps FP8 fallback MLA layers,
+            # which stage the same context buffers as an all-FP8 model when
+            # this pipeline stage holds one of them.
             fp8_fallback_layers = get_kimi_k3_fp8_kv_layer_ids(
                 config, nvfp4_enabled=True, mapping=mapping)
-        has_local_fp8_fallback = bool(
-            fp8_fallback_layers and fp8_fallback_layers.intersection(
-                mapping.pp_layers(config.num_hidden_layers)))
-        # Dense FP4 MLA attends the current chunk and every cached-prefix
-        # partition through the FP8 context kernel, and FP8 fallback layers
-        # stage the same context buffers as an all-FP8 model, even though the
-        # model-wide cache quantization is NVFP4.
-        dense_fp4_mla = (has_fp4_kv_cache
-                         and model_config.sparse_attention_config is None)
+            if fp8_fallback_layers and fp8_fallback_layers.intersection(
+                    mapping.pp_layers(config.num_hidden_layers)):
+                nvfp4_uses_fp8_context = True
         sm_version = get_sm_version()
         fp8_context_mla = (quant_mode is not None
                            and (quant_mode.has_fp8_kv_cache()
-                                or has_local_fp8_fallback or dense_fp4_mla)
+                                or nvfp4_uses_fp8_context)
                            and (sm_version == 90 or is_sm_100f(sm_version)
                                 or is_sm_120f(sm_version)))
         if not fp8_context_mla:
