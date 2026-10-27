@@ -1066,7 +1066,7 @@ class AttentionForwardArgs:
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
-    timestep: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
+    timestep: Optional[Union[torch.Tensor, float]] = None
     # Dense-prefix (0) or sparse (1) phase of a timestep-scheduled sparse
     # algorithm, resolved on the host by the caller. When set, backends use it
     # instead of reading ``timestep``, which CUDA Graph capture cannot do.
