@@ -528,9 +528,7 @@ async def _messages(server, stream):
 @pytest.fixture
 def short_admission_wait(monkeypatch):
     """Shorten how long a streamed request waits for a rejection before it starts."""
-    monkeypatch.setattr(
-        "tensorrt_llm.serve.anthropic_adapter.STREAM_ADMISSION_WAIT_S", 0.01, raising=False
-    )
+    monkeypatch.setattr("tensorrt_llm.serve.anthropic_adapter.STREAM_ADMISSION_WAIT_S", 0.01)
 
 
 def _rejecting_engine(where, stream):
