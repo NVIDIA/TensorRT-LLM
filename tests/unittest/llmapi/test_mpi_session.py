@@ -1,20 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import json
 import os
 import shlex
 import subprocess  # nosec B404
 import sys
+import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Literal
 
 import pytest
 import zmq
+from integration.defs.trt_test_alternative import check_output
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.executor.ipc import ZeroMqQueue
@@ -27,14 +32,22 @@ from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
 
 
 def task0() -> int:
-    from mpi4py import MPI
-
-    # Keep each worker occupied until every worker has received its task.
-    MPI.COMM_WORLD.barrier()
     if MPINodeState.state is None:
         MPINodeState.state = 0
     MPINodeState.state += 1
     return MPINodeState.state
+
+
+def worker_rank():
+    from mpi4py import MPI
+
+    return MPI.COMM_WORLD.Get_rank()
+
+
+def occupy_worker(seconds):
+    import time
+
+    time.sleep(seconds)
 
 
 @pytest.fixture(autouse=True)
@@ -42,27 +55,114 @@ def _enable_mpi(monkeypatch):
     monkeypatch.delenv("TLLM_DISABLE_MPI", raising=False)
 
 
+# Bounds every wait on pool workers. A fresh pool's first task also covers
+# worker spawn and import, so reuse the library's bootstrap deadline.
+_POOL_TIMEOUT = _identity_barrier_timeout()
+
+
+@contextlib.contextmanager
+def _pool_session(*args, **kwargs):
+    """``MpiPoolSession`` that is abandoned instead of joined on failure.
+
+    A failed test may leave workers stuck in a task, and joining them would
+    hang the teardown and the interpreter exit.
+    """
+    session = MpiPoolSession(*args, **kwargs)
+    try:
+        yield session
+    except BaseException:
+        session.abandon()
+        raise
+    session.shutdown()
+
+
+def _submit_sync(session, task, *args, **kwargs):
+    """``session.submit_sync`` with a deadline."""
+    futures = session.submit(task, *args, **kwargs)
+    _, not_done = futures_wait(futures, timeout=_POOL_TIMEOUT)
+    if not_done:
+        raise TimeoutError(f"{len(not_done)}/{len(futures)} copies of {task} "
+                           f"did not finish within {_POOL_TIMEOUT}s")
+    return [future.result() for future in futures]
+
+
 @pytest.mark.cpu_only
 @pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
 def test_mpi_session_basic() -> None:
-    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
-
-    n_workers = 4
-    executor = MpiPoolSession(n_workers, wait_shutdown=True)
-    try:
-        results = executor.submit_sync(task0)
+    with _pool_session(4, wait_shutdown=True) as executor:
+        results = _submit_sync(executor, task0)
         assert results == [1, 1, 1, 1], results
 
-        results = executor.submit_sync(task0)
+        results = _submit_sync(executor, task0)
         assert results == [2, 2, 2, 2], results
-    finally:
-        executor.shutdown()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
+def test_mpi_pool_session_submit_runs_once_per_worker():
+    n_workers = 4
+    with _pool_session(n_workers) as executor:
+        # Warm the pool so every worker is up before one gets occupied.
+        assert sorted(_submit_sync(executor,
+                                   worker_rank)) == list(range(n_workers))
+
+        # With one worker busy, the idle workers must not drain its copy.
+        busy = executor.mpi_pool.submit(occupy_worker, 3)
+        results = _submit_sync(executor, worker_rank)
+        busy.result(timeout=_POOL_TIMEOUT)
+        assert sorted(results) == list(range(n_workers)), results
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device required")
+def test_mpi_comm_session_submit_runs_once_per_rank():
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    command = [
+        "mpirun", "-n", "4", "--allow-run-as-root", "--oversubscribe",
+        sys.executable, "_run_mpi_comm_session_pinning.py"
+    ]
+    stdout = check_output(command, timeout=300, cwd=cur_dir)
+    assert "MpiCommSession pinning checks passed" in stdout
+
+
+@pytest.mark.cpu_only
+def test_mpi_pool_session_concurrent_submits_keep_copies_contiguous():
+    """Each submission's copies must sit together in the pool's queue.
+
+    The pinning barrier does not tell submissions apart, so interleaved
+    copies would let workers of different submissions pass it together.
+    """
+    import time
+    import types
+
+    queue = []
+
+    def fake_submit(fn, task, *args, **kwargs):
+        queue.append(task)
+        time.sleep(0.001)  # yield so concurrent submits would interleave
+
+    n_workers = 4
+    session = types.SimpleNamespace(
+        n_workers=n_workers,
+        mpi_pool=types.SimpleNamespace(submit=fake_submit),
+        _submit_lock=threading.Lock(),
+    )
+    tasks = [f"task{i}" for i in range(8)]
+    threads = [
+        threading.Thread(target=MpiPoolSession.submit, args=(session, task))
+        for task in tasks
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    runs = [queue[i:i + n_workers] for i in range(0, len(queue), n_workers)]
+    assert all(len(set(run)) == 1 for run in runs), queue
+    assert sorted(run[0] for run in runs) == tasks
 
 
 def rendezvous_environment_probe():
-    from mpi4py import MPI
-
-    MPI.COMM_WORLD.barrier()
     return os.environ.get("MASTER_ADDR"), os.environ.get("MASTER_PORT")
 
 
@@ -73,13 +173,10 @@ def test_mpi_pool_session_forwards_current_rendezvous(monkeypatch):
     for address, port in [("127.0.0.1", "33271"), ("localhost", "51003")]:
         monkeypatch.setenv("MASTER_ADDR", address)
         monkeypatch.setenv("MASTER_PORT", port)
-        session = MpiPoolSession(n_workers=2, wait_shutdown=True)
-        try:
-            assert session.submit_sync(rendezvous_environment_probe) == [
+        with _pool_session(n_workers=2, wait_shutdown=True) as session:
+            assert _submit_sync(session, rendezvous_environment_probe) == [
                 (address, port), (address, port)
             ]
-        finally:
-            session.shutdown()
 
 
 _STALE_SPAWN_ENV = "TLLM_TEST_STALE_SPAWN_ENV"
@@ -87,6 +184,7 @@ _STALE_SPAWN_SCRIPT = f"""
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
@@ -122,24 +220,17 @@ def test_mpi_pool_session_does_not_resurrect_unset_forwarded_env(
     if "PMIX_HOSTNAME" in os.environ:
         env["PMIX_HOSTNAME"] = os.environ["PMIX_HOSTNAME"]
     worker_env = tmp_path / "worker_env.json"
-    result = subprocess.run(  # nosec B603
+    check_output(
         [sys.executable, "-c", _STALE_SPAWN_SCRIPT,
          str(worker_env)],
-        capture_output=True,
-        env=env,
-        text=True,
         timeout=300,
+        env=env,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(worker_env.read_text()) == ["1", None]
 
 
 def flashinfer_environment_probe():
     """Return this worker's FlashInfer isolation paths."""
-    # Keep importing this from initializing MPI in the submitting process.
-    from mpi4py import MPI
-
-    MPI.COMM_WORLD.barrier()
     return (
         os.environ.get("FLASHINFER_WORKSPACE_BASE"),
         os.environ.get("FLASHINFER_CUBIN_DIR"),
@@ -157,11 +248,8 @@ def test_mpi_pool_session_flashinfer_workspace_isolation(monkeypatch):
     monkeypatch.delenv("FLASHINFER_CUBIN_DIR", raising=False)
     monkeypatch.delenv("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", raising=False)
 
-    session = MpiPoolSession(n_workers=2, wait_shutdown=True)
-    try:
-        worker_envs = session.submit_sync(flashinfer_environment_probe)
-    finally:
-        session.shutdown()
+    with _pool_session(n_workers=2, wait_shutdown=True) as session:
+        worker_envs = _submit_sync(session, flashinfer_environment_probe)
 
     workspaces = {workspace for workspace, _ in worker_envs}
     cubin_dirs = {cubin_dir for _, cubin_dir in worker_envs}
@@ -296,41 +384,12 @@ def test_remote_mpi_session(
         invalid_home.touch()
         env["HOME"] = str(invalid_home)
         env["TMPDIR"] = str(tmp_path)
+        # trtllm-llmapi-launch otherwise puts its IPC socket under TMPDIR, and
+        # tmp_path can exceed the 107-byte limit on a Unix socket path.
+        env["TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"] = (
+            f"ipc://{tempfile.gettempdir()}/rpc_test_{uuid.uuid4()}")
 
-    with Popen(command,
-               env=env,
-               stdout=PIPE,
-               stderr=PIPE,
-               bufsize=1,
-               start_new_session=True,
-               universal_newlines=True,
-               cwd=os.path.dirname(os.path.abspath(__file__))) as process:
-
-        # Function to read from a stream and write to output
-        def read_stream(stream, output_stream):
-            for line in stream:
-                output_stream.write(line)
-                output_stream.flush()
-
-        # Create threads to read stdout and stderr concurrently
-        stdout_thread = threading.Thread(target=read_stream,
-                                         args=(process.stdout, sys.stdout))
-        stderr_thread = threading.Thread(target=read_stream,
-                                         args=(process.stderr, sys.stderr))
-
-        # Start both threads
-        stdout_thread.start()
-        stderr_thread.start()
-
-        # Wait for the process to complete
-        return_code = process.wait()
-
-        # Wait for both threads to finish reading
-        stdout_thread.join()
-        stderr_thread.join()
-
-        if return_code != 0:
-            raise subprocess.CalledProcessError(return_code, command)
+    print(check_output(command, timeout=120, stderr=PIPE, env=env, cwd=cur_dir))
 
     if task_type == "flashinfer_temporary_cleanup":
         assert not list(tmp_path.glob("trtllm-flashinfer-rank-*"))
@@ -344,7 +403,6 @@ def test_remote_task_wrapper_preserves_paths_and_kwargs(
     existing = str(tmp_path / "existing")
     additional = str(tmp_path / "additional")
     monkeypatch.setattr(sys, "path", [existing])
-    monkeypatch.setattr(mpi_session, "mpi_barrier", lambda: None)
     monkeypatch.setattr(mpi_session, "mpi_rank", lambda: 0)
     monkeypatch.setattr(mpi_session, "mpi_world_size", lambda: 1)
 
@@ -369,8 +427,8 @@ def task1():
 
 @pytest.mark.cpu_only
 def test_split_mpi_env():
-    session = MpiPoolSession(n_workers=4)
-    session.submit_sync(task1)
+    with _pool_session(n_workers=4) as session:
+        _submit_sync(session, task1)
 
 
 @pytest.mark.cpu_only
@@ -389,39 +447,7 @@ def test_llmapi_launch_multiple_tasks(task_script: str):
     ]
     print(' '.join(command))
 
-    with Popen(command,
-               env=os.environ,
-               stdout=PIPE,
-               stderr=PIPE,
-               bufsize=1,
-               start_new_session=True,
-               universal_newlines=True,
-               cwd=os.path.dirname(os.path.abspath(__file__))) as process:
-        # Function to read from a stream and write to output
-        def read_stream(stream, output_stream):
-            for line in stream:
-                output_stream.write(line)
-                output_stream.flush()
-
-        # Create threads to read stdout and stderr concurrently
-        stdout_thread = threading.Thread(target=read_stream,
-                                         args=(process.stdout, sys.stdout))
-        stderr_thread = threading.Thread(target=read_stream,
-                                         args=(process.stderr, sys.stderr))
-
-        # Start both threads
-        stdout_thread.start()
-        stderr_thread.start()
-
-        # Wait for the process to complete
-        return_code = process.wait()
-
-        # Wait for both threads to finish reading
-        stdout_thread.join()
-        stderr_thread.join()
-
-        if return_code != 0:
-            raise subprocess.CalledProcessError(return_code, command)
+    print(check_output(command, timeout=300, stderr=PIPE, cwd=cur_dir))
 
 
 _LAUNCHER = (Path(__file__).parents[3] / "tensorrt_llm" / "llmapi" /
@@ -688,8 +714,10 @@ def _collect_identities(monkeypatch,
     it = iter(futs + never)
     stand_in = types.SimpleNamespace(
         n_workers=n_workers,
-        mpi_pool=types.SimpleNamespace(submit=lambda fn: next(it),
+        mpi_pool=types.SimpleNamespace(submit=lambda *args, **kwargs: next(it),
                                        shutdown=lambda wait=True: None),
+        submit=lambda task: MpiPoolSession.submit(stand_in, task),
+        _submit_lock=threading.Lock(),
         _teardown_unidentified_pool=lambda ids: MpiPoolSession.
         _teardown_unidentified_pool(stand_in, ids),
     )
@@ -805,9 +833,11 @@ def _wait_closer_thread_gone(timeout: float = 5.0) -> None:
 @pytest.fixture
 def _global_executor_state():
     """Snapshot/restore the module-global executor slots around a test."""
-    saved = (MPINodeState._global_comm_executor, MPINodeState._global_mpi_pool)
+    saved = (MPINodeState._global_comm_executor, MPINodeState._global_mpi_pool,
+             MPINodeState._global_rank0_dispatcher)
     yield
-    (MPINodeState._global_comm_executor, MPINodeState._global_mpi_pool) = saved
+    (MPINodeState._global_comm_executor, MPINodeState._global_mpi_pool,
+     MPINodeState._global_rank0_dispatcher) = saved
 
 
 @pytest.mark.cpu_only
