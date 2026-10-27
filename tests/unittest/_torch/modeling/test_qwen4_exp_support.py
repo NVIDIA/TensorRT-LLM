@@ -228,6 +228,10 @@ def test_text_model_registration_and_defaults() -> None:
     assert Qwen4ExpForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
+    reason="requires CUDA with bfloat16 support",
+)
 @torch.inference_mode()
 def test_conditional_generation_text_forward() -> None:
     from tensorrt_llm._torch.attention.backends import TrtllmAttentionMetadata
@@ -318,9 +322,11 @@ def test_conditional_generation_text_forward() -> None:
     assert torch.isfinite(context_logits).all()
 
     embeddings = model.llm.model.embed_tokens(input_ids)
+    # Different raw IDs: the logits must come from the supplied embeddings
+    # rather than from re-embedding input_ids (PLE is disabled above).
     embedded_logits = model(
         attn_metadata=prepare_metadata(),
-        input_ids=input_ids,
+        input_ids=input_ids + 100,
         position_ids=position_ids,
         inputs_embeds=embeddings,
         return_context_logits=True,
