@@ -133,6 +133,7 @@ class IterationWriter:
         """
         context = None
         socket = None
+        message = None
 
         try:
             # Create a ZeroMQ context and socket for inter-process communication
@@ -146,15 +147,21 @@ class IterationWriter:
                 f"Iteration logging: Listening for messages on {address}...")
             with open(log_path, "w") as f:
                 logger.info(f"Iteration logging: Opened log file {log_path}...")
-                # Receive the first message from the socket
-                message = socket.recv_json()
-                logger.debug(f"Iteration logging: Received initial message")
-                # Continue receiving messages until the stop event is set or an
-                # "end" message is received
-                while not stop_event.is_set() and "end" not in message:
-                    f.write(f"{message}\n")
-                    message = socket.recv_json()
-                logger.debug(f"Iteration logging: Received end message")
+                # Wait for the first message, but give up once stop_event is
+                # set: if the sender never connected (e.g. its socket setup
+                # failed) no end sentinel will come and capture() would block
+                # forever in process.join().
+                while message is None and not stop_event.is_set():
+                    if socket.poll(timeout=100):
+                        message = socket.recv_json()
+                if message is not None:
+                    logger.debug(f"Iteration logging: Received initial message")
+                    # Continue receiving messages until the stop event is set
+                    # or an "end" message is received
+                    while not stop_event.is_set() and "end" not in message:
+                        f.write(f"{message}\n")
+                        message = socket.recv_json()
+                    logger.debug(f"Iteration logging: Received end message")
         except KeyboardInterrupt:
             # Handle keyboard interrupt by continuing to receive
             # messages until "None" is received. LlmManager will

@@ -356,10 +356,17 @@ class LlmManager:
             # Ensure the socket sends a termination message and is properly closed
             if socket is not None:
                 logger.debug("Iteration log worker sending None...")
-                # zmq.asyncio: await so the sentinel is flushed before close().
-                await socket.send_json({"end": True})
-                logger.debug("Closing socket...")
-                socket.close()
+                try:
+                    # zmq.asyncio: await so the sentinel is flushed before close().
+                    await socket.send_json({"end": True})
+                except Exception:
+                    # Do not let a failed send skip cleanup or mask the error
+                    # that is already unwinding.
+                    logger.warning(
+                        "Iteration log worker failed to send the end sentinel.")
+                finally:
+                    logger.debug("Closing socket...")
+                    socket.close()
             if context is not None:
                 logger.debug("Terminating context...")
                 context.term()
