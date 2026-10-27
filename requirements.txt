@@ -106,7 +106,7 @@ cuda-core
 llist
 cuda-tile>=1.0.1
 nvidia-cuda-tileiras>=13.1,<13.2
-nvidia-cudnn-frontend>=1.27.0,<1.28
+nvidia-cudnn-frontend>=1.31.0,<1.32
 etcd-sdk-python==0.0.7
 # Required by the checked-in OpenEngine gRPC bindings.
 grpcio>=1.73.1,<2
