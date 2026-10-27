@@ -171,6 +171,23 @@ def test_geometry_holds_fixed_window_stale_and_chunk(cache):
     assert cache.capacity >= tokens + tpb - 1
 
 
+def test_open_is_a_context_manager_that_closes_on_exit(cache):
+    """``with cache.open(...)`` yields the open cache and closes it on exit, also when
+    the block raises, so a failed request cannot leave the rollout open."""
+    with cache.open(cache.test_spec) as opened:
+        assert opened is cache and cache.is_open
+    assert not cache.is_open
+    with pytest.raises(RuntimeError, match="boom"):
+        with cache.open(cache.test_spec):
+            raise RuntimeError("boom")
+    assert not cache.is_open
+    with pytest.raises(RuntimeError, match="not open"):
+        with cache:  # entering needs an open rollout
+            pass
+    open_cache(cache)  # reopens cleanly after the exception
+    assert cache.is_open
+
+
 def test_open_backs_every_page_once_and_publishes_the_table(cache):
     open_cache(cache)
     assert cache.fixed_tokens == cache.history_tokens == cache.staging_offset == 0

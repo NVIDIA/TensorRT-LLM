@@ -149,9 +149,18 @@ class RolloutKVCacheInterface(abc.ABC):
         """Whether a rollout is open."""
 
     @abc.abstractmethod
-    def open(self, spec: RolloutSpec, *, pin_tokens: int = 0) -> None:
+    def open(self, spec: RolloutSpec, *, pin_tokens: int = 0) -> "RolloutKVCacheInterface":
         """Start a rollout of ``spec``; the first ``pin_tokens`` committed tokens are
-        pinned for the whole rollout."""
+        pinned for the whole rollout. Returns the cache, which is a context manager
+        over the open rollout: leaving the ``with`` block closes it."""
+
+    @abc.abstractmethod
+    def __enter__(self) -> "RolloutKVCacheInterface":
+        """The cache, with its rollout open."""
+
+    @abc.abstractmethod
+    def __exit__(self, *exc) -> None:
+        """Close the rollout, whether the block ended normally or by an exception."""
 
     @abc.abstractmethod
     def close(self) -> None:

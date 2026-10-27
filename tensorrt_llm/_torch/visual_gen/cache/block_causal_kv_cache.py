@@ -451,8 +451,9 @@ class BlockCausalKVCacheManager(KVCacheManagerV2, RolloutKVCacheInterface):
 
     # ------------------------------------------------------------------ lifecycle
 
-    def open(self, spec: RolloutSpec, *, pin_tokens: int = 0) -> None:
-        """Start a rollout with this spec; the sequence starts empty.
+    def open(self, spec: RolloutSpec, *, pin_tokens: int = 0) -> "BlockCausalKVCacheManager":
+        """Start a rollout with this spec; the sequence starts empty. Returns the cache,
+        so ``with cache.open(spec, pin_tokens=n):`` closes the rollout on exit.
 
         Args:
             spec: the rollout's geometry. It must fit the pool: ``pool_tokens_for`` of
@@ -530,6 +531,14 @@ class BlockCausalKVCacheManager(KVCacheManagerV2, RolloutKVCacheInterface):
             self._buffers = []
             self._remove_kv_cache(_ROLLOUT_REQUEST_ID)
             raise
+        return self
+
+    def __enter__(self) -> "BlockCausalKVCacheManager":
+        self._require_open()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def _open_with_spec(
         self,
