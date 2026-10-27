@@ -713,6 +713,10 @@ private:
                       .getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
         }
 
+        // Pre-routed tables are built for one tile; the routing kernel cannot stand in for them (their caller
+        // passes local expert counts, global expert ids and no logits).
+        TORCH_CHECK(prerouted == nullptr || tileN == routing_tile_n, "pre-routed call built for tile ", routing_tile_n,
+            " cannot run with tile ", tileN);
         // Prefer the fine-grained runner for the tuned tile when it has a valid config for this shape.
         RunnerType* runner = nullptr;
         int64_t configToRun = config;
@@ -743,7 +747,7 @@ private:
             gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
             routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeElt, *runner, configToRun,
-            topk_weights, topk_ids, output, tileN == routing_tile_n ? prerouted : nullptr);
+            topk_weights, topk_ids, output, prerouted);
     }
 
     std::vector<int32_t> const mSupportedTileN;
