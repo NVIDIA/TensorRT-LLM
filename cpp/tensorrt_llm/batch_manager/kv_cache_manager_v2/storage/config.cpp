@@ -216,7 +216,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     // per-pool sparsity too keeps a shared pool uniformly host-backed or device-backed.
     struct PoolGroupKey
     {
-        AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
+        ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
         std::vector<size_t> slotSizes;
         std::vector<bool> sparsity;
 
@@ -231,8 +231,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     for (auto& sg : slotGroups)
     {
         auto const sizes = sg.slotSizeList();
-        auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
-        auto const policy = attn ? attn->reusePolicy : AttentionReusePolicy::REQUIRED;
+        auto const policy = reusePolicy(registry.getLifeCycle(sg.lifeCycleId));
         TypedVec<PoolIndex, bool> sparsity;
         sparsity.reserve(sizes.size());
         for (PoolIndex pool{0}; pool < sizes.size(); ++pool)

@@ -51,7 +51,7 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
 )
 from tensorrt_llm.mapping import CpType, Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
+from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1262,7 +1262,7 @@ def test_v2_layer_spec_costing_preserves_sink_and_reuse_policy() -> None:
     )
     layers = [
         windowed,
-        replace(windowed, global_layer_id=1, reuse_policy=AttentionReusePolicy.PRIVATE),
+        replace(windowed, global_layer_id=1, reuse_policy=ReusePolicy.PRIVATE),
         replace(windowed, global_layer_id=2, num_sink_tokens=None),
         replace(windowed, global_layer_id=3, sliding_window_size=None, num_sink_tokens=None),
     ]

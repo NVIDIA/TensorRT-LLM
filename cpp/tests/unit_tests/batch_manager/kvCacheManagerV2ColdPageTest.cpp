@@ -61,7 +61,7 @@ KVCacheManagerConfig makeOptionalDiskConfig(bool hostTier)
         auto layer = std::get<AttentionLayerConfig>(config.layers.front());
         layer.layerId = i;
         layer.slidingWindowSize = i == 1 ? 4 : 2;
-        layer.reusePolicy = AttentionReusePolicy::OPTIONAL;
+        layer.reusePolicy = ReusePolicy::OPTIONAL;
         // Unequal buffer sizes exercise multiple physical pools per page.
         layer.buffers.push_back(BufferConfig{"score", 1024, std::nullopt});
         config.layers.emplace_back(std::move(layer));

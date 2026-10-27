@@ -243,7 +243,7 @@ struct ReuseGroupStatus
     // Lifecycle group returned by getLayerGroupId(layerId), not a physical pool index.
     LayerGroupId groupId;
     // REQUIRED constrains the prefix match; OPTIONAL is selected at resume; PRIVATE is never reused.
-    AttentionReusePolicy policy;
+    ReusePolicy policy;
     // Exclusive token endpoint of the prefix claimed by REQUIRED groups, shared by all groups.
     int endpoint;
     // All state needed by this group at endpoint is available; does not imply GPU residency or selection.
@@ -767,8 +767,7 @@ private:
 
     // Extract uncommitted pages from a SeqBlock, resetting block page entries.
     // Returns one TakenPage per lifecycle. Mirrors Python's _take_uncommitted_page().
-    TypedVec<LifeCycleId, TakenPage> _takeUncommittedPage(
-        SeqBlock& sb, BeamIndex beamIdx, std::optional<LifeCycleId> skipLc = std::nullopt);
+    TypedVec<LifeCycleId, TakenPage> _takeUncommittedPage(SeqBlock& sb, BeamIndex beamIdx);
 
     // Get and validate the tree block at a committed ordinal.
     // Mirrors Python's _get_tree_block(). Asserts committed pages reference the correct block.
@@ -822,6 +821,7 @@ private:
     int mCapacity;
     int mHistoryLength;
     std::optional<int> mExpectedPromptLength;
+    int mNumLookupTokens = 0;
     bool mGenerationAllocReady = false;
 
     // Page index tables: [beamIdx][lcId] → either an internal vector or an external span.

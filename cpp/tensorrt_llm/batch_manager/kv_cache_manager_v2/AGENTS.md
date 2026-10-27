@@ -95,7 +95,15 @@ must eventually be `close()`d. Its normal flow is:
 
 `LifeCycleRegistry` maps model layers to lifecycle groups. Attention lifecycles
 may have sliding-window and sink-token rules; SSM lifecycles represent a
-recurrent-state checkpoint. A pool-group index is a storage-layout index and is
+recurrent-state checkpoint. Both layer configs expose `reusePolicy`: `REQUIRED`
+constrains the prefix match, `OPTIONAL` offers state at the required endpoint for
+explicit selection on first resume, and `PRIVATE` never publishes reusable pages.
+All buffers within a layer share that policy. SSM lifecycles are deduplicated by
+policy, so a manager can have up to three SSM groups; iterate `ssmLifeCycleIds()`
+for working state and use `requiredSsmLifeCycleId()` only for prefix pruning.
+Optional SSM checkpoints require an exact endpoint match, including partial
+blocks. Fresh or unselected recurrent state must be initialized or reconstructed
+by the caller before inference. A pool-group index is a storage-layout index and is
 not interchangeable with a layer ID or lifecycle ID.
 
 Sparsity is a property of a pool, not of a lifecycle: a layer's buffers may be

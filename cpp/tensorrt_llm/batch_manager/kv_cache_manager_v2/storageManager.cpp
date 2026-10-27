@@ -432,12 +432,11 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     TypedVec<LifeCycleId, PoolGroupIndex> coldGrouping(numLifeCycles());
     TypedVec<PoolGroupIndex, SlotDesc> coldSlotDescList;
-    std::map<std::pair<AttentionReusePolicy, size_t>, PoolGroupIndex> coldGroupByPageBytes;
+    std::map<std::pair<ReusePolicy, size_t>, PoolGroupIndex> coldGroupByPageBytes;
     for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
     {
         size_t const coldPageBytes = coldPageBytesByLifeCycle[lifeCycle];
-        auto const* attn = std::get_if<AttnLifeCycle>(&mLifeCycles[lifeCycle]);
-        auto const policy = attn ? attn->reusePolicy : AttentionReusePolicy::REQUIRED;
+        auto const policy = reusePolicy(mLifeCycles[lifeCycle]);
         auto [it, inserted] = coldGroupByPageBytes.emplace(
             std::make_pair(policy, coldPageBytes), PoolGroupIndex{static_cast<int>(coldSlotDescList.size().value())});
         PoolGroupIndex const coldPgIdx = it->second;
@@ -1885,14 +1884,13 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromLength(
     // same boundary KvCache::_appendBeams() uses.
     HalfOpenRange<BlockOrdinal> const sharedRange{0, std::min(std::max(promptLength, 0) / tokensPerBlock, numBlocks)};
     TypedVec<LifeCycleId, size_t> numBytes(numLifeCycles(), 0);
-    auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
     auto const& lifeCycles = mLifeCycles.getAll();
     for (LifeCycleId lifeCycle{0}; lifeCycle < lifeCycles.size(); ++lifeCycle)
     {
         auto const poolSizes = slotSize(level, getPoolGroupIndex(level, lifeCycle));
         size_t const slotBytes = std::accumulate(poolSizes.begin(), poolSizes.end(), size_t{0});
         int numRequiredBlocks;
-        if (ssmLcId.has_value() && lifeCycle == *ssmLcId)
+        if (mLifeCycles.isSsm(lifeCycle))
         {
             // One recurrent-state block per beam.
             numRequiredBlocks = effBeamWidth;
@@ -1953,9 +1951,9 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& bat
     auto numSlots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
     // A soft preference, not a feasibility floor: keep one optional endpoint
     // per typical request in addition to its private working pages.
-    for (auto const& [lc, attention] : mLifeCycles.attentionLifeCycles())
+    for (auto const& [lc, lifeCycle] : mLifeCycles)
     {
-        if (attention->allowsCheckpoint())
+        if (reusePolicy(lifeCycle) == ReusePolicy::OPTIONAL)
         {
             numSlots[lc] += slotCountValueFromSize(batch.kvCaches.size());
         }
@@ -2052,12 +2050,11 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(
     BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const
 {
     TypedVec<LifeCycleId, SlotCount> numSlots(numLifeCycles(), 0);
-    auto ssmLcId = mLifeCycles.ssmLifeCycleId();
     int sysBlocks = batch.systemPromptLength / tokensPerBlock;
 
     for (auto const& [lcIdx, lc] : mLifeCycles)
     {
-        if (ssmLcId.has_value() && lcIdx == *ssmLcId)
+        if (mLifeCycles.isSsm(lcIdx))
         {
             // SSM: one dedicated block per request per beam, never shared.
             // _appendBeams() gives every beam its own recurrent-state slot.

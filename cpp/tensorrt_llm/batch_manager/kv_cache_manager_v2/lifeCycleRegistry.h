@@ -40,21 +40,21 @@ struct AttnLifeCycle
 {
     std::optional<int> windowSize; // nullopt = no sliding window
     int numSinkBlocks = 0;         // divUp(numSinkTokens, tokensPerBlock)
-    AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
+    ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
 
     bool isPrivate() const noexcept
     {
-        return reusePolicy == AttentionReusePolicy::PRIVATE;
+        return reusePolicy == ReusePolicy::PRIVATE;
     }
 
     bool requiresPrefixCoverage() const noexcept
     {
-        return reusePolicy == AttentionReusePolicy::REQUIRED;
+        return reusePolicy == ReusePolicy::REQUIRED;
     }
 
     bool allowsCheckpoint() const noexcept
     {
-        return reusePolicy == AttentionReusePolicy::OPTIONAL;
+        return reusePolicy == ReusePolicy::OPTIONAL;
     }
 
     HalfOpenRange<BlockOrdinal> getStaleRange(int historyLength, int tokensPerBlock) const
@@ -89,7 +89,7 @@ struct AttnLifeCycle
     }
 
     static AttnLifeCycle make(std::optional<int> ws, std::optional<int> numSinkTokens, int tokensPerBlock,
-        AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED)
+        ReusePolicy reusePolicy = ReusePolicy::REQUIRED)
     {
         TLLM_CHECK_DEBUG(tokensPerBlock > 0);
         TLLM_CHECK_DEBUG(!ws.has_value() || *ws > 0);
@@ -103,23 +103,25 @@ struct AttnLifeCycle
 // ---------------------------------------------------------------------------
 // SsmLifeCycle — lifecycle for SSM (State Space Model) layers.
 // All blocks before the last full block are stale (recurrent state).
-// Singleton: all SSM layers share the same lifecycle.
+// SSM layers with the same reuse policy share a lifecycle.
 // ---------------------------------------------------------------------------
 struct SsmLifeCycle
 {
+    ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
+
     HalfOpenRange<BlockOrdinal> getStaleRange(int historyLength, int tokensPerBlock) const
     {
         return {BlockOrdinal{0}, BlockOrdinal{historyLength / tokensPerBlock}};
     }
 
-    bool operator==(SsmLifeCycle const&) const noexcept
+    bool operator==(SsmLifeCycle const& other) const noexcept
     {
-        return true;
+        return reusePolicy == other.reusePolicy;
     }
 
-    bool operator<(SsmLifeCycle const&) const noexcept
+    bool operator<(SsmLifeCycle const& other) const noexcept
     {
-        return false;
+        return reusePolicy < other.reusePolicy;
     }
 };
 
@@ -128,16 +130,19 @@ struct SsmLifeCycle
 // ---------------------------------------------------------------------------
 using LifeCycle = std::variant<AttnLifeCycle, SsmLifeCycle>;
 
+inline ReusePolicy reusePolicy(LifeCycle const& lc)
+{
+    return std::visit([](auto const& value) { return value.reusePolicy; }, lc);
+}
+
 inline bool isPrivateLifeCycle(LifeCycle const& lc)
 {
-    auto const* attn = std::get_if<AttnLifeCycle>(&lc);
-    return attn && attn->isPrivate();
+    return reusePolicy(lc) == ReusePolicy::PRIVATE;
 }
 
 inline bool requiresPrefixCoverage(LifeCycle const& lc)
 {
-    auto const* attn = std::get_if<AttnLifeCycle>(&lc);
-    return !attn || attn->requiresPrefixCoverage();
+    return reusePolicy(lc) == ReusePolicy::REQUIRED;
 }
 
 // Free function: compute stale range via std::visit.
@@ -210,14 +215,31 @@ public:
     }
 
     // SSM helpers.
-    std::optional<LifeCycleId> ssmLifeCycleId() const noexcept
+    std::vector<LifeCycleId> const& ssmLifeCycleIds() const noexcept
     {
-        return mSsmLifeCycleId;
+        return mSsmLifeCycleIds;
+    }
+
+    bool isSsm(LifeCycleId id) const
+    {
+        return std::holds_alternative<SsmLifeCycle>((*this)[id]);
+    }
+
+    std::optional<LifeCycleId> requiredSsmLifeCycleId() const
+    {
+        for (auto id : mSsmLifeCycleIds)
+        {
+            if (requiresPrefixCoverage((*this)[id]))
+            {
+                return id;
+            }
+        }
+        return std::nullopt;
     }
 
     bool hasSSM() const noexcept
     {
-        return mSsmLifeCycleId.has_value();
+        return !mSsmLifeCycleIds.empty();
     }
 
     // Return (id, AttnLifeCycle*) pairs for attention lifecycles only. Used by _setupForReuse.
@@ -293,7 +315,7 @@ private:
 
     TypedVec<LifeCycleId, LifeCycle> mLifeCycleList;
     std::map<LifeCycle, LifeCycleId> mLifeCycleIdMap;
-    std::optional<LifeCycleId> mSsmLifeCycleId;
+    std::vector<LifeCycleId> mSsmLifeCycleIds;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
