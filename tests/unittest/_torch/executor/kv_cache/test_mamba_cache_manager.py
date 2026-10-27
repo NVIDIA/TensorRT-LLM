@@ -2529,6 +2529,8 @@ def _build_v2_hybrid_with_mamba_layer(
     conv_state_layout="x_b_c",
     speculative_state=None,
     mamba_d_conv=4,
+    mamba_d_state=8,
+    mamba_head_dim=8,
     mamba_num_heads=4,
     mamba_n_groups=1,
     mamba_ssm_cache_dtype=torch.float16,
@@ -2605,11 +2607,11 @@ def _build_v2_hybrid_with_mamba_layer(
 
     manager_cls = ModelStateManager
     return manager_cls(
-        mamba_d_state=8,
+        mamba_d_state=mamba_d_state,
         mamba_d_conv=mamba_d_conv,
         mamba_num_heads=mamba_num_heads,
         mamba_n_groups=mamba_n_groups,
-        mamba_head_dim=8,
+        mamba_head_dim=mamba_head_dim,
         mamba_num_layers=num_mamba_layers,
         mamba_layer_mask=mamba_mask,
         mamba_cache_dtype=torch.float16,
@@ -4014,7 +4016,7 @@ def test_v2_hybrid_graph_survives_pool_rebalance(manager_cls, replay, tma_write)
         model_manager_cls=manager_cls,
         enable_kv_pool_rebalance=True,
         max_tokens=None,
-        max_gpu_total_bytes=32 << 20,
+        max_gpu_total_bytes=(128 if tma_write is not None else 32) << 20,
         host_cache_size=64 << 20,
     )
     if is_kda and replay:
@@ -4024,6 +4026,9 @@ def test_v2_hybrid_graph_survives_pool_rebalance(manager_cls, replay, tma_write)
             spec_config=MTPDecodingConfig(max_draft_len=2) if replay else None,
             use_replay_state_update=replay,
             mamba_ssm_cache_dtype=torch.float32,
+            mamba_num_heads=16 if tma_write is not None else 4,
+            mamba_head_dim=64 if tma_write is not None else 8,
+            mamba_d_state=128 if tma_write is not None else 8,
             conv_state_layout="x_b_c" if manager_cls is NemotronHybridCacheManager else "q_k_v",
             **options,
         )
