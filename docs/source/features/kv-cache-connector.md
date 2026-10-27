@@ -369,6 +369,48 @@ this path.
 
 **Deployment note.** Under a connector, a workload that was token-bound becomes KV-bound: the connector removes forward-pass tokens but its prefix still occupies GPU pages. Lowering `max_num_tokens` to hand memory back to the KV pool is usually the right adjustment, the opposite of the guidance for a connector-free deployment.
 
+##### Completion headroom on disaggregated servers
+
+A disaggregated server with KV cache manager V2 can reserve logical GPU-page headroom for each
+admitted request to finish; it does not allocate those pages early. The reservation is opt-in: a
+server qualifies only when no tier sits below GPU and either its connector's worker declares
+[`requires_completion_reservation`](#2-worker-interface-kvcacheconnectorworker) or its
+`kv_cache_config.enable_disagg_completion_reservation` (prototype, `False` by default) is set. A
+connector that transfers KV leaves no such tier, because the host tier is dropped automatically and
+the others are refused at bring-up (see
+[KV cache tiers](#kv-cache-tiers-are-gpu-only-under-a-connector)), so its declaration is enough. A
+server with neither keeps its existing admission, `host_cache_size=0` included, whether it has no
+connector, a capacity-only one, or one that does not declare it. The Mooncake store connector
+declares it. The reservation covers full-attention models only, without beam search or pipeline
+parallelism. Windowed, recurrent and mixed-precision caches keep their existing admission policy.
+
+A disaggregated generation server without a connector opts in through the configuration. Without a
+connector the host tier is provisioned automatically, so set `host_cache_size: 0` and configure no
+disk tier; otherwise the cache manager logs a warning and ignores the setting. Such a server
+reserves decode headroom only; the connector-prefill reservation below needs a connector.
+
+```yaml
+kv_cache_config:
+  host_cache_size: 0
+  enable_disagg_completion_reservation: true
+```
+
+- **Decode.** Disaggregated generation admission reserves pages through each request's output
+  limit, including speculative padding. Incoming transfers may overlap decoding, but cannot
+  consume the pages reserved for admitted requests to finish.
+- **Connector prefill.** For connectors without source reservations, the scheduler reserves
+  headroom through the end of each admitted prompt before allocating its first chunk; chunk
+  allocation stays incremental. A new request waits for headroom instead of preempting an
+  admitted one, so other requests' small chunks cannot consume the pages needed to restore its
+  matching prefix after the final-batch query.
+
+A reservation is released when the request finishes or is cancelled, when an unconsumed first
+chunk returns to the queue, when a generation-init admission is reverted before its transfer, and
+on shutdown. The check counts free and evictable GPU pages, so droppable reusable pages do not
+block admission. A server whose pool was clamped below the configured `max_seq_len` may defer a
+request whose output limit reaches `max_seq_len` indefinitely; size the pool above `max_seq_len`.
+This GPU admission budget is separate from any store capacity behind the connector.
+
 #### 2. Worker Interface (`KvCacheConnectorWorker`)
 
 These methods run on all workers (GPU processes) and interact with the actual GPU data.
@@ -430,6 +472,9 @@ These methods run on all workers (GPU processes) and interact with the actual GP
 
 * **`drops_reuse_match_backoff: bool`** (class attribute)
   * **Description**: Optional, `False` by default; only an explicit `True` counts. Declares a connector that prefers whole local matches to backed-off ones: the target `KVCacheManagerV2` drops the one-model draft's reuse backoff, so a local match of whole blocks is used whole and needs no alignment. The draft KV at the tail of a reused block may then belong to a different next token, which can lower draft acceptance but never changes the output. A draft pool never drops its own backoff.
+
+* **`requires_completion_reservation: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts. Turns on the completion reservation of a disaggregated server with no tier below GPU (see [Completion headroom on disaggregated servers](#completion-headroom-on-disaggregated-servers)): `KVCacheManagerV2` then admits a decode or a connector first chunk only while the pages every admitted request needs to finish still fit. Declare it when the connector restores a prefix only after the final batch is chosen, so other requests' chunks must not take the pages that restore needs. Read from the worker, which every rank holds, once when the cache manager is built after the connector, so a worker may set it per instance in `__init__`. Must be the same on every rank. A `capacity_only` worker's declaration is ignored.
 
 The two reuse declarations above are read once, when the cache manager is built after the connector, so a worker may set them per instance in `__init__`. A `capacity_only` worker's declarations are ignored. They must be the same on every rank: unlike `capacity_only`, they are not gathered at startup, and ranks that disagree would claim different local prefixes for the same request.
 

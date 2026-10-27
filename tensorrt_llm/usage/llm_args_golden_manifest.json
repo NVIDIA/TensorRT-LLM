@@ -676,6 +676,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "kv_cache_config.enable_disagg_completion_reservation"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "kv_cache_config.enable_kv_pool_rebalance"
     },
     {

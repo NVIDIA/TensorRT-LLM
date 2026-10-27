@@ -1309,6 +1309,37 @@ def test_KvCacheConfig_declaration(offload_field):
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_disagg_completion_reservation():
+    assert KvCacheConfig().enable_disagg_completion_reservation is False
+    field = KvCacheConfig.model_fields["enable_disagg_completion_reservation"]
+    assert field.json_schema_extra["status"] == "prototype"
+
+    config = KvCacheConfig(host_cache_size=0,
+                           enable_disagg_completion_reservation=True)
+    assert config.enable_disagg_completion_reservation is True
+    assert KvCacheConfig.model_validate(
+        config.model_dump()).enable_disagg_completion_reservation is True
+    assert KvCacheConfig.model_validate_json(
+        config.model_dump_json()).enable_disagg_completion_reservation is True
+    # The C++ config has no such field, and the conversion leaves it out.
+    pybind_config = config._to_pybind()
+    assert pybind_config.host_cache_size == 0
+    assert not hasattr(pybind_config, "enable_disagg_completion_reservation")
+
+    # The deployment path: a YAML extra-options file merged into the LLM args.
+    merged = update_llm_args_with_extra_dict(
+        {"model": "dummy"},
+        yaml.safe_load("kv_cache_config:\n"
+                       "  host_cache_size: 0\n"
+                       "  enable_disagg_completion_reservation: true\n"))
+    assert merged[
+        "kv_cache_config"].enable_disagg_completion_reservation is True
+    with pytest.raises(ValidationError,
+                       match="enable_disagg_completion_reservation"):
+        KvCacheConfig(enable_disagg_completion_reservation="sometimes")
+
+
+@pytest.mark.cpu_only
 def test_KvCacheConfig_offload_priority_compatibility():
     assert KvCacheConfig().cold_tier_offload_min_priority is None
     for field in ("cold_tier_offload_min_priority",

@@ -682,6 +682,8 @@ def make_kv_cache_manager(
     mgr.preempt_request.side_effect = preempt_request
     # A bare Mock would answer truthily and suppress every stall check.
     mgr.has_pending_preemption.return_value = False
+    # Completion headroom is plentiful unless a test says otherwise.
+    mgr.reserve_context_completion.return_value = True
     return mgr
 
 
@@ -2331,6 +2333,75 @@ class TestPreemptionDefersToConnectorSaves:
 
         for _ in range(10):
             sched.schedule_request(reqs, set())
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_completion_reservation_deferral_preserves_started_context(chunked: bool) -> None:
+    """A new prompt waiting for completion headroom must let admitted prefill finish."""
+    manager = make_kv_cache_manager(has_cache_tier_below_gpu=False)
+    # Only the new prompt is refused, whatever order the pass consults them in.
+    manager.reserve_context_completion.side_effect = lambda req: req.py_request_id != 0
+    scheduler = make_scheduler(
+        manager,
+        max_num_tokens=1000,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64) if chunked else None,
+    )
+    waiting = make_ctx_request(0, 500)
+    started = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+    batch = scheduler.schedule_request([waiting, started], set())
+
+    assert ids(batch.context_requests) == [99]
+    assert batch.paused_requests == []
+    manager.preempt_request.assert_not_called()
+    manager.resize_context.assert_called_once_with(started, 100)
+    started.pause.assert_not_called()
+
+    # Once headroom returns, admission accepts the queued prompt.
+    manager.reserve_context_completion.side_effect = None
+    manager.reserve_context_completion.return_value = True
+    resumed = scheduler.schedule_request([waiting], set())
+    assert ids(resumed.context_requests) == [0]
+    manager.preempt_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "chunked, max_num_tokens, align_to_nothing, reaches_prepare",
+    [
+        # Full path: the prompt does not fit the token budget once prepared.
+        (False, 100, False, True),
+        # Chunked path: the pass has no chunk budget left at all.
+        (True, 32, False, False),
+        # Chunked path: no multimodal-safe chunk boundary this pass.
+        (True, 1000, True, True),
+    ],
+    ids=["full_token_budget", "no_chunk_budget", "mm_alignment"],
+)
+def test_completion_reservation_not_consulted_before_budget_skips(
+    chunked: bool, max_num_tokens: int, align_to_nothing: bool, reaches_prepare: bool
+) -> None:
+    """Budget and alignment refusals come first, so they never record a completion bound."""
+    manager = make_kv_cache_manager(has_cache_tier_below_gpu=False)
+    scheduler = make_scheduler(
+        manager,
+        max_num_tokens=max_num_tokens,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64) if chunked else None,
+    )
+    if align_to_nothing:
+        scheduler._align_chunk_to_mm_block = Mock(return_value=0)
+    request = make_ctx_request(0, 200)
+
+    batch = scheduler.schedule_request([request], set())
+
+    assert batch.context_requests == []
+    if reaches_prepare:
+        manager.prepare_context.assert_called_once_with(request)
+    else:
+        manager.prepare_context.assert_not_called()
+    if align_to_nothing:
+        scheduler._align_chunk_to_mm_block.assert_called_once()
+    manager.reserve_context_completion.assert_not_called()
+    manager.resize_context.assert_not_called()
 
 
 class TestDeadlockDetection:

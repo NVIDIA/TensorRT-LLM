@@ -997,6 +997,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         Source reservations advance the prefix before budget checks. Destination
         pages are allocated here; loads are accepted after the final batch trims.
         A loading request remains outside the schedulable state range.
+
+        On a disaggregated server without an eviction tier whose connector
+        declares `requires_completion_reservation`, or whose
+        `kv_cache_config.enable_disagg_completion_reservation` is set, a
+        connector first chunk can be deferred for completion headroom; the
+        rollback below also drops its bound.
         """
         first_chunk = req.is_first_context_chunk
         if self.chunking_enabled:
@@ -1071,6 +1077,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         # V2 resizes KV cache directly in the scheduler (no separate
         # prepareResources for main cache), so include draft tokens.
         req.context_chunk_size = context_tokens
+        if not self.kv_cache_manager.reserve_context_completion(req):
+            # Admitted requests own the completion headroom. Defer this prompt
+            # instead of preempting one of them to make room for it.
+            logger.debug(
+                "Deferring context request %s: admitted requests hold the completion headroom",
+                req.py_request_id,
+            )
+            return ScheduleAction.SKIP, 0, False
         if not self._try_allocate_context(req, context_tokens + draft_len):
             # Out of pages. Give up one started request so this one can
             # proceed, and retry next iteration: a failed resize leaves a
@@ -1238,6 +1252,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                 chunk_tokens += draft_len
                 resize_tokens += draft_len
 
+        if not self.kv_cache_manager.reserve_context_completion(req):
+            # As in _try_schedule_context_full: wait for headroom, do not preempt.
+            logger.debug(
+                "Deferring context request %s: admitted requests hold the completion headroom",
+                req.py_request_id,
+            )
+            return ScheduleAction.SKIP, 0, False
         # V2 resizes KV cache directly in the scheduler, so include
         # draft tokens for last chunk.
         if not self._try_allocate_context(req, resize_tokens):

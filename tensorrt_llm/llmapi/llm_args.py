@@ -5177,6 +5177,24 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description="KV cache manager v2 configuration for block reuse policies."
     )
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    enable_disagg_completion_reservation: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Reserve the GPU KV cache pages each admitted request needs to finish "
+        "on a disaggregated server. Applies only to KV cache manager v2 on a "
+        "disaggregated server with no cache tier below GPU (host_cache_size=0 "
+        "and no disk tier), beam width 1, a single pipeline stage and full "
+        "attention on every layer; elsewhere it is ignored, and KV cache "
+        "manager v2 logs a warning. A request is then admitted only while the "
+        "completion bound of every admitted request still fits: a generation "
+        "request through its output limit and, under a KV connector without "
+        "source reservations, a context request the connector may serve "
+        "through the end of its prompt. The bounds are logical; no page is "
+        "allocated early. A KV connector can request the same through its "
+        "worker's requires_completion_reservation declaration.")
+
     def _to_pybind(self):
         config = _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
