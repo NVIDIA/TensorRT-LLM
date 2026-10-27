@@ -1543,7 +1543,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     ):
         creator = KvCacheCreator(
             model_engine=model_engine,
-            mapping=Mock(cp_config={}),
+            mapping=Mapping(),
             net_max_seq_len=max_seq_len,
             kv_connector_manager=None,
             max_num_tokens=256,
