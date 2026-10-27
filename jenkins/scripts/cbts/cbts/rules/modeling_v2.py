@@ -49,7 +49,9 @@ unit tests. A test file listed at a directory above a node -- a family's
 own test file -- belongs to every node under that directory, so a change
 to any of them keeps it. Whenever the tree on disk cannot answer -- a node directory
 deleted with its `routing.py` -- the file falls back to the wider
-selection.
+selection. So does a node holding a `modeling.py` that its family's
+`routing.py` does not import, such as a target nested below the family's
+first level: its accuracy gate cannot be named.
 
 Outward fallback: not needed, and that is a property of the design
 rather than an accident. Nothing beyond the resolver module is imported
@@ -200,16 +202,26 @@ class ModelingV2Rule(Rule):
         return len(rel_dir.parts) == 1 or (path.is_dir() and any(path.rglob("modeling.py")))
 
     def _gates_under(self, node: Path) -> Optional[set[str]]:
-        """Accuracy-gate prefixes of every target at or under `node`; None if unreadable."""
+        """Accuracy-gate prefixes of every target at or under `node`.
+
+        None if unreadable: no `routing.py`, or a `modeling.py` under `node`
+        that no import line in it routes to, whose gate cannot be named.
+        """
+        models = self._src_root / "models"
         family = node.parts[0]
-        routing = self._src_root / "models" / family / "routing.py"
+        routing = models / family / "routing.py"
         if not routing.is_file():
             return None
-        gates = set()
+        routed, gates = set(), set()
         for target, target_cls in _TARGET_IMPORT.findall(routing.read_text(encoding="utf-8")):
             leaf = Path(family, target)
+            routed.add(leaf)
             if leaf == node or node in leaf.parents:
                 gates.add(f"{_ACCURACY_ROOT}/test_{family}.py::Test{target_cls}")
+        if any(
+            m.parent.relative_to(models) not in routed for m in (models / node).rglob("modeling.py")
+        ):
+            return None
         return gates
 
     def _prefixes_for(self, path: str) -> Optional[set[str]]:

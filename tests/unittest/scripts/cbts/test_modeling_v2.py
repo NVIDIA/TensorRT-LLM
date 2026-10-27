@@ -142,3 +142,19 @@ def test_family_test_file_does_not_displace_the_covering_entry(tmp_path: Path) -
     result = rule.apply(PRInputs(changed_files=[changed], diffs={}))
     kept = {entry for waives in result.block_filters[("l0_b300", 0)].values() for entry in waives}
     assert kept == {f"{_UNIT}/models/fam/test_shared.py", f"{_UNIT}/models/fam"}
+
+
+@pytest.mark.parametrize(
+    "changed",
+    ("models/fam/sm103/t/ops/gemm.py", "models/fam/routing.py"),
+    ids=("nested-target", "family-holding-it"),
+)
+def test_unrouted_target_falls_back_to_everything(tmp_path: Path, changed: str) -> None:
+    """A `modeling.py` no import line in `routing.py` names has no gate to select."""
+    rule = _rule(tmp_path)
+    nested = tmp_path / _SRC / "models/fam/sm103/t/modeling.py"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("")
+    result = rule.apply(PRInputs(changed_files=[f"{_SRC}/{changed}"], diffs={}))
+    kept = {entry for waives in result.block_filters[("l0_b300", 0)].values() for entry in waives}
+    assert kept == set(_ENTRIES)
