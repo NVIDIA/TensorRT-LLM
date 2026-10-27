@@ -3060,6 +3060,7 @@ def test_video_timing_is_forwarded_to_the_processor(monkeypatch):
         {"fps": 10.0, "frames_indices": [0]},
         {"fps": 10.0, "frames_indices": [0, 5, 9]},
         {"fps": 10.0, "frames_indices": [0, None]},
+        {"fps": 10.0, "frames_indices": [-10, 1]},
     ],
     ids=[
         "frame_list",
@@ -3073,6 +3074,7 @@ def test_video_timing_is_forwarded_to_the_processor(monkeypatch):
         "fewer_frame_indices_than_frames",
         "more_frame_indices_than_frames",
         "none_frame_index",
+        "negative_frame_index",
     ],
 )
 def test_video_without_timing_passes_no_metadata(monkeypatch, metadata):

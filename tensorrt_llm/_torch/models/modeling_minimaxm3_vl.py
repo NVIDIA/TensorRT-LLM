@@ -2060,11 +2060,11 @@ class MiniMaxM3VLInputProcessor:
         the sampled frames. With both, the processor writes a
         ``]<]{t} seconds[>[`` timestamp before each temporal group. A video
         without usable timing (no metadata, ``fps`` missing or not a finite
-        positive number, or not one integer frame index per delivered frame) gets
-        ``fps=None`` and no timestamps. Only the keys transformers'
-        ``VideoMetadata`` accepts are passed, and ``total_num_frames`` is the
-        number of frames delivered, because the media loader has already
-        sampled them.
+        positive number, or not one non-negative integer frame index per
+        delivered frame) gets ``fps=None`` and no timestamps. Only the keys
+        transformers' ``VideoMetadata`` accepts are passed, and
+        ``total_num_frames`` is the number of frames delivered, because the
+        media loader has already sampled them.
         """
         metadata = getattr(video, "metadata", None)
         metadata = metadata if isinstance(metadata, Mapping) else {}
@@ -2078,7 +2078,8 @@ class MiniMaxM3VLInputProcessor:
             or frames_indices is None
             or len(frames_indices) != num_frames
             or not all(
-                isinstance(i, numbers.Integral) and not isinstance(i, bool) for i in frames_indices
+                isinstance(i, numbers.Integral) and not isinstance(i, bool) and i >= 0
+                for i in frames_indices
             )
         ):
             fps, frames_indices = None, range(num_frames)
