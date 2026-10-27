@@ -1075,9 +1075,11 @@ class AnthropicStreamReframer:
 
 
 async def _iter_openai_sse_lines(
-    openai_sse: AsyncIterator[Union[str, bytes]],
-) -> AsyncIterator[str]:
+    openai_sse: AsyncIterator[Optional[Union[str, bytes]]],
+) -> AsyncIterator[Optional[str]]:
     """Yield complete lines from string frames or arbitrarily chunked bytes.
+
+    A None item, a tick from ``_with_ticks``, is passed through as None.
 
     The in-process server produces complete SSE strings, while the
     disaggregated frontend relays raw ``aiohttp`` byte chunks.  Network chunks
@@ -1092,6 +1094,9 @@ async def _iter_openai_sse_lines(
 
     try:
         async for payload in openai_sse:
+            if payload is None:
+                yield None
+                continue
             if not isinstance(payload, (str, bytes)):
                 raise TypeError(f"OpenAI SSE payload must be str or bytes, got {type(payload)!r}")
 
@@ -1129,8 +1134,8 @@ STREAM_PING_INTERVAL_S = 10.0
 
 
 async def _with_ticks(
-    source: AsyncIterator[str], timeout: Callable[[], Optional[float]]
-) -> AsyncIterator[Optional[str]]:
+    source: AsyncIterator[Any], timeout: Callable[[], Optional[float]]
+) -> AsyncIterator[Any]:
     """Yield the items of ``source``, and None each time ``timeout()`` seconds pass first.
 
     ``timeout()`` is asked before every wait; None waits for the next item. One
@@ -1149,16 +1154,18 @@ async def _with_ticks(
                 await items.put(item)
         except asyncio.CancelledError:
             # The consumer has stopped; nobody is left to take the end marker.
-            # Stopped while handing over an item, the reader leaves the source
-            # suspended at its yield, so it closes the source itself.
-            aclose = getattr(source, "aclose", None)
-            if aclose is not None:
-                await aclose()
             raise
         except Exception:
             await items.put(end)
             raise
-        await items.put(end)
+        else:
+            await items.put(end)
+        finally:
+            # The reader closes the source in every case: stopped while handing
+            # over an item, it leaves the source suspended at its yield.
+            aclose = getattr(source, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     reader = asyncio.create_task(read_all())
     try:
@@ -1203,7 +1210,9 @@ async def reframe_openai_stream(
             return None
         return max(0.0, STREAM_PING_INTERVAL_S - (loop.time() - last_event))
 
-    lines = _with_ticks(_iter_openai_sse_lines(openai_sse), until_ping)
+    # The ticks wrap the upstream's payloads, not the lines split from them:
+    # one hand-off between the reading task and this one per payload.
+    lines = _iter_openai_sse_lines(_with_ticks(openai_sse, until_ping))
     try:
         async for line in lines:
             if line is None:

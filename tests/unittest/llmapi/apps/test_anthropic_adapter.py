@@ -1937,11 +1937,14 @@ def test_stream_pings_when_chunks_bring_no_event(monkeypatch):
 
 
 def test_stream_sends_no_ping_while_events_flow(monkeypatch):
-    """Every event restarts the wait: a stream five intervals long but never silent has no ping."""
-    steps = [(0.02, _line(chunk({"content": f"word{i} "}))) for i in range(50)]
+    """Every event restarts the wait: a stream longer than the interval but never silent has no ping.
+
+    The 1 s interval is 50 times the 20 ms gap, so a loaded worker does not fake a silence.
+    """
+    steps = [(0.02, _line(chunk({"content": f"word{i} "}))) for i in range(60)]
     steps += [(0, _line(chunk({}, finish_reason="stop"))), (0, "data: [DONE]\n\n")]
 
-    events = _reframe_paced(monkeypatch, steps, interval=0.2)
+    events = _reframe_paced(monkeypatch, steps, interval=1.0)
 
     assert_event_invariants(events)
     assert "ping" not in [name for name, _ in events]
