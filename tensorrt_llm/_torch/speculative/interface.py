@@ -1771,6 +1771,10 @@ class SpecWorkerBase(nn.Module, ABC):
                                                 "cuda",
                                                 torch.cuda.current_device()))
 
+    def post_load_weights(self) -> None:
+        # The loader's default post-load walk calls post_load_weights only.
+        self.cache_derived_state()
+
     def register_auxiliary_state_handler(
             self, handler: AuxiliarySpeculativeStateHandler) -> None:
         """Register one model-owned state handler without re-parenting the module."""
