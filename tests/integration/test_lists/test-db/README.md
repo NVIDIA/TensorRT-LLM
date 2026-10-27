@@ -61,7 +61,10 @@ This command runs the tests specified in the test list and outputs the results t
 ## Check Test List (CI)
 
 Jenkins **Check Test List** runs
-`scripts/check_test_list.py --l0 --qa --waive --validate --parity`.
+`scripts/check_test_list.py --l0 --qa --waive --validate --parity`, and the
+GitHub Actions workflow `.github/workflows/check-test-list.yml` runs
+`--l0 --qa --waive` on every pull request. Neither needs `trt-test-db`: the L0
+entries are read from `test-db/*.yml` directly.
 L0/QA/waive collection uses pure-Python stubs of the compiled modules
 (`tests/integration/defs/stubify_bindings.py`, loaded only via
 `-p stubify_bindings`), so no TensorRT-LLM wheel or C++
