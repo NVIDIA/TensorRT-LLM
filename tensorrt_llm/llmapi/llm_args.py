@@ -2344,6 +2344,30 @@ class DecodingBaseConfig(StrictBaseModel):
         "(default) to use exact-match verification on non-greedy batches. "
         "The non-dynamic-tree one-model path requires FlashInfer.")
 
+    rejection_sample_method: Literal["standard", "block"] = Field(
+        default="standard",
+        status="prototype",
+        description=
+        "Verification rule of rejection sampling (use_rejection_sampling=True). "
+        "'standard': token-level rejection sampling (Leviathan et al., 2023): "
+        "each draft is accepted with probability min(1, p/q) in order, and the "
+        "first rejection resamples from max(p - q, 0). 'block': block "
+        "verification (Sun et al., 2024, arXiv:2403.10444), which judges the "
+        "drafted block jointly; it is lossless, equals 'standard' for one "
+        "draft, and accepts at least as many tokens in expectation. Linear-chain "
+        "one-model paths only (not the dynamic tree); ragged (confidence-"
+        "scheduled) verification steps fall back to 'standard'.")
+
+    draft_temperature_only: bool = Field(
+        default=False,
+        status="prototype",
+        description="If true, rejection-sampled draft tokens are drawn from the "
+        "temperature-scaled draft distribution without the request's top-k / "
+        "top-p / min-p filters, and that distribution is what verification "
+        "divides by (vLLM's 'probabilistic' drafting). Outputs stay lossless "
+        "either way; the setting changes the acceptance rate. Requires "
+        "use_rejection_sampling=True.")
+
     allow_advanced_sampling: bool = Field(
         default=False,
         status="deprecated",
@@ -6965,6 +6989,30 @@ class TorchLlmArgs(BaseLlmArgs):
             return False
         return True
 
+    def _validate_rejection_sampling_options(self) -> None:
+        """Reject rejection-sampling options that would have no effect.
+
+        ``rejection_sample_method`` and ``draft_temperature_only`` only change
+        the rejection path, so setting them while it is off is a configuration
+        mistake. Block verification is also not wired into the dynamic tree.
+        """
+        spec_cfg = self.speculative_config
+        method = getattr(spec_cfg, "rejection_sample_method", "standard")
+        temperature_only = getattr(spec_cfg, "draft_temperature_only", False)
+        if not spec_cfg.use_rejection_sampling:
+            options = []
+            if method != "standard":
+                options.append(f"rejection_sample_method={method!r}")
+            if temperature_only:
+                options.append("draft_temperature_only=True")
+            if options:
+                raise ValueError(f"{' and '.join(options)} require(s) "
+                                 "use_rejection_sampling=True.")
+        if method == "block" and getattr(spec_cfg, "use_dynamic_tree", False):
+            raise ValueError(
+                "rejection_sample_method='block' is not supported with "
+                "use_dynamic_tree=True.")
+
     def _validate_dflash_ctx_budget(self,
                                     memory_budget_bytes: Optional[int] = None
                                     ) -> None:
@@ -7217,6 +7265,8 @@ class TorchLlmArgs(BaseLlmArgs):
                 # The enabled paths (Eagle3, vanilla MTP, PARD, DFlash,
                 # DraftTarget one-model) share the SpecMetadata slot-indexed
                 # dispatch.
+
+            self._validate_rejection_sampling_options()
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"

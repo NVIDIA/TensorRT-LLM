@@ -47,6 +47,7 @@ from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from .block_verification import block_verify, counter_uniforms
 
 
 def rejection_sampling_one_model(
@@ -584,6 +585,14 @@ class SpecMetadata:
     group_all_greedy_sample: Optional[bool] = None
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
+    # Verification rule of the rejection path (deploy-time; from
+    # DecodingBaseConfig.rejection_sample_method): "standard" (token-level) or
+    # "block" (block verification, see block_verification.py).
+    rejection_sample_method: str = "standard"
+    # Whether rejection-sampled drafts ignore the request's top-k / top-p /
+    # min-p and draw from the temperature-scaled draft distribution (deploy-time;
+    # from DecodingBaseConfig.draft_temperature_only).
+    draft_temperature_only: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
     # Whether the occurrence penalties are enabled (deploy-time; from
@@ -2389,6 +2398,41 @@ class SpecWorkerBase(nn.Module, ABC):
             is_padding = is_padding.repeat_interleave(rows_per_request)
         return logits.masked_fill(is_padding.unsqueeze(-1), 0.0)
 
+    @staticmethod
+    def _draft_sampling_params(
+        spec_metadata: "SpecMetadata",
+        start: int = 0,
+        end: Optional[int] = None,
+        repeat: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-row ``(temperatures, top_ks, top_ps, min_ps)`` for drawing drafts.
+
+        The request's own parameters, or -- with ``draft_temperature_only`` --
+        its temperature alone, every filter at its disable value (vLLM's
+        probabilistic drafting). Either way the sampler returns the distribution
+        it drew from, which is what verification divides by, so both are
+        lossless; they differ in acceptance rate.
+
+        ``start`` / ``end`` select the request subset (e.g. the gen slice);
+        ``repeat`` expands each request to the rows a block sampler flattens it
+        into.
+        """
+        temperatures = spec_metadata.request_temperatures[start:end]
+        top_ks = spec_metadata.request_top_ks[start:end]
+        top_ps = spec_metadata.request_top_ps[start:end]
+        min_ps = spec_metadata.request_min_ps[start:end]
+        if getattr(spec_metadata, "draft_temperature_only", False):
+            # Device-side fills: CUDA graph capture rejects host-scalar copies.
+            top_ks = torch.full_like(top_ks, torch.iinfo(torch.int32).max)
+            top_ps = torch.ones_like(top_ps)
+            min_ps = torch.zeros_like(min_ps)
+        if repeat > 1:
+            temperatures, top_ks, top_ps, min_ps = [
+                t.repeat_interleave(repeat)
+                for t in (temperatures, top_ks, top_ps, min_ps)
+            ]
+        return temperatures, top_ks, top_ps, min_ps
+
     def advanced_sample_draft(self,
                               logits: torch.Tensor,
                               spec_metadata: "SpecMetadata",
@@ -2404,10 +2448,8 @@ class SpecWorkerBase(nn.Module, ABC):
         only). Returns tokens in draft-vocab space (the caller applies d2t).
         Expects 2D ``[batch_size, vocab]`` logits (one row per request).
         """
-        temperatures = spec_metadata.request_temperatures[:batch_size]
-        top_ks = spec_metadata.request_top_ks[:batch_size]
-        top_ps = spec_metadata.request_top_ps[:batch_size]
-        min_ps = spec_metadata.request_min_ps[:batch_size]
+        temperatures, top_ks, top_ps, min_ps = self._draft_sampling_params(
+            spec_metadata, end=batch_size)
 
         # One row per request here, matching the request_* slices above.
         # Callers that do not pass a draft_step run this sampler once per step
@@ -2712,14 +2754,27 @@ class SpecWorkerBase(nn.Module, ABC):
                 batch_size,
                 slot=spec_metadata.rng_accept_slot)
 
-            gen_accepted, gen_num_accepted = rejection_sampling_one_model(
-                draft_probs=full_draft_probs,
-                draft_token_ids=full_draft_tokens,
-                target_probs=target_probs,
-                deterministic=True,
-                seed=seed,
-                offset=offset,
-            )
+            use_block = getattr(spec_metadata, "rejection_sample_method",
+                                "standard") == "block"
+            if use_block and is_ragged:
+                logger.warning_once(
+                    "rejection_sample_method='block' does not support ragged "
+                    "(confidence-scheduled) verification; these steps use "
+                    "token-level rejection sampling.",
+                    key="block_verification_ragged_fallback")
+            if use_block and not is_ragged:
+                gen_accepted, gen_num_accepted = self._block_verify(
+                    spec_metadata, full_draft_tokens, full_draft_probs,
+                    target_probs, seed, offset)
+            else:
+                gen_accepted, gen_num_accepted = rejection_sampling_one_model(
+                    draft_probs=full_draft_probs,
+                    draft_token_ids=full_draft_tokens,
+                    target_probs=target_probs,
+                    deterministic=True,
+                    seed=seed,
+                    offset=offset,
+                )
 
             if self.force_num_accepted_tokens != 0.0:
                 # Fill gen_accepted positions 1..runtime_draft_len with all draft tokens
@@ -2747,6 +2802,48 @@ class SpecWorkerBase(nn.Module, ABC):
                 num_accepted_tokens[num_contexts:],
                 spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
         return accepted_tokens, num_accepted_tokens
+
+    def _block_verify(
+            self, spec_metadata: SpecMetadata, draft_tokens: torch.Tensor,
+            draft_probs: torch.Tensor, target_probs: torch.Tensor,
+            seed: torch.Tensor,
+            offset: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Block verification of the gen subset (see ``block_verification``).
+
+        Same contract as ``rejection_sampling_one_model``: ``[num_gens, K + 1]``
+        tokens and ``[num_gens]`` accepted counts including the emitted token.
+        Both random draws are keyed by each request's acceptance-slot
+        ``(seed, offset)``, which is fresh every step, so no two steps of a
+        request reuse a draw: the ``K`` acceptance uniforms come from
+        ``counter_uniforms``, and the emitted token from the seeded sampler run
+        on the residual (temperature 1, every filter off).
+        """
+        num_drafts = draft_tokens.shape[1]
+        uniforms = counter_uniforms(seed, offset, num_drafts)
+
+        def sample_emitted(weights: torch.Tensor) -> torch.Tensor:
+            # Device-side fills: CUDA graph capture rejects host-scalar copies.
+            ones = torch.ones(weights.shape[0],
+                              dtype=torch.float32,
+                              device=weights.device)
+            no_top_k = torch.full_like(ones,
+                                       torch.iinfo(torch.int32).max,
+                                       dtype=torch.int32)
+            return self._sample_from_logits(
+                spec_metadata.advanced_sampling_mode,
+                weights.log(),
+                ones,
+                no_top_k,
+                ones,
+                torch.zeros_like(ones),
+                seed=seed,
+                offset=offset)
+
+        return block_verify(draft_tokens,
+                            draft_probs,
+                            target_probs,
+                            uniforms,
+                            sample_emitted=sample_emitted)
 
     def _rng_state_per_request(
         self,
@@ -2912,14 +3009,8 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # Take the gen slice and repeat each request's value K times to line up
         # with the flattened [num_gens*K, vocab] logits (K rows per request).
-        temps = spec_metadata.request_temperatures[
-            num_contexts:batch_size].repeat_interleave(K)
-        top_ks = spec_metadata.request_top_ks[
-            num_contexts:batch_size].repeat_interleave(K)
-        top_ps = spec_metadata.request_top_ps[
-            num_contexts:batch_size].repeat_interleave(K)
-        min_ps = spec_metadata.request_min_ps[
-            num_contexts:batch_size].repeat_interleave(K)
+        temps, top_ks, top_ps, min_ps = self._draft_sampling_params(
+            spec_metadata, num_contexts, batch_size, repeat=K)
 
         flat_logits = gen_logits.reshape(num_gens * K, vocab)
         # A block sampler emits all K draft positions in one launch; they take

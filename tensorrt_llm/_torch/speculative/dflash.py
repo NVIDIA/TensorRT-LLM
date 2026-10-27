@@ -1873,37 +1873,49 @@ class DFlashWorker(SpecWorkerBase):
                 vocab_size = gen_logits.shape[-1]
                 gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                gen_logits = self._refine_block_logits(
-                    draft_model, gen_logits, inputs, spec_metadata
-                )
-
-                # DFlash 2: replace the independent per-position picks with one
-                # coherent path through the block (absent for plain DFlash).
-                if getattr(draft_model, "lilicorr", None) is not None:
-                    gen_logits = self._apply_lilicorr(
+                # A drafter whose positions depend on the token drawn before
+                # them draws the block itself when drafts are sampled.
+                if self._samples_block_ancestrally(draft_model, spec_metadata):
+                    gen_draft_tokens, vocab_size = self._sample_block_ancestrally(
                         draft_model,
                         gen_logits,
-                        gen_hidden_states.reshape(num_gens, K, -1),
-                        inputs["lilicorr_anchor"],
+                        inputs,
                         spec_metadata,
+                        num_contexts,
+                        batch_size,
                     )
-                    vocab_size = gen_logits.shape[-1]
-                elif getattr(draft_model, "has_candidate_selector", False):
-                    gen_logits = self._apply_dflash2_selector(
-                        draft_model,
-                        gen_logits,
-                        gen_hidden_states.reshape(num_gens, K, -1),
-                        inputs["first_prev_tokens"],
-                        spec_metadata,
+                else:
+                    gen_logits = self._refine_block_logits(
+                        draft_model, gen_logits, inputs, spec_metadata
                     )
-                    vocab_size = gen_logits.shape[-1]
 
-                gen_draft_tokens = self.sample_draft_tokens(
-                    gen_logits,
-                    spec_metadata,
-                    batch_size,
-                    num_contexts=num_contexts,
-                )
+                    # DFlash 2: replace the independent per-position picks with one
+                    # coherent path through the block (absent for plain DFlash).
+                    if getattr(draft_model, "lilicorr", None) is not None:
+                        gen_logits = self._apply_lilicorr(
+                            draft_model,
+                            gen_logits,
+                            gen_hidden_states.reshape(num_gens, K, -1),
+                            inputs["lilicorr_anchor"],
+                            spec_metadata,
+                        )
+                        vocab_size = gen_logits.shape[-1]
+                    elif getattr(draft_model, "has_candidate_selector", False):
+                        gen_logits = self._apply_dflash2_selector(
+                            draft_model,
+                            gen_logits,
+                            gen_hidden_states.reshape(num_gens, K, -1),
+                            inputs["first_prev_tokens"],
+                            spec_metadata,
+                        )
+                        vocab_size = gen_logits.shape[-1]
+
+                    gen_draft_tokens = self.sample_draft_tokens(
+                        gen_logits,
+                        spec_metadata,
+                        batch_size,
+                        num_contexts=num_contexts,
+                    )
 
                 # Opt-in confidence-calibration recording (env-gated). The
                 # confidence values come from an optional provider on the
@@ -2008,6 +2020,30 @@ class DFlashWorker(SpecWorkerBase):
         intra-block bias.
         """
         return gen_logits
+
+    def _samples_block_ancestrally(self, draft_model, spec_metadata) -> bool:
+        """Whether this step's drafts come from :meth:`_sample_block_ancestrally`.
+
+        Plain DFlash positions are independent given the block forward, so
+        sampling every logits row on its own is exact. Drafter families whose
+        positions condition on the previous draft override this.
+        """
+        return False
+
+    def _sample_block_ancestrally(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        inputs: dict,
+        spec_metadata,
+        num_contexts: int,
+        batch_size: int,
+    ) -> Tuple[torch.Tensor, int]:
+        """Draw the block position by position; returns int32 tokens and the vocab width.
+
+        Only called when :meth:`_samples_block_ancestrally` holds.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not sample blocks ancestrally")
 
     def _apply_dflash2_selector(
         self,
