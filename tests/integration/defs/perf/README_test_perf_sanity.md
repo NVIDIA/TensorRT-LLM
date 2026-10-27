@@ -203,6 +203,9 @@ AGG_CONFIG_FOLDER=my/custom/agg DISAGG_CONFIG_FOLDER=my/custom/disagg \
   python jenkins/scripts/perf/local/submit.py ...
 ```
 
+`TRTLLM_PERF_SANITY_WARMUP_PASS=0`, read by `test_perf_sanity.py` itself, skips the
+warmup pass; see [Warmup pass](#warmup-pass).
+
 ## Configuration Files
 
 There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (disagg).
@@ -338,6 +341,45 @@ queue (nvbugs/6564113). Notes:
   connection-warmup iterations; start the range later to profile only measured
   iterations.
 
+### Warmup pass
+
+Before each measured client of a normal aggregated, `ctx_only` or disaggregated `e2e`
+test, the harness (`run_warmup_pass`, `warmup_pass.py`) sends one un-measured wave of
+the same traffic. How many prompts arrive together, how they are chunked against
+`max_num_tokens` and which decode tokens share a step with them are only known once
+traffic arrives, so the server's startup warmup cannot compile every JIT kernel those
+prefill shapes need. The pass makes them compile before the measured window. Its
+command is the measured client's own `benchmark_serving` command with:
+- `--num-prompts` set to the client's concurrency (one wave);
+- `--seed` set to the measured seed + 1, so the pass sends other prompts of the same
+  lengths: other random token ids, or another shuffle of the same dataset file;
+- `--no-test-input` added and `--save-request-time-breakdown` dropped.
+
+Notes:
+- Not run for `gen_only` / `gen_only_no_context` (they measure decode only, and the
+  gen server's benchmark fill gate opens once, so warmup requests would open it
+  early), for AgentX clients (they run their own warmup) or for accuracy-only
+  clients. In e2e it runs after the connection warmup.
+- `TRTLLM_PERF_SANITY_WARMUP_PASS=0` (also `false`, `no`, `off`) skips it, e.g. to
+  reproduce a JIT stall inside the measured window. CI leaves it on. With
+  `jenkins/scripts/perf/local/submit.py`, set
+  `EXTRA_CONTAINER_EXPORTS='TRTLLM_PERF_SANITY_WARMUP_PASS=0'`; it reaches the
+  aggregated ranks and every disaggregated role.
+- Client log: `trtllm-benchmark-warmup-pass.<server_idx>.<client_idx>.log`, not parsed
+  for metrics. The test fails if the pass's benchmark_serving exits non-zero, times
+  out or has every request fail; if only some fail, it logs a warning and the measured
+  client runs.
+- The pass's perf_metrics records are excluded from the time breakdown (see below),
+  and in e2e its iterations come before the measured client's gen-log window, so
+  neither `d_tb_*` nor the gen-worker device step time includes it.
+- Uploaded rows carry `l_warmup_pass_requests` (0 when no pass ran). It is not a match
+  key.
+- With a dataset file, a few of the pass's prompts can coincide with the measured
+  sample (about concurrency / dataset size of them). This only matters for configs
+  with `enable_block_reuse` on.
+- It costs one wave, about 1 / `iterations` of the measured run. Iteration-based nsys
+  ranges count its iterations too.
+
 ### The optional instrumentation modifier
 
 The three shapes that read a disaggregated config (2, 3 and 4 above) take one
@@ -409,13 +451,14 @@ mid-record) costs only that line, never the whole file: dropping the disagg serv
 file would silently reroute the per-request groups to same-role worker fallbacks,
 which produce plausible values for the wrong phase.
 
-The servers also append records of the e2e connection warmup's requests to these
-files. The harness therefore waits until the largest file holds a record for every
-successful warmup request and the files hold still, then notes each file's line count; the aggregation skips those leading lines and leaves
+The servers also append records of the e2e connection warmup's and the warmup pass's
+requests to these files. The harness therefore waits until the largest file holds a
+record for every successful warmup request and the files hold still, then notes each
+file's line count; the aggregation skips those leading lines and leaves
 them out of the census. Unlike the measured run's census, this one is a failure: if
 the count is not reached within `PERF_METRICS_SETTLE_TIMEOUT`, the test fails rather
 than mixing late warmup records into the breakdown. The log line
-`Time breakdown: excluded connection-warmup records from {...}` prints the counts as
+`Time breakdown: excluded warmup records from {...}` prints the counts as
 JSON. To reproduce the uploaded numbers offline, run
 `time_breakdown_metrics.py --mode e2e --output-dir <test output dir>/perf_metrics
 --drop-warmup-request --leading-lines-to-skip '<that JSON>'`.
