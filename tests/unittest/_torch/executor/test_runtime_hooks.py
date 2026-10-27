@@ -593,11 +593,14 @@ def _forward_step_executor(monkeypatch, log: list):
 
     executor = PyExecutor.__new__(PyExecutor)
     executor.iter_counter = 0
+    executor.enable_spec_decode = False
+    executor.runtime_draft_len = 0
     executor.execution_stream = _Stream("execution", log)
     executor.resource_manager = object()
     executor.sampler = types.SimpleNamespace(get_cache_indirection=lambda: None)
     executor.model_engine = types.SimpleNamespace(
-        forward=lambda *args, **kwargs: log.append("forward") or "outputs"
+        forward=lambda *args, **kwargs: log.append("forward") or "outputs",
+        route_capture=None,
     )
     executor._iter_adp_dummy_ctx_tokens = 0
     executor._iter_adp_dummy_gen_tokens = 0
