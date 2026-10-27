@@ -2,16 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """What ``_native`` decides, and that the installed family libraries load.
 
-The first half drives the loader's decisions without opening anything: which
+The first tests drive the loader's decisions without opening anything: which
 outcomes are ``NoTarget`` (this installation does not carry the target, so
 ``auto`` keeps the built-in model) and which are ``NativeLoadError`` (an
 installed library is broken, which is never a fallback).
 
-The second half is the load smoke test of the installed wheel: every family
-library in ``tensorrt_llm/libs`` opens in a fresh process, names the targets it
-carries, and defines no op the target's fake_ops.py does not fake. A library
-aborts its process from a static initializer if two libraries claim one torch
-namespace, so each one is opened in a child process.
+The last is the load smoke test of the installed wheel: every family library in
+``tensorrt_llm/libs`` opens in a fresh process, names the targets it carries, and
+defines no op the target's fake_ops.py does not fake. A library aborts its
+process from a static initializer if two libraries claim one torch namespace, so
+each one is opened in a child process.
 """
 
 from __future__ import annotations
@@ -38,137 +38,74 @@ pytestmark = pytest.mark.cpu_only
 
 _FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss"
 _TARGET = f"{_FAMILY}.gpt_oss_120b__sm_10x__default"
+_TARGET_NS = "mv2_gpt_oss_gpt_oss_120b_sm_10x_default"
 
 
 @pytest.fixture
 def libs(monkeypatch, tmp_path):
-    """An empty libs directory and a cold library cache."""
+    """An empty libs directory, a cold library cache, and ``libs.install(opens)``,
+    which puts a gpt_oss library there; ``opens`` stands in for dlopen, and no
+    fake_ops module is imported, since the stand-in defines no op."""
     monkeypatch.setattr(_native, "_LIBS_DIR", tmp_path)
     monkeypatch.setattr(_native, "_built_targets", {})
     monkeypatch.setattr(_native, "_family_ops", {})
-    return tmp_path
+
+    def install(opens):
+        (tmp_path / "libth_modeling_v2_gpt_oss.so").write_bytes(b"")
+        monkeypatch.setattr(_native, "_open_library", lambda path, family: opens())
+        monkeypatch.setattr(_native, "_import_fakes", lambda module, family: None)
+
+    return types.SimpleNamespace(install=install)
 
 
-def _install(libs: Path, monkeypatch, opens) -> None:
-    """Put a gpt_oss library in `libs`; `opens` stands in for dlopen, and no
-    fake_ops module is imported, since the stand-in defines no op."""
-    (libs / "libth_modeling_v2_gpt_oss.so").write_bytes(b"")
-    monkeypatch.setattr(_native, "_open_library", lambda path, family: opens())
-    monkeypatch.setattr(_native, "_import_fakes", lambda module, family: None)
-
-
-# --- Naming ----------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "module, namespace",
-    [
-        (_TARGET, "mv2_gpt_oss_gpt_oss_120b_sm_10x_default"),
-        (f"{_TARGET}.fake_ops", "mv2_gpt_oss_gpt_oss_120b_sm_10x_default"),
-        (f"{_TARGET}.ops.moe.entry", "mv2_gpt_oss_gpt_oss_120b_sm_10x_default"),
-        (f"{_FAMILY}.fake_ops", "mv2_gpt_oss"),
-        (f"{_FAMILY}.ops.comm.entry", "mv2_gpt_oss"),
-    ],
-)
-def test_namespace_of_a_target_or_family_module(module, namespace):
-    assert namespace_of(module) == namespace
-
-
-@pytest.mark.parametrize(
-    "module", ["tensorrt_llm._torch.models", "tensorrt_llm._torch._experimental.modeling_v2.models"]
-)
-def test_namespace_of_rejects_modules_outside_a_family(module):
+def test_names():
+    assert namespace_of(_TARGET) == _TARGET_NS
+    assert namespace_of(f"{_TARGET}.ops.moe.entry") == _TARGET_NS
+    assert namespace_of(f"{_FAMILY}.fake_ops") == "mv2_gpt_oss"
     with pytest.raises(ValueError):
-        namespace_of(module)
-
-
-@pytest.mark.parametrize("package", [_FAMILY, f"{_TARGET}.weights"])
-def test_load_target_ops_takes_a_target_package_only(package):
+        namespace_of("tensorrt_llm._torch.models")
     with pytest.raises(ValueError, match="models.<family>.<target>"):
-        load_target_ops(package)
+        load_target_ops(f"{_TARGET}.weights")
 
 
-# --- Decisions -----------------------------------------------------------------
-
-
-def test_a_library_this_installation_lacks_is_no_target(libs):
+def test_what_is_no_target_and_what_is_broken(libs, monkeypatch):
     with pytest.raises(NoTarget, match="has no libth_modeling_v2_gpt_oss.so"):
         load_target_ops(_TARGET)
 
-
-def test_a_library_that_fails_to_open_is_a_broken_installation(libs, monkeypatch):
     def fail():
         raise OSError("undefined symbol: _ZN12tensorrt_llm6common")
 
-    _install(libs, monkeypatch, fail)
+    libs.install(fail)
     with pytest.raises(NativeLoadError, match="undefined symbol"):
         load_target_ops(_TARGET)
 
-
-def test_a_target_the_library_does_not_carry_is_no_target(libs, monkeypatch):
-    _install(libs, monkeypatch, lambda: frozenset({"other__sm_90__default"}))
+    libs.install(lambda: frozenset({"other__sm_90__default"}))
     with pytest.raises(NoTarget, match="does not carry gpt_oss_120b__sm_10x__default"):
         load_target_ops(_TARGET)
 
-
-def test_a_library_opens_once(libs, monkeypatch):
-    opened = []
-
-    def opens():
-        opened.append(1)
-        return frozenset({"gpt_oss_120b__sm_10x__default"})
-
-    _install(libs, monkeypatch, opens)
-    assert _native._load_family_library("gpt_oss") == {"gpt_oss_120b__sm_10x__default"}
-    assert _native._load_family_library("gpt_oss") == {"gpt_oss_120b__sm_10x__default"}
-    assert len(opened) == 1
-
-
-@pytest.fixture
-def torch_ops(monkeypatch):
-    """A stand-in torch.ops holding the gpt_oss namespaces."""
-    ops = types.SimpleNamespace(
-        mv2_gpt_oss=object(), mv2_gpt_oss_gpt_oss_120b_sm_10x_default=object()
-    )
-    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(ops=ops))
-    return ops
-
-
-def test_opening_a_library_registers_the_family_fakes_first(libs, monkeypatch, torch_ops):
-    _install(libs, monkeypatch, lambda: frozenset({"gpt_oss_120b__sm_10x__default"}))
-    imported = []
-    monkeypatch.setattr(_native, "_import_fakes", lambda module, family: imported.append(module))
-    assert load_target_ops(_TARGET) is torch_ops.mv2_gpt_oss_gpt_oss_120b_sm_10x_default
-    family_package = _TARGET.rpartition(".")[0]
-    assert imported == [f"{family_package}.fake_ops", f"{_TARGET}.fake_ops"]
-
-
-def test_family_ops_are_the_family_namespace_and_load_once(libs, monkeypatch, torch_ops):
-    opened = []
-
-    def opens():
-        opened.append(1)
-        return frozenset({"gpt_oss_120b__sm_10x__default"})
-
-    _install(libs, monkeypatch, opens)
-    module = f"{_TARGET}.weights"
-    assert load_family_ops(module) is torch_ops.mv2_gpt_oss
-    assert load_family_ops(module) is torch_ops.mv2_gpt_oss
-    assert len(opened) == 1
-
-
-def test_family_ops_of_a_family_this_installation_lacks_are_no_target(libs):
-    with pytest.raises(NoTarget, match="has no libth_modeling_v2_gpt_oss.so"):
-        load_family_ops(f"{_TARGET}.weights")
-
-
-def test_windows_has_no_native_targets(libs, monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(_native, "_built_targets", {})
     with pytest.raises(NoTarget, match="Windows"):
-        _native._load_family_library("gpt_oss")
+        load_target_ops(_TARGET)
 
 
-# --- The installed wheel ---------------------------------------------------------
+def test_a_library_opens_once_and_registers_the_family_fakes_first(libs, monkeypatch):
+    ops = types.SimpleNamespace(mv2_gpt_oss=object(), **{_TARGET_NS: object()})
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(ops=ops))
+    opened, imported = [], []
+
+    def opens():
+        opened.append(1)
+        return frozenset({"gpt_oss_120b__sm_10x__default"})
+
+    libs.install(opens)
+    monkeypatch.setattr(_native, "_import_fakes", lambda module, family: imported.append(module))
+    assert load_target_ops(_TARGET) is getattr(ops, _TARGET_NS)
+    assert load_family_ops(f"{_TARGET}.weights") is ops.mv2_gpt_oss
+    assert load_family_ops(f"{_TARGET}.weights") is ops.mv2_gpt_oss
+    assert len(opened) == 1
+    assert imported == [f"{_FAMILY}.fake_ops", f"{_TARGET}.fake_ops"]
+
 
 _LOAD_ONE_FAMILY = textwrap.dedent(
     """

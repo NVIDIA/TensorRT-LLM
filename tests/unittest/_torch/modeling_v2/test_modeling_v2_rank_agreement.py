@@ -31,85 +31,52 @@ class Target:
 _TARGET = f"{Target.__module__}.{Target.__qualname__}"
 
 
-class _FakeDist:
-    def __init__(self, others):
-        self.others = others
-        self.calls = 0
-
-    def allgather(self, outcome):
-        self.calls += 1
-        return [outcome, *self.others]
-
-
-def _config(rank=0, world_size=2):
-    return SimpleNamespace(mapping=SimpleNamespace(rank=rank, world_size=world_size))
-
-
-def _args(mode):
-    return SimpleNamespace(modeling_v2=mode)
-
-
 @pytest.fixture
-def dist(monkeypatch):
-    fake = _FakeDist(others=[])
-    monkeypatch.setattr(communicator.Distributed, "get", staticmethod(lambda mapping: fake))
-    return fake
+def ranks(monkeypatch):
+    """``ranks(mode, mine, others, world_size=2)``: resolve with this rank's own
+    decision ``mine`` (a target, None or an exception) and the other ranks'
+    outcomes ``others``; returns the result and the number of exchanges."""
+    calls = []
+
+    def resolve_on_all_ranks(mode, mine, others, world_size=2):
+        def resolve(config, llm_args):
+            if isinstance(mine, Exception):
+                raise mine
+            return mine
+
+        def allgather(outcome):
+            calls.append(outcome)
+            return [outcome, *others]
+
+        monkeypatch.setattr(_router_index, "modeling_v2_resolve", resolve)
+        monkeypatch.setattr(
+            communicator.Distributed,
+            "get",
+            staticmethod(lambda mapping: SimpleNamespace(allgather=allgather)),
+        )
+        calls.clear()
+        config = SimpleNamespace(mapping=SimpleNamespace(rank=0, world_size=world_size))
+        return modeling_v2_resolve_on_all_ranks(config, SimpleNamespace(modeling_v2=mode))
+
+    resolve_on_all_ranks.calls = calls
+    return resolve_on_all_ranks
 
 
-def _route_to(monkeypatch, target=None, error=None):
-    """This rank's own decision: what ``modeling_v2_resolve`` returns or raises."""
-
-    def resolve(config, llm_args):
-        if error is not None:
-            raise error
-        return target
-
-    monkeypatch.setattr(_router_index, "modeling_v2_resolve", resolve)
+def test_off_and_one_rank_exchange_nothing(ranks):
+    assert ranks("off", AssertionError("routing ran under off"), []) is None
+    assert ranks("auto", Target, [], world_size=1) is Target
+    assert ranks.calls == []
 
 
-def test_off_exchanges_nothing(monkeypatch, dist):
-    _route_to(monkeypatch, error=AssertionError("routing ran under off"))
-    assert modeling_v2_resolve_on_all_ranks(_config(), _args("off")) is None
-    assert dist.calls == 0
-
-
-def test_one_rank_exchanges_nothing(monkeypatch, dist):
-    _route_to(monkeypatch, target=Target)
-    assert modeling_v2_resolve_on_all_ranks(_config(world_size=1), _args("auto")) is Target
-    assert dist.calls == 0
-
-
-def test_agreeing_ranks_build_the_target(monkeypatch, dist):
-    dist.others = [(_TARGET, None)]
-    _route_to(monkeypatch, target=Target)
-    assert modeling_v2_resolve_on_all_ranks(_config(), _args("require")) is Target
-    assert dist.calls == 1
-
-
-def test_agreeing_fallbacks_build_the_builtin_model(monkeypatch, dist):
-    dist.others = [(None, None)]
-    _route_to(monkeypatch)
-    assert modeling_v2_resolve_on_all_ranks(_config(), _args("auto")) is None
-
-
-def test_disagreeing_ranks_all_fail(monkeypatch, dist):
-    dist.others = [(None, None)]
-    _route_to(monkeypatch, target=Target)
+def test_ranks_build_the_same_code_or_all_fail(ranks):
+    assert ranks("require", Target, [(_TARGET, None)]) is Target
+    assert ranks("auto", None, [(None, None)]) is None
     with pytest.raises(RuntimeError, match="ranks disagree.*rank 1: built-in"):
-        modeling_v2_resolve_on_all_ranks(_config(), _args("auto"))
-
-
-def test_another_ranks_error_fails_this_rank(monkeypatch, dist):
-    dist.others = [(None, "NativeLoadError: libth_modeling_v2_x.so cannot be loaded")]
-    _route_to(monkeypatch, target=Target)
+        ranks("auto", Target, [(None, None)])
     with pytest.raises(RuntimeError, match="rank 1: NativeLoadError"):
-        modeling_v2_resolve_on_all_ranks(_config(), _args("auto"))
-
-
-def test_this_ranks_error_is_raised_after_the_exchange(monkeypatch, dist):
-    """Raising before the exchange would leave the other ranks waiting in it."""
-    dist.others = [(_TARGET, None)]
-    _route_to(monkeypatch, error=ValueError("modeling_v2='require', but no target fits"))
+        ranks("auto", Target, [(None, "NativeLoadError: libth_modeling_v2_x.so cannot be loaded")])
+    # This rank's own error is raised after the exchange, not before it, which
+    # would leave the other ranks waiting in it.
     with pytest.raises(ValueError, match="no target fits"):
-        modeling_v2_resolve_on_all_ranks(_config(), _args("require"))
-    assert dist.calls == 1
+        ranks("require", ValueError("modeling_v2='require', but no target fits"), [(_TARGET, None)])
+    assert len(ranks.calls) == 1

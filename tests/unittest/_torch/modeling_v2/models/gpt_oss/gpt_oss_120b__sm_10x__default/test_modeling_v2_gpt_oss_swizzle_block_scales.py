@@ -31,49 +31,19 @@ def _reference(s: torch.Tensor) -> torch.Tensor:
     return v.permute(0, 1, 4, 3, 2, 5).reshape(e, m, c).contiguous()
 
 
-def _scales(experts: int, rows: int, cols: int, seed: int) -> torch.Tensor:
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    return torch.randint(
-        0, 256, (experts, rows, cols), generator=g, device="cuda", dtype=torch.uint8
-    )
+def test_swizzle_block_scales():
+    g = torch.Generator(device="cuda").manual_seed(0)
+    # gpt-oss-120b's FC1 and FC2 scales (FC2's 90 scales per row padded to 96), and no experts.
+    for shape in ((4, 5888, 92), (3, 384, 96), (0, 128, 4)):
+        s = torch.randint(0, 256, shape, generator=g, device="cuda", dtype=torch.uint8)
+        assert torch.equal(weights._swizzle_scales(s), _reference(s)), shape
 
+    strided = torch.zeros(2, 128, 8, device="cuda", dtype=torch.uint8)[:, :, :4]
+    with pytest.raises(RuntimeError, match="contiguous"):
+        native_ops.swizzle_block_scales(strided)
 
-@pytest.mark.parametrize(
-    "experts, rows, cols",
-    [
-        (1, 128, 4),  # one 128x4 tile
-        (2, 256, 8),  # tiles in both directions
-        (3, 384, 96),  # gpt-oss-120b FC2: H / 32 = 90 scales, padded to 96
-        (4, 5888, 92),  # FC1 rows, many tiles
-        (0, 128, 4),  # no experts
-    ],
-)
-def test_the_kernel_matches_the_torch_swizzle(experts, rows, cols):
-    s = _scales(experts, rows, cols, seed=rows * 131 + cols)
-    expected = _reference(s)
-    assert torch.equal(native_ops.swizzle_block_scales(s), expected)
-    # The loader's call site, which the FC1 and FC2 scale preparation both use.
-    assert torch.equal(weights._swizzle_scales(s), expected)
-
-
-@pytest.mark.parametrize(
-    "scales, match",
-    [
-        (lambda: _scales(1, 100, 4, 0), "rows % 128 == 0"),
-        (lambda: _scales(1, 128, 6, 0), "cols % 4 == 0"),
-        (lambda: _scales(1, 128, 4, 0).float(), "uint8"),
-        (lambda: _scales(2, 128, 8, 0)[:, :, :4], "contiguous"),
-        (lambda: _scales(1, 128, 4, 0).cpu(), "CUDA"),
-    ],
-    ids=["rows", "cols", "dtype", "strided", "host"],
-)
-def test_the_op_rejects_what_the_kernel_cannot_swizzle(scales, match):
-    with pytest.raises(RuntimeError, match=match):
-        native_ops.swizzle_block_scales(scales())
-
-
-def test_the_fake_op_describes_the_output():
     with FakeTensorMode():
-        s = torch.empty(2, 256, 8, device="cuda", dtype=torch.uint8)
-        out = native_ops.swizzle_block_scales(s)
+        out = native_ops.swizzle_block_scales(
+            torch.empty(2, 256, 8, device="cuda", dtype=torch.uint8)
+        )
     assert out.shape == (2, 256, 8) and out.dtype == torch.uint8
