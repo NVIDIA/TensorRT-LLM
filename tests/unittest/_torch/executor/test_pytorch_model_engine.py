@@ -3685,7 +3685,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                         enable_spec_decode=False,
                         runtime_draft_len=0,
                         is_dummy=False)
-                    inputs, gather_ids = prepared.kwargs, prepared.gather_ids
+                    inputs = prepared.kwargs
                     expected_context = list(range(3872, 5000)) if mixed else []
                     self.assertEqual(
                         inputs['input_ids'].cpu().tolist(),
@@ -3693,7 +3693,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                     self.assertEqual(
                         inputs['position_ids'].view(-1).cpu().tolist(),
                         expected_context + ([20, 30] if overlap else [19, 29]))
-                    self.assertIsNone(gather_ids)
                     if mixed:
                         self.assertEqual(inputs['context_requests'], [context])
                         self.assertEqual(metadata.seq_lens.tolist(),

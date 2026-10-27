@@ -896,13 +896,8 @@ class DecoderInputPreparer:
                 host, kv_cache_manager, attn_metadata, spec_metadata, new_tokens_device, lora_params
             )
 
-        gather_ids_device = (
-            self._gather_ids_buffer.tensor[: len(host.lists.gather_ids)]
-            if enable_spec_decode
-            else None
-        )
         return self._finish_prepared(
-            PreparedInputs(inputs, gather_ids_device),
+            PreparedInputs(inputs),
             scheduled_requests,
             kv_cache_manager,
             runtime_draft_len,

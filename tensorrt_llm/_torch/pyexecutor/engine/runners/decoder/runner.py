@@ -647,7 +647,6 @@ class DecoderRunner(ScheduledModelRunner):
                         enable_spec_decode=enable_spec_decode,
                         runtime_draft_len=runtime_draft_len,
                         is_dummy=is_dummy,
-                        gather_ids=prepared.gather_ids,
                         gather_context_logits=gather_context_logits,
                     )
 
@@ -732,14 +731,13 @@ class DecoderRunner(ScheduledModelRunner):
         enable_spec_decode: bool,
         runtime_draft_len: int,
         is_dummy: bool,
-        gather_ids: torch.Tensor | None = None,
         gather_context_logits: bool = False,
     ) -> dict[str, Any]:
         inputs = self._inputs.preprocess_inputs(
             inputs, enable_spec_decode=enable_spec_decode, runtime_draft_len=runtime_draft_len
         )
-        if inputs.get("spec_metadata", None):
-            gather_ids = inputs["spec_metadata"].gather_ids
+        spec_metadata = inputs.get("spec_metadata")
+        gather_ids = spec_metadata.gather_ids if spec_metadata is not None else None
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.

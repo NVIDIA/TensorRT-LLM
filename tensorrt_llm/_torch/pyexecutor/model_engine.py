@@ -916,7 +916,6 @@ class ModelEngine:
         outputs = self._runner.forward_encoder(
             ScheduledInputs(batch=scheduled_requests),
             resource_manager=resource_manager,
-            is_dummy=self._warmup_depth > 0,
         )
         return (
             outputs["encoder_hidden_states"],
