@@ -216,6 +216,16 @@ class KvCacheConnectorWorker(ABC):
     #: Only an explicit True counts. May be set per instance. Must be the same
     #: on every rank.
     drops_reuse_match_backoff: bool = False
+    #: Opt in when a prefix load can come up short -- a page offered at lookup
+    #: is gone at load time -- and the worker reports the affected requests
+    #: through `take_failed_load_requests` / `take_failed_async_load_requests`
+    #: instead of raising. The runtime then restarts only those requests. On a
+    #: tensor-parallel rank (more than one rank without attention DP) the
+    #: worker must still raise, because its peers hold shards of the same
+    #: pages. Requires `take_failed_load_requests` and `drop_bound_saves`,
+    #: KVCacheManagerV2, and the final-batch query path (prefix reservations
+    #: off). Only an explicit True counts.
+    reports_failed_loads: bool = False
 
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
@@ -396,6 +406,65 @@ class KvCacheConnectorWorker(ABC):
         """
         return []
 
+    def take_failed_load_requests(self) -> Set[int]:
+        """Return and forget the requests whose last synchronous prefix load came up short.
+
+        Polled right after every `start_load_kv` when `reports_failed_loads` is
+        True. Every ID must be the `RequestData.request_id` of a context
+        request in the metadata that call loaded; an ID outside that batch
+        fails the executor. The runtime removes each named request from this
+        pass, calls `drop_bound_saves` for it, frees its allocation and rewinds
+        it, and the scheduler readmits it and asks `get_num_new_matched_tokens`
+        again.
+
+        Every write into a named request's pages must be complete or abandoned
+        when its ID is returned: the pages are freed right away and may be
+        handed to another request, so no DMA into them may still be in flight.
+
+        Returns:
+            The request IDs to restart. Empty by default.
+        """
+        return set()
+
+    def take_failed_async_load_requests(self) -> Set[int]:
+        """Return and forget the parked requests whose asynchronous load came up short.
+
+        Polled right after every `get_finished` when `reports_failed_loads` is
+        True. Each ID must have been returned as finished loading by the
+        `get_finished` call this poll follows: once a load is reported finished
+        the scheduler may admit the request over its pages, so a later report
+        would come too late to restart it. An ID whose load is still pending,
+        or that an earlier `get_finished` already returned as finished, fails
+        the executor. The same no-DMA-in-flight rule as
+        `take_failed_load_requests` applies.
+
+        Returns:
+            The request IDs to restart. Empty by default.
+        """
+        return set()
+
+    def drop_bound_saves(self, request_ids: Iterable[int]) -> int:
+        """Remove these requests' saves from the metadata bound for this pass.
+
+        Called before `wait_for_save` for a request restarted after
+        `bind_connector_meta`, whose saves would otherwise publish pages it
+        never computed. Must accept IDs with nothing bound, and be idempotent.
+
+        Args:
+            request_ids: The restarted requests.
+
+        Returns:
+            The number of save entries removed.
+
+        Raises:
+            NotImplementedError: By default. A worker that declares
+                `reports_failed_loads` must implement it.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} declares reports_failed_loads but does not "
+            "implement drop_bound_saves"
+        )
+
     def shutdown(self) -> None:
         """Release whatever this worker holds, once the executor is done with it.
 
@@ -525,10 +594,12 @@ class KvCacheConnectorScheduler(ABC):
         """
         Called when a request's allocation is released for it to run again.
 
-        Rollback and failed admission take this path, where request_finished
-        ends a request instead. Another request may own the released pages
-        before this one is readmitted, so state the connector recorded in page
-        indices has to be dropped or rebuilt here. Defaults to a no-op.
+        Rollback, failed admission and a restart after a failed prefix load
+        (`KvCacheConnectorWorker.reports_failed_loads`) take this path, where
+        request_finished ends a request instead. Another request may own the
+        released pages before this one is readmitted, so state the connector
+        recorded in page indices has to be dropped or rebuilt here. Defaults to
+        a no-op.
 
         Args:
             request: The request whose allocation was released.
@@ -818,6 +889,15 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         #: because this disables most of the per-request path, which is too
         #: much to infer from a merely truthy value.
         self.capacity_only = worker.capacity_only is True
+        #: Whether the worker hands failed prefix loads back for a restart
+        #: instead of raising; see `KvCacheConnectorWorker.reports_failed_loads`.
+        #: Compared against True like `capacity_only`, and off for a role that
+        #: loads nothing.
+        self.reports_failed_loads = (
+            getattr(worker, "reports_failed_loads", False) is True and not self.capacity_only
+        )
+        if self.reports_failed_loads:
+            self._validate_failed_load_reporting(type(worker))
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -848,6 +928,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._prefix_completion_tracker: PrefixLoadCompletionTracker | None = None
         self._deferred_load_terminations: Dict[int, LlmRequest] = {}
         self._finished_load_terminations: List[LlmRequest] = []
+        # Asynchronous loads the latest `get_finished` returned as finished: the
+        # only ones a failed-load report may still restart.
+        self._last_finished_load_ids: Set[int] = set()
 
     @staticmethod
     def validate_attention_dp(
@@ -865,6 +948,32 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                     "The connector must declare supports_attention_dp=True "
                     "and implement owner-local scheduling/transfers against a shared pool."
                 )
+
+    @staticmethod
+    def _validate_failed_load_reporting(worker_cls: type) -> None:
+        """Refuse a worker that declares `reports_failed_loads` without its hooks.
+
+        Only the base defaults count as missing, so a worker class that does
+        not inherit `KvCacheConnectorWorker` is not refused here.
+
+        Args:
+            worker_cls: The worker class that declares `reports_failed_loads`.
+
+        Raises:
+            ValueError: When `take_failed_load_requests` or `drop_bound_saves`
+                is left at the base default.
+        """
+        missing = [
+            name
+            for name in ("take_failed_load_requests", "drop_bound_saves")
+            if getattr(worker_cls, name, None) is getattr(KvCacheConnectorWorker, name)
+        ]
+        if missing:
+            raise ValueError(
+                f"{worker_cls.__name__} declares reports_failed_loads=True but does not "
+                f"implement {', '.join(missing)}; a failed prefix load would have no way "
+                "back to the runtime."
+            )
 
     def _run_on_leader(self, f: Callable[[], _SchedulerResult]) -> _SchedulerResult:
         """
@@ -930,6 +1039,18 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.prefix_reservations_enabled = (
             enabled and self._prefix_capability and not self.capacity_only
         )
+        if self.prefix_reservations_enabled and self.reports_failed_loads:
+            # Every rank ran the collective probe above with the same worker
+            # class, so all of them raise here together.
+            raise ValueError(
+                "KV connector reports_failed_loads is not supported together with "
+                "prefix reservations. A reserved load completes through "
+                "get_finished_prefix_loads and the prefix-load completion tracker, "
+                "which have no failure outcome, and KVCacheManagerV2.free_resources "
+                "refuses a dispatched load. Use the final-batch query path: drop the "
+                "reservation methods from the connector, or set "
+                "scheduler_config.enable_prefix_aware_scheduling=False."
+            )
         if self.prefix_reservations_enabled and self._prefix_completion_tracker is None:
             comm = (
                 mpi_comm().Dup() if not self.enable_attention_dp and mpi_world_size() > 1 else None
@@ -1322,6 +1443,124 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         req_id = request.request_id
         return req_id not in self.finished_async_loading_requests
 
+    def take_failed_load_requests(self) -> Set[int]:
+        """Return the requests whose synchronous prefix load in this pass came up short.
+
+        Polled right after `start_load_kv`; see
+        `KvCacheConnectorWorker.take_failed_load_requests` for the contract and
+        `PyExecutor._recover_failed_connector_loads` for the restart.
+
+        Returns:
+            The worker's request IDs, or an empty set for a connector that does
+            not declare `reports_failed_loads`.
+
+        Raises:
+            RuntimeError: When a tensor-parallel rank reports a failure.
+        """
+        if not self.reports_failed_loads:
+            return set()
+        return self._require_restartable(set(self.worker.take_failed_load_requests()))
+
+    def take_failed_async_load_requests(self) -> List[LlmRequest]:
+        """Return the parked requests whose asynchronous prefix load came up short.
+
+        Unlike `KvCacheConnectorWorker.take_failed_async_load_requests`, which
+        returns IDs, this returns the requests themselves, popped from
+        `finished_async_loading_requests` so that `should_add_sequence` admits
+        them afresh. An ID for a request that finished or was cancelled while
+        parked names nothing to restart: its termination already went to
+        `take_finished_load_terminations`, so it is dropped here.
+
+        Returns:
+            The requests to restart, in request-ID order. Empty for a connector
+            that does not declare `reports_failed_loads`.
+
+        Raises:
+            RuntimeError: When a tensor-parallel rank reports a failure; when a
+                reported load has not been reported finished, whose destination
+                pages may still be written; or when an earlier `get_finished`
+                already returned it as finished, so the scheduler may already
+                have admitted the request over the missing pages.
+        """
+        if not self.reports_failed_loads:
+            return []
+        failed = self._require_restartable(set(self.worker.take_failed_async_load_requests()))
+        still_loading = sorted(
+            request_id
+            for request_id in failed
+            if any(
+                request_id in requests.loading
+                for requests in (
+                    self.new_async_requests,
+                    self.pending_async_requests,
+                    self.local_finished_async_requests,
+                )
+            )
+        )
+        if still_loading:
+            raise RuntimeError(
+                f"KV connector reported failed asynchronous loads for requests {still_loading} "
+                "that it has not reported finished; the destination pages may still be written."
+            )
+        # `finished_async_loading_requests` keeps a request until it ends, well
+        # after the scheduler admitted it, so only this pass's finishes are
+        # still parked.
+        late = sorted(
+            request_id
+            for request_id in failed
+            if request_id in self.finished_async_loading_requests
+            and request_id not in self._last_finished_load_ids
+        )
+        if late:
+            raise RuntimeError(
+                f"KV connector reported failed asynchronous loads for requests {late} after an "
+                "earlier get_finished returned them as finished; they may already be scheduled "
+                "over the missing pages."
+            )
+        restarted = []
+        for request_id in sorted(failed):
+            request = self.finished_async_loading_requests.pop(request_id, None)
+            if request is not None:
+                restarted.append(request)
+        return restarted
+
+    def forget_request(self, request: LlmRequest) -> None:
+        """Drop the saves bound for a request that is about to restart from scratch.
+
+        Those saves would publish pages the request never computed. Nothing is
+        reset here: `KVCacheManagerV2.drop_context_allocation` releases the
+        allocation next, and its `free_resources` runs `reset_request_state`.
+
+        Args:
+            request: The request to restart.
+        """
+        self.worker.drop_bound_saves([request.request_id])
+
+    def _require_restartable(self, failed: Set[int]) -> Set[int]:
+        """Refuse failed-load reports from a tensor-parallel rank.
+
+        A restart is owner-local, which holds under attention DP and on a
+        single rank. Tensor-parallel peers hold shards of the same pages and
+        would keep computing on them, so a worker there must raise instead;
+        this is the backstop for one that does not.
+
+        Args:
+            failed: The request IDs the worker reported.
+
+        Returns:
+            ``failed``, unchanged.
+
+        Raises:
+            RuntimeError: When ``failed`` is not empty on a tensor-parallel rank.
+        """
+        if failed and not self.enable_attention_dp and mpi_world_size() > 1:
+            raise RuntimeError(
+                f"KV connector reported failed prefix loads for requests {sorted(failed)} on a "
+                "tensor-parallel rank; restarts are owner-local (attention DP or a single "
+                "rank). The connector must raise instead."
+            )
+        return failed
+
     def has_pending_transfers(self, request_id: int) -> bool:
         """Keep canceled requests allocated until the worker releases DMA access."""
         return request_id in self._prefix_load_requests or any(
@@ -1569,6 +1808,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # For requests that have finished loading, move them back to the context state.
         for req in all_finished.loading.values():
             self._finish_load(req, is_async=True)
+        self._last_finished_load_ids = set(all_finished.loading)
 
         if self.prefix_reservations_enabled:
             finished = (

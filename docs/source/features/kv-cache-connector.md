@@ -67,7 +67,7 @@ on the leader process; with attention DP, they run on each owning rank.
 
 * **`request_reset(self, request: LlmRequest)`**
   * **Description**: Optional, with a no-op default. The request's allocation has been released and it will run again from the start, unlike `request_finished`, which ends it. Any per-request state held in page indices now describes pages another request may own, so it must be dropped or rebuilt here.
-  * **When it fires**: on `KVCacheManagerV2`, from `free_resources`, which is the path a rollback or a failed admission takes. Direct preemption calls `request_finished` instead, so a connector keying state by request id sees exactly one of the two.
+  * **When it fires**: on `KVCacheManagerV2`, from `free_resources`, which is the path a rollback or a failed admission takes. A restart after a failed prefix load (see the worker's `reports_failed_loads` below) takes it too. Direct preemption calls `request_finished` instead, so a connector keying state by request id sees exactly one of the two.
 
 * **`update_state_after_alloc_by_layer_group(self, request: LlmRequest, block_ids_by_layer_group: list[list[int]])`**
 * **`request_finished_by_layer_group(self, request: LlmRequest, cache_block_ids_by_layer_group: list[list[int]]) -> bool`**
@@ -310,6 +310,8 @@ request in the same iteration. With chunked prefill, allocation growth can limit
 Destroying an allocation clears its connector state, so replay queries again. Specify
 `enable_block_reuse=True` alongside the connector; see
 [Block reuse alongside the connector](#block-reuse-alongside-the-connector).
+Restarting a request whose prefix load failed (`reports_failed_loads`) is available only on
+this path.
 
 **Deployment note.** Under a connector, a workload that was token-bound becomes KV-bound: the connector removes forward-pass tokens but its prefix still occupies GPU pages. Lowering `max_num_tokens` to hand memory back to the KV pool is usually the right adjustment, the opposite of the guidance for a connector-free deployment.
 
@@ -345,6 +347,20 @@ These methods run on all workers (GPU processes) and interact with the actual GP
 * **`get_finished_prefix_loads(self) -> list[int]`**
   * **Description**: Reports locally completed reservation identities for loads dispatched through `SchedulerOutput.prefix_loads`, including synchronous loads. Completion means this worker has finished all reads and writes and established the required CUDA stream visibility. This method must not wait for other workers. The runtime collects reports asynchronously and distributes retirement decisions before scheduling; parked async requests resume and shared resources are released only after every worker has reported.
   * **Compatibility**: Legacy request-ID load and save completions continue through `get_finished`.
+
+* **`reports_failed_loads: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts. Declares a worker whose prefix load can come up short — a page offered at lookup is gone at load time, for example evicted from a full pool — and which reports the affected requests instead of raising. The runtime has already counted those positions as computed, so it restarts each named request from scratch: the request leaves the pass, its allocation is freed and rewound, and the scheduler readmits it and asks `get_num_new_matched_tokens` again. Other requests are unaffected.
+  * **Requirements**: `take_failed_load_requests` and `drop_bound_saves` must be implemented, the KV cache manager must be `KVCacheManagerV2`, and prefix reservations must be off (see [Legacy final-batch queries](#legacy-final-batch-queries)); each is checked at startup. A restart is owner-local, so it applies on a single-rank server or an attention-DP owner. On a tensor-parallel rank, whose peers hold shards of the same pages, the worker must still raise; a report from such a rank fails the executor. A `capacity_only` worker's declaration is ignored.
+
+* **`take_failed_load_requests(self) -> set[int]`**
+  * **Description**: Polled right after every `start_load_kv` when `reports_failed_loads` is set. Returns and forgets the `RequestData.request_id`s whose load in that call came up short. Each must belong to a context request in the metadata that call loaded.
+
+* **`take_failed_async_load_requests(self) -> set[int]`**
+  * **Description**: Polled right after every `get_finished` when `reports_failed_loads` is set. Returns and forgets parked requests whose asynchronous load came up short. Each must have been returned as finished loading by the `get_finished` call this poll follows: after that the scheduler may admit the request over its pages, so a later report comes too late to restart it. An ID for a request that was cancelled while parked names nothing to restart and is ignored.
+  * **Contract for both**: every write into a named request's pages must be complete or abandoned when its ID is returned, because the pages are freed at once and may go to another request. An ID outside the loaded batch, for an asynchronous load not yet reported finished, or for one an earlier `get_finished` already reported finished, is a contract violation and fails the executor.
+
+* **`drop_bound_saves(self, request_ids) -> int`**
+  * **Description**: Removes these requests' saves from the metadata bound for the current pass, so a restarted request does not publish pages it never computed. Called before `wait_for_save`. Must accept IDs with nothing bound and be idempotent; returns the number of entries removed.
 
 * **`shutdown(self)`**
   * **Description**: Optional, with a no-op default. Releases whatever the worker holds — store handles, registered buffers, background threads. Called once, after the executor's worker thread has joined, so no transfer can start afterwards; implementations must be idempotent. Without it a worker's resources live as long as the process, so engines built back to back in one session accumulate them.
@@ -451,6 +467,13 @@ worker. The larger defaults allow slow storage and cancellation drains; tune
 them for the backend. Non-ADP behavior has no new transfer deadline. Workers
 must keep asynchronous start/poll callbacks nonblocking; a callback that itself
 hangs remains subject to the executor's hang detector.
+
+A failed prefix load that a connector reports through `reports_failed_loads` is
+not a connector failure. Only that request restarts, on its owner, without a
+status-vote field or a deadline of its own. Exceptions, polling errors, deadline
+misses and misreported request IDs remain fail-stop through the gate above. If
+the restarted request was the owner's only work and no padding dummy fits, the
+fleet skips one iteration, as it does whenever an owner cannot pad.
 
 ADP requires `KVCacheManagerV2`; an explicit V1 selection is rejected before
 connector construction, and an automatic selection that resolves to V1 is

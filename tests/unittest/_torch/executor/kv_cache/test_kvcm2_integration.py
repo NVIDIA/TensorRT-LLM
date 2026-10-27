@@ -1863,6 +1863,24 @@ def test_context_revert_shrinks_in_place_when_history_fits() -> None:
     assert request.context_chunk_size == 192
 
 
+@pytest.mark.cpu_only
+def test_drop_context_allocation_frees_and_rewinds() -> None:
+    """A failed connector load restarts the request from the start of its prompt."""
+    request = _revert_context_request(93)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.tokens_per_block = 64
+    manager.free_resources = Mock()
+
+    manager.drop_context_allocation(request)
+
+    manager.free_resources.assert_called_once_with(request)
+    request.set_prepopulated_prompt_len.assert_called_once_with(0, 64)
+    assert request.context_current_position == 0
+    assert request.context_chunk_size == 512
+    assert request.estimated_reusable_tokens == 0
+    assert request.py_ctx_pre_resize_cap is None
+
+
 def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> None:
     request = LlmRequest(
         request_id=39,

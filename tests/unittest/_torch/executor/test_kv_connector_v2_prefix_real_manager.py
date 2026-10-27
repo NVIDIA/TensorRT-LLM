@@ -378,6 +378,47 @@ def test_freeing_the_allocation_makes_the_request_askable_again(manager, connect
     assert len(connector.queries) == 2
 
 
+def test_a_dropped_context_allocation_commits_nothing_and_is_asked_again(manager, connector):
+    """A restart after a failed connector load leaves no trace of the lost prefix.
+
+    The served range was skipped, never computed. Dropping the allocation must
+    neither publish it to the radix tree, where every later request would reuse
+    unfilled pages, nor keep the ask memo, which would leave the restarted
+    request without a connector query.
+    """
+    request = make_request()
+    assert schedule(manager, request)
+    run(manager, request)
+    assert request.context_current_position == OFFER_TOKENS
+
+    manager.drop_context_allocation(request)
+
+    assert request.py_request_id not in manager.kv_cache_map
+    assert connector.forgotten == [request.py_request_id]
+    assert request.context_current_position == 0
+    assert request.context_chunk_size == PROMPT_LEN
+    assert not request.py_connector_allocation_reported
+    assert request.py_served_prefix_end == 0
+
+    # The same prompt finds nothing to reuse locally.
+    twin = make_request(request_id=2)
+    assert manager.probe_context_reuse(twin) == 0
+    assert manager.probe_context_reuse(request) == 0
+
+    assert schedule(manager, request)
+    run(manager, request)
+
+    assert request.context_current_position == OFFER_TOKENS
+    assert [query for query in connector.queries if query[0] == request.py_request_id] == [
+        (request.py_request_id, 0),
+        (request.py_request_id, 0),
+    ]
+    assert connector.commits == [
+        (request.py_request_id, OFFER_TOKENS, False),
+        (request.py_request_id, OFFER_TOKENS, False),
+    ]
+
+
 @pytest.mark.parametrize(
     ("requires", "drops", "expected_local_end", "expected_backoff"),
     [

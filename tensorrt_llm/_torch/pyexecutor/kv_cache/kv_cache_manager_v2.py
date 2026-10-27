@@ -4859,6 +4859,30 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         self._after_shrink(request_id, kv_cache)
 
+    def drop_context_allocation(self, req: LlmRequest) -> None:
+        """Release a context request's allocation and rewind it to run from the start.
+
+        For a request the scheduler skipped past a connector prefix whose pages
+        could not be filled (`KvCacheConnectorWorker.reports_failed_loads`).
+        Those positions already count as computed, so the request cannot run
+        this iteration.
+
+        `free_resources` releases unstarted prefix loads and refuses a load that
+        is still pending, which turns a misreported failure into a RuntimeError
+        rather than a use-after-free. It resets the connector state and
+        `py_connector_allocation_reported` / `py_served_prefix_end`, and closes
+        the cache without committing it: blocks reach the radix tree only in
+        `try_commit_blocks` after a forward pass, so the never-filled range is
+        not offered for reuse. The next admission therefore matches local reuse
+        and asks the connector afresh. This is the same release as the drop
+        branches of `revert_allocate_context`.
+
+        Args:
+            req: The context request to restart.
+        """
+        self.free_resources(req)
+        rewind_context_after_cache_drop(req, self.tokens_per_block)
+
     def revert_allocate_context(self, req: LlmRequest) -> bool:
         """Undo this iteration's context resize. False means the cache was dropped,
         not shrunk (history outran pre-resize capacity); the caller drops any draft pool.
