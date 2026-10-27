@@ -4025,22 +4025,14 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 values:
                                 - "rl300-0021.ipp2a1.colossus"''' : ""
     // CPU test pods mount the model scratch from 10.117.145.14, which is not exported to the builders
-    // in the ipp6/ipp9 DCs or to the k8arm builders. Pods placed there stay in ContainerCreating.
+    // in the ipp6/ipp9 DCs. Pods placed there stay in ContainerCreating.
     // Build pods do not mount the model scratch, so they can still use these nodes.
     def scratchUnreachableNodeAffinity = type == "cpu" ? '''
                               - key: "region"
                                 operator: NotIn
                                 values:
                                 - "ipp6"
-                                - "ipp9"
-                              - key: "kubernetes.io/hostname"
-                                operator: NotIn
-                                values:
-                                - "sc-ipp-blossom-prod-k8arm-01"
-                                - "sc-ipp-blossom-prod-k8arm-02"
-                                - "sc-ipp-blossom-prod-k8arm-03"
-                                - "sc-ipp-blossom-prod-k8arm-04"
-                                - "sc-ipp-blossom-prod-k8arm-05"''' : ""
+                                - "ipp9"''' : ""
     def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
