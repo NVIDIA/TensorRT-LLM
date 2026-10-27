@@ -24,10 +24,6 @@ from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     _flashinfer_gdn_verify,
     fused_sigmoid_gating_delta_rule_update,
 )
-from tensorrt_llm._torch.modules.fla.gdn_verify_fused import (
-    gdn_verify_fused_supported,
-    gdn_verify_fused_update,
-)
 from tensorrt_llm._torch.modules.fla.utils import tensor_cache
 from tensorrt_llm._utils import is_flashinfer_gdn_prefill_supported_arch, is_sm_100f
 from tensorrt_llm.logger import logger
@@ -56,12 +52,17 @@ from .mamba2_metadata import InforwardSnapshotSplit, Mamba2Metadata
 from .mamba2_mixer import _cached_arange
 from .recurrent_state_cache import reset_recurrent_state_rows
 
+# Shapes trtllm::gdn_verify covers besides the 128-wide heads (see gdnVerifyKernels.h).
+_FUSED_VERIFY_MIN_TOKENS = 2
+_FUSED_VERIFY_MAX_TOKENS = 8
+_FUSED_VERIFY_HISTORY = 16
+
 
 class FusedVerifyPlan(NamedTuple):
     """Per-call state of a fused target-verify step (Qwen3NextGatedDeltaNet._fused_verify_plan).
 
     With fused_verify, a decode-only cached-replay MTP verify step runs the low-M in_proj with the conv1d update in
-    its epilogue, or the conv1d update kernel, then one fused replay + gated RMSNorm launch (gdn_verify_fused).
+    its epilogue, or the conv1d update kernel, then one fused replay + gated RMSNorm launch (trtllm::gdn_verify).
     """
 
     kv_cache_manager: object
@@ -545,12 +546,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             and self.conv_kernel_size == 4
             and self.activation in ("silu", "swish")
             and self.num_v_heads_per_tp % self.num_k_heads_per_tp == 0
+            and self.norm.weight.dtype == torch.bfloat16
         )
-        # Arrival counters of the fused gated RMSNorm, one per (request, value head) of the largest verify step
-        # (at least two rows per request); its last program per pair resets its counter, so they stay zero between
-        # launches. Allocated with the derived state so a captured step does not allocate.
-        self._fused_verify_max_requests = model_config.max_num_tokens // 2
-        self._fused_verify_counters: Optional[torch.Tensor] = None
 
     def cache_derived_state(self) -> None:
         """Attach downstream static quantization state after loading weights."""
@@ -561,12 +558,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             # does not register the derived scale into norm's state_dict; the
             # detached view still shares storage with out_proj.input_scale.
             self.norm.fp8_scale = scale.detach() if scale is not None else None
-        if self.fused_verify and self._fused_verify_counters is None:
-            self._fused_verify_counters = torch.zeros(
-                self._fused_verify_max_requests * self.num_v_heads_per_tp,
-                dtype=torch.int32,
-                device=self.A_log.device,
-            )
 
     def post_load_weights(self) -> None:
         self.cache_derived_state()
@@ -717,7 +708,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             or spec_metadata is None
             or is_torch_compiling()
             or attn_metadata.num_contexts != 0
-            or self._fused_verify_counters is None
         ):
             return None
         kv_cache_manager = attn_metadata.kv_cache_manager
@@ -741,16 +731,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         layer_cache = kv_cache_manager.mamba_layer_cache(self.layer_idx)
         if layer_cache is None or layer_cache.intermediate_conv_window is None:
             return None
-        if num_decodes * self.num_v_heads_per_tp > self._fused_verify_counters.numel() or not (
-            gdn_verify_fused_supported(
-                draft_token_num,
-                self.num_k_heads_per_tp,
-                self.num_v_heads_per_tp,
-                self.head_k_dim,
-                self.head_v_dim,
-                replay_metadata.replay_history_size,
-                layer_cache.temporal.dtype,
-            )
+        state_indices = attn_metadata.mamba_metadata.state_indices[:num_decodes]
+        if not (
+            _FUSED_VERIFY_MIN_TOKENS <= draft_token_num <= _FUSED_VERIFY_MAX_TOKENS
+            and replay_metadata.replay_history_size == _FUSED_VERIFY_HISTORY
+            and layer_cache.temporal.dtype == torch.bfloat16
+            and state_indices.dtype == torch.int32
         ):
             return None
         conv_weight = self.conv1d.weight
@@ -762,7 +748,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             draft_token_num=draft_token_num,
             replay_metadata=replay_metadata,
             layer_cache=layer_cache,
-            state_indices=attn_metadata.mamba_metadata.state_indices[:num_decodes],
+            state_indices=state_indices,
             conv_weight=conv_weight,
         )
 
@@ -776,31 +762,23 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         """Replay + gated RMSNorm (+ FP8) of convolved q|k|v rows; returns the out_proj input."""
         layer_cache = plan.layer_cache
-        return gdn_verify_fused_update(
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            ssm_states=layer_cache.temporal,
-            state_indices=plan.state_indices,
-            old_u=layer_cache.old_x,
-            old_k=layer_cache.old_B,
-            old_G=layer_cache.old_dt,
-            cache_buf_idx=layer_cache.cache_buf_idx,
-            prev_num_accepted_tokens=layer_cache.prev_num_accepted_tokens,
-            history_size=plan.replay_metadata.replay_history_size,
-            num_decodes=plan.num_decodes,
-            draft_token_num=plan.draft_token_num,
-            num_k_heads=self.num_k_heads_per_tp,
-            num_v_heads=self.num_v_heads_per_tp,
-            head_k_dim=self.head_k_dim,
-            head_v_dim=self.head_v_dim,
-            z=z,
-            norm_weight=self.norm.weight,
-            norm_eps=self.norm.eps,
-            fp8_scale=self.norm.fp8_scale,
-            counters=self._fused_verify_counters,
+        return torch.ops.trtllm.gdn_verify(
+            mixed_qkv,
+            z,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            self.norm.weight,
+            self.norm.fp8_scale,
+            self.norm.eps,
+            layer_cache.temporal,
+            plan.state_indices,
+            layer_cache.old_x,
+            layer_cache.old_B,
+            layer_cache.old_dt,
+            layer_cache.cache_buf_idx,
+            layer_cache.prev_num_accepted_tokens,
         )
 
     def _fused_verify_inproj(
@@ -816,7 +794,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         if low_m_gemm_dispatcher(self.in_proj_qkvz) is None:
             return None
         plan = self._fused_verify_plan(attn_metadata, spec_metadata, hidden_states.shape[0])
-        if plan is None or plan.state_indices.dtype != torch.int32:
+        if plan is None:
             return None
         layer_cache = plan.layer_cache
         res = self._lowm_in_proj(

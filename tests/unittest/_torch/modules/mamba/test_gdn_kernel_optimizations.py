@@ -855,13 +855,13 @@ skip_no_sm100f = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="needs SM100/SM103",
 )
-_VERIFY_DIM, _VERIFY_HIST, _VERIFY_SLOTS = 128, 16, 16
+_VERIFY_DIM, _VERIFY_HIST, _VERIFY_SLOTS = 128, 16, 256
 
 
-def _verify_case(tp16, n, t, pnat, seed=1000):
-    """Per-rank TP8 / TP16 shapes of a 16 k-head / 64 v-head GDN layer."""
+def _verify_case(heads, n, t, pnat, seed=1000):
+    """Per-rank shapes of a 16 k-head / 64 v-head GDN layer: heads = (k heads, v heads)."""
     K = V = _VERIFY_DIM
-    H, HV = (1, 4) if tp16 else (2, 8)
+    H, HV = heads
     g = torch.Generator(device="cuda").manual_seed(seed)
     cd = 2 * H * K + HV * V
     proj = (torch.randn(n * t, cd + HV * V, generator=g, device="cuda") * 0.7).to(torch.bfloat16)
@@ -891,20 +891,20 @@ def _verify_case(tp16, n, t, pnat, seed=1000):
     return H, HV, cd, proj, ba, st, mut
 
 
-def _verify_fused(H, HV, cd, n, t, proj, ba, st, mut, before_launch=None):
-    from tensorrt_llm._torch.modules.fla.gdn_verify_fused import gdn_verify_fused_update
-
-    K = V = _VERIFY_DIM
+def _verify_op(H, HV, cd, n, t, proj, ba, st, mut, fp8, before_launch=None):
     m = {k: v.clone() for k, v in mut.items()}
     if before_launch is not None:
         before_launch(m)
-    o = torch.empty(n, t, HV, V, dtype=torch.bfloat16, device="cuda")
-    y = gdn_verify_fused_update(
+    y = torch.ops.trtllm.gdn_verify(
         proj,
+        proj[:, cd:].view(n * t, HV, _VERIFY_DIM),
         ba[:, HV:],
         ba[:, :HV],
         st["a_log"],
         st["dt_bias"],
+        st["norm_w"],
+        st["fp8_scale"] if fp8 else None,
+        1e-6,
         m["ssm"],
         st["state_indices"],
         m["old_u"],
@@ -912,24 +912,11 @@ def _verify_fused(H, HV, cd, n, t, proj, ba, st, mut, before_launch=None):
         m["old_g"],
         st["buf"],
         st["pnat"],
-        _VERIFY_HIST,
-        n,
-        t,
-        H,
-        HV,
-        K,
-        V,
-        output=o,
-        z=proj[:, cd:].view(n * t, HV, V),
-        norm_weight=st["norm_w"],
-        norm_eps=1e-6,
-        fp8_scale=st["fp8_scale"],
-        counters=torch.zeros(n * HV, dtype=torch.int32, device="cuda"),
     )
-    return o, y, m
+    return y, m
 
 
-def _verify_separate(H, HV, cd, n, t, proj, ba, st, mut):
+def _verify_separate(H, HV, cd, n, t, proj, ba, st, mut, fp8):
     from tensorrt_llm._torch.modules.fla.cached_replay import (
         fused_recurrent_gated_delta_rule_cached_replay_update,
     )
@@ -961,9 +948,9 @@ def _verify_separate(H, HV, cd, n, t, proj, ba, st, mut):
         proj[:, cd:].view(n * t, HV, V),
         st["norm_w"],
         1e-6,
-        fp8_scale=st["fp8_scale"],
+        fp8_scale=st["fp8_scale"] if fp8 else None,
     )
-    return o, y, m
+    return y, m
 
 
 def _rel(a, b):
@@ -973,31 +960,36 @@ def _rel(a, b):
 
 @skip_no_sm100f
 @pytest.mark.parametrize(
-    "tp16,n,t,pnat",
+    "heads,n,t,pnat",
     [
-        (False, 1, 7, 0),
-        (True, 1, 7, 12),
-        (False, 4, 7, 12),
-        (True, 4, 7, 0),
-        (False, 16, 7, 0),
-        (True, 16, 7, 12),
-        (True, 2, 8, 9),
-        (False, 2, 2, 0),
-        (False, 2, 3, 14),
-        (False, 2, 4, 14),
+        ((2, 8), 1, 7, 0),
+        ((1, 4), 1, 7, 12),
+        ((2, 8), 4, 7, 12),
+        ((1, 4), 4, 7, 0),
+        ((2, 8), 16, 7, 0),
+        ((1, 4), 16, 7, 12),
+        ((2, 8), 128, 7, 12),
+        ((16, 64), 8, 7, 12),
+        ((1, 4), 2, 8, 9),
+        ((2, 8), 2, 2, 0),
+        ((2, 8), 2, 3, 14),
+        ((2, 8), 2, 4, 14),
     ],
 )
-def test_gdn_verify_fused_matches_replay_and_norm(tp16, n, t, pnat):
-    H, HV, cd, proj, ba, st, mut = _verify_case(tp16, n, t, pnat)
-    o_ref, y_ref, m_ref = _verify_separate(H, HV, cd, n, t, proj, ba, st, mut)
-    o, y, m = _verify_fused(H, HV, cd, n, t, proj, ba, st, mut)
+@pytest.mark.parametrize("fp8", [False, True])
+def test_gdn_verify_matches_replay_and_norm(heads, n, t, pnat, fp8):
+    H, HV, cd, proj, ba, st, mut = _verify_case(heads, n, t, pnat)
+    y_ref, m_ref = _verify_separate(H, HV, cd, n, t, proj, ba, st, mut, fp8)
+    y, m = _verify_op(H, HV, cd, n, t, proj, ba, st, mut, fp8)
     torch.cuda.synchronize()
-    # the fused kernel writes the out_proj input [n * t, HV * V]; the reference norm is [n * t * HV, V]
+    # trtllm::gdn_verify writes the out_proj input [n * t, HV * V]; the reference norm is [n * t * HV, V]
     y_ref = y_ref.view(y.shape)
-    assert _rel(o, o_ref) < 1e-2
-    # FP8 norm output: identical up to FP8 rounding flips of near-tie values
-    assert _rel(y, y_ref) < 5e-2
-    assert (y.view(torch.uint8) != y_ref.view(torch.uint8)).float().mean().item() < 0.2
+    if fp8:
+        # identical up to FP8 rounding flips of near-tie values
+        assert _rel(y, y_ref) < 5e-2
+        assert (y.view(torch.uint8) != y_ref.view(torch.uint8)).float().mean().item() < 0.2
+    else:
+        assert _rel(y, y_ref) < 1e-2
     assert _rel(m["old_u"], m_ref["old_u"]) < 1e-3
     assert _rel(m["old_k"], m_ref["old_k"]) < 1e-2
     assert torch.allclose(m["old_g"], m_ref["old_g"], rtol=1e-5, atol=1e-6)
@@ -1007,15 +999,24 @@ def test_gdn_verify_fused_matches_replay_and_norm(tp16, n, t, pnat):
 
 
 @skip_no_sm100f
-def test_gdn_verify_fused_reads_state_after_pdl_wait():
+def test_gdn_verify_reads_state_after_pdl_wait():
     n, t = 4, 7
-    H, HV, cd, proj, ba, st, mut = _verify_case(False, n, t, 12)
-    o_ref, y_ref, m_ref = _verify_fused(H, HV, cd, n, t, proj, ba, st, mut)
+    H, HV, cd, proj, ba, st, mut = _verify_case((2, 8), n, t, 12)
+    y_ref, m_ref = _verify_op(H, HV, cd, n, t, proj, ba, st, mut, fp8=True)
     _assert_late_copy_overlaps(mut["ssm"])
-    o, y, m = _verify_fused(
-        H, HV, cd, n, t, proj, ba, st, mut, before_launch=lambda m: _late_copy(m["ssm"], mut["ssm"])
+    y, m = _verify_op(
+        H,
+        HV,
+        cd,
+        n,
+        t,
+        proj,
+        ba,
+        st,
+        mut,
+        fp8=True,
+        before_launch=lambda m: _late_copy(m["ssm"], mut["ssm"]),
     )
     torch.cuda.synchronize()
-    assert torch.equal(o, o_ref)
     assert torch.equal(y.view(torch.uint8), y_ref.view(torch.uint8))
     assert torch.equal(m["ssm"], m_ref["ssm"])
