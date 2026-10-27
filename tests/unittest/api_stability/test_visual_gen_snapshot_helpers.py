@@ -195,15 +195,23 @@ def test_dataclass_fields_and_factories(tmp_path) -> None:
     _changed(snapshot_class(before), snapshot_class(after), tmp_path)
 
 
-def test_alias_discriminator_and_union_order(tmp_path) -> None:
+@pytest.mark.parametrize("change", ["discriminator", "order"])
+def test_alias_discriminator_and_union_order(change, tmp_path) -> None:
     class A(BaseModel):
         kind: Literal["a"] = "a"
+        mode: Literal["a"] = "a"
 
     class B(BaseModel):
         kind: Literal["b"] = "b"
+        mode: Literal["b"] = "b"
 
     before = create_model("Before", value=(Annotated[A | B, Field(discriminator="kind")], ...))
-    after = create_model("After", value=(B | A, ...))
+    after_type = (
+        Annotated[B | A, Field(discriminator="kind")]
+        if change == "order"
+        else Annotated[A | B, Field(discriminator="mode")]
+    )
+    after = create_model("After", value=(after_type, ...))
     assert snapshot_class(before)["fields"]["value"]["discriminator"] == "kind"
     _changed(snapshot_class(before), snapshot_class(after), tmp_path)
 
@@ -304,3 +312,53 @@ def test_unknown_constraint_metadata_fails() -> None:
     model.model_fields["value"].metadata.append(object())
     with pytest.raises(TypeError, match="Unsupported field metadata"):
         snapshot_class(model)
+
+
+@pytest.mark.parametrize(
+    "option", ["init", "repr", "eq", "order", "unsafe_hash", "frozen", "slots", "match_args"]
+)
+def test_dataclass_options_are_checked(option, tmp_path) -> None:
+    before = dataclasses.make_dataclass("Output", [("value", int, 1)])
+    enabled_by_default = {"init", "repr", "eq", "match_args"}
+    after = dataclasses.make_dataclass(
+        "Output", [("value", int, 1)], **{option: option not in enabled_by_default}
+    )
+    _changed(snapshot_class(before), snapshot_class(after), tmp_path)
+
+
+def test_required_dataclass_initvar_is_checked(tmp_path) -> None:
+    before = dataclasses.make_dataclass("Output", [("value", int, 1)])
+    after = dataclasses.make_dataclass(
+        "Output", [("required", dataclasses.InitVar[int]), ("value", int, 1)]
+    )
+    _changed(snapshot_class(before), snapshot_class(after), tmp_path)
+
+
+def test_owned_mixin_after_framework_base_is_checked(monkeypatch) -> None:
+    class Mixin:
+        def public(self) -> None:
+            raise AssertionError("Do not call methods")
+
+    monkeypatch.setattr(Mixin, "__module__", "tensorrt_llm.visual_gen.synthetic")
+
+    class Model(BaseModel, Mixin):
+        value: int = 1
+
+    members = snapshot_class(Model)["members"]
+    assert "public" in members
+    assert "model_dump" not in members
+
+
+def test_property_deleter_is_checked(tmp_path) -> None:
+    class Api:
+        @property
+        def value(self) -> int:
+            raise AssertionError("Do not read properties")
+
+    before = snapshot_class(Api)
+
+    def deleter(self) -> None:
+        raise AssertionError("Do not delete properties")
+
+    Api.value = Api.value.deleter(deleter)
+    _changed(before, snapshot_class(Api), tmp_path)
