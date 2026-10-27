@@ -108,9 +108,9 @@ struct AttnLifeCycle
 };
 
 // ---------------------------------------------------------------------------
-// SsmLifeCycle — lifecycle for SSM (State Space Model) layers.
+// SsmLifeCycle — lifecycle for SSM (State Space Model) buffers.
 // All blocks before the last full block are stale (recurrent state).
-// SSM layers with the same reuse policy share a lifecycle.
+// SSM buffers with the same effective reuse policy share a lifecycle.
 // ---------------------------------------------------------------------------
 struct SsmLifeCycle
 {
@@ -178,8 +178,11 @@ inline HalfOpenRange<BlockOrdinal> computeScratchRange(
     return intersect(capStale, inputRange);
 }
 
-// Factory: create a LifeCycle from a LayerConfig variant.
+// Factory: create the LifeCycle of a layer, using the layer's reuse policy.
 LifeCycle makeLifeCycle(LayerConfig const& layer, int tokensPerBlock);
+
+// Factory: create the LifeCycle that holds one buffer of a layer, using the buffer's effective reuse policy.
+LifeCycle makeLifeCycle(LayerConfig const& layer, BufferConfig const& buffer, int tokensPerBlock);
 
 // Integer id assigned to each unique LifeCycle.
 using LifeCycleId = StrongIndex<int, struct LifeCycleIdTag>;

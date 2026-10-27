@@ -30,9 +30,13 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -407,6 +411,330 @@ TEST_F(ReplayCacheTest, OptionalSsmEvictionPreservesRequiredPrefix)
     if (drop)
         drop->drop();
     reader->close();
+    manager->shutdown();
+}
+
+// One buffer of an SSM layer whose recurrent state is REQUIRED while its replay buffers override the
+// layer's policy with PRIVATE.
+struct SplitSsmBuffer
+{
+    LayerId layer;
+    DataRole role;
+    size_t size;
+    bool isPrivate;
+    // Distinct fill byte of this buffer.
+    uint8_t pattern;
+};
+
+// Layers 1-3 each keep two REQUIRED state roles and two PRIVATE replay roles. Layer 1 also owns a
+// PRIVATE role the other layers lack, like a request-wide counter stored once.
+std::vector<SplitSsmBuffer> splitSsmBuffers()
+{
+    std::vector<SplitSsmBuffer> buffers;
+    for (LayerId layer = 1; layer <= 3; ++layer)
+    {
+        auto const pattern = [layer](int role) { return static_cast<uint8_t>(layer * 32 + role * 4); };
+        buffers.push_back({layer, "state", 4096, false, pattern(0)});
+        buffers.push_back({layer, "conv", 4096, false, pattern(1)});
+        buffers.push_back({layer, "old_x", 4096, true, pattern(2)});
+        buffers.push_back({layer, "old_dt", 1024, true, pattern(3)});
+        if (layer == 1)
+        {
+            buffers.push_back({layer, "count", 512, true, pattern(4)});
+        }
+    }
+    return buffers;
+}
+
+KVCacheManagerConfig makeSplitSsmConfig(bool withHostTier)
+{
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    config.enablePartialCommit = false;
+    if (withHostTier)
+    {
+        config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
+    }
+    std::map<LayerId, SsmLayerConfig> layers;
+    for (auto const& buffer : splitSsmBuffers())
+    {
+        auto& layer = layers[buffer.layer];
+        layer.layerId = buffer.layer;
+        layer.buffers.push_back(BufferConfig{.role = buffer.role,
+            .size = buffer.size,
+            .reusePolicy = buffer.isPrivate ? std::optional<ReusePolicy>{ReusePolicy::PRIVATE} : std::nullopt});
+    }
+    for (auto& [layerId, layer] : layers)
+    {
+        config.layers.emplace_back(std::move(layer));
+    }
+    return config;
+}
+
+// Address of a buffer within the SSM page that `beam` of `cache` currently holds.
+MemAddress ssmBufferAddress(KvCacheManager const& manager, KvCache const& cache, SplitSsmBuffer const& buffer, int beam)
+{
+    auto const slot = cache.getSsmBlockBaseIndex(manager.getLayerGroupId(buffer.layer, buffer.role), BeamIndex{beam});
+    EXPECT_GE(slot, 0);
+    return manager.getMemPoolBaseAddress(buffer.layer, buffer.role)
+        + static_cast<size_t>(slot) * manager.getPageIndexScale(buffer.layer, buffer.role)
+        * manager.getPageStride(buffer.layer, buffer.role);
+}
+
+// Fill byte of a buffer, offset by `salt` to tell writers apart.
+uint8_t splitSsmPattern(SplitSsmBuffer const& buffer, int salt)
+{
+    return static_cast<uint8_t>(buffer.pattern + salt);
+}
+
+TEST_F(ReplayCacheTest, SsmBufferPolicySplitsLayerAcrossGroups)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeSplitSsmConfig(/*withHostTier=*/true));
+    auto const attention = manager->getLayerGroupId(LayerId{0});
+    auto const required = manager->getLayerGroupId(1, "state");
+    auto const privateGroup = manager->getLayerGroupId(1, "old_x");
+    EXPECT_EQ(manager->getLayerGroupId(0, "key"), attention);
+    EXPECT_EQ(manager->lifeCycles().size(), LifeCycleId{3});
+    EXPECT_NE(required, privateGroup);
+    EXPECT_TRUE(requiresPrefixCoverage(manager->lifeCycles()[required]));
+    EXPECT_TRUE(isPrivateLifeCycle(manager->lifeCycles()[privateGroup]));
+    for (auto const& buffer : splitSsmBuffers())
+    {
+        SCOPED_TRACE(std::to_string(buffer.layer) + "/" + buffer.role);
+        EXPECT_EQ(manager->getLayerGroupId(buffer.layer, buffer.role), buffer.isPrivate ? privateGroup : required);
+        EXPECT_THROW(manager->getLayerGroupId(buffer.layer), std::invalid_argument);
+    }
+    EXPECT_THROW(manager->getLayerGroupId(1, "missing"), std::out_of_range);
+
+    EXPECT_EQ(manager->numLayers(), 4);
+    auto layerIds = manager->layerIds();
+    std::sort(layerIds.begin(), layerIds.end());
+    EXPECT_EQ(layerIds, (std::vector<LayerId>{0, 1, 2, 3}));
+    auto grouping = manager->layerGrouping();
+    ASSERT_EQ(grouping.size(), LayerGroupId{3});
+    for (auto& layers : grouping)
+    {
+        std::sort(layers.begin(), layers.end());
+    }
+    EXPECT_EQ(grouping[attention], (std::vector<LayerId>{0}));
+    EXPECT_EQ(grouping[required], (std::vector<LayerId>{1, 2, 3}));
+    EXPECT_EQ(grouping[privateGroup], (std::vector<LayerId>{1, 2, 3}));
+    for (auto const level : {kHotLevel, CacheLevel{1}})
+    {
+        EXPECT_NE(manager->storage().getPoolGroupIndex(level, required),
+            manager->storage().getPoolGroupIndex(level, privateGroup));
+    }
+
+    // Each buffer's page index addresses its own lifecycle's pool: state and conv share one REQUIRED
+    // pool, while the PRIVATE pools hold old_x, old_dt and count, largest first.
+    std::map<DataRole, int> const scales{{"state", 6}, {"conv", 6}, {"old_x", 3}, {"old_dt", 3}, {"count", 1}};
+    std::map<DataRole, int> const scratchPages{{"state", 2}, {"conv", 2}, {"old_x", 1}, {"old_dt", 1}, {"count", 1}};
+    auto cache = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(cache->resume(mStream));
+    ASSERT_TRUE(cache->resize(8));
+    for (auto const& buffer : splitSsmBuffers())
+    {
+        SCOPED_TRACE(std::to_string(buffer.layer) + "/" + buffer.role);
+        auto const converter = manager->getPageIndexConverter(buffer.layer, buffer.role);
+        EXPECT_EQ(converter.scale, scales.at(buffer.role));
+        EXPECT_EQ(converter.scale, manager->getPageIndexScale(buffer.layer, buffer.role));
+        EXPECT_EQ(converter.scratchPagesPerBlock, scratchPages.at(buffer.role));
+        EXPECT_EQ(manager->getPageStride(buffer.layer, buffer.role), static_cast<int>(buffer.size));
+        int const slot
+            = cache->getSsmBlockBaseIndex(manager->getLayerGroupId(buffer.layer, buffer.role), kDefaultBeamIndex);
+        ASSERT_GE(slot, 0);
+        auto const perLayerIndex = converter(std::vector<int>{slot}, PageIndexMode::PER_LAYER).at(0);
+        auto const sharedIndex = converter(std::vector<int>{slot}, PageIndexMode::SHARED).at(0);
+        EXPECT_EQ(manager->getMemPoolBaseAddress(buffer.layer, buffer.role, PageIndexMode::PER_LAYER)
+                + static_cast<size_t>(perLayerIndex) * buffer.size,
+            manager->getMemPoolBaseAddress(buffer.layer, buffer.role, PageIndexMode::SHARED)
+                + static_cast<size_t>(sharedIndex) * buffer.size);
+        EXPECT_EQ(ssmBufferAddress(*manager, *cache, buffer, 0),
+            manager->getMemPoolBaseAddress(buffer.layer, buffer.role, PageIndexMode::SHARED)
+                + static_cast<size_t>(sharedIndex) * buffer.size);
+    }
+    cache->close();
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, PrivateSsmBuffersStayOutOfSnapshotsAndFollowBeams)
+{
+    for (int length : {7, 8})
+    {
+        SCOPED_TRACE(length);
+        auto manager = std::make_shared<KvCacheManager>(makeSplitSsmConfig(/*withHostTier=*/false));
+        auto const required = manager->getLayerGroupId(1, "state");
+        auto const privateGroup = manager->getLayerGroupId(1, "old_x");
+        auto const tokens = makeTokens(length);
+        TokenSpan const span{tokens.data(), length};
+        auto fill = [&](KvCache const& cache, SplitSsmBuffer const& buffer, int salt)
+        {
+            EXPECT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(ssmBufferAddress(*manager, cache, buffer, 0)),
+                          splitSsmPattern(buffer, salt), buffer.size, mStream),
+                cudaSuccess);
+        };
+        auto check = [&](KvCache const& cache, SplitSsmBuffer const& buffer, int beam, int salt)
+        {
+            EXPECT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+            std::vector<uint8_t> data(buffer.size);
+            EXPECT_EQ(
+                cudaMemcpy(data.data(), reinterpret_cast<void const*>(ssmBufferAddress(*manager, cache, buffer, beam)),
+                    data.size(), cudaMemcpyDeviceToHost),
+                cudaSuccess);
+            auto const pattern = splitSsmPattern(buffer, salt);
+            EXPECT_TRUE(std::all_of(data.begin(), data.end(), [pattern](uint8_t value) { return value == pattern; }))
+                << buffer.layer << "/" << buffer.role << " beam " << beam;
+        };
+
+        auto source = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(source->resume(mStream));
+        ASSERT_TRUE(source->resize(length));
+        for (auto const& buffer : splitSsmBuffers())
+        {
+            fill(*source, buffer, 0);
+        }
+        source->commit(span);
+        source->stopCommitting();
+        {
+            auto match = manager->radixTree().match({}, span, false, true);
+            ASSERT_EQ(match.numTokens, length);
+            ASSERT_FALSE(match.blocks.empty());
+            EXPECT_NE(match.blocks.back()->getPage(required), nullptr);
+            for (auto const* block : match.blocks)
+            {
+                EXPECT_EQ(block->getPage(privateGroup), nullptr);
+            }
+        }
+
+        // The reader restores the REQUIRED snapshot but starts from a fresh PRIVATE slot.
+        auto reader = manager->createKvCache({}, span, 2, {}, length);
+        ASSERT_EQ(reader->numCommittedTokens(), length);
+        EXPECT_TRUE(reader->reuseStatus()[required.value()].complete);
+        EXPECT_FALSE(reader->reuseStatus()[privateGroup.value()].complete);
+        ASSERT_TRUE(reader->resume(mStream));
+        reader->commitPendingStats();
+        auto const snapshotStats = manager->getAndResetSsmSnapshotIterationStats();
+        ASSERT_EQ(snapshotStats.size(), 1);
+        ASSERT_EQ(snapshotStats.count(required), 1);
+        EXPECT_EQ(snapshotStats.at(required).iterSnapshotHits, 1);
+        for (auto const& buffer : splitSsmBuffers())
+        {
+            if (buffer.isPrivate)
+            {
+                EXPECT_NE(
+                    ssmBufferAddress(*manager, *source, buffer, 0), ssmBufferAddress(*manager, *reader, buffer, 0));
+                fill(*reader, buffer, 1);
+            }
+            else
+            {
+                check(*reader, buffer, 0, 0);
+            }
+        }
+
+        // Beam expansion copies both lifecycles into every beam's own slot.
+        ASSERT_TRUE(reader->resize(length + 4));
+        reader->setBeamWidth(BeamIndex{3});
+        for (int beam = 0; beam < 3; ++beam)
+        {
+            for (auto const& buffer : splitSsmBuffers())
+            {
+                check(*reader, buffer, beam, buffer.isPrivate ? 1 : 0);
+                if (beam > 0)
+                {
+                    EXPECT_NE(ssmBufferAddress(*manager, *reader, buffer, beam),
+                        ssmBufferAddress(*manager, *reader, buffer, 0));
+                }
+            }
+        }
+        reader->setBeamWidth(BeamIndex{1});
+        reader->close();
+        source->close();
+        manager->shutdown();
+    }
+}
+
+TEST_F(ReplayCacheTest, SuspendedSsmStateSurvivesOffloadAndSlotChange)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeSplitSsmConfig(/*withHostTier=*/true));
+    auto const required = manager->getLayerGroupId(1, "state");
+    auto const privateGroup = manager->getLayerGroupId(1, "old_x");
+    auto const tokens = makeTokens(8);
+    TokenSpan const span{tokens.data(), 8};
+    auto cache = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(cache->resume(mStream));
+    ASSERT_TRUE(cache->resize(10));
+    for (auto const& buffer : splitSsmBuffers())
+    {
+        EXPECT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(ssmBufferAddress(*manager, *cache, buffer, 0)),
+                      splitSsmPattern(buffer, 0), buffer.size, mStream),
+            cudaSuccess);
+    }
+    cache->commit(span);
+    std::map<LayerGroupId, int> oldSlots;
+    for (auto const group : {required, privateGroup})
+    {
+        oldSlots[group] = cache->getSsmBlockBaseIndex(group);
+        ASSERT_GE(oldSlots[group], 0);
+    }
+    cache->suspend();
+
+    // Claim every GPU slot of both SSM pool groups. The suspended cache's held state is evicted to
+    // host memory, and its former GPU slots are overwritten while this test owns them.
+    auto& storage = manager->storage();
+    std::vector<std::pair<LayerGroupId, Slot>> oldSlotReservations;
+    for (auto const group : {required, privateGroup})
+    {
+        auto const pool = storage.getPoolGroupIndex(kHotLevel, group);
+        auto const stats = storage.getStatistics(kHotLevel, pool);
+        EXPECT_GE(stats.evictable, 1);
+        auto slots = storage.newSlotsForPoolGroup(kHotLevel, pool, stats.free + stats.evictable);
+        auto const coldPool = storage.getPoolGroupIndex(CacheLevel{1}, group);
+        auto const coldStats = storage.getStatistics(CacheLevel{1}, coldPool);
+        EXPECT_GE(coldStats.total - coldStats.free, 1);
+        for (auto& slot : slots)
+        {
+            if (slot.slotId().value() == oldSlots[group])
+            {
+                oldSlotReservations.emplace_back(group, std::move(slot));
+            }
+            else
+            {
+                storage.releaseSlot(group, kHotLevel, std::move(slot));
+            }
+        }
+    }
+    ASSERT_EQ(oldSlotReservations.size(), 2);
+    for (auto const& buffer : splitSsmBuffers())
+    {
+        auto const group = manager->getLayerGroupId(buffer.layer, buffer.role);
+        auto const address = manager->getMemPoolBaseAddress(buffer.layer, buffer.role)
+            + static_cast<size_t>(oldSlots[group]) * manager->getPageIndexScale(buffer.layer, buffer.role)
+                * manager->getPageStride(buffer.layer, buffer.role);
+        EXPECT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(address), 0xEE, buffer.size, mStream), cudaSuccess);
+    }
+    EXPECT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+
+    ASSERT_TRUE(cache->resume(mStream));
+    for (auto const group : {required, privateGroup})
+    {
+        EXPECT_NE(cache->getSsmBlockBaseIndex(group), oldSlots[group]);
+    }
+    EXPECT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    for (auto const& buffer : splitSsmBuffers())
+    {
+        std::vector<uint8_t> data(buffer.size);
+        EXPECT_EQ(cudaMemcpy(data.data(), reinterpret_cast<void const*>(ssmBufferAddress(*manager, *cache, buffer, 0)),
+                      data.size(), cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        auto const pattern = splitSsmPattern(buffer, 0);
+        EXPECT_TRUE(std::all_of(data.begin(), data.end(), [pattern](uint8_t value) { return value == pattern; }))
+            << buffer.layer << "/" << buffer.role;
+    }
+    for (auto& [group, slot] : oldSlotReservations)
+    {
+        storage.releaseSlot(group, kHotLevel, std::move(slot));
+    }
+    cache->close();
     manager->shutdown();
 }
 

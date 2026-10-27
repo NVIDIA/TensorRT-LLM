@@ -30,6 +30,7 @@ from typing import (
     Type,
     TypeAlias,
     Union,
+    overload,
 )
 
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
@@ -257,18 +258,27 @@ class DiskCacheTierConfig:
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
 
+class ReusePolicy(enum.IntEnum):
+    REQUIRED = 0
+    PRIVATE = 1
+    OPTIONAL = 2
+
 @dataclass(slots=True)
 class BufferConfig:
+    """One buffer of a layer.
+
+    ``reuse_policy`` of ``None`` uses the layer's policy. Only SSM layers accept a
+    different policy; the buffer then belongs to the SSM layer group of that
+    policy while keeping its layer ID, so one SSM layer can span several layer
+    groups.
+    """
+
     role: DataRole
     size: int
     tokens_per_block_override: int | None = None
     is_sparse: bool = False
     coalescing_group: int = 0
-
-class ReusePolicy(enum.IntEnum):
-    REQUIRED = 0
-    PRIVATE = 1
-    OPTIONAL = 2
+    reuse_policy: ReusePolicy | None = None
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
@@ -282,8 +292,9 @@ class AttentionLayerConfig:
 
 @dataclass(slots=True)
 class SsmLayerConfig:
-    """Recurrent buffers sharing a layer-level reuse policy.
+    """Recurrent buffers with a layer-level default reuse policy.
 
+    A buffer's ``reuse_policy`` overrides the default for that buffer.
     OPTIONAL state is restored only when selected on first resume at the exact
     matched endpoint. The caller initializes or reconstructs all fresh state.
     """
@@ -936,7 +947,12 @@ class KVCacheManager:
     def num_layers(self) -> int: ...
     @property
     def layer_ids(self) -> Iterator[LayerId]: ...
+    # Raises ValueError when the layer's buffers span several layer groups.
+    @overload
     def get_layer_group_id(self, layer_id: LayerId) -> LayerGroupId: ...
+    @overload
+    def get_layer_group_id(self, layer_id: LayerId, role: DataRole) -> LayerGroupId: ...
+    # A layer whose buffers span several layer groups is listed under each of them.
     @property
     def layer_grouping(self) -> Sequence[Sequence[LayerId]]: ...
     @property

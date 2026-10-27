@@ -233,7 +233,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // Compute layer attributes and slot utilization fractions for scratch support.
     mLayerAttributes = config.layerAttributes();
     mSlotUtilFracMax.resize(lifeCycles.size(), Rational{0, 1});
-    for (auto const& [layerId, layerAttr] : mLayerAttributes)
+    for (auto const& [key, layerAttr] : mLayerAttributes)
     {
         LifeCycleId const lcIdx = layerAttr.lifeCycleId;
         if (layerAttr.slotUtilFracMax > mSlotUtilFracMax[lcIdx])
@@ -1764,11 +1764,11 @@ TypedVec<PoolGroupIndex, PoolGroupDesc> StorageManager::poolGroupDescs() const
     return result;
 }
 
-LayerAttr const& StorageManager::getLayerAttr(LayerId layerId) const
+LayerAttr const& StorageManager::getLayerAttr(LayerId layerId, LifeCycleId lifeCycle) const
 {
-    auto it = mLayerAttributes.find(layerId);
+    auto it = mLayerAttributes.find(LayerLifeCycleKey{layerId, lifeCycle});
     if (it == mLayerAttributes.end())
-        throw std::out_of_range("Unknown LayerId for LayerAttr");
+        throw std::out_of_range("Unknown (LayerId, LifeCycleId) for LayerAttr");
     return it->second;
 }
 

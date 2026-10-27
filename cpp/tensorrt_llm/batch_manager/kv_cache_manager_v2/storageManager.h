@@ -306,8 +306,8 @@ public:
     // Pool group base address without per-layer offset.
     MemAddress getMemPoolBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
 
-    // Per-layer storage attributes.
-    LayerAttr const& getLayerAttr(LayerId layerId) const;
+    // Storage attributes of a layer's buffers within one lifecycle.
+    LayerAttr const& getLayerAttr(LayerId layerId, LifeCycleId lifeCycle) const;
 
     // Address of a slot's buffer in a specific pool at a cache level.
     Address slotAddress(CacheLevel level, PoolGroupIndex pgIdx, SlotId slotId, PoolIndex poolIdx) const;
@@ -325,8 +325,8 @@ public:
     // Pool-group slot count (number of pages).
     SlotCount numSlots(PoolGroupIndex pgIdx, CacheLevel level = kHotLevel) const;
 
-    // Layer-to-lifecycle mapping (for KvCacheManager queries).
-    std::unordered_map<LayerId, LifeCycleId> const& layerToLifeCycleIds() const noexcept
+    // Layer-to-lifecycles mapping (for KvCacheManager queries); see StorageConfig::layerToLifeCycleIds().
+    std::unordered_map<LayerId, std::vector<LifeCycleId>> const& layerToLifeCycleIds() const noexcept
     {
         return mLayerToLifeCycleIds;
     }
@@ -433,13 +433,13 @@ private:
     TypedVec<LifeCycleId, LayerGroupId> mBatchingLayerGroupIds;
     // Codec-selected PageIndexPair memory location for each lifecycle.
     TypedVec<LifeCycleId, PageIndexLocation> mPageIndexLocations;
-    std::unordered_map<LayerId, LifeCycleId> mLayerToLifeCycleIds;
+    std::unordered_map<LayerId, std::vector<LifeCycleId>> mLayerToLifeCycleIds;
 
     // slot-to-page-index scale factors: [lcId][poolIdx]
     TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> mSlotToPageIndices;
 
-    // Per-layer storage attributes for scratch slot management.
-    std::map<LayerId, LayerAttr> mLayerAttributes;
+    // Per-(layer, lifecycle) storage attributes for scratch slot management.
+    std::map<LayerLifeCycleKey, LayerAttr> mLayerAttributes;
 
     // Max slot utilization fraction per lifecycle (across all layers in that lifecycle).
     TypedVec<LifeCycleId, Rational> mSlotUtilFracMax;

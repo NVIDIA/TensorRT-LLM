@@ -65,14 +65,20 @@ must eventually be `close()`d. Its normal flow is:
    for later requests; `stopCommitting()` finalizes this process.
 5. Suspend or close the request, returning pages to holding/eviction ownership.
 
-`LifeCycleRegistry` maps model layers to lifecycle groups. Attention lifecycles
+`LifeCycleRegistry` maps layer buffers to lifecycle groups. Attention lifecycles
 may have sliding-window and sink-token rules; SSM lifecycles represent a
 recurrent-state checkpoint. Both layer configs expose `reusePolicy`: `REQUIRED`
 constrains the prefix match, `OPTIONAL` offers state at the required endpoint for
 explicit selection on first resume, and `PRIVATE` never publishes reusable pages.
-All buffers within a layer share that policy. SSM lifecycles are deduplicated by
-policy, so a manager can have up to three SSM groups; iterate `ssmLifeCycleIds()`
-for working state and use `requiredSsmLifeCycleId()` only for prefix pruning.
+Attention buffers use their layer's policy. An SSM buffer may override it through
+`BufferConfig::reusePolicy` and then belongs to the SSM lifecycle of its own
+policy while keeping its `LayerId`, so one SSM layer can span several layer
+groups. Look such a layer up per buffer with `getLayerGroupId(layerId, role)`;
+the one-argument overload throws for it, `layerGrouping()` lists it under each
+of its groups, and per-layer storage attributes are keyed by (layer, lifecycle).
+SSM lifecycles are deduplicated by policy, so a manager can have up to three SSM
+groups; iterate `ssmLifeCycleIds()` for working state and use
+`requiredSsmLifeCycleId()` only for prefix pruning.
 Optional SSM checkpoints require an exact endpoint match, including partial
 blocks. Fresh or unselected recurrent state must be initialized or reconstructed
 by the caller before inference. A pool-group index is a storage-layout index and is

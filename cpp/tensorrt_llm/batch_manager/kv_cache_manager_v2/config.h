@@ -130,8 +130,21 @@ inline std::optional<size_t> cacheTierMaxQuota(CacheTierConfig const& cfg)
     return host != nullptr ? host->maxQuota : std::nullopt;
 }
 
+//! Controls whether a lifecycle participates in prefix matching and page reuse.
+enum class ReusePolicy
+{
+    //! Commit reusable pages and require live-window coverage when matching a prefix.
+    REQUIRED = 0,
+    //! Keep request-local working pages; never publish or reuse them through the radix tree.
+    PRIVATE = 1,
+    //! Commit reusable pages without constraining the REQUIRED prefix match. The caller selects
+    //! available groups at resume; missing or unselected groups use fresh pages for recomputation.
+    //! These pages may be evicted independently without removing the REQUIRED prefix.
+    OPTIONAL = 2,
+};
+
 // ---------------------------------------------------------------------------
-// Buffer configuration (one KV buffer inside an attention layer).
+// Buffer configuration (one buffer inside an attention or SSM layer).
 // ---------------------------------------------------------------------------
 
 struct BufferConfig
@@ -148,6 +161,16 @@ struct BufferConfig
     //! Buffers may coalesce only when their group and expanded size match.
     //! This does not change their lifecycle or shared slot allocation.
     int coalescingGroup = 0;
+
+    //! Reuse policy of this buffer; nullopt uses the layer's policy. Only SSM layers accept a
+    //! policy that differs from the layer's. Such a buffer belongs to the SSM lifecycle of its
+    //! own policy while keeping its layer ID, so one SSM layer can span several layer groups.
+    std::optional<ReusePolicy> reusePolicy;
+
+    [[nodiscard]] ReusePolicy effectiveReusePolicy(ReusePolicy layerPolicy) const noexcept
+    {
+        return reusePolicy.value_or(layerPolicy);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -178,19 +201,6 @@ inline void validateNoDuplicateBufferRoles(std::vector<BufferConfig> const& buff
 
 } // namespace detail
 
-//! Controls whether a layer lifecycle participates in prefix matching and page reuse.
-enum class ReusePolicy
-{
-    //! Commit reusable pages and require live-window coverage when matching a prefix.
-    REQUIRED = 0,
-    //! Keep request-local working pages; never publish or reuse them through the radix tree.
-    PRIVATE = 1,
-    //! Commit reusable pages without constraining the REQUIRED prefix match. The caller selects
-    //! available groups at resume; missing or unselected groups use fresh pages for recomputation.
-    //! These pages may be evicted independently without removing the REQUIRED prefix.
-    OPTIONAL = 2,
-};
-
 struct AttentionLayerConfig
 {
     static constexpr LayerType type = LayerType::ATTENTION;
@@ -205,6 +215,7 @@ struct AttentionLayerConfig
     std::optional<int> numSinkTokens;
 
     // Private working pages never constrain prefix matching or enter the tree.
+    // Every buffer of an attention layer uses this policy.
     ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
 
     [[nodiscard]] std::optional<int> windowSize() const noexcept
@@ -221,6 +232,12 @@ struct AttentionLayerConfig
             {
                 throw std::invalid_argument("Sparse and non-sparse buffers cannot share an attention layer lifecycle");
             }
+            if (buf.effectiveReusePolicy(reusePolicy) != reusePolicy)
+            {
+                throw std::invalid_argument("Attention buffer '" + buf.role
+                    + "' sets a reuse policy that differs from its layer's; per-buffer reuse policies are only "
+                      "supported for SSM layers");
+            }
         }
     }
 };
@@ -235,6 +252,7 @@ struct SsmLayerConfig
 
     LayerId layerId = 0;
     std::vector<BufferConfig> buffers;
+    // Default policy of the layer's buffers; BufferConfig::reusePolicy may override it per buffer.
     ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
 
     void validate() const
@@ -255,6 +273,11 @@ struct SsmLayerConfig
 };
 
 using LayerConfig = std::variant<AttentionLayerConfig, SsmLayerConfig>;
+
+inline std::vector<BufferConfig> const& layerBuffers(LayerConfig const& layer)
+{
+    return std::visit([](auto const& cfg) -> std::vector<BufferConfig> const& { return cfg.buffers; }, layer);
+}
 
 // ---------------------------------------------------------------------------
 // KVCacheDesc — describes one KV cache request's capacity and history length.

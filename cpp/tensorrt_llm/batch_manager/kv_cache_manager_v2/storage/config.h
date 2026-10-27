@@ -28,6 +28,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -197,7 +198,8 @@ struct Rational
 };
 
 // ---------------------------------------------------------------------------
-// LayerAttr — per-layer storage attributes for scratch slot management.
+// LayerAttr — storage attributes of one layer's buffers within one lifecycle, for scratch slot
+// management. An SSM layer whose buffers use different reuse policies has one LayerAttr per lifecycle.
 // Mirrors _storage/_config.py::LayerAttr.
 // ---------------------------------------------------------------------------
 struct LayerAttr
@@ -211,6 +213,9 @@ struct LayerAttr
     // Fraction of slot_util to total number of buffers in the slot, max over all pools.
     Rational slotUtilFracMax;
 };
+
+// (layer, lifecycle) key of a LayerAttr.
+using LayerLifeCycleKey = std::pair<LayerId, LifeCycleId>;
 
 // ---------------------------------------------------------------------------
 // StorageConfig — complete storage layout for the KV cache.
@@ -230,12 +235,13 @@ struct StorageConfig
     // Attribute map for each buffer.
     std::map<BufferId, BufferAttr> bufferAttributes() const;
 
-    // Map LayerId → LifeCycleId.
-    std::unordered_map<LayerId, LifeCycleId> layerToLifeCycleIds() const;
+    // Map LayerId → the lifecycles of its buffers, in ascending order. A layer spans several
+    // lifecycles only when its SSM buffers use different reuse policies.
+    std::unordered_map<LayerId, std::vector<LifeCycleId>> layerToLifeCycleIds() const;
 
-    // Per-layer storage attributes (slot utilization within coalesced slots).
+    // Per-(layer, lifecycle) storage attributes (slot utilization within coalesced slots).
     // Mirrors _storage/_config.py::StorageConfig.layer_attributes().
-    std::map<LayerId, LayerAttr> layerAttributes() const;
+    std::map<LayerLifeCycleKey, LayerAttr> layerAttributes() const;
 
     LifeCycleId numLifeCycles() const;
 };
