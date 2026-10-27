@@ -1310,6 +1310,7 @@ class DFlashWorker(SpecWorkerBase):
                 "fell back to a private ctx arena, so a reused prefix's drafter K/V "
                 "stays unreachable and acceptance length drops as if unpaired."
             )
+        self._configure_prefix_reuse(getattr(attn_metadata, "kv_cache_manager", None))
 
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
@@ -1334,6 +1335,62 @@ class DFlashWorker(SpecWorkerBase):
             table = self._ctx_page_table
             indptr = self._ctx_kv_indptr
         return table.flatten().contiguous(), indptr
+
+    def _configure_prefix_reuse(self, target_cache_manager) -> None:
+        """Set the target KV cache manager up for this drafter's prefix-cache
+        hits, and report how they are served.
+
+        Bound to an unpaired draft pool, the drafter stores the uncached tail of
+        a hit at its target positions and hides the pages below it from its
+        reads (``_ctx_base_for_store``), in whole pages only: a hit ending
+        inside a page would leave that page's stored tail tokens -- up to
+        ``page_size - 1`` of the newest prompt tokens -- unread. The target
+        therefore ends its reuse claims on draft page boundaries
+        (``KVCacheManagerV2.align_reuse_claims_to_draft_pages``). The reused
+        prefix itself has no drafter K/V at all on any unaddressable cache;
+        ``context_recompute_tail`` makes the target recompute the part the
+        drafter attends to.
+        """
+        bound_unpaired = self._ctx_block_tables is not None and not self._ctx_reuse_addressable
+        align = getattr(target_cache_manager, "align_reuse_claims_to_draft_pages", None)
+        if align is not None:
+            align(self._ctx_page_size if bound_unpaired else 0)
+        if self._ctx_reuse_addressable or not getattr(
+            target_cache_manager, "enable_block_reuse", False
+        ):
+            return
+        tail = getattr(target_cache_manager, "_spec_recompute_tail", 0)
+        aligned = bound_unpaired and align is not None
+        logger.info(
+            f"DFlash: prefix-cache hits recompute a {tail}-token prompt tail for the "
+            f"drafter (context_recompute_tail; -1 = whole prompt, 0 = none); reuse "
+            + (
+                f"claims end on {self._ctx_page_size}-token draft page boundaries."
+                if aligned
+                else "claims are not aligned to draft pages."
+            )
+        )
+        if not tail:
+            # The target skips the reused prefix, so _store_prefill_context only
+            # ever sees the uncached tail; nothing else reports the loss.
+            requested = getattr(self.spec_config, "context_recompute_tail", 0)
+            if requested:
+                why = (
+                    f"the KV cache manager disabled context_recompute_tail={requested} "
+                    "(it requires block_reuse_config.policy 'all_reusable' and chunked "
+                    "prefill)"
+                )
+            else:
+                why = (
+                    "context_recompute_tail is 0 (set it to the drafter's attention "
+                    "window -- null resolves it -- or -1 to recompute on hits)"
+                )
+            logger.warning(
+                "DFlash: KV-cache block reuse is on, but the drafter's context K/V are "
+                f"not kept where a prefix-cache hit can hand them back, and {why}: a "
+                "cache-hit request drafts from only the uncached tail of its prompt, so "
+                "acceptance drops on every hit."
+            )
 
     def _ctx_store_start(self, cur: int, first_pos: int) -> int:
         """Position at which a context chunk's drafter K/V is stored.
