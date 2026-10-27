@@ -547,7 +547,7 @@ def _rejecting_engine(where, stream):
         return Mock(return_value=_StreamedGeneration([], then=error))
     return Mock(
         return_value=SimpleNamespace(
-            prompt_token_ids=[1, 2, 3], aresult=AsyncMock(side_effect=error)
+            request_id=1, prompt_token_ids=[1, 2, 3], aresult=AsyncMock(side_effect=error)
         )
     )
 
