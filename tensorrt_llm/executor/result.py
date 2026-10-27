@@ -691,6 +691,12 @@ class GenerationResultBase:
                                           beam_idx, logprobs_result,
                                           req_perf_metrics_dict)
             else:
+                # Each response carries one sequence. Mark every output's
+                # diffs as consumed so the outputs this response does not
+                # update are not decoded again from their previous diff.
+                for output in self._outputs:
+                    output._last_token_ids_len = len(output.token_ids)
+                    output._last_logprobs_len = len(output.logprobs)
                 self._handle_sequence(finish_reasons, response_result,
                                       response_result.sequence_index,
                                       logprobs_result, req_perf_metrics_dict)
