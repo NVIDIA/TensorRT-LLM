@@ -2471,6 +2471,8 @@ def _fp4_mla_hybrid_manager_stub(
     mgr.layer_offsets = {layer: layer for layer in mgr.pp_layers}
     mgr._mamba_layer_mask = [True, False, True, False]
     mgr._use_kda_replay_update = False
+    # KimiK3HybridCacheManager reads this while building the cache config.
+    mgr._kda_replay = None
     mgr.num_local_layers = 4
     mgr.local_num_mamba_layers = 2
     mgr.num_kv_heads_per_layer = [0, 1, 0, 1]
