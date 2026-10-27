@@ -1727,6 +1727,16 @@ def get_draft_model(model_config, draft_config, lm_head, model):
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                   Generic[TModel, TConfig]):
 
+    @classmethod
+    def supports_spec_decode_fast_paths(cls, model_config: ModelConfig) -> bool:
+        """Whether one-engine speculative decoding of this model takes the
+        fast paths (``spec_decode_fast_paths``): greedy and temperature-only
+        tokens of vocabulary-sharded logits through the TP key exchange, the
+        temperature-only CUDA graph variant, the overlap loop on the execution
+        stream and the hoisted position ids. A model enables them where they
+        are validated."""
+        return False
+
     def __init__(self,
                  model: TModel,
                  model_config: ModelConfig[TConfig],
@@ -1749,7 +1759,18 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         self.use_separate_draft_kv_cache = False
         spec_config = getattr(model_config, 'spec_config', None)
         self.spec_config = spec_config
+        self.spec_decode_fast_paths = False
+        key_exchange = None
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
+            self.spec_decode_fast_paths = self.supports_spec_decode_fast_paths(
+                model_config)
+            if self.spec_decode_fast_paths:
+                # Greedy tokens of vocabulary-sharded draft / target logits
+                # come from one peer-memory key exchange per step (TP groups
+                # only; None elsewhere).
+                from ..distributed import ll_exchange
+                key_exchange = ll_exchange.create_tp_key_exchange(
+                    model_config.mapping, model_config.max_num_tokens)
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
                 requested_draft_moe_backend = _get_requested_draft_moe_backend(
@@ -1842,7 +1863,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 model_config.spec_config,
                 model_config,
                 model_config.mapping,
-                use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
+                use_separate_draft_kv_cache=self.use_separate_draft_kv_cache,
+                key_exchange=key_exchange)
             if self.spec_worker is not None:
                 # Cache the static draft->target vocab map now that the draft
                 # model is loaded, so workers read self._d2t instead of probing
@@ -1856,6 +1878,20 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 and getattr(self.draft_model, "shares_target_kv_cache", False)):
             self.draft_model.load_weights_from_target_model(self)
 
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        spec_config = self.spec_config
+        if (self.spec_worker is not None and spec_config is not None
+                and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+                and spec_config.draft_lm_head_dtype == "mxfp8"):
+            from ..modules.mxfp8_draft_head import build_mxfp8_draft_head
+
+            # Rebuilt from the current BF16 weights (idempotent on reloads).
+            self.spec_worker.draft_head = None
+            self.spec_worker.draft_head = build_mxfp8_draft_head(
+                self.lm_head, self.model_config.mapping,
+                self.spec_worker.key_exchange)
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1867,6 +1903,16 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
+        # A padded generation batch's (mrope) positions are a strided view; one
+        # copy here instead of one per attention layer that needs them dense.
+        # Not with context requests: a breakable prefill CUDA graph replays its
+        # body against the capture-time position tensor.
+        hoist_positions = (self.spec_decode_fast_paths
+                           and self.spec_worker is not None
+                           and position_ids is not None
+                           and attn_metadata.num_contexts == 0)
+        if hoist_positions:
+            position_ids = position_ids.contiguous()
         hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -1918,6 +1964,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 if position_ids is not None:
                     spec_position_ids = _slice_spec_position_ids(
                         position_ids, attn_metadata.num_tokens)
+                    if hoist_positions:
+                        # The padded batch's slice is strided again.
+                        spec_position_ids = spec_position_ids.contiguous()
 
             # get accepted tokens and next draft tokens
             return self.spec_worker(input_ids=spec_input_ids,

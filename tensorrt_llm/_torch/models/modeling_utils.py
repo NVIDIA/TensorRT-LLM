@@ -542,6 +542,9 @@ class DecoderModelForCausalLM(nn.Module,
 
     # Keep FX optimizations for decode and prefill above the PCG capture ceiling.
     use_fx_for_pcg_fallback: ClassVar[bool] = True
+    # The model-specific TorchLlmArgs fields this model implements; the loader
+    # rejects a set one that is not listed.
+    model_specific_llm_args: ClassVar[frozenset[str]] = frozenset()
 
     @staticmethod
     def _checkpoint_has_lm_head_scale(
