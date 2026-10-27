@@ -365,6 +365,7 @@ class TestStep3p7Helpers(unittest.TestCase):
 
         scaling_factor = 3.0
         text_config = types.SimpleNamespace(
+            num_hidden_layers=1,
             hidden_size=4,
             moe_num_experts=2,
             moe_top_k=2,
@@ -377,6 +378,8 @@ class TestStep3p7Helpers(unittest.TestCase):
             pretrained_config=text_config,
             mapping=types.SimpleNamespace(enable_attention_dp=True, tp_size=1),
             lora_config=object(),
+            quant_config=None,
+            quant_config_dict=None,
         )
 
         for moe_lora_enabled in (False, True):
@@ -401,7 +404,9 @@ class TestStep3p7Helpers(unittest.TestCase):
 
                 routing_method = create_moe.call_args.kwargs["routing_method"]
                 activation = create_moe.call_args.kwargs["activation"]
-                self.assertEqual(activation.clamp, 1.0)
+                # The backend runs these experts only under MoE LoRA; otherwise
+                # the Python path applies the clamp and the backend gets none.
+                self.assertEqual(activation.clamp, 1.0 if moe_lora_enabled else None)
                 self.assertEqual(activation.clamp_after_silu, moe_lora_enabled)
                 if moe_lora_enabled:
                     allocate_clamp_buffers.assert_not_called()
@@ -448,6 +453,51 @@ class TestStep3p7Helpers(unittest.TestCase):
                 else:
                     python_output.assert_called_once()
                     experts.assert_not_called()
+
+    def test_moe_passes_the_quant_config_of_its_experts_module(self):
+        """An MTP layer nests its decoder block, experts included, under
+        ``mtp_block``."""
+        import tensorrt_llm._torch.models.modeling_step3p7 as step3p7_module
+        from tensorrt_llm._torch.models.modeling_step3p7 import Step3p7MoE
+        from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+        text_config = types.SimpleNamespace(
+            num_hidden_layers=2,
+            hidden_size=4,
+            moe_num_experts=2,
+            moe_top_k=2,
+            moe_intermediate_size=8,
+            need_fp32_gate=False,
+            torch_dtype=torch.float32,
+        )
+        nvfp4 = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+        w4a8 = QuantConfig(quant_algo=QuantAlgo.W4A8_AWQ)
+        model_config = types.SimpleNamespace(
+            pretrained_config=text_config,
+            mapping=types.SimpleNamespace(enable_attention_dp=True, tp_size=1),
+            lora_config=None,
+            quant_config=None,
+            quant_config_dict={
+                "model.layers.1.moe.experts.0.gate_proj": nvfp4,
+                "model.layers.2.mtp_block.moe.experts.0.gate_proj": w4a8,
+            },
+        )
+
+        for layer_idx, expected in ((1, nvfp4), (2, w4a8)):
+            with self.subTest(layer_idx=layer_idx):
+                with (
+                    patch.object(step3p7_module, "Linear", return_value=MagicMock()),
+                    patch.object(
+                        step3p7_module,
+                        "_select_python_expert_path",
+                        return_value=(None, False, None),
+                    ),
+                    patch.object(step3p7_module, "has_moe_lora_targets", return_value=False),
+                    patch.object(step3p7_module, "create_moe") as create_moe,
+                ):
+                    Step3p7MoE(model_config, layer_idx=layer_idx, aux_stream_dict={})
+
+                self.assertIs(create_moe.call_args.kwargs["override_quant_config"], expected)
 
     def test_dummy_weights_initialize_nonpersistent_clamp_buffers(self):
         """Dummy loading initializes the Python clamp path's private buffers."""

@@ -85,6 +85,11 @@ class MoEExecutionContractMixin:
         return False
 
     @property
+    def supports_alltoall(self) -> bool:
+        """Whether the kernel can consume tokens dispatched with all-to-all."""
+        return True
+
+    @property
     def uses_locality_domain(self) -> bool:
         """True when this impl runs partitioned across locality domains."""
         return False
@@ -271,34 +276,6 @@ class MoEWeightOwnerMixin:
             self.quant_config is not None
             and self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8()
         )
-
-    @property
-    def has_w4a8_mxfp4_fp8(self):
-        assert self._weights_created
-        return (
-            self.quant_config is not None
-            and self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8()
-        )
-
-    @property
-    def has_w4a8_mxfp4_mxfp8(self):
-        assert self._weights_created
-        return (
-            self.quant_config is not None
-            and self.quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8()
-        )
-
-    @property
-    def has_w4a16_mxfp4(self):
-        assert self._weights_created
-        return (
-            self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a16_mxfp4()
-        )
-
-    @property
-    def has_mxfp8(self):
-        assert self._weights_created
-        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_mxfp8()
 
     # ---- shape / partition -------------------------------------------------
     @property

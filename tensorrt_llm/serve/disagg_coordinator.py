@@ -61,6 +61,7 @@ from tensorrt_llm.serve.cluster_storage import (
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient
+from tensorrt_llm.serve.render.fingerprint import fingerprint_summary
 from tensorrt_llm.serve.router import (
     CoordinatorDelegatingRouter,
     KvCacheAwareRouter,
@@ -378,6 +379,15 @@ class DisaggCoordinatorService(DisaggCoordinator):
                     routing_key_configs[role] = config
         if routing_key_configs:
             info["routing_key_configs"] = routing_key_configs
+        # Frontends never fetch /server_info, so they cannot check that a worker renders like
+        # their own router; they use the fingerprints this coordinator already fetched.
+        info["render_fingerprints"] = {
+            role: {
+                server: fingerprint_summary(server_info.get("render_fingerprint"))
+                for server, server_info in (getattr(router, "_server_info", None) or {}).items()
+            }
+            for role, router in (("context", self._ctx_router), ("generation", self._gen_router))
+        }
         if self._disagg_cluster_manager:
             info.update(await self._disagg_cluster_manager.cluster_info())
         return info
@@ -646,6 +656,17 @@ class CoordinatorClient(DisaggCoordinator):
         self._is_ready = info.get("is_ready", False)
         self._sync_delegating_router_configs(info)
         await self._sync_router_server_lists(info)
+        self._sync_render_fingerprints(info)
+
+    def _sync_render_fingerprints(self, info: Dict[str, Any]) -> None:
+        published = info.get("render_fingerprints")
+        if published is None:
+            return
+        for role, router in (("context", self._ctx_router), ("generation", self._gen_router)):
+            local = getattr(router, "_local", None)
+            setter = getattr(local, "set_published_render_fingerprints", None)
+            if setter is not None:
+                setter(published.get(role, {}))
 
     def _sync_delegating_router_configs(self, info: Dict[str, Any]) -> None:
         configs = info.get("routing_key_configs", {})

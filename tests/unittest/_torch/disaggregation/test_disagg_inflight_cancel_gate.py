@@ -29,6 +29,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.interfaces import ExecutorEffects
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
     MambaHybridCacheManagerV2,
@@ -507,7 +508,9 @@ def test_flag_unset_preserves_python_transceiver(monkeypatch):
     fake_module = SimpleNamespace(KvCacheTransceiverV2=constructor)
     monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.disaggregation.transceiver", fake_module)
 
-    result = transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)
+    result = transceiver_module.create_kv_cache_transceiver(
+        Mock(), Mock(), Mock(spec=KVCacheManagerV2), Mock(), config
+    )
 
     assert result is expected
     constructor.assert_called_once()

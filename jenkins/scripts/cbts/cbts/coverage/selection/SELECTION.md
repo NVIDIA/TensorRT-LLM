@@ -1,4 +1,8 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # CBTS Coverage Selection
+
 
 How the touch DB is turned into a decision about which cases to run. Collection side:
 `../collection/COLLECTION.md`.
@@ -82,6 +86,14 @@ the local functions and methods that consume the changed binding:
   `staticmethod` decorators, literal defaults, and annotations validated as safe name loads or
   supported builtin / `typing` / `collections.abc` forms; plain, unshadowed `torch.Tensor` and
   `torch.dtype` annotation loads are also supported;
+- a new top-level dataclass using a unique, unchanged `from dataclasses import dataclass`
+  binding (aliases are supported), optionally called with a literal `frozen` boolean. These
+  classes must have no bases, metaclass keywords, type parameters, or executable class-body
+  statements. Fields require unshadowed builtin type annotations and immutable literal defaults
+  in valid order. Methods use the safe declaration checks above with builtin eager annotations;
+  duplicate members, special methods, namespace reflection, and unsupported decorators decline.
+  The class body and its new methods are bounded together by functions consuming the class
+  binding, retaining external reference checks and the normal no-data fallback;
 - added parameters on undecorated functions or methods with safe annotations and literal defaults
   when provided, preserving the existing parameters' declarations, relative order, and defaults,
   along with positional-only parameters, variadic parameters, and the type comment;
@@ -102,6 +114,22 @@ binding, because the attribute receiver may alias the module and its consumers a
 direct name loads. Signature additions on decorated functions or methods decline even when the
 decorator expression is unchanged: decorators can inspect signatures and register schemas during
 import, with consumers that never execute the Python function.
+
+Validated annotation loads of new class bindings do not count as import-time execution consumers;
+their function declarations already contribute impact. Other import-time uses of the class, such
+as registration calls or module-level construction, still decline. Changes to existing decorated
+method signatures remain unsupported even when safe dataclass additions occur in the same file.
+
+The dataclass namespace-discovery check scans the entire post-image, including unchanged functions.
+It rejects `dir`, `__import__`, and `import_module` along with the other namespace APIs, whether
+loaded directly, accessed as attributes, or imported under an alias. Attribute checks match by name
+without resolving the receiver: any `.modules` or `.__dict__` access declines, including an unrelated
+`model.modules()` call. This conservative limit also covers aliases of `sys.modules`.
+
+New classes without local consumers still go through external-reference checks. Registered external
+unit tests are selected; production-code references, unregistered test references, or references with
+unknown locations decline. A class with neither local consumers nor external references can have no
+impacted tests.
 
 The analysis also declines if the binding is consumed by import-executed code. Otherwise its consumers
 are resolved exactly like changed function bodies. If a consumer is new or absent from the DB, Tier 2
@@ -154,6 +182,14 @@ for a module-level change. A file whose whole diff survives that stripping as em
 executable line — neither added nor removed, since `-` lines anchor at the following post-image
 line — so it contributes no impacted tests at all. Tier 1's rules already read diffs through the
 same stripping, so this introduces no assumption the pipeline does not already make.
+
+Verified literal docstring edits have a separate `DocsRule` contribution. For a
+mixed file, coverage uses its executable selection diff to compute changed lines
+and deletions, while reconstructing the pre-image from the original patch.
+Docstring edits therefore do not add function, class, or module impact here;
+the remaining code changes retain the same narrowing and decline policies.
+The resulting stage set unions with every rule contribution, including
+`CPU-Build_Docs`, which is not represented by a test-db block.
 
 ## 6. Tests that are never skipped
 

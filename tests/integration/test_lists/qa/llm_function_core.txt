@@ -367,6 +367,7 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_fp8_4gpus_static
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_fp8_chunked_prefill
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dflash
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_1gpu[cutlass-one_model] TIMEOUT (60)
@@ -603,7 +604,6 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_prims_ts_bfloat16
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[fp8-latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[mxfp8-latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_27B::test_dflash2[VANILLA]
-accuracy/test_llm_api_pytorch.py::TestQwen3_8_2_4T_A95B::test_nvfp4_adp16_cutedsl
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_2_4T_A95B::test_nvfp4_tp8_mtp3_trtllm
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_bf16_tep4_cutlass
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_trtllm_ple_offload
@@ -611,6 +611,8 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_pre
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_1gpu_cutedsl_ple_offload
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_mtp3_trtllm_ple_offload
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_megamoe_cutedsl_ple_offload
+accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_nvfp4kv_trtllm_ple_offload
+accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_tep4_fp8kv_trtllm_ple_offload
 accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestStep3p7SpeculativeDecoding::test_guided_decoding TIMEOUT (60)
 accuracy/test_llm_api_pytorch.py::TestStep3p7SpeculativeDecoding::test_step3p7_mtp TIMEOUT (60)
@@ -724,7 +726,6 @@ disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runt
 disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics
 disaggregated/test_disaggregated.py::test_disaggregated_qwen3_32b_fp8[Qwen3/Qwen3-32B-FP8]
 disaggregated/test_disaggregated.py::test_disaggregated_sa
-disaggregated/test_disaggregated.py::test_disaggregated_sa_python
 disaggregated/test_disaggregated.py::test_disaggregated_single_gpu
 disaggregated/test_disaggregated.py::test_disaggregated_qwen3_multi_orchestrator
 disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer[False-Qwen3-0.6B]
@@ -774,6 +775,7 @@ test_e2e.py::test_trtllm_multimodal_benchmark_serving
 
 # Dense FP4 MLA accuracy (SM107 only)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla
+accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nvfp4_kv_cache_nixl
 
 # fine-grained sync tests (SM107+ only)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_fine_grained_sync[enable_autotuner=False-moe_backend=TRTLLM-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]

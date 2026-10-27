@@ -384,6 +384,7 @@ class Fp4MlaFmha(PhasedFmha):
             metadata.fp4_mla_state.prequantized_q = None
             metadata.fp4_mla_state.prequantized_q_sf = None
             metadata.fp4_mla_state.q_batch_capacity = None
+            metadata.fp4_mla_state.prequantized_q_rows_per_seq = None
 
 
 __all__ = ["Fp4MlaFmha"]

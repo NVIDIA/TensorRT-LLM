@@ -589,6 +589,117 @@ TEST(KvCacheManagerV2StatsTest, PendingReuseByLevelRidesAlongWithScalarCounts)
     EXPECT_TRUE(pending.empty());
 }
 
+TEST(KvCacheManagerV2StatsTest, PendingConnectorReuseSurvivesASplitAndAShrink)
+{
+    std::array<LifeCycleId, 2> const lifeCycles{LifeCycleId{0}, LifeCycleId{1}};
+    PendingStats pending;
+    for (auto const lifeCycle : lifeCycles)
+    {
+        EXPECT_TRUE(pending.recordAllocationRange(
+            lifeCycle, BlockOrdinal{0}, BlockOrdinal{4}, /*beamWidth=*/1, /*countAsMissed=*/true));
+    }
+
+    EXPECT_TRUE(pending.recordConnectorReuse(BlockOrdinal{1}, BlockOrdinal{3}));
+    EXPECT_EQ(pending.globalStats(), (KVCacheStatsDelta{8, 8, 4, 4}));
+    EXPECT_EQ(pending.requestStats(), pending.globalStats());
+    for (auto const lifeCycle : lifeCycles)
+    {
+        auto const& iteration = pending.iterationStatsByLifeCycle().at(lifeCycle);
+        EXPECT_EQ(iteration.iterReusedBlocks, 2);
+        EXPECT_EQ(iteration.iterFullReusedBlocks, 2);
+        EXPECT_EQ(iteration.iterMissedBlocks, 2);
+        EXPECT_EQ(pending.connectorReusedBlocksByLifeCycle().at(lifeCycle), 2);
+    }
+    // A block is rebooked at most once.
+    EXPECT_FALSE(pending.recordConnectorReuse(BlockOrdinal{1}, BlockOrdinal{3}));
+
+    // Shrinking drops each life cycle's tail from whichever category it was in. The split left the
+    // segments out of position order across life cycles, so every one has to be examined.
+    EXPECT_TRUE(pending.subtractAllocationRange(BlockOrdinal{2}, BlockOrdinal{4}));
+    EXPECT_EQ(pending.globalStats(), (KVCacheStatsDelta{4, 4, 2, 2}));
+    for (auto const lifeCycle : lifeCycles)
+    {
+        EXPECT_EQ(pending.connectorReusedBlocksByLifeCycle().at(lifeCycle), 1);
+    }
+
+    EXPECT_TRUE(pending.subtractAllocationRange(BlockOrdinal{0}, BlockOrdinal{2}));
+    EXPECT_TRUE(pending.empty());
+}
+
+TEST(KvCacheManagerV2StatsTest, ConnectorReuseIsCommittedAsReused)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeConfig());
+    auto cache = manager->createKvCache({}, {}, 17);
+    ASSERT_TRUE(cache->resume(stream));
+    ASSERT_TRUE(cache->resize(12));
+    cache->recordConnectorReuse(0, 8);
+
+    KVCacheStatsDelta const requestStats = cache->commitPendingStats();
+    EXPECT_EQ(requestStats, (KVCacheStatsDelta{3, 3, 2, 1}));
+    EXPECT_EQ(manager->getCommittedStats(), requestStats);
+    auto const iterationStats = manager->getAndResetIterationStats();
+    ASSERT_EQ(iterationStats.size(), 1);
+    auto const& iteration = iterationStats.begin()->second;
+    EXPECT_EQ(iteration.iterReusedBlocks, 2);
+    EXPECT_EQ(iteration.iterFullReusedBlocks, 2);
+    EXPECT_EQ(iteration.iterMissedBlocks, 1);
+    auto const connectorReused = manager->getAndResetIterationConnectorReusedBlocks();
+    ASSERT_EQ(connectorReused.size(), 1);
+    EXPECT_EQ(connectorReused.begin()->second, 2);
+    EXPECT_TRUE(manager->getAndResetIterationConnectorReusedBlocks().empty());
+    EXPECT_EQ(manager->getAndResetIterationConnectorCachedTokens(), 8);
+    EXPECT_EQ(manager->getAndResetIterationConnectorCachedTokens(), 0);
+
+    // Once committed, the allocation is no longer pending and stays a miss. The tokens still count
+    // as connector cached tokens.
+    cache->recordConnectorReuse(8, 12);
+    EXPECT_TRUE(cache->commitPendingStats().empty());
+    EXPECT_TRUE(manager->getAndResetIterationConnectorReusedBlocks().empty());
+    EXPECT_EQ(manager->getAndResetIterationConnectorCachedTokens(), 4);
+
+    cache->close();
+    EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+TEST(KvCacheManagerV2StatsTest, ConnectorReuseRebooksOnlyFullyFilledBlocks)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeConfig());
+    auto cache = manager->createKvCache({}, {}, 17);
+    ASSERT_TRUE(cache->resume(stream));
+    ASSERT_TRUE(cache->resize(16));
+    // Tokens 1..10 fill only block 1 completely; blocks 0 and 2 are partly computed locally.
+    cache->recordConnectorReuse(1, 11);
+
+    EXPECT_EQ(cache->commitPendingStats(), (KVCacheStatsDelta{4, 4, 1, 3}));
+    auto const connectorReused = manager->getAndResetIterationConnectorReusedBlocks();
+    ASSERT_EQ(connectorReused.size(), 1);
+    EXPECT_EQ(connectorReused.begin()->second, 1);
+    EXPECT_EQ(manager->getAndResetIterationConnectorCachedTokens(), 10);
+
+    cache->close();
+    EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+TEST(KvCacheManagerV2StatsTest, DiscardedConnectorCachedTokensAreNotCommitted)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeConfig());
+    auto cache = manager->createKvCache({}, {}, 17);
+    cache->recordConnectorReuse(0, 6);
+    cache->discardPendingStats();
+    EXPECT_TRUE(cache->commitPendingStats().empty());
+    EXPECT_EQ(manager->getAndResetIterationConnectorCachedTokens(), 0);
+    cache->close();
+}
+
 TEST(KvCacheManagerV2StatsTest, ManagerCommitResetAndRequestIdTracking)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);

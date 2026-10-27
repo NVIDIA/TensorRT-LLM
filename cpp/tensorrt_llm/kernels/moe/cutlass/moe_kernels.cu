@@ -3206,6 +3206,7 @@ void dequantFP8(OutputType* output, InputType const* input, int64_t const* num_v
         <<<blocks, threads, 0, stream>>>(output, input, num_valid_tokens_ptr, inter_size, scale, scale_is_dequant);
 }
 
+#if !defined(TLLM_MOE_NO_GEMM)
 // The DeepSeek FP8 block-scale MoE folds the pre-FC1 and pre-FC2 1x128 activation quant into the
 // row-expansion and activation-epilogue kernels, enabled automatically on supported hardware (Hopper / SM90).
 // Evaluated once at construction to pick the block-scale runner, so it is fixed for the runner's lifetime.
@@ -5860,6 +5861,7 @@ template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, __nv_bfloat16, _
 template class CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1>;
 #endif
 #endif
+#endif // !defined(TLLM_MOE_NO_GEMM)
 
 } // namespace kernels::cutlass_kernels
 

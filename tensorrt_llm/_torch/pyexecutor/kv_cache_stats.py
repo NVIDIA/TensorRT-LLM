@@ -83,6 +83,10 @@ class KVCacheV2LifeCycleIterationStats:
     # cycle recorded no reuse this iteration.
     full_reused_blocks_by_level: list[int] = field(default_factory=list)
     partial_reused_blocks_by_level: list[int] = field(default_factory=list)
+    # The share of `stats.iter_full_reused_blocks` a KV connector loaded from an external store
+    # rather than matching on device. Those blocks sit on no cache level, so they are the part of
+    # the full reuse count that `full_reused_blocks_by_level` does not cover.
+    connector_reused_blocks: int = 0
 
 
 @dataclass(slots=True)
@@ -134,6 +138,10 @@ class KVCacheV2IterationStatsReport:
     # Readable tier name per cache level, in level order. Lets consumers label the level-indexed
     # counters above without hard-coding a gpu/host/disk split.
     cache_level_tiers: list[str] = field(default_factory=list)
+    # Prompt tokens a KV connector loaded from an external store for requests admitted during
+    # this iteration. They sit on no cache level, so cached_tokens_by_level does not count them.
+    # None when no connector can serve tokens.
+    connector_cached_tokens: int | None = None
 
 
 def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = None) -> dict:
@@ -229,6 +237,8 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
     stats_dict["iterCachedTokensByLevel"] = list(kv_iter_stats.cached_tokens_by_level)
     if kv_iter_stats.cache_level_tiers:
         stats_dict["kvCacheLevelTiers"] = list(kv_iter_stats.cache_level_tiers)
+    if kv_iter_stats.connector_cached_tokens is not None:
+        stats_dict["iterConnectorCachedTokens"] = kv_iter_stats.connector_cached_tokens
 
     stats_dict["kvCacheIterationStatsByPoolGroup"] = {
         str(pool_group_id): {
@@ -283,5 +293,6 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
                 serialized["iterPartialReusedBlocksByLevel"] = list(
                     stats.partial_reused_blocks_by_level
                 )
+            serialized["iterConnectorReusedBlocks"] = stats.connector_reused_blocks
         stats_by_life_cycle[str(life_cycle_id)] = serialized
     stats_dict["kvCacheIterationStatsByLifecycle"] = stats_by_life_cycle

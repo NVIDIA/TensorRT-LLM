@@ -51,7 +51,7 @@ class Nvfp4Gemm(OpWrapper):
     global scales the quantization divided out back into the product.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # deepseek-r1's dense and shared-expert MLPs are the only callers: hidden
     # 7168 into 2 x intermediate, then back down. K and N here are the real

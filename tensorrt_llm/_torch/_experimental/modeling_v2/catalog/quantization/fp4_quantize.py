@@ -45,7 +45,7 @@ class Fp4Quantize(OpWrapper):
     is something a consumer has to be told, not something its shape shows.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # deepseek-r1 reaches this op from both layouts: the swizzled one feeding
     # nvfp4_gemm in the dense and shared-expert MLPs, the linear one feeding the
@@ -75,18 +75,6 @@ class Fp4Quantize(OpWrapper):
         Cell(
             why="a row count that is not a multiple of the swizzle's 128-row tile",
             spec=dict(shape=(37, 7168), dtype=torch.bfloat16, vec=16, swizzled=True),
-        ),
-        Cell(
-            why="qwen3.8 decode: 1 token, hidden 2560, linear -- its routed-expert input",
-            spec=dict(shape=(1, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
-        ),
-        Cell(
-            why="qwen3.8, 7 rows at hidden 2560, linear: several rows, no row padding",
-            spec=dict(shape=(7, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
-        ),
-        Cell(
-            why="qwen3.8 prefill at max_num_tokens 8192, hidden 2560, linear",
-            spec=dict(shape=(8192, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
         ),
     )
 

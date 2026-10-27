@@ -455,7 +455,7 @@ def pard():
 
 
 def ngram():
-    """A drafter outside the one-model engine, over its own request view, as a two-model draft."""
+    """A drafter outside the one-model engine, over its own request view."""
     from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig
 
     return NGramDecodingConfig(max_draft_len=2, max_matching_ngram_size=2)

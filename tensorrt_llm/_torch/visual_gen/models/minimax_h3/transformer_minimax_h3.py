@@ -37,6 +37,9 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
+    apply_minimax_h3_qk_norm_rope_bf16,
+)
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
@@ -75,7 +78,7 @@ def apply_minimax_h3_rotary_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply MiniMax-H3's partial split-half RoPE to ``[B, S, H, D]``."""
+    """Apply MiniMax-H3's partial split-half RoPE to ``[B, S, H, D]`` (eager path)."""
 
     rotary_dim = cos.shape[-1]
     if rotary_dim > hidden_states.shape[-1] or rotary_dim % 2:
@@ -130,23 +133,70 @@ class MiniMaxH3Attention(Attention):
         layer_idx: int,
         module_name: str,
     ) -> None:
+        vgm = model_config.visual_gen_mapping
+        ulysses_size = vgm.ulysses_size if vgm is not None else 1
+        # With ulysses_size > 1 and parallel.async_ulysses, use separate Q/K/V projections so
+        # each one is pushed to the peers while the next is computed (forward_async).
+        use_async_ulysses = bool(ulysses_size > 1 and model_config.parallel.async_ulysses)
         super().__init__(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             head_dim=attention_head_dim,
-            qkv_mode=QKVMode.FUSE_QKV,
+            qkv_mode=QKVMode.SEPARATE_QKV if use_async_ulysses else QKVMode.FUSE_QKV,
             qk_norm=True,
             qk_norm_mode="per_head",
             eps=qk_norm_eps,
             bias=False,
-            # H3 rotates a leading split-half region and passes the tail through.
-            # The shared fused kernel currently implements a different layout.
-            fuse_qk_norm_rope=False,
+            # H3 rotates a leading split-half region and passes the tail through, which
+            # the shared fused kernel does not implement; the flag drives H3's own kernel
+            # (fused_rope.py) through the override of forward() below.
+            fuse_qk_norm_rope=True,
             interleave=False,
             config=model_config,
             layer_idx=layer_idx,
             module_name=module_name,
+            async_ulysses=use_async_ulysses,
+            separate_qkv_is_self_attention=True,
         )
+        self.use_async_ulysses = use_async_ulysses
+
+    def _use_fused_qk_norm_rope(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+    ) -> bool:
+        """Decide between the fused per-head RMSNorm + RoPE kernel and the eager path.
+
+        Only what selects the path is checked here: the per-instance flag, the packed-QKV
+        layout the kernel reads (equal Q/K head counts, head dimension 128), an un-sharded
+        plain RMSNorm with BF16 weights, CUDA BF16 activations, a rotary width that is a
+        multiple of 32 and no autograd. ``apply_minimax_h3_qk_norm_rope_bf16`` raises on
+        anything else.
+        """
+        if not self.fuse_qk_norm_rope or not self.qk_norm or self.qkv_mode != QKVMode.FUSE_QKV:
+            return False
+        if self.local_num_attention_heads != self.local_num_key_value_heads or self.head_dim != 128:
+            return False
+        for norm in (self.norm_q, self.norm_k):
+            if norm.allreduce is not None or norm.use_gemma or norm.weight.dtype != torch.bfloat16:
+                return False
+        cos, sin = rotary_emb
+        if (
+            not hidden_states.is_cuda
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.ndim != 3
+            or cos.shape != (hidden_states.shape[1], cos.shape[-1])
+            or sin.shape != cos.shape
+            or cos.shape[-1] % 32
+            or cos.shape[-1] > self.head_dim
+        ):
+            return False
+        if torch.is_grad_enabled() and any(
+            t.requires_grad
+            for t in (hidden_states, cos, sin, self.norm_q.weight, self.norm_k.weight)
+        ):
+            return False
+        return True
 
     def forward(
         self,
@@ -155,20 +205,41 @@ class MiniMaxH3Attention(Attention):
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.use_async_ulysses:
+            return self.forward_async(
+                hidden_states, rotary_emb, key_padding_mask=key_padding_mask, timestep=timestep
+            )
         batch_size, sequence_length = hidden_states.shape[:2]
-        query, key, value = self.get_qkv(hidden_states)
-        query = query.view(
-            batch_size, sequence_length, self.local_num_attention_heads, self.head_dim
-        )
-        key = key.view(batch_size, sequence_length, self.local_num_key_value_heads, self.head_dim)
-        query, key = self.apply_qk_norm(query, key)
-
-        if rotary_emb is not None:
-            query = apply_minimax_h3_rotary_emb(query, *rotary_emb)
-            key = apply_minimax_h3_rotary_emb(key, *rotary_emb)
-
-        query = query.flatten(2)
-        key = key.flatten(2)
+        if rotary_emb is not None and self._use_fused_qk_norm_rope(hidden_states, rotary_emb):
+            # One launch normalizes and rotates Q and K from the packed projection
+            # output; V stays a view of the same buffer.
+            qkv = self.qkv_proj(hidden_states)
+            value = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)[2]
+            cos, sin = rotary_emb
+            query, key = apply_minimax_h3_qk_norm_rope_bf16(
+                qkv,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                cos,
+                sin,
+                self.norm_q.variance_epsilon,
+                self.local_num_attention_heads,
+                self.head_dim,
+            )
+        else:
+            query, key, value = self.get_qkv(hidden_states)
+            query = query.view(
+                batch_size, sequence_length, self.local_num_attention_heads, self.head_dim
+            )
+            key = key.view(
+                batch_size, sequence_length, self.local_num_key_value_heads, self.head_dim
+            )
+            query, key = self.apply_qk_norm(query, key)
+            if rotary_emb is not None:
+                query = apply_minimax_h3_rotary_emb(query, *rotary_emb)
+                key = apply_minimax_h3_rotary_emb(key, *rotary_emb)
+            query = query.flatten(2)
+            key = key.flatten(2)
         hidden_states = self._attn_impl(
             query,
             key,
@@ -177,6 +248,47 @@ class MiniMaxH3Attention(Attention):
             timestep=timestep,
         )
         return self.to_out[0](hidden_states)
+
+    def forward_async(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        timestep: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """``forward`` with each projection pushed to the peers as soon as it is
+        computed: V, then Q and K with their per-head norm and RoPE, run on the
+        compute stream while the previous tensor's push runs on the side stream
+        (``UlyssesAttention.forward_async``)."""
+        batch_size, sequence_length = hidden_states.shape[:2]
+        head_dim = self.head_dim
+
+        def project(linear: Linear, heads: int, norm: RMSNorm) -> torch.Tensor:
+            states = norm(linear(hidden_states).view(batch_size, sequence_length, heads, head_dim))
+            if rotary_emb is not None:
+                states = apply_minimax_h3_rotary_emb(states, *rotary_emb)
+            return states
+
+        def compute_q() -> torch.Tensor:
+            return project(self.to_q, self.local_num_attention_heads, self.norm_q)
+
+        def compute_k() -> torch.Tensor:
+            return project(self.to_k, self.local_num_key_value_heads, self.norm_k)
+
+        def compute_v() -> torch.Tensor:
+            return self.to_v(hidden_states).view(
+                batch_size, sequence_length, self.local_num_key_value_heads, head_dim
+            )
+
+        out_4d = self.attn.forward_async(
+            compute_q,
+            compute_k,
+            compute_v,
+            key_padding_mask=key_padding_mask,
+            timestep=timestep,
+        )
+        batch_size, local_seq_len = out_4d.shape[:2]
+        return self.to_out[0](out_4d.reshape(batch_size, local_seq_len, -1))
 
 
 def _norm_2d(norm: RMSNorm, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -298,6 +410,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         qk_norm_eps: float,
         model_config: DiffusionModelConfig,
         layer_idx: int,
+        fuse_bf16_gate_up_swiglu: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(
@@ -323,6 +436,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             config=model_config,
             layer_idx=layer_idx,
             reduce_output=model_config.mapping.tp_size > 1,
+            fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
         )
 
     def forward(
@@ -355,6 +469,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
         qk_norm_eps: float,
         final_norm_eps: float,
         model_config: DiffusionModelConfig,
+        fuse_bf16_gate_up_swiglu: bool = False,
     ) -> None:
         super().__init__()
         self._supports_key_padding_mask = model_config.attention.backend.upper() in (
@@ -376,6 +491,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
                     qk_norm_eps=qk_norm_eps,
                     model_config=model_config,
                     layer_idx=layer_idx,
+                    fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
                 )
                 for layer_idx in range(num_layers)
             ]
@@ -430,6 +546,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         qk_norm_eps: float,
         model_config: DiffusionModelConfig,
         layer_idx: int,
+        fuse_bf16_gate_up_swiglu: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(
@@ -455,6 +572,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             config=model_config,
             layer_idx=layer_idx,
             reduce_output=model_config.mapping.tp_size > 1,
+            fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
         )
         self.adaln_proj = MiniMaxH3AdaLayerNormModulation(
             time_embed_dim=time_embed_dim,
@@ -579,6 +697,16 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 "static activation-scale path would read an uninitialized scale."
             )
 
+        # GatedMLP's BF16 gate/up GEMM with SwiGLU in its epilogue is opt-in
+        # because the fused GEMM is slightly slower than cuBLAS at small M. H3's
+        # feed-forward sees M = every packed video and audio token of the clip
+        # (about 19k at 544x960, 38k at the default 768x1344), where dropping the
+        # [M, 2I] intermediate wins, so the BF16 configuration opts in for all
+        # blocks here. The token refiner runs once per request on the text
+        # tokens, so its cost either way is negligible. Quantized
+        # configurations run their own fused GEMMs.
+        fuse_bf16_gate_up_swiglu = quant_algo is None
+
         cfg = model_config.pretrained_config
         num_attention_heads = cfg.num_attention_heads
         attention_head_dim = cfg.attention_head_dim
@@ -682,6 +810,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             qk_norm_eps=qk_norm_eps,
             final_norm_eps=final_norm_eps,
             model_config=model_config,
+            fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
         )
         self.transformer_blocks = nn.ModuleList(
             [
@@ -695,6 +824,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     qk_norm_eps=qk_norm_eps,
                     model_config=model_config,
                     layer_idx=layer_idx,
+                    fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
                 )
                 for layer_idx in range(num_layers)
             ]

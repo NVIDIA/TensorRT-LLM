@@ -31,6 +31,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from ..._utils import async_tensor_h2d
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantConfig
@@ -273,12 +274,12 @@ class Glm5NextContextRows:
             for pos in range(first_final, cached + length, kpool):
                 finals.append(pos)
                 final_ids.append(i)
-        as_dev = lambda vals, dtype: torch.tensor(vals, dtype=dtype, device=device)  # noqa: E731
+        # Pinned non-blocking copies do not wait for the GPU work already queued.
         return cls(
-            positions=as_dev(positions, torch.long),
-            request_ids=as_dev(request_ids, torch.int32),
-            final_positions=as_dev(finals, torch.long),
-            final_request_ids=as_dev(final_ids, torch.int32),
+            positions=async_tensor_h2d(positions, torch.long, device),
+            request_ids=async_tensor_h2d(request_ids, torch.int32, device),
+            final_positions=async_tensor_h2d(finals, torch.long, device),
+            final_request_ids=async_tensor_h2d(final_ids, torch.int32, device),
         )
 
 
@@ -636,7 +637,8 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
           the indexer's ``[wk | gate | weights_proj]``) collect their separate
           checkpoint tensors first (:attr:`FUSED_LINEARS` on the owning module).
         * Production routed experts go to the fused MoE layer's loader,
-          filtered to ``initial_local_expert_ids``.
+          filtered to ``initial_local_expert_ids`` except for the scalar
+          ``input_scale``, which is passed for every expert.
         * The KDA layer's tensors (the shared mixer's local-width modules) are
           sliced to this rank's head range by the module itself.
         * Everything else (norms, HC, router, embeddings) is an exact-shape
@@ -665,6 +667,12 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
 
         experts = getattr(getattr(module, "mlp", None), "experts", None)
         local_expert_ids = set(experts.initial_local_expert_ids) if experts is not None else set()
+        experts_quant = getattr(experts, "quant_config", None)
+        quant_algo = experts_quant.quant_algo if experts_quant is not None else None
+        # The loader reduces every expert's scalar input_scale into the
+        # layer-wide activation scale, which must be identical on every rank
+        # because tokens are quantized before dispatch.
+        collect_all_expert_input_scales = quant_algo == QuantAlgo.NVFP4
         moe_weights: dict[str, torch.Tensor] = {}
         proj_to_w = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
 
@@ -679,9 +687,12 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
             moe = _FUSED_MOE_RE.match(dest)
             if moe is not None:
                 expert_id = int(moe.group("expert"))
-                if expert_id in local_expert_ids:  # other EP ranks' bytes are never read
-                    suffix = "." + moe.group("tensor")
-                    moe_weights[f"{expert_id}.{proj_to_w[moe.group('proj')]}{suffix}"] = (
+                tensor = moe.group("tensor")
+                # Other EP ranks' weights are never read.
+                if expert_id in local_expert_ids or (
+                    collect_all_expert_input_scales and tensor == "input_scale"
+                ):
+                    moe_weights[f"{expert_id}.{proj_to_w[moe.group('proj')]}.{tensor}"] = (
                         materialize(lazy)
                     )
                 continue
@@ -796,14 +807,14 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
                 load_linear(fused_path, [merged])
 
         if experts is not None:
-            quant_algo = (
-                experts.quant_config.quant_algo if experts.quant_config is not None else None
-            )
             tensors_per_expert = {
                 QuantAlgo.FP8_BLOCK_SCALES: 6,
                 QuantAlgo.NVFP4: 12,
             }.get(quant_algo, 3)
             expected = tensors_per_expert * len(local_expert_ids)
+            if collect_all_expert_input_scales:
+                # One input_scale per projection of every non-local expert.
+                expected += len(proj_to_w) * (experts.num_experts - len(local_expert_ids))
             if len(moe_weights) != expected:
                 raise ValueError(
                     f"glm5_next owner {owner!r}: fused MoE collected {len(moe_weights)} expert "
@@ -867,6 +878,7 @@ class Glm5NextLinearAttention(KimiKDALinearAttention):
         dtype: torch.dtype = torch.bfloat16,
         mapping: Mapping | None = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.ONESHOT,
+        aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         del dtype  # the shared mixer is bf16 (fp32 gate parameters and pools)
         # The checkpoint's ``linear_attn_config`` does not name the gate rank:
@@ -879,7 +891,13 @@ class Glm5NextLinearAttention(KimiKDALinearAttention):
         # The mixer's own row-parallel o_proj AllReduce (fixed strategy; the
         # size-aware Glm5NextAllReduce used elsewhere is a perf option, not a
         # correctness requirement, and AUTO's autotuner raced at TP4 decode).
-        super().__init__(config, layer_idx, mapping=mapping, allreduce_strategy=allreduce_strategy)
+        super().__init__(
+            config,
+            layer_idx,
+            mapping=mapping,
+            allreduce_strategy=allreduce_strategy,
+            aux_stream=aux_stream,
+        )
         # Preserve checkpoint FP32 gate parameters. MetaInitMode rejects detach
         # on meta tensors, so create empty FP32 parameters on that branch.
         for name in ("A_log", "dt_bias"):
@@ -1482,10 +1500,9 @@ class Glm5NextSparseAttention(nn.Module):
         )
         # Keep the cached pool keys current, in position order, so a pool
         # spanning several drafts ends up with all of its visible members.
-        for step in range(tokens_per_request):
-            self.attn_backend.update_pool_keys(
-                positions[:, step].contiguous(), self.indexer.index_kpool_compress_ape, metadata
-            )
+        self.attn_backend.update_pool_keys(
+            positions, self.indexer.index_kpool_compress_ape, metadata
+        )
         query = self.q_b_proj(q_resid).view(num_tokens, self.num_heads, self.qk_head_dim)
         # Row i of request b sees its own prefix: visible = position + 1.
         return self._select_and_attend_paged(
@@ -1501,10 +1518,12 @@ class Glm5NextSparseAttention(nn.Module):
 
 
 class Glm5NextGate(DeepseekV3Gate):
-    """DeepSeek noaux_tc routing with FP32 weights, logits and correction bias.
+    """DeepSeek noaux_tc routing with FP32 logits and correction bias.
 
-    Preserve small inter-expert score differences when adding the correction bias;
-    rounding it to BF16 can change expert selection.
+    The checkpoint router weight is BF16, so the base BF16 GEMM with FP32 output
+    forms the same products as FP32 math. Preserve small inter-expert score
+    differences when adding the correction bias; rounding it to BF16 can change
+    expert selection.
     """
 
     def __init__(self, config: PretrainedConfig, moe_backend: str = "CUTLASS") -> None:
@@ -1517,22 +1536,17 @@ class Glm5NextGate(DeepseekV3Gate):
             n_group=int(getattr(config, "n_group", 1) or 1),
             topk_group=int(getattr(config, "topk_group", 1) or 1),
             routed_scaling_factor=float(config.routed_scaling_factor),
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
             fuse_routing_kernel=True,
             apply_routing=False,
             moe_backend=moe_backend,
         )
-        self.hidden_size = int(config.hidden_size)
         self.norm_topk_prob = bool(config.norm_topk_prob)
         # FP32 regardless of the MoE backend (the base class picks bf16 for
         # TRTLLM); the fused routing kernels consume the FP32 tensor directly.
         self.e_score_correction_bias = nn.Parameter(
             torch.empty(int(config.n_routed_experts), dtype=torch.float32), requires_grad=False
         )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        flat = hidden_states.reshape(-1, self.hidden_size)
-        return torch.nn.functional.linear(flat.float(), self.weight)
 
 
 class Glm5NextMoE(nn.Module):
@@ -1740,6 +1754,7 @@ class Glm5NextDecoderLayer(DecoderLayer):
         model_config: ModelConfig,
         dtype: torch.dtype = torch.bfloat16,
         aux_stream: torch.cuda.Stream | None = None,
+        attention_aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -1755,6 +1770,7 @@ class Glm5NextDecoderLayer(DecoderLayer):
                 dtype=dtype,
                 mapping=mapping,
                 allreduce_strategy=model_config.allreduce_strategy,
+                aux_stream=attention_aux_stream,
             )
         else:
             self.self_attn = Glm5NextSparseAttention(
@@ -1855,8 +1871,11 @@ class Glm5NextModel(DecoderModel):
 
         # Decoder and draft layers execute serially and share this side stream.
         self.aux_stream_dict = {}
-        if not model_config.mapping.enable_attention_dp and torch.cuda.is_available():
-            self.aux_stream_dict[AuxStreamType.MoeShared] = torch.cuda.Stream()
+        if torch.cuda.is_available():
+            # KDA overlaps its small gate projections with the QKV projection.
+            self.aux_stream_dict[AuxStreamType.Attention] = torch.cuda.Stream()
+            if not model_config.mapping.enable_attention_dp:
+                self.aux_stream_dict[AuxStreamType.MoeShared] = torch.cuda.Stream()
 
         self.embed_tokens = Embedding(int(config.vocab_size), int(config.hidden_size), dtype=dtype)
         self.layers = nn.ModuleList(
@@ -1868,6 +1887,7 @@ class Glm5NextModel(DecoderModel):
                     model_config,
                     dtype=dtype,
                     aux_stream=self.aux_stream_dict.get(AuxStreamType.MoeShared),
+                    attention_aux_stream=self.aux_stream_dict.get(AuxStreamType.Attention),
                 )
                 for i in range(schedule.num_layers)
             ]
@@ -1896,24 +1916,20 @@ class Glm5NextModel(DecoderModel):
             raise ValueError("specify exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        streams = self.expand_streams(inputs_embeds)
         if runtime_ctx is None:
             runtime_ctx = build_glm5_next_runtime_context(attn_metadata)
         # Only the decoder stack: under one-model MTP the speculative base
         # class appends the draft layer(s) to ``self.layers`` (so the
         # checkpoint's ``model.layers.45.*`` names resolve), and those run in
         # the speculative worker's draft loop, not here.
-        # Generation-only batches take the fused hyper-connection loop. Prefill
-        # (and mixed) batches keep the per-layer path so the engine's warmup /
-        # KV-cache sizing pass measures the same activation peak that mixed
-        # context+generation iterations reach in production (a lower
-        # pure-prefill peak over-allocates the KV cache and OOMs later).
-        if (
-            runtime_ctx.num_contexts == 0
-            and runtime_ctx.num_generations > 0
-            and self._fused_hc_ok()
-        ):
-            return self.collapse_streams(self._forward_single_phase_fused_hc(streams, runtime_ctx))
+        # Every batch phase takes the fused hyper-connection loop, so the
+        # engine's warmup / KV-cache sizing pass measures the same activation
+        # peak that mixed context+generation iterations reach in production.
+        if self._fused_hc_ok():
+            return self.collapse_streams(
+                self._forward_single_phase_fused_hc(inputs_embeds, runtime_ctx)
+            )
+        streams = self.expand_streams(inputs_embeds)
         for layer_idx in range(self.schedule.num_layers):
             streams = self.layers[layer_idx](
                 position_ids=position_ids,
@@ -1935,7 +1951,7 @@ class Glm5NextModel(DecoderModel):
         return cached
 
     def _forward_single_phase_fused_hc(
-        self, streams: torch.Tensor, runtime_ctx: Glm5NextRuntimeContext
+        self, embeds: torch.Tensor, runtime_ctx: Glm5NextRuntimeContext
     ) -> torch.Tensor:
         """Single-phase forward with fused hyper-connection boundaries.
 
@@ -1944,13 +1960,17 @@ class Glm5NextModel(DecoderModel):
         RMSNorm; ``mHC.fused_hc`` (the in-tree DeepSeek-V4 boundary op) runs
         the three as one kernel, so a layer costs 2 fused boundaries instead
         of 4 mappings + 2 norms. The math matches the per-layer forward; the
-        first pre-mapping and last post-mapping stay unfused. Only generation-only batches use it
-        (see :meth:`forward`).
+        first pre-mapping and last post-mapping stay unfused. Pipeline-parallel
+        ranks keep the per-layer path (see :meth:`_fused_hc_ok`).
+
+        Only ``residual`` holds the streams and each sublayer output is dropped
+        once its boundary consumed it, so a long prefill keeps one copy of the
+        [tokens, hc_mult, hidden] streams alive, as the per-layer loop does.
         """
         num_layers = self.schedule.num_layers
         first = self.layers[0]
-        residual = streams
-        post, comb, x = first.hc_attn.pre_mapping(streams)
+        residual = self.expand_streams(embeds)
+        post, comb, x = first.hc_attn.pre_mapping(residual)
         x = first.input_layernorm(x)
         for layer_idx in range(num_layers):
             layer = self.layers[layer_idx]
@@ -1966,6 +1986,7 @@ class Glm5NextModel(DecoderModel):
                 norm_weight=layer.post_attention_layernorm.weight,
                 norm_eps=layer.post_attention_layernorm.variance_epsilon,
             )
+            del attn_out
             mlp_out = layer.run_mlp(x, runtime_ctx.metadata.all_rank_num_tokens)
             if layer_idx + 1 < num_layers:
                 nxt = self.layers[layer_idx + 1]
@@ -1979,6 +2000,7 @@ class Glm5NextModel(DecoderModel):
                 )
             else:
                 residual = layer.hc_ffn.post_mapping(mlp_out, residual, post, comb)
+            del mlp_out
         return residual
 
     def expand_streams(self, embeds: torch.Tensor) -> torch.Tensor:

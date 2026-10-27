@@ -366,6 +366,28 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 remove_weights(layer)
 
 
+def layerwise_moe_quant_config(quant_config_dict: dict[str, QuantConfig],
+                               moe_name: str) -> QuantConfig | None:
+    """The ``quant_config_dict`` entry of the MoE module named ``moe_name``.
+
+    An entry naming the module itself answers first. ``ModelConfig`` injects
+    one per MoE layer for DeepSeek-V4 and MiniMax-M3 exactly because the
+    checkpoint's fine-grained per-linear expert keys do not describe the module
+    as a whole, and it appends it to an insertion-ordered dict, so those keys
+    would otherwise shadow it.
+
+    Failing that, all linear layers inside a MoE share one quant config, so the
+    first key that contains the module name answers for the whole module.
+    """
+    own_entry = quant_config_dict.get(moe_name)
+    if own_entry is not None:
+        return own_entry
+    for key, quant_config in quant_config_dict.items():
+        if moe_name in key:
+            return quant_config
+    return None
+
+
 def apply_layerwise_quant_config(
         model_config: ModelConfig,
         named_modules: Iterator[tuple[str, nn.Module]]) -> None:
@@ -375,11 +397,9 @@ def apply_layerwise_quant_config(
             if getattr(module, '_skip_layerwise_quant_config', False):
                 continue
             if isinstance(module, (MoE, VanillaMoE)):
-                for n, q in quant_config_dict.items():
-                    # all linear layers inside FusedMoE share the same quant config
-                    if name in n:
-                        module.quant_config = q
-                        break
+                q = layerwise_moe_quant_config(quant_config_dict, name)
+                if q is not None:
+                    module.quant_config = q
             elif isinstance(module, Linear):
                 weight_mode = module.weights_loading_config.weight_mode
                 prefix_name = '.'.join(name.split('.')[:-1])
@@ -465,6 +485,37 @@ def apply_quant_config_exclude_modules(
                     # update to their child backend.
                     if hasattr(module, '_weights_created'):
                         module._weights_created = False
+
+
+def moe_experts_quant_config(model_config: ModelConfig,
+                             experts_prefix: str) -> QuantConfig | None:
+    """The final quantization of the MoE experts at ``experts_prefix``.
+
+    What a model passes to ``create_moe`` as ``override_quant_config``: what
+    the ``__post_init__`` passes would leave on the layer, i.e. its
+    ``quant_config_dict`` entry (by the match ``apply_layerwise_quant_config``
+    uses), then the ``exclude_modules`` match, which wins.
+
+    Args:
+        model_config: The model's configuration.
+        experts_prefix: The experts module name, e.g.
+            ``"model.layers.3.mlp.experts"``.
+
+    Returns:
+        The experts' quantization, or ``None`` when it is the model-level
+        ``quant_config``.
+    """
+    override = None
+    if model_config.quant_config_dict is not None:
+        override = layerwise_moe_quant_config(model_config.quant_config_dict,
+                                              experts_prefix)
+    global_quant_config = model_config.quant_config
+    if (global_quant_config is not None
+            and global_quant_config.is_module_excluded_from_quantization(
+                experts_prefix)):
+        override = QuantConfig(
+            kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo)
+    return override
 
 
 class PostInitCaller(type):
@@ -580,6 +631,7 @@ class DecoderModelForCausalLM(nn.Module,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
                 quant_config=lm_head_quant_config,
+                output_dtype=config.lm_head_output_dtype,
             )
         else:
             if (hasattr(config, 'lora_config')
@@ -609,6 +661,7 @@ class DecoderModelForCausalLM(nn.Module,
                 use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
                                              False),
                 quant_config=lm_head_quant_config,
+                output_dtype=config.lm_head_output_dtype,
             )
 
             if self.has_custom_lm_head:
@@ -1461,6 +1514,26 @@ def filter_weights(prefix, weights: Dict):
     return result
 
 
+_TORCH_COMPILE_WRAPPER_ATTR = "_orig_mod"
+
+
+def strip_torch_compile_wrapper(name: str) -> str:
+    """Drop the ``torch.compile`` wrapper segments from a module path.
+
+    ``torch.compile(module)`` returns an ``OptimizedModule`` whose only child
+    is the original module under the attribute ``_orig_mod``, so every path
+    below the compiled scope gains a ``_orig_mod`` component in
+    ``named_modules()`` / ``named_parameters()`` -- e.g.
+    ``model._orig_mod.layers.0.mlp`` for a checkpoint key prefix of
+    ``model.layers.0.mlp``. The wrapper owns no parameters of its own, so
+    removing the component gives back the path the checkpoint uses.
+    """
+    if _TORCH_COMPILE_WRAPPER_ATTR not in name:
+        return name
+    return '.'.join(part for part in name.split('.')
+                    if part != _TORCH_COMPILE_WRAPPER_ATTR)
+
+
 def _get_load_weights_num_workers() -> Optional[int]:
     """Return the per-rank module-loading worker limit, or None for the default.
 
@@ -1582,6 +1655,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
         if len(module._parameters) > 0:
+            # A torch.compile wrapper in the tree (refit into a compiled
+            # engine) inserts `_orig_mod` into the path; checkpoint keys
+            # never carry it.
+            name = strip_torch_compile_wrapper(name)
             # skip load weights if module is in skip_modules
             if any(skip_module in name for skip_module in skip_modules):
                 return
@@ -1732,8 +1809,12 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
 
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
-        if len(module._parameters) == 0 or weight_mapper.should_skip_module(
-                name):
+        if len(module._parameters) == 0:
+            return
+        # A torch.compile wrapper in the tree (refit into a compiled engine)
+        # inserts `_orig_mod` into the path; checkpoint keys never carry it.
+        name = strip_torch_compile_wrapper(name)
+        if weight_mapper.should_skip_module(name):
             return
 
         names = name.split('.')

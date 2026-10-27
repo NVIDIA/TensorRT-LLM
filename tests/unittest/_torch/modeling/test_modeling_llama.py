@@ -19,6 +19,7 @@ from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2, _update_kv_cache_draft_token_location)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -352,7 +353,7 @@ class TestLlama(unittest.TestCase):
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                key = (1, 0)
+                key = KeyType(batch_size=1, draft_len=0)
                 graph_runner.capture(key,
                                      lambda inputs: llama.forward(**inputs),
                                      inputs)
@@ -475,7 +476,7 @@ class TestLlama(unittest.TestCase):
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             prompt_lens=prompt_lens,
-            num_heads_per_kv=num_heads_per_kv,
+            max_num_heads_per_kv=num_heads_per_kv,
         )
 
         position_ids = [torch.arange(0, input_ids.size(-1))]
@@ -549,7 +550,7 @@ class TestLlama(unittest.TestCase):
             use_spec_decoding=use_spec_decoding,
             is_spec_dec_tree=is_spec_dec_tree,
             is_spec_dec_dynamic_tree=is_spec_dec_dynamic_tree,
-            num_heads_per_kv=num_heads_per_kv,
+            max_num_heads_per_kv=num_heads_per_kv,
         )
         cache = kv_cache_manager.kv_cache_map[request.py_request_id]
         assert cache.resize(input_ids.size(-1) + gen_input_ids_0.size(-1))
@@ -675,7 +676,7 @@ class TestLlama(unittest.TestCase):
             use_spec_decoding=use_spec_decoding,
             is_spec_dec_tree=is_spec_dec_tree,
             is_spec_dec_dynamic_tree=False,
-            num_heads_per_kv=num_heads_per_kv,
+            max_num_heads_per_kv=num_heads_per_kv,
         )
 
         attn_metadata_ref.spec_decoding_position_offsets = None

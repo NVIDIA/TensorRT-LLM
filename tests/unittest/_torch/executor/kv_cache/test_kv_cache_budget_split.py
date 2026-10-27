@@ -73,7 +73,7 @@ def _make_creator(
     c._cache_transceiver_config = None
     c._speculative_config = None
     c._mapping = Mock()
-    c._model_engine = Mock()
+    c._model_engine = Mock(cuda_graph_batch_sizes=[], cuda_graph_padding_enabled=False)
     c._llm_args = SimpleNamespace(kv_cache_compression_config=None, sleep_config=None)
     c._disable_overlap_scheduler = False
 
@@ -162,7 +162,6 @@ class TestSplitGpuBudgetForDraft:
             ),
         )
         c._model_engine.model.model_config = target_model_config
-        c._draft_model_engine = None
         c._get_effective_draft_config = Mock(return_value=draft_model_config)
         c._get_num_draft_layers = Mock(return_value=1)
 
@@ -249,7 +248,6 @@ class TestSplitGpuBudgetForDraft:
         creator._model_engine = SimpleNamespace(
             model=SimpleNamespace(model_config=target_model_config)
         )
-        creator._draft_model_engine = None
         creator._draft_config = draft_model_config
         creator._kv_cache_manager_cls = DraftCostKVCacheManager
         creator._is_disagg = False
@@ -327,7 +325,7 @@ class TestSplitGpuBudgetForDraft:
         mode = Mock()
         mode.is_external_drafter.return_value = False
         # A Mock's truthy return would send get_num_extra_kv_tokens down the
-        # one-engine arm; this test's config is a two-model drafter.
+        # one-engine arm; this test's config is a drafter outside the engine.
         mode.use_one_engine.return_value = False
         costed_windows: list[tuple[object, list[int] | None]] = []
 
@@ -367,7 +365,6 @@ class TestSplitGpuBudgetForDraft:
         creator._model_engine = SimpleNamespace(
             model=SimpleNamespace(model_config=target_model_config)
         )
-        creator._draft_model_engine = None
         creator._draft_config = draft_model_config
         creator._kv_cache_manager_cls = RecordingKVCacheManager
         creator._is_disagg = False
@@ -464,6 +461,7 @@ class TestSplitGpuBudgetForDraft:
         creator._max_batch_size = max_batch_size
         creator._max_num_tokens = 128
         creator._speculative_config = None
+        creator._is_disagg = False
         # The second of two pipeline ranks: it holds global layers 2 and 3.
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
         creator._mapping.pp_layers.return_value = [2, 3]
@@ -492,7 +490,6 @@ class TestSplitGpuBudgetForDraft:
         c._skip_est = False
         c._is_kv_cache_manager_v2 = False
         c._is_encoder_decoder = Mock(return_value=False)
-        c._draft_model_engine = None
         c._kv_connector_manager = None
         c._is_disagg = False
         c._max_num_tokens = 8192
@@ -943,7 +940,6 @@ class TestBuildManagersBudgetGates:
             target_kv_per_token=80,
         )
         c._skip_est = False
-        c._draft_model_engine = None
         c._kv_connector_manager = None
         c._is_kv_cache_manager_v2 = True
         # build_managers carries this onto the real manager, not the probes.
@@ -1015,46 +1011,6 @@ class TestBuildManagersBudgetGates:
         assert target_config.max_gpu_total_bytes == 10 * GB
         c._needs_gpu_kv_cache_budget_split.assert_not_called()
 
-    def _make_two_model_creator(self, total_offload: int, disk_path: str) -> KvCacheCreator:
-        """V2 creator whose draft cache comes from a separate engine."""
-        c = self._make_build_creator(total_offload, total_gpu=10 * GB, disk_path=disk_path)
-        c._draft_model_engine = Mock()
-        c._should_create_separate_draft_kv_cache = Mock(return_value=False)
-        # V2 sizes two-model GPU pools per manager from the whole budget.
-        c._needs_gpu_kv_cache_budget_split = Mock(return_value=False)
-        return c
-
-    @pytest.mark.parametrize("budget_attr", OFFLOAD_TIER_BUDGET_ATTRS)
-    def test_two_model_offload_budget_is_split(self, budget_attr, tmp_path):
-        """A separate draft engine divides the offload budgets too.
-
-        Its manager lives alongside the target's, so handing both the whole
-        budget would reserve it twice.
-        """
-        total_offload = 20 * GB
-        c = self._make_two_model_creator(total_offload, str(tmp_path))
-
-        c.build_managers({}, estimating_kv_cache=False)
-
-        calls = c._create_kv_cache_manager.call_args_list
-        target_config = calls[0].kwargs["kv_cache_config_override"]
-        draft_config = calls[1].kwargs["kv_cache_config_override"]
-        target_share = getattr(target_config, budget_attr)
-        draft_share = getattr(draft_config, budget_attr)
-        assert target_share + draft_share == total_offload
-        assert 0 < draft_share < total_offload
-
-    def test_two_model_keeps_the_gpu_budget_whole(self, tmp_path):
-        """Each two-model manager sizes its GPU pools from the full budget."""
-        c = self._make_two_model_creator(20 * GB, str(tmp_path))
-
-        c.build_managers({}, estimating_kv_cache=False)
-
-        calls = c._create_kv_cache_manager.call_args_list
-        for call in calls:
-            config = call.kwargs["kv_cache_config_override"]
-            assert config.max_gpu_total_bytes == 10 * GB
-
 
 class TestExternalDrafterKvDtype:
     """The draft budget must be charged at the dtype the draft pool is ALLOCATED in.
@@ -1117,6 +1073,7 @@ class TestExternalDrafterKvDtype:
         c._tokens_per_block = 64
         c._max_seq_len = 16384
         c._max_batch_size = 1
+        c._max_beam_width = 1
         # Read by _build_managers on the draft path (_util.py); the cost
         # assertions below are per-token, so the value only has to exist.
         c._max_num_tokens = 8192
@@ -1132,10 +1089,10 @@ class TestExternalDrafterKvDtype:
         # each time the cost path reads one more spec-config field.
         c._speculative_config = DSparkDecodingConfig(max_draft_len=4)
         c._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=target_model_config))
-        c._draft_model_engine = None
         c._draft_config = draft_model_config
         c._kv_cache_manager_cls = ProbeKVCacheManager
         c._is_disagg = True
+        c._cache_transceiver_config = None
         c._is_encoder_decoder = Mock(return_value=False)
         c._should_create_separate_draft_kv_cache = Mock(return_value=True)
         c._get_num_draft_layers = Mock(return_value=self.DRAFT_LAYERS)
@@ -1259,7 +1216,7 @@ class TestStandaloneDrafterPageSize:
     def test_allocation_uses_the_page_size_the_cost_charged(self, mocker):
         c, draft_model_config = self._creator(mocker)
         draft_model_config.sparse_attention_config = None
-        c._model_engine._max_cuda_graph_batch_size = 1
+        c._model_engine.max_cuda_graph_batch_size = 1
         c._skip_est = False
         c._enable_kv_cache_stats = Mock(return_value=False)
         c._execution_stream = None
@@ -1871,7 +1828,6 @@ class TestPerRequestWeightedSplit:
             ),
             get_num_attention_layers=lambda: 24,
         )
-        c._draft_model_engine = None
         c._get_effective_draft_config = Mock(
             return_value=SimpleNamespace(
                 quant_config=None,
@@ -1991,7 +1947,6 @@ class TestPerRequestWeightedSplit:
             get_num_attention_layers=lambda: 24,
         )
         c._model_engine.model.model_config = target_model_config
-        c._draft_model_engine = None
         c._get_effective_draft_config = Mock(
             return_value=SimpleNamespace(
                 quant_config=None,
@@ -2040,3 +1995,133 @@ class TestPerRequestWeightedSplit:
         target_requests = (target_config.max_gpu_total_bytes - target_intercept) // mirror_bytes
         assert draft_requests == 31
         assert target_requests == 31
+
+
+class TestGraphCaptureConcurrencyWarning:
+    """Every real build warns when admitted decode concurrency outruns the
+    range covered by captured CUDA graphs.
+
+    Coverage: with padding, up to the largest capture; without, only the
+    dense {1..n} prefix (a ragged batch must match a capture exactly).
+    """
+
+    # The default no-padding capture set for max_batch_size=256:
+    # every batch in 1..32 is exactly captured, above that only sparse sizes.
+    NO_PADDING_SIZES_256 = list(range(1, 32)) + [32, 64, 128, 256]
+
+    def _creator(self, *, capture_sizes, padding, total=1_000, max_batch_size=100):
+        # The scheduler max_batch_size is the admissible-concurrency ceiling
+        # the check sees.
+        c = _make_creator(max_gpu_total_bytes=total)
+        c._max_batch_size = max_batch_size
+        c._model_engine.cuda_graph_batch_sizes = capture_sizes
+        c._model_engine.cuda_graph_padding_enabled = padding
+        return c
+
+    def _warnings(self, mocker, c):
+        from tensorrt_llm._torch.pyexecutor import _util
+
+        warning = mocker.patch.object(_util.logger, "warning")
+        c._warn_if_admitted_concurrency_outruns_graph_capture()
+        return [
+            call.args[0]
+            for call in warning.call_args_list
+            if "captured CUDA graphs" in call.args[0]
+        ]
+
+    def test_warns_when_admitted_concurrency_outruns_capture(self, mocker):
+        # max_batch_size admits 100 concurrent decode requests, far above
+        # the dense 32-batch coverage (100 > 1.5 * 32).
+        c = self._creator(capture_sizes=list(range(1, 33)), padding=False)
+
+        messages = self._warnings(mocker, c)
+
+        assert len(messages) == 1
+        # The warning must name the remedies and the actual coverage limit.
+        assert "cuda_graph_config.max_batch_size" in messages[0]
+        assert "cuda_graph_config.batch_sizes" in messages[0]
+        assert "cuda_graph_config.enable_padding" in messages[0]
+        assert "lower max_batch_size" in messages[0]
+        assert "~100" in messages[0]
+        assert "up to 32" in messages[0]
+
+    def test_raising_capture_max_without_padding_still_warns(self, mocker):
+        # The measured trap: capturing up to 256 with padding off leaves a
+        # ragged 86-request decode batch eager, because only {1..32} is
+        # densely covered. Raising max_batch_size alone is not a remedy.
+        c = self._creator(capture_sizes=self.NO_PADDING_SIZES_256, padding=False)
+
+        messages = self._warnings(mocker, c)
+
+        assert len(messages) == 1
+        assert "up to 32" in messages[0]
+        assert "largest capture 256" in messages[0]
+
+    def test_no_warning_when_padded_capture_covers_admitted_batch(self, mocker):
+        # Same 100-request ceiling; padding rounds any batch up to a
+        # captured size, so coverage extends to the largest capture (256).
+        c = self._creator(capture_sizes=self.NO_PADDING_SIZES_256, padding=True)
+
+        assert self._warnings(mocker, c) == []
+
+    def test_no_warning_when_scheduler_caps_below_capture(self, mocker):
+        # max_batch_size 32 bounds admission at the covered range, so
+        # nothing runs eager.
+        c = self._creator(capture_sizes=list(range(1, 33)), padding=False, max_batch_size=32)
+
+        assert self._warnings(mocker, c) == []
+
+    def test_no_warning_at_the_warn_factor_boundary(self, mocker):
+        # 48 == 1.5 * 32 sits exactly on the threshold; the check warns only
+        # strictly above it.
+        c = self._creator(capture_sizes=list(range(1, 33)), padding=False, max_batch_size=48)
+
+        assert self._warnings(mocker, c) == []
+
+    def test_warns_one_past_the_warn_factor_boundary(self, mocker):
+        # 49 > 1.5 * 32 is the smallest ceiling that trips the warning.
+        c = self._creator(capture_sizes=list(range(1, 33)), padding=False, max_batch_size=49)
+
+        messages = self._warnings(mocker, c)
+
+        assert len(messages) == 1
+        assert "~49" in messages[0]
+        assert "up to 32" in messages[0]
+
+    def test_no_warning_when_graphs_disabled(self, mocker):
+        # An empty capture set means no CUDA graphs: all-eager decode is a
+        # deliberate posture, not an unnoticed fall-off.
+        c = self._creator(capture_sizes=[], padding=False)
+
+        assert self._warnings(mocker, c) == []
+
+    def test_no_warning_when_engine_does_not_expose_capture_set(self, mocker):
+        # A Mock (or absent) attribute must not trigger or crash the check.
+        c = self._creator(capture_sizes=list(range(1, 33)), padding=False)
+        c._model_engine = Mock()
+
+        assert self._warnings(mocker, c) == []
+
+    def _build(self, mocker, tmp_path, *, draft: bool, estimating: bool):
+        c = TestBuildManagersBudgetGates._make_build_creator(
+            20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path)
+        )
+        if not draft:
+            c._should_create_separate_draft_kv_cache = Mock(return_value=False)
+        check = mocker.patch.object(c, "_warn_if_admitted_concurrency_outruns_graph_capture")
+        c.build_managers({}, estimating_kv_cache=estimating)
+        return check
+
+    def test_build_managers_checks_coverage_without_a_draft(self, mocker, tmp_path):
+        check = self._build(mocker, tmp_path, draft=False, estimating=False)
+        check.assert_called_once_with()
+
+    def test_build_managers_checks_coverage_with_a_draft(self, mocker, tmp_path):
+        check = self._build(mocker, tmp_path, draft=True, estimating=False)
+        check.assert_called_once_with()
+
+    def test_estimation_build_skips_coverage_check(self, mocker, tmp_path):
+        # Estimation managers are throwaway probes; the real build that
+        # follows runs the check.
+        check = self._build(mocker, tmp_path, draft=True, estimating=True)
+        check.assert_not_called()

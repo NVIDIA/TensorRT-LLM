@@ -22,7 +22,6 @@ from typing import (
     Dict,
     Generic,
     List,
-    Literal,
     Mapping,
     Optional,
     Tuple,
@@ -41,7 +40,7 @@ from blake3 import blake3
 from packaging.version import Version
 from PIL import Image
 
-from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
+from tensorrt_llm.inputs.multimodal_data import AudioData, MediaModality, VideoData
 from tensorrt_llm.logger import logger
 
 
@@ -71,9 +70,6 @@ def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
         return image.convert(to_mode)
 
 
-# Canonical set of supported media modalities for Pydantic field validation.
-MediaModality = Literal["image", "video", "audio"]
-
 # Output representations supported by `ImageMediaIO`:
 # `"pt"` -> `torch.Tensor`, `"np"` -> uint8 HWC `numpy.ndarray`,
 # `"pil"` -> `PIL.Image.Image`.
@@ -97,7 +93,7 @@ async def _get_aiohttp_session() -> aiohttp.ClientSession:
     return _global_aiohttp_session
 
 
-# Maximum allowed response size for remote fetches (200 MB).
+# Maximum allowed response size and encoded video input size (200 MiB).
 _MAX_RESPONSE_BYTES = 200 * 1024 * 1024
 
 # Chunk size used while enforcing the response size cap.
@@ -860,7 +856,24 @@ def _normalize_file_uri(uri: str) -> str:
     return uri
 
 
-def _safe_read_local_file(location: str) -> bytes:
+def _check_media_size(size: int, max_bytes: int) -> None:
+    if size > max_bytes:
+        raise ValueError(f"Media input exceeds maximum allowed size of {max_bytes} bytes.")
+
+
+def _decode_base64_with_limit(data: str) -> bytes:
+    """Decode base64 media under the shared encoded-input size limit."""
+    max_encoded_chars = 4 * ((_MAX_RESPONSE_BYTES + 2) // 3)
+    if len(data) > max_encoded_chars:
+        raise ValueError(
+            f"Base64 media input exceeds maximum allowed size of {_MAX_RESPONSE_BYTES} decoded bytes."
+        )
+    decoded = base64.b64decode(data)
+    _check_media_size(len(decoded), _MAX_RESPONSE_BYTES)
+    return decoded
+
+
+def _safe_read_local_file(location: str, *, max_bytes: int | None = None) -> bytes:
     """Read a local file, refusing anything that has no end.
 
     Takes a bare path or a ``file://`` URI.
@@ -871,10 +884,9 @@ def _safe_read_local_file(location: str) -> bytes:
     turns a caller into a denial of service. A regular file is finite, which is
     the property required here.
 
-    Size is deliberately not capped: naming a large file of one's own is the
-    normal case for a local caller, and no threshold separates that from an
-    abusive one. This bounds the shape of what may be read, then, not its size
-    or its reach — any regular file the process can read is still readable.
+    When ``max_bytes`` is set, check the file size before reading and bound
+    the read to one byte beyond the limit in case the file grows. Other
+    callers retain the uncapped default.
     """
     path = Path(_normalize_file_uri(location))
     try:
@@ -887,10 +899,19 @@ def _safe_read_local_file(location: str) -> bytes:
             f"path is not a regular file: {location!r}. Character devices, "
             "FIFOs and directories cannot be read as media."
         )
+    if max_bytes is not None:
+        _check_media_size(stat.st_size, max_bytes)
     try:
-        return path.read_bytes()
+        with path.open("rb") as source:
+            # Allocate for the observed size; use the remaining budget only if the file grows.
+            data = source.read(-1 if max_bytes is None else stat.st_size + 1)
+            if max_bytes is not None and len(data) > stat.st_size:
+                data += source.read(max_bytes + 1 - len(data))
     except OSError as exc:
         raise ValueError(f"file could not be read: {exc}") from exc
+    if max_bytes is not None:
+        _check_media_size(len(data), max_bytes)
+    return data
 
 
 _MediaT = TypeVar("_MediaT")
@@ -1094,7 +1115,7 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
 
 
 class VideoMediaIO(BaseMediaIO[VideoData]):
-    """I/O for the video modality; customizes merge for `fps`/`num_frames` coupling."""
+    """Video I/O with a 200 MiB encoded-input limit and coupled sampling kwargs."""
 
     _data_uri_mime_prefix: ClassVar[Optional[str]] = "video/"
 
@@ -1137,6 +1158,7 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         return merged
 
     def load_bytes(self, data: bytes) -> VideoData:
+        _check_media_size(len(data), _MAX_RESPONSE_BYTES)
         # In-memory fast path when cv2 has a stream-buffered backend; spill
         # to a tempfile otherwise so cv2 can open it by path. The tempfile
         # is unlinked on context exit; the inode survives until cv2 closes
@@ -1169,10 +1191,10 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
             )
 
     def load_base64(self, media_type: str, data: str) -> VideoData:
-        return self.load_bytes(base64.b64decode(data))
+        return self.load_bytes(_decode_base64_with_limit(data))
 
     def load_file(self, url: str) -> VideoData:
-        return self.load_bytes(Path(_normalize_file_uri(url)).read_bytes())
+        return self.load_bytes(_safe_read_local_file(url, max_bytes=_MAX_RESPONSE_BYTES))
 
 
 MEDIA_IO_REGISTRY: Mapping[MediaModality, Type[BaseMediaIO]] = MappingProxyType(

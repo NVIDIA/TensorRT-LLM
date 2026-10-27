@@ -1,0 +1,29 @@
+# Qwen/Qwen-Image-Layered  ·  QwenImageLayeredPipeline  ·  layer decomposition
+#
+# /v1/images/edits is the only image route with a field for an input image, which this
+# pipeline requires; /v1/images/generations 422s.
+# width/height are the 640 bucket at this reference's aspect. Pinned so the shape is
+# in the file, and so `serve_check.py --warmup-from` can read it. Set both or neither;
+# they also fix the aspect, so a non-square reference would be squashed into them.
+backend: openai-image-edits
+
+common_params:
+  width: 640
+  height: 640
+  num_inference_steps: 50
+  extra_params:
+    layers: 4                  # 4 output images; save_layers_to_grid tiles them into 1
+  guidance_scale: 4.0
+  max_sequence_length: 512
+  seed: 42
+
+requests:
+  # An empty prompt puts the pipeline in captioning mode: the reference is captioned
+  # and that caption becomes the prompt.
+  - prompt: ""
+    image_reference:
+      content: ../media/image_with_red_background.png
+      format: path
+
+# Other extra_params, all left at their defaults:
+#   cfg_normalize=False · use_en_prompt=False · save_layers_to_grid=False
