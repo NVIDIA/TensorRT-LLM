@@ -632,6 +632,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             )
 
         if self._uses_external_shared_target_kv:
+            next_new_tokens = None
             next_draft_tokens = (
                 self._forward_external_shared_target_kv_draft_loop(
                     position_ids=position_ids,
