@@ -278,6 +278,8 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         mma_inst_shape: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
         fp8_quantize_1x128: bool = False,
+        swizzle_size: int = 1,
+        raster_along_m: bool = True,
     ):
         """Initialize the Rubin persistent blockwise dense GEMM kernel.
 
@@ -291,6 +293,10 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         :type mma_inst_shape: Tuple[int, int, int]
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
+        :param swizzle_size: Cluster swizzle width of the persistent tile scheduler.
+        :type swizzle_size: int
+        :param raster_along_m: Whether consecutive clusters advance along M.
+        :type raster_along_m: bool
         """
         # Call parent constructor with mma_tiler_mn (M, N only)
         super().__init__(
@@ -298,12 +304,26 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             use_2cta_instrs,
             (mma_tiler[0], mma_tiler[1]),
             cluster_shape_mn,
+            swizzle_size,
+            raster_along_m,
         )
         # Match the register split used by the Rubin source kernel's Blackwell
         # base. TRT-LLM's vendored Blackwell kernel uses a balanced 216/216
         # split, while Rubin dedicates more registers to accumulator updates.
         self.num_regs_epilogue_warps = 168
         self.num_regs_acc_update_warps = 256
+        # 256-row CTA tiles split the accumulator update over warps 0-7 (see
+        # _split_acc_update). Both warp groups grow from the 168 launch
+        # registers into what warps 8-11 release: 2 * (216 - 168) <= 168 - 64.
+        self.num_regs_split_acc_update_warps = 216
+        # Named barriers of the split update: 4 + h syncs the stores of MMA_M
+        # half h, 6 joins both halves before the TMEM is freed.
+        self.split_store_barrier_id = 4
+        self.split_acc_update_done_barrier = pipeline.NamedBarrier(
+            barrier_id=6,
+            num_threads=self.threads_per_warp
+            * len((*self.acc_update_warp_id, *self.epilog_warp_id)),
+        )
         self.arch = "sm_107"
         self.num_smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
         self.mma_tiler = mma_tiler
@@ -410,6 +430,13 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         )
         if self.fp8_quantize_1x128 and self.cta_tile_shape_mnk[:2] != (128, 128):
             raise ValueError("Fused FP8 quantization requires a 128x128 CTA output tile")
+        # Four accumulator-update warps would keep two rows (256 FP32 values per
+        # thread) of a 256-row tile's final accumulator in registers and spill;
+        # such tiles split the update by MMA_M half over warps 0-7 instead.
+        self.split_acc_update = self.cta_tile_shape_mnk[0] == 256
+        self.num_acc_update_warps = len(self.acc_update_warp_id) * (
+            2 if self.split_acc_update else 1
+        )
 
         # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -446,6 +473,12 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             self.c_dtype,
         )
 
+        # The split update stores each MMA_M half through C stages of its own,
+        # so plan the C stages in pairs of epilogue subtiles.
+        stage_epi_tile = self.epi_tile
+        if self.split_acc_update:
+            stage_epi_tile = (cute.make_layout(self.cta_tile_shape_mnk[0]), self.epi_tile[1])
+
         # Setup A/B/C/Scale stage count in shared memory and ACC stage count in tensor memory
         (
             self.num_acc_stage,
@@ -458,7 +491,7 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             self.mma_tiler,
             self.a_dtype,
             self.b_dtype,
-            self.epi_tile,
+            stage_epi_tile,
             self.c_dtype,
             self.c_layout,
             self.sfa_dtype,
@@ -468,16 +501,19 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             self.num_smem_capacity,
             self.occupancy,
         )
+        if self.split_acc_update:
+            self.num_c_stage *= 2
         if self.fp8_quantize_1x128:
             # The direct fused epilogue reuses this allocation as one
             # row-major 128x128 FP8 scratch tile (16 KiB). Two 128x32 BF16
             # epilogue stages provide exactly that capacity.
             self.num_c_stage = 2
 
-        # SM107 TMEM (576 cols) can not fit multiple staging stages when
-        # MMA_M=2 (cta_tile_M==256), so only keep one staging + one final.
-        if self.cta_tile_shape_mnk[0] == 256:
-            self.num_acc_stage = 1
+        # SM107 TMEM (576 cols) fits two 256-column stages of a 256-row
+        # (MMA_M=2) accumulator; the split update keeps no final accumulator
+        # in TMEM.
+        if self.split_acc_update:
+            self.num_acc_stage = 2
         elif self.cta_tile_shape_mnk[0] == 128:
             self.num_acc_stage = 3
         else:
@@ -674,7 +710,12 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
 
         # Compute grid size
         self.tile_sched_params, grid = self._compute_grid(
-            c, self.cta_tile_shape_mnk, self.cluster_shape_mn, max_active_clusters
+            c,
+            self.cta_tile_shape_mnk,
+            self.cluster_shape_mn,
+            max_active_clusters,
+            self.swizzle_size,
+            self.raster_along_m,
         )
 
         self.buffer_align_bytes = 1024
@@ -855,7 +896,7 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         )
         scale_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
-            self.threads_per_warp * len(self.epilog_warp_id),
+            self.threads_per_warp * self.num_acc_update_warps,
         )
         scale_pipeline = pipeline.PipelineCpAsync.create(
             barrier_storage=storage.scale_mbar_ptr.data_ptr(),
@@ -867,7 +908,8 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
 
         # Initialize acc_pipeline (barrier) and states
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_acc_consumer_threads = len(self.epilog_warp_id) * (2 if use_2cta_instrs else 1)
+        # One elected thread per accumulator-update warp (of both CTAs for 2CTA)
+        num_acc_consumer_threads = self.num_acc_update_warps * (2 if use_2cta_instrs else 1)
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
         )
@@ -1622,468 +1664,778 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
             #
             acc_pipeline.producer_tail(acc_producer_state)
 
-        #
-        # Specialized acc update warps
-        #
-        if warp_idx <= self.acc_update_warp_id[-1]:
-            cute.arch.setmaxregister_increase(self.num_regs_acc_update_warps)
+        if cutlass.const_expr(self.split_acc_update):
             #
-            # Bar sync for retrieve tensor memory ptr from shared memory
+            # Specialized split acc update warps (256-row CTA tiles)
             #
-            tmem.wait_for_alloc()
-
-            #
-            # Retrieving tensor memory ptr and make accumulator tensor
-            #
-            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-            # (MMA, MMA_M, MMA_N, STAGE)
-            tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            # Use dynamic cosize of tCtAcc_base to place the final accumulator
-            # right after the staging region, so it does not overlap when MMA_M>1.
-            tCtAcc_final = cute.make_tensor(
-                tCtAcc_base.iterator + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base),
-                tCtAcc_base.layout,
-            )
-
-            #
-            # Partition for epilogue
-            #
-            epi_tidx = tidx % 128
-            (
-                tiled_copy_t2r,
-                tiled_copy_r2t,
-                tTR_tAcc_base,
-                tTR_rAcc,
-                tTR_rAcc_final,
-                tTR_sSFA,
-                tTR_sSFB,
-                tRT_rAcc,
-                tRT_tAcc_base,
-            ) = self.acc_update_tmem_copy_and_partition(
-                epi_tidx,
-                tCtAcc_base,
-                tCtAcc_final,
-                tCgC,
-                sSFA_view_as_C,
-                sSFB_view_as_C,
-                epi_tile,
-            )
-
-            #
-            # Persistent tile scheduling loop
-            #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
-            work_tile = tile_sched.initial_work_tile_info()
-
-            acc_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_acc_stage
-            )
-
-            scale_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_scale_stage
-            )
-
-            epi_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
-
-            tile_info_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_tile_stage
-            )
-
-            # get the first tile info
-            tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
-            # Get tile coord from tile scheduler
-            cur_tile_coord = work_tile.tile_idx
-            # initialize the tile info
-            tile_info[0] = cur_tile_coord[0]
-            tile_info[1] = cur_tile_coord[1]
-            tile_info[2] = cur_tile_coord[2]
-            tile_info[3] = work_tile.is_valid_tile
-
-            is_valid_tile = cutlass.Boolean(1)
-            is_valid_tile = tile_info[3] == 1
-
-            while is_valid_tile:
-                # initialize the final accumulator
-                tTR_rAcc_final.fill(0.0)
-
-                # Keep both EPI_M and EPI_N so per-subtile_idx scale is correct
-                # when cta_tile_M > EPI_TILE_M (i.e. EPI_M > 1).
-                tTR_rSFA_ = cute.make_rmem_tensor(
-                    cute.slice_(tTR_sSFA, (None, None, None, None, None, 0)).shape,
-                    self.acc_dtype,
+            if warp_idx <= self.epilog_warp_id[-1]:
+                self._split_acc_update(
+                    warp_idx,
+                    tidx,
+                    tiled_mma,
+                    tmem,
+                    tCtAcc_fake,
+                    tCgC,
+                    sC,
+                    sSFA_view_as_C,
+                    sSFB_view_as_C,
+                    sInfo,
+                    tma_atom_c,
+                    acc_pipeline,
+                    scale_pipeline,
+                    tile_info_pipeline,
+                    epi_tile,
+                    tile_sched_params,
+                    k_tile_cnt,
+                    epilogue_op,
                 )
-                tTR_rSFB_ = cute.make_rmem_tensor(
-                    cute.slice_(tTR_sSFB, (None, None, None, None, None, 0)).shape,
-                    self.acc_dtype,
+        else:
+            #
+            # Specialized acc update warps
+            #
+            if warp_idx <= self.acc_update_warp_id[-1]:
+                cute.arch.setmaxregister_increase(self.num_regs_acc_update_warps)
+                #
+                # Bar sync for retrieve tensor memory ptr from shared memory
+                #
+                tmem.wait_for_alloc()
+
+                #
+                # Retrieving tensor memory ptr and make accumulator tensor
+                #
+                tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+                # (MMA, MMA_M, MMA_N, STAGE)
+                tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+                # Use dynamic cosize of tCtAcc_base to place the final accumulator
+                # right after the staging region, so it does not overlap when MMA_M>1.
+                tCtAcc_final = cute.make_tensor(
+                    tCtAcc_base.iterator + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base),
+                    tCtAcc_base.layout,
                 )
-                # Group (EPI_M, EPI_N) into one mode so tTR_rSFA[.., subtile_idx]
-                # matches the grouped tTR_tAcc indexing below.
-                tTR_rSFA = cute.group_modes(tTR_rSFA_, 3, cute.rank(tTR_rSFA_))
-                tTR_rSFB = cute.group_modes(tTR_rSFB_, 3, cute.rank(tTR_rSFB_))
 
-                scale_consumer_state.reset_count()
-                peek_scale_full_status = cutlass.Boolean(1)
-                if scale_consumer_state.count < k_tile_cnt:
-                    peek_scale_full_status = scale_pipeline.consumer_try_wait(scale_consumer_state)
+                #
+                # Partition for epilogue
+                #
+                epi_tidx = tidx % 128
+                (
+                    tiled_copy_t2r,
+                    tiled_copy_r2t,
+                    tTR_tAcc_base,
+                    tTR_rAcc,
+                    tTR_rAcc_final,
+                    tTR_sSFA,
+                    tTR_sSFB,
+                    tRT_rAcc,
+                    tRT_tAcc_base,
+                ) = self.acc_update_tmem_copy_and_partition(
+                    epi_tidx,
+                    tCtAcc_base,
+                    tCtAcc_final,
+                    tCgC,
+                    sSFA_view_as_C,
+                    sSFB_view_as_C,
+                    epi_tile,
+                )
 
-                acc_consumer_state.reset_count()
-                peek_acc_full_status = cutlass.Boolean(1)
-                if acc_consumer_state.count < k_tile_cnt:
-                    peek_acc_full_status = acc_pipeline.consumer_try_wait(acc_consumer_state)
+                #
+                # Persistent tile scheduling loop
+                #
+                tile_sched = utils.StaticPersistentTileScheduler.create(
+                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+                work_tile = tile_sched.initial_work_tile_info()
 
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    # Set tensor memory buffer for current tile
-                    # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
-                    tTR_tAcc = tTR_tAcc_base[
-                        (None, None, None, None, None, acc_consumer_state.index)
-                    ]
+                acc_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_acc_stage
+                )
 
-                    #
-                    # Wait for scale buffer full
-                    #
-                    scale_pipeline.consumer_wait(scale_consumer_state, peek_scale_full_status)
+                scale_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_scale_stage
+                )
 
-                    tTR_sSFA_slice = cute.slice_(
-                        tTR_sSFA,
-                        (None, None, None, None, None, scale_consumer_state.index),
-                    )
-                    tTR_sSFB_slice = cute.slice_(
-                        tTR_sSFB,
-                        (None, None, None, None, None, scale_consumer_state.index),
-                    )
+                epi_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, 1
+                )
 
-                    scale_atom_copy = cute.make_copy_atom(
-                        cute.nvgpu.CopyUniversalOp(),
+                tile_info_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_tile_stage
+                )
+
+                # get the first tile info
+                tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+                # Get tile coord from tile scheduler
+                cur_tile_coord = work_tile.tile_idx
+                # initialize the tile info
+                tile_info[0] = cur_tile_coord[0]
+                tile_info[1] = cur_tile_coord[1]
+                tile_info[2] = cur_tile_coord[2]
+                tile_info[3] = work_tile.is_valid_tile
+
+                is_valid_tile = cutlass.Boolean(1)
+                is_valid_tile = tile_info[3] == 1
+
+                while is_valid_tile:
+                    # initialize the final accumulator
+                    tTR_rAcc_final.fill(0.0)
+
+                    # Keep both EPI_M and EPI_N so per-subtile_idx scale is correct
+                    # when cta_tile_M > EPI_TILE_M (i.e. EPI_M > 1).
+                    tTR_rSFA_ = cute.make_rmem_tensor(
+                        cute.slice_(tTR_sSFA, (None, None, None, None, None, 0)).shape,
                         self.acc_dtype,
-                        num_bits_per_copy=self.acc_dtype.width,
                     )
+                    tTR_rSFB_ = cute.make_rmem_tensor(
+                        cute.slice_(tTR_sSFB, (None, None, None, None, None, 0)).shape,
+                        self.acc_dtype,
+                    )
+                    # Group (EPI_M, EPI_N) into one mode so tTR_rSFA[.., subtile_idx]
+                    # matches the grouped tTR_tAcc indexing below.
+                    tTR_rSFA = cute.group_modes(tTR_rSFA_, 3, cute.rank(tTR_rSFA_))
+                    tTR_rSFB = cute.group_modes(tTR_rSFB_, 3, cute.rank(tTR_rSFB_))
 
-                    # Copy into the un-grouped rmem tensors (shape matches slice);
-                    # tTR_rSFA / tTR_rSFB share storage via group_modes aliasing.
-                    cute.copy(scale_atom_copy, tTR_sSFA_slice, tTR_rSFA_)
-                    cute.copy(scale_atom_copy, tTR_sSFB_slice, tTR_rSFB_)
-
-                    #
-                    # Wait for accumulator buffer full
-                    #
-
-                    acc_pipeline.consumer_wait(acc_consumer_state, peek_acc_full_status)
-
-                    tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-
-                    #
-                    # Update accumulator by scale factor in subtiles
-                    #
-                    subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-                    for subtile_idx in cutlass.range(subtile_cnt):
-                        #
-                        # Load accumulator from tensor memory buffer to register
-                        #
-                        tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
-                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
-
-                        #
-                        # Update accumulator by scale factor
-                        #
-                        tTR_rAcc_subtile = tTR_rAcc_final[(None, None, None, subtile_idx)]
-                        tTR_rSFA_subtile = tTR_rSFA[(None, None, None, subtile_idx)]
-                        tTR_rSFB_subtile = tTR_rSFB[(None, None, None, subtile_idx)]
-
-                        acc_vec = tTR_rAcc.load()
-                        final_vec = tTR_rAcc_subtile.load()
-                        scale_a = tTR_rSFA_subtile.load()
-                        scale_b = tTR_rSFB_subtile.load()
-                        scale = scale_a * scale_b
-                        final_vec = acc_vec * scale + final_vec
-                        tTR_rAcc_subtile.store(final_vec.to(self.acc_dtype))
-
-                    #
-                    # Async arrive scale buffer empty
-                    #
-                    scale_pipeline.consumer_release(scale_consumer_state)
-                    scale_consumer_state.advance()
-
+                    scale_consumer_state.reset_count()
                     peek_scale_full_status = cutlass.Boolean(1)
                     if scale_consumer_state.count < k_tile_cnt:
                         peek_scale_full_status = scale_pipeline.consumer_try_wait(
                             scale_consumer_state
                         )
-                    #
-                    # Async arrive accumulator buffer empty
-                    #
-                    with cute.arch.elect_one():
-                        acc_pipeline.consumer_release(acc_consumer_state)
-                    acc_consumer_state.advance()
 
+                    acc_consumer_state.reset_count()
                     peek_acc_full_status = cutlass.Boolean(1)
                     if acc_consumer_state.count < k_tile_cnt:
                         peek_acc_full_status = acc_pipeline.consumer_try_wait(acc_consumer_state)
 
-                tRT_tAcc = tRT_tAcc_base[(None, None, None, None, None, 0)]
-                tRT_tAcc = cute.group_modes(tRT_tAcc, 3, cute.rank(tRT_tAcc))
+                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                        # Set tensor memory buffer for current tile
+                        # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
+                        tTR_tAcc = tTR_tAcc_base[
+                            (None, None, None, None, None, acc_consumer_state.index)
+                        ]
 
-                #
-                # Wait for epilogue buffer empty
-                #
-                epi_pipeline.producer_acquire(epi_producer_state)
+                        #
+                        # Wait for scale buffer full
+                        #
+                        scale_pipeline.consumer_wait(scale_consumer_state, peek_scale_full_status)
 
-                # copy the accumulator to tensor memory buffer
-                cute.copy(tiled_copy_r2t, tTR_rAcc_final, tRT_tAcc)
-                cute.arch.fence_view_async_tmem_store()
-
-                #
-                # Async arrive epilogue buffer full
-                #
-                epi_pipeline.producer_commit(epi_producer_state)
-                epi_producer_state.advance()
-
-                #
-                # Advance to next tile
-                #
-                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for idx in cutlass.range(4, unroll_full=True):
-                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
-                is_valid_tile = tile_info[3] == 1
-                cute.arch.fence_proxy(
-                    "async.shared",
-                    space="cta",
-                )
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
-                tile_info_consumer_state.advance()
-
-        #
-        # Specialized epilogue warps
-        #
-        if warp_idx <= self.epilog_warp_id[-1] and warp_idx >= self.epilog_warp_id[0]:
-            cute.arch.setmaxregister_increase(self.num_regs_epilogue_warps)
-            #
-            # Alloc tensor memory buffer
-            #
-            tmem.allocate(self.num_tmem_alloc_cols)
-
-            #
-            # Bar sync for retrieve tensor memory ptr from shared memory
-            #
-            tmem.wait_for_alloc()
-
-            #
-            # Retrieving tensor memory ptr and make accumulator tensor
-            #
-            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-            # (MMA, MMA_M, MMA_N, STAGE)
-            tCtAcc_base_ = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            tCtAcc_final = cute.make_tensor(
-                tCtAcc_base_.iterator + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base_),
-                tCtAcc_base_.layout,
-            )
-
-            #
-            # Partition for epilogue
-            #
-            epi_tidx = tidx % 128
-            (
-                tiled_copy_t2r,
-                tTR_tAcc_base,
-                tTR_rAcc,
-            ) = self.epilog_tmem_copy_and_partition(
-                epi_tidx, tCtAcc_final, tCgC, epi_tile, use_2cta_instrs
-            )
-            tTR_cC = None
-            if cutlass.const_expr(not self.fp8_quantize_1x128):
-                cC_t = transform_partitioned_tensor_layout(tCcC)
-                cC_epi = cute.flat_divide(cC_t, epi_tile)
-                tTR_cC = tiled_copy_t2r.get_slice(epi_tidx).partition_D(cC_epi)
-
-            tTR_rC = None
-            tiled_copy_r2s = None
-            tRS_rC = None
-            tRS_sC = None
-            bSG_sC = None
-            bSG_gC_partitioned = None
-            if cutlass.const_expr(not self.fp8_quantize_1x128):
-                tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
-                tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
-                    tiled_copy_t2r, tTR_rC, epi_tidx, sC
-                )
-                (
-                    tma_atom_c,
-                    bSG_sC,
-                    bSG_gC_partitioned,
-                ) = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_c, tCgC, epi_tile, sC)
-
-            #
-            # Persistent tile scheduling loop
-            #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
-            work_tile = tile_sched.initial_work_tile_info()
-
-            epi_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
-
-            c_pipeline = None
-            if cutlass.const_expr(not self.fp8_quantize_1x128):
-                # Threads/warps participating in tma store pipeline
-                c_producer_group = pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread,
-                    32 * len(self.epilog_warp_id),
-                )
-                c_pipeline = pipeline.PipelineTmaStore.create(
-                    num_stages=self.num_c_stage,
-                    producer_group=c_producer_group,
-                )
-
-            tile_info_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_tile_stage
-            )
-
-            # get the first tile info
-            tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
-            # Get tile coord from tile scheduler
-            cur_tile_coord = work_tile.tile_idx
-            # initialize the tile info
-            tile_info[0] = cur_tile_coord[0]
-            tile_info[1] = cur_tile_coord[1]
-            tile_info[2] = cur_tile_coord[2]
-            tile_info[3] = work_tile.is_valid_tile
-
-            is_valid_tile = cutlass.Boolean(1)
-            is_valid_tile = tile_info[3] == 1
-
-            num_prev_subtiles = cutlass.Int32(0)
-
-            while is_valid_tile:
-                mma_tile_coord_mnl = (
-                    tile_info[0] // cute.size(tiled_mma.thr_id.shape),
-                    tile_info[1],
-                    tile_info[2],
-                )
-                #
-                # Slice to per mma tile index
-                #
-                bSG_gC = None
-                if cutlass.const_expr(not self.fp8_quantize_1x128):
-                    # ((ATOM_V, REST_V), EPI_M, EPI_N)
-                    bSG_gC = bSG_gC_partitioned[
-                        (
-                            None,
-                            None,
-                            None,
-                            mma_tile_coord_mnl[0],
-                            mma_tile_coord_mnl[1],
-                            mma_tile_coord_mnl[2],
+                        tTR_sSFA_slice = cute.slice_(
+                            tTR_sSFA,
+                            (None, None, None, None, None, scale_consumer_state.index),
                         )
+                        tTR_sSFB_slice = cute.slice_(
+                            tTR_sSFB,
+                            (None, None, None, None, None, scale_consumer_state.index),
+                        )
+
+                        scale_atom_copy = cute.make_copy_atom(
+                            cute.nvgpu.CopyUniversalOp(),
+                            self.acc_dtype,
+                            num_bits_per_copy=self.acc_dtype.width,
+                        )
+
+                        # Copy into the un-grouped rmem tensors (shape matches slice);
+                        # tTR_rSFA / tTR_rSFB share storage via group_modes aliasing.
+                        cute.copy(scale_atom_copy, tTR_sSFA_slice, tTR_rSFA_)
+                        cute.copy(scale_atom_copy, tTR_sSFB_slice, tTR_rSFB_)
+
+                        #
+                        # Wait for accumulator buffer full
+                        #
+
+                        acc_pipeline.consumer_wait(acc_consumer_state, peek_acc_full_status)
+
+                        tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+
+                        #
+                        # Update accumulator by scale factor in subtiles
+                        #
+                        subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+                        for subtile_idx in cutlass.range(subtile_cnt):
+                            #
+                            # Load accumulator from tensor memory buffer to register
+                            #
+                            tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
+                            #
+                            # Update accumulator by scale factor
+                            #
+                            tTR_rAcc_subtile = tTR_rAcc_final[(None, None, None, subtile_idx)]
+                            tTR_rSFA_subtile = tTR_rSFA[(None, None, None, subtile_idx)]
+                            tTR_rSFB_subtile = tTR_rSFB[(None, None, None, subtile_idx)]
+
+                            acc_vec = tTR_rAcc.load()
+                            final_vec = tTR_rAcc_subtile.load()
+                            scale_a = tTR_rSFA_subtile.load()
+                            scale_b = tTR_rSFB_subtile.load()
+                            scale = scale_a * scale_b
+                            final_vec = acc_vec * scale + final_vec
+                            tTR_rAcc_subtile.store(final_vec.to(self.acc_dtype))
+
+                        #
+                        # Async arrive scale buffer empty
+                        #
+                        scale_pipeline.consumer_release(scale_consumer_state)
+                        scale_consumer_state.advance()
+
+                        peek_scale_full_status = cutlass.Boolean(1)
+                        if scale_consumer_state.count < k_tile_cnt:
+                            peek_scale_full_status = scale_pipeline.consumer_try_wait(
+                                scale_consumer_state
+                            )
+                        #
+                        # Async arrive accumulator buffer empty
+                        #
+                        with cute.arch.elect_one():
+                            acc_pipeline.consumer_release(acc_consumer_state)
+                        acc_consumer_state.advance()
+
+                        peek_acc_full_status = cutlass.Boolean(1)
+                        if acc_consumer_state.count < k_tile_cnt:
+                            peek_acc_full_status = acc_pipeline.consumer_try_wait(
+                                acc_consumer_state
+                            )
+
+                    tRT_tAcc = tRT_tAcc_base[(None, None, None, None, None, 0)]
+                    tRT_tAcc = cute.group_modes(tRT_tAcc, 3, cute.rank(tRT_tAcc))
+
+                    #
+                    # Wait for epilogue buffer empty
+                    #
+                    epi_pipeline.producer_acquire(epi_producer_state)
+
+                    # copy the accumulator to tensor memory buffer
+                    cute.copy(tiled_copy_r2t, tTR_rAcc_final, tRT_tAcc)
+                    cute.arch.fence_view_async_tmem_store()
+
+                    #
+                    # Async arrive epilogue buffer full
+                    #
+                    epi_pipeline.producer_commit(epi_producer_state)
+                    epi_producer_state.advance()
+
+                    #
+                    # Advance to next tile
+                    #
+                    tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                    for idx in cutlass.range(4, unroll_full=True):
+                        tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                    is_valid_tile = tile_info[3] == 1
+                    cute.arch.fence_proxy(
+                        "async.shared",
+                        space="cta",
+                    )
+                    tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                    tile_info_consumer_state.advance()
+
+            #
+            # Specialized epilogue warps
+            #
+            if warp_idx <= self.epilog_warp_id[-1] and warp_idx >= self.epilog_warp_id[0]:
+                cute.arch.setmaxregister_increase(self.num_regs_epilogue_warps)
+                #
+                # Alloc tensor memory buffer
+                #
+                tmem.allocate(self.num_tmem_alloc_cols)
+
+                #
+                # Bar sync for retrieve tensor memory ptr from shared memory
+                #
+                tmem.wait_for_alloc()
+
+                #
+                # Retrieving tensor memory ptr and make accumulator tensor
+                #
+                tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+                # (MMA, MMA_M, MMA_N, STAGE)
+                tCtAcc_base_ = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+                tCtAcc_final = cute.make_tensor(
+                    tCtAcc_base_.iterator + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base_),
+                    tCtAcc_base_.layout,
+                )
+
+                #
+                # Partition for epilogue
+                #
+                epi_tidx = tidx % 128
+                (
+                    tiled_copy_t2r,
+                    tTR_tAcc_base,
+                    tTR_rAcc,
+                ) = self.epilog_tmem_copy_and_partition(
+                    epi_tidx, tCtAcc_final, tCgC, epi_tile, use_2cta_instrs
+                )
+                tTR_cC = None
+                if cutlass.const_expr(not self.fp8_quantize_1x128):
+                    cC_t = transform_partitioned_tensor_layout(tCcC)
+                    cC_epi = cute.flat_divide(cC_t, epi_tile)
+                    tTR_cC = tiled_copy_t2r.get_slice(epi_tidx).partition_D(cC_epi)
+
+                tTR_rC = None
+                tiled_copy_r2s = None
+                tRS_rC = None
+                tRS_sC = None
+                bSG_sC = None
+                bSG_gC_partitioned = None
+                if cutlass.const_expr(not self.fp8_quantize_1x128):
+                    tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
+                    tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
+                        tiled_copy_t2r, tTR_rC, epi_tidx, sC
+                    )
+                    (
+                        tma_atom_c,
+                        bSG_sC,
+                        bSG_gC_partitioned,
+                    ) = self.epilog_gmem_copy_and_partition(
+                        epi_tidx, tma_atom_c, tCgC, epi_tile, sC
+                    )
+
+                #
+                # Persistent tile scheduling loop
+                #
+                tile_sched = utils.StaticPersistentTileScheduler.create(
+                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+                work_tile = tile_sched.initial_work_tile_info()
+
+                epi_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, 1
+                )
+
+                c_pipeline = None
+                if cutlass.const_expr(not self.fp8_quantize_1x128):
+                    # Threads/warps participating in tma store pipeline
+                    c_producer_group = pipeline.CooperativeGroup(
+                        pipeline.Agent.Thread,
+                        32 * len(self.epilog_warp_id),
+                    )
+                    c_pipeline = pipeline.PipelineTmaStore.create(
+                        num_stages=self.num_c_stage,
+                        producer_group=c_producer_group,
+                    )
+
+                tile_info_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_tile_stage
+                )
+
+                # get the first tile info
+                tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+                # Get tile coord from tile scheduler
+                cur_tile_coord = work_tile.tile_idx
+                # initialize the tile info
+                tile_info[0] = cur_tile_coord[0]
+                tile_info[1] = cur_tile_coord[1]
+                tile_info[2] = cur_tile_coord[2]
+                tile_info[3] = work_tile.is_valid_tile
+
+                is_valid_tile = cutlass.Boolean(1)
+                is_valid_tile = tile_info[3] == 1
+
+                num_prev_subtiles = cutlass.Int32(0)
+
+                while is_valid_tile:
+                    mma_tile_coord_mnl = (
+                        tile_info[0] // cute.size(tiled_mma.thr_id.shape),
+                        tile_info[1],
+                        tile_info[2],
+                    )
+                    #
+                    # Slice to per mma tile index
+                    #
+                    bSG_gC = None
+                    if cutlass.const_expr(not self.fp8_quantize_1x128):
+                        # ((ATOM_V, REST_V), EPI_M, EPI_N)
+                        bSG_gC = bSG_gC_partitioned[
+                            (
+                                None,
+                                None,
+                                None,
+                                mma_tile_coord_mnl[0],
+                                mma_tile_coord_mnl[1],
+                                mma_tile_coord_mnl[2],
+                            )
+                        ]
+
+                    # Set tensor memory buffer for current tile
+                    # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
+                    tTR_tAcc = tTR_tAcc_base[
+                        (None, None, None, None, None, epi_consumer_state.index)
                     ]
 
-                # Set tensor memory buffer for current tile
-                # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
-                tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, epi_consumer_state.index)]
+                    #
+                    # Wait for accumulator buffer full
+                    #
+                    epi_pipeline.consumer_wait(epi_consumer_state)
+
+                    tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+                    tTR_cC_tile = None
+                    if cutlass.const_expr(not self.fp8_quantize_1x128):
+                        bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+                        tTR_cC_tile = tTR_cC[(None, None, None, None, None, *mma_tile_coord_mnl)]
+                        tTR_cC_tile = cute.group_modes(tTR_cC_tile, 3, cute.rank(tTR_cC_tile))
+
+                    #
+                    # Store accumulator to global memory in subtiles
+                    #
+                    if cutlass.const_expr(self.fp8_quantize_1x128):
+                        assert fp8_scale is not None
+                        self._epilog_fp8_register_scratch(
+                            tiled_copy_t2r,
+                            tTR_tAcc,
+                            tTR_rAcc,
+                            sC,
+                            epi_consumer_state,
+                            epi_pipeline,
+                            epi_tidx // 32,
+                            lane_idx,
+                            mma_tile_coord_mnl,
+                            mma_tile_coord_v,
+                            epilogue_op,
+                            mC_mnl,
+                            fp8_scale,
+                        )
+                    else:
+                        subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+                        for subtile_idx in cutlass.range(subtile_cnt):
+                            # Load accumulator from tensor memory buffer to register.
+                            tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+                            cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
+                            # Convert to C type.
+                            acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+                            acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
+                            tRS_rC.store(acc_vec)
+
+                            # Store C to shared memory.
+                            num_prev_subtiles = num_prev_subtiles + 1
+                            c_buffer = num_prev_subtiles % self.num_c_stage
+                            cute.copy(
+                                tiled_copy_r2s,
+                                tRS_rC,
+                                tRS_sC[(None, None, None, c_buffer)],
+                            )
+                            # Fence and barrier to make the shared-memory store
+                            # visible to the TMA store.
+                            cute.arch.fence_proxy(
+                                "async.shared",
+                                space="cta",
+                            )
+                            self.epilog_sync_barrier.arrive_and_wait()
+
+                            # TMA store C to global memory.
+                            if warp_idx == self.epilog_warp_id[0]:
+                                cute.copy(
+                                    tma_atom_c,
+                                    bSG_sC[(None, c_buffer)],
+                                    bSG_gC[(None, subtile_idx)],
+                                )
+                                c_pipeline.producer_commit()
+                                c_pipeline.producer_acquire()
+                            self.epilog_sync_barrier.arrive_and_wait()
+
+                    #
+                    # Async arrive accumulator buffer empty
+                    #
+                    if cutlass.const_expr(not self.fp8_quantize_1x128):
+                        epi_pipeline.consumer_release(epi_consumer_state)
+                        epi_consumer_state.advance()
+
+                    #
+                    # Advance to next tile
+                    #
+                    tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                    for idx in cutlass.range(4, unroll_full=True):
+                        tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                    is_valid_tile = tile_info[3] == 1
+                    cute.arch.fence_proxy(
+                        "async.shared",
+                        space="cta",
+                    )
+                    tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                    tile_info_consumer_state.advance()
+
+                #
+                # Dealloc the tensor memory buffer
+                #
+                tmem.relinquish_alloc_permit()
+                self.epilog_sync_barrier.arrive_and_wait()
+                tmem.free(tmem_ptr)
+                #
+                # Wait for C store complete
+                #
+                if cutlass.const_expr(not self.fp8_quantize_1x128):
+                    c_pipeline.producer_tail()
+
+    @cute.jit
+    def _split_acc_update(
+        self,
+        warp_idx: cutlass.Int32,
+        tidx: cutlass.Int32,
+        tiled_mma: cute.TiledMma,
+        tmem: utils.TmemAllocator,
+        tCtAcc_fake: cute.Tensor,
+        tCgC: cute.Tensor,
+        sC: cute.Tensor,
+        sSFA_view_as_C: cute.Tensor,
+        sSFB_view_as_C: cute.Tensor,
+        sInfo: cute.Tensor,
+        tma_atom_c: cute.CopyAtom,
+        acc_pipeline: pipeline.PipelineUmmaAsync,
+        scale_pipeline: pipeline.PipelineCpAsync,
+        tile_info_pipeline: pipeline.PipelineAsync,
+        epi_tile: cute.Tile,
+        tile_sched_params: utils.PersistentTileSchedulerParams,
+        k_tile_cnt: cutlass.Int32,
+        epilogue_op: cutlass.Constexpr,
+    ):
+        """Accumulator update and store of 256-row CTA tiles on warps 0-7.
+
+        Warp group 0 (warps 0-3) and warp group 1 (warps 4-7) each own one
+        128-row MMA_M half: every thread keeps one row (128 FP32 values) of
+        the final accumulator in registers and stores its half through its
+        own C stages, so the final accumulator never goes back to TMEM.
+        """
+        cute.arch.setmaxregister_increase(self.num_regs_split_acc_update_warps)
+        half_idx = warp_idx // 4
+        epi_tidx = tidx % 128
+
+        # The allocator warp (epilog_warp_id[0]) belongs to warp group 1.
+        tmem.allocate(self.num_tmem_alloc_cols)
+        tmem.wait_for_alloc()
+        tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+        # (MMA, MMA_M, MMA_N, STAGE)
+        tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+
+        #
+        # Partition for the accumulator update: one thread reads one TMEM lane
+        #
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+            self.acc_dtype,
+        )
+        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, STAGE)
+        tAcc_epi = cute.flat_divide(transform_partitioned_tensor_layout(tCtAcc_base), epi_tile)
+        tiled_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tAcc_epi[(None, None, 0, 0, 0)])
+        thr_copy_t2r = tiled_copy_t2r.get_slice(epi_tidx)
+        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, STAGE)
+        tTR_tAcc_base = thr_copy_t2r.partition_S(tAcc_epi)
+        tTR_sSFA = thr_copy_t2r.partition_D(cute.flat_divide(sSFA_view_as_C, epi_tile))
+        tTR_sSFB = thr_copy_t2r.partition_D(cute.flat_divide(sSFB_view_as_C, epi_tile))
+        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, loopM, loopN, loopL)
+        tTR_gC = thr_copy_t2r.partition_D(
+            cute.flat_divide(transform_partitioned_tensor_layout(tCgC), epi_tile)
+        )
+        # (T2R, T2R_M, T2R_N)
+        tTR_rAcc = cute.make_rmem_tensor(
+            tTR_gC[(None, None, None, 0, 0, 0, 0, 0)].shape, self.acc_dtype
+        )
+        # (T2R, T2R_M, T2R_N, EPI_N): this thread's row of its MMA_M half
+        tTR_rAcc_final = cute.make_rmem_tensor(
+            tTR_gC[(None, None, None, 0, None, 0, 0, 0)].shape, self.acc_dtype
+        )
+        subtile_cnt = cute.size(tTR_rAcc_final, mode=[3])
+
+        #
+        # Partition for the store: registers -> sC -> TMA
+        #
+        tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
+        tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
+            tiled_copy_t2r, tTR_rC, epi_tidx, sC
+        )
+        # ((ATOM_V, REST_V), STAGE)
+        # ((ATOM_V, REST_V), EPI_M, EPI_N, loopM, loopN, loopL)
+        tma_atom_c, bSG_sC, bSG_gC_partitioned = self.epilog_gmem_copy_and_partition(
+            epi_tidx, tma_atom_c, tCgC, epi_tile, sC
+        )
+        # Half h stores through C stages [h * num_c_stage_half, (h + 1) * num_c_stage_half).
+        num_c_stage_half = self.num_c_stage // 2
+        c_pipeline = pipeline.PipelineTmaStore.create(
+            num_stages=num_c_stage_half,
+            producer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                self.threads_per_warp * len(self.acc_update_warp_id),
+            ),
+        )
+        store_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=self.split_store_barrier_id + half_idx,
+            num_threads=self.threads_per_warp * len(self.acc_update_warp_id),
+        )
+
+        #
+        # Persistent tile scheduling loop
+        #
+        tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+        )
+        work_tile = tile_sched.initial_work_tile_info()
+
+        acc_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.num_acc_stage
+        )
+
+        scale_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.num_scale_stage
+        )
+
+        tile_info_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.num_tile_stage
+        )
+
+        # get the first tile info
+        tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+        # Get tile coord from tile scheduler
+        cur_tile_coord = work_tile.tile_idx
+        # initialize the tile info
+        tile_info[0] = cur_tile_coord[0]
+        tile_info[1] = cur_tile_coord[1]
+        tile_info[2] = cur_tile_coord[2]
+        tile_info[3] = work_tile.is_valid_tile
+
+        is_valid_tile = cutlass.Boolean(1)
+        is_valid_tile = tile_info[3] == 1
+
+        num_prev_subtiles = cutlass.Int32(0)
+
+        while is_valid_tile:
+            mma_tile_coord_mnl = (
+                tile_info[0] // cute.size(tiled_mma.thr_id.shape),
+                tile_info[1],
+                tile_info[2],
+            )
+            # initialize the final accumulator
+            tTR_rAcc_final.fill(0.0)
+
+            scale_consumer_state.reset_count()
+            peek_scale_full_status = cutlass.Boolean(1)
+            if scale_consumer_state.count < k_tile_cnt:
+                peek_scale_full_status = scale_pipeline.consumer_try_wait(scale_consumer_state)
+
+            acc_consumer_state.reset_count()
+            peek_acc_full_status = cutlass.Boolean(1)
+            if acc_consumer_state.count < k_tile_cnt:
+                peek_acc_full_status = acc_pipeline.consumer_try_wait(acc_consumer_state)
+
+            for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                #
+                # Wait for scale buffer full
+                #
+                scale_pipeline.consumer_wait(scale_consumer_state, peek_scale_full_status)
+
+                # A thread's values share one row (scale A) and one 128-column
+                # block (scale B).
+                scale = (
+                    tTR_sSFA[(0, 0, 0, half_idx, 0, scale_consumer_state.index)]
+                    * tTR_sSFB[(0, 0, 0, half_idx, 0, scale_consumer_state.index)]
+                )
 
                 #
                 # Wait for accumulator buffer full
                 #
-                epi_pipeline.consumer_wait(epi_consumer_state)
-
-                tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-                tTR_cC_tile = None
-                if cutlass.const_expr(not self.fp8_quantize_1x128):
-                    bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
-                    tTR_cC_tile = tTR_cC[(None, None, None, None, None, *mma_tile_coord_mnl)]
-                    tTR_cC_tile = cute.group_modes(tTR_cC_tile, 3, cute.rank(tTR_cC_tile))
+                acc_pipeline.consumer_wait(acc_consumer_state, peek_acc_full_status)
 
                 #
-                # Store accumulator to global memory in subtiles
+                # Update this half's accumulator by the scale factor in subtiles
                 #
-                if cutlass.const_expr(self.fp8_quantize_1x128):
-                    assert fp8_scale is not None
-                    self._epilog_fp8_register_scratch(
+                for subtile_idx in cutlass.range_constexpr(subtile_cnt):
+                    cute.copy(
                         tiled_copy_t2r,
-                        tTR_tAcc,
-                        tTR_rAcc,
-                        sC,
-                        epi_consumer_state,
-                        epi_pipeline,
-                        epi_tidx // 32,
-                        lane_idx,
-                        mma_tile_coord_mnl,
-                        mma_tile_coord_v,
-                        epilogue_op,
-                        mC_mnl,
-                        fp8_scale,
-                    )
-                else:
-                    subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-                    for subtile_idx in cutlass.range(subtile_cnt):
-                        # Load accumulator from tensor memory buffer to register.
-                        tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
-                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
-
-                        # Convert to C type.
-                        acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                        acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
-                        tRS_rC.store(acc_vec)
-
-                        # Store C to shared memory.
-                        num_prev_subtiles = num_prev_subtiles + 1
-                        c_buffer = num_prev_subtiles % self.num_c_stage
-                        cute.copy(
-                            tiled_copy_r2s,
-                            tRS_rC,
-                            tRS_sC[(None, None, None, c_buffer)],
-                        )
-                        # Fence and barrier to make the shared-memory store
-                        # visible to the TMA store.
-                        cute.arch.fence_proxy(
-                            "async.shared",
-                            space="cta",
-                        )
-                        self.epilog_sync_barrier.arrive_and_wait()
-
-                        # TMA store C to global memory.
-                        if warp_idx == self.epilog_warp_id[0]:
-                            cute.copy(
-                                tma_atom_c,
-                                bSG_sC[(None, c_buffer)],
-                                bSG_gC[(None, subtile_idx)],
+                        tTR_tAcc_base[
+                            (
+                                None,
+                                None,
+                                None,
+                                half_idx,
+                                subtile_idx,
+                                acc_consumer_state.index,
                             )
-                            c_pipeline.producer_commit()
-                            c_pipeline.producer_acquire()
-                        self.epilog_sync_barrier.arrive_and_wait()
+                        ],
+                        tTR_rAcc,
+                    )
+                    tTR_rAcc_subtile = tTR_rAcc_final[(None, None, None, subtile_idx)]
+                    tTR_rAcc_subtile.store(tTR_rAcc.load() * scale + tTR_rAcc_subtile.load())
 
+                #
+                # Async arrive scale buffer empty
+                #
+                scale_pipeline.consumer_release(scale_consumer_state)
+                scale_consumer_state.advance()
+
+                peek_scale_full_status = cutlass.Boolean(1)
+                if scale_consumer_state.count < k_tile_cnt:
+                    peek_scale_full_status = scale_pipeline.consumer_try_wait(scale_consumer_state)
                 #
                 # Async arrive accumulator buffer empty
                 #
-                if cutlass.const_expr(not self.fp8_quantize_1x128):
-                    epi_pipeline.consumer_release(epi_consumer_state)
-                    epi_consumer_state.advance()
+                with cute.arch.elect_one():
+                    acc_pipeline.consumer_release(acc_consumer_state)
+                acc_consumer_state.advance()
 
-                #
-                # Advance to next tile
-                #
-                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for idx in cutlass.range(4, unroll_full=True):
-                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
-                is_valid_tile = tile_info[3] == 1
+                peek_acc_full_status = cutlass.Boolean(1)
+                if acc_consumer_state.count < k_tile_cnt:
+                    peek_acc_full_status = acc_pipeline.consumer_try_wait(acc_consumer_state)
+
+            #
+            # Store this half in subtiles
+            #
+            # ((ATOM_V, REST_V), EPI_M, EPI_N)
+            bSG_gC = bSG_gC_partitioned[(None, None, None, *mma_tile_coord_mnl)]
+            for subtile_idx in cutlass.range_constexpr(subtile_cnt):
+                # Convert to C type.
+                acc_vec = tiled_copy_r2s.retile(
+                    tTR_rAcc_final[(None, None, None, subtile_idx)]
+                ).load()
+                tRS_rC.store(epilogue_op(acc_vec.to(self.c_dtype)))
+
+                # Store C to shared memory.
+                num_prev_subtiles = num_prev_subtiles + 1
+                c_buffer = half_idx * num_c_stage_half + num_prev_subtiles % num_c_stage_half
+                cute.copy(
+                    tiled_copy_r2s,
+                    tRS_rC,
+                    tRS_sC[(None, None, None, c_buffer)],
+                )
+                # Fence and barrier to make the shared-memory store visible
+                # to the TMA store.
                 cute.arch.fence_proxy(
                     "async.shared",
                     space="cta",
                 )
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
-                tile_info_consumer_state.advance()
+                store_sync_barrier.arrive_and_wait()
+
+                # TMA store C to global memory from the half's first warp.
+                if warp_idx % 4 == 0:
+                    cute.copy(
+                        tma_atom_c,
+                        bSG_sC[(None, c_buffer)],
+                        bSG_gC[(None, half_idx, subtile_idx)],
+                    )
+                    c_pipeline.producer_commit()
+                    c_pipeline.producer_acquire()
+                store_sync_barrier.arrive_and_wait()
 
             #
-            # Dealloc the tensor memory buffer
+            # Advance to next tile
             #
-            tmem.relinquish_alloc_permit()
-            self.epilog_sync_barrier.arrive_and_wait()
-            tmem.free(tmem_ptr)
-            #
-            # Wait for C store complete
-            #
-            if cutlass.const_expr(not self.fp8_quantize_1x128):
-                c_pipeline.producer_tail()
+            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+            for idx in cutlass.range(4, unroll_full=True):
+                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+            is_valid_tile = tile_info[3] == 1
+            cute.arch.fence_proxy(
+                "async.shared",
+                space="cta",
+            )
+            tile_info_pipeline.consumer_release(tile_info_consumer_state)
+            tile_info_consumer_state.advance()
+
+        #
+        # Dealloc the tensor memory buffer once both halves stopped reading it
+        #
+        tmem.relinquish_alloc_permit()
+        self.split_acc_update_done_barrier.arrive_and_wait()
+        tmem.free(tmem_ptr)
+        #
+        # Wait for C store complete
+        #
+        c_pipeline.producer_tail()
 
     @cute.jit
     def _epilog_fp8_register_scratch(
@@ -2500,9 +2852,11 @@ class SM107BlockwiseGemmKernel(Sm100BlockwiseGemmKernel):
         Check if the gemm can be implemented on SM107.
         """
         can_impl = True
-        # The fused packed-FP8 epilogue writes full 128-column tiles and only
+        # The fused packed-FP8 epilogue writes full 128x128 CTA tiles and only
         # predicates rows.
-        if fuse_fp8_quantize_1x128 and (n % 128 != 0 or c_major != "n"):
+        if fuse_fp8_quantize_1x128 and (
+            n % 128 != 0 or c_major != "n" or mma_tiler[0] // (2 if use_2cta_instrs else 1) != 128
+        ):
             can_impl = False
 
         # Check data types
