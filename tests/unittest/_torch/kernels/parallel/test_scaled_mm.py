@@ -25,7 +25,7 @@ from utils.util import getSMVersion
                     reason="the exact-m cuBLASLt configs are tuned for SM 10.3")
 @pytest.mark.parametrize("m", [224, 448, 504, 672, 896])
 def test_fp8_scaled_mm_exact_m_configs(m):
-    """Shapes with an exact-m entry in cublas_lut::fp8_exact_m_algo_list run their config and match torch."""
+    """Shapes with an exact-m entry in cublas_lut::sm103_fp8_exact_m_algo_list run their config and match torch."""
     k, n = 4096, 2560
     torch.random.manual_seed(0)
     x = torch.rand((m, k), device="cuda").to(torch.float8_e4m3fn)
