@@ -4070,7 +4070,7 @@ def test_v2_hybrid_graph_survives_pool_rebalance(manager_cls, replay, tma_write)
             window = cache.old_x.shape[2]
             x = torch.full((1, steps, heads, dim), 0.2, device="cuda", dtype=cache.old_x.dtype)
             dt = torch.full((1, steps, heads, 1), 0.1, device="cuda", dtype=x.dtype).expand_as(x)
-            A = -torch.ones(heads, 1, 1, device="cuda").expand(heads, dim, state_dim)
+            A = torch.full((heads, 1, 1), -1.0, device="cuda").expand(heads, dim, state_dim)
             B = torch.full((1, steps, groups, state_dim), 0.3, device="cuda", dtype=x.dtype)
             C = torch.full_like(B, 0.4)
             result = torch.empty_like(x)
