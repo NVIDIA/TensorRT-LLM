@@ -2325,7 +2325,7 @@ class PyExecutor:
             # Thread/listener cleanup above is safe. Graph destruction, device
             # synchronization and allocator teardown can touch DMA-owned memory
             # or hang on a failed device, so retain the whole execution state.
-            return
+            return False
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
         # that is referenced by raw pointers inside captured CUDA graphs.  If

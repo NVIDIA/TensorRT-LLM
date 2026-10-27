@@ -46,6 +46,8 @@ def executor(monkeypatch):
     transceiver = SimpleNamespace(shutdown=lambda: events.append("unregister"))
     ex = object.__new__(PyExecutor)
     ex._closed = False
+    ex.enable_attention_dp = False
+    ex._kv_connector_failed = False
     ex._resources_released = False
     ex._event_loop_error = None
     ex._fatal_error = None
