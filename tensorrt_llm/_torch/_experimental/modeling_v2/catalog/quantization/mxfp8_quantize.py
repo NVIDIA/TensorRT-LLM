@@ -39,10 +39,6 @@ class Mxfp8Quantize(OpWrapper):
     # it today.
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="gpt-oss hidden 2880, linear scales, aligned to 512 -> padded 3072",
-            spec=dict(shape=(16, 2880), dtype=torch.bfloat16, swizzled=False, alignment=512),
-        ),
-        Cell(
             why="decode-shaped: one token through the same padding",
             spec=dict(shape=(1, 2880), dtype=torch.bfloat16, swizzled=False, alignment=512),
         ),

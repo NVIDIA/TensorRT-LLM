@@ -22,7 +22,8 @@ from tensorrt_llm._bootstrap import _UNIFIED_CACHE_ENV_VARS
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
-from .._utils import global_mpi_rank, mpi_barrier, mpi_rank
+from .. import _utils
+from .._utils import global_mpi_rank, mpi_rank
 from .utils import logger_debug, print_colored
 
 if ENABLE_MULTI_DEVICE:
@@ -206,6 +207,7 @@ class MPINodeState:
     # This is necessary because MPICommExecutor can only be created once per MPI process
     _global_comm_executor = None
     _global_mpi_pool = None
+    _global_rank0_dispatcher = None
 
     @staticmethod
     def is_initialized() -> bool:
@@ -258,10 +260,30 @@ class MpiSession(abc.ABC):
     @abc.abstractmethod
     def submit(self, task: Callable[..., T], *args,
                **kwargs) -> List[Future[T]]:
+        """Run ``task(*args, **kwargs)`` exactly once on every rank.
+
+        All ranks start their copy only after every rank has picked one up,
+        so the copies may use collectives on the session communicator.
+        Submissions run in submission order on every rank, one at a time: a
+        rank picks up the next submission only after its copy of the
+        previous one has returned, so a task that never returns blocks every
+        later submission.
+
+        Returns:
+            Futures of the copies, or an empty list if that's unsupported.
+            Their order, if returned, is arbitrary and must not be assumed.
+            The returned futures shall not be canceled or the behavior is
+            unspecified.
+        """
         raise NotImplementedError()
 
     @abc.abstractmethod
     def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:
+        """Like ``submit``, but waits for every rank and returns the results.
+
+        Returns:
+            One result per rank, in arbitrary order that must not be assumed.
+        """
         raise NotImplementedError()
 
     @abc.abstractmethod
@@ -422,19 +444,56 @@ def _identity_barrier_timeout() -> float:
     return _DEFAULT_IDENTITY_TIMEOUT
 
 
-def _worker_identity_barrier():
+def _run_on_each_worker(task: Callable[..., T], *args, **kwargs) -> T:
     """Runs inside a pool worker; module-level so it is picklable.
 
-    The leading barrier pins the ``n_workers`` submitted tasks one-per-worker
-    (a worker holding one task blocks until every other worker holds its own,
-    so no worker can drain a second one), collecting every worker's identity
-    exactly once. The workers' ``MPI_COMM_WORLD`` is the spawned worker world
-    (the parent process is not a member).
+    ``MPIPoolExecutor`` hands each queued task to whichever worker is idle, so
+    a worker that finishes early could run several of the ``n_workers`` copies
+    of a task while another runs none. The leading barrier pins the copies
+    one-per-worker: a worker holding one copy blocks until every other worker
+    holds its own, so no worker can take a second one. The workers'
+    ``MPI_COMM_WORLD`` is the spawned worker world (the parent process is not
+    a member).
     """
     from mpi4py import MPI
     MPI.COMM_WORLD.barrier()
+    return task(*args, **kwargs)
+
+
+def _run_on_each_rank(task: Callable[..., T], *args, **kwargs) -> T:
+    """``MpiCommSession`` counterpart of ``_run_on_each_worker``.
+
+    Runs on every rank of the session communicator, rank 0 included, so the
+    barrier goes through the process-wide communicator (``_utils.comm``),
+    which ``MpiCommSession`` checks is the session communicator. Thread-local
+    communicators are ignored: the copies run on executor threads, not on the
+    thread that submitted them.
+    """
+    _utils.comm.Barrier()
+    return task(*args, **kwargs)
+
+
+class _Rank0Dispatcher:
+    """Runs rank 0's copies of ``MpiCommSession`` tasks in the workers' order.
+
+    Each worker rank of an ``MPICommExecutor`` runs one task at a time in queue
+    order: the barrier of submission k, then its task, then the barrier of
+    submission k + 1. Rank 0 runs its copies on a single thread so that its
+    barriers and its tasks' own collectives reach the communicator in that
+    same order. ``lock`` makes queueing the worker copies and rank 0's copy one
+    step, so concurrent submissions reach both queues in the same order.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="MpiCommSessionRank0")
+
+
+def _worker_identity() -> tuple[int, Optional[bytes]]:
+    """Runs inside a pool worker; module-level so it is picklable."""
     pid = os.getpid()
-    return (pid, _process_start_time(pid))
+    return pid, _process_start_time(pid)
 
 
 class MpiPoolSession(MpiSession):
@@ -467,6 +526,8 @@ class MpiPoolSession(MpiSession):
         self._wait_shutdown = wait_shutdown
         self._env_overrides = dict(env_overrides) if env_overrides else {}
         self._worker_identities: Tuple = ()
+        # Keeps the copies of one submission contiguous in the pool's queue.
+        self._submit_lock = threading.Lock()
         self.mpi_pool: Optional[MPIPoolExecutor] = None
         self._start_mpi_pool()
         if wait_shutdown:
@@ -479,16 +540,27 @@ class MpiPoolSession(MpiSession):
 
     def submit(self, task: Callable[..., T], *args,
                **kwargs) -> List[Future[T]]:
-        return [
-            self.mpi_pool.submit(task, *args, **kwargs)
-            for i in range(self.n_workers)
-        ]
+        """See ``MpiSession.submit``.
+
+        The ranks are the ``n_workers`` spawned workers; this process is not
+        one of them, and the workers' ``MPI_COMM_WORLD`` holds only them.
+
+        Returns:
+            One future per worker, in arbitrary order.
+        """
+        with self._submit_lock:
+            return [
+                self.mpi_pool.submit(_run_on_each_worker, task, *args, **kwargs)
+                for i in range(self.n_workers)
+            ]
 
     def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:
-        futures = [
-            self.mpi_pool.submit(task, *args, **kwargs)
-            for i in range(self.n_workers)
-        ]
+        """See ``MpiSession.submit_sync``.
+
+        Returns:
+            One result per worker, in arbitrary order.
+        """
+        futures = self.submit(task, *args, **kwargs)
         return [future.result() for future in futures]
 
     def shutdown(self, wait=True):
@@ -519,10 +591,7 @@ class MpiPoolSession(MpiSession):
         """
         timeout = _identity_barrier_timeout()
         try:
-            futures = [
-                self.mpi_pool.submit(_worker_identity_barrier)
-                for _ in range(self.n_workers)
-            ]
+            futures = self.submit(_worker_identity)
             done, not_done = futures_wait(futures, timeout=timeout)
             identities = tuple(f.result() for f in done)
         except Exception as e:
@@ -649,11 +718,16 @@ class MpiPoolSession(MpiSession):
 class MpiCommSession(MpiSession):
 
     def __init__(self, comm=None, n_workers: int = 1):
+        # TODO: MpiCommSession in fact can only run on _utils.comm, so these
+        #  arguments are redundant and should be removed.
         self.comm = comm
         self.n_workers = n_workers
-        self.thread_pool: Optional[ThreadPoolExecutor] = None
+
         self.mpi_pool: Optional[MPIPoolExecutor] = None
         self.owns_mpi_pool = False  # Track if this instance owns the mpi_pool
+        # Shared by every session on the same mpi_pool.
+        self._rank0_dispatcher: Optional[_Rank0Dispatcher] = None
+        self._rank0_futures: set[Future] = set()
 
         if n_workers <= 0:
             raise ValueError(
@@ -673,6 +747,14 @@ class MpiCommSession(MpiSession):
                     f'n_workers must be equal to the number of processes in MPI, got {n_workers} vs {get_mpi_world_size()}'
                 )
 
+            if mpi4py.MPI.Comm.Compare(
+                    self.comm, _utils.comm) not in (mpi4py.MPI.IDENT,
+                                                    mpi4py.MPI.CONGRUENT):
+                raise ValueError(
+                    'MpiCommSession comm must match the process-wide MPI '
+                    'communicator; call tensorrt_llm._utils.set_mpi_comm(comm) '
+                    'on every rank of comm before creating the session')
+
         self._start_mpi_pool()
 
     def get_comm(self):
@@ -680,23 +762,34 @@ class MpiCommSession(MpiSession):
 
     def submit(self, task: Callable[..., T], *args,
                **kwargs) -> List[Future[T]]:
-        """Submit a task to MPI workers.
+        """See ``MpiSession.submit``.
 
-        Args:
-            task: The task to be submitted.
-            args: Positional arguments for the task.
-            kwargs: Keyword arguments for the task.
+        The ranks are those of ``comm``. This process is rank 0 and runs its
+        copy on a dedicated thread; the other ranks serve tasks through
+        ``MPICommExecutor``.
+
+        Returns:
+            One future per rank, in arbitrary order.
         """
         assert self.mpi_pool is not None, 'MPI session not started'
-        worker_futures = [
-            self.mpi_pool.submit(task, *args, **kwargs)
-            for i in range(self.n_workers - 1)
-        ]
-
-        rank0_future = self.thread_pool.submit(task, *args, **kwargs)
+        dispatcher = self._rank0_dispatcher
+        with dispatcher.lock:
+            worker_futures = [
+                self.mpi_pool.submit(_run_on_each_rank, task, *args, **kwargs)
+                for i in range(self.n_workers - 1)
+            ]
+            rank0_future = dispatcher.executor.submit(_run_on_each_rank, task,
+                                                      *args, **kwargs)
+        self._rank0_futures.add(rank0_future)
+        rank0_future.add_done_callback(self._rank0_futures.discard)
         return [rank0_future] + worker_futures
 
     def submit_sync(self, task: Callable[..., T], *args, **kwargs) -> List[T]:
+        """See ``MpiSession.submit_sync``.
+
+        Returns:
+            One result per rank of ``comm``, in arbitrary order.
+        """
         futures = self.submit(task, *args, **kwargs)
         return [future.result() for future in futures]
 
@@ -710,17 +803,18 @@ class MpiCommSession(MpiSession):
             self.mpi_pool.shutdown(wait=wait)
             logger.info("MpiCommSession.shutdown: mpi_pool done")
         self.mpi_pool = None
-        if self.thread_pool is not None:
-            self.thread_pool.shutdown(wait=wait)
-            self.thread_pool = None
+        if self._rank0_dispatcher is not None:
+            if self.owns_mpi_pool:
+                self._rank0_dispatcher.executor.shutdown(wait=wait)
+            elif wait:
+                futures_wait(list(self._rank0_futures))
+            self._rank0_dispatcher = None
 
     def abort(self):
         self.get_comm().Abort(1)
 
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
-
-        self.thread_pool = ThreadPoolExecutor(max_workers=2)
 
         # Use global MPICommExecutor if using COMM_WORLD
         # This is necessary because MPICommExecutor can only be created once per MPI process
@@ -738,10 +832,12 @@ class MpiCommSession(MpiSession):
                 MPINodeState._global_comm_executor = MPICommExecutor(self.comm)
                 MPINodeState._global_mpi_pool = MPINodeState._global_comm_executor.__enter__(
                 )
+                MPINodeState._global_rank0_dispatcher = _Rank0Dispatcher()
             else:
                 logger_debug("Reusing global MPICommExecutor for COMM_WORLD\n",
                              "yellow")
             self.mpi_pool = MPINodeState._global_mpi_pool
+            self._rank0_dispatcher = MPINodeState._global_rank0_dispatcher
             self.owns_mpi_pool = False
         else:
             logger_debug(
@@ -750,6 +846,7 @@ class MpiCommSession(MpiSession):
             # For non-COMM_WORLD communicators, create a new executor
             comm_executor = MPICommExecutor(self.comm)
             self.mpi_pool = comm_executor.__enter__()
+            self._rank0_dispatcher = _Rank0Dispatcher()
             self.owns_mpi_pool = True
 
     def __del__(self):
@@ -839,7 +936,16 @@ class RemoteMpiCommSessionClient(MpiSession):
                *args,
                sync: bool = False,
                **kwargs) -> list:
-        """Submit a task to the remote MPI pool."""
+        """See ``MpiSession.submit``.
+
+        The ``RemoteMpiCommSessionServer`` runs the task through its own
+        ``MpiCommSession`` or ``MpiPoolSession``, after appending this
+        client's ``sys.path`` on every rank.
+
+        Returns:
+            An empty list: the client gets no futures. A rank whose copy of
+            an async task raises is reported through ``check_worker_error``.
+        """
         if self._is_shutdown:
             logger_debug("RemoteMpiCommSessionClient is already shut down\n",
                          "yellow")
@@ -852,7 +958,11 @@ class RemoteMpiCommSessionClient(MpiSession):
         return []
 
     def submit_sync(self, task, *args, **kwargs) -> List[T]:
-        """Submit a task to the remote MPI pool and wait for task completion."""
+        """See ``MpiSession.submit_sync``.
+
+        Returns:
+            One result per rank of the server's session, in arbitrary order.
+        """
         self.submit(task, *args, sync=True, **kwargs)
 
         # poll() blocks on the response socket and wakes when a result arrives.
@@ -965,9 +1075,6 @@ class RemoteMpiCommSessionServer():
             f"MpiCommSession rank{mpi_rank()} start task [{task}] with args: {args} and kwargs: {kwargs}\n",
             "green")
 
-        # Pin one task to each rank before any worker can accept another task.
-        mpi_barrier()
-
         try:
             return task(*args, **kwargs)
         except Exception as e:
@@ -1010,6 +1117,10 @@ class RemoteMpiCommSessionServer():
             return
         MPINodeState._global_comm_executor = None
         MPINodeState._global_mpi_pool = None
+        dispatcher = MPINodeState._global_rank0_dispatcher
+        MPINodeState._global_rank0_dispatcher = None
+        if dispatcher is not None:
+            dispatcher.executor.shutdown(wait=False)
         if abort is None:
             abort = lambda: mpi4py.MPI.COMM_WORLD.Abort(1)  # noqa: E731
 

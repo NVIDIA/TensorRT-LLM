@@ -11,11 +11,13 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (
     flashinfer_silu_and_mul as op,
 )
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "flashinfer_silu_and_mul requires a CUDA device"
@@ -26,7 +28,21 @@ def _build(spec, seed):
     return torch.randn(spec["shape"], generator=g, device="cuda").to(spec["dtype"])
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:40] for c in op.CELLS])
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
+        Cell(
+            why="deepseek default at attention TP8: the shared expert's gate+up, 2 x 2048/8",
+            spec=dict(shape=(16, 512), dtype=torch.bfloat16),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:40] for c in CELLS])
 def test_certified_cells(cell) -> None:
     x = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     with validating(op):

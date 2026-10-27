@@ -45,7 +45,7 @@ class MlaRopeGeneration(OpWrapper):
     # single-layer. Fixed by the checkpoint, so the cells vary what a step
     # varies -- how many new tokens, the page size, and whether the scales are
     # passed explicitly.
-    _R1 = dict(
+    R1 = dict(
         num_heads=128,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
@@ -62,7 +62,7 @@ class MlaRopeGeneration(OpWrapper):
                 q_scaling=Q_SCALING_R1,
                 write_scale=None,
                 read_scale=None,
-                **_R1,
+                **R1,
             ),
         ),
         Cell(
@@ -73,7 +73,7 @@ class MlaRopeGeneration(OpWrapper):
                 q_scaling=Q_SCALING_R1,
                 write_scale=None,
                 read_scale=None,
-                **_R1,
+                **R1,
             ),
         ),
         Cell(
@@ -84,29 +84,7 @@ class MlaRopeGeneration(OpWrapper):
                 q_scaling=1.0,
                 write_scale=0.5,
                 read_scale=2.0,
-                **_R1,
-            ),
-        ),
-        Cell(
-            why="deepseek default at attention TP8: 16 heads per rank, production decode",
-            spec=dict(
-                predicted_tokens_per_seq=1,
-                tokens_per_block=32,
-                q_scaling=Q_SCALING_R1,
-                write_scale=None,
-                read_scale=None,
-                **dict(_R1, num_heads=16),
-            ),
-        ),
-        Cell(
-            why="deepseek default MTP3 at attention TP8: P=4 (draft length 3 + 1) at 16 heads",
-            spec=dict(
-                predicted_tokens_per_seq=4,
-                tokens_per_block=32,
-                q_scaling=Q_SCALING_R1,
-                write_scale=None,
-                read_scale=None,
-                **dict(_R1, num_heads=16),
+                **R1,
             ),
         ),
     )

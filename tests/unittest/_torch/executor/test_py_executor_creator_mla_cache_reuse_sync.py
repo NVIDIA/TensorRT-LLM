@@ -304,6 +304,7 @@ def _run_create_py_executor(
         tp_size=1,
         pp_size=1,
         has_pp=lambda: False,
+        has_cp_helix=lambda: False,
         enable_attention_dp=False,
         is_last_pp_rank=lambda: True,
     )

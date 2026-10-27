@@ -2656,6 +2656,8 @@ class _StubADPExecutor:
 
         self.dist = Mock()
         self.dist.tp_size = 1
+        self.dist.cp_size = 1
+        self.dist.tp_rank = 0
         self.dist.tp_allgather.side_effect = lambda value: [value]
         self.dist.tp_allreduce.side_effect = lambda value, op: max(value, int(peer_forward_intent))
         self.adp_router = Mock(exclude_retiring_requests=exclude_retiring_requests)
@@ -3011,6 +3013,7 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
         enable_iter_perf_stats=False,
         num_fetch_requests=0,
         dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0),
+        kv_cache_transceiver=None,
         _should_exclude_last_generation_logits=lambda: False,
         _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
         _kv_cache_capacity={},
@@ -3096,6 +3099,7 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
         enable_iter_perf_stats=False,
         num_fetch_requests=0,
         dist=Mock(cp_config={}, cp_rank=0, cp_size=1, rank=0, tp_size=1),
+        kv_cache_transceiver=None,
         _should_exclude_last_generation_logits=lambda: False,
         _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
         _kv_cache_capacity={},
@@ -3140,7 +3144,7 @@ def test_generic_disagg_adp_mixed_rank_states_stay_queueable():
     assert rank_batch_sizes == [1, 1]
 
     for stub, batch_size in zip((busy_rank, terminal_rank), rank_batch_sizes, strict=True):
-        stub.dist.tp_allgather_int64 = Mock(
+        stub.dist.tp_cp_allgather_int64 = Mock(
             return_value=np.array([[size] for size in rank_batch_sizes])
         )
         can_queue, can_queue_this_rank = PyExecutor._can_queue(
@@ -3286,7 +3290,7 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     first_dummy = stub._pending_adp_dummy_request
     assert first_dummy is not None
 
-    stub.dist.tp_allgather_int64 = Mock(return_value=np.array([[1], [0]]))
+    stub.dist.tp_cp_allgather_int64 = Mock(return_value=np.array([[1], [0]]))
     can_queue, _ = PyExecutor._can_queue(stub, types.SimpleNamespace(batch_size=1))
     assert can_queue is False
     PyExecutor._finalize_adp_dummy_allocation(stub, can_queue)
@@ -3295,7 +3299,7 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     spec_resource_manager.free_resources.assert_called_once_with(first_dummy)
     stub.kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
 
-    stub.dist.tp_allgather_int64 = Mock(return_value=np.array([[1], [1]]))
+    stub.dist.tp_cp_allgather_int64 = Mock(return_value=np.array([[1], [1]]))
     _run_pad(stub)
     second_dummy = stub._pending_adp_dummy_request
     assert second_dummy is not None

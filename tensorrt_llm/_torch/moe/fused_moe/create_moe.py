@@ -179,7 +179,7 @@ def create_moe_backend(
             layer_idx=layer_idx,
             activation=activation,
         )
-    elif moe_cls in (CuteDslFusedMoE, CuteDslFc12FusedMoE):
+    elif issubclass(moe_cls, (CuteDslFusedMoE, CuteDslFc12FusedMoE)):
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
