@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllLamport.h"
 
 #include <array>
 #include <cstdint>
@@ -96,8 +97,27 @@ enum MoeA2AMetaInfoIndex : int64_t
     CFT_ENABLED_INDEX = 23,
     // Total required bytes per rank, including all control buffers, payloads and alignment padding.
     WORKSPACE_SIZE_INDEX = 24,
+
+    // Lamport transport (moeAlltoAllLamport.h), appended after the regions above by
+    // moe_a2a_lamport_extend_workspace_layout. Every field is zero when it is not allocated.
+    // Landing rows per source rank: the largest runtime_max_tokens_per_rank of a Lamport step.
+    LAMPORT_MAX_NUM_TOKENS_INDEX = 25,
+    // Payload format (kernels::moe_comm::lamport::PayloadFormat) and hidden size the landing rows hold.
+    LAMPORT_PAYLOAD_FORMAT_INDEX = 26,
+    LAMPORT_HIDDEN_SIZE_INDEX = 27,
+    // Round state: int32 words (epoch, ...), then a uint64 receive-source mask per token slot.
+    LAMPORT_STATE_OFFSET_INDEX = 28,
+    // Landing rows: payload, scale and weight rows, then two sets of expert-id rows.
+    LAMPORT_LANDING_OFFSET_INDEX = 29,
+    // Combine landing rows: one bf16 partial row per (source rank, token).
+    LAMPORT_COMBINE_LANDING_OFFSET_INDEX = 30,
+    // Receive buffers of a Lamport dispatch, packed like the dispatch payload region.
+    LAMPORT_RECV_OFFSET_INDEX = 31,
+    // Reserved receive capacity, including payload alignment padding.
+    LAMPORT_RECV_SIZE_INDEX = 32,
+
     // Number of int64_t entries in the metadata tensor; not a stored layout field.
-    NUM_METAINFO_FIELDS = 25
+    NUM_METAINFO_FIELDS = 33
 };
 
 using MoeA2AWorkspaceLayout = std::array<int64_t, NUM_METAINFO_FIELDS>;
@@ -132,11 +152,29 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
         {"MOE_A2A_EPLB_STATS_NUM_EXPERTS_INDEX", EPLB_STATS_NUM_EXPERTS_INDEX},
         {"MOE_A2A_CFT_ENABLED_INDEX", CFT_ENABLED_INDEX},
         {"MOE_A2A_WORKSPACE_SIZE_INDEX", WORKSPACE_SIZE_INDEX},
+        {"MOE_A2A_LAMPORT_MAX_NUM_TOKENS_INDEX", LAMPORT_MAX_NUM_TOKENS_INDEX},
+        {"MOE_A2A_LAMPORT_PAYLOAD_FORMAT_INDEX", LAMPORT_PAYLOAD_FORMAT_INDEX},
+        {"MOE_A2A_LAMPORT_HIDDEN_SIZE_INDEX", LAMPORT_HIDDEN_SIZE_INDEX},
+        {"MOE_A2A_LAMPORT_STATE_OFFSET_INDEX", LAMPORT_STATE_OFFSET_INDEX},
+        {"MOE_A2A_LAMPORT_LANDING_OFFSET_INDEX", LAMPORT_LANDING_OFFSET_INDEX},
+        {"MOE_A2A_LAMPORT_COMBINE_LANDING_OFFSET_INDEX", LAMPORT_COMBINE_LANDING_OFFSET_INDEX},
+        {"MOE_A2A_LAMPORT_RECV_OFFSET_INDEX", LAMPORT_RECV_OFFSET_INDEX},
+        {"MOE_A2A_LAMPORT_RECV_SIZE_INDEX", LAMPORT_RECV_SIZE_INDEX},
         {"MOE_A2A_NUM_METAINFO_FIELDS", NUM_METAINFO_FIELDS},
         {"MOE_A2A_MAX_RANKS", kMaxRanks},
         {"MOE_A2A_MAX_TOP_K", kMaxTopK},
         {"MOE_A2A_MAX_PAYLOADS", kMaxPayloads},
         {"MOE_A2A_WORKSPACE_ALIGNMENT", kWorkspaceAlignment},
+        // Limits of the Lamport transport and its payload formats.
+        {"MOE_A2A_LAMPORT_MAX_RANKS", lamport::kMaxRanks},
+        {"MOE_A2A_LAMPORT_MAX_TOP_K", lamport::kMaxTopK},
+        {"MOE_A2A_LAMPORT_MAX_TOKENS_PER_RANK", lamport::kMaxTokensPerRank},
+        {"MOE_A2A_LAMPORT_DISPATCH_BLOCKS_PER_SM", lamport::kDispatchBlocksPerSM},
+        {"MOE_A2A_LAMPORT_IDS_SENTINEL", static_cast<int32_t>(lamport::kIdsSentinel)},
+        {"MOE_A2A_LAMPORT_FORMAT_BF16", lamport::kBf16},
+        {"MOE_A2A_LAMPORT_FORMAT_MXFP8", lamport::kMxfp8},
+        {"MOE_A2A_LAMPORT_FORMAT_FP8_BLOCK128", lamport::kFp8Block128},
+        {"MOE_A2A_LAMPORT_FORMAT_NVFP4", lamport::kNvfp4},
     };
 }
 
