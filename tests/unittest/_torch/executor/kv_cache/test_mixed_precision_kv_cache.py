@@ -300,6 +300,16 @@ def test_mixed_precision_rejects_custom_managers():
 
     assert object.__new__(_Wrapper)._mixed_precision_kv_supported()
 
+    # A manager whose pool already holds the low-precision history accepts any pool dtype.
+    class _Native(_OptedIn):
+        _mixed_precision_native_pool = True
+
+    native = object.__new__(_Native)
+    native._init_mixed_precision(
+        KvCacheConfig(dtype="mixed_nvfp4_bfloat16"), None, 1024, DataType.FP8
+    )
+    assert native.high_precision_dtype == DataType.BF16
+
 
 def test_appended_draft_layers_stay_native(make_manager):
     """One-model draft layers appended to the target manager keep a plain cache."""

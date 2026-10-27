@@ -182,8 +182,8 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     if (pyt_kv_cache_dtype.startswith("mixed_")
             and getattr(model_config.sparse_attention_config, "algorithm",
                         None) in ("dsa", "deepseek_v4")):
-        # Native NVFP4 pools: the retained tokens are overlaid after the top-k gather.
-        mapped_pyt_quant = QuantAlgo.NVFP4.value
+        # These backends keep the history in their own pool, in the low-precision format.
+        mapped_pyt_quant = _KV_CACHE_MAP[pyt_kv_cache_dtype.split("_")[1]]
 
     effective_kv_cache_quant = (kv_cache_quant if pyt_kv_cache_dtype == "auto"
                                 else mapped_pyt_quant)
