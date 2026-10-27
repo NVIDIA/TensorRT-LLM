@@ -249,6 +249,26 @@ def test_bad_markers_and_selectors_are_skipped(
     assert f"skipped test_cases.py::{selector}" in capfd.readouterr().err
 
 
+def test_unreadable_test_source_aborts_split(
+    splitter: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "test_cases.py"
+    source.write_text("def test_good(): pass\n", encoding="utf-8")
+    test_list = tmp_path / "qa.txt"
+    test_list.write_text("test_cases.py::test_good\n", encoding="utf-8")
+    read_text = Path.read_text
+
+    def fail_source_read(path: Path, *args: object, **kwargs: object) -> str:
+        if path == source:
+            raise PermissionError("test source is unreadable")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_source_read)
+    with pytest.raises(PermissionError, match="test source is unreadable"):
+        splitter.split_test_list(test_list, tmp_path / "out", tmp_path)
+    assert not (tmp_path / "out").exists()
+
+
 def test_inherited_class_mark_order_and_class_pytestmark(
     splitter: ModuleType, tmp_path: Path
 ) -> None:

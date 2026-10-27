@@ -261,7 +261,7 @@ def split_test_list(
                 (_bucket(required), f"{case} {suffix}" if suffix else case)
                 for case, required in cases
             ]
-        except (OSError, TypeError, ValueError, SyntaxError) as error:
+        except (TypeError, ValueError, SyntaxError) as error:
             skipped.append({"line": lineno, "entry": original, "reason": str(error)})
             print(f"{test_list}:{lineno}: skipped {selector}: {error}", file=sys.stderr)
             continue
