@@ -1436,7 +1436,10 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
 
         if _is_qwen3_5(model_config):
             # Decode-sized projections race cuBLAS against the low-M GEMMs.
-            prepare_low_m_gemm(self, force=True)
+            prepare_low_m_gemm(
+                self,
+                force=True,
+                per_rank_tuning=model_config.mapping.enable_attention_dp)
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
