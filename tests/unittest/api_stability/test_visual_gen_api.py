@@ -38,7 +38,7 @@ assert not torch.distributed.is_initialized()
 assert not multiprocessing.active_children()
 """
     environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", TRTLLM_NO_USAGE_STATS="1")
-    paths = [str(Path(__file__).parent), str(Path(__file__).resolve().parents[3])]
+    paths = [str(Path(__file__).parent)]
     if environment.get("PYTHONPATH"):
         paths.append(environment["PYTHONPATH"])
     environment["PYTHONPATH"] = os.pathsep.join(paths)

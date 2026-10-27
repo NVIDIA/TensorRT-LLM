@@ -22,7 +22,9 @@ configuration types (including discriminated unions). Shared LLM types such as
 
 The snapshot records parameter order and kind, requiredness, annotations,
 defaults, named default factories, async behavior, field aliases, model config,
-constraint metadata, and API status metadata. It reads class definitions without
+constraint metadata, and API status metadata. Output dataclasses also record
+constructor parameters (including `InitVar`), decorator options, slots, and
+positional matching fields. It reads class definitions without
 constructing an engine, evaluating properties, or invoking default factories.
 Anonymous/local factories and unsupported default or constraint values fail
 explicitly and need a stable encoding. Annotation spelling changes can require a
@@ -56,7 +58,9 @@ reference; recording their current shape does not promote them to stable APIs.
 Snapshots do not classify compatibility automatically. Validator logic, default
 factory behavior, exceptions, generated tensor shapes, and per-pipeline
 `extra_param_specs` / `ref_slot_specs` values still need behavioral tests and
-human review. Semantic-only implementation changes may not trigger a reference
+human review. Public class constants and descriptors other than ordinary
+properties, classmethods, and staticmethods are outside this initial gate.
+Semantic-only implementation changes may not trigger a reference
 diff or the path-based label check. VisualGen public API changes also follow
 the team review rules in
 `tensorrt_llm/_torch/visual_gen/ENGINEERING_CRITERIA.md`.

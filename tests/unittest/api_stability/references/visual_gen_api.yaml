@@ -684,6 +684,7 @@ classes:
     kind: pydantic
     members:
       n_workers:
+        deleter: null
         getter:
           async: false
           async_generator: false
@@ -697,6 +698,7 @@ classes:
         setter: null
         status: null
       seq_parallel_size:
+        deleter: null
         getter:
           async: false
           async_generator: false
@@ -710,6 +712,7 @@ classes:
         setter: null
         status: null
       token_sharded_tp:
+        deleter: null
         getter:
           async: false
           async_generator: false
@@ -723,6 +726,7 @@ classes:
         setter: null
         status: null
       total_parallel_size:
+        deleter: null
         getter:
           async: false
           async_generator: false
@@ -1293,6 +1297,7 @@ classes:
     kind: pydantic
     members:
       cache_backend:
+        deleter: null
         getter:
           async: false
           async_generator: false
@@ -1306,6 +1311,7 @@ classes:
         setter: null
         status: null
       cache_dit:
+        deleter: null
         getter:
           async: false
           async_generator: false
@@ -1353,6 +1359,7 @@ classes:
         returns: VisualGenArgs
         status: prototype
       teacache:
+        deleter: null
         getter:
           async: false
           async_generator: false
@@ -1406,7 +1413,52 @@ classes:
       name: post_denoise
       required: false
     kind: dataclass
-    members: {}
+    match_args:
+      tuple:
+      - generation
+      - pre_denoise
+      - denoise
+      - post_denoise
+    members:
+      __init__:
+        async: false
+        async_generator: false
+        binding: instance
+        parameters:
+        - annotation: <unspecified>
+          kind: POSITIONAL_OR_KEYWORD
+          name: self
+          required: true
+        - annotation: builtins.float
+          default: 0.0
+          kind: POSITIONAL_OR_KEYWORD
+          name: generation
+          required: false
+        - annotation: builtins.float
+          default: 0.0
+          kind: POSITIONAL_OR_KEYWORD
+          name: pre_denoise
+          required: false
+        - annotation: builtins.float
+          default: 0.0
+          kind: POSITIONAL_OR_KEYWORD
+          name: denoise
+          required: false
+        - annotation: builtins.float
+          default: 0.0
+          kind: POSITIONAL_OR_KEYWORD
+          name: post_denoise
+          required: false
+        returns: None
+        status: null
+    options:
+      eq: true
+      frozen: false
+      init: true
+      order: false
+      repr: true
+      unsafe_hash: false
+    slots: null
     status: prototype
   tensorrt_llm.visual_gen.output.VisualGenOutput:
     bases:
@@ -1467,7 +1519,74 @@ classes:
       name: metrics
       required: false
     kind: dataclass
+    match_args:
+      tuple:
+      - request_id
+      - image
+      - video
+      - audio
+      - action
+      - frame_rate
+      - audio_sample_rate
+      - error
+      - metrics
     members:
+      __init__:
+        async: false
+        async_generator: false
+        binding: instance
+        parameters:
+        - annotation: <unspecified>
+          kind: POSITIONAL_OR_KEYWORD
+          name: self
+          required: true
+        - annotation: builtins.int
+          default: -1
+          kind: POSITIONAL_OR_KEYWORD
+          name: request_id
+          required: false
+        - annotation: Optional[torch.Tensor]
+          default: null
+          kind: POSITIONAL_OR_KEYWORD
+          name: image
+          required: false
+        - annotation: Optional[torch.Tensor]
+          default: null
+          kind: POSITIONAL_OR_KEYWORD
+          name: video
+          required: false
+        - annotation: Optional[torch.Tensor]
+          default: null
+          kind: POSITIONAL_OR_KEYWORD
+          name: audio
+          required: false
+        - annotation: Optional[torch.Tensor]
+          default: null
+          kind: POSITIONAL_OR_KEYWORD
+          name: action
+          required: false
+        - annotation: Optional[float]
+          default: null
+          kind: POSITIONAL_OR_KEYWORD
+          name: frame_rate
+          required: false
+        - annotation: Optional[int]
+          default: null
+          kind: POSITIONAL_OR_KEYWORD
+          name: audio_sample_rate
+          required: false
+        - annotation: Optional[str]
+          default: null
+          kind: POSITIONAL_OR_KEYWORD
+          name: error
+          required: false
+        - annotation: Optional[tensorrt_llm.visual_gen.output.VisualGenMetrics]
+          default: null
+          kind: POSITIONAL_OR_KEYWORD
+          name: metrics
+          required: false
+        returns: None
+        status: null
       save:
         async: false
         async_generator: false
@@ -1503,6 +1622,14 @@ classes:
           required: false
         returns: Union[pathlib.Path, List[pathlib.Path]]
         status: null
+    options:
+      eq: true
+      frozen: false
+      init: true
+      order: false
+      repr: true
+      unsafe_hash: false
+    slots: null
     status: prototype
   tensorrt_llm.visual_gen.params.MediaRef:
     bases:
@@ -2168,6 +2295,7 @@ classes:
         returns: <unspecified>
         status: prototype
       default_params:
+        deleter: null
         getter:
           async: false
           async_generator: false
@@ -2181,6 +2309,7 @@ classes:
         setter: null
         status: null
       extra_param_specs:
+        deleter: null
         getter:
           async: false
           async_generator: false
@@ -2265,6 +2394,7 @@ classes:
         returns: Dict[str, Any]
         status: prototype
       ref_slot_specs:
+        deleter: null
         getter:
           async: false
           async_generator: false
@@ -2368,6 +2498,7 @@ classes:
         returns: <unspecified>
         status: null
       done:
+        deleter: null
         getter:
           async: false
           async_generator: false

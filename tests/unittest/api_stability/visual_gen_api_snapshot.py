@@ -101,7 +101,9 @@ def _metadata(value: object) -> object:
     raise TypeError(f"Unsupported field metadata: {type(value)}")
 
 
-def snapshot_callable(function: object, binding: str = "instance") -> dict:
+def snapshot_callable(
+    function: object, binding: str = "instance", *, factories: dict[str, object] | None = None
+) -> dict:
     """Read an unbound callable, retaining argument order and invocation semantics."""
     signature = inspect.signature(function, eval_str=False)
     return {
@@ -114,7 +116,9 @@ def snapshot_callable(function: object, binding: str = "instance") -> dict:
                 "kind": parameter.kind.name,
                 "annotation": _annotation(parameter.annotation),
                 **_default(
-                    parameter.default, None, required=parameter.default is inspect.Parameter.empty
+                    parameter.default,
+                    (factories or {}).get(parameter.name),
+                    required=parameter.default is inspect.Parameter.empty,
                 ),
             }
             for parameter in signature.parameters.values()
@@ -136,7 +140,9 @@ def _members(cls: type) -> dict:
             or base is BaseModel
             or (base is not cls and not _owned(base) and base.__module__ != cls.__module__)
         ):
-            break
+            # Excluded framework methods still shadow later mixin members.
+            seen.update(vars(base))
+            continue
         for name, member in vars(base).items():
             if name in seen or (name.startswith("_") and name not in _API_DUNDERS):
                 continue
@@ -145,20 +151,26 @@ def _members(cls: type) -> dict:
                 result[name] = {
                     "getter": snapshot_callable(member.fget, "property"),
                     "setter": snapshot_callable(member.fset, "property") if member.fset else None,
+                    "deleter": snapshot_callable(member.fdel, "property") if member.fdel else None,
                 }
             elif isinstance(member, (classmethod, staticmethod)):
                 binding = "class" if isinstance(member, classmethod) else "static"
                 result[name] = snapshot_callable(member.__func__, binding)
             elif inspect.isfunction(member):
-                # Generated dataclass constructor defaults use a sentinel; fields
-                # below record their requiredness, order, factories and kw_only.
+                factories = None
+                # Generated constructors use a sentinel for default factories.
+                # Keep their signature as well: InitVar parameters aren't fields.
                 if (
                     name == "__init__"
                     and dataclasses.is_dataclass(cls)
                     and member.__code__.co_filename == "<string>"
                 ):
-                    continue
-                result[name] = snapshot_callable(member)
+                    factories = {
+                        field.name: field.default_factory
+                        for field in dataclasses.fields(cls)
+                        if field.default_factory is not dataclasses.MISSING
+                    }
+                result[name] = snapshot_callable(member, factories=factories)
     return result
 
 
@@ -198,6 +210,12 @@ def snapshot_class(cls: type) -> dict:
         }
     elif dataclasses.is_dataclass(cls):
         result["kind"] = "dataclass"
+        result["options"] = {
+            name: getattr(cls.__dataclass_params__, name)
+            for name in ("init", "repr", "eq", "order", "unsafe_hash", "frozen")
+        }
+        result["slots"] = _value(vars(cls).get("__slots__"))
+        result["match_args"] = _value(vars(cls).get("__match_args__"))
         result["fields"] = [
             {
                 "name": field.name,
