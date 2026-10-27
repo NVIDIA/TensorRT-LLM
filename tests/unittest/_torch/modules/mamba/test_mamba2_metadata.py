@@ -15,12 +15,17 @@
 """Unit tests for Mamba2 metadata preparation optimizations."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.modules.mamba import mamba2_metadata
+from tensorrt_llm._torch.modules.mamba.cache_manager import (
+    MIN_REPLAY_HISTORY_SIZE,
+    ReplayStateUpdateMetadata,
+)
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
     REPLAY_WORK_CACHE_BUF_IDX,
     REPLAY_WORK_CACHE_SLOT,
@@ -32,10 +37,6 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
     cu_seqlens_to_chunk_indices_offsets,
     cu_seqlens_to_chunk_indices_offsets_triton,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    MIN_REPLAY_HISTORY_SIZE,
-    ReplayStateUpdateMetadata,
-)
 
 skip_no_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -44,7 +45,6 @@ skip_no_cuda = pytest.mark.skipif(
 
 
 class _GdnReplayCacheManager:
-    use_replay_state_update = True
     use_gdn_cached_replay_all_layer_commit = True
 
     def __init__(self, prev_num_accepted_tokens, cache_buf_idx):
@@ -58,6 +58,54 @@ class _GdnReplayCacheManager:
             replay_step_width=6,
             replay_history_size=MIN_REPLAY_HISTORY_SIZE,
         )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("num_decodes", [0, 2])
+def test_replay_mode_uses_one_metadata_query(monkeypatch, enabled, num_decodes):
+    replay = SimpleNamespace(
+        prev_num_accepted_tokens=object(),
+        cache_buf_idx=object(),
+        replay_step_width=3,
+        replay_history_size=MIN_REPLAY_HISTORY_SIZE,
+    )
+
+    class Manager:
+        get_replay_state_update_metadata = Mock(return_value=replay if enabled else None)
+
+        @property
+        def use_replay_state_update(self):
+            raise AssertionError("Replay mode must come from metadata, not the legacy flag")
+
+    manager = Manager()
+    metadata = object.__new__(Mamba2Metadata)
+    metadata.state_indices = [7, 2, 9]
+    metadata.replay_work_items = object()
+    metadata.replay_n_writes = object()
+    build = Mock()
+    monkeypatch.setattr(mamba2_metadata, "_build_replay_work_items_torch", build)
+    Mamba2Metadata._prepare_replay_work_items(metadata, manager, 1 + num_decodes, 1)
+    manager.get_replay_state_update_metadata.assert_called_once_with()
+    assert metadata.replay_num_decodes == (num_decodes if enabled else 0)
+    if enabled and num_decodes:
+        build.assert_called_once_with(
+            [2, 9],
+            replay.prev_num_accepted_tokens,
+            replay.cache_buf_idx,
+            metadata.replay_work_items,
+            metadata.replay_n_writes,
+            replay.replay_step_width,
+            replay.replay_history_size,
+        )
+    else:
+        build.assert_not_called()
+
+
+def test_replay_metadata_optional_for_non_mamba_manager():
+    metadata = object.__new__(Mamba2Metadata)
+    metadata.replay_num_decodes = 10
+    metadata._prepare_replay_work_items(SimpleNamespace(), 3, 1)
+    assert metadata.replay_num_decodes == 0
 
 
 class _StateIndexCacheManager:
@@ -266,8 +314,6 @@ class TestMamba2Metadata:
 
     def test_prepare_replay_work_items_write_first(self):
         class ReplayCacheManager:
-            use_replay_state_update = True
-
             def __init__(self):
                 self.state_indices = [0, 3, 1, 4, 2]
                 self.prev_num_accepted_tokens = torch.tensor(
@@ -449,6 +495,26 @@ class TestMamba2Metadata:
         )
         torch.testing.assert_close(metadata.replay_work_items[:num_decodes], expected_items)
         torch.testing.assert_close(metadata.replay_n_writes, expected_n_writes)
+
+    def test_prepare_replay_work_items_skips_flashinfer_ring_replay(self):
+        """Ring replay folds in-kernel, so no work items are built at any batch size."""
+        num_decodes = 40
+        prev_num_accepted_tokens = torch.full((num_decodes,), 13, dtype=torch.int32, device="cuda")
+        manager = _GdnReplayCacheManager(
+            prev_num_accepted_tokens, torch.zeros_like(prev_num_accepted_tokens)
+        )
+        manager.use_gdn_cached_replay_all_layer_commit = False
+        manager.use_gdn_flashinfer_ring_replay = True
+        metadata = Mamba2Metadata(max_batch_size=num_decodes, chunk_size=8)
+        metadata.state_indices.copy_(torch.arange(num_decodes, dtype=torch.int32, device="cuda"))
+        metadata.replay_work_items.fill_(-7)
+        metadata.replay_n_writes.fill_(-7)
+
+        metadata._prepare_replay_work_items(manager, num_decodes, 0)
+
+        assert metadata.replay_num_decodes == num_decodes
+        assert (metadata.replay_work_items == -7).all()
+        assert (metadata.replay_n_writes == -7).all()
 
     def test_single_sequence_unaligned(self):
         """Test with a single sequence that doesn't align with chunk size."""

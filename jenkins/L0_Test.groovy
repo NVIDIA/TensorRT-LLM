@@ -4046,15 +4046,13 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.michaeln_blossom
     """
 
-    // Austin FlexCache looks slow and unstable recently. Remove gh200 temporarily.
-    // That means gh200 nodes will use the default Blossom data scratch.
-    if (type.contains("6000d") || type.contains("rtx-5080")) {
-        // rtx-pro-6000d, gh200 and rtx-5080 nodes are located in Austin DC, we use the FlexCache to speed up the data access.
+    // RTXPro6000D, RTX5080 and GH200 use the Austin model scratch.
+    if (type.contains("6000d") || type.contains("rtx-5080") || type == "gh200") {
         llmModelVolume = """
                 - name: scratch-trt-llm-data
                   nfs:
-                    server: 10.20.162.212
-                    path: /vol/scratch26/scratch.trt_llm_data
+                    server: 10.59.164.111
+                    path: /vol/scratch58/scratch.trt_llm_data
         """
     }
 

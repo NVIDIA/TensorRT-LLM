@@ -163,6 +163,20 @@ def test_messages_route_converts_nonstream_response(server_kind):
 
 
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])
+def test_messages_route_accepts_thinking_display(server_kind):
+    """The thinking config Claude Code sends is served, not answered with a 400."""
+    client, backend = _make_route_client(server_kind, _json_chat_response())
+
+    response = client.post(
+        "/v1/messages",
+        json=_request(max_tokens=4096, thinking={"type": "adaptive", "display": "updates"}),
+    )
+
+    assert response.status_code == 200
+    assert backend.await_args.args[0].chat_template_kwargs["enable_thinking"] is True
+
+
+@pytest.mark.parametrize("server_kind", ["standard", "disagg"])
 def test_messages_route_rejects_anthropic_server_tools(server_kind):
     client, backend = _make_route_client(server_kind, _json_chat_response())
 
@@ -436,14 +450,29 @@ def test_chat_stream_logs_a_failure_and_raises_it(monkeypatch, server_logger):
     assert "engine failed" in server_logger.error.call_args.args[0]
 
 
-def test_standard_and_disagg_register_messages_route(monkeypatch, tmp_path):
-    # The disagg server's register_routes mounts a prometheus multiprocess
-    # collector, which errors unless PROMETHEUS_MULTIPROC_DIR points at a real
-    # directory. Production sets that up in set_prometheus_multiproc_dir()
-    # during startup; building the server with object.__new__ skips startup
-    # entirely, so the directory has to be supplied here. monkeypatch keeps it
-    # from leaking into any other test in the session.
+@pytest.fixture
+def prometheus_multiproc_dir(tmp_path, monkeypatch):
+    """PROMETHEUS_MULTIPROC_DIR for one test.
+
+    prometheus_client picks and caches its value class the first time a metric
+    is built with the variable set, so the class is restored as well as the
+    environment; otherwise later metrics in the process fail without a
+    directory.
+    """
+    import prometheus_client.values
+
     monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    saved_value_class = prometheus_client.values.ValueClass
+    try:
+        yield tmp_path
+    finally:
+        prometheus_client.values.ValueClass = saved_value_class
+
+
+def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
+    # register_routes mounts a prometheus multiprocess collector, which needs a
+    # real PROMETHEUS_MULTIPROC_DIR; object.__new__ skips the startup that
+    # creates one.
 
     standard = object.__new__(OpenAIServer)
     standard.app = FastAPI()
@@ -465,6 +494,7 @@ def test_standard_and_disagg_register_messages_route(monkeypatch, tmp_path):
         openai_completion=AsyncMock(),
         openai_chat_completion=AsyncMock(),
         anthropic_count_tokens=AsyncMock(),
+        openai_responses=AsyncMock(),
     )
     disagg._perf_metrics_collector = SimpleNamespace(get_perf_metrics=AsyncMock())
     disagg._disagg_cluster_storage = None
@@ -485,6 +515,10 @@ def test_standard_and_disagg_register_messages_route(monkeypatch, tmp_path):
     for server in (standard, disagg):
         paths = {route.path for route in server.app.routes}
         assert "/v1/messages/count_tokens" in paths
+
+    disagg_paths = {route.path for route in disagg.app.routes}
+    assert "/v1/responses" in disagg_paths
+    assert "/v1/models" in disagg_paths
 
 
 def _batch_client(runner=None):

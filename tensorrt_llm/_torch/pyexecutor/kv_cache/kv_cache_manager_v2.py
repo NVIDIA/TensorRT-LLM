@@ -132,6 +132,7 @@ from ..resource_manager import (
     _project_max_attention_window_vec,
     get_pp_layers,
     request_context,
+    scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
 
@@ -1668,13 +1669,18 @@ class KVCacheManagerV2(BaseResourceManager):
                     "KVCacheManagerV2 does not support a draft cache "
                     "manager or draft-owned layers with helix context parallelism."
                 )
-            if mapping.enable_attention_dp:
+            if mapping.enable_attention_dp and mapping.pp_size > 1:
+                # Only the pp=1 executor loops call
+                # DisaggTransferCoordinator.align_gen_admission_across_cp. Without
+                # it a CP rank can admit a gen-init request its peers did not
+                # admit and hang alone in the gen transfer status collective.
+                # KvCacheTransceiverV2._check_compatible rejects the same
+                # combination; lift both together.
                 raise ValueError(
-                    "KVCacheManagerV2 does not support attention-DP with "
-                    "helix context parallelism: disagg transfer-completion "
-                    "consensus is skipped under attention-DP, so the "
-                    "scheduler's request view would not be rank-invariant "
-                    "across the CP group."
+                    "KVCacheManagerV2 does not support attention-DP with helix "
+                    "context parallelism when pp_size > 1 "
+                    f"(got pp_size={mapping.pp_size}). Set "
+                    "pipeline_parallel_size=1 or enable_attention_dp=False."
                 )
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
@@ -2033,19 +2039,21 @@ class KVCacheManagerV2(BaseResourceManager):
             else self.event_manager
         )
         if not has_host_cache_tier:
-            candidate = KVCacheManagerPy(
+            candidate = self._allocate_cache_pools(
                 config,
                 event_manager=event_sink,
                 cold_page_codec=create_cold_page_codec(config),
+                max_gpu_total_bytes=kv_cache_config.max_gpu_total_bytes,
             )
         else:
             init_error: Optional[Exception] = None
             local_init_status = _KVCacheManagerInitStatus.OK
             try:
-                candidate = KVCacheManagerPy(
+                candidate = self._allocate_cache_pools(
                     config,
                     event_manager=event_sink,
                     cold_page_codec=create_cold_page_codec(config),
+                    max_gpu_total_bytes=kv_cache_config.max_gpu_total_bytes,
                 )
             except Exception as error:
                 init_error = error.with_traceback(None)
@@ -2061,6 +2069,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 raise RuntimeError("KV cache manager initialization failed on another rank")
 
         assert candidate is not None
+        if self._get_external_cache_bytes(candidate):
+            config = replace(
+                config,
+                cache_tiers=[
+                    GpuCacheTierConfig(quota=candidate.get_quota(GPU_LEVEL)),
+                    *config.cache_tiers[1:],
+                ],
+            )
         self.kv_cache_manager_py_config = config
         self.impl = candidate
         self.can_evict = len(config.cache_tiers) > 1
@@ -3458,6 +3474,55 @@ class KVCacheManagerV2(BaseResourceManager):
             ),
         )
 
+    def _get_external_cache_bytes(self, cache: KVCacheManagerPy) -> int:
+        """Return GPU storage owned outside the native pools for this capacity."""
+        return 0
+
+    def _allocate_cache_pools(
+        self,
+        config: KVCacheManagerConfigPy,
+        *,
+        event_manager,
+        cold_page_codec,
+        max_gpu_total_bytes: int | None = None,
+    ) -> KVCacheManagerPy:
+        """Fit native pools and external storage within the physical GPU budget."""
+        cache = KVCacheManagerPy(
+            config, event_manager=event_manager, cold_page_codec=cold_page_codec
+        )
+        external_bytes = self._get_external_cache_bytes(cache)
+        # A token limit sizes the native pools; their minimum slots and allocation
+        # granularity can exceed that logical size. Only a byte limit caps the
+        # combined physical allocation, including model-owned scratch.
+        if not external_bytes or not max_gpu_total_bytes:
+            return cache
+        native_bytes = cache.get_quota(GPU_LEVEL)
+        if native_bytes + external_bytes <= max_gpu_total_bytes:
+            return cache
+
+        lower_quota = 0
+        upper_quota = config.cache_tiers[0].quota
+        pool_quota = min(
+            upper_quota - 1,
+            native_bytes * max_gpu_total_bytes // (native_bytes + external_bytes),
+        )
+        while lower_quota < pool_quota < upper_quota:
+            if not cache.resize(GPU_LEVEL, pool_quota):
+                # A quota below the native minimum cannot be resized. Search
+                # above it before concluding that the combined budget cannot fit.
+                lower_quota = pool_quota
+            else:
+                external_bytes = self._get_external_cache_bytes(cache)
+                if cache.get_quota(GPU_LEVEL) + external_bytes <= max_gpu_total_bytes:
+                    return cache
+                upper_quota = pool_quota
+            pool_quota = (lower_quota + upper_quota) // 2
+        cache.shutdown()
+        raise ValueError(
+            "The GPU cache quota cannot accommodate native pools and "
+            f"external cache storage ({external_bytes} bytes)."
+        )
+
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
@@ -4724,12 +4789,11 @@ class KVCacheManagerV2(BaseResourceManager):
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init"
         )
-        if self._has_cp_helix and not req.is_dummy_request:
+        if self._has_cp_helix and self.is_disagg and not req.is_dummy_request:
             raise ValueError(
-                "resize_context is not helix-aware: its rank-local chunk "
-                "target would under-size the global ledger. Helix requests "
-                "are disagg-generation-only and must never take the context "
-                "path."
+                "resize_context is not available under disaggregated helix: "
+                "requests hold only this rank's slice of the prompt, which "
+                "would under-size the global ledger."
             )
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
@@ -6911,14 +6975,8 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
         for layer_id, buffer in self._iter_cache_buffers_for_invalid_check():
-            # process in chunks of 256 pages to avoid OoM
-            for i in range(0, buffer.shape[0], 256):
-                buffer_slice = buffer[i : i + 256]
-                try:
-                    has_invalid_values.logical_or_(torch.isnan(buffer_slice).any())
-                    has_invalid_values.logical_or_(torch.isinf(buffer_slice).any())
-                except NotImplementedError:
-                    some_checks_unavailable = True
+            if scan_kv_buffer_for_invalid_values(buffer, has_invalid_values):
+                some_checks_unavailable = True
             if fill_with_zero:
                 buffer.zero_()
                 # warmup runs this with fill_with_zero=True to scrub the cache

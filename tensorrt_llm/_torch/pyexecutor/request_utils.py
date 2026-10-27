@@ -336,6 +336,7 @@ def merge_requests(
     cp_rank: int,
     cp_size: int,
     exclude_last_generation_logits: bool,
+    is_disagg: bool,
 ) -> List[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests based on CP configuration.
 
@@ -349,6 +350,9 @@ def merge_requests(
         cp_rank: Current CP rank.
         cp_size: Total number of CP ranks.
         exclude_last_generation_logits: Whether to exclude last generation logits.
+        is_disagg: Whether this executor serves disaggregated generation. Only
+            disaggregated Helix slices the prompt per rank; aggregated Helix
+            keeps the full prompt on every rank.
 
     Returns:
         List of LlmRequest objects.
@@ -359,13 +363,15 @@ def merge_requests(
     if "cp_type" in cp_config:
         cp_type = cp_config["cp_type"]
         if cp_type == CpType.HELIX:
-            return merge_helix_requests(
-                new_requests,
-                cp_rank=cp_rank,
-                cp_size=cp_size,
-                tokens_per_block=cp_config["tokens_per_block"],
-                exclude_last_generation_logits=exclude_last_generation_logits,
-            )
+            if is_disagg:
+                return merge_helix_requests(
+                    new_requests,
+                    cp_rank=cp_rank,
+                    cp_size=cp_size,
+                    tokens_per_block=cp_config["tokens_per_block"],
+                    exclude_last_generation_logits=exclude_last_generation_logits,
+                )
+            return merge_requests_to_llm_requests(new_requests, exclude_last_generation_logits)
         else:
             raise NotImplementedError(f"Unsupported cp type {cp_type.name}.")
 
