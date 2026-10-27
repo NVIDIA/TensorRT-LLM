@@ -1554,6 +1554,36 @@ class TestConversationAwareADPRouter:
         for turn in turns:
             assert self._route(router, states, [turn])[turn.id] == 2
 
+    def test_uncached_prefill_estimate_published_while_demotion_is_on(self):
+        """Opener: the whole prompt; a later turn: its growth since the previous turn."""
+        router = self._router(tp_size=2)
+        router.set_publish_uncached_estimate(True)
+        opener = _make_conv_request_item(0, "A", num_tokens=5000)
+        self._route(router, self._states(2), [opener])
+        assert opener.request.py_uncached_prefill_tokens == 5000
+        turn2 = _make_conv_request_item(1, "A", num_tokens=5300)
+        self._route(router, self._states(2), [turn2])
+        assert turn2.request.py_uncached_prefill_tokens == 300
+        off = _make_conv_request_item(2, "B", num_tokens=5000)
+        self._route(self._router(tp_size=2), self._states(2), [off])
+        assert not isinstance(off.request.py_uncached_prefill_tokens, int)
+
+    def test_uncached_prefill_estimate_follows_the_subagent_not_its_parent(self):
+        """Sub-agents share their parent's rank but not its prompt history."""
+        router = self._router(tp_size=2)
+        router.set_publish_uncached_estimate(True)
+        self._route(
+            router, self._states(2), [_make_conv_request_item(0, "parent", num_tokens=9000)]
+        )
+        child = _make_conv_request_item(1, "child", num_tokens=4000, subagent_affinity_id="parent")
+        self._route(router, self._states(2), [child])
+        assert child.request.py_uncached_prefill_tokens == 4000
+        child_turn2 = _make_conv_request_item(
+            2, "child", num_tokens=4500, subagent_affinity_id="parent"
+        )
+        self._route(router, self._states(2), [child_turn2])
+        assert child_turn2.request.py_uncached_prefill_tokens == 500
+
     def test_no_conversation_id_falls_back_and_is_not_recorded(self):
         router = self._router(tp_size=4)
         items = [_make_conv_request_item(i, None) for i in range(8)]
