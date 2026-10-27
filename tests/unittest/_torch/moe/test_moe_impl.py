@@ -37,6 +37,7 @@ from tensorrt_llm._torch.moe.fused_moe import moe_resolution
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     ActivationParamShape,
     MoEActivationSupport,
+    SimpleActivation,
     SwigluActivation,
 )
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
@@ -1198,13 +1199,13 @@ _CUTLASS_DECLARATIONS = (
     ),
     pytest.param(
         TrtllmTritonFp8BlockScalesImpl,
-        {120},
+        {120, 121},
         {torch.bfloat16},
         (False, False),
         (False, False),
         FusedMoeOpFlags(),
         False,
-        id="fp8_block_scales-sm120",
+        id="fp8_block_scales-sm120-121",
     ),
     pytest.param(
         TrtllmCutlassNvfp4Impl,
@@ -1375,6 +1376,7 @@ def test_cutlass_leaf_input_declarations(leaf):
     [
         pytest.param(90, "deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales", id="sm90"),
         pytest.param(120, "trtllm.triton.grouped_gemm.fp8_block_scales", id="sm120"),
+        pytest.param(121, "trtllm.triton.grouped_gemm.fp8_block_scales", id="sm121"),
     ],
 )
 def test_cutlass_literal_picks_the_fp8_block_scales_leaf_by_sm(sm, impl_id):
@@ -1872,13 +1874,33 @@ _TRITON_FP8_BLOCK_SCALES_ID = "trtllm.triton.grouped_gemm.fp8_block_scales"
             "post-SiLU clamping",
             id="triton-post-silu-clamp",
         ),
+        pytest.param(
+            121, _TRITON_FP8_BLOCK_SCALES_ID, SwigluActivation(), None, id="sm121-plain-swiglu"
+        ),
+        pytest.param(
+            121, _TRITON_FP8_BLOCK_SCALES_ID, SwigluActivation(clamp=5.0), None, id="sm121-clamp"
+        ),
+        pytest.param(
+            121,
+            _TRITON_FP8_BLOCK_SCALES_ID,
+            SwigluActivation(clamp=5.0, clamp_after_silu=True),
+            "post-SiLU clamping",
+            id="sm121-post-silu-clamp",
+        ),
+        pytest.param(
+            121,
+            _TRITON_FP8_BLOCK_SCALES_ID,
+            SimpleActivation(ActivationType.Relu2),
+            None,
+            id="sm121-relu2",
+        ),
     ],
 )
 def test_fp8_block_scales_leaves_admit_only_what_their_kernel_runs(
     sm, impl_id, activation, rejection
 ):
     """The SM90 leaf issues the CUTLASS op, which takes every activation constant;
-    the SM120 Triton kernel runs gated SiLU / GELU and clamps before the SiLU."""
+    the SM120/121 Triton kernel runs SiLU / GELU / Relu2 and clamps before the SiLU."""
     with override_moe_environment(MoEEnvironment(sm=sm)):
         report = resolve_moe_impl(
             _cutlass_model_config(QuantAlgo.FP8_BLOCK_SCALES),
@@ -1901,13 +1923,8 @@ def test_fp8_block_scales_leaves_admit_only_what_their_kernel_runs(
         pytest.param(
             "Swiglu", True, frozenset({"clamp"}), "post-SiLU clamping", id="post_silu_clamp"
         ),
-        pytest.param(
-            "Relu2",
-            False,
-            frozenset(),
-            "does not execute Relu2 (executes: Geglu, Swiglu)",
-            id="relu2",
-        ),
+        # Admitted: the internal build's Relu2 limit binds only the CUTLASS op.
+        pytest.param("Relu2", False, frozenset(), None, id="relu2"),
     ],
 )
 def test_triton_fp8_block_scales_leaf_declines_what_its_kernel_lacks(
@@ -1926,9 +1943,12 @@ def test_triton_fp8_block_scales_leaf_declines_what_its_kernel_lacks(
         problem, _single_rank_deployment(MoEEnvironment(sm=120, oss_cutlass_moe=False))
     )
 
-    assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
-    assert detail in verdict.detail
-    assert "USING_OSS_CUTLASS_MOE_GEMM" not in verdict.detail
+    if detail is None:
+        assert verdict.eligible, verdict.detail
+    else:
+        assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+        assert detail in verdict.detail
+        assert "USING_OSS_CUTLASS_MOE_GEMM" not in verdict.detail
 
 
 def test_only_leaves_issuing_the_op_are_bound_by_the_oss_build():

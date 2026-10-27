@@ -27,7 +27,7 @@ on a GPU-less host gets the same verdict a serving process does.
 
 import torch
 
-from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm._utils import is_sm_100f
 
 from ..impl_contract import (
@@ -237,6 +237,20 @@ def check_no_activation_constants(cls: type, p: MoEProblem) -> MoEEligibility | 
         return _reject(
             MoERejectReason.ACTIVATION_UNSUPPORTED,
             f"{cls.__name__} takes no activation constants, got {sorted(p.activation_constants)}",
+        )
+    return None
+
+
+def check_gated_activation(cls: type, p: MoEProblem) -> MoEEligibility | None:
+    """Gated activations only, for the FP8 block-scale leaves.
+
+    Their ``run_moe`` passes no activation to the runner, so ``act_type`` stays
+    at its gated default whatever the layer's activation is.
+    """
+    if not is_gated_activation(p.activation_type):
+        return _reject(
+            MoERejectReason.ACTIVATION_UNSUPPORTED,
+            f"{cls.__name__} runs only a gated FC1 kernel, got non-gated {p.activation}",
         )
     return None
 

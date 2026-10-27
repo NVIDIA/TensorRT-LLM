@@ -38,29 +38,30 @@ from .identity import TECHNIQUE_TRITON, cutlass_descriptor
 class TrtllmTritonFp8BlockScalesImpl(CutlassFusedMoEBase):
     """``trtllm.triton.grouped_gemm.fp8_block_scales``.
 
-    FP8 block scales on SM120, where CUTLASS TMA fails for large token counts
-    (``cuTensorMapEncodeTiled`` limitations). The whole MoE runs in
+    FP8 block scales on SM120/SM121. CUTLASS TMA fails on SM120 for large token
+    counts (``cuTensorMapEncodeTiled`` limitations). The whole MoE runs in
     ``run_triton_fp8_block_scale_moe``, which never enters C++.
     """
 
     descriptor = cutlass_descriptor(
         "fp8_block_scales",
-        "Internal Triton FP8 block-scale grouped GEMM, SM120.",
+        "Internal Triton FP8 block-scale grouped GEMM, SM120/SM121.",
         technique=TECHNIQUE_TRITON,
         # run_triton_fp8_block_scale_moe takes no bias operands.
         supports_expert_bias=False,
     )
-    sm_support = SmSupport(allowed=frozenset({120}))
+    sm_support = SmSupport(allowed=frozenset({120, 121}))
     #: The Triton kernel is instantiated for BF16 activations only.
     supported_dtypes = BF16_ONLY
-    # Only these two gated kinds, and of the three ABI registers only the clamp:
+    # Two gated kinds and Relu2, and of the three ABI registers only the clamp:
     # the kernel takes it by value, so a per-expert clamp cannot be honoured.
     # ``clamp_after_silu`` stays unset -- the kernel clamps before the SiLU only.
     activation_support = MoEActivationSupport(
-        kinds=frozenset({ActivationType.Swiglu, ActivationType.Geglu}),
+        kinds=frozenset({ActivationType.Swiglu, ActivationType.Geglu, ActivationType.Relu2}),
         limit=ActivationParamShape.UNIFORM_SCALAR,
     )
     issues_fused_moe_op = False
+    pad_intermediate_on_single_tp_rank_to = 128
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
