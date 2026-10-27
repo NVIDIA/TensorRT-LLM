@@ -1063,8 +1063,11 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
     # width and therefore split into the ``up`` and ``gate`` halves. Every
     # other tensor of that module (per-tensor scalars such as ``input_scale``,
     # ``weight_scale_2`` and FP8's ``weight_scale``, input-side
-    # ``pre_quant_scale``) describes the whole module and is given to both.
-    _FEED_FORWARD_ROW_SPLIT_SUFFIXES = frozenset({"weight", "bias", "weight_scale"})
+    # ``pre_quant_scale`` and ``svdquant_lora_a``) describes the whole module
+    # and is given to both.
+    _FEED_FORWARD_ROW_SPLIT_SUFFIXES = frozenset(
+        {"weight", "bias", "weight_scale", "svdquant_lora_b"}
+    )
 
     @classmethod
     def _remap_feed_forward_weights(

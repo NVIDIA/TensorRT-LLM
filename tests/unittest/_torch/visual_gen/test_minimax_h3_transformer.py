@@ -1142,15 +1142,17 @@ def test_diffusers_swiglu_weight_is_reordered_from_up_gate_to_gate_up() -> None:
 
 
 def test_prequantized_swiglu_splits_rows_and_shares_input_side_tensors() -> None:
-    """ModelOpt NVFP4 exports carry one scale set for the fused ``[up, gate]``."""
-    n, k = 4, 32
+    """ModelOpt NVFP4/SVDQuant exports carry one scale set for the fused ``[up, gate]``."""
+    n, k, rank = 4, 32, 2
     up_rows = torch.arange(n * k // 2, dtype=torch.uint8).reshape(n, k // 2)
     gate_rows = up_rows + 100
     weight = torch.cat((up_rows, gate_rows))
     weight_scale = torch.arange(2 * n * (k // 16), dtype=torch.float32).reshape(2 * n, k // 16)
+    lora_b = torch.arange(2 * n * rank, dtype=torch.float32).reshape(2 * n, rank)
     weight_scale_2 = torch.tensor(0.5)
     input_scale = torch.tensor(2.0)
     pre_quant_scale = torch.arange(k, dtype=torch.float32)
+    lora_a = torch.arange(rank * k, dtype=torch.float32).reshape(rank, k)
     prefix = "transformer_blocks.0.ff.net.0.proj."
     remapped = h3.MiniMaxH3Transformer3DModel._remap_feed_forward_weights(
         {
@@ -1159,6 +1161,8 @@ def test_prequantized_swiglu_splits_rows_and_shares_input_side_tensors() -> None
             prefix + "weight_scale_2": weight_scale_2,
             prefix + "input_scale": input_scale,
             prefix + "pre_quant_scale": pre_quant_scale,
+            prefix + "svdquant_lora_a": lora_a,
+            prefix + "svdquant_lora_b": lora_b,
         }
     )
 
@@ -1166,10 +1170,12 @@ def test_prequantized_swiglu_splits_rows_and_shares_input_side_tensors() -> None
         base = f"transformer_blocks.0.ff.{half}."
         torch.testing.assert_close(remapped[base + "weight"], weight[rows])
         torch.testing.assert_close(remapped[base + "weight_scale"], weight_scale[rows])
+        torch.testing.assert_close(remapped[base + "svdquant_lora_b"], lora_b[rows])
         # Per-tensor and input-side tensors are shared, not halved.
         assert remapped[base + "weight_scale_2"] is weight_scale_2
         assert remapped[base + "input_scale"] is input_scale
         assert remapped[base + "pre_quant_scale"] is pre_quant_scale
+        assert remapped[base + "svdquant_lora_a"] is lora_a
 
 
 def test_prequantized_fp8_swiglu_shares_scalar_weight_scale() -> None:

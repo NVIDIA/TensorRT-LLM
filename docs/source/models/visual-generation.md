@@ -190,6 +190,9 @@ are not supported. See the
   list are taken from the checkpoint's `quantization_config` when `quant_config`
   is not set. Passing `quant_config: {quant_algo: NVFP4}` instead keeps the packed
   weights but quantizes activations dynamically and ignores the exclusion list.
+  ModelOpt SVDQuant exports (`quant_algo: NVFP4_SVD`) load the same way; their
+  `pre_quant_scale` and low-rank `svdquant_lora_a` / `svdquant_lora_b` tensors are
+  applied by the NVFP4 Linear (see Quantization below).
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
 
@@ -213,6 +216,13 @@ args = VisualGenArgs(model="/path/to/model", quant_config={"quant_algo": "FP8", 
 ```
 
 Omit `quant_config` for BF16/FP16 baseline.
+
+A pre-quantized checkpoint whose `quantization_config` says `NVFP4_SVD` (ModelOpt
+SVDQuant) resolves to static NVFP4 with `pre_quant_scale`. Each quantized Linear
+then computes `nvfp4_gemm(x * pre_quant_scale) + ((x * pre_quant_scale) @ A^T) @ B^T`
+with the checkpoint's `svdquant_lora_a` (`A`) and `svdquant_lora_b` (`B`); fused
+QKV and gate/up Linears concatenate `A` and block-diagonalise `B`. The residual
+is not sharded for tensor parallelism yet.
 
 #### Wan VAE NVFP4
 
