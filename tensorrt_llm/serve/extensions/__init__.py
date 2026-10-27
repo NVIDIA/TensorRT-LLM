@@ -25,6 +25,6 @@ Submodules may import ``openai_protocol`` (request/response types), which in
 turn imports the registry module. Nothing here may import ``openai_server``.
 """
 
-from . import gpt_oss, kimi_k3, nemotron
+from . import deepseek_v41, gpt_oss, kimi_k3, nemotron
 
-__all__ = ["gpt_oss", "kimi_k3", "nemotron"]
+__all__ = ["deepseek_v41", "gpt_oss", "kimi_k3", "nemotron"]

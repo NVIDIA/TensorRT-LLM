@@ -21,6 +21,8 @@ import pytest
 
 from tensorrt_llm.serve import serving_extensions
 from tensorrt_llm.serve.serving_extensions import (
+    DEGENERATE_TOKEN_RUN_LENGTH,
+    DegenerateTokens,
     ServingExtension,
     apply_model_chat_extensions,
     register_serving_extension,
@@ -776,6 +778,7 @@ class TestExtensionHooks:
         assert extension.serialize_tool(request.tools[0]) == request.tools[0].model_dump()
         assert extension.dynamic_tools(request.messages) == []
         assert extension.prompt_tokens_excluded_from_usage(request) == 0
+        assert extension.degenerate_tokens(SimpleNamespace(pad_token_id=0, vocab_size=8)) is None
 
     def test_load_builtin_extensions_keeps_its_private_alias(self) -> None:
         assert (
@@ -822,3 +825,93 @@ class TestExtensionHooks:
     def test_gpt_oss_declares_harmony_output(self) -> None:
         extension = serving_extensions.get_serving_extension("gpt_oss")
         assert extension.output_mode() is serving_extensions.OutputMode.HARMONY_TOKENS
+
+
+class _CompositeConfig:
+    """A multimodal config: the vocabulary is on its text config."""
+
+    def __init__(self, vocab_size, **fields):
+        self.text_config = SimpleNamespace(vocab_size=vocab_size)
+        self.__dict__.update(fields)
+
+    def get_text_config(self):
+        return self.text_config
+
+
+class TestDegenerateTokens:
+    """Which models declare degenerate tokens, and which ids they resolve to."""
+
+    def test_deepseek_v41_resolves_from_the_checkpoint_config(self, tmp_path) -> None:
+        """Loaded the way the server loads it, from the fields the release checkpoint ships."""
+        import json
+
+        from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
+        from tensorrt_llm.serve.chat_utils import resolve_top_level_model_type
+
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["DeepseekV41ForCausalLM"],
+                    "model_type": "deepseek_v41",
+                    "bos_token_id": 0,
+                    "eos_token_id": 1,
+                    "pad_token_id": 2,
+                    "text_config": {"model_type": "deepseek_v41_text", "vocab_size": 129280},
+                    "vision_config": {"model_type": "deepseek_v41_vision"},
+                }
+            )
+        )
+        config = load_pretrained_config(str(tmp_path))
+        extension = serving_extensions.get_serving_extension(resolve_top_level_model_type(config))
+
+        # <｜▁pad▁｜> and <|place_holder_mm_span_0442|>.
+        assert extension.degenerate_tokens(config) == DegenerateTokens(
+            token_ids=(2, 129279), run_length=DEGENERATE_TOKEN_RUN_LENGTH
+        )
+
+    @pytest.mark.parametrize(
+        ("config", "token_ids"),
+        [
+            pytest.param(_CompositeConfig(129280, pad_token_id=2), (2, 129279), id="composite"),
+            pytest.param(
+                SimpleNamespace(pad_token_id=2, vocab_size=129280), (2, 129279), id="flat"
+            ),
+            pytest.param(_CompositeConfig(129280), (129279,), id="no_pad_token"),
+            pytest.param(_CompositeConfig(3, pad_token_id=2), (2,), id="pad_is_the_last_id"),
+            pytest.param(SimpleNamespace(pad_token_id=2), (2,), id="no_vocabulary_size"),
+        ],
+    )
+    def test_deepseek_v41_ids(self, config, token_ids) -> None:
+        extension = serving_extensions.get_serving_extension("deepseek_v41")
+        assert extension.degenerate_tokens(config).token_ids == token_ids
+
+    def test_deepseek_v41_without_ids_declares_nothing(self) -> None:
+        extension = serving_extensions.get_serving_extension("deepseek_v41")
+        assert extension.degenerate_tokens(SimpleNamespace()) is None
+
+    def test_kimi_k3_declares_its_last_vocabulary_id(self) -> None:
+        """[PAD]; the composite config's pad_token_id defaults to 0 and is not read."""
+        extension = serving_extensions.get_serving_extension("kimi_k3")
+        assert extension.degenerate_tokens(_CompositeConfig(163840, pad_token_id=0)) == (
+            DegenerateTokens(token_ids=(163839,))
+        )
+        assert extension.degenerate_tokens(SimpleNamespace()) is None
+
+    @pytest.mark.parametrize("model_type", ["qwen3", "gpt_oss", "nemotron_h", None])
+    def test_other_models_declare_nothing(self, model_type) -> None:
+        extension = serving_extensions.get_serving_extension(model_type)
+        config = _CompositeConfig(129280, pad_token_id=2)
+        assert extension.degenerate_tokens(config) is None
+
+    @pytest.mark.parametrize(
+        ("fields", "match"),
+        [
+            pytest.param({"token_ids": ()}, "at least one", id="no_ids"),
+            pytest.param({"token_ids": (-1,)}, "non-negative", id="negative_id"),
+            pytest.param({"token_ids": (True,)}, "non-negative", id="bool_id"),
+            pytest.param({"token_ids": (2,), "run_length": 0}, "run_length", id="empty_run"),
+        ],
+    )
+    def test_declaration_is_validated(self, fields, match) -> None:
+        with pytest.raises(ValueError, match=match):
+            DegenerateTokens(**fields)

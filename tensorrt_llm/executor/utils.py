@@ -169,6 +169,33 @@ def is_context_length_exceeded_message(message: str) -> bool:
     return bool(_CONTEXT_LENGTH_EXCEEDED_RE.search(message))
 
 
+def degenerate_generation_message(token_id: int, run_length: int) -> str:
+    """Client-facing message for a generation failed on a degenerate token run.
+
+    See ``SamplingParams._set_degenerate_token_runs``. Keep in sync with
+    ``is_degenerate_generation_message``.
+    """
+    return (f"Generation failed: the output degenerated into a run of token id "
+            f"{token_id} ({run_length} in a row), which the model does not "
+            "write in valid output. The output was discarded; retry the "
+            "request.")
+
+
+_DEGENERATE_GENERATION_RE = re.compile(
+    r"Generation failed: the output degenerated into a run of token id \d+ "
+    r"\(\d+ in a row\)")
+
+
+def is_degenerate_generation_message(message: str) -> bool:
+    """True if ``message`` contains a ``degenerate_generation_message``.
+
+    Substring search for the same reason as
+    ``is_context_length_exceeded_message``: the message reaches the server as
+    plain text, prefixed when it comes from a postprocessing worker.
+    """
+    return bool(_DEGENERATE_GENERATION_RE.search(message))
+
+
 class EngineDeadError(RuntimeError):
     """Raised by pending and new requests once the engine is known dead.
 

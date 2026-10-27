@@ -10,7 +10,7 @@ import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Literal,
-                    NamedTuple, Optional, TypeAlias, Union)
+                    NamedTuple, NoReturn, Optional, TypeAlias, Union)
 from weakref import WeakMethod
 
 import torch
@@ -27,9 +27,10 @@ from ..logger import logger
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..metrics.perf_utils import \
     process_req_perf_metrics as _process_req_perf_metrics
-from ..sampling_params import LogprobParams, SamplingParams
+from ..sampling_params import DegenerateTokenRun, LogprobParams, SamplingParams
 from .postprocessor_hook import PostProcessorHook, apply_post_processor_hook
-from .utils import (EngineDeadError, ErrorResponse, has_event_loop,
+from .utils import (EngineDeadError, ErrorResponse, RequestError,
+                    degenerate_generation_message, has_event_loop,
                     is_llm_response)
 
 if TYPE_CHECKING:
@@ -494,6 +495,9 @@ class GenerationResultBase:
                 for stop_reason, stop_ids in self.sampling_params._get_stop_reasons_and_words(
                 ):
                     if output.token_ids[-len(stop_ids):] == stop_ids:
+                        if isinstance(stop_reason, DegenerateTokenRun):
+                            self._fail_degenerate_generation(
+                                stop_reason, output)
                         output.stop_reason = stop_reason
                         if not self.sampling_params.include_stop_str_in_output:
                             self._trim_stop_word_outputs(output, len(stop_ids))
@@ -521,6 +525,27 @@ class GenerationResultBase:
         # Tracing is recorded once when the entire request is done.
         if self._done:
             self.do_tracing(output, req_perf_metrics_dict)
+
+    def _fail_degenerate_generation(self, run: DegenerateTokenRun,
+                                    output: CompletionOutput) -> NoReturn:
+        """Fail a request whose generation stopped on a degenerate token run.
+
+        The run means the generation has broken down, so nothing of it is a
+        reply: the request fails without output, and every later wait on this
+        result raises the same error. A client that kept the output instead
+        would carry a truncated reply into every later turn.
+        """
+        message = degenerate_generation_message(run.token_id, run.length)
+        logger.warning(f"Request {self.id}: {message} "
+                       f"({len(output.token_ids)} tokens generated)")
+        if not self._done:
+            # Other sequences of the request are still generating, for output
+            # that is discarded with this one.
+            self.abort()
+        error = RequestError(message)
+        self._error_msg = message
+        self._terminal_error = error
+        raise error
 
     @staticmethod
     def _trim_stop_word_outputs(output: CompletionOutput,

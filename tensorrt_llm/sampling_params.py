@@ -101,6 +101,18 @@ class LogprobParams(NamedTuple):
     prompt_logprobs_simple_format: bool = False
 
 
+class DegenerateTokenRun(NamedTuple):
+    """``length`` consecutive copies of ``token_id`` that end a generation as failed.
+
+    The stop reason ``SamplingParams._get_stop_reasons_and_words`` reports for a
+    run set with ``SamplingParams._set_degenerate_token_runs``. A generation that
+    stops on one has broken down, so it is reported as an error, never as a stop.
+    """
+
+    token_id: int
+    length: int
+
+
 class LogprobMode(StrEnum):
     RAW = "raw"
     """
@@ -288,6 +300,8 @@ class SamplingParams:
     stop_token_ids: Optional[List[int]] = None
     include_stop_str_in_output: bool = False
     _stop_word_ids: Optional[List[List[int]]] = field(default=None, init=False, repr=False)
+    # (token id, run length) pairs set by _set_degenerate_token_runs.
+    _degenerate_token_runs: Tuple[Tuple[int, int], ...] = field(default=(), init=False, repr=False)
 
     embedding_bias: Optional[torch.Tensor] = None
     logits_processor: Optional[Union[LogitsProcessor, List[LogitsProcessor]]] = None
@@ -628,22 +642,37 @@ class SamplingParams:
                 )
             return words + self._bad_word_ids
 
+    def _set_degenerate_token_runs(self, token_ids: Iterable[int], run_length: int) -> None:
+        """Fail the generation once it writes one of ``token_ids`` ``run_length`` times in a row.
+
+        For servers of models that declare such tokens. Each run is an extra
+        stop word matched by token id, after the request's own stop words, and
+        reported as a ``DegenerateTokenRun`` stop reason.
+        """
+        if run_length < 1:
+            raise ValueError(f"run_length must be at least 1, got {run_length}")
+        self._degenerate_token_runs = tuple(
+            (token_id, run_length) for token_id in dict.fromkeys(token_ids)
+        )
+
     def _get_stop_words(self) -> List[List[int]]:
         words = []
         if self.stop_token_ids:
             words = [[i] for i in self.stop_token_ids]
 
-        if self.stop is None:
-            return words
-        else:
+        if self.stop is not None:
             if self._stop_word_ids is None:
                 raise RuntimeError(
                     f"{self.__class__.__name__}.stop ({self.stop}) is not processed by tokenizer, "
                     "please call the setup method."
                 )
-            return words + self._stop_word_ids
+            words = words + self._stop_word_ids
+        # Last, so that a stop word of the request wins where both match.
+        return words + [[token_id] * length for token_id, length in self._degenerate_token_runs]
 
-    def _get_stop_reasons_and_words(self) -> List[Tuple[Union[str, int], List[List[int]]]]:
+    def _get_stop_reasons_and_words(
+        self,
+    ) -> List[Tuple[Union[str, int, DegenerateTokenRun], List[List[int]]]]:
         stop_reasons = []
         if self.stop_token_ids is not None:
             stop_reasons.extend(self.stop_token_ids)
@@ -652,6 +681,7 @@ class SamplingParams:
                 stop_reasons.append(self.stop)
             else:
                 stop_reasons.extend(self.stop)
+        stop_reasons.extend(DegenerateTokenRun(*run) for run in self._degenerate_token_runs)
         stop_words = self._get_stop_words()
         return list(zip(stop_reasons, stop_words))
 
