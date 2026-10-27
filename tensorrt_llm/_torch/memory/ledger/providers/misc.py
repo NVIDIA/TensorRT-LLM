@@ -139,6 +139,18 @@ class DwdpPagePoolProvider:
             ]
 
         held = sum(pool.held_pages(slot) for slot in range(pool.num_slots))
+        failed = getattr(pool, "release_failed", 0)
+
+        note = None
+        if failed:
+            # release() drops a handle it could not free, so held_pages stops
+            # counting memory that is plausibly still mapped. Reporting the
+            # smaller number without saying so would read as a clean release.
+            note = (
+                f"at least this much: {failed} handle(s) failed to release "
+                "and are no longer tracked, so the true figure may be higher"
+            )
+
         return [
             Entry(
                 category=Category.DWDP_PAGES,
@@ -147,6 +159,7 @@ class DwdpPagePoolProvider:
                 placement=Placement.NON_TORCH,
                 basis=Basis.PHYSICAL_BACKING,
                 owner="dwdp.PagePool",
+                note=note,
             )
         ]
 
