@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+from functools import partial
 from pathlib import Path
 from unittest.mock import patch
 
@@ -32,13 +33,23 @@ _GiB = 1 << 30
 
 
 def _write_cgroup(
-    path: Path, limit: int | str, current: int, file_bytes: int = 0, shmem: int = 0
+    path: Path,
+    limit: int | str,
+    current: int,
+    file_bytes: int = 0,
+    shmem: int = 0,
+    file_dirty: int = 0,
+    file_writeback: int = 0,
+    unevictable: int = 0,
 ) -> None:
     """Populate a synthetic cgroup v2 directory."""
     path.mkdir(parents=True, exist_ok=True)
     (path / "memory.max").write_text(f"{limit}\n")
     (path / "memory.current").write_text(f"{current}\n")
-    (path / "memory.stat").write_text(f"anon 123\nfile {file_bytes}\nshmem {shmem}\nkernel 0\n")
+    (path / "memory.stat").write_text(
+        f"anon 123\nfile {file_bytes}\nshmem {shmem}\nkernel 0\n"
+        f"file_dirty {file_dirty}\nfile_writeback {file_writeback}\nunevictable {unevictable}\n"
+    )
 
 
 @pytest.mark.parametrize("value,expected", [("1000", 1024000), ("0", 0), ("-1", 0), ("bad", None)])
@@ -96,6 +107,75 @@ def test_cgroup_missing_stats_preserve_limit(tmp_path: Path, stat: str | None) -
         memory_utils._read_cgroup_memory_headroom_bytes(str(tmp_path), str(tmp_path / "absent"))
         == 10
     )
+
+
+@pytest.mark.parametrize(
+    "shmem,file_dirty,file_writeback,unevictable,expected",
+    [
+        (0, 60, 0, 0, 30),
+        (0, 0, 60, 0, 30),
+        (0, 0, 0, 60, 30),
+        (0, 30, 20, 10, 30),
+        (10, 20, 15, 5, 40),
+        (20, 40, 30, 20, 10),
+    ],
+)
+def test_cgroup_non_reclaimable_file_pages(
+    tmp_path: Path,
+    shmem: int,
+    file_dirty: int,
+    file_writeback: int,
+    unevictable: int,
+    expected: int,
+) -> None:
+    """Exclude pages requiring writeback or unavailable to reclaim.
+
+    The counters can overlap, and unevictable can include anonymous pages.
+    Conservatively subtracting them may exhaust file credit, never free bytes.
+    """
+    _write_cgroup(tmp_path, 100, 90, 80, shmem, file_dirty, file_writeback, unevictable)
+    assert memory_utils._read_cgroup_headroom(tmp_path) == expected
+
+
+@pytest.mark.parametrize("counter", ["file_dirty", "file_writeback", "unevictable"])
+@pytest.mark.parametrize("value", [None, "bad"])
+def test_cgroup_incomplete_file_stats_get_no_credit(
+    tmp_path: Path, counter: str, value: str | None
+) -> None:
+    """Unknown non-reclaimable bytes cannot grant credit or remove the hard cap."""
+    _write_cgroup(tmp_path, 100, 90, 80)
+    path = tmp_path / "memory.stat"
+    replacement = "" if value is None else f"{counter} {value}\n"
+    path.write_text(path.read_text().replace(f"{counter} 0\n", replacement))
+    assert memory_utils._read_cgroup_headroom(tmp_path) == 10
+
+
+def test_integrated_gpu_excludes_unavailable_cgroup_cache(tmp_path: Path) -> None:
+    """Real procfs/cgroup parsing must cap even a larger CUDA-free estimate."""
+    root = tmp_path / "cgroup"
+    _write_cgroup(root, 100 * _GiB, 90 * _GiB, 80 * _GiB, 10 * _GiB, 20 * _GiB, 15 * _GiB, 5 * _GiB)
+    proc = tmp_path / "proc_cgroup"
+    proc.write_text("0::/\n")
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(f"MemAvailable: {80 * _GiB // 1024} kB\n")
+    # Redirect only file locations; execute the real parsers and budget logic.
+    with (
+        patch.object(
+            memory_utils,
+            "_read_meminfo_available_bytes",
+            side_effect=partial(memory_utils._read_meminfo_available_bytes, str(meminfo)),
+        ),
+        patch.object(
+            memory_utils,
+            "_read_cgroup_memory_headroom_bytes",
+            side_effect=partial(
+                memory_utils._read_cgroup_memory_headroom_bytes, str(root), str(proc)
+            ),
+        ),
+    ):
+        # Only 30 GiB of the 80 GiB file counter is credited. Together with
+        # 10 GiB of unused cgroup allowance, the allocatable budget is 40 GiB.
+        assert memory_utils.get_integrated_gpu_free_memory(70 * _GiB, 120 * _GiB) == 40 * _GiB
 
 
 @pytest.mark.parametrize(

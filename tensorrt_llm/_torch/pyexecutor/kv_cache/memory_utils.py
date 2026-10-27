@@ -27,7 +27,7 @@ def _read_meminfo_available_bytes(meminfo_path: str = "/proc/meminfo") -> int | 
 
 
 def _read_cgroup_headroom(cgroup: Path) -> int | None:
-    """Read one cgroup v2 limit, discounting file cache but excluding shmem."""
+    """Read one cgroup v2 limit, crediting only readily reclaimable file cache."""
     try:
         limit_text = (cgroup / "memory.max").read_text().strip()
         if limit_text == "max":
@@ -40,9 +40,15 @@ def _read_cgroup_headroom(cgroup: Path) -> int | None:
     reclaimable = 0
     try:
         stats = dict(line.split() for line in (cgroup / "memory.stat").read_text().splitlines())
-        # The file counter includes tmpfs and shared memory, which cannot be
-        # reclaimed like ordinary file cache. Missing counters get no credit.
-        reclaimable = max(0, int(stats["file"]) - int(stats["shmem"]))
+        # Exclude shmem, pages awaiting writeback, and unevictable pages.
+        # These counters can overlap, and unevictable includes anonymous
+        # pages, so subtracting all is deliberately conservative. Missing
+        # counters get no file-cache credit.
+        unavailable = sum(
+            max(0, int(stats[key]))
+            for key in ("shmem", "file_dirty", "file_writeback", "unevictable")
+        )
+        reclaimable = max(0, int(stats["file"]) - unavailable)
     except (OSError, UnicodeError, ValueError, KeyError):
         pass
     return max(0, limit - max(0, current - reclaimable))
