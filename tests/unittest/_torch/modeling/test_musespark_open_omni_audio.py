@@ -227,7 +227,8 @@ def test_tokenizer_vocab_unwraps_a_wrapper_whose_get_vocab_is_a_stub():
 # (c) tower forward: shapes, dtype, checkpoint-name mirror
 # ---------------------------------------------------------------------------
 def test_tower_state_dict_mirrors_the_checkpoint_suffixes():
-    tower = audio.MuseSparkOpenAudioEncoder(HIDDEN_SIZE)
+    with torch.device("meta"):
+        tower = audio.MuseSparkOpenAudioEncoder(HIDDEN_SIZE)
     assert sorted(tower.state_dict()) == CHECKPOINT_SUFFIXES
     assert len(CHECKPOINT_SUFFIXES) == 72
     pairs = audio.audio_state_dict_to_checkpoint_keys(
@@ -240,7 +241,8 @@ def test_tower_state_dict_mirrors_the_checkpoint_suffixes():
 
 
 def test_tower_shapes_match_the_checkpoint():
-    tower = audio.MuseSparkOpenAudioEncoder(HIDDEN_SIZE)
+    with torch.device("meta"):
+        tower = audio.MuseSparkOpenAudioEncoder(HIDDEN_SIZE)
     state = tower.state_dict()
     # Patchifier linears: product of patchify factors is 1920.
     assert tuple(state["stages.0.0.linear.weight"].shape) == (256, 16)
@@ -265,23 +267,37 @@ def test_tower_builds_under_meta_init():
     assert {p.dtype for p in tower.parameters()} == {torch.bfloat16}
 
 
+#: Output width of the tower the forward tests run. They check properties that
+#: hold at any width (rows per 1920 samples, dtype, clip independence,
+#: causality), and a full-width BF16 forward takes minutes on some CPUs, so they
+#: keep the shipped patch geometry with narrow stages. The full-width layout is
+#: checked by the construction tests above.
+NARROW_OUTPUT_SIZE = 16
+
+
+def _narrow_tower():
+    return audio.MuseSparkOpenAudioEncoder(
+        NARROW_OUTPUT_SIZE, hidden_sizes=(8, 8, 8, 8), layers_per_stage=(1, 1, 1, 1)
+    )
+
+
 @pytest.mark.parametrize(
     "num_samples",
     [1, SAMPLES_PER_TOKEN, SAMPLES_PER_TOKEN + 1, 3 * SAMPLES_PER_TOKEN, 4_000],
 )
 def test_tower_forward_row_count_width_dtype(num_samples):
     torch.manual_seed(0)
-    tower = audio.MuseSparkOpenAudioEncoder(HIDDEN_SIZE)
+    tower = _narrow_tower()
     wav = torch.randn(num_samples, dtype=torch.float32) * 0.1
     (out,) = tower([wav])
-    assert out.shape == (math.ceil(num_samples / SAMPLES_PER_TOKEN), HIDDEN_SIZE)
+    assert out.shape == (math.ceil(num_samples / SAMPLES_PER_TOKEN), NARROW_OUTPUT_SIZE)
     assert out.dtype == torch.bfloat16
     assert torch.isfinite(out.float()).all()
 
 
 def test_tower_forward_multiple_clips_keeps_order_and_per_clip_lengths():
     torch.manual_seed(1)
-    tower = audio.MuseSparkOpenAudioEncoder(HIDDEN_SIZE)
+    tower = _narrow_tower()
     wavs = [torch.randn(n) * 0.1 for n in (SAMPLES_PER_TOKEN, 2 * SAMPLES_PER_TOKEN + 5)]
     outs = tower(wavs)
     assert [o.shape[0] for o in outs] == [1, 3]
@@ -294,7 +310,7 @@ def test_tower_forward_multiple_clips_keeps_order_and_per_clip_lengths():
 def test_tower_causality():
     """The tower is causal: changing the tail must not change earlier rows."""
     torch.manual_seed(2)
-    tower = audio.MuseSparkOpenAudioEncoder(HIDDEN_SIZE)
+    tower = _narrow_tower()
     base = torch.randn(2 * SAMPLES_PER_TOKEN) * 0.1
     changed = base.clone()
     changed[SAMPLES_PER_TOKEN:] += 1.0
