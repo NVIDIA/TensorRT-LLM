@@ -2879,6 +2879,13 @@ def filterCbtsStageJobs(parallelJobs, parallelJobsFiltered, multiGpuJobs, testFi
                (needsSanity && key =~ /PackageSanityCheck/) ||
                (needsPerfSanity && key =~ /PerfSanity/)
     }
+    // Coverage omits multi-GPU stages; preserve those forced by auto-trigger in the baseline set.
+    if (cbts.scope == "coverage") {
+        def autoTriggerTags = testFilter[(AUTO_TRIGGER_TAG_LIST)] ?: []
+        filtered += parallelJobsFiltered.findAll { key, _ ->
+            autoTriggerTags.any { key.contains(it) }
+        }
+    }
     if (affectedSet.isEmpty()) {
         if (filtered.isEmpty()) {
             echo "CBTS [${cbts.scope}]: trigger-mode mismatch + nothing force-kept → no-op"
