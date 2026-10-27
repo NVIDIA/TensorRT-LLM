@@ -530,6 +530,12 @@ private:
         }
         if (isContextKernel(runnerParams.mKernelType))
         {
+            // Only SM107 needs the dense paged-context NVRTC warmup grid.
+            // Other architectures retain their precompiled context path.
+            if (mSM != kSM_107)
+            {
+                return;
+            }
             cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
             TLLM_CUDA_CHECK(cudaStreamIsCapturing(runnerParams.stream, &captureStatus));
             TLLM_CHECK_WITH_INFO(captureStatus == cudaStreamCaptureStatusNone,
