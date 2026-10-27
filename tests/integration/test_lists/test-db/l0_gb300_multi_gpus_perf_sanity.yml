@@ -55,6 +55,8 @@ l0_gb300_multi_gpus_perf_sanity:
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_glm53_flash_fp8_grace_blackwell-glm53_flash_fp8_tp4_mtp3_isl13312_osl33] TIMEOUT (30)
   # glm-5.3-flash-nvfp4 tp4 mtp3 8k1k (aggregated)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_glm53_flash_nvfp4_grace_blackwell-glm53_flash_nvfp4_tp4_mtp3_8k1k] TIMEOUT (30)
+  # qwen3.8-flash-next-nvfp4 modeling_v2 tp1 mtp3 8k1k (aggregated, 1 GPU)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_qwen3_8_flash_next_fp4_grace_blackwell-qwen3_8_flash_next_fp4_mv2_tp1_mtp3_8k1k] TIMEOUT (35)
   # nemotron-ultra-v3-fp4 8k64k (ctx_only)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_nemotron-ultra-v3-fp4_8k64k_con1_ctx1_dep4_gen1_tep4_eplb0_mtp5_ccb-NIXL] TIMEOUT (30)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_nemotron-ultra-v3-fp4_8k64k_con9832_ctx1_dep4_gen8_dep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (60)

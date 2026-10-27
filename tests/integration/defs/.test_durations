@@ -918,6 +918,7 @@
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_nemotron_ultra_v3_fp4_grace_blackwell-nemotron_ultra_v3_fp4_dep4_mtp0_50k2k]": 1863.1629285714287,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_nemotron_ultra_v3_fp4_grace_blackwell-nemotron_ultra_v3_fp4_dep4_mtp3_50k2k]": 780.4455,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_nemotron_ultra_v3_fp4_grace_blackwell-nemotron_ultra_v3_fp4_tep4_mtp6_50k2k]": 1339.9197142857142,
+   "perf/test_perf_sanity.py::test_e2e[aggr_upload-gb300_qwen3_8_flash_next_fp4_grace_blackwell-qwen3_8_flash_next_fp4_mv2_tp1_mtp3_8k1k]": 1011.102,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gemma4_26b_a4b_nvfp4_blackwell-gemma4_26b_a4b_nvfp4_tp1_1k1k]": 289.63309090909087,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb200_qwen3-235b-fp4_8k1k_con1024_ctx1_tp1_gen1_dep8_eplb0_mtp0_ccb-NIXL]": 284.1654117647059,
    "perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb200_qwen3-235b-fp4_8k1k_con1_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL]": 228.4835294117647,
