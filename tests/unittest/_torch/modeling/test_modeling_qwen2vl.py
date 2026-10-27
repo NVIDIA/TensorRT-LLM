@@ -95,6 +95,7 @@ def test_qwen2_5_vision_attention_checks_rotated_qkv_views(returned_view: str) -
         v: torch.Tensor,
         position_ids: torch.Tensor | None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+        packed_qk: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if returned_view == "equivalent":
             q, k, v = q.view_as(q), k.view_as(k), v.view_as(v)

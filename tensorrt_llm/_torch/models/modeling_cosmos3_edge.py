@@ -254,6 +254,7 @@ class Cosmos3EdgeVisionAttention(Qwen2_5_VLVisionAttention):
         v: Optional[torch.Tensor],
         position_ids: Optional[torch.IntTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        packed_qk: Optional[torch.Tensor] = None,
     ):
         del position_ids, position_embeddings
         return q, k, v
