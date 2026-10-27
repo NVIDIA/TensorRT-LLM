@@ -1819,6 +1819,10 @@ def _ids(items):
     return [item.id for item in items]
 
 
+def _kv_router(tp_size):
+    return DefaultADPRouter(dist=_mock_dist(tp_size=tp_size), kv_balanced_admission=True)
+
+
 @pytest.mark.parametrize(
     "tokens,loads,counts,slots,budget,forced,groups,expected",
     [
@@ -1849,8 +1853,26 @@ def test_plan_kv_balanced_admission(tokens, loads, counts, slots, budget, forced
 
 
 class TestDefaultADPRouterKVBalance:
+    @pytest.mark.parametrize(
+        "config,enabled",
+        [
+            (None, False),
+            (AttentionDpConfig(), False),
+            (AttentionDpConfig(enable_kv_balanced_admission=True), True),
+        ],
+    )
+    def test_config_turns_it_on(self, config, enabled):
+        router = ADPRouter.create(
+            dist=_mock_dist(tp_size=2), has_seq_slot_headroom=False, attention_dp_config=config
+        )
+        assert type(router) is DefaultADPRouter and router.kv_balanced_admission is enabled
+        chosen = router.pop_requests(
+            _gen_queue([8000, 300, 400]), _states([20000, 21000], [8, 7]), 1, 8
+        )
+        assert _ids(chosen) == ([2] if enabled else [0])
+
     def test_pop_ages_the_rest_and_route_follows_the_plan(self):
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        router = _kv_router(2)
         queue = _gen_queue([8000, 300, 400])
         states = _states([20000, 21000], [8, 7])  # only rank 1 has a slot
         chosen = router.pop_requests(queue, states, 4, max_num_active_requests=8)
@@ -1864,23 +1886,28 @@ class TestDefaultADPRouterKVBalance:
         assert router._kv_balance_skipped_rounds == {0: 1, 1: 1}
 
     def test_request_passed_over_too_often_is_admitted_next(self):
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        router = _kv_router(2)
         router._kv_balance_skipped_rounds = {0: KV_BALANCE_MAX_SKIPPED_ROUNDS}
         chosen = router.pop_requests(_gen_queue([8000, 300]), _states([20000, 21300], [7, 8]), 4, 8)
         assert _ids(chosen) == [0]
         assert router._kv_balance_skipped_rounds == {1: 1}
 
     def test_only_the_head_window_is_considered(self):
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        router = _kv_router(2)
         # The best fit (10 tokens) sits just behind the window.
         queue = _gen_queue([1000] * KV_BALANCE_WINDOW + [10])
         chosen = router.pop_requests(queue, _states([0, 0], [0, 1]), 1, max_num_active_requests=1)
         assert _ids(chosen) == [0]
 
-    @pytest.mark.parametrize("case", ["kv_balance_off", "context_request", "single_rank"])
+    @pytest.mark.parametrize(
+        "case", ["config_off", "kv_balance_off", "context_request", "single_rank"]
+    )
     def test_fifo_fallback(self, case):
         single_rank = case == "single_rank"
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=1 if single_rank else 2))
+        router = DefaultADPRouter(
+            dist=_mock_dist(tp_size=1 if single_rank else 2),
+            kv_balanced_admission=case != "config_off",
+        )
         queue = _gen_queue([8000, 300, 400])
         if case == "context_request":
             context_type = RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
@@ -1891,7 +1918,7 @@ class TestDefaultADPRouterKVBalance:
         assert router._kv_balanced_placement == {} and router._kv_balance_skipped_rounds == {}
 
     def test_requests_not_popped_by_kv_admission_keep_heap_routing(self):
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        router = _kv_router(2)
         items = [_gen_item(i, n) for i, n in enumerate([9000, 3000, 3000, 3000])]
         assignment, expected = router.route_requests(_states([0, 0], [0, 0]), items, 4)
         assert [len(assignment[r]) for r in range(2)] == [2, 2] and expected == 2
@@ -1904,7 +1931,7 @@ class TestDefaultADPRouterKVBalance:
             def __iter__(self):
                 raise AssertionError("queue read without capacity")
 
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        router = _kv_router(2)
         queue = _UntouchableQueue([_gen_item(i, 100) for i in range(4)])
         assert router.pop_requests(queue, _states([0, 0], [0, 0]), 0, 8) == []
 
@@ -1916,7 +1943,7 @@ class TestDefaultADPRouterKVBalance:
         monkeypatch.setattr(PriorityWaitingQueue, "remove_by_ids", _no_full_scan)
         queue = PriorityWaitingQueue()
         queue.add_requests(_gen_item(i, 100 + i % 50, priority=(i % 5) / 10) for i in range(2000))
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        router = _kv_router(2)
         chosen = router.pop_requests(queue, _states([0, 0], [0, 0]), 4, 8)
         # Only top-priority requests (ids 4, 9, 14, ...) are admitted.
         assert len(chosen) == 4 and all(item.id % 5 == 4 for item in chosen)
@@ -1929,7 +1956,7 @@ class TestDefaultADPRouterKVBalance:
         if policy == "priority":
             queue.add_requests(items)
         order = _ids(queue)
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        router = _kv_router(2)
         chosen = set(_ids(router.pop_requests(queue, _states([20000, 21000], [7, 7]), 2, 8)))
         assert len(chosen) == 2 and chosen <= set(order[:KV_BALANCE_WINDOW])
         assert [queue.pop_request().id for _ in range(len(queue))] == [
@@ -1937,7 +1964,7 @@ class TestDefaultADPRouterKVBalance:
         ]
 
     def test_lower_priority_request_waits_for_a_higher_priority_one(self):
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        router = _kv_router(2)
         queue = PriorityWaitingQueue()
         # By KV alone the 100-token request fits rank 0 better.
         queue.add_requests([_gen_item(0, 100, priority=0.5), _gen_item(1, 9000, priority=0.9)])
@@ -1945,7 +1972,7 @@ class TestDefaultADPRouterKVBalance:
         assert _ids(chosen) == [1] and _ids(queue) == [0]
 
     def test_priority_displacement_restarts_the_skip_count(self):
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        router = _kv_router(2)
         queue = PriorityWaitingQueue()
         queue.add_requests(_gen_item(i, 100 + i) for i in range(KV_BALANCE_WINDOW))
         states = _states([0, 0], [0, 0])
@@ -1960,7 +1987,7 @@ class TestDefaultADPRouterKVBalance:
         assert not passed_over & set(router._kv_balance_skipped_rounds)
 
     def test_gen_admission_order_is_kept_and_reported(self):
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        router = _kv_router(2)
         queue = GenAdmissionWaitingQueue(GenAdmissionConfig(ttft_percentile=100.0))
         for i in range(KV_BALANCE_WINDOW + 8):
             item = _gen_item(i, 8000 if i % 3 else 300)
@@ -1975,7 +2002,7 @@ class TestDefaultADPRouterKVBalance:
 
     def test_equal_priorities_admit_like_fcfs(self):
         rng = random.Random(0)
-        routers = [DefaultADPRouter(dist=_mock_dist(tp_size=4)) for _ in range(2)]
+        routers = [_kv_router(4) for _ in range(2)]
         queues = [FCFSWaitingQueue(), PriorityWaitingQueue()]
         tokens, counts = [0] * 4, [0] * 4
         next_id = 0
@@ -2003,7 +2030,7 @@ class TestDefaultADPRouterKVBalance:
         """Gen-only fill without departures: per-rank request counts stay within one."""
         num_ranks, slots = 16, 16
         rng = random.Random(0)
-        router = DefaultADPRouter(dist=_mock_dist(tp_size=num_ranks))
+        router = _kv_router(num_ranks)
         tokens, counts = [0] * num_ranks, [0] * num_ranks
         queue = FCFSWaitingQueue()
         next_id = 0

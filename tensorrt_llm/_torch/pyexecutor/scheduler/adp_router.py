@@ -25,8 +25,9 @@ Protocol:
     3. ADPRouter.route_requests() distributes new requests
 
 Includes:
-    - DefaultADPRouter: load-balanced min-heap routing; generation-only
-      (disaggregated decode) requests are admitted and placed by KV length
+    - DefaultADPRouter: load-balanced min-heap routing; with
+      enable_kv_balanced_admission, generation-only (disaggregated decode)
+      requests are admitted and placed by KV length
     - KVCacheAwareADPRouter: cache-aware routing that factors in
       prefix match length from the KV cache radix tree
 """
@@ -279,7 +280,13 @@ class ADPRouter(ABC):
                 account_for_in_transfer=attention_dp_config.kv_cache_routing_account_for_in_transfer,
             )
 
-        return DefaultADPRouter(dist=dist, has_seq_slot_headroom=has_seq_slot_headroom)
+        return DefaultADPRouter(
+            dist=dist,
+            has_seq_slot_headroom=has_seq_slot_headroom,
+            kv_balanced_admission=(
+                attention_dp_config is not None and attention_dp_config.enable_kv_balanced_admission
+            ),
+        )
 
     @abstractmethod
     def create_rank_state(
@@ -450,7 +457,8 @@ class DefaultADPRouter(ADPRouter):
            fewer tokens get more requests. Requests are sorted by token count
            (descending) for better load balancing.
 
-    Generation-only requests are admitted by KV load: while the first
+    With ``kv_balanced_admission`` (``AttentionDpConfig.enable_kv_balanced_admission``),
+    generation-only requests are admitted by KV load: while the first
     ``KV_BALANCE_WINDOW`` queued requests are all such requests,
     ``pop_requests`` plans admission and placement together
     (``plan_kv_balanced_admission``, ordered by ``WaitingQueue.admission_groups``)
@@ -458,8 +466,14 @@ class DefaultADPRouter(ADPRouter):
     benchmark fill phase admit in queue order.
     """
 
-    def __init__(self, dist: Distributed, has_seq_slot_headroom: bool = False):
+    def __init__(
+        self,
+        dist: Distributed,
+        has_seq_slot_headroom: bool = False,
+        kv_balanced_admission: bool = False,
+    ):
         super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
+        self.kv_balanced_admission = kv_balanced_admission
         # Request id -> admitting rounds it was passed over in the window.
         self._kv_balance_skipped_rounds: Dict[int, int] = {}
         # Request id -> planned rank, until route_requests places it.
@@ -490,7 +504,11 @@ class DefaultADPRouter(ADPRouter):
     ) -> list[RequestQueueItem]:
         self._kv_balanced_placement = {}
         # A single rank has no placement to choose.
-        if not kv_balance or max_new_requests <= 0 or len(all_rank_states) <= 1:
+        if (
+            not (self.kv_balanced_admission and kv_balance)
+            or max_new_requests <= 0
+            or len(all_rank_states) <= 1
+        ):
             return super().pop_requests(
                 waiting_queue, all_rank_states, max_new_requests, max_num_active_requests
             )
