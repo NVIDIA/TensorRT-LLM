@@ -23,7 +23,12 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     MambaLayerGroup,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.modules.fla.cache_manager import GDNReplayState, Qwen35HybridCacheManager
+from tensorrt_llm._torch.modules.fla.cache_manager import (
+    GDNReplayState,
+    Qwen35HybridCacheManager,
+    _use_flashinfer_ring_replay,
+)
+from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import FLASHINFER_REPLAY_RING_SIZE
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     _KDA_BETA_CACHE_ALIGNMENT_BYTES,
     KDAIntermediateState,
@@ -68,7 +73,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     _mamba_snapshot_rule_counts,
     _promote_mamba_state_triton,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import _stack_state_views
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
+    MambaAcceptanceBatch,
+    _stack_state_views,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     LlmRequest,
@@ -4037,6 +4045,186 @@ def _v2_kda_draft_record_manager(kda_draft_records, enable_block_reuse):
         enable_partial_reuse=False,
     )
     return mgr
+
+
+def _ring_gate_manager(
+    *,
+    draft_len=3,
+    head_dim=128,
+    d_state=128,
+    conv_dtype=torch.bfloat16,
+    ssm_dtype=torch.bfloat16,
+    conv_state_layout="q_k_v",
+    mamba_pp_layers=(0,),
+):
+    return SimpleNamespace(
+        spec_config=MTPDecodingConfig(max_draft_len=draft_len),
+        _state_layout=SimpleNamespace(
+            mamba_pp_layers=mamba_pp_layers,
+            ssm_state_shape=(4, head_dim, d_state) if mamba_pp_layers else (),
+            conv_state_dtype=conv_dtype,
+            ssm_state_dtype=ssm_dtype,
+            conv_state_layout=conv_state_layout,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("env", "replay_enabled", "available", "overrides", "expected", "warns"),
+    [
+        ("1", True, True, {}, True, False),
+        ("1", True, True, {"draft_len": 7}, True, False),
+        (None, True, True, {}, False, False),
+        ("1", False, True, {}, False, True),
+        ("1", True, False, {}, False, True),
+        ("1", True, True, {"ssm_dtype": torch.float32}, False, True),
+        ("1", True, True, {"conv_dtype": torch.float16}, False, True),
+        ("1", True, True, {"head_dim": 64}, False, True),
+        ("1", True, True, {"draft_len": 2}, False, True),
+        ("1", True, True, {"conv_state_layout": "x_b_c"}, False, True),
+        ("force", True, True, {"mamba_pp_layers": ()}, False, False),
+    ],
+    ids=[
+        "eligible_T4",
+        "eligible_T8",
+        "not_opted_in",
+        "replay_off",
+        "kernel_unavailable",
+        "fp32_state",
+        "fp16_model",
+        "head_dim_64",
+        "T3",
+        "x_b_c_layout",
+        "no_local_gdn_layers",
+    ],
+)
+def test_gdn_flashinfer_ring_replay_gate(
+    monkeypatch, env, replay_enabled, available, overrides, expected, warns
+):
+    if env is None:
+        monkeypatch.delenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", env)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fla.flashinfer_cached_replay."
+        "is_flashinfer_cached_replay_available",
+        lambda: available,
+    )
+    warning_log = MagicMock()
+    monkeypatch.setattr("tensorrt_llm._torch.modules.fla.cache_manager.logger.warning", warning_log)
+
+    assert _use_flashinfer_ring_replay(_ring_gate_manager(**overrides), replay_enabled) is expected
+    assert warning_log.called is warns
+
+
+@pytest.mark.parametrize("available", [True, False], ids=["eligible", "kernel_unavailable"])
+def test_gdn_flashinfer_ring_replay_gate_force(monkeypatch, available):
+    monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "force")
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fla.flashinfer_cached_replay."
+        "is_flashinfer_cached_replay_available",
+        lambda: available,
+    )
+    if available:
+        assert _use_flashinfer_ring_replay(_ring_gate_manager(), True) is True
+    else:
+        with pytest.raises(RuntimeError, match="force"):
+            _use_flashinfer_ring_replay(_ring_gate_manager(), True)
+
+
+def test_gdn_flashinfer_ring_replay_gate_force_replay_disabled(monkeypatch):
+    monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "force")
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fla.flashinfer_cached_replay."
+        "is_flashinfer_cached_replay_available",
+        lambda: True,
+    )
+    with pytest.raises(RuntimeError, match="requires GDN replay"):
+        _use_flashinfer_ring_replay(_ring_gate_manager(), False)
+
+
+@skip_no_cuda
+def test_v2_gdn_ring_replay_allocates_rings_instead_of_double_buffer():
+    policy = GDNReplayState(tokens_per_gen_step=4, use_flashinfer_ring=True)
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=2,
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        conv_state_layout="q_k_v",
+        speculative_state=policy,
+    )
+    ring_size = FLASHINFER_REPLAY_RING_SIZE
+    try:
+        assert mgr.use_gdn_flashinfer_ring_replay
+        assert not mgr.use_gdn_cached_replay_all_layer_commit
+        assert policy.old_x is None and policy.old_B is None
+        assert policy.old_dt is None and policy.old_dA_cumsum is None
+        nheads, head_dim, d_state = mgr.ssm_state_shape
+        layers, slots = mgr.local_num_mamba_layers, policy.cache_base.shape[0]
+        n_groups = mgr._state_layout.n_groups_per_rank
+        assert policy.k_ring.shape == (layers, slots, n_groups, ring_size, d_state)
+        assert policy.u_ring.shape == (layers, slots, nheads, ring_size, head_dim)
+        assert policy.g_ring.shape == (layers, slots, nheads, ring_size)
+        assert policy.g_ring.dtype == torch.float32
+        for t in (policy.cache_base, policy.k_ring, policy.u_ring, policy.g_ring):
+            assert not t.any()
+
+        layer_cache = mgr.mamba_layer_cache(1)
+        offset = mgr.mamba_layer_offsets[1]
+        assert layer_cache.old_x is None
+        assert layer_cache.cache_base is policy.cache_base
+        assert layer_cache.k_ring.data_ptr() == policy.k_ring[offset].data_ptr()
+        assert layer_cache.u_ring.data_ptr() == policy.u_ring[offset].data_ptr()
+        assert layer_cache.g_ring.data_ptr() == policy.g_ring[offset].data_ptr()
+    finally:
+        mgr.shutdown()
+    assert policy.cache_base is None and policy.k_ring is None
+    assert policy.u_ring is None and policy.g_ring is None
+
+
+def test_v2_gdn_ring_replay_update_advances_ring_start():
+    policy = GDNReplayState(tokens_per_gen_step=4, use_flashinfer_ring=True)
+    policy.prev_num_accepted_tokens = torch.tensor([13, 13, 2, 13, 13], dtype=torch.int32)
+    policy.cache_buf_idx = torch.zeros(5, dtype=torch.int32)
+    policy.cache_base = torch.tensor([5, 20, 30, 7, 9], dtype=torch.int32)
+
+    # Slot 0 holds a context request, slot 3 a dummy and slot 4 CUDA-graph padding.
+    generation_slots = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    policy.update(
+        MambaAcceptanceBatch(
+            attention_metadata=None,
+            num_contexts=1,
+            num_generations=4,
+            num_accepted_tokens=torch.tensor([3, 2, 3, 3], dtype=torch.int32),
+            accepted_positions=torch.tensor([2, 1, 2, 2], dtype=torch.int32),
+            source_state_indices=generation_slots,
+            destination_state_indices=generation_slots,
+            is_dummy_request=torch.tensor([False, False, True, True]),
+        )
+    )
+
+    # Slot 1 flushed (13 + 4 > 16): its start moves past the 13 folded rows and
+    # wraps, (20 + 13) % 32 = 1. Slot 2 only appended. Others are untouched.
+    assert policy.cache_base.tolist() == [5, 1, 30, 7, 9]
+    assert policy.prev_num_accepted_tokens.tolist() == [13, 3, 4, 13, 13]
+
+
+def test_v2_gdn_ring_replay_resets_context_slots():
+    policy = GDNReplayState(tokens_per_gen_step=4, use_flashinfer_ring=True)
+    policy.prev_num_accepted_tokens = torch.tensor([5, 6, 7], dtype=torch.int32)
+    policy.cache_buf_idx = torch.ones(3, dtype=torch.int32)
+    policy.cache_base = torch.tensor([5, 6, 7], dtype=torch.int32)
+    ring_size = FLASHINFER_REPLAY_RING_SIZE
+    policy.k_ring = torch.ones(2, 3, 1, ring_size, 4)
+    policy.u_ring = torch.ones(2, 3, 2, ring_size, 4)
+    policy.g_ring = torch.ones(2, 3, 2, ring_size)
+
+    policy.reset_slots(torch.tensor([2]), [2])
+
+    assert policy.prev_num_accepted_tokens.tolist() == [5, 6, 0]
+    assert policy.cache_base.tolist() == [5, 6, 0]
+    for ring in (policy.k_ring, policy.u_ring, policy.g_ring):
+        assert not ring[:, 2].any()  # the new request's slot, in every layer
+        assert ring[:, :2].all()  # other slots untouched
 
 
 def test_mamba_cache_manager_delegates_kda_replay_capability() -> None:

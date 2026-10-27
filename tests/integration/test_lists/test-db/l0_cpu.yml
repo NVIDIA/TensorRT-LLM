@@ -203,6 +203,8 @@ l0_cpu:
   - unittest/inputs
   - unittest/kv_cache_manager_v2_tests
   - unittest/llmapi/test_deepseek_v32_encoding.py
+  - unittest/llmapi/test_deepseek_v32_tokenizer.py
+  - unittest/llmapi/test_deepseek_v41_tokenizer.py
   - unittest/llmapi/apps/test_anthropic_adapter.py
   - unittest/llmapi/apps/test_anthropic_batches.py
   - unittest/llmapi/apps/test_anthropic_gateway.py
