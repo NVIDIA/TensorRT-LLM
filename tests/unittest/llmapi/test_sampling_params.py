@@ -534,3 +534,34 @@ def test_thinking_budget_text_generation_caps_reasoning_tokens(thinking_token_bu
     assert tokenizer.decode(generated_ids) == tokenizer.decode(
         [start_id, *expected_reasoning_ids, end_id, answer_id]
     )
+
+
+def test_bad_token_ids_single_tokens():
+    assert SamplingParams(bad_token_ids=[5, 7])._get_bad_words() == [[5], [7]]
+
+
+def test_bad_token_ids_multi_token_sequences():
+    # A user can block a multi-token bad word explicitly.
+    sp = SamplingParams(bad_token_ids=[[10, 11], 5])
+    assert sp._get_bad_words() == [[10, 11], [5]]
+
+
+@pytest.mark.parametrize(
+    "bad_token_ids",
+    [
+        ["12"],  # str is iterable: would silently become [['1', '2']]
+        "hello",  # top-level str: would become one entry per character
+        [[10, "a"]],
+        [[]],
+        [1.5],
+        [None],
+        [True],  # bool is an int subclass
+        [[10, True]],
+        [(12, 13)],  # inner sequences must be lists, as annotated
+        {5: "other token"},  # a mapping would silently keep only its keys
+        "",
+    ],
+)
+def test_bad_token_ids_rejects_malformed_entries(bad_token_ids):
+    with pytest.raises(ValueError, match="bad_token_ids"):
+        SamplingParams(bad_token_ids=bad_token_ids)
