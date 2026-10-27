@@ -1893,6 +1893,7 @@ def test_helix_retention_uses_rank_local_ranges(
             world_size=2, cp_size=2, tp_size=1, rank=rank, cp_config={"cp_type": "HELIX"}
         ),
         dtype=DataType.HALF,
+        is_disagg=True,
     )
     request = _ContextRequest(
         1, list(range(local_prompt)), local_prompt, "retention", use_conversation_params=False
@@ -1908,6 +1909,59 @@ def test_helix_retention_uses_rank_local_ranges(
         assert manager.prepare_context_cache(request) is not None
         cache = manager.kv_cache_map[request.py_request_id]
         assert cache.resize(global_prompt)
+        group = manager.impl.get_layer_group_id(0)
+        assert cache.get_page_priorities(group) == expected
+        assert cache.resize((len(expected) + 1) * 128)
+        assert cache.get_page_priorities(group) == expected + [10]
+    finally:
+        manager.free_resources(request)
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "range_start,range_end,expected", [(0, 128, [80, 35]), (128, 256, [35, 80])]
+)
+@pytest.mark.parametrize("rank", [0, 1])
+def test_agg_helix_retention_uses_global_ranges(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+    range_start: int,
+    range_end: int,
+    expected: list[int],
+) -> None:
+    # Aggregated helix holds the full prompt on every rank, so a range in prompt
+    # tokens marks exactly the ledger blocks (two 64-token pages each) it covers.
+    dist = SimpleNamespace(allreduce=lambda value, op: value, local_world_size=1)
+    monkeypatch.setattr(Distributed, "get", lambda mapping: dist)
+    manager = KVCacheManagerV2(
+        KvCacheConfig(enable_block_reuse=False, max_gpu_total_bytes=4 << 20),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=64,
+        max_seq_len=512,
+        max_batch_size=1,
+        max_num_tokens=256,
+        mapping=Mapping(
+            world_size=2, cp_size=2, tp_size=1, rank=rank, cp_config={"cp_type": "HELIX"}
+        ),
+        dtype=DataType.HALF,
+        is_disagg=False,
+    )
+    prompt_len = 256
+    request = _ContextRequest(
+        1, list(range(prompt_len)), prompt_len, "retention", use_conversation_params=False
+    )
+    request.total_input_len_cp = prompt_len
+    request.kv_cache_retention_config = KvCacheRetentionConfig(
+        [KvCacheRetentionConfig.TokenRangeRetentionConfig(range_start, range_end, 80)],
+        decode_retention_priority=10,
+    )
+    try:
+        assert manager.prepare_context_cache(request) is not None
+        cache = manager.kv_cache_map[request.py_request_id]
+        assert cache.resize(prompt_len)
         group = manager.impl.get_layer_group_id(0)
         assert cache.get_page_priorities(group) == expected
         assert cache.resize((len(expected) + 1) * 128)

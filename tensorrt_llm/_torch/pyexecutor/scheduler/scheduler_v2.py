@@ -1530,11 +1530,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                         f"or max_tokens (GLOBAL tokens across CP ranks, not "
                         f"per-rank), or reduce concurrency."
                     )
-                # Aggregated helix has a single hot GPU pool (no host, disk
-                # or GPU cold level), so a suspended request's pages have
-                # nowhere to go and recompute-pause is the only way to make
-                # room.
-            else:
+            # Under helix without a tier below GPU, a suspended request's pages
+            # have nowhere to go, so recompute-pause is the only way to make
+            # room.
+            if not self.has_cp_helix or self.kv_cache_manager.has_cache_tier_below_gpu:
                 req_it_end, success = self._try_evict_for_gen(
                     req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
                 )
@@ -1558,10 +1557,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         # GPU pages so other requests can resume().
         # Skip if already suspended — suspending again is a no-op
         # that frees no pages.
-        if self.has_cp_helix:
-            # Suspending frees nothing in aggregated helix's single hot GPU
-            # pool. The request still sits out this step, so clear its stale
-            # batch index.
+        if self.has_cp_helix and not self.kv_cache_manager.has_cache_tier_below_gpu:
+            # Suspending frees nothing under helix without a tier below GPU.
+            # The request still sits out this step, so clear its stale batch
+            # index.
             self._clear_request_runtime_state(req)
         elif self.kv_cache_manager.is_request_active(
             req.py_request_id
@@ -1642,7 +1641,9 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         The fallback for a pool that suspension cannot drain; see
         `KVCacheManagerV2.preempt_request`. With a cache tier below GPU,
-        suspension is cheaper and keeps the pages, so that path is left alone.
+        suspension is cheaper and keeps the pages, so this waits for the
+        generation path to suspend a decode request; under helix it falls back
+        to preemption once no decode request holds GPU pages.
 
         The victim leaves on `recompute_paused`, the same channel the
         generation side uses, because a re-prefill needs more teardown than the
@@ -1654,7 +1655,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns True when pages became available in this iteration.
         """
         if self.kv_cache_manager.has_cache_tier_below_gpu:
-            return False
+            # Wait while a generation request holds GPU pages: it either
+            # finishes or the generation path suspends it to the lower tier.
+            # Under helix, when none does, every running request is mid-prefill
+            # and nothing else frees pages, so fall through to recompute-pause.
+            if not self.has_cp_helix or any(
+                r.is_generation_in_progress_state
+                and self.kv_cache_manager.is_request_active(r.py_request_id)
+                for r in requests_list
+            ):
+                return False
         # A disaggregated generation worker received its context KV rather
         # than computing it, so it cannot replay a prefill at all.
         if not self.enable_recompute_pause:
@@ -1807,19 +1817,22 @@ class KVCacheV2Scheduler(RequestScheduler):
                 )
             return
 
-        # Aggregated helix (`KVCacheManagerV2.__init__`) and a connector
-        # (`PyExecutor._reject_non_gpu_cache_tiers`) reject every tier below GPU
-        # at bring-up, so offering host_cache_size there is advice the user
-        # cannot act on.
-        if self.has_cp_helix and self.enable_recompute_pause:
+        if self.has_cp_helix:
+            # Under helix, max_gpu_total_bytes is per rank but max_tokens
+            # counts tokens across all CP ranks.
             remedy = (
-                "Aggregated helix runs a single hot GPU pool, so no secondary "
-                "tier can be configured. Increase "
-                "kv_cache_config.max_gpu_total_bytes (rank-local bytes), "
-                "max_tokens (GLOBAL tokens across CP ranks) or "
-                "free_gpu_memory_fraction, or lower max_batch_size."
+                "Increase kv_cache_config.max_gpu_total_bytes (rank-local bytes) "
+                "or max_tokens (GLOBAL tokens across CP ranks), or lower "
+                "max_batch_size."
             )
+            # A host tier helps only where requests can be suspended and
+            # resumed: aggregated helix, which does not have one yet.
+            if self.enable_recompute_pause and not self.kv_cache_manager.has_cache_tier_below_gpu:
+                remedy = f"Configure kv_cache_config.host_cache_size. {remedy}"
         elif getattr(self.kv_cache_manager, "kv_connector_manager", None) is not None:
+            # A connector rejects every tier below GPU at bring-up
+            # (`PyExecutor._reject_non_gpu_cache_tiers`), so host_cache_size is
+            # not an option here.
             remedy = (
                 "A KV connector is attached, which requires a GPU-only cache, "
                 "so no secondary tier can be configured. Increase "
