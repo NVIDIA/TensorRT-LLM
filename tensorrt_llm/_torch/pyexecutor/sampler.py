@@ -1407,15 +1407,22 @@ class TorchSampler(Sampler, AsyncWorkerMixin):
             target_indices = (source_indices + d2t) % vocab_t
             aligned_draft_probs[..., target_indices] = draft_probs
             draft_probs = aligned_draft_probs
+        num_draft_tokens = draft_probs.size(0)
+        draft_token_length = get_draft_token_length(request)
+        if not (0 < num_draft_tokens <= draft_token_length):
+            raise ValueError(
+                f"draft_probs row count ({num_draft_tokens}) must be in "
+                f"(0, {draft_token_length}]"
+            )
         rejected_indices = get_rejected_indices(
             draft_probs,
             target_probs,
             generator,
-            request.py_draft_tokens,
+            request.py_draft_tokens[:num_draft_tokens],
         )
         sample_last = True
         if rejected_indices.numel() == 0:
-            num_initially_accepted = get_draft_token_length(request)
+            num_initially_accepted = num_draft_tokens
             sample_last = False
         else:
             num_initially_accepted = cast(int, rejected_indices[0].item())

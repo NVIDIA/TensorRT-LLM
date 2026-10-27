@@ -1516,6 +1516,7 @@ class PyExecutor:
                 self.iter_counter += 1
 
     def _prepare_draft_requests(self):
+        """Reset draft placeholders and discard logits from the previous round."""
         try:
             # Set draft tokens here to make the KV cache manager
             # and scheduler aware of them.
@@ -1525,6 +1526,7 @@ class PyExecutor:
                     continue
 
                 req.py_last_draft_tokens = req.py_draft_tokens
+                req.py_draft_logits = None
 
                 if self.max_total_draft_tokens > 0 and self.use_spec_decode and not req.py_disable_speculative_decoding:
                     req.py_draft_tokens = [0] * self.max_total_draft_tokens

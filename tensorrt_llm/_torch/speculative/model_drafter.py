@@ -63,6 +63,7 @@ class ModelDrafter(Drafter):
         spec_resource_manager: Optional[BaseResourceManager] = None,
         guided_decoder: Optional[GuidedDecoder] = None,
     ):
+        """Initialize draft execution and per-request token/logit accumulators."""
         # Validate required parameters
         if draft_model_engine is None:
             raise ValueError("draft_model_engine cannot be None")
@@ -97,8 +98,9 @@ class ModelDrafter(Drafter):
             assert spec_config._allow_greedy_draft_tokens
             assert spec_config.draft_len_schedule is None
 
-        # Create accumulator for draft tokens in non-CDL mode
+        # Create accumulators for draft tokens and logits in non-CDL mode
         self.draft_tokens_accumulator: Dict[int, List[int]] = {}
+        self.draft_logits_accumulator: Dict[int, List[torch.Tensor]] = {}
 
         # Initialize draft latency tracking for specDecodingStats
         self.last_draft_latency_ms = 0.0
@@ -115,14 +117,13 @@ class ModelDrafter(Drafter):
         return LlmRequest(
             input_tokens=input_tokens,
             request_id=request.py_request_id,
-            max_new_tokens=request.py_max_new_tokens,
+            max_new_tokens=max(request.py_max_new_tokens, self.max_draft_len),
             sampling_config=request.sampling_config,
             guided_decoding_params=request.guided_decoding_params,
             target_seq_slot=request.py_seq_slot,
             return_perf_metrics=request.return_perf_metrics,
             is_streaming=False,
-            exclude_last_generation_logits=
-            True,  # prepare_draft_tokens uses overlap scheduling
+            exclude_last_generation_logits=False,
             is_draft=True,
             # NB: self.sampler is shared with PyExecutor
             return_generation_logits=self.sampler.should_provide_draft_probs(
@@ -473,12 +474,20 @@ class ModelDrafter(Drafter):
                 # generation_logits returns [beam_width, seq_length, vocab_size]
                 beam_width = generation_logits.size(0)
                 assert beam_width == 1, f"expected beam_width=1, got {beam_width}"
-                generation_logits.squeeze_(0)
+                generation_logits = generation_logits.squeeze(0)
+                step_idx = draft_position - 1
+                assert generation_logits.size(0) > step_idx, (
+                    f"expected at least {draft_position} draft logit rows, "
+                    f"got {generation_logits.size(0)}")
+                step_logits = generation_logits[step_idx]
                 # Transfer to CUDA if needed (chunked LogitsStorage stores on CPU)
-                if generation_logits.device.type == 'cpu':
-                    generation_logits = generation_logits.to('cuda',
-                                                             non_blocking=True)
-            target_model_req.py_draft_logits = generation_logits
+                if (step_logits.device.type == 'cpu'
+                        and torch.cuda.is_available()):
+                    step_logits = step_logits.to('cuda', non_blocking=True)
+                if req.py_request_id not in self.draft_logits_accumulator:
+                    self.draft_logits_accumulator[req.py_request_id] = []
+                self.draft_logits_accumulator[req.py_request_id].append(
+                    step_logits)
 
             if req.state != LlmRequestState.GENERATION_COMPLETE and draft_position < target_model_req.py_draft_pages_allocated:
                 new_requests.append(req)
@@ -651,6 +660,7 @@ class ModelDrafter(Drafter):
             if target_model_req.is_context_init_state:
                 continue
             target_model_req.py_draft_tokens = [0] * self.max_draft_len
+            target_model_req.py_draft_logits = None
 
         self.draft_seq_slot_manager.prepare_resources(draft_batch)
         return draft_batch
@@ -708,6 +718,9 @@ class ModelDrafter(Drafter):
         for req_id, tokens in self.draft_tokens_accumulator.items():
             target_model_req = self.req_id_to_old_request[req_id]
             target_model_req.py_draft_tokens = tokens
+            logits_list = self.draft_logits_accumulator.pop(req_id, None)
+            target_model_req.py_draft_logits = (
+                torch.stack(logits_list, dim=0) if logits_list else None)
 
     @nvtx_range("_execute_draft_iteration")
     def _execute_draft_iteration(
@@ -812,8 +825,9 @@ class ModelDrafter(Drafter):
         draft_batch.context_requests = []
 
         previous_draft_state = initial_draft_state
-        # reset draft tokens accumulator
+        # reset draft tokens and logits accumulators
         self.draft_tokens_accumulator = {}
+        self.draft_logits_accumulator = {}
         # Generate remaining draft tokens iteratively
         for i in range(self.max_draft_len - 1):
             if len(draft_batch.generation_requests) == 0:
@@ -1028,6 +1042,11 @@ class ModelDrafter(Drafter):
             for req_id, tokens in self.draft_tokens_accumulator.items():
                 target_model_req = self.req_id_to_old_request[req_id]
                 target_model_req.py_draft_tokens = tokens
+                # Rows not yet stacked by process_dynamic_draft_outputs
+                logits_list = self.draft_logits_accumulator.pop(req_id, None)
+                if logits_list:
+                    target_model_req.py_draft_logits = torch.stack(logits_list,
+                                                                   dim=0)
 
             # Record draft latency for stats
             draft_end_time = time.time()

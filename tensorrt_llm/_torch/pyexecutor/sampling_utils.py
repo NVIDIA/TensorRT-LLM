@@ -431,23 +431,37 @@ def get_rejected_indices(
     generator: torch.Generator,
     draft_tokens: list[int],
 ) -> torch.Tensor:
-    # NB: ModelDrafter._pad_to_max_draft_tokens pads draft_tokens, but
-    #     not draft_probs. Relying on shape of draft_probs here.
-    num_draft_tokens = draft_probs.size(0)
-    draft_tokens = draft_tokens[:num_draft_tokens]
+    """Return rejected draft positions using aligned draft and target rows.
+
+    Each draft token must have a draft-probability row. Tokens with zero
+    target probability are always rejected, including the zero-over-zero case.
+    """
+    num_draft_tokens = len(draft_tokens)
+    if draft_probs.size(0) != num_draft_tokens:
+        raise ValueError(
+            f"draft_probs row count ({draft_probs.size(0)}) does not match "
+            f"number of draft tokens ({num_draft_tokens})"
+        )
     # NB: torch.arange is needed to enable "advanced indexing",
     #   cf. https://numpy.org/devdocs/user/basics.indexing.html#integer-array-indexing
     token_idx = torch.arange(num_draft_tokens, dtype=torch.int32, device=generator.device)
-    draft_tokens_cuda = torch.tensor(draft_tokens, dtype=torch.int32, pin_memory=True).to(
-        device=generator.device, non_blocking=True
-    )
+    draft_tokens_cuda = torch.tensor(
+        draft_tokens, dtype=torch.int32, pin_memory=generator.device.type == "cuda"
+    ).to(device=generator.device, non_blocking=True)
     p = draft_probs[token_idx, draft_tokens_cuda]
     q = target_probs.squeeze(0)[token_idx, draft_tokens_cuda]
-    accept_probs = torch.minimum(torch.ones((), device=generator.device, dtype=q.dtype), q / p)
+    accept_probs = torch.where(
+        q > 0,
+        torch.minimum(torch.ones((), device=generator.device, dtype=q.dtype), q / p),
+        torch.zeros_like(q),
+    )
     # Use deterministic random generation for multi-GPU consistency
     rejected_indices = (
-        torch.rand(accept_probs.shape, generator=generator, device=accept_probs.device)
-        > accept_probs
+        (
+            torch.rand(accept_probs.shape, generator=generator, device=accept_probs.device)
+            > accept_probs
+        )
+        | (q <= 0)
     ).nonzero()
     return rejected_indices
 
