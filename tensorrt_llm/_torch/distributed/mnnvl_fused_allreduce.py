@@ -299,8 +299,10 @@ class MnnvlAllReduceNorm:
         self.slot = _SlotWorkspace(mapping, comm, hidden_size, self.SLOT_CTAS, TWO_SHOT_ROWS)
         dev = table.table.device
         # Never-read operands of the compiled signature (gate, FP8 out, scale); rows are runtime values.
-        self._unused_gate = torch.empty((1,), dtype=torch.bfloat16, device=dev)
-        self._unused_quant = torch.empty((1, hidden_size), dtype=torch.uint8, device=dev)
+        # zeros, not empty: models are built under MetaInitMode, which turns torch.empty into meta tensors
+        # and materializes only parameters and buffers.
+        self._unused_gate = torch.zeros((1,), dtype=torch.bfloat16, device=dev)
+        self._unused_quant = torch.zeros((1, hidden_size), dtype=torch.uint8, device=dev)
         self._unused_scale = torch.zeros((1,), dtype=torch.float32, device=dev)
 
     def supports_rows(self, rows: int) -> bool:
@@ -524,13 +526,14 @@ class GemmAllReduceNorm:
         self._pdl = get_env_enable_pdl()
         self._sms = torch.cuda.get_device_properties(table.table.device).multi_processor_count
         dev = table.table.device
-        # Never-read operands of the compiled signature (rows are compile-time values here).
-        self._unused_quant = torch.empty(
+        # Never-read operands of the compiled signature (rows are compile-time values here); zeros, not
+        # empty, as in MnnvlAllReduceNorm (MetaInitMode).
+        self._unused_quant = torch.zeros(
             (self.MAX_ROWS, hidden_size), dtype=torch.uint8, device=dev
         )
         self._unused_scale = torch.zeros((1,), dtype=torch.float32, device=dev)
-        self._unused_a16 = torch.empty((1, 8), dtype=torch.bfloat16, device=dev)
-        self._unused_a8 = torch.empty((1, 16), dtype=torch.uint8, device=dev)
+        self._unused_a16 = torch.zeros((1, 8), dtype=torch.bfloat16, device=dev)
+        self._unused_a8 = torch.zeros((1, 16), dtype=torch.uint8, device=dev)
 
     def tactic(self, m: int, k: int, k_warps: int, n_tiles: int, ksplit: int):
         """(k_warps, n_tiles, swap, min_blocks) for ``m`` rows from the GEMM tactic of the projection, or None.

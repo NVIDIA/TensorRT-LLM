@@ -206,7 +206,41 @@ def _gemm_norm_cases(tp, k=1024):
         _check(res, ref_res, ("gemm residual", m))
 
 
-CASES = {"norm": _norm_cases, "moe_fold": _moe_fold_cases, "gemm_norm": _gemm_norm_cases}
+def _meta_init_cases(tp):
+    """Kernels built under MetaInitMode, as the model loader builds the model, hold no meta tensor and run."""
+    from tensorrt_llm._torch.distributed.mnnvl_fused_allreduce import (
+        GemmAllReduceNorm,
+        _LamportTable,
+    )
+    from tensorrt_llm._torch.distributed.ops import get_or_scale_allreduce_mnnvl_workspace
+    from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+
+    ar, rank = _mnnvl(tp)
+    mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
+    comm = get_or_scale_allreduce_mnnvl_workspace(mapping, torch.bfloat16)["comm"]
+    with MetaInitMode():
+        table = _LamportTable(mapping, torch.bfloat16)
+        norm_kernel = MnnvlAllReduceNorm(mapping, comm, H, table)
+        gemm_kernel = GemmAllReduceNorm(mapping, H, table)
+    for kernel in (norm_kernel, gemm_kernel):
+        meta = [k for k, v in vars(kernel).items() if isinstance(v, torch.Tensor) and v.is_meta]
+        assert not meta, (type(kernel).__name__, meta)
+    m = 7
+    norm_weight = _rand((H,), 3, 0.1) + 1
+    xs = [_rand((m, H), 300 + r) for r in range(tp)]
+    residual = _rand((m, H), 301)
+    ref_norm, ref_res = _ref_norm(sum(x.float() for x in xs), residual, norm_weight)
+    norm, res = norm_kernel(residual, norm_weight, EPS, x=xs[rank])
+    _check(norm, ref_norm, ("meta-init norm", m))
+    _check(res, ref_res, ("meta-init residual", m))
+
+
+CASES = {
+    "norm": _norm_cases,
+    "moe_fold": _moe_fold_cases,
+    "gemm_norm": _gemm_norm_cases,
+    "meta_init": _meta_init_cases,
+}
 
 
 @pytest.mark.parametrize("case", list(CASES))
