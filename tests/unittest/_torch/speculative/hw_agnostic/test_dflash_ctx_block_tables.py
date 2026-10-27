@@ -26,6 +26,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.speculative import dflash as dflash_module
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
@@ -85,6 +86,78 @@ def test_unified_manager_with_unsupported_layout_is_an_error(layer_groups, layer
 
     with pytest.raises(NotImplementedError, match="same lifecycle and page-index scale"):
         _init_block_tables(_worker(unified=True), mgr)
+
+
+@pytest.mark.parametrize("unified", [False, True])
+@pytest.mark.parametrize("block_offset", [0, 12])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_refresh_ctx_block_tables_preserves_layer_offsets_and_source(
+    monkeypatch: pytest.MonkeyPatch, unified: bool, block_offset: int, dtype: torch.dtype
+) -> None:
+    worker = _worker(unified=unified)
+    worker._ctx_pool_idx = 1
+    worker._ctx_block_offset = block_offset
+    worker._ctx_block_divisor = 2
+    worker._ctx_block_tables = torch.full((3, 4), -7, dtype=torch.int32)
+    worker._ctx_block_counts = torch.full((3,), -7, dtype=torch.int64)
+    bad_page_index = -(1 << 31)
+    source = torch.full((2, 3, 2, 4), 99, dtype=dtype)
+    source[1, :2, 0] = torch.tensor(
+        [
+            [block_offset, block_offset + 2, -1, bad_page_index],
+            [block_offset + 4, block_offset + 6, block_offset + 8, -1],
+        ],
+        dtype=dtype,
+    )
+    original = source.clone()
+    other_source = torch.full_like(source, 123)
+    metadata = SimpleNamespace(
+        kv_cache_block_offsets=source if unified else other_source,
+        draft_kv_cache_block_offsets=other_source if unified else source,
+    )
+
+    def decode_reference(
+        encoded: torch.Tensor, divisor: int, table: torch.Tensor, counts: torch.Tensor
+    ) -> None:
+        rows = encoded.shape[0]
+        counts[:rows].copy_((encoded >= 0).sum(dim=1))
+        table[:rows].copy_(encoded.clamp(min=0).div(divisor, rounding_mode="floor"))
+
+    decode = Mock(side_effect=decode_reference)
+    monkeypatch.setattr(dflash_module, "decode_draft_block_table", decode)
+
+    assert worker._refresh_ctx_block_tables(metadata, num_seqs=2)
+
+    decode.assert_called_once()
+    encoded, divisor, table, counts = decode.call_args.args
+    assert encoded.dtype == (torch.int64 if block_offset else dtype)
+    assert torch.equal(
+        encoded,
+        torch.tensor(
+            [
+                [0, 2, -1 - block_offset, bad_page_index - block_offset],
+                [4, 6, 8, -1 - block_offset],
+            ],
+            dtype=torch.int64,
+        ),
+    )
+    assert divisor == 2
+    assert table is worker._ctx_block_tables
+    assert counts is worker._ctx_block_counts
+    assert torch.equal(table, torch.tensor([[0, 1, 0, 0], [2, 3, 4, 0], [-7, -7, -7, -7]]))
+    assert torch.equal(counts, torch.tensor([2, 3, -7]))
+    assert torch.equal(source, original)
+    assert torch.equal(other_source, torch.full_like(other_source, 123))
+
+
+@pytest.mark.parametrize("unified", [False, True])
+def test_unified_cache_keeps_strict_allocation_check_in_generation_prepare(unified: bool) -> None:
+    worker = _worker(unified=unified)
+    worker._paged_latent_prepare = True
+    worker._draft_tokens_per_req = 8
+    metadata = SimpleNamespace(runtime_draft_len=7, captured_hidden_states=object())
+
+    assert worker._fused_gen_prepare_applies(metadata) is not unified
 
 
 def test_drafter_block_inside_the_allocation_is_accepted():

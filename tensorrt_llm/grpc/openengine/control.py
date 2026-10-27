@@ -283,6 +283,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
     ) -> model_pb2.ModelInfo:
         # Single-model server: like Generate, any non-empty name resolves to the
         # loaded model.
+        media_modalities = self._inference.supported_media_modalities
         info = model_pb2.ModelInfo(
             model_id=self._model,
             served_model_name=self._model,
@@ -291,9 +292,10 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             supports_token_ids_input=True,
             # Generate rejects `lora_name` even on an enable_lora build.
             supports_lora=False,
-            supports_multimodal=False,
+            supports_multimodal=bool(media_modalities),
             reasoning_parser=str(self._llm.args.reasoning_parser or ""),
         )
+        info.extra.update({"trtllm_supported_modalities": sorted(media_modalities)})
 
         max_seq_len = _positive_int(self._llm.args.max_seq_len)
         if max_seq_len is not None:
