@@ -38,6 +38,10 @@ from typing import List, NamedTuple, Optional, Sequence, Union
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_append_paged_kv_assign_q import (
+    MlaRopeAppendPagedKvAssignQ,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_append_paged_kv_assign_q import (  # noqa: E501
     mla_rope_append_paged_kv_assign_q as op,
 )
@@ -51,6 +55,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mla_rope_append_paged_kv_assign_q requires a CUDA device"
@@ -545,7 +550,26 @@ def _fp8_env(max_batch_size: int = 8, orig_quant: Optional[float] = None) -> _Ml
     )
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
+        Cell(
+            why="deepseek default at attention TP8: 16 heads per rank, production context",
+            spec=dict(
+                cached=[0, 32, 100],
+                new=[37, 64, 300],
+                tokens_per_block=32,
+                **dict(MlaRopeAppendPagedKvAssignQ.R1, head_num=16),
+            ),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell) -> None:
     """Every configuration the entry claims, through the same driver the
     hand-written cases use.

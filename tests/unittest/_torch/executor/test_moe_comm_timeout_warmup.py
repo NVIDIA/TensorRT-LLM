@@ -17,7 +17,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_comm_timeout_guard import (
     MoECommTimeoutGuard,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 
 pytestmark = pytest.mark.cpu_only
 
@@ -46,8 +46,8 @@ class _WarmupScopeStub:
     ``moe_load_balancer``, which it skips when there is no load balancer.
     """
 
-    warmup_scope = PyTorchModelEngine.warmup_scope
-    _set_warmup_effects = PyTorchModelEngine._set_warmup_effects
+    warmup_scope = ModelEngine.warmup_scope
+    _set_warmup_effects = ModelEngine._set_warmup_effects
     moe_load_balancer = None
 
     def __init__(self) -> None:

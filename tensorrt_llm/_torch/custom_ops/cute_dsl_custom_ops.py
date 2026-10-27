@@ -699,6 +699,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cutlass
     import cutlass.cute as cute
 
+    from ..kernels.blackwell import fp8_block_scale_low_m_gemm as fp8_low_m
     from ..kernels.blackwell.blockwise_gemm.blockwise_gemm import \
         Sm100BlockwiseGemmKernel
     from ..kernels.blackwell.dense_blockscaled_gemm_act_fusion import \
@@ -5605,6 +5606,30 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.dtype == torch.bfloat16, "CuTe DSL fp8 bmm output dtype must be bf16"
         assert output.shape == (batch_size, m,
                                 n), "CuTe DSL fp8 bmm output shape is incorrect"
+
+    @torch.library.custom_op("trtllm::fp8_block_scale_low_m_gemm",
+                             mutates_args=(),
+                             device_types="cuda")
+    def fp8_block_scale_low_m_gemm(input: torch.Tensor, weight: torch.Tensor,
+                                   weight_scale: torch.Tensor) -> torch.Tensor:
+        """FP8 block-scale GEMM for few rows (``fp8_block_scale_low_m_gemm.py``).
+
+        Takes the operands of ``fp8_swap_ab_gemm(..., disable_ue8m0_cast=True)``:
+        BF16 ``input [M, K]`` with ``1 <= M <= 256``, the UE8M0-resmoothed FP8
+        ``weight [N, K]`` and its DeepGEMM-packed UE8M0 ``weight_scale``.
+        Returns BF16 ``[M, N]``.
+        """
+        fp8_low_m.check_inputs(input, weight, weight_scale)
+        output = torch.empty((input.shape[0], weight.shape[0]),
+                             dtype=torch.bfloat16,
+                             device=input.device)
+        return fp8_low_m.run_low_m_gemm(input, weight, weight_scale, output)
+
+    @torch.library.register_fake("trtllm::fp8_block_scale_low_m_gemm")
+    def _(input: torch.Tensor, weight: torch.Tensor,
+          weight_scale: torch.Tensor) -> torch.Tensor:
+        return input.new_empty((input.shape[0], weight.shape[0]),
+                               dtype=torch.bfloat16)
 
     # =============================================================================
     # Dense GEMM with SwiGLU Fusion (FC1 Kernel for MoE as Dense GEMM)
