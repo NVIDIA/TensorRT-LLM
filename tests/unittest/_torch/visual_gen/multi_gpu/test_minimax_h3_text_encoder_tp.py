@@ -33,6 +33,7 @@ def _assert_projection_shards(
     assert mapping.tp_rank == rank
     assert mapping.tp_group == [0, 1]
     assert mapping.tp_group_pg is group
+    assert mapping.tp_group_name == group.group_name
     assert dist.get_world_size(mapping.tp_group_pg) == 2
     assert dist.get_rank(mapping.tp_group_pg) == rank
     assert mapping._use_torch_distributed_allreduce
@@ -53,6 +54,7 @@ def _assert_projection_shards(
             assert mapping.tp_rank == rank
             assert mapping.tp_group == [0, 1]
             assert mapping.tp_group_pg is group
+            assert mapping.tp_group_name == group.group_name
             assert dist.get_world_size(mapping.tp_group_pg) == 2
             assert dist.get_rank(mapping.tp_group_pg) == rank
             assert mapping._use_torch_distributed_allreduce

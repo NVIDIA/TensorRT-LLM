@@ -157,6 +157,10 @@ class _MiniMaxH3TextEncoderMapping(MpiTopology):
             raise RuntimeError("MiniMax-H3 text encoder TP process group is not initialized.")
         return self._tp_group_pg
 
+    @property
+    def tp_group_name(self) -> str:
+        return self.tp_group_pg.group_name
+
 
 @register_pipeline(
     "MiniMaxH3ModularPipeline",
