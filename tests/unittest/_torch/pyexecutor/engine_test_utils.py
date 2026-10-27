@@ -297,6 +297,7 @@ def _model_engine_with_runner(
 ) -> tuple[ModelEngine, Mock]:
     engine = object.__new__(ModelEngine)
     engine._cleanup_done = True
+    engine.llm_args = SimpleNamespace(enable_autotuner=False)
     engine._model_caller = Mock()
     engine.model = SimpleNamespace(extra_attrs={})
     if runner is None:
