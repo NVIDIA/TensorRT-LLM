@@ -461,7 +461,8 @@ def _should_apply_low_m_gemm(input: torch.Tensor, module: Optional[torch.nn.Modu
     """Fast pre-filter: the global enable flag (or a dispatcher attached to ``module``) and the M upper bound."""
     if not LOW_M_GEMM_ACTIVE and getattr(module, "_low_m_gemm_dispatcher", None) is None:
         return False
-    if input.ndim < 1:
+    # The AutoTuner race is host code that torch.compile cannot trace.
+    if input.ndim < 1 or torch.compiler.is_compiling():
         return False
     k = int(input.shape[-1])
     return k > 0 and input.numel() <= _MAX_M * k
@@ -512,6 +513,9 @@ class LowMGemmDispatcher:
         # Saved ``force`` flag from :meth:`attach` so :meth:`_init_runners` can
         # honour it without requiring an extra argument.
         self._force: bool = False
+        # Tune on every rank: ranks of the group see different shapes (attention DP), so a rank-local cache
+        # hit must not skip a collective a peer enters.
+        self.per_rank_tuning: bool = False
 
     def attach(
         self,
@@ -588,8 +592,13 @@ class LowMGemmDispatcher:
             use_cuda_graph=not pdl,
             # Every rank of the group runs the winner of rank 0's race: ranks
             # timing the same shape differently would run different kernels,
-            # and the slowest rank sets the pace of each collective.
-            distributed_tuning_strategy=DistributedTuningStrategy.BROADCAST,
+            # and the slowest rank sets the pace of each collective. Under
+            # attention DP the ranks' shapes differ, so each tunes its own.
+            distributed_tuning_strategy=(
+                DistributedTuningStrategy.INDEPENDENT
+                if self.per_rank_tuning
+                else DistributedTuningStrategy.BROADCAST
+            ),
         )
         # Mark prepared only after all runners and the tuning config exist so the
         # invariant "_prepared implies runners are non-None" always holds.
@@ -865,6 +874,7 @@ _DISPATCHER = LowMGemmDispatcher()
 def prepare_low_m_gemm(
     model: torch.nn.Module,
     force: bool = False,
+    per_rank_tuning: bool = False,
 ) -> LowMGemmDispatcher:
     """Create a per-engine dispatcher and attach it to every eligible submodule.
 
@@ -883,11 +893,14 @@ def prepare_low_m_gemm(
         force: Attach even when ``TRTLLM_LOW_M_GEMM_BACKEND`` is not set
             (reserved for callers that activate the dispatcher via a future
             LLM arg).
+        per_rank_tuning: Tune each rank on its own (attention DP: the ranks'
+            projections see different token counts).
 
     Returns:
         The newly created :class:`LowMGemmDispatcher` for this engine.
     """
     dispatcher = LowMGemmDispatcher()
+    dispatcher.per_rank_tuning = per_rank_tuning
     dispatcher.attach(model, force=force)
     return dispatcher
 
