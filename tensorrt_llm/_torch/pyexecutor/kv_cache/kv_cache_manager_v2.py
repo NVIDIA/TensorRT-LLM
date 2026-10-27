@@ -7653,11 +7653,17 @@ class KVCacheManagerV2(BaseResourceManager):
     def batch_block_table_key(self, request_ids: List[int]) -> Optional[tuple]:
         """Key of the rows ``copy_batch_block_offsets`` writes for ``request_ids``: equal keys mean an identical
         copy for a batch of fewer than two blocks' tokens per request and step. Per request: its block count and
-        the page indices of its last blocks. None where the device table is not a plain copy of the host table
-        (per-layer page tables, sparse metadata) or blocks can change otherwise (block or scratch reuse)."""
+        the page indices of its last blocks (beam 0). None where the device table is not a plain copy of the host
+        table (per-layer page tables, sparse metadata) or blocks can change otherwise (block or scratch reuse, a
+        finite attention window freeing earlier blocks, other beams)."""
         if (
             self.enable_swa_scratch_reuse
             or self.enable_block_reuse
+            or self.max_beam_width > 1
+            or any(
+                window is not None and window < self.max_seq_len
+                for window in self.max_attention_window_vec
+            )
             or self._use_per_layer_page_tables
             or self.sparse_metadata_batch is not None
         ):
