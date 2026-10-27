@@ -2507,11 +2507,14 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
 
     disagg_cfg = parse_disagg_config_file(config_file)
     blocker = _shared_draft_kv_blocker(disagg_cfg.server_configs)
-    if blocker is not None and os.environ.get(
-            "TRTLLM_DISAGG_SHARED_DRAFT_KV") == "1":
+    shared_draft_kv = os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV")
+    if blocker is not None and shared_draft_kv == "1":
         raise click.UsageError(
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires {blocker}.")
-    os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = ("0" if blocker else "1")
+    # Every worker gets the same value; an explicit 0 keeps the draft KV
+    # private on all of them.
+    if shared_draft_kv != "0":
+        os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = ("0" if blocker else "1")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.

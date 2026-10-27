@@ -233,6 +233,19 @@ def test_dflash_on_generation_worker_only_keeps_separate_cache(monkeypatch, tmp_
         assert not creator._should_unify_dflash_kv_cache()
 
 
+def test_launcher_keeps_an_explicit_private_draft_kv(monkeypatch, tmp_path):
+    spec = {"decoding_type": "DFlash"}
+    monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, "0")
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(
+            monkeypatch,
+            tmp_path,
+            context_servers={"speculative_config": spec},
+            generation_servers={"speculative_config": spec},
+        )
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == "0"
+
+
 def test_dflash_with_different_tp_shares_the_cache(monkeypatch, tmp_path):
     # Context and generation may differ in TP: heads are resharded per view.
     spec = {"decoding_type": "DFlash", "attention_backend": "TRTLLM"}
