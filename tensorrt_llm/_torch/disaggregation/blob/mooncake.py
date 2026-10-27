@@ -154,6 +154,12 @@ _instance_ids = itertools.count()  # names each driver's worker threads
 # Why a row was skipped (nothing moved and nothing went wrong), and the result it gets; ``stats()``
 # counts skipped rows by both, and a part's warning names its first row that faulted or was
 # skipped, with the skip's reason.
+#
+# NOT_READY here departs from the protocol's "only for a hold the store confirmed": 0.3.13 cannot
+# tell a write in progress from a complete replica it cannot read. -703 answers both, and so does
+# batch_is_exist's 0 after a -705; a session left open after a start that raised may not exist.
+# The usual cause is a write in progress, which as a FAULT would stop every fetch that races a
+# writer and count toward isolation; a replica that stays unreadable costs only its rows.
 _SKIP_RESULTS = {
     # get -703: no complete replica, as while the object is written or once its replica's
     # endpoint went stale
@@ -407,7 +413,9 @@ class MooncakeDriver:
             raise RegistrationError(f"register_buffer raised {error!r}", registration) from error
         # The SDK undoes a partial registration before it answers (RdmaTransport::
         # registerLocalMemoryInternal), so a non-OK answer leaves nothing registered; a rollback
-        # that itself fails is only logged by the SDK and cannot be seen here.
+        # that itself fails is only logged by the SDK and cannot be seen here. Handing back the
+        # handle instead would keep the lender's hold for good: unregistering what the SDK never
+        # kept fails.
         if code != _Code.OK:
             raise RegistrationError(f"register_buffer returned {_describe(code)}")
         self._add(registration)
@@ -606,6 +614,9 @@ class MooncakeDriver:
                 if not self._workers_alive:
                     done = self._end_untaken_rows(self._queued_ops(), _NO_WORKER_LEFT)
                 self._lock.notify_all()  # drain waits for every worker thread to exit
+            # Called after this worker stopped counting, so a drain may return True first. Rows
+            # are left queued only once every worker died of a BaseException that left no
+            # operation unprovable, which only an on_change raising against the protocol does.
             for op in done:
                 self._call_on_change(op)
 
