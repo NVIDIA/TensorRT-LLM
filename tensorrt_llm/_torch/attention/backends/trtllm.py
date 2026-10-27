@@ -696,7 +696,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         view = self.mixed_precision_staging
         if (view is not None and view.lengths is not None
                 and view.manager is self.kv_cache_manager):
-            # Spec decoding + overlap: staging lengths follow kv_lens_cuda.
+            # Keep the staging lengths in step with kv_lens_cuda.
             lengths = view.lengths
             n = lengths.shape[1]
             lengths[1].copy_(self.kv_lens_cuda[:n])

@@ -117,7 +117,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # re-prefill (see _has_recurrent_state on the attention-only base classes).
     _has_recurrent_state = True
 
-    # Mixed-precision KV: the retained-token group is appended like any attention group.
+    # Twins are appended like any attention layer group.
     _supports_mixed_precision_kv = True
 
     # Construction and cache configuration

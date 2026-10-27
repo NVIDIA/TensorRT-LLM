@@ -94,8 +94,7 @@ class TokenMajorGenView:
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
-    # Mixed-precision KV: page table of the retained-token twin (-1 = page not retained) and
-    # the absolute positions of this step's context tokens; None unless mixed precision is on.
+    # Twin page table (-1 = not retained) and context positions.
     retained_block_table = None
     retained_context_positions = None
     sparse_metadata_params: Optional[DSAMetadataParams] = None
@@ -382,7 +381,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
 
     def _has_mixed_precision_staging(self) -> bool:
-        # The gather's FP8 scratch already is the copy; see has_mixed_precision_retained_rows.
+        # No staging: attention reads the gather's FP8 scratch.
         return False
 
     @property
@@ -1121,7 +1120,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
-        # Mixed-precision KV: retained-pool page table in block_table row order, -1 = not retained.
+        # Twin page table; -1 = not retained.
         if getattr(self.kv_cache_manager, "high_layers", None):
             self.retained_block_table = self.get_empty(
                 self.cuda_graph_buffers,

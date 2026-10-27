@@ -1703,7 +1703,7 @@ class MLA(nn.Module):
                             **fp4_rope_kwargs,
                         )
                         if getattr(attn_metadata, "has_mixed_precision_retained_rows", False):
-                            # The fused kernel wrote only the NVFP4 pool; write the FP8 twin here.
+                            # The fused kernel wrote the NVFP4 pool; write the FP8 twin.
                             store_retained_generation_rows(
                                 self.mqa, attn_metadata, latent_cache, position_ids
                             )

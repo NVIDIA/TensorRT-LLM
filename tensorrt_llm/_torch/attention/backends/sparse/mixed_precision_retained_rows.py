@@ -35,8 +35,7 @@ def _copy_kv_row(
     src = src_ptr + src_row.to(tl.int64) * ROW_WIDTH
     row = tl.load(src + offsets, mask=mask, other=0.0)
     if ROTATE:
-        # RoPE on the trailing k_pe, stored as (x, y) pairs, like the append kernel: rotate in
-        # float and round to the activation dtype before the KV scale.
+        # Rotate k_pe like the append kernel: float math, round, scale.
         rope = offsets - (ROW_WIDTH - ROPE_DIM)
         in_rope = mask & (rope >= 0)
         x = row.to(tl.float32)

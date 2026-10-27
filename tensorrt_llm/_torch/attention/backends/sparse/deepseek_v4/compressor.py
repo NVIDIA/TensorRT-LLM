@@ -353,7 +353,7 @@ class Compressor(nn.Module):
             scale_output,
         )
 
-        # Mixed-precision KV: the same scatter also writes this layer's retained twin.
+        # Write the twin with the same scatter.
         if not self.is_indexer and metadata.has_mixed_precision_retained_rows:
             store_retained_compressed_rows(
                 self,
