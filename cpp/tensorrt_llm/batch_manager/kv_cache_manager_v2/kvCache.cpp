@@ -2977,7 +2977,7 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claim
         auto& snapshotBlock = *matched.back();
         auto* snapshotPage = snapshotBlock.storage[lcId];
         TLLM_CHECK_WITH_INFO(snapshotPage, "Last matched block must have SSM snapshot after truncation");
-        ssmLevel = std::max(ssmLevel.value_or(kHotLevel), snapshotPage->cacheLevel);
+        ssmLevel = snapshotPage->cacheLevel;
         mSsmBlocks[kDefaultBeamIndex][lcId] = snapshotPage->hold();
         if (claimRetention)
         {
