@@ -55,20 +55,17 @@ class SampledAcceptWorkspace:
             uc = torch.zeros(words, dtype=torch.int64, device=device)
             return cls(uc, uc.data_ptr(), 0, 1)
         from tensorrt_llm._torch.distributed.ops import (
+            _get_mnnvl_workspace_comm,
             _make_mnnvl_mcast_buffer,
             _mnnvl_workspace_all_succeeded,
         )
-        from tensorrt_llm._utils import mpi_comm
+        from tensorrt_llm._utils import mpi_disabled
 
-        session = mpi_comm()
-        session_group = session.Get_group()
-        group = session_group.Incl(mapping.tp_group)
-        session_group.Free()
-        comm = session.Create_group(group)
-        group.Free()
+        comm = _get_mnnvl_workspace_comm(mapping)
         ok = not torch.cuda.is_current_stream_capturing()
         if not _mnnvl_workspace_all_succeeded(comm, ok):
-            comm.Free()
+            if not mpi_disabled():
+                comm.Free()
             raise RuntimeError(
                 "SampledAcceptWorkspace.create must run outside CUDA-graph capture on every rank"
             )

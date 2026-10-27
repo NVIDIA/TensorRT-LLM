@@ -38,7 +38,7 @@ def _runner(
 ) -> DecoderRunner:
     # forward reads only the model's extra attributes, the two per-engine objects and the step.
     runner = object.__new__(DecoderRunner)
-    runner.model = _ModelWithoutWeights()
+    runner._model = _ModelWithoutWeights()
     runner._h2d_cache = skip_cache
     runner._step_pack = pack
     runner._forward_decoder = step
@@ -175,7 +175,7 @@ class _ScheduledWithContext:
 
 def test_greedy_fallback_leaves_the_replayed_graph_outputs_intact():
     runner = object.__new__(DecoderRunner)
-    runner.model = _GreedyFallbackModel()
+    runner._model = _GreedyFallbackModel()
     # max_beam_width is read from the runner config; the fallback reads nothing else from it.
     runner._config = Mock(spec_set=["max_beam_width"], max_beam_width=1)
     runner.sample_in_graph_callable = None
@@ -211,7 +211,7 @@ def test_greedy_only_outputs_follow_the_guided_decoder_switch(keep, monkeypatch)
     """With an executor-side guided decoder (keep_greedy_only_outputs False) the batch gets logits; otherwise the
     forward's greedy-only outputs are returned as they are."""
     runner = object.__new__(DecoderRunner)
-    runner.model = _GreedyFallbackModel()
+    runner._model = _GreedyFallbackModel()
     runner._config = Mock(spec_set=["max_beam_width"], max_beam_width=1)
     runner.sample_in_graph_callable = None
     runner.keep_greedy_only_outputs = keep
@@ -231,7 +231,7 @@ def test_greedy_only_outputs_follow_the_guided_decoder_switch(keep, monkeypatch)
 def test_an_idle_batch_gets_logits_for_its_dummy_row():
     """An empty batch (an idle attention-DP rank's dummy row) never keeps greedy-only outputs."""
     runner = object.__new__(DecoderRunner)
-    runner.model = _GreedyFallbackModel()
+    runner._model = _GreedyFallbackModel()
     runner._config = Mock(spec_set=["max_beam_width"], max_beam_width=1)
     runner.sample_in_graph_callable = None
     hidden = torch.ones(1, 4, device="cuda")

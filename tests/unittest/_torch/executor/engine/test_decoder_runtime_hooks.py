@@ -34,7 +34,7 @@ def _runner(
 ) -> DecoderRunner:
     # Only the two attributes the threshold reads.
     runner = object.__new__(DecoderRunner)
-    runner.sparse_attention_config = sparse_attention_config
+    runner._sparse_attention_config = sparse_attention_config
     runner.runtime_hooks = hooks
     return runner
 

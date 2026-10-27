@@ -62,19 +62,16 @@ def create_workspace(mapping, device, slot_rows: int) -> AcceptWorkspace:
     words = 2 * slot_rows * max(mapping.tp_size, 1)
     if mapping.tp_size > 1:
         from tensorrt_llm._torch.distributed.ops import (
+            _get_mnnvl_workspace_comm,
             _make_mnnvl_mcast_buffer,
             _mnnvl_workspace_all_succeeded,
         )
-        from tensorrt_llm._utils import mpi_comm
+        from tensorrt_llm._utils import mpi_disabled
 
-        session = mpi_comm()
-        session_group = session.Get_group()
-        group = session_group.Incl(mapping.tp_group)
-        session_group.Free()
-        comm = session.Create_group(group)
-        group.Free()
+        comm = _get_mnnvl_workspace_comm(mapping)
         if not _mnnvl_workspace_all_succeeded(comm, True):
-            comm.Free()
+            if not mpi_disabled():
+                comm.Free()
             raise RuntimeError("exchange workspace creation failed on another rank")
         handle = _make_mnnvl_mcast_buffer(
             comm, max(words * 8, 4096), mapping, mapping.is_multi_node()

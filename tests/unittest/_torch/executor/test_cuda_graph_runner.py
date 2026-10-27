@@ -225,7 +225,6 @@ def _decoder_runner(
         spec_config=None,
         cuda_graph_mem_pool=None,
         enable_attention_dp=False,
-        original_max_draft_len=0,
         original_max_total_draft_tokens=0,
         is_encoder_decoder=False,
         mapping=Mapping(),
