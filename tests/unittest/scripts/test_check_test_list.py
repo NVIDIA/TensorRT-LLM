@@ -367,6 +367,35 @@ def test_verify_qa_test_lists_clears_stale_file(mod, tmp_path, monkeypatch):
     assert result == ["accuracy/test_new.py::test_current[a]"]
 
 
+def test_list_test_db_names(mod, tmp_path):
+    """Entries from every block are merged, deduplicated and sorted; dynamic perf lists are skipped."""
+    (tmp_path / "l0_a.yml").write_text(
+        "version: 0.0.1\n"
+        "l0_a:\n"
+        "- condition: {terms: {stage: pre_merge}}\n"
+        "  tests:\n"
+        "  - b.py::test_b ISOLATION\n"
+        "  - a.py::test_a[x] TIMEOUT (60)\n"
+        "- condition: {terms: {stage: post_merge}}\n"
+        "  tests:\n"
+        "  - b.py::test_b ISOLATION\n"
+        "- condition: {terms: {stage: post_merge}}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "l0_perf_sanity.yml").write_text(
+        "l0_ps:\n- tests:\n  - perf/test_s.py::test_s\n", encoding="utf-8"
+    )
+    (tmp_path / "llm_perf_core.yml").write_text(
+        "l0_p:\n- tests:\n  - perf/test_p.py::test_p\n", encoding="utf-8"
+    )
+
+    assert mod.list_test_db_names(str(tmp_path)) == [
+        "a.py::test_a[x] TIMEOUT (60)",
+        "b.py::test_b ISOLATION",
+        "perf/test_s.py::test_s",
+    ]
+
+
 # --------------------------------------------------------------------------
 # module-const soundness against in-place mutation / rebinding
 # --------------------------------------------------------------------------
