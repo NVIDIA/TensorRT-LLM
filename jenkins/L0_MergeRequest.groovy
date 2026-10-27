@@ -621,7 +621,7 @@ def mergeWaiveList(pipeline, globalVars)
         }
         return [targetBranch: targetBranch, targetCommit: targetBranchTOTCommit]
     }
-    def snapshotTime = java.time.Instant.now().toString()
+    def snapshotTime = new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", TimeZone.getTimeZone('UTC'))
 
     try {
         // Get waive list diff in current MR
