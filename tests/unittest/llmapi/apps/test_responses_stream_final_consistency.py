@@ -251,6 +251,32 @@ def test_final_tool_calls_are_the_streamed_ones(parsers, chunks):
     assert _message_texts(final) == _message_texts(_done_items(frames, "message"))
 
 
+def test_a_namespace_double_colon_call_is_the_declared_custom_tool_in_both_views():
+    """DeepSeek-V4.1 writes "namespace::tool"; the client declared exec under a namespace."""
+    functions = {
+        "type": "namespace",
+        "name": "functions",
+        "description": "",
+        "tools": [{"type": "custom", "name": "exec", "description": "Run code."}],
+    }
+    call = (
+        "<｜DSML｜ calls>\n"
+        '<｜DSML｜ invoke name="functions::exec">\n'
+        '<｜DSML｜ parameter name="input" string="true">ls -la</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>\n"
+        "</｜DSML｜ calls>"
+    )
+    processor = _processor(tools=[functions], reasoning_parser=None, tool_parser="deepseek_v41")
+    frames, result = _stream(processor, ["Running it.\n\n", call])
+    streamed_calls = _done_items(frames, "custom_tool_call")
+    assert [(c["namespace"], c["name"], c["input"]) for c in streamed_calls] == [
+        ("functions", "exec", "ls -la")
+    ]
+
+    final = _final_output(processor, result)
+    assert [i for i in final if i["type"] == "custom_tool_call"] == streamed_calls
+
+
 def test_an_unterminated_call_is_text_in_both_views():
     unterminated = "<tool_call>exec<arg_key>input</arg_key><arg_value>const cmd = `cat m.json`"
     processor = _processor(tools=[_tool()], reasoning_parser="glm47", tool_parser="glm47")
