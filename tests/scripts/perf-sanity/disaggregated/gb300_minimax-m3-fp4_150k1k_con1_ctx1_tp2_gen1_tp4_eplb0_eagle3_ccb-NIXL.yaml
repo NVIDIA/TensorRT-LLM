@@ -22,6 +22,10 @@
 # MiniMax-M3 TP4 target is on main, this lane runs it. #20306's TP4 target took
 # 6.15 ms per decode step here against 10.54 ms for the built-in model (same
 # wheel, GB300).
+#
+# On the ctx worker, block reuse and its 180 GiB host tier (the study's AgentX prefix
+# reuse) are off: the fixed random prompts share no prefix, and with reuse on the
+# first measured ctx_only request would reuse the warmup request's prompt.
 metadata:
   model_name: minimax_m3_fp4
   precision: fp4
@@ -159,10 +163,7 @@ worker_config:
       use_kv_cache_manager_v2: true
       free_gpu_memory_fraction: 0.94
       event_buffer_max_size: 0
-      host_cache_size: 193273528320
-      enable_block_reuse: true
-      block_reuse_config:
-        policy: per_conversation
+      enable_block_reuse: false
     speculative_config:
       decoding_type: Eagle3
       max_draft_len: 3

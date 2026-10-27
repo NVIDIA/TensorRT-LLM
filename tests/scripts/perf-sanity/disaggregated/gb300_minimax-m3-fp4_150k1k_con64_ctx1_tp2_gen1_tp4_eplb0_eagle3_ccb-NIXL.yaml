@@ -20,6 +20,10 @@
 # target took 47.5 ms per decode step here against 45.6 ms for the built-in model
 # (median, same wheel, GB300), so this lane keeps the built-in model. The con1
 # lane, where that target is faster, uses `auto`.
+#
+# On the ctx worker, block reuse and its 180 GiB host tier (the study's AgentX prefix
+# reuse) are off: the fixed random prompts share no prefix, and with reuse on the
+# first measured ctx_only request would reuse the warmup request's prompt.
 metadata:
   model_name: minimax_m3_fp4
   precision: fp4
@@ -157,10 +161,7 @@ worker_config:
       use_kv_cache_manager_v2: true
       free_gpu_memory_fraction: 0.94
       event_buffer_max_size: 0
-      host_cache_size: 193273528320
-      enable_block_reuse: true
-      block_reuse_config:
-        policy: per_conversation
+      enable_block_reuse: false
     speculative_config:
       decoding_type: Eagle3
       max_draft_len: 3
