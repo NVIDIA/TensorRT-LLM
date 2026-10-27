@@ -175,33 +175,6 @@ def engine_kv_cache_quant_algo(config: "ModelConfig", llm_args: "TorchLlmArgs"):
     return {"fp8": QuantAlgo.FP8, "nvfp4": QuantAlgo.NVFP4}.get(dtype, dtype)
 
 
-def _route(
-    config: "ModelConfig", llm_args: "TorchLlmArgs", mode: ModelingV2Mode
-) -> Tuple[Optional[type], Optional[str]]:
-    """``(target class, None)``, or ``(None, why)`` for the built-in implementation.
-
-    ``why`` is None when the checkpoint names no architecture, which is not a
-    fallback worth reporting. Under ``require`` a missing target raises instead.
-    A target's native code loads when ``route`` imports the target (see
-    ``_native``), so its ``NoTarget`` lands here like any other.
-    """
-    pretrained_config = config.pretrained_config
-    if not getattr(pretrained_config, "architectures", None):
-        return None, None
-    arch = pretrained_config.architectures[0]
-
-    try:
-        route = registered_routes().get(arch)
-        if route is None:
-            known = ", ".join(sorted(registered_routes())) or "(none)"
-            raise NoTarget(f"no route for this architecture; routed architectures: {known}")
-        return route(config, llm_args, _device_compute_capability()), None
-    except NoTarget as why:
-        if mode is ModelingV2Mode.REQUIRE:
-            raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None
-        return None, f"no target fits {arch!r} ({why})"
-
-
 def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[type]:
     """Decide which modeling_v2 target, if any, this deployment builds.
 
@@ -209,17 +182,29 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
     for the architecture, or when that ``route`` raises ``NoTarget``.
     In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
-
-    This decides for the calling rank only; the model loader uses
-    :func:`modeling_v2_resolve_on_all_ranks`.
     """
     mode = ModelingV2Mode.of(llm_args)
     if mode is ModelingV2Mode.OFF:
         return None
-    target, fallback = _route(config, llm_args, mode)
-    if fallback is not None:
-        logger.info(f"modeling_v2: {fallback}; using the built-in implementation")
-    return target
+
+    pretrained_config = config.pretrained_config
+    if not getattr(pretrained_config, "architectures", None):
+        return None
+    arch = pretrained_config.architectures[0]
+
+    try:
+        route = registered_routes().get(arch)
+        if route is None:
+            known = ", ".join(sorted(registered_routes())) or "(none)"
+            raise NoTarget(f"no route for this architecture; routed architectures: {known}")
+        return route(config, llm_args, _device_compute_capability())
+    except NoTarget as why:
+        if mode is ModelingV2Mode.REQUIRE:
+            raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None
+        logger.info(
+            f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
+        )
+        return None
 
 
 def _qualified(target: Optional[type]) -> Optional[str]:
@@ -240,20 +225,15 @@ def modeling_v2_resolve_on_all_ranks(
 
     ``off`` returns before any exchange: nothing in this package runs then.
     """
-    mode = ModelingV2Mode.of(llm_args)
-    if mode is ModelingV2Mode.OFF:
+    if ModelingV2Mode.of(llm_args) is ModelingV2Mode.OFF:
         return None
 
-    target = fallback = error = None
+    target = error = None
     try:
-        target, fallback = _route(config, llm_args, mode)
+        target = modeling_v2_resolve(config, llm_args)
     except Exception as caught:  # noqa: BLE001 -- re-raised below, after every rank has reported
         error = caught
-    outcome = (
-        _qualified(target),
-        fallback,
-        None if error is None else f"{type(error).__name__}: {error}",
-    )
+    outcome = (_qualified(target), None if error is None else f"{type(error).__name__}: {error}")
 
     mapping = config.mapping
     outcomes = [outcome]
@@ -264,25 +244,18 @@ def modeling_v2_resolve_on_all_ranks(
 
     if error is not None:
         raise error
-    failed = {rank: o[2] for rank, o in enumerate(outcomes) if o[2] is not None}
+    failed = {rank: why for rank, (_, why) in enumerate(outcomes) if why is not None}
     if failed:
         detail = "; ".join(f"rank {rank}: {why}" for rank, why in sorted(failed.items()))
         raise RuntimeError(f"modeling_v2: other ranks failed to resolve a target ({detail})")
-    if len({o[0] for o in outcomes}) > 1:
+    if len({built for built, _ in outcomes}) > 1:
         detail = "; ".join(
-            f"rank {rank}: {o[0] or 'built-in (' + str(o[1]) + ')'}"
-            for rank, o in enumerate(outcomes)
+            f"rank {rank}: {built or 'built-in'}" for rank, (built, _) in enumerate(outcomes)
         )
         raise RuntimeError(
             f"modeling_v2: ranks disagree on the implementation to build ({detail}); "
             "every rank has to run the same code"
         )
-
-    if mapping.rank == 0:
-        if target is not None:
-            logger.warning(
-                f"modeling_v2: building {_qualified(target)} on all {len(outcomes)} rank(s)"
-            )
-        elif fallback is not None:
-            logger.warning(f"modeling_v2: {fallback}; using the built-in implementation")
+    if target is not None and mapping.rank == 0:
+        logger.warning(f"modeling_v2: building {_qualified(target)} on all {len(outcomes)} rank(s)")
     return target
