@@ -10,7 +10,8 @@ from ..sampling_params import GuidedDecodingParams, SamplingParams
 from ..scheduling_params import SchedulingParams
 from .llm import LLM, RequestOutput
 # yapf: disable
-from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BlockReuseConfig,
+from .llm_args import (AttentionDpConfig, AutoDecodingConfig,
+                       AutoTunerNvMMHConfig, BlockReuseConfig,
                        CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, CheckpointIOPolicy,
                        ColdPageQuantizationCompressionConfig,
@@ -92,6 +93,7 @@ __all__ = [
     'LlmArgs',
     'TorchLlmArgs',
     'AutoDecodingConfig',
+    'AutoTunerNvMMHConfig',
     'AttentionDpConfig',
     'LoRARequest',
     'SaveHiddenStatesDecodingConfig',

@@ -97,6 +97,11 @@
       "path": "attn_backend"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "autotuner_nvmmh_config.max_tactics"
+    },
+    {
       "allowed_values": [
         "pytorch"
       ],

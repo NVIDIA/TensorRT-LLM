@@ -1069,6 +1069,64 @@ def test_cute_dsl_fp8_block_scale_bmm_rubin(m, use_tvm_ffi):
     torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="The test requires SM107 and SM107 CuTe DSL support.",
+)
+@pytest.mark.parametrize("m", [7, 300])
+def test_cute_dsl_fp8_block_scale_bmm_rubin_tile_shapes(m, monkeypatch):
+    """Every MMA tile of the SM107 blockwise BMM, including the 256-row tiles
+    whose accumulator update is split over two warp groups."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLFp8RubinBmmRunner
+
+    # 8 K tiles wrap the A/B pipeline; 3 N tiles and 3 groups give every CTA
+    # several persistent tiles.
+    k, n, num_groups = 1024, 384, 3
+    torch.random.manual_seed(0)
+    a = torch.randn((m, num_groups, k), device="cuda", dtype=torch.bfloat16) / k
+    a_fp8, a_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(a)
+    b = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16) / k
+    b_fp8 = torch.empty_like(b, dtype=torch.float8_e4m3fn)
+    b_scales = torch.empty((num_groups, n // 128, k // 128),
+                           device="cuda",
+                           dtype=torch.float32)
+    for group_idx in range(num_groups):
+        b_fp8[group_idx], b_scales[group_idx] = per_block_cast_to_fp8(
+            b[group_idx])
+    output_expected = torch.einsum("mgk,gnk->gmn", a, b)
+    output = torch.empty((num_groups, m, n),
+                         device="cuda",
+                         dtype=torch.bfloat16)
+
+    monkeypatch.setattr(AutoTuner.get(), "nvmmh_config", None)
+    runner = CuteDSLFp8RubinBmmRunner()
+    inputs = [a_fp8, b_fp8, a_scales, b_scales, output]
+    clusters = {False: ((1, 1), (2, 2)), True: ((2, 1), (2, 2))}
+    tactics = [
+        tactic for tactic in runner.get_valid_tactics(inputs, None)
+        if tactic[3] in clusters[tactic[0]]
+    ]
+    assert len({tactic[:3] for tactic in tactics}) == 4
+
+    outputs_128_rows = {}
+    for tactic in tactics:
+        use_2cta_instrs, mma_tiler, mma_inst_shape = tactic[:3]
+        output.fill_(float("nan"))
+        runner(inputs, tactic=tactic)
+        torch.cuda.synchronize()
+        assert calc_diff(output, output_expected) < 1e-3, tactic
+        # A 256-row tile runs the same MMAs and FP32 promotion per element as
+        # the 128-row tile of its instruction.
+        if mma_tiler[0] // (2 if use_2cta_instrs else 1) == 128:
+            outputs_128_rows.setdefault(mma_inst_shape, output.clone())
+        else:
+            torch.testing.assert_close(output,
+                                       outputs_128_rows[mma_inst_shape],
+                                       rtol=0,
+                                       atol=0)
+
+
 def _allocate_fp8_bmm_quant_outputs(a_fp8, b_fp8):
     num_groups, m, _ = a_fp8.shape
     n = b_fp8.shape[1]

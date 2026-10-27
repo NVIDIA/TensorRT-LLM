@@ -157,6 +157,27 @@ class TuningConfig:
     exclude_from_cache: bool = False
 
 
+@dataclass(frozen=True)
+class NvMMHConfig:
+    """nvMatmulHeuristics (nvMMH) guidance for CuTe DSL GEMM/BMM runners.
+
+    When installed on the AutoTuner, nvMMH-aware runners build their tactic
+    list from the top ``max_tactics`` kernel configurations nvMMH ranks for
+    the problem instead of enumerating their full tactic space. Every field
+    nvMMH models (CTA tile, cluster shape, split-K, rasterization order,
+    swizzle) is taken as returned; only knobs nvMMH does not model are swept.
+    """
+    max_tactics: int = 5
+
+    def __post_init__(self):
+        if (isinstance(self.max_tactics, bool)
+                or not isinstance(self.max_tactics, int)
+                or self.max_tactics < 1):
+            raise ValueError(
+                f"NvMMHConfig.max_tactics must be a positive integer, got "
+                f"{self.max_tactics!r}")
+
+
 @dataclass(unsafe_hash=True)
 class StaticDim:
     val: int
@@ -275,6 +296,16 @@ class TunableRunner(ABC):
             Any: The unique id of the runner, which can be converted to a string for the cache key.
         """
         return tuple(self.__dict__.values())
+
+    def tactic_space_key(self) -> Optional[Tuple]:
+        """Discriminates cache entries profiled over a non-default tactic space.
+
+        Runners whose candidate tactics depend on a process-wide search policy
+        (e.g. nvMatmulHeuristics guidance) return a literal tuple describing
+        that policy, so entries tuned under one policy are not reused under
+        another. None keeps the default cache key.
+        """
+        return None
 
 
 @contextlib.contextmanager
@@ -541,7 +572,7 @@ class AutoTunerProfilingCache:
         tuning_config: TuningConfig,
         apply_map_to_tuning_buckets: bool = True,
     ) -> Tuple:
-        return (
+        cache_key = (
             custom_op,
             runner.__class__.__name__,
             str(runner.unique_id()),
@@ -553,6 +584,10 @@ class AutoTunerProfilingCache:
                 apply_map_to_tuning_buckets,
             ),
         )
+        tactic_space_key = runner.tactic_space_key()
+        if tactic_space_key is not None:
+            cache_key += (tactic_space_key, )
+        return cache_key
 
     def merge_cache_data(self, cache_data: Dict[Tuple, Tuple]):
         self.cache.update(cache_data)
@@ -946,6 +981,9 @@ class AutoTuner:
         self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
+        # nvMatmulHeuristics guidance for CuTe DSL GEMM/BMM runners; None
+        # profiles their full tactic space.
+        self.nvmmh_config: Optional[NvMMHConfig] = None
 
         # Timing backend: globaltimer kernel vs cuda events.
         # TLLM_PROFILING_TIMER env var overrides auto-detection:
