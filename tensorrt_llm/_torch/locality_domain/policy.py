@@ -91,13 +91,7 @@ DISABLED_PLAN = LinearPartitionPlan(
 
 
 class LocalityDomainExecutionPlanner:
-    """Produces PartitionPlans based on hardware capability and module config.
-
-    Centralizes all enable/disable logic that was previously scattered in:
-    - Linear.maybe_create_locality_domain_sub_modules() (linear.py:2704-2708)
-    - attention.py: is_locality_domain_supported() backend patching
-    - fused_moe_cute_dsl.py: CuteDslGroupGemmMLP.__init__
-    """
+    """Produces PartitionPlans based on hardware capability and module config."""
 
     def __init__(self, policy: LocalityDomainPolicy):
         self.policy = policy

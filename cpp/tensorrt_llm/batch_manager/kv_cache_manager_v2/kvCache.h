@@ -27,6 +27,7 @@
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/executor/executor.h"
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -248,7 +249,8 @@ public:
 
     KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
         std::optional<RequestIdType> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt,
-        std::optional<bool> textOnly = std::nullopt, bool enableRequestStats = false);
+        std::optional<bool> textOnly = std::nullopt, bool enableRequestStats = false,
+        std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt, bool isPrefetch = false);
 
     ~KvCache();
 
@@ -545,6 +547,12 @@ public:
     // Priority for (blockOrdinal, lifeCycleId) based on the callback.
     Priority getPriority(BlockOrdinal ordinal, LifeCycleId lc) const;
 
+    //! Retention is resolved by block start, with decode beginning after the final prompt block.
+    executor::RetentionPriorityAndDuration getRetention(BlockOrdinal ordinal) const;
+
+    //! Current priorities for the request's allocated pages in one layer group.
+    std::vector<Priority> getPagePriorities(LayerGroupId layerGroupId, BeamIndex beamIndex = kDefaultBeamIndex) const;
+
     // Reference to StorageManager (for page acquisition/release).
     StorageManager* storageManager() const;
 
@@ -623,7 +631,7 @@ private:
     // counts. Called at the end of _setupForReuse, which collects them in the same walk.
     void _finalizeCachedTokensByLevel(
         int numTokens, TypedVec<BlockOrdinal, CacheLevel> const& attentionLevels, std::optional<CacheLevel> ssmLevel);
-    void _setupForReuse(BlockRadixTree::ReuseMatch const& match);
+    void _setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claimRetention);
     // Reconstruct the committed token sequence from a match's blocks (mirrors
     // Python's _get_matched_tokens); used when reuse-matching no longer has the
     // raw input tokens in scope.
@@ -768,6 +776,8 @@ private:
     std::shared_ptr<KvCacheManager> mManager;
     ReuseScope mReuseScope;
     PriorityCb mPriorityCb;
+    std::optional<executor::KvCacheRetentionConfig> mRetentionConfig;
+    std::vector<executor::RetentionPriorityAndDuration> mPromptRetentions;
     std::optional<CUstream> mCudaStream;
     Status mStatus;
     CommitState mCommitState;
@@ -792,6 +802,7 @@ private:
     std::optional<int> mPageStorageRow;
 
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
+    std::vector<FuncGuard<std::function<void()>>> mPartialCopyRetentionHolds;
 
     std::vector<TokenIdExt> mCommittedTokens;
     // Initial current-residency provenance, observed before reused pages are held or promoted.

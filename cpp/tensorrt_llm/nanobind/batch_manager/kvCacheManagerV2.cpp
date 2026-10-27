@@ -825,6 +825,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // Export the C++ debug mode as an immutable Python bool snapshot.
     m.attr("NDEBUG") = nb::bool_(!kv::gDebug);
+    m.attr("DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY")
+        = nb::int_(tensorrt_llm::batch_manager::kDefaultColdTierOffloadMinPriority);
 
     // ---- Exceptions --------------------------------------------------------
     static nb::object sOutOfMemoryError = nb::exception<kv::OutOfMemoryError>(m, "OutOfMemoryError");
@@ -1614,12 +1616,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool>(), nb::arg("role"), nb::arg("size"),
-            nb::arg("tokens_per_block_override") = std::nullopt, nb::arg("is_sparse") = false)
+        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int>(), nb::arg("role"), nb::arg("size"),
+            nb::arg("tokens_per_block_override") = std::nullopt, nb::arg("is_sparse") = false,
+            nb::arg("coalescing_group") = 0)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
         .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)
-        .def_rw("is_sparse", &kv::BufferConfig::isSparse) DEF_COPY(kv::BufferConfig);
+        .def_rw("is_sparse", &kv::BufferConfig::isSparse)
+        .def_rw("coalescing_group", &kv::BufferConfig::coalescingGroup) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
         .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>,
@@ -1748,7 +1752,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::vector<kv::BatchDesc> constraints, std::optional<kv::BatchDesc> typicalStep,
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
-                bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance)
+                bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
+                kv::Priority coldTierOffloadMinPriority)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1773,6 +1778,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->textOnly = textOnly;
                 cfg->enablePartialCommit = enablePartialCommit;
                 cfg->poolRebalance = std::move(poolRebalance);
+                cfg->coldTierOffloadMinPriority = coldTierOffloadMinPriority;
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1783,7 +1789,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("typical_step") = std::nullopt, nb::arg("initial_pool_ratio").none() = std::nullopt,
             nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("commit_min_snapshot") = false,
             nb::arg("enable_stats") = true, nb::arg("text_only") = false, nb::arg("enable_partial_commit") = true,
-            nb::arg("pool_rebalance") = kv::PoolRebalanceConfig{})
+            nb::arg("pool_rebalance") = kv::PoolRebalanceConfig{},
+            nb::arg("cold_tier_offload_min_priority") = tensorrt_llm::batch_manager::kDefaultColdTierOffloadMinPriority)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -1791,6 +1798,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("enable_partial_reuse", &kv::KVCacheManagerConfig::enablePartialReuse)
         .def_rw("reuse_match_backoff", &kv::KVCacheManagerConfig::reuseMatchBackoff)
         .def_rw("enable_partial_commit", &kv::KVCacheManagerConfig::enablePartialCommit)
+        .def_rw("cold_tier_offload_min_priority", &kv::KVCacheManagerConfig::coldTierOffloadMinPriority)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
         .def_rw("initial_pool_ratio", &kv::KVCacheManagerConfig::initialPoolRatio,
@@ -1954,6 +1962,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("acknowledge_page_storage", &kv::KvCache::acknowledgePageStorage, nb::arg("version"),
             nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_page_priorities",
+            [](kv::KvCache const& self, int layerGroupId, int beamIndex)
+            { return self.getPagePriorities(kv::LayerGroupId{layerGroupId}, kv::BeamIndex{beamIndex}); },
+            nb::arg("layer_group_id"), nb::arg("beam_index") = 0, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_page_storage_snapshot",
             [](kv::KvCache const& self, int layerGroupId, int beamIdx)
@@ -2642,6 +2655,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("config"), nb::arg("event_manager").none() = nb::none(),
             nb::arg("cold_page_codec").none() = nb::none())
         .def("shutdown", &kv::KvCacheManager::shutdown, nb::call_guard<nb::gil_scoped_release>())
+        .def("refresh_retention", &kv::KvCacheManager::refreshRetention, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "prefetch_reuse",
+            [](kv::KvCacheManager& self, nb::object reuseScopeObj, nb::object inputTokens, int target)
+            {
+                auto reuseScope = castReuseScope(std::move(reuseScopeObj));
+                return withTokens(inputTokens,
+                    [&](kv::TokenSpan view, bool knownNoDigest)
+                    {
+                        nb::gil_scoped_release release;
+                        return self.prefetchReuse(std::move(reuseScope), view, kv::CacheLevel{target}, knownNoDigest);
+                    });
+            },
+            nb::arg("reuse_scope"), nb::arg("input_tokens"), nb::arg("target"))
         .def("is_sparse", &kv::KvCacheManager::isSparse, nb::arg("layer_id"), nb::arg("data_role"))
         .def(
             "clear_reusable_blocks", &kv::KvCacheManager::clearReusableBlocks, nb::call_guard<nb::gil_scoped_release>())
@@ -2649,7 +2676,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "create_kv_cache",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,
                 std::optional<kv::RequestIdType> id, nb::object customPriorityCallback,
-                std::optional<int> expectedPromptLength, std::optional<bool> textOnly, bool enableRequestStats)
+                std::optional<int> expectedPromptLength, std::optional<bool> textOnly, bool enableRequestStats,
+                std::optional<executor::KvCacheRetentionConfig> retentionConfig)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 kv::KvCache::PriorityCb priorityCb = castPriorityCallback(*self, std::move(customPriorityCallback));
@@ -2657,7 +2685,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 {
                     nb::gil_scoped_release release;
                     return self->createKvCache(std::move(reuseScope), kv::TokenSpan{}, id, std::move(priorityCb),
-                        expectedPromptLength, textOnly, enableRequestStats);
+                        expectedPromptLength, textOnly, enableRequestStats, std::move(retentionConfig));
                 }
                 return withTokens(inputTokens,
                     [&](kv::TokenSpan view, bool knownNoDigest)
@@ -2674,12 +2702,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         }
                         nb::gil_scoped_release release;
                         return self->createKvCache(std::move(reuseScope), view, id, std::move(priorityCb), promptLen,
-                            textOnly, enableRequestStats);
+                            textOnly, enableRequestStats, std::move(retentionConfig));
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
             nb::arg("custom_priority_callback") = nb::none(), nb::arg("expected_prompt_length") = std::nullopt,
-            nb::arg("text_only") = std::nullopt, nb::arg("enable_request_stats") = false)
+            nb::arg("text_only") = std::nullopt, nb::arg("enable_request_stats") = false,
+            nb::arg("kv_cache_retention_config") = std::nullopt)
         .def(
             "probe_reuse",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)

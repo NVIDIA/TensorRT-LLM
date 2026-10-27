@@ -26,6 +26,15 @@ Options:
             pytest -- i.e. assert validate-accepts is a subset of collectable.
             Catches resolver soundness bugs and stale entries.
 
+Collection stub (``--l0`` / ``--qa`` / ``--waive``):
+  These modes run ``pytest --co`` with ``tests/integration/defs/stubify_bindings.py``
+  (loaded only via ``-p stubify_bindings``, not by default) so TensorRT-LLM need
+  not be compiled and no ``tensorrt_llm`` wheel is downloaded. The stub fabricates
+  the compiled modules on demand; its ``_EXPLICIT`` table is only for symbols
+  whose real *value* is consumed at import time. Full local builds will not catch
+  stub gaps — watch Jenkins Check Test List. Pre-commit still runs only
+  ``--validate`` / waive duplicate checks (no stubbed ``--co``).
+
 Note:
 All the perf tests will be excluded since they are generated dynamically.
 """
@@ -36,6 +45,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from itertools import product
 from pathlib import Path
@@ -897,23 +907,82 @@ def compute_parity(
 
 
 # =============================================================================
-# L0 / QA / Waive verification (runtime, requires pytest + model weights)
+# L0 / QA / Waive verification (runtime pytest --co with bindings collection stub)
 # =============================================================================
 
 
-def install_python_dependencies(llm_src):
-    subprocess.run(f"cd {llm_src} && pip3 install -r requirements-dev.txt",
-                   shell=True,
-                   check=True)
+def _get_trt_test_db_version() -> str:
+    """Read TRT_TEST_DB_VERSION from jenkins/ci_versions.properties."""
+    props_file = Path(
+        __file__).resolve().parent.parent / "jenkins" / "ci_versions.properties"
+    with open(props_file) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("TRT_TEST_DB_VERSION="):
+                return line.split("=", 1)[1]
+    raise RuntimeError(f"TRT_TEST_DB_VERSION not found in {props_file}")
+
+
+def install_python_dependencies(llm_src: str) -> None:
+    """Install collection dependencies without TRT-LLM binaries."""
     subprocess.run(
-        f"pip3 install --force-reinstall --no-deps {llm_src}/../tensorrt_llm-*.whl",
-        shell=True,
-        check=True)
+        [sys.executable, "-m", "pip", "install", "-r", "requirements-dev.txt"],
+        cwd=llm_src,
+        check=True,
+    )
+    trt_test_db_ver = _get_trt_test_db_version()
     subprocess.run(
-        "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple "
-        "--ignore-installed trt-test-db==1.8.5+bc6df7",
-        shell=True,
-        check=True)
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--extra-index-url",
+            "https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple",
+            "--ignore-installed",
+            f"trt-test-db=={trt_test_db_ver}",
+        ],
+        check=True,
+    )
+
+
+def _collection_pytest_env(llm_src: str, models_root: str) -> dict[str, str]:
+    """Env for stubbed ``pytest --co``: PYTHONPATH + bindings stub flags."""
+    existing = os.environ.get("PYTHONPATH", "")
+    pythonpath = os.pathsep.join(p for p in (llm_src, existing) if p)
+    return {
+        **os.environ,
+        "PYTHONPATH": pythonpath,
+        "TRT_LLM_NO_LIB_INIT": "1",
+        # Override any caller LLM_MODELS_ROOT. Collection only interpolates the
+        # path into class-body constants; an empty directory keeps the models
+        # NFS share off the Check Test List pod.
+        "LLM_MODELS_ROOT": models_root,
+    }
+
+
+def _run_collection_pytest(llm_src: str, test_list: str) -> None:
+    """Run pytest --co with the collection bindings stub plugin."""
+    defs_dir = os.path.join(llm_src, "tests", "integration", "defs")
+    with tempfile.TemporaryDirectory(
+            prefix="trtllm-collection-models-root-") as models_root:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "stubify_bindings",
+                f"--test-list={test_list}",
+                f"--output-dir={llm_src}",
+                "-s",
+                "--co",
+                "-q",
+            ],
+            check=True,
+            cwd=defs_dir,
+            env=_collection_pytest_env(llm_src, models_root),
+        )
 
 
 def verify_l0_test_lists(llm_src):
@@ -965,11 +1034,7 @@ def verify_l0_test_lists(llm_src):
     with open(test_list, "w") as f:
         f.writelines(f"{line}\n" for line in sorted(cleaned_lines))
 
-    subprocess.run(
-        f"cd {llm_src}/tests/integration/defs && "
-        f"pytest --test-list={test_list} --output-dir={llm_src} -s --co -q",
-        shell=True,
-        check=True)
+    _run_collection_pytest(llm_src, test_list)
 
 
 def verify_qa_test_lists(llm_src):
@@ -986,11 +1051,7 @@ def verify_qa_test_lists(llm_src):
     test_def_files = subprocess.check_output(
         f"ls -d {test_qa_path}/*.txt", shell=True).decode().strip().split('\n')
     for test_def_file in test_def_files:
-        subprocess.run(
-            f"cd {llm_src}/tests/integration/defs && "
-            f"pytest --test-list={test_def_file} --output-dir={llm_src} -s --co -q",
-            shell=True,
-            check=True)
+        _run_collection_pytest(llm_src, test_def_file)
         # append all the test_def_file to qa_test.txt
         with open(f"{llm_src}/qa_test.txt", "a") as f:
             with open(test_def_file, "r") as test_file:
@@ -1101,11 +1162,7 @@ def verify_waive_list(llm_src, args):
     with open(tmp_waives_file, "w") as f:
         f.writelines(f"{line}\n" for line in sorted(processed_lines))
 
-    subprocess.run(
-        f"cd {llm_src}/tests/integration/defs && "
-        f"pytest --test-list={tmp_waives_file} --output-dir={llm_src} -s --co -q",
-        shell=True,
-        check=True)
+    _run_collection_pytest(llm_src, tmp_waives_file)
 
 
 def main():
@@ -1176,7 +1233,6 @@ def main():
     script_dir = os.path.dirname(os.path.realpath(__file__))
     llm_src = os.path.abspath(os.path.join(script_dir, "../"))
 
-    # Only skip installing dependencies if ONLY --check-duplicates or --validate is used
     if args.l0 or args.qa or args.waive:
         install_python_dependencies(llm_src)
 

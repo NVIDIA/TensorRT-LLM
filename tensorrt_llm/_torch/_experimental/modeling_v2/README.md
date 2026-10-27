@@ -36,10 +36,15 @@ exists to catch.
 
 The decision is one function, `route`, in the family's `routing.py`. It reads
 the facts that fix which code runs -- the checkpoint's config shape, the
-parallel mapping, the GPU's compute capability and the speculative-decoding
-config -- and either returns a target class or raises `NoTarget` with the
-reason in words. Tuning knobs such as `max_batch_size`, `max_num_tokens` and CUDA graph
-settings are not routing inputs: they do not change which code runs, so a
+parallel mapping, the GPU's compute capability, the speculative-decoding
+config, the KV cache algorithm the engine will run with, and the engine choices
+it derives from the `ModelConfig` and the LLM arguments it is also given
+(qwen4_exp: MoE backend, recurrent-state cache dtype, prefill CUDA graph
+backend) -- and either returns a target class or raises `NoTarget` with the
+reason in words. A target declines what its
+constructor would refuse, so that `auto` falls back instead of failing mid-build.
+Tuning knobs such as `max_batch_size`, `max_num_tokens` and the CUDA graph
+bucket lists are not routing inputs: they do not change which code runs, so a
 target claims a configuration regardless of them. `require` therefore promises
 that the target ran, not that a particular knob setting was measured. The model
 loader decides when it is about to build the model, after the built-in model's
@@ -66,8 +71,8 @@ LLM(model=..., modeling_v2=...)  ->  ModelLoader
                                         +-- modeling_v2_resolve(config, llm_args)
                                               |
                     _router_index.py          +-- architectures[0] -> routing module
-                    models/<x>/routing.py     +-- route(config, mapping, compute_capability,
-                                              |         spec_config, kv_cache_quant_algo)
+                    models/<x>/routing.py     +-- route(model_config, llm_args,
+                                              |         compute_capability)
                                               |         -> target class, or NoTarget
                                         |
                                      config.modeling_v2_target = class
@@ -284,8 +289,9 @@ Perf is measured, never gated.
 ## Status of every record in this tree
 
 **Every entry the gpt-oss and deepseek default targets call is certified on
-sm_100 and sm_103, and both targets are gated on both.** The qwen4_exp and
-glm-5.2 targets and the entries they own are certified on sm_103.
+sm_100 and sm_103, and both targets are gated on both.** The qwen4_exp target
+and glm-5.2's sm_103 tep4 target, and the entries they own, are certified on
+sm_103.
 
 The default targets' 21 entries -- 20 shared, 1 (`fused_moe`) owned by deepseek's default target -- each drive
 their cells through `__call__` and `reference`. Where that runs depends on the
@@ -297,8 +303,8 @@ entry:
 * `mnnvl_allreduce` needs 8 ranks over two trays. Its matrix runs only by
   hand under srun (see its docstring), and no CI job re-runs it.
 
-glm-5.2's 39 owned entries run in the same pre-merge job as the 17, and its
-all-reduce's 4-rank matrix in the pre-merge 4-GPU job.
+The glm-5.2 tep4 target's 39 owned entries run in the same pre-merge job as
+the 17, and its all-reduce's 4-rank matrix in the pre-merge 4-GPU job.
 
 Certification is per architecture: `ARCHS` says
 where the cells were driven, and a missing architecture reads as unknown,

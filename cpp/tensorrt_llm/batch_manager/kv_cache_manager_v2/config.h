@@ -144,6 +144,10 @@ struct BufferConfig
     std::optional<int> tokensPerBlockOverride;
 
     bool isSparse = false; //!< Whether history uses the sparse attention lifecycle.
+
+    //! Buffers may coalesce only when their group and expanded size match.
+    //! This does not change their lifecycle or shared slot allocation.
+    int coalescingGroup = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -449,6 +453,9 @@ struct KVCacheManagerConfig
     // Publish a finalized partial block for reuse when committing stops.
     // Beam search disables this while retaining full-block reuse.
     bool enablePartialCommit = true;
+
+    // Unreferenced GPU pages below this priority are dropped instead of offloaded.
+    Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority;
 
     bool enableSwaScratchReuse() const noexcept
     {
