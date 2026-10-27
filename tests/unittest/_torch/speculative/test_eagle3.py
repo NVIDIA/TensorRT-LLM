@@ -29,6 +29,7 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_num_gpus_less_than, skip_pre_blackwell
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.sparse.dsa import (
     DSACacheManagerV2, DSAtrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention.backends.trtllm import \
@@ -471,6 +472,38 @@ def test_mtp_eagle_dynamic_tree_context_input_uses_prompt_lookahead() -> None:
         draft_inputs["input_ids"],
         torch.tensor([11, 12, 13, 21, 88], dtype=torch.int32, device="cuda"),
     )
+
+
+@skip_num_gpus_less_than(1)
+def test_eagle3_prepare_skipped_uploads_keep_slot_ids_current() -> None:
+    slots = {5: 2, 6: 0, 7: 3}
+    md = object.__new__(Eagle3OneModelSpecMetadata)
+    md.use_rejection_sampling = False
+    md.use_dynamic_tree = False
+    md.num_tokens = 0
+    md.num_generations = 0
+    md.batch_indices_cuda = torch.full((8, ),
+                                       -1,
+                                       dtype=torch.int,
+                                       device="cuda")
+    md.slot_ids = torch.full((8, ), -1, dtype=torch.long, device="cuda")
+    md._batch_indices_upload = DeviceCopyBuffer(md.batch_indices_cuda)
+    md._slot_ids_upload = DeviceCopyBuffer(md.slot_ids)
+    md.spec_resource_manager = SimpleNamespace(slot_manager=SimpleNamespace(
+        get_slot=lambda rid: slots[rid]))
+    md.spec_dec_mode = SimpleNamespace(is_mtp_eagle_one_model=lambda: True)
+
+    # Repeated and prefix batches may skip the upload; a reassigned slot may not.
+    for request_ids, reassign in [([5, 6], None), ([5, 6], None), ([5], None),
+                                  ([5, 6, 7], None), ([5, 6, 7], (6, 4))]:
+        if reassign is not None:
+            slots[reassign[0]] = reassign[1]
+        md.request_ids = request_ids
+        md.prepare()
+        torch.cuda.synchronize()
+        n = len(request_ids)
+        assert md.batch_indices_cuda[:n].tolist() == list(range(n))
+        assert md.slot_ids[:n].tolist() == [slots[r] for r in request_ids]
 
 
 @pytest.fixture(scope="function")

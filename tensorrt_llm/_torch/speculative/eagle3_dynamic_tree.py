@@ -599,6 +599,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         num_accepted_tokens,
         original_all_rank_num_tokens,
         resource_manager,
+        accepted_tokens,
+        pre_draft_seq_lens,
     ):
         """Dynamic tree draft loop with growing context."""
         spec_tree_manager = self.spec_tree_manager
@@ -759,7 +761,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             gen_slots = slot_storage.all_ids_buf[num_contexts:batch_size]
             spec_tree_manager.scatter_to_slot_storage(slot_storage, gen_slots, num_gens)
 
-        return real_draft_tokens
+        return real_draft_tokens, None
 
     def _sample_and_accept_dynamic_tree(
         self, logits, attn_metadata, spec_metadata, batch_size, num_contexts, num_gens

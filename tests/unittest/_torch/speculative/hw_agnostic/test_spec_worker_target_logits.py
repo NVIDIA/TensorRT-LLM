@@ -9,7 +9,9 @@ import torch
 
 import tensorrt_llm._torch.distributed as distributed
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
+from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 
 pytestmark = pytest.mark.cpu_only
@@ -179,3 +181,49 @@ def test_the_spec_model_hands_the_workers_target_logits_to_its_forward():
     assert torch.equal(rows, hidden[gather_ids])
     assert rest == ["lm_head", "processor", attn_metadata, spec_metadata, "drafter"]
     assert calls["forward"]["logits"] == "worker logits"
+
+
+@pytest.mark.parametrize(
+    "greedy,temperature_only,penalty,has_exchange,rows,sharded",
+    [
+        (True, False, False, True, 4, True),
+        (False, True, False, True, 4, True),
+        (False, False, False, True, 4, False),
+        (True, False, True, True, 4, False),
+        (True, False, False, False, 4, False),
+        (True, False, False, True, 9, False),
+    ],
+)
+def test_mtp_eagle_target_logits_are_sharded_for_greedy_batches(
+    greedy, temperature_only, penalty, has_exchange, rows, sharded
+):
+    head_calls = []
+
+    class Head:
+        tp_mode, gather_output, padding_size = TensorParallelMode.COLUMN, True, 0
+
+        def __call__(self, hidden_states, gather_output=True):
+            head_calls.append(gather_output)
+            return hidden_states
+
+    worker = object.__new__(Eagle3OneModelWorker)
+    worker.key_exchange = SimpleNamespace(MAX_ROWS=8) if has_exchange else None
+    worker._samples_sharded_target = has_exchange
+    worker.guided_decoder = worker._d2t = None
+    worker.mapping = SimpleNamespace(tp_size=8, tp_rank=0, enable_attention_dp=False)
+    metadata = SimpleNamespace(
+        is_all_greedy_sample=greedy,
+        temperature_only=temperature_only,
+        enable_penalty=penalty,
+        sharded_target_logits=None,
+    )
+    hidden = torch.zeros(rows, 2)
+    processor = _RecordingLogitsProcessor("gathered")
+
+    out = worker.target_logits(hidden, Head(), processor, None, metadata, None)
+
+    assert metadata.sharded_target_logits is sharded
+    if sharded:
+        assert out is hidden and head_calls == [False] and processor.calls == []
+    else:
+        assert out == "gathered" and head_calls == []
