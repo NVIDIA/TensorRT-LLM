@@ -140,6 +140,11 @@ def test_targets_do_not_share_files():
                     )
 
 
+# `CELLS = certified_cells(op, TARGET_CELLS)`; the test function's own name
+# `test_certified_cells(` must not count as driving the cells.
+_DRIVES_TARGET_CELLS = re.compile(r"^CELLS\s*=\s*certified_cells\(\w+,\s*TARGET_CELLS\)", re.M)
+
+
 def test_every_entry_with_cells_has_a_test_that_drives_them():
     """A cell list nothing executes is worse than no cell list.
 
@@ -150,8 +155,9 @@ def test_every_entry_with_cells_has_a_test_that_drives_them():
 
     Checked by reading rather than importing, like the rest of this file: an
     entry declares `Cell(` in its source, and some test under this tree has to
-    name both the entry and `.CELLS` -- or `certified_cells(`, which drives the
-    entry's cells and its targets'. That is weaker than proving the cells were
+    name both the entry and `.CELLS` -- or assign
+    `CELLS = certified_cells(op, TARGET_CELLS)`, which drives the entry's cells
+    and its targets'. That is weaker than proving the cells were
     driven, and it is what a check that runs anywhere can say.
     """
     tests = list(Path(__file__).resolve().parent.rglob("*.py"))
@@ -162,7 +168,7 @@ def test_every_entry_with_cells_has_a_test_that_drives_them():
         if "Cell(" not in entry.read_text():
             continue
         if not any(
-            entry.stem in src and (".CELLS" in src or "certified_cells(" in src)
+            entry.stem in src and (".CELLS" in src or _DRIVES_TARGET_CELLS.search(src))
             for src in sources.values()
         ):
             undriven.append(str(entry.relative_to(_ROOT)))
@@ -195,11 +201,15 @@ def test_target_cells_feed_entries_the_target_calls(test):
     assert (_ROOT / "catalog" / area / f"{entry}.py").is_file(), (
         f"{test.name}: declares TARGET_CELLS but mirrors no catalog/{area}/{entry}.py"
     )
-    assert "certified_cells(" in test.read_text(), (
-        f"{test.name}: declares TARGET_CELLS but never drives them through certified_cells("
+    text = test.read_text()
+    assert _DRIVES_TARGET_CELLS.search(text), (
+        f"{test.name}: declares TARGET_CELLS but never passes them to certified_cells"
+    )
+    assert re.search(r'parametrize\(\s*"cell",\s*CELLS\b', text), (
+        f"{test.name}: test_certified_cells does not parametrize over CELLS"
     )
     targets = None
-    for node in ast.parse(test.read_text()).body:
+    for node in ast.parse(text).body:
         if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == "TARGET_CELLS":
             targets = [ast.literal_eval(k) for k in node.value.keys]
     assert targets, f"{test.name}: TARGET_CELLS is not a dict literal keyed by target directory"
