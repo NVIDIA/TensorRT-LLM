@@ -60,6 +60,7 @@ from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
                        TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TORCH_LLMARGS_REMOVED_ARGS, ExecutorMemoryType,
                        MoeConfig, RuntimeMemoryStatus, TorchLlmArgs,
+                       multimodal_input_processor_kwargs,
                        validate_token_encoder_bucket_config)
 from .llm_utils import CachedModelLoader, KvCacheRetentionConfig, ModelLoader
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -2102,22 +2103,15 @@ class _TorchLLM(BaseLLM):
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
         checkpoint_format = getattr(self.args, "checkpoint_format", None)
-        input_processor_kwargs = {}
-        video_pruning_rate = self.args.multimodal_config.video_pruning_rate
-        if video_pruning_rate is not None:
-            input_processor_kwargs['video_pruning_rate'] = video_pruning_rate
-        if self.args.multimodal_config.audio_input_form != "waveform":
-            input_processor_kwargs[
-                'audio_input_form'] = self.args.multimodal_config.audio_input_form
+        audio_input_form = self.args.multimodal_config.audio_input_form
         self.input_processor = create_input_processor(
             self._hf_model_dir,
             self.tokenizer,
             checkpoint_format,
             trust_remote_code=self.args.trust_remote_code,
             enable_tokenization_cache=self.args.enable_tokenization_cache,
-            **input_processor_kwargs)
+            **multimodal_input_processor_kwargs(self.args.multimodal_config))
         self._tokenizer = self.input_processor.tokenizer
-        audio_input_form = self.args.multimodal_config.audio_input_form
         if audio_input_form != "waveform" and getattr(self.input_processor,
                                                       "audio_input_form",
                                                       None) != audio_input_form:

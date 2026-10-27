@@ -908,6 +908,23 @@ class MultimodalConfig(StrictBaseModel):
         return self
 
 
+def multimodal_input_processor_kwargs(
+        multimodal_config: MultimodalConfig) -> Dict[str, Any]:
+    """Keyword arguments to forward to a model's input processor.
+
+    Every place that builds an input processor for one set of LLM args (the
+    LLM, its model engine and the multimodal encoder) goes through this, so
+    they agree on the audio form and the video pruning rate. Only non-default
+    values are forwarded, because most input processors do not take them.
+    """
+    kwargs: Dict[str, Any] = {}
+    if multimodal_config.video_pruning_rate is not None:
+        kwargs["video_pruning_rate"] = multimodal_config.video_pruning_rate
+    if multimodal_config.audio_input_form != "waveform":
+        kwargs["audio_input_form"] = multimodal_config.audio_input_form
+    return kwargs
+
+
 class GuidedDecodingConfig(StrictBaseModel):
 
     class GuidedDecodingBackend(Enum):

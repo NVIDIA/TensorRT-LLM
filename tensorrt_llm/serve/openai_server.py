@@ -642,6 +642,8 @@ class OpenAIServer(_VideoRoutesMixin):
             raise ValueError(
                 "Runtime control endpoints require num_serve_frontends=1 "
                 "because replay protection is local to each frontend.")
+        # trtllm-serve refuses this before loading the model (commands/serve.py);
+        # this covers a server built directly in Python around a finished LLM.
         multimodal_config = getattr(generator.args, "multimodal_config", None)
         if getattr(multimodal_config, "audio_input_form",
                    "waveform") != "waveform":

@@ -618,6 +618,28 @@ def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
     llm_args["num_serve_frontends"] = 1
 
 
+def _reject_spectrogram_audio_input(llm_args: dict) -> None:
+    """Refuse ``multimodal_config.audio_input_form='spectrogram'`` up front.
+
+    The server decodes its audio inputs to waveforms and no request field
+    carries a spectrogram, so the setting can never take effect. Checking it
+    here, before the LLM is built, saves the model load and warmup that a
+    check on the finished server would come after.
+    """
+    multimodal_config = llm_args.get("multimodal_config")
+    if isinstance(multimodal_config, dict):
+        audio_input_form = multimodal_config.get("audio_input_form", "waveform")
+    else:
+        audio_input_form = getattr(multimodal_config, "audio_input_form",
+                                   "waveform")
+    if audio_input_form != "waveform":
+        raise click.BadParameter(
+            f"multimodal_config.audio_input_form={audio_input_form!r} is not "
+            "supported by trtllm-serve: its audio inputs are decoded to "
+            "waveforms, and no request field carries a spectrogram.",
+            param_hint="extra_llm_api_options")
+
+
 def launch_server(
         host: str,
         port: int,
@@ -647,6 +669,7 @@ def launch_server(
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
+    _reject_spectrogram_audio_input(llm_args)
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
     # An attached frontend gets the launcher's socket from its spawn env; the
@@ -1661,6 +1684,7 @@ def serve(
             enable_sleep_mode=enable_sleep_mode)
 
         _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
+        _reject_spectrogram_audio_input(llm_args)
         # Preserve requested settings for failures before entering the LLM constructor.
         try:
             from tensorrt_llm.usage.usage_lib import _capture_startup_context
