@@ -283,9 +283,26 @@ class DecoderWarmup:
         )
         # Warm here, not in AllReduce.__init__, to scope it to the LLM executor's graph capture.
         warmup_named_allreduce_topologies(self.model)
-        # Retain a partial summary when a phase raises.
-        with self._warmup_timer:
-            return self._warmup_scheduled(resource_manager, kv_cache_manager)
+        # The MSA prewarm scope closes after the timed warmup: its end-of-warmup
+        # sparse-decode prewarm is not one of the warmup timer's phases.
+        with self._msa_prewarm_scope():
+            # Retain a partial summary when a phase raises.
+            with self._warmup_timer:
+                return self._warmup_scheduled(resource_manager, kv_cache_manager)
+
+    def _msa_prewarm_scope(self) -> contextlib.AbstractContextManager:
+        """MiniMax-M3 MSA prewarm phase scope (m3ax_msa_prewarm); a no-op for other models."""
+        sparse_config = self.sparse_attention_config
+        if (
+            not isinstance(sparse_config, MiniMaxM3SparseAttentionConfig)
+            or sparse_config.implementation != "msa"
+        ):
+            return contextlib.nullcontext()
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.m3ax_msa_prewarm import (
+            hook as msa_prewarm_hook,
+        )
+
+        return msa_prewarm_hook.warmup_scope(self)
 
     def _get_max_shape_warmup_requests(
         self, resource_manager: ResourceManager
@@ -1491,9 +1508,16 @@ class DecoderWarmup:
         ):
             return
 
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.m3ax_msa_prewarm import (
+            hook as msa_prewarm_hook,
+        )
         from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import (
             prewarm_split_proxy_variants,
         )
+
+        # Compile every fmha_sm100 variant this rank's MSA plans can select and
+        # start recording the sparse-decode call shapes.
+        msa_prewarm_hook.before_msa_indexer_prewarm(self, kv_cache_manager)
 
         params = sparse_config.to_sparse_metadata_params(
             pretrained_config=self.model.model_config.pretrained_config
