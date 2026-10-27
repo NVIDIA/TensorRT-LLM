@@ -1084,11 +1084,37 @@ def test_selfsampling_route_k2048_regclus() -> None:
     k = 2048
     for b, n in ((1, 16399), (8, 32771), (8, 65551), (16, 32771)):
         plan = ss_host.route(b, n, (n + 63) // 64 * 64, k)
-        assert plan["kernel"] == "reg_clus" and plan["tpl"][3] == 2, (b, n, plan["kernel"])
+        assert plan["kernel"] == "reg_clus" and plan["tpl"][3] == k, (b, n, plan["kernel"])
     for b in (32, 64):
         assert ss_host.route(b, 16399, 16448, k)["kernel"] == "reg"
     assert ss_host.route(1, 131087, 131136, k)["kernel"] == "main"
-    assert len(ss_host.route(1, 65536, 65536, 1024)["tpl"]) == 3
+    assert ss_host.route(1, 65536, 65536, 1024)["tpl"][3] == 1024
+
+
+@pytest.mark.parametrize("hint_free", [False, True])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_selfsampling_regclus_static_k_cache(hint_free: bool, deterministic: bool) -> None:
+    """Changing K at fixed cluster geometry must select the matching compiled variant."""
+    b, n, npad = 2, 65551, 65600
+    gen = torch.Generator(device=_DEV).manual_seed(20998)
+    logits = torch.randn((b, npad), generator=gen, device=_DEV)
+    logits[:, n:] = 3e38
+    lengths = torch.full((b,), n, dtype=torch.int32, device=_DEV)
+    # Revisit the first K after compiling both larger variants to exercise cache reuse.
+    for k in (512, 1024, 2048, 512):
+        assert ss_host.route(b, n, npad, k, det=deterministic)["kernel"] == "reg_clus"
+        values, hints = logits[:, :n].topk(k)
+        if hint_free:
+            out = torch.full((b, k), -7, dtype=torch.int32, device=_DEV)
+            ss_host.run_varlen(logits, lengths, out, max_seq_len=n, deterministic=deterministic)
+        else:
+            # A wider output follows the host's existing packed-row convention.
+            out = torch.full((b, k + 64), -7, dtype=torch.int32, device=_DEV)
+            ss_host.run(logits, hints.to(torch.int32), n, out, deterministic=deterministic)
+            assert bool((out.flatten()[b * k :] == -7).all())
+            out = out.flatten()[: b * k].view(b, k)
+        torch.cuda.synchronize()
+        _check_exact(logits, out[:, :k], n, values)
 
 
 @pytest.mark.parametrize("pattern", ["randn", "ties", "equal"])

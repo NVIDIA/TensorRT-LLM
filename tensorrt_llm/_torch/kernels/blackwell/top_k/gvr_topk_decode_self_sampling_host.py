@@ -278,7 +278,7 @@ def route(
             smc = (3 * NB + 2 * CMPC) * 4
             return {
                 "kernel": "reg_clus",
-                "tpl": (BLKC, vsel, cs) + ((2,) if k > BLKC else ()),
+                "tpl": (BLKC, vsel, cs, k),
                 "rt": {"n": n, "npad": npad, "k": k},  # dims only
                 "grid": (cs, b),
                 "cluster": cs,

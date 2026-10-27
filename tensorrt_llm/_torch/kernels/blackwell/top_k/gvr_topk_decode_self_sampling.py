@@ -10839,26 +10839,23 @@ def _val__regclus(frags, s: int):
 
 
 class GvrRegClusKernel:
-    """gvr_reg_clus<BLK, VPT, CS>."""
+    """gvr_reg_clus<BLK, VPT, CS, K>; K specializes only hint-slot unrolling."""
 
     def __init__(
         self,
-        blk: int,
-        vpt: int,
-        cs: int,
+        tpl: tuple[int, int, int, int],
         pdl: bool = False,
         varlen: bool = False,
         next_n: int = 1,
         cr_shift: int = 0,
         hint_free: bool = False,
         det: bool = False,
-        kh: int = 1,
     ) -> None:
+        blk, vpt, cs, k = tpl
+        assert 0 < k <= 2 * blk, "reg_clus supports at most two hint slots per thread"
+        self.top_k = k
         self.det = bool(det)
         assert blk == BLKC, "all instantiations BLK=BLKC=1024"
-        # hint slots per thread: ceil(K / BLK)
-        assert kh in (1, 2)
-        self.kh = kh
         assert vpt in (1, 2, 4) and cs in (2, 4, 8)
         self.blk = blk
         self.vpt = vpt
@@ -10893,6 +10890,10 @@ class GvrRegClusKernel:
         CS = cutlass.const_expr(self.cs)
         S = cutlass.const_expr(self.S)
         NW = cutlass.const_expr(self.blk // 32)
+        # Keep tensor shapes dynamic: specializing selection arithmetic can
+        # regress the exact-rescue path. Static K only controls slot unrolling.
+        K = cutlass.const_expr(self.top_k)
+        HINT_SLOTS = cutlass.const_expr((K + self.blk - 1) // self.blk)
 
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()  # knob default off
@@ -10931,7 +10932,7 @@ class GvrRegClusKernel:
                 n = nv
             if short != cutlass.Int32(0):
                 if rank == cutlass.Int32(0):
-                    for h in cutlass.range_constexpr(self.kh):
+                    for h in cutlass.range_constexpr(HINT_SLOTS):
                         th = tid + cutlass.Int32(h * self.blk)
                         if th < kq:
                             ov = cutlass.Int32(-1)
@@ -11041,14 +11042,14 @@ class GvrRegClusKernel:
             base4 = rank * cutlass.Int32(self.span)
             tix = (n4 << cutlass.Int32(2)) + tid  # CUDA `tidx`
 
-            # ---- P0: redundant hint gather, EVERY CTA (k<=KH*BLK by dispatch
-            # gate). One coalesced word per thread per slot, NO cluster barrier —
+            # ---- P0: redundant hint gather, EVERY CTA (ceil(K/BLK) slots).
+            # One coalesced word per thread per slot, NO cluster barrier —
             # GMIN/GMAX identical everywhere by construction.
             if cutlass.const_expr(self.hint_free):
                 # Exactly K distinct values in endpoint-inclusive uniform blocks.
                 if tid < k:
                     pv0 = tid
-                if cutlass.const_expr(self.kh == 2):
+                if cutlass.const_expr(HINT_SLOTS == 2):
                     if tid + cutlass.Int32(self.blk) < k:
                         pv1 = tid + cutlass.Int32(self.blk)
                 if k == cutlass.Int32(512) or k == cutlass.Int32(1024) or k == cutlass.Int32(2048):
@@ -11057,7 +11058,7 @@ class GvrRegClusKernel:
                         pv0 = ((tid // cutlass.Int32(64)) * (n - cutlass.Int32(64))) // (
                             sample_blocks - cutlass.Int32(1)
                         ) + tid % cutlass.Int32(64)
-                    if cutlass.const_expr(self.kh == 2):
+                    if cutlass.const_expr(HINT_SLOTS == 2):
                         sample_id = tid + cutlass.Int32(self.blk)
                         if sample_id < k:
                             pv1 = ((sample_id // cutlass.Int32(64)) * (n - cutlass.Int32(64))) // (
@@ -11066,7 +11067,7 @@ class GvrRegClusKernel:
             else:
                 if tid < k:
                     pv0 = ld_g_i32(p_addr, tid)
-                if cutlass.const_expr(self.kh == 2):
+                if cutlass.const_expr(HINT_SLOTS == 2):
                     if tid + cutlass.Int32(self.blk) < k:
                         pv1 = ld_g_i32(p_addr, tid + cutlass.Int32(self.blk))
 
@@ -11103,7 +11104,7 @@ class GvrRegClusKernel:
                 uk = fkey(ldg_f32(x_addr, pv0))  # __ldg(X+pv0)
                 lmin = uk
                 lmax = uk
-            if cutlass.const_expr(self.kh == 2):
+            if cutlass.const_expr(HINT_SLOTS == 2):
                 if cutlass.Uint32(pv1) < cutlass.Uint32(n):
                     uk = fkey(ldg_f32(x_addr, pv1))
                     if uk < lmin:
@@ -12466,7 +12467,7 @@ def get_compiled__regclus(
     hint_free: bool = False,
     det: bool = False,
 ) -> Any:
-    """Compile (or fetch) the variant for constexpr tuple (BLK, VPT, CS[, KH])."""
+    """Compile (or fetch) the variant for constexpr tuple (BLK, VPT, CS, K)."""
     key = (
         tuple(tpl),
         bool(pdl),
@@ -12480,18 +12481,14 @@ def get_compiled__regclus(
     if compiled is None:
         from cutlass.cute import runtime as _crt
 
-        blk, vpt, cs = tpl[:3]
         kernel = GvrRegClusKernel(
-            blk,
-            vpt,
-            cs,
+            tpl,
             pdl=pdl,
             varlen=varlen,
             next_n=next_n,
             cr_shift=cr_shift,
             hint_free=hint_free,
             det=det,
-            kh=tpl[3] if len(tpl) > 3 else 1,
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()
