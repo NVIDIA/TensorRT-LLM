@@ -8,8 +8,9 @@ from types import SimpleNamespace
 import pytest
 
 grpc = pytest.importorskip(  # noqa: E402
-    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
+    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.73.1,<2")'
 )
+pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 from conftest import AbortError, FakeServicerContext  # noqa: E402
 
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
@@ -498,10 +499,11 @@ async def test_health_reports_not_ready_for_a_crashed_engine_that_is_not_shut_do
 
 
 @pytest.mark.asyncio
-async def test_health_survives_a_raising_health_check():
+@pytest.mark.parametrize("error_type", [RuntimeError, TypeError, AttributeError])
+async def test_health_survives_a_raising_health_check(error_type):
     """A probe reports state; it must not turn an engine fault into an RPC error."""
     llm = _llm()
-    llm._check_health = lambda: (_ for _ in ()).throw(RuntimeError("engine gone"))
+    llm._check_health = lambda: (_ for _ in ()).throw(error_type("engine gone"))
     servicer = OpenEngineControlServicer(llm, MODEL, _inference(), kv_transfer_backend="")
 
     response = await servicer.Health(lifecycle_pb2.HealthRequest(), FakeServicerContext())

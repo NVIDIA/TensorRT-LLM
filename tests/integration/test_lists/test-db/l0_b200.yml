@@ -112,7 +112,7 @@ l0_b200:
   #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
   #               rebind mpi4py's serializer at import time, which applies process-wide on
   #               every stage that collects them, including where the tests themselves skip.
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py TIMEOUT (90)
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py --ignore=unittest/_torch/attention/sparse/deepseek_v4/test_prims_ts_sparse_mla_fmha.py TIMEOUT (90)
   - unittest/_torch/executor/kv_cache/test_mixed_precision_kv_cache.py
   # Keep cold-JIT MSA coverage out of the 60-minute attention aggregate.
   # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
@@ -126,6 +126,7 @@ l0_b200:
   - unittest/disaggregated/test_deepseek_v4_kv_transfer.py
   - unittest/disaggregated/test_fp4_mla_kv_transfer.py
   - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_sparse_mla.py TIMEOUT (60)
+  - unittest/_torch/attention/sparse/deepseek_v4/test_prims_ts_sparse_mla_fmha.py TIMEOUT (60)
   - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py TIMEOUT (60)
   - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_indices_transform.py TIMEOUT (60)
   - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_o_proj.py TIMEOUT (30)
@@ -230,6 +231,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_create_moe_forwards_situ_activation_as_one_carrier
   - unittest/_torch/moe/test_moe_backend.py::test_create_moe_backend_rejects_apply_router_weight_on_input_by_declaration
   - unittest/_torch/moe/test_moe_backend.py::test_apply_router_weight_on_input_support_is_not_inherited
+  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_nvfp4_pre_quant_scale_matches_cutlass
   # WideEP DeepEP-to-CuTeDSL metadata selection and adapter-free contracts.
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens
@@ -260,11 +262,13 @@ l0_b200:
   # UUID KV-event tests hardcode Qwen3-VL-2B (no model_dir fixture id), so they
   # are excluded by the qwen3_30b_a3b_fp8 filter above; select them explicitly.
   - unittest/_torch/multimodal/test_mm_encoder_standalone.py -k "test_kv_event_mm_keys and uuid"
+  # Run beam-search end-to-end tests in a separate sampler invocation.
+  - unittest/_torch/sampler/test_beam_search.py
   # test_speculative_d2h_parity_real_predictor (both no_stop_token and
   # stop_token_15) is a HW-agnostic sampler D2H-parity invariant (plain CUDA
   # stream/event, no SM gating), covered on A30 pre-merge; drop that whole
   # function's leaves on Blackwell, keep the rest of the sampler dir.
-  - unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor"
+  - unittest/_torch/sampler --ignore=unittest/_torch/sampler/test_beam_search.py -k "not test_speculative_d2h_parity_real_predictor"
   - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/speculative/test_lilicorr_loading.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
@@ -438,6 +442,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_glm_image_transformer.py
   - unittest/_torch/visual_gen/test_glm_image_pipeline.py
   - unittest/_torch/visual_gen/test_minimax_h3_transformer.py
+  - unittest/_torch/visual_gen/test_minimax_h3_fused_rope.py
   - unittest/_torch/visual_gen/test_minimax_h3_fused_adaln.py
   - unittest/_torch/visual_gen/test_minimax_h3_vae_decode.py
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_public_visual_gen_api_smoke TIMEOUT (30)

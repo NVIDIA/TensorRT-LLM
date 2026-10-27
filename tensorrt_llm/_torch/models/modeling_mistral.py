@@ -50,9 +50,9 @@ from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
                                  MultimodalPlaceholderMetadata,
                                  MultimodalPlaceholderPlacement, TextPrompt,
                                  register_input_processor)
-from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
-                                          MultimodalEncoderItemMetadata)
+from tensorrt_llm.inputs.multimodal import (MultimodalItemMetadata,
+                                            MultimodalParams)
+from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.inputs.utils import encode_base64_image
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.logger import logger
@@ -411,11 +411,11 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
-    def get_mm_encoder_item_metadata(
+    def _build_mm_item_metadata(
         self,
         _prompt_token_ids: List[int],
         multimodal_data: Dict[str, Any],
-    ) -> Optional[MultimodalEncoderItemMetadata]:
+    ) -> Optional[MultimodalItemMetadata]:
         """Return Pixtral image items and physical ViT patch counts."""
         image_data = multimodal_data.get("image")
         if not isinstance(image_data, dict):
@@ -440,10 +440,22 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
             token_length // (merge * merge)
             for token_length in encoder_token_lengths
         ]
-        return MultimodalEncoderItemMetadata(
+        return MultimodalItemMetadata(
             item_refs=item_refs,
             encoder_token_lengths=encoder_token_lengths,
             output_embedding_lengths=output_embedding_lengths)
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = (
+            self._build_mm_item_metadata(prompt_token_ids, multimodal_data)
+            if multimodal_data.get("multimodal_embedding") is None else None)
+        return metadata if metadata is not None else super(
+        ).get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
 
     @torch.inference_mode()
     def call_with_text_prompt(

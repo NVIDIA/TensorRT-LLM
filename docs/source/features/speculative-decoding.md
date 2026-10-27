@@ -229,16 +229,15 @@ SA can be combined with the following speculative decoding techniques:
 * **EAGLE 3** (`Eagle3DecodingConfig`)
 * **PARD** (`PARDDecodingConfig`)
 
-To enable SA combination, set `use_sa_spec=True` on the speculative config. The `sa_spec_threshold` parameter controls the minimum suffix match length required to override the neural draft (default: 4).
+To enable SA combination, set `sa_config=SAEnhancerConfig(...)` on the speculative config. The `threshold` field controls the minimum suffix match length required to override the neural draft (default: 4).
 
 ```python
-from tensorrt_llm.llmapi import Eagle3DecodingConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig, SAEnhancerConfig
 
 speculative_config = Eagle3DecodingConfig(
     max_draft_len=4,
     speculative_model="/path/to/eagle3_model",
-    use_sa_spec=True,
-    sa_spec_threshold=4)
+    sa_config=SAEnhancerConfig(threshold=4))
 
 llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 ```
@@ -293,6 +292,7 @@ speculative_config:
 
 ```yaml
 # Dynamic tree mode
+max_batch_size: 4
 speculative_config:
   decoding_type: Eagle3
   max_draft_len: 6
@@ -300,7 +300,6 @@ speculative_config:
   use_dynamic_tree: true
   dynamic_tree_max_topK: 10
   max_total_draft_tokens: 60
-  max_batch_size: 4
 ```
 
 ```yaml
@@ -309,8 +308,8 @@ speculative_config:
   decoding_type: Eagle3
   max_draft_len: 4
   speculative_model: /path/to/draft/model
-  use_sa_spec: true
-  sa_spec_threshold: 4
+  sa_config:
+    threshold: 4
 ```
 
 ```{note}

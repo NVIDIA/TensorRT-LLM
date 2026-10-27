@@ -101,6 +101,7 @@ Welcome to TensorRT LLM's Documentation!
    :caption: Developer Guide
 
    developer-guide/overview.md
+   developer-guide/multimodal.md
    developer-guide/perf-analysis.md
    developer-guide/perf-benchmarking.md
    developer-guide/moe-perf-guide.md

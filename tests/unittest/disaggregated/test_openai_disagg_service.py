@@ -30,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     ConversationAwareADPRouter,
     RankState,
 )
+from tensorrt_llm._utils import get_global_steady_clock_now_in_seconds
 from tensorrt_llm.disaggregated_params import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.disagg_utils import (
@@ -62,6 +63,7 @@ from tensorrt_llm.serve.openai_protocol import (
     _deserialize_first_gen_logits,
     _serialize_first_gen_log_probs,
     _serialize_first_gen_logits,
+    to_llm_disaggregated_params,
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import (
@@ -968,6 +970,69 @@ async def test_context_retry_preserves_generation_reservation_id():
     gen_call = service._gen_client.send_request.call_args
     assert gen_call.kwargs["req_id"] == 101
     assert gen_call.args[0].disaggregated_params.ctx_request_id == 202
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+async def test_gen_request_carries_orig_elapsed(monkeypatch, schedule_style):
+    """Only a context-first GEN request carries orig_elapsed_s."""
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service(schedule_style)
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
+    service._ctx_client.send_request = AsyncMock(
+        side_effect=lambda req, *a, **k: _make_completion_response(
+            "",
+            finish_reason="length",
+            disagg_request_id=req.disaggregated_params.disagg_request_id,
+            context_only=True,
+        )
+    )
+    service._gen_client.send_request = AsyncMock(
+        side_effect=lambda req, *a, **k: _make_completion_response(
+            "done",
+            finish_reason="stop",
+            disagg_request_id=req.disaggregated_params.disagg_request_id,
+            context_only=False,
+        )
+    )
+    hooks = mock.Mock()
+    # ServerArrivalTimeMiddleware stamps arrivals on the global steady clock.
+    hooks.request_arrival_time = get_global_steady_clock_now_in_seconds() - 5.0
+
+    await service._send_disagg_request(CompletionRequest(model="test-model", prompt="hello"), hooks)
+
+    gen_req = service._gen_client.send_request.call_args.args[0]
+    elapsed = gen_req.disaggregated_params.orig_elapsed_s
+    if schedule_style == "generation_first":
+        assert elapsed is None
+        assert (
+            "orig_elapsed_s"
+            not in gen_req.model_dump(mode="json", exclude_unset=True)["disaggregated_params"]
+        )
+        return
+    assert 5.0 <= elapsed < 60.0
+    # On the wire (the client sends exclude_unset=True) ...
+    wire = gen_req.model_dump(mode="json", exclude_unset=True)
+    assert wire["disaggregated_params"]["orig_elapsed_s"] == elapsed
+    # ... and through to the LLM API params the GEN executor reads.
+    assert to_llm_disaggregated_params(gen_req.disaggregated_params).orig_elapsed_s == elapsed
+    # The context request does not carry it.
+    ctx_req = service._ctx_client.send_request.call_args.args[0]
+    assert ctx_req.disaggregated_params.orig_elapsed_s is None
+
+
+def test_orig_elapsed_arrival_fallback():
+    before = get_global_steady_clock_now_in_seconds()
+    assert OpenAIDisaggregatedService._get_arrival_time(None) >= before
+    assert OpenAIDisaggregatedService._get_arrival_time(mock.Mock()) >= before
+    hooks = SimpleNamespace(request_arrival_time=12.5)
+    assert OpenAIDisaggregatedService._get_arrival_time(hooks) == 12.5
+    req = CompletionRequest(model="m", prompt="p")
+    OpenAIDisaggregatedService._stamp_orig_elapsed(req, 0.0)  # no disaggregated_params: no-op
+    assert req.disaggregated_params is None
 
 
 def test_generation_postprocessor_rewrites_usage_from_disaggregated_params():
