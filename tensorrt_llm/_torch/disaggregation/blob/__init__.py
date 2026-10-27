@@ -12,6 +12,7 @@ Read top down; a fetch or publish flows ``BlobBackend`` -> ``StoreDriver`` -> st
 - ``store`` and ``keys``: the private driver boundary, which shares only ``MemoryKind`` with the
   public contract, and the store key encoding. How an object is laid out in a store is its
   driver's private format.
+- ``mooncake``: ``MooncakeDriver``, a ``StoreDriver`` over a set-up Mooncake SDK client.
 
 No module imports torch, ``tensorrt_llm._torch.pyexecutor`` or a store SDK at import time.
 ``README.md`` next to this file says how to write a driver and how to assemble a backend.
