@@ -3349,10 +3349,12 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_event_window_sizes_by_layer_group(
         self, attention_only: bool = False
     ) -> Dict[int, int]:
-        # Assumes every layer in a group shares the same sliding_window_size,
-        # which is how `impl.layer_grouping` partitions layers today. Only the
+        # Assumes every layer listed in a group shares the same sliding_window_size,
+        # which is how `impl.layer_grouping` groups layers today. Only the
         # first layer's window is read; if the grouping policy ever permits
-        # mixed windows in one group, this needs to fan out per-layer.
+        # mixed windows in one group, this needs to fan out per-layer. A layer
+        # listed under several groups is an SSM layer whose buffers use
+        # different reuse policies, so it describes each of them as SSM.
         #
         # `attention_only` is set for the streaming event manager, which tracks
         # attention prefix reuse only: excluding SSM and other non-attention life cycles
@@ -3899,7 +3901,11 @@ class KVCacheManagerV2(BaseResourceManager):
                         )
                     )
                 else:
-                    layers.append(SsmLayerConfig(layer_id=layer_id, buffers=buffers))
+                    layers.append(
+                        SsmLayerConfig(
+                            layer_id=layer_id, buffers=buffers, reuse_policy=layer.reuse_policy
+                        )
+                    )
 
         if not layers:
             raise ValueError("KVCacheManagerV2 requires at least one non-empty local cache layer")
@@ -5430,10 +5436,12 @@ class KVCacheManagerV2(BaseResourceManager):
     def _life_cycle_by_layer_group(self) -> List[AttnLifeCycle]:
         """Attention life cycle per layer group.
 
-        Every layer in a group shares one life cycle, which is how
-        ``impl.layer_grouping`` partitions layers, so the first layer describes
-        the group. A group with no window -- full attention, or a group whose
-        layers carry no window at all -- yields an empty stale range.
+        The layers listed in a group share its window and sinks, which is how
+        ``impl.layer_grouping`` groups layers, so the first layer describes the
+        group. A layer listed under several groups is an SSM layer whose buffers
+        use different reuse policies; it has no window in any of them. A group
+        with no window -- full attention, or a group whose layers carry no
+        window at all -- yields an empty stale range.
         """
         if self._layer_group_life_cycles is None:
             layers = self.kv_cache_manager_py_config.layers
@@ -6122,6 +6130,8 @@ class KVCacheManagerV2(BaseResourceManager):
         for life_cycle_id, layer_ids in enumerate(self.impl.layer_grouping):
             if not layer_ids:
                 continue
+            # A layer listed under several groups is an SSM layer whose buffers use
+            # different reuse policies, so its kind describes each of those groups.
             layer = self.kv_cache_manager_py_config.layers[int(layer_ids[0])]
             is_attention = isinstance(layer, AttentionLayerConfig)
             metadata[life_cycle_id] = (
