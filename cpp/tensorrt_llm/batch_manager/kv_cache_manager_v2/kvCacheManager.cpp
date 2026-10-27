@@ -32,6 +32,7 @@
 #include <map>
 #include <memory>
 #include <stdexcept>
+#include <string>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -602,7 +603,7 @@ int KvCacheManager::getPageIndexScale(LayerId layerId, DataRole role) const
 PageIndexConverter KvCacheManager::getPageIndexConverter(LayerId layerId, DataRole role) const
 {
     auto const& attr = mStorage->getBufferAttr(layerId, role);
-    auto const& layerAttr = mStorage->getLayerAttr(layerId);
+    auto const& layerAttr = mStorage->getLayerAttr(layerId, attr.lifeCycleId);
     int scale = mStorage->mSlotToPageIndices.at(attr.lifeCycleId).at(attr.poolIndex);
     int offset = exactDiv(static_cast<int>(attr.offset), static_cast<int>(attr.size));
     int scratchPages = layerAttr.slotUtil.at(attr.poolIndex);
@@ -800,16 +801,32 @@ std::vector<LayerId> KvCacheManager::layerIds() const
 
 LayerGroupId KvCacheManager::getLayerGroupId(LayerId layerId) const
 {
-    return mStorage->layerToLifeCycleIds().at(layerId);
+    auto const& lifeCycles = mStorage->layerToLifeCycleIds().at(layerId);
+    if (lifeCycles.size() != 1)
+    {
+        throw std::invalid_argument("Layer " + std::to_string(layerId) + " has buffers in "
+            + std::to_string(lifeCycles.size())
+            + " layer groups because its buffers use different reuse policies; look up its layer group per "
+              "buffer with getLayerGroupId(layerId, role)");
+    }
+    return lifeCycles.front();
+}
+
+LayerGroupId KvCacheManager::getLayerGroupId(LayerId layerId, DataRole const& role) const
+{
+    return mStorage->getBufferAttr(layerId, role).lifeCycleId;
 }
 
 TypedVec<LayerGroupId, std::vector<LayerId>> KvCacheManager::layerGrouping() const
 {
     LifeCycleId numLc = mLifeCycles.size();
     TypedVec<LayerGroupId, std::vector<LayerId>> result(numLc);
-    for (auto const& [lid, lc] : mStorage->layerToLifeCycleIds())
+    for (auto const& [lid, lifeCycles] : mStorage->layerToLifeCycleIds())
     {
-        result.at(lc).push_back(lid);
+        for (auto const lc : lifeCycles)
+        {
+            result.at(lc).push_back(lid);
+        }
     }
     return result;
 }

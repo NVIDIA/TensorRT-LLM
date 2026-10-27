@@ -46,15 +46,25 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, int tokensPerBlock)
         layer);
 }
 
+LifeCycle makeLifeCycle(LayerConfig const& layer, BufferConfig const& buffer, int tokensPerBlock)
+{
+    LifeCycle lc = makeLifeCycle(layer, tokensPerBlock);
+    // Attention layers reject buffer policies that differ from the layer's, so only SSM lifecycles change here.
+    if (auto* ssm = std::get_if<SsmLifeCycle>(&lc))
+    {
+        ssm->reusePolicy = buffer.effectiveReusePolicy(ssm->reusePolicy);
+    }
+    return lc;
+}
+
 // ---------------------------------------------------------------------------
 // LifeCycleRegistry
 // ---------------------------------------------------------------------------
 
 LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
 {
-    for (auto const& layer : config.layers)
+    auto const registerLifeCycle = [this](LifeCycle const& lc)
     {
-        LifeCycle lc = makeLifeCycle(layer, config.tokensPerBlock);
         if (mLifeCycleIdMap.find(lc) == mLifeCycleIdMap.end())
         {
             check();
@@ -63,6 +73,19 @@ LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
             mLifeCycleIdMap[lc] = id;
             if (std::holds_alternative<SsmLifeCycle>(lc))
                 mSsmLifeCycleIds.push_back(id);
+        }
+    };
+    for (auto const& layer : config.layers)
+    {
+        auto const& buffers = layerBuffers(layer);
+        // A layer without buffers registers its layer-level lifecycle.
+        if (buffers.empty())
+        {
+            registerLifeCycle(makeLifeCycle(layer, config.tokensPerBlock));
+        }
+        for (auto const& buffer : buffers)
+        {
+            registerLifeCycle(makeLifeCycle(layer, buffer, config.tokensPerBlock));
         }
     }
     check();

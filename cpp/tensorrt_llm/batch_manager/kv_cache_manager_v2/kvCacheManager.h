@@ -285,9 +285,16 @@ public:
     int numLayers() const noexcept;
 
     std::vector<LayerId> layerIds() const;
-    LayerGroupId getLayerGroupId(LayerId layerId) const;
 
-    // Layer grouping: layers with the same lifecycle share pool allocation.
+    // Layer group of every buffer of a layer. Throws std::invalid_argument when the layer's SSM
+    // buffers use different reuse policies and therefore span several layer groups; look up such a
+    // layer per buffer with getLayerGroupId(layerId, role).
+    LayerGroupId getLayerGroupId(LayerId layerId) const;
+    // Layer group of one buffer. Throws std::out_of_range for an unknown buffer.
+    LayerGroupId getLayerGroupId(LayerId layerId, DataRole const& role) const;
+
+    // Layer grouping: layers with the same lifecycle share pool allocation. A layer whose
+    // buffers span several layer groups is listed under each of them.
     // NOTE: the iteration order of the layer lists (and of the groups) is NOT
     // part of the API contract and may differ across backends/runs. Do not rely
     // on it to infer buffer/pool memory order — query poolGroupDescs()

@@ -1722,15 +1722,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "may name a layer that named nothing.") DEF_COPY(kv::SparseCacheConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int>(), nb::arg("role"), nb::arg("size"),
+        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<kv::ReusePolicy>>(), nb::arg("role"), nb::arg("size"),
             nb::arg("tokens_per_block_override") = std::nullopt, nb::arg("is_sparse") = false,
-            nb::arg("coalescing_group") = 0, nb::arg("sparse_unit_chunks") = 1)
+            nb::arg("coalescing_group") = 0, nb::arg("sparse_unit_chunks") = 1, nb::arg("reuse_policy") = std::nullopt)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
         .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)
         .def_rw("is_sparse", &kv::BufferConfig::isSparse)
         .def_rw("coalescing_group", &kv::BufferConfig::coalescingGroup)
-        .def_rw("sparse_unit_chunks", &kv::BufferConfig::sparseUnitChunks) DEF_COPY(kv::BufferConfig);
+        .def_rw("sparse_unit_chunks", &kv::BufferConfig::sparseUnitChunks)
+        .def_rw("reuse_policy", &kv::BufferConfig::reusePolicy) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
         .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>,
@@ -3664,7 +3665,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("layer_ids", &kv::KvCacheManager::layerIds)
         .def_prop_ro(
             "layer_grouping", [](kv::KvCacheManager const& self) { return self.layerGrouping().raw(); },
-            "Layers grouped by shared lifecycle/pool allocation. The iteration order of the "
+            "Layers grouped by shared lifecycle/pool allocation. A layer whose buffers span several "
+            "layer groups is listed under each of them. The iteration order of the "
             "layer lists (and of the groups) is NOT an API contract and may differ across "
             "backends/runs; do not rely on it for buffer/pool memory order -- use "
             "pool_group_descs (PoolGroupDesc.pools[i].base_address + coalesced_buffers) instead.")
@@ -3672,6 +3674,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "get_layer_group_id",
             [](kv::KvCacheManager const& self, kv::LayerId layerId) { return self.getLayerGroupId(layerId).value(); },
             nb::arg("layer_id"))
+        .def(
+            "get_layer_group_id",
+            [](kv::KvCacheManager const& self, kv::LayerId layerId, kv::DataRole const& role)
+            { return self.getLayerGroupId(layerId, role).value(); },
+            nb::arg("layer_id"), nb::arg("role"), "Layer group of one buffer of the layer.")
         .def(
             "get_sparse_cache_max_units",
             [](kv::KvCacheManager const& self, kv::LayerId layerId)

@@ -153,3 +153,90 @@ def test_ssm_layer_reuse_policies(length, select_optional):
         for cache in reversed(caches):
             cache.close()
         manager.shutdown()
+
+
+@pytest.mark.parametrize("length", [7, 8])
+def test_ssm_buffer_reuse_policies(length):
+    replay = kv.BufferConfig(role="old_x", size=2048, reuse_policy=kv.ReusePolicy.PRIVATE)
+    assert replay.reuse_policy == kv.ReusePolicy.PRIVATE
+    assert kv.BufferConfig(role="state", size=4096).reuse_policy is None
+    layers = [
+        kv.AttentionLayerConfig(layer_id=0, buffers=[kv.BufferConfig(role="key", size=4096)]),
+        *[
+            kv.SsmLayerConfig(
+                layer_id=i,
+                buffers=[
+                    kv.BufferConfig(role="state", size=4096),
+                    kv.BufferConfig(role="conv", size=4096),
+                    kv.BufferConfig(role="old_x", size=2048, reuse_policy=kv.ReusePolicy.PRIVATE),
+                ],
+            )
+            for i in (1, 2)
+        ],
+    ]
+    config = kv.KVCacheManagerConfig(
+        tokens_per_block=4,
+        cache_tiers=[kv.GpuCacheTierConfig(quota=8 << 20)],
+        layers=layers,
+        commit_min_snapshot=True,
+    )
+    assert config.layers[1].buffers[2].reuse_policy == kv.ReusePolicy.PRIVATE
+    manager = kv.KVCacheManager(config)
+    stream = torch.cuda.Stream()
+    tokens = list(range(length))
+    caches = []
+    try:
+        required = manager.get_layer_group_id(1, "state")
+        private = manager.get_layer_group_id(layer_id=1, role="old_x")
+        assert required != private
+        assert manager.get_layer_group_id(2, "conv") == required
+        assert manager.get_layer_group_id(2, "old_x") == private
+        assert manager.get_layer_group_id(0) == manager.get_layer_group_id(0, "key")
+        for layer_id in (1, 2):
+            with pytest.raises(ValueError, match="layer groups"):
+                manager.get_layer_group_id(layer_id)
+        assert manager.num_layers == 3
+        assert sorted(manager.layer_ids) == [0, 1, 2]
+        assert sorted(manager.layer_grouping[required]) == [1, 2]
+        assert sorted(manager.layer_grouping[private]) == [1, 2]
+
+        source = manager.create_kv_cache(input_tokens=[])
+        caches.append(source)
+        assert source.resume(stream.cuda_stream)
+        assert source.resize(length)
+        source.commit(tokens, is_end=True)
+        source.close()
+        reader = manager.create_kv_cache(input_tokens=tokens)
+        caches.append(reader)
+        assert reader.num_committed_tokens == length
+        assert reader.reuse_status[required].complete
+        assert not reader.reuse_status[private].complete
+        assert reader.resume(stream.cuda_stream)
+        indices = [reader.get_ssm_block_base_index(group) for group in (required, private)]
+        assert all(index >= 0 for index in indices)
+        reader.suspend()
+        assert reader.resume(stream.cuda_stream)
+        assert indices == [reader.get_ssm_block_base_index(group) for group in (required, private)]
+    finally:
+        for cache in reversed(caches):
+            cache.close()
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("policy", [kv.ReusePolicy.PRIVATE, kv.ReusePolicy.OPTIONAL])
+def test_attention_buffer_reuse_policy_must_match_layer(policy):
+    def make_config(buffer_policy):
+        return kv.KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[kv.GpuCacheTierConfig(quota=4 << 20)],
+            layers=[
+                kv.AttentionLayerConfig(
+                    layer_id=0,
+                    buffers=[kv.BufferConfig(role="key", size=4096, reuse_policy=buffer_policy)],
+                )
+            ],
+        )
+
+    make_config(kv.ReusePolicy.REQUIRED)
+    with pytest.raises(ValueError, match="only supported for SSM layers"):
+        make_config(policy)

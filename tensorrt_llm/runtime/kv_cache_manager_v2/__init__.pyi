@@ -320,6 +320,8 @@ class BufferConfig:
     is_sparse: bool = False
     coalescing_group: int = 0
 
+    reuse_policy: ReusePolicy | None = None
+
     sparse_unit_chunks: int = 1
     """Pieces a selection unit is gathered from within *this buffer's* page.
 
@@ -425,8 +427,9 @@ class AttentionLayerConfig:
 
 @dataclass(slots=True)
 class SsmLayerConfig:
-    """Recurrent buffers sharing a layer-level reuse policy.
+    """Recurrent buffers with a layer-level default reuse policy.
 
+    A buffer's ``reuse_policy`` overrides the default for that buffer.
     OPTIONAL state is restored only when selected on first resume at the exact
     matched endpoint. The caller initializes or reconstructs all fresh state.
     """
@@ -1852,7 +1855,12 @@ class KVCacheManager:
     def num_layers(self) -> int: ...
     @property
     def layer_ids(self) -> Iterator[LayerId]: ...
+    # Raises ValueError when the layer's buffers span several layer groups.
+    @overload
     def get_layer_group_id(self, layer_id: LayerId) -> LayerGroupId: ...
+    @overload
+    def get_layer_group_id(self, layer_id: LayerId, role: DataRole) -> LayerGroupId: ...
+    # A layer whose buffers span several layer groups is listed under each of them.
     @property
     def layer_grouping(self) -> Sequence[Sequence[LayerId]]: ...
     @property

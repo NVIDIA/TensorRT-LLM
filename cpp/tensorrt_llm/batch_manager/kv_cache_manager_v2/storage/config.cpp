@@ -86,23 +86,27 @@ std::map<BufferId, BufferAttr> StorageConfig::bufferAttributes() const
     return ret;
 }
 
-std::unordered_map<LayerId, LifeCycleId> StorageConfig::layerToLifeCycleIds() const
+std::unordered_map<LayerId, std::vector<LifeCycleId>> StorageConfig::layerToLifeCycleIds() const
 {
-    std::unordered_map<LayerId, LifeCycleId> map;
+    std::unordered_map<LayerId, std::vector<LifeCycleId>> map;
     for (auto const& [bufId, attr] : bufferAttributes())
     {
-        auto [it, inserted] = map.emplace(bufId.layerId, attr.lifeCycleId);
-        if (!inserted)
+        auto& ids = map[bufId.layerId];
+        if (std::find(ids.begin(), ids.end(), attr.lifeCycleId) == ids.end())
         {
-            TLLM_CHECK_DEBUG(it->second == attr.lifeCycleId);
+            ids.push_back(attr.lifeCycleId);
         }
+    }
+    for (auto& [layerId, ids] : map)
+    {
+        std::sort(ids.begin(), ids.end());
     }
     return map;
 }
 
-std::map<LayerId, LayerAttr> StorageConfig::layerAttributes() const
+std::map<LayerLifeCycleKey, LayerAttr> StorageConfig::layerAttributes() const
 {
-    std::map<LayerId, LayerAttr> ret;
+    std::map<LayerLifeCycleKey, LayerAttr> ret;
     for (auto const& pg : slotDescList)
     {
         for (auto const& variant : pg.variants)
@@ -121,17 +125,17 @@ std::map<LayerId, LayerAttr> StorageConfig::layerAttributes() const
 
                 for (auto const& [layerId, count] : slotUtilPerLayer)
                 {
-                    auto it = ret.find(layerId);
+                    LayerLifeCycleKey const key{layerId, lcId};
+                    auto it = ret.find(key);
                     if (it == ret.end())
                     {
                         LayerAttr attr;
                         attr.lifeCycleId = lcId;
                         attr.slotUtil.resize(variant.coalescedBuffers.size(), 0);
                         attr.slotUtilFracMax = Rational{0, 1};
-                        it = ret.emplace(layerId, std::move(attr)).first;
+                        it = ret.emplace(key, std::move(attr)).first;
                     }
                     auto& attr = it->second;
-                    TLLM_CHECK_DEBUG(attr.lifeCycleId == lcId);
                     attr.slotUtil[poolIndex] = count;
                     Rational frac{count, buffersPerSlot};
                     if (frac > attr.slotUtilFracMax)
@@ -167,24 +171,18 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
 
     for (auto const& layer : config.layers)
     {
-        LifeCycle lc = makeLifeCycle(layer, tokensPerBlock);
-        LifeCycleId lcId = registry.getId(lc);
+        LayerId const layerId = std::visit([](auto const& cfg) { return cfg.layerId; }, layer);
+        for (auto const& buf : layerBuffers(layer))
+        {
+            LifeCycleId const lcId = registry.getId(makeLifeCycle(layer, buf, tokensPerBlock));
+            int tpbo = buf.tokensPerBlockOverride.value_or(tokensPerBlock);
+            int exp = exactDiv(tokensPerBlock, tpbo);
+            size_t expandedSize = buf.size * static_cast<size_t>(exp);
 
-        std::visit(
-            [&](auto const& cfg)
-            {
-                for (auto const& buf : cfg.buffers)
-                {
-                    int tpbo = buf.tokensPerBlockOverride.value_or(tokensPerBlock);
-                    int exp = exactDiv(tokensPerBlock, tpbo);
-                    size_t expandedSize = buf.size * static_cast<size_t>(exp);
-
-                    BufferId bid{cfg.layerId, buf.role};
-                    expansionMap[bid] = exp;
-                    bufferGroups[lcId][{buf.coalescingGroup, expandedSize, buf.isSparse}].push_back(bid);
-                }
-            },
-            layer);
+            BufferId bid{layerId, buf.role};
+            expansionMap[bid] = exp;
+            bufferGroups[lcId][{buf.coalescingGroup, expandedSize, buf.isSparse}].push_back(bid);
+        }
     }
 
     // Build one SlotDescVariant per life cycle.

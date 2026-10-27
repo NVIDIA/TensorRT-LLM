@@ -23,7 +23,9 @@
 
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <variant>
+#include <vector>
 
 namespace
 {
@@ -167,6 +169,97 @@ TEST(KvCacheManagerV2ConfigTest, SparseBuffersCoalesceBySize)
     // tokensPerBlockOverride is the index converter's, and a sparse buffer does not use it.
     EXPECT_EQ(first.expansion, 1);
     EXPECT_EQ(second.expansion, 1);
+}
+
+TEST(KvCacheManagerV2ConfigTest, AttentionBuffersMustUseTheirLayerReusePolicy)
+{
+    auto config = makeConfig();
+    auto& buffer = std::get<AttentionLayerConfig>(config.layers.front()).buffers.front();
+    buffer.reusePolicy = ReusePolicy::REQUIRED;
+    EXPECT_NO_THROW(config.validate());
+    EXPECT_NO_THROW(createStorageConfig(config));
+    for (auto const policy : {ReusePolicy::PRIVATE, ReusePolicy::OPTIONAL})
+    {
+        buffer.reusePolicy = policy;
+        EXPECT_THROW(config.validate(), std::invalid_argument);
+        EXPECT_THROW(createStorageConfig(config), std::invalid_argument);
+    }
+}
+
+TEST(KvCacheManagerV2ConfigTest, SsmBufferReusePoliciesSplitLayerLifecycles)
+{
+    auto config = makeTieredConfig();
+    config.commitMinSnapshot = true;
+    for (LayerId layerId = 1; layerId <= 2; ++layerId)
+    {
+        config.layers.push_back(SsmLayerConfig{.layerId = layerId,
+            .buffers = {BufferConfig{.role = "state", .size = 4096},
+                BufferConfig{.role = "replay", .size = 2048, .reusePolicy = ReusePolicy::PRIVATE},
+                BufferConfig{.role = "draft", .size = 2048, .reusePolicy = ReusePolicy::OPTIONAL}}});
+    }
+    // A layer-level PRIVATE layer shares the lifecycle of PRIVATE buffer overrides.
+    config.layers.push_back(SsmLayerConfig{
+        .layerId = 3, .buffers = {BufferConfig{.role = "replay", .size = 2048}}, .reusePolicy = ReusePolicy::PRIVATE});
+    ASSERT_NO_THROW(config.validate());
+
+    LifeCycleRegistry const registry(config);
+    auto const storage = createStorageConfig(config);
+    auto const attributes = storage.bufferAttributes();
+    auto lifeCycle = [&](LayerId layerId, DataRole const& role) {
+        return attributes.at(BufferId{layerId, role}).lifeCycleId;
+    };
+    auto const required = lifeCycle(1, "state");
+    auto const privateLc = lifeCycle(1, "replay");
+    auto const optional = lifeCycle(1, "draft");
+
+    // Lifecycles are registered in buffer order, after the attention layer's.
+    EXPECT_EQ(registry.size(), LifeCycleId{4});
+    EXPECT_EQ(storage.numLifeCycles(), LifeCycleId{4});
+    EXPECT_EQ(required, LifeCycleId{1});
+    EXPECT_EQ(privateLc, LifeCycleId{2});
+    EXPECT_EQ(optional, LifeCycleId{3});
+    EXPECT_EQ(registry.ssmLifeCycleIds(), (std::vector<LifeCycleId>{required, privateLc, optional}));
+    EXPECT_EQ(registry.requiredSsmLifeCycleId(), required);
+    EXPECT_EQ(std::get<SsmLifeCycle>(registry[privateLc]).reusePolicy, ReusePolicy::PRIVATE);
+    EXPECT_EQ(std::get<SsmLifeCycle>(registry[optional]).reusePolicy, ReusePolicy::OPTIONAL);
+    EXPECT_EQ(lifeCycle(2, "state"), required);
+    EXPECT_EQ(lifeCycle(2, "replay"), privateLc);
+    EXPECT_EQ(lifeCycle(2, "draft"), optional);
+    EXPECT_EQ(lifeCycle(3, "replay"), privateLc);
+
+    auto const layerLifeCycles = storage.layerToLifeCycleIds();
+    EXPECT_EQ(layerLifeCycles.size(), 4U);
+    EXPECT_EQ(layerLifeCycles.at(0), (std::vector<LifeCycleId>{LifeCycleId{0}}));
+    EXPECT_EQ(layerLifeCycles.at(1), (std::vector<LifeCycleId>{required, privateLc, optional}));
+    EXPECT_EQ(layerLifeCycles.at(2), (std::vector<LifeCycleId>{required, privateLc, optional}));
+    EXPECT_EQ(layerLifeCycles.at(3), (std::vector<LifeCycleId>{privateLc}));
+
+    auto const grouping = storage.lifeCycleGrouping();
+    EXPECT_NE(grouping[required], grouping[privateLc]);
+    EXPECT_NE(grouping[required], grouping[optional]);
+    EXPECT_NE(grouping[privateLc], grouping[optional]);
+
+    // Slot utilization is tracked per (layer, lifecycle): every SSM layer owns one buffer in each
+    // slot of the lifecycles it uses.
+    auto const layerAttributes = storage.layerAttributes();
+    EXPECT_EQ(layerAttributes.size(), 8U);
+    EXPECT_EQ(layerAttributes.count({3, required}), 0U);
+    for (LayerId layerId : {1, 2, 3})
+    {
+        for (auto const lc : {required, privateLc, optional})
+        {
+            if (layerId == 3 && lc != privateLc)
+            {
+                continue;
+            }
+            SCOPED_TRACE(std::to_string(layerId) + "/" + std::to_string(lc.value()));
+            auto const& attr = layerAttributes.at({layerId, lc});
+            EXPECT_EQ(attr.lifeCycleId, lc);
+            ASSERT_EQ(attr.slotUtil.size(), PoolIndex{1});
+            EXPECT_EQ(attr.slotUtil[PoolIndex{0}], 1);
+            EXPECT_EQ(attr.slotUtilFracMax, (Rational{1, lc == privateLc ? 3 : 2}));
+        }
+    }
 }
 
 } // namespace
