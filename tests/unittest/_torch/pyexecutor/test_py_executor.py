@@ -61,7 +61,6 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
-from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 from tensorrt_llm.llmapi import DisaggScheduleStyle
@@ -4624,51 +4623,3 @@ def test_first_token_response_carries_the_prefill_logits(monkeypatch, overlap):
         assert py_result.generation_logits is None
         py_result.append_generation_logits(first_logits + 10)  # the next decode step lands
         assert torch.equal(response.result.generation_logits, first_logits.transpose(0, 1))
-
-
-@pytest.mark.parametrize("table_value", [0.0, 1.0])
-@pytest.mark.parametrize("extra_ids", [None, [1, 1, 0]])
-@pytest.mark.parametrize("v2", [False, True])
-@pytest.mark.parametrize(
-    "request_type",
-    [
-        RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION,
-        RequestType.REQUEST_TYPE_CONTEXT_ONLY,
-        RequestType.REQUEST_TYPE_GENERATION_ONLY,
-    ],
-)
-def test_prompt_tuning_rejected_at_admission_with_valid_peers(
-    table_value, request_type, extra_ids, v2
-):
-    # Equal virtual IDs and extra IDs must never make either table eligible for
-    # model execution or KV reuse. Exercise the native pickle transport first.
-    import pickle
-
-    from tensorrt_llm._torch.pyexecutor.llm_request import executor_request_to_llm_request
-
-    source = trtllm.Request(
-        input_token_ids=[100, 101, 1],
-        max_tokens=2,
-        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
-        type=request_type,
-        prompt_tuning_config=trtllm.PromptTuningConfig(torch.full((2, 8), table_value), extra_ids),
-    )
-    restored = pickle.loads(pickle.dumps(source))
-    request = executor_request_to_llm_request(42, restored, [43], False)
-    valid = _make_admission_request(44)
-    executor = _make_admission_executor(None, [request, *request.child_requests, valid])
-    executor._is_kv_manager_v2 = v2
-
-    assert request.orig_prompt_len == 3
-    assert request.child_requests[0].orig_prompt_len == 3
-    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
-
-    assert admitted == [valid]
-    assert executor.active_requests == [valid]
-    assert executor._handle_errors.call_count == 2
-    for call, rejected in zip(
-        executor._handle_errors.call_args_list, [request, *request.child_requests]
-    ):
-        assert "Prompt tuning is not supported" in call.args[0]
-        assert call.kwargs == {"requests": [rejected], "charge_budget": False}
-    executor._validate_request_budget.assert_called_once_with(valid)

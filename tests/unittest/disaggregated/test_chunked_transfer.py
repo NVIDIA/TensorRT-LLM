@@ -642,7 +642,7 @@ def test_pipelined_transfer_requires_gen_first_flow():
     executor._validate_token_id_range = MagicMock()
     executor.sampler.validate_request = MagicMock()
 
-    request = MagicMock(kv_cache_retention_config=None, py_prompt_tuning=False)
+    request = MagicMock(kv_cache_retention_config=None)
     request.sampling_config = None
     request.py_beam_width = 1
     request.llm_request_type = LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
@@ -668,7 +668,7 @@ def test_pipelined_transfer_requires_chunked_prefill():
         attn_runtime_features=SimpleNamespace(chunked_prefill=False)
     )
 
-    request = MagicMock(kv_cache_retention_config=None, py_prompt_tuning=False)
+    request = MagicMock(kv_cache_retention_config=None)
     request.llm_request_type = LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
     request.py_disaggregated_params = SimpleNamespace(
         schedule_style=DisaggScheduleStyle.GENERATION_FIRST
@@ -690,7 +690,7 @@ def test_pipelined_transfer_rejects_pipeline_parallelism_for_context_request():
     executor.model_engine.attn_runtime_features.chunked_prefill = True
     executor.dist.pp_size = 2
 
-    request = MagicMock(kv_cache_retention_config=None, py_prompt_tuning=False)
+    request = MagicMock(kv_cache_retention_config=None)
     request.py_beam_width = 1
     request.llm_request_type = LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
     request.py_disaggregated_params = SimpleNamespace(
@@ -723,7 +723,7 @@ def test_pipelined_transfer_requires_single_beam_for_context_request():
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
     executor.model_engine.attn_runtime_features.chunked_prefill = True
 
-    request = MagicMock(kv_cache_retention_config=None, py_prompt_tuning=False)
+    request = MagicMock(kv_cache_retention_config=None)
     request.py_beam_width = 2
     request.llm_request_type = LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
     request.is_context_only_request = True
@@ -746,7 +746,7 @@ def test_pipelined_transfer_allows_non_disaggregated_request():
     executor._validate_token_id_range = MagicMock()
     executor.sampler.validate_request = MagicMock()
 
-    request = MagicMock(kv_cache_retention_config=None, py_prompt_tuning=False)
+    request = MagicMock(kv_cache_retention_config=None)
     request.sampling_config = None
     request.py_beam_width = 1
     request.llm_request_type = LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
@@ -771,7 +771,7 @@ def test_pipelined_transfer_allows_generation_only_request():
     executor._validate_token_id_range = MagicMock()
     executor.sampler.validate_request = MagicMock()
 
-    request = MagicMock(kv_cache_retention_config=None, py_prompt_tuning=False)
+    request = MagicMock(kv_cache_retention_config=None)
     request.sampling_config = None
     request.py_beam_width = 2
     request.llm_request_type = LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY

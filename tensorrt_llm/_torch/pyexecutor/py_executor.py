@@ -7119,9 +7119,6 @@ class PyExecutor:
         request.py_csa2_remote_tail_split = split
 
     def _validate_request(self, request: LlmRequest):
-        if getattr(request, "py_prompt_tuning", False):
-            raise ValueError(
-                "Prompt tuning is not supported by the PyTorch executor.")
         self._configure_csa2_remote_tail(request)
         retention = request.kv_cache_retention_config
         if self._is_kv_manager_v2 and retention is not None:

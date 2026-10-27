@@ -610,7 +610,6 @@ public:
     /// @param badWords A list of bad words tokens. Each "word" can be composed of multiple tokens
     /// @param stopWords A list of stop words tokens. Each "word" can be composed of multiple tokens
     /// @param embeddingBias The embedding bias tensor. Expected shape is [vocab_size]
-    /// @param pTuningConfig The prompt tuning configuration
     /// @param multimodalInput The multimodal input {multimodalHashes, multimodalPositions, multimodalLengths, optional
     /// exact prompt runs}
     /// @param mRopeConfig The mrope configuration
@@ -641,7 +640,6 @@ public:
         std::optional<std::list<VecTokens>> badWords = std::nullopt,
         std::optional<std::list<VecTokens>> stopWords = std::nullopt,
         std::optional<Tensor> embeddingBias = std::nullopt,
-        std::optional<PromptTuningConfig> pTuningConfig = std::nullopt,
         std::optional<MultimodalInput> multimodalInput = std::nullopt,
         std::optional<MropeConfig> mRopeConfig = std::nullopt, std::optional<LoraConfig> loraConfig = std::nullopt,
         std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
@@ -672,7 +670,6 @@ public:
     [[nodiscard]] std::optional<std::list<VecTokens>> getBadWords() const;
     [[nodiscard]] std::optional<std::list<VecTokens>> getStopWords() const;
     [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const;
-    [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const;
     [[nodiscard]] std::optional<MultimodalInput> getMultimodalInput() const;
     [[nodiscard]] std::optional<MropeConfig> getMropeConfig() const;
     [[nodiscard]] std::optional<LoraConfig> getLoraConfig() const;
@@ -699,7 +696,6 @@ public:
     void setBadWords(std::list<VecTokens> const& badWords);
     void setStopWords(std::list<VecTokens> const& stopWords);
     void setEmbeddingBias(Tensor const& embeddingBias);
-    void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig);
     void setMultimodalInput(MultimodalInput const& multimodalInput);
     void setMropeConfig(MropeConfig const& mRopeConfig);
     void setLoraConfig(LoraConfig const& loraConfig);

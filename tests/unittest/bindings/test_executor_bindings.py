@@ -288,7 +288,6 @@ def test_request():
         "bad_words": [[4, 5, 6]],
         "stop_words": [[7, 8, 9]],
         "embedding_bias": torch.ones(1),
-        "prompt_tuning_config": trtllm.PromptTuningConfig(torch.ones(100, 64)),
         "lora_config": trtllm.LoraConfig(1),
         "client_id": 1234,
     }
@@ -302,10 +301,10 @@ def test_request():
                 assert attr_value == v
     assert isinstance(request.sampling_config, trtllm.SamplingConfig)
     assert isinstance(request.output_config, trtllm.OutputConfig)
-    assert isinstance(request.prompt_tuning_config, trtllm.PromptTuningConfig)
-    assert (request.prompt_tuning_config.embedding_table == torch.ones(
-        100, 64)).all()
     assert isinstance(request.lora_config, trtllm.LoraConfig)
+    assert not hasattr(request, "prompt_tuning_config")
+    with pytest.raises(TypeError, match="incompatible function arguments"):
+        trtllm.Request(**kwargs, prompt_tuning_config=None)
 
 
 def test_result():
@@ -1036,7 +1035,10 @@ def test_request_pickle():
                              max_tokens=5,
                              streaming=False,
                              client_id=123,
-                             sampling_config=samplingConfig)
+                             sampling_config=samplingConfig,
+                             cache_salt="request-pickle",
+                             priority=0.75,
+                             disagg_request_id=456)
     request_copy = pickle.loads(pickle.dumps(request))
 
     assert request.sampling_config.beam_width == request_copy.sampling_config.beam_width
@@ -1048,3 +1050,7 @@ def test_request_pickle():
     assert request.output_config.return_log_probs == request_copy.output_config.return_log_probs
     assert request.guided_decoding_params == request_copy.guided_decoding_params
     assert request.kv_cache_retention_config == request_copy.kv_cache_retention_config
+    assert request_copy.client_id == 123
+    assert request_copy.priority == 0.75
+    assert request_copy.disagg_request_id == 456
+    assert request_copy.cache_salt == "request-pickle"

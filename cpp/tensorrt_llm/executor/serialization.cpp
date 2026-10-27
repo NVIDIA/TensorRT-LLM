@@ -755,7 +755,6 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto badWords = su::deserialize<std::optional<std::list<VecTokens>>>(is);
     auto stopWords = su::deserialize<std::optional<std::list<VecTokens>>>(is);
     auto embeddingBias = su::deserialize<std::optional<Tensor>>(is);
-    auto pTuningConfig = su::deserialize<std::optional<PromptTuningConfig>>(is);
     auto multimodalInput = su::deserialize<std::optional<MultimodalInput>>(is);
     auto mRopeConfig = su::deserialize<std::optional<MropeConfig>>(is);
     auto loraConfig = su::deserialize<std::optional<LoraConfig>>(is);
@@ -778,9 +777,9 @@ Request Serialization::deserializeRequest(std::istream& is)
 
     return Request(std::move(inputTokenIds), maxNewTokens, streaming, samplingConfig, outputConfig, endId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
-        std::move(pTuningConfig), std::move(multimodalInput), std::move(mRopeConfig), std::move(loraConfig),
-        std::move(kvCacheRetentionConfig), std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens,
-        priority, requestType, std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
+        std::move(multimodalInput), std::move(mRopeConfig), std::move(loraConfig), std::move(kvCacheRetentionConfig),
+        std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
+        std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
         std::move(guidedDecodingParams), allottedTimeMs, disaggRequestId, std::move(cacheSalt));
 }
 

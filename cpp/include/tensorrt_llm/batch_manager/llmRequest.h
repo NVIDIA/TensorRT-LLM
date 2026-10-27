@@ -263,8 +263,6 @@ public:
             }
         }
 
-        TLLM_CHECK_WITH_INFO(
-            !req.getPromptTuningConfig().has_value(), "Prompt tuning is not supported by the PyTorch executor.");
         auto multimodalInput = req.getMultimodalInput();
         if (multimodalInput)
         {

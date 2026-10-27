@@ -130,17 +130,6 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         // No speculative decoding config, draft tokens should be empty
         EXPECT_EQ(llmReq.getNumDraftTokens(), 0);
     }
-
-    // Unsupported tables must never reach model execution or cache allocation.
-    for (int const tableValue : {0, 1})
-    {
-        texec::Request execReq(inputTokens, maxNewTokens);
-        auto embeddingTable = texec::Tensor::cpu(texec::DataType::kFP32, {4, 8});
-        std::fill_n(static_cast<float*>(embeddingTable.getData()), 32, static_cast<float>(tableValue));
-        execReq.setPromptTuningConfig(
-            texec::PromptTuningConfig(embeddingTable, VecTokenExtraIds(inputTokens.size(), 1)));
-        EXPECT_THROW(tb::LlmRequest(requestId, execReq), tc::TllmException);
-    }
 }
 
 TEST_F(LlmRequestTest, extraIdsWithoutPromptTuning)
@@ -199,19 +188,6 @@ TEST_F(LlmRequestTest, invalidExecRequest)
             llmReq.validate(500, 1000, 0);
         };
         lambdaErrMsgs.emplace_back(lambda, "beamWidth > 0");
-    }
-
-    // Invalid ptable shape
-    {
-        auto lambda = [&inputTokens, maxNewTokens, requestId]()
-        {
-            texec::Request execReq(inputTokens, maxNewTokens);
-            auto embeddingTable = texec::Tensor::cpu(texec::DataType::kFP32, {17, 32, 69});
-            texec::PromptTuningConfig config(embeddingTable);
-            execReq.setPromptTuningConfig(config);
-            tb::LlmRequest llmReq(requestId, execReq);
-        };
-        lambdaErrMsgs.emplace_back(lambda, "Expected prompt embedding table to have shape");
     }
 
     for (auto& lambdaErrMsg : lambdaErrMsgs)
