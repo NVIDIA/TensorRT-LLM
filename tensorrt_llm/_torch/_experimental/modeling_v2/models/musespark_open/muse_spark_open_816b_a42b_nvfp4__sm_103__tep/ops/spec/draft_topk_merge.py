@@ -25,6 +25,16 @@ from ``torch.topk(gathered_fp32_logits, top_k, dim=-1)`` -- values, vocab ids
   Both are exact: a bf16 widens to fp32 exactly and a bf16 * bf16 product
   fits fp32's significand, so these equal the built-in tensors bit for bit,
   and the built-in einsum over them is unchanged.
+
+With a drafter logit transform ``t`` the keys are canonical
+(``draft_shard_topk``'s ``canon``) and ``values`` is the transform's table
+(``kernels/draft_head/logit_transform.py``): ``values[key16]`` is ``t`` of the
+bf16 value of ``key16``, computed by the drafter's own method. The selection,
+the arrangement and the network above run on canonical keys and their decoded
+bf16 values unchanged, which compare as the transformed values do, so they give
+``torch.topk(t(logits))``'s ids and order; the unary values are then
+``values[key16]``, bitwise ``t`` of every candidate, since all members of a tie
+group transform to the same bits.
 """
 
 from __future__ import annotations
@@ -33,7 +43,9 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from .draft_shard_topk import CANON_ENTRIES, SHARD, radix_key16
 
 #: ``torch.topk`` sorts k <= 32 results with this many bitonic slots.
 SORT_SLOTS = 32
@@ -93,6 +105,7 @@ def _draft_topk_merge_kernel(
     unary_ptr,
     pred_out_ptr,
     succ_out_ptr,
+    values_ptr,
     rows_per_rank,
     num_ranks,
     num_keys,
@@ -110,6 +123,7 @@ def _draft_topk_merge_kernel(
     SLOTS: tl.constexpr,
     RANK_BLOCK: tl.constexpr,
     HALVES: tl.constexpr,
+    TRANSFORM: tl.constexpr,
 ):
     # Every program of a row runs the (small) merge; each gathers one RANK_BLOCK
     # slice of the codebook rows, so the gathers spread over more SMs.
@@ -194,7 +208,11 @@ def _draft_topk_merge_kernel(
     ids = result >> 16
     if part == 0:
         tl.store(ids_ptr + row * TOP_K + kk, ids)
-        tl.store(unary_ptr + row * TOP_K + kk, _decode_value(result & 0xFFFF))
+        if TRANSFORM:
+            # The drafter transform of each candidate: one table entry per tie group.
+            tl.store(unary_ptr + row * TOP_K + kk, tl.load(values_ptr + (result & 0xFFFF)))
+        else:
+            tl.store(unary_ptr + row * TOP_K + kk, _decode_value(result & 0xFFFF))
 
     # Selector operands for this row (successors) and the next one (predecessors).
     out_rows = (row * TOP_K + kk[:, None]).to(tl.int64) * rank_dim
@@ -252,15 +270,77 @@ class DraftTopKMerge(OpWrapper):
         successor_codebook    [vocab, rank] bf16, stride(-1) == 1
         top_k                 <= 32, a power of two
         num_ranks             ranks in the gather (the tensor-parallel size)
+        rank_block, num_warps launch geometry
+        values                None, or a drafter logit transform's table [65536]
+                              fp32 (key16 -> transformed value); the keys are then
+                              ``draft_shard_topk``'s canonical keys of that transform
 
     Returns ``(candidate_ids [B, K, top_k] int64, unary [B, K, top_k] fp32,
     predecessors [B, K, top_k, rank] fp32, successors [B, K, top_k, rank] fp32)``:
     ``candidate_ids`` / ``unary`` are ``torch.topk(full_logits.float(), top_k)``'s
-    indices / values, and the operands are ``dflash2_score_edges``'s
+    indices / values -- with ``values``, ``torch.topk(t(full_logits))``'s, ``t``
+    the transform -- and the operands are ``dflash2_score_edges``'s
     ``predecessors * gate.float()[:, :, None]`` and ``successors``. Exact.
     """
 
     ARCHS = frozenset({Arch.SM_103})
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            "one request at TP8, int32 all-gather keys",
+            {
+                "requests": 1,
+                "positions": 7,
+                "shard": SHARD,
+                "ranks": 8,
+                "layout": "int32",
+                "transform": None,
+            },
+        ),
+        Cell(
+            "one request at TP8, fp32 all-reduce halves",
+            {
+                "requests": 1,
+                "positions": 7,
+                "shard": SHARD,
+                "ranks": 8,
+                "layout": "halves",
+                "transform": None,
+            },
+        ),
+        Cell(
+            "one request at TP8, fp32 halves, the Muse Spark Open drafter transform",
+            {
+                "requests": 1,
+                "positions": 7,
+                "shard": SHARD,
+                "ranks": 8,
+                "layout": "halves",
+                "transform": "musespark",
+            },
+        ),
+        Cell(
+            "two requests at TP4, int32 keys, the drafter transform",
+            {
+                "requests": 2,
+                "positions": 7,
+                "shard": 2 * SHARD,
+                "ranks": 4,
+                "layout": "int32",
+                "transform": "musespark",
+            },
+        ),
+        Cell(
+            "24 requests at TP8, rank top-k halves, the drafter transform",
+            {
+                "requests": 24,
+                "positions": 7,
+                "shard": SHARD,
+                "ranks": 8,
+                "layout": "rank",
+                "transform": "musespark",
+            },
+        ),
+    )
     note = (
         "Tie order is torch 2.14's (SortUtils.cuh bitonicSort, k <= 32 -> 32 "
         "slots), which torch does not document. draft_head.install checks it "
@@ -282,6 +362,7 @@ class DraftTopKMerge(OpWrapper):
         num_ranks: int,
         rank_block: int = RANK_BLOCK,
         num_warps: int = NUM_WARPS,
+        values: torch.Tensor | None = None,
     ):
         rows = num_requests * num_positions
         halves = gathered_keys.dtype == torch.float32
@@ -307,6 +388,7 @@ class DraftTopKMerge(OpWrapper):
             unary,
             preds,
             succs,
+            unary if values is None else values,
             rows,
             num_ranks,
             num_keys,
@@ -324,6 +406,7 @@ class DraftTopKMerge(OpWrapper):
             SLOTS=SORT_SLOTS,
             RANK_BLOCK=rank_block,
             HALVES=halves,
+            TRANSFORM=values is not None,
             num_warps=num_warps,
         )
         return ids, unary, preds, succs
@@ -342,6 +425,7 @@ class DraftTopKMerge(OpWrapper):
         num_ranks: int,
         rank_block: int = RANK_BLOCK,
         num_warps: int = NUM_WARPS,
+        values: torch.Tensor | None = None,
     ):
         """``torch.topk`` over the candidates scattered into a -inf vocabulary row.
 
@@ -349,21 +433,28 @@ class DraftTopKMerge(OpWrapper):
 
         Every element outside the candidate lists is below the k-th value or
         tied with it at a higher id, so replacing it with -inf changes neither
-        the selection nor the arrangement torch sorts.
+        the selection nor the arrangement torch sorts. With ``values`` the
+        candidates carry the decoded canonical values, which order and tie as
+        the transformed values do; each selected value is then replaced by
+        ``values`` at its key16.
         """
         rows = num_requests * num_positions
         ranks = num_ranks
         if gathered_keys.dtype == torch.float32:
             gathered_keys = unpack_halves(gathered_keys, ranks)
         vocab_size = ranks * shard
-        vocab, values = _decode_keys(gathered_keys, ranks, shard)
+        vocab, decoded = _decode_keys(gathered_keys, ranks, shard)
         dense = torch.full((rows, vocab_size), float("-inf"), device=gathered_keys.device)
         row_index = torch.arange(rows, device=gathered_keys.device)[:, None].expand_as(vocab[:rows])
         for r in range(ranks):
-            ids_r, vals_r = vocab[r * rows : (r + 1) * rows], values[r * rows : (r + 1) * rows]
+            ids_r, vals_r = vocab[r * rows : (r + 1) * rows], decoded[r * rows : (r + 1) * rows]
             keep = ids_r >= 0
             dense[row_index[keep], ids_r[keep]] = vals_r[keep]
         unary, ids = torch.topk(dense, top_k, dim=-1)
+        if values is not None:
+            # Decoded canonical values are bf16-exact: their key16 indexes the table.
+            key16 = radix_key16(unary.to(torch.bfloat16).view(torch.int16))
+            unary = values.to(unary.device)[key16.long()]
         ids = ids.view(num_requests, num_positions, top_k)
         unary = unary.view(num_requests, num_positions, top_k)
         successors = successor_codebook[ids].float()
@@ -385,8 +476,20 @@ class DraftTopKMerge(OpWrapper):
         successor_codebook: torch.Tensor,
         top_k: int,
         num_ranks: int,
+        rank_block: int = RANK_BLOCK,
+        num_warps: int = NUM_WARPS,
+        values: torch.Tensor | None = None,
         **unused,
     ) -> None:
+        if values is not None and (
+            values.dtype != torch.float32
+            or tuple(values.shape) != (CANON_ENTRIES,)
+            or not values.is_contiguous()
+            or values.device != gathered_keys.device
+        ):
+            raise ValueError(
+                f"values must be a contiguous [{CANON_ENTRIES}] fp32 table on the keys' device"
+            )
         rows = num_requests * num_positions
         ranks = num_ranks
         if gathered_keys.dtype == torch.int32:

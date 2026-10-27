@@ -180,6 +180,9 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
 
     _fold_verify: bool = False
     _fold_path_walk_tail: bool = False
+    #: Its ``_apply_dflash2_selector`` applies the draft head's deferred drafter
+    #: logit transform (``draft_head.head._defers_transform``).
+    _draft_transform_aware = True
 
     # ------------------------------------------------------------------
     # The per-step state
@@ -759,6 +762,7 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             self.mapping,
             self.__dict__.get("_draft_head_allreduce"),
             walk=walk,
+            transform=self._draft_head_transform_for(gen_logits),
         )
         step.tail = _Tail(tokens, next_tokens, kv_lens is not None, batch_indices)
         if kv_lens is not None:
