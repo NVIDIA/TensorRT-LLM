@@ -19,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType,
 )
 from tensorrt_llm._torch.speculative import SpecMetadata, get_spec_metadata
+from tensorrt_llm._torch.speculative.interface import supports_sharded_target_sampling
 from tensorrt_llm.mapping import Mapping
 
 from ...metadata import build_attention_metadata
@@ -111,7 +112,7 @@ class DecoderMetadata:
         if self.spec_metadata is not None:
             return self.spec_metadata
         self.spec_metadata = create_spec_metadata(
-            self._config, self.model.config, spec_resource_manager
+            self._config, self.model.config, spec_resource_manager, self.mapping
         )
         return self.spec_metadata
 
@@ -130,6 +131,7 @@ def create_spec_metadata(
     config: DecoderRunnerConfig,
     pretrained_config: object,
     spec_resource_manager: BaseResourceManager | None,
+    mapping: Mapping | None = None,
 ) -> SpecMetadata | None:
     """Create speculative metadata sized by the runner capacities."""
     return get_spec_metadata(
@@ -140,6 +142,10 @@ def create_spec_metadata(
         spec_resource_manager=spec_resource_manager,
         max_seq_len=config.max_seq_len,
         num_seq_slots=config.num_seq_slots,
+        # The decode CUDA graphs then capture the temperature-only variant.
+        temperature_only_graphs=config.cuda_graph_config is not None
+        and config.spec_decode_fast_paths
+        and supports_sharded_target_sampling(config.spec_config, mapping),
     )
 
 

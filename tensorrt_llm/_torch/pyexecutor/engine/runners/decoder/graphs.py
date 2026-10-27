@@ -507,6 +507,7 @@ class DecoderCudaGraphs:
         enable_spec_decode: bool,
         gather_context_logits: bool,
         position_id_offsets: torch.Tensor | None,
+        static_inputs_staged: int = 0,
     ) -> Any:
         """Run the model by replaying the graph for ``key``, capturing it first if needed.
 
@@ -529,6 +530,7 @@ class DecoderCudaGraphs:
                 enable_spec_decode=enable_spec_decode,
                 gather_context_logits=gather_context_logits,
                 position_id_offsets=position_id_offsets,
+                static_inputs_staged=static_inputs_staged,
             )
 
     def _run(
@@ -544,6 +546,7 @@ class DecoderCudaGraphs:
         enable_spec_decode: bool,
         gather_context_logits: bool,
         position_id_offsets: torch.Tensor | None,
+        static_inputs_staged: int = 0,
     ) -> Any:
         breakable_runner = self.breakable_cuda_graph_runner
         if key is None:
@@ -585,7 +588,10 @@ class DecoderCudaGraphs:
                 )
                 try:
                     outputs = self.cuda_graph_runner.replay(
-                        key, inputs, position_id_offsets=position_id_offsets
+                        key,
+                        inputs,
+                        position_id_offsets=position_id_offsets,
+                        static_inputs_staged=static_inputs_staged,
                     )
                 finally:
                     restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
@@ -596,7 +602,10 @@ class DecoderCudaGraphs:
                 try:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         outputs = self.cuda_graph_runner.replay(
-                            key, inputs, position_id_offsets=position_id_offsets
+                            key,
+                            inputs,
+                            position_id_offsets=position_id_offsets,
+                            static_inputs_staged=static_inputs_staged,
                         )
                 finally:
                     restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
@@ -747,6 +756,7 @@ class DecoderCudaGraphs:
             label: str,
             force_lora_graph: bool,
             sample_type: SampleType | None = None,
+            temperature_only: bool = False,
         ) -> None:
             assert self._force_lora_graph_for_capture is None
             self._force_lora_graph_for_capture = force_lora_graph
@@ -769,6 +779,7 @@ class DecoderCudaGraphs:
                             draft_len,
                             max_seq_len,
                             force_non_greedy=force_non_greedy,
+                            temperature_only=temperature_only,
                         )
                         with self._dummy_requests.release_batch_context(
                             warmup_request, resource_manager
@@ -839,9 +850,17 @@ class DecoderCudaGraphs:
             self._config.spec_config is not None
             and self._config.spec_config.spec_dec_mode.use_one_engine()
         )
+        temperature_only_graphs = (
+            uses_own_spec_decoder
+            and self._metadata.spec_metadata is not None
+            and self._metadata.spec_metadata.temperature_only_graphs
+        )
 
         def _capture_variant(
-            label: str, force_non_greedy: bool = False, sample_type: SampleType | None = None
+            label: str,
+            force_non_greedy: bool = False,
+            sample_type: SampleType | None = None,
+            temperature_only: bool = False,
         ) -> None:
             for use_lora_graph in lora_graph_cases:
                 variant_label = label
@@ -852,6 +871,7 @@ class DecoderCudaGraphs:
                     label=variant_label,
                     force_lora_graph=use_lora_graph,
                     sample_type=sample_type,
+                    temperature_only=temperature_only,
                 )
 
         if uses_own_spec_decoder:
@@ -864,6 +884,13 @@ class DecoderCudaGraphs:
             # needs no override while the advanced one has to force the flag.
             _capture_variant("greedy")
             _capture_variant("advanced sampling", force_non_greedy=True)
+            if temperature_only_graphs:
+                # Temperature-only batches replay the vocabulary-sharded Gumbel-max
+                # target sampling (the advanced pass records the stock sampler: its
+                # params enable top-k / top-p / min-p).
+                _capture_variant(
+                    "temperature-only sampling", force_non_greedy=True, temperature_only=True
+                )
         else:
             # TorchSampler branch: FULL carries no sampling in the graph and is
             # what every batch replays unless in-graph sampling is enabled, so it
@@ -886,6 +913,7 @@ class DecoderCudaGraphs:
         # This is a defensive guard.
         if self._metadata.spec_metadata is not None:
             self._metadata.spec_metadata.is_all_greedy_sample = True
+            self._metadata.spec_metadata.temperature_only = False
 
     def _capture_prefill_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm up and capture prefill CUDA graphs, timing each phase separately.

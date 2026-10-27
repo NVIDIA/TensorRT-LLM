@@ -80,6 +80,20 @@ from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
 
+def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
+    """``spec_decode_fast_paths`` of the one-engine speculative language model
+    (the model itself, or a multimodal model's language model); False for any
+    other model."""
+    from ..models.modeling_speculative import SpecDecOneEngineForCausalLM
+    if isinstance(model, MultimodalModelMixin):
+        try:
+            model = model.language_model
+        except NotImplementedError:
+            return False
+    return (isinstance(model, SpecDecOneEngineForCausalLM)
+            and model.spec_decode_fast_paths)
+
+
 class ModelEngine(ABC):
 
     @abstractmethod
@@ -311,6 +325,7 @@ class PyTorchModelEngine(ModelEngine):
                 self.moe_load_balancer = moe_load_balancer
         else:
             self.model = model
+        self.spec_decode_fast_paths = _spec_decode_fast_paths(self.model)
         self._validate_breakable_cuda_graph_compatibility()
 
     def _init_from_model(self) -> None:
@@ -743,6 +758,7 @@ class PyTorchModelEngine(ModelEngine):
             cuda_graph_specialize_lora=(
                 self.llm_args.lora_config is not None
                 and self.llm_args.lora_config.cuda_graph_specialize_lora),
+            spec_decode_fast_paths=self.spec_decode_fast_paths,
             **extra_fields,
         )
 

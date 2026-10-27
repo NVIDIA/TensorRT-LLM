@@ -12,11 +12,13 @@ import torch
 from torch import nn
 
 import tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.breakable_cuda_graph as bcg
+from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
     break_graph,
     eager_on_graph,
+    is_in_breakable_cuda_graph,
 )
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.breakable_cuda_graph import _copy_output
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import (
@@ -24,10 +26,16 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import (
     BreakableCUDAGraphRunnerState,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInputs
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.utils import make_weak_ref
+from tensorrt_llm._torch.utils import (
+    get_per_request_prefill_cuda_graph_flag,
+    make_weak_ref,
+    set_per_request_prefill_cuda_graph_flag,
+)
+from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
@@ -429,3 +437,175 @@ def test_runner_warmup_exception_restores_idle_state():
     with pytest.raises(ValueError, match="expected"):
         runner.warmup(fail)
     assert runner.state == BreakableCUDAGraphRunnerState.IDLE
+
+
+def test_runner_flag_covers_the_whole_forward():
+    """Code outside the captured body sees the BCG flag in warmup, capture and replay alike."""
+    body = _Body().cuda()
+    runner = BreakableCUDAGraphRunner(body)
+    inputs = {"value": torch.zeros((4, 4), device="cuda")}
+    seen = []
+
+    def engine_forward():
+        seen.append(is_in_breakable_cuda_graph())
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(inputs["value"]))
+        return body(inputs["value"])
+
+    runner.capture(4, engine_forward)
+    runner.execute(4, engine_forward)
+    torch.cuda.synchronize()
+    assert len(seen) == BreakableCUDAGraphRunner._WARMUP_STEPS + 2 and all(seen)
+    assert not is_in_breakable_cuda_graph()
+
+
+def test_runner_smaller_bucket_output_does_not_alias_shared_output():
+    """A later, smaller capture must not place its body output inside the shared output buffer,
+    or the captured copy into the shared buffer would overwrite its own source."""
+    rows, cols = 4096, 4096  # 64 MiB float32 output, above the allocator's small-segment limit
+    output_spans = {}
+
+    class WorkspaceBody(nn.Module):
+        def forward(self, value):
+            workspace = torch.empty(5 * value.numel() // 2, dtype=value.dtype, device=value.device)
+            del workspace
+            output = value * 2 + 1
+            output_spans[value.shape[0]] = (output.data_ptr(), output.nbytes)
+            return output
+
+    static_input = torch.randn(rows, cols, device="cuda")
+    body = WorkspaceBody().cuda()
+    runner = BreakableCUDAGraphRunner(body)
+    active = {"rows": rows}
+
+    def engine_forward():
+        value = static_input[: active["rows"]]
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(value))
+        return body(value)
+
+    buckets = (rows, 3 * rows // 4)
+    for num_tokens in buckets:
+        active["rows"] = num_tokens
+        runner.capture(num_tokens, engine_forward)
+    assert runner.captured_num_tokens == sorted(buckets)
+
+    shared_begin = runner._shared_output.data_ptr()
+    shared_end = shared_begin + runner._shared_output.nbytes
+    output_begin, output_bytes = output_spans[buckets[1]]
+    assert output_begin == shared_begin or not (
+        output_begin < shared_end and shared_begin < output_begin + output_bytes
+    )
+
+    for num_tokens in reversed(buckets):
+        active["rows"] = num_tokens
+        result = runner.execute(num_tokens, engine_forward)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(result, static_input[:num_tokens] * 2 + 1, rtol=0, atol=0)
+
+
+def _make_padding_preparer(breakable_runner):
+    preparer = object.__new__(DecoderInputPreparer)
+    preparer._config = SimpleNamespace(
+        enable_attention_dp=False,
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+        prefill_cuda_graph_num_tokens=[4, 8, 16],
+        use_mrope=False,
+    )
+    preparer.mapping = None
+    preparer.dist = None
+    preparer._buffers = SimpleNamespace(
+        input_ids_cuda=torch.ones(32, dtype=torch.int, device="cuda"),
+        position_ids_cuda=torch.ones(32, dtype=torch.int, device="cuda"),
+    )
+    preparer.breakable_cuda_graph_runner = breakable_runner
+    return preparer
+
+
+@pytest.mark.parametrize(
+    "state, captured, num_tokens, expected_tokens",
+    [
+        # Idle: pad only to a captured bucket; 8 was not captured.
+        ("idle", [4, 16], 5, 16),
+        ("idle", [4, 16], 3, 4),
+        # Idle without any captured bucket: no padding, eager forward.
+        ("idle", [], 5, 5),
+        # Capture and warmup pad to the configured bucket being recorded.
+        ("capturing", [], 5, 8),
+        ("warming_up", [16], 5, 8),
+        # Without a breakable runner: the configured buckets.
+        (None, None, 5, 8),
+    ],
+)
+def test_prefill_padding_targets_replayable_buckets(state, captured, num_tokens, expected_tokens):
+    runner = state and SimpleNamespace(
+        is_capturing=state == "capturing",
+        is_warming_up=state == "warming_up",
+        captured_num_tokens=captured,
+    )
+    preparer = _make_padding_preparer(runner)
+    attn_metadata = SimpleNamespace(padded_num_tokens=None)
+    try:
+        padded = preparer.pad_tokens(attn_metadata, num_tokens, num_contexts=1)
+        assert padded == expected_tokens
+        assert get_per_request_prefill_cuda_graph_flag() == (expected_tokens != num_tokens)
+        expected_padded = expected_tokens if expected_tokens != num_tokens else None
+        assert attn_metadata.padded_num_tokens == expected_padded
+        assert torch.all(preparer._buffers.input_ids_cuda[num_tokens:expected_tokens] == 0)
+    finally:
+        set_per_request_prefill_cuda_graph_flag(False)
+
+
+class _PositionBody(nn.Module):
+    """Decoder body stand-in whose output reads the (mrope) position ids."""
+
+    def forward(self, input_ids, attn_metadata, position_ids, inputs_embeds=None, **kwargs):
+        return position_ids.reshape(3, -1).t().float() * 2.0
+
+
+class _EchoWorker:
+    """Spec worker stand-in returning the target hidden states."""
+
+    def target_logits(self, hidden_states, *args):
+        return hidden_states
+
+    def __call__(self, **kwargs):
+        return kwargs["hidden_states"].clone()
+
+
+def test_padded_context_replay_with_spec_worker_matches_eager():
+    """A padded context batch's positions are a strided view of the engine buffer. A hoisted
+    ``.contiguous()`` copy (the pre-fix forward) is a fresh tensor the replayed body never reads: it
+    reads the freed capture-time copy (capture-stream pool), so the replay returns stale positions."""
+    body = _PositionBody().cuda()
+    model = object.__new__(SpecDecOneEngineForCausalLM)
+    nn.Module.__init__(model)
+    model.model = body
+    model.spec_worker = _EchoWorker()
+    model.spec_decode_fast_paths = True
+    model.layer_idx = -1
+    model.lm_head = model.logits_processor = model.draft_model = None
+    runner = BreakableCUDAGraphRunner(body)
+    buffer = torch.zeros((3, 1, 32), dtype=torch.int32, device="cuda")
+    padded = buffer[..., :16]
+    assert not padded.is_contiguous()
+    attn_metadata = SimpleNamespace(num_contexts=1, padded_num_tokens=16, num_tokens=12)
+    spec_metadata = SimpleNamespace(
+        gather_ids=torch.arange(12, device="cuda"), is_layer_capture=lambda layer_idx: False
+    )
+
+    def forward():
+        return model.forward(attn_metadata, position_ids=padded, spec_metadata=spec_metadata)
+
+    def engine_forward():
+        if runner.is_capturing:
+            return runner.capture_model_body(forward)
+        return forward()
+
+    buffer.copy_(torch.arange(96, dtype=torch.int32, device="cuda").view(3, 1, 32))
+    runner.capture(16, engine_forward)
+    buffer.copy_(torch.arange(1000, 1096, dtype=torch.int32, device="cuda").view(3, 1, 32))
+    expected = forward()
+    replayed = runner.execute(16, forward)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(replayed, expected)

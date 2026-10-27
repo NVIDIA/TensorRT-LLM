@@ -600,7 +600,7 @@ def _install_graph_runner_stub(runner: DecoderRunner,
         if stub.key is not None else (None, None, None))
     stub.replayed_inputs = []
 
-    def replay(key, inputs, position_id_offsets=None):
+    def replay(key, inputs, position_id_offsets=None, static_inputs_staged=0):
         stub.replayed_inputs.append(_clone_tensors(inputs))
         return {
             "logits": torch.zeros((inputs["input_ids"].shape[0], 10),
@@ -1303,7 +1303,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         prepared_inputs = engine._runner._inputs.prepare_inputs.return_value.kwargs
         runner.replay.assert_called_once_with(key,
                                               prepared_inputs,
-                                              position_id_offsets=None)
+                                              position_id_offsets=None,
+                                              static_inputs_staged=0)
 
     def test_zero_runtime_draft_speculation_graph_miss_is_semantic_eager(
             self) -> None:
@@ -2556,6 +2557,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         spec_metadata = Mock(
             _force_non_greedy_for_capture=False,
             context_prompt_lookahead_tokens=None,
+            supports_steady_prepare=False,
         )
 
         # The sampler's slot stores as the previous step left them.

@@ -164,6 +164,7 @@ class _ReceiveCase:
         self.transceiver.kv_transfer_timeout_ms = 1000
         self.transceiver._ever_had_recv_session = True
         self.transceiver._gen_need_sync = False
+        self.transceiver._init_gen_idle_poll(False)
         self.transceiver._gen_allgather = Mock(side_effect=AssertionError("unexpected collective"))
         self.transceiver._mapping = mapping
         self.transceiver._wait_reqs = {}

@@ -49,3 +49,6 @@ class DecoderRunnerConfig(RunnerConfig):
     mm_encoder_cache_enabled: bool
     enable_autotuner: bool
     cuda_graph_specialize_lora: bool
+    # The model takes the one-engine speculative fast paths
+    # (SpecDecOneEngineForCausalLM.spec_decode_fast_paths).
+    spec_decode_fast_paths: bool

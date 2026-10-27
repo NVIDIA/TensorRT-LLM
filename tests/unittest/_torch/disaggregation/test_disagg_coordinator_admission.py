@@ -9,6 +9,7 @@ attention DP), so every case runs one ``CoordinatorHarness``. The CP alignment
 cases stand in for the CP peers through the harness dist's ``cp_allgather``.
 """
 
+import random
 from types import SimpleNamespace
 
 import pytest
@@ -129,6 +130,20 @@ def test_async_python_v2_pp1_bypasses_the_window() -> None:
 )
 def test_async_python_keeps_the_window_without_v2_and_pp1(kwargs) -> None:
     h = _harness(consumes_transfer_buffer=False, **kwargs)
+    _receiving(h, 1)
+
+    admitted, blocked = h.coordinator.admit([_candidate(2)])
+
+    assert (admitted, blocked) == ([], True)
+
+
+def test_explicit_budget_keeps_the_window_for_async_python_v2_pp1() -> None:
+    """A max_tokens_in_buffer the user set bounds the transfers where the
+    defaulted one is bypassed."""
+    controller = DisaggTransferAdmissionController(32, 32, budget_is_explicit=True)
+    h = CoordinatorHarness(
+        admission_controller=controller, is_kv_manager_v2=True, consumes_transfer_buffer=False
+    )
     _receiving(h, 1)
 
     admitted, blocked = h.coordinator.admit([_candidate(2)])
@@ -321,3 +336,50 @@ def test_cp_alignment_is_skipped_without_cp() -> None:
 
     assert h.coordinator.align_gen_admission_across_cp(admitted) == admitted
     assert dist.gathered == []
+
+
+def _gate_request(rid: int, tokens: int, in_progress: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id=rid,
+        py_request_id=rid,
+        total_input_len_cp=tokens,
+        py_prompt_len=tokens,
+        prompt_len=tokens,
+        is_disagg_generation_transmission_in_progress=in_progress,
+    )
+
+
+@pytest.mark.parametrize("seed", range(400))
+def test_admission_gate_matches_select(seed) -> None:
+    """The scheduler-side gate closes at the first candidate select() defers, so selecting from
+    the candidates it let through admits the same prefix with the same signals."""
+    rng = random.Random(seed)
+    controller = DisaggTransferAdmissionController(
+        max_tokens_in_buffer=rng.randint(1, 4000), tokens_per_block=rng.choice([16, 32, 64])
+    )
+    active = [
+        _gate_request(1000 + k, rng.randint(1, 2500), in_progress=rng.random() < 0.7)
+        for k in range(rng.randint(0, 3))
+    ]
+    candidates = [_gate_request(k, rng.randint(0, 3000)) for k in range(rng.randint(0, 12))]
+    reference = controller.select(active, candidates)
+
+    gate = controller.begin_gate(active)
+    observed = []
+    for candidate in candidates:
+        if gate.closed:
+            break
+        observed.append(candidate)
+        gate.observe_candidate(candidate)
+    gated = controller.select(active, observed)
+
+    assert [r.request_id for r in gated.admitted_requests] == [
+        r.request_id for r in reference.admitted_requests
+    ]
+    assert gated.limited_by_budget == reference.limited_by_budget
+    assert gated.is_blocked_by_active_transfers() == reference.is_blocked_by_active_transfers()
+    assert gated.active_transfer_blocks == reference.active_transfer_blocks
+    assert gated.admitted_transfer_blocks == reference.admitted_transfer_blocks
+    # Only the candidate that closed the gate is allocated and then deferred.
+    assert gated.deferred_request_count == min(reference.deferred_request_count, 1)
+    assert len(candidates) - len(observed) == max(reference.deferred_request_count - 1, 0)

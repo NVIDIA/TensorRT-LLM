@@ -1231,6 +1231,7 @@ def _make_v2_multimodal_scheduler(
     manager = Mock(spec=KVCacheManagerV2)
     manager.context_replay_tokens.return_value = None
     manager.tokens_per_block = 10
+    manager.inforward_snapshot_rows = 0
     manager.enable_block_reuse = False
     manager.enable_joint_kv_cache_reuse = False
     manager._has_cp_helix = False
