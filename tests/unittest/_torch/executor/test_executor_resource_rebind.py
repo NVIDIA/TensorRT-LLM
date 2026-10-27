@@ -265,7 +265,7 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
     cache.get_kv_cache_stats.return_value = SimpleNamespace(max_num_blocks=8, tokens_per_block=16)
     resources = PyExecutorResources(
         resource_manager=ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: cache}),
-        scheduler=Mock(),
+        scheduler=Mock(ctx_demote_uncached_tokens=0),
         kv_cache_transceiver=None,
         peft_cache_config=None,
         virtual_memory_pools=None,
