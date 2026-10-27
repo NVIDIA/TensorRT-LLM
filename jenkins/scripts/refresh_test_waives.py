@@ -71,15 +71,19 @@ def _snapshot_ms(initial_waives: str) -> int:
 
 
 def _parse_rules(content: str) -> list[WaiveRule]:
+    """Parse baseline markers, allowing omitted reasons except for numeric TIMEOUT values."""
     rules = []
     for line in content.splitlines():
         line = line.partition("#")[0].strip()
         if not line:
             continue
-        match = re.fullmatch(r"(.+?)\s+(?:SKIP|XFAIL|UNSTABLE|TIMEOUT)\s+\((.+)\)", line)
+        match = re.fullmatch(r"(.+?)\s+(SKIP|XFAIL|UNSTABLE|TIMEOUT)(?:\s*\((.+)\))?", line)
         if not match:
             raise ValueError(f"Unsupported waive rule: {line}")
-        rules.append(WaiveRule(*match.groups()))
+        nodeid, marker, reason = match.groups()
+        if marker == "TIMEOUT" and (reason is None or not reason.isdigit()):
+            raise ValueError(f"Invalid TIMEOUT rule: {line}")
+        rules.append(WaiveRule(nodeid, reason or ""))
     return rules
 
 
@@ -123,6 +127,7 @@ def _scoped_test_name(nodeid: str, stage_name: str, sm_version: int | None) -> s
 def _matching_rules(
     rules: Iterable[WaiveRule], stage_name: str, sm_version: int | None
 ) -> dict[str, WaiveRule]:
+    """Index applicable rules by the test names used in this stage's reports."""
     result = {}
     for rule in rules:
         name = _scoped_test_name(rule.nodeid, stage_name, sm_version)
@@ -142,6 +147,7 @@ def _read_test_lists(value: str) -> list[str] | None:
 
 
 def _test_name(case: ET.Element, stage_name: str) -> str:
+    """Recover a test's unprefixed node ID from JUnit attributes."""
     filename = case.get("file", "")
     if not filename:
         return ""
@@ -150,6 +156,7 @@ def _test_name(case: ET.Element, stage_name: str) -> str:
 
 
 def _failed_cases(root: ET.Element) -> list[ET.Element]:
+    """Return cases with either a pytest failure or an execution error."""
     return [
         case
         for case in root.iter("testcase")
@@ -284,6 +291,7 @@ def query_latest_waives(test_names: list[str], branch: str) -> tuple[list[WaiveR
 
 
 def _detect_sm_version() -> int | None:
+    """Read the local GPU compute capability, or return None when unavailable."""
     if not shutil.which("nvidia-smi"):
         return None
     try:
