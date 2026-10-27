@@ -1853,15 +1853,15 @@ def test_configurable_moe_multi_gpu(
 # ============================================================================
 
 
-def _hook_vs_finalize_worker(mapping, model_config, seq_len):
+def _hook_vs_finalize_worker(mapping, model_config, seq_len, backend_type):
     try:
-        _hook_vs_finalize_worker_impl(mapping, model_config, seq_len)
+        _hook_vs_finalize_worker_impl(mapping, model_config, seq_len, backend_type)
     except Exception:
         traceback.print_exc()
         raise
 
 
-def _hook_vs_finalize_worker_impl(mapping, model_config, seq_len):
+def _hook_vs_finalize_worker_impl(mapping, model_config, seq_len, backend_type):
     """``do_finalize=False`` + registered hook must equal ``do_finalize=True``.
 
     The hook re-implements the kernel's own finalize (gather the permuted rows
@@ -1890,7 +1890,7 @@ def _hook_vs_finalize_worker_impl(mapping, model_config, seq_len):
         router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
 
         quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
-            QuantAlgo.NVFP4, x, MoeBackendType.TRTLLM
+            QuantAlgo.NVFP4, x, backend_type
         )
         quantize_util = quantize_util_cls(
             num_experts=num_experts,
@@ -1915,7 +1915,7 @@ def _hook_vs_finalize_worker_impl(mapping, model_config, seq_len):
             dtype=dtype,
             mapping=mapping,
             quant_config=quant_config,
-            moe_backend=MoeBackendType.TRTLLM.value,
+            moe_backend=backend_type.value,
             enable_eplb=False,
             num_slots=-1,
             layer_updates_per_iter=-1,
@@ -1991,16 +1991,23 @@ def _hook_vs_finalize_entry(comm_method_type, *worker_args):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
 @pytest.mark.threadleak(enabled=False)  # module-scoped MPIPoolExecutor persists by design
-def test_unfinalized_combine_fn_matches_in_kernel_finalize_multi_gpu(moe_multi_gpu_executor):
+@pytest.mark.parametrize(
+    "backend_type", [MoeBackendType.TRTLLM, MoeBackendType.CUTEDSL], ids=["TRTLLM", "CUTEDSL"]
+)
+def test_unfinalized_combine_fn_matches_in_kernel_finalize_multi_gpu(
+    moe_multi_gpu_executor, backend_type
+):
     if get_sm_version() < 100:
         pytest.skip("TRTLLM-Gen NVFP4 (the backend that returns the triple) needs Blackwell")
+    if backend_type == MoeBackendType.CUTEDSL and get_sm_version() not in (100, 103):
+        pytest.skip("CuteDSL returns the NVFP4 triple only on SM100/SM103")
 
     world_size = 4
     mapping = _create_mapping_for_parallel_mode(world_size, "DEP")
     model_config = MoeModelConfig(8, 2, 512, 512)
     results = moe_multi_gpu_executor.map(
         _hook_vs_finalize_entry,
-        *zip(*[("ALLGATHER", mapping, model_config, 4)] * world_size),
+        *zip(*[("ALLGATHER", mapping, model_config, 4, backend_type)] * world_size),
     )
     for r in results:
         assert r is None
