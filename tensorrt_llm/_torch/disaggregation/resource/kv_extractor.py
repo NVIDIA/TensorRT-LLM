@@ -236,6 +236,7 @@ def _build_pool_views_for_variant(
     role_layouts: Optional[Dict] = None,
     ignored_roles: frozenset[DataRole] = frozenset(),
     view_partition: Optional[Callable] = None,
+    kv_heads_for_layer: Optional[Callable[[int], Optional[int]]] = None,
 ) -> List[PoolView]:
     """Bucket one slot-desc variant's coalesced buffers into pool views.
 
@@ -243,11 +244,17 @@ def _build_pool_views_for_variant(
     kind share a view (KEY+VALUE), roles with different kinds in the same
     physical pool get separate views (M3 coalesced index-K). ``role_layouts``
     supplies the per-role resharding geometry carried onto the view.
+    ``view_partition`` further splits roles of one kind (e.g. by owning
+    model) so layers that differ in head geometry never share a view even
+    when their buffers share a physical pool. ``kv_heads_for_layer`` gives a
+    layer's per-rank KV-head count, which head-sharded views record; all
+    layers of a view must agree on it.
     """
     role_layouts = role_layouts or {}
     bucket_entries: Dict[tuple, list] = defaultdict(list)
     bucket_roles: Dict[tuple, set] = defaultdict(set)
     bucket_layouts: Dict[tuple, set] = defaultdict(set)
+    bucket_layers: Dict[tuple, set] = defaultdict(set)
     for pool_idx, coalesced_buffer in enumerate(variant.coalesced_buffers):
         single_buffer_size = int(coalesced_buffer.single_buffer_size)
         offset = 0
@@ -267,6 +274,7 @@ def _build_pool_views_for_variant(
                 )
                 bucket_roles[bucket_key].add(str(buffer_id.role))
                 bucket_layouts[bucket_key].add(role_layouts.get(buffer_id.role))
+                bucket_layers[bucket_key].add(int(buffer_id.layer_id))
             offset += single_buffer_size
 
     # All ordering below is canonicalization — the page table is
@@ -310,6 +318,20 @@ def _build_pool_views_for_variant(
                 f"{context} bytes_per_layer={bytes_per_layer} is not a multiple of "
                 f"bytes_per_head={layout.bytes_per_head}"
             )
+        num_kv_heads = None
+        if kv_heads_for_layer is not None and mapper_kind != MapperKind.REPLICATED:
+            layer_heads = {
+                heads
+                for heads in (kv_heads_for_layer(layer) for layer in bucket_layers[bucket_key])
+                if heads
+            }
+            if len(layer_heads) > 1:
+                raise ValueError(
+                    f"{context} mixes layers with different per-rank KV-head counts "
+                    f"{sorted(layer_heads)}; layers with different head geometry must be "
+                    "in separate views"
+                )
+            num_kv_heads = layer_heads.pop() if layer_heads else None
         if layout.ring_slot_bytes is not None and (
             mapper_kind != MapperKind.REPLICATED
             or layout.ring_slot_bytes <= 0
@@ -330,6 +352,7 @@ def _build_pool_views_for_variant(
                     list(layout.section_bytes) if layout.section_bytes is not None else None
                 ),
                 bytes_per_head=layout.bytes_per_head,
+                num_kv_heads=num_kv_heads,
                 ring_slot_bytes=layout.ring_slot_bytes,
             )
         )
@@ -404,6 +427,10 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
 
         raise ValueError(f"Cannot resolve layer config for internal layer {internal_layer_id}")
 
+    def _kv_heads_for_layer(internal_layer_id: int) -> Optional[int]:
+        heads = manager.num_kv_heads_per_layer
+        return int(heads[internal_layer_id]) if internal_layer_id < len(heads) else None
+
     pool_groups: List[PhysicalPoolGroup] = []
     storage_pg_to_list_idx: Dict[int, int] = {}
     layer_groups_by_id: List[LayerGroup | None] = [None] * len(manager.impl.layer_grouping)
@@ -468,6 +495,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 role_layouts=role_layouts,
                 ignored_roles=ignored_roles,
                 view_partition=view_partition,
+                kv_heads_for_layer=None if is_recurrent else _kv_heads_for_layer,
             )
             for pool_view in pool_views:
                 if pool_view.mapper_kind not in _MAPPER_KINDS_BY_CACHE_KIND[cache_kind]:
