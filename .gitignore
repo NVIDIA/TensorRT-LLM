@@ -78,6 +78,8 @@ ad-test-workspace/
 
 # build/debug
 *.safetensors
+# Test fixtures (stored in Git LFS, see .gitattributes)
+!tests/unittest/_torch/visual_gen/l2/test_data/*.safetensors
 */tllm_debug/**
 *.patch
 !cpp/tensorrt_llm/deep_ep/*.patch

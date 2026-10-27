@@ -35,7 +35,7 @@ default.
 
 | Category | Examples | Reference | rel-L2 |
 |---|---|---|---:|
-| Lossless | Parallelism, compile / attention backend, CUDA graph, offload, BF16 regression check | Feature off, or HF diffusers for the BF16 check | 0.01 |
+| Lossless | Parallelism, compile / attention backend, CUDA graph, offload, BF16 regression check | Feature off, or HF diffusers in FP32 for the BF16 check | 0.01 |
 | 8-bit quantization | FP8, FP8 blockwise, SageAttention | BF16, same block | 0.05 |
 | 4-bit quantization | NVFP4 | BF16, same block | 0.1 |
 
@@ -49,6 +49,10 @@ Exceptions:
 Measured basis (Wan 2.2 A14B, real-trajectory inputs, Blackwell and Rubin):
 
 - Dynamic quantization loss at one block: FP8 max 0.026, NVFP4 max 0.074.
+  FP8 blockwise max 0.032 and SageAttention max 0.021 (Blackwell only).
+- BF16 vs HF FP32 at one block: max 0.0068. Injected structural defects
+  (RoPE height/width swap or frame stride, dropped cross-attention, rolled
+  heads) all score at least 0.0149, so 0.01 catches all 64 cases.
 - Lossless one-block features (compile, attention backends, fusion off): max
   0.0087. Ulysses, CUDA graph and offload: at most 1.2e-4.
 - Loss is about the same at 1 block and at the full 40-block expert, and every
@@ -100,13 +104,27 @@ then update `FIXTURE_SHA256` and re-measure the thresholds.
 
 ## Tests
 
-`test_wan22_t2v_a14b_l2.py`, both experts:
+`test_wan22_t2v_a14b_l2.py`, both experts, one GPU:
 
-- `test_bf16_matches_hf`: TRT-LLM block vs HF diffusers block, rel-L2 <= 0.01.
-  CI has no "before the change" build, so the BF16 regression check needs an
-  independent implementation as its reference.
-- `test_quantization_loss_budget`: dynamic FP8 (<= 0.05) and NVFP4 (<= 0.1)
-  vs TRT-LLM BF16, and asserts the quantized Linear methods are active.
+| Test | Candidate | Reference | rel-L2 |
+|---|---|---|---:|
+| `test_bf16_matches_hf` | TRT-LLM BF16 | HF diffusers block in FP32 | 0.01 |
+| `test_lossless_feature` | torch.compile (per block), CUDA graph runner, CPU offload | Same block, eager, weights on GPU | 0.01 |
+| `test_attention_backend_lossless` | TRTLLM, CUTEDSL, FA4 attention | VANILLA (PyTorch SDPA) | 0.01 |
+| `test_quantization_loss_budget` | Dynamic FP8, FP8 blockwise / NVFP4 | TRT-LLM BF16 | 0.05 / 0.1 |
+| `test_sage_attention_loss_budget` | SageAttention (int8 Q/K, FP8 V, blocks 1/16/1) | Dense TRTLLM attention | 0.05 |
+
+The BF16 regression check uses HF diffusers because CI has no "before the
+change" build to compare against. HF runs in FP32 so the score holds only
+TRT-LLM's own BF16 error: against a BF16 HF block the two implementations'
+rounding adds up (max 0.0103 vs 0.0068 against FP32), and a 0.02 threshold
+there would miss 2 of 16 dropped-cross-attention cases. Every feature test also asserts the feature
+actually ran (quantized Linear methods, Sage config on the self-attention
+backends, a compiled graph, a captured CUDA graph, weights back on the CPU).
+
+GPU gating: NVFP4, CUTEDSL and FA4 need SM100+; the Sage recipe is
+registered for SM100 only. Dynamic FP8 blockwise currently aborts in DeepGEMM
+on SM107 and is marked xfail there.
 
 ```bash
 cd tests/unittest
