@@ -14,7 +14,7 @@ import torch
 
 from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
 from tensorrt_llm.grpc.openengine.bindings import generation_pb2, kv_pb2
-from tensorrt_llm.grpc.openengine.disagg import prefill_ready_response
+from tensorrt_llm.grpc.openengine.disagg import _struct_to_dict, disaggregated_params_from_request
 from tensorrt_llm.grpc.openengine.preparation import (
     _DECODE_PREPARATION_KEY,
     _decode_preparation,
@@ -22,9 +22,11 @@ from tensorrt_llm.grpc.openengine.preparation import (
 )
 from tensorrt_llm.grpc.openengine.server import OpenEngineServer
 from tensorrt_llm.grpc.openengine.servicer import _PreparationLease
+from tensorrt_llm.grpc.openengine.streaming import _format_result, _OpenEngineFormatState
 from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.llmapi.llm import PreprocessedInputs
+from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
 
@@ -293,11 +295,56 @@ def test_prefill_handoff_carries_portable_preparation_metadata():
         ctx_usage=None,
         first_gen_log_probs=None,
     )
-    response = prefill_ready_response("prefill", params, "nixl", decode_preparation=payload)
+    result = SimpleNamespace(
+        error=None,
+        prompt_token_ids=capture["prompt_token_ids"],
+        cached_tokens=0,
+        finished=False,
+        outputs=[
+            SimpleNamespace(
+                index=0, token_ids=[], text="", finish_reason=None, disaggregated_params=params
+            )
+        ],
+    )
+    state = _OpenEngineFormatState(
+        request_id="prefill",
+        sampling_params=SamplingParams(),
+        is_context_only=True,
+        kv_transfer_backend="nixl",
+        decode_preparation=payload,
+    )
+    responses = _format_result(result, state)
+    assert len(responses) == 1
+    response = responses[0]
+    assert response.WhichOneof("event") == "prefill_ready"
+    assert response.prefill_ready.kv_session.attributes_struct[_DECODE_PREPARATION_KEY] == payload
     request.kv.session.CopyFrom(response.prefill_ready.kv_session)
     restored = _prepared_decode_from_request(request, llm)
     assert restored.prompt_token_ids == capture["prompt_token_ids"]
     restored.multimodal_params.release_handles()
+
+
+def test_disaggregated_session_filters_preparation_and_preserves_generation_tokens():
+    request = generation_pb2.GenerateRequest(request_id="decode")
+    session = request.kv.session
+    session.session_id = "1"
+    session.attributes_struct.update(
+        {
+            _DECODE_PREPARATION_KEY: "prepared-image-state",
+            "ctx_info_endpoint": "tcp://localhost:1234",
+            "first_gen_tokens": [7, 8],
+        }
+    )
+
+    attributes = _struct_to_dict(session.attributes_struct)
+    assert _DECODE_PREPARATION_KEY not in attributes
+    assert attributes["first_gen_tokens"] == [7, 8]
+    params = disaggregated_params_from_request(request)
+    assert params.request_type == "generation_only"
+    assert params.ctx_request_id == 1
+    assert params.first_gen_tokens == [7, 8]
+    assert params.ctx_info_endpoint == "tcp://localhost:1234"
+    assert session.attributes_struct[_DECODE_PREPARATION_KEY] == "prepared-image-state"
 
 
 def test_capture_is_request_scoped_and_does_not_modify_processor_output():
