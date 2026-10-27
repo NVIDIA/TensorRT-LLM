@@ -208,7 +208,7 @@ def _engine_inputs(tmp_path, tokenizer, content, server_chat_template=None, **fi
 
     def generate_async(*, inputs, **kwargs):
         captured["inputs"] = inputs
-        return SimpleNamespace(prompt_token_ids=[7, 11], finished=True)
+        return SimpleNamespace(request_id=1, prompt_token_ids=[7, 11], finished=True)
 
     server = make_stub_openai_server(
         tmp_path, "test-vlm", _TestVlmConfig(), generate_async, tokenizer=tokenizer

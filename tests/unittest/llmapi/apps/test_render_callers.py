@@ -860,13 +860,8 @@ class TestKimiK3MessagesAndCountTokens:
         from fastapi.testclient import TestClient
 
         from tensorrt_llm.serve import chat_utils
-        from tensorrt_llm.serve.openai_protocol import (
-            ChatCompletionResponse,
-            ChatCompletionResponseChoice,
-            ChatMessage,
-            UsageInfo,
-        )
         from tensorrt_llm.serve.openai_server import OpenAIServer
+        from tensorrt_llm.serve.postprocess_handlers import chat_response_post_processor
         from tensorrt_llm.tokenizer import TransformersTokenizer
 
         # Keep text-only routing independent of multimodal model initialization.
@@ -880,7 +875,7 @@ class TestKimiK3MessagesAndCountTokens:
             # Token ids run as given; text is tokenized the way kimi_k3's input processor does.
             executed = inputs.get("prompt_token_ids") or tokenizer(inputs["prompt"]).input_ids
             engine["executed"] = executed
-            return SimpleNamespace(prompt_token_ids=executed, finished=True)
+            return SimpleNamespace(request_id=1, prompt_token_ids=executed, finished=True)
 
         server = object.__new__(OpenAIServer)
         server.model = "m"
@@ -906,20 +901,25 @@ class TestKimiK3MessagesAndCountTokens:
             generate_async=generate_async,
         )
         server.await_disconnected = AsyncMock()
-        server._create_chat_response = AsyncMock(
-            return_value=ChatCompletionResponse(
-                id="chatcmpl-k3",
-                model="m",
-                choices=[
-                    ChatCompletionResponseChoice(
-                        index=0,
-                        message=ChatMessage(role="assistant", content="ok"),
-                        finish_reason="stop",
-                    )
-                ],
-                usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+
+        async def create_chat_response(promise, postproc_params, raw_request, *args):
+            # The real chat post-processor computes the usage the reply bills.
+            output = SimpleNamespace(
+                index=0,
+                text="ok",
+                token_ids=[1],
+                length=1,
+                finish_reason="stop",
+                stop_reason=None,
+                logprobs=None,
+                disaggregated_params=None,
             )
-        )
+            result = SimpleNamespace(
+                outputs=[output], prompt_token_ids=promise.prompt_token_ids, cached_tokens=0
+            )
+            return chat_response_post_processor(result, postproc_params.postproc_args)
+
+        server._create_chat_response = create_chat_response
         app = FastAPI()
         app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
         app.add_api_route(
@@ -939,7 +939,7 @@ class TestKimiK3MessagesAndCountTokens:
         ],
     )
     def test_the_count_equals_the_input_the_turn_is_billed_for(self, k3_server, fields) -> None:
-        client, server, tokenizer, engine = k3_server
+        client, _, tokenizer, engine = k3_server
         body = {**self.COUNT_BODY, **fields}
 
         turn = client.post("/v1/messages", json={**body, "max_tokens": 2048})
@@ -951,11 +951,9 @@ class TestKimiK3MessagesAndCountTokens:
         # The tool result's markup reached the model as text, inside the vocabulary.
         assert max(executed) < len(tokenizer)
         assert self.MARKUP in tokenizer.decode(executed)
-        # The chat post-processor bills the executed prompt minus the generation channel opener.
-        postproc_args = server._create_chat_response.call_args.args[1].postproc_args
-        billed = postproc_args.num_prompt_tokens - postproc_args.num_prompt_tokens_offset
-        assert postproc_args.num_prompt_tokens == len(executed)
-        assert postproc_args.num_prompt_tokens_offset == 3
+        # The turn bills the executed prompt minus the generation channel opener.
+        billed = turn.json()["usage"]["input_tokens"]
+        assert billed == len(executed) - 3
         assert count.json() == {"input_tokens": billed}
 
 
