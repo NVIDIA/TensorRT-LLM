@@ -30,6 +30,7 @@ import torch
 
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -559,3 +560,214 @@ def test_prefill_only_pressure_recompute_pauses_with_host_tier() -> None:
 
     assert not any(active), "requests did not finish"
     assert first_recompute_paused == (2,)
+
+
+# Kimi K3 keeps a fixed-size KDA recurrent state per request next to its
+# attention KV. These shapes match K3's per-rank KDA state (6 heads, K = V = 128,
+# conv width 4), so a state slot is ~2.25 MiB and the state pool is small.
+NUM_KDA_LAYERS = 6
+NUM_HYBRID_REQUESTS = 12
+HYBRID_PROMPT_LEN = 60
+HYBRID_NEW_TOKENS = 40
+
+# Paged attention next to the KDA state: plain multi-head KV, and K3's MLA
+# latent cache (one K-only head of kv_lora_rank + qk_rope_head_dim = 512 + 64).
+HYBRID_KV_LAYOUTS = {
+    "mha": dict(kv_cache_type=CacheType.SELF, num_layers=1, num_kv_heads=8, head_dim=128),
+    "mla": dict(kv_cache_type=CacheType.SELFKONLY, num_layers=4, num_kv_heads=1, head_dim=576),
+}
+
+
+def _make_hybrid_rank(
+    cp_rank: int, kv_layout: str, host_cache_size: int
+) -> tuple[MambaHybridCacheManagerV2, KVCacheV2Scheduler]:
+    """A real KDA + attention hybrid manager and scheduler for one CP rank,
+    with a KV pool small enough that the requests run out of pages."""
+    layout = HYBRID_KV_LAYOUTS[kv_layout]
+    num_attention_layers = layout["num_layers"]
+    distributed = Mock()
+    distributed.allreduce.side_effect = lambda value, op: value
+    distributed.local_world_size = 1
+    with patch.object(Distributed, "get", return_value=distributed):
+        manager = MambaHybridCacheManagerV2(
+            mamba_d_state=128,
+            mamba_d_conv=4,
+            mamba_num_heads=6,
+            mamba_n_groups=6,
+            mamba_head_dim=128,
+            mamba_num_layers=NUM_KDA_LAYERS,
+            mamba_layer_mask=[True] * NUM_KDA_LAYERS + [False] * num_attention_layers,
+            mamba_cache_dtype=torch.bfloat16,
+            mamba_ssm_cache_dtype=torch.float32,
+            kv_cache_config=KvCacheConfig(
+                max_tokens=768, host_cache_size=host_cache_size, enable_block_reuse=False
+            ),
+            kv_cache_type=layout["kv_cache_type"],
+            num_layers=num_attention_layers,
+            num_kv_heads=layout["num_kv_heads"],
+            head_dim=layout["head_dim"],
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=128,
+            max_batch_size=NUM_HYBRID_REQUESTS,
+            mapping=Mapping(
+                world_size=CP_SIZE,
+                rank=cp_rank,
+                cp_size=CP_SIZE,
+                cp_config={"cp_type": CpType.HELIX},
+            ),
+            dtype=DataType.HALF,
+            layer_mask=[False] * NUM_KDA_LAYERS + [True] * num_attention_layers,
+            vocab_size=1024,
+            conv_state_layout="q_k_v",
+            is_disagg=False,
+        )
+    scheduler = KVCacheV2Scheduler(
+        max_batch_size=NUM_HYBRID_REQUESTS,
+        max_num_tokens=128,
+        kv_cache_manager=manager,
+        scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, TOKENS_PER_BLOCK),
+        enable_recompute_pause=True,
+    )
+    return manager, scheduler
+
+
+def _kda_states(manager: MambaHybridCacheManagerV2, request_id: int) -> list:
+    """The request's recurrent state in every KDA layer, as the kernels see it."""
+    slot = manager.get_state_indices([request_id])[0]
+    return [manager.get_ssm_states(layer)[slot] for layer in range(NUM_KDA_LAYERS)]
+
+
+def _hybrid_step(
+    manager: MambaHybridCacheManagerV2,
+    scheduler: KVCacheV2Scheduler,
+    active: list,
+    markers: dict,
+) -> tuple:
+    """One executor iteration on one rank; returns what the rank decided.
+
+    Once a request finishes its prefill, its KDA state is filled with a marker
+    (`markers` maps request ID to it), and every later decode step checks the
+    marker is still there, whether or not the request was suspended between.
+    The forward pass does not run, so nothing else writes the state.
+    """
+    out = scheduler.schedule_request(active, set())
+    decided = (
+        tuple(
+            (r.py_request_id, r.context_current_position, r.context_chunk_size)
+            for r in out.context_requests
+        ),
+        tuple(r.py_request_id for r in out.generation_requests),
+        tuple(r.py_request_id for r in out.paused_requests),
+        tuple(r.py_request_id for r in out.recompute_paused_requests),
+    )
+    for request in out.recompute_paused_requests:
+        request.reset_for_recompute(1 << 20)
+        # The re-prefill rebuilds the state from the prompt.
+        markers.pop(request.py_request_id, None)
+
+    batch = ScheduledRequests()
+    for request in out.context_requests:
+        batch.append_context_request(request)
+    batch.generation_requests = list(out.generation_requests)
+    # Assigns every scheduled request a state slot; a resumed request's state
+    # is back on GPU by now.
+    manager.prepare_resources(batch)
+    for request in out.generation_requests:
+        request_id = request.py_request_id
+        if request_id in markers:
+            for state in _kda_states(manager, request_id):
+                assert bool((state == markers[request_id]).all()), request_id
+
+    # Forward pass: prefill chunks advance, every finished prefill and every
+    # decode step samples one token.
+    manager.update_context_resources(batch)
+    for request in out.context_requests:
+        request.move_to_next_context_chunk()
+        if request.context_remaining_length == 0:
+            request.state = LlmRequestState.GENERATION_IN_PROGRESS
+            request.add_new_token(0, 0)
+            markers[request.py_request_id] = float(request.py_request_id)
+            for state in _kda_states(manager, request.py_request_id):
+                state.fill_(markers[request.py_request_id])
+    for request in out.generation_requests:
+        request.add_new_token(0, 0)
+        request.py_decoding_iter += 1
+    manager.update_resources(batch)
+
+    for request in list(active):
+        if request.get_num_tokens(0) >= HYBRID_PROMPT_LEN + HYBRID_NEW_TOKENS:
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            manager.free_resources(request)
+            markers.pop(request.py_request_id, None)
+            active.remove(request)
+    return decided
+
+
+@pytest.mark.parametrize(
+    "host_cache_size", [0, ROOMY_HOST_TIER_BYTES], ids=["gpu_only", "host_tier"]
+)
+@pytest.mark.parametrize("kv_layout", HYBRID_KV_LAYOUTS)
+def test_agg_helix_kda_state_survives_suspend_and_restarts_on_recompute(
+    kv_layout: str, host_cache_size: int
+) -> None:
+    """KDA state under KV pressure on a K3-like hybrid manager: every rank
+    makes the same choices, a suspended request resumes with its KDA state
+    intact, and a recompute-paused request re-prefills from the first token,
+    where the KDA prefill starts without initial state."""
+    ranks = [_make_hybrid_rank(cp_rank, kv_layout, host_cache_size) for cp_rank in range(CP_SIZE)]
+    active = [
+        [
+            LlmRequest(
+                request_id=i,
+                max_new_tokens=HYBRID_NEW_TOKENS,
+                input_tokens=list(range(i, i + HYBRID_PROMPT_LEN)),
+                sampling_config=SamplingConfig(1),
+                is_streaming=False,
+            )
+            for i in range(1, NUM_HYBRID_REQUESTS + 1)
+        ]
+        for _ in ranks
+    ]
+    markers = [{} for _ in ranks]
+
+    # Requests suspended after their prefill, until they decode again.
+    suspended_with_state: set[int] = set()
+    resumed_with_state: set[int] = set()
+    # Recompute-paused requests, until their re-prefill starts.
+    awaiting_re_prefill: set[int] = set()
+    num_re_prefills = 0
+    num_suspends = 0
+    for _ in range(MAX_ITERATIONS):
+        if not any(active):
+            break
+        decisions = [
+            _hybrid_step(manager, scheduler, rank_active, rank_markers)
+            for (manager, scheduler), rank_active, rank_markers in zip(ranks, active, markers)
+        ]
+        assert all(d == decisions[0] for d in decisions), decisions
+        ctx, gen, paused, recompute_paused = decisions[0]
+
+        for request_id, start_position, _ in ctx:
+            if request_id in awaiting_re_prefill:
+                assert start_position == 0, (request_id, start_position)
+                awaiting_re_prefill.remove(request_id)
+                num_re_prefills += 1
+        resumed_with_state.update(suspended_with_state.intersection(gen))
+        suspended_with_state.difference_update(gen)
+        for request_id in recompute_paused:
+            suspended_with_state.discard(request_id)
+            awaiting_re_prefill.add(request_id)
+        # A request suspended mid-prefill has no marker yet.
+        suspended_with_state.update(r for r in paused if r in markers[0])
+        num_suspends += len(paused)
+
+    assert not any(active), "requests did not finish"
+    assert not awaiting_re_prefill
+    if host_cache_size:
+        assert resumed_with_state, "no request resumed with its KDA state"
+    else:
+        # Without a tier below GPU, suspending frees nothing, so helix never
+        # suspends and recompute-pause makes all the room.
+        assert num_suspends == 0
+        assert num_re_prefills > 0
