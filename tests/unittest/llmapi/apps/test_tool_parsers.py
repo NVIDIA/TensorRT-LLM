@@ -7385,21 +7385,33 @@ class TestGlmStreamingMatchesWholeParse:
         value = "ls" + fresh[:fresh.rindex("</arg_value>")]
         assert (normal, calls) == ("", [("exec", dict(cmd=value))])
 
-    def test_many_openers_in_the_arguments_take_linear_time(self, parser_cls):
-        """Thousands of call openers in one call, none of them a fresh call.
+    def test_many_openers_in_the_arguments_read_one_header(
+            self, parser_cls, monkeypatch):
+        """Call openers in one call, none of them a fresh call.
 
-        Reading only the last opener takes milliseconds; reading every opener
-        to the end of the call takes tens of seconds, well past the bound.
+        Only the last opener is read as a call header, so the headers read do
+        not grow with the openers; reading every opener to the end of the call
+        makes the parse quadratic in them.
         """
-        unit = _glm_open_call(parser_cls, "exec", _glm_pairs(("cmd", "ls")))
-        text = unit * 12000 + "</think></tool_call>"
-        start = time.monotonic()
+        split_call = parser_cls._split_call
+        headers = []
 
-        result = _glm_parity(parser_cls, text, _GLM_EXEC_TOOLS,
-                             [("whole", [text])])
+        def counting_split_call(self, body):
+            headers.append(body)
+            return split_call(self, body)
 
-        assert result == (text, [])
-        assert time.monotonic() - start < 10
+        monkeypatch.setattr(parser_cls, "_split_call", counting_split_call)
+
+        def headers_read(openers):
+            unit = _glm_open_call(parser_cls, "exec", _glm_pairs(("cmd", "ls")))
+            text = unit * openers + "</think></tool_call>"
+            headers.clear()
+            result = _glm_parity(parser_cls, text, _GLM_EXEC_TOOLS,
+                                 [("whole", [text])])
+            assert result == (text, [])
+            return len(headers)
+
+        assert headers_read(200) == headers_read(20)
 
     def test_a_response_with_several_calls(self, parser_cls):
         """Unreadable and restarted calls among good ones, then a cut-off."""
