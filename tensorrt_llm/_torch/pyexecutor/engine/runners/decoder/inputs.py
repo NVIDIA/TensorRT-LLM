@@ -25,7 +25,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
 )
-from tensorrt_llm._torch.pyexecutor.runtime_hooks import DecodePrologue, StepInputStager
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import DecodePrologue
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase
@@ -314,8 +314,6 @@ class DecoderInputPreparer:
 
     # The model's decode prologue (RuntimeHooks.decode_prologue), set by the runner.
     decode_prologue: DecodePrologue | None = None
-    # The model's step-input stager while it records this preparer's writes, else None.
-    step_input_stager: StepInputStager | None = None
 
     def __init__(
         self,
@@ -524,7 +522,11 @@ class DecoderInputPreparer:
                 mapping=self.mapping,
                 dist=self.dist,
             )
-        padding = dict(
+        return pad_input_tokens(
+            attn_metadata,
+            num_tokens,
+            num_contexts,
+            attn_all_rank_num_tokens,
             input_ids=self._buffers.input_ids_cuda,
             position_ids=self._position_ids_buffer(),
             dist=self.dist,
@@ -535,12 +537,6 @@ class DecoderInputPreparer:
                 else PrefillCudaGraphBackend.DISABLED
             ),
             prefill_cuda_graph_num_tokens=self._config.prefill_cuda_graph_num_tokens,
-        )
-        if self.step_input_stager is not None:
-            # Staged write; see the window banner in DecoderRunner._forward_decoder.
-            padding["step_input_stager"] = self.step_input_stager
-        return pad_input_tokens(
-            attn_metadata, num_tokens, num_contexts, attn_all_rank_num_tokens, **padding
         )
 
     def model_inputs(
@@ -844,18 +840,10 @@ class DecoderInputPreparer:
         self._copy_position_ids_to_device(host)
 
         if enable_spec_decode:
-            gather_ids = torch.tensor(
-                host.lists.gather_ids, dtype=torch.int, pin_memory=prefer_pinned()
+            self._buffers.gather_ids_cuda[: len(host.lists.gather_ids)].copy_(
+                torch.tensor(host.lists.gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
+                non_blocking=True,
             )
-            if self.step_input_stager is not None:
-                # Staged write; see the window banner in DecoderRunner._forward_decoder.
-                self.step_input_stager.copy(
-                    self._buffers.gather_ids_cuda[: len(host.lists.gather_ids)], gather_ids
-                )
-            else:
-                self._buffers.gather_ids_cuda[: len(host.lists.gather_ids)].copy_(
-                    gather_ids, non_blocking=True
-                )
 
         self._prepare_attn_metadata(
             host,
@@ -1721,52 +1709,24 @@ class DecoderInputPreparer:
         assert total_num_tokens <= self._config.max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self._config.max_num_tokens})"  # noqa: E501
         )
-        stager = self.step_input_stager
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
             input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=prefer_pinned())
-            if stager is not None:
-                # Staged write; see the window banner in DecoderRunner._forward_decoder.
-                stager.copy(self._buffers.input_ids_cuda[:num_tokens], input_ids)
-            else:
-                self._buffers.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+            self._buffers.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
         if num_draft_tokens > 0:
             draft_tokens = torch.tensor(draft_tokens, dtype=torch.int, pin_memory=prefer_pinned())
-            if stager is not None:
-                # Staged write; see the window banner in DecoderRunner._forward_decoder.
-                stager.copy(self._buffers.draft_tokens_cuda[: len(draft_tokens)], draft_tokens)
-            else:
-                self._buffers.draft_tokens_cuda[: len(draft_tokens)].copy_(
-                    draft_tokens, non_blocking=True
-                )
+            self._buffers.draft_tokens_cuda[: len(draft_tokens)].copy_(
+                draft_tokens, non_blocking=True
+            )
         if self._config.is_spec_decode and len(num_accepted_draft_tokens) > 0:
             num_accepted_draft_tokens = torch.tensor(
                 num_accepted_draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
             )
-            accepted = self._buffers.num_accepted_draft_tokens_cuda[
-                : len(num_accepted_draft_tokens)
-            ]
-            if stager is not None:
-                # Staged write; see the window banner in DecoderRunner._forward_decoder.
-                stager.copy(accepted, num_accepted_draft_tokens)
-            else:
-                accepted.copy_(num_accepted_draft_tokens, non_blocking=True)
-        if next_draft_tokens_device is not None and stager is not None:
-            # Staged write; see the window banner in DecoderRunner._forward_decoder.
-            stager.overlap_inputs(
-                self._buffers,
-                previous_batch_indices,
-                previous_pos_indices,
-                num_tokens,
-                num_draft_tokens,
-                self.get_runtime_tokens_per_gen_step(runtime_draft_len),
-                len(extend_requests) - len(extend_dummy_requests),
-                new_tokens_device,
-                next_draft_tokens_device,
-                new_tokens_lens_device,
+            self._buffers.num_accepted_draft_tokens_cuda[: len(num_accepted_draft_tokens)].copy_(
+                num_accepted_draft_tokens, non_blocking=True
             )
-        elif next_draft_tokens_device is not None:
+        if next_draft_tokens_device is not None:
             # Initialize these two values to zeros
             self._buffers.previous_pos_id_offsets_cuda.zero_()
             self._buffers.previous_kv_lens_offsets_cuda.zero_()
@@ -1866,10 +1826,6 @@ class DecoderInputPreparer:
         # cover the previous-batch rows; padding-request rows are covered by
         # neither, so without this the embedding would gather stale contents
         # of the uninitialized buffer, which may exceed the vocabulary size.
-        if stager is not None and host.lists.unwritten_input_id_rows:
-            # A native write to input_ids_cuda inside the window needs a flush
-            # first; see the window banner in DecoderRunner._forward_decoder.
-            stager.flush()
         _zero_fill_row_spans(self._buffers.input_ids_cuda, host.lists.unwritten_input_id_rows)
 
         host.num_tokens = num_tokens
@@ -1918,11 +1874,6 @@ class DecoderInputPreparer:
                 self._buffers.mrope_position_ids_cuda[:, :, start_idx:end_idx].copy_(
                     segment[:, :, : end_idx - start_idx], non_blocking=True
                 )
-        elif self.step_input_stager is not None:
-            # Staged write; see the window banner in DecoderRunner._forward_decoder.
-            self.step_input_stager.position_ids(
-                self._buffers.position_ids_cuda[:total_num_tokens], host_position_ids
-            )
         else:
             self._buffers.position_ids_cuda[:total_num_tokens].copy_(
                 host_position_ids, non_blocking=True
@@ -2230,11 +2181,6 @@ class DecoderInputPreparer:
         """Mark the end of this pass's host-to-device input copies."""
         self._prepare_inputs_event = torch.cuda.Event()
         self._prepare_inputs_event.record()
-
-    @property
-    def input_copy_event(self) -> torch.cuda.Event | None:
-        """The event ``record_input_copy`` recorded last."""
-        return self._prepare_inputs_event
 
     def wait_for_input_copy(self) -> None:
         if self._prepare_inputs_event is not None:

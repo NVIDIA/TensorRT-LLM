@@ -1486,15 +1486,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         page_indices = pool_indices * cache_manager.indexer_k_cache_page_scale
         num_blocks = page_indices.shape[1]
         self.host_indexer_k_cache_block_offsets[: self.num_seqs, :num_blocks].copy_(page_indices)
-        if self.step_input_stager is not None:
-            # Staged write; see the window banner in DecoderRunner._forward_decoder.
-            self.step_input_stager.copy(
-                self.indexer_k_cache_block_offsets[: self.num_seqs],
-                self.host_indexer_k_cache_block_offsets[: self.num_seqs],
-                clamp_min=0,
-            )
-            self.step_input_stager.clamp_min(self.indexer_k_cache_block_offsets[self.num_seqs :], 0)
-            return pool_indices
         self.indexer_k_cache_block_offsets[: self.num_seqs].copy_(
             self.host_indexer_k_cache_block_offsets[: self.num_seqs], non_blocking=True
         )
@@ -1711,16 +1702,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     kv_lens[self.num_contexts : self.num_seqs],
                     self.num_tokens - self.num_ctx_tokens,
                 )
-                if self.step_input_stager is not None:
-                    # Staged write; see the window banner in DecoderRunner._forward_decoder.
-                    self.step_input_stager.copy(
-                        self.topk_indices_buffer[gen_range, :],
-                        self.host_topk_indices_buffer[gen_range, :],
-                    )
-                else:
-                    self.topk_indices_buffer[gen_range, :].copy_(
-                        self.host_topk_indices_buffer[gen_range, :], non_blocking=True
-                    )
+                self.topk_indices_buffer[gen_range, :].copy_(
+                    self.host_topk_indices_buffer[gen_range, :], non_blocking=True
+                )
 
     def prepare_for_spec_decode(self, kv_lens: torch.Tensor):
         # The DeepGEMM paged-MQA kernel (fp8_paged_mqa_logits) runs a native
@@ -1820,16 +1804,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 num_tokens = self.num_generations * expand_factor
                 gen_kv_lens_expanded = gen_kv_lens.repeat_interleave(expand_factor)
                 self.kv_lens_expanded_host[:num_tokens].copy_(gen_kv_lens_expanded)
-                if self.step_input_stager is not None:
-                    # Staged write; see the window banner in DecoderRunner._forward_decoder.
-                    self.step_input_stager.copy(
-                        self.kv_lens_expanded_cuda[:num_tokens],
-                        self.kv_lens_expanded_host[:num_tokens],
-                    )
-                else:
-                    self.kv_lens_expanded_cuda[:num_tokens].copy_(
-                        self.kv_lens_expanded_host[:num_tokens], non_blocking=True
-                    )
+                self.kv_lens_expanded_cuda[:num_tokens].copy_(
+                    self.kv_lens_expanded_host[:num_tokens], non_blocking=True
+                )
                 self._refresh_expanded_block_table(expand_factor)
         else:
             self.dsl_expand_factor = 1
@@ -2059,15 +2036,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_block_table_expanded[:num_tokens, :max_len].copy_(
             expanded_blocks, non_blocking=True
         )
-        if self.step_input_stager is not None:
-            # Staged write; see the window banner in DecoderRunner._forward_decoder.
-            self.step_input_stager.copy(
-                self.block_table_expanded[:num_tokens],
-                self.host_block_table_expanded[:num_tokens],
-                clamp_min=0,
-            )
-            self.step_input_stager.clamp_min(self.block_table_expanded[num_tokens:], 0)
-            return
         self.block_table_expanded[:num_tokens].copy_(
             self.host_block_table_expanded[:num_tokens], non_blocking=True
         )
@@ -2108,15 +2076,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             pad_cols.unsqueeze(0) >= num_blocks_per_seq[: self.num_seqs].unsqueeze(1), -1
         )
         # Copy to GPU
-        if self.step_input_stager is not None:
-            # Staged write; see the window banner in DecoderRunner._forward_decoder.
-            self.step_input_stager.copy(
-                self.block_table[: self.num_seqs, :max_blocks_used], host_block_table
-            )
-        else:
-            self.block_table[: self.num_seqs, :max_blocks_used].copy_(
-                host_block_table, non_blocking=True
-            )
+        self.block_table[: self.num_seqs, :max_blocks_used].copy_(
+            host_block_table, non_blocking=True
+        )
 
     def prepare_for_skip_indexer(self, kv_lens: torch.Tensor):
         num_extra_kv_tokens = self.kv_cache_params.num_extra_kv_tokens
@@ -2182,17 +2144,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64,
                 out=self.host_gen_cached_token_indptr[1 : self.num_generations + 1],
             )
-            if self.step_input_stager is not None:
-                # Staged write; see the window banner in DecoderRunner._forward_decoder.
-                self.step_input_stager.copy(
-                    self.gen_cached_token_indptr[: self.num_generations + 1],
-                    self.host_gen_cached_token_indptr[: self.num_generations + 1],
-                )
-            else:
-                self.gen_cached_token_indptr[: self.num_generations + 1].copy_(
-                    self.host_gen_cached_token_indptr[: self.num_generations + 1],
-                    non_blocking=True,
-                )
+            self.gen_cached_token_indptr[: self.num_generations + 1].copy_(
+                self.host_gen_cached_token_indptr[: self.num_generations + 1], non_blocking=True
+            )
             # generation kv indptr
             torch.cumsum(
                 kv_lens[self.num_contexts : self.num_seqs],
@@ -2200,16 +2154,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64,
                 out=self.host_gen_kv_indptr[1 : self.num_generations + 1],
             )
-            if self.step_input_stager is not None:
-                # Staged write; see the window banner in DecoderRunner._forward_decoder.
-                self.step_input_stager.copy(
-                    self.gen_kv_indptr[: self.num_generations + 1],
-                    self.host_gen_kv_indptr[: self.num_generations + 1],
-                )
-            else:
-                self.gen_kv_indptr[: self.num_generations + 1].copy_(
-                    self.host_gen_kv_indptr[: self.num_generations + 1], non_blocking=True
-                )
+            self.gen_kv_indptr[: self.num_generations + 1].copy_(
+                self.host_gen_kv_indptr[: self.num_generations + 1], non_blocking=True
+            )
         else:
             self.max_gen_seq_len = 0
 
@@ -2221,14 +2168,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.seq_lens,
             dim=0,
         )
-        if self.step_input_stager is not None:
-            # Staged write; see the window banner in DecoderRunner._forward_decoder.
-            self.step_input_stager.copy(
-                self.req_idx_per_token[: self.num_tokens],
-                self.host_req_idx_per_token[: self.num_tokens],
-            )
-        else:
-            self.req_idx_per_token[: self.num_tokens].copy_(
-                self.host_req_idx_per_token[: self.num_tokens],
-                non_blocking=True,
-            )
+        self.req_idx_per_token[: self.num_tokens].copy_(
+            self.host_req_idx_per_token[: self.num_tokens],
+            non_blocking=True,
+        )

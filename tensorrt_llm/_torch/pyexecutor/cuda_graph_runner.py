@@ -160,10 +160,6 @@ class CUDAGraphRunner:
     multiple graphs, keyed by batch shape and execution-path specializations.
     """
     WARMUP_STEPS = 1
-    # Tokens of input_ids / position_ids that a step-input stager already
-    # wrote into the static inputs for the next replay (0: the replay copies
-    # them).
-    staged_static_input_tokens = 0
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
@@ -808,12 +804,7 @@ class CUDAGraphRunner:
                 f"replay() got {seqlen} tokens for key {key}, but the graph "
                 f"was captured for {expected_num_tokens} tokens. A shorter "
                 "input_ids leaves the tail of the static input buffer stale.")
-        # A step-input stager already wrote input_ids / position_ids[:seqlen]
-        # into the static buffers.
-        staged = self.staged_static_input_tokens == seqlen
-        self.staged_static_input_tokens = 0
-        if not staged:
-            static_tensors["input_ids"][:seqlen].copy_(input_ids)
+        static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
         if self.config.use_mrope:
@@ -860,8 +851,7 @@ class CUDAGraphRunner:
                     f"for key {key}, but expected {expected_position_ids_shape}. "
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
-            if not staged:
-                static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
+            static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
         if num_encoder_tokens:

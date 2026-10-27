@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, ClassVar, List, Optional, Protocol, Type
+from typing import TYPE_CHECKING, List, Optional, Protocol, Type
 
 import torch
 from packaging.version import Version
@@ -37,7 +37,6 @@ from ..pyexecutor.resource_manager import ResourceManagerType
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
     from ..pyexecutor.llm_request import LlmRequest
-    from ..pyexecutor.runtime_hooks import StepInputStager
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -460,8 +459,6 @@ class SpecMetadata:
     """
     Metadata for speculative decoding.
     """
-    # A step-input stager while it records this metadata's writes, else None.
-    step_input_stager: ClassVar[Optional["StepInputStager"]] = None
     # The max number of requests in a single batch.
     max_num_requests: int
     # The number of draft layers. (Also the number of draft tokens for the linear tree.)
@@ -884,11 +881,6 @@ class SpecMetadata:
                                        device='cuda')
 
         def _upload(dst: torch.Tensor, values: list[int]) -> None:
-            if self.step_input_stager is not None:
-                # Staged write; see the window banner in DecoderRunner._forward_decoder.
-                self.step_input_stager.copy(
-                    dst[:len(values)], torch.tensor(values, dtype=torch.int64))
-                return
             dst[:len(values)].copy_(torch.tensor(values,
                                                  dtype=torch.int64,
                                                  pin_memory=prefer_pinned()),

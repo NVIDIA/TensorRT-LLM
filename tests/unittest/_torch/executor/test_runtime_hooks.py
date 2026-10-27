@@ -3,11 +3,11 @@
 """How the engine reads the step-loop hooks a model declares (``runtime_hooks_of``).
 
 The engine's call sites run their original statements when a hook is off: every
-object a hook attaches to declares it off at class level, every call a call
-site makes on a hook is a method of the hook's protocol, every read of a hook in
-the engine files is decided by its all-off value toward the original statements
-(checked on the source), and call sites of each hook run on stand-ins issue
-their original work with the hook off and hand it to the hook when it is on.
+object that holds a hook declares it off at class level, every call a call site
+makes on a hook is a method of the hook's protocol, every read of a hook in the
+engine files is decided by its all-off value toward the original statements
+(checked on the source), and call sites of each hook run on stand-ins with the
+hook off and on.
 """
 
 import ast
@@ -25,8 +25,6 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     DEFAULT_RUNTIME_HOOKS,
     ExecutorEvents,
     RuntimeHooks,
-    SamplerStoreWriter,
-    StepInputStager,
     runtime_hooks_of,
 )
 
@@ -59,8 +57,6 @@ def test_a_model_without_hooks_gets_the_all_off_default(model):
     assert hooks is DEFAULT_RUNTIME_HOOKS
     assert hooks == RuntimeHooks()
     assert not hooks.loop_on_execution_stream
-    assert hooks.step_input_stager is None
-    assert hooks.sampler_store_writer is None
     assert hooks.decode_prologue is None
     assert hooks.executor_events is None
 
@@ -117,36 +113,14 @@ def test_hooks_are_immutable_once_declared():
         hooks.loop_on_execution_stream = True
 
 
-def test_engine_classes_declare_the_stager_off():
-    """Every object a hook attaches to declares the attribute off at class level."""
-    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
-        DSAtrtllmAttentionMetadata,
-    )
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+def test_engine_classes_declare_the_hooks_off():
+    """Every object that holds a hook declares it off at class level."""
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-    from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSpecMetadata
-    from tensorrt_llm._torch.speculative.interface import SpecMetadata
-    from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
 
-    for cls in (
-        TrtllmAttentionMetadata,
-        DSAtrtllmAttentionMetadata,
-        SpecMetadata,
-        Eagle3OneModelSpecMetadata,
-    ):
-        assert cls.step_input_stager is None, cls
-        # A class attribute, not a dataclass field: the constructors do not take it.
-        assert "step_input_stager" not in {f.name for f in dataclasses.fields(cls)}, cls
-    assert DecoderInputPreparer.step_input_stager is None
     assert DecoderInputPreparer.decode_prologue is None
     assert DecoderRunner.runtime_hooks is DEFAULT_RUNTIME_HOOKS
-    assert KVCacheManagerV2.step_input_stager is None
-    assert CUDAGraphRunner.staged_static_input_tokens == 0
-    assert SpecSampler.store_writer is None
     assert PyExecutor._execution_stream_loop_armed is False
     assert PyExecutor._loop_on_execution_stream is False
     assert PyExecutor._executor_events is None
@@ -155,26 +129,6 @@ def test_engine_classes_declare_the_stager_off():
 # Per hook protocol: the local names and attribute names a call site holds the hook in, and
 # the engine files with call sites.
 _HOOK_CONSUMERS = {
-    StepInputStager: (
-        ("stager", "stager_source", "step_input_stager"),
-        ("step_input_stager",),
-        (
-            "pyexecutor/engine/runners/decoder/runner.py",
-            "pyexecutor/engine/runners/decoder/inputs.py",
-            "pyexecutor/engine/runners/common.py",
-            "pyexecutor/kv_cache/kv_cache_manager_v2.py",
-            "attention/backends/trtllm.py",
-            "attention/backends/sparse/dsa/metadata.py",
-            "attention/backends/sparse/dsa/indexer.py",
-            "speculative/eagle3.py",
-            "speculative/interface.py",
-        ),
-    ),
-    SamplerStoreWriter: (
-        ("store_writer",),
-        ("store_writer",),
-        ("speculative/spec_sampler_base.py",),
-    ),
     ExecutorEvents: ((), ("_executor_events",), ("pyexecutor/py_executor.py",)),
 }
 
@@ -216,63 +170,6 @@ def test_every_hook_call_site_uses_its_protocol(protocol):
                 unknown.append(f"{rel}:{line}: {method}")
     assert not unknown, f"calls outside the {protocol.__name__} protocol:\n" + "\n".join(unknown)
     assert used == methods
-
-
-class _StoreWriterModel(torch.nn.Module):
-    def __init__(self, writer) -> None:
-        super().__init__()
-        self.runtime_hooks = RuntimeHooks(sampler_store_writer=writer)
-
-
-def _instantiate_sampler(monkeypatch, model, sampler):
-    """``instantiate_sampler`` for a speculative engine whose spec decoder is ``sampler``."""
-    from tensorrt_llm._torch.pyexecutor import _util
-
-    monkeypatch.setattr(_util, "confidential_compute_enabled", lambda: False)
-    monkeypatch.setattr(_util, "resolve_max_num_sequences", lambda *args, **kwargs: 8)
-    monkeypatch.setattr(_util, "create_torch_sampler_args", lambda **kwargs: "sampler args")
-    monkeypatch.setattr(_util, "get_spec_decoder", lambda args, spec_config: sampler)
-    engine = types.SimpleNamespace(
-        max_seq_len=64,
-        spec_config=types.SimpleNamespace(
-            spec_dec_mode=types.SimpleNamespace(has_spec_decoder=lambda: True)
-        ),
-        model=model,
-    )
-    llm_args = types.SimpleNamespace(
-        sampler_force_async_worker=False,
-        disable_overlap_scheduler=False,
-        enable_speculative_beam_history_d2h=False,
-    )
-    return _util.instantiate_sampler(
-        engine,
-        llm_args,
-        None,
-        max_batch_size=8,
-        max_beam_width=1,
-        mm_encoder_only=False,
-        speculative_config=None,
-    )
-
-
-def test_instantiate_sampler_binds_no_writer_without_hooks(monkeypatch):
-    from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
-
-    sampler = SpecSampler.__new__(SpecSampler)
-
-    assert _instantiate_sampler(monkeypatch, _PlainModel(), sampler) is sampler
-    assert "store_writer" not in vars(sampler)
-    assert sampler.store_writer is None
-
-
-def test_instantiate_sampler_binds_the_declared_writer(monkeypatch):
-    from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
-
-    writer = object()
-    sampler = SpecSampler.__new__(SpecSampler)
-
-    assert _instantiate_sampler(monkeypatch, _StoreWriterModel(writer), sampler) is sampler
-    assert sampler.store_writer is writer
 
 
 def test_executor_events_protocol():
@@ -371,13 +268,6 @@ def test_overlap_loop_scope_stays_off_with_side_streams(monkeypatch, name, value
     assert recorder.entered == []
 
 
-def test_instantiate_sampler_leaves_other_spec_decoders_alone(monkeypatch):
-    sampler = types.SimpleNamespace()
-
-    assert _instantiate_sampler(monkeypatch, _StoreWriterModel(object()), sampler) is sampler
-    assert "store_writer" not in vars(sampler)
-
-
 # ---------------------------------------------------------------------------------------------
 # With every hook off, every call site runs its original statements.
 #
@@ -390,33 +280,20 @@ def test_instantiate_sampler_leaves_other_spec_decoders_alone(monkeypatch):
 # ---------------------------------------------------------------------------------------------
 
 _SEAM_CONSUMERS = (
-    "pyexecutor/engine/runners/decoder/runner.py",
     "pyexecutor/engine/runners/decoder/inputs.py",
-    "pyexecutor/cuda_graph_runner.py",
-    "pyexecutor/kv_cache/kv_cache_manager_v2.py",
     "pyexecutor/py_executor.py",
-    "pyexecutor/_util.py",
-    "attention/backends/trtllm.py",
-    "attention/backends/sparse/dsa/metadata.py",
-    "attention/backends/sparse/dsa/indexer.py",
-    "speculative/eagle3.py",
-    "speculative/interface.py",
-    "speculative/spec_sampler_base.py",
 )
 
 # Attributes that hold a hook, and their value when every hook is off.
 _SEAM_ATTRS = {
-    "step_input_stager": None,
-    "store_writer": None,
     "_executor_events": None,
     "_loop_on_execution_stream": False,
     "_execution_stream_loop_armed": False,
-    "staged_static_input_tokens": 0,
     "runtime_hooks": DEFAULT_RUNTIME_HOOKS,
     "decode_prologue": None,
 }
 # Locals the call sites hold a hook (or a decision on one) in.
-_SEAM_LOCALS = ("stager", "stager_source", "store_writer", "prologue", "staged", "staged_store")
+_SEAM_LOCALS = ("prologue",)
 _HOOK_FIELDS = {field.name for field in dataclasses.fields(RuntimeHooks)}
 
 
@@ -441,15 +318,10 @@ class _AllOffWalk:
     # -- reads of a hook ------------------------------------------------------------------
     @staticmethod
     def _is_seam_call(node: ast.AST) -> bool:
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
-            return False
-        if node.func.id == "runtime_hooks_of":
-            return True
         return (
-            node.func.id == "getattr"
-            and len(node.args) >= 2
-            and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value == "step_input_stager"
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "runtime_hooks_of"
         )
 
     def reads_seam(self, node: ast.AST, env: dict) -> bool:
@@ -476,7 +348,7 @@ class _AllOffWalk:
                 return _SEAM_ATTRS[node.attr]
             return _UNKNOWN
         if self._is_seam_call(node):
-            return DEFAULT_RUNTIME_HOOKS if node.func.id == "runtime_hooks_of" else None
+            return DEFAULT_RUNTIME_HOOKS
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
             operand = self.value(node.operand, env)
             return _UNKNOWN if operand is _UNKNOWN else not operand
@@ -496,13 +368,6 @@ class _AllOffWalk:
             if isinstance(op, (ast.Is, ast.IsNot)) and left is not _UNKNOWN:
                 if isinstance(node.comparators[0], ast.Constant) and right is None:
                     return (left is None) == isinstance(op, ast.Is)
-            if (
-                isinstance(op, ast.Eq)
-                and isinstance(node.left, ast.Attribute)
-                and node.left.attr == "staged_static_input_tokens"
-            ):
-                # No tokens were staged; a graph replay has at least one token.
-                return False
         return _UNKNOWN
 
     # -- statements -------------------------------------------------------------------------
@@ -598,15 +463,15 @@ def test_every_seam_read_has_a_native_branch(rel):
 def test_the_seam_check_reports_undecided_reads():
     source = """
 def step(self, x):
-    stager = self.step_input_stager
-    if stager is not None:
-        stager.copy(x)
+    events = self._executor_events
+    if events is not None:
+        events.after_warmup()
     else:
         x.copy_()
-    stager.flush()
-    if x or stager:
+    events.at_shutdown()
+    if x or events:
         pass
-    self.step_input_stager = x
+    self._executor_events = x
 """
     walk = _AllOffWalk("sample.py")
     walk.block(ast.parse(source).body, {})
@@ -815,584 +680,3 @@ def test_executor_loop_cleanup_calls_at_shutdown_after_a_completed_loop(complete
     executor._executor_loop_cleanup()
     assert executor.is_shutdown
     assert events.calls == (["at_shutdown"] if completed else [])
-
-
-# -- the step-input stager ------------------------------------------------------------------
-
-
-class _RecordingStager:
-    def __init__(self) -> None:
-        self.calls = []
-
-    def __getattr__(self, name):
-        return lambda *args, **kwargs: self.calls.append((name, args, kwargs))
-
-
-def _block_offsets_manager(monkeypatch, log: list):
-    """A ``KVCacheManagerV2`` with only what ``copy_batch_block_offsets`` reads (one page table)."""
-    from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-
-    monkeypatch.setattr(
-        kv_cache_manager_v2,
-        "copy_batch_block_offsets_to_device",
-        lambda *args: log.append(("native", args)),
-    )
-    manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
-    manager._publish_sparse_metadata = lambda: None
-    manager.max_copy_beam_width = 1
-    manager.kv_cache_type = None
-    manager._use_per_layer_page_tables = False
-    manager.index_mapper = types.SimpleNamespace(
-        get_copy_index=lambda request_ids, num_contexts, beam_width, cross: torch.tensor([1, 0])
-    )
-    manager.host_kv_cache_block_offsets = torch.zeros(2, 4, dtype=torch.int32)
-    manager.index_scales = torch.ones(1, dtype=torch.int32)
-    manager._index_scale_ints = [1]
-    manager.kv_offset = torch.zeros(1, dtype=torch.int32)
-    manager._stream = types.SimpleNamespace(cuda_stream=7)
-    return manager
-
-
-def test_kv_cache_block_offsets_copy_natively_without_a_stager(monkeypatch):
-    log = []
-    manager = _block_offsets_manager(monkeypatch, log)
-    dst = torch.empty(2, 4, dtype=torch.int32)
-
-    manager.copy_batch_block_offsets(dst, [3, 4], 1, 0, 2)
-    assert len(log) == 1
-    kind, args = log[0]
-    assert kind == "native"
-    assert args[0] is manager.host_kv_cache_block_offsets and args[1] is dst
-    assert args[2].tolist() == [1, 0]
-    assert args[3] is manager.index_scales and args[4] is manager.kv_offset and args[5] == 7
-
-
-def test_kv_cache_block_offsets_are_staged_with_a_stager(monkeypatch):
-    log = []
-    manager = _block_offsets_manager(monkeypatch, log)
-    manager.step_input_stager = _RecordingStager()
-    dst = torch.empty(2, 4, dtype=torch.int32)
-
-    manager.copy_batch_block_offsets(dst, [3, 4], 1, 0, 2)
-    assert log == []
-    ((name, args, _),) = manager.step_input_stager.calls
-    assert name == "block_offsets"
-    assert args[0] is manager.host_kv_cache_block_offsets and args[1] is dst
-    assert args[2:] == ([1, 0], [1], [0])
-
-
-def _slot_mapping_inputs(tokens: int):
-    metadata = types.SimpleNamespace(
-        host_indexer_k_cache_block_offsets=torch.tensor([[0, 1]], dtype=torch.int32),
-        host_slot_mapping_fp8=torch.zeros(tokens, dtype=torch.int64),
-        host_slot_mapping_scale=torch.zeros(tokens, dtype=torch.int64),
-        slot_mapping_fp8=torch.full((tokens,), -1, dtype=torch.int64),
-        slot_mapping_scale=torch.full((tokens,), -1, dtype=torch.int64),
-    )
-    params = types.SimpleNamespace(
-        batch_size=1,
-        tokens_per_block=4,
-        head_dim=8,
-        new_kv_tokens=torch.tensor([tokens]),
-        data_bytes_per_token=8,
-        cached_kv_tokens=torch.tensor([1]),
-        quant_block_size=8,
-    )
-    return metadata, params
-
-
-def test_indexer_slot_mappings_copy_natively_without_a_stager():
-    from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer
-
-    metadata, params = _slot_mapping_inputs(3)
-
-    Indexer.recompute_slot_mappings(metadata, params)
-    assert torch.equal(metadata.slot_mapping_fp8, metadata.host_slot_mapping_fp8)
-    assert torch.equal(metadata.slot_mapping_scale, metadata.host_slot_mapping_scale)
-
-
-def test_indexer_slot_mappings_are_staged_with_a_stager():
-    from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import Indexer
-
-    metadata, params = _slot_mapping_inputs(3)
-    metadata.step_input_stager = _RecordingStager()
-
-    Indexer.recompute_slot_mappings(metadata, params)
-    assert [name for name, _, _ in metadata.step_input_stager.calls] == ["copy", "copy"]
-    assert bool((metadata.slot_mapping_fp8 == -1).all())
-    assert bool((metadata.slot_mapping_scale == -1).all())
-
-
-# -- the step-input window in the decoder runner -------------------------------------------------
-
-
-class _ReferenceStager:
-    """A step-input stager that accepts every step it is offered and logs the window's lifecycle."""
-
-    def __init__(self, log: list, accept: bool = True, tokens: int = 3) -> None:
-        self.log, self.accept, self.tokens = log, accept, tokens
-
-    def begin_if_eligible(
-        self,
-        preparer,
-        requests,
-        attn_metadata,
-        spec_metadata,
-        new_tensors_device,
-        *,
-        graph_replay,
-        static_inputs,
-        is_dummy,
-        enable_spec_decode,
-        promoted,
-    ):
-        self.log.append(("begin", graph_replay, static_inputs))
-        return self if self.accept else None
-
-    def end(self, record_event: bool = True) -> None:
-        self.log.append(("end", record_event))
-
-    def discard(self) -> None:
-        self.log.append("discard")
-
-    def set_completion_event(self, event) -> None:
-        self.log.append(("completion_event", event))
-
-    def static_inputs_tokens(self) -> int:
-        return self.tokens
-
-
-class _WindowGraphs:
-    """The ``DecoderCudaGraphs`` calls ``_forward_decoder`` makes, with one selected graph key.
-
-    ``run`` follows ``DecoderCudaGraphs._run``: ``before_replay`` runs only right before the
-    replay of an already captured graph, and the replay consumes the staged static inputs.
-    """
-
-    def __init__(self, log: list, key, *, needs_capture=False, warmup_only=False, fail=None):
-        self.log, self.key, self.fail = log, key, fail
-        self.cuda_graph_runner = types.SimpleNamespace(
-            needs_capture=lambda key: needs_capture,
-            is_warmup_only=warmup_only,
-            shared_static_tensors={"input_ids": torch.zeros(4, dtype=torch.int64)},
-            staged_static_input_tokens=0,
-        )
-
-    def attention_dp_execution_batch(self, requests):
-        return requests
-
-    def promote_final_contexts(self, requests, kv_cache_manager, **kwargs):
-        return requests, frozenset()
-
-    def pad_batch(self, requests, resource_manager, runtime_draft_len):
-        return contextlib.nullcontext(requests)
-
-    def select(self, requests, resource_manager, **kwargs):
-        return types.SimpleNamespace(
-            key=self.key,
-            use_lora_graph=False,
-            attn_metadata=kwargs["attn_metadata"],
-            spec_metadata=None,
-        )
-
-    def captures_model_body(self, key) -> bool:
-        return False
-
-    def run(self, key, inputs, run_model, postprocess_inputs, *, before_replay=None, **kwargs):
-        runner = self.cuda_graph_runner
-        if self.fail == "before_replay":
-            raise RuntimeError("graph run failed")
-        if key is None:
-            self.log.append("eager")
-        elif runner.needs_capture(key) or runner.is_warmup_only:
-            self.log.append("capture")
-        else:
-            if before_replay is not None:
-                before_replay()
-            self.log.append(("replay", runner.staged_static_input_tokens))
-            runner.staged_static_input_tokens = 0
-            if self.fail == "replay":
-                raise RuntimeError("replay failed")
-        return "outputs"
-
-
-class _WindowPreparer:
-    """The ``DecoderInputPreparer`` calls ``_forward_decoder`` makes."""
-
-    def __init__(self, log: list, fail: bool = False) -> None:
-        self.log, self.fail = log, fail
-        self.input_copy_event = "input-copy-event"
-
-    def prepare_inputs(self, *args, **kwargs):
-        self.log.append("prepare")
-        if self.fail:
-            raise RuntimeError("preparation failed")
-        return types.SimpleNamespace(kwargs={}, runtime_draft_len=0, gather_ids=None)
-
-    def record_input_copy(self) -> None:
-        self.log.append("record_input_copy")
-
-    def postprocess_inputs(self, *args, **kwargs) -> None:
-        pass
-
-
-def _window_runner(monkeypatch, graphs, preparer, stager):
-    """A ``DecoderRunner`` with only what ``_forward_decoder`` reads (no speculation, no CED)."""
-    from tensorrt_llm._torch.pyexecutor import ced_replay
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner as runner_module
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
-
-    monkeypatch.setattr(runner_module, "get_draft_kv_cache_manager", lambda *args: None)
-    monkeypatch.setattr(ced_replay, "uses_private_decoder_cache", lambda *args: False)
-    attn_metadata = types.SimpleNamespace()
-    runner = DecoderRunner.__new__(DecoderRunner)
-    runner._config = types.SimpleNamespace(spec_config=None, use_mrope=False, is_spec_decode=False)
-    runner._metadata = types.SimpleNamespace(
-        setup_attention=lambda *args: attn_metadata,
-        attn_metadata=attn_metadata,
-        spec_metadata=None,
-    )
-    runner._graphs = graphs
-    runner._inputs = preparer
-    runner._stage_in_graph_sampling = None
-    runner._cuda_graph_metadata_prepare_scope = lambda *args, **kwargs: contextlib.nullcontext()
-    runner._execute_logit_post_processors = lambda *args: None
-    runner.forward_pass_callable = None
-    runner.moe_load_balancer = None
-    runner.model = types.SimpleNamespace()
-    runner.kv_cache_manager_key = "kv_cache_manager"
-    runner.runtime_hooks = RuntimeHooks(step_input_stager=stager)
-    return runner
-
-
-def _decode_step(runner):
-    forward_inputs = types.SimpleNamespace(
-        batch=types.SimpleNamespace(num_context_requests=0),
-        new_tensors_device=None,
-        cache_indirection_buffer=None,
-        gather_context_logits=False,
-        enable_spec_decode=False,
-        runtime_draft_len=0,
-    )
-    resource_manager = types.SimpleNamespace(get_resource_manager=lambda key: object())
-    return runner._forward_decoder(forward_inputs, resource_manager, is_dummy=False)
-
-
-def _names(log: list) -> list:
-    return [entry if isinstance(entry, str) else entry[0] for entry in log]
-
-
-_GRAPH_KEY = (1, 0, False)
-_STAGED_STEP = ["begin", "prepare", "end", "record_input_copy", "completion_event", "replay"]
-
-
-def test_a_replay_issues_the_staged_preparation_before_the_replay(monkeypatch):
-    log = []
-    graphs = _WindowGraphs(log, _GRAPH_KEY)
-    runner = _window_runner(monkeypatch, graphs, _WindowPreparer(log), _ReferenceStager(log))
-
-    assert _decode_step(runner) == "outputs"
-    assert log == [
-        ("begin", True, graphs.cuda_graph_runner.shared_static_tensors),
-        "prepare",
-        ("end", False),
-        "record_input_copy",
-        ("completion_event", "input-copy-event"),
-        ("replay", 3),
-    ]
-
-
-@pytest.mark.parametrize(
-    "key, needs_capture, warmup_only, ran",
-    [
-        (None, False, False, "eager"),
-        (_GRAPH_KEY, True, False, "capture"),
-        (_GRAPH_KEY, False, True, "capture"),
-    ],
-    ids=["eager", "initial_capture", "warmup_only"],
-)
-def test_a_step_that_is_not_a_replay_never_opens_a_window(
-    monkeypatch, key, needs_capture, warmup_only, ran
-):
-    log = []
-    graphs = _WindowGraphs(log, key, needs_capture=needs_capture, warmup_only=warmup_only)
-    runner = _window_runner(monkeypatch, graphs, _WindowPreparer(log), _ReferenceStager(log))
-
-    _decode_step(runner)
-    assert log == ["prepare", "record_input_copy", ran]
-    assert graphs.cuda_graph_runner.staged_static_input_tokens == 0
-
-
-def test_a_declined_replay_prepares_natively(monkeypatch):
-    log = []
-    graphs = _WindowGraphs(log, _GRAPH_KEY)
-    stager = _ReferenceStager(log, accept=False)
-    runner = _window_runner(monkeypatch, graphs, _WindowPreparer(log), stager)
-
-    _decode_step(runner)
-    assert _names(log) == ["begin", "prepare", "record_input_copy", "replay"]
-    assert log[-1] == ("replay", 0)
-
-
-def test_a_failed_preparation_discards_the_window(monkeypatch):
-    log = []
-    graphs = _WindowGraphs(log, _GRAPH_KEY)
-    runner = _window_runner(
-        monkeypatch, graphs, _WindowPreparer(log, fail=True), _ReferenceStager(log)
-    )
-
-    with pytest.raises(RuntimeError, match="preparation failed"):
-        _decode_step(runner)
-    assert _names(log) == ["begin", "prepare", "discard"]
-
-
-@pytest.mark.parametrize(
-    "fail, expected",
-    [
-        ("before_replay", ["begin", "prepare", "discard"]),
-        ("replay", _STAGED_STEP),
-    ],
-    ids=["window_open", "window_closed"],
-)
-def test_a_failed_run_discards_only_a_window_still_open(monkeypatch, fail, expected):
-    log = []
-    graphs = _WindowGraphs(log, _GRAPH_KEY, fail=fail)
-    runner = _window_runner(monkeypatch, graphs, _WindowPreparer(log), _ReferenceStager(log))
-
-    with pytest.raises(RuntimeError):
-        _decode_step(runner)
-    assert _names(log) == expected
-
-
-def test_replay_eager_replay_opens_one_window_per_replay(monkeypatch):
-    log = []
-    graphs = _WindowGraphs(log, _GRAPH_KEY)
-    runner = _window_runner(monkeypatch, graphs, _WindowPreparer(log), _ReferenceStager(log))
-
-    _decode_step(runner)
-    graphs.key = None
-    _decode_step(runner)
-    graphs.key = _GRAPH_KEY
-    _decode_step(runner)
-    assert _names(log) == [
-        *_STAGED_STEP,
-        "prepare",
-        "record_input_copy",
-        "eager",
-        *_STAGED_STEP,
-    ]
-    assert [entry for entry in log if entry[0] == "replay"] == [("replay", 3), ("replay", 3)]
-
-
-def _replay_graphs(monkeypatch, log: list, *, needs_capture: bool, warmup_only: bool):
-    """A ``DecoderCudaGraphs`` with only what ``_run`` reads, logging capture and replay."""
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import graphs as graphs_module
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
-
-    monkeypatch.setattr(graphs_module, "prepare_attn_metadata_for_draft_replay", lambda *args: None)
-    monkeypatch.setattr(
-        graphs_module, "restore_attn_metadata_after_draft_replay", lambda *args: None
-    )
-    monkeypatch.setattr(
-        graphs_module, "MoeLoadBalancerIterContext", lambda balancer: contextlib.nullcontext()
-    )
-    graphs = DecoderCudaGraphs.__new__(DecoderCudaGraphs)
-    graphs.breakable_cuda_graph_runner = None
-    graphs._torch_compile_bypass = contextlib.nullcontext
-    graphs.cuda_graph_runner = types.SimpleNamespace(
-        needs_capture=lambda key: needs_capture,
-        is_warmup_only=warmup_only,
-        capture=lambda key, fn, inputs, **kwargs: log.append("capture"),
-        replay=lambda key, inputs, **kwargs: log.append("replay"),
-    )
-    return graphs
-
-
-@pytest.mark.parametrize(
-    "key, needs_capture, warmup_only, expected",
-    [
-        (_GRAPH_KEY, False, False, ["before_replay", "replay"]),
-        (_GRAPH_KEY, True, False, ["capture", "replay"]),
-        (_GRAPH_KEY, True, True, ["capture"]),
-        (None, False, False, ["eager"]),
-    ],
-    ids=["replay", "capture_then_replay", "warmup_only", "eager"],
-)
-def test_before_replay_runs_only_before_the_replay_of_a_captured_graph(
-    monkeypatch, key, needs_capture, warmup_only, expected
-):
-    log = []
-    graphs = _replay_graphs(monkeypatch, log, needs_capture=needs_capture, warmup_only=warmup_only)
-
-    graphs._run(
-        key,
-        {"input_ids": torch.zeros(2, dtype=torch.int64)},
-        lambda inputs: log.append("eager"),
-        lambda inputs: None,
-        attn_metadata=None,
-        draft_kv_cache_manager=None,
-        moe_load_balancer=None,
-        enable_spec_decode=True,
-        gather_context_logits=False,
-        position_id_offsets=None,
-        before_replay=lambda: log.append("before_replay"),
-    )
-    assert log == expected
-
-
-# -- the speculative sampler's store writer -----------------------------------------------------
-
-
-class _ReferenceStoreWriter:
-    """Stores like the native ``index_copy_`` path, then copies the store to the host tensors."""
-
-    def __init__(self, supported: bool = True) -> None:
-        self._supported = supported
-        self.calls = []
-
-    def supported(self, store, new_tokens, next_new_tokens, new_tokens_lens, next_draft_tokens):
-        self.calls.append("supported")
-        return self._supported
-
-    def store_and_copy_out(
-        self,
-        store,
-        slots,
-        new_tokens,
-        next_new_tokens,
-        new_tokens_lens,
-        next_draft_tokens,
-        host_new_tokens,
-        host_new_tokens_lens,
-        host_next_draft_tokens,
-        record_event=True,
-    ) -> None:
-        self.calls.append(("store_and_copy_out", list(slots), record_event))
-        index = torch.tensor(slots, dtype=torch.long)
-        store.new_tokens.squeeze(-1).T.index_copy_(0, index, new_tokens)
-        store.next_new_tokens.squeeze(-1).T.index_copy_(0, index, next_new_tokens)
-        store.new_tokens_lens.index_copy_(0, index, new_tokens_lens)
-        store.next_draft_tokens.index_copy_(0, index, next_draft_tokens)
-        host_new_tokens.copy_(store.new_tokens)
-        host_new_tokens_lens.copy_(store.new_tokens_lens)
-        host_next_draft_tokens.copy_(store.next_draft_tokens)
-
-    def set_completion_event(self, event) -> None:
-        self.calls.append(("completion_event", event))
-
-
-def _cpu_sampling(monkeypatch, *, pinned: bool) -> None:
-    """Run ``SpecSampler.sample_async`` on CPU: device transfers stay on the host."""
-    from tensorrt_llm._torch.speculative import spec_sampler_base
-
-    original_to = torch.Tensor.to
-    original_empty_like = torch.empty_like
-
-    def to_cpu(tensor, *args, **kwargs):
-        if kwargs.get("device") == "cuda":
-            kwargs = {**kwargs, "device": "cpu"}
-        return original_to(tensor, *args, **kwargs)
-
-    def empty_like(tensor, *args, pin_memory=False, **kwargs):
-        # Pinning needs a CUDA context; the writer's host buffers are plain host tensors here.
-        return original_empty_like(tensor, *args, **kwargs)
-
-    monkeypatch.setattr(torch.Tensor, "to", to_cpu)
-    monkeypatch.setattr(torch, "empty_like", empty_like)
-    monkeypatch.setattr(spec_sampler_base, "prefer_pinned", lambda: pinned)
-    monkeypatch.setattr(spec_sampler_base, "handle_stop_criteria", lambda *args, **kwargs: False)
-
-
-def _store_sampler(writer, *, async_worker: bool = False):
-    """A ``SpecSampler`` with a six-slot store, draft length 3 and the given store writer."""
-    from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
-
-    sampler = SpecSampler.__new__(SpecSampler)
-    sampler.draft_len = 3
-    sampler.max_accepted_path_len = 4
-    sampler.max_seq_len = 128
-    sampler.store = types.SimpleNamespace(
-        new_tokens=torch.zeros(4, 6, 1, dtype=torch.int32),
-        next_new_tokens=torch.zeros(4, 6, 1, dtype=torch.int32),
-        next_draft_tokens=torch.zeros(6, 3, dtype=torch.int32),
-        new_tokens_lens=torch.zeros(6, dtype=torch.int32),
-    )
-    sampler.store_writer = writer
-    sampler._async_worker_active = lambda: async_worker
-    sampler._copy_to_host = lambda tensor: tensor.clone()
-    sampler._record_sampler_event = lambda: types.SimpleNamespace(cuda_event="sampler-event")
-    return sampler
-
-
-def _sample_generation_step(sampler, *, verify_lens: bool = False):
-    """Three generation requests in nonconsecutive slots 4, 1 and 3."""
-    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-
-    def request(request_id: int, slot: int):
-        return types.SimpleNamespace(
-            py_request_id=request_id,
-            py_seq_slot=slot,
-            state=LlmRequestState.GENERATION_IN_PROGRESS,
-            py_draft_tokens=[10, 11, 12],
-            py_draft_tokens_effective_len=None,
-            py_verify_len=None,
-            py_decoding_iter=0,
-        )
-
-    scheduled = types.SimpleNamespace(
-        context_requests_chunking=[],
-        context_requests_last_chunk=[],
-        generation_requests=[request(7, 4), request(8, 1), request(9, 3)],
-    )
-    outputs = dict(
-        new_tokens=torch.arange(12, dtype=torch.int32).reshape(3, 4) + 100,
-        new_tokens_lens=torch.tensor([1, 3, 2], dtype=torch.int32),
-        next_draft_tokens=torch.arange(9, dtype=torch.int32).reshape(3, 3) + 200,
-        next_new_tokens=torch.arange(12, dtype=torch.int32).reshape(3, 4) + 300,
-    )
-    if verify_lens:
-        outputs["verify_lens"] = torch.tensor([2, 3, 1], dtype=torch.int32)
-        outputs["verify_lens_in_output_order"] = True
-    return sampler.sample_async(scheduled, outputs, [])
-
-
-def _assert_same_stores(sampler, state, native, native_state) -> None:
-    for name in ("new_tokens", "next_new_tokens", "next_draft_tokens", "new_tokens_lens"):
-        assert torch.equal(getattr(sampler.store, name), getattr(native.store, name)), name
-    for name in ("new_tokens", "new_tokens_lens", "next_draft_tokens"):
-        assert torch.equal(getattr(state.host, name), getattr(native_state.host, name)), name
-
-
-def test_the_store_writer_matches_the_native_stores_on_nonconsecutive_slots(monkeypatch):
-    _cpu_sampling(monkeypatch, pinned=True)
-    native = _store_sampler(None)
-    writer = _ReferenceStoreWriter()
-    sampler = _store_sampler(writer)
-
-    native_state = _sample_generation_step(native)
-    state = _sample_generation_step(sampler)
-    assert writer.calls == [
-        "supported",
-        ("store_and_copy_out", [4, 1, 3], False),
-        ("completion_event", "sampler-event"),
-    ]
-    assert native.store.new_tokens_lens.tolist() == [0, 3, 0, 2, 1, 0]
-    _assert_same_stores(sampler, state, native, native_state)
-    assert state.host.verify_lens is None
-    assert state.device.new_tokens is sampler.store.next_new_tokens
-
-
-@pytest.mark.parametrize("case", ["declined", "verify_lens", "async_worker", "not_pinned"])
-def test_the_store_writer_falls_back_to_the_native_stores(monkeypatch, case):
-    _cpu_sampling(monkeypatch, pinned=case != "not_pinned")
-    native = _store_sampler(None)
-    writer = _ReferenceStoreWriter(supported=case != "declined")
-    sampler = _store_sampler(writer, async_worker=case == "async_worker")
-
-    native_state = _sample_generation_step(native, verify_lens=case == "verify_lens")
-    state = _sample_generation_step(sampler, verify_lens=case == "verify_lens")
-    assert writer.calls == (["supported"] if case == "declined" else [])
-    _assert_same_stores(sampler, state, native, native_state)
-    if case == "verify_lens":
-        assert state.host.verify_lens.tolist() == [2, 3, 1]
