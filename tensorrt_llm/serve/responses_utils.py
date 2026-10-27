@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from typing import (Any, Callable, List, Literal, Optional, OrderedDict, Tuple,
                     Union)
 
+import anyio
+from fastapi.responses import StreamingResponse
 from jinja2.exceptions import TemplateError
 from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
@@ -3353,6 +3355,24 @@ async def _with_ticks(
         await asyncio.gather(reader, return_exceptions=True)
 
 
+class ClosingStreamingResponse(StreamingResponse):
+    """A streaming response that closes its body iterator however it ends.
+
+    A client that disconnects while a frame is being sent leaves the iterator
+    suspended at its yield: on ASGI 2.3 the send is cancelled, on 2.4 it raises
+    and Starlette raises ``ClientDisconnect``, skipping any background task. The
+    iterator, and the generation stream it reads, would then be closed only when
+    garbage-collected.
+    """
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self.body_iterator.aclose()
+
+
 async def keep_responses_stream_alive(
         frames: AsyncGenerator[str, None]) -> AsyncGenerator[str, None]:
     """Send ``frames``, repeating ``response.in_progress`` while they are silent.
@@ -3364,10 +3384,12 @@ async def keep_responses_stream_alive(
     first token too. It is part of the stream format and carries the same
     response as at the start, which clients already hold.
 
-    Events are numbered here, where they leave the server: a repeated event
-    takes the next number, and every event after it is renumbered to its place
-    in the stream. Until then each event already carries its place and goes out
-    as it came.
+    Events are numbered here, where they leave the server. The processor that
+    makes them cannot do it: postprocess workers each format events with their
+    own copy of it, and when a keepalive is due the reader may already hold the
+    next numbered event. A repeated event takes the next number, and every event
+    after it is renumbered to its place in the stream. Until then each event
+    already carries its place and goes out as it came.
     """
     in_progress: Optional[str] = None
     ended = False

@@ -122,7 +122,8 @@ from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        prepare_chat_request, render_chat,
                                        render_chat_for_length,
                                        render_conversation)
-from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
+from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
+                                                ConversationHistoryStore,
                                                 ResponsesStreamingProcessor,
                                                 ServerArrivalTimeMiddleware)
 from tensorrt_llm.serve.responses_utils import \
@@ -3517,12 +3518,14 @@ class OpenAIServer(_VideoRoutesMixin):
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
             if request.stream:
-                return StreamingResponse(content=keep_responses_stream_alive(
-                    guard_responses_stream(
-                        create_streaming_generator(promise, postproc_params),
-                        streaming_processor.get_stream_failed_events,
-                    )),
-                                         media_type="text/event-stream")
+                return ClosingStreamingResponse(
+                    content=keep_responses_stream_alive(
+                        guard_responses_stream(
+                            create_streaming_generator(promise,
+                                                       postproc_params),
+                            streaming_processor.get_stream_failed_events,
+                        )),
+                    media_type="text/event-stream")
             else:
                 response = await create_response(promise, postproc_params)
                 # Context-only: the orchestrator may ask for the prompt as a

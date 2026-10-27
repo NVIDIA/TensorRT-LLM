@@ -22,6 +22,7 @@ an id it has not seen opened.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -31,11 +32,13 @@ from unittest.mock import AsyncMock
 import aiohttp
 import pytest
 from openai.types.responses.tool import FunctionTool
+from starlette.requests import ClientDisconnect
 
 import tensorrt_llm.serve.responses_utils as responses_utils
 from tensorrt_llm.executor import EngineDeadError, RequestError
 from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
+    ClosingStreamingResponse,
     ResponsesStreamingEventsHelper,
     ResponsesStreamingProcessor,
     _create_output_content,
@@ -784,6 +787,54 @@ async def test_a_client_that_leaves_while_a_frame_waits_closes_the_source():
     for _ in range(5):
         await asyncio.sleep(0)
     await stream.aclose()
+
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec_version", ["2.3", "2.4"])
+async def test_a_client_that_disconnects_mid_send_closes_the_source(spec_version):
+    """The response closes its stream when a send fails, on both ASGI paths.
+
+    ASGI 2.3 cancels the blocked send; 2.4 raises from it, and Starlette then
+    raises ClientDisconnect without running a background task.
+    """
+    closed = []
+
+    async def frames():
+        try:
+            for frame in _processor().get_initial_responses():
+                yield frame
+            await asyncio.Event().wait()
+        finally:
+            closed.append(True)
+
+    response = ClosingStreamingResponse(
+        content=keep_responses_stream_alive(frames()), media_type="text/event-stream"
+    )
+    first_body = asyncio.Event()
+    bodies = 0
+
+    async def send(message):
+        nonlocal bodies
+        if message["type"] != "http.response.body":
+            return
+        bodies += 1
+        if bodies == 1:
+            first_body.set()
+            return
+        if spec_version == "2.4":
+            raise OSError("connection reset")
+        await asyncio.Event().wait()
+
+    async def receive():
+        await first_body.wait()
+        await asyncio.sleep(0.05)
+        return {"type": "http.disconnect"}
+
+    scope = {"type": "http", "asgi": {"spec_version": spec_version}}
+    with contextlib.suppress(ClientDisconnect):
+        await asyncio.wait_for(response(scope, receive, send), timeout=5)
 
     assert closed == [True]
 
