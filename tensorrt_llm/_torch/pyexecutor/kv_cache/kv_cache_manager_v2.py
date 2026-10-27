@@ -1342,6 +1342,7 @@ def _convert_batch_block_offsets_kernel(
     out_pool_stride,
     num_blocks,
     BLOCK: tl.constexpr,
+    BAD_PAGE: tl.constexpr,
 ):
     # grid = (num_op_pools, num_seqs, cdiv(num_blocks, BLOCK)): one column tile
     # of both lanes of one sequence's row in one attention-op table.
@@ -1356,8 +1357,8 @@ def _convert_batch_block_offsets_kernel(
         offset = tl.load(param + 2 * num_params)
         # Columns past the snapshot's width are BAD_PAGE_INDEX, as in the host rows.
         src = rows_ptr + (pool * num_seqs + seq) * rows_width + cols
-        base = tl.load(src, mask=cols < rows_width, other=-1)
-        value = tl.where(base < 0, -1, base * scale + offset)
+        base = tl.load(src, mask=cols < rows_width, other=BAD_PAGE)
+        value = tl.where(base == BAD_PAGE, BAD_PAGE, base * scale + offset)
         dst = out_ptr + op_pool.to(tl.int64) * out_pool_stride + seq * 2 * num_blocks
         tl.store(dst + lane * num_blocks + cols, value, mask=cols < num_blocks)
 
@@ -1374,10 +1375,19 @@ def _convert_batch_block_offsets(
     assert rows.is_contiguous() and rows.shape[1] == num_seqs and rows.shape[2] <= num_blocks
     assert out.shape[2] == 2 and out[0].is_contiguous()
     assert params.shape == (3, out.shape[0], 2) and params.dtype == torch.int32
+    assert params.is_contiguous()
     block = 1024
     grid = (out.shape[0], num_seqs, triton.cdiv(num_blocks, block))
     _convert_batch_block_offsets_kernel[grid](
-        rows, out, params, num_seqs, rows.shape[2], out.stride(0), num_blocks, BLOCK=block
+        rows,
+        out,
+        params,
+        num_seqs,
+        rows.shape[2],
+        out.stride(0),
+        num_blocks,
+        BLOCK=block,
+        BAD_PAGE=BAD_PAGE_INDEX,
     )
 
 

@@ -1608,13 +1608,15 @@ class DFlashWorker(SpecWorkerBase):
         """
         request_ids = spec_metadata.request_ids or []
         num_contexts = max(0, len(request_ids) - spec_metadata.num_generations)
+        seq_lens = spec_metadata.seq_lens
+        token_offset = sum(seq_lens[:num_contexts])
         updates = {}
-        for request_idx, rid in enumerate(request_ids[num_contexts:], num_contexts):
+        for rid, seq_len in zip(request_ids[num_contexts:], seq_lens[num_contexts:]):
             slot = self._req_to_slot.get(rid)
-            if slot is None or rid == ATTENTION_DP_DUMMY_REQUEST_ID:
-                continue
-            token_offset = sum(spec_metadata.seq_lens[:request_idx])
-            updates[slot] = min(int(spec_metadata.host_position_ids[token_offset]), self._max_ctx)
+            if slot is not None and rid != ATTENTION_DP_DUMMY_REQUEST_ID:
+                position = int(spec_metadata.host_position_ids[token_offset])
+                updates[slot] = min(position, self._max_ctx)
+            token_offset += seq_len
         self._write_ctx_len(updates)
 
     def _advance_ctx_len(self, slots: torch.Tensor, num_accepted: torch.Tensor) -> None:
