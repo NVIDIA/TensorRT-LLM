@@ -1463,7 +1463,9 @@ class KVCacheManagerV2(BaseResourceManager):
     low_precision_dtype: Optional[DataType] = None
     high_layers: dict[int, int] = {}
     high_precision_dtype: Optional[DataType] = None
-    # Set by each manager class that hosts retained-token twins; not inherited.
+    # Declared by each manager implementation that hosts retained-token twins and
+    # inherited by its per-model subclasses; the base's own declaration covers only
+    # the plain dense manager (see _mixed_precision_kv_supported).
     _supports_mixed_precision_kv = True
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
@@ -3609,7 +3611,7 @@ class KVCacheManagerV2(BaseResourceManager):
         mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
         if mixed is None:
             return
-        if not type(self).__dict__.get("_supports_mixed_precision_kv", False):
+        if not self._mixed_precision_kv_supported():
             raise NotImplementedError(
                 f"kv_cache_config.dtype={kv_cache_config.dtype!r} is not supported by "
                 f"{type(self).__name__}"
@@ -3636,6 +3638,15 @@ class KVCacheManagerV2(BaseResourceManager):
                     self._shared_kv_layers.add(
                         first_shared - 1 - source_types[::-1].index(layer_type)
                     )
+
+    def _mixed_precision_kv_supported(self) -> bool:
+        """The nearest ``_supports_mixed_precision_kv`` declaration in the class hierarchy."""
+        for cls in type(self).__mro__:
+            if cls is KVCacheManagerV2:
+                return type(self) is KVCacheManagerV2
+            if "_supports_mixed_precision_kv" in cls.__dict__:
+                return bool(cls.__dict__["_supports_mixed_precision_kv"])
+        return False
 
     def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
         """Whether this local layer stores its history in the low-precision pool."""

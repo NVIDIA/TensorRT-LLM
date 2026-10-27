@@ -291,6 +291,15 @@ def test_mixed_precision_rejects_custom_managers():
     manager._init_mixed_precision(KvCacheConfig(), None, 1024, DataType.FP8)
     assert manager.high_layers == {}
 
+    # Per-model subclasses inherit the declaration of the manager they wrap.
+    class _OptedIn(_CustomManager):
+        _supports_mixed_precision_kv = True
+
+    class _Wrapper(_OptedIn):
+        pass
+
+    assert object.__new__(_Wrapper)._mixed_precision_kv_supported()
+
 
 def test_appended_draft_layers_stay_native(make_manager):
     """One-model draft layers appended to the target manager keep a plain cache."""
