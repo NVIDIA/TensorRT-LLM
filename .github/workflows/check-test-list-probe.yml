@@ -128,7 +128,7 @@ jobs:
         runner: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["linux-amd64-cpu4", "ubuntu-latest"]') }}
         # full: requirements-dev.txt as Jenkins installs it, but with CPU torch.
         # full-cuda: same with CUDA torch, which pulls the CUDA runtime wheels.
-        # reduced: drop GPU-only and MPI packages to see what collection needs.
+        # reduced: drop GPU-only packages to see what collection needs.
         deps: [full, full-cuda, reduced]
     steps:
       # Same layout as the Jenkins stage: the source lives in a subdirectory and
@@ -170,11 +170,12 @@ jobs:
           import sys
           from pathlib import Path
 
-          # GPU-only, CUDA-runtime or MPI packages; torch/torchvision are preinstalled.
+          # GPU-only or CUDA-runtime packages; torch/torchvision are preinstalled.
+          # mpi4py stays: tensorrt_llm/_utils.py imports mpi4py.MPI at module level.
           drop = re.compile(
               r"^(torch([<>=!~;\[ ]|$)|torchvision|triton|nvidia-(?!ml-py)|nccl4py|cuda-tile|cupti-python|"
               r"flashinfer|flash-attn|flash-linear-attention|fla-core|quack-kernels|"
-              r"torch-c-dlpack-ext|apache-tvm-ffi|mooncake|nixl|PyNvVideoCodec|mpi4py)",
+              r"torch-c-dlpack-ext|apache-tvm-ffi|mooncake|nixl|PyNvVideoCodec)",
               re.IGNORECASE)
           kept, dropped = [], []
           for name in ("requirements.txt", "requirements-dev.txt"):
@@ -194,13 +195,15 @@ jobs:
           fi
           cat "${RUNNER_TEMP}/probe-requirements.txt"
 
+      # mpi4py loads libmpi when mpi4py.MPI is imported. The CI image ships
+      # HPC-X OpenMPI; on a plain runner the openmpi wheel provides it.
       - name: Install requirements
         id: install
         continue-on-error: true
         run: |
           start=$SECONDS
           python -m pip install --extra-index-url "${TORCH_CPU_INDEX}" \
-            -c "${RUNNER_TEMP}/torch-pin.txt" -r "${RUNNER_TEMP}/probe-requirements.txt"
+            -c "${RUNNER_TEMP}/torch-pin.txt" -r "${RUNNER_TEMP}/probe-requirements.txt" openmpi
           echo "REQ_SECONDS=$((SECONDS - start))" >> "$GITHUB_ENV"
 
       - name: Install trt-test-db
@@ -315,177 +318,8 @@ jobs:
             echo "|---|---|---|"
             echo "| torch | done | ${TORCH_SECONDS:-} |"
             echo "| requirements | ${{ steps.install.outcome }} | ${REQ_SECONDS:-} |"
-            echo "| trt-test-db (${TTDB_SOURCE:-none}) | ${{ steps.trt_test_db.outcome }} | ${TTDB_SECONDS:-} |"
-            echo "| check_test_list | ${{ steps.collect.outcome }} | ${COLLECT_SECONDS:-} |"
-            echo
-            echo "Disk added by installs: $(( used_kb / 1024 )) MiB; free now: $(df -h --output=avail / | tail -1)"
-            echo
-            echo "Collection errors mentioning missing modules or shared libraries:"
-            echo '```'
-            grep -hoE "(ModuleNotFoundError|ImportError|OSError).{0,200}|lib[a-z0-9_]+\.so[.0-9]*.{0,80}(cannot open|not found|No such file)" \
-              "${RUNNER_TEMP}/collect.log" 2>/dev/null | sort | uniq -c | sort -rn | head -40 || true
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-
-  base-image:
-    name: Resolve the NGC base image
-    runs-on: ubuntu-latest
-    outputs:
-      image: ${{ steps.ref.outputs.image }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          sparse-checkout: docker/Dockerfile.multi
-          sparse-checkout-cone-mode: false
-      - id: ref
-        run: |
-          image=$(sed -n 's/^ARG BASE_IMAGE=//p' docker/Dockerfile.multi)
-          tag=$(sed -n 's/^ARG BASE_TAG=//p' docker/Dockerfile.multi)
-          echo "image=${image}:${tag}" >> "$GITHUB_OUTPUT"
-
-  # LLM_DOCKER_IMAGE lives on artifactory, which GitHub-hosted runners cannot
-  # resolve. Its public base image has the same torch and CUDA toolkit; the
-  # pull time shows up as the job's "Initialize containers" step.
-  collect-ngc:
-    name: Collect (NGC PyTorch image, ubuntu-latest)
-    needs: base-image
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    container:
-      image: ${{ needs.base-image.outputs.image }}
-    env:
-      PIP_BREAK_SYSTEM_PACKAGES: '1'
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          path: llm
-
-      - name: Disk before install
-        run: |
-          echo "DISK_BEFORE_KB=$(df -k --output=used / | tail -1)" >> "$GITHUB_ENV"
-          df -h /
-
-      - name: Install requirements
-        id: install
-        continue-on-error: true
-        run: |
-          start=$SECONDS
-          python3 -m pip install -r llm/requirements-dev.txt
-          echo "REQ_SECONDS=$((SECONDS - start))" >> "$GITHUB_ENV"
-
-      - name: Install trt-test-db
-        id: trt_test_db
-        continue-on-error: true
-        working-directory: llm
-        run: |
-          version=$(sed -n 's/^TRT_TEST_DB_VERSION=//p' jenkins/ci_versions.properties)
-          start=$SECONDS
-          python3 -m pip install --extra-index-url "${TRT_PYPI_INDEX}" --ignore-installed "trt-test-db==${version}"
-          echo "TTDB_SECONDS=$((SECONDS - start))" >> "$GITHUB_ENV"
-          echo "TTDB_SOURCE=urm" >> "$GITHUB_ENV"
-
-      # urm.nvidia.com does not resolve from GitHub-hosted runners. check_test_list
-      # only runs `trt-test-db -d DIR --test-names --output FILE`, which lists every
-      # test name in DIR/*.yml; this stand-in produces the same set from the YAML.
-      - name: Fall back to a trt-test-db stand-in
-        if: steps.trt_test_db.outcome == 'failure'
-        run: |
-          mkdir -p "${RUNNER_TEMP}/bin"
-          cat > "${RUNNER_TEMP}/bin/trt-test-db" <<'EOF'
-          #!/usr/bin/env python3
-          import argparse
-          import glob
-          import os
-
-          import yaml
-
-          parser = argparse.ArgumentParser()
-          parser.add_argument("-d", required=True)
-          parser.add_argument("--test-names", action="store_true", required=True)
-          parser.add_argument("--output", required=True)
-          args = parser.parse_args()
-          names = set()
-          for path in glob.glob(os.path.join(args.d, "*.yml")):
-              with open(path) as f:
-                  for key, blocks in (yaml.safe_load(f) or {}).items():
-                      if isinstance(blocks, list):
-                          for block in blocks:
-                              names.update(str(t) for t in block.get("tests") or [])
-          with open(args.output, "w") as f:
-              f.write("\n".join(sorted(names)) + "\n")
-          EOF
-          chmod +x "${RUNNER_TEMP}/bin/trt-test-db"
-          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
-          echo "TTDB_SOURCE=stand-in" >> "$GITHUB_ENV"
-
-      - name: CUDA libraries visible
-        run: |
-          {
-            echo "## CUDA libraries (NGC PyTorch image)"
-            echo '```'
-            python3 - <<'EOF'
-          import ctypes
-          import glob
-          import site
-
-          import torch
-
-          print(f"torch {torch.__version__} cuda={torch.version.cuda} "
-                f"cuda.is_available={torch.cuda.is_available()}")
-          for lib in ("libcuda.so.1", "libcudart.so.13", "libnvrtc.so.13", "libnccl.so.2"):
-              try:
-                  ctypes.CDLL(lib)
-                  print(f"{lib}: on default loader path")
-              except OSError:
-                  print(f"{lib}: not on default loader path")
-          wheels = sorted({p.split("/nvidia/")[1].split("/")[0]
-                           for d in site.getsitepackages()
-                           for p in glob.glob(f"{d}/nvidia/*/lib/*.so*")})
-          print("pip nvidia/* lib dirs:", ", ".join(wheels) or "none")
-          EOF
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Run check_test_list
-        id: collect
-        continue-on-error: true
-        env:
-          NVIDIA_TRITON_SERVER_VERSION: '26.09'
-        run: |
-          export LLM_ROOT="$PWD/llm" LLM_BACKEND_ROOT="$PWD/llm/triton_backend"
-          start=$SECONDS
-          # Dependencies were installed by the steps above; skip the script's own
-          # pip install so the measured set is exactly the one under test.
-          set -o pipefail
-          rc=0
-          python3 - 2>&1 <<'EOF' | tee "${RUNNER_TEMP}/collect.log" || rc=$?
-          import importlib.util
-          import os
-          import sys
-
-          path = os.path.join(os.environ["LLM_ROOT"], "scripts", "check_test_list.py")
-          spec = importlib.util.spec_from_file_location("check_test_list", path)
-          module = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(module)
-          module.install_python_dependencies = lambda llm_src: None
-          sys.argv = [path, "--l0", "--qa", "--waive", "--validate", "--parity",
-                      "--check-duplicate-waives"]
-          module.main()
-          EOF
-          echo "COLLECT_SECONDS=$((SECONDS - start))" >> "$GITHUB_ENV"
-          exit $rc
-
-      - name: Summary
-        if: always()
-        run: |
-          used_kb=$(( $(df -k --output=used / | tail -1) - ${DISK_BEFORE_KB:-0} ))
-          {
-            echo "## Collect in ${{ needs.base-image.outputs.image }} on ubuntu-latest"
-            echo "| Step | Result | Seconds |"
-            echo "|---|---|---|"
-            echo "| torch | from image | |"
-            echo "| requirements | ${{ steps.install.outcome }} | ${REQ_SECONDS:-} |"
-            echo "| trt-test-db (${TTDB_SOURCE:-none}) | ${{ steps.trt_test_db.outcome }} | ${TTDB_SECONDS:-} |"
+            echo "| trt-test-db from urm | ${{ steps.trt_test_db.outcome }} | ${TTDB_SECONDS:-} |"
+            echo "| trt-test-db used | ${TTDB_SOURCE:-none} | |"
             echo "| check_test_list | ${{ steps.collect.outcome }} | ${COLLECT_SECONDS:-} |"
             echo
             echo "Disk added by installs: $(( used_kb / 1024 )) MiB; free now: $(df -h --output=avail / | tail -1)"
