@@ -798,7 +798,8 @@ def get_draft_block_width(spec_config, *, shift_label: bool = True) -> int:
         return DFlashWorker.block_width_for(spec_config)
     if (spec_config.spec_dec_mode.is_dspark()
             and not spec_config.draft_is_embedded_in_target):
-        return DSparkWorker.block_width_for(spec_config, shift_label=shift_label)
+        return DSparkWorker.block_width_for(spec_config,
+                                            shift_label=shift_label)
     return 0
 
 
