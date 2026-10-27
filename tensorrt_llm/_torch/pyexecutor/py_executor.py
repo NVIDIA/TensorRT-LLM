@@ -1516,6 +1516,7 @@ class PyExecutor:
                 self.iter_counter += 1
 
     def _prepare_draft_requests(self):
+        """Reset draft placeholders and discard logits from the previous round."""
         try:
             # Set draft tokens here to make the KV cache manager
             # and scheduler aware of them.

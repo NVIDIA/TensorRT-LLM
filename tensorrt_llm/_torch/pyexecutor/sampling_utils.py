@@ -431,6 +431,11 @@ def get_rejected_indices(
     generator: torch.Generator,
     draft_tokens: list[int],
 ) -> torch.Tensor:
+    """Return rejected draft positions using aligned draft and target rows.
+
+    Each draft token must have a draft-probability row. Tokens with zero
+    target probability are always rejected, including the zero-over-zero case.
+    """
     num_draft_tokens = len(draft_tokens)
     if draft_probs.size(0) != num_draft_tokens:
         raise ValueError(

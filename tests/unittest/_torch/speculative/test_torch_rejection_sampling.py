@@ -60,6 +60,7 @@ def test_get_rejected_indices():
 
 
 def test_get_rejected_indices_zero_target_prob_rejected():
+    """Reject tokens outside target support even when draft probability is zero."""
     # Token 1 has p == 0 and q == 0 (0 / 0 = NaN in unguarded q / p);
     # Token 2 has p > 0 and q == 0. Both must always be rejected.
     draft_probs = torch.tensor([
@@ -91,6 +92,7 @@ def test_get_rejected_indices_zero_target_prob_rejected():
 
 
 def test_get_rejected_indices_mismatched_row_count_raises():
+    """Reject missing or extra draft rows instead of silently accepting tokens."""
     vocab_size = 8
     draft_probs = torch.full((2, vocab_size), 1.0 / vocab_size)
     target_probs = torch.full((4, vocab_size), 1.0 / vocab_size)
@@ -106,6 +108,7 @@ def test_get_rejected_indices_mismatched_row_count_raises():
 @pytest.mark.parametrize("use_chunked_generation_logits", [False, True])
 def test_process_decoded_tokens_accumulates_draft_logits_in_order(
         monkeypatch, use_chunked_generation_logits: bool):
+    """Pair every draft token with its sampling row in either storage mode."""
     if not torch.cuda.is_available():
         orig_empty = torch.empty
         monkeypatch.setattr(
@@ -225,7 +228,53 @@ def test_process_decoded_tokens_accumulates_draft_logits_in_order(
                            step_logits[step])
 
 
+@pytest.mark.parametrize("has_final_state", [False, True])
+def test_prepare_draft_tokens_stacks_logits_once(monkeypatch, has_final_state):
+    """Retain one stacked tensor per request across both draft-loop exits."""
+    target_req = SimpleNamespace(py_draft_tokens=[], py_draft_logits=None)
+    draft_batch = SimpleNamespace(all_requests=lambda: [])
+    final_state = SimpleNamespace(scheduled_requests=draft_batch)
+    rows = [torch.arange(8, dtype=torch.float32) + step for step in range(3)]
+
+    drafter = ModelDrafter.__new__(ModelDrafter)
+    drafter.max_draft_len = len(rows)
+    drafter.draft_model_engine = object()
+    drafter.use_static_draft_loop = False
+    drafter.guided_decoder = None
+    drafter.draft_tokens_accumulator = {7: [1, 2, 3]}
+    drafter.draft_logits_accumulator = {7: rows}
+    drafter.req_id_to_old_request = {7: target_req}
+    drafter._setup_draft_batch_and_resources = lambda requests: draft_batch
+    drafter.update_cur_draft_layer_idx = lambda *args: None
+    drafter.forward_draft_model = lambda *args, **kwargs: {}
+    drafter.sample_async = lambda *args: None
+    drafter.update_request_states = lambda *args: None
+    drafter._execute_draft_loop = lambda *args: (
+        final_state if has_final_state else None)
+    drafter.update_requests = lambda *args: None
+    drafter.process_decoded_tokens = lambda *args: None
+
+    stacked = []
+    original_stack = torch.stack
+
+    def track_stack(*args, **kwargs):
+        """Record allocations while preserving the real tensor operation."""
+        result = original_stack(*args, **kwargs)
+        stacked.append(result)
+        return result
+
+    monkeypatch.setattr(torch, "stack", track_stack)
+    drafter.prepare_draft_tokens(draft_batch, resource_manager=object())
+
+    assert len(stacked) == 1
+    assert target_req.py_draft_logits is stacked[0]
+    assert torch.equal(target_req.py_draft_logits, original_stack(rows))
+    assert target_req.py_draft_tokens == [1, 2, 3]
+    assert drafter.draft_logits_accumulator == {}
+
+
 def test_early_stop_draft_rejection_sampling(monkeypatch):
+    """Verify only real drafts and emit the bonus after the last real draft."""
     if not torch.cuda.is_available():
         orig_empty = torch.empty
         monkeypatch.setattr(
