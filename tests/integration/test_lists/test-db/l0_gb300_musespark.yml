@@ -38,3 +38,15 @@ l0_gb300_musespark:
   - unittest/_torch/modeling/test_musespark_open_moe_prepare_overlap.py
   - unittest/_torch/modeling/test_musespark_open_fusion_switches.py
   - unittest/_torch/modeling/test_musespark_open_finalize_local.py
+  # DFlash on the TRTLLM attention backend, the shared target/draft KV cache, and the
+  # disaggregated KV transfer that carries it. Pre-merge CI on this branch runs only the
+  # MuseSpark stages, and these files are listed on no other MuseSpark stage. This stage
+  # deselects cpu_only tests; those files are on l0_cpu_musespark.yml.
+  - unittest/_torch/speculative/hw_agnostic/test_dflash_trtllm_window.py
+  - unittest/_torch/speculative/hw_agnostic/test_dflash_dummy_slot.py
+  - unittest/_torch/speculative/hw_agnostic/test_dflash_worker.py
+  - unittest/_torch/speculative/hw_agnostic/test_dflash2_semantics.py
+  - unittest/_torch/executor/kv_cache/test_kv_cache_v2_attention_op_tables.py
+  - unittest/disaggregated/test_kv_transfer.py
+  - unittest/disaggregated/test_bounce.py
+  - accuracy/test_disaggregated_serving.py::TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv

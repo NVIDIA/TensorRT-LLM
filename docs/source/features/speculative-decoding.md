@@ -152,7 +152,7 @@ Reference: [DFlash: Distilled Flash Speculative Decoding](https://arxiv.org/pdf/
 * `speculative_model`: Path or HuggingFace model ID for the DFlash draft model.
 * `mask_token_id`: Token ID used as the mask token for parallel prediction. If not set, it is read from the draft model config.
 * `target_layer_ids`: List of target model layer indices whose hidden states are captured for cross-attention in the draft model. If not set, read from the draft model config.
-* `attention_backend`: Cross-attention backend for the draft model, independent of the drafter's standard attention modules. `"AUTO"` (the default) resolves to `"TRTLLM"` where it can run and every drafter layer is windowed (sliding-window drafters such as DFlash 2), and to `"VANILLA"` otherwise, including on a disaggregated worker and under `modeling_v2`. `"VANILLA"` uses FlashAttention with a contiguous context K/V cache and runs anywhere. `"TRTLLM"` uses TRTLLM-Gen FMHA (via FlashInfer) over a private paged context K/V cache and supports SM100/SM103 only. `"FA4"` uses the flash-attn CuTe DSL kernels on the same paged cache and supports SM90 only.
+* `attention_backend`: Cross-attention backend for the draft model, independent of the drafter's standard attention modules. `"AUTO"` (the default) resolves to `"TRTLLM"` where it can run and every drafter layer is windowed (sliding-window drafters such as DFlash 2), and to `"VANILLA"` otherwise, including on a disaggregated worker with `TRTLLM_DISAGG_SHARED_DRAFT_KV=0` and under `modeling_v2`. `"VANILLA"` uses FlashAttention with a contiguous context K/V cache and runs anywhere. `"TRTLLM"` uses TRTLLM-Gen FMHA (via FlashInfer) over a paged context K/V cache held by the KV cache manager (see [Draft KV cache](#dflash-draft-kv-cache)) and supports SM100/SM103 only. `"FA4"` uses the flash-attn CuTe DSL kernels on the same paged cache and supports SM90 only.
 
 ```python
 from tensorrt_llm.llmapi import DFlashDecodingConfig
@@ -165,6 +165,39 @@ speculative_config = DFlashDecodingConfig(
 
 llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 ```
+
+#### DFlash draft KV cache
+
+With `attention_backend="TRTLLM"`, TRTLLM target attention, and the default
+`KVCacheManagerV2`, the drafter's layers are allocated in the target's KV cache
+manager. Target and draft layers share one page table, so one KV budget covers
+both and each request's draft pages are allocated, padded and freed with its
+target pages. The draft layers keep the drafter's own dtype, so an FP8 target KV
+cache (`kv_cache_config.dtype: fp8`) is paired with a BF16 draft cache.
+
+In disaggregated serving, the context server's draft pages are transferred to
+the generation server with the target pages, so the drafter starts generation
+with the prompt context instead of an empty one. Both servers therefore need
+the same `speculative_config`: a generation server whose context server keeps a
+different number of draft layers, for example one without a drafter, fails
+those requests at the first KV transfer. To draft on the generation server
+alone, set `attention_backend="VANILLA"` or `TRTLLM_DISAGG_SHARED_DRAFT_KV=0`
+there; it then drafts without the prompt context, at a lower acceptance length.
+The target and draft layers
+are resharded by their own KV-head counts, so the draft's KV-head count, head
+dimension and dtype may differ from the target's, and the context and
+generation servers may use different tensor-parallel sizes or attention DP
+settings. An NVFP4 target KV cache requires a draft with an identical dtype
+and KV-head count. The target's and draft's K-only (MLA) or K/V cache kind must
+match, and both servers must run the same target and drafter.
+
+The drafter keeps a separate draft KV cache manager instead when any of the
+following applies: context parallelism larger than 1, a per-layer KV-head count
+on the target or drafter, a specialized KV cache manager (for example, hybrid Mamba
+models), Gemma 4 hybrid attention, or, in disaggregated serving, a draft layout
+that cannot be transferred with the target's. When the layers are shared, the
+worker log reports `target and draft KV layers share one KV cache manager` at
+startup.
 
 [DFlash 2](https://inco.ai/blog/dflash2/) is also supported. The same `DFlashDecodingConfig` can be used for DFlash 2; no extra arguments are required.
 

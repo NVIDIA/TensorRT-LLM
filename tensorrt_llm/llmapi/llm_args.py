@@ -3316,7 +3316,10 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "on the same paged cache and supports SM90 only. AUTO (the default) "
         "resolves to TRTLLM where it can run and every drafter layer is "
         "windowed, and to VANILLA otherwise, including on a disaggregated worker "
-        "and under modeling_v2.")
+        "with TRTLLM_DISAGG_SHARED_DRAFT_KV=0 and under modeling_v2. In "
+        "disaggregated serving a TRTLLM drafter keeps its KV with the target's, "
+        "so the context server's drafter context reaches the generation server; "
+        "both servers need the same speculative_config.")
 
     skip_ctx_buffer_budget_check: bool = Field(
         default=False,
@@ -6003,6 +6006,23 @@ _TORCH_LLMARGS_REMOVED_ARG_CHECKS: Dict[str, Callable[[Any], None]] = {
 TORCH_LLMARGS_REMOVED_ARGS = frozenset(_TORCH_LLMARGS_REMOVED_ARG_CHECKS)
 
 
+def disagg_shares_draft_kv(
+        speculative_config: Optional[DecodingBaseConfig]) -> bool:
+    """Whether a disaggregated worker transfers its drafter's KV with the target's.
+
+    TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires the draft KV to share the target's
+    KV cache manager, and 0 keeps it private. Unset, a DFlash drafter on a
+    backend that can share it (AUTO or TRTLLM) does, so a context and a
+    generation server given the same speculative_config agree on their own;
+    the transceiver rejects a pair that does not.
+    """
+    env = os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV")
+    if env:
+        return env == "1"
+    return (isinstance(speculative_config, DFlashDecodingConfig)
+            and speculative_config.attention_backend in ("AUTO", "TRTLLM"))
+
+
 def disagg_dflash_error(
     speculative_config: Optional[DecodingBaseConfig],
     cache_transceiver_config: Optional[CacheTransceiverConfig]
@@ -7064,14 +7084,34 @@ class TorchLlmArgs(BaseLlmArgs):
             if isinstance(self.speculative_config, DFlashDecodingConfig):
                 disagg = (self.cache_transceiver_config is not None
                           and self.cache_transceiver_config.backend is not None)
-                # TRTLLM's separate draft pool collapses on a disaggregated worker; modeling_v2 drafts on VANILLA.
-                if self.speculative_config.attention_backend == "AUTO" and (
-                        disagg or self.modeling_v2 != "off"):
+                shared_draft_kv = disagg_shares_draft_kv(
+                    self.speculative_config)
+                # An unshared disaggregated worker refuses a windowed TRTLLM draft pool; modeling_v2 drafts on VANILLA.
+                if (self.speculative_config.attention_backend == "AUTO"
+                        and ((disagg and not shared_draft_kv)
+                             or self.modeling_v2 != "off")):
                     self.speculative_config.attention_backend = "VANILLA"
                     logger.info(
                         "DFlash attention_backend AUTO resolved to VANILLA "
-                        "(disaggregated worker or modeling_v2).")
-                if disagg:
+                        "(modeling_v2, or a disaggregated worker with "
+                        "TRTLLM_DISAGG_SHARED_DRAFT_KV=0).")
+                assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
+                # From the disaggregated-serving-benchmarking overlay (TRT-LLM aa7db814):
+                # the disagg_dflash_error refusal is dropped so gen-only SOL
+                # ladders can run DFlash on a disaggregated gen. Acceptance is
+                # forced (TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS), so the
+                # collapsed acceptance the refusal guards against does not
+                # reach the measurement; the drafter still runs every step.
+                # Only valid as a throughput measurement, never for quality.
+                # A Hugging Face repo id is not readable yet: both calls below
+                # then run without the drafter's config.json (the budget check
+                # covers only the token budget), and CachedModelLoader repeats
+                # both after the drafter is downloaded.
+                self.speculative_config.resolve_from_checkpoint()
+                # A draft KV shared with the target is transferred with it;
+                # checked once AUTO is resolved from the checkpoint.
+                if disagg and not (self.speculative_config.attention_backend in
+                                   ("TRTLLM", "AUTO") and shared_draft_kv):
                     # The transceiver moves the target KV cache, but the
                     # drafter's context is built from target hidden states
                     # during prefill and is not transferred with it, so a
@@ -7086,20 +7126,8 @@ class TorchLlmArgs(BaseLlmArgs):
                         "prefill and is not transferred, so a generation "
                         "server drafts without the prompt context. Output is "
                         "unaffected; expect a lower acceptance rate than the "
-                        "same configuration run aggregated.")
-                assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
-                # From the disaggregated-serving-benchmarking overlay (TRT-LLM aa7db814):
-                # the disagg_dflash_error refusal is dropped so gen-only SOL
-                # ladders can run DFlash on a disaggregated gen. Acceptance is
-                # forced (TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS), so the
-                # collapsed acceptance the refusal guards against does not
-                # reach the measurement; the drafter still runs every step.
-                # Only valid as a throughput measurement, never for quality.
-                # A Hugging Face repo id is not readable yet: both calls below
-                # then run without the drafter's config.json (the budget check
-                # covers only the token budget), and CachedModelLoader repeats
-                # both after the drafter is downloaded.
-                self.speculative_config.resolve_from_checkpoint()
+                        "same configuration run aggregated. To transfer it, "
+                        "run both servers with attention_backend TRTLLM.")
                 self._validate_dflash_ctx_budget()
 
             if isinstance(self.speculative_config, DSparkDecodingConfig):

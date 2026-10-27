@@ -10,7 +10,7 @@ produces tp_size duplicate requests, but the scheduler distributes them
 share, not all copies.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -27,12 +27,19 @@ from tensorrt_llm._torch.pyexecutor._util import (
     _create_kv_cache_manager,
     _derive_v2_layer_type_attention_windows,
     _get_num_pool_groups_for_estimation,
+    _get_num_storage_pool_groups,
     get_mla_context_workspace_kv_len_cap,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
+    KVCacheManagerV2,
+    Role,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
@@ -953,8 +960,76 @@ def test_creator_uses_v2_affine_cache_cost():
     assert cost == CacheCost(slope=20, intercept=21)
 
 
+@pytest.mark.skip(
+    reason="[agentx port] needs main's per-layer AttentionReusePolicy (#19727), "
+    "which the agentx KV bindings lack"
+)
+def test_v2_layer_spec_costing_preserves_sink_and_reuse_policy() -> None:
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
+
+    windowed = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.BF16,
+        num_kv_heads=1,
+        head_dim=16,
+        buffer_roles=(Role.KEY, Role.VALUE),
+        sliding_window_size=128,
+        num_sink_tokens=65,
+    )
+    layers = [
+        windowed,
+        replace(windowed, global_layer_id=1, reuse_policy=AttentionReusePolicy.PRIVATE),
+        replace(windowed, global_layer_id=2, num_sink_tokens=None),
+        replace(windowed, global_layer_id=3, sliding_window_size=None, num_sink_tokens=None),
+    ]
+    config = KvCacheConfig(enable_block_reuse=False, enable_swa_scratch_reuse=True)
+    kwargs = dict(
+        tokens_per_block=64,
+        max_seq_len=4096,
+        kv_cache_config=config,
+        layer_specs=layers,
+    )
+    slope, fixed = KVCacheManagerV2.get_cache_size_per_token(
+        None, Mapping(), max_batch_size=2, max_num_tokens=256, **kwargs
+    )
+    # Each layer costs 64 bytes/token. Different sinks or policies cannot share scratch.
+    # The SWA layers retain 5, 5, and 3 pages, including two pages for 65 sink tokens.
+    assert slope == 64
+    assert fixed == 256 * 192 + 2 * (320 + 320 + 192) * 64
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.layer_specs = tuple(layers)
+    manager._has_cp_helix = False
+    manager.max_attention_window_vec = [128, 128, 128, None]
+    manager.tokens_per_block = 64
+    manager.max_batch_size = 2
+    manager.max_num_tokens = 256
+    manager._generation_kv_capacity_headroom = 1
+    manager.enable_swa_scratch_reuse = True
+    quota = manager._get_quota_from_max_tokens(512)
+    assert quota == slope * 512 + fixed
+    assert manager._get_max_tokens_from_quota(quota) == 512
+    assert KVCacheManagerV2._get_per_request_layer_tokens(None, Mapping(), **kwargs) == (
+        [(64, 320, 320), (64, 320, 320), (64, 192, 192), (64, 4160, 0)],
+        4160,
+    )
+
+    # Draft lifecycles need 7 and 21 usable slots: separate resume rounding
+    # gives 8 + 23 slots; rounding their average together would give only 30.
+    draft = replace(windowed, owner=KVCacheLayerOwner.DRAFT, num_sink_tokens=0)
+    kwargs.update(
+        layer_specs=[draft, replace(draft, global_layer_id=1, num_sink_tokens=448)],
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False, max_util_for_resume=0.95),
+    )
+    assert KVCacheManagerV2.get_cache_size_per_token(
+        None, Mapping(), max_batch_size=2, max_num_tokens=64, is_draft=True, **kwargs
+    ) == (0, (8 + 23) * 64 * 64)
+
+
 def test_v2_quota_from_max_tokens_models_context_swa_scratch():
     manager = object.__new__(KVCacheManagerV2)
+    manager.layer_specs = None
     manager._has_cp_helix = False
     manager.num_local_layers = 3
     manager.pp_layers = [4, 5, 6]
@@ -1572,3 +1647,55 @@ def test_create_kv_cache_manager_cross_pool_keeps_single_window_default() -> Non
 
     assert manager_config is kv_cache_config
     assert manager_config.max_attention_window is None
+
+
+def _fp8_target_bf16_draft_specs(*, draft_window):
+    target = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.FP8,
+        num_kv_heads=8,
+        head_dim=128,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    return [
+        *(replace(target, global_layer_id=i) for i in range(3)),
+        replace(
+            target,
+            global_layer_id=3,
+            owner=KVCacheLayerOwner.DRAFT,
+            dtype=DataType.BF16,
+            sliding_window_size=draft_window,
+        ),
+    ]
+
+
+def test_unified_fp8_target_bf16_draft_scales_by_combined_pool_groups():
+    """The V2 pool-group count comes from the combined target and draft layout.
+
+    The FP8 target and the windowed BF16 draft differ in life cycle and slot
+    size, so they land in two pool groups; counting the target's model config
+    alone gives one.
+    """
+    tpb = 32
+    spec_config = SimpleNamespace(
+        tokens_per_gen_step=1,
+        spec_dec_mode=SimpleNamespace(is_dflash=lambda: True, use_one_engine=lambda: False),
+    )
+    baseline = _make_creator(tpb, [_make_mock_request(128)], False, 1)
+    baseline._speculative_config = spec_config
+    baseline._build_unified_dflash_layer_specs = lambda kv_cache_config: ()
+    unified = _make_creator(tpb, [_make_mock_request(128)], False, 1)
+    unified._speculative_config = spec_config
+    specs = _fp8_target_bf16_draft_specs(draft_window=128)
+    unified._build_unified_dflash_layer_specs = lambda kv_cache_config: tuple(specs)
+
+    assert _get_num_storage_pool_groups(specs, tpb) == 2
+    assert unified._get_token_num_for_estimation() == 2 * baseline._get_token_num_for_estimation()
+
+
+def test_unified_fp8_target_bf16_draft_in_one_life_cycle_is_one_pool_group():
+    """Pages of different sizes in one life cycle share a pool group."""
+    specs = _fp8_target_bf16_draft_specs(draft_window=None)
+
+    assert _get_num_storage_pool_groups(specs, 32) == 1

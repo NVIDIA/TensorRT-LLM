@@ -3138,16 +3138,24 @@ class Receiver(ReceiverBase):
     ) -> bool:
         """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
         The split assumes every writer contributes the same size, which holds when:
-          * duplicate_head_factor == 1 -- else some ranks don't send KV yet still count in
-            expected_transfers, so the live writers overflow their slots;
+          * every head duplication factor is 1, on both sides, rank-wide and in each matched view
+            pair (target and draft views may replicate heads differently) -- else some ranks don't
+            send KV yet still count in expected_transfers, so the live writers overflow their slots;
           * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
             for PP fan-in, every overlapping stage must hold the same number of layers
             (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
             list isn't available (shorter than the fan-in degree), be conservative and fall back.
         Otherwise fall back to the per-fragment path (correct, just not coalesced).
-        Equal layer count means equal bytes only when the per-block sizes match; reserve() rejects
-        the mismatched case, so this only needs the count to split evenly."""
-        if overlap.duplicate_head_factor != 1:
+        Equal layer count means equal bytes only when the per-block sizes match; for PP fan-in
+        (writers_split_layers) reserve() rejects the mismatched case, so this only needs the count
+        to split evenly."""
+        # Any duplicated head, rank-wide or in a single view pair, leaves some
+        # writers without a share (sender side) or doubles one (receiver side).
+        rank_factors = (overlap.duplicate_head_factor, overlap.peer_duplicate_head_factor)
+        view_factors = getattr(overlap, "view_duplicate_head_factors", {}).values()
+        if any(factor != 1 for factor in rank_factors) or any(
+            factor != 1 for pair in view_factors for factor in pair
+        ):
             return False
         if overlap.overlap_pp_size > 1:
             lpp = getattr(peer_ri, "layer_num_per_pp", None)
@@ -3272,8 +3280,12 @@ class Receiver(ReceiverBase):
                     receiver_page_table=self._registrar.self_extractor.page_table,
                     dst_slot=mamba_dst_slot,
                 )
+        # Fan-in writers split layers only across PP stages; read the overlap only for a fan-in.
         bounced = allow_bounce and self._bounce.reserve(
-            receiver_req, task.expected_transfers, extra_bytes=extra_bytes
+            receiver_req,
+            task.expected_transfers,
+            extra_bytes=extra_bytes,
+            writers_split_layers=task.expected_transfers > 1 and topo_overlap.overlap_pp_size > 1,
         )
         session = self._get_session(task._unique_rid)
         if session is None:
@@ -3378,14 +3390,15 @@ class Receiver(ReceiverBase):
             finally:
                 messenger.stop()
 
-            # Recurrent-state (Mamba/KDA) layout gate on the receiver side.
-            # The sender-side check (PeerRegistrar.register) runs in the
-            # sender's listener thread, where exceptions are only logged, so
-            # reject here — before REGISTER_RANK_INFO is even sent, so no
-            # dealers are connected and no partial registration happens for
-            # the bad peer. The failure is converted to PeerIncompatibleError
-            # (handled in dispatch_task) so only requests targeting this peer
-            # fail, and cached so later requests fail fast.
+            # Recurrent-state (Mamba/KDA), replicated-role and draft-layer layout
+            # gates on the receiver side. The sender-side check
+            # (PeerRegistrar.register) runs in the sender's listener thread,
+            # where exceptions are only logged, so reject here — before
+            # REGISTER_RANK_INFO is even sent, so no dealers are connected and
+            # no partial registration happens for the bad peer. The failure is
+            # converted to PeerIncompatibleError (handled in dispatch_task) so
+            # only requests targeting this peer fail, and cached so later
+            # requests fail fast.
             try:
                 MambaPolicy.validate_peer_compatible(
                     self._registrar.self_rank_info,
@@ -3397,6 +3410,7 @@ class Receiver(ReceiverBase):
                     self._registrar.self_extractor.page_table,
                     sender_info.page_table,
                 )
+                PeerRegistrar.validate_draft_layers(self._registrar.self_rank_info, sender_info)
             except ValueError as e:
                 msg = (
                     f"context peer at '{info_endpoint}' is incompatible: {e} "

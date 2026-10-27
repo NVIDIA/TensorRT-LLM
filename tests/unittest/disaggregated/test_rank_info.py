@@ -15,6 +15,7 @@
 
 from types import SimpleNamespace
 
+import msgpack
 import numpy as np
 import pytest
 
@@ -194,3 +195,64 @@ def test_rank_info_represents_cache_element_bytes(
     restored = RankInfo.from_bytes(rank_info.to_bytes())
     assert restored.attention.element_bytes == expected_element_bytes
     assert isinstance(restored.attention.element_bytes, expected_type)
+
+
+@pytest.mark.parametrize(
+    ("layer_specs", "draft_layer_ids", "expected"),
+    [
+        (None, (), 0),
+        # Folded MTP/Eagle draft layers have no layer specs and travel as
+        # ordinary layers, so they are not advertised.
+        (None, (36,), 0),
+        ((object(),), (36, 37), 2),
+    ],
+)
+def test_from_kv_cache_manager_reports_unified_draft_layers(
+    monkeypatch, layer_specs, draft_layer_ids, expected
+) -> None:
+    monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _: None)
+    manager = SimpleNamespace(
+        mapping=SimpleNamespace(
+            rank=0,
+            tp_size=1,
+            tp_rank=0,
+            pp_size=1,
+            pp_rank=0,
+            dp_size=1,
+            cp_size=1,
+            cp_rank=0,
+            enable_attention_dp=False,
+        ),
+        num_kv_heads_per_layer=[8, 8],
+        pp_layers=[0, 1],
+        tokens_per_block=32,
+        head_dim=128,
+        dtype=bindings.DataType.HALF,
+        kv_factor=2,
+        layer_specs=layer_specs,
+        draft_layer_ids=draft_layer_ids,
+    )
+
+    info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
+
+    assert info.num_draft_layers == expected
+    assert RankInfo.from_bytes(info.to_bytes()).num_draft_layers == expected
+
+
+def test_rank_info_from_bytes_defaults_missing_draft_layer_count() -> None:
+    ri = RankInfo(
+        instance_name="gen_0",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[32],
+        sender_endpoints=[],
+        self_endpoint="",
+        transfer_engine_info=b"",
+    )
+    payload = msgpack.unpackb(ri.to_bytes(), strict_map_key=False)
+    del payload["num_draft_layers"]
+
+    assert RankInfo.from_bytes(msgpack.packb(payload)).num_draft_layers == 0

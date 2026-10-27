@@ -79,6 +79,11 @@ def get_paged_kv_storage_unsupported_reason(
     if isinstance(manager, KVCacheManagerV2):
         if manager.enable_swa_scratch_reuse:
             return "KVCacheManagerV2 SWA scratch reuse is not supported."
+        # get_kv_page_offset indexes the life cycles' kv_offset by attention-op pool.
+        if getattr(manager, "_use_per_layer_page_tables", False) or (
+            getattr(manager, "_attention_op_pool_groups", None) is not None
+        ):
+            return "KVCacheManagerV2 per-layer or shared attention-op tables are not supported."
     elif isinstance(manager, KVCacheManager):
         if manager.num_pools != 1:
             return "KVCacheManagerV1 with multiple memory pools is not supported."

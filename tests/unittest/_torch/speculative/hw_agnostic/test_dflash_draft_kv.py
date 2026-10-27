@@ -56,17 +56,27 @@ def test_default_dflash_resolves_auto_before_choosing_its_draft_cache(
 
 
 @pytest.mark.parametrize(
-    ("transceiver", "modeling_v2", "resolved"),
-    [("NIXL", "off", "VANILLA"), (None, "auto", "VANILLA"), (None, "off", "AUTO")],
+    ("transceiver", "shared", "modeling_v2", "resolved"),
+    [
+        ("NIXL", "0", "off", "VANILLA"),
+        ("NIXL", "1", "off", "AUTO"),
+        ("NIXL", None, "off", "AUTO"),
+        (None, "0", "auto", "VANILLA"),
+        (None, "0", "off", "AUTO"),
+    ],
 )
-def test_auto_keeps_vanilla_where_trtllm_would_collapse_or_be_bypassed(
-    tmp_path, monkeypatch, transceiver, modeling_v2, resolved
+def test_auto_keeps_vanilla_where_trtllm_is_refused_or_bypassed(
+    tmp_path, monkeypatch, transceiver, shared, modeling_v2, resolved
 ) -> None:
-    """A disaggregated worker gets no draft KV; modeling_v2 DFlash compositions need VANILLA."""
+    """Workers keeping a private draft KV refuse TRTLLM; modeling_v2 DFlash compositions need VANILLA."""
     from tensorrt_llm.llmapi import CacheTransceiverConfig, TorchLlmArgs, llm_args
 
     # No GPU: whatever stays AUTO is left to the ranks' windowed-and-probe rule.
     monkeypatch.setattr(llm_args.torch.cuda, "is_available", lambda: False)
+    if shared is None:
+        monkeypatch.delenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", shared)
     (tmp_path / "config.json").write_text(json.dumps(_WINDOWED))
     args = TorchLlmArgs(
         model="dummy",

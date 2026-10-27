@@ -786,6 +786,21 @@ def get_num_extra_kv_tokens(spec_config):
     return 0
 
 
+def get_draft_block_width(spec_config) -> int:
+    """Block width the worker drafting for ``spec_config`` appends per request.
+
+    0 when that worker does not append a block to a paged draft KV cache.
+    """
+    if spec_config is None:
+        return 0
+    if spec_config.spec_dec_mode.is_dflash():
+        return DFlashWorker.block_width_for(spec_config)
+    if (spec_config.spec_dec_mode.is_dspark()
+            and not spec_config.draft_is_embedded_in_target):
+        return DSparkWorker.block_width_for(spec_config)
+    return 0
+
+
 def get_draft_kv_cache_manager(spec_config, resource_manager):
     """
     Return the one-model draft cache manager, including a shared draft KV view
@@ -804,7 +819,9 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
     target = resource_manager.get_resource_manager(
         ResourceManagerType.KV_CACHE_MANAGER)
     get_view = getattr(target, "get_draft_kv_cache_view", None)
-    return get_view() if get_view is not None else None
+    view = get_view() if get_view is not None else None
+    # A unified manager's request resources are already handled through target.
+    return None if view is target else view
 
 
 def update_spec_config_from_model_config(spec_config,

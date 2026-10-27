@@ -107,6 +107,10 @@ struct BufferConfig
     std::optional<int> tokensPerBlockOverride;
 
     bool isSparse = false; //!< Whether history uses the sparse attention lifecycle.
+
+    //! Buffers may coalesce only when their group and expanded size match.
+    //! This does not change their lifecycle or shared slot allocation.
+    int coalescingGroup = 0;
 };
 
 // ---------------------------------------------------------------------------

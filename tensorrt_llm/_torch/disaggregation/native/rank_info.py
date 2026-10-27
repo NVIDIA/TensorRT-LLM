@@ -48,6 +48,9 @@ class RankInfo:
     attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
+    # Layers a unified KV cache manager owns for the drafter (layer specs with
+    # a DRAFT owner). They ride the target's pages, so both peers must agree.
+    num_draft_layers: int = 0
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -112,6 +115,9 @@ class RankInfo:
             ),
             aux_meta=aux_buffer_meta,
             page_table=build_page_table_from_manager(kvm),
+            num_draft_layers=(
+                len(kvm.draft_layer_ids) if getattr(kvm, "layer_specs", None) is not None else 0
+            ),
         )
 
     @classmethod

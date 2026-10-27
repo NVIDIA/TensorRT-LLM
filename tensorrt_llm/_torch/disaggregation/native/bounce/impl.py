@@ -235,13 +235,15 @@ class VmmBounceTransport(BounceTransport):
         *,
         timeout: Optional[float] = _RESERVE_TIMEOUT_S,
         extra_bytes: int = 0,
+        writers_split_layers: bool = True,
     ) -> bool:
         """Reserve a region and create its state, recording the address for the senders. Returns
         False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
         must divide across the writers. ``extra_bytes`` is the non-paged payload the sender appends
         to the same coalesced write (mamba/KDA recurrent state, sized by the receiver via
         ``mamba_receiver_payload_bytes``); the region must cover it or the write would overrun into the
-        neighboring slot."""
+        neighboring slot. ``writers_split_layers`` is False when every fan-in writer sends a head
+        slice of every layer (TP fan-in), True when the writers hold different layers (PP fan-in)."""
         total = 0
         has_state_group = False
         # Block tables are positional with -1 holes (see Chunk); only the
@@ -311,10 +313,12 @@ class VmmBounceTransport(BounceTransport):
                 f"({total % num_writers}B remainder); head-mismatch explosion NOT mitigated",
                 warn_key="kv-bounce-uneven-fanin",
             )
-        if num_writers > 1:
+        if num_writers > 1 and writers_split_layers:
             # Fan-in gives each writer an equal share of the region, which only matches where it
-            # writes when all writers send the same bytes. Equal layer count guarantees that only
-            # when the per-block sizes match, so require that here, else fall back.
+            # writes when all writers send the same bytes. A TP fan-in writer sends 1/num_writers
+            # of every block of every group, so its share is exact for any per-group block sizes.
+            # PP fan-in writers send different layers, and an equal layer count gives equal bytes
+            # only when the per-block sizes match, so require that here, else fall back.
             # Exclude None entries (STATE groups) — they are already guarded above.
             present_slot_bytes = {
                 self._block_bytes_per_group[g]
@@ -475,12 +479,23 @@ class VmmBounceTransport(BounceTransport):
             ok = True
             try:
                 # Scatter each writer's fragments from its own source, never one global offset, so a
-                # missing or fallback writer cannot shift where the others are read from.
+                # missing or fallback writer cannot shift where the others are read from. All writers
+                # go into ONE batched copy: the copy helper reuses one pinned metadata buffer per
+                # stream and needs a sync between calls, and one call costs one host round trip
+                # instead of one per writer.
+                srcs, dsts, frag_sizes = [], [], []
                 for src_base, dst_ptrs, sizes in descs:
                     p = Plan(dst_ptrs, dst_ptrs, sizes, int(sizes.sum()))
-                    scatter_contiguous(
-                        src_base, p.dst_ptrs, p.sizes, p.offsets, stream=self._scatter_stream
-                    )
+                    srcs.append(np.int64(src_base) + p.offsets)
+                    dsts.append(p.dst_ptrs)
+                    frag_sizes.append(p.sizes)
+                scatter_contiguous(
+                    0,
+                    np.concatenate(dsts),
+                    np.concatenate(frag_sizes),
+                    np.concatenate(srcs),
+                    stream=self._scatter_stream,
+                )
                 CUASSERT(cudart.cudaStreamSynchronize(self._scatter_stream))
             except Exception as e:
                 # a scatter failure must not kill the worker nor be reported as success
@@ -524,6 +539,7 @@ class NoBounceTransport(BounceTransport):
         *,
         timeout: Optional[float] = _RESERVE_TIMEOUT_S,
         extra_bytes: int = 0,
+        writers_split_layers: bool = True,
     ) -> bool:
         return False
 

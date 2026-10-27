@@ -238,8 +238,13 @@ def test_fanin_bounce_safe_gate() -> None:
 
     safe = tfr.Receiver._fanin_bounce_safe
 
-    def ov(dup: int, pp: int, ranks: tuple[int, ...] = (0,)) -> SimpleNamespace:
-        return SimpleNamespace(duplicate_head_factor=dup, overlap_pp_size=pp, ranks=list(ranks))
+    def ov(dup: int, pp: int, ranks: tuple[int, ...] = (0,), peer_dup: int = 1) -> SimpleNamespace:
+        return SimpleNamespace(
+            duplicate_head_factor=dup,
+            peer_duplicate_head_factor=peer_dup,
+            overlap_pp_size=pp,
+            ranks=list(ranks),
+        )
 
     def ri(lpp: list[int], page_table: SimpleNamespace | None = None) -> SimpleNamespace:
         return SimpleNamespace(layer_num_per_pp=lpp, page_table=page_table)
@@ -252,6 +257,10 @@ def test_fanin_bounce_safe_gate() -> None:
     assert safe(ov(1, 1), ri([24]), None) is True
     assert safe(ov(1, 0), ri([24]), None) is True
     assert safe(ov(2, 1), ri([24]), None) is False  # duplicate heads / MLA -> some don't send
+    # The senders' duplication counts too: with 4 KV heads, ctx TEP8 -> gen TEP2 has 4 writers
+    # but elects 2 of them; MLA ctx TP8 -> gen TP4 elects 1 of 2. The receiver's own factor is 1.
+    assert safe(ov(1, 1, ranks=(0, 1, 2, 3), peer_dup=2), ri([24]), None) is False
+    assert safe(ov(1, 1, ranks=(0, 1), peer_dup=2), ri([24]), None) is False
     # EVEN PP fan-in (equal layers per overlapping stage) -> allowed
     assert safe(ov(1, 4), ri([20, 20, 20, 20]), None) is True
     # UNEVEN PP fan-in -> per-writer sizes differ -> fall back
@@ -446,6 +455,17 @@ class TestFanInReserve:
         assert t.reserve(req, num_writers=2) is False
         assert req.bounce_dst_base is None
 
+    def test_reserve_heterogeneous_tp_fanin_ok(self, monkeypatch):
+        # TP fan-in: each writer sends a head slice of every block of every group, so its bytes are
+        # total // num_writers for any per-group sizes (here a full-attention group of 16 layers and
+        # a sliding-window group of 46 layers, 64 KiB per layer and block, gathered by 4 writers).
+        t = _make_transport(monkeypatch, block_bytes_per_group=[16 << 16, 46 << 16])
+        req = _recv_req([3, 2])  # total = 3*16 + 2*46 = 140 layer-blocks of 64 KiB
+        assert t.reserve(req, num_writers=4, writers_split_layers=True) is False
+        assert t.reserve(req, num_writers=4, writers_split_layers=False) is True
+        rid_slice = (req.unique_rid, req.slice_id)
+        assert t.writer_base(rid_slice, 3) == 0x100000 + 3 * ((140 << 16) // 4)
+
     def test_reserve_uniform_multigroup_fanin_ok(self, monkeypatch):
         # Uniform slot bytes across present groups -> even byte split -> bounce allowed.
         t = _make_transport(monkeypatch, block_bytes_per_group=[100, 100])
@@ -549,6 +569,45 @@ class TestFanInReserve:
         assert [t[0] for t in descs] == [100, 200]  # per-writer src_base preserved
         assert [list(t[1]) for t in descs] == [[10], [20]]  # dst_ptrs
         assert [list(t[2]) for t in descs] == [[8], [8]]  # sizes
+
+    def test_fanin_scatter_is_one_batched_copy(self, monkeypatch):
+        # The batched copy reuses one pinned metadata buffer per stream and needs a sync between
+        # calls; one call per writer before a single sync let a writer's kernel run with the next
+        # writer's fragment table. All writers must go into one call, each from its own source.
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        req = _recv_req([2])
+        assert t.reserve(req, num_writers=2) is True
+        rid_slice = (req.unique_rid, req.slice_id)
+        for rank, dst, src_base in ((7, 20, 200), (3, 10, 100)):
+            t.record_result(
+                rid_slice,
+                rank,
+                np.array([dst], dtype=np.int64),
+                np.array([8], dtype=np.int64),
+                src_base=src_base,
+            )
+        calls = []
+
+        def fake_scatter(src_base, dst_ptrs, sizes, offsets, *, stream):
+            calls.append(("scatter", src_base, list(dst_ptrs), list(sizes), list(offsets)))
+
+        monkeypatch.setattr(btr, "scatter_contiguous", fake_scatter)
+        monkeypatch.setattr(
+            btr,
+            "cudart",
+            SimpleNamespace(
+                cudaSetDevice=lambda dev: (0,),
+                cudaStreamSynchronize=lambda stream: calls.append(("sync", stream)) or (0,),
+            ),
+        )
+        monkeypatch.setattr(btr, "CUASSERT", lambda ret: ret)
+        t._scatter_stream = 0
+        t._stop = SimpleNamespace(is_set=lambda: False)
+        t._scatter_q.put(None)  # poison pill behind the queued region
+        t._scatter_loop()
+        # one copy: both writers' destinations, each read from its own src_base (+ offset 0)
+        assert calls == [("scatter", 0, [10, 20], [8, 8], [100, 200]), ("sync", 0)]
+        assert t._recv_alloc.released  # region settled after the scatter
 
     def test_fanin_fallback_writer_leaves_survivor_at_its_own_base(self, monkeypatch):
         # Regression: if one fan-in writer falls back to in-place (SUCCESS, empty tail) while a

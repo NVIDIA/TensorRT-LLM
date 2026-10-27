@@ -235,10 +235,12 @@ class BounceTransport(ABC):
         *,
         timeout: Optional[float] = None,
         extra_bytes: int = 0,
+        writers_split_layers: bool = True,
     ) -> bool:
         """Reserve a region and record its address for the senders. False falls back to per-fragment.
         ``extra_bytes`` sizes the sender's non-paged payload (mamba/KDA recurrent state) that rides
-        the same coalesced write as the KV blocks."""
+        the same coalesced write as the KV blocks. ``writers_split_layers`` says whether the fan-in
+        writers hold different layers (PP fan-in) rather than a head slice of every layer."""
 
     @abstractmethod
     def writer_base(self, rid_slice, writer_index: int) -> Optional[int]:
