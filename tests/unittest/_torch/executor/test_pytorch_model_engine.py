@@ -3158,6 +3158,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             mapping=mapping,
             dtype=tensorrt_llm.bindings.DataType.HALF,
         )
+        self.addCleanup(kv_cache_manager.shutdown)
         kv_cache_manager.add_dummy_requests([1, 2], prompt_lens, is_gen=True)
         attn_metadata = TrtllmAttentionMetadata(
             max_num_requests=4,
