@@ -952,7 +952,7 @@ def _collection_pytest_env(llm_src: str, models_root: str) -> dict[str, str]:
         "TRT_LLM_NO_LIB_INIT": "1",
         # Override any caller LLM_MODELS_ROOT. Collection only interpolates the
         # path into class-body constants; an empty directory keeps the models
-        # NFS share off the Check Test List pod.
+        # NFS share off the collection host.
         "LLM_MODELS_ROOT": models_root,
     }
 
