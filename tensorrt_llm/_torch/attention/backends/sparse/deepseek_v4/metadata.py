@@ -203,6 +203,16 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
 
+        # Device scalars (num_contexts, num_generations, num_gen_tokens_per_seq)
+        # for the shape-static generation position-id graph.
+        self.gen_position_params_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (3,),
+            dtype=torch.int,
+            cache_name="gen_position_params_cuda",
+            capture_graph=capture_graph,
+        )
+
         # compressed_mask_cuda: per-token bool mask for postprocess scatter.
         # Precomputed from new_comp_kv_lens to skip padded generation slots.
         self.compressed_mask_cuda = {
@@ -954,22 +964,16 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             )
 
         if self.num_gen_tokens_per_seq > 0 and num_generations > 0:
-            # Extract output_offset as Python int per ratio to avoid
-            # tensor-scalar slice inside compiled function.
-            # For decode-only batches (num_contexts == 0), offset is 0.
-            gen_output_offsets = {
-                r: self.cu_new_comp_kv_cuda[r][num_contexts].item() if num_contexts > 0 else 0
-                for r in self._compress_ratios_sorted
-            }
+            gen_params = self.gen_position_params_cuda
+            gen_params[0].fill_(num_contexts)
+            gen_params[1].fill_(num_generations)
+            gen_params[2].fill_(self.num_gen_tokens_per_seq)
             self._compute_gen_compressed_position_ids(
                 self.past_kv_lens_cuda,
                 self.cu_new_comp_kv_cuda,
                 self.compressed_position_ids_cuda,
-                num_contexts,
-                num_generations,
-                self.num_gen_tokens_per_seq,
+                gen_params,
                 self._compress_ratios_sorted,
-                gen_output_offsets,
             )
 
     def on_update_kv_lens(self):
@@ -1073,11 +1077,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         past_kv_lens_bufs: Dict[int, torch.Tensor],
         cu_new_comp_kv_bufs: Dict[int, torch.Tensor],
         compressed_position_ids_bufs: Dict[int, torch.Tensor],
-        num_contexts: int,
-        num_generations: int,
-        num_gen_tokens_per_seq: int,
+        gen_params: torch.Tensor,
         compress_ratios: list,
-        gen_output_offsets: Dict[int, int],
     ):
         """Generation position IDs in exact compact compressor output order.
 
@@ -1086,26 +1087,47 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         compact output index. Reserved slots after the compact prefix are masked
         during postprocess, so their position IDs are irrelevant.
 
-        gen_output_offsets: dict mapping compress_ratio -> Python int offset,
-        pre-extracted by the caller to avoid tensor-scalar .item() inside
-        compiled code.  0 for decode-only batches."""
-        device = past_kv_lens_bufs[compress_ratios[0]].device
+        Generation outputs of ratio ``r`` occupy slots
+        ``[cu_new_comp_kv[r][num_contexts], ... + num_generations * ceil(next_n / r))``;
+        slots outside that range (the context prefix and the tail) are left
+        untouched.
+
+        Every shape is a buffer capacity and ``gen_params`` is a [3] int32
+        device tensor ``(num_contexts, num_generations, num_gen_tokens_per_seq)``,
+        so one compiled graph serves every batch composition. Per-batch values
+        must not enter as Python ints: dynamo 0/1-specializes and value-guards
+        them, so each new mix of context and generation requests would
+        recompile.
+        """
+        device = gen_params.device
+        num_contexts = gen_params[0:1]
+        num_generations = gen_params[1:2]
+        num_gen_tokens_per_seq = gen_params[2:3]
         batch_size = num_contexts + num_generations
+        last_seq = (batch_size - 1).clamp(min=0)
         for compress_ratio in compress_ratios:
-            new_gen_comp = (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
-            gen_comp = num_generations * new_gen_comp
-            output_offset = gen_output_offsets[compress_ratio]
-            cu_new_comp = cu_new_comp_kv_bufs[compress_ratio]
-            output_idx = torch.arange(gen_comp, dtype=torch.int32, device=device) + output_offset
-            # Search the zero-offset prefix: Inductor miscompiles searchsorted on cu_new_comp[1:].
-            req_idx = torch.searchsorted(cu_new_comp[: batch_size + 1], output_idx, right=True) - 1
-            req_idx = req_idx.clamp(min=num_contexts, max=batch_size - 1)
-            offset_in_req = output_idx - cu_new_comp[req_idx]
+            cu = cu_new_comp_kv_bufs[compress_ratio]
             past_kv_lens = past_kv_lens_bufs[compress_ratio]
+            position_ids = compressed_position_ids_bufs[compress_ratio]
+
+            gen_comp = num_generations * (
+                (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
+            )
+            output_offset = cu.gather(0, num_contexts.long())
+
+            # Stale entries past batch_size would break searchsorted's ordering.
+            seq_idx = torch.arange(cu.shape[0] - 1, dtype=torch.int32, device=device)
+            cu_valid = torch.where(seq_idx < batch_size, cu[1:], torch.iinfo(torch.int32).max)
+
+            output_idx = torch.arange(position_ids.shape[0], dtype=torch.int32, device=device)
+            req_idx = torch.searchsorted(cu_valid, output_idx, right=True)
+            req_idx = torch.maximum(
+                torch.minimum(req_idx, last_seq.to(req_idx.dtype)), num_contexts.to(req_idx.dtype)
+            )
+            offset_in_req = output_idx - cu[req_idx]
             result = ((past_kv_lens[req_idx] + offset_in_req) * compress_ratio).to(torch.int)
-            compressed_position_ids_bufs[compress_ratio][
-                output_offset : output_offset + gen_comp
-            ] = result
+            in_gen_range = (output_idx >= output_offset) & (output_idx < output_offset + gen_comp)
+            position_ids.copy_(torch.where(in_gen_range, result, position_ids))
 
     @staticmethod
     @maybe_compile(dynamic=True, options={"max-autotune": True})

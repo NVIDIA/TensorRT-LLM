@@ -337,9 +337,30 @@ class DecoderWarmup:
         # Ordering matters for torch.compile graph specialization:
         # 1-token first to capture the 0→1 transition graph; max-shape next to seed
         # triton autotuning with the largest inputs; 2-token last for the small-ctx path.
-        warmup_configs = one_token_configs + max_configs + small_ctx_configs
+        # The MoE JIT shapes follow, so they do not change that order.
+        warmup_configs = (
+            one_token_configs
+            + max_configs
+            + small_ctx_configs
+            + self._get_moe_jit_warmup_requests()
+        )
         # Deduplicate the warmup_configs while keeping the order.
         return list(dict.fromkeys(warmup_configs))
+
+    def _get_moe_jit_warmup_requests(self) -> list[tuple[int, int]]:
+        """Context-only shapes that compile every token-specialized MoE kernel variant.
+
+        Some MoE backends JIT-compile one kernel per token tile that they pick from
+        the per-rank token count, and report the counts that reach each tile through
+        ``jit_warmup_num_tokens``. Without one forward per such count, the first
+        serving batch of a new size compiles its kernel in the middle of serving.
+        """
+        num_tokens = set()
+        for module in self.model.modules():
+            get_num_tokens = getattr(module, "jit_warmup_num_tokens", None)
+            if callable(get_num_tokens):
+                num_tokens.update(get_num_tokens())
+        return [(n, 0) for n in sorted(num_tokens) if 0 < n <= self._config.max_num_tokens]
 
     def _warmup_scheduled(
         self, resource_manager: ResourceManager, kv_cache_manager

@@ -22,6 +22,7 @@ weight transform. The backend owns SymmBuffer allocation and reuse.
 
 from __future__ import annotations
 
+import functools
 import os
 import socket
 from types import ModuleType
@@ -269,6 +270,20 @@ def _quantize_bf16_to_fp8_ue8m0(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Te
 
         _FUSED_PER_TOKEN_CAST = torch.compile(_call, dynamic=True, fullgraph=False)
     return _FUSED_PER_TOKEN_CAST(x)
+
+
+@functools.lru_cache(maxsize=None)
+def _first_num_tokens_per_block_m(
+    get_block_m, num_ranks: int, num_experts: int, max_num_tokens: int, num_topk: int
+) -> Tuple[int, ...]:
+    """Smallest per-rank token count for each ``BLOCK_M`` DeepGEMM picks up to ``max_num_tokens``."""
+    first_num_tokens = {}
+    for num_tokens in range(1, max_num_tokens + 1):
+        block_m = get_block_m(
+            num_ranks, num_experts, max_num_tokens, num_tokens, num_topk, "fp8xfp4"
+        )
+        first_num_tokens.setdefault(block_m, num_tokens)
+    return tuple(sorted(first_num_tokens.values()))
 
 
 def _assert_num_slots_divisible_by_ep(num_slots: int, ep_size: int) -> None:
@@ -897,6 +912,28 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
     def supports_fused_prepare(self) -> bool:
         """Whether ``run_moe`` can prepare DG SymmBuffer directly from BF16 input."""
         return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "megamoe_prepare")
+
+    def jit_warmup_num_tokens(self) -> List[int]:
+        """Per-rank token counts whose forwards build every kernel variant this layer launches.
+
+        DeepGEMM specializes ``fp8_fp4_mega_moe`` on its token tile (``BLOCK_M``), picks
+        the tile from the per-rank token count of each call, and JIT-compiles a variant
+        on first use. Returns the smallest token count for each tile reachable up to
+        ``max_num_tokens``, so warmup forwards at these counts compile every variant
+        before serving.
+        """
+        get_block_m = getattr(self._dg, "get_block_m_for_mega_moe", None)
+        if get_block_m is None:
+            return []
+        return list(
+            _first_num_tokens_per_block_m(
+                get_block_m,
+                self.ep_size,
+                self.num_slots,
+                self.max_num_tokens,
+                self.routing_method.experts_per_token,
+            )
+        )
 
     def run_moe(
         self,
