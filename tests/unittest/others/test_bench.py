@@ -121,15 +121,20 @@ def _lora_dataset_stream(lora_request) -> io.StringIO:
 @pytest.mark.parametrize(
     "lora_request, message",
     [
-        ({}, "missing required key"),
-        ({"lora_name": "adapter"}, "missing required key"),
-        ("adapter", "must be a JSON object"),
-        (["adapter", 1], "must be a JSON object"),
+        ({}, "missing required key(s) ['lora_name', 'lora_int_id']"),
+        ({"lora_path": "/tmp/a"}, "missing required key(s) ['lora_name', 'lora_int_id']"),
+        ({"lora_name": "adapter"}, "missing required key(s) ['lora_int_id']"),
+        ({"lora_int_id": 1}, "missing required key(s) ['lora_name']"),
+        ("adapter", "must be a JSON object, got str"),
+        (["adapter", 1], "must be a JSON object, got list"),
     ],
 )
 def test_malformed_lora_request_raises_dataset_format_error(lora_request, message):
-    with pytest.raises(DatasetFormatError, match=message):
+    with pytest.raises(DatasetFormatError) as exc_info:
         create_dataset_from_stream(_FakeTokenizer(), _lora_dataset_stream(lora_request))
+    assert message in str(exc_info.value)
+    # The offending request is named so it can be found in a large dataset.
+    assert "'task_id': 1" in str(exc_info.value)
 
 
 def test_lora_request_is_parsed():
