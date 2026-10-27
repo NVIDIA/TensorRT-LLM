@@ -150,6 +150,44 @@ def resmooth_to_fp8_e8m0(
     return weight, weight_scale
 
 
+def transform_k128_scales_to_cutedsl_mxfp8_layout(
+    weight_scale: torch.Tensor,
+    mn: int,
+    k: int,
+) -> torch.Tensor:
+    """Convert K128 block scales to CuTe DSL's K32 R128c4 MXFP8 layout.
+
+    The source tensor has one FP32 UE8M0-compatible scale per 128x128 weight
+    block.  The CuTe DSL MXFP8 GEMM consumes one UE8M0 byte per 1x32 block in
+    the standard R128c4 layout.  Preserve the original K128 quantization by
+    replicating every source scale into its four corresponding K32 slots.
+
+    Args:
+        weight_scale: float32 tensor of shape (ceil_div(mn, 128), k // 128).
+        mn: Number of weight rows (the MN extent); k must be a multiple of 128.
+        k: Weight K extent.
+
+    Returns:
+        uint8 tensor holding pad_up(mn, 128) * (k // 32) UE8M0 scales in R128c4 layout.
+    """
+    if weight_scale.dtype != torch.float32 or weight_scale.dim() != 2:
+        raise ValueError(
+            "weight_scale must be a 2D float32 K128 block-scale tensor")
+    if k % 128 != 0:
+        raise ValueError(f"K={k} must be divisible by 128")
+
+    expected_shape = (ceil_div(mn, 128), k // 128)
+    if tuple(weight_scale.shape) != expected_shape:
+        raise ValueError(f"weight_scale shape must be {expected_shape}, got "
+                         f"{tuple(weight_scale.shape)}")
+
+    per_row_scale = weight_scale.repeat_interleave(128, dim=0)[:mn]
+    ue8m0_scale = (per_row_scale.contiguous().view(torch.int32) >> 23).to(
+        torch.uint8)
+    k32_scale = ue8m0_scale.repeat_interleave(4, dim=1)
+    return torch.ops.trtllm.block_scale_interleave(k32_scale.contiguous())
+
+
 def get_m_alignment_for_contiguous_layout():
     return 128
 

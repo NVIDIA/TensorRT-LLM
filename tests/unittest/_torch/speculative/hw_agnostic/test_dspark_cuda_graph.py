@@ -27,7 +27,7 @@ graph-capturable.
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.dspark.attention import (
+from tensorrt_llm._torch.models.modeling_dspark import (
     apply_dspark_rotary,
     apply_dspark_rotary_batched,
     dspark_attention_forward,

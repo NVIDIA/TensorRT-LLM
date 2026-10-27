@@ -118,67 +118,38 @@ class TestModelInfo:
     def test_extract_architecture_multiple(self):
         """Extracts first architecture when list has multiple entries."""
         mock = MagicMock()
-        mock.architectures = ["Qwen2ForCausalLM", "GPT2LMHeadModel"]
-        assert usage_lib._extract_architecture_class_name(mock) == "Qwen2ForCausalLM"
+        mock.architectures = ["Qwen3ForCausalLM", "GPT2LMHeadModel"]
+        assert usage_lib._extract_architecture_class_name(mock) == "Qwen3ForCausalLM"
 
     def test_extract_architecture_none_config(self):
         """Returns None when config is None."""
         assert usage_lib._extract_architecture_class_name(None) is None
 
     def test_extract_architecture_empty_list(self):
-        """Falls back to class name when architectures list is empty."""
-        mock = MagicMock(spec=[])  # No attributes by default
-        mock.architectures = []
-        result = usage_lib._extract_architecture_class_name(mock)
-        assert result is not None  # Should return the class name
+        """An empty architectures list falls back to the config class name."""
+
+        class FakeConfig:
+            architectures = []
+
+        assert usage_lib._extract_architecture_class_name(FakeConfig()) == "FakeConfig"
 
     def test_extract_architecture_no_attr(self):
-        """Falls back to class name when architecture attr is missing."""
+        """A config without architecture fields falls back to its class name."""
 
         class FakeConfig:
             pass
 
         config = FakeConfig()
-        result = usage_lib._extract_architecture_class_name(config)
-        assert result == "FakeConfig"
+        assert usage_lib._extract_architecture_class_name(config) == "FakeConfig"
+        name, digest = usage_lib._architecture_telemetry_fields(config)
+        assert name == ""
+        assert digest.startswith("sha256:")
 
-    def test_extract_architecture_trtllm_singular(self):
-        """TRT-LLM PretrainedConfig uses .architecture (singular string)."""
+    def test_extract_architecture_malformed_first_item_fails_closed(self) -> None:
+        """A non-string first list item is not coerced or skipped."""
         mock = MagicMock(spec=[])
-        mock.architecture = "LlamaForCausalLM"
-        assert usage_lib._extract_architecture_class_name(mock) == "LlamaForCausalLM"
-
-    def test_extract_architecture_engine_config_nested(self):
-        """HF from_pretrained on engine dir produces nested pretrained_config dict."""
-
-        class FakeEngineConfig:
-            pretrained_config = {
-                "architecture": "LlamaForCausalLM",
-                "dtype": "float16",
-                "hidden_size": 2048,
-            }
-            build_config = {"max_batch_size": 8}
-
-        config = FakeEngineConfig()
-        assert usage_lib._extract_architecture_class_name(config) == "LlamaForCausalLM"
-
-    def test_extract_architecture_hf_takes_priority(self):
-        """HF .architectures (plural) takes priority over TRT-LLM .architecture."""
-        mock = MagicMock(spec=[])
-        mock.architectures = ["LlamaForCausalLM"]
-        mock.architecture = "ShouldNotBeUsed"
-        assert usage_lib._extract_architecture_class_name(mock) == "LlamaForCausalLM"
-
-    def test_extract_architecture_singular_over_nested(self):
-        """Direct .architecture (singular) takes priority over nested dict."""
-
-        class FakeConfig:
-            architecture = "MixtralForCausalLM"
-            pretrained_config = {
-                "architecture": "ShouldNotBeUsed",
-            }
-
-        assert usage_lib._extract_architecture_class_name(FakeConfig()) == "MixtralForCausalLM"
+        mock.architectures = [object(), "LlamaForCausalLM"]
+        assert usage_lib._extract_architecture_class_name(mock) is None
 
     def test_no_raw_config_fields(self):
         """Ensure PR #11299's raw config fields are NOT in the schema."""
@@ -188,10 +159,51 @@ class TestModelInfo:
         assert "num_attention_heads" not in fields
         assert "model_type" not in fields
 
-    def test_extract_arch_catches_attribute_error(self):
-        """_extract_architecture_class_name handles configs without expected attrs."""
-        result = usage_lib._extract_architecture_class_name(42)  # int has no .architectures
-        assert result is not None  # falls through to type(42).__name__ == "int"
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "LlamaForCausalLM",
+            "Cosmos3EdgeForConditionalGeneration",
+        ],
+    )
+    def test_public_architecture_is_reported_by_name(self, architecture: str) -> None:
+        """Allowlisted public names use plaintext and no hash."""
+        mock = MagicMock(spec=[])
+        mock.architectures = [architecture]
+        assert usage_lib._architecture_telemetry_fields(mock) == (architecture, "")
+
+    def test_unknown_architecture_is_hashed(self) -> None:
+        """Unknown names use a stable domain-separated SHA-256 digest."""
+        mock = MagicMock(spec=[])
+        mock.architectures = ["PrivateAcmeForCausalLM"]
+        assert usage_lib._architecture_telemetry_fields(mock) == (
+            "",
+            "sha256:76873ad24ad3dc7dc6b25e04899914610d375e85177cdac3ce6538f6294ccd04",
+        )
+
+    def test_allowlist_matching_is_exact(self) -> None:
+        """Whitespace is not normalized into an allowlisted public name."""
+        mock = MagicMock(spec=[])
+        mock.architectures = [" Qwen2ForCausalLM "]
+        assert usage_lib._architecture_telemetry_fields(mock) == (
+            "",
+            "sha256:20e36456e99ce3fbeda8ae98a8827b6a11c0cad17933ef2c9fca78416264a731",
+        )
+
+    @pytest.mark.parametrize("architecture", [None, "", "   ", 42, {"name": "Secret"}])
+    def test_missing_or_malformed_architecture_uses_empty_sentinels(
+        self, architecture: object
+    ) -> None:
+        """Missing and malformed values fail closed without a name or hash."""
+        mock = MagicMock(spec=[])
+        mock.architectures = [architecture]
+        assert usage_lib._architecture_telemetry_fields(mock) == ("", "")
+
+    def test_unencodable_architecture_uses_empty_sentinels(self) -> None:
+        """A malformed Unicode value cannot escape fail-silent collection."""
+        mock = MagicMock(spec=[])
+        mock.architectures = ["Private\ud800Architecture"]
+        assert usage_lib._architecture_telemetry_fields(mock) == ("", "")
 
 
 # ---------------------------------------------------------------------------
@@ -249,10 +261,10 @@ class TestConfigExtraction:
         """Extracts available fields without crashing on missing ones."""
 
         class PartialArgs:
-            backend = "tensorrt"
+            backend = "pytorch"
 
         result = usage_lib._extract_trtllm_config(PartialArgs())
-        assert result["backend"] == "tensorrt"
+        assert result["backend"] == "pytorch"
 
     def test_extract_config_defaults_for_missing(self):
         """Missing optional configs are omitted from the result dict."""
@@ -274,17 +286,8 @@ class TestConfigExtraction:
         assert "quantization_algo" not in result
         assert "kv_cache_dtype" not in result
 
-    def test_extract_config_infers_backend_from_class_name(self):
-        """Backend inferred as 'tensorrt' when backend missing and class name contains 'TrtLlm'."""
-
-        class TrtLlmArgsLike:
-            pass  # no backend attr -> triggers cls_name inference
-
-        result = usage_lib._extract_trtllm_config(TrtLlmArgsLike())
-        assert result.get("backend") == "tensorrt"
-
-    def test_extract_config_no_backend_no_trtllm_in_name(self):
-        """Backend omitted when class name does not contain 'TrtLlm'."""
+    def test_extract_config_no_backend(self):
+        """Backend omitted when the args object has no backend value."""
 
         class GenericArgs:
             pass
@@ -451,7 +454,6 @@ class TestFeatureExtraction:
         """CUDA graphs detected via cuda_graph_config (PyTorch backend)."""
         mock = MagicMock()
         mock.cuda_graph_config = MagicMock()  # non-None = enabled
-        mock.extended_runtime_perf_knob_config = None
         result = json.loads(usage_lib._collect_features(mock))
         assert result["cuda_graphs"] is True
 
@@ -459,32 +461,13 @@ class TestFeatureExtraction:
         """CUDA graphs false when cuda_graph_config is None (PyTorch)."""
         mock = MagicMock()
         mock.cuda_graph_config = None
-        mock.extended_runtime_perf_knob_config = None
         result = json.loads(usage_lib._collect_features(mock))
         assert result["cuda_graphs"] is False
 
-    def test_cuda_graphs_trt_backend(self):
-        """CUDA graphs detected via extended_runtime_perf_knob_config (TRT)."""
-        mock = MagicMock()
-        mock.cuda_graph_config = None
-        mock.extended_runtime_perf_knob_config.cuda_graph_mode = True
-        result = json.loads(usage_lib._collect_features(mock))
-        assert result["cuda_graphs"] is True
-
-    def test_cuda_graphs_trt_disabled(self):
-        """CUDA graphs false when cuda_graph_mode is False (TRT)."""
-        mock = MagicMock()
-        mock.cuda_graph_config = None
-        mock.extended_runtime_perf_knob_config.cuda_graph_mode = False
-        result = json.loads(usage_lib._collect_features(mock))
-        assert result["cuda_graphs"] is False
-
-    def test_cuda_graphs_no_config_either_backend(self):
-        """CUDA graphs false when neither backend config is present."""
-        mock = MagicMock()
-        mock.cuda_graph_config = None
-        mock.extended_runtime_perf_knob_config = None
-        result = json.loads(usage_lib._collect_features(mock))
+    def test_cuda_graphs_no_config(self):
+        """CUDA graphs are disabled when the args have no graph config attribute."""
+        args = object()
+        result = json.loads(usage_lib._collect_features(args))
         assert result["cuda_graphs"] is False
 
     # --- Chunked context ---
@@ -538,7 +521,6 @@ class TestFeatureExtraction:
         mock.speculative_config = MagicMock()
         mock.kv_cache_config.enable_block_reuse = True
         mock.cuda_graph_config = MagicMock()
-        mock.extended_runtime_perf_knob_config = None
         mock.enable_chunked_prefill = True
         mock.parallel_config.enable_attention_dp = True
         mock.parallel_config.tp_size = 8

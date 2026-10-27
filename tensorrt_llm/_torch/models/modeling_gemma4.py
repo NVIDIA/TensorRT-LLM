@@ -14,9 +14,10 @@
 # limitations under the License.
 """TensorRT-LLM PyTorch backend implementation for Gemma4 text model."""
 
+import copy
 import dataclasses
 import math
-from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -24,18 +25,23 @@ import transformers
 from packaging.version import Version
 from torch import nn
 
+from tensorrt_llm._torch.attention.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
-from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
-from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
-from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
-from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
+from tensorrt_llm._torch.moe.fused_moe.activation import SimpleActivation
+from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
+from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
-from ..attention_backend.interface import (
+from ..attention.backends import (
+    AttentionMetadata,
+    FlashInferAttentionMetadata,
+    TrtllmAttentionMetadata,
+)
+from ..attention.backends.interface import (
     AttentionMask,
     CustomAttentionMask,
     PositionalEmbeddingParams,
@@ -44,25 +50,37 @@ from ..attention_backend.interface import (
 )
 from ..distributed import AllReduce
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..model_config import ModelConfig
-from ..modules.decoder_layer import DecoderLayer
-from ..modules.embedding import Embedding
-from ..modules.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
-from ..modules.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant, rmsnorm_fp4_quant_available
-from ..modules.fused_ops.rmsnorm_residual_add import (
+from ..kernels.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
+from ..kernels.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant, rmsnorm_fp4_quant_available
+from ..kernels.fused_ops.rmsnorm_residual_add import (
     rmsnorm_residual_add,
     rmsnorm_residual_add_scale,
 )
+from ..model_config import KVCacheLayerSpec, ModelConfig
+from ..modules.decoder_layer import DecoderLayer
+from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
 from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
-from .modeling_speculative import SpecDecOneEngineForCausalLM, _slice_spec_position_ids
-from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
+from .modeling_gemma3 import build_gemma_attention_mask
+from .modeling_speculative import (
+    _SPECULATIVE_POSITION_HEADROOM,
+    SpecDecOneEngineForCausalLM,
+    _slice_spec_position_ids,
+)
+from .modeling_utils import (
+    DecoderModel,
+    DecoderModelForCausalLM,
+    moe_experts_quant_config,
+    register_auto_model,
+)
 
 if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
     from .modeling_gemma4mm import Gemma4ForConditionalGeneration
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
@@ -74,6 +92,81 @@ if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
     )
 
 from transformers import Gemma4TextConfig  # noqa: E402
+
+
+def _get_gemma4_per_layer_config(
+    config: Gemma4TextConfig,
+    layer_idx: int,
+) -> Optional[Gemma4TextConfig]:
+    """Return concrete layer geometry when Transformers provides it."""
+    per_layer_config = getattr(config, "per_layer_config", None)
+    if per_layer_config is None:
+        return None
+    return per_layer_config[layer_idx]
+
+
+def _get_gemma4_layer_head_dim(config: Gemma4TextConfig, layer_idx: int) -> int:
+    """Resolve one layer's head dimension across Gemma4 config schemas."""
+    layer_config = _get_gemma4_per_layer_config(config, layer_idx)
+    if layer_config is not None:
+        return layer_config.head_dim
+
+    head_dim = config.head_dim
+    if config.layer_types[layer_idx] == "sliding_attention":
+        return head_dim
+    global_head_dim = getattr(config, "global_head_dim", None)
+    return global_head_dim if global_head_dim is not None else head_dim
+
+
+def _get_gemma4_layer_num_q_heads(config: Gemma4TextConfig, layer_idx: int) -> int:
+    """Resolve the query-head count from concrete per-layer geometry."""
+    layer_config = _get_gemma4_per_layer_config(config, layer_idx)
+    if layer_config is not None:
+        return layer_config.num_attention_heads
+    return config.num_attention_heads
+
+
+def _get_gemma4_layer_num_kv_heads(config: Gemma4TextConfig, layer_idx: int) -> int:
+    """Resolve one layer's KV-head count across Gemma4 config schemas."""
+    layer_config = _get_gemma4_per_layer_config(config, layer_idx)
+    if layer_config is not None:
+        return layer_config.num_key_value_heads
+
+    num_kv_heads = config.num_key_value_heads
+    is_sliding = config.layer_types[layer_idx] == "sliding_attention"
+    if not is_sliding and getattr(config, "attention_k_eq_v", False):
+        return getattr(config, "num_global_key_value_heads", None) or num_kv_heads
+    return num_kv_heads
+
+
+def _get_gemma4_kv_cache_layer_specs(config: Gemma4TextConfig) -> list[KVCacheLayerSpec]:
+    """Translate Gemma4 config schemas into model-agnostic KV geometry."""
+    sliding_window = getattr(config, "sliding_window", None)
+    return [
+        KVCacheLayerSpec(
+            head_dim=_get_gemma4_layer_head_dim(config, layer_idx),
+            num_kv_heads=_get_gemma4_layer_num_kv_heads(config, layer_idx),
+            num_q_heads=_get_gemma4_layer_num_q_heads(config, layer_idx),
+            attention_window=(
+                int(sliding_window)
+                if sliding_window is not None
+                and config.layer_types[layer_idx] == "sliding_attention"
+                else None
+            ),
+        )
+        for layer_idx in range(config.num_hidden_layers)
+    ]
+
+
+def _gemma4_rope_max_positions(model_config: ModelConfig) -> int:
+    """Size RoPE for transient speculative positions beyond max_seq_len."""
+    max_positions = model_config.pretrained_config.max_position_embeddings
+    spec_config = model_config.spec_config
+    if spec_config is not None:
+        # Overlap can have one pending verification width, while the current target and shared,
+        # Q-only assistant consume the next one.
+        max_positions += 2 * spec_config.tokens_per_gen_step
+    return max_positions
 
 
 # ---------------------------------------------------------------------------
@@ -204,27 +297,51 @@ class Gemma4Attention(QKNormRoPEAttention):
         self.is_sliding = is_sliding
         self.is_kv_shared = is_kv_shared
         config = model_config.pretrained_config
-
-        # Per-layer head_dim and kv heads
-        # Note: num_global_key_value_heads is only used when K=V (alternative
-        # attention). For non-K=V full layers, use regular num_key_value_heads.
-        use_k_eq_v = getattr(config, "attention_k_eq_v", False) and not is_sliding
-        if is_sliding:
-            layer_head_dim = config.head_dim
-            layer_num_kv_heads = config.num_key_value_heads
-        else:
-            layer_head_dim = getattr(config, "global_head_dim", config.head_dim)
-            if use_k_eq_v:
-                layer_num_kv_heads = (
-                    getattr(config, "num_global_key_value_heads", None)
-                    or config.num_key_value_heads
+        geometry_layer_idx = layer_idx
+        if geometry_layer_idx is None:
+            if (
+                getattr(config, "per_layer_attributes", None)
+                or getattr(config, "per_layer_config", None) is not None
+            ):
+                raise ValueError(
+                    "Gemma4Attention requires layer_idx with a heterogeneous Transformers config."
                 )
-            else:
-                layer_num_kv_heads = config.num_key_value_heads
+            geometry_layer_idx = next(
+                (
+                    idx
+                    for idx, layer_type in enumerate(config.layer_types)
+                    if (layer_type == "sliding_attention") == is_sliding
+                ),
+                None,
+            )
+            if geometry_layer_idx is None:
+                raise ValueError(
+                    "Gemma4Attention could not infer layer_idx: no layer type "
+                    f"matches is_sliding={is_sliding}."
+                )
+
+        # Native TRTLLM's SM100 FP8-KV path consumes BF16 Q/K/V and quantizes
+        # while appending to the cache. Keep RoPE at the model layer so the
+        # fused Gemma4 prep kernel can produce those BF16 inputs for both
+        # sliding and full-attention layers.
+        self._use_trtllm_fused_qkv_prep = (
+            not is_kv_shared
+            and model_config.attn_backend == "TRTLLM"
+            and model_config.get_quant_config().layer_quant_mode.has_fp8_kv_cache()
+            and is_sm_100f()
+        )
+
+        # Transformers 5.14+ exposes heterogeneous geometry only through
+        # per_layer_config, while older versions keep flat global fields.
+        # Resolve both schemas without enabling ambiguous global access.
+        use_k_eq_v = getattr(config, "attention_k_eq_v", False) and not is_sliding
+        layer_head_dim = _get_gemma4_layer_head_dim(config, geometry_layer_idx)
+        layer_num_kv_heads = _get_gemma4_layer_num_kv_heads(config, geometry_layer_idx)
+        layer_num_q_heads = _get_gemma4_layer_num_q_heads(config, geometry_layer_idx)
 
         # Build RoPE params per layer type
         rope_params = RopeParams()
-        rope_params.max_positions = config.max_position_embeddings
+        rope_params.max_positions = _gemma4_rope_max_positions(model_config)
         if is_sliding:
             # Sliding: default RoPE, theta=10K, full rotation
             rope_config = (
@@ -263,14 +380,9 @@ class Gemma4Attention(QKNormRoPEAttention):
 
         self.use_k_eq_v = use_k_eq_v
 
-        # Temporarily override config.head_dim so the Attention base class
-        # picks up the correct per-layer head_dim.
-        original_head_dim = config.head_dim
-        config.head_dim = layer_head_dim
-
         super().__init__(
             hidden_size=config.hidden_size,
-            num_attention_heads=config.num_attention_heads,
+            num_attention_heads=layer_num_q_heads,
             num_key_value_heads=layer_num_kv_heads,
             max_position_embeddings=config.max_position_embeddings,
             bias=False,
@@ -281,10 +393,14 @@ class Gemma4Attention(QKNormRoPEAttention):
             dense_bias=False,
             config=model_config,
             q_scaling=q_scaling,
+            head_dim=layer_head_dim,
+            # Full-attention layers use proportional RoPE whose active
+            # frequencies are paired across the full head. Apply it at the
+            # module layer because fused preprocessing cannot represent that
+            # pairing with only the logical rotary dimension. Sliding layers
+            # let the backend decide whether it can fuse RoPE.
+            rope_fusion=None if is_sliding and not self._use_trtllm_fused_qkv_prep else False,
         )
-
-        # Restore original config head_dim
-        config.head_dim = original_head_dim
 
         # Fix proportional RoPE for full-attention layers.
         #
@@ -329,10 +445,11 @@ class Gemma4Attention(QKNormRoPEAttention):
             # the rotate split, matching HF's rotate_half(head_dim//2) pairing.
             self.rotary_emb.head_dim = layer_head_dim
 
-        # trtllm-gen FMHA kernels are available only on datacenter Blackwell.
-        # Use FlashInfer FA2 on other architectures, including SM120/SM121;
-        # multimodal custom masks then use FlashInfer's native mask planning.
-        self.attn.flashinfer_backend = "trtllm-gen" if is_sm_100f() else "fa2"
+        # With FlashInfer, use trtllm-gen only on datacenter Blackwell and FA2
+        # elsewhere. The TRTLLM backend selects phased FMHA directly and does
+        # not expose this FlashInfer option.
+        if hasattr(self.attn, "flashinfer_backend"):
+            self.attn.flashinfer_backend = "trtllm-gen" if is_sm_100f() else "fa2"
 
         # KV shared layers: use target layer's index for KV cache access
         # so the attention backend reads from the target layer's cache slot.
@@ -373,24 +490,26 @@ class Gemma4Attention(QKNormRoPEAttention):
             has_weights=False,
         )
 
-        # Fused QKV prep (norm+rope+FP8 quant in one Triton kernel).  Decided
-        # lazily on first apply_rope because attn.flashinfer_backend and
-        # has_fp8_kv_cache are finalized after __init__.  The unfused path
-        # below stays as the reference / fallback.
+        # Fused QKV prep (norm+rope with optional FP8 output in one Triton
+        # kernel). Decided lazily on first apply_rope because the attention
+        # backend's quantization state is finalized after __init__. The
+        # unfused path below stays as the reference / fallback.
         self._fused_qkv_prep: Optional[bool] = None
+        self._fused_qkv_prep_out_fp8 = False
         self._fused_prep_blocked = False
 
     def _fused_qkv_prep_enabled(self) -> bool:
         if self._fused_qkv_prep is None:
             rot = self.rotary_emb
+            use_flashinfer_fp8 = getattr(self.attn, "flashinfer_backend", None) == "trtllm-gen"
+            use_trtllm_bf16 = self._use_trtllm_fused_qkv_prep
             self._fused_qkv_prep = (
                 not self.is_kv_shared
                 and not self.fuse_qk_norm_rope
                 and not self.skip_rope
-                # The kernel emits KV-cache-dtype FP8 and replicates the
-                # flashinfer 2-target rope; only the profiled trtllm-gen +
-                # FP8-KV serving path is routed through it.
-                and getattr(self.attn, "flashinfer_backend", None) == "trtllm-gen"
+                # FlashInfer trtllm-gen consumes separate FP8 tensors. Native
+                # TRTLLM instead consumes the kernel's packed BF16 output.
+                and (use_flashinfer_fp8 or use_trtllm_bf16)
                 and getattr(self.attn, "has_fp8_kv_cache", False)
                 and rot is not None
                 and getattr(rot, "is_neox", False)
@@ -401,11 +520,15 @@ class Gemma4Attention(QKNormRoPEAttention):
                 and rot.rotary_cos_sin.shape[1] == 2
                 and rot.rotary_cos_sin.shape[2] * 2 == self.head_dim
                 and rot.rotary_cos_sin.is_contiguous()
+                # Triton's reduction and tile ranges require powers of two.
+                and self.head_dim > 0
+                and self.head_dim & (self.head_dim - 1) == 0
                 and self.q_norm.weight.shape == (self.head_dim,)
                 and self.k_norm.weight.shape == (self.head_dim,)
                 and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
                 and self.q_norm.variance_epsilon == self.v_norm.variance_epsilon
             )
+            self._fused_qkv_prep_out_fp8 = use_flashinfer_fp8
         return self._fused_qkv_prep
 
     def apply_rope(
@@ -434,9 +557,9 @@ class Gemma4Attention(QKNormRoPEAttention):
 
             # Fused path: one Triton kernel reads the packed QKV GEMM output
             # (strided per-head views), applies q/k/v RMSNorm + RoPE, and
-            # emits FP8 Q/K/V directly — replacing the reshape copies, three
-            # norms, the rope launch, and the backend's three
-            # .to(float8_e4m3fn) casts.
+            # emits Q/K/V directly — replacing the reshape copies, three
+            # norms, and the rope launch. The FlashInfer trtllm-gen path also
+            # emits FP8 here instead of launching three backend casts.
             if (
                 k is None
                 and v is None
@@ -456,7 +579,8 @@ class Gemma4Attention(QKNormRoPEAttention):
                     self.num_heads,
                     self.num_key_value_heads,
                     self.head_dim,
-                    out_fp8=True,
+                    out_fp8=self._fused_qkv_prep_out_fp8,
+                    packed_output=self._use_trtllm_fused_qkv_prep,
                 )
 
             q, k, v = self.split_qkv(q, k, v)
@@ -497,9 +621,10 @@ class Gemma4Attention(QKNormRoPEAttention):
         **kwargs,
     ) -> torch.Tensor:
         if attention_mask_data is not None:
-            assert isinstance(attn_metadata, FlashInferAttentionMetadata), (
-                "Only FlashInfer backend supports custom attention mask currently."
-            )
+            assert isinstance(
+                attn_metadata,
+                (FlashInferAttentionMetadata, TrtllmAttentionMetadata),
+            ), "Only FlashInfer and TRTLLM backends support custom attention masks."
             assert attention_mask == CustomAttentionMask.CUSTOM
         # Custom-mask (multimodal) prefill uses the Triton prefill fallback,
         # which consumes BF16 q/k/v — keep the unfused prep for those calls.
@@ -621,8 +746,11 @@ class Gemma4MoE(nn.Module):
             dtype=config.torch_dtype,
             reduce_results=True,
             model_config=model_config,
+            override_quant_config=moe_experts_quant_config(
+                model_config, f"model.layers.{layer_idx}.moe.experts"
+            ),
             layer_idx=layer_idx,
-            activation_type=ActivationType.Geglu,
+            activation=SimpleActivation(kind=ActivationType.Geglu),
             # VANILLA mode: preprocess_weights splits 3D gate_up_proj into per-expert w1/w3
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
         )
@@ -1225,6 +1353,8 @@ class Gemma4TextModel(DecoderModel):
 
 @register_auto_model("Gemma4ForCausalLM")
 class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
+    build_mtp_draft_model_from_config = True
+
     def __init__(
         self,
         model_config: ModelConfig[Gemma4TextConfig],
@@ -1244,102 +1374,68 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
                 "moe_ep_size>1 requires a Gemma4 MoE variant (only 26B-A4B-it today)."
             )
 
+        model_config.set_kv_cache_layer_specs(
+            _get_gemma4_kv_cache_layer_specs(model_config.pretrained_config)
+        )
         super().__init__(Gemma4TextModel(model_config), model_config)
 
     @classmethod
-    def get_model_defaults(cls, llm_args) -> dict:
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults.
 
-        FlashInfer backend is required for hybrid attention (per-layer
-        head_dim 256/512 with VSWA), trtllm-gen cubin dispatch, and
-        bidirectional attention masks for multimodal tokens.
+        SM100f defaults to TRTLLM; other architectures default to FlashInfer
+        FA2 because the TRTLLM backend's non-trtllm-gen fallback (MMHA)
+        supports head sizes only up to 256, while Gemma4 full-attention layers
+        use 512. External shared-KV MTP also requires FlashInfer attention
+        metadata.
         """
+        speculative_config = getattr(llm_args, "speculative_config", None)
+        spec_dec_mode = getattr(speculative_config, "spec_dec_mode", None)
+        uses_external_shared_kv = (
+            spec_dec_mode is not None and spec_dec_mode.is_mtp_eagle_one_model()
+        )
         return {
-            "attn_backend": "FLASHINFER",
+            "attn_backend": (
+                "FLASHINFER" if uses_external_shared_kv or not is_sm_100f() else "TRTLLM"
+            ),
         }
 
-    def _get_token_type_mask(self, mm_token_type_ids: torch.Tensor):
-        """Build bidirectional attention mask from mm_token_type_ids.
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Gemma4's VSWA layout.
 
-        mm_token_type_ids: 0=text, 1=image, 2=video, 3=audio. Only VISION
-        tokens (image/video) attend bidirectionally within their contiguous
-        blob; text and audio stay causal. Matches HF Gemma4, where
-        ``is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)`` and
-        audio is left causal.
+        Hybrid-attention checkpoints (per-layer head_dim) are routed to V2
+        unconditionally regardless of this preference.
         """
-        device = mm_token_type_ids.device
-        token_type_ids = mm_token_type_ids.clone()
-        # Only vision tokens (image=1, video=2) get the bidirectional mask;
-        # audio (3) stays causal, matching HF Gemma4 (audio is not in is_vision).
-        is_mm = (token_type_ids == 1) | (token_type_ids == 2)
+        return "V2"
 
-        # Detect blob boundaries: positions where type changes or goes 0->nonzero
-        padded = torch.cat(
-            (
-                torch.tensor([0], device=device, dtype=mm_token_type_ids.dtype),
-                mm_token_type_ids,
-            )
-        )
-        # A new blob starts whenever the type changes and the current is nonzero
-        changes = (padded[1:] != padded[:-1]) & is_mm
-        blob_ids = torch.cumsum(changes.int(), dim=0)
-        # Mask out text tokens
-        blob_ids = blob_ids * is_mm.int()
-
-        # Tokens with the same non-zero blob_id attend bidirectionally
-        token_type_mask = blob_ids.unsqueeze(0) == blob_ids.unsqueeze(1)
-        token_type_mask.logical_and_(is_mm.unsqueeze(0))
-        token_type_mask.logical_and_(is_mm.unsqueeze(1))
-
-        return token_type_mask
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer the Python transceiver so disaggregated serving over NIXL keeps V2."""
+        return "PYTHON"
 
     def get_context_mask(
         self,
         mm_token_type_ids: torch.Tensor,
         effective_sliding_window: Optional[int] = None,
         prefix_len: int = 0,
-    ):
-        """Build context mask with causal + bidirectional for MM tokens.
+    ) -> torch.Tensor:
+        """Build a context mask; chunk boundaries must not split vision blobs."""
+        length = len(mm_token_type_ids)
+        return build_gemma_attention_mask(
+            mm_token_type_ids, [length], [prefix_len], effective_sliding_window
+        ).view(length, prefix_len + length)
 
-        Returns a [extend_len, prefix_len + extend_len] mask where:
-        - The first `prefix_len` columns (cached/paged history) are True for
-          all rows. SWA window enforcement is delegated to the kernel's
-          window_left clip. Bidirectional MM across the prefix/extend
-          boundary is NOT supported here; callers must ensure chunk
-          boundaries do not split a multimodal block.
-        - The last `extend_len` columns follow the original causal +
-          (optional) sliding window + MM-bidirectional logic.
-        """
-        device = mm_token_type_ids.device
-        extend_len = len(mm_token_type_ids)
-
-        pos = torch.arange(extend_len, device=device)
-        causal_mask = pos.unsqueeze(0) <= pos.unsqueeze(1)
-
-        if effective_sliding_window is not None and effective_sliding_window < extend_len:
-            causal_mask.logical_and_(pos.unsqueeze(0) > pos.unsqueeze(1) - effective_sliding_window)
-
-        token_type_mask = self._get_token_type_mask(mm_token_type_ids)
-        causal_mask = causal_mask.masked_fill(token_type_mask, True)
-
-        if prefix_len > 0:
-            prefix_block = torch.ones(
-                extend_len, prefix_len, dtype=causal_mask.dtype, device=device
-            )
-            causal_mask = torch.cat([prefix_block, causal_mask], dim=1)
-
-        return causal_mask
-
-    def get_flashinfer_attention_mask(
+    def get_attention_mask(
         self,
         mm_token_type_ids: torch.Tensor,
         attn_metadata: AttentionMetadata,
         effective_sliding_window: Optional[int] = None,
     ) -> torch.Tensor:
-        """Build FlashInfer custom mask for context requests."""
-        assert isinstance(attn_metadata, FlashInferAttentionMetadata), (
-            "Only FlashInfer backend supports custom mask currently."
-        )
+        """Build a custom attention mask for context requests."""
         num_contexts = attn_metadata.num_contexts
         assert num_contexts > 0
 
@@ -1354,18 +1450,9 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         else:
             cached_token_lens = [0] * num_contexts
 
-        context_mask_list = []
-        token_offset = 0
-        for context_len, prefix_len in zip(context_lens, cached_token_lens, strict=True):
-            context_end = token_offset + context_len
-            mask_i = self.get_context_mask(
-                mm_token_type_ids=mm_token_type_ids[token_offset:context_end],
-                effective_sliding_window=effective_sliding_window,
-                prefix_len=prefix_len,
-            )
-            context_mask_list.append(mask_i.flatten())
-            token_offset = context_end
-        return torch.cat(context_mask_list, dim=0).contiguous()
+        return build_gemma_attention_mask(
+            mm_token_type_ids, context_lens, cached_token_lens, effective_sliding_window
+        )
 
     def _forward_speculative(
         self,
@@ -1428,7 +1515,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         # full-attention layers retain their normal causal mask.
         use_bidir = getattr(self.config, "use_bidirectional_attention", None)
         if mm_token_type_ids is not None and use_bidir == "vision":
-            local_attention_mask_data = self.get_flashinfer_attention_mask(
+            local_attention_mask_data = self.get_attention_mask(
                 mm_token_type_ids=mm_token_type_ids,
                 attn_metadata=attn_metadata,
                 effective_sliding_window=self.config.sliding_window,
@@ -1576,11 +1663,21 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
 
     def __init__(self, model_config: ModelConfig):
         assistant_config = model_config.pretrained_config
+        assistant_text_config = copy.deepcopy(assistant_config.text_config)
+        # The assistant is deliberately built without `spec_config` to avoid recursive speculative
+        # initialization. Carry only its fixed physical position headroom through the internal model
+        # attributes instead.
+        assistant_text_config.max_position_embeddings += model_config.extra_attrs.get(
+            _SPECULATIVE_POSITION_HEADROOM, 0
+        )
         text_model_config = dataclasses.replace(
             model_config,
-            pretrained_config=assistant_config.text_config,
+            pretrained_config=assistant_text_config,
             spec_config=None,
         )
+        # extra_attrs is init=False and would otherwise be reset by replace(),
+        # disconnecting the assistant's custom-op registries from the engine.
+        text_model_config.extra_attrs = model_config.extra_attrs
         super().__init__(
             Gemma4TextModel(text_model_config),
             config=model_config,

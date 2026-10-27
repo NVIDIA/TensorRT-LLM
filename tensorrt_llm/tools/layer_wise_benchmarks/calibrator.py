@@ -680,6 +680,123 @@ class Calibrator:
             f" and {chunk_count} chunks"
         )
 
+    def get_replay_token_count(
+        self, start_iter: int | None = None, stop_iter: int | None = None
+    ) -> int:
+        """Get the tokens per iteration recorded for the sliced layers.
+
+        A record is per (layer, chunk), not per layer: `maybe_collect_or_replay_slots`
+        is called from `_forward_chunk_impl`, which `_forward_multiple_chunks` runs
+        once per MoE chunk. So an iteration's token count is the sum over one layer's
+        chunks -- `split_chunk(4096, 3)` records `[1366, 6]`, `[1365, 6]`, `[1365, 6]`
+        for 4096 tokens -- and reading it off a single record would report a chunk's
+        count instead.
+
+        Args:
+            start_iter: First iteration to consider, inclusive. None means all.
+            stop_iter: Last iteration to consider, inclusive. None means all.
+
+        Returns:
+            int: the token count every (iteration, layer) in the range agrees on.
+
+        Raises:
+            ValueError: If mode is not REPLAY, if the range holds no record, or if
+                the records in it do not all describe the same routing. One CUDA
+                graph holds one shape, so such a range cannot be replayed.
+        """
+        if self.mode != Mode.REPLAY:
+            raise ValueError(
+                f"get_replay_token_count() is only valid in REPLAY mode, "
+                f"current mode is {self.mode.name}"
+            )
+        window = (
+            "the calibration"
+            if start_iter is None and stop_iter is None
+            else f"iterations [{start_iter}, {stop_iter}]"
+        )
+        # (iteration, layer_idx) -> (tokens summed over that layer's chunks, the dims
+        # past the token one). Those trailing dims are carried rather than summed: a
+        # range agreeing on tokens and differing in top_k is still more than one shape.
+        per_layer = {}
+        for iteration, entry in self._replay_db.items():
+            if start_iter is not None and iteration < start_iter:
+                continue
+            if stop_iter is not None and iteration > stop_iter:
+                continue
+            for m in entry["metadata"]:
+                tokens, *trailing = m["token_selected_slots_shape"]
+                key = (iteration, m["layer_idx"])
+                summed, recorded_trailing = per_layer.get(key, (0, tuple(trailing)))
+                if tuple(trailing) != recorded_trailing:
+                    raise ValueError(
+                        f"Chunks of layer {m['layer_idx']} at iteration {iteration} "
+                        f"disagree on the routing shape past its token dimension: "
+                        f"{list(recorded_trailing)} and {trailing}"
+                    )
+                per_layer[key] = (summed + tokens, recorded_trailing)
+
+        if not per_layer:
+            raise ValueError(f"No routing recorded over {window} to replay")
+
+        shapes = {}
+        for (iteration, layer_idx), (tokens, trailing) in sorted(per_layer.items()):
+            shapes.setdefault((tokens, trailing), []).append((iteration, layer_idx))
+        if len(shapes) > 1:
+            detail = "; ".join(
+                f"{[tokens, *trailing]} at {len(where)} of them, first iteration "
+                f"{where[0][0]} layer {where[0][1]}"
+                for (tokens, trailing), where in shapes.items()
+            )
+            raise ValueError(
+                f"{len(shapes)} different routing shapes recorded over {window}, "
+                f"across {len(per_layer)} (iteration, layer) pairs, so no single "
+                f"--batch-size/--seq-len-q reproduces them and one CUDA graph "
+                f"cannot hold them: {detail}"
+            )
+        return next(iter(shapes))[0]
+
+    def get_missing_replay_iterations(
+        self, start_iter: int, stop_iter: int, limit: int = 8
+    ) -> tuple[int, list[int]]:
+        """Get how many iterations in [start_iter, stop_iter] this rank does not hold.
+
+        The work is bounded by the calibration, not by the window asked for. Both
+        flags behind this are a bare `type=int` with no upper bound, so
+        `--replay-stop-iter 1000000000` is one keystroke away; enumerating that window
+        costs tens of gigabytes and takes the box down before the caller's error
+        message is ever printed. The count is arithmetic instead, and the scan for
+        examples stops at `limit` of them -- at most `limit` plus the number of
+        iterations the range does hold.
+
+        Args:
+            start_iter: First iteration of the requested window, inclusive.
+            stop_iter: Last iteration of the requested window, inclusive.
+            limit: How many of the missing iterations to return.
+
+        Returns:
+            tuple[int, list[int]]: How many iterations are missing, and the first
+                `limit` of them in ascending order. (0, []) when none are.
+
+        Raises:
+            ValueError: If mode is not REPLAY.
+        """
+        if self.mode != Mode.REPLAY:
+            raise ValueError(
+                f"get_missing_replay_iterations() is only valid in REPLAY mode, "
+                f"current mode is {self.mode.name}"
+            )
+        # max(): an inverted window holds nothing and misses nothing, rather than
+        # reporting a negative count.
+        width = max(0, stop_iter - start_iter + 1)
+        held = sum(1 for i in self._replay_db if start_iter <= i <= stop_iter)
+        examples = []
+        for i in range(start_iter, stop_iter + 1):
+            if len(examples) == limit:
+                break
+            if i not in self._replay_db:
+                examples.append(i)
+        return width - held, examples
+
     def get_replay_iteration_range(self):
         """Get the valid iteration range for REPLAY mode.
 

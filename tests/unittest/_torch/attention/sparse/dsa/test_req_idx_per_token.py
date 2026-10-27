@@ -20,6 +20,7 @@ Tests for the token->request map used by DSAtrtllmAttentionMetadata.
 2. on_update_kv_lens() must rebuild the map after the MTP draft loop rewrites
    seq_lens, or every draft token is misattributed to request 0
    (https://nvbugs/6513132, https://nvbugs/6513093).
+3. on_update_kv_lens() must preserve the base metadata invalidation contract.
 """
 
 from unittest.mock import Mock
@@ -27,7 +28,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+from tensorrt_llm._torch.attention.backends.sparse.dsa import (
     DSAtrtllmAttentionMetadata,
     build_req_idx_per_token,
 )
@@ -64,7 +65,26 @@ def test_matches_host_repeat_interleave(seq_lens, device):
     assert result.to(torch.int32).tolist() == _host_reference(seq_lens).tolist()
 
 
-def test_on_update_kv_lens_rebuilds_stale_map():
+def test_on_update_kv_lens_invalidates_base_mla_state() -> None:
+    md = object.__new__(DSAtrtllmAttentionMetadata)
+    md.enable_flash_mla = False
+    md._mla_scheduler_buffers_valid = True
+    md._mla_ctx_cu_seqlens_valid = True
+    md._invalidate_pool_view_cache = Mock()
+    md._num_tokens = 0
+    md._num_generations = 0
+    md.kv_cache_manager = None
+    md.kv_lens_cuda = torch.empty(0, dtype=torch.int32)
+    md._compute_kv_lens_row_reorder = Mock()
+    md.prepare_dense_topk_indices = Mock()
+
+    md.on_update_kv_lens()
+
+    assert not md._mla_scheduler_buffers_valid
+    assert not md._mla_ctx_cu_seqlens_valid
+
+
+def test_on_update_kv_lens_rebuilds_stale_map() -> None:
     """on_update_kv_lens() must replace prepare()'s stale map (fails pre-fix)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
@@ -78,6 +98,12 @@ def test_on_update_kv_lens_rebuilds_stale_map():
     # __init__ (bypassed by object.__new__) defaults this to False;
     # on_update_kv_lens() reads it since #16925.
     md.in_mtp_draft_loop = False
+    # Same reason: `_invalidate_pool_view_cache` clears this unconditionally, and
+    # unlike the sibling test above we exercise the real method rather than a Mock
+    # (the map rebuild happens downstream of it). A dict, not a Mock, so that a
+    # future attribute added to that method fails loudly here instead of being
+    # absorbed.
+    md._group_remap_batched = {}
     # Stub collaborators unrelated to the map rebuild (test_dsa_indexer.py style).
     md.kv_lens_cuda = torch.tensor([100, 200, 300], dtype=torch.int32, device=device)
     md._compute_kv_lens_row_reorder = Mock()

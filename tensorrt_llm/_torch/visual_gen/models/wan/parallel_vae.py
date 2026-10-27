@@ -117,6 +117,26 @@ class WanCausalConvHalo(HaloExchangeConv):
         spatial_padding[spatial_axis] = 0
         return (spatial_padding[0], spatial_padding[1])
 
+    @property
+    def absorbs_silu(self) -> bool:
+        # Delegate the fusion contract through the halo wrapper. RMSNorm and
+        # SiLU are pointwise over spatial positions, so applying them after
+        # halo exchange is mathematically equivalent.
+        return getattr(self.module, "absorbs_silu", False)
+
+    @property
+    def absorbs_norm(self) -> bool:
+        return getattr(self.module, "absorbs_norm", False)
+
+    @property
+    def supports_residual_fusion(self) -> bool:
+        # A rank-local residual can enter the epilogue only when the wrapped
+        # convolution directly emits the local extent. The fallback path emits
+        # halo outputs and strips them after the convolution.
+        return self._local_output_spatial_padding is not None and getattr(
+            self.module, "supports_residual_fusion", False
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -295,10 +315,9 @@ class ParallelVAE_Wan(ParallelVAEBase):
 
 
 # Two parallel-VAE wrappers, one per VAE *class* (not a temporary transition):
-#   ParallelVAE_Wan       wraps the diffusers AutoencoderKLWan -- used by Cosmos3
-#                         (models/cosmos3) and the Wan TRTLLM_USE_DIFFUSER_VAE
-#                         debug fallback.
-#   ParallelVAE_TrtllmWan wraps the native WanVAE -- the default for Wan2.1/2.2.
+#   ParallelVAE_Wan       wraps the diffusers AutoencoderKLWan -- used by the
+#                         TRTLLM_USE_DIFFUSER_VAE debug fallback for Wan and Cosmos3.
+#   ParallelVAE_TrtllmWan wraps the native WanVAE -- the default for Wan and Cosmos3.
 # They share all splitting logic via the base class; only the conv3d/attention
 # module classes differ. ParallelVAE_Wan stays as long as any model uses the
 # diffusers AutoencoderKLWan.
@@ -311,6 +330,9 @@ class ParallelVAE_TrtllmWan(ParallelVAE_Wan):
     the native ``WanConv2d`` subclasses ``nn.Conv2d``.
     """
 
+    # ``NVFP4WanCausalConv3d`` subclasses this native class, so the same rewrite
+    # wraps both BF16 and FP4 convs with ``WanCausalConvHalo``. The halo wrapper
+    # delegates the FP4 fusion flags defined above.
     _conv3d_cls = wan_vae.WanCausalConv3d
     _attn_cls = wan_vae.WanAttentionBlock
 

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Dict, List, Optional
@@ -31,9 +46,14 @@ class DisaggregatedParams:
          Each entry is a torch.Tensor of shape [num_tokens, vocab_size] (one per beam/sequence).
         ctx_usage (Dict[str, Any]): The context usage payload to preserve exact
          usage accounting on the generation server.
-
+        remote_tail_start (int): Prompt-token boundary transferred by a remote-tail
+         context worker. The generation worker replays the suffix starting here.
+        orig_elapsed_s (float): Seconds since the request arrived at the disagg orchestrator,
+         measured when the generation request was dispatched. Used for GEN admission ordering.
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
+        multimodal_positions (List[int]): Prompt-token offset of each multimodal item.
+        multimodal_lengths (List[int]): Prompt-token count of each multimodal item.
     """
 
     request_type: Optional[str] = None
@@ -50,10 +70,10 @@ class DisaggregatedParams:
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
     ctx_usage: Optional[Dict[str, Any]] = None
-    # Multi-turn conversation id (from session headers such as X-Session-ID),
-    # carried through so worker-side consumers (e.g. the ADP router) can see
-    # the same id the disagg orchestrator routed on.
-    conversation_id: Optional[str] = None
+    remote_tail_start: Optional[int] = None
+    multimodal_positions: Optional[List[int]] = None
+    multimodal_lengths: Optional[List[int]] = None
+    orig_elapsed_s: Optional[float] = None
 
     # E-P Disaggregated Params
     multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = (
@@ -95,6 +115,19 @@ class DisaggregatedParams:
             )
 
     def __post_init__(self):
+        if (self.multimodal_positions is None) != (self.multimodal_lengths is None):
+            raise ValueError(
+                "multimodal_positions and multimodal_lengths must be provided together"
+            )
+        if self.multimodal_positions is not None:
+            if len(self.multimodal_positions) != len(self.multimodal_lengths):
+                raise ValueError(
+                    "multimodal_positions and multimodal_lengths must have the same length"
+                )
+            if any(position < 0 for position in self.multimodal_positions):
+                raise ValueError("multimodal_positions must be non-negative")
+            if any(length <= 0 for length in self.multimodal_lengths):
+                raise ValueError("multimodal_lengths must be positive")
         if self.request_type is not None:
             self.request_type = self.request_type.lower()
             if self.request_type not in [

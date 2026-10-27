@@ -1,7 +1,7 @@
 # AGENTS.md
 
 TensorRT-LLM: open-source library for optimized LLM inference on NVIDIA GPUs.
-Python and C++ codebase with PyTorch and AutoDeploy execution paths.
+Python and C++ codebase with a PyTorch execution path.
 
 > If a `CLAUDE.local.md` file exists alongside this file, read and respect it — it contains developer-specific overrides that supplement this shared guidance.
 
@@ -15,7 +15,28 @@ Python and C++ codebase with PyTorch and AutoDeploy execution paths.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
 - LLM args or nested-config changes must run `python3 scripts/generate_llm_args_golden_manifest.py` and commit
   `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval
+- Changes to serving YAML fields, aliases, defaults, types, or constraints (including nested,
+  disaggregated, and VisualGen configs) must regenerate and inspect the editor JSON Schemas with
+  `python3 scripts/generate_trtllm_serve_schemas.py`, using a
+  TensorRT-LLM build matching the checkout. Update the generator's YAML-specific adaptations when
+  configuration annotations alone do not capture the change, and add regression coverage for the
+  affected accepted/rejected values. Run
+  `pytest -m cpu_only tests/unittest/llmapi/test_trtllm_serve_config_schemas.py`.
+  Commit the generated `tensorrt_llm/schemas/*.json` snapshots; never hand-edit them.
+  Version bumps in `tensorrt_llm/version.py` also require regeneration: the snapshots
+  include the package version in their `$id` and `title`. For an automated version-only
+  bump, `python3 scripts/generate_trtllm_serve_schemas.py --sync-version` updates only
+  that metadata without importing TensorRT-LLM or requiring a matching build.
+  `python3 scripts/generate_trtllm_serve_schemas.py --check` and the CPU schema tests
+  reject missing or stale snapshots. Wheels and HTML docs publish these same files.
+- When adding or renaming a public model architecture identifier, update
+  `tensorrt_llm/usage/architecture_allowlist.py` with its exact identifier. It must be publicly
+  documented by the upstream model provider or in `docs/source/models/supported-models.md`; never add
+  private, customer-specific, or arbitrary user-supplied names
 - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
+- Put a change's rationale and history (why it was made, what it replaces, ticket/PR references) in the PR
+  description, not in code comments. Code comments should explain the code as it stands for a future reader,
+  not narrate how it got there.
 - Set `LLM_MODELS_ROOT` env var when running tests that need model weights
 
 ## Common Commands
@@ -23,6 +44,8 @@ Python and C++ codebase with PyTorch and AutoDeploy execution paths.
 | Task | Command |
 |------|---------|
 | Unit tests | `pytest tests/unittest/` |
+| C++ component tests | `cmake --build cpp/build_RelWithDebInfo --target common-tests` (also `runtime-tests`, `executor-tests`, `batch-manager-tests`, `kernel-tests`) |
+| C++ test scheduling | `ctest --test-dir cpp/build_RelWithDebInfo -L common --output-on-failure` (build the selected tests first) |
 | Specific test | `pytest tests/unittest/llmapi/test_llm_args.py` |
 | Pattern match | `pytest tests/unittest -k "test_llm_args"` |
 | Integration tests | `LLM_MODELS_ROOT=/path/to/models pytest tests/integration/defs/...` |
@@ -54,7 +77,6 @@ See [architecture diagram](.github/tava_architecture_diagram.md) for the full Me
 | Backend | Status | Entry Point | Key Path |
 |---------|--------|-------------|----------|
 | **PyTorch** | Default | `TorchLlmArgs` | `_torch/pyexecutor/` → `PyExecutor` → PyTorch Engine |
-| **AutoDeploy** | Beta | `_torch/auto_deploy/` shim | `_torch/auto_deploy/shim/ad_executor.py` → adapts `PyExecutor` → graph transforms + torch.export |
 
 ### Shared C++ Core (via Nanobind)
 
@@ -64,7 +86,7 @@ Both backends share these C++ components:
 
 ### Request Flow
 ```text
-HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy)
+HuggingFace Model → LLM API → PyTorch Executor
     → Scheduler → Model Forward → Decoder → Sampling → Generated Tokens
 ```
 
@@ -72,6 +94,12 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy)
 - `trtllm-serve`: OpenAI-compatible REST + gRPC server, supports all backends
 - **Disaggregated serving**: separates prefill (context) and decode (generation) across GPUs
   - KV cache exchange via NIXL (default), UCX, or MPI
+
+### Multimodal request data
+
+Read the [multimodal developer guide](docs/source/developer-guide/multimodal.md) before changing multimodal paths.
+Reuse `MultimodalParams`; request Params own cache references.
+Encoder and LLM forward Params are execution views.
 
 ## Key Files
 
@@ -84,8 +112,8 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy)
 | `tensorrt_llm/executor/executor.py` | Execution abstraction (`GenerationExecutor`) |
 | `tensorrt_llm/models/automodel.py` | Auto-discovery and model registry |
 | `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from the top-level `models/` package) |
-| `tensorrt_llm/_torch/modules/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying `tensorrt_llm/_torch/modules/attention.py`, `tensorrt_llm/_torch/modules/mla.py`, or `tensorrt_llm/_torch/attention_backend/`** |
-| `tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
+| `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying anything under `tensorrt_llm/_torch/attention/`** |
+| `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
 ## Design Patterns
@@ -108,7 +136,7 @@ PyTorch backend where it makes sense (attention, quantization, parallelism).
 
 Key entry points:
 - Public Python API: `from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams`.
-- Serving CLI: `trtllm-serve --model <HF id> --visual_gen_args <YAML path>`.
+- Serving CLI: `trtllm-serve <HF id> --visual_gen_args <YAML path>`.
 
 Key files:
 - `tensorrt_llm/_torch/visual_gen/ENGINEERING_CRITERIA.md`: **Engineering criteria for any change under `tensorrt_llm/visual_gen/` or `tensorrt_llm/_torch/visual_gen/`** — API discipline, feature/test/lossy-vs-lossless requirements, examples & docs rules. Read before modifying anything in those trees.
@@ -162,12 +190,29 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
 
+New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
+`LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
+for integration tests and `REQUIRES_GPU` for tests that need a GPU. `google-tests`
+continues to build all C++ tests; component aggregate targets build migrated tests.
+
+### Advisory semantic review
+
+The bot-to-bot semantic review workflow is disabled. See
+[.github/semantic-review.md](.github/semantic-review.md) for its current status and
+historical implementation details.
+
+### Vendor source tools and promotion
+
+Use the tools under `scripts/vendor/` to manage locked vendor sources, prepare
+lock-only promotions, and optionally monitor source-update PRs. Read
+[Vendored Sources](3rdparty/vendor-sources.md) for commands, contributor metadata,
+and operator guidance before changing vendor state or publishing promotions.
+
 ### Triggering CI
 
 CI is triggered by posting comments on the PR. Basic commands:
 - `/bot run` — trigger the standard CI pipeline
 - `/bot run --disable-fail-fast` — run all stages even if earlier ones fail (only add when explicitly needed)
-- `/bot run --extra-stage "DGX_B200-4_GPUs-AutoDeploy-1, DGX_H100-4_GPUs-AutoDeploy-1"` — include AutoDeploy CI stages (use for AutoDeploy-related PRs)
 
 For a full list of up-to-date bot commands, post `/bot help` as a PR comment and check the bot's reply.
 
@@ -183,7 +228,6 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 | Architecture overview | `docs/source/developer-guide/overview.md` |
 | PyTorch backend | `docs/source/torch/arch_overview.md` |
 | Adding a new model | `docs/source/torch/adding_new_model.md` |
-| AutoDeploy | `docs/source/features/auto_deploy/auto-deploy.md` |
 | Disaggregated serving | `docs/source/features/disagg-serving.md` |
 | Speculative decoding | `docs/source/features/speculative-decoding.md` |
 | Quantization | `docs/source/features/quantization.md` |

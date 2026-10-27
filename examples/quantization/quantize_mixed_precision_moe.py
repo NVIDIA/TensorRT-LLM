@@ -9,8 +9,6 @@ import torch
 from safetensors.torch import safe_open, save_file
 from tqdm import tqdm
 
-import tensorrt_llm
-
 
 def parse_args():
     parser = argparse.ArgumentParser()

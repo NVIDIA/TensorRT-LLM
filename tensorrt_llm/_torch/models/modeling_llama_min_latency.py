@@ -26,20 +26,21 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a)
 
 from ...models.modeling_utils import QuantConfig
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PredefinedAttentionMask
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PredefinedAttentionMask
 from ..model_config import ModelConfig
-from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
-                                 FusedMoEQuantScalesFP8,
-                                 Llama4RenormalizeMoeRoutingMethod,
-                                 MoEWeightLoadingMode)
 from ..modules.gated_mlp import GatedMLP, swiglu
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..moe.fused_moe import (BaseMoeRoutingMethod, ConfigurableMoE,
+                             FusedMoEQuantScalesFP8,
+                             Llama4RenormalizeMoeRoutingMethod,
+                             MoEWeightLoadingMode, cutlass_leaf)
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_llama import Llama4Attention, Llama4DecoderLayer, Llama4MoE
+from .modeling_utils import moe_experts_quant_config
 
 # Perf heuristics thresholds.
 # Use routing gemv kernels when num_tokens <= 8.
@@ -445,7 +446,15 @@ class Llama4MinLatencyAttention(Llama4Attention):
                                      skip_attn_scaling)
 
 
-class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
+class Llama4MinLatencyFusedMoE(ConfigurableMoE):
+    """Cutlass MoE layer with a min-latency FP8 fast path.
+
+    Subclasses the wrapper rather than a Cutlass execution unit: those are
+    ``MoEImplBase`` with no ``forward``, so they can only be reached as
+    ``ConfigurableMoE.backend``. ``moe_cls`` pins that backend -- the Cutlass
+    leaf for this layer's format -- because the min-latency op below reads the
+    Cutlass weight layout.
+    """
 
     def __init__(
         self,
@@ -462,9 +471,16 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
+        override_quant_config: Optional[QuantConfig] = None,
     ):
 
+        experts_quant_config = override_quant_config or model_config.quant_config
+        quant_algo = (experts_quant_config.quant_algo
+                      if experts_quant_config is not None else None)
+
         super().__init__(
+            moe_cls=cutlass_leaf(quant_algo),
+            override_quant_config=override_quant_config,
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -482,8 +498,8 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
         if num_experts == 128 \
             and hidden_size == 5120 \
             and intermediate_size == 8192 \
-            and model_config.quant_config is not None \
-            and model_config.quant_config.quant_mode.has_fp8_qdq() \
+            and experts_quant_config is not None \
+            and experts_quant_config.quant_mode.has_fp8_qdq() \
             and model_config.mapping.moe_tp_size == 8 \
             and model_config.mapping.moe_ep_size == 1 \
             and routing_method.top_k == 1 \
@@ -496,6 +512,8 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
         router_logits: torch.Tensor,
         output_dtype: Optional[torch.dtype] = None,
         x_high: Optional[torch.Tensor] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
     ) -> torch.Tensor:
 
         # Use special min-latency MoE kernels when num_tokens <= 8.
@@ -518,26 +536,31 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
                     "x_high is required when x.dtype is float8_e4m3fn in Llama4FusedMoE fallback path!"
                 )
 
+        # The wrapper's scheduler defaults a missing rank list to ``[x.shape[0]]``,
+        # which is only correct at parallel_size 1; forward what the caller knows.
         return super().forward(x,
                                router_logits,
                                do_finalize=True,
-                               output_dtype=output_dtype)
+                               output_dtype=output_dtype,
+                               all_rank_num_tokens=all_rank_num_tokens,
+                               use_dp_padding=use_dp_padding)
 
 
 class Llama4MinLatencyMoE(Llama4MoE):
 
     def __init__(
-            self,
-            *,
-            num_experts: int,
-            top_k: int,
-            hidden_size: int,
-            intermediate_size: int,
-            shared_expert_intermediate_size: int,
-            aux_stream: torch.cuda.Stream,
-            dtype: Optional[torch.dtype] = None,
-            tune_max_num_tokens: int = 8192,
-            model_config: ModelConfig = ModelConfig(),
+        self,
+        *,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        shared_expert_intermediate_size: int,
+        aux_stream: torch.cuda.Stream,
+        dtype: Optional[torch.dtype] = None,
+        tune_max_num_tokens: int = 8192,
+        model_config: ModelConfig = ModelConfig(),
+        layer_idx: Optional[int] = None,
     ):
 
         # First, initialize the base class.
@@ -552,6 +575,14 @@ class Llama4MinLatencyMoE(Llama4MoE):
             tune_max_num_tokens=tune_max_num_tokens,
             model_config=model_config,
         )
+
+        # ``super().__init__`` is not given ``layer_idx``: that is what puts a
+        # MoE in ``extra_attrs["moe_layers"]``, and the module it builds here
+        # is dropped by the assignment below, so it must not take this layer's
+        # slot. Resolve the layerwise quant entry here instead, so that the
+        # replacement is still built in this layer's checkpoint format.
+        self.experts_quant_config = moe_experts_quant_config(
+            model_config, f"model.layers.{layer_idx}.feed_forward.experts")
 
         # Then, override modules with min-latency versions.
         self.shared_expert = Llama4MinLatencyGatedMLP(
@@ -575,6 +606,7 @@ class Llama4MinLatencyMoE(Llama4MoE):
             model_config=model_config,
             apply_router_weight_on_input=True,
             aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
+            override_quant_config=self.experts_quant_config,
         )
 
         self.router = Llama4MinLatencyLinear(
@@ -591,12 +623,15 @@ class Llama4MinLatencyMoE(Llama4MoE):
         if self.experts.enable_min_latency_fused_moe and hasattr(
                 self.shared_expert.gate_up_proj, "input_scale"):
             pre_score_scaling_input_scale = self.shared_expert.gate_up_proj.input_scale
+            # FP8 dequant scales are created by the quant method on the weight
+            # owner, which is the backend execution unit, not the wrapper.
+            experts_impl = self.experts.backend
             self.experts.min_latency_quant_scales = FusedMoEQuantScalesFP8(
-                fc1_dequant=self.experts.fc31_dequant.data /
-                self.experts.fc31_input_dequant.data *
+                fc1_dequant=experts_impl.fc31_dequant.data /
+                experts_impl.fc31_input_dequant.data *
                 pre_score_scaling_input_scale,
-                fc2_quant=self.experts.fc2_quant,
-                fc2_dequant=self.experts.fc2_dequant,
+                fc2_quant=experts_impl.fc2_quant,
+                fc2_dequant=experts_impl.fc2_dequant,
                 fc1_input_dequant=pre_score_scaling_input_scale,
             )
 
@@ -615,6 +650,8 @@ class Llama4MinLatencyMoE(Llama4MoE):
             hidden_states,
             router_logits,
             x_high=hidden_states_high,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=False,
         )
 
         return routed_output
@@ -712,7 +749,8 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
                 shared_expert_intermediate_size=config.intermediate_size,
                 model_config=model_config,
                 aux_stream=aux_stream,
-                dtype=config.torch_dtype)
+                dtype=config.torch_dtype,
+                layer_idx=layer_idx)
 
             self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp()
             self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp()

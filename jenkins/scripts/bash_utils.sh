@@ -38,13 +38,18 @@ function retry_command() {
         if [ $cmd_timeout -gt 0 ]; then
             if timeout $cmd_timeout "${cmd[@]}"; then
                 return 0
+            else
+                # Capture here: after `fi`, $? is the `if` statement's status.
+                rc=$?
             fi
         else
             if "${cmd[@]}"; then
                 return 0
+            else
+                # Capture here: after `fi`, $? is the `if` statement's status.
+                rc=$?
             fi
         fi
-        rc=$?
         count=$((count + 1))
         if [ $rc -eq 124 ] && [ $cmd_timeout -gt 0 ]; then
             echo "Command timed out after ${cmd_timeout}s. Attempt $count/$max_retries."

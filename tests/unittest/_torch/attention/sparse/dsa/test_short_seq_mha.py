@@ -30,20 +30,20 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionRuntimeFeatures,
     PositionalEmbeddingParams,
     RopeParams,
 )
-from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
-from tensorrt_llm._torch.attention_backend.sparse.dsa.module import (
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManager
+from tensorrt_llm._torch.attention.backends.sparse.dsa.module import (
     _forward_dsa_attn,
     should_use_short_mha,
 )
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._utils import get_sm_version, str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
@@ -331,7 +331,6 @@ def _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens, devi
             request_ids=[req_idx],
             token_nums=[seq_len],
             is_gen=False,
-            prepare_resource=True,
         )
     return kv_cache_manager
 

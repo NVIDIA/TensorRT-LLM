@@ -15,28 +15,142 @@
 """Unit tests for Mamba2 metadata preparation optimizations."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch.modules.mamba import mamba2_metadata
+from tensorrt_llm._torch.modules.mamba.cache_manager import (
+    MIN_REPLAY_HISTORY_SIZE,
+    ReplayStateUpdateMetadata,
+)
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
     REPLAY_WORK_CACHE_BUF_IDX,
     REPLAY_WORK_CACHE_SLOT,
     REPLAY_WORK_PNAT,
     REPLAY_WORK_POSITION_IN_DECODE_BATCH,
     Mamba2Metadata,
+    _build_replay_work_items_torch,
+    _build_replay_work_items_triton,
     cu_seqlens_to_chunk_indices_offsets,
     cu_seqlens_to_chunk_indices_offsets_triton,
-)
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
-    MIN_REPLAY_HISTORY_SIZE,
-    ReplayStateUpdateMetadata,
 )
 
 skip_no_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA required for triton kernels",
 )
+
+
+class _GdnReplayCacheManager:
+    use_gdn_cached_replay_all_layer_commit = True
+
+    def __init__(self, prev_num_accepted_tokens, cache_buf_idx):
+        self.prev_num_accepted_tokens = prev_num_accepted_tokens
+        self.cache_buf_idx = cache_buf_idx
+
+    def get_replay_state_update_metadata(self):
+        return ReplayStateUpdateMetadata(
+            prev_num_accepted_tokens=self.prev_num_accepted_tokens,
+            cache_buf_idx=self.cache_buf_idx,
+            replay_step_width=6,
+            replay_history_size=MIN_REPLAY_HISTORY_SIZE,
+        )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("num_decodes", [0, 2])
+def test_replay_mode_uses_one_metadata_query(monkeypatch, enabled, num_decodes):
+    replay = SimpleNamespace(
+        prev_num_accepted_tokens=object(),
+        cache_buf_idx=object(),
+        replay_step_width=3,
+        replay_history_size=MIN_REPLAY_HISTORY_SIZE,
+    )
+
+    class Manager:
+        get_replay_state_update_metadata = Mock(return_value=replay if enabled else None)
+
+        @property
+        def use_replay_state_update(self):
+            raise AssertionError("Replay mode must come from metadata, not the legacy flag")
+
+    manager = Manager()
+    metadata = object.__new__(Mamba2Metadata)
+    metadata.state_indices = [7, 2, 9]
+    metadata.replay_work_items = object()
+    metadata.replay_n_writes = object()
+    build = Mock()
+    monkeypatch.setattr(mamba2_metadata, "_build_replay_work_items_torch", build)
+    Mamba2Metadata._prepare_replay_work_items(metadata, manager, 1 + num_decodes, 1)
+    manager.get_replay_state_update_metadata.assert_called_once_with()
+    assert metadata.replay_num_decodes == (num_decodes if enabled else 0)
+    if enabled and num_decodes:
+        build.assert_called_once_with(
+            [2, 9],
+            replay.prev_num_accepted_tokens,
+            replay.cache_buf_idx,
+            metadata.replay_work_items,
+            metadata.replay_n_writes,
+            replay.replay_step_width,
+            replay.replay_history_size,
+        )
+    else:
+        build.assert_not_called()
+
+
+def test_replay_metadata_optional_for_non_mamba_manager():
+    metadata = object.__new__(Mamba2Metadata)
+    metadata.replay_num_decodes = 10
+    metadata._prepare_replay_work_items(SimpleNamespace(), 3, 1)
+    assert metadata.replay_num_decodes == 0
+
+
+class _StateIndexCacheManager:
+    """Returns ``state_indices`` as set, a list or a CPU tensor, for a batch of decode requests."""
+
+    def __init__(self, state_indices):
+        self.state_indices = state_indices
+
+    def get_state_indices(self, request_ids, is_padding):
+        return self.state_indices[: len(request_ids)]
+
+
+def _decode_attn_metadata(kv_cache_manager):
+    """Attention metadata of a two-request decode step."""
+    seq_lens = torch.tensor([1, 1], dtype=torch.int)
+    return SimpleNamespace(
+        seq_lens=seq_lens,
+        seq_lens_cuda=seq_lens.cuda(),
+        num_contexts=0,
+        num_ctx_tokens=0,
+        kv_cache_manager=kv_cache_manager,
+        request_ids=[10, 11],
+        kv_cache_params=None,
+    )
+
+
+def _torch_reference_work_items(state_indices, prev_num_accepted_tokens, cache_buf_idx):
+    """Run the production ATen path into fresh buffers.
+
+    The Triton kernel's contract is that it reproduces this path exactly, so
+    this path -- not a third hand-written copy -- is what it is compared to.
+    """
+    num_decodes = state_indices.numel()
+    work_items = torch.zeros(num_decodes, 4, dtype=torch.int32, device="cuda")
+    n_writes = torch.zeros(1, dtype=torch.int32, device="cuda")
+    _build_replay_work_items_torch(
+        state_indices,
+        prev_num_accepted_tokens,
+        cache_buf_idx,
+        work_items,
+        n_writes,
+        6,
+        MIN_REPLAY_HISTORY_SIZE,
+    )
+    return work_items, n_writes
 
 
 @skip_no_cuda
@@ -97,10 +211,109 @@ class TestMamba2Metadata:
         assert metadata.chunk_indices is not None
         assert metadata.chunk_offsets is not None
 
+    def test_prepare_skips_an_unchanged_state_index_upload(self, monkeypatch):
+        """A decode step whose state indices (a list from the cache manager) did not change enqueues no upload: the
+        device buffer keeps values the host never sent. A changed step uploads again."""
+        # The test writes the buffer behind prepare() to see the skip, which the check of skipped copies reports.
+        monkeypatch.setattr("tensorrt_llm._device_copy._verify_skipped_device_copies", False)
+        manager = _StateIndexCacheManager([3, 1])
+        metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
+        attn_metadata = _decode_attn_metadata(manager)
+
+        metadata.prepare(attn_metadata)
+        torch.cuda.synchronize()
+        assert metadata.state_indices[:2].tolist() == [3, 1]
+
+        metadata.state_indices.fill_(-1)
+        metadata.prepare(attn_metadata)
+        torch.cuda.synchronize()
+        assert metadata.state_indices[:2].tolist() == [-1, -1]
+
+        manager.state_indices = [3, 2]
+        metadata.prepare(attn_metadata)
+        torch.cuda.synchronize()
+        assert metadata.state_indices[:2].tolist() == [3, 2]
+
+    def test_prepare_uploads_state_indices_from_a_list_or_a_cpu_tensor(self):
+        """State indices that come as a list, then a CPU tensor, then the first list again all reach the device: the
+        tensor step's upload updates the record of what the device holds, so the last step is not taken as
+        unchanged."""
+        manager = _StateIndexCacheManager([3, 1])
+        metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
+        attn_metadata = _decode_attn_metadata(manager)
+
+        for state_indices, expected in (
+            ([3, 1], [3, 1]),
+            (torch.tensor([5, 6], dtype=torch.int32), [5, 6]),
+            ([3, 1], [3, 1]),
+        ):
+            manager.state_indices = state_indices
+            metadata.prepare(attn_metadata)
+            torch.cuda.synchronize()
+            assert metadata.state_indices[:2].tolist() == expected
+
+    def test_check_of_skipped_copies_reports_a_write_behind_prepare(self, monkeypatch):
+        """With the check of skipped copies on (TLLM_DEBUG_MODE=1, or the unit-test fixture), a state index buffer
+        that something other than prepare() wrote fails the next prepare() whose indices did not change."""
+        monkeypatch.setattr("tensorrt_llm._device_copy._verify_skipped_device_copies", True)
+        manager = _StateIndexCacheManager([3, 1])
+        metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
+        attn_metadata = _decode_attn_metadata(manager)
+
+        metadata.prepare(attn_metadata)
+        metadata.prepare(attn_metadata)
+        metadata.state_indices[:2].copy_(torch.tensor([5, 6], dtype=torch.int32))
+        with pytest.raises(AssertionError, match="holds \\[5, 6\\] instead of \\[3, 1\\]"):
+            metadata.prepare(attn_metadata)
+
+    def test_prepare_alias_keeps_one_owner_across_manager_and_metadata_writes(self, monkeypatch):
+        class CacheManager:
+            def __init__(self):
+                self._state_indices_buffer = DeviceCopyBuffer(
+                    torch.zeros(2, dtype=torch.int32, device="cuda")
+                )
+                self.alias = True
+                self.values = [9, 2]
+
+            def get_state_indices(self, request_ids, is_padding):
+                if self.alias:
+                    return self._state_indices_buffer.tensor
+                return self.values
+
+        manager = CacheManager()
+        metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
+        attn_metadata = _decode_attn_metadata(manager)
+        address = manager._state_indices_buffer.tensor.data_ptr()
+        writes = []
+        original = torch.Tensor.copy_
+
+        def counted(dst, src, *args, **kwargs):
+            if dst.is_cuda and dst.data_ptr() == address:
+                writes.append(src.tolist())
+            return original(dst, src, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "copy_", counted)
+        manager._state_indices_buffer.update(torch.tensor([1, 2], dtype=torch.int32))
+        metadata.prepare(attn_metadata)
+        torch.cuda.synchronize()
+        assert metadata.state_indices.tolist() == [1, 2]
+        manager.alias = False
+        metadata.prepare(attn_metadata)
+        torch.cuda.synchronize()
+        assert manager._state_indices_buffer.tensor.tolist() == [9, 2]
+        manager._state_indices_buffer.update(torch.tensor([1, 2], dtype=torch.int32))
+        manager.alias = True
+        metadata.prepare(attn_metadata)
+        manager._state_indices_buffer.update(torch.tensor([1, 2], dtype=torch.int32))
+        metadata.prepare(attn_metadata)
+        torch.cuda.synchronize()
+        assert metadata.state_indices.tolist() == [1, 2]
+        assert manager._state_indices_buffer.tensor.tolist() == [1, 2]
+        assert metadata.state_indices.data_ptr() == address
+        assert writes == [[1, 2], [9, 2], [1, 2]]
+
     def test_prepare_replay_work_items_write_first(self):
         class ReplayCacheManager:
-            use_replay_state_update = True
-
             def __init__(self):
                 self.state_indices = [0, 3, 1, 4, 2]
                 self.prev_num_accepted_tokens = torch.tensor(
@@ -154,6 +367,134 @@ class TestMamba2Metadata:
         assert actual[0, REPLAY_WORK_CACHE_SLOT] == 3
         assert actual[0, REPLAY_WORK_PNAT] == 11
         assert actual[0, REPLAY_WORK_CACHE_BUF_IDX] == 1
+
+    @pytest.mark.parametrize("num_decodes", [16, 17, 40, 255, 256])
+    def test_replay_work_items_triton_matches_torch(self, num_decodes):
+        """The two builders must agree everywhere the dispatch may pick either.
+
+        num_decodes 17 and 255 are not powers of two, so the kernel runs with
+        masked-off lanes -- those must contribute nothing to the write-first
+        prefix sum.
+        """
+        num_slots = num_decodes + 7
+        prev_num_accepted_tokens = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 21
+        cache_buf_idx = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 2
+        state_indices = torch.randperm(num_slots, device="cuda")[:num_decodes].to(torch.int32)
+
+        triton_items = torch.zeros(num_decodes, 4, dtype=torch.int32, device="cuda")
+        triton_n_writes = torch.zeros(1, dtype=torch.int32, device="cuda")
+        _build_replay_work_items_triton(
+            state_indices,
+            prev_num_accepted_tokens,
+            cache_buf_idx,
+            triton_items,
+            triton_n_writes,
+            6,
+            MIN_REPLAY_HISTORY_SIZE,
+        )
+        torch_items, torch_n_writes = _torch_reference_work_items(
+            state_indices, prev_num_accepted_tokens, cache_buf_idx
+        )
+
+        torch.testing.assert_close(triton_items, torch_items)
+        torch.testing.assert_close(triton_n_writes, torch_n_writes)
+
+    def test_prepare_replay_work_items_uses_the_selected_builder(self):
+        """The entry point must feed the builder the decode slice, not the whole batch."""
+        num_contexts, num_decodes = 3, 40
+        num_slots = num_contexts + num_decodes + 7
+        prev_num_accepted_tokens = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 21
+        cache_buf_idx = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 2
+        state_indices = torch.randperm(num_slots, device="cuda")[: num_contexts + num_decodes].to(
+            torch.int32
+        )
+        manager = _GdnReplayCacheManager(prev_num_accepted_tokens, cache_buf_idx)
+        metadata = Mamba2Metadata(max_batch_size=num_contexts + num_decodes, chunk_size=8)
+        metadata.state_indices[: num_contexts + num_decodes].copy_(state_indices)
+
+        metadata._prepare_replay_work_items(manager, num_contexts + num_decodes, num_contexts)
+        expected_items, expected_n_writes = _torch_reference_work_items(
+            state_indices[num_contexts:], prev_num_accepted_tokens, cache_buf_idx
+        )
+
+        torch.testing.assert_close(metadata.replay_work_items[:num_decodes], expected_items)
+        torch.testing.assert_close(metadata.replay_n_writes, expected_n_writes)
+
+    @pytest.mark.parametrize(
+        ("num_decodes", "expect_fused"),
+        [
+            pytest.param(8, False, id="below-partition-min"),
+            pytest.param(16, True, id="partition-min"),
+            pytest.param(256, True, id="fused-max"),
+            pytest.param(257, False, id="above-fused-max"),
+        ],
+    )
+    def test_prepare_gdn_replay_work_items_dispatch_boundary(
+        self, monkeypatch, num_decodes, expect_fused
+    ):
+        """Pin which batch sizes reach the single-launch kernel.
+
+        The equivalence tests above pass on either side of this boundary, so
+        without this the fused launch could silently stop being used.
+        """
+        num_slots = num_decodes + 7
+        prev_num_accepted_tokens = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 21
+        cache_buf_idx = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 2
+        manager = _GdnReplayCacheManager(prev_num_accepted_tokens, cache_buf_idx)
+        metadata = Mamba2Metadata(max_batch_size=num_decodes, chunk_size=8)
+        metadata.state_indices.copy_(torch.arange(num_decodes, dtype=torch.int32, device="cuda"))
+
+        launches = []
+        original_kernel = mamba2_metadata._prepare_gdn_replay_work_items_kernel
+
+        class _CountingKernel:
+            def __getitem__(self, grid):
+                launches.append(grid)
+                return original_kernel[grid]
+
+        monkeypatch.setattr(
+            mamba2_metadata, "_prepare_gdn_replay_work_items_kernel", _CountingKernel()
+        )
+
+        metadata._prepare_replay_work_items(manager, num_decodes, 0)
+
+        assert bool(launches) is expect_fused
+
+    def test_prepare_gdn_replay_work_items_cuda_graph_replay(self):
+        num_decodes = 40
+        num_slots = num_decodes + 7
+        prev_num_accepted_tokens = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 21
+        cache_buf_idx = torch.arange(num_slots, dtype=torch.int32, device="cuda") % 2
+        manager = _GdnReplayCacheManager(prev_num_accepted_tokens, cache_buf_idx)
+        metadata = Mamba2Metadata(max_batch_size=num_decodes, chunk_size=8)
+        metadata.state_indices.copy_(torch.arange(num_decodes, dtype=torch.int32, device="cuda"))
+
+        metadata._prepare_replay_work_items(manager, num_decodes, 0)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            metadata._prepare_replay_work_items(manager, num_decodes, 0)
+
+        updated_state_indices = torch.arange(
+            num_slots - 1,
+            num_slots - num_decodes - 1,
+            -1,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        metadata.state_indices.copy_(updated_state_indices)
+        prev_num_accepted_tokens.copy_(
+            (torch.arange(num_slots, dtype=torch.int32, device="cuda") * 7) % 21
+        )
+        cache_buf_idx.bitwise_xor_(1)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        expected_items, expected_n_writes = _torch_reference_work_items(
+            updated_state_indices, prev_num_accepted_tokens, cache_buf_idx
+        )
+        torch.testing.assert_close(metadata.replay_work_items[:num_decodes], expected_items)
+        torch.testing.assert_close(metadata.replay_n_writes, expected_n_writes)
 
     def test_single_sequence_unaligned(self):
         """Test with a single sequence that doesn't align with chunk size."""

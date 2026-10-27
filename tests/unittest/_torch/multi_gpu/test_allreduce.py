@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import pickle
 import sys
 import traceback
@@ -31,9 +30,10 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              MoEAllReduceParams)
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.nccl_window_tensor_scope import \
+    discard_nccl_window_tensor_outputs
 from tensorrt_llm.mapping import Mapping
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
     cloudpickle.dumps,
@@ -257,25 +257,28 @@ def run_allreduce_op(
 
     calc_func, ref_func = fusion_op_to_func[fusion_op]
 
-    # common allreduce path
-    xs = torch.chunk(x.clone(), tensor_parallel_size, dim=-1)
+    # This helper invokes NCCL-symmetric modules directly, so it owns their
+    # output windows until validation finishes.
+    with discard_nccl_window_tensor_outputs((x, residual)):
+        # common allreduce path
+        xs = torch.chunk(x.clone(), tensor_parallel_size, dim=-1)
 
-    # trigger autotune
-    with autotune():
-        tuning_output = calc_func(xs[tensor_parallel_rank], residual)
+        # trigger autotune
+        with autotune():
+            tuning_output = calc_func(xs[tensor_parallel_rank], residual)
 
-    native_output = calc_func(xs[tensor_parallel_rank], residual)
-    ref_output = ref_func(xs[tensor_parallel_rank], residual)
+        native_output = calc_func(xs[tensor_parallel_rank], residual)
+        ref_output = ref_func(xs[tensor_parallel_rank], residual)
 
-    for calc_output in (tuning_output, native_output):
-        assert len(calc_output) == len(ref_output)
-        for calc_output_tensor, ref_output_tensor in zip(
-                calc_output, ref_output):
-            check_accuracy(calc_output_tensor,
-                           ref_output_tensor,
-                           atol=0.05,
-                           rtol=0.15,
-                           percent=0.99)
+        for calc_output in (tuning_output, native_output):
+            assert len(calc_output) == len(ref_output)
+            for calc_output_tensor, ref_output_tensor in zip(
+                    calc_output, ref_output):
+                check_accuracy(calc_output_tensor,
+                               ref_output_tensor,
+                               atol=0.05,
+                               rtol=0.15,
+                               percent=0.99)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,

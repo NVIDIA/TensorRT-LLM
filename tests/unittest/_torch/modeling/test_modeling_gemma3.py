@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -10,16 +13,17 @@ from transformers import Gemma3ForCausalLM as HFGemma3ForCausalLM
 from transformers import Gemma3TextConfig
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend import (AttentionMetadata,
-                                                   FlashInferAttentionMetadata)
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends import (AttentionMetadata,
+                                                    FlashInferAttentionMetadata)
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.gemma3_weight_mapper import \
     Gemma3HfWeightMapper
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 GEMMA3_1B_CONFIG = {
@@ -122,7 +126,7 @@ class TestGemma3(unittest.TestCase):
                                         copy_on_partial_reuse=False,
                                         max_tokens=num_blocks *
                                         tokens_per_block)
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=config.num_hidden_layers,
@@ -403,7 +407,7 @@ class TestGemma3(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
-    def test_gemma3_flashinfer_mask(self):
+    def test_gemma3_attention_mask(self):
         config_dict = deepcopy(GEMMA3_1B_CONFIG)
         gemma3_config = Gemma3TextConfig.from_dict(config_dict)
 
@@ -461,7 +465,7 @@ class TestGemma3(unittest.TestCase):
         # First sample has 2 image tokens, second sample has 2 image tokens, third sample has none.
         image_token_mask = torch.tensor(
             [True, True, False, True, True, True, False, False], device=device)
-        causal_mask = gemma3.get_flashinfer_attention_mask(
+        causal_mask = gemma3.get_attention_mask(
             image_token_mask=image_token_mask, attn_metadata=attn_metadata)
         # Causal mask for context request 1.
         ctx_request_1_mask = torch.tensor(

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import io
 import os
 import tempfile
@@ -29,9 +32,9 @@ from ._test_openai_mmencoder import \
 assert mm_encoder_server is not None  # keep 'mm_encoder_server' fixture visible in this module
 
 
-@pytest.fixture(scope="module", ids=["Qwen2.5-VL-3B-Instruct"])
+@pytest.fixture(scope="module", ids=["Qwen3/Qwen3-VL-2B-Instruct"])
 def model_name():
-    return "Qwen2.5-VL-3B-Instruct"
+    return "Qwen3/Qwen3-VL-2B-Instruct"
 
 
 @pytest.fixture(scope="module")
@@ -43,6 +46,7 @@ def temp_extra_llm_api_options_file(request):
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "free_gpu_memory_fraction": 0.6,
+                "use_kv_cache_manager_v2": True,
             },
         }
 
@@ -132,6 +136,41 @@ def test_single_chat_session_image(client: openai.OpenAI, model_name: str):
     )
     assert legacy.choices[0].message.content \
         == chat_completion.choices[0].message.content
+
+
+@pytest.mark.parametrize("typed", [True, False], ids=["message", "untyped"])
+def test_responses_image_input(client: openai.OpenAI, model_name: str,
+                               typed: bool):
+    """An input_image sent to /v1/responses has to reach the model.
+
+    The text is the same with and without the image, so an image that never
+    reaches the model leaves the input token count of a text-only request.
+    """
+    image_url = str(llm_models_root() / "multimodals" / "test_data" /
+                    "seashore.png")
+    question = {
+        "type": "input_text",
+        "text": "Describe the natural environment in the image."
+    }
+    image = {"type": "input_image", "image_url": image_url, "detail": "auto"}
+
+    def user_item(*parts):
+        item = {"role": "user", "content": list(parts)}
+        if typed:
+            item["type"] = "message"
+        return item
+
+    with_image = client.responses.create(model=model_name,
+                                         input=[user_item(question, image)],
+                                         max_output_tokens=16,
+                                         temperature=0.0)
+    text_only = client.responses.create(model=model_name,
+                                        input=[user_item(question)],
+                                        max_output_tokens=16,
+                                        temperature=0.0)
+
+    assert with_image.output_text
+    assert with_image.usage.input_tokens > text_only.usage.input_tokens
 
 
 # used by mm_encoder_server

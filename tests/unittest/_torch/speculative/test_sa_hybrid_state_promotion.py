@@ -15,7 +15,7 @@ from unittest import mock
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MixedMambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MixedMambaHybridCacheManager
 from tensorrt_llm._torch.speculative.sa_worker import SAWorker
 
 

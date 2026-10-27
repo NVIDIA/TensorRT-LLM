@@ -21,8 +21,10 @@ Usage:
 """
 
 import argparse
+from pathlib import Path
 
 from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm.visual_gen import MediaRef
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output_path",
         default="qwen_image_layered_output.png",
-        help="Path to save the layer grid image.",
+        help="Path to save the output image.",
     )
     return parser.parse_args()
 
@@ -62,11 +64,20 @@ def main() -> None:
     visual_gen = VisualGen(model=args.model, args=extra_args)
 
     params = visual_gen.default_params
-    params.image = args.image
+    params.image_reference = [MediaRef(content=args.image, format="path")]
 
     output = visual_gen.generate(inputs=args.prompt, params=params)
-    saved = output.save(args.output_path)
-    print(f"Saved image to {saved}")
+    if output.image is not None and output.image.shape[0] > 1:
+        output_path = Path(args.output_path)
+        paths = [
+            output_path.with_name(f"{output_path.stem}_layer_{i}{output_path.suffix}")
+            for i in range(output.image.shape[0])
+        ]
+        saved = output.save(paths)
+        print(f"Saved images to {saved}")
+    else:
+        saved = output.save(args.output_path)
+        print(f"Saved image to {saved}")
 
 
 if __name__ == "__main__":

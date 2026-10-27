@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import copy
 from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 
@@ -15,7 +18,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
 from tensorrt_llm._torch.models.checkpoints.hf.llava_next_weight_mapper import \
     LlavaNextHfWeightMapper
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
-from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
+from tensorrt_llm.inputs.multimodal import (MultimodalItemMetadata,
                                             MultimodalParams)
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -25,7 +28,7 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        support_multimodal_disaggregated)
 from ...logger import logger
 from ...sampling_params import SamplingParams
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_clip import CLIPVisionModel
@@ -283,8 +286,12 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         return fused_input_ids, mm_features
 
     def build_disagg_prefill_multimodal_inputs(
-            self, inputs: Union[TextPrompt, TokensPrompt],
-            mm_handles: List[Dict[str, Any]]) -> DisaggPrefillMultimodalInputs:
+        self,
+        inputs: Union[TextPrompt, TokensPrompt],
+        mm_handles: List[Dict[str, Any]],
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
         """
         Build disaggregated prefill inputs from multimodal embedding handles.
 
@@ -293,13 +300,12 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         Args:
             inputs: Inputs containing an already tokenized text prompt or a text prompt string.
             mm_handles: List of multimodal embedding handles.
+            mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
 
         Returns:
-            DisaggPrefillMultimodalInputs containing expanded token IDs,
-            prompt-side MM positions/lengths, exact runs, and encoder-output
-            embedding lengths.
+            Expanded token IDs and common multimodal params containing
+            prompt layout, item metadata, and embedding handles.
         """
-        # TODO: Move this function to the base input processor class when extending for more models
         text_prompt = inputs.get("prompt")
         prompt_token_ids = inputs.get("prompt_token_ids")
         if text_prompt:
@@ -339,13 +345,17 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 f"({mm_token_length[-1] + mm_token_offsets[-1]}) should be less "
                 f"than or equal to final_length ({final_length})")
 
-        return DisaggPrefillMultimodalInputs(
-            prompt_token_ids=expanded_ids,
+        return expanded_ids, MultimodalParams.from_embeddings(
+            mm_handles,
+            MultimodalItemMetadata(
+                [("image", i) for i in range(len(mm_handles))],
+                output_embedding_lengths=[
+                    handle["tensor_size"][0] for handle in mm_handles
+                ],
+            ),
+            multimodal_hashes=mm_hashes,
             multimodal_lengths=mm_token_length,
             multimodal_positions=mm_token_offsets,
-            multimodal_embedding_lengths=[
-                mm_handle["tensor_size"][0] for mm_handle in mm_handles
-            ],
             multimodal_item_run_cu_offsets=list(range(len(mm_token_length) +
                                                       1)),
             multimodal_run_positions=mm_token_offsets,
@@ -664,7 +674,7 @@ class LlavaNextModel(PreTrainedModel):
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         # Surface the in-vocab image placeholder to the model engine's
-        # ``_prepare_multimodal_indices``.
+        # ``runners.prepare_multimodal_indices``.
         self._mm_token_ids = torch.tensor(
             [model_config.pretrained_config.image_token_index],
             dtype=torch.int32)

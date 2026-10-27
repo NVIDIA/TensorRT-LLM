@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 metadata:
   model_name: deepseek_r1_0528_fp4_v2
   precision: fp4
@@ -61,10 +64,10 @@ worker_config:
       backend: CUTEDSL
       use_low_precision_moe_combine: true
     cache_transceiver_config:
-      max_tokens_in_buffer: 16384
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 2048
+      agent_bounce_buffer_enable: true
       kv_transfer_timeout_ms: 600000
     disable_overlap_scheduler: false
     speculative_config: &id001
@@ -91,10 +94,10 @@ worker_config:
       backend: CUTEDSL
       use_low_precision_moe_combine: true
     cache_transceiver_config:
-      max_tokens_in_buffer: 16384
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 2048
+      agent_bounce_buffer_enable: true
       kv_transfer_timeout_ms: 600000
     disable_overlap_scheduler: false
     speculative_config: *id001

@@ -11,29 +11,31 @@ from transformers import GptOssConfig
 
 from tensorrt_llm._utils import get_hf_rope_theta, get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (PositionalEmbeddingParams,
-                                           PredefinedAttentionMask, RopeParams)
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (PositionalEmbeddingParams,
+                                            PredefinedAttentionMask, RopeParams)
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 
 # isort and yapf will fight against each other here, so we disable isort
 # isort: off
-from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
-                                 RenormalizeMoeRoutingMethod, TritonFusedMoE,
-                                 create_moe)
+from ..moe.fused_moe import (MoEWeightLoadingMode, RenormalizeMoeRoutingMethod,
+                             SwigluBiasActivation, TritonFusedMoE, create_moe,
+                             is_moe_weight_owner)
 # isort: on
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from ..utils import Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, filter_weights, register_auto_model
+from .modeling_utils import (DecoderModel, filter_weights,
+                             moe_experts_quant_config, register_auto_model)
 
 # Use TinyGEMM when the number of tokens is not larger than this threshold
 MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
@@ -173,16 +175,15 @@ class MLPBlock(torch.nn.Module):
             output_dtype=torch.bfloat16
             if config.moe_backend.upper() == "TRTLLM" else torch.float32)
 
-        self.swiglu_alpha = torch.tensor(
-            [1.702] * (self.num_slots // config.mapping.moe_ep_size),
-            dtype=torch.float32).cuda()
-        self.swiglu_beta = torch.tensor(
-            [1.0] * (self.num_slots // config.mapping.moe_ep_size),
-            dtype=torch.float32).cuda()
-        self.swiglu_limit = torch.tensor(
-            [7.0] * (self.num_slots // config.mapping.moe_ep_size),
-            dtype=torch.float32).cuda()
+        # gpt-oss constants are uniform across experts; the backend broadcasts
+        # them to whatever per-expert shape its kernels index, sized by the
+        # local slot count it resolved.
+        self.moe_activation = SwigluBiasActivation(gate_sigmoid_scale=1.702,
+                                                   linear_offset=1.0,
+                                                   clamp=7.0)
         # Prepare MoE creation parameters
+        experts_quant_config = moe_experts_quant_config(
+            config, f"model.block.{layer_idx}.mlp.experts")
         moe_params = {
             'routing_method': self.routing_method,
             'num_experts': pretrained_config.num_local_experts,
@@ -193,9 +194,8 @@ class MLPBlock(torch.nn.Module):
             'model_config': config,
             'weight_loading_mode': MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             'bias': True,
-            'swiglu_alpha': self.swiglu_alpha,
-            'swiglu_beta': self.swiglu_beta,
-            'swiglu_limit': self.swiglu_limit,
+            'activation': self.moe_activation,
+            'override_quant_config': experts_quant_config,
             'layer_idx': self.layer_idx,
         }
 
@@ -569,10 +569,7 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
         statically dividing memory between them.
 
         The preference is adopted only when the user leaves
-        ``kv_cache_config.use_kv_cache_manager_v2`` at ``"auto"``. Two-model
-        speculative decoding demotes it to V1 because V2 sizes both the target
-        and draft KV cache managers from the full budget; an explicit ``True``
-        is rejected by ``llm_utils._resolve_kv_cache_manager_v2_auto``.
+        ``kv_cache_config.use_kv_cache_manager_v2`` at ``"auto"``.
         """
         return "V2"
 
@@ -624,33 +621,49 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
 
         assert model_config.mapping.pp_size == 1, "Pipeline parallelism is not supported."
 
+        # The experts resolve their exclusion when they are built, so the
+        # patterns name TRT-LLM modules before the layers exist.
+        self._translate_exclude_modules(model_config.quant_config)
         super().__init__(
             Transformer(model_config),
             model_config=model_config,
         )
 
+    @classmethod
+    def _translate_exclude_modules(cls, quant_config: QuantConfig) -> None:
+        """Rewrite ``exclude_modules`` from GPT-OSS checkpoint names to TRT-LLM
+        module names, in place.
+
+        ``re:`` entries are passed through untouched: a regex body spells its
+        dots in its own way (``\\.``, ``[.]``, ``.``), so splitting it on a
+        literal ``.`` would corrupt the pattern, and prefixing the entry would
+        move the ``re:`` marker into the middle and demote the whole pattern to
+        a glob that matches nothing. A producer writing a regex already names
+        the runtime module path.
+        """
+        if not quant_config.exclude_modules:
+            return
+        if quant_config.quant_algo == "NVFP4":
+            quant_config.exclude_modules = [
+                'block.*.attn.qkv',
+                'block.*.attn.out',
+                'block.*.mlp.gate',
+                'embedding',
+                'unembedding',
+            ]
+
+        params_map_reverse = {v: k for k, v in cls.params_map.items()}
+        for i, module in enumerate(quant_config.exclude_modules):
+            if module.startswith("re:"):
+                continue
+            names = module.split(".")
+            if names[-1] in params_map_reverse:
+                names[-1] = params_map_reverse[names[-1]]
+            prefix = [] if names[0] == "model" else ["model"]
+            quant_config.exclude_modules[i] = '.'.join(prefix + names)
+
     def __post_init__(self):
         # Do not call super().__post_init__()
-        params_map_reverse = {v: k for k, v in self.params_map.items()}
-
-        quant_config = self.model_config.quant_config
-        if quant_config.exclude_modules:
-            if quant_config.quant_algo == "NVFP4":
-                quant_config.exclude_modules = [
-                    'block.*.attn.qkv',
-                    'block.*.attn.out',
-                    'block.*.mlp.gate',
-                    'embedding',
-                    'unembedding',
-                ]
-
-            for i, module in enumerate(quant_config.exclude_modules):
-                names = module.split(".")
-                if names[-1] in params_map_reverse:
-                    names[-1] = params_map_reverse[names[-1]]
-                prefix = [] if names[0] == "model" else ["model"]
-                quant_config.exclude_modules[i] = '.'.join(prefix + names)
-
         super().apply_quant_config_exclude_modules()
 
         for _, module in self.named_modules():
@@ -697,13 +710,13 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
             # We need to use parent module name (without .backend) to match saved weight names.
             # After MoE refactoring is fully complete, all paths will follow this branch.
             names = name.split('.')
-            if names[-1] == "backend" and isinstance(module, MoE):
+            if names[-1] == "backend" and is_moe_weight_owner(module):
                 # Backend is under experts module (ConfigurableMoE wrapper)
                 name = '.'.join(names[:-1])
 
             module_weights = filter_weights(name, weights)
 
-            if isinstance(module, MoE):
+            if is_moe_weight_owner(module):
                 try:
                     # For BF16 ckpt.
                     # Deinterleave for gate and up.
@@ -826,13 +839,13 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                 name = name.replace(k, v)
 
             names = name.split('.')
-            if names[-1] == "backend" and isinstance(module, MoE):
+            if names[-1] == "backend" and is_moe_weight_owner(module):
                 # Backend is under experts module (ConfigurableMoE wrapper)
                 name = '.'.join(names[:-1])
 
             module_weights = filter_weights(name, weights)
 
-            if isinstance(module, MoE):
+            if is_moe_weight_owner(module):
                 assert getattr(module, "quant_config", None) is not None and \
                    module.quant_config.quant_mode.has_nvfp4()
                 gate_up = module_weights.get('gate_up_proj', None)

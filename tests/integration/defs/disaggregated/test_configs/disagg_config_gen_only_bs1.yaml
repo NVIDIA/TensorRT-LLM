@@ -1,4 +1,4 @@
-model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+model: Qwen3/Qwen3-0.6B
 hostname: localhost
 backend: pytorch
 cuda_graph_config: null

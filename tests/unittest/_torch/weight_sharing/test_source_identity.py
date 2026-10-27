@@ -35,6 +35,10 @@ from _source_identity_fakes import (
 
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     IdentityCheckPolicy,
     SourceIdentity,
     SourceIdentityMismatchError,
@@ -71,14 +75,25 @@ def test_from_model_config_requires_one_artifact_source() -> None:
         )
 
 
-def test_from_model_config_binds_transform_abi() -> None:
+@pytest.mark.parametrize(
+    "transform_abi_id",
+    [
+        LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+        MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+        PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+        QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+        QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    ],
+)
+def test_from_model_config_binds_transform_abi(transform_abi_id: str) -> None:
+    """Each published transform-layout ABI is bound into the generated identity."""
     identity = SourceIdentity.from_model_config(
         FakeModelConfig(),
         artifact_identity=make_artifact_identity(),
-        transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+        transform_abi_id=transform_abi_id,
     )
 
-    assert identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
+    assert identity.transform_abi_id == transform_abi_id
 
 
 @pytest.mark.parametrize("transform_abi_id", ["", 1])
@@ -112,6 +127,16 @@ def test_model_layout_field_mismatch_flags_global_and_shard():
     assert not result.matched
     assert "model_fingerprint" in result.mismatched_fields
     assert "shard_fingerprint" in result.mismatched_fields
+
+
+def test_sliding_window_config_mismatch_flags_global():
+    # The realized sliding-window profile dimension needs no SourceIdentity
+    # change: the checkpoint config already separates windowed checkpoints.
+    a = identity_from(FakeModelConfig(pretrained_config=FakePretrainedConfig(sliding_window=None)))
+    b = identity_from(FakeModelConfig(pretrained_config=FakePretrainedConfig(sliding_window=4096)))
+    result = a.matches(b)
+    assert not result.matched
+    assert "model_fingerprint" in result.mismatched_fields
 
 
 def test_non_layout_model_metadata_does_not_affect_match():
@@ -346,6 +371,41 @@ def test_transform_abi_participates_in_global_fingerprint():
 
     assert result.mismatched_fields == ["transform_abi_id"]
     assert without_abi.global_fingerprint != with_abi.global_fingerprint
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [IdentityCheckPolicy.WARN_FALLBACK, IdentityCheckPolicy.ENFORCE],
+    ids=lambda policy: policy.value,
+)
+@pytest.mark.parametrize(
+    "source_transform_abi_id, should_share",
+    [
+        pytest.param(PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, True, id="same-phi3-abi"),
+        pytest.param(None, False, id="missing-abi"),
+        pytest.param(LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1, False, id="llama-abi"),
+        pytest.param(MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, False, id="mistral-abi"),
+        pytest.param(QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, False, id="qwen2-abi"),
+        pytest.param(QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, False, id="qwen3-abi"),
+    ],
+)
+def test_phi3_transform_abi_shares_only_with_the_same_abi(
+    source_transform_abi_id: str | None,
+    should_share: bool,
+    policy: IdentityCheckPolicy,
+) -> None:
+    """A Phi3-ABI receiver shares only with a same-ABI donor, under either policy."""
+    local = identity_from(
+        FakeModelConfig(),
+        transform_abi_id=PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    )
+    source = identity_from(FakeModelConfig(), transform_abi_id=source_transform_abi_id)
+
+    decision = check_weight_sharing_compatibility(local, source, policy)
+
+    assert decision.should_share is should_share
+    assert decision.match_result.mismatched_fields == ([] if should_share else ["transform_abi_id"])
+    assert (local.global_fingerprint == source.global_fingerprint) is should_share
 
 
 def test_format_version_mismatch_never_matches():

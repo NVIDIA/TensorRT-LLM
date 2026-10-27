@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 from unittest.mock import patch
 
@@ -11,8 +9,6 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.speculative.speculation_gate import SpeculationGate
 from tensorrt_llm.llmapi import CudaGraphConfig, Eagle3DecodingConfig, KvCacheConfig
 from tensorrt_llm.logger import logger
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
 @pytest.fixture(scope="function")
@@ -59,7 +55,6 @@ def test_spec_gate_e2e(enforce_single_worker):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=True,
         acceptance_rate_window_size=acceptance_rate_window_size,
         acceptance_rate_threshold=acceptance_rate_threshold,
     )

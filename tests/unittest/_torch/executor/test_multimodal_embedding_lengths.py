@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor import _util
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequestState,
     PyResult,
@@ -14,6 +15,12 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult, MultimodalResult
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings.executor import FinishReason
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+)
+from tensorrt_llm.mapping import Mapping
 
 
 @pytest.mark.parametrize(
@@ -26,16 +33,22 @@ from tensorrt_llm.bindings.executor import FinishReason
         (
             SimpleNamespace(
                 multimodal_lengths=[6, 5],
-                py_multimodal_data={"multimodal_embedding_lengths": [5, 3]},
+                py_multimodal_data={
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0), ("image", 1)], output_embedding_lengths=[5, 3]
+                    )
+                },
             ),
-            [5, 3],
+            (5, 3),
         ),
         (
             SimpleNamespace(
                 multimodal_lengths=[6, 5],
                 py_multimodal_data={
                     "layout_metadata": {
-                        "multimodal_embedding_lengths": [6, 4],
+                        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                            [("image", 0), ("image", 1)], output_embedding_lengths=[6, 4]
+                        ),
                     },
                 },
             ),
@@ -49,13 +62,28 @@ def test_multimodal_embedding_lengths_returns_top_level_metadata(req, expected):
     assert get_multimodal_embedding_lengths(req) == expected
 
 
+@pytest.mark.cpu_only
+def test_multimodal_embedding_lengths_uses_item_metadata():
+    """Encoder output export uses the same rows as model input assembly."""
+    metadata = MultimodalItemMetadata([("image", 0)], output_embedding_lengths=[2])
+    data = {MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata}
+    params = MultimodalParams(multimodal_data=data)
+    req = SimpleNamespace(multimodal_lengths=[4], py_multimodal_data=params.multimodal_data)
+
+    assert get_multimodal_embedding_lengths(req) is params.get_item_layout()[1]
+
+
 @pytest.mark.parametrize(
     "req,exception,match",
     [
         (
             SimpleNamespace(
                 multimodal_lengths=[4],
-                py_multimodal_data={"multimodal_embedding_lengths": [3, 1]},
+                py_multimodal_data={
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0), ("image", 1)], output_embedding_lengths=[3, 1]
+                    )
+                },
             ),
             ValueError,
             "length must match",
@@ -63,7 +91,11 @@ def test_multimodal_embedding_lengths_returns_top_level_metadata(req, expected):
         (
             SimpleNamespace(
                 multimodal_lengths=[4],
-                py_multimodal_data={"multimodal_embedding_lengths": [5]},
+                py_multimodal_data={
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0)], output_embedding_lengths=[5]
+                    )
+                },
             ),
             ValueError,
             "exceeds",
@@ -71,7 +103,11 @@ def test_multimodal_embedding_lengths_returns_top_level_metadata(req, expected):
         (
             SimpleNamespace(
                 multimodal_lengths=[4],
-                py_multimodal_data={"multimodal_embedding_lengths": [-1]},
+                py_multimodal_data={
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0)], output_embedding_lengths=[-1]
+                    )
+                },
             ),
             ValueError,
             "non-negative",
@@ -80,19 +116,26 @@ def test_multimodal_embedding_lengths_returns_top_level_metadata(req, expected):
             SimpleNamespace(
                 multimodal_lengths=[4],
                 py_multimodal_data={
-                    "multimodal_embedding_lengths": torch.tensor([4]),
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", i) for i in range(len(torch.tensor([4])))],
+                        output_embedding_lengths=torch.tensor([4]),
+                    ),
                 },
             ),
             TypeError,
-            "must be a list",
+            "must contain only integers",
         ),
         (
             SimpleNamespace(
                 multimodal_lengths=[4],
-                py_multimodal_data={"multimodal_embedding_lengths": (4,)},
+                py_multimodal_data={
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0)], output_embedding_lengths=(4.0,)
+                    )
+                },
             ),
             TypeError,
-            "must be a list",
+            "integers",
         ),
         (
             SimpleNamespace(
@@ -100,7 +143,7 @@ def test_multimodal_embedding_lengths_returns_top_level_metadata(req, expected):
                 py_multimodal_data=["multimodal_embedding_lengths", [4]],
             ),
             TypeError,
-            "py_multimodal_data must be a dict",
+            "multimodal_data must be a dict",
         ),
     ],
 )
@@ -166,6 +209,60 @@ def test_mm_encoder_sampler_aligns_mixed_batch_by_request_index():
     assert mm_embedding_lengths == [4]
     assert text_request.py_result.mrope_position is None
     assert mm_request.py_result.mrope_position == ("mm-pos", "mm-delta")
+
+
+@pytest.mark.parametrize(
+    "mapping,exports_results",
+    [
+        pytest.param(Mapping(), True, id="single_rank"),
+        pytest.param(Mapping(world_size=2, rank=1, tp_size=2), False, id="tp_follower"),
+        pytest.param(
+            Mapping(world_size=2, rank=1, tp_size=2, enable_attention_dp=True),
+            True,
+            id="attention_dp_follower",
+        ),
+        pytest.param(
+            Mapping(world_size=4, rank=2, tp_size=2, pp_size=2, enable_attention_dp=True),
+            False,
+            id="attention_dp_later_pp_stage",
+        ),
+    ],
+)
+@pytest.mark.cpu_only
+def test_mm_encoder_sampler_exports_results_only_on_response_ranks(mapping, exports_results):
+    """Ranks whose responses never reach the frontend must not export MM results."""
+    sampler = _util.instantiate_sampler(
+        SimpleNamespace(max_seq_len=16, spec_config=None),
+        SimpleNamespace(
+            sampler_force_async_worker=False,
+            disable_overlap_scheduler=True,
+            enable_speculative_beam_history_d2h=False,
+        ),
+        mapping,
+        max_batch_size=1,
+        max_beam_width=1,
+        mm_encoder_only=True,
+        speculative_config=None,
+        max_num_sequences=1,
+    )
+    request = _FakeRequest(multimodal_lengths=[4])
+    state = sampler.SampleState(
+        requests=[request],
+        data=MultimodalResult(
+            mm_embeddings=[torch.ones(4, 2)],
+            mm_embedding_request_indices=[0],
+            mm_embedding_lengths=[[4]],
+            num_context_requests=1,
+            extra_data={"mrope_position_ids": ["pos"], "mrope_position_deltas": ["delta"]},
+        ),
+    )
+
+    sampler.update_requests(state)
+
+    assert request.state == LlmRequestState.GENERATION_COMPLETE
+    assert request.finished_reason == (FinishReason.LENGTH, 0)
+    assert bool(request.py_result.mm_embeddings) is exports_results
+    assert (request.py_result.mrope_position is not None) is exports_results
 
 
 @pytest.mark.cpu_only

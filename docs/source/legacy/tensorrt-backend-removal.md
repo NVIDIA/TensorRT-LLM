@@ -2,8 +2,7 @@
 
 ```{note}
 **Breaking change.** The TensorRT engine backend has been removed. PyTorch is now
-the sole execution backend for TensorRT LLM (AutoDeploy, built on the PyTorch
-backend, remains available).
+the sole execution backend for TensorRT LLM.
 ```
 
 ## What changed
@@ -40,7 +39,7 @@ There is no separate checkpoint-conversion or engine-build step.
 
 PyTorch usage lives with the [LLM API examples](../examples/index.rst) (for example
 `quickstart_advanced.py`, `quickstart_multimodal.py`) and the model-specific
-[deployment guides](../deployment-guide/). The per-model `convert_checkpoint.py` /
+[deployment guides](../deployment-guide/index.rst). The per-model `convert_checkpoint.py` /
 `trtllm-build` example directories have been removed.
 
 ## Retained reference docs

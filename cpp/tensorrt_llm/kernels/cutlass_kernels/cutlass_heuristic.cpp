@@ -382,10 +382,19 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100_dynamic_cluster_shape
     std::vector<CutlassGemmConfig> candidate_configs;
     if ((config & CutlassGemmConfig::FP4_ONLY) != 0)
     {
+        // FP4 block-scaled types only support the TMA epilogue schedule on SM107.
+        // SM107 uses the shared tile set below; the SM100-only tiles are not enabled for it.
+        if (sm == 107 && schedule != EpilogueScheduleType::TMA)
+        {
+            return {};
+        }
+
         if (sm == 100)
         {
+            // FP4 block-scaled types only support TMA epilogue schedule
             if (schedule != EpilogueScheduleType::TMA)
                 return {};
+
             candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x64x128B,
                 MainloopScheduleType::AUTO, schedule, cluster1sm, dynamic_cluster_shape, fallback_cluster_shape, sm});
             if (supports_2sm)
@@ -414,12 +423,12 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100_dynamic_cluster_shape
     if ((config & CutlassGemmConfig::MXFP8_MXFP8) != 0)
     {
         // MXFP8xMXFP8 always instantiates the Mxf8f6f4 block-scaled tensor-op
-        // with cutlass::arch::Sm100, even on SM103 (the SM103 dispatch case in
+        // with cutlass::arch::Sm100, even on SM103/SM107 (the SM103 dispatch case in
         // dispatchMoeGemmSelectTileShapeTmaWarpSpecialized only handles FP4xFP4;
         // MXFP8 falls through to the sm_version>=100 && <120 branch which
         // instantiates Arch=Sm100). Therefore the TMA-only constraint enforced
         // by getDispatchFunctionForSM100 (Arch::kMinComputeCapability==103 is
-        // false for Sm100) applies on both SM100 and SM103, so we filter out
+        // false for Sm100) applies on SM100, SM103 and SM107, so we filter out
         // non-TMA epilogue candidates unconditionally here.
         if (schedule != EpilogueScheduleType::TMA)
             return {};
@@ -499,6 +508,11 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100(
             ClusterShape::Undefined, sm},
     };
 #else
+    if (tensorrt_llm::common::isSM100Family(sm) && sm != 103 && sm != 107)
+    {
+        TLLM_LOG_INFO("Reassigned sm version to 100 for unknown sm version belonging to SM100 family");
+        sm = 100;
+    }
     if (config & CutlassGemmConfig::GROUPED_GEMM)
     {
         std::vector<CutlassGemmConfig> candidate_configs;

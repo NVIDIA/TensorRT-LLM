@@ -14,14 +14,20 @@
 # limitations under the License.
 
 import abc
+import functools
 import json
-from typing import NamedTuple
+import time
+from contextlib import AbstractContextManager
+from typing import Callable, Iterator, NamedTuple
+from unittest.mock import Mock
 
 import pytest
 
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
+from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
+                                                     forced_tool_arguments_end)
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
 from tensorrt_llm.serve.tool_parser.core_types import (StreamingParseResult,
                                                        StructureInfo)
@@ -29,6 +35,7 @@ from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
 from tensorrt_llm.serve.tool_parser.deepseekv4_parser import DeepSeekV4Parser
 from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
 from tensorrt_llm.serve.tool_parser.deepseekv32_parser import DeepSeekV32Parser
+from tensorrt_llm.serve.tool_parser.deepseekv41_parser import DeepSeekV41Parser
 from tensorrt_llm.serve.tool_parser.gemma4_parser import Gemma4ToolParser
 from tensorrt_llm.serve.tool_parser.glm4_parser import Glm4ToolParser
 from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
@@ -225,6 +232,16 @@ class TestBaseToolParser:
         assert len(results) == 1
         assert json.loads(results[0].parameters) == {}
 
+    def test_parse_base_json_null_arguments(self, sample_tools):
+        """Test parse_base_json handles an explicit null arguments value."""
+        parser = ConcreteToolParser()
+        action = {"name": "get_weather", "arguments": None}
+
+        results = parser.parse_base_json(action, sample_tools)
+
+        assert len(results) == 1
+        assert json.loads(results[0].parameters) == {}
+
     def test_ends_with_partial_token(self):
         """Test _ends_with_partial_token detection."""
         parser = ConcreteToolParser()
@@ -343,6 +360,25 @@ class TestBaseToolParser:
         assert isinstance(info, StructureInfo)
         assert "test_function" in info.begin
         assert info.trigger == "[TOOL_CALLS]"
+
+    def test_finish_default_noop(self, sample_tools):
+        """The default finalization hook emits nothing and keeps state.
+
+        Existing parsers manage ``self._buffer`` incrementally; the
+        end-of-stream hook must not change their behavior.
+        """
+        parser = ConcreteToolParser()
+        parser._buffer = '[TOOL_CALLS] {"name":"get_weather"'
+
+        result = parser.finish(sample_tools)
+
+        assert result.normal_text == ""
+        assert result.calls == []
+        assert parser._buffer == '[TOOL_CALLS] {"name":"get_weather"'
+
+    def test_extracts_forced_tool_calls_default_false(self):
+        """Forced tool_choice extraction is opt-in per parser."""
+        assert ConcreteToolParser.extracts_forced_tool_calls is False
 
 
 # ============================================================================
@@ -645,6 +681,43 @@ class TestKimiK2ToolParser(BaseToolParserTestClass):
         assert len(result.calls) == 1
         assert result.calls[0].name == "get_weather"
         assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
+
+    def test_hyphenated_function_name(self):
+        """Test that function names containing hyphens are parsed."""
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get-weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string"
+                            }
+                        },
+                    },
+                ),
+            )
+        ]
+        tool_call = ('<|tool_call_begin|>functions.get-weather:0'
+                     '<|tool_call_argument_begin|>{"location":"Tokyo"}'
+                     '<|tool_call_end|>')
+
+        result = KimiK2ToolParser().detect_and_parse(
+            '<|tool_calls_section_begin|>' + tool_call +
+            '<|tool_calls_section_end|>', tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get-weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
+
+        parser = KimiK2ToolParser()
+        parser.parse_streaming_increment('<|tool_calls_section_begin|>', tools)
+        result = parser.parse_streaming_increment(tool_call, tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get-weather"
 
 
 class TestQwen3ToolParser(BaseToolParserTestClass):
@@ -1016,6 +1089,683 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         assert len(r_args.calls) == 1
         assert json.loads(r_args.calls[0].parameters) == {"location": "SF"}
 
+    @pytest.mark.parametrize(
+        "arguments_chunk",
+        [', "arguments": {}}', "}", ', "arguments": null}'],
+        ids=["empty_object", "key_absent", "explicit_null"],
+    )
+    def test_streaming_zero_arg_tool(self, parser, arguments_chunk):
+        """Test streaming a zero-argument tool call.
+
+        A model can express "no arguments" as an empty object, by omitting the
+        key, or as an explicit null. All three have to complete the call and
+        stream "{}".
+        """
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_time",
+                    description="Get current time",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            )
+        ]
+        chunks = [
+            "<tool_call>\n",
+            '{"name": "get_time"',
+            arguments_chunk,
+            "\n</tool_call>",
+        ]
+
+        results = [
+            parser.parse_streaming_increment(chunk, tools) for chunk in chunks
+        ]
+
+        names = [c.name for r in results for c in r.calls if c.name]
+        assert "get_time" in names
+
+        # A zero-argument call still has to stream its arguments, otherwise the
+        # client is left with arguments="", which is not valid JSON.
+        params = "".join(c.parameters for r in results for c in r.calls)
+        assert params == "{}", f"Expected '{{}}', got {params!r}"
+
+        # The one-shot path resolves all three shapes to the same "{}".
+        oneshot = parser.detect_and_parse("".join(chunks), tools)
+        assert oneshot.calls[0].parameters == "{}"
+
+        # The completed call must also be consumed from the buffer, otherwise the
+        # parser stays in the tool-call branch and swallows the rest of the output.
+        assert "<tool_call>" not in parser._buffer
+
+
+class TestQwen3CoderRequiredTools:
+
+    @staticmethod
+    def _call(name, parameter="", value=""):
+        body = f"<parameter={parameter}>{value}</parameter>\n" if parameter else ""
+        return f"<tool_call>\n<function={name}>\n{body}</function>\n</tool_call>"
+
+    @pytest.fixture
+    def compiler(self):
+        import xgrammar
+
+        tokenizer = xgrammar.TokenizerInfo([bytes([i])
+                                            for i in range(256)] + [b"<EOS>"],
+                                           stop_token_ids=[256])
+        return xgrammar.GrammarCompiler(tokenizer)
+
+    @pytest.mark.parametrize("thinking", [False, True])
+    def test_required_grammar_accepts_model_template(self, compiler, thinking):
+        from pathlib import Path
+
+        import xgrammar
+        from jinja2 import Environment
+
+        tools = [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(
+                                         name="f",
+                                         parameters={
+                                             "type": "object",
+                                             "properties": {
+                                                 "location": {
+                                                     "type": "string"
+                                                 },
+                                                 "unit": {
+                                                     "type": "string"
+                                                 }
+                                             },
+                                             "required": ["location"]
+                                         }))
+        ]
+        template = Environment().from_string(
+            (Path(__file__).parent / "data" /
+             "nemotron_super_vl_chat_template.jinja").read_text())
+        rendered = template.render(
+            messages=[{
+                "role": "user",
+                "content": "Weather?"
+            }, {
+                "role":
+                "assistant",
+                "content":
+                "",
+                "reasoning_content":
+                "Checking." if thinking else "",
+                "tool_calls": [{
+                    "function": {
+                        "name": "f",
+                        "arguments": {
+                            "location": "Denver",
+                            "unit": "celsius"
+                        }
+                    }
+                }]
+            }],
+            tools=[tool.model_dump(exclude_none=True) for tool in tools],
+            add_generation_prompt=False)
+        output = rendered.rsplit("<|im_start|>assistant\n",
+                                 1)[1].split("<|im_end|>", 1)[0]
+        prefill = "<think>" if thinking else "<think></think>"
+        assert output.startswith(prefill)
+        output = output[len(prefill):]
+        matcher = xgrammar.GrammarMatcher(
+            compiler.compile_structural_tag(
+                Qwen3CoderToolParser().build_required_structural_tag(
+                    tools, thinking=thinking)))
+        assert matcher.accept_string(output) and matcher.accept_token(256)
+
+    @pytest.mark.parametrize("thinking", [False, True])
+    @pytest.mark.parametrize("required",
+                             [["location"], ["location", "unit"], []])
+    def test_required_grammar_accepts_parameter_whitespace(
+            self, compiler, thinking, required):
+        import xgrammar
+
+        tools = [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(
+                                         name="get_weather",
+                                         parameters={
+                                             "type": "object",
+                                             "properties": {
+                                                 "location": {
+                                                     "type": "string"
+                                                 },
+                                                 "unit": {
+                                                     "type": "string"
+                                                 }
+                                             },
+                                             "required": required,
+                                             "additionalProperties": False
+                                         }))
+        ]
+        fmt = Qwen3CoderToolParser().build_required_structural_tag(
+            tools, thinking=thinking)
+        compiled = compiler.compile_structural_tag(fmt)
+        prefix = "Checking.</think>" if thinking else ""
+        for whitespace in ("", "\n", "\n\t ", "\r\n"):
+            body = ("<parameter=location>Denver</parameter>" + whitespace +
+                    "<parameter=unit>celsius</parameter>" + whitespace)
+            text = prefix + whitespace + "<tool_call>\n<function=get_weather>\n" + body + "</function>\n</tool_call>"
+            matcher = xgrammar.GrammarMatcher(compiled)
+            assert matcher.accept_string(text)
+            assert matcher.accept_token(256)
+            parsed = Qwen3CoderToolParser().detect_and_parse(
+                text[len(prefix):], tools)
+            assert json.loads(parsed.calls[0].parameters) == {
+                "location": "Denver",
+                "unit": "celsius"
+            }
+        for body, accepted in [("", not required),
+                               ("<parameter=location>Denver</parameter>\n",
+                                "unit" not in required)]:
+            matcher = xgrammar.GrammarMatcher(compiled)
+            text = prefix + "\n<tool_call>\n<function=get_weather>\n" + body + "</function>\n</tool_call>"
+            assert (matcher.accept_string(text)
+                    and matcher.accept_token(256)) is accepted
+        matcher = xgrammar.GrammarMatcher(compiled)
+        assert matcher.accept_string(prefix + "\n ")
+        assert not matcher.accept_token(256)
+
+    @pytest.mark.parametrize("schema", [
+        {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": True
+        },
+        {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {}
+        },
+        {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {
+                "type": "string"
+            }
+        },
+        {
+            "type": "object",
+            "required": "x"
+        },
+        {
+            "type": "object",
+            "minProperties": "bad"
+        },
+        {
+            "type": "object",
+            "properties": {},
+            "required": ["x"]
+        },
+        {
+            "type": "object",
+            "properties": {},
+            "minProperties": 1
+        },
+    ])
+    def test_required_grammar_rejects_unsupported_schemas(self, schema):
+        tools = [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(
+                                         name="f", parameters=schema))
+        ]
+        with pytest.raises(ValueError) as exc:
+            Qwen3CoderToolParser().build_required_structural_tag(tools,
+                                                                 thinking=False)
+        assert "EBNF" not in str(exc.value)
+
+    @pytest.mark.parametrize(
+        "value",
+        ["a</tool_call>b", "a<tool_call>b", "a</think>b", "a</function>b"])
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    def test_grammar_accepted_delimiters_preserve_arguments(
+            self, compiler, value, chunk_size):
+        import xgrammar
+
+        tools = [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(
+                                         name="f",
+                                         parameters={
+                                             "type": "object",
+                                             "properties": {
+                                                 "x": {
+                                                     "type": "string"
+                                                 }
+                                             },
+                                             "required": ["x"]
+                                         }))
+        ]
+        text = self._call("f", "x", value) + "\n" + self._call(
+            "f", "x", "second")
+        parser = Qwen3CoderToolParser()
+        matcher = xgrammar.GrammarMatcher(
+            compiler.compile_structural_tag(
+                parser.build_required_structural_tag(tools, thinking=False)))
+        assert matcher.accept_string(text) and matcher.accept_token(256)
+        whole = parser.detect_and_parse(text, tools)
+        assert [json.loads(call.parameters) for call in whole.calls] == [{
+            "x":
+            value
+        }, {
+            "x":
+            "second"
+        }]
+        results = [
+            parser.parse_streaming_increment(text[i:i + chunk_size], tools)
+            for i in range(0, len(text), chunk_size)
+        ] + [parser.finish(tools)]
+        arguments = {}
+        for result in results:
+            for call in result.calls:
+                arguments[call.tool_index] = arguments.get(call.tool_index,
+                                                           "") + call.parameters
+        assert [json.loads(arguments[i]) for i in range(2)] == [{
+            "x": value
+        }, {
+            "x": "second"
+        }]
+        assert "".join(result.normal_text for result in results) == "\n"
+
+    def test_incomplete_function_header_is_not_a_call(self, sample_tools):
+        text = "<tool_call><function=f</function></tool_call>"
+        parser = Qwen3CoderToolParser()
+        assert parser.detect_and_parse(text, sample_tools).calls == []
+        assert parser.parse_streaming_increment(text, sample_tools).calls == []
+        assert parser.finish(sample_tools).calls == []
+
+    @pytest.mark.timeout(3)
+    @pytest.mark.parametrize("name", ["", " ", "\t"])
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    @pytest.mark.parametrize("body", [
+        "",
+        "<parameter=location>a</tool_call><tool_call>b</parameter>",
+    ])
+    def test_empty_function_name_recovers(
+            self, sample_tools: list[ChatCompletionToolsParam], name: str,
+            chunk_size: int, body: str) -> None:
+        text = (f"<tool_call><function={name}>{body}</function></tool_call>" +
+                self._call("get_weather", "location", "Denver"))
+        parser = Qwen3CoderToolParser()
+        results = [
+            parser.parse_streaming_increment(text[i:i + chunk_size],
+                                             sample_tools)
+            for i in range(0, len(text), chunk_size)
+        ] + [parser.finish(sample_tools)]
+        calls = [call for result in results for call in result.calls]
+        assert "".join(result.normal_text for result in results) == ""
+        assert [call.name for call in calls if call.name] == ["get_weather"]
+        assert {call.tool_index for call in calls} == {0}
+        assert json.loads("".join(call.parameters for call in calls)) == {
+            "location": "Denver"
+        }
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    def test_empty_function_name_preserves_surrounding_output(
+            self, sample_tools: list[ChatCompletionToolsParam],
+            chunk_size: int) -> None:
+        text = ("before" + self._call("get_weather", "location", "Taipei") +
+                "between<tool_call><function= ></function></tool_call>" +
+                self._call("get_weather", "location", "Denver") + "after")
+        parser = Qwen3CoderToolParser()
+        results = [
+            parser.parse_streaming_increment(text[i:i + chunk_size],
+                                             sample_tools)
+            for i in range(0, len(text), chunk_size)
+        ] + [parser.finish(sample_tools)]
+        calls = [call for result in results for call in result.calls]
+        assert "".join(result.normal_text
+                       for result in results) == "beforebetweenafter"
+        assert [(call.tool_index, call.name) for call in calls
+                if call.name] == [(0, "get_weather"), (1, "get_weather")]
+        for index, location in enumerate(["Taipei", "Denver"]):
+            assert json.loads("".join(call.parameters for call in calls
+                                      if call.tool_index == index)) == {
+                                          "location": location
+                                      }
+
+    @pytest.mark.parametrize("body", [
+        "",
+        "<parameter=location>a</tool_call>b",
+        "<parameter=location>Denver</parameter></function></tool_",
+    ])
+    def test_unterminated_empty_function_name_does_not_leak(
+            self, sample_tools: list[ChatCompletionToolsParam],
+            body: str) -> None:
+        parser = Qwen3CoderToolParser()
+        result = parser.parse_streaming_increment(
+            "<tool_call><function= >" + body, sample_tools)
+        assert result.normal_text == ""
+        assert result.calls == []
+        tail = parser.finish(sample_tools)
+        assert tail.normal_text == ""
+        assert tail.calls == []
+
+    @pytest.mark.parametrize("thinking", [False, True])
+    def test_required_grammar_rejects_empty_and_unknown_calls(
+            self, sample_tools, compiler, thinking):
+        import xgrammar
+
+        fmt = Qwen3CoderToolParser().build_required_structural_tag(
+            sample_tools, thinking=thinking)
+        compiled = compiler.compile_structural_tag(fmt)
+        prefix = "Check the available tools.</think>" if thinking else ""
+        weather = self._call("get_weather", "location", "Denver")
+        search = self._call("search_web", "query", "weather")
+        for text, expected in [
+            ("", False),
+            (prefix, False),
+            (prefix + "Hello.", False),
+            (prefix + weather, True),
+            (prefix + weather + "\n", True),
+            (prefix + weather + "\n\n", True),
+            (prefix + search, True),
+            (prefix + weather + "\n" + search, True),
+            (prefix + weather + "\n\n" + search, True),
+            (prefix + self._call("unknown", "location", "Denver"), False),
+            (prefix + weather + "\n" +
+             self._call("unknown", "location", "Denver"), False),
+            (prefix + self._call("get_weather"), False),
+            (prefix + weather[:-12], False),
+        ]:
+            matcher = xgrammar.GrammarMatcher(compiled)
+            accepted = matcher.accept_string(text) and matcher.accept_token(256)
+            assert accepted == expected, text
+        if thinking:
+            matcher = xgrammar.GrammarMatcher(compiled)
+            assert not matcher.accept_string("Consider <tool_call>")
+
+    @pytest.mark.parametrize("parameters", [
+        None, {}, {
+            "type": "object"
+        }, {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False
+        }
+    ])
+    def test_required_grammar_supports_parameterless_tools(
+            self, compiler, parameters):
+        import xgrammar
+
+        tools = [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(
+                                         name="ping", parameters=parameters))
+        ]
+        fmt = Qwen3CoderToolParser().build_required_structural_tag(
+            tools, thinking=False)
+        matcher = xgrammar.GrammarMatcher(compiler.compile_structural_tag(fmt))
+        assert matcher.accept_string(self._call("ping"))
+        assert matcher.accept_token(256)
+        assert tools[0].function.parameters == parameters
+
+    @pytest.mark.parametrize("parameters,value", [
+        ({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                }
+            },
+            "required": ["x"]
+        }, "[1,2]"),
+        ({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "object",
+                    "properties": {
+                        "ok": {
+                            "type": "boolean"
+                        }
+                    }
+                }
+            },
+            "required": ["x"]
+        }, '{"ok":true}'),
+        ({
+            "type": "object",
+            "properties": {
+                "x": {
+                    "anyOf": [{
+                        "type": "string"
+                    }, {
+                        "type": "null"
+                    }]
+                }
+            },
+            "required": ["x"]
+        }, "null"),
+    ])
+    def test_required_grammar_supports_nested_and_nullable_arguments(
+            self, compiler, parameters, value):
+        import xgrammar
+
+        tools = [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(
+                                         name="f", parameters=parameters))
+        ]
+        fmt = Qwen3CoderToolParser().build_required_structural_tag(
+            tools, thinking=False)
+        matcher = xgrammar.GrammarMatcher(compiler.compile_structural_tag(fmt))
+        text = self._call("f", "x", value)
+        assert matcher.accept_string(text)
+        assert matcher.accept_token(256)
+        assert json.loads(Qwen3CoderToolParser().detect_and_parse(
+            text, tools).calls[0].parameters) == {
+                "x": json.loads(value)
+            }
+
+    @pytest.mark.parametrize("thinking", [False, True])
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    def test_required_stream_matches_complete_response(self, sample_tools,
+                                                       thinking, chunk_size):
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        tools = sample_tools + [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(name="ping"))
+        ]
+        text = ("Checking.</think>" if thinking else "") + "\n".join([
+            self._call("get_weather", "location", "}"),
+            self._call("search_web", "query", "weather"),
+            self._call("ping")
+        ])
+
+        def make_args():
+            args = TestForcedToolChoicePostprocessing._make_args(
+                tools, tool_parser="qwen3_coder")
+            args.tool_choice = "required"
+            args.tool_parser_grammar_constrained = True
+            args.reasoning_parser = "nemotron-v3"
+            args.chat_template_kwargs = {"enable_thinking": thinking}
+            return args
+
+        whole = chat_response_post_processor(
+            TestForcedToolChoicePostprocessing._fake_response(text),
+            make_args())
+        chunks = [
+            text[i:i + chunk_size] for i in range(0, len(text), chunk_size)
+        ]
+        streamed = TestForcedToolChoicePostprocessing._stream_deltas(
+            make_args(), chunks)
+        calls = {}
+        reasoning = ""
+        for payload in streamed:
+            for choice in payload["choices"]:
+                delta = choice["delta"]
+                reasoning += delta.get("reasoning_content") or ""
+                for call in delta.get("tool_calls") or []:
+                    item = calls.setdefault(call["index"], {
+                        "name": "",
+                        "arguments": "",
+                        "ids": []
+                    })
+                    item["name"] += call["function"].get("name") or ""
+                    item["arguments"] += call["function"].get("arguments") or ""
+                    if call.get("id"):
+                        item["ids"].append(call["id"])
+        expected = whole.choices[0]
+        assert len(calls) == len(expected.message.tool_calls) == 3
+        for index, call in enumerate(expected.message.tool_calls):
+            assert calls[index]["name"] == call.function.name
+            assert json.loads(calls[index]["arguments"]) == json.loads(
+                call.function.arguments)
+            assert len(calls[index]["ids"]) == 1
+        assert reasoning == (expected.message.reasoning_content or "")
+        assert streamed[-1]["choices"][0][
+            "finish_reason"] == expected.finish_reason == "tool_calls"
+
+    def test_required_truncation_preserves_finish_reason(self, sample_tools):
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        text = self._call("get_weather", "location", "Denver")[:-12]
+        args = TestForcedToolChoicePostprocessing._make_args(
+            sample_tools, tool_parser="qwen3_coder")
+        args.tool_choice = "required"
+        whole = chat_response_post_processor(
+            TestForcedToolChoicePostprocessing._fake_response(text, "length"),
+            args)
+        assert whole.choices[0].finish_reason == "length"
+        assert not whole.choices[0].message.tool_calls
+        streamed = TestForcedToolChoicePostprocessing._stream_deltas(
+            args, [text], "length")
+        assert streamed[-1]["choices"][0]["finish_reason"] == "length"
+
+
+class TestQwen3CoderParameterRecovery:
+    FIRST = "<tool_call><function=f><parameter=x>abc</function></tool_call>"
+    SECOND = "<tool_call><function=g><parameter=y>1</parameter></function></tool_call>"
+
+    @pytest.fixture
+    def tools(self):
+        return [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name=name,
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            parameter: {
+                                "type": "string"
+                            }
+                        },
+                    },
+                ),
+            ) for name, parameter in [("f", "x"), ("g", "y")]
+        ]
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    @pytest.mark.parametrize("suffix,expected", [
+        ("", [("f", {
+            "x": "abc"
+        })]),
+        (SECOND, [("f", {
+            "x": "abc"
+        }), ("g", {
+            "y": "1"
+        })]),
+        ("<tool_call><function=g></function></tool_call>", [("f", {
+            "x": "abc"
+        }), ("g", {})]),
+    ])
+    def test_missing_parameter_closer_recovers_calls(self, tools, chunk_size,
+                                                     suffix, expected):
+        text = self.FIRST + suffix
+        parser = Qwen3CoderToolParser()
+        whole = parser.detect_and_parse(text, tools)
+        assert whole.normal_text == ""
+        assert [(call.name, json.loads(call.parameters))
+                for call in whole.calls] == expected
+
+        results = [
+            parser.parse_streaming_increment(text[i:i + chunk_size], tools)
+            for i in range(0, len(text), chunk_size)
+        ] + [parser.finish(tools)]
+        calls = {}
+        for result in results:
+            for call in result.calls:
+                item = calls.setdefault(call.tool_index, {
+                    "name": "",
+                    "arguments": ""
+                })
+                item["name"] += call.name or ""
+                item["arguments"] += call.parameters
+        assert [(item["name"], json.loads(item["arguments"]))
+                for item in calls.values()] == expected
+        assert "".join(result.normal_text for result in results) == ""
+        assert parser.finish(tools).calls == []
+
+    @pytest.mark.parametrize("constrained", [False, True])
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    def test_chat_recovery_policy_preserves_required_arguments(
+            self, tools, constrained, chunk_size):
+        import xgrammar
+
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        value = "abc</function>\n</tool_call>\n<tool_call>\n<function=g>\n<parameter=y>1"
+        text = "<tool_call>\n<function=f>\n<parameter=x>" + value + "</parameter>\n</function>\n</tool_call>"
+        compiler = xgrammar.GrammarCompiler(
+            xgrammar.TokenizerInfo([bytes([i])
+                                    for i in range(256)] + [b"<EOS>"],
+                                   stop_token_ids=[256]))
+        matcher = xgrammar.GrammarMatcher(
+            compiler.compile_structural_tag(
+                Qwen3CoderToolParser().build_required_structural_tag(
+                    tools, thinking=False)))
+        assert matcher.accept_string(text) and matcher.accept_token(256)
+
+        def make_args():
+            args = TestForcedToolChoicePostprocessing._make_args(
+                tools, tool_parser="qwen3_coder")
+            args.tool_choice = "required" if constrained else "auto"
+            args.tool_parser_grammar_constrained = constrained
+            return args
+
+        expected = [("f", {
+            "x": value
+        })] if constrained else [("f", {
+            "x": "abc"
+        }), ("g", {
+            "y": "1"
+        })]
+        whole = chat_response_post_processor(
+            TestForcedToolChoicePostprocessing._fake_response(text),
+            make_args())
+        assert [(call.function.name, json.loads(call.function.arguments))
+                for call in whole.choices[0].message.tool_calls] == expected
+        payloads = TestForcedToolChoicePostprocessing._stream_deltas(
+            make_args(),
+            [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)])
+        calls = {}
+        for payload in payloads:
+            for choice in payload["choices"]:
+                for call in choice["delta"].get("tool_calls") or []:
+                    item = calls.setdefault(call["index"], {
+                        "name": "",
+                        "arguments": ""
+                    })
+                    item["name"] += call["function"].get("name") or ""
+                    item["arguments"] += call["function"].get("arguments") or ""
+        assert [(item["name"], json.loads(item["arguments"]))
+                for item in calls.values()] == expected
+
 
 class TestQwen3CoderToolParser(BaseToolParserTestClass):
     """Test suite for Qwen3CoderToolParser class."""
@@ -1234,10 +1984,9 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
             },
             "param6": [1, 2, 3],
             "param7": None,
-            "param8": {
-                "arg1": 3,
-                "arg2": [1, 2]
-            }
+            # An unknown type is decoded as JSON only; a Python literal is
+            # not JSON, so the text is kept.
+            "param8": "{'arg1': 3, 'arg2': [1, 2]}",
         }
 
     def test_parse_anyof_parameter_type_conversion(self, parser):
@@ -1402,6 +2151,516 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
         assert result.calls[0].name == "execute_bash"
         assert json.loads(result.calls[0].parameters) == {
             "command": "pwd && ls"
+        }
+
+    @pytest.mark.parametrize(
+        "schema,raw,expected",
+        [
+            # Booleans accept 1/0 and surrounding whitespace; any other text
+            # is kept as written instead of turning into false.
+            ({
+                "type": "boolean"
+            }, "1", True),
+            ({
+                "type": "boolean"
+            }, " False ", False),
+            ({
+                "type": "boolean"
+            }, "yes", "yes"),
+            # Every type a schema allows is tried, null first.
+            ({
+                "type": ["integer", "null"]
+            }, "null", None),
+            ({
+                "type": ["integer", "null"]
+            }, "7", 7),
+            ({
+                "anyOf": [{
+                    "type": "integer"
+                }, {
+                    "type": "string"
+                }]
+            }, "12", 12),
+            ({
+                "type": ["number", "string"]
+            }, "abc", "abc"),
+            ({
+                "enum": [1, 2, 3]
+            }, "2", 2),
+            # A string parameter keeps null and numerals as text.
+            ({
+                "type": "string"
+            }, "null", "null"),
+            ({
+                "type": "string"
+            }, "42", "42"),
+            # A non-finite number is not valid JSON, so the text is kept.
+            ({
+                "type": "number"
+            }, "inf", "inf"),
+            ({
+                "type": "number"
+            }, "5.0", 5),
+            # Objects are decoded as JSON only, not as Python literals.
+            ({
+                "type": "object"
+            }, "{'a': 1}", "{'a': 1}"),
+        ],
+    )
+    def test_parameter_value_typing(self, parser, schema, raw, expected):
+        """Values are typed by their schema the way vLLM's Qwen3 parser types them."""
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "p": schema
+                    }
+                },
+            ),
+        )
+        text = ("<tool_call>\n<function=f>\n"
+                f"<parameter=p>\n{raw}\n</parameter>\n"
+                "</function>\n</tool_call>")
+
+        result = parser.detect_and_parse(text, [tool])
+
+        value = json.loads(result.calls[0].parameters)["p"]
+        assert value == expected
+        assert type(value) is type(expected)
+
+    def test_string_values_are_kept_verbatim(self, parser):
+        """Only the newline the template puts on each side of a value is removed.
+
+        Indentation, trailing spaces and literal HTML entities belong to the
+        value, as they do in the code a coding model writes.
+        """
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="write",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string"
+                        }
+                    },
+                },
+            ),
+        )
+        content = "    if a &lt; b:\n        return a  "
+        text = ("<tool_call>\n<function=write>\n"
+                f"<parameter=content>\n{content}\n</parameter>\n"
+                "</function>\n</tool_call>")
+
+        result = parser.detect_and_parse(text, [tool])
+
+        assert json.loads(result.calls[0].parameters) == {"content": content}
+
+    def test_values_stay_strings_without_a_schema(self, parser):
+        """Without a schema to type them by, values are kept as written."""
+        text = ("<tool_call>\n<function=search>\n"
+                "<parameter=limit>10</parameter>\n"
+                "<parameter=label>null</parameter>\n"
+                "</function>\n</tool_call>")
+
+        result = parser.detect_and_parse(text, [])
+
+        assert json.loads(result.calls[0].parameters) == {
+            "limit": "10",
+            "label": "null",
+        }
+
+    def test_streaming_matches_detect_and_parse(self, parser):
+        """Streamed arguments equal the whole-text parse, key order included.
+
+        The second delta completes several parameters at once, and they must be
+        streamed in the order the model wrote them.
+        """
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "first": {
+                            "type": "string"
+                        },
+                        "count": {
+                            "type": "integer"
+                        },
+                        "ratio": {
+                            "type": "number"
+                        },
+                        "flag": {
+                            "type": "boolean"
+                        },
+                        "label": {
+                            "type": ["string", "null"]
+                        },
+                        "items": {
+                            "type": "array"
+                        },
+                    },
+                },
+            ),
+        )
+        body = ("<parameter=first>\nx\n</parameter>\n"
+                "<parameter=count>\n3\n</parameter>\n"
+                "<parameter=ratio>\n0.5\n</parameter>\n"
+                "<parameter=flag>\n1\n</parameter>\n"
+                "<parameter=label>\nnull\n</parameter>\n"
+                "<parameter=items>\n[1, 2]\n</parameter>\n")
+        split = body.index("<parameter=count>")
+        deltas = [
+            "<tool_call>",
+            "\n<function=f>\n" + body[:split],
+            body[split:] + "</function>\n",
+            "</tool_call>",
+        ]
+
+        streamed = ""
+        for delta in deltas:
+            for call in parser.parse_streaming_increment(delta, [tool]).calls:
+                streamed += call.parameters or ""
+        whole = Qwen3CoderToolParser().detect_and_parse("".join(deltas), [tool])
+
+        assert streamed == whole.calls[0].parameters
+        assert json.loads(streamed) == {
+            "first": "x",
+            "count": 3,
+            "ratio": 0.5,
+            "flag": True,
+            "label": None,
+            "items": [1, 2],
+        }
+
+    def test_missing_parameter_end_tag_ends_at_next_parameter(self, parser):
+        """A parameter left without its closing tag ends where the next begins.
+
+        Otherwise the next parameter would be swallowed into its value.
+        """
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "a": {
+                            "type": "integer"
+                        },
+                        "b": {
+                            "type": "string"
+                        },
+                    },
+                },
+            ),
+        )
+        body = ("\n<function=f>\n"
+                "<parameter=a>\n1\n"
+                "<parameter=b>\nx\n</parameter>\n"
+                "</function>\n")
+
+        whole = parser.detect_and_parse("<tool_call>" + body + "</tool_call>",
+                                        [tool])
+        streamed = ""
+        streaming_parser = Qwen3CoderToolParser()
+        for delta in ("<tool_call>", body, "</tool_call>"):
+            for call in streaming_parser.parse_streaming_increment(
+                    delta, [tool]).calls:
+                streamed += call.parameters or ""
+
+        assert json.loads(whole.calls[0].parameters) == {"a": 1, "b": "x"}
+        assert streamed == whole.calls[0].parameters
+
+    @pytest.mark.parametrize(
+        "schema,raw,expected",
+        [
+            # One newline on each side is the template's; the rest is the value.
+            ({
+                "type": "string"
+            }, "\n\nhello\n\n", "\nhello\n"),
+            (None, "\n\nhello\n\n", "\nhello\n"),
+            # A carriage return is part of the value; only the newline is
+            # trimmed.
+            ({
+                "type": "string"
+            }, "\r\nhello\r\n", "\r\nhello\r"),
+            ({
+                "type": "string"
+            }, "\n\r\nhello\r\n\n", "\r\nhello\r\n"),
+            # Escape sequences written as text are not decoded.
+            ({
+                "type": "string"
+            }, "\\r\\nhello\\r\\n", "\\r\\nhello\\r\\n"),
+            ({
+                "type": "boolean"
+            }, "\\r\\nhello\\r\\n", "\\r\\nhello\\r\\n"),
+            # true is text unless the schema allows a boolean.
+            ({
+                "type": "string"
+            }, "true", "true"),
+            (None, "true", "true"),
+            ({
+                "type": ["string", "boolean"]
+            }, "true", True),
+            ({
+                "type": "boolean"
+            }, "\ntrue\n", True),
+            # Spaces and HTML entities in a string are part of the value.
+            ({
+                "type": "string"
+            }, "  keep &amp;  ", "  keep &amp;  "),
+            # null is text unless the schema allows null.
+            ({
+                "type": "string"
+            }, "null", "null"),
+            ({
+                "type": "string"
+            }, "NULL", "NULL"),
+            (None, "null", "null"),
+            ({
+                "type": ["string", "null"]
+            }, "null", None),
+            # A boolean is read through surrounding spaces and accepts 1/0;
+            # other text is kept.
+            ({
+                "type": "boolean"
+            }, " true ", True),
+            ({
+                "type": "boolean"
+            }, "1", True),
+            ({
+                "type": "boolean"
+            }, "maybe", "maybe"),
+            # An integer that does not parse falls back to JSON, which reads a
+            # padded null as null.
+            ({
+                "type": "integer"
+            }, " null ", None),
+            # When string is allowed, digits stay text.
+            ({
+                "type": ["string", "null"]
+            }, "123", "123"),
+            ({
+                "anyOf": [{
+                    "type": "string"
+                }, {
+                    "type": "null"
+                }]
+            }, "123", "123"),
+            # An object is decoded as JSON only, not as a Python literal.
+            ({
+                "type": "object"
+            }, "{'x': 1}", "{'x': 1}"),
+        ],
+    )
+    def test_raw_values_are_typed_as_written(self, parser, schema, raw,
+                                             expected):
+        """The text between the parameter tags is the value, as in vLLM.
+
+        The value is placed between the tags exactly as given, with no newline
+        added by the test, and must come out the same whole and streamed.
+        """
+        properties = {} if schema is None else {"p": schema}
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": properties
+                },
+            ),
+        )
+        body = f"\n<function=f>\n<parameter=p>{raw}</parameter>\n</function>\n"
+
+        whole = parser.detect_and_parse("<tool_call>" + body + "</tool_call>",
+                                        [tool])
+        streamed = ""
+        streaming_parser = Qwen3CoderToolParser()
+        deltas = ["<tool_call>"]
+        deltas += [body[i:i + 3] for i in range(0, len(body), 3)]
+        deltas.append("</tool_call>")
+        for delta in deltas:
+            for call in streaming_parser.parse_streaming_increment(
+                    delta, [tool]).calls:
+                streamed += call.parameters or ""
+
+        value = json.loads(whole.calls[0].parameters)["p"]
+        assert value == expected
+        assert type(value) is type(expected)
+        assert streamed == whole.calls[0].parameters
+
+    @pytest.mark.parametrize("function_end", ["</function>\n", ""])
+    def test_unterminated_last_parameter_ends_with_function(
+            self, parser, function_end):
+        """A last parameter with no closing tag runs to the end of the function.
+
+        This holds whole and streamed alike, also when </function> is missing,
+        and a warning names the parameter.
+        """
+        from unittest.mock import patch
+
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "a": {
+                            "type": "integer"
+                        },
+                        "b": {
+                            "type": "string"
+                        },
+                    },
+                },
+            ),
+        )
+        body = ("\n<function=f>\n<parameter=a>\n1\n</parameter>\n"
+                "<parameter=b>\nnever closed\n" + function_end)
+        logger_path = "tensorrt_llm.serve.tool_parser.qwen3_coder_parser.logger"
+
+        with patch(logger_path) as mock_logger:
+            whole = parser.detect_and_parse(
+                "<tool_call>" + body + "</tool_call>", [tool])
+        assert json.loads(whole.calls[0].parameters) == {
+            "a": 1,
+            "b": "never closed"
+        }
+        assert mock_logger.warning.call_count == 1
+        assert "'b'" in mock_logger.warning.call_args.args[0]
+
+        streamed = ""
+        streaming_parser = Qwen3CoderToolParser()
+        deltas = ["<tool_call>"]
+        deltas += [body[i:i + 3] for i in range(0, len(body), 3)]
+        deltas.append("</tool_call>")
+        with patch(logger_path) as mock_logger:
+            results = [
+                streaming_parser.parse_streaming_increment(delta, [tool])
+                for delta in deltas
+            ]
+            # The serving layer finishes every stream; an unclosed last
+            # parameter is only known to have ended once the stream does.
+            results.append(streaming_parser.finish([tool]))
+        for result in results:
+            for call in result.calls:
+                streamed += call.parameters or ""
+        assert streamed == whole.calls[0].parameters
+        assert mock_logger.warning.call_count == 1
+        assert "'b'" in mock_logger.warning.call_args.args[0]
+
+    def test_value_containing_function_tags_stays_whole(self, parser):
+        """Function tags inside a closed value are part of the value."""
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="f",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string"
+                        },
+                        "n": {
+                            "type": "integer"
+                        },
+                    },
+                },
+            ),
+        )
+        code = 'print("</function>", "<function=g>")'
+        body = (f"\n<function=f>\n<parameter=code>\n{code}\n</parameter>\n"
+                "<parameter=n>\n2\n</parameter>\n</function>\n")
+
+        whole = parser.detect_and_parse("<tool_call>" + body + "</tool_call>",
+                                        [tool])
+        streamed = ""
+        streaming_parser = Qwen3CoderToolParser()
+        deltas = ["<tool_call>"]
+        deltas += [body[i:i + 3] for i in range(0, len(body), 3)]
+        deltas.append("</tool_call>")
+        for delta in deltas:
+            for call in streaming_parser.parse_streaming_increment(
+                    delta, [tool]).calls:
+                streamed += call.parameters or ""
+
+        assert [call.name for call in whole.calls] == ["f"]
+        assert json.loads(whole.calls[0].parameters) == {"code": code, "n": 2}
+        assert streamed == whole.calls[0].parameters
+
+    @pytest.mark.parametrize("streaming", [False, True],
+                             ids=["non_streaming", "streaming"])
+    def test_parse_preserves_string_and_null_types(self, parser, streaming):
+        """None stays text where a string is allowed and is null elsewhere."""
+        tool_def = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="set_values",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "literal_none": {
+                            "anyOf": [{
+                                "type": "string"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "literal_null": {
+                            "type": "string"
+                        },
+                        "nullable_null": {
+                            "anyOf": [{
+                                "type": "string"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "nullable_integer": {
+                            "anyOf": [{
+                                "type": "integer"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                    },
+                },
+            ),
+        )
+        chunks = [
+            "<tool_call>\n",
+            "<function=set_values>\n",
+            "<parameter=literal_none>None</parameter>\n",
+            "<parameter=literal_null>null</parameter>\n",
+            "<parameter=nullable_null>null</parameter>\n",
+            "<parameter=nullable_integer>None</parameter>\n",
+            "</function>\n</tool_call>",
+        ]
+        if streaming:
+            calls = []
+            for chunk in chunks:
+                calls.extend(
+                    parser.parse_streaming_increment(chunk, [tool_def]).calls)
+        else:
+            calls = parser.detect_and_parse("".join(chunks), [tool_def]).calls
+
+        assert [call.name for call in calls if call.name] == ["set_values"]
+        parameters = "".join(call.parameters for call in calls
+                             if call.parameters)
+        assert json.loads(parameters) == {
+            "literal_none": "None",
+            "literal_null": "null",
+            "nullable_null": None,
+            "nullable_integer": None,
         }
 
 
@@ -1778,6 +3037,272 @@ class TestDeepSeekV4Parser(BaseToolParserTestClass):
         )
 
 
+class TestDeepSeekV41Parser(BaseToolParserTestClass):
+    """Test DeepSeek-V4.1's spaced DSML tool-call format."""
+
+    def make_parser(self):
+        return DeepSeekV41Parser()
+
+    def make_tool_parser_test_cases(self):
+        return ToolParserTestCases(
+            has_tool_call_true=
+            ('Some text <｜DSML｜ calls> <｜DSML｜ invoke name="get_weather"> '
+             '<｜DSML｜ parameter name="location" string="true">NYC</｜DSML｜ parameter> '
+             "</｜DSML｜ invoke> </｜DSML｜ calls>"),
+            detect_and_parse_single_tool=(
+                ('Normal text<｜DSML｜ calls> <｜DSML｜ invoke name="get_weather"> '
+                 '<｜DSML｜ parameter name="location" string="true">NYC</｜DSML｜ parameter> '
+                 "</｜DSML｜ invoke> </｜DSML｜ calls>"),
+                "Normal text",
+                "get_weather",
+                {
+                    "location": "NYC"
+                },
+            ),
+            detect_and_parse_multiple_tools=(
+                ('<｜DSML｜ calls> <｜DSML｜ invoke name="get_weather"> '
+                 '<｜DSML｜ parameter name="location" string="true">NYC</｜DSML｜ parameter> '
+                 '</｜DSML｜ invoke> <｜DSML｜ invoke name="search_web"> '
+                 '{ "query": "AI" } </｜DSML｜ invoke> </｜DSML｜ calls>'),
+                ("get_weather", "search_web"),
+            ),
+            detect_and_parse_malformed_tool=
+            ('<｜DSML｜ calls> <｜DSML｜invoke name="get_weather"> '
+             '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
+             "</｜DSML｜invoke> </｜DSML｜ calls>"),
+            detect_and_parse_with_parameters_key=(
+                ('<｜DSML｜ calls> <｜DSML｜ invoke name="search_web"> '
+                 '{ "query": "test" } </｜DSML｜ invoke> </｜DSML｜ calls>'),
+                "search_web",
+                {
+                    "query": "test"
+                },
+            ),
+            parse_streaming_increment_partial_bot_token="<｜DSML｜ cal",
+            undefined_tool=
+            ('<｜DSML｜ calls> <｜DSML｜ invoke name="undefined_func"> '
+             '<｜DSML｜ parameter name="arg" string="true">value</｜DSML｜ parameter> '
+             "</｜DSML｜ invoke> </｜DSML｜ calls>"),
+        )
+
+    def test_parse_streaming_increment_complete_tool_call(self, sample_tools):
+        parser = self.make_parser()
+        chunks = [
+            "Normal text<｜DSML｜ cal",
+            'ls><｜DSML｜ invoke name="get_weather">',
+            '<｜DSML｜ parameter name="location" string="true">NYC',
+            "</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>",
+        ]
+
+        results = [
+            parser.parse_streaming_increment(chunk, sample_tools)
+            for chunk in chunks
+        ]
+
+        assert "".join(result.normal_text
+                       for result in results) == "Normal text"
+        calls = [call for result in results for call in result.calls]
+        assert [call.name for call in calls if call.name] == ["get_weather"]
+        assert json.loads("".join(call.parameters for call in calls)) == {
+            "location": "NYC"
+        }
+
+
+# ============================================================================
+# DeepSeek streaming text preservation
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "parser_cls",
+    [DeepSeekV3Parser, DeepSeekV31Parser, DeepSeekV32Parser, DeepSeekV4Parser])
+@pytest.mark.parametrize(
+    "deltas",
+    [
+        # A delta that is itself a prefix of a tool-call start token.
+        ["Use ", "<", "div> for a block element."],
+        # A delta that ends on such a prefix after other text.
+        ["The condition is a <", " b, so it holds."],
+        # Text that starts like a start token and then diverges from it, for
+        # both of the tokens the V3.2 and V4 parsers look for.
+        ["Use <｜DSML｜function", "ality and <｜DSML｜invoke", "ality"],
+    ],
+)
+def test_deepseek_streaming_preserves_withheld_text(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], deltas: list[str]) -> None:
+    """Withholding a delta may delay text but must never drop it."""
+    parser = parser_cls()
+
+    streamed = "".join(
+        parser.parse_streaming_increment(delta, sample_tools).normal_text
+        for delta in deltas)
+
+    expected = "".join(deltas)
+    assert streamed == expected, f"Expected {expected!r}, got {streamed!r}"
+    assert parser_cls().detect_and_parse(expected,
+                                         sample_tools).normal_text == expected
+
+
+@pytest.mark.parametrize(
+    "parser_cls",
+    [DeepSeekV3Parser, DeepSeekV31Parser, DeepSeekV32Parser, DeepSeekV4Parser])
+def test_deepseek_streaming_keeps_markdown_fences(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser]) -> None:
+    """Content without tool-call markup is streamed verbatim."""
+    text = "Here is the code:\n```python\nprint(1)\n```\nDone."
+
+    streamed = parser_cls().parse_streaming_increment(text,
+                                                      sample_tools).normal_text
+
+    assert streamed == text, f"Expected {text!r}, got {streamed!r}"
+    assert parser_cls().detect_and_parse(text, sample_tools).normal_text == text
+
+
+def _dsml_tool_call(tag_prefix: str, block_name: str, name: str,
+                    string_arguments: dict[str, str]) -> str:
+    """A tool call as the DSML encoders render it: each string value verbatim."""
+    parameters = "\n".join(
+        f'<{tag_prefix}parameter name="{key}" string="true">{value}'
+        f"</{tag_prefix}parameter>" for key, value in string_arguments.items())
+    return (f"<{tag_prefix}{block_name}>\n"
+            f'<{tag_prefix}invoke name="{name}">\n{parameters}\n'
+            f"</{tag_prefix}invoke>\n</{tag_prefix}{block_name}>")
+
+
+@pytest.mark.parametrize("parser_cls,tag_prefix,block_name", [
+    (DeepSeekV32Parser, "｜DSML｜", "function_calls"),
+    (DeepSeekV4Parser, "｜DSML｜", "tool_calls"),
+    (DeepSeekV41Parser, "｜DSML｜ ", "calls"),
+])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_dsml_string_parameter_values_are_kept_as_written(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], tag_prefix: str, block_name: str,
+        streaming: bool) -> None:
+    """A string value's leading and trailing whitespace is part of the value.
+
+    An edit's ``old_string`` must match the file including its indentation,
+    and a written file keeps its last newline.
+    """
+    arguments = {
+        "location": "    indented line\n    second line",
+        "unit": "file content\n",
+    }
+    text = _dsml_tool_call(tag_prefix, block_name, "get_weather", arguments)
+
+    parser = parser_cls()
+    if streaming:
+        results = [
+            parser.parse_streaming_increment(text[i:i + 7], sample_tools)
+            for i in range(0, len(text), 7)
+        ]
+        calls = [call for result in results for call in result.calls]
+    else:
+        calls = parser.detect_and_parse(text, sample_tools).calls
+
+    assert [call.name for call in calls if call.name] == ["get_weather"]
+    assert json.loads("".join(call.parameters or ""
+                              for call in calls)) == arguments
+
+
+@pytest.mark.parametrize(
+    "parser_cls, tool_call_text",
+    [
+        (
+            DeepSeekV3Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+             'get_weather\n```json\n{"location": "Tokyo"}\n```'
+             "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"),
+        ),
+        (
+            DeepSeekV31Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>"
+             '{"location": "Tokyo"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'),
+        ),
+        (
+            DeepSeekV32Parser,
+            ('<｜DSML｜function_calls><｜DSML｜invoke name="get_weather">'
+             '<｜DSML｜parameter name="location" string="true">Tokyo'
+             "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>"),
+        ),
+        (
+            DeepSeekV4Parser,
+            ('<｜DSML｜tool_calls><｜DSML｜invoke name="get_weather">'
+             '<｜DSML｜parameter name="location" string="true">Tokyo'
+             "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"),
+        ),
+    ],
+)
+def test_deepseek_streaming_emits_text_before_tool_call(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], tool_call_text: str) -> None:
+    """Text that precedes a tool call in the same delta is content."""
+    text = "Normal text" + tool_call_text
+
+    result = parser_cls().parse_streaming_increment(text, sample_tools)
+
+    assert result.normal_text == "Normal text"
+    assert result.normal_text == parser_cls().detect_and_parse(
+        text, sample_tools).normal_text
+    assert "get_weather" in [call.name for call in result.calls if call.name]
+
+
+@pytest.mark.parametrize(
+    "parser_cls, tool_call_text",
+    [
+        (
+            DeepSeekV3Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+             'get_weather\n```json\n{"location": "Tokyo"}\n```'
+             "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"),
+        ),
+        (
+            DeepSeekV31Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>"
+             '{"location": "Tokyo"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'),
+        ),
+        (
+            DeepSeekV32Parser,
+            ('<｜DSML｜function_calls><｜DSML｜invoke name="get_weather">'
+             '{"location": "Tokyo"}</｜DSML｜invoke></｜DSML｜function_calls>'),
+        ),
+        (
+            DeepSeekV4Parser,
+            ('<｜DSML｜tool_calls><｜DSML｜invoke name="get_weather">'
+             '{"location": "Tokyo"}</｜DSML｜invoke></｜DSML｜tool_calls>'),
+        ),
+    ],
+)
+def test_deepseek_streaming_prefix_is_delta_independent(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], tool_call_text: str) -> None:
+    """The prefix is streamed verbatim however the deltas are cut."""
+    prefix = "  Normal text  "
+    text = prefix + tool_call_text
+    splits = [
+        [text],
+        [prefix, tool_call_text],
+        [text[:8], text[8:]],
+    ]
+
+    for deltas in splits:
+        parser = parser_cls()
+        results = [
+            parser.parse_streaming_increment(delta, sample_tools)
+            for delta in deltas
+        ]
+        streamed = "".join(result.normal_text for result in results)
+        names = [
+            call.name for result in results for call in result.calls
+            if call.name
+        ]
+
+        assert streamed == prefix, f"{deltas!r} streamed {streamed!r}"
+        assert names == ["get_weather"], f"{deltas!r} called {names!r}"
+
+
 # ============================================================================
 # Glm4ToolParser Tests
 # ============================================================================
@@ -1855,26 +3380,19 @@ class TestGlm4ToolParser(BaseToolParserTestClass):
             self, sample_tools, parser):
         """Test streaming parser with complete tool call in chunks."""
 
-        # Send bot token with function name
+        # Nothing is reported until the call is complete
         result = parser.parse_streaming_increment("<tool_call>get_weather\n",
                                                   sample_tools)
+        assert result.calls == []
 
-        # Should send tool name
-        assert len(result.calls) == 1
-        assert result.calls[0].name == "get_weather"
-        assert result.calls[0].parameters == ""
-
-        # Send arguments
         result = parser.parse_streaming_increment(
             "<arg_key>location</arg_key>\n"
             "<arg_value>SF</arg_value>\n"
             "</tool_call>", sample_tools)
 
-        # Should stream arguments and complete the tool call
-        all_params = "".join(call.parameters for call in result.calls
-                             if call.parameters)
-        assert "location" in all_params
-        assert "SF" in all_params
+        # One item carries the name and the arguments
+        assert [(c.name, json.loads(c.parameters))
+                for c in result.calls] == [("get_weather", dict(location="SF"))]
 
     def test_parse_streaming_increment_multiple_tools_streaming(
             self, sample_tools, parser):
@@ -1889,40 +3407,27 @@ class TestGlm4ToolParser(BaseToolParserTestClass):
             "</tool_call>", sample_tools)
 
         # Second tool
-        result = parser.parse_streaming_increment("<tool_call>search_web\n",
-                                                  sample_tools)
+        result = parser.parse_streaming_increment(
+            "<tool_call>search_web\n</tool_call>", sample_tools)
 
-        # Should have started second tool
-        assert len(result.calls) == 1
-        assert result.calls[0].name == "search_web"
-        assert result.calls[0].parameters == ""
-        assert result.calls[0].tool_index == 1
+        assert [(c.tool_index, c.name)
+                for c in result.calls] == [(1, "search_web")]
 
     def test_parse_streaming_multiple_params(self, sample_tools, parser):
-        """Test streaming parser handles multiple parameters."""
-
-        # Send function name
+        """The arguments arrive together once the call closes."""
         parser.parse_streaming_increment("<tool_call>get_weather\n",
                                          sample_tools)
-
-        # Send first parameter
         result1 = parser.parse_streaming_increment(
             "<arg_key>location</arg_key>\n"
             "<arg_value>NYC</arg_value>\n", sample_tools)
+        assert result1.calls == []
 
-        params1 = "".join(call.parameters for call in result1.calls
-                          if call.parameters)
-        assert "location" in params1
-
-        # Send second parameter and close
         result2 = parser.parse_streaming_increment(
             "<arg_key>unit</arg_key>\n"
             "<arg_value>celsius</arg_value>\n"
             "</tool_call>", sample_tools)
-
-        params2 = "".join(call.parameters for call in result2.calls
-                          if call.parameters)
-        assert "unit" in params2
+        assert [json.loads(c.parameters) for c in result2.calls
+                ] == [dict(location="NYC", unit="celsius")]
 
     def test_detect_and_parse_multiple_params(self, sample_tools):
         """Test one-shot parsing with multiple parameters."""
@@ -1997,16 +3502,14 @@ class TestGlm4ToolParser(BaseToolParserTestClass):
     def test_streaming_no_args(self, sample_tools, parser):
         """Test streaming a tool call with no arguments."""
 
-        # First increment sends the tool name
         result1 = parser.parse_streaming_increment("<tool_call>get_weather\n",
                                                    sample_tools)
-        names = [c.name for c in result1.calls if c.name]
-        assert "get_weather" in names
+        assert result1.calls == []
 
-        # Second increment closes the tool call with empty args
+        # Closing the call reports it with empty arguments
         result2 = parser.parse_streaming_increment("</tool_call>", sample_tools)
-        params = "".join(c.parameters for c in result2.calls)
-        assert "{}" in params
+        assert [(c.name, c.parameters)
+                for c in result2.calls] == [("get_weather", "{}")]
 
     def test_supports_structural_tag(self, parser):
         """Test that supports_structural_tag returns False."""
@@ -2139,26 +3642,19 @@ class TestGlm47ToolParser(BaseToolParserTestClass):
     def test_parse_streaming_increment_complete_tool_call(
             self, sample_tools, parser):
         """Test streaming parser with complete tool call in chunks."""
-        # Send bot token with function name and first arg_key
+        # Nothing is reported until the call is complete
         result = parser.parse_streaming_increment(
             "<tool_call>get_weather<arg_key>", sample_tools)
+        assert result.calls == []
 
-        # Should send tool name (has_arg_key is True)
-        assert len(result.calls) == 1
-        assert result.calls[0].name == "get_weather"
-        assert result.calls[0].parameters == ""
-
-        # Send arguments
         result = parser.parse_streaming_increment(
             "location</arg_key>"
             "<arg_value>SF</arg_value>"
             "</tool_call>", sample_tools)
 
-        # Should stream arguments and complete the tool call
-        all_params = "".join(call.parameters for call in result.calls
-                             if call.parameters)
-        assert "location" in all_params
-        assert "SF" in all_params
+        # One item carries the name and the arguments
+        assert [(c.name, json.loads(c.parameters))
+                for c in result.calls] == [("get_weather", dict(location="SF"))]
 
     def test_parse_streaming_increment_multiple_tools_streaming(
             self, sample_tools, parser):
@@ -2170,13 +3666,10 @@ class TestGlm47ToolParser(BaseToolParserTestClass):
 
         # Second tool
         result = parser.parse_streaming_increment(
-            "<tool_call>search_web<arg_key>", sample_tools)
+            "<tool_call>search_web</tool_call>", sample_tools)
 
-        # Should have started second tool
-        assert len(result.calls) == 1
-        assert result.calls[0].name == "search_web"
-        assert result.calls[0].parameters == ""
-        assert result.calls[0].tool_index == 1
+        assert [(c.tool_index, c.name)
+                for c in result.calls] == [(1, "search_web")]
 
     def test_streaming_zero_arg_tool(self, parser):
         """Test streaming a zero-argument tool call."""
@@ -2900,6 +4393,39 @@ class TestPoolsideV1ToolParserFactory:
             json.dumps({"model_type": "laguna"}))
 
         assert resolve_auto_tool_parser(str(model_dir)) == "poolside_v1"
+
+
+# ============================================================================
+# Nemotron 3.5 Super VL Parser Tests
+# ============================================================================
+
+
+class TestNemotron35SuperVLToolParserFactory:
+    """Nemotron 3.5 Super VL reuses `qwen3_coder`.
+
+    Its chat template instructs the model to emit that XML shape rather than
+    JSON, so it ships no parser of its own. The parser itself is covered by
+    `TestQwen3CoderToolParser`; only the mapping is new here.
+    """
+
+    def test_auto_detect_nemotron_h_omni(self, tmp_path):
+        """`model_type` diverges from the architecture string.
+
+        The checkpoint's architecture is `NemotronH_Omni_Reasoning_V3` but its
+        `model_type` is `nemotron_h_omni`, and the lookup is exact-match, so
+        without the mapping row `--tool_parser auto` resolved to None.
+        """
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            resolve_auto_tool_parser
+        model_dir = tmp_path / "NVIDIA-Nemotron-3.5-Super-120B-A12B"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({
+                "model_type": "nemotron_h_omni",
+                "architectures": ["NemotronH_Omni_Reasoning_V3"],
+            }))
+
+        assert resolve_auto_tool_parser(str(model_dir)) == "qwen3_coder"
 
 
 # ============================================================================
@@ -4068,6 +5594,304 @@ class TestBuildToolStrictGuidedDecoding:
         assert "calculate" in fmt["tags"][0]["begin"]
 
 
+# ============================================================================
+# Named tool_choice (forced function call) Tests — TRTLLM-12758
+# ============================================================================
+
+
+def _make_tools(*specs):
+    """Helper: build a list of ChatCompletionToolsParam from (name, params) specs."""
+    return [
+        ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(name=name, parameters=params),
+        ) for name, params in specs
+    ]
+
+
+_SCHEMA_LOCATION = {
+    "type": "object",
+    "properties": {
+        "location": {
+            "type": "string"
+        },
+    },
+    "required": ["location"],
+}
+
+_SCHEMA_QUERY = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string"
+        },
+    },
+    "required": ["query"],
+}
+
+
+class TestBuildForcedToolCallDecoding:
+    """Test ``_build_forced_tool_call_decoding`` from openai_server.
+
+    Covers OpenAI-spec ``tool_choice = {"type": "function",
+    "function": {"name": "X"}}`` for non-harmony tool parsers (TRTLLM-12758).
+    The helper returns ``(begin_prefix, GuidedDecodingParams)``: the caller
+    prefix-injects ``begin_prefix`` into the rendered chat prompt and applies
+    the guided-decoding params to the request, so the model is forced to
+    start generation inside the tool call and the resulting arguments are
+    JSON-schema valid.
+    """
+
+    @pytest.mark.parametrize(
+        "parser_name",
+        ["qwen3", "deepseek_v3", "kimi_k2", "gemma4"],
+    )
+    def test_forced_name_returns_prefix_and_json_schema(self, parser_name):
+        """Forced-name path returns a parser-specific prefix and JSON schema.
+
+        Across parser families, ``begin_prefix`` must contain the forced
+        function name and the guided-decoding params must constrain the args
+        to the function's ``parameters`` JSON Schema.
+        """
+        from tensorrt_llm.sampling_params import GuidedDecodingParams
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION),
+                            ("search_web", _SCHEMA_QUERY))
+        begin_prefix, guided = _build_forced_tool_call_decoding(
+            tools, parser_name, "get_weather")
+
+        # ``begin_prefix`` is exactly the parser's tool-call begin string.
+        parser = ToolParserFactory.parsers[parser_name.lower()]()
+        expected_begin = parser.structure_info()("get_weather").begin
+        assert begin_prefix == expected_begin
+        assert "get_weather" in begin_prefix
+
+        assert isinstance(guided, GuidedDecodingParams)
+        assert guided.json == _SCHEMA_LOCATION
+        assert guided.json_object is False
+        assert guided.structural_tag is None
+
+    def test_forced_name_no_parameters_uses_json_object(self):
+        """Forced-name path falls back to ``json_object`` when no schema.
+
+        When the forced function has no ``parameters``, the helper falls back
+        to ``json_object=True`` so the synthesized ``arguments`` field is still
+        well-formed JSON (typically ``{}``).
+        """
+        from tensorrt_llm.sampling_params import GuidedDecodingParams
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(name="ping"),
+            ),
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(name="other",
+                                            parameters=_SCHEMA_QUERY),
+            ),
+        ]
+        begin_prefix, guided = _build_forced_tool_call_decoding(
+            tools, "qwen3", "ping")
+        assert "ping" in begin_prefix
+        assert isinstance(guided, GuidedDecodingParams)
+        assert guided.json is None
+        assert guided.json_object is True
+
+    def test_forced_name_ignores_strict_flag(self):
+        """The forced-call path engages regardless of any ``strict=True``."""
+        from tensorrt_llm.serve.openai_server import (
+            _build_forced_tool_call_decoding,
+            _build_tool_strict_guided_decoding_params)
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        # Strict-tools path is unchanged: no strict → None.
+        assert _build_tool_strict_guided_decoding_params(tools, "qwen3") is None
+        # Forced-call path: always constrains.
+        begin_prefix, guided = _build_forced_tool_call_decoding(
+            tools, "qwen3", "get_weather")
+        assert begin_prefix
+        assert guided is not None
+
+    def test_forced_name_missing_raises_value_error(self):
+        """Forcing a function that is not in tools must raise ValueError."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        with pytest.raises(ValueError) as exc:
+            _build_forced_tool_call_decoding(tools, "qwen3", "missing_fn")
+        msg = str(exc.value)
+        assert "missing_fn" in msg
+        assert "get_weather" in msg  # available functions reported
+
+    def test_forced_name_no_tools_raises_value_error(self):
+        """Forcing a function without any tools provided is a 4xx-class error."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        with pytest.raises(ValueError):
+            _build_forced_tool_call_decoding([], "qwen3", "get_weather")
+        with pytest.raises(ValueError):
+            _build_forced_tool_call_decoding(None, "qwen3", "get_weather")
+
+    def test_forced_name_no_parser_raises_value_error(self):
+        """Forcing a function on a server without a tool_parser is a 4xx."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        with pytest.raises(ValueError):
+            _build_forced_tool_call_decoding(tools, None, "get_weather")
+        with pytest.raises(ValueError):
+            _build_forced_tool_call_decoding(tools, "", "get_weather")
+
+    def test_forced_name_unsupported_parser_raises_value_error(self):
+        """Parsers that do not support structural tags cannot honor forced names."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        # glm4, glm47, qwen3_coder, minimax_m2 do not support structural tags.
+        for parser_name in ("glm4", "glm47", "qwen3_coder", "minimax_m2"):
+            with pytest.raises(ValueError) as exc:
+                _build_forced_tool_call_decoding(tools, parser_name,
+                                                 "get_weather")
+            assert "structural" in str(exc.value).lower()
+
+    def test_forced_name_unknown_parser_raises_value_error(self):
+        """An unregistered parser name should also raise."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        with pytest.raises(ValueError):
+            _build_forced_tool_call_decoding(tools, "no_such_parser",
+                                             "get_weather")
+
+    def test_strict_path_unchanged_by_default(self):
+        """Strict-tools path stays untouched without ``strict=True``.
+
+        Regression guard: ``_build_tool_strict_guided_decoding_params`` must
+        still return ``None`` when no tool has ``strict=True``, independent of
+        the new forced-call helper.
+        """
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        assert _build_tool_strict_guided_decoding_params(tools, "qwen3") is None
+
+
+class TestForcedToolCallStreamingFinishReason:
+    """A forced call that streams nothing must not claim ``tool_calls``.
+
+    The streaming forced-call branch sets ``has_tool_call`` so the final chunk
+    reports ``finish_reason="tool_calls"``. It used to do so on every
+    iteration, including ones with empty ``delta_text``. When generation ends
+    before any non-empty text -- ``max_completion_tokens`` reached before the
+    first detokenized chunk, or an abort -- no ``DeltaToolCall`` is ever
+    emitted, so the client saw a ``tool_calls`` finish reason with no tool
+    call attached.
+    """
+
+    @staticmethod
+    def _args(**overrides):
+        from tensorrt_llm.serve.openai_protocol import (
+            ChatCompletionNamedFunction, ChatCompletionNamedToolChoiceParam)
+        from tensorrt_llm.serve.postprocess_handlers import ChatPostprocArgs
+
+        args = ChatPostprocArgs(role="assistant", model="test-model")
+        args.tool_parser = "qwen3"
+        # The forced call is derived from the request, not from a dedicated
+        # field: both ``tool_choice`` and ``tools`` must be set or
+        # ``_forced_tool_choice`` / ``_forced_choice_uses_tool_parser`` will
+        # not see a forced call and these assertions become vacuous.
+        args.tool_choice = ChatCompletionNamedToolChoiceParam(
+            function=ChatCompletionNamedFunction(name="get_weather"))
+        args.tools = [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(
+                                         name="get_weather",
+                                         parameters=_SCHEMA_LOCATION))
+        ]
+        args.num_prompt_tokens = 3
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    @staticmethod
+    def _rsp(text, finish_reason):
+        output = Mock()
+        output.index = 0
+        output.text_diff = text
+        output.text = text
+        output.token_ids_diff = [1] if text else []
+        output.token_ids = [1] if text else []
+        output.finish_reason = finish_reason
+        output.stop_reason = None
+        output.logprobs_diff = None
+        output.disaggregated_params = None
+
+        rsp = Mock()
+        rsp.outputs = [output]
+        rsp._done = finish_reason is not None
+        rsp.cached_tokens = 0
+        rsp.prompt_token_ids = [1, 2, 3]
+        # Read via getattr() and fed straight into a pydantic model, so it must
+        # be a real value: a bare Mock fails float validation.
+        rsp.avg_decoded_tokens_per_iter = None
+        return rsp
+
+    def _finish_reasons(self, chunks):
+        reasons = []
+        for chunk in chunks:
+            for line in chunk.splitlines():
+                if not line.startswith("data: ") or line.endswith("[DONE]"):
+                    continue
+                payload = json.loads(line[len("data: "):].strip())
+                for choice in payload.get("choices", []):
+                    if choice.get("finish_reason"):
+                        reasons.append(choice["finish_reason"])
+        return reasons
+
+    def test_forced_call_with_no_text_does_not_report_tool_calls(self):
+        """Generation ending before any text must not claim a tool call."""
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_stream_post_processor
+
+        args = self._args()
+        # A single terminal iteration that never produced detokenized text.
+        chunks = chat_stream_post_processor(self._rsp("", "length"), args)
+
+        assert not args.has_tool_call.get(0, False), (
+            "has_tool_call was set without any DeltaToolCall being emitted")
+        reasons = self._finish_reasons(chunks)
+        assert "tool_calls" not in reasons, (
+            f"reported a tool-call finish reason with no tool call: {reasons}")
+        assert reasons == ["length"]
+
+    def test_forced_call_with_text_still_reports_tool_calls(self):
+        """Baseline: once a delta is emitted the finish reason still flips."""
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_stream_post_processor
+
+        args = self._args()
+        chat_stream_post_processor(self._rsp('{"city":', None), args)
+        assert args.forced_tool_name_sent.get(0, False)
+        assert args.has_tool_call.get(0, False)
+
+        args.first_iteration = False
+        chunks = chat_stream_post_processor(self._rsp(' "Rome"}', "stop"), args)
+        assert self._finish_reasons(chunks) == ["tool_calls"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
@@ -4311,6 +6135,494 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         assert stage2.calls[0].name == "get_weather"
         assert json.loads(stage2.calls[0].parameters) == {"location": "NYC"}
 
+    def test_extracts_forced_tool_calls(self):
+        """K3 opts in to serve-level extraction on forced tool_choice.
+
+        XTML has no structural-tag grammar, so a forced call still arrives
+        as preamble + markup and must not be passed through raw.
+        """
+        assert KimiK3ToolParser.extracts_forced_tool_calls is True
+
+    def test_streaming_early_end_flush(self, sample_tools, parser):
+        """Emit a buffered complete call when the stream ends before EOT.
+
+        Without the finalization hook the buffered section was silently
+        dropped.
+        """
+        result = parser.parse_streaming_increment(
+            "Sure. " + self.BOT + self._call(
+                "get_weather", 1, self._argument("location", "string", "NYC")),
+            sample_tools)
+        assert result.normal_text == "Sure. "
+        assert result.calls == []
+
+        result = parser.finish(sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "NYC"}
+        assert parser._buffer == ""
+
+    def test_streaming_early_end_flush_salvages_complete_calls(
+            self, sample_tools, parser):
+        """A stream truncated mid-call still emits the calls that completed."""
+        parser.parse_streaming_increment(
+            self.BOT + self._call("get_weather", 1,
+                                  self._argument("location", "string", "LA")) +
+            '<|open|>call tool="search_web" index="2"<|sep|>'
+            '<|open|>argument key="query" type="str', sample_tools)
+
+        result = parser.finish(sample_tools)
+
+        assert [call.name for call in result.calls] == ["get_weather"]
+        assert json.loads(result.calls[0].parameters) == {"location": "LA"}
+
+    def test_finish_after_complete_section_is_empty(self, sample_tools, parser):
+        """A cleanly closed section leaves nothing for the flush to emit."""
+        result = parser.parse_streaming_increment(
+            self._section(
+                self._call("get_weather", 1,
+                           self._argument("location", "string", "NYC"))),
+            sample_tools)
+        assert len(result.calls) == 1
+
+        result = parser.finish(sample_tools)
+
+        assert result.normal_text == ""
+        assert result.calls == []
+
+    @pytest.mark.parametrize("residue", [
+        "<|close|>message<|sep|>", "<|end_of_msg|>",
+        "<|close|>message<|sep|><|end_of_msg|>"
+    ])
+    def test_streaming_post_section_residue_never_leaks(self, sample_tools,
+                                                        parser, residue):
+        """Structural framing after the section is stripped, not streamed.
+
+        ``parse_streaming_increment`` leaves post-section residue in the
+        buffer; if it arrives in a later increment the no-``bot_token`` path
+        must not emit it as content. Streaming must match non-streaming, which
+        strips the same residue via ``_trailing_structural``. Regression:
+        without the ``_section_done`` guard the residue leaked as ``content``.
+        """
+        preamble = "Sure. "
+        section = self._section(
+            self._call("get_weather", 1,
+                       self._argument("location", "string", "NYC")))
+        # Section completes in the first increment; residue trickles in one
+        # character at a time in later increments (worst case for partial
+        # structural tokens).
+        chunks = [preamble + section] + list(residue)
+
+        normal_text = ""
+        calls = []
+        for chunk in chunks:
+            result = parser.parse_streaming_increment(chunk, sample_tools)
+            normal_text += result.normal_text
+            calls.extend(result.calls)
+        result = parser.finish(sample_tools)
+        normal_text += result.normal_text
+        calls.extend(result.calls)
+
+        assert normal_text == preamble
+        assert [call.name for call in calls] == ["get_weather"]
+        # Streaming agrees with the non-streaming path on the same full text.
+        non_streaming = self.make_parser().detect_and_parse(
+            preamble + section + residue, sample_tools)
+        assert non_streaming.normal_text == preamble
+
+    def test_finish_flushes_held_partial_bot_token_as_text(
+            self, sample_tools, parser):
+        """A held-back bot_token prefix is plain text once the stream ends."""
+        result = parser.parse_streaming_increment("A <|open|>too", sample_tools)
+        assert result.normal_text == "A "
+
+        result = parser.finish(sample_tools)
+
+        assert result.normal_text == "<|open|>too"
+        assert result.calls == []
+
+    def test_streaming_multiple_calls_split_across_chunks(
+            self, sample_tools, parser):
+        """Both calls of a two-call section arrive once EOT lands."""
+        first = self._call("get_weather", 1,
+                           self._argument("location", "string", "LA"))
+        second = self._call("search_web", 2,
+                            self._argument("query", "string", "AI"))
+        section = self.BOT + first + second + self.EOT
+        # Split inside the second call header and inside the EOT token.
+        chunks = [
+            section[:len(self.BOT) + len(first) + 14],
+            section[len(self.BOT) + len(first) + 14:-7],
+            section[-7:],
+        ]
+
+        collected = []
+        for chunk in chunks:
+            collected.extend(
+                parser.parse_streaming_increment(chunk, sample_tools).calls)
+
+        assert [call.name
+                for call in collected] == ["get_weather", "search_web"]
+        assert json.loads(collected[0].parameters) == {"location": "LA"}
+        assert json.loads(collected[1].parameters) == {"query": "AI"}
+
+    def test_literal_lt_in_attribute_value(self, sample_tools, parser):
+        """Attribute values may contain a literal ``<``.
+
+        The K3 encoder escapes only ``&`` and ``"``, so ``<`` reaches the
+        parser raw; the old header pattern (``[^<]*?``) silently dropped the
+        whole call.
+        """
+        text = self._section(
+            self._call("a<b", 1, self._argument("expr", "string", "x")) +
+            self._call("get_weather", 2, self._argument("k<ey", "string", "v")))
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert [call.name for call in result.calls] == ["a<b", "get_weather"]
+        assert json.loads(result.calls[1].parameters) == {"k<ey": "v"}
+
+
+class TestForcedToolChoicePostprocessing:
+    """Serve-level tests for named/forced ``tool_choice`` and stream flush.
+
+    Drives the real ``chat_response_post_processor`` /
+    ``chat_stream_post_processor`` with fake generation results, since the
+    named-choice extraction and the end-of-stream flush live in the serving
+    layer, above the parsers the rest of this file tests.
+    """
+
+    BOT = TestKimiK3ToolParser.BOT
+    EOT = TestKimiK3ToolParser.EOT
+
+    WEATHER_CALL_SECTION = (
+        BOT + '<|open|>call tool="get_weather" index="1"<|sep|>'
+        '<|open|>argument key="location" type="string"<|sep|>NYC'
+        '<|close|>argument<|sep|>'
+        '<|close|>call<|sep|>' + EOT)
+
+    @staticmethod
+    def _make_args(sample_tools,
+                   tool_parser=None,
+                   forced_tool_name=None,
+                   stream=False):
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+        from tensorrt_llm.serve.postprocess_handlers import ChatPostprocArgs
+
+        request_kwargs = dict(
+            model="test-model",
+            messages=[{
+                "role": "user",
+                "content": "What is the weather in NYC?"
+            }],
+            tools=sample_tools,
+            stream=stream,
+        )
+        if forced_tool_name is not None:
+            request_kwargs["tool_choice"] = {
+                "type": "function",
+                "function": {
+                    "name": forced_tool_name
+                },
+            }
+        req = ChatCompletionRequest(**request_kwargs)
+        args = ChatPostprocArgs.from_request(req)
+        args.tool_parser = tool_parser
+        args.num_prompt_tokens = 5
+        return args
+
+    @staticmethod
+    def _fake_response(text, finish_reason="stop"):
+        from types import SimpleNamespace
+        output = SimpleNamespace(index=0,
+                                 text=text,
+                                 token_ids=[1, 2, 3],
+                                 finish_reason=finish_reason,
+                                 stop_reason=None,
+                                 disaggregated_params=None)
+        return SimpleNamespace(outputs=[output], cached_tokens=0)
+
+    @staticmethod
+    def _stream_deltas(args, chunks, finish_reason="stop"):
+        """Feed text chunks through the streaming postprocessor.
+
+        Returns the decoded SSE payloads (one dict per emitted chunk).
+        """
+        from types import SimpleNamespace
+
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_stream_post_processor
+
+        payloads = []
+        for chunk_index, chunk in enumerate(chunks):
+            last = chunk_index == len(chunks) - 1
+            output = SimpleNamespace(
+                index=0,
+                text_diff=chunk,
+                token_ids_diff=[chunk_index],
+                logprobs_diff=[],
+                finish_reason=finish_reason if last else None,
+                stop_reason=None,
+                length=chunk_index + 1,
+                disaggregated_params=None,
+            )
+            rsp = SimpleNamespace(outputs=[output],
+                                  cached_tokens=0,
+                                  id="test-request",
+                                  _done=last)
+            for line in chat_stream_post_processor(rsp, args):
+                payloads.append(json.loads(line[len("data: "):]))
+        return payloads
+
+    def test_forced_choice_k3_extracts_arguments(self, sample_tools):
+        """The headline TRTLLM-15176 bug.
+
+        A forced tool_choice must return the extracted JSON, not the raw
+        preamble + XTML markup.
+        """
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="kimi_k3",
+                               forced_tool_name="get_weather")
+        rsp = self._fake_response("Let me check. " + self.WEATHER_CALL_SECTION)
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        assert choice.finish_reason == "tool_calls"
+        assert len(choice.message.tool_calls) == 1
+        function = choice.message.tool_calls[0].function
+        assert function.name == "get_weather"
+        assert json.loads(function.arguments) == {"location": "NYC"}
+        assert choice.message.content == "Let me check. "
+
+    def test_forced_choice_k3_name_mismatch_uses_request_name(
+            self, sample_tools):
+        """The caller chose the tool; a disagreeing model only earns a log."""
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="kimi_k3",
+                               forced_tool_name="search_web")
+        rsp = self._fake_response(self.WEATHER_CALL_SECTION)
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        function = choice.message.tool_calls[0].function
+        assert function.name == "search_web"
+        assert json.loads(function.arguments) == {"location": "NYC"}
+
+    def test_forced_choice_k3_no_markup_returns_content(self, sample_tools):
+        """Return content when a K3 forced call produced no markup.
+
+        Nothing constrains K3 forced calls; if the model emits no markup,
+        return the text as content rather than garbage arguments.
+        """
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="kimi_k3",
+                               forced_tool_name="get_weather")
+        rsp = self._fake_response("I cannot help with that.")
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        assert choice.finish_reason == "stop"
+        assert not choice.message.tool_calls
+        assert choice.message.content == "I cannot help with that."
+
+    def test_forced_choice_raw_passthrough_keeps_text_as_arguments(
+            self, sample_tools):
+        """Ungated parsers report the constrained arguments value.
+
+        Parsers without ``extracts_forced_tool_calls`` rely on JSON-schema
+        guided decoding, so the generated text is the arguments value and is
+        reported as-is, with finish_reason="tool_calls".
+        """
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="qwen3",
+                               forced_tool_name="get_weather")
+        rsp = self._fake_response('{"location": "NYC"}')
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        assert choice.finish_reason == "tool_calls"
+        function = choice.message.tool_calls[0].function
+        assert function.name == "get_weather"
+        assert function.arguments == '{"location": "NYC"}'
+
+    def test_forced_choice_truncates_overrun_arguments(self, sample_tools):
+        """A model that overruns the arguments must not leak the tail.
+
+        Generation starts inside the tool call, so an unconstrained model
+        closes the enclosing object, emits the parser's end tag and keeps
+        talking. Only the arguments value may be reported, otherwise the
+        caller cannot json.loads() it.
+        """
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="qwen3",
+                               forced_tool_name="get_weather")
+        rsp = self._fake_response(
+            ' {"location":"NYC"}}\n</tool_call>\n\nOkay, the user just said '
+            '"Just say hi."\n</think>\n\nHello! How can I assist you today?')
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        function = choice.message.tool_calls[0].function
+        assert function.name == "get_weather"
+        assert json.loads(function.arguments) == {"location": "NYC"}
+        assert choice.finish_reason == "tool_calls"
+
+    def test_forced_choice_incomplete_arguments_returns_content(
+            self, sample_tools):
+        """A truncated arguments value must not be reported as a tool call.
+
+        Guided decoding constrains the shape but not the length: hitting the
+        token budget leaves a partial JSON value. Reporting it as `arguments`
+        would hand the caller something json.loads() rejects, and claiming
+        finish_reason="tool_calls" would assert a call that never completed.
+        """
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="qwen3",
+                               forced_tool_name="get_weather")
+        rsp = self._fake_response('{"location": "San Fra')
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        assert not choice.message.tool_calls
+        assert choice.message.content == '{"location": "San Fra'
+        assert choice.finish_reason != "tool_calls"
+
+    def test_forced_choice_empty_generation_returns_no_tool_call(
+            self, sample_tools):
+        """An empty generation must not become a tool call with empty args."""
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="qwen3",
+                               forced_tool_name="get_weather")
+        rsp = self._fake_response("")
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        assert not choice.message.tool_calls
+        assert choice.finish_reason != "tool_calls"
+
+    def test_forced_choice_streaming_stops_at_end_of_arguments(
+            self, sample_tools):
+        """The stream stops emitting once the arguments value completes."""
+        args = self._make_args(sample_tools,
+                               tool_parser="qwen3",
+                               forced_tool_name="get_weather",
+                               stream=True)
+        payloads = self._stream_deltas(
+            args,
+            ['{"location"', ':"NYC"}', '}\n</tool_call>\n', 'Hello there!'])
+
+        deltas = [p["choices"][0]["delta"] for p in payloads if p["choices"]]
+        tool_deltas = [d for d in deltas if d.get("tool_calls")]
+        arguments = "".join(
+            d["tool_calls"][0]["function"].get("arguments") or ""
+            for d in tool_deltas)
+        assert json.loads(arguments) == {"location": "NYC"}
+        # Name and id are sent exactly once, on the opening delta.
+        named = [
+            d for d in tool_deltas if d["tool_calls"][0]["function"].get("name")
+        ]
+        assert len(named) == 1
+        assert named[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert len([d for d in tool_deltas
+                    if d["tool_calls"][0].get("id")]) == 1
+        # A forced call produces no assistant text. Content here means the raw
+        # generation -- including the overrun tail -- leaked into the message.
+        assert not any(d.get("content") for d in deltas), (
+            "forced call leaked content: "
+            f"{[d.get('content') for d in deltas if d.get('content')]}")
+
+    def test_forced_choice_k3_streaming_extracts(self, sample_tools):
+        """Extract the forced call from a streamed K3 response.
+
+        The preamble streams as content deltas and the extracted call as a
+        tool_calls delta with the forced name.
+        """
+        args = self._make_args(sample_tools,
+                               tool_parser="kimi_k3",
+                               forced_tool_name="get_weather",
+                               stream=True)
+        section = self.WEATHER_CALL_SECTION
+        payloads = self._stream_deltas(
+            args, ["Let me check. ", section[:40], section[40:]])
+
+        deltas = [p["choices"][0]["delta"] for p in payloads if p["choices"]]
+        content = "".join(d.get("content") or "" for d in deltas)
+        assert content == "Let me check. "
+        tool_deltas = [d for d in deltas if d.get("tool_calls")]
+        assert len(tool_deltas) == 1
+        function = tool_deltas[0]["tool_calls"][0]["function"]
+        assert function["name"] == "get_weather"
+        assert json.loads(function["arguments"]) == {"location": "NYC"}
+        finish_reasons = [
+            p["choices"][0].get("finish_reason") for p in payloads
+            if p["choices"]
+        ]
+        assert finish_reasons[-1] == "tool_calls"
+
+    def test_streaming_early_end_flushes_buffered_call(self, sample_tools):
+        """Flush the buffered call when an auto-choice stream ends early.
+
+        A stream that ends before EOT still emits the buffered call via the
+        finalization hook instead of dropping it.
+        """
+        args = self._make_args(sample_tools, tool_parser="kimi_k3", stream=True)
+        truncated = self.WEATHER_CALL_SECTION[:-len(self.EOT)]
+        payloads = self._stream_deltas(
+            args, ["Sure. ", truncated[:30], truncated[30:]])
+
+        deltas = [p["choices"][0]["delta"] for p in payloads if p["choices"]]
+        tool_deltas = [d for d in deltas if d.get("tool_calls")]
+        assert len(tool_deltas) == 1
+        function = tool_deltas[0]["tool_calls"][0]["function"]
+        assert function["name"] == "get_weather"
+        assert json.loads(function["arguments"]) == {"location": "NYC"}
+        finish_reasons = [
+            p["choices"][0].get("finish_reason") for p in payloads
+            if p["choices"]
+        ]
+        assert finish_reasons[-1] == "tool_calls"
+
+    def test_forced_choice_k3_streaming_no_markup_is_content(
+            self, sample_tools):
+        """Streaming honest fallback: no markup means content, not a call."""
+        args = self._make_args(sample_tools,
+                               tool_parser="kimi_k3",
+                               forced_tool_name="get_weather",
+                               stream=True)
+        payloads = self._stream_deltas(args, ["I cannot ", "help with that."])
+
+        deltas = [p["choices"][0]["delta"] for p in payloads if p["choices"]]
+        assert not any(d.get("tool_calls") for d in deltas)
+        content = "".join(d.get("content") or "" for d in deltas)
+        assert content == "I cannot help with that."
+        finish_reasons = [
+            p["choices"][0].get("finish_reason") for p in payloads
+            if p["choices"]
+        ]
+        assert finish_reasons[-1] == "stop"
+
 
 class TestConfigureParserSpecialTokenDecoding:
     """Test parser-specific detokenization settings in the OpenAI server."""
@@ -4355,3 +6667,899 @@ class TestConfigureParserSpecialTokenDecoding:
 
         assert sampling_params.skip_special_tokens is False
         assert sampling_params.spaces_between_special_tokens is True
+
+
+# ============================================================================
+# Forced tool call: argument truncation — TRTLLM-12758
+# ============================================================================
+
+
+class TestParserExtractsForcedToolCalls:
+    """Routing between the two forced-call strategies.
+
+    Parsers that extract forced calls from their own markup must NOT be sent
+    down the grammar path: none of them supports structural tags, so the
+    server would reject every forced request against them and the extraction
+    path in the post-processor would be unreachable.
+    """
+
+    def test_kimi_k3_is_routed_to_extraction(self) -> None:
+        from tensorrt_llm.serve.openai_server import \
+            _parser_extracts_forced_tool_calls
+
+        assert _parser_extracts_forced_tool_calls("kimi_k3") is True
+        # Guard the premise: K3 has no structural-tag support, so without the
+        # routing above it would be rejected outright.
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        assert ToolParserFactory.parsers["kimi_k3"]().supports_structural_tag(
+        ) is False
+
+    def test_json_parsers_use_the_grammar_path(self) -> None:
+        from tensorrt_llm.serve.openai_server import \
+            _parser_extracts_forced_tool_calls
+
+        assert _parser_extracts_forced_tool_calls("qwen3") is False
+        assert _parser_extracts_forced_tool_calls(None) is False
+        assert _parser_extracts_forced_tool_calls("not_a_parser") is False
+
+
+class TestForcedToolArgumentsEnd:
+    """Test ``forced_tool_arguments_end`` from postprocess_handlers.
+
+    The forced-call path prefix-injects ``{"name": X, "arguments":`` into the
+    prompt, so generation begins inside a tool-call object. Whatever the model
+    produces after the arguments value -- the enclosing ``}``, the parser's end
+    tag, reasoning, ordinary prose -- must not be reported as ``arguments``.
+    """
+
+    def test_returns_none_for_incomplete_json(self) -> None:
+        assert forced_tool_arguments_end('{"location": "San Fra') is None
+
+    def test_returns_none_for_empty_or_blank(self) -> None:
+        assert forced_tool_arguments_end("") is None
+        assert forced_tool_arguments_end("   ") is None
+
+    def test_exact_json_consumes_everything(self) -> None:
+        text = '{"location": "Paris"}'
+        assert forced_tool_arguments_end(text) == len(text)
+
+    def test_skips_leading_whitespace(self) -> None:
+        text = '  {"location": "Paris"}'
+        assert forced_tool_arguments_end(text) == len(text)
+
+    def test_truncates_model_overrun(self) -> None:
+        """Regression for the observed CI failure.
+
+        The model closed the enclosing tool-call object, emitted the end tag,
+        then carried on with reasoning and a chat reply. Only the leading
+        arguments object may survive.
+        """
+        overrun = (' {"location":"Hello", "unit":"fahrenheit"}}\n</tool_call>\n'
+                   '\nOkay, the user just said "Just say hi."\n</think>\n\n'
+                   'Hello! How can I assist you today?')
+        end = forced_tool_arguments_end(overrun)
+        assert end is not None
+        arguments = overrun[:end]
+        # Must be parseable on its own -- this is exactly what the failing
+        # test did with ``json.loads(forced_call.function.arguments)``.
+        assert json.loads(arguments) == {
+            "location": "Hello",
+            "unit": "fahrenheit",
+        }
+
+    def test_streaming_incremental_cutoff(self) -> None:
+        """Feeding the overrun in chunks yields the same arguments and stops."""
+        chunks = [
+            ' {"location":', '"Hello", "unit"', ':"fahrenheit"}', '}\n</tool_',
+            'call>\n\nHello!'
+        ]
+        buffered, sent_len, done, streamed = "", 0, False, ""
+        for chunk in chunks:
+            if done:
+                continue
+            buffered += chunk
+            end = forced_tool_arguments_end(buffered)
+            limit = len(buffered) if end is None else end
+            if end is not None:
+                done = True
+            streamed += buffered[sent_len:limit]
+            sent_len = max(sent_len, limit)
+        assert done, "stream never detected the end of the arguments"
+        assert json.loads(streamed) == {
+            "location": "Hello",
+            "unit": "fahrenheit",
+        }
+
+
+class TestUnparsedToolCallWarning:
+    """A detected-but-unparsed tool call must leave a diagnostic in the logs.
+
+    When ``has_tool_call`` is true but the parser extracts zero calls, the
+    request still returns 200 and the response carries no tool call, which a
+    client cannot tell apart from the model choosing not to call a tool
+    (GitHub issue #17917). The serving layer therefore logs one warning per
+    parser name on the non-streaming path.
+    """
+
+    class _MarkupOnlyParser(BaseToolParser):
+        """Recognises its marker but never extracts a call."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.bot_token = "<tool_call>"
+            self.eot_token = "</tool_call>"
+
+        def has_tool_call(self, text: str) -> bool:
+            """Report the marker as present whenever ``bot_token`` occurs."""
+            return self.bot_token in text
+
+        def detect_and_parse(
+                self, text: str,
+                tools: list[ChatCompletionToolsParam]) -> StreamingParseResult:
+            """Always fail to extract a call from the complete text."""
+            return StreamingParseResult(normal_text="", calls=[])
+
+        def parse_streaming_increment(
+                self, new_text: str,
+                tools: list[ChatCompletionToolsParam]) -> StreamingParseResult:
+            """Always fail to extract a call from a streamed increment."""
+            return StreamingParseResult(normal_text="", calls=[])
+
+        def structure_info(self) -> Callable[[str], StructureInfo]:
+            """Return a trivial structure for the test marker."""
+            return lambda name: StructureInfo(
+                begin="<tool_call>", end="</tool_call>", trigger="<tool_call>")
+
+    _PARSER_NAME = "markup_only_test_parser"
+    # A second registration of the same parser class: the warning is keyed by
+    # the configured parser name, so two names must not de-duplicate together.
+    _OTHER_PARSER_NAME = "markup_only_test_parser_other"
+    _TEXT_WITH_MARKUP = "<tool_call><function=get_weather></function></tool_call>"
+
+    @pytest.fixture(autouse=True)
+    def _register_parser(self) -> Iterator[None]:
+        """Register the markup-only parsers with the factory for each test."""
+        from unittest.mock import patch
+
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+
+        with patch.dict(
+                ToolParserFactory.parsers, {
+                    self._PARSER_NAME: self._MarkupOnlyParser,
+                    self._OTHER_PARSER_NAME: self._MarkupOnlyParser,
+                }):
+            yield
+
+    @staticmethod
+    def _chat_args(tool_parser: str) -> ChatPostprocArgs:
+        """Build Chat Completions postproc args with one tool and ``tool_parser``."""
+        args = ChatPostprocArgs(role="assistant", model="test-model")
+        args.tool_parser = tool_parser
+        args.tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        return args
+
+    @staticmethod
+    def _patched_logger() -> AbstractContextManager[Mock]:
+        """Patch the logger the warning helper writes to."""
+        from unittest.mock import patch
+
+        return patch("tensorrt_llm.serve.tool_parser.base_tool_parser.logger")
+
+    def test_chat_non_streaming_warns_and_names_parser(self) -> None:
+        """Chat, non-streaming: one warning that names the parser and the flag."""
+        from tensorrt_llm.serve.postprocess_handlers import apply_tool_parser
+
+        args = self._chat_args(self._PARSER_NAME)
+        with self._patched_logger() as mock_logger:
+            _, calls = apply_tool_parser(args,
+                                         0,
+                                         self._TEXT_WITH_MARKUP,
+                                         streaming=False)
+
+        assert calls == []
+        assert mock_logger.warning_once.call_count == 1
+        message = mock_logger.warning_once.call_args.args[0]
+        assert self._PARSER_NAME in message
+        assert "--tool_parser" in message
+        # De-duplicated per parser: a misconfigured server must not log once
+        # per request.
+        assert mock_logger.warning_once.call_args.kwargs["key"] == (
+            self._PARSER_NAME)
+
+    def test_chat_non_streaming_silent_without_markup(self) -> None:
+        """Chat, non-streaming: plain text without markup stays silent."""
+        from tensorrt_llm.serve.postprocess_handlers import apply_tool_parser
+
+        args = self._chat_args(self._PARSER_NAME)
+        with self._patched_logger() as mock_logger:
+            apply_tool_parser(args, 0, "The weather is sunny.", streaming=False)
+
+        mock_logger.warning_once.assert_not_called()
+
+    def test_chat_non_streaming_silent_when_calls_extracted(self) -> None:
+        """Chat, non-streaming: a successfully parsed call stays silent."""
+        from tensorrt_llm.serve.postprocess_handlers import apply_tool_parser
+
+        args = self._chat_args("qwen3")
+        # Qwen3 wraps the call as "<tool_call>\n{...}\n</tool_call>": its
+        # bot/eot tokens carry the newlines, so a newline-less payload is not
+        # recognised as markup at all and would make this case pass for the
+        # wrong reason.
+        text = ('<tool_call>\n{"name": "get_weather", '
+                '"arguments": {"location": "Paris"}}\n</tool_call>')
+        assert Qwen3ToolParser().has_tool_call(text), (
+            "the silence below must come from the extracted call, not from "
+            "the parser failing to detect the markup")
+        with self._patched_logger() as mock_logger:
+            _, calls = apply_tool_parser(args, 0, text, streaming=False)
+
+        assert len(calls) == 1
+        mock_logger.warning_once.assert_not_called()
+
+    def test_chat_streaming_path_is_out_of_scope(self) -> None:
+        """Chat, streaming: the warning is not emitted on the streaming path."""
+        from tensorrt_llm.serve.postprocess_handlers import apply_tool_parser
+
+        args = self._chat_args(self._PARSER_NAME)
+        with self._patched_logger() as mock_logger:
+            apply_tool_parser(args,
+                              0,
+                              self._TEXT_WITH_MARKUP,
+                              streaming=True,
+                              finished=True)
+
+        mock_logger.warning_once.assert_not_called()
+
+    def test_responses_non_streaming_warns_and_names_parser(self) -> None:
+        """Responses, non-streaming: one warning that names the parser."""
+        from tensorrt_llm.serve.responses_utils import _apply_tool_parser
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        with self._patched_logger() as mock_logger:
+            _, calls = _apply_tool_parser(self._PARSER_NAME,
+                                          tools,
+                                          0,
+                                          self._TEXT_WITH_MARKUP,
+                                          streaming=False)
+
+        assert calls == []
+        assert mock_logger.warning_once.call_count == 1
+        assert self._PARSER_NAME in mock_logger.warning_once.call_args.args[0]
+
+    def test_responses_non_streaming_silent_without_markup(self) -> None:
+        """Responses, non-streaming: plain text without markup stays silent."""
+        from tensorrt_llm.serve.responses_utils import _apply_tool_parser
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        with self._patched_logger() as mock_logger:
+            _apply_tool_parser(self._PARSER_NAME,
+                               tools,
+                               0,
+                               "The weather is sunny.",
+                               streaming=False)
+
+        mock_logger.warning_once.assert_not_called()
+
+    def test_responses_non_streaming_silent_when_calls_extracted(self) -> None:
+        """Responses, non-streaming: a successfully parsed call stays silent."""
+        from tensorrt_llm.serve.responses_utils import _apply_tool_parser
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        text = ('<tool_call>\n{"name": "get_weather", '
+                '"arguments": {"location": "Paris"}}\n</tool_call>')
+        assert Qwen3ToolParser().has_tool_call(text), (
+            "the silence below must come from the extracted call, not from "
+            "the parser failing to detect the markup")
+        with self._patched_logger() as mock_logger:
+            _, calls = _apply_tool_parser("qwen3",
+                                          tools,
+                                          0,
+                                          text,
+                                          streaming=False)
+
+        assert len(calls) == 1
+        mock_logger.warning_once.assert_not_called()
+
+    def test_responses_streaming_path_is_out_of_scope(self) -> None:
+        """Responses, streaming: the warning is not emitted while streaming."""
+        from tensorrt_llm.serve.responses_utils import _apply_tool_parser
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        with self._patched_logger() as mock_logger:
+            _apply_tool_parser(self._PARSER_NAME,
+                               tools,
+                               0,
+                               self._TEXT_WITH_MARKUP,
+                               streaming=True)
+
+        mock_logger.warning_once.assert_not_called()
+
+    def test_warning_is_keyed_per_parser(self) -> None:
+        """Two misconfigured parsers each warn under their own key.
+
+        ``warning_once`` keeps one message per key, so passing the parser
+        name as the key is what lets a second misconfigured parser still be
+        reported instead of being silenced by the first one's message.
+        """
+        from tensorrt_llm.serve.postprocess_handlers import apply_tool_parser
+
+        with self._patched_logger() as mock_logger:
+            for parser_name in (self._PARSER_NAME, self._OTHER_PARSER_NAME):
+                apply_tool_parser(self._chat_args(parser_name),
+                                  0,
+                                  self._TEXT_WITH_MARKUP,
+                                  streaming=False)
+
+        keys = [
+            call.kwargs["key"]
+            for call in mock_logger.warning_once.call_args_list
+        ]
+        assert keys == [self._PARSER_NAME, self._OTHER_PARSER_NAME]
+
+
+# ============================================================================
+# GLM parsers: streaming reports what detect_and_parse reports
+# ============================================================================
+
+
+def _glm_tool(name, properties=None):
+    """One declared tool; `properties` is its JSON-schema property map."""
+    return ChatCompletionToolsParam(type="function",
+                                    function=FunctionDefinition(
+                                        name=name,
+                                        parameters={
+                                            "type": "object",
+                                            "properties": properties or {},
+                                        }))
+
+
+def _glm_typed_tool(name, **types):
+    """A tool whose properties are declared with the given JSON types."""
+    return _glm_tool(name, {key: dict(type=t) for key, t in types.items()})
+
+
+AGENT_TOOLS = [
+    _glm_tool(name) for name in ("exec_command", "apply_patch", "update_plan",
+                                 "spawn_agent", "followup_task", "exec")
+]
+
+# (emitted name, the name the call is delivered under).
+MANGLED_NAMES = [
+    # A group qualifier the declaration lacks.
+    ("functions.exec_command", "exec_command"),
+    ("collaboration.spawn_agent", "spawn_agent"),
+    ("functions.collaboration.followup_task", "followup_task"),
+    # An unbalanced tag fused onto an otherwise exact name.
+    ("apply_patch</arg_value>", "apply_patch"),
+    ("exec</arg_value>", "exec"),
+    ("<tool_call>exec_command", "exec_command"),
+    ("coll</arg_value><tool_call>collaboration.spawn_agent", "spawn_agent"),
+    # Declared and unknown names are delivered as written.
+    ("exec_command", "exec_command"),
+    ("no_such_tool", "no_such_tool"),
+    ("my_exec_command", "my_exec_command"),
+]
+
+# Prose and code in the name position, mostly mentioning a declared tool; none
+# is a call.
+PROSE_NAMES = [
+    "ops_check - re-querying for current status. Since my last report",
+    "exec_command depended on the tools. Let me use the correct approach",
+    "exec_sudo_command onCompleteCommand=\"export SKILLS_DIR=/x\"",
+    "collaboration.immediately_agent(\"target\" => \"/root/builder\")",
+    "exec_command(cmd=\"cat /workspace/kernel.cu\"",
+    "exec command",
+]
+
+
+def _chunkings(text):
+    """(label, chunks): whole, per character, fixed sizes, every two-way split."""
+    yield "arriving whole", [text]
+    yield "one character per delta", list(text)
+    for size in (2, 3, 5, 8, 13, 40):
+        yield f"{size} characters per delta", [
+            text[i:i + size] for i in range(0, len(text), size)
+        ]
+    for i in range(1, len(text)):
+        yield f"split at {i}", [text[:i], text[i:]]
+
+
+def _glm_raw_call(parser_cls, name, argument_text):
+    """One call around `argument_text`; GLM-4.5 ends the name with a newline."""
+    newline = "\n" if parser_cls is Glm4ToolParser else ""
+    return f"<tool_call>{name}{newline}{argument_text}</tool_call>"
+
+
+def _glm_pairs(*pairs, separator=""):
+    return "".join(
+        f"<arg_key>{key}</arg_key>{separator}<arg_value>{value}</arg_value>"
+        f"{separator}" for key, value in pairs)
+
+
+def _glm_call(parser_cls, name, *pairs):
+    """One call in `parser_cls`'s own markup."""
+    separator = "\n" if parser_cls is Glm4ToolParser else ""
+    return _glm_raw_call(parser_cls, name,
+                         _glm_pairs(*pairs, separator=separator))
+
+
+def _glm_stream(parser_cls, chunks, tools):
+    """(text, [(name, arguments)]) from the increments plus `finish`.
+
+    Each call must arrive complete, as one item with its name and arguments.
+    """
+    parser = parser_cls()
+    results = [parser.parse_streaming_increment(c, tools) for c in chunks]
+    results.append(parser.finish(tools))
+    calls = [call for result in results for call in result.calls]
+    assert [c.tool_index for c in calls] == list(range(len(calls)))
+    assert not parser.current_tool_name_sent
+    return ("".join(r.normal_text for r in results), [(c.name, c.parameters)
+                                                      for c in calls])
+
+
+def _glm_parity(parser_cls, text, tools, chunkings=None):
+    """Assert every chunking streams detect_and_parse's text and calls.
+
+    Returns the whole-text normal text and its [(name, arguments)].
+    """
+    whole = parser_cls().detect_and_parse(text, tools)
+    expected = [(c.name, json.loads(c.parameters)) for c in whole.calls]
+    for label, chunks in chunkings or _chunkings(text):
+        normal, calls = _glm_stream(parser_cls, chunks, tools)
+        assert [(n, json.loads(a)) for n, a in calls] == expected, label
+        assert normal.strip() == whole.normal_text, label
+    return whole.normal_text, expected
+
+
+_GLM_SCHEMAS = {
+    kind: dict(type=kind)
+    for kind in ("string", "integer", "number", "boolean", "object", "array")
+}
+_GLM_SCHEMAS.update({"any": {}, "$ref": {"$ref": "#/$defs/F"}, "none": None})
+
+# Declared strings are delivered verbatim, whatever they look like, markup
+# included.
+_GLM_STRING_VALUES = [
+    "99797", "true", "1e3", "null", "0099797", " padded \n", "", "北京",
+    'say "hi"', "C:\\Users\\test.txt", "line one\nline two", '{"k": "v"}',
+    'echo "}" >> a.json', "printf '{\"a\": [1, 2]}' | jq .",
+    'let s = "</arg_value>"; run(s)', "a</arg_value>b",
+    "ends with the tag</arg_value>", "</arg_value> starts with it",
+    "two</arg_value>of</arg_value>them", "tag then newline</arg_value>\nmore",
+    "</arg_valueX>", "<arg_key>not a key</arg_key>", "<b>bold</b>",
+    "1 < 2 && 3 > 2", "struct MMA_Traits<SM100_MMA_F16BF16_(TS|SS)<", "<",
+    "a<<b<<<c<", "closes with </", "almost the tag </arg_valu",
+    "almost the whole tag </arg_value", "a</arg_value><"
+]
+
+# (raw value, schema, delivered value). Other declared types decode, keeping
+# the text when the result is not strict JSON; with no resolvable type ("none",
+# "any", "$ref") only strict JSON decodes.
+_GLM_TYPED_VALUES = [(value, "string", value) for value in _GLM_STRING_VALUES]
+_GLM_TYPED_VALUES += [
+    ("42", "integer", 42),
+    ('"42"', "integer", 42),
+    ("1.5", "number", 1.5),
+    ("1e308", "number", 1e308),
+    ("1e309", "number", "1e309"),
+    ("-1e309", "integer", "-1e309"),
+    ("NaN", "number", "NaN"),
+    ("-Infinity", "number", "-Infinity"),
+    ("true", "boolean", True),
+    ("{}", "object", {}),
+    ('{"a": 1e308}', "object", dict(a=1e308)),
+    ('{"a": 1e309}', "object", '{"a": 1e309}'),
+    ('{"k": "x</arg_value>y"}', "object", dict(k="x</arg_value>y")),
+    ('[{\\"id\\": \\"1\\"}]', "array", [dict(id="1")]),
+    ("['a', 'b']", "array", ["a", "b"]),
+    ("...", "array", "..."),
+    ("{1, 2}", "object", "{1, 2}"),
+    ("{['a']: 1}", "object", "{['a']: 1}"),
+    ("1j", "number", "1j"),
+    ("b'x'", "array", "b'x'"),
+    ("not json", "object", "not json"),
+    ("8000", "none", 8000),
+    ('{"a": [1, 2]}', "none", dict(a=[1, 2])),
+    ("true", "none", True),
+    ("null", "none", None),
+    ("ls -la", "none", "ls -la"),
+    ("", "none", ""),
+    ("NaN", "none", "NaN"),
+    ("'single'", "none", "'single'"),
+    ('{"a": 1}', "any", dict(a=1)),
+    ('{"a": 1}', "$ref", dict(a=1)),
+]
+
+_GLM_VALUES = sorted({row[0] for row in _GLM_TYPED_VALUES})
+
+_GLM_TOOLS = [_glm_typed_tool("f", code="string", n="integer", opts="object")]
+
+# (argument text of a call to `f`, delivered arguments or None for no call).
+# A call is delivered only if its argument text is nothing but separators and
+# complete pairs; otherwise its whole markup is released as text.
+_GLM_ARGUMENT_TEXTS = [
+    ("", {}),
+    ("\n ", {}),
+    ("<arg_key>code</arg_key>\n<arg_value>a</arg_value>\\n <arg_key>n"
+     "</arg_key> <arg_value>1</arg_value>\n", dict(code="a", n=1)),
+    # A repeated key keeps its first value.
+    (_glm_pairs(("code", "a"), ("code", "b")), dict(code="a")),
+    (_glm_pairs(("n", "1"), ("code", "a"), ("n", "2")), dict(n=1, code="a")),
+    (_glm_pairs(("code", "a"), ("code", "x</arg_value>y")), dict(code="a")),
+    # A value quoting the closing tag, or ending in a prefix of it.
+    (_glm_pairs(("code", "'</arg_value>'"),
+                ("n", "3")), dict(code="'</arg_value>'", n=3)),
+    (_glm_pairs(("n", "3"), ("code", "a<")), dict(n=3, code="a<")),
+    (_glm_pairs(("code", "a</arg_valu"),
+                ("n", "3")), dict(code="a</arg_valu", n=3)),
+    # Each argument is typed alone, and an object value still closes the call.
+    (_glm_pairs(("code", "w"), ("n", "3"), ("budget", "8000"), ("note", ""),
+                ("opts", '{"verbose": true}')),
+     dict(code="w", n=3, budget=8000, note="", opts=dict(verbose=True))),
+    ("<arg_key>code</arg_key><arg_value>ls -la", None),
+    ("<arg_key>n</arg_key><arg_value>5", None),
+    ("<arg_key>code</arg_key><arg_value>ls</think>", None),
+    (_glm_pairs(("code", "ls -la")) + ".", None),
+    (_glm_pairs(("code", "ls")) + "<arg_k", None),
+    ("<arg_key>code</arg_key>", None),
+    ("<arg_key>code</arg_key>junk<arg_value>ls</arg_value>", None),
+    ("<arg_key>code<arg_value>ls</arg_value>", None),
+    ("<arg_key>a</arg_key>" + _glm_pairs(("code", "ls")), None),
+    (_glm_pairs(("code", "x</arg_value><arg_key>y")), None),
+    (_glm_pairs(("code", "a")) + "<arg_key>n</arg_key><arg_value>2", None),
+]
+
+
+@pytest.mark.parametrize("parser_cls", [Glm4ToolParser, Glm47ToolParser])
+class TestGlmStreamingMatchesWholeParse:
+    """Any chunking streams the calls and text detect_and_parse returns."""
+
+    def test_declares_the_contract(self, parser_cls):
+        assert parser_cls.streaming_matches_whole_parse
+
+    @pytest.mark.parametrize("value,schema,expected", _GLM_TYPED_VALUES)
+    def test_argument_typing(self, parser_cls, value, schema, expected):
+        properties = {"v": _GLM_SCHEMAS[schema]} if schema != "none" else {}
+        text = _glm_call(parser_cls, "f", ("v", value))
+
+        _, calls = _glm_parity(parser_cls, text, [_glm_tool("f", properties)])
+
+        assert calls == [("f", dict(v=expected))]
+
+    @pytest.mark.parametrize("value", _GLM_VALUES)
+    def test_every_value_under_every_schema(self, parser_cls, value):
+        text = _glm_call(parser_cls, "f", ("v", value))
+        for schema in _GLM_SCHEMAS.values():
+            properties = {} if schema is None else {"v": schema}
+            _glm_parity(parser_cls, text, [_glm_tool("f", properties)],
+                        [("whole", [text]), ("per character", list(text))])
+
+    @pytest.mark.parametrize("argument_text,expected", _GLM_ARGUMENT_TEXTS)
+    def test_argument_text(self, parser_cls, argument_text, expected):
+        text = _glm_raw_call(parser_cls, "f", argument_text)
+
+        normal, calls = _glm_parity(parser_cls, text, _GLM_TOOLS)
+
+        if expected is None:
+            assert (normal, calls) == (text, [])
+        else:
+            assert (normal, calls) == ("", [("f", expected)])
+
+    @pytest.mark.parametrize("text", [
+        "To end a call the model writes </tool_call> and then stops.",
+        "The answer is 42. See </tool_",
+        "Compare a <tool",
+        "<tool_call>get_w",
+        "Cut off: <tool_call>exec<arg_key>k</arg_key><arg_value>v</tool_c",
+    ])
+    def test_text_without_a_complete_call_streams_verbatim(
+            self, parser_cls, text):
+        assert _glm_parity(parser_cls, text, AGENT_TOOLS) == (text, [])
+
+    def test_a_response_with_several_calls(self, parser_cls):
+        """Unreadable and restarted calls among good ones, then a cut-off."""
+        call = functools.partial(_glm_call, parser_cls)
+        out_of_order = call("exec<arg_value>input</arg_key>", ("k", "v"))
+        unclosed = _glm_raw_call(parser_cls, "exec",
+                                 "<arg_key>cmd</arg_key><arg_value>ls</think>")
+        text = ("Checking now." + call("exec", ("cmd", 'echo "}" >> a.json')) +
+                out_of_order + call("get_time") + " Then " + unclosed +
+                call("exec<tool_call>exec",
+                     ("cmd", "ls")) + " </tool_call> is prose. <tool_call>exec")
+
+        normal, calls = _glm_parity(parser_cls, text,
+                                    [_glm_typed_tool("exec", cmd="string")])
+
+        assert calls == [("exec", dict(cmd='echo "}" >> a.json')),
+                         ("get_time", {}), ("exec", dict(cmd="ls"))]
+        assert normal == (
+            "Checking now." + out_of_order + " Then " + unclosed +
+            "<tool_call>exec </tool_call> is prose. <tool_call>exec")
+
+    def test_a_name_without_its_own_line(self, parser_cls):
+        """GLM-4.7 reads these calls; GLM-4.5 needs a newline after the name."""
+        text = ("<tool_call>get_time</tool_call><tool_call>exec<arg_key>k"
+                "</arg_key><arg_value>v</arg_value></tool_call>")
+
+        result = _glm_parity(parser_cls, text, AGENT_TOOLS)
+
+        if parser_cls is Glm4ToolParser:
+            assert result == (text, [])
+        else:
+            assert result == ("", [("get_time", {}), ("exec", dict(k="v"))])
+
+    def test_text_after_a_call_waits_for_the_next_increment(
+            self, parser_cls, sample_tools):
+        """The text an increment returns always precedes its calls."""
+        call = _glm_call(parser_cls, "get_weather", ("location", "NYC"))
+        parser = parser_cls()
+
+        results = [
+            parser.parse_streaming_increment(chunk, sample_tools)
+            for chunk in ("Before. ", call + "After." + call + " Done.", "", "")
+        ]
+
+        expected = [("Before. ", 0), ("", 1), ("After.", 1), (" Done.", 0)]
+        assert [(r.normal_text, len(r.calls)) for r in results] == expected
+
+    @pytest.mark.parametrize("emitted,delivered", MANGLED_NAMES)
+    def test_mangled_name(self, parser_cls, emitted, delivered):
+        text = _glm_call(parser_cls, emitted, ("cmd", "ls -la /workspace"))
+
+        _, calls = _glm_parity(parser_cls, text, AGENT_TOOLS)
+
+        assert calls == [(delivered, dict(cmd="ls -la /workspace"))]
+
+    @pytest.mark.parametrize("prose", PROSE_NAMES)
+    @pytest.mark.parametrize("pairs", [[("cmd", "ls")], []],
+                             ids=["with arguments", "without arguments"])
+    def test_a_prose_name_is_released_as_text(self, parser_cls, prose, pairs):
+        text = _glm_call(parser_cls, prose, *pairs)
+
+        normal, calls = _glm_parity(parser_cls, text, AGENT_TOOLS)
+
+        assert (normal, calls) == (text, [])
+
+    def test_a_bare_name_is_typed_by_its_qualified_declaration(
+            self, parser_cls):
+        tools = [
+            _glm_typed_tool("functions.exec",
+                            cmd="string",
+                            max_output_tokens="integer")
+        ]
+        text = _glm_call(parser_cls, "exec", ("cmd", "8000"),
+                         ("max_output_tokens", "8000"))
+
+        _, calls = _glm_parity(parser_cls, text, tools)
+
+        assert calls == [("functions.exec",
+                          dict(cmd="8000", max_output_tokens=8000))]
+
+    def test_a_long_separator_run_streams_in_linear_time(self, parser_cls):
+        """A long run of literal backslash-n separators, two per increment.
+
+        A linear parse takes a fraction of a second; one that rescans the
+        buffer on every increment takes tens of seconds, well past the bound.
+        """
+        text = _glm_raw_call(parser_cls, "f",
+                             _glm_pairs(("code", "ls")) + "\\n" * 40000)
+        chunks = [text[i:i + 2] for i in range(0, len(text), 2)]
+        start = time.monotonic()
+
+        _, calls = _glm_parity(parser_cls, text, _GLM_TOOLS,
+                               [("two per delta", chunks)])
+
+        assert calls == [("f", dict(code="ls"))]
+        assert time.monotonic() - start < 10
+
+
+# ============================================================================
+# BaseToolParser.resolve_tool_name
+# ============================================================================
+
+_NAMESPACED = ("functions.exec", "functions.wait", "collaboration.spawn_agent",
+               "collaboration.list_agents")
+
+
+@pytest.mark.parametrize(
+    "name,declared,expected",
+    [
+        # A bare name maps onto its qualified declaration, fused markup or not.
+        ("exec", _NAMESPACED, "functions.exec"),
+        ("spawn_agent", _NAMESPACED, "collaboration.spawn_agent"),
+        ("<tool_call>exec", _NAMESPACED, "functions.exec"),
+        ("exec</arg_value>", _NAMESPACED, "functions.exec"),
+        ("functions.exec </arg_value>", _NAMESPACED, "functions.exec"),
+        # A qualifier the declaration lacks is dropped; an exact name wins.
+        ("functions.exec_command", ("exec_command", ), "exec_command"),
+        ("exec", ("exec", "functions.exec"), "exec"),
+        # An ambiguous tail, prose mentioning a tool, unknown or empty names.
+        ("status", ("a.status", "b.status"), None),
+        ("collab? no. Use exec.<tool_call>exec", _NAMESPACED, None),
+        ("ops_check - re-querying for current status", _NAMESPACED, None),
+        ("exec surg? No, use proper functions.exec tool", _NAMESPACED, None),
+        ("exec_command_placeholder</arg_value>", _NAMESPACED, None),
+        ("totally_undeclared", _NAMESPACED, None),
+        ("", _NAMESPACED, None),
+        (None, _NAMESPACED, None),
+    ])
+def test_resolve_tool_name(name, declared, expected):
+    tool_indices = {tool: index for index, tool in enumerate(declared)}
+    assert BaseToolParser.resolve_tool_name(name, tool_indices) == expected
+
+
+def test_parse_base_json_reports_the_name_as_emitted(sample_tools):
+    """Only the GLM parsers resolve names; the shared path keeps them as is."""
+    action = dict(name="functions.get_weather", parameters={})
+
+    calls = ConcreteToolParser().parse_base_json(action, sample_tools)
+
+    assert [(c.name, c.tool_index)
+            for c in calls] == [("functions.get_weather", -1)]
+
+
+# ============================================================================
+# DeepSeek DSML layout: the newlines inside a tool-call block are not content
+# ============================================================================
+
+_DSML_FORMATS = [
+    (DeepSeekV32Parser, "function_calls", "invoke", "parameter"),
+    (DeepSeekV4Parser, "tool_calls", "invoke", "parameter"),
+    (DeepSeekV41Parser, " calls", " invoke", " parameter"),
+]
+
+
+def _dsml_block(calls_tag: str, invoke_tag: str, parameter_tag: str) -> str:
+    """Two calls laid out as the checkpoint encoders write them: one per line."""
+    dsml = "｜DSML｜"
+
+    def invoke(name: str, key: str, value: str) -> str:
+        return (f'<{dsml}{invoke_tag} name="{name}">\n'
+                f'<{dsml}{parameter_tag} name="{key}" string="true">{value}'
+                f"</{dsml}{parameter_tag}>\n"
+                f"</{dsml}{invoke_tag}>")
+
+    return (f"<{dsml}{calls_tag}>\n" +
+            invoke("get_weather", "location", "NYC") + "\n" +
+            invoke("search_web", "query", "AI") + "\n" +
+            f"</{dsml}{calls_tag}>")
+
+
+def _stream(parser,
+            text: str,
+            chunk_size: int,
+            tools: list[ChatCompletionToolsParam],
+            *,
+            finish: bool = True):
+    results = [
+        parser.parse_streaming_increment(text[i:i + chunk_size], tools)
+        for i in range(0, len(text), chunk_size)
+    ]
+    if finish:
+        results.append(parser.finish(tools))
+    content = "".join(result.normal_text for result in results)
+    calls = [call for result in results for call in result.calls]
+    return content, calls
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 7, 10_000])
+def test_dsml_newlines_between_calls_are_not_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """The newline after each invoke is the block's layout, however it is chunked.
+
+    Streamed as text, it became content after every tool call: over Anthropic
+    Messages, a whitespace-only text block followed each tool_use, and a client
+    that drops such blocks sent back a turn that no longer matched what was
+    served.
+    """
+    text = "Let me check.\n\n" + _dsml_block(calls_tag, invoke_tag,
+                                             parameter_tag)
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == "Let me check."
+    assert [call.name for call in calls
+            if call.name] == ["get_weather", "search_web"]
+    arguments = [
+        json.loads(call.parameters) for call in calls
+        if not call.name and call.parameters
+    ]
+    assert arguments == [{"location": "NYC"}, {"query": "AI"}]
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [5, 10_000])
+def test_dsml_text_after_the_block_is_still_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """Only the layout inside the block is dropped; text after it is kept.
+
+    In one increment, the closing tag and the text after it follow the last
+    invoke; that text must come out of that increment.
+    """
+    text = _dsml_block(calls_tag, invoke_tag, parameter_tag) + " Done."
+
+    parser = parser_cls()
+    content, calls = _stream(parser,
+                             text,
+                             chunk_size,
+                             sample_tools,
+                             finish=False)
+
+    assert content == " Done."
+    finish_result = parser.finish(sample_tools)
+    assert finish_result.normal_text == ""
+    assert finish_result.calls == []
+    assert [call.name for call in calls
+            if call.name] == ["get_weather", "search_web"]
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 7, 10_000])
+def test_dsml_blank_line_before_the_block_is_not_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """The encoders write a blank line between the content and the block.
+
+    The content keeps its own whitespace; only that blank line is dropped, on
+    both paths.
+    """
+    content_in = "  Indented first line.\nLast line.\n"
+    text = content_in + "\n\n" + _dsml_block(calls_tag, invoke_tag,
+                                             parameter_tag)
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == content_in
+    assert parser_cls().detect_and_parse(text,
+                                         sample_tools).normal_text == content_in
+    assert [call.name for call in calls
+            if call.name] == ["get_weather", "search_web"]
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 10_000])
+def test_dsml_trailing_blank_lines_without_a_block_are_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """Newlines held back in case a block follows come out when none does."""
+    text = "Done.\n\n"
+
+    content, calls = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == text
+    assert calls == []
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _DSML_FORMATS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 10_000])
+def test_dsml_stream_cut_inside_the_block_keeps_only_the_content(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], calls_tag: str, invoke_tag: str,
+        parameter_tag: str, chunk_size: int) -> None:
+    """A stream cut short inside the block ends with its content.
+
+    The non-streaming path reads the same text the same way.
+    """
+    block = _dsml_block(calls_tag, invoke_tag, parameter_tag)
+    text = "Checking.\n\n" + block[:block.index("</｜DSML｜")]
+
+    content, _ = _stream(parser_cls(), text, chunk_size, sample_tools)
+
+    assert content == "Checking."
+    assert parser_cls().detect_and_parse(text,
+                                         sample_tools).normal_text == content

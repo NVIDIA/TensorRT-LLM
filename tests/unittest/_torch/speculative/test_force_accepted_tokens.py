@@ -35,7 +35,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.speculative.interface import (
     FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR,
     SpecWorkerBase,

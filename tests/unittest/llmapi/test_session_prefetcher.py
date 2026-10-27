@@ -13,6 +13,8 @@ import pytest
 from test_common import session_prefetcher
 from test_common.session_prefetcher import SessionPrefetcher, warm_page_cache
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _FakeMarker:
     def __init__(self, *args):
@@ -64,6 +66,7 @@ def prefetcher(monkeypatch):
 
     monkeypatch.setattr(SessionPrefetcher, "_build", _fake_build)
     monkeypatch.setattr(SessionPrefetcher, "_warm", lambda self, d: warmed.append(d))
+    monkeypatch.setattr(session_prefetcher, "_prefetched_workers_alive", lambda session: True)
     p.built, p.warmed, p.overlays = built, warmed, overlays
     return p
 
@@ -73,9 +76,14 @@ class _FakePool:
         self.n_workers = n_workers
         self.wait_shutdown = wait_shutdown
         self.shut = False
+        self.abandoned = False
 
     def shutdown(self):
         self.shut = True
+
+    def abandon(self) -> None:
+        self.abandoned = True
+        self.shutdown()
 
 
 def _arm(prefetcher, pool, spec=4):
@@ -300,6 +308,46 @@ def test_factory_hit_hands_over_shadow(prefetcher):
     assert factory(4) is pool  # prefetched pool handed over
 
 
+def test_factory_dead_shadow_builds_fresh_pool(prefetcher, monkeypatch) -> None:
+    dead = _FakePool(1)
+    _arm(prefetcher, dead, spec=1)
+    monkeypatch.setattr(session_prefetcher, "_prefetched_workers_alive", lambda session: False)
+
+    factory = prefetcher._make_factory(_FakePool)
+    replacement = factory(1)
+
+    assert replacement is not dead
+    assert replacement.wait_shutdown
+    # The discard is backgrounded so the replacement spawn is not stuck behind a
+    # 30s wait on workers that will never answer; join it before asserting.
+    for thread in threading.enumerate():
+        if thread.name == "session-prefetch-discard-dead":
+            thread.join(timeout=10)
+    assert dead.abandoned and dead.shut
+    assert prefetcher.stats["pools_discarded_dead"] == 1
+    assert prefetcher.stats["pools_handed_over"] == 0
+
+
+def test_prefetched_worker_identity_check_rejects_dead_or_recycled_pid(monkeypatch) -> None:
+    starts = {101: b"start-a", 102: b"start-b"}
+    fake_mpi_session = types.SimpleNamespace(_process_start_time=starts.get)
+    monkeypatch.setitem(sys.modules, "tensorrt_llm.llmapi.mpi_session", fake_mpi_session)
+    pool = types.SimpleNamespace(
+        n_workers=2,
+        _worker_identities=((101, b"start-a"), (102, b"start-b")),
+    )
+
+    assert session_prefetcher._prefetched_workers_alive(pool)
+    pool._worker_identities = ((101, b"start-a"),)
+    assert not session_prefetcher._prefetched_workers_alive(pool)
+    pool._worker_identities = ((101, b"start-a"), (102, b"start-b"))
+
+    starts.pop(102)
+    assert not session_prefetcher._prefetched_workers_alive(pool)
+    starts[102] = b"recycled-process"
+    assert not session_prefetcher._prefetched_workers_alive(pool)
+
+
 def test_take_spec_mismatch_returns_none(prefetcher):
     pool = _FakePool(4)
     _arm(prefetcher, pool, spec=4)
@@ -479,8 +527,8 @@ def test_model_param_discovery(monkeypatch):
     # (a name under LLM_MODELS_ROOT, or an absolute path) — discovered
     # without any test-file changes.
     monkeypatch.setenv("LLM_MODELS_ROOT", "/models-root")
-    item = _FakeItem(params={"model_folder": "Nemotron-H-8B-Base-8K"})
-    assert session_prefetcher._model_dir_of(item) == "/models-root/Nemotron-H-8B-Base-8K"
+    item = _FakeItem(params={"model_folder": "NVIDIA-Nemotron-Nano-9B-v2"})
+    assert session_prefetcher._model_dir_of(item) == "/models-root/NVIDIA-Nemotron-Nano-9B-v2"
     item = _FakeItem(params={"model_dir": "/abs/path/model"})
     assert session_prefetcher._model_dir_of(item) == "/abs/path/model"
     # Non-model params never produce a guess.

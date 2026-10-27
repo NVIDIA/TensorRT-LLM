@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -19,45 +19,12 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # keep this list sorted alphabetically
 set(SRCS
-    cache_transmission/mpi_utils/connection.cpp
     cache_transmission/agent_utils/connection.cpp
-    cache_transmission/transferAgent.cpp
     cache_transmission/cacheSplitConcat.cu
+    cache_transmission/mpi_utils/connection.cpp
     cache_transmission/rnnCacheSplitConcat.cu
-    contextPhaseParams.cpp
-    debugConfig.cpp
-    decodingConfig.cpp
-    executorConfig.cpp
     executorKVCacheEventManager.cpp
-    extendedRuntimePerfKnobConfig.cpp
-    guidedDecodingConfig.cpp
-    guidedDecodingParams.cpp
-    jsonSerialization.cpp
-    kvCacheConfig.cpp
-    kvCacheRetentionConfig.cpp
-    logitsPostProcessorConfig.cpp
-    loraConfig.cpp
-    orchestratorConfig.cpp
-    outputConfig.cpp
-    parallelConfig.cpp
-    peftCacheConfig.cpp
-    promptTuningConfig.cpp
-    mropeConfig.cpp
-    multimodalInput.cpp
-    request.cpp
-    requestUtils.cpp
-    requestWithId.cpp
-    response.cpp
-    samplingConfig.cpp
-    dynamicBatchConfig.cpp
-    schedulerConfig.cpp
-    serialization.cpp
-    speculativeDecodingConfig.cpp
-    tensor.cpp
-    types.cpp
-    requestUtils.cpp
-    contextPhaseParams.cpp
-    cacheTransceiverConfig.cpp)
+    jsonSerialization.cpp)
 
 if(NOT WIN32)
   # additional warnings
@@ -74,10 +41,76 @@ else() # Windows
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
 endif()
 
+set(EXECUTOR_TYPE_SRCS
+    cacheTransceiverConfig.cpp
+    decodingConfig.cpp
+    dynamicBatchConfig.cpp
+    extendedRuntimePerfKnobConfig.cpp
+    guidedDecodingConfig.cpp
+    guidedDecodingParams.cpp
+    kvCacheConfig.cpp
+    kvCacheRetentionConfig.cpp
+    outputConfig.cpp
+    peftCacheConfig.cpp
+    samplingConfig.cpp
+    schedulerConfig.cpp
+    types.cpp)
+
+add_library(tllm_executor_types STATIC ${EXECUTOR_TYPE_SRCS})
+add_library(tllm::executor_types ALIAS tllm_executor_types)
+target_link_libraries(
+  tllm_executor_types
+  PUBLIC tllm::common_error
+  PRIVATE tllm::common_logging)
+target_compile_features(tllm_executor_types PUBLIC cxx_std_20)
+set_target_properties(tllm_executor_types PROPERTIES POSITION_INDEPENDENT_CODE
+                                                     ON)
+
+add_library(tllm_executor_serialization STATIC samplingConfigSerialization.cpp)
+add_library(tllm::executor_serialization ALIAS tllm_executor_serialization)
+target_link_libraries(
+  tllm_executor_serialization
+  PUBLIC tllm::executor_types
+  PRIVATE tllm::common_error)
+set_target_properties(tllm_executor_serialization
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(
+  tllm_executor_values STATIC
+  contextPhaseParams.cpp
+  loraConfig.cpp
+  mropeConfig.cpp
+  multimodalInput.cpp
+  promptTuningConfig.cpp
+  request.cpp
+  response.cpp
+  serialization.cpp
+  tensor.cpp)
+add_library(tllm::executor_values ALIAS tllm_executor_values)
+target_link_libraries(tllm_executor_values PUBLIC tllm::executor_serialization
+                                                  tllm::runtime_buffers)
+
+add_library(tllm_executor_transfer_agent STATIC
+            cache_transmission/transferAgent.cpp)
+add_library(tllm::executor_transfer_agent ALIAS tllm_executor_transfer_agent)
+target_link_libraries(
+  tllm_executor_transfer_agent
+  PUBLIC tllm::common_logging CUDA::cuda_driver
+  PRIVATE ${CMAKE_DL_LIBS})
+
+foreach(component tllm_executor_values tllm_executor_transfer_agent)
+  target_compile_features(${component} PUBLIC cxx_std_20)
+  set_target_properties(${component} PROPERTIES CXX_EXTENSIONS OFF
+                                                POSITION_INDEPENDENT_CODE ON)
+endforeach()
+
 add_library(${EXECUTOR_STATIC_TARGET} STATIC ${SRCS})
+target_link_libraries(
+  ${EXECUTOR_STATIC_TARGET} PUBLIC tllm::executor_values
+                                   tllm::executor_transfer_agent)
 set_target_properties(
   ${EXECUTOR_STATIC_TARGET}
-  PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
+  PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              POSITION_INDEPENDENT_CODE ON)
 
 set_property(TARGET ${EXECUTOR_STATIC_TARGET}

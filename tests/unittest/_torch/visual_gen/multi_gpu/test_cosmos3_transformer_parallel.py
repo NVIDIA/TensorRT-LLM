@@ -21,50 +21,39 @@ os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
-try:
-    import sys
-    from pathlib import Path
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    DiffusionModelConfig,
+    TorchCompileConfig,
+)
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
+    COSMOS3_EDGE_BACKBONE_TYPE,
+    QWEN3_RECIPE,
+    Cosmos3CrossAttention,
+    Cosmos3VFMTransformer,
+    _resolve_cosmos3_cross_attention_backend,
+)
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
-    from tensorrt_llm._torch.visual_gen.config import (
-        AttentionConfig,
-        DiffusionModelConfig,
-        TorchCompileConfig,
-    )
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-    from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
-        COSMOS3_EDGE_BACKBONE_TYPE,
-        Cosmos3VFMTransformer,
-    )
-
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
-
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
-    # Module-level configs below reference this; every test skips in this
-    # branch, but the definitions still have to import cleanly.
-    COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
+from ._worker_pool import run_distributed
 
 # Attention2D (attn2d) wraps the compute backend in Attention2DAttention, which
 # requires (a) an LSE-capable inner backend — only FA4, VANILLA does not support
 # LSE — and (b) the ``flash_attn_combine`` JIT kernel.  Detect both up front so the
-# attn2d tests skip cleanly when the kernels are not built (e.g. non-Blackwell CI).
+# attn2d tests fail loudly when the kernels are missing on their Blackwell runner —
+# a build/dependency problem, not a reason to skip.
 try:
-    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
+    from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
         _flash_attn_fwd as _fa4_fwd,
     )
-    from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+    from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
         _flash_attn_combine as _fa_combine,
     )
 
-    _ATTN2D_AVAILABLE = MODULES_AVAILABLE and _fa4_fwd is not None and _fa_combine is not None
+    _ATTN2D_AVAILABLE = _fa4_fwd is not None and _fa_combine is not None
 except ImportError:
     _ATTN2D_AVAILABLE = False
 
@@ -157,6 +146,15 @@ _COSMOS3_AUDIO_CONFIG = dict(
     temporal_compression_factor_sound=1,
 )
 
+_ACTION_DIM = 64
+_T_ACTION = 4
+_COSMOS3_ACTION_CONFIG = dict(
+    **_COSMOS3_TEST_CONFIG,
+    action_gen=True,
+    action_dim=_ACTION_DIM,
+    num_embodiment_domains=32,
+)
+
 SEED_WEIGHTS = 123
 SEED_INPUT = 456
 SEED_COND_TEXT = 42
@@ -166,6 +164,57 @@ RTOL = 1e-2
 ATOL = 1e-2
 
 
+@pytest.mark.parametrize(
+    ("backend", "mapping", "expected"),
+    [
+        ("TRTLLM", None, "VANILLA"),
+        ("CUTEDSL", None, "CUTEDSL"),
+        (
+            "CUTEDSL",
+            SimpleNamespace(ulysses_size=1, attn2d_row_size=1, attn2d_col_size=1),
+            "CUTEDSL",
+        ),
+        (
+            "FA4",
+            SimpleNamespace(ulysses_size=2, attn2d_row_size=2, attn2d_col_size=2),
+            "FA4",
+        ),
+    ],
+)
+def test_cosmos3_cross_attention_backend_resolution(backend, mapping, expected):
+    assert _resolve_cosmos3_cross_attention_backend(backend, mapping) == expected
+
+
+@pytest.mark.parametrize("ulysses_size", [1, 2])
+def test_cosmos3_cross_attention_rejects_cute_dsl_with_attention2d(ulysses_size):
+    mapping = SimpleNamespace(
+        ulysses_size=ulysses_size,
+        attn2d_row_size=2,
+        attn2d_col_size=2,
+    )
+    with pytest.raises(ValueError, match="Use attention backend FA4"):
+        _resolve_cosmos3_cross_attention_backend("CUTEDSL", mapping)
+
+
+def test_cute_dsl_ulysses_backend_rejected():
+    config = _make_model_config(
+        _COSMOS3_TEST_CONFIG,
+        ulysses_size=2,
+        backend="CUTEDSL",
+    )
+    with pytest.raises(ValueError, match="Use attention backend VANILLA or FA4"):
+        Cosmos3CrossAttention(
+            hidden_size=_COSMOS3_TEST_CONFIG["hidden_size"],
+            num_attention_heads=_COSMOS3_TEST_CONFIG["num_attention_heads"],
+            num_key_value_heads=_COSMOS3_TEST_CONFIG["num_key_value_heads"],
+            head_dim=_COSMOS3_TEST_CONFIG["head_dim"],
+            model_config=config,
+            recipe=QWEN3_RECIPE,
+        )
+
+    assert config.attention.backend == "CUTEDSL"
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_mpi_env():
     yield
@@ -173,57 +222,15 @@ def _cleanup_mpi_env():
 
 
 # =============================================================================
-# Distributed helpers (same pattern as test_wan_tp.py)
+# Distributed helpers
 # =============================================================================
 
 
-def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", port: int = 29500):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    torch.cuda.set_device(rank % torch.cuda.device_count())
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-
-
-def cleanup_distributed():
-    try:
-        from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
-
-        DeviceMeshTopologyImpl.device_mesh = None
-        DeviceMeshTopologyImpl.tp_mesh = None
-        VisualGenMapping.seq_mesh = None
-    except ImportError:
-        pass
-    if dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
-
-
-def _distributed_worker(rank, world_size, backend, test_fn, port):
-    try:
-        init_distributed_worker(rank, world_size, backend, port)
-        test_fn(rank, world_size)
-    except Exception as e:
-        print(f"Rank {rank} failed with error: {e}", flush=True)
-        raise
-    finally:
-        cleanup_distributed()
-
-
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-    backend = "nccl" if use_cuda else "gloo"
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            _distributed_worker,
-            args=(world_size, backend, test_fn, port),
-            nprocs=world_size,
-            join=True,
-        )
+    run_distributed(
+        world_size, test_fn, dist_backend="nccl" if use_cuda else "gloo", preload=("tensorrt_llm",)
     )
 
 
@@ -241,6 +248,7 @@ def _make_model_config(
     attn2d_row_size=1,
     attn2d_col_size=1,
     backend="VANILLA",
+    quant_config=None,
 ):
     pretrained_config = SimpleNamespace(**pretrained_dict)
     ws = cfg_size * tp_size * ulysses_size * attn2d_row_size * attn2d_col_size
@@ -260,7 +268,7 @@ def _make_model_config(
     )
     config = DiffusionModelConfig(
         pretrained_config=pretrained_config,
-        quant_config=QuantConfig(),
+        quant_config=quant_config if quant_config is not None else QuantConfig(),
         torch_compile=TorchCompileConfig(enable=False),
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
@@ -282,6 +290,61 @@ def _stabilize_model_weights(model: Cosmos3VFMTransformer) -> None:
                 p.data.uniform_(-std, std)
             else:
                 p.data.uniform_(-0.01, 0.01)
+
+
+# Shared static activation scale for synthetic FP8 "calibration". One value for
+# every projection keeps q/k/v (and gate/up) scales equal, which is the invariant
+# ModelOpt calibration produces and the shared-quantize fast path relies on.
+_FP8_INPUT_SCALE = 1e-2
+_FP8_SCALE_SUFFIXES = ("weight_scale", "input_scale", "inv_input_scale", "kv_scales")
+
+
+def _init_static_fp8_weights(model: Cosmos3VFMTransformer) -> None:
+    """Synthesize a calibrated static-FP8 state on the unsharded model.
+
+    Non-quantized parameters get the `_stabilize_model_weights` init; each FP8
+    Linear gets weights quantized from the same distribution with a per-tensor
+    amax/448 weight_scale and the shared static input_scale.
+    """
+    from tensorrt_llm._torch.modules.linear import Linear as TrtllmLinear
+
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p.dtype == torch.float8_e4m3fn or name.endswith(_FP8_SCALE_SUFFIXES):
+                continue
+            if "norm" in name and name.endswith(".weight"):
+                p.fill_(1.0)
+            elif p.ndim >= 2:
+                fan_in = p.shape[1]
+                std = 0.02 / max(1.0, fan_in**0.5)
+                p.data.uniform_(-std, std)
+            else:
+                p.data.uniform_(-0.01, 0.01)
+        for _, module in model.named_modules():
+            if not (
+                isinstance(module, TrtllmLinear) and module.weight.dtype == torch.float8_e4m3fn
+            ):
+                continue
+            fan_in = module.weight.shape[1]
+            std = 0.02 / max(1.0, fan_in**0.5)
+            w = torch.empty(
+                module.weight.shape, device=module.weight.device, dtype=torch.float32
+            ).uniform_(-std, std)
+            weight_scale = w.abs().amax() / 448.0
+            module.weight.data.copy_((w / weight_scale).to(torch.float8_e4m3fn))
+            module.weight_scale.data.copy_(weight_scale)
+            module.input_scale.data.fill_(_FP8_INPUT_SCALE)
+            module.inv_input_scale.data.fill_(1.0 / _FP8_INPUT_SCALE)
+
+
+def _assert_static_fp8_engaged(model: Cosmos3VFMTransformer) -> None:
+    """The test must exercise W8A8 with split projections, not silently run BF16."""
+    cross_attn = model.gen_layers[0].cross_attention
+    assert cross_attn.to_q.weight.dtype == torch.float8_e4m3fn
+    assert cross_attn._maybe_share_qkv_quantize is True
+    mlp = model.gen_layers[0].mlp
+    assert mlp.gate_proj.weight.dtype == torch.float8_e4m3fn
+    assert mlp._maybe_share_gate_up_quantize is True
 
 
 def _shard_dim0(tensor, tp_rank, tp_size):
@@ -433,6 +496,29 @@ def _forward(
         ).video
 
 
+def _forward_with_unequal_text_lengths(
+    model: Cosmos3VFMTransformer, device: torch.device, text_seed: int
+) -> torch.Tensor:
+    channels = _COSMOS3_TEST_CONFIG["latent_channel"]
+    hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+        device, channels=channels, text_seed=text_seed, batch=2
+    )
+    text_mask.zero_()
+    text_mask[0, :2] = 1
+    text_mask[1, :_TEXT_LEN] = 1
+    model.reset_cache()
+    with torch.inference_mode():
+        return model(
+            hidden_states=hs,
+            timestep=ts / _NUM_TRAIN_TIMESTEPS,
+            raw_timestep=ts,
+            text_ids=text_ids,
+            text_mask=text_mask,
+            video_shape=video_shape,
+            fps=_FPS,
+        ).video
+
+
 def _forward_with_audio(
     model: Cosmos3VFMTransformer, device: torch.device, text_seed: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -460,6 +546,34 @@ def _forward_with_audio(
             audio_latents=audio_latents,
         )
     return out.video, out.audio
+
+
+def _forward_with_action(
+    model: Cosmos3VFMTransformer, device: torch.device, text_seed: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    channels = _COSMOS3_TEST_CONFIG["latent_channel"]
+    hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+        device, channels=channels, text_seed=text_seed
+    )
+    torch.manual_seed(SEED_INPUT + 2)
+    action_latents = (
+        torch.randn(hs.shape[0], _T_ACTION, _ACTION_DIM, device=device, dtype=hs.dtype) * 0.1
+    )
+    domain_ids = torch.tensor([7], dtype=torch.long, device=device)
+    model.reset_cache()
+    with torch.inference_mode():
+        out = model(
+            hidden_states=hs,
+            timestep=ts / _NUM_TRAIN_TIMESTEPS,
+            raw_timestep=ts,
+            text_ids=text_ids,
+            text_mask=text_mask,
+            video_shape=video_shape,
+            fps=_FPS,
+            action_latents=action_latents,
+            action_domain_ids=domain_ids,
+        )
+    return out.video, out.action
 
 
 def _build_ref_and_parallel(
@@ -506,6 +620,49 @@ def _build_ref_and_parallel(
     return ref_model, parallel_model, vgm, device
 
 
+def _build_fp8_ref_and_parallel(
+    *,
+    tp_size: int = 1,
+    ulysses_size: int = 1,
+    cfg_size: int = 1,
+) -> Tuple[Cosmos3VFMTransformer, Cosmos3VFMTransformer, VisualGenMapping, torch.device]:
+    """Static-FP8 variant of `_build_ref_and_parallel`.
+
+    Both models carry the same synthetic calibrated FP8 state (same weights,
+    same per-tensor scales), so parity isolates the parallelism over the
+    W8A8 path with split q/k/v and gate/up projections.
+    """
+    device = torch.device(f"cuda:{dist.get_rank() % torch.cuda.device_count()}")
+
+    torch.manual_seed(SEED_WEIGHTS)
+    ref_config = _make_model_config(
+        _COSMOS3_TEST_CONFIG,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8),
+    )
+    ref_model = Cosmos3VFMTransformer(ref_config).to(device).eval()
+    _init_static_fp8_weights(ref_model)
+    ref_model.post_load_weights()
+    _assert_static_fp8_engaged(ref_model)
+
+    parallel_config = _make_model_config(
+        _COSMOS3_TEST_CONFIG,
+        cfg_size=cfg_size,
+        tp_size=tp_size,
+        ulysses_size=ulysses_size,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8),
+    )
+    vgm = parallel_config.visual_gen_mapping
+    parallel_model = Cosmos3VFMTransformer(parallel_config).to(device).eval()
+    if tp_size > 1:
+        _copy_ref_weights_to_tp(ref_model, parallel_model, vgm.tp_rank, tp_size)
+    else:
+        parallel_model.load_state_dict(ref_model.state_dict())
+    parallel_model.post_load_weights()
+    _assert_static_fp8_engaged(parallel_model)
+
+    return ref_model, parallel_model, vgm, device
+
+
 def _cfg_text_seed(rank: int, *, tp_size: int, ulysses_size: int, cfg_size: int) -> int:
     if cfg_size > 1:
         cfg_rank = rank // (tp_size * ulysses_size)
@@ -523,7 +680,7 @@ def _assert_parity(actual: torch.Tensor, expected: torch.Tensor, *, msg: str) ->
 
 
 # =============================================================================
-# Test logic (module-level for mp.spawn pickling)
+# Test logic (module-level so the pool can pickle it by reference)
 # =============================================================================
 
 
@@ -580,7 +737,18 @@ def _logic_cosmos3_ulysses_vs_single_gpu(rank, world_size):
     text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
 
     ref_out = _forward(ref_model, device, text_seed)
-    ulysses_out = _forward(ulysses_model, device, text_seed)
+    from tensorrt_llm._torch.visual_gen.attention.backends import parallel as parallel_attention
+
+    original_prefix_helper = parallel_attention._run_attention_with_replicated_kv
+
+    def fail_disabled_prefix_helper(*_args, **_kwargs):
+        raise AssertionError("Uniform Ulysses text must not enter the compiler-disabled helper")
+
+    parallel_attention._run_attention_with_replicated_kv = fail_disabled_prefix_helper
+    try:
+        ulysses_out = _forward(ulysses_model, device, text_seed)
+    finally:
+        parallel_attention._run_attention_with_replicated_kv = original_prefix_helper
 
     if rank == 0:
         diff = (ulysses_out.float() - ref_out.float()).abs()
@@ -594,6 +762,75 @@ def _logic_cosmos3_ulysses_vs_single_gpu(rank, world_size):
         ulysses_out,
         ref_out,
         msg=f"Rank {rank}: Ulysses output differs from single-GPU reference",
+    )
+
+
+def _logic_cosmos3_ulysses_unequal_text_vs_single_gpu(rank, world_size):
+    """Text-tower K/V trimming under Ulysses is T1 against the unsharded forward."""
+    ref_model, ulysses_model, _, device = _build_ref_and_parallel(ulysses_size=world_size)
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
+
+    ref_out = _forward_with_unequal_text_lengths(ref_model, device, text_seed)
+
+    captured_text_tower = {}
+
+    def capture_text_tower(_module, inputs, output):
+        captured_text_tower["text_ids_shape"] = inputs[0].shape
+        captured_text_tower["text_mask_shape"] = inputs[1].shape
+        captured_text_tower["cached_kv"] = output
+
+    handle = ulysses_model.language_model.register_forward_hook(capture_text_tower)
+    try:
+        ulysses_out = _forward_with_unequal_text_lengths(ulysses_model, device, text_seed)
+    finally:
+        handle.remove()
+
+    # The sequence-parallel cache must remain a full, trimmed text prefix on
+    # every rank. Ulysses shards its heads only after the generated-token A2A.
+    expected_text_shape = torch.Size((2, _TEXT_LEN))
+    assert captured_text_tower["text_ids_shape"] == expected_text_shape
+    assert captured_text_tower["text_mask_shape"] == expected_text_shape
+    assert ulysses_model.cached_kv[0][0].shape[1] == _TEXT_LEN
+    assert ulysses_model.cached_kv is captured_text_tower["cached_kv"]
+    assert ulysses_model.cached_real_text_lens.device.type == "cpu"
+    torch.testing.assert_close(
+        ulysses_model.cached_real_text_lens,
+        torch.tensor([2, _TEXT_LEN], dtype=torch.int32),
+    )
+    ulysses_out_float = ulysses_out.float()
+    ref_out_float = ref_out.float()
+    error = ulysses_out_float - ref_out_float
+    diff = error.abs()
+    ref_norm = torch.linalg.vector_norm(ref_out_float)
+    assert ref_norm > 0, "Reference output must have nonzero norm"
+    relative_l2 = torch.linalg.vector_norm(error) / ref_norm
+    cosine = torch.nn.functional.cosine_similarity(
+        ulysses_out_float.flatten(), ref_out_float.flatten(), dim=0
+    )
+    if rank == 0:
+        print(
+            f"[ulysses={world_size},text_lens=2/{_TEXT_LEN}] "
+            f"max_abs_diff={diff.max().item():.6e}, "
+            f"mean_abs_diff={diff.mean().item():.6e}, "
+            f"relative_l2={relative_l2.item():.6e}, "
+            f"cosine={cosine.item():.6e}",
+            flush=True,
+        )
+
+    assert relative_l2 <= 1e-2
+    assert cosine >= 0.9999
+
+    _assert_parity(
+        ulysses_out,
+        ref_out,
+        msg=f"Rank {rank}: unequal-length Ulysses output differs from single-GPU reference",
+    )
+    torch.testing.assert_close(
+        ulysses_out_float,
+        ref_out_float,
+        rtol=1e-4,
+        atol=1e-5,
+        msg=f"Rank {rank}: unequal-length Ulysses regression exceeded tight tolerance",
     )
 
 
@@ -625,6 +862,37 @@ def _logic_cosmos3_ulysses_audio_vs_single_gpu(rank, world_size):
         ulysses_audio,
         ref_audio,
         msg=f"Rank {rank}: Ulysses+audio AUDIO differs from single-GPU reference",
+    )
+
+
+def _logic_cosmos3_ulysses_action_vs_single_gpu(rank, world_size):
+    ref_model, ulysses_model, _, device = _build_ref_and_parallel(
+        ulysses_size=world_size, pretrained_dict=_COSMOS3_ACTION_CONFIG
+    )
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
+
+    ref_video, ref_action = _forward_with_action(ref_model, device, text_seed)
+    ulysses_video, ulysses_action = _forward_with_action(ulysses_model, device, text_seed)
+
+    if rank == 0:
+        vdiff = (ulysses_video.float() - ref_video.float()).abs()
+        adiff = (ulysses_action.float() - ref_action.float()).abs()
+        print(
+            f"[ulysses={world_size}+action] "
+            f"video max_abs_diff={vdiff.max().item():.6e}, "
+            f"action max_abs_diff={adiff.max().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        ulysses_video,
+        ref_video,
+        msg=f"Rank {rank}: Ulysses+action VIDEO differs from single-GPU reference",
+    )
+    _assert_parity(
+        ulysses_action,
+        ref_action,
+        msg=f"Rank {rank}: Ulysses+action ACTION differs from single-GPU reference",
     )
 
 
@@ -682,6 +950,128 @@ def _logic_cosmos3_cfg_ulysses_vs_single_gpu(rank, world_size):
     )
 
 
+def _logic_cosmos3_fp8_tp_vs_single_gpu(rank, world_size):
+    ref_model, tp_model, _, device = _build_fp8_ref_and_parallel(tp_size=world_size)
+    text_seed = _cfg_text_seed(rank, tp_size=world_size, ulysses_size=1, cfg_size=1)
+
+    ref_out = _forward(ref_model, device, text_seed)
+    tp_out = _forward(tp_model, device, text_seed)
+
+    if rank == 0:
+        diff = (tp_out.float() - ref_out.float()).abs()
+        print(
+            f"[fp8,tp={world_size}] max_abs_diff={diff.max().item():.6e}, "
+            f"mean_abs_diff={diff.mean().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        tp_out, ref_out, msg=f"Rank {rank}: FP8 TP output differs from single-GPU FP8 reference"
+    )
+
+
+def _logic_cosmos3_fp8_ulysses_vs_single_gpu(rank, world_size):
+    ref_model, ulysses_model, _, device = _build_fp8_ref_and_parallel(ulysses_size=world_size)
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
+
+    ref_out = _forward(ref_model, device, text_seed)
+    ulysses_out = _forward(ulysses_model, device, text_seed)
+
+    if rank == 0:
+        diff = (ulysses_out.float() - ref_out.float()).abs()
+        print(
+            f"[fp8,ulysses={world_size}] max_abs_diff={diff.max().item():.6e}, "
+            f"mean_abs_diff={diff.mean().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        ulysses_out,
+        ref_out,
+        msg=f"Rank {rank}: FP8 Ulysses output differs from single-GPU FP8 reference",
+    )
+
+
+def _logic_cosmos3_fp8_ulysses_unequal_text_vs_single_gpu(rank, world_size):
+    """The replicated-K/V sequence-parallel cross-attention path under SEPARATE_QKV."""
+    ref_model, ulysses_model, _, device = _build_fp8_ref_and_parallel(ulysses_size=world_size)
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
+
+    ref_out = _forward_with_unequal_text_lengths(ref_model, device, text_seed)
+    ulysses_out = _forward_with_unequal_text_lengths(ulysses_model, device, text_seed)
+
+    assert ulysses_model.cached_kv[0][0].shape[1] == _TEXT_LEN
+    torch.testing.assert_close(
+        ulysses_model.cached_real_text_lens,
+        torch.tensor([2, _TEXT_LEN], dtype=torch.int32),
+    )
+
+    if rank == 0:
+        diff = (ulysses_out.float() - ref_out.float()).abs()
+        print(
+            f"[fp8,ulysses={world_size},text_lens=2/{_TEXT_LEN}] "
+            f"max_abs_diff={diff.max().item():.6e}, "
+            f"mean_abs_diff={diff.mean().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        ulysses_out,
+        ref_out,
+        msg=f"Rank {rank}: FP8 unequal-length Ulysses output differs from FP8 reference",
+    )
+
+
+def _logic_cosmos3_fp8_cfg_vs_single_gpu(rank, world_size):
+    ref_model, parallel_model, _, device = _build_fp8_ref_and_parallel(cfg_size=world_size)
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=1, cfg_size=world_size)
+
+    ref_out = _forward(ref_model, device, text_seed)
+    parallel_out = _forward(parallel_model, device, text_seed)
+
+    _assert_parity(
+        parallel_out,
+        ref_out,
+        msg=f"Rank {rank}: FP8 CFG output differs from single-GPU FP8 reference",
+    )
+
+
+def _logic_cosmos3_fp8_tp_ulysses_vs_single_gpu(rank, world_size):
+    tp_size = 2
+    ulysses_size = 2
+    ref_model, combined_model, _, device = _build_fp8_ref_and_parallel(
+        tp_size=tp_size, ulysses_size=ulysses_size
+    )
+    text_seed = _cfg_text_seed(rank, tp_size=tp_size, ulysses_size=ulysses_size, cfg_size=1)
+
+    ref_out = _forward(ref_model, device, text_seed)
+    combined_out = _forward(combined_model, device, text_seed)
+
+    if rank == 0:
+        diff = (combined_out.float() - ref_out.float()).abs()
+        print(
+            f"[fp8,tp={tp_size},ulysses={ulysses_size}] max_abs_diff={diff.max().item():.6e}, "
+            f"mean_abs_diff={diff.mean().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        combined_out,
+        ref_out,
+        msg=f"Rank {rank}: FP8 TP+Ulysses output differs from single-GPU FP8 reference",
+    )
+
+
+def _logic_cosmos3_fp8_attn2d_rejected(rank, world_size):
+    config = _make_model_config(
+        _COSMOS3_TEST_CONFIG,
+        attn2d_row_size=world_size,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8),
+    )
+    with pytest.raises(NotImplementedError, match="context parallelism"):
+        Cosmos3VFMTransformer(config)
+
+
 def _logic_cosmos3_attn2d_vs_single_gpu(rank, world_size):
     # 2x1 attn2d mesh (Q gathered across rows, K/V kept local). FA4 backend since
     # Attention2DAttention requires an LSE-capable inner backend.
@@ -712,6 +1102,29 @@ def _logic_cosmos3_attn2d_vs_single_gpu(rank, world_size):
         attn2d_out,
         ref_out,
         msg=f"Rank {rank}: Attention2D (2x1) output differs from single-GPU reference",
+    )
+
+
+def _logic_cosmos3_attn2d_unequal_text_vs_single_gpu(rank, world_size):
+    """A real 1x2 mesh partitions unequal text prefixes across columns."""
+    try:
+        ref_model, attn2d_model, _, device = _build_ref_and_parallel(
+            attn2d_row_size=1,
+            attn2d_col_size=2,
+            backend="FA4",
+            pretrained_dict=_COSMOS3_FA4_CONFIG,
+        )
+    except ImportError:
+        pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=1, cfg_size=1)
+    ref_out = _forward_with_unequal_text_lengths(ref_model, device, text_seed)
+    attn2d_out = _forward_with_unequal_text_lengths(attn2d_model, device, text_seed)
+
+    _assert_parity(
+        attn2d_out,
+        ref_out,
+        msg=f"Rank {rank}: Attention2D (1x2) unequal text differs from single-GPU reference",
     )
 
 
@@ -759,58 +1172,91 @@ def _logic_cosmos3_attn2d_ulysses_vs_single_gpu(rank, world_size):
 class TestCosmos3TransformerParallel:
     """Cosmos3 TP / Ulysses / CFG parity vs single-GPU (synthetic weights, no checkpoint)."""
 
-    def _skip_if_unavailable(self):
-        if not MODULES_AVAILABLE:
-            pytest.skip("Required modules not available")
-
     def test_tp2_vs_single_gpu(self):
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_tp_vs_single_gpu)
 
     def test_ulysses2_vs_single_gpu(self):
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_vs_single_gpu)
+
+    def test_ulysses2_unequal_text_lengths_vs_single_gpu(self):
+        """CFG-in-one-batch text padding is excluded from sequence-parallel K/V."""
+        run_test_in_distributed(
+            world_size=2,
+            test_fn=_logic_cosmos3_ulysses_unequal_text_vs_single_gpu,
+        )
 
     def test_edge_tp2_vs_single_gpu(self):
         """Edge's non-gated relu² MLP shards without the gate_up fusion the
         Qwen recipe uses, so column/row splitting takes a different path."""
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_edge_tp_vs_single_gpu)
 
     def test_edge_ulysses2_vs_single_gpu(self):
         """Edge under sequence sharding: no und Q/K norm, and the reasoner's
         keys are normed only where the generator consumes them."""
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_edge_ulysses_vs_single_gpu)
 
     def test_ulysses2_audio_vs_single_gpu(self):
         """Ulysses parity with the audio modality on: video + audio tokens are
         sharded together across the sequence dimension."""
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_audio_vs_single_gpu)
+
+    def test_ulysses2_action_vs_single_gpu(self):
+        """Ulysses parity with action tokens appended to the GEN sequence."""
+        run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_action_vs_single_gpu)
 
     @pytest.mark.gpu4
     def test_tp2_ulysses2_vs_single_gpu(self):
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_tp_ulysses_vs_single_gpu)
 
     @pytest.mark.gpu4
     def test_cfg2_ulysses2_vs_single_gpu(self):
-        self._skip_if_unavailable()
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_cfg_ulysses_vs_single_gpu)
 
     def test_attn2d_2x1_vs_single_gpu(self):
-        self._skip_if_unavailable()
-        if not _ATTN2D_AVAILABLE:
-            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        assert _ATTN2D_AVAILABLE, (
+            "FA4 / flash_attn_combine JIT kernels not available; expected on the Blackwell CI runner"
+        )
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_attn2d_vs_single_gpu)
+
+    def test_attn2d_1x2_unequal_text_lengths_vs_single_gpu(self):
+        assert _ATTN2D_AVAILABLE, (
+            "FA4 / flash_attn_combine JIT kernels not available; expected on the Blackwell CI runner"
+        )
+        run_test_in_distributed(
+            world_size=2,
+            test_fn=_logic_cosmos3_attn2d_unequal_text_vs_single_gpu,
+        )
 
     @pytest.mark.gpu4
     def test_attn2d_2x1_ulysses2_vs_single_gpu(self):
-        self._skip_if_unavailable()
-        if not _ATTN2D_AVAILABLE:
-            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        assert _ATTN2D_AVAILABLE, (
+            "FA4 / flash_attn_combine JIT kernels not available; expected on the Blackwell CI runner"
+        )
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_attn2d_ulysses_vs_single_gpu)
+
+    def test_fp8_tp2_vs_single_gpu(self):
+        run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_fp8_tp_vs_single_gpu)
+
+    def test_fp8_ulysses2_vs_single_gpu(self):
+        run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_fp8_ulysses_vs_single_gpu)
+
+    def test_fp8_ulysses2_unequal_text_lengths_vs_single_gpu(self):
+        """SEPARATE_QKV cross-attention through the replicated-K/V Ulysses path."""
+        run_test_in_distributed(
+            world_size=2,
+            test_fn=_logic_cosmos3_fp8_ulysses_unequal_text_vs_single_gpu,
+        )
+
+    def test_fp8_cfg2_vs_single_gpu(self):
+        run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_fp8_cfg_vs_single_gpu)
+
+    @pytest.mark.gpu4
+    def test_fp8_tp2_ulysses2_vs_single_gpu(self):
+        run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_fp8_tp_ulysses_vs_single_gpu)
+
+    def test_fp8_attn2d_rejected(self):
+        """Attention2D/ring sequence sharding is unvalidated with split q/k/v: refuse loudly."""
+        run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_fp8_attn2d_rejected)
 
 
 if __name__ == "__main__":

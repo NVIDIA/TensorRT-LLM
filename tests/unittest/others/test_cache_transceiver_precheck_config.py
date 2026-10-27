@@ -19,26 +19,19 @@ Target: tests/scripts/perf-sanity/cache_transceiver_precheck/precheck_config.py
 
 import json
 import os
+import shlex
 import subprocess
 import sys
+import time
 import types
 
 import pytest
 
-_PRECHECK_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..",
-    "..",
-    "..",
-    "tests",
-    "scripts",
-    "perf-sanity",
-    "cache_transceiver_precheck",
-)
-sys.path.insert(0, os.path.abspath(_PRECHECK_DIR))
+__extra_import_path__ = ["~/tests/scripts/perf-sanity/cache_transceiver_precheck"]
+import precheck_config as pcfg
+import run_precheck as rp
 
-import precheck_config as pcfg  # noqa: E402
-import run_precheck as rp  # noqa: E402  (stdlib-only at import time)
+_PRECHECK_DIR = os.path.dirname(os.path.abspath(pcfg.__file__))
 
 
 def _disagg_yaml(ctx_extra=None, gen_extra=None, **overrides):
@@ -148,6 +141,18 @@ def test_gen_only_no_context_skips():
     plan = pcfg.resolve_plan(cfg, benchmark_mode="gen_only")
     assert plan["skip"]
     # e2e over the same yaml still runs (ctx servers are launched there).
+    assert not pcfg.resolve_plan(cfg, benchmark_mode="e2e")["skip"]
+
+
+def test_gen_only_no_context_test_id_skips_over_an_ordinary_yaml():
+    """The primary entry path: the test id names the mode, the yaml does not."""
+    cfg = _disagg_yaml(benchmark={"mode": "e2e", "input_length": 1024})
+
+    plan = pcfg.resolve_plan(cfg, benchmark_mode="gen_only_no_context")
+    assert plan["skip"]
+    assert "gen_only_no_context" in plan["skip_reason"]
+
+    assert not pcfg.resolve_plan(cfg, benchmark_mode="gen_only")["skip"]
     assert not pcfg.resolve_plan(cfg, benchmark_mode="e2e")["skip"]
 
 
@@ -284,9 +289,9 @@ def test_use_kv_cache_manager_v2_flags():
     # Absent -> "auto" (the driver resolves it against the model's
     # get_preferred_kv_cache_manager_version at runtime, like serving).
     plan = pcfg.resolve_plan(_disagg_yaml())
-    assert plan["ctx_use_kv_cache_manager_v2"] == "auto"
-    assert plan["gen_use_kv_cache_manager_v2"] == "auto"
-    assert pcfg.side_plan(plan, "ctx")["use_kv_cache_manager_v2"] == "auto"
+    assert plan["ctx_use_kv_cache_manager_v2"] is True
+    assert plan["gen_use_kv_cache_manager_v2"] is True
+    assert pcfg.side_plan(plan, "ctx")["use_kv_cache_manager_v2"] is True
 
     # Explicit yaml values win, per side.
     plan = pcfg.resolve_plan(
@@ -474,11 +479,119 @@ class TestRendezvousStaleness:
 
 def test_wireup_timeout_derivation():
     plan = pcfg.resolve_plan(_disagg_yaml())  # ctx dep4 -> gen dep16
-    assert plan["wireup_timeout_s"] == min(1800, 150 * 16)
+    assert plan["wireup_timeout_s"] == 600
     plan = pcfg.resolve_plan(_disagg_yaml(gen_extra={"tensor_parallel_size": 4}))
     assert plan["wireup_timeout_s"] == 600
     plan = pcfg.resolve_plan(_disagg_yaml(cache_transceiver_precheck={"wireup_timeout_s": 42}))
     assert plan["wireup_timeout_s"] == 42
+
+
+def test_timeout_budget_is_bounded_and_layered():
+    one_peer = pcfg.timeout_budget(_disagg_yaml(), max_world=16)
+    assert one_peer == {
+        "wireup_timeout_s": 600,
+        "longest_phase_timeout_s": 900,
+        "watchdog_timeout_s": 960,
+        "step_timeout_s": 1200,
+    }
+
+    cfg = _disagg_yaml(hardware={"gpus_per_node": 4, "num_ctx_servers": 12, "num_gen_servers": 1})
+    multi_peer = pcfg.timeout_budget(cfg, max_world=32)
+    # Even 12 serialized ctx peers retain the 20-minute default health limit.
+    # Progress refreshes protect legitimate per-peer phases without scaling
+    # the external backstop with topology.
+    assert multi_peer["longest_phase_timeout_s"] == 900
+    assert multi_peer["step_timeout_s"] == 1200
+
+    cfg["cache_transceiver_precheck"] = {"step_timeout_s": 900}
+    with pytest.raises(ValueError, match="must exceed the longest phase watchdog"):
+        pcfg.timeout_budget(cfg, max_world=32)
+
+    cfg["cache_transceiver_precheck"] = {"step_timeout_s": 1800}
+    assert pcfg.timeout_budget(cfg, max_world=32)["step_timeout_s"] == 1800
+
+    cfg["cache_transceiver_precheck"] = {"step_timeout_s": 1801}
+    with pytest.raises(ValueError, match="must not exceed the global health-check limit"):
+        pcfg.timeout_budget(cfg, max_world=32)
+
+
+@pytest.mark.parametrize("model_root", ["/models with spaces", "/models/o'hare"])
+def test_precheck_commands_propagate_model_root(monkeypatch, model_root):
+    # CI provides the model root inside its inbound pytest command, not in the
+    # environment of the Python process that generates the launch script.
+    monkeypatch.delenv("LLM_MODELS_ROOT", raising=False)
+    monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
+    lines = pcfg.precheck_prefix_lines(
+        {},
+        "e2e",
+        "$config",
+        "unset UCX_TLS &&",
+        max_world=8,
+        llm_models_root=model_root,
+    )
+    shell_script = "\n".join(
+        [
+            "CTX_WORKER_ENV_VARS=",
+            "GEN_WORKER_ENV_VARS=",
+            "PYTEST_COMMON_VARS=",
+            "llmSrcNode=/repo",
+            "testOutputDir=/tmp/output",
+            "config=/tmp/config.yaml",
+            *lines,
+            "printf '%s\\n' \"$pytestCommandCTXPrecheck\"",
+            "printf '%s\\n' \"$pytestCommandGENPrecheck\"",
+        ]
+    )
+
+    result = subprocess.run(
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
+    )
+    commands = result.stdout.splitlines()
+
+    assert len(commands) == 2
+    for command in commands:
+        tokens = shlex.split(command)
+        assignment = f"LLM_MODELS_ROOT={model_root}"
+        assert assignment in tokens
+        assert tokens.index(assignment) < tokens.index("python3")
+
+
+def test_precheck_commands_split_pytest_common_vars(monkeypatch):
+    # $PYTEST_COMMON_VARS is spliced unquoted on purpose: bash word splitting
+    # must yield separate K=V env-assignment tokens ahead of the executable.
+    # Values containing spaces are unsupported by design — this pins the
+    # expected splitting behavior.
+    monkeypatch.delenv("LLM_MODELS_ROOT", raising=False)
+    monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
+    lines = pcfg.precheck_prefix_lines(
+        {},
+        "e2e",
+        "$config",
+        "unset UCX_TLS &&",
+        max_world=8,
+        llm_models_root="/models",
+    )
+    shell_script = "\n".join(
+        [
+            "CTX_WORKER_ENV_VARS=",
+            "GEN_WORKER_ENV_VARS=",
+            'PYTEST_COMMON_VARS="FOO=1 BAR=two"',
+            "llmSrcNode=/repo",
+            "testOutputDir=/tmp/output",
+            "config=/tmp/config.yaml",
+            *lines,
+            "printf '%s\\n' \"$pytestCommandCTXPrecheck\"",
+        ]
+    )
+
+    result = subprocess.run(
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
+    )
+    tokens = shlex.split(result.stdout.splitlines()[0])
+
+    python_index = tokens.index("python3")
+    for assignment in ("FOO=1", "BAR=two"):
+        assert tokens.index(assignment) < python_index
 
 
 def _enabled_line(cfg):
@@ -523,6 +636,7 @@ def test_precheck_commands_export_model_root_safely(model_root, monkeypatch):
         text=True,
         capture_output=True,
         check=True,
+        timeout=60,
     )
     assert result.stdout == model_root
 
@@ -531,7 +645,7 @@ def test_disabled_precheck_does_not_require_or_export_model_root(monkeypatch):
     monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
 
     lines = pcfg.precheck_prefix_lines(
-        _disagg_yaml(),
+        _disagg_yaml(cache_transceiver_precheck={"enabled": False}),
         "e2e",
         "$config",
         "unset UCX_TLS &&",
@@ -557,6 +671,50 @@ def test_enabled_precheck_requires_model_root(monkeypatch, llm_models_root):
         )
 
 
+def test_precheck_enabled_helper(monkeypatch):
+    # submit.py consults this helper to decide whether a missing model root is
+    # fatal — it must mirror the policy encoded in ctPrecheckEnabled.
+    monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
+    assert pcfg.PRECHECK_DEFAULTS["enabled"] is True
+    assert pcfg.precheck_enabled({}) is True
+    assert pcfg.precheck_enabled({"cache_transceiver_precheck": {"enabled": False}}) is False
+    monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", "0")
+    assert pcfg.precheck_enabled({}) is False
+    monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", "true")
+    assert pcfg.precheck_enabled({"cache_transceiver_precheck": {"enabled": False}}) is True
+
+
+@pytest.mark.parametrize("force_enable", [False, True])
+def test_dwdp_ctx_disables_precheck(monkeypatch, force_enable):
+    # A DWDP ctx side is one MPI step of single-GPU servers, which the gate's
+    # one-srun-per-ctx-server launch cannot reproduce: skip it, even when the
+    # env var forces the precheck on, and without demanding a model root.
+    if force_enable:
+        monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", "1")
+    else:
+        monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
+    cfg = _disagg_yaml()
+    cfg["worker_config"]["ctx"]["dwdp_config"] = {"dwdp_size": 4, "num_groups": 1}
+
+    lines = pcfg.precheck_prefix_lines(cfg, "e2e", "$c", "unset &&", max_world=8)
+
+    assert "export ctPrecheckEnabled=0" in lines
+    assert not any(line.startswith("export LLM_MODELS_ROOT=") for line in lines)
+
+
+def test_skip_waived_case_overrides_force_enable(monkeypatch):
+    monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", "1")
+    lines = pcfg.precheck_prefix_lines(
+        {},
+        "e2e",
+        "$c",
+        "unset &&",
+        max_world=8,
+        skip_precheck=True,
+    )
+    assert next(x for x in lines if x.startswith("export ctPrecheckEnabled")).endswith("=0")
+
+
 def test_precheck_env_kill_switch_truthy(monkeypatch):
     """The TRTLLM_DISAGG_CT_PRECHECK kill switch parses the usual boolean spellings.
 
@@ -566,7 +724,7 @@ def test_precheck_env_kill_switch_truthy(monkeypatch):
     cfg = {"cache_transceiver_precheck": {"enabled": True}}
     monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
     assert _enabled_line(cfg).endswith("=1")  # yaml opt-in
-    assert _enabled_line({}).endswith("=0")  # off by default (waived)
+    assert _enabled_line({}).endswith("=1")  # on by default
     for v in ("1", "true", "on", "YES", " True "):
         monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", v)
         assert _enabled_line(cfg).endswith("=1"), v
@@ -608,6 +766,140 @@ def test_gate_library_content(tmp_path):
         pcfg.gate_library_content("/nowhere/draft.sh", str(tmp_path / "empty"))
 
 
+@pytest.mark.parametrize("driver_status", (None, "PASS", "RUNNING", "FAIL"))
+@pytest.mark.parametrize(
+    ("exit_code", "expected_verdict"),
+    ((124, "EXTERNAL_TIMEOUT"), (137, "EXTERNAL_KILL")),
+)
+def test_gate_records_external_timeout_verdict(
+    tmp_path, exit_code, expected_verdict, driver_status
+):
+    """A killed step gets the gate's verdict unless the driver already wrote a FAIL verdict.
+
+    A stale PASS or a RUNNING status left by a dead driver is replaced, and the junit excerpt
+    still shows the driver's error markers after they scrolled out of the log tail.
+    """
+    gate = os.path.join(
+        os.path.dirname(_PRECHECK_DIR),
+        "..",
+        "..",
+        "..",
+        "jenkins",
+        "scripts",
+        "perf",
+        "disaggregated",
+        "slurm_ct_precheck_gate.sh",
+    )
+    gate = os.path.abspath(gate)
+    shell_script = f"""
+source {shlex.quote(gate)}
+timeout() {{
+    local name="${{DISAGG_SERVING_TYPE/_PRECHECK_/_}}"
+    name="${{name,,}}"  # GEN_PRECHECK_0 -> gen_0
+    if [ -n "{driver_status or ""}" ]; then
+        echo "{driver_status} $name" > "$precheckDir/status/$name.status"
+    fi
+    echo "[precheck $name r0] UNHANDLED_ERROR: FileExistsError: [Errno 17] File exists"
+    echo "[precheck $name] STATUS_WRITE_ERROR: OSError: [Errno 5] Input/output error"
+    seq 100  # later output pushes the marker out of the log tail
+    printf '\\0'  # an aborted MPI job can leave a NUL byte in the log
+    return {exit_code}
+}}
+sleep() {{ :; }}
+cleanup_on_failure() {{ :; }}
+ctPrecheckEnabled=1
+ctPrecheckTimeout=1200
+testOutputDir={shlex.quote(str(tmp_path / "output"))}
+jobWorkspace={shlex.quote(str(tmp_path / "workspace"))}
+mkdir -p "$jobWorkspace"
+numGenServers=1
+numCtxServers=1
+nodesPerGenServer=1
+nodesPerCtxServer=1
+gpusPerNodePerGenServer=1
+gpusPerNodePerCtxServer=1
+genNodeLists=(gen-node)
+ctxNodeLists=(ctx-node)
+srunArgs=()
+pytestCommandGENPrecheck=gen-command
+pytestCommandCTXPrecheck=ctx-command
+precheckRunScript=/unused
+run_cache_transceiver_precheck
+"""
+    subprocess.run(
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
+    )
+
+    status_dir = tmp_path / "output" / "cache_transceiver_precheck" / "status"
+    for name in ("gen_0", "ctx_0"):
+        verdict = (status_dir / f"{name}.status").read_text()
+        if driver_status == "FAIL":
+            assert verdict == f"FAIL {name}\n"  # the driver's root cause wins over the exit code
+            continue
+        assert verdict.startswith(f"{expected_verdict} {name}:")
+        if exit_code == 124:
+            assert "1200s total-runtime backstop" in verdict
+        else:
+            assert "possibly timeout -k escalation" in verdict
+    junit = (tmp_path / "workspace" / "results-ct-precheck.xml").read_text()
+    assert ("FAIL gen_0" if driver_status == "FAIL" else expected_verdict) in junit
+    assert "NO_STATUS" not in junit
+    assert "UNHANDLED_ERROR: FileExistsError: [Errno 17] File exists" in junit
+    assert "STATUS_WRITE_ERROR: OSError: [Errno 5] Input/output error" in junit
+
+
+def test_gate_scopes_precheck_launch_environment(tmp_path):
+    gate = os.path.join(
+        os.path.dirname(_PRECHECK_DIR),
+        "..",
+        "..",
+        "..",
+        "jenkins",
+        "scripts",
+        "perf",
+        "disaggregated",
+        "slurm_ct_precheck_gate.sh",
+    )
+    gate = os.path.abspath(gate)
+    shell_script = f"""
+source {shlex.quote(gate)}
+timeout() {{
+    case "$DISAGG_SERVING_TYPE:$pytestCommand" in
+        "GEN_PRECHECK_0:gen-command --server-idx 0"|\
+        "CTX_PRECHECK_0:ctx-command --server-idx 0") return 0 ;;
+        *) return 99 ;;
+    esac
+}}
+sleep() {{ :; }}
+cleanup_on_failure() {{ return 98; }}
+ctPrecheckEnabled=1
+ctPrecheckTimeout=1200
+testOutputDir={shlex.quote(str(tmp_path / "output"))}
+jobWorkspace={shlex.quote(str(tmp_path / "workspace"))}
+mkdir -p "$jobWorkspace"
+numGenServers=1
+numCtxServers=1
+nodesPerGenServer=1
+nodesPerCtxServer=1
+gpusPerNodePerGenServer=1
+gpusPerNodePerCtxServer=1
+genNodeLists=(gen-node)
+ctxNodeLists=(ctx-node)
+srunArgs=()
+pytestCommandGENPrecheck=gen-command
+pytestCommandCTXPrecheck=ctx-command
+precheckRunScript=/unused
+DISAGG_SERVING_TYPE=REAL_PERF_PARENT
+pytestCommand=real-perf-command
+run_cache_transceiver_precheck
+printf '%s\n%s\n' "$DISAGG_SERVING_TYPE" "$pytestCommand"
+"""
+    result = subprocess.run(
+        ["bash"], input=shell_script, capture_output=True, check=True, text=True, timeout=60
+    )
+    assert result.stdout.splitlines()[-2:] == ["REAL_PERF_PARENT", "real-perf-command"]
+
+
 def test_rid_tags_dense_within_session():
     """Rids must be dense within a (ctx, gen) session.
 
@@ -636,7 +928,7 @@ def test_rid_tags_dense_within_session():
 
 
 class TestMultiPeerOrchestration:
-    """CPU-only end-to-end run of the 2-ctx x 1-gen session protocol.
+    """CPU-only end-to-end runs of the multi-peer session protocol.
 
     Exercises the exact multi-instance logic of the hardware "B" topology:
     real ZMQ sockets + HMAC frames + StatusRecorder + rendezvous files via
@@ -668,8 +960,16 @@ class TestMultiPeerOrchestration:
         ctx_dp_rank = 0
         disagg_info_endpoint = None
 
-    def _mk_runner(self, role, server_idx, plan, work_dir, monkeypatch):
-        import sys
+    def _mk_runner(
+        self,
+        role,
+        server_idx,
+        plan,
+        work_dir,
+        monkeypatch,
+        fail_ctx=False,
+        wave_delay_s=0,
+    ):
         import types
 
         # PrecheckRunner.__init__ imports mpi4py only to ensure MPI init.
@@ -685,6 +985,10 @@ class TestMultiPeerOrchestration:
         calls = {"waves": 0}
 
         def ctx_run_wave(peer_idx, li, req_len, rep, wave):
+            if fail_ctx:
+                raise rp._TransferError("injected ctx failure")
+            if wave_delay_s:
+                time.sleep(wave_delay_s)
             calls["waves"] += 1
             return {p: self._FakeParams() for p in wave}, {}
 
@@ -694,7 +998,18 @@ class TestMultiPeerOrchestration:
         runner._calls = calls
         return runner
 
-    def _run(self, tmp_path, monkeypatch, fail_peer_idx=None):
+    def _run(
+        self,
+        tmp_path,
+        monkeypatch,
+        fail_peer_idx=None,
+        fail_ctx_idx=None,
+        num_ctx_servers=2,
+        first_ctx_wave_delay_s=0,
+        peer_progress_timeout_s=None,
+        contract_difference=None,
+        corrupt_welcome=False,
+    ):
         import threading
 
         monkeypatch.setenv("SLURM_JOB_ID", "777")
@@ -702,7 +1017,11 @@ class TestMultiPeerOrchestration:
         # resolve in sandboxed/CI environments, and everything is one process.
         monkeypatch.setenv("SLURMD_NODENAME", "127.0.0.1")
         cfg = _disagg_yaml(
-            hardware={"gpus_per_node": 4, "num_ctx_servers": 2, "num_gen_servers": 1},
+            hardware={
+                "gpus_per_node": 4,
+                "num_ctx_servers": num_ctx_servers,
+                "num_gen_servers": 1,
+            },
             cache_transceiver_precheck={
                 "request_lengths": [32],
                 "num_requests": 1,
@@ -713,11 +1032,42 @@ class TestMultiPeerOrchestration:
             },
         )
         plan = pcfg.resolve_plan(cfg)
+        if peer_progress_timeout_s is not None:
+            plan["peer_progress_timeout_s"] = peer_progress_timeout_s
+            monkeypatch.setattr(rp, "CONTROL_POLL_INTERVAL_MS", 50)
         work = str(tmp_path)
         noop = lambda *a, **k: None  # noqa: E731 - signal.alarm needs main thread
 
         gen = self._mk_runner("gen", 0, plan, work, monkeypatch)
-        ctxs = [self._mk_runner("ctx", i, plan, work, monkeypatch) for i in range(2)]
+        ctxs = [
+            self._mk_runner(
+                "ctx",
+                i,
+                plan,
+                work,
+                monkeypatch,
+                fail_ctx=(fail_ctx_idx is not None and i == fail_ctx_idx),
+                wave_delay_s=first_ctx_wave_delay_s if i == 0 else 0,
+            )
+            for i in range(num_ctx_servers)
+        ]
+
+        if corrupt_welcome:
+            send_recv = gen._leader_send_recv_with_progress
+
+            def change_welcome(*args: object, **kwargs: object) -> list:
+                """Corrupt only the welcome to exercise the gen-side guard."""
+                reply = send_recv(*args, **kwargs)
+                if reply[0] == "welcome":
+                    reply[1]["transfer_contract"] = {"unexpected": True}
+                return reply
+
+            gen._leader_send_recv_with_progress = change_welcome
+
+        if contract_difference is not None:
+            gen.transfer_contract = {"ctx": {"use_v2": True, "runtime": "PYTHON"}}
+            for ctx in ctxs:
+                ctx.transfer_contract = contract_difference
 
         if fail_peer_idx is not None:
             real_gen_run_peer = rp.gen_run_peer
@@ -752,19 +1102,57 @@ class TestMultiPeerOrchestration:
         ]
         for t in threads:
             t.start()
+
+        def gen_arm(what, publish_progress=True, **kwargs):
+            if publish_progress:
+                rp.publish_peer_progress(gen, what)
+
         try:
             rp._drive_ctx_peers(
-                gen, noop, noop, rp._make_peer_failure_recorder(gen, noop, {"what": "test"})
+                gen, gen_arm, noop, rp._make_peer_failure_recorder(gen, noop, {"what": "test"})
             )
         finally:
             # Always join every peer, even when the driver raises. Asserting
             # inside the loop can itself strand later peers and trip CI's
             # pytest-threadleak hook.
             for thread in threads:
-                thread.join(timeout=5)
+                thread.join(timeout=60)
             leaked = [thread.name for thread in threads if thread.is_alive()]
             assert not leaked, f"ctx serve threads wedged: {leaked}"
         return plan, gen, ctxs, failures
+
+    @pytest.mark.parametrize(
+        "contract",
+        [
+            {"ctx": {"use_v2": False, "runtime": "PYTHON"}},
+            {"ctx": {"use_v2": True, "runtime": "CPP"}},
+            {"ctx": {"use_v2": True, "runtime": "PYTHON"}, "kv_shape": {"is_mla": True}},
+        ],
+        ids=["manager", "runtime", "shape"],
+    )
+    def test_resolved_contract_mismatch_stops_before_transfer(
+        self, tmp_path: object, monkeypatch: pytest.MonkeyPatch, contract: dict
+    ) -> None:
+        """Real peer sessions reject divergent resolution without dispatching KV."""
+        _, gen, ctxs, failures = self._run(
+            tmp_path, monkeypatch, num_ctx_servers=1, contract_difference=contract
+        )
+        assert failures
+        assert all(ctx._calls["waves"] == 0 for ctx in ctxs)
+        assert any(
+            "resolved transfer contract mismatch" in case["reason"] for case in gen.recorder.cases
+        )
+
+    def test_rejected_welcome_aborts_peer(
+        self, tmp_path: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Gen rejection completes the abort exchange so ctx does not time out."""
+        _, gen, ctxs, failures = self._run(
+            tmp_path, monkeypatch, num_ctx_servers=1, corrupt_welcome=True
+        )
+        assert failures == [("gen_0", "_PeerAbort")]
+        assert ctxs[0]._calls["waves"] == 0
+        assert any("handshake contract mismatch" in case["reason"] for case in gen.recorder.cases)
 
     def test_two_ctx_full_pass(self, tmp_path, monkeypatch):
         plan, gen, ctxs, failures = self._run(tmp_path, monkeypatch)
@@ -780,6 +1168,123 @@ class TestMultiPeerOrchestration:
         for c in ctxs:
             assert c._calls["waves"] == total_waves
             assert [x["status"] for x in c.recorder.cases] == ["PASS"]
+
+    def test_four_ctx_full_pass(self, tmp_path, monkeypatch):
+        # ctx_0's four delayed waves take longer than the one-second queued
+        # wait budget. gen phase progress must refresh ctx_1..ctx_3 rather than
+        # letting their hello watchdog expire cumulatively behind ctx_0.
+        plan, gen, ctxs, failures = self._run(
+            tmp_path,
+            monkeypatch,
+            num_ctx_servers=4,
+            first_ctx_wave_delay_s=0.3,
+            peer_progress_timeout_s=1,
+        )
+        assert not failures
+        assert [c["peer"] for c in gen.recorder.cases] == [
+            "ctx_0",
+            "ctx_1",
+            "ctx_2",
+            "ctx_3",
+        ]
+        assert all(c["status"] == "PASS" for c in gen.recorder.cases)
+        assert all([case["status"] for case in ctx.recorder.cases] == ["PASS"] for ctx in ctxs)
+
+    def test_one_ctx_four_gen_full_pass(self, tmp_path, monkeypatch):
+        """Queued gen instances refresh from the active ctx's progress."""
+        import threading
+
+        monkeypatch.setenv("SLURM_JOB_ID", "778")
+        monkeypatch.setenv("SLURMD_NODENAME", "127.0.0.1")
+        monkeypatch.setattr(rp, "CONTROL_POLL_INTERVAL_MS", 50)
+        cfg = _disagg_yaml(
+            hardware={
+                "gpus_per_node": 4,
+                "num_ctx_servers": 1,
+                "num_gen_servers": 4,
+            },
+            cache_transceiver_precheck={
+                "request_lengths": [32],
+                "num_requests": 1,
+                "warmup_requests": 1,
+                "rendezvous_timeout_s": 30,
+                "wave_timeout_s": 30,
+                "wireup_timeout_s": 0,
+            },
+        )
+        plan = pcfg.resolve_plan(cfg)
+        # One ctx session takes four 0.3s waves, so later gen instances wait
+        # longer than this budget and need ctx progress to avoid false timeout.
+        plan["peer_progress_timeout_s"] = 1
+        work = str(tmp_path)
+        noop = lambda *args, **kwargs: None  # noqa: E731 - signal.alarm needs main thread
+
+        ctx = self._mk_runner(
+            "ctx",
+            0,
+            plan,
+            work,
+            monkeypatch,
+            wave_delay_s=0.3,
+        )
+        gens = [self._mk_runner("gen", i, plan, work, monkeypatch) for i in range(4)]
+        peer_failures = []
+        thread_errors = []
+
+        def record_ctx_peer_failure(peer, exc):
+            peer_failures.append((peer, type(exc).__name__))
+
+        def progress_arm(runner):
+            def arm(what, publish_progress=True, **kwargs):
+                if publish_progress:
+                    rp.publish_peer_progress(runner, what)
+
+            return arm
+
+        def run_ctx():
+            try:
+                rp._serve_gen_peers(
+                    ctx,
+                    plan,
+                    progress_arm(ctx),
+                    noop,
+                    record_ctx_peer_failure,
+                )
+            except Exception as exc:  # noqa: BLE001 - surface thread failures in the test
+                thread_errors.append(("ctx", exc))
+
+        def run_gen(gen):
+            try:
+                rp._drive_ctx_peers(
+                    gen,
+                    progress_arm(gen),
+                    noop,
+                    rp._make_peer_failure_recorder(gen, noop, {"what": "test"}),
+                )
+            except Exception as exc:  # noqa: BLE001 - surface thread failures in the test
+                thread_errors.append((f"gen_{gen.server_idx}", exc))
+
+        threads = [threading.Thread(target=run_ctx, name="ctx_0", daemon=True)]
+        threads.extend(
+            threading.Thread(
+                target=run_gen,
+                args=(gen,),
+                name=f"gen_{gen.server_idx}",
+                daemon=True,
+            )
+            for gen in gens
+        )
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        leaked = [thread.name for thread in threads if thread.is_alive()]
+        assert not leaked, f"orchestration threads wedged: {leaked}"
+        assert not thread_errors
+        assert not peer_failures
+        assert [case["status"] for case in ctx.recorder.cases] == ["PASS"] * 4
+        assert all([case["status"] for case in gen.recorder.cases] == ["PASS"] for gen in gens)
 
     def test_ctx_failure_last_peer(self, tmp_path, monkeypatch):
         # The failing pair is driven LAST: the earlier healthy peer already
@@ -834,7 +1339,6 @@ def test_ctx_run_wave_missing_params_broadcast(tmp_path, monkeypatch):
     delivered via bcast the rank must raise; with a clean (None) broadcast it
     must return normally.
     """
-    import sys
     import types
 
     monkeypatch.setitem(sys.modules, "mpi4py", types.SimpleNamespace(MPI=None))
@@ -980,3 +1484,65 @@ def test_python_transceiver_bandwidth_csv(tmp_path):
     assert abs(bw - 153600 * 1024 * 1024 / 1e9) < 1e-9
     # no perf files -> None
     assert rp.parse_python_bandwidth_gbps(str(tmp_path / "empty")) is None
+
+
+@pytest.mark.parametrize(
+    "metadata,expected",
+    [
+        ({}, None),
+        ({"architecture": "DeepseekV4ForCausalLM"}, "DeepseekV4ForCausalLM"),
+        ({"architecture": " DeepseekV4ForCausalLM "}, "DeepseekV4ForCausalLM"),
+    ],
+)
+def test_declared_architecture(metadata: dict, expected: str | None) -> None:
+    """Retain one optional, normalized architecture in both roles and the fingerprint."""
+    cfg = _disagg_yaml(metadata=metadata)
+    assert pcfg.declared_architecture(cfg) == expected
+    plan = pcfg.resolve_plan(cfg)
+    assert plan["architecture"] == expected
+    for role in ("ctx", "gen"):
+        assert pcfg.side_plan(plan, role)["architecture"] == expected
+    assert json.loads(plan["fingerprint"])["architecture"] == expected
+    if expected is not None:
+        normalized = pcfg.resolve_plan(_disagg_yaml(metadata={"architecture": expected}))
+        assert normalized["fingerprint"] == plan["fingerprint"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        " \t\n",
+        42,
+        {},
+        True,
+        [],
+        [""],
+        [" "],
+        [None],
+        [42],
+        ["DeepseekV4ForCausalLM"],
+        ["Unknown", "DeepseekV4ForCausalLM"],
+    ],
+)
+def test_invalid_declared_architecture(value: object) -> None:
+    """Reject malformed scalars and every list, including a valid later entry."""
+    with pytest.raises(ValueError, match=r"metadata\.architecture"):
+        pcfg.resolve_plan(_disagg_yaml(metadata={"architecture": value}))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("architecture", "DeepseekV4ForCausalLM"),
+        ("ctx_use_kv_cache_manager_v2", False),
+        ("gen_kv_dtype", "bf16"),
+    ],
+)
+def test_fingerprint_covers_preference_inputs(field: str, value: object) -> None:
+    """Different preference inputs cannot share a static plan fingerprint."""
+    plan = pcfg.resolve_plan(_disagg_yaml())
+    before = plan["fingerprint"]
+    plan[field] = value
+    assert pcfg.plan_fingerprint(plan) != before

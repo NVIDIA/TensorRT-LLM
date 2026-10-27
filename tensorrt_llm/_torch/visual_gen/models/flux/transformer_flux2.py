@@ -50,11 +50,44 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 # HF FLUX.2 uses Flux2FeedForward with linear_in/linear_out attribute names.
 # We use GatedMLP which uses gate_up_proj/down_proj. Remap at load time.
-# NOTE: linear_in is NOT remapped here — it's split into gate/up halves in load_weights()
+# NOTE: linear_in is NOT remapped here — _split_linear_in_weights() splits it into gate/up halves
 # because GatedMLP.gate_up_proj uses FUSED_GATE_UP_LINEAR mode (expects 2 separate weights).
 _FLUX2_WEIGHT_KEY_REMAPS = [
     ("linear_out.", "down_proj."),
 ]
+
+
+def _split_linear_in_weights(weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Split each ``linear_in`` entry into ``linear_in_gate`` and ``linear_in_up`` entries.
+
+    ``<module>.linear_in.<suffix>`` becomes ``<module>.linear_in_gate.<suffix>`` and
+    ``<module>.linear_in_up.<suffix>``. ``linear_in`` stacks the gate rows above the up rows.
+    Single-element tensors (per-tensor scales), ``input_scale``, ``weight_scale_2`` and
+    ``pre_quant_scale`` are not indexed by output row and are passed unchanged to both entries.
+    ``weight``, ``bias``, ``weight_scale`` and ``weight_scale_inv`` are indexed by output
+    row or row block and are chunked in half along dim 0. Unknown suffixes are rejected.
+    """
+    split_weights = {}
+    gate_up_weights = {}
+    for key, value in weights.items():
+        module_name, sep, suffix = key.partition(".linear_in.")
+        if not sep:
+            split_weights[key] = value
+            continue
+        if suffix in ("input_scale", "weight_scale_2", "pre_quant_scale"):
+            gate = up = value
+        elif suffix in ("weight", "bias", "weight_scale", "weight_scale_inv"):
+            if value.numel() == 1:
+                gate = up = value
+            else:
+                gate, up = value.chunk(2, dim=0)
+        else:
+            raise ValueError(f"Unsupported linear_in checkpoint tensor: {key}")
+        gate_up_weights[f"{module_name}.linear_in_gate.{suffix}"] = gate
+        gate_up_weights[f"{module_name}.linear_in_up.{suffix}"] = up
+    split_weights.update(gate_up_weights)
+    return split_weights
+
 
 # =============================================================================
 # Time + Guidance Embedding (matches HuggingFace structure exactly)
@@ -246,6 +279,7 @@ class Flux2TransformerBlock(nn.Module):
             config=config,
             layer_idx=layer_idx,
             module_name=f"transformer_blocks.{layer_idx}.attn",
+            supports_static_e4m3_attention=False,
         )
 
         # FFN for image stream (shared GatedMLP from _torch/modules)
@@ -802,27 +836,7 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
         weights = remapped
 
         # Split pre-fused linear_in weights into gate/up halves for GatedMLP.
-        # HF checkpoint has single linear_in.weight [2*intermediate, hidden],
-        # but GatedMLP.gate_up_proj uses FUSED_GATE_UP_LINEAR mode which
-        # expects separate gate and up weights to concatenate during loading.
-        keys_to_add = {}
-        keys_to_remove = []
-        for key, value in weights.items():
-            if ".linear_in.weight" in key:
-                prefix = key.replace("linear_in.weight", "")
-                gate, up = value.chunk(2, dim=0)
-                keys_to_add[f"{prefix}linear_in_gate.weight"] = gate
-                keys_to_add[f"{prefix}linear_in_up.weight"] = up
-                keys_to_remove.append(key)
-            elif ".linear_in.bias" in key:
-                prefix = key.replace("linear_in.bias", "")
-                gate, up = value.chunk(2, dim=0)
-                keys_to_add[f"{prefix}linear_in_gate.bias"] = gate
-                keys_to_add[f"{prefix}linear_in_up.bias"] = up
-                keys_to_remove.append(key)
-        for k in keys_to_remove:
-            del weights[k]
-        weights.update(keys_to_add)
+        weights = _split_linear_in_weights(weights)
 
         # Map fused layer names to original HF checkpoint names.
         # The loader concatenates these checkpoint keys into fused module weights.

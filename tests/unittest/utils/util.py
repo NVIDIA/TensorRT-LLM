@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -56,8 +56,17 @@ def ASSERT_DRV(err):
 # ref: https://github.com/NVIDIA/cuda-python/blob/main/examples/extra/jit_program_test.py
 def getSMVersion():
     # Init
-    err, = cuda.cuInit(0)
+    try:
+        err, = cuda.cuInit(0)
+    except RuntimeError as exc:
+        # Missing/broken driver (e.g. CPU-only collection hosts). Returning inf
+        # keeps every SM-gated parametrization, so collection sees the superset
+        # of test IDs; no GPU test can run on such a host anyway.
+        print(f"WARNING: CUDA driver init failed in getSMVersion(): {exc}")
+        return math.inf
     if err == cuda.CUresult.CUDA_ERROR_NO_DEVICE:
+        print("WARNING: CUDA reports no device in getSMVersion(). "
+              "Tests that require a GPU will be skipped.")
         return -1
     ASSERT_DRV(err)
 
@@ -84,7 +93,8 @@ def getCUDAVersion():
     try:
         cuda_version = subprocess.run(['nvcc', '--version'],
                                       stdout=subprocess.PIPE,
-                                      universal_newlines=True)
+                                      universal_newlines=True,
+                                      timeout=60)
         output = cuda_version.stdout.split()
         release_version = output[-4].replace(',', '.').split('.')
         return int(release_version[0]) * 100 + int(release_version[1])
@@ -94,7 +104,7 @@ def getCUDAVersion():
 
 def isSM100Family():
     sm = getSMVersion()
-    return sm == 100 or sm == 103
+    return sm >= 100 and sm < 110
 
 
 skip_pre_ada = pytest.mark.skipif(
@@ -110,10 +120,16 @@ skip_pre_blackwell = pytest.mark.skipif(
     getSMVersion() < 100,
     reason="This test is not supported in pre-Blackwell architecture")
 skip_blackwell = pytest.mark.skipif(
-    getSMVersion() == 100 or getSMVersion() == 103,
+    isSM100Family(),
     reason="This test is not supported in Blackwell architecture")
 skip_blackwell_geforce = pytest.mark.skipif(
     getSMVersion() == 120, reason="This test is not supported on SM 120")
+skip_pre_rubin = pytest.mark.skipif(
+    getSMVersion() < 107,
+    reason="This test is not supported in pre-Rubin architecture")
+skip_rubin = pytest.mark.skipif(
+    100 <= getSMVersion() < 110 and getSMVersion() not in (100, 103),
+    reason="This test is not supported on non-Blackwell 100f architectures")
 
 # If used together with @parameterized, we have to use unittest.skipIf instead of pytest.mark.skipif
 skip_pre_ada_unittest = unittest.skipIf(

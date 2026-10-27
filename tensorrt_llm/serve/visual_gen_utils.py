@@ -2,17 +2,36 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import os
+from collections.abc import Mapping
+from io import BytesIO
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from urllib.parse import urlparse
 
-from tensorrt_llm.inputs.media_io import is_isobmff_image_bytes, sniff_media_kind
+from PIL import Image, UnidentifiedImageError
+
+from tensorrt_llm.inputs.media_io import sniff_media_kind
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
+from tensorrt_llm.serve.openai_protocol import (
+    ImageEditRequest,
+    ImageGenerationRequest,
+    VideoGenerationRequest,
+)
 
 if TYPE_CHECKING:
+    from fastapi import UploadFile
+
     # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
     # whole visual_gen tree into every LLM serving process.
     from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+
+IMAGE_EDIT_MAX_IMAGES = 16
+IMAGE_EDIT_MAX_IMAGE_BYTES = 50 * 1024 * 1024
+IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES = 256 * 1024 * 1024
+IMAGE_EDIT_MAX_OUTPUT_IMAGES = 64
+_IMAGE_EDIT_INPUT_FORMATS = {"PNG", "JPEG"}
+_INVALID_IMAGE_EDIT_INPUT_MESSAGE = "image edit input is not a PNG/JPEG image"
 
 # Per-field warnings for OpenAI-shaped knobs that the engine has no
 # semantic for. Each entry maps the request attribute to the message
@@ -90,28 +109,300 @@ def _merge_extra_params(
         params.extra_params = None
 
 
-def _read_reference_payload(reference) -> bytes:
-    """Read the ``input_reference`` payload (base64 JSON or multipart file).
+def local_media_path_is_disallowed() -> bool:
+    """Whether server-side filesystem paths are refused at the HTTP boundary.
 
-    Payload size is deliberately not checked here: encoded size is not part
-    of the request-validity contract, and body limits belong to the
-    proxy/ASGI deployment layer (HTTP 413). Base64 decodes strictly so
-    malformed encodings — not sizes — are rejected.
+    One switch for both directions, because both are the same trust question:
+    a ``path`` reference has the server read its own disk, and
+    ``response_format='path'`` has it disclose where it wrote. Either is what a
+    co-located client wants and what a remote one has no business doing, and
+    the code cannot tell the two deployments apart, so both are allowed by
+    default and turned off together with ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1``.
+    The local Python API is unaffected: this gate is the HTTP boundary's.
     """
-    if isinstance(reference, str):
-        try:
-            return base64.b64decode(reference, validate=True)
-        except ValueError as exc:
-            # binascii.Error subclasses ValueError.
-            raise ValueError("input_reference is not valid base64 data.") from exc
-    return reference.file.read()
+    raw = os.environ.get("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "0")
+    if raw not in ("0", "1"):
+        logger.warning(
+            "Unrecognized value for TRTLLM_DISALLOW_LOCAL_MEDIA_PATH: "
+            f"{raw!r}. Expected '0' or '1'. Treating as '0' "
+            "(server-side paths allowed)."
+        )
+    return raw == "1"
+
+
+def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
+    """Extract ``(content, format, role)`` from one raw HTTP reference.
+
+    ``ref`` is a multipart ``UploadFile`` (has ``.file``) or a
+    ``MediaReferenceItem`` exposing ``content`` / ``format`` / ``role``. An
+    upload is read to ``bytes`` here — the only decode the boundary owns — and
+    its format is implied by the transport rather than declared by the client;
+    everything else passes through for the engine to resolve.
+    """
+    if hasattr(ref, "file"):  # multipart UploadFile
+        return ref.file.read(), "bytes", getattr(ref, "role", None)
+    content = getattr(ref, "content", None)
+    if not isinstance(content, str):
+        raise ValueError("reference item must carry a 'content' string.")
+    if ref.format == "path" and local_media_path_is_disallowed():
+        raise ValueError(
+            "reference format='path' is disallowed on this server "
+            "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it reads server-side files "
+            "and is only meaningful for co-located clients. Send the file as "
+            "base64 or upload it via multipart/form-data."
+        )
+    return content, ref.format, getattr(ref, "role", None)
+
+
+def _build_reference_list(value: Any) -> Optional[list]:
+    """Normalize one HTTP reference field into a list of ``MediaRef`` objects.
+
+    ``value`` is None, a multipart ``UploadFile``, a ``MediaReferenceItem``, or
+    a list of those. Each entry becomes a ``MediaRef`` carrying its transport
+    content plus the declared (or, for an upload, implied) wire format.
+    Resolution to bytes happens later, at the engine choke point.
+    """
+    if value is None:
+        return None
+    # Local import: the visual_gen tree is already loaded in a VisualGen serving
+    # process, and this keeps it out of every plain-LLM process (see TYPE_CHECKING).
+    from tensorrt_llm.visual_gen.params import MediaRef
+
+    raw_items = value if isinstance(value, list) else [value]
+    refs = []
+    for item in raw_items:
+        content, content_format, role = _reference_transport(item)
+        refs.append(MediaRef(content=content, format=content_format, role=role))
+    return refs
+
+
+def _read_image_edit_upload(value: Any) -> bytes:
+    """Read a multipart image-edit upload, capping it while it streams."""
+    total = 0
+    if hasattr(value.file, "seek"):
+        value.file.seek(0)
+    chunks = []
+    while True:
+        chunk = value.file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > IMAGE_EDIT_MAX_IMAGE_BYTES:
+            raise ValueError(
+                "Image edit input exceeds the per-image byte limit "
+                f"({total} > {IMAGE_EDIT_MAX_IMAGE_BYTES})."
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _decode_image_edit_string(value: str) -> bytes:
+    """Decode one base64 image-edit input, refusing paths and URLs.
+
+    OpenAI's ``image`` field is base64 or an upload. A path or URL there would
+    ask the server to fetch on the client's behalf, which this endpoint has
+    never offered.
+    """
+    decoded = _decode_base64_media(value)
+    if decoded is not None:
+        return decoded
+    if urlparse(value).scheme in ("file", "http", "https"):
+        raise ValueError(
+            "Image edit inputs must be uploaded files or base64-encoded images; "
+            "local paths and URLs are not supported."
+        )
+    raise ValueError("String image edit inputs must be base64-encoded image data.")
+
+
+def _build_image_edit_reference_list(value: Any) -> Optional[list]:
+    """Build references from an image-edit request's OpenAI-shaped ``image``.
+
+    That field follows OpenAI's schema, which has no place to declare a wire
+    form, so each entry is decoded here — the same read a multipart upload
+    already gets — and carried on as ``bytes``. The size and PNG/JPEG checks
+    stay at the boundary because only this endpoint imposes them.
+    """
+    if value is None:
+        return None
+    from tensorrt_llm.visual_gen.params import MediaRef
+
+    refs = []
+    total_bytes = 0
+    for item in value if isinstance(value, list) else [value]:
+        if hasattr(item, "file"):  # multipart UploadFile
+            payload = _read_image_edit_upload(item)
+        elif isinstance(item, str):
+            payload = _decode_image_edit_string(item)
+        else:
+            raise ValueError(
+                "Image edit inputs must be base64-encoded images or uploaded files, "
+                f"got {type(item).__name__}."
+            )
+        if len(payload) > IMAGE_EDIT_MAX_IMAGE_BYTES:
+            raise ValueError(
+                "Image edit input exceeds the per-image byte limit "
+                f"({len(payload)} > {IMAGE_EDIT_MAX_IMAGE_BYTES})."
+            )
+        _validate_png_jpeg_image(payload)
+        total_bytes += len(payload)
+        if total_bytes > IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES:
+            raise ValueError(
+                "Image edit inputs exceed the total byte limit "
+                f"({total_bytes} > {IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES})."
+            )
+        refs.append(MediaRef(content=payload, format="bytes"))
+    return refs
+
+
+def _decode_inline_media(extra_params: dict | None, specs) -> None:
+    """Turn base64 strings into bytes for extra params declared as media.
+
+    JSON has no byte type, so a client can only inline binary as base64. Any
+    extra param whose spec accepts ``bytes`` is decoded here, at the HTTP
+    boundary, so pipelines keep a bytes-only contract and never parse
+    transport encodings. Values that already arrived as bytes (multipart)
+    pass through.
+    """
+    if not extra_params:
+        return
+    for key, value in list(extra_params.items()):
+        spec = specs.get(key) if specs else None
+        if spec is None or "bytes" not in getattr(spec, "type", ""):
+            continue
+        if isinstance(value, Mapping):
+            inner = value.get("control")
+            if isinstance(inner, str):
+                extra_params[key] = {**value, "control": _b64(key, inner)}
+        elif isinstance(value, str):
+            extra_params[key] = _b64(key, value)
+
+
+def _b64(key: str, value: str) -> bytes:
+    try:
+        return base64.b64decode(value, validate=True)
+    except ValueError as exc:  # binascii.Error subclasses ValueError
+        raise ValueError(
+            f"extra_params['{key}'] must be base64-encoded media bytes; "
+            "it is not valid base64 data."
+        ) from exc
+
+
+def _decode_base64_media(value: str) -> Optional[bytes]:
+    payload = value
+    if value.startswith("data:"):
+        _, sep, payload = value.partition(",")
+        if not sep:
+            return None
+    if len(payload) > ((IMAGE_EDIT_MAX_IMAGE_BYTES + 2) // 3) * 4:
+        raise ValueError(
+            "Image edit input exceeds the per-image byte limit "
+            f"before decoding ({len(payload)} encoded bytes)."
+        )
+    try:
+        return base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _validate_png_jpeg_image(value: bytes) -> None:
+    try:
+        with Image.open(BytesIO(value)) as image:
+            image_format = image.format
+            image.verify()
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
+        raise ValueError(_INVALID_IMAGE_EDIT_INPUT_MESSAGE) from exc
+    if image_format not in _IMAGE_EDIT_INPUT_FORMATS:
+        raise ValueError(_INVALID_IMAGE_EDIT_INPUT_MESSAGE)
+
+
+def _resolve_image_edit_layer_multiplier(
+    request: ImageEditRequest,
+    generator: VisualGen,
+) -> int:
+    extra = request.extra_params or {}
+    save_layers_to_grid = extra.get("save_layers_to_grid", False)
+    if save_layers_to_grid is True:
+        return 1
+    if save_layers_to_grid not in (False, None):
+        raise ValueError(
+            "extra_params.save_layers_to_grid must be a bool when estimating image edit output count."
+        )
+
+    layer_spec = generator.extra_param_specs.get("layers")
+    if layer_spec is None:
+        return 1
+
+    layers = extra.get("layers", getattr(layer_spec, "default", 1))
+    if layers is None:
+        return 1
+    if isinstance(layers, bool) or not isinstance(layers, int):
+        raise ValueError(
+            "extra_params.layers must be an int when estimating image edit output count."
+        )
+    return layers
+
+
+def _validate_image_edit_request_limits(
+    request: ImageEditRequest,
+    generator: VisualGen,
+) -> int:
+    image_count = len(request.image) if isinstance(request.image, list) else 1
+    if image_count > IMAGE_EDIT_MAX_IMAGES:
+        raise ValueError(
+            f"Image edit accepts at most {IMAGE_EDIT_MAX_IMAGES} input images, got {image_count}."
+        )
+
+    output_count = (request.n or 1) * _resolve_image_edit_layer_multiplier(request, generator)
+    if output_count > IMAGE_EDIT_MAX_OUTPUT_IMAGES:
+        raise ValueError(
+            "Image edit request can produce at most "
+            f"{IMAGE_EDIT_MAX_OUTPUT_IMAGES} output images, got {output_count}."
+        )
+    return image_count
+
+
+def _apply_deprecated_input_reference(
+    input_reference: str | UploadFile | None,
+    params: VisualGenParams,
+) -> None:
+    """Back-compat for the deprecated single ``input_reference``.
+
+    Sniff-routes the payload to ``image_reference`` (image) or ``video_reference``
+    (video), preserving the pre-typed-fields behavior. Ignored when a typed
+    image/video reference is already set — the typed fields take precedence.
+    The field has only ever carried base64 in JSON or a multipart upload, so the
+    wire form follows from the transport; routing needs the bytes, so they are
+    read here and handed to the engine like any other reference.
+    """
+    if input_reference is None:
+        return
+    logger.warning("'input_reference' is deprecated; use 'image_reference' / 'video_reference'.")
+    if params.image_reference or params.video_reference:
+        return
+    from tensorrt_llm.visual_gen.params import MediaRef
+
+    if hasattr(input_reference, "file"):  # multipart upload
+        payload = input_reference.file.read()
+    else:
+        # Local import, for the reason given at the first one.
+        from tensorrt_llm.visual_gen.params import _read_reference_payload
+
+        payload = _read_reference_payload(input_reference)
+    kind = sniff_media_kind(payload)
+    if kind == "image":
+        params.image_reference = [MediaRef(content=payload, format="bytes")]
+    elif kind == "video":
+        params.video_reference = [MediaRef(content=payload, format="bytes")]
+    else:
+        raise ValueError(
+            "input_reference is not a recognized media container; supported "
+            "inputs are PNG/JPEG images and MP4/AVI video."
+        )
 
 
 def parse_visual_gen_params(
-    request: ImageGenerationRequest | VideoGenerationRequest,
-    id: str,
+    request: ImageGenerationRequest | ImageEditRequest | VideoGenerationRequest,
     generator: VisualGen,
-    media_storage_path: Optional[str] = None,
 ) -> VisualGenParams:
     """Translate an HTTP request into :class:`VisualGenParams`.
 
@@ -133,6 +424,10 @@ def parse_visual_gen_params(
         params.width, params.height = request.width, request.height
     elif request.size is not None and request.size != "auto":
         params.width, params.height = map(int, request.size.split("x"))
+    elif isinstance(request, ImageEditRequest):
+        if request.width is None and request.height is None and request.size in (None, "auto"):
+            params.width = None
+            params.height = None
 
     # Universal per-request overlays — each guard is the "do not
     # override with None" rule in action.
@@ -150,6 +445,14 @@ def parse_visual_gen_params(
     if isinstance(request, ImageGenerationRequest):
         if request.n is not None:
             params.num_images_per_prompt = request.n
+
+    elif isinstance(request, ImageEditRequest):
+        if request.mask is not None:
+            raise ValueError("Image edit mask input is not supported yet.")
+        if request.n is not None:
+            params.num_images_per_prompt = request.n
+        _validate_image_edit_request_limits(request, generator)
+        params.image_reference = _build_image_edit_reference_list(request.image)
 
     elif isinstance(request, VideoGenerationRequest):
         if request.frame_rate is not None:
@@ -176,44 +479,22 @@ def parse_visual_gen_params(
                     "directly."
                 )
             params.num_frames = derived
-        if request.input_reference is not None:
-            payload = _read_reference_payload(request.input_reference)
-            kind = sniff_media_kind(payload)
-            if kind == "image":
-                # Rejected on signature alone, not on a failed decode:
-                # whether Pillow reads HEIF/AVIF depends on optional plugins,
-                # and the worker process need not have the same ones.
-                if is_isobmff_image_bytes(payload):
-                    raise ValueError(
-                        "input_reference is a HEIF/AVIF image, which is not "
-                        "a supported reference format; convert it to PNG or "
-                        "JPEG."
-                    )
-                # I2V: the stored image file is the cross-model contract.
-                # every I2V pipeline reads ``params.image`` as a path.
-                if media_storage_path is None:
-                    raise ValueError(
-                        "media_storage_path is required when input_reference is an image"
-                    )
-                ref_path = os.path.join(media_storage_path, f"{id}_reference")
-                with open(ref_path, "wb") as f:
-                    f.write(payload)
-                params.image = ref_path
-            elif kind == "video":
-                # V2V: encoded bytes pass through untouched; the worker
-                # demuxes and NVDEC-decodes them (acceptance happens there,
-                # so corrupt content behind a valid signature still fails as
-                # a client error).
-                if params.extra_params is None:
-                    params.extra_params = {}
-                params.extra_params["video"] = payload
-            else:
-                raise ValueError(
-                    "input_reference is not a recognized media container; "
-                    "supported inputs are PNG/JPEG images and MP4/AVI video."
-                )
+        # Reference inputs: hand the pipeline a ``MediaRef`` carrying the
+        # transport content (``bytes`` for an upload, the string otherwise).
+        # The engine resolves it to bytes; the boundary never touches disk.
+        image_refs = _build_reference_list(request.image_reference)
+        if image_refs:
+            params.image_reference = image_refs
+        video_refs = _build_reference_list(request.video_reference)
+        if video_refs:
+            params.video_reference = video_refs
+        audio_refs = _build_reference_list(request.audio_reference)
+        if audio_refs:
+            params.audio_reference = audio_refs
+        _apply_deprecated_input_reference(request.input_reference, params)
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
+    _decode_inline_media(request.extra_params, generator.extra_param_specs)
     _merge_extra_params(params, request.extra_params, generator.extra_param_specs)
 
     return params

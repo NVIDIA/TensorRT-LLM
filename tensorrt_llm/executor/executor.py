@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import atexit
 import faulthandler
 import json
@@ -21,7 +24,6 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger, set_level
 
 from .._utils import mpi_world_size
-from ..bindings import executor as tllm
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
@@ -29,21 +31,19 @@ from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
 from ..llmapi.tokenizer import TokenizerBase
-from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
+from ..llmapi.utils import (enable_llm_debug,
                             enable_worker_single_process_for_tp1, logger_debug,
                             print_colored)
-from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
-                               SamplingParams)
+from ..sampling_params import LogprobParams, SamplingParams
 from ..scheduling_params import SchedulingParams
-from .ipc import FusedIpcQueue
 from .postproc_worker import PostprocParams, PostprocWorkerConfig
 from .request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest,
                       PromptAdapterRequest)
 from .result import GenerationResult, IterationResult
-from .utils import IntraProcessQueue, ProcessPoolExecutorSession, RequestError
+from .utils import ProcessPoolExecutorSession, RequestError
 
 if TYPE_CHECKING:
-    from .._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
+    from .._torch.disaggregation.kv_cache_transceiver import KvCacheTransceiver
     from .proxy import GenerationExecutorProxy
     from .worker import GenerationExecutorWorker
 
@@ -73,13 +73,6 @@ class CppExecutorError(RuntimeError):
         return f"{self.message}\nStack trace:\n{self.stack_trace}"
 
 
-class IterationResultQueue:
-    is_initialized: bool = False
-    # FusedIpcQueue or IntraProcessQueue is used to communicate results from workers to proxy
-    queue: Optional[Union[Queue, FusedIpcQueue, IntraProcessQueue]] = None
-    aqueue: Optional[AsyncQueue] = None
-
-
 class GenerationExecutor(ABC):
 
     def __init__(self,
@@ -89,9 +82,6 @@ class GenerationExecutor(ABC):
         self.postproc_config = PostprocWorkerConfig(
             num_postprocess_workers=num_postprocess_workers,
             postprocess_tokenizer_dir=postprocess_tokenizer_dir)
-
-        self.kv_events_queues = IterationResultQueue()
-        self.stats_queues = IterationResultQueue()
 
         atexit.register(
             lambda ref, finalizer=type(self).shutdown: finalizer(obj)
@@ -127,7 +117,6 @@ class GenerationExecutor(ABC):
         self,
         prompt_token_ids: List[int],
         sampling_params: SamplingParams,
-        query_token_ids: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         streaming: bool = False,
@@ -147,7 +136,8 @@ class GenerationExecutor(ABC):
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
         """
-        assert isinstance(prompt_token_ids[0], int)
+        assert isinstance(prompt_token_ids, np.ndarray) or isinstance(
+            prompt_token_ids[0], int)
         assert isinstance(sampling_params, SamplingParams)
 
         self._maybe_initialize_iteration_results()
@@ -159,7 +149,6 @@ class GenerationExecutor(ABC):
             prompt_token_ids,
             sampling_params=sampling_params,
             postproc_params=postproc_params,
-            query_token_ids=query_token_ids,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
             streaming=streaming,
@@ -183,7 +172,6 @@ class GenerationExecutor(ABC):
         self,
         prompt_token_ids: Union[List[int], List[List[int]]],
         sampling_params: Union[SamplingParams, List[SamplingParams]],
-        query_token_ids: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
         lora_request: Optional[Union[LoRARequest, List[LoRARequest]]] = None,
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, List[PromptAdapterRequest]]] = None,
@@ -198,8 +186,6 @@ class GenerationExecutor(ABC):
 
         if unbatched:
             prompt_token_ids = [prompt_token_ids]
-            if query_token_ids:
-                query_token_ids = [query_token_ids]
 
         futures = []
         for i, p in enumerate(prompt_token_ids):
@@ -219,7 +205,6 @@ class GenerationExecutor(ABC):
             future = self.generate_async(
                 p,
                 sampling_params=sp,
-                query_token_ids=query_token_ids,
                 lora_request=lora_req,
                 prompt_adapter_request=pa_req,
                 streaming=False,
@@ -243,21 +228,15 @@ class GenerationExecutor(ABC):
 
     def _get_logprob_params(
             self, request: GenerationRequest) -> Optional[LogprobParams]:
-        """Store logprobs-related fields from request for the later logprob calculation."""
+        """Store fields needed to compute prompt logprobs from context logits."""
         logprob_params = None
-        if request.sampling_params.logprobs is not None or request.sampling_params.prompt_logprobs is not None:
+        if request.sampling_params.prompt_logprobs is not None:
             logprob_params = LogprobParams(
-                logprobs=request.sampling_params.logprobs,
                 prompt_logprobs=request.sampling_params.prompt_logprobs,
                 # drop logits if users didn't explicitly ask for it, or if it's using PostProcess flow
                 drop_context_logits=(
-                    not request.sampling_params._need_return_context_logits)
+                    not request.sampling_params.return_context_logits)
                 or self.postproc_config.num_postprocess_workers > 0,
-                drop_generation_logits=(
-                    not request.sampling_params._need_return_generation_logits)
-                or self.postproc_config.num_postprocess_workers > 0,
-                logprobs_simple_format=request.sampling_params.
-                logprobs_simple_format,
                 prompt_logprobs_simple_format=request.sampling_params.
                 prompt_logprobs_simple_format)
 
@@ -307,6 +286,12 @@ class GenerationExecutor(ABC):
                 self._set_fatal_error(error)
                 self.shutdown()
             raise error
+
+        # Called once per streamed response: skip the get_nowait() raise/catch
+        # of Empty in the common no-error case. An error enqueued concurrently
+        # is picked up on the next call.
+        if self._error_queue.empty():
+            return
 
         # Drain the first error from the queue using get_nowait() to
         # avoid blocking if another thread consumed the item between
@@ -387,6 +372,28 @@ class GenerationExecutor(ABC):
     def shutdown(self):
         pass
 
+    def start_profile(self,
+                      output_dir: Optional[str] = None,
+                      num_steps: Optional[int] = None,
+                      start_step: int = 0,
+                      activities: Optional[List[str]] = None) -> None:
+        """Start runtime profiling in the backend engine.
+
+        Default implementation logs a warning. Subclasses that back a
+        ``PyExecutor`` should override to forward the call.
+        """
+        logger.warning(f"start_profile is not supported on executor type "
+                       f"{type(self).__name__}.")
+
+    def stop_profile(self) -> None:
+        """Stop runtime profiling in the backend engine.
+
+        Default implementation logs a warning. Subclasses that back a
+        ``PyExecutor`` should override to forward the call.
+        """
+        logger.warning(f"stop_profile is not supported on executor type "
+                       f"{type(self).__name__}.")
+
     @property
     def resource_governor_queue(self):
         """Return the resource governor queue if this executor supports it."""
@@ -419,6 +426,14 @@ class GenerationExecutor(ABC):
         Returns:
             dict: Primary/GPU KV cache capacity.
         """
+        return {}
+
+    def get_openengine_discovery(self) -> dict:
+        """Get startup OpenEngine node and KV publisher discovery metadata."""
+        return {}
+
+    def get_kv_cache_load(self) -> dict:
+        """Get a non-destructive primary/GPU KV cache load snapshot."""
         return {}
 
     def aget_stats(self, timeout: float) -> IterationResult:
@@ -471,6 +486,10 @@ class GenerationExecutor(ABC):
     def get_data_transceiver_state(self) -> bytes:
         return b""
 
+    def get_startup_metrics(self) -> dict | None:
+        """Return startup metrics, or ``None`` when temporarily unavailable."""
+        return {}
+
     @staticmethod
     def _create_ray_executor(
         worker_kwargs: Dict,
@@ -480,7 +499,7 @@ class GenerationExecutor(ABC):
         tp_size: int,
     ):
         logger.warning(f"Orchestrator is creating Ray executor")
-        from .ray_executor import RayExecutor
+        from .ray.executor import RayExecutor
 
         return RayExecutor(worker_kwargs,
                            model_world_size=model_world_size,
@@ -537,9 +556,6 @@ class GenerationExecutor(ABC):
 
     @staticmethod
     def create(
-        engine: Path,
-        executor_config: Optional[tllm.ExecutorConfig] = None,
-        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         model_world_size: int = 1,
         world_size: int = 0,
         mpi_session: Optional[MpiSession] = None,
@@ -557,8 +573,8 @@ class GenerationExecutor(ABC):
 
         if world_size > 1 and world_size < model_world_size:
             raise RuntimeError(
-                "Cannot instantiate Generator for engine built "
-                f"for {model_world_size} ranks, while currently running "
+                "Cannot instantiate an executor requiring "
+                f"{model_world_size} ranks, while currently running "
                 f"on {world_size} ranks.")
 
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
@@ -599,9 +615,6 @@ class GenerationExecutor(ABC):
                 is_llm_executor=is_llm_executor)
 
         worker_kwargs = {
-            "engine": engine,
-            "executor_config": executor_config,
-            "batched_logits_processor": batched_logits_processor,
             "hf_model_dir": hf_model_dir,
             "tokenizer": tokenizer,
             "llm_args": llm_args,

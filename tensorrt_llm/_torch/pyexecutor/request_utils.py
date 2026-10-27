@@ -1,6 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Utility functions for request processing."""
 
 import os
+import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -84,7 +88,7 @@ def derive_attention_dp_per_rank_request_cap(
     attention DP, where no component otherwise enforces a per-rank token cap
     (nvbug-6133201). Each gen request occupies ``1 + max_total_draft_tokens``
     token slots per step. Mirrors the CUDA graph batch-size cap at
-    ``model_engine._filter_cuda_graph_batch_sizes``.
+    ``engine.cuda_graph.filter_cuda_graph_batch_sizes``.
 
     Args:
         base_cap: Per-rank request cap from ``get_max_num_sequences()``.
@@ -184,62 +188,9 @@ def get_from_waiting_queue(
     # Put the pending requests back to the waiting queue
     # All ranks should have the same waiting queue
     waiting_queue.prepend_requests(pending_requests)
+    waiting_queue.mark_admitted(items)
 
     return items
-
-
-def partition_context_for_star_attention(
-    ctx_ids_list: List[int], cp_rank: int, cp_size: int, block_size: int, anchor_block_size: int
-) -> Tuple[List[List[int]], List[List[int]], int]:
-    """Partition context for Star Attention CP.
-
-    Args:
-        ctx_ids_list: List of context token IDs.
-        cp_rank: Current CP rank.
-        cp_size: Total number of CP ranks.
-        block_size: Size of each block.
-        anchor_block_size: Size of anchor block.
-
-    Returns:
-        Tuple of (ctx_blocks, position_blocks, padding).
-    """
-    ctx_ids = torch.tensor(ctx_ids_list).unsqueeze(0)
-    ctx_len = ctx_ids.shape[-1]
-
-    if block_size is None:
-        block_size = ctx_len // cp_size
-    if anchor_block_size is None:
-        anchor_block_size = block_size
-
-    assert anchor_block_size <= block_size, (
-        f"cp_anchor_size {anchor_block_size} should be smaller than block_size {block_size}"
-    )
-
-    padding = 0
-    if ctx_len % block_size != 0:
-        padding = block_size - (ctx_len % block_size)
-        assert padding <= ctx_len, "block size is too large for context, please set it smaller"
-        ctx_ids = torch.cat((ctx_ids, torch.zeros_like(ctx_ids)[:, :padding]), dim=-1)
-    position_ids = torch.arange(0, ctx_ids.shape[-1]).unsqueeze(0)
-
-    ctx_ids_blocks = torch.tensor_split(torch.stack(ctx_ids.split(block_size, dim=-1)), cp_size)
-    position_ids_blocks = torch.tensor_split(
-        torch.stack(position_ids.split(block_size, dim=-1)), cp_size
-    )
-
-    if cp_rank != 0:
-        ctx_blocks = [ctx_ids_blocks[0][0].tolist()[0][:anchor_block_size]]
-        position_blocks = [position_ids_blocks[0][0].tolist()[0][:anchor_block_size]]
-    else:
-        ctx_blocks, position_blocks = [], []
-
-    for idx in range(len(ctx_ids_blocks[cp_rank])):
-        ctx_block = ctx_ids_blocks[cp_rank][idx]
-        position_block = position_ids_blocks[cp_rank][idx]
-        ctx_blocks.append(ctx_block.tolist()[0])
-        position_blocks.append(position_block.tolist()[0])
-
-    return ctx_blocks, position_blocks, padding
 
 
 def partition_context_for_helix(
@@ -378,79 +329,6 @@ def merge_helix_requests(
     return req_with_children
 
 
-def merge_star_attention_requests(
-    new_requests: List,
-    cp_rank: int,
-    cp_size: int,
-    cp_config: dict,
-    exclude_last_generation_logits: bool,
-) -> List[LlmRequest]:
-    """Merge requests for Star Attention CP.
-
-    Args:
-        new_requests: List of RequestQueueItem objects.
-        cp_rank: Current CP rank.
-        cp_size: Total number of CP ranks.
-        cp_config: CP configuration dict containing 'block_size' and 'cp_anchor_size'.
-        exclude_last_generation_logits: Whether to exclude last generation logits.
-
-    Returns:
-        List of LlmRequest objects.
-    """
-    result = []
-    block_size = cp_config["block_size"]
-    anchor_block_size = cp_config["cp_anchor_size"]
-
-    for req_item in new_requests:
-        req_id, exe_req, query_token_ids = req_item.id, req_item.request, req_item.query
-        ctx_len0 = len(exe_req.input_token_ids)
-
-        ctx_blocks, position_blocks, last_block_padding_num = partition_context_for_star_attention(
-            exe_req.input_token_ids, cp_rank, cp_size, block_size, anchor_block_size
-        )
-
-        if cp_rank == cp_size - 1 and last_block_padding_num > 0:
-            ctx_blocks[-1] = ctx_blocks[-1][:-last_block_padding_num]
-            position_blocks[-1] = position_blocks[-1][:-last_block_padding_num]
-
-        # if has query
-        if query_token_ids:
-            ctx_blocks.append(query_token_ids)
-            position_blocks.append([i for i in range(ctx_len0, ctx_len0 + len(query_token_ids))])
-
-        # insert the dummy block to align the number of ctx iterations of each rank
-        total_blocks = (ctx_len0 + block_size - 1) // block_size
-        num_blocks_per_rank = (total_blocks + cp_size - 1) // cp_size + 1  # 1 for query block
-        if len(ctx_blocks) == num_blocks_per_rank:
-            ctx_blocks.insert(1, [])
-            position_blocks.insert(1, [])
-        elif len(ctx_blocks) == num_blocks_per_rank + 1:
-            # anchor + ctx_blocks + qry_block
-            pass
-        else:
-            raise ValueError(
-                f"Invalid context partition: rank = {cp_rank}, "
-                f"len(ctx_blocks) = {len(ctx_blocks)}, "
-                f"num_blocks_per_rank = {num_blocks_per_rank}"
-            )
-
-        # fake data for scheduler
-        ctx_blocks_list = [0] * (block_size + anchor_block_size)
-
-        req = executor_request_to_llm_request(
-            req_id, exe_req, exclude_last_generation_logits, ctx_blocks_list
-        )
-        req.gen_iters = 0
-        req.ctx_iters = 0
-        req.ctx_blocks = ctx_blocks
-        req.ctx_position_blocks = position_blocks
-        req.query_id = query_token_ids
-
-        result.append(req)
-
-    return result
-
-
 @nvtx_range("merge_requests")
 def merge_requests(
     new_requests: List,
@@ -466,8 +344,8 @@ def merge_requests(
 
     Args:
         new_requests: List of RequestQueueItem objects.
-        cp_config: CP configuration dict. May contain 'cp_type', 'tokens_per_block',
-            'block_size', 'cp_anchor_size'.
+        cp_config: CP configuration dict. May contain 'cp_type' and
+            'tokens_per_block'.
         cp_rank: Current CP rank.
         cp_size: Total number of CP ranks.
         exclude_last_generation_logits: Whether to exclude last generation logits.
@@ -480,15 +358,7 @@ def merge_requests(
     """
     if "cp_type" in cp_config:
         cp_type = cp_config["cp_type"]
-        if cp_type == CpType.STAR:
-            return merge_star_attention_requests(
-                new_requests,
-                cp_rank=cp_rank,
-                cp_size=cp_size,
-                cp_config=cp_config,
-                exclude_last_generation_logits=exclude_last_generation_logits,
-            )
-        elif cp_type == CpType.HELIX:
+        if cp_type == CpType.HELIX:
             return merge_helix_requests(
                 new_requests,
                 cp_rank=cp_rank,
@@ -505,18 +375,44 @@ def merge_requests(
 class RequestBroadcaster:
     """Broadcasts requests across distributed ranks (TP, PP, CP)."""
 
-    def __init__(self, dist: Distributed, hang_detector: HangDetector):
+    def __init__(
+        self,
+        dist: Distributed,
+        hang_detector: HangDetector,
+        sync_clock: bool = False,
+    ):
         self.dist = dist
         self.hang_detector = hang_detector
         self.send_requests_handler = None
+        # sync_clock: rank 0's time.monotonic() and ``aux`` (>= 0) ride along
+        # with the request count, read on every rank as ``rank0_now`` and
+        # ``rank0_aux``. Must be the same on all ranks: it changes the length.
+        self.sync_clock = sync_clock
+        self.rank0_now: Optional[float] = None
+        self.aux: Optional[float] = None
+        self.rank0_aux: Optional[float] = None
 
-    def broadcast(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
-        """Broadcast requests and Python objects across ranks."""
+    def broadcast(
+        self, new_requests: List, prefer_cpu: bool = False
+    ) -> Tuple[List, Optional[Tuple]]:
+        """Broadcast requests and Python objects across ranks.
+
+        Args:
+            new_requests: Requests fetched on rank 0 (ignored on other ranks).
+            prefer_cpu: Keep the request-count probe on the CPU transport.
+                Pass True from the idle fetch path, where non-root ranks park
+                in the probe while rank 0 blocks on the request queue: a
+                GPU-staged probe holds a spinning NCCL kernel on the device for
+                the whole park and puts the wait under the NCCL watchdog. Must
+                be passed with the same value on all ranks.
+        """
+        if self._single_round(prefer_cpu):
+            return self._broadcast_single_round(new_requests)
         request_count = len(new_requests) if self.dist.rank == 0 else 0
         # Idle non-root ranks can wait here while rank 0 blocks in the
         # pause-wrapped request queue fetch, so keep the probe pause-wrapped too.
         with self.hang_detector.pause():
-            request_count = self._broadcast_request_count(request_count)
+            request_count = self._broadcast_request_count(request_count, prefer_cpu=prefer_cpu)
 
         if request_count == 0:
             return [], None
@@ -537,29 +433,85 @@ class RequestBroadcaster:
 
         return new_requests, py_request_objects
 
-    def _broadcast_request_count(self, request_count: int) -> int:
-        """Broadcast rank 0's request count using the same PP route as requests."""
+    def _single_round(self, prefer_cpu: bool) -> bool:
+        """Whether the count probe + payload pair collapses into one collective.
+
+        Rank-consistent: ``prefer_cpu`` is so by the caller's contract, the
+        rest is static topology / transport state shared by every rank. The
+        PP route keeps its probe + send/recv chain, the idle path
+        (``prefer_cpu``) keeps the CPU-transport probe as its wake mechanism,
+        and ``sync_clock`` keeps the probe that carries rank 0's clock.
+        """
+        return (
+            not prefer_cpu
+            and not self.sync_clock
+            and self.dist.world_size > 1
+            and not self.dist.has_pp
+            and bool(getattr(self.dist, "supports_single_round_broadcast", False))
+        )
+
+    @nvtx_range("broadcast_requests")
+    def _broadcast_single_round(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
+        """One collective: rank 0 sends (requests, py objects) or "nothing".
+
+        Empty iterations cost one size exchange instead of the count probe's
+        two collectives; iterations with new requests cost two collectives
+        instead of four. Rank 0 stages the payload asynchronously and is not
+        held on this call (``TorchDist._cuda_broadcast_object``: it can run
+        one call ahead of the slowest peer, no further); non-root ranks wait
+        here for rank 0 exactly as they did in the probe. The hang-detector
+        pause covers both the non-root wait and the root's bounded fence.
+        """
+        payloads = None
+        if self.dist.rank == 0 and new_requests:
+            payloads = (new_requests, self._collect_py_objects(new_requests))
+        with self.hang_detector.pause():
+            received = self.dist.broadcast_or_none(payloads, root=0)
+        if received is None:
+            return [], None
+        if self.dist.rank == 0:
+            # Preserve the original objects on rank 0.
+            return new_requests, payloads[1]
+        return received
+
+    def _broadcast_request_count(self, request_count: int, prefer_cpu: bool = False) -> int:
+        """Broadcast rank 0's request count and, with ``sync_clock``, its clock and aux in us."""
+        header = [request_count]
+        if self.sync_clock:
+            is_root = self.dist.rank == 0
+            header.append(int(time.monotonic() * 1e6) if is_root else 0)
+            header.append(int(self.aux * 1e6) if is_root and self.aux is not None else -1)
+        header = self._broadcast_header(header, prefer_cpu=prefer_cpu)
+        if self.sync_clock:
+            self.rank0_now = header[1] / 1e6
+            self.rank0_aux = None if header[2] < 0 else header[2] / 1e6
+        return header[0]
+
+    def _broadcast_header(self, header: List[int], prefer_cpu: bool = False) -> List[int]:
+        """Broadcast rank 0's header using the same PP route as requests."""
         if self.dist.world_size == 1:
-            return request_count
+            return header
 
         if not self.dist.has_pp:
-            return self.dist.broadcast(request_count, root=0)
+            return [
+                int(v) for v in self.dist.broadcast_int64(header, root=0, prefer_cpu=prefer_cpu)
+            ]
 
         if self.dist.is_first_pp_rank:
             with nvtx_range("tp_broadcast_request_count"):
-                request_count = self.dist.tp_cp_broadcast(request_count, root=0)
+                header = [int(v) for v in self.dist.tp_cp_broadcast_int64(header, root=0)]
 
         tag = self.dist.pp_size + 1  # Avoid the heavy request payload tag.
 
         if not self.dist.is_first_pp_rank:
             with nvtx_range("recv_request_count_from_prev_pp"):
-                request_count = self.dist.recv_object(self.dist.prev_pp_rank, tag)
+                header = self.dist.recv_object(self.dist.prev_pp_rank, tag)
 
         if not self.dist.is_last_pp_rank:
             with nvtx_range("send_request_count_to_next_pp"):
-                self.dist.send_object(request_count, self.dist.next_pp_rank, tag)
+                self.dist.send_object(header, self.dist.next_pp_rank, tag)
 
-        return request_count
+        return header
 
     def _collect_py_objects(self, new_requests: List) -> Tuple:
         """Collect Python-only objects from requests."""
@@ -578,6 +530,7 @@ class RequestBroadcaster:
             new_requests, "py_conversation_params", include_none=True
         )
         py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
+        py_lora_ckpt_source = collect_py_objects_from_requests(new_requests, "py_lora_ckpt_source")
 
         return tuple(
             filter(
@@ -590,6 +543,7 @@ class RequestBroadcaster:
                     py_disaggregated_params,
                     py_conversation_params,
                     py_lora_path,
+                    py_lora_ckpt_source,
                 ],
             )
         )

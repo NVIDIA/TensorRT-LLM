@@ -1,20 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 from typing import Any, Dict, Literal, Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 from transformers import Gemma3TextConfig
 
+from tensorrt_llm._torch.attention.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
-from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
-from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
-                                           PositionalEmbeddingParams,
-                                           PredefinedAttentionMask, RopeParams)
+from ..attention.backends import (AttentionMetadata,
+                                  FlashInferAttentionMetadata,
+                                  TrtllmAttentionMetadata)
+from ..attention.backends.interface import (AttentionMask, CustomAttentionMask,
+                                            PositionalEmbeddingParams,
+                                            PredefinedAttentionMask, RopeParams)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
@@ -25,6 +44,87 @@ from ..modules.rms_norm import RMSNorm
 from ..utils import inference_mode_unless_compiling
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
+
+
+@triton.jit
+def _write_mask(
+    output,
+    blob_ids,
+    query_length,
+    prefix_length,
+    WINDOW: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    key_length = prefix_length + query_length
+    valid = col < key_length
+    offsets = row.to(tl.int64) * key_length + col
+    allowed = col <= prefix_length + row
+    if WINDOW is not None:
+        allowed &= col > prefix_length + row - WINDOW
+    query_blob = tl.load(blob_ids + row)
+    key_blob = tl.load(blob_ids + col - prefix_length,
+                       valid & (col >= prefix_length),
+                       other=0)
+    allowed |= (query_blob != 0) & (query_blob == key_blob)
+    tl.store(output + offsets, allowed, valid)
+
+
+def build_gemma_attention_mask(
+    token_types: torch.Tensor,
+    context_lengths: list[int],
+    prefix_lengths: list[int],
+    sliding_window: int | None = None,
+) -> torch.Tensor:
+    """Build flattened bool masks for packed Gemma context requests.
+
+    CUDA graph capture requires prior warmup. Request lengths, prefix lengths,
+    and the sliding window are host-side launch parameters and must remain
+    fixed during replay; token-type values may change in place. This function
+    does not modify token_types.
+
+    Args:
+        token_types: One-dimensional CUDA bool image flags (Gemma3) or integer
+            modality IDs (Gemma4: 0=text, 1=image, 2=video, 3=audio). Contiguous
+            runs of the same vision type attend bidirectionally. A strided
+            input is supported; trailing generation tokens are ignored.
+        context_lengths: Number of new tokens for each context request.
+        prefix_lengths: Cached token counts in the same request order. Chunk
+            boundaries must not split a vision blob, as in the model caller.
+        sliding_window: Exclusive lower attention-window bound, or None.
+
+    Returns:
+        Contiguous mask with sum(q * (p + q)) elements. Prefix columns apply
+        causal/window rules; vision blobs override those rules only among
+        new tokens. Intermediate storage is linear in the context length.
+    """
+    mask_sizes = [
+        q * (p + q)
+        for q, p in zip(context_lengths, prefix_lengths, strict=True)
+    ]
+    output = torch.empty(sum(mask_sizes),
+                         dtype=torch.bool,
+                         device=token_types.device)
+    token_offset = 0
+    mask_offset = 0
+    for q, p, size in zip(context_lengths,
+                          prefix_lengths,
+                          mask_sizes,
+                          strict=True):
+        types = token_types[token_offset:token_offset + q]
+        if size:
+            vision = (types == 1) | (types == 2)
+            previous = torch.cat((types.new_zeros(1), types[:-1]))
+            starts = (types != previous) & vision
+            blobs = torch.cumsum(starts, dim=0, dtype=torch.int32)
+            blobs.masked_fill_(~vision, 0)
+            _write_mask[(q, triton.cdiv(
+                p + q, 1024))](output[mask_offset:mask_offset + size], blobs, q,
+                               p, sliding_window, 1024)
+        token_offset += q
+        mask_offset += size
+    return output
 
 
 class Gemma3TextScaledWordEmbedding(Embedding):
@@ -117,8 +217,9 @@ class Gemma3Attention(QKNormRoPEAttention):
 
         if attention_mask_data is not None:
             assert isinstance(
-                attn_metadata, FlashInferAttentionMetadata
-            ), "Only FlashInfer backend supports custom attention mask currently."
+                attn_metadata,
+                (FlashInferAttentionMetadata, TrtllmAttentionMetadata),
+            ), "Only FlashInfer and TRTLLM backends support custom attention masks."
             assert attention_mask == CustomAttentionMask.CUSTOM
         return super().forward(position_ids=position_ids,
                                hidden_states=hidden_states,
@@ -292,90 +393,38 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
 
-    def _get_token_type_mask(self, image_token_mask: torch.BoolTensor):
-        device = image_token_mask.device
-        sequence_length = len(image_token_mask)
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: Any = None
+                                               ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Gemma3's VSWA layout.
 
-        # Create a list of token type ids. 0 for text tokens, 1 for all image tokens (regardless of which image they belong to).
-        token_type_ids = torch.zeros(sequence_length,
-                                     dtype=torch.int32,
-                                     device=device)
-        token_type_ids[image_token_mask] = 1
-
-        # There could be image tokens from multiple images where those corresponding to the
-        # same image are contiguous. We assign a unique id to each contiguous blob of image tokens now.
-
-        # Pad with zero at the start to detect changes.
-        padded = torch.cat((torch.tensor([0], device=device), token_type_ids))
-
-        # Identify where blobs start (0->1 transitions)
-        starts = (padded[1:] > padded[:-1]).int()
-
-        # Cumulative sum of starts gives a unique id for each blob. Note that
-        # this assigns a unique id to the zeros separating the blobs.
-        blob_ids = torch.cumsum(starts, dim=0)
-
-        # Mask out zeros (positions where token_type_ids == 0).
-        token_type_ids *= blob_ids
-
-        # Create a mask where each blob is a unique id.
-        token_type_mask = token_type_ids.unsqueeze(
-            0) == token_type_ids.unsqueeze(1)
-
-        # If text token, do not change anything.
-        token_type_mask = torch.where(token_type_ids == 0, False,
-                                      token_type_mask)
-
-        return token_type_mask
+        V2 sizes the sliding-window and full-attention pools independently
+        instead of statically dividing memory between them.
+        """
+        return "V2"
 
     def get_context_mask(
         self,
         image_token_mask: torch.BoolTensor,
         effective_sliding_window: Optional[int] = None,
-    ):
-        """
-        Returns an attention mask such that text tokens attend to each other in causal fashion while image
-        tokens attend in causal fashion as well as to all other image tokens in a bidirectional manner.
-        Args:
-            image_token_mask: A boolean tensor of shape (sequence_length,) where True indicates an image token.
-            effective_sliding_window: The effective sliding window size for the attention mask. Default is None, which means no sliding window.
-            For Gemma3, this is the sliding window size from config (e.g. 512 for 1B model).
-        Returns:
-            A boolean attention mask of shape (sequence_length, sequence_length).
-        """
-        device = image_token_mask.device
-        sequence_length = len(image_token_mask)
-        if effective_sliding_window is None or effective_sliding_window >= sequence_length:
-            causal_mask = torch.arange(
-                sequence_length, device=device).unsqueeze(0) <= torch.arange(
-                    sequence_length, device=device).unsqueeze(1)
-        else:
-            attention_mask_1 = (torch.arange(sequence_length,
-                                             device=device).unsqueeze(0)
-                                <= torch.arange(sequence_length,
-                                                device=device).unsqueeze(1))
-            attention_mask_2 = (
-                torch.arange(sequence_length, device=device).unsqueeze(0)
-                > torch.arange(sequence_length, device=device).unsqueeze(1) -
-                effective_sliding_window)
-            causal_mask = attention_mask_1 & attention_mask_2
+    ) -> torch.Tensor:
+        """Build causal/window attention with bidirectional image blobs."""
+        length = len(image_token_mask)
+        return build_gemma_attention_mask(image_token_mask, [length], [0],
+                                          effective_sliding_window).view(
+                                              length, length)
 
-        # Apply a bidirectional mask for image tokens.
-        token_type_mask = self._get_token_type_mask(image_token_mask)
-        causal_mask = causal_mask.masked_fill(token_type_mask, True)
-        return causal_mask
-
-    # ASSUMPTIONS:
-    # 1) Chunked prefill is disabled to avoid chunking image tokens as they need bidirectional attention.
-    # 2) KV cache reuse is disabled to avoid partially matched image tokens (entire image must be reused to get things correct).
-    def get_flashinfer_attention_mask(
+    # Image blobs cannot be split by chunked prefill or partial prefix reuse.
+    def get_attention_mask(
             self,
             image_token_mask: torch.BoolTensor,
             attn_metadata: AttentionMetadata,
             effective_sliding_window: Optional[int] = None) -> torch.Tensor:
         """
-        This is specifically needed for context phase requests. Currently, we don't create custom mask for generation requests because FlashInfer backend
-        doesn't use it anyway and there's nothing special we need to do for generation requests.
+        This is specifically needed for context phase requests. Generation
+        requests use the regular causal attention semantics and do not need a
+        custom mask.
         - This function will only be called for a batch when there's at least one context request in the batch with image tokens.
         - In context phase, each sample's input_ids may have a mix of image tokens and text tokens where tokens corresponding to an image
         appear as a contiguous blob. Example: torch.IntTensor([2, 3, 4, 5, img_idx, img_idx, img_idx, ..., img_idx, 100])
@@ -391,27 +440,24 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             A flattened boolean mask of shape (sum(q_len[i] * k_len[i] for i in range(batch_size)).
         """
 
-        assert isinstance(
-            attn_metadata, FlashInferAttentionMetadata
-        ), "Only FlashInfer backend supports custom mask currently."
         num_contexts = attn_metadata.num_contexts
         assert num_contexts > 0, "There should be at least one context request in the batch for custom mask."
 
-        qo_indptr = attn_metadata.qo_indptr[:num_contexts + 1]
-        cached_token_lens = attn_metadata.cached_token_lens[:num_contexts]
-        assert (cached_token_lens == 0).all(
-        ), "cached_token_lens should be 0 for context requests since chunked prefill and kv cache reuse must be disabled."
+        context_lens = attn_metadata.seq_lens[:num_contexts].tolist()
+        cached_token_lens = (
+            attn_metadata.kv_cache_params.
+            num_cached_tokens_per_seq[:num_contexts]
+            if attn_metadata.kv_cache_params is not None and
+            attn_metadata.kv_cache_params.num_cached_tokens_per_seq is not None
+            else [0] * num_contexts)
+        assert not any(cached_token_lens), (
+            "cached_token_lens should be 0 for context requests since chunked prefill "
+            "and kv cache reuse must be disabled.")
 
         # Create masks for context requests.
-        context_mask_list = []
-        for i in range(num_contexts):
-            mask_i = self.get_context_mask(
-                image_token_mask=image_token_mask[qo_indptr[i]:qo_indptr[i +
-                                                                         1]],
-                effective_sliding_window=effective_sliding_window,
-            )
-            context_mask_list.append(mask_i.flatten())
-        return torch.cat(context_mask_list, dim=0).contiguous()
+        return build_gemma_attention_mask(image_token_mask, context_lens,
+                                          cached_token_lens,
+                                          effective_sliding_window)
 
     @inference_mode_unless_compiling
     def forward(
@@ -428,12 +474,12 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
         local_attention_mask_data = None
         global_attention_mask_data = None
         if image_token_mask is not None:
-            global_attention_mask_data = self.get_flashinfer_attention_mask(
+            global_attention_mask_data = self.get_attention_mask(
                 image_token_mask=image_token_mask,
                 attn_metadata=attn_metadata,
                 effective_sliding_window=None,
             )
-            local_attention_mask_data = self.get_flashinfer_attention_mask(
+            local_attention_mask_data = self.get_attention_mask(
                 image_token_mask=image_token_mask,
                 attn_metadata=attn_metadata,
                 effective_sliding_window=self.config.sliding_window,

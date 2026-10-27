@@ -41,18 +41,19 @@ from transformers import T5Config
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, PredefinedAttentionMask
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, PredefinedAttentionMask
+from ..attention.cross_attention import CrossAttention
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
-from ..modules.cross_attention import CrossAttention
 from ..modules.embedding import Embedding, LMHead
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.mlp import MLP
 from ..modules.rms_norm import RMSNorm
+from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
 from .modeling_utils import PostInitCaller, register_auto_model
 
 # ---------------------------------------------------------------------------
@@ -438,6 +439,7 @@ class T5CrossAttention(CrossAttention):
 # ---------------------------------------------------------------------------
 
 
+@nccl_window_tensor_scoped_module
 class T5EncoderLayer(nn.Module):
     """T5 encoder layer: pre-norm self-attention + pre-norm MLP."""
 
@@ -521,6 +523,7 @@ class T5EncoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+@nccl_window_tensor_scoped_module
 class T5DecoderLayer(nn.Module):
     """T5 decoder layer: pre-norm self-attention + pre-norm cross-attention +
     pre-norm MLP."""
@@ -631,6 +634,7 @@ class T5DecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+@nccl_window_tensor_scoped_module
 class T5Encoder(nn.Module):
     """T5 encoder: shared embedding → encoder layers → final RMSNorm."""
 
@@ -688,6 +692,7 @@ class T5Encoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+@nccl_window_tensor_scoped_module
 class T5Decoder(nn.Module):
     """T5 decoder: decoder layers → final RMSNorm."""
 

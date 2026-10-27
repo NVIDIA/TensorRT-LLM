@@ -67,8 +67,8 @@ ValidatedParams validateInputs(at::Tensor const& x, std::optional<at::Tensor> co
         TORCH_CHECK(ln_bias->device() == x.device(), "ln_bias must be on the same device as x");
         TORCH_CHECK(ln_weight->dim() == 1 && ln_weight->size(0) == D, "ln_weight must be 1D [D]");
         TORCH_CHECK(ln_bias->dim() == 1 && ln_bias->size(0) == D, "ln_bias must be 1D [D]");
-        CHECK_TYPE(ln_weight.value(), torch::kBFloat16);
-        CHECK_TYPE(ln_bias.value(), torch::kBFloat16);
+        CHECK_TYPE(ln_weight.value(), torch::kFloat32);
+        CHECK_TYPE(ln_bias.value(), torch::kFloat32);
         TORCH_CHECK(ln_weight->is_contiguous(), "ln_weight must be contiguous");
         TORCH_CHECK(ln_bias->is_contiguous(), "ln_bias must be contiguous");
     }
@@ -87,8 +87,8 @@ ValidatedParams validateInputs(at::Tensor const& x, std::optional<at::Tensor> co
             "scale_msa must be [B, D] = [", B, ", ", D, "]");
         TORCH_CHECK(shift_msa->dim() == 2 && shift_msa->size(0) == B && shift_msa->size(1) == D,
             "shift_msa must be [B, D] = [", B, ", ", D, "]");
-        CHECK_TYPE(scale_msa.value(), torch::kBFloat16);
-        CHECK_TYPE(shift_msa.value(), torch::kBFloat16);
+        CHECK_TYPE(scale_msa.value(), torch::kFloat32);
+        CHECK_TYPE(shift_msa.value(), torch::kFloat32);
         TORCH_CHECK(scale_msa->is_contiguous(), "scale_msa must be contiguous");
         TORCH_CHECK(shift_msa->is_contiguous(), "shift_msa must be contiguous");
     }
@@ -110,10 +110,10 @@ at::Tensor fused_adaptive_layernorm(at::Tensor const& x, std::optional<at::Tenso
 
     tensorrt_llm::kernels::AdaptiveLayerNormParams params;
     params.x = reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr());
-    params.ln_weight = v.has_ln_affine ? reinterpret_cast<__nv_bfloat16 const*>(ln_weight->data_ptr()) : nullptr;
-    params.ln_bias = v.has_ln_affine ? reinterpret_cast<__nv_bfloat16 const*>(ln_bias->data_ptr()) : nullptr;
-    params.scale_msa = v.has_modulation ? reinterpret_cast<__nv_bfloat16 const*>(scale_msa->data_ptr()) : nullptr;
-    params.shift_msa = v.has_modulation ? reinterpret_cast<__nv_bfloat16 const*>(shift_msa->data_ptr()) : nullptr;
+    params.ln_weight = v.has_ln_affine ? reinterpret_cast<float const*>(ln_weight->data_ptr()) : nullptr;
+    params.ln_bias = v.has_ln_affine ? reinterpret_cast<float const*>(ln_bias->data_ptr()) : nullptr;
+    params.scale_msa = v.has_modulation ? reinterpret_cast<float const*>(scale_msa->data_ptr()) : nullptr;
+    params.shift_msa = v.has_modulation ? reinterpret_cast<float const*>(shift_msa->data_ptr()) : nullptr;
     params.out_bf16 = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
     params.out_fp4 = nullptr;
     params.out_sf = nullptr;
@@ -157,10 +157,10 @@ std::tuple<at::Tensor, at::Tensor> fused_adaptive_layernorm_quant(at::Tensor con
 
     tensorrt_llm::kernels::AdaptiveLayerNormParams params;
     params.x = reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr());
-    params.ln_weight = v.has_ln_affine ? reinterpret_cast<__nv_bfloat16 const*>(ln_weight->data_ptr()) : nullptr;
-    params.ln_bias = v.has_ln_affine ? reinterpret_cast<__nv_bfloat16 const*>(ln_bias->data_ptr()) : nullptr;
-    params.scale_msa = v.has_modulation ? reinterpret_cast<__nv_bfloat16 const*>(scale_msa->data_ptr()) : nullptr;
-    params.shift_msa = v.has_modulation ? reinterpret_cast<__nv_bfloat16 const*>(shift_msa->data_ptr()) : nullptr;
+    params.ln_weight = v.has_ln_affine ? reinterpret_cast<float const*>(ln_weight->data_ptr()) : nullptr;
+    params.ln_bias = v.has_ln_affine ? reinterpret_cast<float const*>(ln_bias->data_ptr()) : nullptr;
+    params.scale_msa = v.has_modulation ? reinterpret_cast<float const*>(scale_msa->data_ptr()) : nullptr;
+    params.shift_msa = v.has_modulation ? reinterpret_cast<float const*>(shift_msa->data_ptr()) : nullptr;
     params.out_bf16 = nullptr;
     params.out_fp4 = reinterpret_cast<uint32_t*>(y_fp4.data_ptr());
     params.out_sf = reinterpret_cast<uint32_t*>(sf_out.data_ptr());

@@ -14,19 +14,14 @@ l0_a30:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch/modeling -k "modeling_nemotron_nas"
-  - unittest/_torch/modeling -k "modeling_phi3"
-  - unittest/_torch/modeling -k "modeling_qwen"
-  - unittest/_torch/modeling -k "modeling_qwen_moe"
+  - unittest/_torch/modeling -k "modeling_qwen3"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   - unittest/_torch/modeling -k "modeling_speculative"
   - unittest/_torch/sampler/test_beam_search.py
   - unittest/_torch/sampler/test_beam_search_speculative_d2h.py
   - unittest/_torch/sampler/test_logits_logprobs.py
-  - test_e2e.py::test_openai_completions_with_logit_bias[torch_sampler]
-  - test_e2e.py::test_openai_chat_with_logit_bias[torch_sampler]
-  - test_e2e.py::test_openai_completions_with_logit_bias[trtllm_sampler]
-  - test_e2e.py::test_openai_chat_with_logit_bias[trtllm_sampler]
+  - test_e2e.py::test_openai_completions_with_logit_bias
+  - test_e2e.py::test_openai_chat_with_logit_bias
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
 - condition:
@@ -44,6 +39,7 @@ l0_a30:
   tests:
   # ------------- CPP tests ---------------
   - cpp/test_unit_tests.py::test_unit_tests[batch_manager-80]
+  - cpp/test_unit_tests.py::test_kv_cache_compression_unit_tests[80]
 - condition:
     ranges:
       system_gpu_count:
@@ -61,28 +57,5 @@ l0_a30:
   - cpp/test_unit_tests.py::test_unit_tests[common-80]
   - cpp/test_unit_tests.py::test_unit_tests[executor-80]
   - cpp/test_unit_tests.py::test_unit_tests[kernels-80]
-  - cpp/test_unit_tests.py::test_unit_tests[layers-80]
   - cpp/test_unit_tests.py::test_unit_tests[runtime-80]
   - cpp/test_unit_tests.py::test_unit_tests[thop-80]
-# ------------- AutoDeploy Backend Stages ---------------
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*a30*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: pre_merge
-      backend: autodeploy
-  tests:
-  - unittest/auto_deploy/singlegpu/compile
-  - unittest/auto_deploy/singlegpu/custom_ops
-  - unittest/auto_deploy/singlegpu/mlir
-  - unittest/auto_deploy/singlegpu/models
-  - unittest/auto_deploy/singlegpu/shim
-  - unittest/auto_deploy/singlegpu/smoke
-  - unittest/auto_deploy/singlegpu/transformations
-  - unittest/auto_deploy/singlegpu/utils

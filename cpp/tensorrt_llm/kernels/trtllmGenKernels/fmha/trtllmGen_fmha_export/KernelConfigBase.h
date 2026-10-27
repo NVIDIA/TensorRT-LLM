@@ -115,12 +115,18 @@ enum class AttentionMaskType {
   Dense = 0,
   // Causal mask.
   Causal,
-  // Sliding window causal mask or chunked attention causal mask.
+  // Shared non-variable sliding/chunked mask. Runtime params select the flavor:
+  //   * mChunkedAttentionSize > 0: chunked causal attention.
+  //   * otherwise: sliding window with inclusive K range [q - mLeftSlidingWindow, q + mRightSlidingWindow].
   SlidingOrChunkedCausal,
   // Custom mask.
   Custom,
   // Sliding window mask combined with custom packed mask.
-  SlidingWindowCustom
+  SlidingWindowCustom,
+  // Per-token contiguous window. Each packed-Q row provides an inclusive K index range
+  // [start, end]. Start/end are absolute positions within the batch item's K/V sequence,
+  // and the range must include the Q row's K-space position: start <= qPosK <= end.
+  VariableWindow
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -136,6 +142,7 @@ ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
 ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
 ATTENTION_MASK_TYPE_FUNCTION(SlidingWindowCustom)
+ATTENTION_MASK_TYPE_FUNCTION(VariableWindow)
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
 
@@ -144,9 +151,12 @@ __host__ __device__ inline bool isCustomMask(AttentionMaskType maskType) {
          maskType == AttentionMaskType::SlidingWindowCustom;
 }
 
-__host__ __device__ inline bool usesSlidingWindowMask(AttentionMaskType maskType) {
-  return maskType == AttentionMaskType::SlidingOrChunkedCausal ||
-         maskType == AttentionMaskType::SlidingWindowCustom;
+// True for any contiguous-window mask: the shared non-variable sliding/chunked mask, native
+// sliding-window custom mask, or per-token VariableWindow mask.
+__host__ __device__ inline bool isAnySlidingWindowMask(AttentionMaskType maskType) {
+  return isSlidingOrChunkedCausalMask(maskType) ||
+         isSlidingWindowCustomMask(maskType) ||
+         isVariableWindowMask(maskType);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -181,6 +191,23 @@ FMHA_KERNEL_TYPE_FUNCTION(SwapsMmaAbForGeneration)
 FMHA_KERNEL_TYPE_FUNCTION(KeepsMmaAbForGeneration)
 
 #undef FMHA_KERNEL_TYPE_FUNCTION
+
+// Context SlidingOrChunkedCausal is the only mask that emits a runtime two-sided
+// (left + optional right) sliding/chunked window in a single cubin. Generation (swapsMmaAb)
+// SlidingOrChunkedCausal stays left-bound only, and VariableWindow is per-row on its own path;
+// neither takes the two-sided window codegen.
+__host__ __device__ inline bool isContextSlidingOrChunked(AttentionMaskType maskType,
+                                                          FmhaKernelType kernelType) {
+  return isSlidingOrChunkedCausalMask(maskType) && isContextKernel(kernelType);
+}
+
+// A mask applies a right (upper) K bound when it is context SlidingOrChunkedCausal (runtime
+// rightSlidingWindow) or VariableWindow (per-row end). swapsMmaAb generation kernels emit only the
+// left-bound-only causal/sliding shape, so they are incompatible with right-bounded masks.
+__host__ __device__ inline bool needsRightBound(AttentionMaskType maskType,
+                                                FmhaKernelType kernelType) {
+  return isContextSlidingOrChunked(maskType, kernelType) || isVariableWindowMask(maskType);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -401,6 +428,8 @@ template <> inline std::string toString(AttentionMaskType e) {
     return "Custom";
   case AttentionMaskType::SlidingWindowCustom:
     return "SlidingWindowCustom";
+  case AttentionMaskType::VariableWindow:
+    return "VariableWindow";
   default:
     TLLM_LOG_ERROR("Unsupported enum.");
     return "";
@@ -470,6 +499,16 @@ template <> inline std::string toString(MmaOrder e) {
 }
 
 #endif // !TLLM_FMHA_TRTLLM_COMPAT (enum types, toString, helpers)
+
+__host__ __device__ inline float getSoftmaxPScale(tg::Dtype dtypeBmm2,
+                                                  float skipCorrThreshold = 0.f) {
+  // Non-E4M3 BMM2 uses a P scale of 1.
+  if (dtypeBmm2 != tg::Dtype::E4m3) {
+    return 1.f;
+  }
+  // 1.75 * 2^8 == 448. A future threshold-dependent scale must keep scale * 2^threshold <= 448.
+  return skipCorrThreshold > 0.f ? 1.75f : 448.f;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // *************************************************************************************************
@@ -647,6 +686,10 @@ template <> inline std::string toString(MmaOrder e) {
   X(bool, mUsesAttentionSinks, false, bool)                                                        \
   /* Whether to use block sparse attention. */                                                     \
   X(bool, mUseBlockSparseAttention, false, bool)                                                   \
+  /* Whether to emit the DSv4 fused-epilogue scales as UE8M0 exponent bytes instead of FP32. */    \
+  X(bool, mUsesDsv4Ue8m0ScaleO, false, bool)                                                       \
+  /* Whether to compute softmax row sums with P times an all-ones matrix using UTCMMA. */          \
+  X(bool, mUsesMmaForSoftmaxSum, false, bool)                                                      \
   /* Whether to use an ordered sequence between softmax0 and softmax1. */                          \
   X(bool, mUsesOrderedSequence, true, bool)                                                        \
   /* Whether to use CGA reduction (deprecated, kept for benchmarking). */                          \
@@ -661,6 +704,39 @@ template <> inline std::string toString(MmaOrder e) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA_RUBIN(X)
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA_FINE_GRAINED_TEST(X)
+
+#ifdef TLLM_RUBIN_FEATURES
+#undef KERNEL_CONFIG_BASE_FIELDS_EXTRA_RUBIN
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA_RUBIN(X)                                                   \
+  /* Whether to use fp16 softmax. */                                                               \
+  X(bool, mEnablesFp16Softmax, false, bool)                                                        \
+  /* Whether the kernel forces the output to be valid values */                                    \
+  /* (not -0.0 for FP and NAN for UE8m0). */                                                       \
+  X(bool, mFineGrainedForceValid, false, bool)                                                         \
+  /* Whether the kernel is a FineGrained producer */                                                   \
+  /* (invalidates output buffer prior to writing results). */                                      \
+  X(bool, mFineGrainedProducer, false, bool)                                                           \
+  /* Whether to use tcgen05.ld.spcompress to compress S before softmax (and thus P). */            \
+  X(bool, mUsesSpcompress, false, bool)
+#endif // TLLM_RUBIN_FEATURES
+
+#if defined(TLLM_RUBIN_FEATURES) && defined(TLLM_TEST)
+#undef KERNEL_CONFIG_BASE_FIELDS_EXTRA_FINE_GRAINED_TEST
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA_FINE_GRAINED_TEST(X)                                            \
+  /* Whether the FineGrained Producer kernel invalidates a separate buffer (used for testing only). */ \
+  X(bool, mFineGrainedSeparateInvalidation, false, bool)
+#endif // defined(TLLM_RUBIN_FEATURES) && defined(TLLM_TEST)
+
+#define KERNEL_CONFIG_BASE_FIELDS_EXTRA(X)                                                         \
+  KERNEL_CONFIG_BASE_FIELDS_EXTRA_RUBIN(X)                                                         \
+  KERNEL_CONFIG_BASE_FIELDS_EXTRA_FINE_GRAINED_TEST(X)
+
+#undef KERNEL_CONFIG_BASE_FIELDS
+#define KERNEL_CONFIG_BASE_FIELDS(X)                                                               \
+  KERNEL_CONFIG_BASE_FIELDS_BASE(X)                                                                \
+  KERNEL_CONFIG_BASE_FIELDS_EXTRA(X)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -727,3 +803,7 @@ template <> struct hash<fmha::KernelConfigBase> {
 
 #undef KERNEL_CONFIG_BASE_FIELDS
 #undef KERNEL_CONFIG_BASE_FIELDS_BASE
+#undef KERNEL_CONFIG_BASE_FIELDS_EXTRA
+// It's ok to undefine a macro that is not defined.
+#undef KERNEL_CONFIG_BASE_FIELDS_EXTRA_RUBIN
+#undef KERNEL_CONFIG_BASE_FIELDS_EXTRA_FINE_GRAINED_TEST

@@ -21,17 +21,17 @@ from backend_capability import BACKEND_CAPS, unsupported_reason
 from kv_cache_utils import apply_rope, fill_kv_cache_logical, make_position_ids
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
     RopeParams,
 )
-from tensorrt_llm._torch.attention_backend.utils import create_attention, get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import create_attention, get_attention_backend
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch, torch_dtype_to_binding
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
@@ -120,7 +120,7 @@ class BackendCase:
     kv_lora_rank: Optional[int] = None
     qk_nope_head_dim: Optional[int] = None
     qk_rope_head_dim: Optional[int] = None
-    use_kv_cache_manager_v2: bool = False
+    use_kv_cache_manager_v2: bool = True
 
     @property
     def num_seqs(self) -> int:
@@ -275,7 +275,9 @@ def _build_kv_cache_manager(case: BackendCase, backend: str, kv_dtype: torch.dty
 # FlashInfer, the comparison validates the absorbed-MQA math regardless of the
 # RoPE values (RoPE correctness is covered by test_attention_mla.py).
 # ---------------------------------------------------------------------------
-def _build_mla_kv_cache_manager(case: BackendCase, backend: str):
+def _build_mla_kv_cache_manager(
+    case: BackendCase, backend: str, *, kv_dtype: torch.dtype | None = None
+) -> KVCacheManager | KVCacheManagerV2:
     """A SELFKONLY KV cache for MLA: one latent head, head_dim kv_lora+qk_rope."""
     d_latent = case.kv_lora_rank + case.qk_rope_head_dim
     paged = BACKEND_CAPS[backend]["paged"]
@@ -300,7 +302,7 @@ def _build_mla_kv_cache_manager(case: BackendCase, backend: str):
         max_seq_len=pages_per_seq * tokens_per_block,
         max_batch_size=case.num_seqs,
         mapping=mapping,
-        dtype=torch_dtype_to_binding(case.compute_dtype),
+        dtype=torch_dtype_to_binding(kv_dtype if kv_dtype is not None else case.compute_dtype),
     )
 
 
@@ -662,8 +664,10 @@ def _prepare_mla_context_inputs(
     )
 
 
-def _run_mla_context_backend(case, backend, inputs, *, kv_layout: str) -> torch.Tensor:
-    """Run one backend's up-projected MLA context; return [nnz_q, heads*v_head]."""
+def _run_mla_context_backend(
+    case: BackendCase, backend: str, inputs: dict, *, kv_dtype: torch.dtype, kv_layout: str
+) -> torch.Tensor:
+    """Run up-projected MLA context; an FP8 cache also enables TRTLLM FP8 compute."""
     AttentionCls = get_attention_backend(backend)
     qk_head = case.qk_nope_head_dim + case.qk_rope_head_dim
     request_ids = list(range(case.num_seqs))
@@ -676,6 +680,7 @@ def _run_mla_context_backend(case, backend, inputs, *, kv_layout: str) -> torch.
         num_kv_heads=case.num_kv_heads,
         q_scaling=case.q_scaling,
         pos_embd_params=pos_embd_params,
+        quant_config=_quant_config(kv_dtype),
         is_mla_enable=True,
         q_lora_rank=case.q_lora_rank,
         kv_lora_rank=case.kv_lora_rank,
@@ -683,7 +688,7 @@ def _run_mla_context_backend(case, backend, inputs, *, kv_layout: str) -> torch.
         qk_rope_head_dim=case.qk_rope_head_dim,
         v_head_dim=case.v_head_dim,
     )
-    mgr = _build_mla_kv_cache_manager(case, backend)
+    mgr = _build_mla_kv_cache_manager(case, backend, kv_dtype=kv_dtype)
     mgr.add_dummy_requests(request_ids, case.token_nums)
     fuse_rope = AttentionCls.support_fused_rope()
     q, k, v, latent_cache, expected_latent_cache = _prepare_mla_context_inputs(
@@ -693,7 +698,7 @@ def _run_mla_context_backend(case, backend, inputs, *, kv_layout: str) -> torch.
         fuse_rope=fuse_rope,
     )
     expected_latents = _split_packed_tokens(expected_latent_cache, case.seq_lens)
-    cache_atol, cache_rtol = _tolerances(case, case.compute_dtype) if fuse_rope else (0.0, 0.0)
+    cache_atol, cache_rtol = _tolerances(case, kv_dtype) if fuse_rope else (0.0, 0.0)
     metadata = AttentionCls.Metadata(
         num_contexts=case.num_contexts,
         kv_cache_params=KVCacheParams(
@@ -877,7 +882,9 @@ def run_backend(
     """
     if case.is_mla:
         if case.is_context_only:
-            return _run_mla_context_backend(case, backend, inputs, kv_layout=kv_layout)
+            return _run_mla_context_backend(
+                case, backend, inputs, kv_dtype=kv_dtype, kv_layout=kv_layout
+            )
         return _run_mla_gen_backend(
             case, backend, inputs, kv_layout=kv_layout, cuda_graph=cuda_graph
         )

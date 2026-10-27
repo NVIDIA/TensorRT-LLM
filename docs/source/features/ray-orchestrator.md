@@ -26,9 +26,9 @@ This example is the same as in `/examples/llm-api`, with the only change being `
 
 ## Features
 Currently available:
-- Generate text asynchronously (refer to [llm_inference_async_ray.py](/examples/ray_orchestrator/llm_inference_async_ray.py))
-- Multi-node inference (refer to [multi-node README](/examples/ray_orchestrator/multi_nodes/README.md))
-- Disaggregated serving (refer to [disagg README](/examples/ray_orchestrator/disaggregated/README.md))
+- Generate text asynchronously (refer to [llm_inference_async_ray.py](source:examples/ray_orchestrator/llm_inference_async_ray.py))
+- Multi-node inference (refer to [multi-node README](source:examples/ray_orchestrator/multi_nodes/README.md))
+- Disaggregated serving (refer to [disagg README](source:examples/ray_orchestrator/disaggregated/README.md))
 
 *Initial testing has been focused on LLaMA and DeepSeek variants. Please open an Issue if you encounter problems with other models so we can prioritize support.*
 
@@ -37,6 +37,18 @@ Currently available:
 - Integration with RLHF frameworks, such as [Verl](https://github.com/volcengine/verl) and [NVIDIA NeMo-RL](https://github.com/NVIDIA-NeMo/RL).
 
 ## Architecture
-This feature introduces new classes such as [RayExecutor](/tensorrt_llm/executor/ray_executor.py) and [RayGPUWorker](/tensorrt_llm/executor/ray_gpu_worker.py) for Ray actor lifecycle management and distributed inference. In Ray mode, collective ops run on [torch.distributed](https://docs.pytorch.org/tutorials/beginner/dist_overview.html) without MPI. We welcome contributions to improve and extend this support.
+This feature introduces new classes such as [RayExecutor](source:tensorrt_llm/executor/ray/executor.py) and [RayGPUWorker](source:tensorrt_llm/executor/ray/gpu_worker.py) for Ray actor lifecycle management and distributed inference. In Ray mode, collective ops run on [torch.distributed](https://docs.pytorch.org/tutorials/beginner/dist_overview.html) without MPI. We welcome contributions to improve and extend this support.
 
-![Ray orchestrator architecture](/docs/source/media/ray_orchestrator_architecture.jpg)
+![Ray orchestrator architecture](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/ray_orchestrator_architecture.jpg)
+
+## Environment Variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TLLM_DISABLE_MPI` | unset | `1` runs without MPI. The Ray orchestrator sets it on its workers. |
+| `TLLM_RAY_FORCE_LOCAL_CLUSTER` | `0` | `1` always starts a new local Ray cluster instead of attaching to an existing one. |
+| `TRTLLM_RAY_PER_WORKER_GPUS` | `1.0` | GPUs reserved for each worker actor. A fraction lets several actors share one GPU (colocated use). `ray_placement_config.per_worker_gpu_share` takes precedence. |
+| `TRTLLM_RAY_BUNDLE_INDICES` | unset | Comma-separated placement-group bundle indices, one per rank (unique, in range). Must be set from inside a Ray placement group. `ray_placement_config` takes precedence. |
+| `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES`, `RAY_DEDUP_LOGS` | set by the orchestrator (`1`, `0`) | Keep Ray from restricting `CUDA_VISIBLE_DEVICES` per worker and from collapsing duplicate log lines across ranks. Export them yourself before `ray start` on a manually launched cluster, as the [multi-node example](source:examples/ray_orchestrator/multi_nodes/run_cluster.sh) does. |
+| `TLLM_CUDA_OBJECT_COLLECTIVES` | `1` | Without MPI, small Python-object collectives (attention-DP votes, response gathers) are staged through CUDA tensors on dedicated NCCL communicators. `0` falls back to the gloo CPU backend. Must be identical on every rank. |
+| `TLLM_REFIT_DEDUP_MODULES` | `1` | During RL weight refit, each module's refit hook runs once even if a `torch.compile` wrapper exposes it twice. `0` disables this, for bisecting. |

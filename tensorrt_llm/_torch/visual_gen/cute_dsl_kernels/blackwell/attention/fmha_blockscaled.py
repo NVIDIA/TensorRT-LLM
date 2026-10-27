@@ -482,9 +482,12 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         cum_seqlen_k: Optional[cute.Tensor],
         lse_tensor: Optional[cute.Tensor],
         sink_tensor: Optional[cute.Tensor],
-        scale_softmax_log2: Float32,
-        scale_softmax: Float32,
-        scale_output: Float32,
+        scale_softmax_log2_value: Float32,
+        scale_softmax_log2_tensor: Optional[cute.Tensor],
+        scale_softmax_value: Float32,
+        scale_softmax_tensor: Optional[cute.Tensor],
+        scale_output_value: Float32,
+        scale_output_tensor: Optional[cute.Tensor],
         scale_v_channels: Optional[cute.Tensor],
         skip_softmax_threshold_log2: Optional[Float32],
         window_size_left: Optional[Int32],
@@ -521,12 +524,18 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         :type cum_seqlen_q: Optional[cute.Tensor]
         :param cum_seqlen_k: The cumulative sequence length tensor for key
         :type cum_seqlen_k: Optional[cute.Tensor]
-        :param scale_softmax_log2: The log2 scale factor for softmax
-        :type scale_softmax_log2: Float32
-        :param scale_softmax: The scale factor for softmax
-        :type scale_softmax: Float32
-        :param scale_output: The scale factor for the output
-        :type scale_output: Float32
+        :param scale_softmax_log2_value: The log2 scale factor for softmax; ignored if scale_softmax_log2_tensor is set
+        :type scale_softmax_log2_value: Float32
+        :param scale_softmax_log2_tensor: Optional device scalar that replaces scale_softmax_log2_value
+        :type scale_softmax_log2_tensor: Optional[cute.Tensor]
+        :param scale_softmax_value: The scale factor for softmax; ignored if scale_softmax_tensor is set
+        :type scale_softmax_value: Float32
+        :param scale_softmax_tensor: Optional device scalar that replaces scale_softmax_value
+        :type scale_softmax_tensor: Optional[cute.Tensor]
+        :param scale_output_value: The scale factor for the output; ignored if scale_output_tensor is set
+        :type scale_output_value: Float32
+        :param scale_output_tensor: Optional device scalar that replaces scale_output_value
+        :type scale_output_tensor: Optional[cute.Tensor]
         :param window_size_left: Left-side sliding window size for attention masking.
         :type window_size_left: Optional[Int32]
         :param window_size_right: Right-side sliding window size for attention masking.
@@ -895,9 +904,12 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
             cum_seqlen_k,
             lse,
             sink,
-            scale_softmax_log2,
-            scale_softmax,
-            scale_output,
+            scale_softmax_log2_value,
+            scale_softmax_log2_tensor,
+            scale_softmax_value,
+            scale_softmax_tensor,
+            scale_output_value,
+            scale_output_tensor,
             m_scale_v_channels,
             skip_softmax_threshold_log2,
             window_size_left,
@@ -944,9 +956,12 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         cum_seqlen_k: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
         mSink: Optional[cute.Tensor],
-        scale_softmax_log2: Float32,
-        scale_softmax: Float32,
-        scale_output: Float32,
+        scale_softmax_log2_value: Float32,
+        scale_softmax_log2_tensor: Optional[cute.Tensor],
+        scale_softmax_value: Float32,
+        scale_softmax_tensor: Optional[cute.Tensor],
+        scale_output_value: Float32,
+        scale_output_tensor: Optional[cute.Tensor],
         m_scale_v_channels: Optional[cute.Tensor],
         skip_softmax_threshold_log2: Optional[Float32],
         window_size_left: Optional[Int32],
@@ -997,10 +1012,18 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         :type mO_qdl: cute.Tensor
         :param mO: Non-partitioned output tensor
         :type mO: cute.Tensor
-        :param scale_softmax_log2: The log2 scale factor for softmax
-        :type scale_softmax_log2: Float32
-        :param scale_output: The scale factor for the output
-        :type scale_output: Float32
+        :param scale_softmax_log2_value: The log2 scale factor for softmax; ignored if scale_softmax_log2_tensor is set
+        :type scale_softmax_log2_value: Float32
+        :param scale_softmax_log2_tensor: Optional device scalar that replaces scale_softmax_log2_value
+        :type scale_softmax_log2_tensor: Optional[cute.Tensor]
+        :param scale_softmax_value: The scale factor for softmax; ignored if scale_softmax_tensor is set
+        :type scale_softmax_value: Float32
+        :param scale_softmax_tensor: Optional device scalar that replaces scale_softmax_value
+        :type scale_softmax_tensor: Optional[cute.Tensor]
+        :param scale_output_value: The scale factor for the output; ignored if scale_output_tensor is set
+        :type scale_output_value: Float32
+        :param scale_output_tensor: Optional device scalar that replaces scale_output_value
+        :type scale_output_tensor: Optional[cute.Tensor]
         :param window_size_left: Left-side sliding window size for attention masking.
         :type window_size_left: Optional[Int32]
         :param window_size_right: Right-side sliding window size for attention masking.
@@ -1259,6 +1282,14 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         )
         work_tile = tile_sched.initial_work_tile_info()
         pipeline_init_wait()
+        if cutlass.const_expr(scale_softmax_tensor is not None):
+            scale_softmax = scale_softmax_tensor[0]
+        else:
+            scale_softmax = scale_softmax_value
+        if cutlass.const_expr(scale_softmax_log2_tensor is not None):
+            scale_softmax_log2 = scale_softmax_log2_tensor[0]
+        else:
+            scale_softmax_log2 = scale_softmax_log2_value
         softmax_fn = partial(
             self.softmax,
             qk_thr_mma=qk_thr_mma,
@@ -1971,6 +2002,10 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
             tTMEM_LOAD_VECtS0 = thr_tmem_load_vec.partition_S(tStS_vec0)
             tTMEM_LOAD_VECtS1 = thr_tmem_load_vec.partition_S(tStS_vec1)
             tTMEM_LOAD_VECcS = thr_tmem_load_vec.partition_D(tScS_vec)
+            if cutlass.const_expr(scale_output_tensor is not None):
+                scale_output = scale_output_tensor[0]
+            else:
+                scale_output = scale_output_value
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
                 batch_coord = curr_block_coord[2][1]

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import bisect
 import logging
+import traceback
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -47,6 +48,7 @@ try:
 except ImportError:
     logger = logging.getLogger(__name__)
 
+from . import fabric_gather
 from .specs import PeerRanges, lookup_owner
 from .weight_buffer import WeightBuffer
 
@@ -57,6 +59,15 @@ from .weight_buffer import WeightBuffer
 # single-link contention.  Ported from the IPC-era DWDP contention
 # optimization (PR #12974) to the VA-based pipeline.
 MEMCPY_BATCH_SLICE_BYTES = 1 << 21
+
+# One ``cudaMemcpyBatchAsync`` batch: parallel destination-pointer,
+# source-pointer and size lists, always of equal length.
+_CopyBatch = Tuple[List[int], List[int], List[int]]
+
+# Launch arguments for one layer's ``trtllm::dwdp_fabric_gather``: device-resident
+# destination, source, 16-byte-line-count and group-boundary tensors, plus the
+# number of blocks each group gets.
+_GatherPlan = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]
 
 
 class DWDPWeightManager:
@@ -88,6 +99,9 @@ class DWDPWeightManager:
         "_transport",
         "_use_batched_prefetch",
         "_batched_copy_plans",
+        "_use_gather",
+        "_gather_plans",
+        "_released",
     )
 
     def __init__(
@@ -166,6 +180,7 @@ class DWDPWeightManager:
         #   Waited on by copy_stream (WAR — must finish read before overwrite).
         self._prefetch_events: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(2)]
         self._consume_events: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(2)]
+        self._transport = None
 
         # Initialize consume_events as "already signaled" so the first prefetch
         # does not stall. We record them on the current (default) stream, which
@@ -180,14 +195,33 @@ class DWDPWeightManager:
         # src_ptrs, sizes)`` tuple per layer to avoid host-side rebuild on
         # every prefetch.
         self._use_batched_prefetch = contention_opt
-        self._batched_copy_plans: Dict[int, Tuple[List[int], List[int], List[int]]] = {}
+        self._batched_copy_plans: Dict[int, _CopyBatch] = {}
+        self._released = False
+
+        # SM gather: the same per-peer plan, pulled by a kernel instead of the copy
+        # engine (see ``fabric_gather``).  Opt-in; off if the op is not registered.
+        # Layers whose descriptors are not 16-byte aligned cache None and fall back
+        # to the copy engine.
+        self._use_gather = fabric_gather.is_enabled() and fabric_gather.gather_op() is not None
+        if self._use_gather:
+            # Reserve the gather's SMs in the persistent CuTeDSL grids, pin the dense
+            # GEMM to the CLC scheduler and turn off cooperative MoE routing unless the
+            # user set them explicitly.  Runs during setup, before the first forward.
+            fabric_gather.apply_compute_side_defaults()
+        if fabric_gather.is_enabled() and not self._use_gather:
+            logger.warning(
+                "[DWDPWeightManager] Fabric gather requested but trtllm::dwdp_fabric_gather is "
+                "not registered; falling back to the copy-engine prefetch"
+            )
+        self._gather_plans: Dict[int, Optional[_GatherPlan]] = {}
 
         logger.info(
             f"[DWDPWeightManager] Initialized: rank={dwdp_rank}/{dwdp_size}, "
             f"moe_layers={len(self._moe_layer_indices)}, "
             f"weights={self._weight_names}, "
             f"experts_per_rank={self._experts_per_rank}, "
-            f"contention_opt={contention_opt}"
+            f"contention_opt={contention_opt}, "
+            f"gather={self._use_gather}"
         )
 
     @property
@@ -257,12 +291,11 @@ class DWDPWeightManager:
         remote slices. Finally, records a prefetch_event so the compute stream
         can wait for the copy to complete.
 
-        Two implementations dispatch on ``self._use_batched_prefetch`` (set
-        from ``DwdpConfig.contention_opt``): the default per-slice path
-        issues one ``torch.Tensor.copy_`` per peer chunk, while the batched
-        path collapses all chunks into a single ``cudaMemcpyBatchAsync``
-        call whose sub-slices round-robin across peers in 2 MiB chunks to
-        limit single-NVLink-link contention.
+        Three transports share the per-peer plan: the default per-slice path
+        (one ``torch.Tensor.copy_`` per chunk), ``DwdpConfig.contention_opt``
+        (one ``cudaMemcpyBatchAsync`` per layer, 2 MiB sub-slices interleaved
+        across peers to limit single-link contention) and
+        ``TRTLLM_DWDP_PREFETCH_GATHER`` (one SM kernel per layer; see ``fabric_gather``).
 
         This method returns immediately — all GPU work is enqueued on
         copy_stream and does not block the CPU.
@@ -285,7 +318,9 @@ class DWDPWeightManager:
             # before overwriting it with new P2P data.
             self._copy_stream.wait_event(self._consume_events[buf_idx])
 
-            if self._use_batched_prefetch:
+            if self._use_gather:
+                self._prefetch_layer_gather(layer_idx)
+            elif self._use_batched_prefetch:
                 self._prefetch_layer_batched(layer_idx)
             else:
                 self._prefetch_layer_per_slice(layer_idx)
@@ -329,22 +364,11 @@ class DWDPWeightManager:
                     dst_offset += n
                     cursor = chunk_end
 
-    def _build_batched_prefetch_copy_plan(
-        self, layer_idx: int
-    ) -> Tuple[List[int], List[int], List[int]]:
-        """Build a per-layer ``cudaMemcpyBatchAsync`` plan.
-
-        Strategy: collect every ``(dst_ptr, src_ptr, size_bytes)`` triple
-        from the same per-slice / per-peer walk used by
-        ``_prefetch_layer_per_slice``, then split each peer's contiguous
-        chunks into ``MEMCPY_BATCH_SLICE_BYTES`` (2 MiB) sub-slices and
-        interleave them across peers in round-robin order.  Interleaving
-        is what limits single-NVLink-link contention — at any moment the
-        in-flight memcpys touch every peer link rather than saturating one.
+    def _build_peer_descriptor_groups(self, layer_idx: int) -> List[List[Tuple[int, int, int]]]:
+        """Build a per-layer copy plan, grouped by peer.
 
         Returns:
-            Three parallel lists ``(dst_ptrs, src_ptrs, sizes)`` of the
-            same length, suitable for ``cudaMemcpyBatchAsync``.
+            Coalesced ``(dst_ptr, src_ptr, size_bytes)`` descriptors per non-empty peer, ascending.
         """
         # Step 1: collect per-peer ``(dst_ptr, src_ptr, total_size)`` triples.
         peer_triples: Dict[int, List[Tuple[int, int, int]]] = {}
@@ -373,25 +397,55 @@ class DWDPWeightManager:
                     dst_offset += n
                     cursor = chunk_end
 
-        # Step 2: split each per-peer triple into 2 MiB sub-slices.
-        peer_subslices: Dict[int, List[Tuple[int, int, int]]] = {}
+        # Step 2: merge triples adjacent in both address spaces (only fragmented
+        # remote slices produce more than one triple per peer and weight).
+        coalesced: Dict[int, List[Tuple[int, int, int]]] = {}
         for peer, triples in peer_triples.items():
+            merged: List[Tuple[int, int, int]] = []
+            for dst_ptr, src_ptr, size in sorted(triples, key=lambda t: (t[0], t[1])):
+                if merged:
+                    prev_dst, prev_src, prev_size = merged[-1]
+                    if prev_dst + prev_size == dst_ptr and prev_src + prev_size == src_ptr:
+                        merged[-1] = (prev_dst, prev_src, prev_size + size)
+                        continue
+                merged.append((dst_ptr, src_ptr, size))
+            coalesced[peer] = merged
+
+        # Step 3: one descriptor group per peer, peers ascending.
+        return [coalesced[peer] for peer in sorted(coalesced) if coalesced[peer]]
+
+    def _build_batched_prefetch_copy_plan(self, layer_idx: int) -> _CopyBatch:
+        """Build a per-layer ``cudaMemcpyBatchAsync`` plan.
+
+        Strategy: take the per-peer descriptor groups, split each peer's
+        contiguous chunks into ``MEMCPY_BATCH_SLICE_BYTES`` (2 MiB) sub-slices
+        and interleave them across peers in round-robin order.  Interleaving
+        is what limits single-NVLink-link contention — at any moment the
+        in-flight memcpys touch every peer link rather than saturating one.
+
+        Returns:
+            Three parallel lists ``(dst_ptrs, src_ptrs, sizes)`` of the
+            same length, suitable for ``cudaMemcpyBatchAsync``.
+        """
+        # Step 1: split each peer's descriptors into 2 MiB sub-slices.
+        peer_subslices: List[List[Tuple[int, int, int]]] = []
+        for group in self._build_peer_descriptor_groups(layer_idx):
             sub_list: List[Tuple[int, int, int]] = []
-            for dst_ptr, src_ptr, total in triples:
+            for dst_ptr, src_ptr, total in group:
                 offset = 0
                 while offset < total:
                     sz = min(MEMCPY_BATCH_SLICE_BYTES, total - offset)
                     sub_list.append((dst_ptr + offset, src_ptr + offset, sz))
                     offset += sz
-            peer_subslices[peer] = sub_list
+            peer_subslices.append(sub_list)
 
-        # Step 3: round-robin across peers.  At each round, take the next
+        # Step 2: round-robin across peers.  At each round, take the next
         # sub-slice from every peer that still has one, then advance.
         # Peers naturally drop out as their sub-slice lists exhaust.
         dst_ptrs: List[int] = []
         src_ptrs: List[int] = []
         sizes: List[int] = []
-        cursors = {peer: 0 for peer in peer_subslices}
+        cursors = {peer: 0 for peer in range(len(peer_subslices))}
         while cursors:
             for peer in list(cursors):
                 idx = cursors[peer]
@@ -439,6 +493,35 @@ class DWDPWeightManager:
                 f"{layer_idx}, copies={len(dst_ptrs)}): {err}"
             )
 
+    def _build_gather_plan(self, layer_idx: int) -> Optional[_GatherPlan]:
+        """Build the gather launch arguments, or None if the layer is empty or not 16-byte aligned."""
+        groups = self._build_peer_descriptor_groups(layer_idx)
+        if not groups:
+            return None
+        return fabric_gather.build_plan(groups, self._copy_stream.device)
+
+    def _prefetch_layer_gather(self, layer_idx: int) -> None:
+        """SM-gather prefetch: one kernel per layer; misaligned layers fall back to the copy engine."""
+        if layer_idx in self._gather_plans:
+            plan = self._gather_plans[layer_idx]
+        else:
+            plan = self._build_gather_plan(layer_idx)
+            self._gather_plans[layer_idx] = plan
+            if plan is None:
+                logger.warning(
+                    f"[DWDPWeightManager] Layer {layer_idx} is not 16-byte aligned; "
+                    f"using the copy-engine prefetch for it"
+                )
+
+        if plan is None:
+            self._prefetch_layer_batched(layer_idx)
+            return
+
+        dst_ptrs, src_ptrs, lines, row_starts, blocks = plan
+        fabric_gather.gather_op()(
+            dst_ptrs, src_ptrs, lines, row_starts, blocks, fabric_gather.THREADS
+        )
+
     def wait_and_bind(self, backend_module: torch.nn.Module, layer_idx: int) -> None:
         """Wait for prefetch completion and bind weight tensors to the module.
 
@@ -446,33 +529,11 @@ class DWDPWeightManager:
             1. Wait for prefetch_events[buf_idx] (RAW — copy must finish before read).
             2. Bind each weight's full tensor (local zero-copy + remote P2P data)
                as the param.data of the backend module's corresponding attribute.
-            3. Record consume_events[other_buf] (WAR signal for the OTHER buffer
-               slot, telling copy_stream it is safe to overwrite that slot).
 
-        The WAR event is recorded for the OTHER buffer slot because by the time
-        this forward pass completes, the copy_stream may already be writing to
-        the alternate slot for the next-next layer's prefetch.
-
-        Design rationale — implicit compute-done signal via stream in-order semantics:
-            The IPC-era predecessor of this code carried per-layer compute_events
-            (O(N_moe), ~116 events for DSv3 with 58 MoE layers and ping-pong slots)
-            to signal "kernel(L) finished, slot is reusable". This implementation
-            replaces them with per-slot consume_events recorded inside this very
-            method (4 events total, independent of N_moe).
-
-            The simplification relies on CUDA stream in-order semantics: an event
-            recorded on a stream fires only after every prior enqueue on that
-            stream has completed. Because step 3 above (record consume_events[
-            other_buf]) is enqueued on compute_stream AFTER step 2's binding —
-            which is in turn ordered before the next kernel(L) launch on the same
-            stream — the consume event for slot S cannot fire until every kernel
-            that read slot S has finished. This gives the same WAR ordering as
-            an explicit per-layer compute_event would, with O(1) bookkeeping.
-
-            Implication for future work: if num_buffers ever grows beyond 2 (e.g.
-            to support cross-node prefetch with deeper pipelines), per-slot events
-            may need to become per-slot event LISTS, and the "next kernel is
-            enqueued on the same stream" invariant must be preserved.
+        The matching WAR signal is deliberately recorded by ``record_compute``
+        after the MoE kernel has been enqueued. Recording it here would place the
+        event before the kernel on the compute stream and could let the copy
+        stream overwrite a slot while that kernel is still reading it.
 
         Args:
             backend_module: The MoE backend module whose weight parameters will
@@ -490,8 +551,6 @@ class DWDPWeightManager:
             )
 
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
-        other_buf = 1 - buf_idx
-
         compute_stream = torch.cuda.current_stream(
             torch.device("cuda", self._weight_buffer.device_id)
         )
@@ -508,12 +567,65 @@ class DWDPWeightManager:
             param = getattr(backend_module, name)
             param.data = full_tensor
 
-        # WAR signal for the OTHER buffer slot: after this forward pass
-        # finishes consuming the current slot, the copy_stream is free to
-        # overwrite the other slot for the next-next layer's prefetch.
-        self._consume_events[other_buf].record(compute_stream)
+        logger.debug(f"[DWDPWeightManager] Bound weights: layer={layer_idx}, buf_slot={buf_idx}")
 
-        logger.debug(
-            f"[DWDPWeightManager] Bound weights: layer={layer_idx}, "
-            f"buf_slot={buf_idx}, signal_consume_slot={other_buf}"
+    def record_compute(self, layer_idx: int) -> None:
+        """Record that the current layer has finished consuming its buffer slot.
+
+        This method must be called after the layer's MoE kernel is enqueued on
+        the current compute stream. CUDA stream ordering then guarantees that
+        the consume event cannot complete until the kernel has stopped reading
+        the slot. The copy stream waits on this event before reusing the slot
+        for the layer two positions ahead in the MoE sequence.
+
+        Args:
+            layer_idx: MoE layer whose compute was just enqueued.
+        """
+        if layer_idx not in self._moe_layer_set:
+            raise KeyError(
+                f"Layer {layer_idx} is not a MoE layer. Valid layers: {self._moe_layer_indices}"
+            )
+
+        buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
+        compute_stream = torch.cuda.current_stream(
+            torch.device("cuda", self._weight_buffer.device_id)
         )
+        self._consume_events[buf_idx].record(compute_stream)
+        logger.debug(f"[DWDPWeightManager] Compute recorded: layer={layer_idx}, buf_slot={buf_idx}")
+
+    def release(self) -> None:
+        """Synchronize outstanding work and release all owned VMM resources."""
+        if self._released:
+            return
+
+        # Teardown is outside the inference hot path. A device synchronization
+        # makes both compute and copy-stream users of the composite VA quiescent
+        # before unmapping it.
+        torch.cuda.synchronize(self._weight_buffer.device_id)
+        self._peer_views.clear()
+        try:
+            self._weight_buffer.release()
+        finally:
+            # The transport owns MNNVL handles that outlive the process, so free
+            # them even when the buffer release raises; the buffer error stays in
+            # flight. Mark released either way so __del__ does not retry a call
+            # that just failed.
+            if self._transport is not None:
+                try:
+                    self._transport.release()
+                except Exception:  # noqa: BLE001 - must not mask the buffer error
+                    logger.error(
+                        f"[DWDPWeightManager] Transport release failed\n{traceback.format_exc()}"
+                    )
+                self._transport = None
+            self._batched_copy_plans.clear()
+            # Gather plans hold raw pointers into the VA just unmapped.
+            self._gather_plans.clear()
+            self._released = True
+
+    def __del__(self) -> None:
+        """Best-effort fallback for callers that miss explicit teardown."""
+        try:
+            self.release()
+        except Exception as exc:
+            logger.debug(f"[DWDPWeightManager] __del__ release failed: {exc!r}")

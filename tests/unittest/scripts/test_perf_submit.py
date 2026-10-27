@@ -64,6 +64,12 @@ def example_submit_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     return _load_module(EXAMPLE_SUBMIT_PATH, monkeypatch)
 
 
+@pytest.fixture
+def local_submit_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    """The local harness only; the CI submit.py has no SLURM GRES helpers."""
+    return _load_module(SUBMIT_PATHS[1], monkeypatch)
+
+
 def _get_benchmark_config(module: ModuleType, concurrency):
     config = {"benchmark": {"concurrency_list": concurrency}}
     if Path(module.__file__).parent.name == "local":
@@ -178,6 +184,49 @@ def test_ci_submit_selects_same_least_duration_shard_as_pytest_split(
     )
 
     assert selected == test_lines[1]
+
+
+@pytest.mark.parametrize(
+    ("selected_suffix", "waive_line", "expected"),
+    (
+        (" SKIP (inline)", "", True),
+        (" SKIP(inline)", "", True),
+        ("", "{nodeid} SKIP (global)", True),
+        ("", "{nodeid} SKIP(global)", True),
+        ("", "{nodeid} XFAIL (known failure)", False),
+        ("", "perf/test_other.py::test_other SKIP (other)", False),
+    ),
+)
+def test_ci_submit_skips_precheck_only_for_selected_skip_waive(
+    ci_submit_module: ModuleType,
+    tmp_path: Path,
+    selected_suffix: str,
+    waive_line: str,
+    expected: bool,
+) -> None:
+    nodeid = "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-case]"
+    waives = tmp_path / "waives.txt"
+    waives.write_text(waive_line.format(nodeid=nodeid), encoding="utf-8")
+
+    assert (
+        ci_submit_module.selected_test_is_skip_waived(f"{nodeid}{selected_suffix}", waives)
+        is expected
+    )
+
+
+def test_ci_submit_honors_matching_platform_scoped_skip_waive(
+    ci_submit_module: ModuleType, tmp_path: Path
+) -> None:
+    nodeid = "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-case]"
+    waives = tmp_path / "waives.txt"
+    waives.write_text(f"full:GB300/{nodeid} SKIP (platform)\n", encoding="utf-8")
+
+    assert ci_submit_module.selected_test_is_skip_waived(
+        nodeid, waives, test_prefix="GB300-Disagg-Perf"
+    )
+    assert not ci_submit_module.selected_test_is_skip_waived(
+        nodeid, waives, test_prefix="DGX_B200-Disagg-Perf"
+    )
 
 
 def test_ci_submit_selector_matches_installed_pytest_split(
@@ -333,3 +382,206 @@ def test_resolve_llm_models_root_does_not_mask_malformed_command(
 
     with pytest.raises(ValueError, match="cannot parse exported pytestCommand"):
         ci_submit_module._resolve_llm_models_root(lines)
+
+
+# --------------------- gen-only request-queue capacity cap -----------------------
+# The fill loop cannot reach a target above the GEN executor's active capacity,
+# so TLLM_BENCHMARK_REQ_QUEUES_SIZE is clamped to it. This applies to every
+# gen_only run of the local harness, not just BOLT ones.
+@pytest.mark.parametrize(
+    "gen_config, concurrency, expected",
+    [
+        # Capacity above the ask: concurrency wins (no clamp).
+        ({"max_batch_size": 512}, 128, 128),
+        # Capacity below the ask: clamped to max_batch_size.
+        ({"max_batch_size": 64}, 128, 64),
+        # Exactly equal: no clamp.
+        ({"max_batch_size": 128}, 128, 128),
+        # attention_dp multiplies capacity by TP.
+        ({"max_batch_size": 64, "enable_attention_dp": True, "tensor_parallel_size": 4}, 128, 128),
+        # TP is ignored unless attention_dp is on.
+        ({"max_batch_size": 64, "tensor_parallel_size": 4}, 128, 64),
+        # attention_dp on but TP still too small to cover the ask.
+        ({"max_batch_size": 8, "enable_attention_dp": True, "tensor_parallel_size": 2}, 128, 16),
+        # Missing max_batch_size defaults to concurrency, i.e. no clamp.
+        ({}, 128, 128),
+    ],
+)
+def test_get_benchmark_request_queue_size(
+    local_submit_module: ModuleType, gen_config, concurrency, expected
+):
+    config = {"worker_config": {"gen": gen_config}}
+    assert local_submit_module.get_benchmark_request_queue_size(config, concurrency) == expected
+
+
+@pytest.mark.parametrize("worker_config", [{}, {"gen": None}, None])
+def test_get_benchmark_request_queue_size_tolerates_absent_gen_config(
+    local_submit_module: ModuleType, worker_config
+):
+    config = {} if worker_config is None else {"worker_config": worker_config}
+    assert local_submit_module.get_benchmark_request_queue_size(config, 32) == 32
+
+
+# ------------------------- partition GRES tri-state / #SBATCH --------------------
+def _fake_sinfo(monkeypatch, module, gres_out, raises=False):
+    def fake_check_output(cmd, **kwargs):
+        if raises:
+            raise OSError("sinfo unavailable")
+        return gres_out
+
+    monkeypatch.setattr(module.subprocess, "check_output", fake_check_output)
+
+
+def test_partition_gpu_gres_prefers_gpu_row_over_null(local_submit_module: ModuleType, monkeypatch):
+    _fake_sinfo(monkeypatch, local_submit_module, "(null)\ngpu:8\n")
+    assert local_submit_module.partition_gpu_gres("batch") == "gpu:8"
+
+
+def test_partition_gpu_gres_reports_null_as_definitive(
+    local_submit_module: ModuleType, monkeypatch
+):
+    # NOT None: "(null)" means the partition really has no GPU GRES (e.g. EOS),
+    # which generate_gpu_request must distinguish from "sinfo could not answer".
+    _fake_sinfo(monkeypatch, local_submit_module, "(null)\n")
+    assert local_submit_module.partition_gpu_gres("batch") == "(null)"
+
+
+def test_partition_gpu_gres_returns_none_when_sinfo_fails(
+    local_submit_module: ModuleType, monkeypatch
+):
+    _fake_sinfo(monkeypatch, local_submit_module, "", raises=True)
+    assert local_submit_module.partition_gpu_gres("batch") is None
+
+
+def test_partition_gpu_gres_returns_none_for_sentinel_partition(
+    local_submit_module: ModuleType,
+):
+    assert local_submit_module.partition_gpu_gres("unspecified") is None
+
+
+def test_generate_gpu_request_adds_gres_when_partition_advertises_gpus(
+    local_submit_module: ModuleType, monkeypatch
+):
+    _fake_sinfo(monkeypatch, local_submit_module, "gpu:4\n")
+    assert local_submit_module.generate_gpu_request("batch", 4) == [
+        "#SBATCH --gpus-per-node=4",
+        "#SBATCH --gres=gpu:4",
+    ]
+
+
+def test_generate_gpu_request_omits_everything_on_gpu_less_partition(
+    local_submit_module: ModuleType, monkeypatch
+):
+    # "(null)" is definitive, so ask for nothing -- --gres would be rejected as
+    # an invalid generic resource on a cluster that registers no GRES at all.
+    _fake_sinfo(monkeypatch, local_submit_module, "(null)\n")
+    assert local_submit_module.generate_gpu_request("batch", 4) == []
+
+
+def test_generate_gpu_request_still_asks_when_sinfo_cannot_answer(
+    local_submit_module: ModuleType, monkeypatch
+):
+    # Undeterminable must NOT be read as "no GPUs": request --gpus-per-node
+    # (but not --gres, which we cannot justify without a GRES reading).
+    _fake_sinfo(monkeypatch, local_submit_module, "", raises=True)
+    assert local_submit_module.generate_gpu_request("batch", 8) == ["#SBATCH --gpus-per-node=8"]
+
+
+def test_default_slurm_partition_picks_the_starred_entry(
+    local_submit_module: ModuleType, monkeypatch
+):
+    _fake_sinfo(monkeypatch, local_submit_module, "batch\ninteractive*\n")
+    assert local_submit_module.default_slurm_partition() == "interactive"
+
+
+def test_default_slurm_partition_empty_when_none_flagged(
+    local_submit_module: ModuleType, monkeypatch
+):
+    _fake_sinfo(monkeypatch, local_submit_module, "batch\ninteractive\n")
+    assert local_submit_module.default_slurm_partition() == ""
+
+
+def _dwdp_disagg_config(num_ctx_servers=16, dwdp_size=16, num_groups=1, ctx_tp=1):
+    return {
+        "hardware": {"gpus_per_node": 4, "num_ctx_servers": num_ctx_servers, "num_gen_servers": 3},
+        "worker_config": {
+            "ctx": {
+                "tensor_parallel_size": ctx_tp,
+                "dwdp_config": {"dwdp_size": dwdp_size, "num_groups": num_groups},
+            },
+            "gen": {"tensor_parallel_size": 1, "context_parallel_size": 8},
+        },
+    }
+
+
+def _disagg_hardware(module: ModuleType, config: dict, benchmark_mode: str = "e2e") -> dict:
+    if Path(module.__file__).parent.name == "local":
+        return module.get_hardware_config(config, "disaggregated", benchmark_mode)
+    return module.get_hardware_config(config, "disaggregated", benchmark_mode, None)
+
+
+def test_dwdp_ctx_servers_pack_into_one_mpi_step(submit_module: ModuleType):
+    # 16 single-GPU ctx servers fill 4 nodes as one MPI step instead of taking
+    # a node each; the 3 helix CP8 gen servers keep 2 nodes apiece.
+    hardware = _disagg_hardware(submit_module, _dwdp_disagg_config())
+    assert hardware["dwdp_size"] == 16
+    assert hardware["ctx_nodes"] == 4
+    assert hardware["total_nodes"] == 4 + 3 * 2
+    assert hardware["total_gpus"] == 40
+
+
+def test_non_dwdp_ctx_servers_keep_one_node_slice_each(submit_module: ModuleType):
+    config = _dwdp_disagg_config()
+    del config["worker_config"]["ctx"]["dwdp_config"]
+    hardware = _disagg_hardware(submit_module, config)
+    assert hardware["dwdp_size"] == 0
+    assert hardware["ctx_nodes"] == 16
+    assert hardware["total_nodes"] == 16 + 3 * 2
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    (
+        ({"ctx_tp": 2}, r"tp \* pp \* cp == 1"),
+        ({"num_ctx_servers": 8}, "num_ctx_servers must equal dwdp_size"),
+        ({"num_ctx_servers": 6, "dwdp_size": 3, "num_groups": 2}, "fill whole nodes"),
+    ),
+)
+def test_dwdp_ctx_layout_rejects_unlaunchable_configs(
+    submit_module: ModuleType, overrides: dict, message: str
+):
+    with pytest.raises(ValueError, match=message):
+        _disagg_hardware(submit_module, _dwdp_disagg_config(**overrides))
+
+
+def test_dwdp_ctx_worker_command_replaces_llmapi_launch(ci_submit_module: ModuleType):
+    worker_line = (
+        'export partialPytestCommandWorker="LLM_ROOT=/src COLUMNS=300 '
+        '/src/tensorrt_llm/llmapi/trtllm-llmapi-launch pytest -vv --test-list=/w/list.txt"'
+    )
+    assert ci_submit_module.get_dwdp_ctx_worker_command(worker_line, "bash /rank.sh") == (
+        'export partialPytestCommandDWDPCtxWorker="LLM_ROOT=/src COLUMNS=300 '
+        'bash /rank.sh pytest -vv --test-list=/w/list.txt"'
+    )
+
+
+def _aggregated_hardware(module: ModuleType, config: dict, benchmark_mode: str) -> dict:
+    if Path(module.__file__).parent.name == "local":
+        return module.get_hardware_config(config, "aggregated", benchmark_mode)
+    return module.get_hardware_config(config, "aggregated", benchmark_mode, None)
+
+
+def test_ctx_only_folds_dwdp_ctx_servers_into_one_server(submit_module: ModuleType):
+    # ctx_only runs the 16 single-GPU DWDP ctx servers as one 16-GPU
+    # attention-DP server, not as a single one-GPU server.
+    hardware = _aggregated_hardware(submit_module, _dwdp_disagg_config(), "ctx_only")
+    assert hardware["gpus_per_server"] == 16
+    assert hardware["total_nodes"] == 4
+
+
+def test_ctx_only_without_dwdp_sizes_from_ctx_parallelism(submit_module: ModuleType):
+    config = _dwdp_disagg_config(num_ctx_servers=2, ctx_tp=8)
+    del config["worker_config"]["ctx"]["dwdp_config"]
+    hardware = _aggregated_hardware(submit_module, config, "ctx_only")
+    assert hardware["gpus_per_server"] == 8
+    assert hardware["total_nodes"] == 2

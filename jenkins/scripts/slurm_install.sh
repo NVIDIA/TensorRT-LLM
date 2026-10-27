@@ -23,6 +23,11 @@ bashUtilsPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | s
 source "$bashUtilsPath"
 
 slurm_install_setup() {
+    : "${tarName:?tarName is required}"
+    : "${llmTarfile:?llmTarfile is required}"
+    : "${resourcePathNode:?resourcePathNode is required}"
+    : "${stageName:?stageName is required}"
+    : "${pytestCommand:?pytestCommand is required}"
     cd $resourcePathNode
     llmSrcNode=$resourcePathNode/TensorRT-LLM/src
 
@@ -30,6 +35,16 @@ slurm_install_setup() {
     lock_file="install_lock_job_${SLURM_JOB_ID:-local}_node_${SLURM_NODEID:-0}.lock"
 
     if [ $SLURM_LOCALID -eq 0 ]; then
+        # Authenticate github.com traffic. GITHUB_CLONE_TOKEN is exported by the sbatch launch script
+        set +x
+        if [ -n "${GITHUB_CLONE_TOKEN:-}" ]; then
+            git config --global --replace-all \
+                url."https://x-access-token:${GITHUB_CLONE_TOKEN}@github.com/".insteadOf \
+                "https://github.com/"
+            echo "Configured authenticated github.com access via git insteadOf."
+        fi
+        set -x
+
         if [ -f "$lock_file" ]; then
             rm -f "$lock_file"
         fi
@@ -60,9 +75,11 @@ slurm_install_setup() {
         if [[ $pytestCommand == *--run-ray* ]]; then
             retry_command --timeout 2700 pip3 install --retries 10 "ray[default]==2.55.1"
         fi
-        retry_command --timeout 2700 bash -c "pip3 install --retries 10 opencv-python-headless"
         retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
         retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-grpc-smg.txt"
+        if [[ $pytestCommand == *--run-ray* ]]; then
+            retry_command --timeout 2700 bash "$llmSrcNode/jenkins/scripts/install_mamba.sh"
+        fi
         retry_command --timeout 2700 bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
         gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
         hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"

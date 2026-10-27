@@ -1,8 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
+from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.executor.result import GenerationResultBase, Logprob
+from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
 
@@ -73,6 +93,7 @@ def test_to_disaggregated_params():
         first_gen_tokens=[1, 2],
         ctx_dp_rank=5,
         ctx_info_endpoint="tcp://10.0.0.1:5000",
+        remote_tail_start=128,
         ctx_usage={
             "prompt_tokens": 10,
             "completion_tokens": 0,
@@ -81,7 +102,6 @@ def test_to_disaggregated_params():
                 "cached_tokens": 4,
             },
         },
-        conversation_id="conv-abc",
     )
     openai_params = to_disaggregated_params(llm_params)
 
@@ -90,9 +110,9 @@ def test_to_disaggregated_params():
     assert openai_params.first_gen_tokens == [1, 2]
     assert openai_params.ctx_dp_rank == 5
     assert openai_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
+    assert openai_params.remote_tail_start == 128
     assert openai_params.ctx_usage.prompt_tokens == 10
     assert openai_params.ctx_usage.prompt_tokens_details.cached_tokens == 4
-    assert openai_params.conversation_id == "conv-abc"
 
 
 def test_to_llm_disaggregated_params():
@@ -107,13 +127,13 @@ def test_to_llm_disaggregated_params():
         request_type="generation_only",
         ctx_dp_rank=2,
         ctx_info_endpoint="tcp://10.0.0.1:5000",
+        remote_tail_start=256,
         ctx_usage=UsageInfo(
             prompt_tokens=10,
             completion_tokens=0,
             total_tokens=10,
             prompt_tokens_details=PromptTokensDetails(cached_tokens=4),
         ),
-        conversation_id="conv-xyz",
     )
     llm_params = to_llm_disaggregated_params(openai_params)
 
@@ -121,28 +141,9 @@ def test_to_llm_disaggregated_params():
     assert llm_params.request_type == "generation_only"
     assert llm_params.ctx_dp_rank == 2
     assert llm_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
+    assert llm_params.remote_tail_start == 256
     assert llm_params.ctx_usage["prompt_tokens"] == 10
     assert llm_params.ctx_usage["prompt_tokens_details"]["cached_tokens"] == 4
-    assert llm_params.conversation_id == "conv-xyz"
-
-
-def test_disaggregated_params_conversation_id():
-    """conversation_id defaults to None and survives the serve<->llm round-trip."""
-    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
-    from tensorrt_llm.serve.openai_protocol import (
-        to_disaggregated_params,
-        to_llm_disaggregated_params,
-    )
-
-    assert DisaggregatedParams().conversation_id is None
-
-    # serve -> llm -> serve preserves the conversation id end to end.
-    openai_params = OpenAIDisaggregatedParams(
-        request_type="context_only", conversation_id="conv-roundtrip"
-    )
-    llm_params = to_llm_disaggregated_params(openai_params)
-    assert llm_params.conversation_id == "conv-roundtrip"
-    assert to_disaggregated_params(llm_params).conversation_id == "conv-roundtrip"
 
 
 def test_opaque_state_round_trips_through_openai_protocol():
@@ -156,6 +157,26 @@ def test_opaque_state_round_trips_through_openai_protocol():
     )
     assert openai_params.encoded_opaque_state == "b3BhcXVl"
     assert to_llm_disaggregated_params(openai_params).opaque_state == b"opaque"
+
+
+def test_multimodal_spans_round_trip_through_openai_json():
+    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
+    from tensorrt_llm.serve.openai_protocol import (
+        to_disaggregated_params,
+        to_llm_disaggregated_params,
+    )
+
+    original = DisaggregatedParams(
+        request_type="context_only",
+        first_gen_tokens=[17],
+        opaque_state=b"opaque",
+        remote_tail_start=128,
+        multimodal_positions=[1, 5],
+        multimodal_lengths=[2, 1],
+    )
+    encoded = to_disaggregated_params(original).model_dump_json()
+    restored = to_llm_disaggregated_params(OpenAIDisaggregatedParams.model_validate_json(encoded))
+    assert restored == original
 
 
 @patch("tensorrt_llm.disaggregated_params.tllme")
@@ -210,3 +231,55 @@ def test_get_request_type_invalid():
     """Invalid request_type raises ValueError at construction time."""
     with pytest.raises(ValueError, match="Unknown request type"):
         DisaggregatedParams(request_type="invalid_type")
+
+
+def test_context_only_response_carries_the_first_token_logprobs_and_logits():
+    """A context_only response carries the first token's logprob and logits onward.
+
+    The context worker's response holds the first generated token's logprob and
+    logits. The client folds them into the DisaggregatedParams that travel to the
+    generation worker, which prepends them so its outputs cover every generated
+    token.
+    """
+    result = GenerationResultBase(
+        id=1,
+        sampling_params=SamplingParams(max_tokens=4, logprobs=1, return_generation_logits=True),
+    )
+    first_token_logprob = {7: Logprob(logprob=-0.5, rank=1)}
+    first_logits = torch.arange(6, dtype=torch.float32).reshape(1, 1, 6)
+    context_result = SimpleNamespace(
+        is_final=True,
+        decoding_iter=1,
+        avg_decoded_tokens_per_iter=1.0,
+        context_phase_params=SimpleNamespace(
+            first_gen_tokens=[7],
+            req_id=1,
+            opaque_state=b"",
+            draft_tokens=None,
+            ctx_dp_rank=0,
+            disagg_info_endpoint=None,
+        ),
+        finish_reasons=[tllm.FinishReason.LENGTH],
+        output_token_ids=[[7]],
+        sequence_index=0,
+        cum_log_probs=[-0.5],
+        log_probs=[[first_token_logprob]],
+        generation_logits=first_logits,
+        per_pos_drafted=None,
+        per_pos_accepted=None,
+        spec_dec_totals=None,
+        time_breakdown_metrics=None,
+        context_logits=None,
+        request_perf_metrics=None,
+        additional_context_outputs=None,
+        additional_generation_outputs=None,
+    )
+
+    result._handle_response(SimpleNamespace(result=context_result, has_error=lambda: False))
+
+    params = result.disaggregated_params
+    assert params.request_type == "context_only"
+    assert params.first_gen_tokens == [7]
+    assert params.first_gen_log_probs == [first_token_logprob]
+    (logits,) = params.first_gen_logits
+    assert torch.equal(logits, first_logits[0, :1])

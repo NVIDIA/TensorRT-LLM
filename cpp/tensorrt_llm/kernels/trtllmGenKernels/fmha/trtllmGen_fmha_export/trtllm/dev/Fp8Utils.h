@@ -191,6 +191,14 @@ inline __device__ void e4m3PackEpilogue(OutRegs& out,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Block amax floors. The two scale formats track different upstreams, so they differ.
+// FP32 scales follow TRT-LLM's standalone inverse-RoPE FP8 kernel.
+float constexpr kFp32AmaxEps = 1.0e-12f;
+// UE8M0 scales follow vLLM's fused_inv_rope_fp8_quant.
+float constexpr kUe8m0AmaxEps = 1.0e-10f;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Quantize one output block to packed E4M3 and write its FP32 dequant scale. The input values are
 // expected to already be in the final output layout.
 template <int32_t NumVals, int32_t NumPackedRegs, typename OutRegs>
@@ -200,51 +208,36 @@ inline __device__ void e4m3QuantEpilogue(OutRegs& out,
                                          int64_t scaleOffset) {
   static_assert(NumVals == NumPackedRegs * 4, "One packed register stores four E4M3 values.");
 
-  float const amax = reduceMaxAbs<NumVals>(vals);
+  float const amax = reduceMaxAbs<NumVals>(vals, kFp32AmaxEps);
   e4m3PackEpilogue<NumVals, NumPackedRegs>(out, vals, scalePtr, scaleOffset, amax);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Apply the DSv4 inverse-RoPE transform to the final 64 dimensions of a 512-dim head when this
-// 1x128 block covers that range, then quantize the block to packed E4M3 and write its FP32 dequant
-// scale. Blocks outside the inverse-RoPE range follow the same path as e4m3QuantEpilogue.
-template <int32_t NumVals, int32_t NumPackedRegs, typename OutRegs>
-inline __device__ void dsv4InvRopeFp8QuantEpilogue(OutRegs& out,
-                                                   cutlass::Array<float, NumVals>& vals,
-                                                   float* scalePtr,
-                                                   float const* cosSinCache,
-                                                   int64_t scaleOffset,
-                                                   int32_t position,
-                                                   int32_t headDimOffset) {
-  static_assert(NumVals == NumPackedRegs * 4, "One packed register stores four E4M3 values.");
-  static_assert(NumVals == 128, "DSv4 fused epilogue processes one 1x128 quant group.");
-
-  // DSv4 inverse-RoPE applies to the last 64 dimensions, [448, 512), of a 512-dim head. The
-  // helper processes one 128-value quant block, so the RoPE block starts at 384 and the RoPE
-  // values begin at offset 64 inside that block. DSv4 uses non-NeoX interleaved RoPE: adjacent
-  // element pairs share one cos/sin value. Each cos/sin cache row is laid out as
-  // [cos(32), sin(32)].
+// Rotate the RoPE half of one 1x128 block in place and return the block amax, seeded with amaxEps.
+// DSv4 uses non-NeoX interleaved RoPE: adjacent element pairs share one cos/sin value, and each
+// cos/sin cache row is laid out as [cos(32), sin(32)]. Shared by the FP32 and UE8M0 epilogues,
+// which differ only in the scale they store.
+template <int32_t NumVals, int32_t NumPackedRegs>
+inline __device__ float dsv4ApplyInvRope(cutlass::Array<float, NumVals>& vals,
+                                         float const* cosSinCache,
+                                         int32_t position,
+                                         float amaxEps) {
   int32_t constexpr ropeStart = 448;
   int32_t constexpr ropeHalf = 32;
   int32_t constexpr ropeBlockStart = ropeStart - ropeHalf * 2;
   int32_t constexpr ropeOffset = ropeStart - ropeBlockStart;
   int32_t constexpr cosSinStride = ropeHalf * 2;
 
-  // TODO: use headDimOffset as template parameter to drop warp divergence.
-  if (headDimOffset != ropeBlockStart) {
-    e4m3QuantEpilogue<NumVals, NumPackedRegs>(out, vals, scalePtr, scaleOffset);
-    return;
-  }
-
-  float const* csRow = cosSinCache + position * cosSinStride;
-
   static_assert(ropeOffset % 4 == 0, "The RoPE offset must be aligned to packed E4M3 registers.");
   int32_t constexpr ropePackedRegStart = ropeOffset / 4;
-  float amax = reduceMaxAbs<ropeOffset>(vals);
+
+  float const* csRow = cosSinCache + position * cosSinStride;
+  float amax = reduceMaxAbs<ropeOffset>(vals, amaxEps);
 
   // Match the standalone TRT-LLM inverse-RoPE FP8 kernel's per-4-value structure: each packed
-  // register in the RoPE half contains two interleaved RoPE pairs.
+  // register in the RoPE half contains two interleaved RoPE pairs. An explicit __fmaf_rn form
+  // pinned to vLLM's Triton lowering was measured bit-identical to these plain expressions.
 #pragma unroll
   for (int32_t regIdx = ropePackedRegStart; regIdx < NumPackedRegs; ++regIdx) {
     int32_t const ii = regIdx * 4;
@@ -270,8 +263,119 @@ inline __device__ void dsv4InvRopeFp8QuantEpilogue(OutRegs& out,
     vals[ii + 3] = rotatedSecond1;
     amax = fmaxf(amax, fmaxf(fabsf(rotatedFirst1), fabsf(rotatedSecond1)));
   }
+  return amax;
+}
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Apply the DSv4 inverse-RoPE transform to the final 64 dimensions of a 512-dim head when this
+// 1x128 block covers that range, then quantize the block to packed E4M3 and write its FP32 dequant
+// scale. Blocks outside the inverse-RoPE range follow the same path as e4m3QuantEpilogue.
+template <int32_t NumVals, int32_t NumPackedRegs, typename OutRegs>
+inline __device__ void dsv4InvRopeFp8QuantEpilogue(OutRegs& out,
+                                                   cutlass::Array<float, NumVals>& vals,
+                                                   float* scalePtr,
+                                                   float const* cosSinCache,
+                                                   int64_t scaleOffset,
+                                                   int32_t position,
+                                                   int32_t headDimOffset) {
+  static_assert(NumVals == NumPackedRegs * 4, "One packed register stores four E4M3 values.");
+  static_assert(NumVals == 128, "DSv4 fused epilogue processes one 1x128 quant group.");
+
+  int32_t constexpr ropeStart = 448;
+  int32_t constexpr ropeHalf = 32;
+  int32_t constexpr ropeBlockStart = ropeStart - ropeHalf * 2;
+
+  // TODO: use headDimOffset as template parameter to drop warp divergence.
+  if (headDimOffset != ropeBlockStart) {
+    e4m3QuantEpilogue<NumVals, NumPackedRegs>(out, vals, scalePtr, scaleOffset);
+    return;
+  }
+
+  float const amax =
+    dsv4ApplyInvRope<NumVals, NumPackedRegs>(vals, cosSinCache, position, kFp32AmaxEps);
   e4m3PackEpilogue<NumVals, NumPackedRegs>(out, vals, scalePtr, scaleOffset, amax);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// UE8M0 variant of e4m3PackEpilogue matching vLLM's fused_inv_rope_fp8_quant / DeepGEMM fp8_einsum
+// recipe: the dequant scale is the power of two exp2(ceil(log2(max(amax, 1e-10) / 448))), stored as
+// its FP32 exponent byte. scalePtr/scaleOffset address individual exponent bytes; four consecutive
+// per-head 1x128 blocks share one INT32 word of the packed scale tensor (block 0 in the LSB).
+template <int32_t NumVals, int32_t NumPackedRegs, typename OutRegs>
+inline __device__ void ue8m0PackEpilogue(OutRegs& out,
+                                         cutlass::Array<float, NumVals> const& vals,
+                                         uint8_t* scalePtr,
+                                         int64_t scaleOffset,
+                                         float amax) {
+  static_assert(NumVals == NumPackedRegs * 4, "One packed register stores four E4M3 values.");
+
+  float constexpr fp8Max = 448.f;
+  float constexpr fp8MaxRcp = 1.f / fp8Max;
+  // The caller clamps amax to the vLLM eps (1e-10) via the reduction init value.
+  float const scaleRaw = amax * fp8MaxRcp;
+  // The UE8M0 byte is the biased exponent of exp2(ceil(log2(scaleRaw))): the mantissa carry-out
+  // of +0x7FFFFF increments the exponent exactly when the mantissa is nonzero (exact ceil).
+  uint32_t const rawBits = __float_as_uint(scaleRaw);
+  uint32_t const scaleByte = (rawBits + 0x007FFFFFu) >> 23;
+  scalePtr[scaleOffset] = static_cast<uint8_t>(scaleByte);
+  float const invScale = __uint_as_float((254u - scaleByte) << 23);
+
+  // No explicit +/-448 clamp: |vals| <= amax keeps |vals * invScale| < ~900 (never inf/NaN), and
+  // the satfinite E4M3 conversion saturates identically to vLLM's clamp-then-convert.
+#pragma unroll
+  for (int32_t regIdx = 0; regIdx < NumPackedRegs; ++regIdx) {
+    int32_t const ii = regIdx * 4;
+    out[regIdx] = convert_float4_to_e4m3(vals[ii + 0] * invScale,
+                                         vals[ii + 1] * invScale,
+                                         vals[ii + 2] * invScale,
+                                         vals[ii + 3] * invScale);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// UE8M0-scale variant of e4m3QuantEpilogue. Same 1x128 block quantization, but the dequant scale
+// is a power of two stored as one packed UE8M0 exponent byte.
+template <int32_t NumVals, int32_t NumPackedRegs, typename OutRegs>
+inline __device__ void e4m3QuantEpilogueUe8m0(OutRegs& out,
+                                              cutlass::Array<float, NumVals> const& vals,
+                                              uint8_t* scalePtr,
+                                              int64_t scaleOffset) {
+  static_assert(NumVals == NumPackedRegs * 4, "One packed register stores four E4M3 values.");
+
+  float const amax = reduceMaxAbs<NumVals>(vals, kUe8m0AmaxEps);
+  ue8m0PackEpilogue<NumVals, NumPackedRegs>(out, vals, scalePtr, scaleOffset, amax);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// UE8M0-scale variant of dsv4InvRopeFp8QuantEpilogue. The inverse-RoPE transform is identical; only
+// the scale computation/storage differs.
+template <int32_t NumVals, int32_t NumPackedRegs, typename OutRegs>
+inline __device__ void dsv4InvRopeFp8QuantEpilogueUe8m0(OutRegs& out,
+                                                        cutlass::Array<float, NumVals>& vals,
+                                                        uint8_t* scalePtr,
+                                                        float const* cosSinCache,
+                                                        int64_t scaleOffset,
+                                                        int32_t position,
+                                                        int32_t headDimOffset) {
+  static_assert(NumVals == NumPackedRegs * 4, "One packed register stores four E4M3 values.");
+  static_assert(NumVals == 128, "DSv4 fused epilogue processes one 1x128 quant group.");
+
+  int32_t constexpr ropeStart = 448;
+  int32_t constexpr ropeHalf = 32;
+  int32_t constexpr ropeBlockStart = ropeStart - ropeHalf * 2;
+
+  if (headDimOffset != ropeBlockStart) {
+    e4m3QuantEpilogueUe8m0<NumVals, NumPackedRegs>(out, vals, scalePtr, scaleOffset);
+    return;
+  }
+
+  float const amax =
+    dsv4ApplyInvRope<NumVals, NumPackedRegs>(vals, cosSinCache, position, kUe8m0AmaxEps);
+  ue8m0PackEpilogue<NumVals, NumPackedRegs>(out, vals, scalePtr, scaleOffset, amax);
 }
 
 } // namespace dev

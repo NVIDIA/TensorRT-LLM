@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
 import subprocess
+import sys
+import tempfile
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
@@ -12,7 +16,8 @@ import claude_agent_sdk
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
-    PermissionResultAllow,
+    SdkMcpTool,
+    ToolAnnotations,
     create_sdk_mcp_server,
 )
 from claude_agent_sdk.types import (
@@ -28,6 +33,7 @@ from claude_agent_sdk.types import (
     ToolUseBlock,
 )
 
+from ..tools import normalize_tool, tool_result_to_claude
 from ..types import (
     AgentTextEvent,
     CompactBoundaryEvent,
@@ -81,6 +87,23 @@ async def _fetch_context_usage(sdk_client: Any) -> dict[str, Any] | None:
         return await getter()
     except Exception:
         return None
+
+
+async def _fetch_server_info(sdk_client: Any) -> dict[str, Any] | None:
+    """The CLI's initialize response, or ``None`` when it cannot be read.
+
+    Like ``get_context_usage`` this is a local control request answered
+    from the session the SDK already connected — no model call, no
+    tokens. Returns commands, subagents, models and output styles.
+    """
+    getter = getattr(sdk_client, "get_server_info", None)
+    if getter is None:
+        return None
+    try:
+        info = await getter()
+    except Exception:
+        return None
+    return info if isinstance(info, dict) else None
 
 
 def _apply_context_usage(usage: UsageInfo, context: dict[str, Any] | None) -> UsageInfo:
@@ -173,6 +196,34 @@ def _subagent_label_from_task_input(tool_input: dict[str, Any]) -> str:
     return "subagent"
 
 
+def _assistant_error_detail(message: AssistantMessage) -> str:
+    """Render whatever context the SDK attached to a failed assistant turn.
+
+    ``AssistantMessage.error`` is frequently the bare string ``"unknown"``,
+    which tells an operator nothing about why a campaign stage died. Surface
+    the adjacent fields (model, stop reason, usage, any partial content) so
+    the failure is diagnosable from the run log alone.
+    """
+    parts: list[str] = []
+    for attr in ("model", "stop_reason", "subtype", "uuid", "session_id"):
+        value = getattr(message, attr, None)
+        if value is not None:
+            parts.append(f"{attr}={value!r}")
+    usage = getattr(message, "usage", None)
+    if usage is not None:
+        parts.append(f"usage={usage!r}")
+    blocks = getattr(message, "content", None) or []
+    kinds = [type(block).__name__ for block in blocks]
+    if kinds:
+        parts.append(f"content_blocks={kinds}")
+    for block in blocks:
+        text = getattr(block, "text", None)
+        if text:
+            parts.append(f"partial_text={text[:400]!r}")
+            break
+    return f" ({'; '.join(parts)})" if parts else ""
+
+
 class ClaudeCodeClient(BackendClient):
     def __init__(self, sdk_client) -> None:
         self._client = sdk_client
@@ -202,7 +253,10 @@ class ClaudeCodeClient(BackendClient):
                     yield _rate_limit_warning_from_event(sdk_message)
                 elif isinstance(sdk_message, AssistantMessage):
                     if sdk_message.error is not None:
-                        raise RuntimeError(f"Claude Code turn failed: {sdk_message.error}")
+                        raise RuntimeError(
+                            f"Claude Code turn failed: {sdk_message.error}"
+                            f"{_assistant_error_detail(sdk_message)}"
+                        )
                     parent_id = sdk_message.parent_tool_use_id
                     label = self._resolve_label(parent_id)
                     for block in sdk_message.content:
@@ -275,6 +329,34 @@ class ClaudeCodeClient(BackendClient):
             return None
         return usage
 
+    async def list_available_skills(self) -> list[str] | None:
+        """Invocable skill names from the CLI's initialize response.
+
+        Read off ``get_server_info``'s ``commands`` — a local control
+        request, so this costs no model call. The names are the spelling
+        the harness loaded (plugin skills as ``<plugin>:<name>``), which
+        is what a caller quotes back to an agent.
+
+        ``commands`` is a **superset** of the skills the model itself can
+        invoke: it also carries the built-in slash commands and any skill
+        the CLI registered as a command but not as model-invocable (bad
+        frontmatter, or an opt-out). Membership therefore proves the name
+        is *installed*, not that ``Skill`` will load it. The exact
+        model-invocable list only ever arrives on the ``init`` event
+        mid-turn, which is precisely the model call this avoids.
+        """
+        info = await _fetch_server_info(self._client)
+        if info is None:
+            return None
+        commands = info.get("commands")
+        if not isinstance(commands, list):
+            return None
+        return [
+            entry["name"]
+            for entry in commands
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+        ]
+
 
 _CLI_VERSION_TIMEOUT_S = 5.0
 _VERSION_CACHE: str | None = None
@@ -344,12 +426,110 @@ def _claude_backend_version() -> str:
 _REASONING_EFFORT = "max"
 
 
+def _sdk_tools(tools: list) -> list[SdkMcpTool]:
+    """Translate framework or legacy tool definitions at the SDK boundary."""
+    result = []
+    for original in tools:
+        definition = normalize_tool(original)
+
+        async def handler(arguments, definition=definition):
+            return tool_result_to_claude(await definition.handler(arguments))
+
+        result.append(
+            SdkMcpTool(
+                name=definition.name,
+                description=definition.description,
+                input_schema=definition.input_schema,
+                handler=handler,
+                annotations=ToolAnnotations(**definition.annotations)
+                if definition.annotations
+                else None,
+            )
+        )
+    return result
+
+
+# The Agent SDK passes the system prompt to the ``claude`` binary as a single
+# argv string, and Linux caps one argv string at 128 KiB (MAX_ARG_STRLEN), so
+# a long prompt kills the CLI at exec with ``[Errno 7] Argument list too
+# long``. Above the threshold the full prompt is written to a file under the
+# working directory and the argv prompt becomes a short pointer telling the
+# model to read it first. The pointer is deliberately plain: no SDK feature
+# is involved.
+_DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD = 64 * 1024
+
+
+def _system_prompt_file_threshold() -> int:
+    raw = os.environ.get("AGENT_FLOW_SYSTEM_PROMPT_FILE_THRESHOLD")
+    if raw is None:
+        return _DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"[agent-flow] ignoring invalid AGENT_FLOW_SYSTEM_PROMPT_FILE_THRESHOLD={raw!r}; "
+            f"falling back to {_DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return _DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD
+
+
+SYSTEM_PROMPT_FILE_THRESHOLD = _system_prompt_file_threshold()
+
+
+def spill_system_prompt(system_prompt: str, cwd: Path, threshold: int | None = None) -> str:
+    """Return the prompt to pass on argv; spill the full text to a file if large.
+
+    Files are content-addressed (``.agent-flow/system-prompt-<sha12>.md``) so
+    every role/session with the same prompt shares one file and a changed
+    prompt never overwrites a file a live session may still be reading.
+    """
+    limit = SYSTEM_PROMPT_FILE_THRESHOLD if threshold is None else threshold
+    data = system_prompt.encode("utf-8")
+    if len(data) <= limit:
+        return system_prompt
+    digest = hashlib.sha256(data).hexdigest()[:12]
+    target_dir = Path(cwd) / ".agent-flow"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"system-prompt-{digest}.md"
+    if not target.exists():
+        # Use a unique temp file per writer so concurrent sessions spilling
+        # the same prompt can't truncate or unlink each other's in-progress
+        # file before os.replace runs.
+        fd, tmp_name = tempfile.mkstemp(dir=target_dir, prefix=target.name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp_name, target)
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
+    kb = (len(data) + 1023) // 1024
+    return (
+        "Your full system instructions could not be passed inline and were written to "
+        f"this file: {target}\n\n"
+        f"Before doing anything else, read that file IN FULL with the Read tool ({kb} KB; "
+        "if a single read stops short of the end, continue with offset until you have read "
+        "the last line) and follow it as your system prompt for the whole session. "
+        "Everything it says applies unchanged; the human's task and all rules are in it."
+    )
+
+
 class ClaudeCodeBackend(Backend):
+    def __init__(
+        self,
+        reasoning_effort: str | None = None,
+        disabled_skills: tuple[str, ...] = (),
+    ) -> None:
+        self._reasoning_effort = reasoning_effort or _REASONING_EFFORT
+        self._disabled_skills = disabled_skills
+
     def version(self) -> str:
         return _claude_backend_version()
 
     def reasoning_effort(self) -> str:
-        return _REASONING_EFFORT
+        return self._reasoning_effort
 
     @asynccontextmanager
     async def create_client(
@@ -360,9 +540,10 @@ class ClaudeCodeBackend(Backend):
         hooks: dict | None = None,
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        cwd: Path | None = None,
     ) -> AsyncIterator[BackendClient]:
-        # External MCP server configs (e.g. ``{"Glean": {"type": "http",
-        # "url": ...}}``) are layered alongside the in-process
+        # External MCP server configs (e.g. ``{"knowledge-base": {"type":
+        # "http", "url": ...}}``) are layered alongside the in-process
         # ``agent-tools`` server built from ``tools``. The keys are the
         # server names the model sees and must therefore not collide with
         # ``agent-tools``.
@@ -376,11 +557,11 @@ class ClaudeCodeBackend(Backend):
         if tools:
             mcp_servers["agent-tools"] = create_sdk_mcp_server(
                 name="agent-tools",
-                tools=tools,
+                tools=_sdk_tools(tools),
             )
 
-        async def _approve_tool(tool_name, tool_input, context):
-            return PermissionResultAllow()
+        work_dir = cwd or Path.cwd()
+        system_prompt = spill_system_prompt(system_prompt, work_dir)
 
         options = ClaudeAgentOptions(
             tools=ToolsPreset(type="preset", preset="claude_code"),
@@ -391,13 +572,18 @@ class ClaudeCodeBackend(Backend):
             ),
             mcp_servers=mcp_servers,
             model=model,
-            effort=_REASONING_EFFORT,
-            cwd=Path.cwd(),
+            effort=self._reasoning_effort,
+            cwd=work_dir,
             sandbox={"enabled": False},
             permission_mode="bypassPermissions",
-            can_use_tool=_approve_tool,
             hooks=hooks,
-            disallowed_tools=list(disallowed_tools or []),
+            disallowed_tools=[
+                *(disallowed_tools or []),
+                *(f"Skill({name})" for name in self._disabled_skills),
+            ],
+            # Forward the CLI's stderr so startup failures are diagnosable
+            # instead of vanishing with the subprocess.
+            stderr=lambda line: print(f"[claude-cli stderr] {line}", file=sys.stderr, flush=True),
         )
 
         async with ClaudeSDKClient(options=options) as sdk_client:

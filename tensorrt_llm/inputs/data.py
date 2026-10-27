@@ -32,8 +32,14 @@ class TextPrompt(TypedDict):
     input processor for mm input processing.
     """
 
-    query: NotRequired[str]
-    """The query input text for star attention."""
+    chat_template_applied: NotRequired[bool]
+    """
+    True when ``prompt`` is the chat template's output with one registered
+    multimodal placeholder per media item already in it. Set by trtllm-serve
+    and by the prompt builders in ``tensorrt_llm.inputs.utils``; input
+    processors that otherwise render a raw ``prompt`` through the model's chat
+    template use it verbatim when this is set.
+    """
 
 
 class TokensPrompt(TypedDict):
@@ -62,9 +68,6 @@ class TokensPrompt(TypedDict):
     Optional multi-modal processor kwargs to be forwarded to the
     input processor for mm input processing.
     """
-
-    query_token_ids: NotRequired[List[int]]
-    """The query input token IDs for star attention."""
 
     multi_item_part_lens: NotRequired[List[int]]
     """Metadata for multi-item scoring.

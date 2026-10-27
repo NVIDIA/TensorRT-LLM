@@ -23,7 +23,7 @@
 #   partition        — SLURM partition name
 #   account          — SLURM account
 #   jobname          — descriptive job name
-#   mount_dir        — top-level directory to bind-mount into the container
+#   user_root_dir        — top-level directory to bind-mount into the container
 #   scripts_dir      — directory containing compile.slurm and compile.sh
 #   repo_dir         — path to the TensorRT-LLM repo to compile
 #
@@ -37,7 +37,7 @@ partition="<PARTITION>"                     # e.g., batch
 account="<ACCOUNT>"                        # e.g., my_account
 jobname="<JOB_NAME>"                       # e.g., trtllm-compile.username
 
-mount_dir="<MOUNT_DIR>"                    # e.g., /shared/users
+user_root_dir="<USER_ROOT_DIR>"            # e.g., /shared/users
 scripts_dir="<SCRIPTS_DIR>"               # directory containing compile.slurm & compile.sh
 repo_dir="<REPO_DIR>"                      # path to TensorRT-LLM repo
 # ─────────────────────────────────────────────────────────────────────────
@@ -57,5 +57,5 @@ sbatch \
     --account="${account}" \
     --job-name="${jobname}" \
     "${scripts_dir}/compile.slurm" \
-    "${container_image}" "${mount_dir}" "${scripts_dir}" "${repo_dir}" \
+    "${container_image}" "${user_root_dir}" "${scripts_dir}" "${repo_dir}" \
     "${extra_build_args[@]}"

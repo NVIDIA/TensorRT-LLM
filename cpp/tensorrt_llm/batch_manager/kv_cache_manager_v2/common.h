@@ -22,14 +22,12 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/common/assert.h"
 
-#include <array>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <optional>
 #include <string>
 #include <sys/types.h>
-#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -48,7 +46,7 @@ extern bool const gDebug; // true == debug mode (expensive assertions enabled)
 
 enum class PageStatus : int
 {
-    LOCKED = 0,    // Required in GPU. Eviction/dropping not allowed.
+    LOCKED = 0,    // Pinned at the current storage level. Eviction/dropping not allowed.
     HELD = 1,      // Allow eviction but not dropping.
     DROPPABLE = 2, // Allow eviction and dropping.
 };
@@ -76,9 +74,11 @@ enum class PageIndexMode : int
 // Strongly-typed integer aliases (mirroring Python NewType wrappers).
 // ---------------------------------------------------------------------------
 
-// Index of a cache level (0 = GPU, 1 = host, 2 = disk, ...).
+// Index of a cache level (0 = hot; subsequent levels are colder storage tiers).
 using CacheLevel = StrongIndex<int, struct CacheLevelTag, 0>;
-inline constexpr CacheLevel kGpuLevel{0};
+// The kernel-facing hot level; colder levels may also use GPU memory.
+inline constexpr CacheLevel kHotLevel{0};
+inline constexpr CacheLevel kSparseHistoryLevel{1}; // Sparse history requires HOST_MEM at this level.
 
 // Opaque request identifier shared with the rest of the batch manager.
 using RequestIdType = tensorrt_llm::batch_manager::RequestIdType;

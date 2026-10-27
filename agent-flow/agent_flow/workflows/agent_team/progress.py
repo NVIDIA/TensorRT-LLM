@@ -71,11 +71,11 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from claude_agent_sdk import tool
 from rich.syntax import Syntax
 
 from agent_flow.console import print_layer_panel
 from agent_flow.logger import get_logger
+from agent_flow.tools import tool
 
 PLAN_STAGE = "plan_stage"
 BUILD_STAGE = "build_stage"
@@ -243,6 +243,29 @@ def _append(path: Path, agent: str, entry: dict[str, Any]) -> None:
     write_progress(path, data)
 
 
+def record_progress_entry(
+    path: Path, agent: str, iteration: int, fields: dict[str, Any]
+) -> dict[str, Any]:
+    """Stamp, append, and log a progress entry, returning the full entry.
+
+    The orchestrator uses this in no-in-process-MCP mode (``--no-mcp-tools``),
+    where the agent hands its ``summary`` / ``decision`` / ``weighted_score``
+    back through a file instead of the ``append_*_progress`` MCP tool.
+    ``iteration``, ``agent``, and ``timestamp`` are stamped here (not trusted
+    from the agent) so the shared log stays consistent with the MCP-mode path.
+    ``fields`` supplies the role-specific keys in their canonical order.
+    """
+    entry = {
+        "iteration": iteration,
+        "agent": agent,
+        "timestamp": _now_iso(),
+        **fields,
+    }
+    _append(path, agent, entry)
+    _log_progress_write(agent, entry)
+    return entry
+
+
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -295,11 +318,25 @@ class ProgressContext:
     The workflow updates ``current_iteration`` before each agent run so the
     tool stamps the right iteration number on every entry without the agent
     having to pass (or guess) it.
+
+    ``feedback_path`` splits *where human feedback is read from* off ``path``.
+    It is ``None`` on the linear path, where both live in the one shared
+    ``progress.yaml``. The concurrent path sets it: a node's own ``path`` is
+    its private ``progress.yaml``, but ``--feedback`` is only ever appended to
+    the *shared* workspace file, so without this split ``read_human_feedback``
+    would read the node's private (always empty) list and silently starve the
+    node agents of the user's guidance.
     """
 
     path: Path
     current_iteration: int = 0
+    feedback_path: Path | None = None
     _tool_cache: list[Any] | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def human_feedback_path(self) -> Path:
+        """Where ``read_human_feedback`` reads from — ``path`` unless split off."""
+        return self.feedback_path if self.feedback_path is not None else self.path
 
 
 def build_progress_tools(
@@ -659,7 +696,7 @@ def build_progress_tools(
             },
         )
         async def read_human_feedback(_args: dict[str, Any]) -> dict[str, Any]:
-            entries = read_progress(ctx.path)[HUMAN_FEEDBACK]
+            entries = read_progress(ctx.human_feedback_path)[HUMAN_FEEDBACK]
             if not entries:
                 text = "# No human_feedback entries yet.\n"
             else:
@@ -732,9 +769,16 @@ def build_progress_tools(
         append_plan_drafter_progress,
         _make_read_tool("plan_drafter"),
     ]
+    plan_reviewer_tools = [
+        append_plan_reviewer_progress,
+        _make_read_tool("plan_reviewer"),
+    ]
     if plan_drafter_replan_on_qa:
         plan_drafter_tools.append(_make_build_read_tool("plan_drafter"))
         plan_drafter_tools.append(_make_human_feedback_tool("plan_drafter"))
+        # The replan PlanReviewer audits feedback-triggered replans, so it
+        # needs the user's direct voice too — same rationale as QA below.
+        plan_reviewer_tools.append(_make_human_feedback_tool("plan_reviewer"))
 
     # QA intentionally does not get `read_latest_progress`: its verdict
     # must be grounded in ``task.yaml`` and the actual code it builds, not
@@ -745,10 +789,7 @@ def build_progress_tools(
     # stays out of reach.
     return {
         "plan_drafter": plan_drafter_tools,
-        "plan_reviewer": [
-            append_plan_reviewer_progress,
-            _make_read_tool("plan_reviewer"),
-        ],
+        "plan_reviewer": plan_reviewer_tools,
         "coder": [
             append_coder_progress,
             _make_read_tool("coder"),

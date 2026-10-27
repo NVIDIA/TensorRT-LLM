@@ -3,11 +3,11 @@
 
 import asyncio
 import base64
-import tempfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
+from typing import (Any, Collection, Coroutine, Dict, List, Optional, Tuple,
+                    TypedDict, Union)
 from urllib.parse import urlparse
 
 import numpy as np
@@ -18,17 +18,20 @@ from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.utils import logging
 
+from tensorrt_llm.inputs.chat_template_guard import \
+    validate_chat_template_kwargs
 from tensorrt_llm.inputs.content_format import (ContentFormat,
                                                 detect_content_format)
-from tensorrt_llm.inputs.media_io import (_get_aiohttp_session,
+from tensorrt_llm.inputs.data import prompt_inputs
+from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, VideoMediaIO,
+                                          _decode_base64_with_limit,
+                                          _get_aiohttp_session,
                                           _load_and_convert_image,
-                                          _load_video_by_cv2,
                                           _normalize_file_uri,
                                           _safe_aiohttp_get, _safe_request_get)
 from tensorrt_llm.inputs.media_io import \
     convert_image_mode as convert_image_mode
-from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
-                                            default_hasher)
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.multimodal_data import \
     BaseModalityData as BaseModalityData
 from tensorrt_llm.inputs.multimodal_data import VideoData as VideoData
@@ -38,6 +41,7 @@ from tensorrt_llm.llmapi.llm_utils import ModelLoader
 from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
+from tensorrt_llm.tokenizer.deepseek_v41 import DeepseekV41Tokenizer
 
 logger = logging.get_logger(__name__)
 
@@ -130,8 +134,7 @@ def load_base64_video(video: str) -> BytesIO:
         msg = "Only base64 data URLs are supported for now."
         raise NotImplementedError(msg)
 
-    content = base64.b64decode(data)
-    return content
+    return _decode_base64_with_limit(data)
 
 
 def load_video(video: str,
@@ -140,38 +143,31 @@ def load_video(video: str,
                format: str = "pt",
                device: str = "cpu",
                extract_audio: bool = False) -> VideoData:
+    """Load video frames with the shared source-byte cache identity.
+
+    Encoded video inputs share the serving loader's size limit. Local files
+    are read fully into memory during decoding. Local-file I/O failures raise
+    ValueError, with the original OSError as their cause.
+    """
+    # Decode through `VideoMediaIO`, the loader `trtllm-serve` uses, so the
+    # same video gets the same source-byte anchor (`raw_bytes_hash`) and
+    # therefore the same multimodal hash offline and in serving.
+    video_io = VideoMediaIO(num_frames=num_frames,
+                            fps=fps,
+                            format=format,
+                            device=device,
+                            extract_audio=extract_audio)
     parsed_url = urlparse(video)
     if parsed_url.scheme in ["http", "https"]:
         resp = _safe_request_get(video, stream=False)
-        with tempfile.NamedTemporaryFile(delete=True,
-                                         suffix=".mp4") as tmp_file:
-            tmp_file.write(resp.content)
-            tmp_file.flush()
-            return _load_video_by_cv2(tmp_file.name,
-                                      num_frames,
-                                      fps,
-                                      format,
-                                      device,
-                                      extract_audio=extract_audio)
+        return video_io.load_bytes(resp.content)
     elif parsed_url.scheme in ("", "file"):
-        return _load_video_by_cv2(video,
-                                  num_frames,
-                                  fps,
-                                  format,
-                                  device,
-                                  extract_audio=extract_audio)
+        try:
+            return video_io.load_file(video)
+        except OSError as error:
+            raise ValueError(f"Video '{video}' could not be opened.") from error
     elif parsed_url.scheme == "data":
-        decoded_video = load_base64_video(video)
-        with tempfile.NamedTemporaryFile(delete=True,
-                                         suffix='.mp4') as tmp_file:
-            tmp_file.write(decoded_video)
-            tmp_file.flush()
-            return _load_video_by_cv2(tmp_file.name,
-                                      num_frames,
-                                      fps,
-                                      format,
-                                      device,
-                                      extract_audio=extract_audio)
+        return video_io.load_bytes(load_base64_video(video))
     else:
         raise ValueError(f"Unsupported video scheme: {parsed_url.scheme}")
 
@@ -182,36 +178,33 @@ async def async_load_video(video: str,
                            format: str = "pt",
                            device: str = "cpu",
                            extract_audio: bool = False) -> VideoData:
+    """Load video frames without blocking the event loop.
+
+    Encoded video inputs share the serving loader's size limit. Local files
+    are read fully into memory during decoding. Local-file I/O failures raise
+    ValueError, with the original OSError as their cause.
+    """
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
+    # See `load_video`: share the serving decode path so hashes agree.
+    video_io = VideoMediaIO(num_frames=num_frames,
+                            fps=fps,
+                            format=format,
+                            device=device,
+                            extract_audio=extract_audio)
     parsed_url = urlparse(video)
-
-    def _load_from_bytes(data: bytes) -> VideoData:
-        with tempfile.NamedTemporaryFile(delete=True, suffix='.mp4') as tmp:
-            tmp.write(data)
-            tmp.flush()
-            return _load_video_by_cv2(tmp.name,
-                                      num_frames,
-                                      fps,
-                                      format,
-                                      device,
-                                      extract_audio=extract_audio)
-
     if parsed_url.scheme in ["http", "https"]:
         session = await _get_aiohttp_session()
         video_data = await _safe_aiohttp_get(video, session=session)
-        return await asyncio.to_thread(_load_from_bytes, video_data)
+        return await asyncio.to_thread(video_io.load_bytes, video_data)
     elif parsed_url.scheme == "data":
         decoded_video = await asyncio.to_thread(load_base64_video, video)
-        return await asyncio.to_thread(_load_from_bytes, decoded_video)
+        return await asyncio.to_thread(video_io.load_bytes, decoded_video)
     elif parsed_url.scheme in ("", "file"):
-        return await asyncio.to_thread(_load_video_by_cv2,
-                                       video,
-                                       num_frames,
-                                       fps,
-                                       format,
-                                       device,
-                                       extract_audio=extract_audio)
+        try:
+            return await asyncio.to_thread(video_io.load_file, video)
+        except OSError as error:
+            raise ValueError(f"Video '{video}' could not be opened.") from error
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
@@ -351,11 +344,15 @@ class ConversationMessage(TypedDict, total=False):
             This is used by `interleave_mm_placeholders` to insert multimodal placeholders at the
             correct positions, and to reconstruct the OpenAI-style content list for templates that
             handle media natively.
+        tools: Message-level (dynamic) tool declarations carried on system messages. Only
+            populated for models whose python-renderer chat template consumes them (kimi_k3);
+            absent for other models.
     """
     role: str
     content: str
     media: List[MultimodalData]
     content_parts: List[Union[str, dict]]
+    tools: List[Dict[str, Any]]
 
 
 class MultimodalDataTracker:
@@ -422,6 +419,27 @@ class MultimodalDataTracker:
             _retrieve(self._data), _retrieve(self._embeddings))
         return data_result, embed_result
 
+    async def discard_all_async(
+        self
+    ) -> tuple[Optional[Dict[str, List[Any]]], Optional[Dict[str, List[Any]]]]:
+        """Return `(None, None)`, closing the pending loads instead of running them.
+
+        Use instead of `retrieve_all_async` when the caller will not use the
+        media: the per-item loads are coroutines `add_data` parked and never
+        started, and closing them is what keeps Python from reporting them as
+        never awaited. Exactly one of the two may be awaited per tracker.
+
+        Placeholder counts and `item_order` are unaffected; `add_data` builds
+        both synchronously.
+        """
+        for pending in (self._data, self._embeddings):
+            for items in pending.values():
+                for item in items:
+                    if asyncio.iscoroutine(item):
+                        item.close()
+            pending.clear()
+        return None, None
+
     def retrieve_all_sync(
         self
     ) -> tuple[Optional[Dict[str, List[Any]]], Optional[Dict[str, List[Any]]]]:
@@ -476,8 +494,24 @@ class MultimodalDataTracker:
         `index` is the item's position in `multi_modal_data[modality]`;
         `placeholder` is the exact string the input processor will look
         for when splicing this item's encoder embedding.
+
+        Items are recorded in chat-part send order. When the model's chat
+        template regroups placeholders by modality (declared via
+        `MultimodalPlaceholderMetadata.prompt_modality_order`), sort by
+        that priority so the returned list matches what the template
+        actually emits — preserving per-modality send order as the tie
+        break.
         """
-        return list(self._item_order)
+        prompt_order = MULTIMODAL_PLACEHOLDER_REGISTRY.get_prompt_modality_order(
+            self._model_type)
+        if not prompt_order:
+            return list(self._item_order)
+        rank = {m: i for i, m in enumerate(prompt_order)}
+        return sorted(
+            self._item_order,
+            key=lambda e:
+            (rank.get(e["modality"], len(prompt_order)), e["index"]),
+        )
 
 
 def add_multimodal_placeholders(
@@ -605,13 +639,20 @@ def resolve_hf_chat_template(
 
     # 1. If chat_template is not None, return it
     if chat_template is not None:
+        templates = getattr(tokenizer, "chat_template", None)
+        if isinstance(templates, dict) and chat_template in templates:
+            return templates[chat_template]
         return chat_template
 
-    # 2. If tool is not provided, use the processor's default chat template
-    if not tools and processor and hasattr(processor, 'chat_template'):
-        return processor.chat_template
+    # 2. Without tools, prefer the processor's chat template when it has one.
+    #    A processor without one (some keep the template on their tokenizer
+    #    only) falls through to the tokenizer below.
+    if not tools and processor:
+        processor_template = getattr(processor, "chat_template", None)
+        if processor_template is not None:
+            return processor_template
 
-    # 3. If tool is provided, use the tool
+    # 3. Use the tokenizer's chat template, which accounts for the tools
     try:
         return tokenizer.get_chat_template(chat_template, tools=tools)
     except Exception:
@@ -695,8 +736,13 @@ def apply_chat_template(
     chat_template: Optional[str] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
     enable_tokenize: bool = False,
+    injected_chat_template_kwargs: Optional[Collection[str]] = None,
 ) -> (str | List[str]):
     """Apply chat template to the conversation.
+
+    `injected_chat_template_kwargs` names the keys of `chat_template_kwargs`
+    the server derived from API-level fields rather than the caller; the
+    unused-kwargs guard exempts them (see `validate_chat_template_kwargs`).
 
     Uses content-format-driven dispatch:
     - PASSTHROUGH: skip template rendering, just concatenate content strings
@@ -705,8 +751,25 @@ def apply_chat_template(
     - STRING: keeps flattened text with pre-inserted placeholders
     """
 
+    if isinstance(tokenizer, DeepseekV41Tokenizer):
+        # The native renderer deep-copies messages; omit pending media coroutines
+        # and retain flattened content with its interleaved image placeholders.
+        messages = [{
+            key: value
+            for key, value in message.items()
+            if key not in ("media", "content_parts")
+        } for message in conversation]
+        native_kwargs = dict(chat_template_kwargs or {})
+        native_kwargs.update(tokenize=enable_tokenize,
+                             add_generation_prompt=add_generation_prompt)
+        return tokenizer.apply_chat_template(messages=messages,
+                                             tools=tools,
+                                             **native_kwargs)
+
     # Handle DeepSeek tokenizers with custom chat templates.
-    if isinstance(tokenizer, (DeepseekV32Tokenizer, DeepseekV4Tokenizer)):
+    if isinstance(
+            tokenizer,
+        (DeepseekV32Tokenizer, DeepseekV4Tokenizer, DeepseekV41Tokenizer)):
         prompt = tokenizer.apply_chat_template(
             messages=conversation,
             tools=tools,
@@ -747,6 +810,10 @@ def apply_chat_template(
         raise ValueError(
             "No chat template found for the given tokenizer and tools.")
 
+    validate_chat_template_kwargs(hf_chat_template,
+                                  chat_template_kwargs,
+                                  injected_keys=injected_chat_template_kwargs)
+
     # Determine content format and prepare conversation accordingly
     content_format = _resolve_content_format(model_type, hf_chat_template)
 
@@ -786,6 +853,7 @@ async def async_apply_chat_template(
     chat_template: Optional[str] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
     enable_tokenize: bool = False,
+    injected_chat_template_kwargs: Optional[Collection[str]] = None,
 ) -> (str | List[str]):
     """Apply chat template without blocking the event loop."""
     return await asyncio.to_thread(
@@ -801,7 +869,135 @@ async def async_apply_chat_template(
         chat_template=chat_template,
         chat_template_kwargs=chat_template_kwargs,
         enable_tokenize=enable_tokenize,
+        injected_chat_template_kwargs=injected_chat_template_kwargs,
     )
+
+
+def apply_mm_placeholders(
+    model_type: str,
+    message: ConversationMessage,
+    placeholder_counts: Dict[str, int],
+    mm_data_tracker: "MultimodalDataTracker",
+    *,
+    item_order_start: int = 0,
+    content_format: Optional[ContentFormat] = None,
+) -> None:
+    """Insert this message's multimodal placeholders into its text, in place.
+
+    Only `ContentFormat.STRING` templates need them. For `OPENAI`,
+    `apply_chat_template` rebuilds `content` from `content_parts` via
+    `_build_openai_content`, so pre-inserting here would render every media
+    item twice: once as text and once as the template's own content part.
+
+    When the model opts into interleaving and `content_parts` is available the
+    placeholders keep their original positions; otherwise they are placed in
+    bulk according to the registered placement.
+    """
+    if not placeholder_counts:
+        return
+
+    if content_format is None:
+        registry_format = MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
+            model_type)
+        content_format = (registry_format if registry_format is not None else
+                          ContentFormat.STRING)
+    if content_format != ContentFormat.STRING:
+        return
+
+    content_parts = message.get("content_parts")
+    interleave = MULTIMODAL_PLACEHOLDER_REGISTRY.get_interleave_placeholders(
+        model_type)
+    if content_parts and interleave:
+        message["content"] = interleave_mm_placeholders(
+            model_type, content_parts, placeholder_counts,
+            mm_data_tracker.placeholder_modalities())
+    else:
+        message["content"] = add_multimodal_placeholders(
+            model_type,
+            message["content"],
+            placeholder_counts,
+            item_order=mm_data_tracker.item_order()[item_order_start:],
+        )
+
+
+async def async_build_multimodal_prompt(
+    *,
+    model_type: str,
+    tokenizer: Union[TransformersTokenizer, TokenizerBase],
+    processor: ProcessorMixin,
+    prompt: str,
+    media: List[str],
+    modality: str = "image",
+    add_generation_prompt: bool = True,
+    chat_template: Optional[str] = None,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
+    media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Package one text prompt plus media URLs into engine inputs.
+
+    For callers whose request format is a plain prompt and a list of media
+    references rather than OpenAI chat messages -- the Triton `llmapi` backend,
+    for example. Runs the same steps `trtllm-serve` runs for
+    `v1/chat/completions`: resolve placeholders for the model's content format,
+    render the chat template, and attach the fetched media.
+
+    The media fetches and the template rendering are awaited together, so
+    several items on one request are loaded concurrently.
+
+    Args:
+        model_type: Top-level HF `model_type`, the multimodal registry key.
+        prompt: The user's text, without any placeholder tokens.
+        media: URLs, `data:` URIs or local paths, one per item.
+        modality: Registered media modality, e.g. `"image"`.
+
+    Returns:
+        A `TextPrompt` carrying `multi_modal_data`, ready for
+        `LLM.generate_async`.
+    """
+    media_io_cls = MEDIA_IO_REGISTRY.get(modality)
+    if media_io_cls is None:
+        raise ValueError(f"Unsupported modality {modality!r}. "
+                         f"Registered modalities: {list(MEDIA_IO_REGISTRY)}")
+    media_io = media_io_cls.create((media_io_kwargs or {}).get(modality), None)
+
+    mm_data_tracker = MultimodalDataTracker(model_type)
+    content_parts: List[Union[str, Dict[str, Any]]] = []
+    for index, item in enumerate(media):
+        # `add_data` takes the un-awaited fetch; they run concurrently below.
+        mm_data_tracker.add_data(modality, media_io.async_load(item))
+        content_parts.append({"type": modality, "media_index": index})
+    content_parts.append(prompt)
+
+    message = ConversationMessage(role="user",
+                                  content=prompt,
+                                  media=[],
+                                  content_parts=content_parts)
+    placeholder_counts = mm_data_tracker.placeholder_counts()
+    apply_mm_placeholders(model_type, message, placeholder_counts,
+                          mm_data_tracker)
+
+    prompt_task = async_apply_chat_template(
+        model_type=model_type,
+        tokenizer=tokenizer,
+        processor=processor,
+        conversation=[message],
+        add_generation_prompt=add_generation_prompt,
+        mm_placeholder_counts=[placeholder_counts],
+        chat_template=chat_template,
+        chat_template_kwargs=chat_template_kwargs,
+    )
+    rendered, (mm_data,
+               _) = await asyncio.gather(prompt_task,
+                                         mm_data_tracker.retrieve_all_async())
+
+    inputs = prompt_inputs(rendered)
+    if mm_data:
+        inputs["multi_modal_data"] = mm_data
+        inputs["chat_template_applied"] = True
+        item_order = mm_data_tracker.item_order()
+        if item_order:
+            inputs["mm_item_order"] = item_order
+    return inputs
 
 
 def default_multimodal_input_loader(
@@ -981,6 +1177,7 @@ def default_multimodal_input_loader(
         input = {"prompt": prompt}
 
         if mm_placeholder_counts:
+            input["chat_template_applied"] = True
             if mm_embeddings is not None:
                 _, input[
                     "multi_modal_embeddings"] = mm_data_tracker.retrieve_all_sync(
@@ -995,14 +1192,3 @@ def default_multimodal_input_loader(
         inputs.append(input)
 
     return inputs
-
-
-def get_cache_salt_id(cache_salt: str) -> int:
-    b = cache_salt.encode("utf-8")
-    h = default_hasher(b).digest(length=8)
-    cache_salt_id = int.from_bytes(h, "little", signed=False)
-    if cache_salt_id < 0 or cache_salt_id >= (1 << 64):
-        raise ValueError(
-            f"cache_salt_id must be in [0, 2**64 - 1], got {cache_salt_id}.")
-
-    return cache_salt_id

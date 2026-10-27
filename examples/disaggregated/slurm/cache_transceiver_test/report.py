@@ -30,6 +30,7 @@ import csv
 import datetime
 import glob
 import json
+import logging
 import math
 import os
 import re
@@ -85,9 +86,12 @@ def build_cases(cfg):
     versions = cfg["test_matrix"].get("cache_manager_versions", ["V1"])
     cases = []
     for combination in combinations:
+        before = len(cases)
         for ver in versions:
             # The V2 cache manager only supports the Python cache transceiver.
             if ver == "V2" and combination["runtime"] == "CPP":
+                continue
+            if ver == "V1" and combination["runtime"] == "PYTHON":
                 continue
             cases.append(
                 {
@@ -97,6 +101,17 @@ def build_cases(cfg):
                     "label": f"{combination['backend']}/{combination['runtime']}/{ver}",
                 }
             )
+        if len(cases) == before:
+            logging.getLogger(__name__).warning(
+                "Configured combination %s/%s has no supported cache manager version in %s",
+                combination["backend"],
+                combination["runtime"],
+                versions,
+            )
+    if not cases:
+        raise ValueError(
+            "Test matrix contains no supported cases: use CPP with V1 or PYTHON with V2."
+        )
     return cases
 
 
@@ -323,8 +338,12 @@ class _TransportAcc:
 
     def feed(self, line):
         if _CONFIG_HEADER.search(line):
+            # Supports the older UCX single-line format.
             self._in_kv = _is_kv_data_header(line)
             return
+        # UCX 1.22 may put the operation description on the next line.
+        if _is_kv_data_header(line):
+            self._in_kv = True
         transports = _proto_row_transports(line)
         if not transports:
             return

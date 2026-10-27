@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional
@@ -29,6 +32,10 @@ class KVCacheParams:
     host_sink_token_length: Optional[torch.Tensor] = None
     # The number of extra kv for draft tokens
     num_extra_kv_tokens: Optional[int] = 0
+
+    # Whether generation page tables expose all reserved pages. Backends that
+    # use this must track the logical KV length separately.
+    use_full_generation_page_table: bool = False
 
 
 class CacheType(Enum):

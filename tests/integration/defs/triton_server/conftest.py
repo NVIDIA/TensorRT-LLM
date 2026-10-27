@@ -1,4 +1,18 @@
 # -*- coding: utf-8 -*-
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import datetime
 import os
@@ -270,96 +284,13 @@ def models_root():
 
 
 @pytest.fixture(scope="session")
-def llama_v2_tokenizer_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llama_v2_tokenizer_model_root = os.path.join(models_root, "llama-models-v2")
-
-    assert os.path.exists(
-        llama_v2_tokenizer_model_root
-    ), f"{llama_v2_tokenizer_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llama_v2_tokenizer_model_root
-
-
-@pytest.fixture(scope="session")
-def mistral_v1_tokenizer_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    mistral_v1_tokenizer_model_root = os.path.join(models_root,
-                                                   "mistral-7b-v0.1")
-
-    assert os.path.exists(
-        mistral_v1_tokenizer_model_root
-    ), f"{mistral_v1_tokenizer_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return mistral_v1_tokenizer_model_root
-
-
-@pytest.fixture(scope="session")
-def gpt_tokenizer_model_root(llm_backend_venv):
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    gpt_tokenizer_model_root = os.path.join(models_root, "gpt2")
-
-    assert os.path.exists(
-        gpt_tokenizer_model_root
-    ), f"{gpt_tokenizer_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return gpt_tokenizer_model_root
-
-
-@pytest.fixture(scope="session")
-def gptj_tokenizer_model_root(llm_backend_venv):
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    gptj_tokenizer_model_root = os.path.join(models_root, "gpt-j-6b")
-
-    assert os.path.exists(
-        gptj_tokenizer_model_root
-    ), f"{gptj_tokenizer_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return gptj_tokenizer_model_root
-
-
-@pytest.fixture(scope="session")
-def gpt2_medium_tokenizer_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    gpt_tokenizer_model_root = os.path.join(models_root, "gpt2-medium")
-
-    assert os.path.exists(
-        gpt_tokenizer_model_root
-    ), f"{gpt_tokenizer_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return gpt_tokenizer_model_root
-
-
-@pytest.fixture(scope="session")
-def gpt_next_ptuning_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    gpt_next_ptuning_model_root = os.path.join(models_root, "email_composition")
-
-    assert os.path.exists(
-        gpt_next_ptuning_model_root
-    ), f"{gpt_next_ptuning_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return gpt_next_ptuning_model_root
-
-
-@pytest.fixture(scope="session")
-def gpt_2b_lora_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    gpt_2b_lora_model_root = os.path.join(models_root, "lora", "gpt-next-2b")
-
-    assert os.path.exists(
-        gpt_2b_lora_model_root
-    ), f"{gpt_2b_lora_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return gpt_2b_lora_model_root
-
-
-@pytest.fixture(scope="session")
 def tiny_llama_lora_model_root():
     """HF-format LoRA adapter for TinyLlama-1.1B-Chat-v1.0.
 
     Used by the llmapi triton backend's E2E LoRA test
-    (`test_llmapi_lora`). Same base model as `tiny_llama_model_root`.
+    (`test_llmapi_lora`), together with an inlined TinyLlama-1.1B-Chat-v1.0
+    base-model path lookup at the call site — the adapter is fine-tuned
+    specifically for that base model and has no Qwen3-0.6B equivalent.
     """
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
@@ -371,209 +302,6 @@ def tiny_llama_lora_model_root():
         tiny_llama_lora_model_root
     ), f"{tiny_llama_lora_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     return tiny_llama_lora_model_root
-
-
-@pytest.fixture(scope="session")
-def blip2_opt_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    blip2_opt_model_root = os.path.join(models_root, "blip2-opt-2.7b")
-
-    assert os.path.exists(
-        blip2_opt_model_root
-    ), f"{blip2_opt_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return blip2_opt_model_root
-
-
-@pytest.fixture(scope="session")
-def llava_onevision_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llava_onevision_model_root = os.path.join(models_root,
-                                              "llava-onevision-qwen2-7b-ov-hf")
-
-    assert os.path.exists(
-        llava_onevision_model_root
-    ), f"{llava_onevision_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llava_onevision_model_root
-
-
-@pytest.fixture(scope="session")
-def test_video_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    test_video = os.path.join(models_root, "video-neva", "test_video")
-
-    assert os.path.exists(
-        test_video
-    ), f"{test_video} does not exist under NFS LLM_MODELS_ROOT dir"
-    return test_video
-
-
-@pytest.fixture(scope="session")
-def llava_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llava_model_root = os.path.join(models_root, "llava-1.5-7b-hf")
-
-    assert os.path.exists(
-        llava_model_root
-    ), f"{llava_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llava_model_root
-
-
-@pytest.fixture(scope="session")
-def mllama_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    mllama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                     "Llama-3.2-11B-Vision")
-
-    assert os.path.exists(
-        mllama_model_root
-    ), f"{mllama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return mllama_model_root
-
-
-@pytest.fixture(scope="session")
-def llama_v3_8b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                    "llama-v3-8b-instruct-hf")
-
-    assert os.path.exists(
-        llama_model_root
-    ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llama_model_root
-
-
-@pytest.fixture(scope="session")
-def llama3_v1_8b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                    "Meta-Llama-3.1-8B")
-
-    assert os.path.exists(
-        llama_model_root
-    ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llama_model_root
-
-
-@pytest.fixture(scope="session")
-def mixtral_8x7b_v0_1_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    mixtral_8x7b_v0_1_model_root = os.path.join(models_root,
-                                                "Mixtral-8x7B-v0.1")
-
-    assert os.path.exists(
-        mixtral_8x7b_v0_1_model_root
-    ), f"{mixtral_8x7b_v0_1_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return mixtral_8x7b_v0_1_model_root
-
-
-@pytest.fixture(scope="session")
-def llama_v3_70b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                    "Llama-3-70B-Instruct-Gradient-1048k")
-
-    assert os.path.exists(
-        llama_model_root
-    ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llama_model_root
-
-
-@pytest.fixture(scope="session")
-def vicuna_7b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    vicuna_7b_model_root = os.path.join(models_root, "vicuna-7b-v1.3")
-
-    assert os.path.exists(
-        vicuna_7b_model_root
-    ), f"{vicuna_7b_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return vicuna_7b_model_root
-
-
-@pytest.fixture(scope="session")
-def medusa_vicuna_7b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    medusa_vicuna_7b_model_root = os.path.join(models_root,
-                                               "medusa-vicuna-7b-v1.3")
-
-    assert os.path.exists(
-        medusa_vicuna_7b_model_root
-    ), f"{medusa_vicuna_7b_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return medusa_vicuna_7b_model_root
-
-
-@pytest.fixture(scope="session")
-def eagle_vicuna_7b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    eagle_vicuna_7b_model_root = os.path.join(models_root,
-                                              "EAGLE-Vicuna-7B-v1.3")
-
-    assert os.path.exists(
-        eagle_vicuna_7b_model_root
-    ), f"{eagle_vicuna_7b_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return eagle_vicuna_7b_model_root
-
-
-@pytest.fixture(scope="session")
-def t5_small_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    t5_small_model_root = os.path.join(models_root, "t5-small")
-
-    assert os.path.exists(
-        t5_small_model_root
-    ), f"{t5_small_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return t5_small_model_root
-
-
-@pytest.fixture(scope="session")
-def whisper_large_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    whisper_large_model_root = os.path.join(models_root, "whisper-models",
-                                            "large-v3")
-
-    assert os.path.exists(
-        whisper_large_model_root
-    ), f"{whisper_large_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return whisper_large_model_root
-
-
-@pytest.fixture(scope="session")
-def tiny_llama_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    tiny_llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                         "TinyLlama-1.1B-Chat-v1.0")
-
-    assert os.path.exists(
-        tiny_llama_model_root
-    ), f"{tiny_llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return tiny_llama_model_root
-
-
-@pytest.fixture(scope="session")
-def mistral_small_3_1_24b_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    model_root = os.path.join(models_root,
-                              "Mistral-Small-3.1-24B-Instruct-2503")
-
-    assert os.path.exists(
-        model_root
-    ), f"{model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return model_root
 
 
 # Returns an array of total memory for each available device

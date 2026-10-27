@@ -12,6 +12,7 @@ LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique that e
    - [NeMo LoRA Format](#nemo-lora-format)
    - [Routed-Expert MoE LoRA](#routed-expert-moe-lora)
    - [Cache Management](#cache-management)
+   - [Options for Performance Tuning](#options-for-performance-tuning)
 4. [TRTLLM serve with LoRA](#trtllm-serve-with-lora)
    - [YAML Configuration](#yaml-configuration)
    - [Starting the Server](#starting-the-server)
@@ -34,7 +35,7 @@ The PyTorch backend provides LoRA support, allowing you to:
 
 ```python
 from tensorrt_llm import LLM
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -118,6 +119,22 @@ llm = LLM(
 )
 ```
 
+#### Native FP8 adapter support
+
+The base model's quantization and the LoRA adapter's data type are independent. Dense LoRA modules can keep
+FP8 E4M3 adapter weights and execute them with native FP8 grouped GEMM kernels on the following architectures:
+
+| GPU architecture | Native FP8 adapter support |
+|---|---|
+| Hopper (SM90) | Yes |
+| Blackwell B200 (SM100) | Yes |
+| Blackwell (SM103/SM107) | No |
+| Blackwell (SM120/SM121) | No |
+
+If native FP8 LoRA kernels are unavailable for the current device or were excluded from the TensorRT-LLM build,
+the adapter weights are converted to the model compute data type. Native FP8 adapter weights are not supported
+for routed-expert MoE LoRA modules; see [Routed-Expert MoE LoRA](#routed-expert-moe-lora).
+
 ### NeMo LoRA Format
 
 ```python
@@ -159,7 +176,7 @@ LoRA can be applied to the routed-expert projections of a Mixture-of-Experts (Mo
 
 ```python
 from tensorrt_llm import LLM
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 
 lora_config = LoraConfig(
     lora_target_modules=[
@@ -231,6 +248,23 @@ llm = LLM(
     peft_cache_config=peft_cache_config
 )
 ```
+
+### Options for Performance Tuning
+
+`LoraConfig` exposes several options for performance tuning depending on the user's workload. The first is `overlap_lora_and_base`:
+setting this to `True` enables concurrent execution of LoRA adapter and base model computations, which are scheduled on
+separate CUDA streams. This allows to significantly reduce the latency overhead introduced by LoRA, especially in low-concurrency
+(i.e., memory-bound) regimes. This option covers the LoRA path for the `mlp`, `gated_mlp`, `attention` and `linear` modules, but does
+not apply to MoE LoRA.
+
+The second option is `cuda_graph_specialize_lora`: enabling this triggers the capture of two sets of CUDA graphs, having the LoRA path
+enabled or disabled for all requests in the batch; by default, a single set of CUDA graphs is captured with the LoRA path active, using
+dummy requests without `lora_task_id`, with empty adapter slots that have rank `0` and zeroed weight pointers. This option is particularly 
+effective when the majority of requests in the workload does not use LoRA, since it allows most batches to follow the non-LoRA path and 
+therefore eliminate all of the associated overhead.
+
+However, it should be noted that enabling `cuda_graph_specialize_lora` will result in a slight memory overhead due to the additional
+number of CUDA graphs that need to be captured and stored (about 50MB for 21 generation graphs with Qwen3 32B).
 
 ## TRTLLM serve with LoRA
 

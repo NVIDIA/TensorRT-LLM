@@ -364,6 +364,12 @@ models:
         default: null
         status: beta
         required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
+        required: false
 
   CompletionResponse:
     fields:
@@ -453,6 +459,12 @@ models:
         type: Optional[float]
         default: null
         status: beta
+        required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
         required: false
 
   CompletionStreamResponse:
@@ -580,6 +592,12 @@ models:
         default: <factory:list>
         status: stable
         required: false
+      store:
+        kind: openai
+        type: Optional[bool]
+        default: null
+        status: stable
+        required: false
       stream:
         kind: openai
         type: Optional[bool]
@@ -612,8 +630,14 @@ models:
         required: false
       tool_choice:
         kind: openai
-        type: Optional[Union[Literal['none', 'auto'], ChatCompletionNamedToolChoiceParam]]
+        type: Optional[Union[Literal['none', 'auto', 'required'], ChatCompletionNamedToolChoiceParam]]
         default: none
+        status: stable
+        required: false
+      parallel_tool_calls:
+        kind: openai
+        type: Optional[bool]
+        default: null
         status: stable
         required: false
       user:
@@ -624,9 +648,15 @@ models:
         required: false
       reasoning_effort:
         kind: openai
-        type: Optional[ReasoningEffort | Literal['low', 'medium', 'high']]
+        type: Optional[ReasoningEffort | Literal['low', 'medium', 'high', 'max', 'none']]
         default: "ReasoningEffort.LOW"
         status: stable
+        required: false
+      thinking:
+        kind: extension
+        type: Optional[ChatCompletionThinkingParam]
+        default: null
+        status: prototype
         required: false
       thinking_token_budget:
         kind: extension
@@ -772,6 +802,12 @@ models:
         default: null
         status: stable
         required: false
+      injected_chat_template_kwargs:
+        kind: extension
+        type: Optional[List[str]]
+        default: null
+        status: prototype
+        required: false
       media_io_kwargs:
         kind: extension
         type: Optional[Dict[MediaModality, Dict[str, Any]]]
@@ -865,6 +901,12 @@ models:
         default: null
         status: beta
         required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
+        required: false
 
   ChatCompletionResponse:
     fields:
@@ -955,6 +997,12 @@ models:
         default: null
         status: beta
         required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
+        required: false
 
   ChatCompletionStreamResponse:
     fields:
@@ -1002,6 +1050,18 @@ models:
         type: Optional[bool]
         default: false
         status: stable
+        required: false
+      conversation_params:
+        kind: extension
+        type: Optional[ConversationParams]
+        default: null
+        status: prototype
+        required: false
+      disaggregated_params:
+        kind: extension
+        type: Optional[DisaggregatedParams]
+        default: null
+        status: prototype
         required: false
       include:
         kind: openai
@@ -1062,6 +1122,18 @@ models:
         type: Optional[ResponsePrompt]
         default: null
         status: stable
+        required: false
+      prompt_token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: null
+        status: prototype
+        required: false
+      prompt_token_ids_b64:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
         required: false
       reasoning:
         kind: openai
@@ -1150,6 +1222,18 @@ models:
 
   ResponsesResponse:
     fields:
+      disaggregated_params:
+        kind: extension
+        type: Optional[DisaggregatedParams]
+        default: null
+        status: prototype
+        required: false
+      finish_reason:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
+        required: false
       id:
         kind: openai
         type: str
@@ -1160,6 +1244,12 @@ models:
         kind: openai
         type: int
         default: <factory:<lambda>>
+        status: stable
+        required: false
+      incomplete_details:
+        kind: openai
+        type: Optional[IncompleteDetails]
+        default: null
         status: stable
         required: false
       instructions:
@@ -1198,6 +1288,18 @@ models:
         default: null
         status: stable
         required: true
+      prompt_token_ids:
+        kind: extension
+        type: Optional[List[int]]
+        default: null
+        status: prototype
+        required: false
+      prompt_token_ids_b64:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
+        required: false
       temperature:
         kind: openai
         type: float
@@ -1311,7 +1413,7 @@ models:
         required: true
       response_format:
         kind: openai
-        type: Literal['url', 'b64_json']
+        type: Literal['url', 'b64_json', 'path']
         default: url
         status: stable
         required: false
@@ -1449,8 +1551,8 @@ models:
         required: true
       response_format:
         kind: extension
-        type: Literal['url', 'b64_json']
-        default: url
+        type: Literal['file', 'path']
+        default: file
         status: stable
         required: false
       format:
@@ -1465,11 +1567,29 @@ models:
         default: null
         status: stable
         required: false
+      image_reference:
+        kind: extension
+        type: Optional[Union[UploadFile, MediaReferenceItem, List[MediaReferenceItem]]]
+        default: null
+        status: prototype
+        required: false
+      video_reference:
+        kind: extension
+        type: Optional[Union[UploadFile, MediaReferenceItem, List[MediaReferenceItem]]]
+        default: null
+        status: prototype
+        required: false
+      audio_reference:
+        kind: extension
+        type: Optional[Union[UploadFile, MediaReferenceItem, List[MediaReferenceItem]]]
+        default: null
+        status: prototype
+        required: false
       input_reference:
         kind: extension
         type: Optional[Union[str, UploadFile]]
         default: null
-        status: prototype
+        status: deprecated
         required: false
       size:
         kind: extension
@@ -1542,4 +1662,24 @@ models:
         type: Optional[str]
         default: null
         status: stable
+        required: false
+  MediaReferenceItem:
+    fields:
+      content:
+        kind: extension
+        type: str
+        default: null
+        status: prototype
+        required: true
+      format:
+        kind: extension
+        type: Literal['path', 'url', 'base64']
+        default: null
+        status: prototype
+        required: true
+      role:
+        kind: extension
+        type: Optional[MediaRole]
+        default: null
+        status: prototype
         required: false

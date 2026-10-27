@@ -19,6 +19,7 @@
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/utils/math.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -70,24 +71,46 @@ PooledPhysMemAllocator::PooledPhysMemAllocator(size_t physMemSize)
     // Get current device.
     cuCheck(cuCtxGetDevice(&mDeviceId));
 
-    // Build the best allocation property.
+    // Build the best allocation property. Prefer shareable handle types so
+    // UCX cuda_ipc can export the memory for intra-node zero-copy transfers:
+    // FABRIC (MNNVL) > POSIX_FILE_DESCRIPTOR (pidfd-based, UCX >= 1.22) > NONE,
+    // and within each handle type prefer gpuDirectRDMACapable over not.
     mProp.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     mProp.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     mProp.location.id = mDeviceId;
-    mProp.allocFlags.gpuDirectRDMACapable = 1;
-    mProp.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
 
-    if (!isPropSupported(mProp))
+    constexpr CUmemAllocationHandleType kHandleTypePreference[]
+        = {CU_MEM_HANDLE_TYPE_FABRIC, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, CU_MEM_HANDLE_TYPE_NONE};
+    bool supported = false;
+    for (auto const handleType : kHandleTypePreference)
     {
-        mProp.requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
-        if (!isPropSupported(mProp))
+        for (bool const rdmaCapable : {true, false})
         {
-            mProp.allocFlags.gpuDirectRDMACapable = 0;
-            if (!isPropSupported(mProp))
+            mProp.requestedHandleTypes = handleType;
+            mProp.allocFlags.gpuDirectRDMACapable = rdmaCapable ? 1 : 0;
+            if (isPropSupported(mProp))
             {
-                throw std::runtime_error("PooledPhysMemAllocator: no supported physical memory allocation property");
+                supported = true;
+                break;
             }
         }
+        if (supported)
+        {
+            break;
+        }
+    }
+    if (!supported)
+    {
+        throw std::runtime_error("PooledPhysMemAllocator: no supported physical memory allocation property");
+    }
+    if (!mProp.allocFlags.gpuDirectRDMACapable)
+    {
+        // Otherwise this surfaces only later, as an opaque RDMA registration failure.
+        TLLM_LOG_WARNING(
+            "PooledPhysMemAllocator: device %d refused gpuDirectRDMACapable for KV cache memory with handle type %d, "
+            "so the pools are allocated without it. nvidia_peermem (ibv_reg_mr) cannot register this memory for "
+            "GPUDirect RDMA; dma-buf registration still can.",
+            static_cast<int>(mDeviceId), static_cast<int>(mProp.requestedHandleTypes));
     }
 }
 
@@ -117,20 +140,23 @@ VirtMem::VirtMem(size_t vmSize, PooledPhysMemAllocator& physMemAllocator, size_t
     mAccessDesc.location.id = physMemAllocator.deviceId();
     mAccessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
 
-    extend(initNumPhysMem);
+    try
+    {
+        extend(initNumPhysMem);
+    }
+    catch (...)
+    {
+        // A constructor that throws never runs ~VirtMem, so the reservation above has to be
+        // released here or the address range stays held for the life of the process. extend()
+        // has already unmapped whatever it managed to map before failing.
+        KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
+        throw;
+    }
 }
 
 VirtMem::~VirtMem() noexcept
 {
-    try
-    {
-        destroy();
-    }
-    catch (...)
-    {
-        // Destructors cannot surface CUDA cleanup failures. Explicit destroy()
-        // still reports them to match Python VirtMem.destroy().
-    }
+    KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
 }
 
 void VirtMem::push(PooledPhysMemAllocator::PooledPhysMem handle)

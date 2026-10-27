@@ -28,14 +28,14 @@ import torch
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     MLAParams,
     PositionalEmbeddingParams,
     RopeParams,
 )
-from tensorrt_llm._torch.attention_backend.sparse.dsa import DSABackendForwardArgs, DSACacheManager
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSABackendForwardArgs, DSACacheManager
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
@@ -777,6 +777,12 @@ def _run_test_for_backend(
         * kv_cache_tokens_per_block
         * max_num_contexts
     )
+    # The static token-sparse context FMHA may load KV rows beyond the selected ones, and its
+    # TMA descriptor does not bound rows to the pool. A pool sized only for these short
+    # sequences (a single 64-token block for context_sequence_lengths=[10]) can therefore be
+    # read past its end, which faults whenever the following address range is unmapped. Keep
+    # at least TopK rows in the pool, as any real deployment does.
+    max_tokens = max(max_tokens, SPARSE_TOPK)
 
     pretrained_config = SimpleNamespace(
         rms_norm_eps=1e-6,

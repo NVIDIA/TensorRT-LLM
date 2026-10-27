@@ -17,13 +17,13 @@
 import datetime
 import gc
 import importlib
+import importlib.util
 import logging
 import os
 import platform
 import re
 import shutil
 import subprocess as sp
-import sys
 import tempfile
 import time
 import urllib.request
@@ -48,16 +48,13 @@ from _pytest.mark import ParameterSet
 # is harmless.
 from test_common import session_prefetcher_hooks as _prefetch_hooks
 
-from tensorrt_llm.bindings import ipc_nvls_supported
-from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
-
 from .perf.gpu_clock_lock import GPUClockLock
 from .perf.session_data_writer import SessionDataWriter
 from .test_list_parser import (TestCorrectionMode, apply_waives,
                                get_test_name_corrections_v2, handle_corrections,
                                modify_by_test_list, preprocess_test_list_lines)
-from .trt_test_alternative import (call, check_output, exists, is_windows,
-                                   is_wsl, makedirs, print_info, print_warning,
+from .trt_test_alternative import (check_output, exists, is_windows, is_wsl,
+                                   makedirs, print_info, print_warning,
                                    wsl_to_win_path)
 from .utils.periodic_junit import PeriodicJUnitXML
 
@@ -74,10 +71,7 @@ DEBUG_CI_STORAGE = os.environ.get("DEBUG_CI_STORAGE", False)
 
 
 def _get_s3_output():
-    tests_root = Path(__file__).resolve().parents[2]
-    tests_root_str = str(tests_root)
-    if tests_root_str not in sys.path:
-        sys.path.append(tests_root_str)
+    # tests/ is on the path via the pythonpath entry in pytest.ini.
     return importlib.import_module("test_common.s3_output")
 
 
@@ -267,50 +261,6 @@ def disaggregated_example_root(llm_root, llm_venv):
     return example_root
 
 
-@pytest.fixture(scope="function")
-def minitron_model_root(request):
-    "Get minitron model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    if hasattr(request, "param"):
-        assert request.param == "4b"
-        minitron_model_root = os.path.join(models_root,
-                                           "nemotron/Minitron-4B-Base")
-
-    assert exists(minitron_model_root), f"{minitron_model_root} does not exist!"
-
-    return minitron_model_root
-
-
-@pytest.fixture(scope="function")
-def mistral_nemo_model_root(request):
-    "Get Mistral Nemo model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if hasattr(request, "param"):
-        assert request.param == "Mistral-Nemo-12b-Base"
-        mistral_nemo_model_root = os.path.join(models_root,
-                                               "Mistral-Nemo-Base-2407")
-    assert exists(
-        mistral_nemo_model_root), f"{mistral_nemo_model_root} does not exist!"
-    return mistral_nemo_model_root
-
-
-@pytest.fixture(scope="function")
-def mistral_nemo_minitron_model_root(request):
-    "Get Mistral Nemo Minitron model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if hasattr(request, "param"):
-        assert request.param == "Mistral-NeMo-Minitron-8B-Instruct"
-        mistral_nemo_minitron_model_root = os.path.join(
-            models_root, "Mistral-NeMo-Minitron-8B-Instruct")
-    assert exists(mistral_nemo_minitron_model_root
-                  ), f"{mistral_nemo_minitron_model_root} does not exist!"
-    return mistral_nemo_minitron_model_root
-
-
 @pytest.fixture(scope="module")
 def gpt_example_root(llm_root, llm_venv):
     "Get gpt example root"
@@ -321,22 +271,6 @@ def gpt_example_root(llm_root, llm_venv):
     ])
 
     return example_root
-
-
-@pytest.fixture(scope="function")
-def llm_exaone_model_root(request) -> str:
-    "Get EXAONE model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    exaone_model_root = os.path.join(models_root, "exaone")
-    if hasattr(request, "param"):
-        if request.param == "exaone_3.0_7.8b_instruct":
-            exaone_model_root = os.path.join(models_root, "exaone")
-        elif request.param == "exaone_deep_2.4b":
-            exaone_model_root = os.path.join(models_root, "EXAONE-Deep-2.4B")
-
-    return exaone_model_root
 
 
 @pytest.fixture(scope="module")
@@ -483,109 +417,24 @@ def llm_venv(request, llm_root, custom_user_workspace):
             shutil.rmtree(workspace_dir, ignore_errors=True)
 
 
-@pytest.fixture(scope="session")
-@cached_in_llm_models_root("gpt-next/megatron_converted_843m_tp1_pp1.nemo",
-                           True)
-def gpt_next_root():
-    "get gpt-next/megatron_converted_843m_tp1_pp1.nemo"
-    raise RuntimeError("megatron_converted_843m_tp1_pp1.nemo must be cached")
+@pytest.fixture(scope="session", autouse=True)
+def _auto_install_media_deps(llm_venv):
+    """Ensure OpenCV is available for video multimodal tests.
 
-
-@pytest.fixture(scope="function")
-def bert_model_root(hf_bert_model_root):
-    "Get bert model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    bert_model_name = hf_bert_model_root
-    bert_model_root = os.path.join(models_root, bert_model_name)
-
-    assert os.path.exists(
-        bert_model_root
-    ), f"{bert_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-
-    return (bert_model_name, bert_model_root)
-
-
-@pytest.fixture(scope="function")
-def enc_dec_model_root(request):
-    "Get enc-dec model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    tllm_model_name = request.param
-    if "wmt" not in tllm_model_name:
-        # HuggingFace root
-        enc_dec_model_root = os.path.join(models_root, tllm_model_name)
-    else:
-        # FairSeq root
-        enc_dec_model_root = os.path.join(models_root, "fairseq-models",
-                                          tllm_model_name)
-
-    assert os.path.exists(
-        enc_dec_model_root
-    ), f"{enc_dec_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-
-    return (tllm_model_name, enc_dec_model_root)
-
-
-@pytest.fixture(scope="function")
-def whisper_model_root(request):
-    "Get whisper model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    assert request.param in [
-        "large-v2",
-        "large-v3",
-    ], "whisper only supports large-v2 or large-v3 for now"
-    tllm_model_name = request.param
-    whisper_model_root = os.path.join(models_root, "whisper-models",
-                                      tllm_model_name)
-    assert os.path.exists(
-        whisper_model_root
-    ), f"{whisper_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-
-    return (tllm_model_name, whisper_model_root)
-
-
-@pytest.fixture(scope="function")
-def whisper_example_audio_file(whisper_model_root):
-    return os.path.join(whisper_model_root[1], "1221-135766-0002.wav")
-
-
-@pytest.fixture(scope="function")
-def multimodal_model_root(request, llm_venv):
-    "Get multimodal model root"
-    models_root = os.path.join(llm_models_root(), "multimodals")
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    tllm_model_name = request.param
-    if "cogvlm-chat" in tllm_model_name:
-        models_root = os.path.join(llm_models_root(), "cogvlm-chat")
-    if "video-neva" in tllm_model_name:
-        models_root = os.path.join(llm_models_root(), "video-neva")
-        tllm_model_name = tllm_model_name + ".nemo"
-    if "neva-22b" in tllm_model_name:
-        models_root = os.path.join(llm_models_root(), "neva")
-        tllm_model_name = tllm_model_name + ".nemo"
-    elif "Llama-3.2" in tllm_model_name:
-        models_root = os.path.join(llm_models_root(), "llama-3.2-models")
-    elif "Mistral-Small" in tllm_model_name:
-        models_root = llm_models_root()
-
-    multimodal_model_root = os.path.join(models_root, tllm_model_name)
-
-    if "llava-onevision" in tllm_model_name and "video" in tllm_model_name:
-        multimodal_model_root = multimodal_model_root[:-6]
-
-    assert os.path.exists(
-        multimodal_model_root
-    ), f"{multimodal_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-
-    yield (tllm_model_name, multimodal_model_root)
-
-    if "llava-onevision" in tllm_model_name:
-        llm_venv.run_cmd(["-m", "pip", "uninstall", "llava", "-y"])
+    Uses ``opencv-python-headless`` already on the system when present. Otherwise
+    set ``TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1`` to install it.
+    """
+    if importlib.util.find_spec("cv2") is not None:
+        return
+    if os.environ.get("TRTLLM_AUTO_INSTALL_MEDIA_DEPS", "0") != "1":
+        # TODO remove autouse once callers that need OpenCV depend on this
+        # fixture explicitly, and replace this warning with an error.
+        print_warning(
+            "OpenCV (cv2) is not installed, which is required for some tests.\n"
+            "You may need to install opencv-python-headless manually, or set "
+            "TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1 to auto-install.")
+        return
+    llm_venv.run_cmd(["-m", "pip", "install", "opencv-python-headless"])
 
 
 def remove_file(fn):
@@ -594,374 +443,10 @@ def remove_file(fn):
 
 
 @pytest.fixture(scope="module")
-@cached_in_llm_models_root("replit-code-v1_5-3b", True)
-def llm_replit_code_v1_5_3b_model_root():
-    "Get replit-code-v1_5-3b model root"
-    raise RuntimeError("replit-code-v1_5-3b must be cached")
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("gpt2", True)
-def llm_gpt2_model_root():
-    "Get gpt2 model root"
-    raise RuntimeError("gpt2 must be cached")
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("gpt2-medium", True)
-def llm_gpt2_medium_model_root():
-    "Get gpt2 medium model root"
-    raise RuntimeError("gpt2-medium must be cached")
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("GPT-2B-001_bf16_tp1.nemo", True)
-def llm_gpt2_next_model_root():
-    "get gpt-2b-001_bf16_tp1.nemo"
-    raise RuntimeError("GPT-2B-001_bf16_tp1.nemo must be cached")
-
-
-@pytest.fixture(scope="module")
 @cached_in_llm_models_root("santacoder", True)
 def llm_gpt2_santacoder_model_root():
     "get santacoder data"
     raise RuntimeError("santacoder must be cached")
-
-
-@pytest.fixture(scope="module")
-def llm_gpt2_starcoder_model_root(llm_venv, request):
-    "get starcoder-model"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    starcoder_model_root = os.path.join(models_root, "starcoder-model")
-    if hasattr(request, "param"):
-        if request.param == "starcoder":
-            starcoder_model_root = os.path.join(models_root, "starcoder-model")
-        elif request.param == "starcoderplus":
-            starcoder_model_root = os.path.join(models_root, "starcoderplus")
-        elif request.param == "starcoder2":
-            starcoder_model_root = os.path.join(models_root, "starcoder2-model")
-
-    return starcoder_model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("starcoder2-3b", True)
-def llm_gpt2_starcoder2_model_root():
-    "get starcoder2-3b"
-    raise RuntimeError("starcoder2-3b must be cached")
-
-
-@pytest.fixture(scope="function")
-def starcoder_model_root(request):
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "starcoder":
-        starcoder_model_root = os.path.join(models_root, "starcoder-model")
-    elif request.param == "starcoder2-15b":
-        starcoder_model_root = os.path.join(models_root, "starcoder2-model")
-    elif request.param == "starcoder2-3b":
-        starcoder_model_root = os.path.join(models_root, "starcoder2-3b")
-    elif request.param == "starcoderplus":
-        starcoder_model_root = os.path.join(models_root, "starcoderplus")
-
-    assert os.path.exists(
-        starcoder_model_root
-    ), f"{starcoder_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return starcoder_model_root
-
-
-@pytest.fixture(scope="function")
-def llm_gpt2b_lora_model_root(request):
-    "get gpt2b lora model"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    model_root_list = []
-    lora_root = os.path.join(models_root, "lora", "gpt-next-2b")
-    if hasattr(request, "param"):
-        if isinstance(request.param, tuple):
-            model_list = list(request.param)
-        else:
-            model_list = [request.param]
-
-        for item in model_list:
-            if item == "gpt2b_lora-900.nemo":
-                model_root_list.append(
-                    os.path.join(lora_root, "gpt2b_lora-900.nemo"))
-            elif item == "gpt2b_lora-stories.nemo":
-                model_root_list.append(
-                    os.path.join(lora_root, "gpt2b_lora-stories.nemo"))
-
-    return ",".join(model_root_list)
-
-
-@pytest.fixture(scope="module")
-def llama_v2_tokenizer_model_root():
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    llama_v2_tokenizer_model_root = os.path.join(models_root, "llama-models-v2")
-
-    assert os.path.exists(
-        llama_v2_tokenizer_model_root
-    ), f"{llama_v2_tokenizer_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llama_v2_tokenizer_model_root
-
-
-@pytest.fixture(scope="function")
-def llama_model_root(request):
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "llama-30b":
-        llama_model_root = os.path.join(models_root, "llama-models",
-                                        "llama-30b-hf")
-    elif request.param == "TinyLlama-1.1B-Chat-v1.0":
-        llama_model_root = os.path.join(models_root, "llama-models-v2",
-                                        "TinyLlama-1.1B-Chat-v1.0")
-    elif request.param == "llama-v3-8b-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v3", "8B")
-    elif request.param == "llama-v3-8b-instruct-hf":
-        llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                        "llama-v3-8b-instruct-hf")
-    elif request.param == "Llama-3-8B-Instruct-Gradient-1048k":
-        llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                        "Llama-3-8B-Instruct-Gradient-1048k")
-    elif request.param == "Llama-3-70B-Instruct-Gradient-1048k":
-        llama_model_root = os.path.join(models_root, "llama-models-v3",
-                                        "Llama-3-70B-Instruct-Gradient-1048k")
-    elif request.param == "llama-3.1-8b":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Meta-Llama-3.1-8B")
-    elif request.param == "llama-3.1-8b-instruct-hf-fp8":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Llama-3.1-8B-Instruct-FP8")
-    elif request.param == "llama-3.1-8b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.1-model",
-                                        "Llama-3.1-8B-Instruct")
-    elif request.param == "llama-3.1-8b-hf-nvfp4":
-        llama_model_root = os.path.join(models_root, "nvfp4-quantized",
-                                        "Meta-Llama-3.1-8B")
-    elif request.param == "llama-3.2-1b":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-1B")
-    elif request.param == "llama-3.2-1b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-1B-Instruct")
-    elif request.param == "llama-3.2-3b":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-3B")
-    elif request.param == "llama-3.2-3b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.2-models",
-                                        "Llama-3.2-3B-Instruct")
-    elif request.param == "llama-3.3-70b-instruct":
-        llama_model_root = os.path.join(models_root, "llama-3.3-models",
-                                        "Llama-3.3-70B-Instruct")
-    assert os.path.exists(
-        llama_model_root
-    ), f"{llama_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return llama_model_root
-
-
-@pytest.fixture(scope="function")
-def code_llama_model_root(request):
-    "get CodeLlama model data"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "CodeLlama-7b-Instruct":
-        codellama_model_root = os.path.join(models_root, "codellama",
-                                            "CodeLlama-7b-Instruct-hf")
-    elif request.param == "CodeLlama-13b-Instruct":
-        codellama_model_root = os.path.join(models_root, "codellama",
-                                            "CodeLlama-13b-Instruct-hf")
-    elif request.param == "CodeLlama-34b-Instruct":
-        codellama_model_root = os.path.join(models_root, "codellama",
-                                            "CodeLlama-34b-Instruct-hf")
-    elif request.param == "CodeLlama-70b-hf":
-        codellama_model_root = os.path.join(models_root, "codellama",
-                                            "CodeLlama-70b-hf")
-    return codellama_model_root
-
-
-@pytest.fixture(scope="function")
-def draft_target_model_roots(request):
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    draft_model_root = None
-    target_model_root = None
-    if request.param == "gpt2":
-        draft_model_root = os.path.join(models_root, "gpt2-medium")
-        target_model_root = os.path.join(models_root, "gpt2-medium")
-
-    assert os.path.exists(
-        draft_model_root
-    ), f"Draft-Target-Model draft model path {draft_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    assert os.path.exists(
-        target_model_root
-    ), f"Draft-Target-Model target model path {target_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return draft_model_root, target_model_root
-
-
-@pytest.fixture(scope="function")
-def ngram_root(request):
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "gpt2":
-        models_root = os.path.join(models_root, "gpt2-medium")
-    assert os.path.exists(
-        models_root
-    ), f"NGram model path {models_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return models_root
-
-
-@pytest.fixture(scope="function")
-def medusa_model_roots(request):
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    base_model_root_for_medusa = None
-    medusa_heads_model_root = None
-    if request.param == "medusa-vicuna-7b-v1.3":
-        base_model_root_for_medusa = os.path.join(models_root, "vicuna-7b-v1.3")
-        medusa_heads_model_root = os.path.join(models_root,
-                                               "medusa-vicuna-7b-v1.3")
-    elif request.param == "llama3.1-medusa-8b-hf_v0.1":
-        base_model_root_for_medusa = os.path.join(models_root,
-                                                  "llama3.1-medusa-8b-hf_v0.1")
-        medusa_heads_model_root = base_model_root_for_medusa
-    assert os.path.exists(
-        base_model_root_for_medusa
-    ), f"Medusa base model path {base_model_root_for_medusa} does not exist under NFS LLM_MODELS_ROOT dir"
-    assert os.path.exists(
-        medusa_heads_model_root
-    ), f"Medusa heads model path {medusa_heads_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return base_model_root_for_medusa, medusa_heads_model_root
-
-
-@pytest.fixture(scope="function")
-def lookahead_model_roots(request):
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    base_model_root_for_lookahead = None
-    if request.param == "vicuna-7b-v1.3":
-        base_model_root_for_lookahead = os.path.join(models_root,
-                                                     "vicuna-7b-v1.3")
-    assert os.path.exists(
-        base_model_root_for_lookahead
-    ), f"Lookahead base model path {base_model_root_for_lookahead} does not exist under NFS LLM_MODELS_ROOT dir"
-    return base_model_root_for_lookahead
-
-
-@pytest.fixture(scope="function")
-def redrafter_model_roots(request):
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    base_model_root_for_redrafter = None
-    redrafter_drafting_model_root = None
-    if request.param == "redrafter-vicuna-7b-v1.3":
-        base_model_root_for_redrafter = os.path.join(models_root,
-                                                     "vicuna-7b-v1.3")
-        redrafter_drafting_model_root = os.path.join(
-            models_root, "redrafter-vicuna-7b-v1.3")
-    assert os.path.exists(
-        base_model_root_for_redrafter
-    ), f"ReDrafter base model path {base_model_root_for_redrafter} does not exist under NFS LLM_MODELS_ROOT dir"
-    assert os.path.exists(
-        redrafter_drafting_model_root
-    ), f"ReDrafter heads model path {redrafter_drafting_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-    return base_model_root_for_redrafter, redrafter_drafting_model_root
-
-
-@pytest.fixture(scope="function")
-def eagle_model_roots(request):
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    base_model_root_for_eagle = None
-    eagle_heads_model_root = None
-    if request.param == "EAGLE-Vicuna-7B-v1.3":
-        # Test the checkpoint released from HF, which requires two separate weights,
-        # one for the base model and one for the EagleNets.
-        base_model_root_for_eagle = os.path.join(models_root, "vicuna-7b-v1.3")
-        eagle_heads_model_root = os.path.join(models_root,
-                                              "EAGLE-Vicuna-7B-v1.3")
-        assert os.path.exists(
-            base_model_root_for_eagle
-        ), f"EAGLE base model path {base_model_root_for_eagle} does not exist under NFS LLM_MODELS_ROOT dir"
-        assert os.path.exists(
-            eagle_heads_model_root
-        ), f"EAGLE heads model path {eagle_heads_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-        return base_model_root_for_eagle, eagle_heads_model_root
-
-    elif request.param == "llama3.1-eagle-8b-hf_v0.5":
-        # Test the checkpoint released from ModelOpt, which only requires one weight,
-        # which includes both the base model and EagleNets, and is an FP8 datatype.
-        modelopt_checkpoint_root_for_eagle = os.path.join(
-            models_root, "modelopt-hf-model-hub", "llama3.1-eagle-8b-hf_v0.5")
-        assert os.path.exists(
-            modelopt_checkpoint_root_for_eagle
-        ), f"EAGLE ModelOpt checkpoint path {modelopt_checkpoint_root_for_eagle} does not exist under NFS LLM_MODELS_ROOT dir"
-        return modelopt_checkpoint_root_for_eagle
-    else:
-        assert "Error Eagle weight's name"
-
-
-@pytest.fixture(scope="function")
-def mamba_model_root(request):
-    "get mamba model data"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    mamba_model_root = os.path.join(models_root, "mamba", "mamba-130m-hf")
-    if hasattr(request, "param"):
-        if request.param == "mamba-2.8b":
-            mamba_model_root = os.path.join(models_root, "mamba",
-                                            "mamba-2.8b-hf")
-        elif request.param == "mamba-130m":
-            mamba_model_root = os.path.join(models_root, "mamba",
-                                            "mamba-130m-hf")
-        elif request.param == "mamba-1.4b":
-            mamba_model_root = os.path.join(models_root, "mamba",
-                                            "mamba-1.4b-hf")
-        elif request.param == "mamba-790m":
-            mamba_model_root = os.path.join(models_root, "mamba",
-                                            "mamba-790m-hf")
-        elif request.param == "mamba-370m":
-            mamba_model_root = os.path.join(models_root, "mamba",
-                                            "mamba-370m-hf")
-        elif request.param == "mamba2-2.7b":
-            mamba_model_root = os.path.join(models_root, "mamba2",
-                                            "mamba2-2.7b")
-        elif request.param == "mamba2-1.3b":
-            mamba_model_root = os.path.join(models_root, "mamba2",
-                                            "mamba2-1.3b")
-        elif request.param == "mamba2-780m":
-            mamba_model_root = os.path.join(models_root, "mamba2",
-                                            "mamba2-780m")
-        elif request.param == "mamba2-370m":
-            mamba_model_root = os.path.join(models_root, "mamba2",
-                                            "mamba2-370m")
-        elif request.param == "mamba2-130m":
-            mamba_model_root = os.path.join(models_root, "mamba2",
-                                            "mamba2-130m")
-        elif request.param == "mamba-codestral-7B-v0.1":
-            mamba_model_root = os.path.join(models_root, "mamba2",
-                                            "mamba-codestral-7B-v0.1")
-
-    assert exists(mamba_model_root), f"{mamba_model_root} does not exist!"
-
-    return mamba_model_root
-
-
-@pytest.fixture(scope="function")
-def nemotron_nas_model_root(request):
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    assert hasattr(request, "param"), "Param is missing!"
-
-    nemotron_nas_model_root = os.path.join(models_root, "nemotron-nas",
-                                           request.param)
-
-    assert exists(
-        nemotron_nas_model_root), f"{nemotron_nas_model_root} doesn't exist!"
-
-    return nemotron_nas_model_root
 
 
 @pytest.fixture(scope="function")
@@ -978,27 +463,7 @@ def llm_lora_model_root(request):
         model_list = [request.param]
 
     for item in model_list:
-        if item == "Japanese-Alpaca-LoRA-7b-v0":
-            model_root_list.append(
-                os.path.join(models_root, "llama-models",
-                             "Japanese-Alpaca-LoRA-7b-v0"))
-        elif item == "luotuo-lora-7b-0.1":
-            model_root_list.append(
-                os.path.join(models_root, "llama-models", "luotuo-lora-7b-0.1"))
-        elif item == "Ko-QWEN-7B-Chat-LoRA":
-            model_root_list.append(
-                os.path.join(models_root, "Ko-QWEN-7B-Chat-LoRA"))
-        elif item == "Qwen1.5-7B-Chat-750Mb-lora":
-            model_root_list.append(
-                os.path.join(models_root, "Qwen1.5-7B-Chat-750Mb-lora"))
-        elif item == "Upcycled-Qwen1.5-MoE2.7B-LoRA":
-            model_root_list.append(
-                os.path.join(models_root, "Upcycled-Qwen1.5-MoE2.7B-LoRA"))
-        elif item == "Phi-3-mini-4k-instruct-ru-lora":
-            model_root_list.append(
-                os.path.join(models_root, "lora", "phi",
-                             "Phi-3-mini-4k-instruct-ru-lora"))
-        elif item == "peft-lora-starcoder2-15b-unity-copilot":
+        if item == "peft-lora-starcoder2-15b-unity-copilot":
             model_root_list.append(
                 os.path.join(
                     models_root,
@@ -1006,329 +471,12 @@ def llm_lora_model_root(request):
                     "starcoder",
                     "peft-lora-starcoder2-15b-unity-copilot",
                 ))
-        elif item == "chinese-mixtral-lora":
-            model_root_list.append(
-                os.path.join(models_root, "chinese-mixtral-lora"))
-        elif item == "komt-mistral-7b-v1-lora":
-            model_root_list.append(
-                os.path.join(models_root, "komt-mistral-7b-v1-lora"))
-        elif item == "Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32":
-            model_root_list.append(
-                os.path.join(
-                    models_root, "nemotron-nas",
-                    "Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_NIM_r32"))
         elif item == "gpt-oss-20b-lora-adapter_NIM_r8":
             model_root_list.append(
                 os.path.join(models_root, "gpt_oss",
                              "gpt-oss-20b-lora-adapter_NIM_r8"))
 
     return ",".join(model_root_list)
-
-
-@pytest.fixture(scope="function")
-def llm_dora_model_root(request):
-    "get dora model path"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    assert hasattr(request, "param"), "Param is missing!"
-    model_list = []
-    model_root_list = []
-    if isinstance(request.param, tuple):
-        model_list = list(request.param)
-    else:
-        model_list = [request.param]
-
-    for item in model_list:
-        if item == "commonsense-llama-v3-8b-dora-r32":
-            model_root_list.append(
-                os.path.join(
-                    models_root,
-                    "llama-models-v3",
-                    "DoRA-weights",
-                    "llama_dora_commonsense_checkpoints",
-                    "LLama3-8B",
-                    "dora_r32",
-                ))
-
-    return ",".join(model_root_list)
-
-
-@pytest.fixture(scope="function")
-def llm_mistral_model_root(request):
-    "get mistral model path"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    model_root = os.path.join(models_root, "mistral-7b-v0.1")
-    if request.param == "mistral-7b-v0.1":
-        model_root = os.path.join(models_root, "mistral-7b-v0.1")
-    if request.param == "mistral-nemo-instruct-2407":
-        model_root = os.path.join(models_root, "Mistral-Nemo-Instruct-2407")
-    if request.param == "komt-mistral-7b-v1":
-        model_root = os.path.join(models_root, "komt-mistral-7b-v1")
-    if request.param == "mistral-7b-v0.3":
-        model_root = os.path.join(models_root, "Mistral-7B-Instruct-v0.3")
-
-    return model_root
-
-
-@pytest.fixture(scope="function")
-def llm_mixtral_model_root(request):
-    "get mixtral model path"
-    models_root = llm_models_root()
-    model_root = os.path.join(models_root, "Mixtral-8x7B-v0.1")
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "Mixtral-8x7B-v0.1":
-        model_root = os.path.join(models_root, "Mixtral-8x7B-v0.1")
-    if request.param == "Mixtral-8x22B-v0.1":
-        model_root = os.path.join(models_root, "Mixtral-8x22B-v0.1")
-    if request.param == "Mixtral-8x7B-Instruct-v0.1":
-        model_root = os.path.join(models_root, "Mixtral-8x7B-Instruct-v0.1")
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("mathstral-7B-v0.1", True)
-def llm_mathstral_model_root(llm_venv):
-    "return mathstral-7B-v0.1 model root"
-
-    workspace = llm_venv.get_working_directory()
-    long_mathstral_model_root = os.path.join(workspace, "mathstral-7B-v0.1")
-
-    return long_mathstral_model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("LongAlpaca-7B", True)
-def llm_long_alpaca_model_root(llm_venv):
-    "return long alpaca model root"
-
-    workspace = llm_venv.get_working_directory()
-    long_alpaca_model_root = os.path.join(workspace, "LongAlpaca-7B")
-
-    return long_alpaca_model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("gpt-neox-20b", True)
-def llm_gptneox_model_root(llm_venv):
-    "return gptneox model root"
-
-    workspace = llm_venv.get_working_directory()
-    gptneox_model_root = os.path.join(workspace, "gpt-neox-20b")
-
-    return gptneox_model_root
-
-
-@pytest.fixture(scope="function")
-def llm_phi_model_root(request):
-    "return phi model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    if "Phi-3.5" in request.param:
-        phi_model_root = os.path.join(models_root, "Phi-3.5/" + request.param)
-    elif "Phi-3" in request.param:
-        phi_model_root = os.path.join(models_root, "Phi-3/" + request.param)
-    else:
-        phi_model_root = os.path.join(models_root, request.param)
-
-    assert os.path.exists(
-        phi_model_root
-    ), f"{phi_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-
-    return phi_model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("falcon-180b", True)
-def llm_falcon_180b_model_root():
-    "prepare falcon 180b model & return falcon model root"
-    raise RuntimeError("falcon 180b must be cached")
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("falcon-11B", True)
-def llm_falcon_11b_model_root(llm_venv):
-    "prepare falcon-11B model & return falcon model root"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "falcon-11B")
-
-    call(f"git clone https://huggingface.co/tiiuae/falcon-11B {model_root}",
-         shell=True)
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("email_composition", True)
-def llm_gpt2_next_8b_model_root():
-    raise RuntimeError("gpt-next 8b must be cached")
-
-
-@pytest.fixture(scope="function")
-def llm_glm_4_9b_model_root(request):
-    "prepare glm-4-9b model & return model path"
-    model_name = request.param
-    models_root = llm_models_root()
-    if model_name == "glm-4-9b":
-        model_root = os.path.join(models_root, "glm-4-9b")
-    elif model_name == "glm-4-9b-chat":
-        model_root = os.path.join(models_root, "glm-4-9b-chat")
-    elif model_name == "glm-4-9b-chat-1m":
-        model_root = os.path.join(models_root, "glm-4-9b-chat-1m")
-    elif model_name == "glm-4v-9b":
-        model_root = os.path.join(models_root, "glm-4v-9b")
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("internlm-chat-7b", True)
-def llm_internlm_7b_model_root(llm_venv):
-    "prepare internlm 7b model"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "internlm-chat-7b")
-
-    call(
-        f"git clone https://huggingface.co/internlm/internlm-chat-7b {model_root}",
-        shell=True,
-    )
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("internlm2-7b", True)
-def llm_internlm2_7b_model_root(llm_venv):
-    "prepare internlm2 7b model"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "internlm2-7b")
-
-    call(
-        f"git clone https://huggingface.co/internlm/internlm2-7b {model_root}",
-        shell=True,
-    )
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("internlm-chat-20b", True)
-def llm_internlm_20b_model_root(llm_venv):
-    "prepare internlm 20b model"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "internlm-chat-20b")
-
-    call(
-        f"git clone https://huggingface.co/internlm/internlm-chat-20b {model_root}",
-        shell=True,
-    )
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("Qwen-7B-Chat", True)
-def llm_qwen_7b_model_root(llm_venv):
-    "prepare qwen-7b model & return model path"
-    workspace = llm_venv.get_working_directory()
-    model_root = os.path.join(workspace, "Qwen-7B-Chat")
-
-    return model_root
-
-
-@pytest.fixture(scope="function")
-def llm_qwen_model_root(request, llm_venv):
-    "prepare qwen model & return model path"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    qwen_model_root = os.path.join(models_root, "Qwen-7B-Chat")
-
-    if hasattr(request, "param"):
-        if request.param == "qwen_7b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen-7B-Chat")
-        elif request.param == "qwen_14b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen-14B-Chat")
-        elif request.param == "qwen_72b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen-72B-Chat")
-        elif request.param == "qwen_7b_chat_int4":
-            qwen_model_root = os.path.join(models_root, "Qwen-7B-Chat-Int4")
-        elif request.param == "qwen-vl-chat":
-            qwen_model_root = os.path.join(models_root, "Qwen-VL-Chat")
-        elif request.param == "qwen1.5_7b_chat_awq":
-            qwen_model_root = os.path.join(models_root, "Qwen1.5-7B-Chat-AWQ")
-        elif request.param == "qwen1.5_0.5b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen1.5-0.5B-Chat")
-        elif request.param == "qwen1.5_7b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen1.5-7B-Chat")
-        elif request.param == "qwen1.5_14b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen1.5-14B-Chat")
-        elif request.param == "qwen1.5_moe_a2.7b_chat":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen1.5-MoE-A2.7B-Chat")
-        elif request.param == "qwen1.5_72b_chat":
-            qwen_model_root = os.path.join(models_root, "Qwen1.5-72B-Chat")
-        elif request.param == "qwen1.5_moe_a2.7b_chat":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen1.5-MoE-A2.7B-Chat")
-        elif request.param == "qwen1.5_14b_chat_int4":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen1.5-14B-Chat-GPTQ-Int4")
-        elif request.param == "qwen2_0.5b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2-0.5B-Instruct")
-        elif request.param == "qwen2_7b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2-7B-Instruct")
-        elif request.param == "qwen2_7b_awq":
-            qwen_model_root = os.path.join(models_root, "Qwen2-7B-Instruct-AWQ")
-        elif request.param == "qwen2_57b_a14b":
-            qwen_model_root = os.path.join(models_root, "Qwen2-57B-A14B")
-        elif request.param == "qwen2_72b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2-72B-Instruct")
-        elif request.param == "qwen2_vl_7b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2-VL-7B-Instruct")
-        elif request.param == "qwen2_audio_7b_instruct":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen2-Audio-7B-Instruct")
-        elif request.param == "qwen2.5_0.5b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-0.5B-Instruct")
-        elif request.param == "qwen2.5_1.5b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-1.5B-Instruct")
-        elif request.param == "qwen2.5_7b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-7B-Instruct")
-        elif request.param == "qwen2.5_14b_instruct_int4":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen2.5-14B-Instruct-GPTQ-Int4")
-        elif request.param == "qwen2.5_72b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-72B-Instruct")
-
-    assert exists(qwen_model_root), f"{qwen_model_root} does not exist!"
-
-    return qwen_model_root
-
-
-@pytest.fixture(scope="function")
-def llm_granite_model_root(request):
-    models_root = llm_models_root()
-    model_name = request.param
-    granite_model_root = os.path.join(models_root, model_name)
-    assert exists(granite_model_root), f"{granite_model_root} does not exist!"
-    return granite_model_root
-
-
-@pytest.fixture(scope="session")
-@cached_in_llm_models_root("nemotron/Nemotron-3-8B-Base-4k.nemo", True)
-def llm_nemotron_3_8b_model_root():
-    "get nemotron/Nemotron-3-8B-Base-4k.nemo"
-    raise RuntimeError("nemotron/Nemotron-3-8B-Base-4k.nemo must be cached")
-
-
-@pytest.fixture(scope="session")
-@cached_in_llm_models_root("nemotron/Nemotron-4-15B-Base.nemo", True)
-def llm_nemotron_4_15b_model_root():
-    "get nemotron/Nemotron-4-15B-Base.nemo"
-    raise RuntimeError("nemotron/Nemotron-4-15B-Base.nemo must be cached")
 
 
 @pytest.fixture(scope="session")
@@ -1342,53 +490,6 @@ def mmlu_dataset_root():
         mmlu_dataset_root
     ), f"{mmlu_dataset_root} does not exist under NFS LLM_MODELS_ROOT dir"
     return mmlu_dataset_root
-
-
-@pytest.fixture(scope="function")
-def deepseek_model_root(request):
-    "get deepseek model"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-    if request.param == "deepseek-coder-6.7b-instruct":
-        model_root = os.path.join(models_root, "deepseek-coder-6.7b-instruct")
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-def llm_commandr_v01_model_root(llm_venv):
-    "prepare command-r model & return model path"
-    models_root = llm_models_root()
-    model_root = os.path.join(models_root, "c4ai-command-r-v01")
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-def llm_commandr_plus_model_root(llm_venv):
-    "prepare command-r-plus model & return model path"
-    models_root = llm_models_root()
-    model_root = os.path.join(models_root, "c4ai-command-r-plus")
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-def llm_aya_23_8b_model_root(llm_venv):
-    "prepare Aya-23-8B model & return model path"
-    models_root = llm_models_root()
-    model_root = os.path.join(models_root, "aya-23-8B")
-
-    return model_root
-
-
-@pytest.fixture(scope="module")
-def llm_aya_23_35b_model_root(llm_venv):
-    "prepare Aya-23-35B model & return model path"
-    models_root = llm_models_root()
-    model_root = os.path.join(models_root, "aya-23-35B")
-
-    return model_root
 
 
 @pytest.fixture(scope="function")
@@ -1485,14 +586,6 @@ def qcache_dir_without_install_package(llm_venv, llm_root):
     )
 
 
-@pytest.fixture(scope="module")
-def star_attention_input_root(llm_root):
-    "Get star attention input file dir"
-    star_attention_input_root = unittest_path() / "_torch" / "multi_gpu"
-
-    return star_attention_input_root
-
-
 def parametrize_with_ids(
     argnames: str | Sequence[str],
     argvalues: Iterable[ParameterSet | Sequence[object] | object],
@@ -1532,6 +625,13 @@ def skip_by_device_count(request):
         if expected_count > int(device_count):
             pytest.skip(
                 f"Device count {device_count} is less than {expected_count}")
+
+
+def get_mpi_world_size() -> int:
+    """Lazy wrapper so conftest import does not load MPI bindings."""
+    from tensorrt_llm.llmapi.mpi_session import \
+        get_mpi_world_size as _get_mpi_world_size
+    return _get_mpi_world_size()
 
 
 @pytest.fixture(autouse=True)
@@ -1608,8 +708,9 @@ def is_ipc_nvls_supported():
     if not torch.cuda.is_available():
         return False
     try:
+        from tensorrt_llm.bindings import ipc_nvls_supported
         return ipc_nvls_supported()
-    except RuntimeError:
+    except (RuntimeError, ImportError):
         return False
 
 
@@ -1673,6 +774,11 @@ skip_no_sm120 = pytest.mark.skipif(get_sm_version() != 120,
 skip_arm = pytest.mark.skipif(
     "aarch64" in platform.machine(),
     reason="This test is not supported on ARM architecture",
+)
+
+skip_x86 = pytest.mark.skipif(
+    "x86_64" in platform.machine(),
+    reason="This test is not supported on x86 architecture",
 )
 
 
@@ -1884,6 +990,17 @@ def pytest_addoption(parser):
         "Only used with --periodic-junit.",
     )
     parser.addoption(
+        "--periodic-unfinished-test-path",
+        action="store",
+        default=None,
+        help="Override the unfinished_test.txt location (default: alongside "
+        "--periodic-junit-xmlpath). Use this to make a rerun attempt that writes "
+        "its results XML elsewhere still share the original attempt's "
+        "unfinished_test.txt, so a crash during the rerun itself is recorded in "
+        "the same place the caller checks for unresolved crashes. Only used "
+        "with --periodic-save-unfinished-test.",
+    )
+    parser.addoption(
         "--periodic-hang-traceback",
         action="store_true",
         default=False,
@@ -2024,6 +1141,8 @@ def pytest_configure(config):
         periodic_batch_size = config.getoption("--periodic-batch-size")
         periodic_save_unfinished_test = config.getoption(
             "--periodic-save-unfinished-test", default=False)
+        periodic_unfinished_test_path = config.getoption(
+            "--periodic-unfinished-test-path", default=None)
         periodic_hang_traceback = config.getoption("--periodic-hang-traceback",
                                                    default=False)
 
@@ -2043,11 +1162,11 @@ def pytest_configure(config):
                 'warning': print_warning
             },
             save_unfinished_test=periodic_save_unfinished_test,
+            unfinished_test_path=periodic_unfinished_test_path,
             dump_hang_traceback=periodic_hang_traceback,
         )
 
-        # Configure and register the reporter
-        reporter.pytest_configure(config)
+        # Registration replays the historic pytest_configure hook.
         config.pluginmanager.register(reporter, 'periodic_junit')
 
         print_info("PeriodicJUnitXML reporter registered")

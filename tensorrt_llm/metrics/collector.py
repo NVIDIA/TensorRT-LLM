@@ -20,6 +20,14 @@ from typing import Dict, List, Optional, Union
 
 from .enums import MetricNames
 
+# Upper bound on distinct ``token_position`` label values for the per-position
+# speculative-decoding counters. Each position is one Prometheus time series per
+# model, so this caps label cardinality no matter how deep a request drafts.
+# This bound used to be implicit in the per-request arrays' fixed length; those
+# now grow with max_draft_len so per-request accuracy is not truncated, which
+# makes the metrics-side limit its own explicit concern.
+MAX_SPEC_DECODE_POSITION_LABELS = 16
+
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
 class MetricsCollector:
@@ -45,6 +53,7 @@ class MetricsCollector:
             trtllm_prompt_tokens_total
             trtllm_generation_tokens_total
             trtllm_prompt_cached_tokens_total
+            trtllm_prompt_cache_hit_tokens_total
             trtllm_prompt_cached_tokens_per_request
             trtllm_spec_decode_drafted_tokens_total
             trtllm_spec_decode_accepted_tokens_total
@@ -63,9 +72,11 @@ class MetricsCollector:
             trtllm_kv_cache_iter_full_reused_blocks_total
             trtllm_kv_cache_iter_partial_reused_blocks_total
             trtllm_kv_cache_iter_missed_blocks_total
+            trtllm_kv_cache_iter_connector_reused_blocks_total
             trtllm_kv_cache_gen_alloc_blocks_total
             trtllm_kv_cache_onboard_bytes_total
             trtllm_kv_cache_offload_bytes_total
+            trtllm_kv_cache_disk_prefetch_blocks_total
             trtllm_kv_cache_intra_device_copy_bytes_total
             trtllm_num_requests_running
             trtllm_num_requests_waiting
@@ -102,6 +113,8 @@ class MetricsCollector:
             trtllm_kv_cache_config_info
     """
     labelname_finish_reason = "finished_reason"
+    labelname_cache_level = "cache_level"
+    labelname_cache_tier = "cache_tier"
 
     def __init__(
         self,
@@ -279,6 +292,14 @@ class MetricsCollector:
             name=self.metric_prefix + "kv_cache_iter_missed_blocks",
             documentation="Total missed KV cache blocks (context phase)",
             labelnames=self.labels.keys())
+        self.kv_cache_iter_connector_reused_blocks = Counter(
+            name=self.metric_prefix + "kv_cache_iter_connector_reused_blocks",
+            documentation=
+            "Total reused KV cache blocks loaded by a KV cache connector "
+            "from an external store (a subset of the reused blocks). Counted "
+            "when the load is accepted, before an asynchronous transfer "
+            "completes.",
+            labelnames=self.labels.keys())
         self.kv_cache_gen_alloc_blocks_total = Counter(
             name=self.metric_prefix + "kv_cache_gen_alloc_blocks_total",
             documentation="Total blocks allocated during generation phase",
@@ -290,6 +311,13 @@ class MetricsCollector:
         self.kv_cache_offload_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_offload_bytes_total",
             documentation="Total bytes transferred from GPU to host (offload)",
+            labelnames=self.labels.keys())
+        self.kv_cache_disk_prefetch_blocks_total = Counter(
+            name=self.metric_prefix + "kv_cache_disk_prefetch_blocks_total",
+            documentation=(
+                "Process-lifetime total V2 KV-cache blocks migrated from disk "
+                "to host by the prefetch mechanism. "
+                "Resets only when the serving process restarts."),
             labelnames=self.labels.keys())
         self.kv_cache_intra_device_copy_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_intra_device_copy_bytes_total",
@@ -415,8 +443,37 @@ class MetricsCollector:
         # Prompt cache hit tracking
         self.counter_tokens_cached_prompt = Counter(
             name=self.metric_prefix + "prompt_cached_tokens_total",
-            documentation="Total prompt tokens served from KV cache.",
+            documentation=(
+                "Process-lifetime total prompt tokens served from KV cache. "
+                "Resets only when the serving process restarts, not when the "
+                "KV cache is flushed or evicted."),
             labelnames=self.labels.keys())
+        self.counter_tokens_cached_prompt.labels(**self.labels)
+        self.labels_with_cache_level = {
+            **self.labels,
+            self.labelname_cache_level: "",
+            self.labelname_cache_tier: "",
+        }
+        self.counter_tokens_cached_prompt_by_tier = Counter(
+            name=self.metric_prefix + "prompt_cache_hit_tokens_total",
+            documentation=(
+                "Process-lifetime total prompt tokens served from each KV "
+                "cache level. Resets only when the serving process restarts, "
+                "not when the KV cache is flushed or evicted. cache_level is "
+                "the index into the configured tier list and cache_tier names "
+                "the memory backing it, so a deployment with a hot and a cold "
+                "GPU level reports them as two series sharing the gpu name. "
+                "Pages already prefetched from disk to host count as host. "
+                "Tokens a KV cache connector loaded from an external store "
+                "are reported as cache_tier=connector with an empty "
+                "cache_level, since the store is not a configured level. "
+                "They are counted when the load is accepted, before an "
+                "asynchronous transfer completes."),
+            labelnames=self.labels_with_cache_level.keys())
+        # The configured levels are only known once stats arrive; children are created then so
+        # that zero-valued levels are still visible before their first cache hit.
+        self._registered_cache_levels = False
+        self._registered_connector_cache_tier = False
         self.histogram_tokens_cached_prompt = Histogram(
             name=self.metric_prefix + "prompt_cached_tokens_per_request",
             documentation="Histogram of cached prompt tokens per request.",
@@ -535,11 +592,60 @@ class MetricsCollector:
         # Convenience function for logging to histogram.
         histogram.labels(**self.labels).observe(data)
 
+    def _cache_level_labels(self, level: int,
+                            level_tiers: Optional[List[str]]) -> Dict[str, str]:
+        tier = level_tiers[level] if level_tiers and level < len(
+            level_tiers) else ""
+        return {
+            self.labelname_cache_level: str(level),
+            self.labelname_cache_tier: tier,
+        }
+
+    def _log_cached_tokens_by_level(self, counts: Optional[List[int]],
+                                    level_tiers: Optional[List[str]]) -> None:
+        """Log cached prompt tokens for each configured cache level.
+
+        The level count comes from the engine's tier list, so the series are created on the
+        first stats report rather than at construction time.
+        """
+        if not counts:
+            return
+        if not self._registered_cache_levels:
+            for level in range(len(counts)):
+                self.counter_tokens_cached_prompt_by_tier.labels(
+                    **self.labels,
+                    **self._cache_level_labels(level, level_tiers))
+            self._registered_cache_levels = True
+        for level, count in enumerate(counts):
+            if count > 0:
+                self._log_counter(self.counter_tokens_cached_prompt_by_tier,
+                                  self._cache_level_labels(level, level_tiers),
+                                  count)
+
+    def _log_connector_cached_tokens(self, count: Optional[int]) -> None:
+        """Log cached prompt tokens a KV cache connector loaded from an external store.
+
+        Reported only when a connector can serve tokens, so the series appears only then.
+        """
+        if count is None:
+            return
+        labels = {
+            self.labelname_cache_level: "",
+            self.labelname_cache_tier: "connector",
+        }
+        if not self._registered_connector_cache_tier:
+            self.counter_tokens_cached_prompt_by_tier.labels(
+                **self._label_merge(labels))
+            self._registered_connector_cache_tier = True
+        if count > 0:
+            self._log_counter(self.counter_tokens_cached_prompt_by_tier, labels,
+                              count)
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
 
-    def log_request_metrics_dict(self, metrics_dict: dict[str, float]) -> None:
+    def log_request_metrics_dict(self, metrics_dict: dict) -> None:
         """Log per-request metrics from TRTLLM engine responses.
 
         This method updates Prometheus metrics including:
@@ -553,6 +659,7 @@ class MetricsCollector:
         - histogram_inference_time_request
         - counter_prompt_tokens
         - counter_generation_tokens
+        - counter_tokens_cached_prompt
 
         Args:
             metrics_dict: A dictionary containing request metrics with the following expected keys:
@@ -567,6 +674,8 @@ class MetricsCollector:
                 - `MetricNames.INFERENCE_TIME` (float): Total inference duration in seconds.
                 - `MetricNames.PROMPT_TOKENS` (int): Number of input tokens.
                 - `MetricNames.GENERATION_TOKENS` (int): Number of output tokens.
+                - `MetricNames.PROMPT_CACHE_CACHED_TOKENS` (int): Number of prompt tokens served
+                  from KV cache.
 
         Returns:
             None: Metrics are logged to Prometheus; nothing is returned.
@@ -629,7 +738,8 @@ class MetricsCollector:
                     if per_pos_drafted[i] > 0:
                         last_nonzero = i
                         break
-                for pos in range(last_nonzero + 1):
+                for pos in range(
+                        min(last_nonzero + 1, MAX_SPEC_DECODE_POSITION_LABELS)):
                     labels_with_pos = {
                         **self.labels, self.labelname_token_pos: pos
                     }
@@ -799,12 +909,26 @@ class MetricsCollector:
 
         # Per-iteration KV cache stats. V2 reports reuse/miss by lifecycle and
         # storage/transfer counters by pool group; legacy V1 uses window stats.
+        disk_prefetch_blocks = iteration_stats.get("iterDiskPrefetchBlocks", 0)
+        if disk_prefetch_blocks > 0:
+            self._log_counter(self.kv_cache_disk_prefetch_blocks_total, {},
+                              disk_prefetch_blocks)
+
+        self._log_cached_tokens_by_level(
+            iteration_stats.get("iterCachedTokensByLevel"),
+            iteration_stats.get("kvCacheLevelTiers"))
+        self._log_connector_cached_tokens(
+            iteration_stats.get("iterConnectorCachedTokens"))
+
         kv_iter = iteration_stats.get("kvCacheIterationStats")
         kv_iter_by_lifecycle = iteration_stats.get(
             "kvCacheIterationStatsByLifecycle")
         kv_iter_by_pool_group = iteration_stats.get(
             "kvCacheIterationStatsByPoolGroup")
-        if kv_iter or kv_iter_by_lifecycle or kv_iter_by_pool_group:
+        kv_iter_by_cold_pool_group = iteration_stats.get(
+            "kvCacheIterationStatsByColdPoolGroup")
+        if (kv_iter or kv_iter_by_lifecycle or kv_iter_by_pool_group
+                or kv_iter_by_cold_pool_group):
             # Prefer lifecycle-level attention stats when present. An SSM-only
             # lifecycle report must not hide the legacy/window-level attention
             # aggregate. Missing kind remains attention-compatible.
@@ -815,12 +939,18 @@ class MetricsCollector:
             }
             reuse_stats = attention_lifecycle_stats or kv_iter or {}
             pool_group_stats = kv_iter_by_pool_group or kv_iter or {}
+            # Host/disk blocks come from the cold pool-group view, the only V2 view that reports them:
+            # cold levels group lifecycles independently of the hot level, so a hot pool group cannot
+            # own a cold one, and this view accounts for every cold block exactly once. Legacy V1 has
+            # no such view and keeps its cold counters on the window stats, hence the fallback.
+            secondary_stats = kv_iter_by_cold_pool_group or pool_group_stats
             total_secondary_max = 0
             total_secondary_used = 0
             total_reused = 0
             total_full_reused = 0
             total_partial_reused = 0
             total_missed = 0
+            total_connector_reused = 0
             total_gen_alloc = 0
             total_onboard_bytes = 0
             total_offload_bytes = 0
@@ -831,10 +961,16 @@ class MetricsCollector:
                 total_full_reused += stats.get("iterFullReusedBlocks", 0)
                 total_partial_reused += stats.get("iterPartialReusedBlocks", 0)
                 total_missed += stats.get("iterMissedBlocks", 0)
+                total_connector_reused += stats.get("iterConnectorReusedBlocks",
+                                                    0)
 
-            for stats in pool_group_stats.values():
+            for stats in secondary_stats.values():
                 total_secondary_max += stats.get("secondaryMaxNumBlocks", 0)
                 total_secondary_used += stats.get("secondaryUsedNumBlocks", 0)
+
+            # The cold view deliberately omits the per-iteration delta fields, so these stay on the
+            # hot pool-group view where they are actually tracked.
+            for stats in pool_group_stats.values():
                 total_gen_alloc += stats.get("iterGenAllocBlocks", 0)
                 total_onboard_bytes += stats.get("iterOnboardBytes", 0)
                 total_offload_bytes += stats.get("iterOffloadBytes", 0)
@@ -863,6 +999,9 @@ class MetricsCollector:
             if total_missed > 0:
                 self._log_counter(self.kv_cache_iter_missed_blocks, {},
                                   total_missed)
+            if total_connector_reused > 0:
+                self._log_counter(self.kv_cache_iter_connector_reused_blocks,
+                                  {}, total_connector_reused)
             if total_gen_alloc > 0:
                 self._log_counter(self.kv_cache_gen_alloc_blocks_total, {},
                                   total_gen_alloc)

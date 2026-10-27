@@ -33,6 +33,10 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
     int64_t const num_experts, int64_t const n_group, int64_t const topk_group, int64_t const topk,
     double const routed_scaling_factor, cudaStream_t const stream = 0);
 
+void invokeKimiK3NoAuxTcMxFp8Quant(float* scores, float* bias, __nv_bfloat16* hidden_states, __nv_bfloat16* topk_values,
+    int32_t* topk_indices, int64_t* quantized_hidden_states, int32_t* hidden_states_scale, int64_t const num_tokens,
+    double const routed_scaling_factor, cudaStream_t const stream = 0);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

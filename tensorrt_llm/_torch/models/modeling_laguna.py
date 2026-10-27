@@ -15,7 +15,7 @@
 """Laguna / Laguna-XS model for TensorRT-LLM PyTorch backend."""
 
 import math
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -24,33 +24,40 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (
+from ..attention.attention import _helix_cp_allgather_input, _helix_cp_output_projection
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
     RopeParams,
 )
+from ..attention.qk_norm_attention import QKNormRoPEAttention
 from ..distributed import AllReduce, AllReduceParams
-from ..modules.attention import _helix_cp_allgather_input, _helix_cp_output_projection
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (
+from ..modules.gated_mlp import GatedMLP
+from ..modules.linear import Linear, TensorParallelMode
+from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (
     MiniMaxM2MoeRoutingMethod,
+    MoEImplClass,
     RoutingMethodType,
+    SqrtSoftplusMoeRoutingMethod,
     create_moe,
     resolve_moe_cls,
 )
-from ..modules.fused_moe.interface import MoE, MoEWeightLoadingMode
-from ..modules.fused_moe.interface import MoE as MoEInterface
-from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, TensorParallelMode
-from ..modules.qk_norm_attention import QKNormRoPEAttention
-from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe.interface import MoEWeightLoadingMode
+from ..moe.fused_moe.weight_owner import is_moe_weight_owner
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
 from .checkpoints.hf.weight_mapper import HfWeightMapper
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, register_auto_model, register_mapper
+from .modeling_utils import (
+    DecoderModel,
+    moe_experts_quant_config,
+    register_auto_model,
+    register_mapper,
+)
 
 # ---------------------------------------------------------------------------
 #  Gate (MoE router)
@@ -58,7 +65,8 @@ from .modeling_utils import DecoderModel, register_auto_model, register_mapper
 
 
 class LagunaGate(nn.Module):
-    """Sigmoid router with e_score_correction_bias (MiniMaxM2 routing)."""
+    """Router with e_score_correction_bias and config-driven scoring: "sigmoid"
+    (MiniMaxM2 routing) or "sqrtsoftplus" (DeepSeek-V4-style sqrt-softplus)."""
 
     def __init__(
         self,
@@ -66,11 +74,18 @@ class LagunaGate(nn.Module):
         num_experts: int,
         top_k: int,
         dtype: Optional[torch.dtype] = None,
-        moe_backend_cls: Type[MoE] = None,
-    ):
+        moe_backend_cls: Optional[MoEImplClass] = None,
+        scoring_func: str = "sigmoid",
+    ) -> None:
         super().__init__()
         self.top_k = top_k
         self.moe_backend_cls = moe_backend_cls
+        if scoring_func not in ("sigmoid", "sqrtsoftplus"):
+            raise ValueError(
+                f"Unsupported moe_router_score_func={scoring_func!r}; "
+                'expected "sigmoid" or "sqrtsoftplus".'
+            )
+        self.scoring_func = scoring_func
         self.weight = nn.Parameter(
             torch.empty((num_experts, hidden_size), dtype=dtype),
             requires_grad=False,
@@ -98,7 +113,12 @@ class LagunaGate(nn.Module):
 
     @property
     def routing_method(self):
-        return MiniMaxM2MoeRoutingMethod(
+        routing_cls = (
+            SqrtSoftplusMoeRoutingMethod
+            if self.scoring_func == "sqrtsoftplus"
+            else MiniMaxM2MoeRoutingMethod
+        )
+        return routing_cls(
             top_k=self.top_k,
             num_experts=self.weight.shape[0],
             callable_e_score_correction_bias=lambda: self.e_score_correction_bias,
@@ -127,6 +147,9 @@ class LagunaMoE(nn.Module):
                 strategy=model_config.allreduce_strategy,
             )
 
+        experts_quant_config = moe_experts_quant_config(
+            model_config, f"model.layers.{layer_idx}.mlp.experts"
+        )
         self.gate = LagunaGate(
             hidden_size=self.hidden_dim,
             num_experts=self.num_experts,
@@ -134,13 +157,16 @@ class LagunaMoE(nn.Module):
             dtype=config.torch_dtype,
             moe_backend_cls=resolve_moe_cls(
                 model_config,
+                override_quant_config=experts_quant_config,
                 routing=RoutingMethodType.MiniMax2,
                 # Match the create_moe call below, which passes no bias and no
                 # swiglu alpha/beta. Left unknown, gates that create_moe
                 # rejects abstain here and the gate would name a backend the
                 # layer does not run.
                 swiglu_gptoss_style=False,
+                layer_idx=layer_idx,
             ),
+            scoring_func=getattr(config, "moe_router_score_func", "sigmoid"),
         )
 
         self.experts = create_moe(
@@ -152,6 +178,7 @@ class LagunaMoE(nn.Module):
             dtype=config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
+            override_quant_config=experts_quant_config,
             layer_idx=layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
         )
@@ -667,7 +694,7 @@ class LagunaHfWeightMapper(HfWeightMapper):
         return weights
 
     def is_special_instance_module(self, module: nn.Module) -> bool:
-        return isinstance(module, MoEInterface)
+        return is_moe_weight_owner(module)
 
     def handle_special_instance_module(
         self,
@@ -676,7 +703,7 @@ class LagunaHfWeightMapper(HfWeightMapper):
         module_weights: dict,
         allow_partial_loading: bool = False,
     ) -> None:
-        if isinstance(module, MoEInterface):
+        if is_moe_weight_owner(module):
             # DeepSeekFP8 block-scales MoE expects "weight_scale_inv" but NVFP4
             # MoE expects the original "weight_scale" (plus "weight_scale_2").
             use_fp8_block_rename = (

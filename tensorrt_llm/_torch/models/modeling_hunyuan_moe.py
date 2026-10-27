@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Dict, Optional, Union
 
 import torch
@@ -10,23 +25,23 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     ConsumableWeightsDict
 from tensorrt_llm.functional import PositionEmbeddingType
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (PositionalEmbeddingParams,
-                                           PredefinedAttentionMask, RopeParams)
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (PositionalEmbeddingParams,
+                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (CutlassFusedMoE, MoE,
-                                 RenormalizeMoeRoutingMethod, VanillaMoE,
-                                 create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (RenormalizeMoeRoutingMethod, VanillaMoE,
+                             create_moe, is_moe_weight_owner)
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             duplicate_kv_weight, register_auto_model)
+                             duplicate_kv_weight, moe_experts_quant_config,
+                             register_auto_model)
 
 
 class HunyuanMoE(nn.Module):
@@ -35,6 +50,7 @@ class HunyuanMoE(nn.Module):
         self,
         model_config: ModelConfig[PretrainedConfig],
         aux_stream: torch.cuda.Stream,
+        layer_idx: int,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -63,7 +79,9 @@ class HunyuanMoE(nn.Module):
             aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
             dtype=config.torch_dtype,
             reduce_results=reduce_results,
-            model_config=model_config)
+            model_config=model_config,
+            override_quant_config=moe_experts_quant_config(
+                model_config, f"model.layers.{layer_idx}.mlp.experts"))
 
         self.shared_mlp = GatedMLP(
             hidden_size=config.hidden_size,
@@ -216,7 +234,8 @@ class HunYuanDecoderLayer(DecoderLayer):
 
         if is_moe_single_node:
             self.mlp = HunyuanMoE(
-                model_config, aux_stream_dict[AuxStreamType.MoeChunkingOverlap])
+                model_config, aux_stream_dict[AuxStreamType.MoeChunkingOverlap],
+                layer_idx)
         else:
             self.mlp = GatedMLP(hidden_size=config.hidden_size,
                                 intermediate_size=config.intermediate_size,
@@ -378,7 +397,7 @@ class HunYuanMoEV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                 # and weights loading is done in the backend, so module name includes '.backend'.
                 # We need to use parent module name (without .backend) to match saved weight names.
                 # After MoE refactoring is fully complete, all paths will follow this branch.
-                if names[-1] == "backend" and isinstance(module, MoE):
+                if names[-1] == "backend" and is_moe_weight_owner(module):
                     name = '.'.join(names[:-1])
                     names = name.split('.')
 
@@ -409,7 +428,9 @@ class HunYuanMoEV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                     original_name = name
                     name = name.replace('gate', 'gate.wg')
                     module_weights = filter_weights(name, weights)
-                    if isinstance(module, CutlassFusedMoE) or isinstance(
+                    # VanillaMoE is named separately: it owns expert weights as
+                    # an nn.ModuleList and so is outside is_moe_weight_owner.
+                    if is_moe_weight_owner(module) or isinstance(
                             module, VanillaMoE):
                         # model.layers.{idx}.mlp.experts
                         updated_module_weights = {}

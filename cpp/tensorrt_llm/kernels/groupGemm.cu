@@ -21,6 +21,7 @@
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/kernel/default_gemm_grouped.h"
 #include "cutlass/gemm/kernel/gemm_grouped.h"
+#include "fp8GroupedGemmConfig.h"
 
 #ifdef ENABLE_FP8
 #include "cute/tensor.hpp"
@@ -45,8 +46,25 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
+bool supportsFp8GroupedGemm(int smVersion)
+{
+    if (smVersion == fp8GroupedGemmConfig::kSm90)
+    {
+#if defined(ENABLE_FP8) && defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) && !defined(EXCLUDE_SM_90)
+        return true;
+#endif
+    }
+    else if (smVersion == fp8GroupedGemmConfig::kSm100)
+    {
+#if defined(ENABLE_FP8) && defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) && !defined(EXCLUDE_SM_100F)
+        return true;
+#endif
+    }
+    return false;
+}
+
 #ifdef ENABLE_FP8
-#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 namespace
 {
 
@@ -54,8 +72,8 @@ void checkFp8GroupedGemmAlignment(std::vector<cutlass::gemm::GemmCoord> const& p
 {
     int const smVersion = tensorrt_llm::common::getSMVersion();
     // CUTLASS also exposes this kernel level on SM120/SM121; enable those after validation.
-    TLLM_CHECK_WITH_INFO(
-        smVersion == 90, "%s requires Hopper (SM90), but the current device is SM%d", kernelName, smVersion);
+    TLLM_CHECK_WITH_INFO(smVersion == fp8GroupedGemmConfig::kSm90 || smVersion == fp8GroupedGemmConfig::kSm100,
+        "%s requires Hopper (SM90) or B200 (SM100), but the current device is SM%d", kernelName, smVersion);
 
     for (size_t problemIdx = 0; problemIdx < problemSizes.size(); ++problemIdx)
     {
@@ -73,7 +91,7 @@ void checkFp8GroupedGemmAlignment(std::vector<cutlass::gemm::GemmCoord> const& p
 }
 
 } // namespace
-#endif // CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED
+#endif // CUTLASS architecture support
 #endif // ENABLE_FP8
 
 int64_t inline getGemmCoordSize(int64_t problemCount)
@@ -261,7 +279,7 @@ void groupedGemmType_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::
 #ifdef ENABLE_FP8
 
 // ====================================================================
-// FP8 grouped GEMM using CUTLASS 3.x collective API (Hopper SM90).
+// FP8 grouped GEMM using architecture-specific CUTLASS 3.x collectives.
 //
 // The legacy CUTLASS 2.x DefaultGemmGrouped does NOT support fp8 element
 // types. This implementation uses the CUTLASS 3.x CollectiveBuilder and
@@ -278,9 +296,10 @@ void groupedGemmType_(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::
 // them to device memory via the provided workspace.
 // ====================================================================
 
-#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
-void fp8GroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, std::vector<void*> const& ptrA,
+template <typename Config>
+void fp8GroupedGemmImpl(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
     cudaStream_t stream)
@@ -288,6 +307,12 @@ void fp8GroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, s
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     using namespace cute;
+
+    using ArchTag = typename Config::ArchTag;
+    using TileShape = typename Config::TileShape;
+    using ClusterShape = typename Config::ClusterShape;
+    using KernelSchedule = typename Config::KernelSchedule;
+    using EpilogueSchedule = typename Config::EpilogueSchedule;
 
     using ElementA = cutlass::float_e4m3_t;
     using ElementB = cutlass::float_e4m3_t;
@@ -306,23 +331,14 @@ void fp8GroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, s
     static constexpr int kAlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
     static constexpr int kAlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
-    using ArchTag = cutlass::arch::Sm90;
     using OperatorClass = cutlass::arch::OpClassTensorOp;
-
-    // Tile and cluster shapes chosen for fp8 on Hopper.
-    using TileShape = Shape<_128, _128, _128>;
-    using ClusterShape = Shape<_1, _2, _1>;
-
-    // Kernel and epilogue schedule for fp8 grouped GEMM with PtrArray TMA.
-    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8FastAccum;
-    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
 
     using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 
-    using CollectiveEpilogue =
-        typename cutlass::epilogue::collective::CollectiveBuilder<ArchTag, OperatorClass, TileShape, ClusterShape,
-            cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator, ElementC, LayoutC*,
-            kAlignmentC, ElementD, LayoutD*, kAlignmentD, EpilogueSchedule>::CollectiveOp;
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<ArchTag, OperatorClass,
+        TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
+        ElementAccumulator, ElementC, LayoutC*, kAlignmentC, ElementD, LayoutD*, kAlignmentD, EpilogueSchedule,
+        cutlass::epilogue::fusion::LinearCombination<ElementD, ElementAccumulator>>::CollectiveOp;
 
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<ArchTag, OperatorClass, ElementA,
         LayoutA*, kAlignmentA, ElementB, LayoutB*, kAlignmentB, ElementAccumulator, TileShape, ClusterShape,
@@ -439,11 +455,22 @@ void fp8GroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, s
     hwInfo.device_id = 0;
     cudaGetDevice(&hwInfo.device_id);
     hwInfo.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hwInfo.device_id);
+    if constexpr (Config::kUsesDynamicClusterShape)
+    {
+        hwInfo.cluster_shape = Config::clusterShape();
+        hwInfo.cluster_shape_fallback = Config::clusterShapeFallback();
+        hwInfo.max_active_clusters = cutlass::KernelHardwareInfo::query_device_max_active_clusters(hwInfo.cluster_shape,
+            GemmKernel::MaxThreadsPerBlock, reinterpret_cast<void const*>(&cutlass::device_kernel<GemmKernel>));
+    }
 
     // Build CUTLASS 3.x arguments. alpha=1, beta=0 for LoRA GEMM.
-    typename Gemm::Arguments arguments{cutlass::gemm::GemmUniversalMode::kGrouped,
-        {problemCount, devProblemShapes, nullptr}, {devPtrA, devStrideA, devPtrB, devStrideB},
-        {{1.0f, 0.0f}, devPtrC, devStrideC, devPtrD, devStrideD}, hwInfo};
+    typename Gemm::Arguments arguments;
+    decltype(arguments.epilogue.thread) fusionArgs{};
+    fusionArgs.alpha = 1.0f;
+    fusionArgs.beta = 0.0f;
+    arguments =
+        typename Gemm::Arguments{cutlass::gemm::GemmUniversalMode::kGrouped, {problemCount, devProblemShapes, nullptr},
+            {devPtrA, devStrideA, devPtrB, devStrideB}, {fusionArgs, devPtrC, devStrideC, devPtrD, devStrideD}, hwInfo};
 
     Gemm gemm;
 
@@ -468,7 +495,32 @@ void fp8GroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, s
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-#endif // CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED
+void fp8GroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, std::vector<void*> const& ptrA,
+    std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
+    void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,
+    cudaStream_t stream)
+{
+    int const smVersion = tensorrt_llm::common::getSMVersion();
+    if (smVersion == fp8GroupedGemmConfig::kSm90)
+    {
+#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) && !defined(EXCLUDE_SM_90)
+        fp8GroupedGemmImpl<fp8GroupedGemmConfig::Sm90Config>(problemSizes, ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace,
+            gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, stream);
+        return;
+#endif
+    }
+    else if (smVersion == fp8GroupedGemmConfig::kSm100)
+    {
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) && !defined(EXCLUDE_SM_100F)
+        fp8GroupedGemmImpl<fp8GroupedGemmConfig::Sm100Config>(problemSizes, ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace,
+            gemmParamsWorkSpaceSize, gemmWorkSpace, gemmWorkspaceSize, stream);
+        return;
+#endif
+    }
+    TLLM_CHECK_WITH_INFO(false, "FP8 grouped GEMM was not compiled for SM%d", smVersion);
+}
+
+#endif // CUTLASS architecture support
 
 #endif // ENABLE_FP8
 
@@ -480,7 +532,7 @@ void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vecto
     TLLM_LOG_TRACE("%s start, isLoraIn: %d, minKN = %d", __PRETTY_FUNCTION__, static_cast<int>(isLoraIn), minKN);
 
 #ifdef ENABLE_FP8
-#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
     if (dataType == tensorrt_llm::DataType::kFP8)
     {
         checkFp8GroupedGemmAlignment(problem_sizes, "FP8 grouped GEMM");
@@ -493,9 +545,9 @@ void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vecto
     if (dataType == tensorrt_llm::DataType::kFP8)
     {
         TLLM_CHECK_WITH_INFO(
-            false, "FP8 grouped GEMM requires CUTLASS modifiable TMA support (CUDA 12.3+ and Hopper SM90 kernels).");
+            false, "FP8 grouped GEMM requires CUTLASS modifiable TMA support (CUDA 12.3+ and SM90/SM100 kernels).");
     }
-#endif // CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED
+#endif // CUTLASS architecture support
 #endif // ENABLE_FP8
 
     if (isLoraIn)

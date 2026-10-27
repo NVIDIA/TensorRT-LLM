@@ -2,26 +2,146 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
-from typing import List, Optional
+from collections.abc import Mapping as AbcMapping
+from typing import TYPE_CHECKING, List, Optional, Protocol, Sequence, Union
 
 import torch
 import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          is_speculators_dspark_config,
+                                          translate_speculators_dspark_config)
 from tensorrt_llm.logger import logger
 
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
 
-def is_gemma4_hybrid(config):
-    """True for Gemma4 models with hybrid attention (different head_dim per layer type)."""
-    global_head_dim = getattr(config, 'global_head_dim', None)
-    head_dim = getattr(config, 'head_dim', None)
-    return (global_head_dim is not None and isinstance(head_dim, int)
-            and global_head_dim != head_dim)
+
+class _NamedLayerType(Protocol):
+    name: str
+
+
+_LayerType = Union[str, _NamedLayerType]
+
+
+def resolve_cache_transceiver_config(
+        cache_transceiver_config: Optional[CacheTransceiverConfig]) -> None:
+    """Resolve defaults and validate runtime-independent configuration."""
+    if cache_transceiver_config is None or cache_transceiver_config.backend is None:
+        return
+
+    # Paths that skip model defaults treat "auto" as the C++ runtime.
+    if cache_transceiver_config.transceiver_runtime == "auto":
+        cache_transceiver_config.transceiver_runtime = None
+
+    # Keep "DEFAULT" on the config until in-flight-cancel validation runs.
+    effective_backend = cache_transceiver_config.backend
+    if effective_backend == "DEFAULT":
+        effective_backend, _ = cache_transceiver_config._resolve_default_backend(
+        )
+
+    runtime = cache_transceiver_config.transceiver_runtime
+    enable_pipelined_transfer = cache_transceiver_config.enable_pipelined_transfer
+    if runtime is None and enable_pipelined_transfer:
+        if effective_backend != "NIXL":
+            raise ValueError(
+                f"enable_pipelined_transfer is set but backend "
+                f"'{effective_backend}' requires the C++ "
+                f"transceiver, which does not support pipelined transfer. Use NIXL backend to "
+                f"enable pipelined transfer.")
+        logger.warning(
+            "enable_pipelined_transfer is set; auto-selecting the Python "
+            "transceiver instead of the C++ transceiver to enable "
+            "pipelined KV cache transfer. "
+            "Set transceiver_runtime='CPP' and "
+            "kv_cache_config.use_kv_cache_manager_v2=False to select C++ "
+            "with a model that supports V1; disable pipelined transfer too.")
+        cache_transceiver_config.transceiver_runtime = "PYTHON"
+    elif runtime == "CPP" and enable_pipelined_transfer:
+        raise ValueError(
+            "enable_pipelined_transfer is set but transceiver_runtime='CPP' "
+            "explicitly disables Python auto-selection. Use transceiver_runtime='PYTHON' to enable pipelined transfer."
+        )
+
+    if (cache_transceiver_config.transceiver_runtime == "PYTHON"
+            and effective_backend != "NIXL"):
+        raise ValueError(
+            f"Python transceiver currently only supports NIXL backend, "
+            f"got {effective_backend}. "
+            "Please use transceiver_runtime='CPP' with "
+            "kv_cache_config.use_kv_cache_manager_v2=False for MPI, UCX, "
+            "or MOONCAKE backends, with a model that supports V1.")
+
+
+def uses_vswa_kv_cache_layout(
+        max_attention_windows: Optional[Sequence[Optional[int]]]) -> bool:
+    """Return whether windows require a variable-window KV cache layout.
+
+    Recurrent-state cache sentinels are negative and do not represent
+    attention windows, so hybrid linear-attention layouts are not VSWA.
+    """
+    return (max_attention_windows is not None
+            and len(set(max_attention_windows)) > 1
+            and all(window is None or window > 0
+                    for window in max_attention_windows))
+
+
+def _is_sliding_attention_layer(layer_type: _LayerType) -> bool:
+    """Return whether a config layer type denotes sliding attention."""
+    layer_type_name = getattr(layer_type, "name", str(layer_type)).lower()
+    return "sliding" in layer_type_name
+
+
+def get_layer_attention_window(
+    config: object,
+    layer_idx: int,
+) -> Optional[int]:
+    """Return the active sliding window for one layer, or ``None``.
+
+    An explicit ``use_sliding_window=False`` disables sliding attention.
+    Otherwise, infer it from ``sliding_window`` and ``layer_types`` so legacy
+    configs that omit the flag continue to work. Qwen2-style configs that omit
+    ``layer_types`` use ``max_window_layers`` as the first sliding-layer index.
+    """
+    use_sliding_window = getattr(config, "use_sliding_window", None)
+    if use_sliding_window is False:
+        return None
+
+    sliding_window = getattr(config, "sliding_window", None)
+    if isinstance(sliding_window, (list, tuple)):
+        raise NotImplementedError(
+            "Attention-window derivation assumes a single sliding-window "
+            f"size, got multiple: {sliding_window}")
+    if sliding_window is None:
+        if use_sliding_window is True:
+            raise ValueError(
+                "use_sliding_window=True requires a positive integer "
+                "sliding_window.")
+        return None
+
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types:
+        layer_type = layer_types[layer_idx % len(layer_types)]
+        if not _is_sliding_attention_layer(layer_type):
+            return None
+    else:
+        max_window_layers = getattr(config, "max_window_layers", None)
+        if (isinstance(max_window_layers, int)
+                and not isinstance(max_window_layers, bool)
+                and layer_idx < max_window_layers):
+            return None
+
+    if (not isinstance(sliding_window, int) or isinstance(sliding_window, bool)
+            or sliding_window <= 0):
+        raise ValueError(
+            "Sliding attention requires a positive integer sliding_window.")
+    return sliding_window
 
 
 def is_hybrid_linear(config):
     return is_nemotron_hybrid(config) or is_qwen3_hybrid(config) or \
-        is_kimi_linear(config)
+        is_kimi_linear(config) or is_qwen4_exp(config) or is_glm5_next(config)
 
 
 def is_kimi_linear(config):
@@ -81,6 +201,67 @@ def get_kimi_linear_layer_masks(config):
 
 def get_kimi_linear_num_attention_layers(config):
     full_mask, _ = get_kimi_linear_layer_masks(config)
+    return sum(full_mask)
+
+
+def is_glm5_next(config: transformers.PretrainedConfig) -> bool:
+    """True for GLM-5.3-Flash ("glm5_next") hybrid KDA + sparse-MLA text models.
+
+    Handles both the flattened text config (model_type "glm5_next_text") and
+    the composite VLM config (model_type "glm5_next" with a nested
+    text_config).
+    """
+    return getattr(config, "model_type",
+                   None) in ("glm5_next", "glm5_next_text")
+
+
+def unwrap_glm5_next_text_config(
+        config: transformers.PretrainedConfig) -> transformers.PretrainedConfig:
+    """Return the flattened GLM-5.3-Flash text config.
+
+    ``is_glm5_next`` accepts both the flattened text config and the composite
+    "glm5_next" config with a nested ``text_config``; consumers read
+    text-level fields (``layer_types``, ``linear_attn_config``,
+    ``kv_lora_rank``, ...), so they must unwrap the composite form first.
+    """
+    if getattr(config, "model_type", None) == "glm5_next":
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None:
+            return text_config
+    return config
+
+
+def get_glm5_next_layer_masks(
+        config: transformers.PretrainedConfig) -> tuple[list[bool], list[bool]]:
+    """Return (full_attention_layer_mask, kda_layer_mask) for GLM-5.3-Flash.
+
+    The text config's literal ``layer_types`` list names every decoder layer
+    as exactly one of ``linear_attention`` (KDA) or
+    ``deepseek_sparse_attention`` (sparse MLA + indexer); 34 + 11 on the real
+    checkpoint.
+    """
+    config = unwrap_glm5_next_text_config(config)
+    if (getattr(config, "layer_types", None) is None
+            or len(config.layer_types) != config.num_hidden_layers):
+        raise ValueError(
+            "glm5_next layer_types must contain num_hidden_layers entries")
+    full_mask, kda_mask = [], []
+    for layer_idx, layer_type in enumerate(config.layer_types):
+        is_kda = layer_type == "linear_attention"
+        is_full = layer_type == "deepseek_sparse_attention"
+        if is_kda == is_full:
+            raise ValueError(
+                f"glm5_next layer {layer_idx} must be exactly one of "
+                f"linear_attention / deepseek_sparse_attention; got "
+                f"{layer_type!r}")
+        kda_mask.append(is_kda)
+        full_mask.append(is_full)
+    return full_mask, kda_mask
+
+
+def get_glm5_next_num_attention_layers(
+        config: transformers.PretrainedConfig) -> int:
+    full_mask, _ = get_glm5_next_layer_masks(config)
     return sum(full_mask)
 
 
@@ -145,6 +326,67 @@ def resolve_ssm_cache_dtype(config):
     return None
 
 
+def resolve_auto_ssm_cache_dtype(config, fallback):
+    """Resolve the model's automatic recurrent-state dtype."""
+    if is_kimi_linear(config):
+        from ..modules.kimi_kda.cache_manager import \
+            resolve_kimi_ssm_cache_dtype
+        return resolve_kimi_ssm_cache_dtype(config)
+    return (resolve_ssm_cache_dtype(config) or resolve_hf_torch_dtype(config)
+            or fallback)
+
+
+def validate_kimi_kda_state_dtype(config,
+                                  mamba_ssm_cache_dtype,
+                                  mamba_ssm_stochastic_rounding=False):
+    """Delegate KDA state-cache validation to the model owner."""
+    if is_kimi_linear(config):
+        from ..modules.kimi_kda.cache_manager import \
+            validate_kimi_state_cache_dtype
+        validate_kimi_state_cache_dtype(mamba_ssm_cache_dtype,
+                                        mamba_ssm_stochastic_rounding)
+
+
+def resolve_vocab_size(config) -> Optional[int]:
+    """Return the language model's vocabulary size, or None if absent.
+
+    Multimodal wrappers keep the language model's fields on a nested config
+    and leave ``vocab_size`` unset at the top level, so reading
+    ``config.vocab_size`` on them yields None. The nested attribute name
+    differs per family: ``llm_config`` for Nemotron-H Omni, ``text_config``
+    for the Kimi K3 / Qwen composite configs, ``language_config`` for
+    HyperCLOVAX, which holds a plain dict rather than a config object.
+
+    The top-level read comes first because a composite config may carry both
+    a top-level ``vocab_size`` and a nested one; the top-level value is what
+    the cache key generator has always been given, and lowering it would let
+    synthetic multimodal ids collide with real token ids.
+    """
+    vocab_size = getattr(config, "vocab_size", None)
+    if vocab_size is not None:
+        return vocab_size
+    # ``get_text_config`` covers ``text_config``, ``text_encoder``, ``decoder``
+    # and ``generator``, plus per-model overrides that install their own. It
+    # does not know ``llm_config`` or ``language_config``, so the loop below
+    # stays. Not every config here is an HF one, hence the callable check.
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        vocab_size = getattr(get_text_config(), "vocab_size", None)
+        if vocab_size is not None:
+            return vocab_size
+    for attr in ("llm_config", "text_config", "language_config"):
+        inner = getattr(config, attr, None)
+        if inner is None:
+            continue
+        if isinstance(inner, AbcMapping):
+            vocab_size = inner.get("vocab_size")
+        else:
+            vocab_size = getattr(inner, "vocab_size", None)
+        if vocab_size is not None:
+            return vocab_size
+    return None
+
+
 def is_nemotron_hybrid(config):
     if hasattr(config, "hybrid_override_pattern"
                ) and config.hybrid_override_pattern is not None and len(
@@ -158,6 +400,22 @@ def is_mla(config):
             config, "qk_rope_head_dim", None):
         return True
     return False
+
+
+def supports_fp4_mla_attention(model_config: "ModelConfig") -> bool:
+    """Whether the model uses the dedicated dense TRTLLM FP4 MLA path."""
+    return (is_mla(model_config.pretrained_config)
+            and model_config.attn_backend == "TRTLLM"
+            and model_config.sparse_attention_config is None
+            and not is_hybrid_linear(model_config.pretrained_config))
+
+
+def uses_fp4_mla_attention(model_config: "ModelConfig") -> bool:
+    """Use the resolved quantization, never the requested cache dtype."""
+    quant_config = getattr(model_config, "quant_config", None)
+    return (quant_config is not None
+            and quant_config.quant_mode.has_fp4_kv_cache()
+            and supports_fp4_mla_attention(model_config))
 
 
 def is_minimax_m3(sparse_attention_config):
@@ -191,6 +449,15 @@ def is_qwen3_hybrid(config):
     cache-manager routing (MambaHybridCacheManager) and layer-type derivation.
     """
     return is_qwen3_next(config) or is_qwen3_5(config)
+
+
+def is_qwen4_exp(config: transformers.PretrainedConfig) -> bool:
+    """Return whether this is a Qwen4-Exp text or composite config."""
+    architectures = getattr(config, "architectures", None)
+    return bool(architectures) and architectures[0] in {
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+    }
 
 
 def get_qwen3_hybrid_layer_types(config):
@@ -238,6 +505,22 @@ def get_qwen3_hybrid_layer_masks(config):
 def get_qwen3_hybrid_num_attention_layers(config):
     layer_mask, _ = get_qwen3_hybrid_layer_masks(config)
     return sum(layer_mask)
+
+
+def mamba_effective_tp_size(mapping) -> int:
+    """TP degree for sizing per-rank mamba/KDA state (budgeting AND allocation).
+
+    Attention-DP replicates the state and takes precedence; helix repurposes
+    CP ranks as plain TP for recurrent-state layers. Must match the runtime
+    pool construction (mamba_cache_manager) or the budget split withholds
+    unsharded-state bytes the allocator never uses (observed: 27.2 GiB/rank
+    mis-withheld on a helix16 gen worker whose real pool is 1/16-sharded).
+    """
+    if mapping.enable_attention_dp:
+        return 1
+    if mapping.has_cp_helix():
+        return mapping.tp_size * mapping.cp_size
+    return mapping.tp_size
 
 
 @dataclasses.dataclass
@@ -299,7 +582,7 @@ class MambaKVCacheParams:
 
     def get_states_bytes_per_layer(self, mapping) -> int:
         """Return the total bytes of Mamba state per layer, used for budgeting."""
-        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        tp_size = mamba_effective_tp_size(mapping)
         d_inner = self.head_dim * self.num_heads
         conv_dim = (d_inner + 2 * self.n_groups * self.state_size) // tp_size
         nheads = self.num_heads // tp_size
@@ -314,63 +597,39 @@ class MambaKVCacheParams:
         return state_bytes_per_layer
 
 
-def extract_mamba_kv_cache_params(
-    config,
-    spec_config=None,
-    quant_config=None,
-) -> MambaKVCacheParams:
-    """Build the mamba-related inputs for kv_cache_manager_cls.
-
-    Supports Nemotron-hybrid, Qwen3-hybrid (Qwen3-Next + Qwen3.5) and
-    Kimi K3 (kimi_linear).
-
-    Args:
-        config: HuggingFace model config of a hybrid Mamba model.
-        spec_config: Optional speculative-decoding config used to describe
-            appended attention-only MTP/draft layers separately from target
-            layers.
-        quant_config: Optional, used only to surface `mamba_ssm_cache_dtype`.
-
-    Returns:
-        MambaKVCacheParams with normalized field names.
-    """
+def extract_mamba_kv_cache_params(config,
+                                  spec_config=None,
+                                  quant_config=None) -> MambaKVCacheParams:
+    """Dispatch geometry extraction to the model's cache implementation."""
     if is_nemotron_hybrid(config):
-        state_size = config.ssm_state_size
-        conv_kernel = config.conv_kernel
-        num_heads = config.mamba_num_heads
-        n_groups = config.n_groups
-        head_dim = config.mamba_head_dim
-        pattern = config.hybrid_override_pattern
-        target_full_attn_mask = [layer_type == "*" for layer_type in pattern]
-        mamba_mask = [layer_type == "M" for layer_type in pattern]
-    elif is_qwen3_hybrid(config):
-        state_size = config.linear_key_head_dim
-        conv_kernel = config.linear_conv_kernel_dim
-        num_heads = config.linear_num_value_heads
-        n_groups = config.linear_num_key_heads
-        head_dim = config.linear_value_head_dim
-        target_full_attn_mask, mamba_mask = get_qwen3_hybrid_layer_masks(config)
+        from ..modules.mamba.cache_manager import \
+            get_nemotron_cache_params as extract
+    elif is_qwen3_hybrid(config) or is_qwen4_exp(config):
+        from ..modules.fla.cache_manager import get_gdn_cache_params as extract
     elif is_kimi_linear(config):
-        # Kimi K3 KDA (Kimi Delta Attention) state, mapped onto the Mamba
-        # cache-manager parametrization (see PythonMambaCacheManager):
-        #   conv_dim = head_dim*num_heads + 2*n_groups*state_size
-        #            = 3 * num_heads * head_dim  -> [q | k | v] short-conv
-        #   ssm state shape = [num_heads, head_dim, state_size]
-        #            = [H, V, K] fp32 delta-rule recurrent state.
-        # conv_kernel is set to short_conv_kernel_size + 1 so the pool's
-        # (conv_kernel - 1) columns hold the FULL FLA ShortConvolution cache
-        # window of `short_conv_kernel_size` columns.
-        lin = unwrap_kimi_text_config(config).linear_attn_config
-        state_size = lin["head_dim"]
-        conv_kernel = lin["short_conv_kernel_size"] + 1
-        num_heads = lin["num_heads"]
-        n_groups = lin["num_heads"]
-        head_dim = lin["head_dim"]
-        target_full_attn_mask, mamba_mask = get_kimi_linear_layer_masks(config)
+        from ..modules.kimi_kda.cache_manager import \
+            get_kimi_cache_params as extract
+    elif is_glm5_next(config):
+        from ..attention.backends.sparse.glm_kpool.cache_manager import \
+            get_glm5_next_cache_params as extract
     else:
         raise ValueError(
             f"{type(config).__name__} is not a supported hybrid Mamba config")
+    return extract(config, spec_config=spec_config, quant_config=quant_config)
 
+
+def build_mamba_kv_cache_params(config,
+                                *,
+                                state_size,
+                                conv_kernel,
+                                num_heads,
+                                n_groups,
+                                head_dim,
+                                mamba_mask,
+                                target_full_attn_mask,
+                                spec_config=None,
+                                quant_config=None) -> MambaKVCacheParams:
+    """Normalize dtype and draft layout after model-owned geometry extraction."""
     num_draft_layers = 0
     if spec_config is not None:
         # Imported lazily to avoid a circular dependency between
@@ -383,18 +642,9 @@ def extract_mamba_kv_cache_params(
         mamba_ssm_cache_dtype = _coerce_torch_dtype(
             quant_config.mamba_ssm_cache_dtype)
     if mamba_ssm_cache_dtype is None:
-        mamba_ssm_cache_dtype = (resolve_ssm_cache_dtype(config)
-                                 or resolve_hf_torch_dtype(config)
-                                 or torch.bfloat16)
-    if is_kimi_linear(config) and mamba_ssm_cache_dtype != torch.float32:
-        # The KDA delta-rule recurrent state must be kept in fp32 for
-        # numerical parity with the HF reference (fla chunk/fused_recurrent
-        # KDA kernels carry the state in fp32).
-        logger.info(
-            f"Kimi K3: overriding mamba_ssm_cache_dtype "
-            f"{mamba_ssm_cache_dtype} -> torch.float32 (KDA recurrent state "
-            "must be fp32)")
-        mamba_ssm_cache_dtype = torch.float32
+        mamba_ssm_cache_dtype = resolve_auto_ssm_cache_dtype(
+            config, torch.bfloat16)
+    validate_kimi_kda_state_dtype(config, mamba_ssm_cache_dtype)
 
     return MambaKVCacheParams(
         state_size=state_size,
@@ -409,37 +659,6 @@ def extract_mamba_kv_cache_params(
         dtype=resolve_hf_torch_dtype(config) or torch.bfloat16,
         mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
     )
-
-
-def is_qwen_image_bench_config(config_dict: dict) -> bool:
-    """Detect Qwen-Image-Bench's composite VLM checkpoint config.
-
-    The checkpoint advertises the generic Qwen3.5 VLM architecture, but
-    TRT-LLM needs a dedicated architecture key to route it to
-    QwenImageBenchModel. Generic Qwen3.5 text checkpoints can also publish
-    composite text/vision metadata, so require the explicit
-    `language_model_only: false` marker from Qwen-Image-Bench before
-    rewriting the architecture.
-
-    The text-config normalization itself lives on
-    `modeling_qwen3_5.Qwen35ConfigCompat`; this stays here because it is pure
-    dispatch detection over the raw config dict and keeps the model module out
-    of the hot path until a Qwen3.5 checkpoint is actually loaded.
-    """
-    architectures = config_dict.get("architectures") or []
-    text_config = config_dict.get("text_config")
-    vision_config = config_dict.get("vision_config")
-    required_multimodal_token_ids = {
-        "image_token_id",
-        "video_token_id",
-        "vision_start_token_id",
-        "vision_end_token_id",
-    }
-    return (config_dict.get("language_model_only") is False
-            and architectures[:1] == ["Qwen3_5ForConditionalGeneration"]
-            and isinstance(text_config, dict) and bool(text_config)
-            and isinstance(vision_config, dict) and bool(vision_config)
-            and required_multimodal_token_ids.issubset(config_dict))
 
 
 def _resolve_composite_torch_dtype(*config_dicts: dict) -> torch.dtype:
@@ -479,7 +698,7 @@ def _build_minicpmv4_6_config(
     # Extract + normalize the Qwen3.5 dense text tower (rope flatten,
     # quantization inheritance, architectures -> Qwen3_5ForCausalLM). MiniCPM-V
     # 4.6 always nests its language model under ``text_config``, so force
-    # extraction of that nested config (same path Qwen-Image-Bench uses).
+    # extraction of that nested config.
     text_dict = Qwen35ConfigCompat.normalize(config_dict,
                                              require_text_config=True)
     text_config = transformers.Qwen3NextConfig.from_dict(text_dict)
@@ -533,6 +752,36 @@ def is_kimi_k3_multimodal_config(config_dict: dict) -> bool:
             and isinstance(vision_config, dict) and bool(vision_config))
 
 
+def is_qwen4_exp_multimodal_config(config_dict: dict) -> bool:
+    """Return whether a checkpoint contains the composite vision model."""
+    text_config = config_dict.get("text_config")
+    vision_config = config_dict.get("vision_config")
+    return (config_dict.get("model_type") == "qwen4_exp"
+            and config_dict.get("language_model_only") is not True
+            and isinstance(text_config, dict) and bool(text_config)
+            and isinstance(vision_config, dict) and bool(vision_config))
+
+
+def _normalize_qwen4_exp_quantization_config(
+        config_dict: dict, text_config: dict) -> Optional[dict]:
+    """Normalize the text quantization policy in a composite checkpoint."""
+    quantization_config = (text_config.get("quantization_config")
+                           or config_dict.get("quantization_config"))
+    if not isinstance(quantization_config, dict):
+        return None
+
+    from tensorrt_llm._torch.models.modeling_qwen3_5 import Qwen35ConfigCompat
+
+    normalized = dict(quantization_config)
+    modules = normalized.get("modules_to_not_convert")
+    if isinstance(modules, list):
+        modules = Qwen35ConfigCompat._normalize_exclude_modules(modules)
+        modules = Qwen35ConfigCompat._add_qkvz_bf16_workaround(
+            text_config, modules)
+        normalized["modules_to_not_convert"] = sorted(set(modules))
+    return normalized
+
+
 # TODO: remove this once the transformers can support all of those models in _CONFIG_REGISTRY
 class LazyConfigDict(dict):
 
@@ -545,11 +794,59 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     cosmos3="Cosmos3Config",
     cosmos3_omni=
     "Cosmos3Config",  # backward-compat alias for pre-rename checkpoints
+    cosmos3_edge="Cosmos3EdgeConfig",
+    cosmos3_edge_text="Cosmos3EdgeTextConfig",
+    cosmos3_edge_vision="Cosmos3EdgeVisionConfig",
+    cosmos3_edge_projector="Cosmos3EdgeProjectorConfig",
     deepseek_v32="DeepseekV3Config",
     kimi_k2="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
+    k3_dspark="K3DsparkConfig",
     laguna="LagunaConfig",
 )  # NOTE: HF config.json uses deepseek_v32 as model_type but with same DSV3 config class
+
+_NEMOTRON_H_LEGACY_LAYER_TYPES = {
+    "linear_attention": "mamba",
+    "full_attention": "attention",
+}
+
+
+def nemotron_h_legacy_layer_types(config_dict):
+    """``config_dict`` respelled with pre-5.13 Nemotron-H layer names, else None.
+
+    transformers 5.13 renamed the per-layer vocabulary and made
+    ``hybrid_override_pattern`` a derived property that is no longer serialized,
+    so a checkpoint re-saved under a newer transformers cannot be parsed by the
+    pinned one. Restoring the legacy spelling regenerates the pattern, which the
+    Nemotron-H model path reads for its layer counts and mamba/attention masks.
+    """
+    if config_dict.get("model_type") != "nemotron_h":
+        return None
+    patched = dict(config_dict)
+    renamed = False
+    for field in ("layers_block_type", "mtp_layers_block_type"):
+        layer_types = patched.get(field)
+        if not isinstance(layer_types, list):
+            continue
+        renamed |= any(t in _NEMOTRON_H_LEGACY_LAYER_TYPES for t in layer_types)
+        patched[field] = [
+            _NEMOTRON_H_LEGACY_LAYER_TYPES.get(t, t) for t in layer_types
+        ]
+    return patched if renamed else None
+
+
+def match_nemotron_h_layer_types(model_config, layer_types):
+    """``layer_types`` respelled to match ``model_config``'s own vocabulary.
+
+    Assigning to a config bypasses ``__init__``, and with it transformers'
+    legacy-to-modern remap, so a mismatched spelling is stored unvalidated and
+    surfaces only when a pattern is later derived from it.
+    """
+    native = getattr(model_config, "layers_block_type", None) or []
+    if any(t in _NEMOTRON_H_LEGACY_LAYER_TYPES for t in native):
+        modern = {v: k for k, v in _NEMOTRON_H_LEGACY_LAYER_TYPES.items()}
+        return [modern.get(t, t) for t in layer_types]
+    return [_NEMOTRON_H_LEGACY_LAYER_TYPES.get(t, t) for t in layer_types]
 
 
 def load_pretrained_config(model_name_or_path: str,
@@ -571,17 +868,25 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
-    elif is_qwen_image_bench_config(config_dict):
-        from tensorrt_llm._torch.models.modeling_qwen3_5 import \
-            Qwen35ConfigCompat
-        model_config = transformers.AutoConfig.from_pretrained(
-            model_name_or_path, trust_remote_code=trust_remote_code)
-        # Keep the composite VLM config so the vision encoder and multimodal
-        # token IDs remain available, but normalize the text side to the
-        # Qwen3Next-compatible shape used by TRT-LLM's Qwen3.5 decoder.
-        model_config.architectures = ["QwenImageBenchForConditionalGeneration"]
-        model_config.text_config = transformers.Qwen3NextConfig.from_dict(
-            Qwen35ConfigCompat.normalize(config_dict, require_text_config=True))
+    elif is_speculators_dspark_config(config_dict):
+        # A DSpark drafter in the vLLM speculators format: no top-level
+        # model_type, and its auto_map needs the speculators package. Build
+        # the backbone's config from the translation the spec config uses.
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        translated = translate_speculators_dspark_config(config_dict)
+        model_config = CONFIG_MAPPING["qwen3"].from_dict(translated)
+        logger.info(
+            f"{model_name_or_path}: speculators-format DSpark drafter, read as "
+            f"qwen3 with target_layer_ids "
+            f"{translated['dflash_config']['target_layer_ids']} "
+            f"(aux_hidden_state_layer_ids - 1) and no sliding window")
+    elif model_type in ("glm5_next", "glm5_next_text"):
+        from tensorrt_llm._torch import configs
+        config_name = ("Glm5NextConfig"
+                       if model_type == "glm5_next" else "Glm5NextTextConfig")
+        config_class = getattr(transformers, config_name,
+                               getattr(configs, config_name))
+        model_config = config_class.from_dict(config_dict, **kwargs)
     elif model_type == "glm_moe_dsa":
         # GLM-MoE-DSA configs tag every layer with
         # layer_types=['deepseek_sparse_attention', ...] for HF bookkeeping.
@@ -634,6 +939,63 @@ def load_pretrained_config(model_name_or_path: str,
         text_dict = dict(config_dict.get("text_config") or config_dict)
         model_config = KimiLinearConfig.from_dict(text_dict)
         model_config.architectures = ["KimiLinearForCausalLM"]
+    elif is_qwen4_exp_multimodal_config(config_dict):
+        # Preserve the composite config for the VLM wrapper. The text-only
+        # branch below deliberately flattens the nested text config.
+        from tensorrt_llm._torch.configs import Qwen4ExpConfig
+        normalized_config = dict(config_dict)
+        text_dict = dict(config_dict["text_config"])
+        quantization_config = _normalize_qwen4_exp_quantization_config(
+            config_dict, text_dict)
+        if quantization_config is not None:
+            text_dict["quantization_config"] = dict(quantization_config)
+            normalized_config["text_config"] = text_dict
+            normalized_config["quantization_config"] = dict(quantization_config)
+        resolved_dtype = _resolve_composite_torch_dtype(config_dict, text_dict)
+        model_config = Qwen4ExpConfig.from_dict(normalized_config, **kwargs)
+        model_config.architectures = ["Qwen4ExpForConditionalGeneration"]
+        model_config.text_config.architectures = ["Qwen4ExpForCausalLM"]
+        model_config.text_config.torch_dtype = resolved_dtype
+        model_config.torch_dtype = resolved_dtype
+    elif model_type in ("qwen4_exp", "qwen4_exp_text"):
+        from tensorrt_llm._torch.configs import Qwen4ExpTextConfig
+        text_dict = dict(config_dict.get("text_config") or config_dict)
+        quantization_config = _normalize_qwen4_exp_quantization_config(
+            config_dict, text_dict)
+        if quantization_config is not None:
+            text_dict["quantization_config"] = quantization_config
+        model_config = Qwen4ExpTextConfig.from_dict(text_dict)
+        model_config.architectures = ["Qwen4ExpForCausalLM"]
+    elif model_type in ("deepseek_v41", "deepseek_v41_text"):
+        # Preserve the composite config and propagate its dtype to the text tower.
+        # Vision checkpoints use the internal ConditionalGeneration dispatch alias.
+        from tensorrt_llm._torch.configs import (DeepseekV41Config,
+                                                 DeepseekV41TextConfig)
+        nested_text = config_dict.get("text_config")
+        if isinstance(nested_text, dict) and nested_text:
+            resolved_dtype = _resolve_composite_torch_dtype(
+                config_dict, nested_text)
+            model_config = DeepseekV41Config.from_dict(config_dict, **kwargs)
+            model_config.text_config.architectures = ["DeepseekV41ForCausalLM"]
+            model_config.text_config.torch_dtype = resolved_dtype
+            model_config.torch_dtype = resolved_dtype
+        else:
+            # ``dict(config_dict)`` already carries the top-level
+            # ``quantization_config``, and ``DeepseekV41TextConfig`` propagates it
+            # in ``__init__`` (see the note above), so the flat branch needs no
+            # hoisting step of its own.
+            model_config = DeepseekV41TextConfig.from_dict(
+                dict(config_dict), **kwargs)
+        model_config.architectures = ["DeepseekV41ForCausalLM"]
+        vision_config = getattr(model_config, "vision_config", None)
+        if getattr(vision_config, "num_hidden_layers", 0) > 0:
+            model_config.architectures = ["DeepseekV41ForConditionalGeneration"]
+    elif model_type == "muse_spark":
+        # The runtime reads a flat config; the translation from the composite
+        # one rejects any value the runtime does not implement.
+        from tensorrt_llm._torch.configs import MuseSparkOpenConfig
+        model_config = MuseSparkOpenConfig.from_open_format(config_dict)
+        model_config.architectures = ["MuseSparkForConditionalGeneration"]
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
@@ -672,8 +1034,28 @@ def load_pretrained_config(model_name_or_path: str,
         }
         model_config = CONFIG_MAPPING[model_type].from_dict(patched_dict)
     else:
-        model_config = transformers.AutoConfig.from_pretrained(
-            model_name_or_path, trust_remote_code=trust_remote_code)
+        try:
+            model_config = transformers.AutoConfig.from_pretrained(
+                model_name_or_path, trust_remote_code=trust_remote_code)
+        except Exception as exc:
+            # Retried only on failure, so a transformers that parses the
+            # checkpoint itself never reaches this. Broad by necessity: the
+            # vocabulary mismatch surfaces as a strict-dataclass validation
+            # error from the built-in config, or as an AssertionError raised
+            # by a checkpoint's own remote code.
+            renamed = nemotron_h_legacy_layer_types(config_dict)
+            if renamed is None:
+                raise
+            from transformers.models.auto.configuration_auto import \
+                CONFIG_MAPPING
+            model_config = CONFIG_MAPPING[model_type].from_dict(
+                renamed, **kwargs)
+            cause = (str(exc).splitlines() or [""])[0]
+            logger.warning(
+                f"{model_name_or_path} uses the transformers>=5.13 Nemotron-H "
+                f"layer vocabulary; rebuilt it with the legacy names after "
+                f"{type(exc).__name__}: {cause} -- hybrid_override_pattern="
+                f"{getattr(model_config, 'hybrid_override_pattern', None)!r}")
 
     # Transformers 5.x sets rope_scaling to {"rope_type": "default"} instead
     # of None for models with standard RoPE (no scaling).  Clear it so that

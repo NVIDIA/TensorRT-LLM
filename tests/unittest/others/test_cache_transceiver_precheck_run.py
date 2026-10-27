@@ -36,24 +36,23 @@ import json
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
-_PRECHECK_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..",
-    "..",
-    "..",
-    "tests",
-    "scripts",
-    "perf-sanity",
-    "cache_transceiver_precheck",
-)
-sys.path.insert(0, os.path.abspath(_PRECHECK_DIR))
-
-import run_precheck as rp  # noqa: E402  (stdlib-only at import time)
+__extra_import_path__ = ["~/tests/scripts/perf-sanity/cache_transceiver_precheck"]
+import run_precheck as rp
 
 KEY = b"k" * 32
+
+_DEEPSEEK_V4_CONFIGS = [
+    (suite, path)
+    for suite in ("perf", "perf-sanity")
+    for path in sorted(
+        (Path(rp.__file__).parents[2] / suite / "disaggregated").glob("*deepseek-v4*.yaml")
+    )
+]
+assert _DEEPSEEK_V4_CONFIGS, "No DeepSeek V4 disaggregated configurations found"
 
 
 # --------------------------------------------------------------------------- #
@@ -198,6 +197,15 @@ def test_wait_for_addr_times_out_on_missing_file(tmp_path):
         rp.wait_for_addr(rp.addr_path(str(tmp_path), 0, 0), timeout_s=0)
 
 
+def test_wait_for_addr_stops_once_the_abort_flag_is_up(tmp_path, monkeypatch):
+    """A ctx that failed before publishing raises the flag; gen stops waiting, with its reason."""
+    monkeypatch.setenv("SLURM_JOB_ID", "7")
+    work = str(tmp_path)
+    rp.raise_abort_flag(work, "ctx_0 UNHANDLED_ERROR: FileExistsError")
+    with pytest.raises(rp._PeerAbort, match="abandoned: ctx_0 UNHANDLED_ERROR: FileExistsError"):
+        rp.wait_for_addr(rp.addr_path(work, 0, 0), timeout_s=5, work_dir=work)
+
+
 def test_abort_flag_roundtrip_and_write_once(tmp_path, monkeypatch):
     monkeypatch.setenv("SLURM_JOB_ID", "1")
     work = str(tmp_path)
@@ -215,6 +223,39 @@ def test_abort_flag_stale_job_ignored(tmp_path, monkeypatch):
     assert rp.abort_flag_reason(str(tmp_path)) is None
 
 
+def test_shared_file_write_survives_a_spurious_eexist(tmp_path, monkeypatch):
+    """NFS can fail every create of one name with EEXIST; a fresh name gets through."""
+    real_open = os.open
+    poisoned = []
+
+    def open_poisoning_the_first_created_name(path, flags, *args, **kwargs):
+        if str(path).startswith(str(tmp_path)) and flags & os.O_CREAT:
+            if not poisoned or path in poisoned:
+                poisoned.append(path)
+                raise FileExistsError(17, "File exists", path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", open_poisoning_the_first_created_name)
+    path = tmp_path / "status" / "gen_0.status"
+    rp.atomic_write_shared_file(str(path), "PASS gen_0\n")
+
+    assert len(poisoned) == 1  # mkstemp() moved on instead of retrying the poisoned name
+    assert os.path.basename(poisoned[0]).startswith(".")  # a leftover misses status/*.status
+    assert path.read_text() == "PASS gen_0\n"
+    assert path.stat().st_mode & 0o777 == 0o644
+    assert os.listdir(path.parent) == ["gen_0.status"]  # no temp file left behind
+
+
+def test_shared_file_write_removes_its_temp_file_on_failure(tmp_path, monkeypatch):
+    def failing_replace(_src, _dst):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(OSError, match="Input/output error"):
+        rp.atomic_write_shared_file(str(tmp_path / "gen_0.json"), "{}")
+    assert os.listdir(tmp_path) == []
+
+
 # --------------------------------------------------------------------------- #
 # StatusRecorder
 # --------------------------------------------------------------------------- #
@@ -227,16 +268,104 @@ def _read_status(tmp_path, name):
 
 
 def test_recorder_pass(tmp_path):
-    rec = rp.StatusRecorder(str(tmp_path), "gen", 0, is_leader=True)
+    metadata = {"model_dir_resolved": True, "synthetic_kv_shape": False}
+    rec = rp.StatusRecorder(str(tmp_path), "gen", 0, is_leader=True, metadata=metadata)
+    metadata["model_dir_resolved"] = False
     rec.record("ctx_0", 1024, "PASS")
     text, doc = _read_status(tmp_path, "gen_0")
     assert text.startswith("RUNNING")  # not final yet: a SIGKILL must not read as PASS
     assert doc["overall"] == "RUNNING"
+    assert doc["model_dir_resolved"] is True
+    assert doc["synthetic_kv_shape"] is False
     rec.finalize(extra={"transceiver_runtime": "CPP"})
     text, doc = _read_status(tmp_path, "gen_0")
     assert text.startswith("PASS gen_0")
     assert doc["overall"] == "PASS"
     assert doc["transceiver_runtime"] == "CPP"
+    assert doc["model_dir_resolved"] is True
+    assert doc["synthetic_kv_shape"] is False
+
+
+@pytest.mark.parametrize(
+    "checkpoint,case_status,model_dir_resolved,synthetic_kv_shape",
+    [
+        ("unresolved", "INIT_ERROR", False, True),
+        ("gqa", "PASS", True, False),
+        ("sparse", "TIMEOUT", True, True),
+        ("malformed", "TRANSFER_ERROR", True, True),
+    ],
+)
+def test_runner_persists_checkpoint_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint: str,
+    case_status: str,
+    model_dir_resolved: bool,
+    synthetic_kv_shape: bool,
+) -> None:
+    """Carry actual checkpoint resolution through successful and failed status writes."""
+    models_root = tmp_path / "models"
+    model_dir = models_root / "model"
+    if checkpoint != "unresolved":
+        model_dir.mkdir(parents=True)
+        hf_config = {
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+        }
+        if checkpoint == "sparse":
+            hf_config["index_head_dim"] = 128
+        config_text = "{" if checkpoint == "malformed" else json.dumps(hf_config)
+        (model_dir / "config.json").write_text(config_text)
+    monkeypatch.setenv("LLM_MODELS_ROOT", str(models_root))
+    config_path = tmp_path / "precheck.yaml"
+    config_path.write_text(
+        json.dumps(
+            {
+                "metadata": {"model_dir_name": "model"},
+                "hardware": {"gpus_per_node": 1, "num_ctx_servers": 1, "num_gen_servers": 1},
+                "worker_config": {
+                    role: {
+                        "tensor_parallel_size": 1,
+                        "cache_transceiver_config": {"backend": "NIXL"},
+                    }
+                    for role in ("ctx", "gen")
+                },
+            }
+        )
+    )
+    args = rp.parse_args(
+        [
+            "--role",
+            "gen",
+            "--server-idx",
+            "0",
+            "--config",
+            str(config_path),
+            "--work-dir",
+            str(tmp_path),
+        ]
+    )
+    plan, side = rp.load_plan(args)
+    monkeypatch.setitem(sys.modules, "mpi4py", types.SimpleNamespace(MPI=None))
+    runner = rp.PrecheckRunner(args, plan, side, types.SimpleNamespace(Get_rank=lambda: 0))
+    runner.recorder.record("ctx_0", 64, case_status, "example outcome")
+    _, doc = _read_status(tmp_path, "gen_0")
+    assert doc["overall"] == ("RUNNING" if case_status == "PASS" else "FAIL")
+    assert doc["model_dir_resolved"] is model_dir_resolved
+    assert doc["synthetic_kv_shape"] is synthetic_kv_shape
+    runner.recorder.finalize(
+        extra={"transceiver_runtime": "PYTHON", "kv_cache_manager": "V2", "per_gpu_bw_gbps": 2.5}
+    )
+    _, doc = _read_status(tmp_path, "gen_0")
+    assert doc["overall"] == ("PASS" if case_status == "PASS" else "FAIL")
+    assert doc["cases"][0]["status"] == case_status
+    assert doc["model_dir_resolved"] is model_dir_resolved
+    assert doc["synthetic_kv_shape"] is synthetic_kv_shape
+    assert doc["transceiver_runtime"] == "PYTHON"
+    assert doc["kv_cache_manager"] == "V2"
+    assert doc["per_gpu_bw_gbps"] == 2.5
 
 
 def test_recorder_failure_summary_first_line_only(tmp_path):
@@ -266,6 +395,43 @@ def test_recorder_non_leader_writes_nothing(tmp_path):
     rec.record("ctx_0", 0, "TRANSFER_ERROR", "x")
     rec.finalize()
     assert not os.path.exists(os.path.join(str(tmp_path), "status"))
+
+
+def test_recorder_reports_a_write_failure_then_recovers(tmp_path, capfd):
+    """Only the leader writes, so a raise would strand the other ranks in a collective."""
+    work = tmp_path / "work"
+    work.write_text("")  # a file where the work dir belongs: every status write fails
+    rec = rp.StatusRecorder(str(work), "gen", 0, is_leader=True)
+    rec.record("ctx_0", 1024, "MISMATCH", "pair=13 layer=0")  # must not raise
+    err = capfd.readouterr().err
+    assert f"STATUS_WRITE_ERROR: NotADirectoryError: [Errno 20] Not a directory: '{work}" in err
+    # The root cause reaches the log even though no file holds it.
+    assert "verdict: FAIL gen_0: 1 case(s) failed; first: peer=ctx_0 req_len=1024 MISMATCH" in err
+
+    work.unlink()  # the filesystem recovers
+    rec.record("ctx_1", 1024, "PASS")
+    rec.finalize()
+    text, doc = _read_status(work, "gen_0")
+    assert text.startswith("FAIL gen_0: 1 case(s) failed; first: peer=ctx_0")
+    assert [case["peer"] for case in doc["cases"]] == ["ctx_0", "ctx_1"]
+
+
+def test_recorder_writes_the_status_line_before_the_json(tmp_path, monkeypatch):
+    """The gate reads only the .status line, so a failed .json write must not hold it back."""
+    real_write = rp.atomic_write_shared_file
+
+    def write_all_but_json(path, *args, **kwargs):
+        if path.endswith(".json"):
+            raise OSError(5, "Input/output error", path)
+        real_write(path, *args, **kwargs)
+
+    monkeypatch.setattr(rp, "atomic_write_shared_file", write_all_but_json)
+    rec = rp.StatusRecorder(str(tmp_path), "gen", 0, is_leader=True)
+    rec.record("ctx_0", 1024, "MISMATCH", "pair=13 layer=0")
+    status = (tmp_path / "status" / "gen_0.status").read_text()
+    assert status.startswith(
+        "FAIL gen_0: 1 case(s) failed; first: peer=ctx_0 req_len=1024 MISMATCH"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -351,6 +517,8 @@ def _plan(**overrides):
         "rendezvous_timeout_s": 600,
         "wireup_timeout_s": 300,
         "wave_timeout_s": 180,
+        "setup_timeout_s": 600,
+        "peer_progress_timeout_s": 900,
     }
     plan.update(overrides)
     return plan
@@ -368,12 +536,340 @@ def test_schedule_covers_all_cells_in_lockstep_order():
 
 def test_timeout_budgets():
     plan = _plan()
-    # Handshakes serialize across peers: rendezvous + per-peer slack.
-    assert rp.hello_timeout_s(plan, 2) == 600 + 2 * (300 + 300)
+    # Peer count is deliberately absent: active peer progress refreshes this
+    # bounded no-progress interval for every serialized waiter.
+    assert rp.hello_timeout_s(plan) == 900
     # Only the schedule's FIRST rep pays the NIXL wire-up allowance.
     assert rp.wave_timeout_s(plan, 0, 0) == 180 + 300
     assert rp.wave_timeout_s(plan, 0, 1) == 180
     assert rp.wave_timeout_s(plan, 1, 0) == 180
+
+
+@pytest.mark.parametrize("role", ["ctx", "gen"])
+def test_peer_progress_marker_is_atomic_and_run_stamped(tmp_path, monkeypatch, role):
+    monkeypatch.setenv("SLURM_JOB_ID", "111")
+    runner = types.SimpleNamespace(
+        role=role,
+        is_leader=True,
+        work_dir=str(tmp_path),
+        server_idx=2,
+    )
+    rp.publish_peer_progress(runner, "peer_0 first wave")
+    first = rp.read_peer_progress(str(tmp_path), role, 2)
+    assert isinstance(first, int)
+
+    rp.publish_peer_progress(runner, "peer_0 second wave")
+    assert rp.read_peer_progress(str(tmp_path), role, 2) != first
+
+    monkeypatch.setenv("SLURM_JOB_ID", "222")
+    assert rp.read_peer_progress(str(tmp_path), role, 2) is None
+
+
+def test_ctx_control_wait_refreshes_only_on_target_gen_progress(monkeypatch):
+    class Again(Exception):
+        pass
+
+    class FakeSocket:
+        def __init__(self):
+            self.calls = 0
+
+        def recv(self):
+            self.calls += 1
+            if self.calls <= 2:
+                raise Again
+            return rp.pack_msg(("done", {}), KEY)
+
+    runner = types.SimpleNamespace(
+        is_leader=True,
+        work_dir="/unused",
+        comm=types.SimpleNamespace(bcast=lambda value, root=0: value),
+        _zmq=lambda: (types.SimpleNamespace(Again=Again), None),
+    )
+    progress = iter((10, 11, 11))
+    monotonic = iter((0.0, 1.0, 2.0, 3.0))
+    progress_reads = []
+
+    def read_progress(work_dir, role, server_idx):
+        progress_reads.append((role, server_idx))
+        return next(progress)
+
+    monkeypatch.setattr(rp, "read_peer_progress", read_progress)
+    monkeypatch.setattr(rp.time, "monotonic", lambda: next(monotonic))
+    arms = []
+
+    def arm(what, seconds, python_alarm, publish_progress=True):
+        arms.append((what, seconds, python_alarm, publish_progress))
+
+    msg = rp._recv_ctx_control(
+        runner,
+        FakeSocket(),
+        KEY,
+        peer_idx=3,
+        what="bye gen_3",
+        timeout_s=5,
+        arm=arm,
+        refresh_from_gen_progress=True,
+    )
+    assert msg[0] == "done"
+    assert arms == [
+        ("bye gen_3", 5, False, True),
+        ("bye gen_3", 5, False, False),
+    ]
+    assert progress_reads == [("gen", 3), ("gen", 3), ("gen", 3)]
+
+
+def test_ctx_control_wait_times_out_without_progress(monkeypatch):
+    class Again(Exception):
+        pass
+
+    class FakeSocket:
+        def recv(self):
+            raise Again
+
+    runner = types.SimpleNamespace(
+        is_leader=True,
+        work_dir="/unused",
+        comm=types.SimpleNamespace(bcast=lambda value, root=0: value),
+        _zmq=lambda: (types.SimpleNamespace(Again=Again), None),
+    )
+    monotonic = iter((0.0, 6.0))
+    monkeypatch.setattr(rp, "read_peer_progress", lambda work_dir, role, server_idx: None)
+    monkeypatch.setattr(rp.time, "monotonic", lambda: next(monotonic))
+    with pytest.raises(rp._Timeout, match="made no progress for 5s"):
+        rp._recv_ctx_control(
+            runner,
+            FakeSocket(),
+            KEY,
+            peer_idx=3,
+            what="hello gen_3",
+            timeout_s=5,
+            arm=lambda *args, **kwargs: None,
+            refresh_from_gen_progress=True,
+        )
+
+
+def test_watchdog_tracks_each_phase_budget(monkeypatch):
+    class FakeHangDetector:
+        instance = None
+
+        def __init__(self, timeout, on_detected):
+            self.timeout = timeout
+            self.on_detected = on_detected
+            self.checkpoints = []
+            FakeHangDetector.instance = self
+
+        def start(self):
+            pass
+
+        def checkpoint(self):
+            self.checkpoints.append(self.timeout)
+
+        def cancel_task(self):
+            pass
+
+        def stop(self):
+            pass
+
+    api = types.SimpleNamespace(HangDetector=FakeHangDetector)
+    monkeypatch.setattr(rp, "load_internal_apis", lambda: api)
+    runner = types.SimpleNamespace(
+        role="gen",
+        is_leader=False,
+        server_idx=0,
+        side={"num_peers": 1},
+        recorder=types.SimpleNamespace(record=lambda *args: None, finalize=lambda: None),
+    )
+    previous_alarm_handler = rp.signal.getsignal(rp.signal.SIGALRM)
+    arm, disarm, stop, _ = rp._install_watchdog(runner, _plan(), rank=0)
+    try:
+        arm("setup", seconds=600)
+        arm("first wave", seconds=480)
+        arm("steady wave")
+        assert FakeHangDetector.instance.checkpoints == [660, 540, 240]
+    finally:
+        disarm()
+        stop()
+        rp.signal.signal(rp.signal.SIGALRM, previous_alarm_handler)
+
+
+# --------------------------------------------------------------------------- #
+# Transfer ownership
+# --------------------------------------------------------------------------- #
+def _ctx_finish_runner(monkeypatch, check_status):
+    events = []
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt_llm",
+        types.SimpleNamespace(logger=types.SimpleNamespace(info=lambda *_args, **_kwargs: None)),
+    )
+    runner = object.__new__(rp.PrecheckRunner)
+    runner.xcvr = types.SimpleNamespace(check_context_transfer_status=check_status)
+    runner.llm_request_state = types.SimpleNamespace(DISAGG_TRANS_ERROR="error")
+    runner.server_idx = 0
+    runner.rank = 0
+    runner._consensus_error = lambda err: None if err is None else repr(err)
+    runner._free_all = lambda reqs: events.append(("free", sorted(reqs)))
+    return runner, events
+
+
+def test_ctx_finish_wave_frees_only_after_every_request_completes(monkeypatch):
+    runner, events = _ctx_finish_runner(monkeypatch, lambda _n: ([101, 102], []))
+    reqs = {
+        0: types.SimpleNamespace(py_request_id=101, state="in_progress"),
+        1: types.SimpleNamespace(py_request_id=102, state="in_progress"),
+    }
+
+    runner.ctx_finish_wave(reqs)
+
+    assert events == [("free", [0, 1])]
+
+
+def test_ctx_finish_wave_retains_pages_after_transfer_failure(monkeypatch):
+    runner, events = _ctx_finish_runner(monkeypatch, lambda _n: ([101], [102]))
+    reqs = {
+        0: types.SimpleNamespace(py_request_id=101, state="in_progress"),
+        1: types.SimpleNamespace(py_request_id=102, state="in_progress"),
+    }
+
+    with pytest.raises(rp._FatalTransferError, match=r"ctx transfer failed for pairs \[1\]"):
+        runner.ctx_finish_wave(reqs)
+
+    assert events == []
+
+
+def test_ctx_finish_wave_block_all_requires_terminal_status(monkeypatch):
+    # A request still nonterminal after block-all returns exceeded the
+    # kv_transfer_timeout deadline (Python) or violated the true block-all
+    # contract (C++); both classify as a page-retaining gate failure.
+    runner, events = _ctx_finish_runner(monkeypatch, lambda _n: ([101], []))
+    reqs = {
+        0: types.SimpleNamespace(py_request_id=101, state="in_progress"),
+        1: types.SimpleNamespace(py_request_id=102, state="in_progress"),
+    }
+
+    with pytest.raises(rp._FatalTransferError, match="block-all returned before terminal"):
+        runner.ctx_finish_wave(reqs)
+
+    assert events == []
+
+
+def _gen_run_wave_runner(monkeypatch, outcome):
+    requests = {}
+    events = []
+    states = types.SimpleNamespace(
+        DISAGG_GENERATION_TRANS_COMPLETE="complete",
+        DISAGG_TRANS_ERROR="error",
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(
+            cuda=types.SimpleNamespace(synchronize=lambda: events.append("cuda_sync"))
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt_llm",
+        types.SimpleNamespace(logger=types.SimpleNamespace(info=lambda *_args, **_kwargs: None)),
+    )
+
+    def make_request(_is_ctx, rid, _req_len, _runtime, ctx_params=None):
+        req = types.SimpleNamespace(py_request_id=rid, state="in_progress")
+        requests[rid] = req
+        return req
+
+    monkeypatch.setattr(rp, "make_request", make_request)
+    monkeypatch.setattr(rp, "add_sequence", lambda *_args: None)
+
+    def check_status(_at_least_request_num):
+        completed, failed, cancelled = outcome(requests)
+        for rid in completed:
+            requests[rid].state = states.DISAGG_GENERATION_TRANS_COMPLETE
+        for rid in failed:
+            requests[rid].state = states.DISAGG_TRANS_ERROR
+        return completed, failed, [requests[rid] for rid in cancelled]
+
+    runner = object.__new__(rp.PrecheckRunner)
+    runner.runtime = "PYTHON"
+    runner.kvm = object()
+    runner.use_v2 = True
+    runner.server_idx = 0
+    runner.rank = 0
+    runner.llm_request_state = states
+    runner.plan = {"verify_data": False, "warmup_requests": 0}
+    runner.xcvr = types.SimpleNamespace(
+        request_and_receive_async=lambda _req: None,
+        check_gen_transfer_status=check_status,
+    )
+    runner.comm = types.SimpleNamespace(allgather=lambda value: [value])
+    runner._owned = lambda _wave: [0, 1]
+    runner._pair_rid = lambda _peer, _li, _rep, pair: 101 + pair
+    runner._consensus_error = lambda err: None if err is None else repr(err)
+    runner._free_all = lambda reqs: events.append(("free", sorted(reqs)))
+    return runner, events
+
+
+def test_gen_run_wave_frees_only_after_every_receive_completes(monkeypatch):
+    runner, events = _gen_run_wave_runner(monkeypatch, lambda _reqs: ([101, 102], [], []))
+
+    ok, detail = runner.gen_run_wave(0, 0, 64, 0, [0, 1], {0: object(), 1: object()})
+
+    assert ok and not detail
+    assert events == ["cuda_sync", ("free", [0, 1])]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "message"),
+    (
+        (lambda _reqs: ([101], [102], []), r"failed=\[102\]"),
+        (lambda _reqs: ([101], [], [102]), r"cancelled=\[102\]"),
+        # Nonterminal after the block-all deadline: a gate failure, not a
+        # keep-polling condition.
+        (lambda _reqs: ([101], [], []), r"missing=\[102\]"),
+    ),
+)
+def test_gen_run_wave_retains_pages_without_all_successes(monkeypatch, outcome, message):
+    runner, events = _gen_run_wave_runner(monkeypatch, outcome)
+
+    with pytest.raises(rp._FatalTransferError, match=message):
+        runner.gen_run_wave(0, 0, 64, 0, [0, 1], {0: object(), 1: object()})
+
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    ("failing_resolver", "message"),
+    (
+        ("runtime", "refusing to validate a runtime"),
+        ("manager", "refusing to assume V1"),
+    ),
+)
+def test_model_preference_resolution_fails_closed(monkeypatch, failing_resolver, message):
+    def resolve_runtime(_shim, _model_cls, _hf_view):
+        if failing_resolver == "runtime":
+            raise RuntimeError("runtime resolution failed")
+
+    def resolve_manager(_args, _model_cls, _hf_view):
+        if failing_resolver == "manager":
+            raise RuntimeError("manager resolution failed")
+        return True
+
+    api = types.SimpleNamespace(
+        resolve_transceiver_runtime_auto=resolve_runtime,
+        resolve_kv_cache_manager_v2_auto=resolve_manager,
+        TorchLlmArgs=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        MTPDecodingConfig=lambda **kwargs: types.SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(rp, "load_internal_apis", lambda: api)
+    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (object(), object()))
+    cache_cfg = types.SimpleNamespace(transceiver_runtime="auto")
+    side = {
+        "use_kv_cache_manager_v2": "auto",
+        "parallel": {"tp": 1, "pp": 1, "cp": 1},
+    }
+
+    with pytest.raises(RuntimeError, match=message):
+        rp.resolve_model_prefs("/model", side, cache_cfg)
 
 
 # --------------------------------------------------------------------------- #
@@ -416,54 +912,6 @@ def test_resolve_model_prefs_allows_registered_class_without_preference_hook(mon
 # --------------------------------------------------------------------------- #
 # Transfer ownership
 # --------------------------------------------------------------------------- #
-def _ctx_finish_runner(monkeypatch, check_status):
-    events = []
-    monkeypatch.setitem(
-        sys.modules,
-        "tensorrt_llm",
-        types.SimpleNamespace(logger=types.SimpleNamespace(info=lambda *_args, **_kwargs: None)),
-    )
-    runner = object.__new__(rp.PrecheckRunner)
-    runner.xcvr = types.SimpleNamespace(check_context_transfer_status=check_status)
-    runner.llm_request_state = types.SimpleNamespace(DISAGG_TRANS_ERROR="error")
-    runner.server_idx = 0
-    runner.rank = 0
-    runner._consensus_error = lambda err: None if err is None else repr(err)
-    runner._free_all = lambda reqs: events.append(("free", sorted(reqs)))
-    return runner, events
-
-
-def test_ctx_finish_wave_frees_only_after_block_all_returns_every_request(monkeypatch):
-    events = []
-
-    def check_status(at_least_request_num):
-        events.append(("block_all", at_least_request_num))
-        return [101, 102], []
-
-    runner, free_events = _ctx_finish_runner(monkeypatch, check_status)
-    reqs = {
-        0: types.SimpleNamespace(py_request_id=101, state="in_progress"),
-        1: types.SimpleNamespace(py_request_id=102, state="in_progress"),
-    }
-    runner._free_all = lambda owned: events.append(("free", sorted(owned)))
-
-    runner.ctx_finish_wave(reqs)
-
-    assert events == [("block_all", None), ("free", [0, 1])]
-    assert free_events == []
-
-
-def test_ctx_finish_wave_retains_pages_when_block_all_omits_request(monkeypatch):
-    runner, events = _ctx_finish_runner(monkeypatch, lambda _n: ([101], []))
-    reqs = {
-        0: types.SimpleNamespace(py_request_id=101, state="in_progress"),
-        1: types.SimpleNamespace(py_request_id=102, state="in_progress"),
-    }
-
-    with pytest.raises(rp._FatalTransferError, match="block-all returned before terminal"):
-        runner.ctx_finish_wave(reqs)
-
-    assert events == []
 
 
 def test_ctx_finish_wave_retains_pages_when_block_all_raises(monkeypatch):
@@ -474,19 +922,6 @@ def test_ctx_finish_wave_retains_pages_when_block_all_raises(monkeypatch):
     reqs = {0: types.SimpleNamespace(py_request_id=101, state="in_progress")}
 
     with pytest.raises(rp._FatalTransferError, match="interrupted"):
-        runner.ctx_finish_wave(reqs)
-
-    assert events == []
-
-
-def test_ctx_finish_wave_retains_pages_when_request_failed(monkeypatch):
-    runner, events = _ctx_finish_runner(monkeypatch, lambda _n: ([101], [102]))
-    reqs = {
-        0: types.SimpleNamespace(py_request_id=101, state="in_progress"),
-        1: types.SimpleNamespace(py_request_id=102, state="error"),
-    }
-
-    with pytest.raises(rp._FatalTransferError, match=r"ctx transfer failed for pairs \[1\]"):
         runner.ctx_finish_wave(reqs)
 
     assert events == []
@@ -623,73 +1058,6 @@ def test_ctx_run_wave_post_dispatch_collective_error_is_fatal(monkeypatch):
         runner.ctx_run_wave(0, 0, 64, 0, [0])
 
 
-def _gen_run_wave_runner(monkeypatch, outcome):
-    requests = {}
-    events = []
-    states = types.SimpleNamespace(
-        DISAGG_GENERATION_TRANS_COMPLETE="complete",
-        DISAGG_TRANS_ERROR="error",
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "torch",
-        types.SimpleNamespace(
-            cuda=types.SimpleNamespace(synchronize=lambda: events.append("cuda_sync"))
-        ),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "tensorrt_llm",
-        types.SimpleNamespace(logger=types.SimpleNamespace(info=lambda *_args, **_kwargs: None)),
-    )
-
-    def make_request(_is_ctx, rid, _req_len, _runtime, ctx_params=None):
-        req = types.SimpleNamespace(py_request_id=rid, state="in_progress")
-        requests[rid] = req
-        return req
-
-    monkeypatch.setattr(rp, "make_request", make_request)
-    monkeypatch.setattr(rp, "add_sequence", lambda *_args: None)
-
-    def check_status(_at_least_request_num):
-        completed, failed, cancelled = outcome(requests)
-        for rid in completed:
-            requests[rid].state = states.DISAGG_GENERATION_TRANS_COMPLETE
-        for rid in failed:
-            requests[rid].state = states.DISAGG_TRANS_ERROR
-        return completed, failed, [requests[rid] for rid in cancelled]
-
-    runner = object.__new__(rp.PrecheckRunner)
-    runner.runtime = "PYTHON"
-    runner.kvm = object()
-    runner.use_v2 = True
-    runner.server_idx = 0
-    runner.rank = 0
-    runner.side = {"parallel": {"enable_attention_dp": False}}
-    runner.mapping = types.SimpleNamespace(pp_rank=0)
-    runner.llm_request_state = states
-    runner.plan = {"verify_data": False, "warmup_requests": 0}
-    runner.xcvr = types.SimpleNamespace(
-        request_and_receive_async=lambda _req: None,
-        check_gen_transfer_status=check_status,
-    )
-    runner.comm = types.SimpleNamespace(allgather=lambda value: [value])
-    runner._owned = lambda _wave: [0, 1]
-    runner._pair_rid = lambda _peer, _li, _rep, pair: 101 + pair
-    runner._consensus_error = lambda err: None if err is None else repr(err)
-    runner._free_all = lambda owned: events.append(("free", sorted(owned)))
-    return runner, events
-
-
-def test_gen_run_wave_frees_only_after_every_python_receive_completes(monkeypatch):
-    runner, events = _gen_run_wave_runner(monkeypatch, lambda _reqs: ([101, 102], [], []))
-
-    ok, detail = runner.gen_run_wave(0, 0, 64, 0, [0, 1], {0: object(), 1: object()})
-
-    assert ok and not detail
-    assert events == ["cuda_sync", ("free", [0, 1])]
-
-
 def test_gen_run_wave_checks_python_status_on_empty_owner_rank(monkeypatch):
     calls = []
 
@@ -723,23 +1091,6 @@ def test_gen_run_wave_setup_error_retains_allocated_pages(monkeypatch):
         runner.gen_run_wave(0, 0, 64, 0, [0, 1], {0: object(), 1: object()})
 
     assert calls == 2
-    assert events == []
-
-
-@pytest.mark.parametrize(
-    ("outcome", "message"),
-    (
-        (lambda _reqs: ([101], [102], []), r"failed=\[102\]"),
-        (lambda _reqs: ([101], [], [102]), r"cancelled=\[102\]"),
-        (lambda _reqs: ([101], [], []), r"missing=\[102\]"),
-    ),
-)
-def test_gen_run_wave_retains_pages_without_all_successes(monkeypatch, outcome, message):
-    runner, events = _gen_run_wave_runner(monkeypatch, outcome)
-
-    with pytest.raises(rp._FatalTransferError, match=message):
-        runner.gen_run_wave(0, 0, 64, 0, [0, 1], {0: object(), 1: object()})
-
     assert events == []
 
 
@@ -949,6 +1300,131 @@ def test_gen_peer_loop_reraises_fatal_transfer(monkeypatch):
     assert recorded == []
 
 
+class _AbortSentinel(Exception):
+    """Raised by a patched hard-abort function in place of ending the test process."""
+
+
+@pytest.mark.parametrize("scenario", ["leader", "non_leader", "leader_cannot_record"])
+def test_hard_abort_unhandled_records_the_error_then_aborts(tmp_path, monkeypatch, capfd, scenario):
+    monkeypatch.setenv("SLURM_JOB_ID", "7")
+    work = str(tmp_path)
+    alarms, slept, aborted = [], [], []
+
+    def abort_process(comm):
+        aborted.append(comm)
+        raise _AbortSentinel
+
+    monkeypatch.setattr(rp.signal, "alarm", alarms.append)
+    monkeypatch.setattr(rp, "time", types.SimpleNamespace(sleep=slept.append))
+    monkeypatch.setattr(rp, "_hard_abort_process", abort_process)
+    is_leader = scenario != "non_leader"
+    runner = types.SimpleNamespace(
+        role="ctx",
+        server_idx=2,
+        rank=0 if is_leader else 3,
+        is_leader=is_leader,
+        work_dir=work,
+        comm=object(),
+        recorder=rp.StatusRecorder(work, "ctx", 2, is_leader=is_leader),
+    )
+    if scenario == "leader_cannot_record":
+        # The abort must still happen when the verdict cannot be recorded.
+        def failing_record(*_args):
+            raise RuntimeError("cannot record")
+
+        runner.recorder.record = failing_record
+
+    def publish_addr():
+        raise FileExistsError(17, "File exists", "/work/rendezvous/.ctx2_gen0.addr.k3x9q1")
+
+    with pytest.raises(FileExistsError) as raised:
+        publish_addr()
+    with pytest.raises(_AbortSentinel):
+        rp._hard_abort_unhandled(runner, raised.value)
+
+    assert aborted == [runner.comm]
+    assert alarms == [0]  # a pending watchdog alarm must not interrupt the verdict write
+    detail = "FileExistsError: [Errno 17] File exists: '/work/rendezvous/.ctx2_gen0.addr.k3x9q1'"
+    err = capfd.readouterr().err
+    assert f"] UNHANDLED_ERROR: {detail}" in err  # the gate greps this line
+    assert "in publish_addr" in err  # the traceback names the raising frame
+    if is_leader:  # peers fail fast, even when the verdict could not be recorded
+        assert rp.abort_flag_reason(work) == f"ctx_2 UNHANDLED_ERROR: {detail}"
+    if scenario == "leader":
+        text, doc = _read_status(tmp_path, "ctx_2")
+        assert text.startswith(
+            f"FAIL ctx_2: 1 case(s) failed; first: peer=- req_len=0 UNHANDLED_ERROR: {detail}"
+        )
+        assert doc["overall"] == "FAIL"
+    if scenario == "non_leader":
+        # No verdict (only the leader writes one), but peers still fail fast.
+        assert os.listdir(work) == ["precheck.abort"]
+        assert rp.abort_flag_reason(work) == f"ctx_2 r3 UNHANDLED_ERROR: {detail}"
+    # Only a non-leader waits, in case the leader failed too and is still writing its verdict.
+    assert slept == ([rp.ABORT_COORDINATION_TIMEOUT_S] if scenario == "non_leader" else [])
+
+
+@pytest.mark.parametrize("role", ["ctx", "gen"])
+@pytest.mark.parametrize(
+    ("error", "expected_handler"),
+    [
+        (FileExistsError(17, "File exists"), "_hard_abort_unhandled"),
+        (RuntimeError("leader-only zmq bind failed"), "_hard_abort_unhandled"),
+        (rp._FatalTransferError("not quiesced"), "_hard_abort_unquiesced"),
+        (rp._Timeout("deadline"), "_hard_abort_unquiesced"),
+    ],
+    ids=["unhandled_oserror", "unhandled_other", "ownership_fatal", "ownership_timeout"],
+)
+def test_main_routes_a_peer_loop_error_to_a_hard_abort(monkeypatch, role, error, expected_handler):
+    """The error may be this rank's alone; returning from main() would hang in MPI_Finalize."""
+
+    def do_nothing(*_args, **_kwargs):
+        pass
+
+    def peer_loop(*_args):
+        raise error
+
+    # Stub out MPI, CUDA, the plan, the runner and the watchdog so main() runs on the CPU.
+    ns = types.SimpleNamespace
+    comm = ns(Get_rank=lambda: 0, Get_size=lambda: 1)
+    monkeypatch.setitem(sys.modules, "mpi4py", ns(MPI=ns(COMM_WORLD=comm)))
+    monkeypatch.setitem(
+        sys.modules, "torch", ns(cuda=ns(set_device=do_nothing, device_count=lambda: 1))
+    )
+    monkeypatch.setitem(sys.modules, "tensorrt_llm", ns(logger=ns(set_level=do_nothing)))
+    monkeypatch.setenv("UCX_PROTO_INFO", "used")  # main() setdefault()s it; monkeypatch undoes it
+    plan = dict(_kv_shape=None, _model_dir=None, n_pairs=1, request_lengths=[1], setup_timeout_s=1)
+    monkeypatch.setattr(rp, "load_plan", lambda _args: (plan, {"parallel": {"world_size": 1}}))
+    runner = ns(
+        role=role,
+        server_idx=0,
+        is_leader=True,
+        use_v2=True,
+        runtime="CPP",
+        setup=do_nothing,
+        _consensus_error=do_nothing,
+    )
+    monkeypatch.setattr(rp, "PrecheckRunner", lambda *_args: runner)
+    # _install_watchdog returns (arm, disarm, stop, current_cell).
+    monkeypatch.setattr(
+        rp, "_install_watchdog", lambda *_args: (do_nothing,) * 3 + ({"what": "-"},)
+    )
+    monkeypatch.setattr(rp, "_serve_gen_peers" if role == "ctx" else "_drive_ctx_peers", peer_loop)
+    calls = []
+    for handler_name in ("_hard_abort_unhandled", "_hard_abort_unquiesced"):
+
+        def fake_hard_abort(runner_arg, *args, handler_name=handler_name):
+            calls.append((handler_name, runner_arg, args[-1]))  # the exception comes last
+            raise _AbortSentinel
+
+        monkeypatch.setattr(rp, handler_name, fake_hard_abort)
+
+    with pytest.raises(_AbortSentinel):
+        rp.main(["--role", role, "--server-idx", "0", "--config", "x", "--work-dir", "x"])
+
+    assert calls == [(expected_handler, runner, error)]
+
+
 # --------------------------------------------------------------------------- #
 # Internal-API contract (imports tensorrt_llm; no GPU work)
 # --------------------------------------------------------------------------- #
@@ -1042,6 +1518,64 @@ class TestInternalApiContract:
             cache_cfg,
         )
 
+    def test_deepseek_v4_auto_selects_kv_cache_manager_v2(self, api, tmp_path):
+        model_dir = tmp_path / "deepseek-v4"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"architectures": ["DeepseekV4ForCausalLM"]})
+        )
+        side = {
+            "architecture": "LlamaForCausalLM",
+            "use_kv_cache_manager_v2": "auto",
+            "parallel": {"tp": 1, "pp": 1, "cp": 1},
+        }
+        cache_cfg = api.CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
+
+        assert rp.resolve_model_prefs(str(model_dir), side, cache_cfg) is True
+
+    @pytest.mark.parametrize("role", ["ctx", "gen"])
+    @pytest.mark.parametrize(
+        "config_path",
+        [pytest.param(path, id=f"{suite}/{path.stem}") for suite, path in _DEEPSEEK_V4_CONFIGS],
+    )
+    def test_deepseek_v4_declared_architecture_without_checkpoint(
+        self, api: object, tmp_path: Path, role: str, config_path: Path
+    ) -> None:
+        """All DeepSeek V4 disagg configurations resolve V2/PYTHON without weights."""
+        import yaml
+
+        cfg = yaml.safe_load(config_path.read_text())
+        assert rp.pcfg.resolve_model_dir(cfg, llm_models_root=str(tmp_path)) is None
+        side = rp.pcfg.side_plan(rp.pcfg.resolve_plan(cfg), role)
+        assert side["architecture"] == "DeepseekV4ForCausalLM"
+        cache_cfg = api.CacheTransceiverConfig(**side["cache_transceiver_config"])
+        assert rp.resolve_model_prefs(None, side, cache_cfg) is True
+        assert cache_cfg.transceiver_runtime == "PYTHON"
+
+    def test_resolved_contract_includes_pipelined_runtime_promotion(self, api: object) -> None:
+        """Record the final Python runtime when pipelining promotes an unset runtime."""
+        cfg = {
+            "hardware": {"gpus_per_node": 1, "num_ctx_servers": 1, "num_gen_servers": 1},
+            "worker_config": {
+                role: {
+                    "cache_transceiver_config": {
+                        "backend": "NIXL",
+                        "transceiver_runtime": None,
+                        "enable_pipelined_transfer": True,
+                    },
+                    "kv_cache_config": {"use_kv_cache_manager_v2": True},
+                }
+                for role in ("ctx", "gen")
+            },
+        }
+        runner = rp.PrecheckRunner.__new__(rp.PrecheckRunner)
+        runner.plan = rp.pcfg.resolve_plan(cfg)
+        runner.role, runner.is_leader = "ctx", False
+        resolved = runner._resolve_transfer_config(dict(rp.pcfg.FALLBACK_KV_SHAPE))
+        assert resolved.transceiver_runtime == "PYTHON"
+        assert runner.transfer_contract["ctx"]["runtime"] == "PYTHON"
+        assert runner.transfer_contract["gen"]["runtime"] == "PYTHON"
+
     def test_enum_members(self, api):
         for enum, members in (
             (api.DataType, ("FP8", "HALF", "BF16")),
@@ -1112,3 +1646,221 @@ class TestInternalApiContract:
         assert gen_req.py_request_id == 13
         py_gen = rp.make_request(False, rid=14, req_len=8, runtime="PYTHON", ctx_params=ctx_params)
         assert py_gen.py_disaggregated_params.request_type == "generation_only"
+
+
+@pytest.mark.parametrize(
+    "model_dir,declared,registered,expected",
+    [
+        (None, "Declared", True, True),
+        ("/checkpoint", "Declared", True, False),
+        (None, None, False, None),
+        (None, "Unknown", False, None),
+        ("/checkpoint", "Declared", False, None),
+    ],
+)
+def test_architecture_fallback_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    model_dir: str | None,
+    declared: str | None,
+    registered: bool,
+    expected: bool | None,
+) -> None:
+    """Checkpoint identity wins; unknown or missing identity still fails closed."""
+    checkpoint_cls = object() if model_dir and registered else None
+    declared_cls = object() if registered or model_dir else None
+    view = object() if model_dir else None
+    registry_calls = []
+    resolver_calls = []
+
+    def get_registered_model_class(name: str) -> object | None:
+        """Record the full scalar used to select the exact declared class."""
+        registry_calls.append(name)
+        assert name == declared
+        return declared_cls
+
+    def resolve_v2(args: object, cls: object, config: object) -> bool:
+        """Capture the identity and checkpoint view passed to serving's resolver."""
+        resolver_calls.append((cls, config))
+        return cls is declared_cls
+
+    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _: (checkpoint_cls, view))
+    api = types.SimpleNamespace(
+        get_registered_model_class=get_registered_model_class,
+        TorchLlmArgs=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        resolve_kv_cache_manager_v2_auto=resolve_v2,
+    )
+    monkeypatch.setattr(rp, "load_internal_apis", lambda: api)
+    side = {
+        "architecture": declared,
+        "use_kv_cache_manager_v2": "auto",
+        "parallel": {"tp": 1, "pp": 1, "cp": 1},
+    }
+    cache_cfg = types.SimpleNamespace(transceiver_runtime="PYTHON")
+    if expected is None:
+        with pytest.raises(RuntimeError, match="refusing to assume V1"):
+            rp.resolve_model_prefs(model_dir, side, cache_cfg)
+        assert not resolver_calls
+    else:
+        assert rp.resolve_model_prefs(model_dir, side, cache_cfg) is expected
+        assert resolver_calls == [(checkpoint_cls if model_dir else declared_cls, view)]
+    assert registry_calls == ([declared] if model_dir is None and declared else [])
+
+
+@pytest.mark.parametrize("failure", ["resolution", "rank_contract", "api_import"])
+def test_setup_rejects_rank_divergence_before_construction(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """All ranks synchronize local errors before entering GPU constructors."""
+    runner = rp.PrecheckRunner.__new__(rp.PrecheckRunner)
+    runner.transfer_contract = {"ctx": {"use_v2": True}}
+    calls = []
+
+    def allgather(value: object) -> list:
+        """Emulate one remote rank disagreeing at the correct collective."""
+        calls.append(value)
+        if len(calls) == 1:
+            return [value, "missing architecture" if failure == "resolution" else ""]
+        return [value, {"ctx": {"use_v2": False}}]
+
+    runner.comm = types.SimpleNamespace(allgather=allgather)
+    if failure != "api_import":
+        runner._resolve_transfer_config = lambda shape: object()
+
+    def load_api() -> object:
+        """Fail the real preparation import when testing rank-local errors."""
+        if failure == "api_import":
+            raise ImportError("native binding unavailable")
+        return types.SimpleNamespace()
+
+    monkeypatch.setattr(rp, "load_internal_apis", load_api)
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "configuration resolution"
+            if failure != "rank_contract"
+            else "contract mismatch within instance"
+        ),
+    ):
+        runner.setup({}, 32)
+    assert len(calls) == (2 if failure == "rank_contract" else 1)
+
+
+@pytest.mark.parametrize("role", ["ctx", "gen"])
+def test_resolved_contract_preserves_role_asymmetry(
+    monkeypatch: pytest.MonkeyPatch, role: str
+) -> None:
+    """Both peers derive the same full contract despite role and path differences."""
+    import precheck_config as pcfg
+
+    cfg = {
+        "metadata": {"architecture": "Example"},
+        "hardware": {"gpus_per_node": 1, "num_ctx_servers": 1, "num_gen_servers": 1},
+        "worker_config": {
+            side: {
+                "cache_transceiver_config": {
+                    "backend": "DEFAULT",
+                    "transceiver_runtime": "CPP" if side == "ctx" else "PYTHON",
+                },
+                "kv_cache_config": {
+                    "use_kv_cache_manager_v2": side == "gen",
+                    "dtype": "half" if side == "ctx" else "fp16",
+                },
+            }
+            for side in ("ctx", "gen")
+        },
+    }
+
+    def make_cache_config(**kwargs: object) -> object:
+        """Stand in for external pydantic config with its backend resolver surface."""
+        return types.SimpleNamespace(**kwargs, _resolve_default_backend=lambda: ("NIXL", None))
+
+    monkeypatch.setattr(
+        rp,
+        "load_internal_apis",
+        lambda: types.SimpleNamespace(
+            CacheTransceiverConfig=make_cache_config,
+            resolve_cache_transceiver_config=lambda cfg: None,
+            get_registered_model_class=lambda name: object(),
+        ),
+    )
+    runner = rp.PrecheckRunner.__new__(rp.PrecheckRunner)
+    runner.plan = pcfg.resolve_plan(cfg)
+    runner.role, runner.is_leader = role, False
+    shape = dict(pcfg.FALLBACK_KV_SHAPE, source="different local path")
+    resolved = runner._resolve_transfer_config(shape)
+    assert runner.use_v2 is (role == "gen")
+    assert resolved.transceiver_runtime == ("CPP" if role == "ctx" else "PYTHON")
+    expected = {"backend": "NIXL", "kv_dtype": "fp16"}
+    assert runner.transfer_contract["ctx"] == dict(expected, use_v2=False, runtime="CPP")
+    assert runner.transfer_contract["gen"] == dict(expected, use_v2=True, runtime="PYTHON")
+    assert "source" not in runner.transfer_contract["kv_shape"]
+
+
+@pytest.mark.parametrize("invalid_role", ["ctx", "gen"])
+@pytest.mark.parametrize(
+    "use_v2,runtime,pipelined,error",
+    [
+        (False, "PYTHON", False, "Python transceiver requires KVCacheManagerV2"),
+        (False, None, True, "Python transceiver requires KVCacheManagerV2"),
+        (True, "CPP", False, "KVCacheManagerV2 requires"),
+    ],
+)
+def test_setup_rejects_invalid_manager_runtime_before_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_role: str,
+    use_v2: bool,
+    runtime: str | None,
+    pipelined: bool,
+    error: str,
+) -> None:
+    """Reject either peer's invalid resolved pairing before GPU construction."""
+    cfg = {
+        "hardware": {"gpus_per_node": 1, "num_ctx_servers": 1, "num_gen_servers": 1},
+        "worker_config": {
+            role: {
+                "cache_transceiver_config": {
+                    "backend": "NIXL",
+                    "transceiver_runtime": runtime if role == invalid_role else "CPP",
+                    "enable_pipelined_transfer": pipelined if role == invalid_role else False,
+                },
+                "kv_cache_config": {
+                    "use_kv_cache_manager_v2": use_v2 if role == invalid_role else False,
+                },
+            }
+            for role in ("ctx", "gen")
+        },
+    }
+
+    def make_cache_config(**kwargs: object) -> types.SimpleNamespace:
+        return types.SimpleNamespace(**kwargs, _resolve_default_backend=lambda: ("NIXL", None))
+
+    def resolve_cache_config(cache_cfg: types.SimpleNamespace) -> None:
+        if cache_cfg.enable_pipelined_transfer:
+            cache_cfg.transceiver_runtime = "PYTHON"
+
+    def forbid_construction(**kwargs: object) -> None:
+        pytest.fail("Invalid configuration reached GPU/distributed resource construction")
+
+    monkeypatch.setattr(
+        rp,
+        "load_internal_apis",
+        lambda: types.SimpleNamespace(
+            CacheTransceiverConfig=make_cache_config,
+            resolve_cache_transceiver_config=resolve_cache_config,
+            Mapping=forbid_construction,
+        ),
+    )
+    runner = rp.PrecheckRunner.__new__(rp.PrecheckRunner)
+    runner.plan = rp.pcfg.resolve_plan(cfg)
+    runner.role, runner.is_leader = "ctx", False
+    errors: list[str] = []
+
+    def allgather(value: str) -> list[str]:
+        errors.append(value)
+        return [value]
+
+    runner.comm = types.SimpleNamespace(allgather=allgather)
+    with pytest.raises(RuntimeError, match=error):
+        runner.setup(dict(rp.pcfg.FALLBACK_KV_SHAPE), 32)
+    assert len(errors) == 1
+    assert error in errors[0]

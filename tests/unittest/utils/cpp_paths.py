@@ -1,10 +1,7 @@
 import os as _os
 import pathlib as _pl
-import sys as _sys
 
 import pytest
-
-_sys.path.append(_os.path.join(_os.path.dirname(__file__), '..', '..', '..'))
 
 
 @pytest.fixture(scope="module")

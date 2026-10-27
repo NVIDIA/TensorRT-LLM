@@ -16,20 +16,28 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
+from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    KVCacheManager, PeftCacheManager, _merge_kv_cache_pool_pointers,
-    _warn_if_unsupported_v1_kv_cache_event_hash_algo)
+    KVCacheManager, PeftCacheManager, ResourceManager, ResourceManagerType,
+    _get_minimum_blocks_per_window, _merge_kv_cache_pool_pointers,
+    _warn_if_unsupported_v1_kv_cache_event_hash_algo,
+    scan_kv_buffer_for_invalid_values)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._utils import binding_to_str_dtype
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.bindings.internal.batch_manager import \
-    PeftTaskNotCachedException
+from tensorrt_llm.bindings.internal.batch_manager import (
+    LinearCacheType, PeftTaskNotCachedException)
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
                                                 KV_CACHE_HASH_ALGO_V1,
@@ -42,7 +50,15 @@ LoraModuleType = tensorrt_llm.bindings.LoraModuleType
 current_dir = pathlib.Path(__file__).parent.resolve()
 root_dir = current_dir.parent.parent.parent.parent
 
-sys.path.append(str(root_dir / "tests" / "integration"))
+
+def _text_lora_model_config(model_config: ModelConfigCpp) -> LoraModelConfig:
+    return LoraModelConfig(
+        lora_target_modules=[],
+        trtllm_modules_to_hf_modules={},
+        hidden_size=model_config.hidden_size,
+        dtype=binding_to_str_dtype(model_config.data_type),
+        owner=DecoderLoraOwner(),
+    )
 
 
 def test_v1_kv_cache_event_hash_algo_warning_for_non_v1():
@@ -70,6 +86,80 @@ def test_v1_kv_cache_event_hash_algo_no_warning_for_auto():
             KV_CACHE_HASH_ALGO_AUTO)
 
     warning.assert_not_called()
+
+
+def test_minimum_blocks_per_window_aligns_attention_pool_capacity() -> None:
+    recurrent_window = LinearCacheType.RECURRENT_STATES.value
+    local_blocks = {
+        64: (8, 4),
+        128: (7, 3),
+        recurrent_window: (20, 0),
+    }
+    rank_blocks = [
+        local_blocks,
+        {
+            64: (5, 2),
+            128: (6, 1),
+        },
+        {
+            64: (6, 3),
+            128: (9, 2),
+            recurrent_window: (18, 0),
+        },
+    ]
+
+    assert _get_minimum_blocks_per_window(
+        local_blocks,
+        rank_blocks,
+        [{64, 128}, {64, 128}, {64, 128}],
+    ) == {
+        64: (5, 2),
+        128: (6, 1),
+        recurrent_window: (18, 0),
+    }
+
+
+def test_minimum_blocks_per_window_rejects_asymmetric_hosted_windows() -> None:
+    recurrent_window = LinearCacheType.RECURRENT_STATES.value
+    # Linear-attention sizing emits a positive placeholder key even when the
+    # rank only hosts recurrent-state layers. The hosted-window set, not the
+    # sizing keys, must expose the PP asymmetry.
+    with pytest.raises(RuntimeError, match="Asymmetrical pipeline parallelism"):
+        _get_minimum_blocks_per_window(
+            {
+                128: (8, 4),
+                recurrent_window: (20, 0),
+            },
+            [
+                {
+                    128: (8, 4),
+                    recurrent_window: (20, 0),
+                },
+                {
+                    128: (5, 2)
+                },
+            ],
+            [set(), {128}],
+        )
+
+
+def test_v1_window_resolution_and_grouping_use_local_layer_order() -> None:
+    manager = object.__new__(KVCacheManager)
+    manager.pp_layers = [3, 5]
+    manager.num_local_layers = 2
+    config = KvCacheConfig(max_attention_window=[64, 128, 512])
+
+    manager.max_attention_window_vec = manager._resolve_max_attention_window_vec(
+        config,
+        max_seq_len=256,
+    )
+
+    assert manager.max_attention_window_vec == [64, 256]
+    assert config.max_attention_window == [64, 128, 512]
+    assert manager._get_window_size_to_layers() == {
+        64: [0],
+        256: [1],
+    }
 
 
 class TestMergeKVCachePoolPointers(unittest.TestCase):
@@ -419,6 +509,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
 
         self.assertTrue(peft_cache_manager.impl.enabled)
@@ -433,6 +524,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=self.create_peft_cache_config(),
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
             initial_data_type=torch.float8_e4m3fn,
         )
 
@@ -446,6 +538,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
 
         request_id = 0
@@ -464,6 +557,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
 
         empty_context = []
@@ -480,6 +574,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
 
         request_id = 3
@@ -514,6 +609,7 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
         )
 
         request_id = 0
@@ -939,8 +1035,67 @@ class TestResourceManager(unittest.TestCase):
         simulate_prefill_completion_only_use_for_testing(req3)
         kv_cache_manager.free_resources(req3)
 
-    def test_batch_cache_indices_honor_requested_blocks_with_beams(self):
-        """V1 truncates packed beam cache indices to the requested blocks."""
+    def test_free_resources_poisoned_request_skips_reuse_store(self):
+        """A py_kv_reuse_poisoned release must not publish reuse blocks.
+
+        A context request that failed before completing its first chunk has
+        written no KV, but releaseBlocks' legacy fallback stores blocks for
+        requests still at context position 0. The poisoned release must
+        store nothing, while an untagged position-0 release keeps the legacy
+        fallback behavior. Runs against the real remove_sequence binding,
+        pinning the call signature free_resources uses.
+        """
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                          enable_block_reuse=True,
+                                          max_tokens=256),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=64,
+            max_seq_len=1024,
+            max_batch_size=1,
+            mapping=Mapping(),
+        )
+        try:
+            tokens = [1, 2, 3, 4, 5]
+            initial_reused = kv_cache_manager.get_kv_cache_stats().reused_blocks
+
+            # Failed first-chunk prefill: still at context position 0.
+            req1 = self.create_llm_request(0, tokens)
+            kv_cache_manager.impl.add_sequence_batch(
+                [(req1.py_request_id, req1.prompt_len, 1)], [req1])
+            req1.py_kv_reuse_poisoned = True
+            kv_cache_manager.free_resources(req1)
+
+            req2 = self.create_llm_request(1, tokens)
+            kv_cache_manager.impl.add_sequence_batch(
+                [(req2.py_request_id, req2.prompt_len, 1)], [req2])
+            stats = kv_cache_manager.get_kv_cache_stats()
+            self.assertEqual(
+                stats.reused_blocks, initial_reused,
+                "A poisoned (failed first-chunk) release must not publish "
+                "its unwritten blocks for reuse")
+
+            # Control: an untagged position-0 release keeps the legacy
+            # fallback, which stores the prompt's blocks for reuse.
+            kv_cache_manager.free_resources(req2)
+            req3 = self.create_llm_request(2, tokens)
+            kv_cache_manager.impl.add_sequence_batch(
+                [(req3.py_request_id, req3.prompt_len, 1)], [req3])
+            stats = kv_cache_manager.get_kv_cache_stats()
+            self.assertGreater(
+                stats.reused_blocks, initial_reused,
+                "An untagged position-0 release must keep the legacy "
+                "fallback store")
+            kv_cache_manager.free_resources(req3)
+        finally:
+            kv_cache_manager.shutdown()
+
+    def test_batch_cache_indices_honor_requested_blocks_for_beam0(self):
+        """V1 returns and truncates only beam 0's cache indices."""
         kv_cache_manager = KVCacheManager(
             kv_cache_config=KvCacheConfig(max_tokens=256,
                                           enable_block_reuse=False),
@@ -961,11 +1116,10 @@ class TestResourceManager(unittest.TestCase):
                                                 max_beam_width=2)
 
             full_indices = kv_cache_manager.get_batch_cache_indices(
-                [request_id], beam_width=2)
+                [request_id])
             requested_blocks = 4
             truncated_indices = kv_cache_manager.get_batch_cache_indices(
                 [request_id],
-                beam_width=2,
                 num_blocks_per_seq=[requested_blocks],
             )
 
@@ -1097,11 +1251,98 @@ class TestResourceManager(unittest.TestCase):
             peft_cache_config=peft_cache_config,
             lora_config=LoraConfig(),
             model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
             execution_stream=execution_stream,
         )
 
         # The PeftCacheManager should be created successfully with the provided stream
         self.assertTrue(peft_cache_manager.impl.enabled)
+
+    def _reload_ckpt_source(self, server_ckpt_source, request_ckpt_source):
+        """Return the ckpt_source add_request_peft reloads an adapter with."""
+        peft_cache_manager = PeftCacheManager(
+            peft_cache_config=self.create_peft_cache_config(),
+            lora_config=LoraConfig(lora_ckpt_source=server_ckpt_source),
+            model_config=self.model_config,
+            lora_model_config=_text_lora_model_config(self.model_config),
+        )
+        peft_cache_manager.impl = MagicMock()
+        peft_cache_manager.impl.is_task_cached.return_value = False
+        lora_manager = MagicMock()
+        lora_manager.cpp_lora_weights = {7: torch.zeros(1)}
+        lora_manager.cpp_lora_config = {7: torch.zeros(1)}
+        peft_cache_manager._lora_manager = lora_manager
+
+        request = self._create_request(request_id=0, task_id=7)
+        request.py_lora_path = "/path/to/adapter"
+        request.py_lora_ckpt_source = request_ckpt_source
+        peft_cache_manager.add_request_peft(request)
+
+        lora_manager.load_from_ckpt.assert_called_once()
+        return lora_manager.load_from_ckpt.call_args.kwargs["ckpt_source"]
+
+    def test_add_request_peft_reloads_with_request_ckpt_source(self):
+        """The engine-side reload uses the format the request was admitted with."""
+        self.assertEqual(self._reload_ckpt_source("nemo", "hf"), "hf")
+        self.assertEqual(self._reload_ckpt_source("hf", "nemo"), "nemo")
+
+    def test_add_request_peft_reload_defaults_to_config_ckpt_source(self):
+        """Without a per-request format, the reload uses the LoRA config's."""
+        self.assertEqual(self._reload_ckpt_source("nemo", None), "nemo")
+        self.assertEqual(self._reload_ckpt_source("hf", None), "hf")
+
+
+@pytest.mark.cpu_only
+class TestKVCacheManagerConnectorReporting(unittest.TestCase):
+    """Which allocations the V1 manager reports to an attached connector."""
+
+    @staticmethod
+    def _make_manager(connector) -> KVCacheManager:
+        manager = KVCacheManager.__new__(KVCacheManager)
+        manager.mapping = Mapping()
+        manager.impl = MagicMock()
+        manager.is_draft = False
+        manager.num_extra_kv_tokens = 0
+        manager.kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+        manager.kv_connector_manager = connector
+        manager._kv_reserve_draft_tokens = 0
+        manager._preprepared_dummy_request_ids = set()
+        manager.get_cache_indices = MagicMock(return_value=[4, 5])
+        return manager
+
+    @staticmethod
+    def _context_batch() -> ScheduledRequests:
+        request = SimpleNamespace(py_request_id=1,
+                                  prompt_len=64,
+                                  py_beam_width=1,
+                                  py_draft_tokens=[],
+                                  is_first_context_chunk=True,
+                                  is_last_context_chunk=True)
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [request]
+        return batch
+
+    def test_a_fresh_allocation_is_reported(self):
+        connector = MagicMock(capacity_only=False)
+        connector.should_add_sequence.return_value = True
+        manager = self._make_manager(connector)
+
+        manager.prepare_resources(self._context_batch())
+
+        connector.update_state_after_alloc.assert_called_once()
+        self.assertEqual(connector.update_state_after_alloc.call_args.args[1],
+                         [4, 5])
+
+    def test_a_capacity_only_connector_is_told_of_no_allocation(self):
+        """It cannot reach these blocks, so gathering indices is wasted."""
+        connector = MagicMock(capacity_only=True)
+        connector.should_add_sequence.return_value = True
+        manager = self._make_manager(connector)
+
+        manager.prepare_resources(self._context_batch())
+
+        manager.get_cache_indices.assert_not_called()
+        connector.update_state_after_alloc.assert_not_called()
 
 
 @pytest.mark.cpu_only
@@ -1179,8 +1420,13 @@ class TestKVCacheManagerConfigForwarding(unittest.TestCase):
 
     def test_secondary_offload_min_priority_forwarded_to_cpp_manager(self):
         """Regression guard: preserve explicit priority 0 when building C++ kwargs."""
-        kv_cache_config = KvCacheConfig(max_tokens=64,
-                                        secondary_offload_min_priority=0)
+        for config_type in (KvCacheConfig, tllm.KvCacheConfig):
+            with self.subTest(config_type=config_type):
+                self._check_offload_priority_forwarding(config_type)
+
+    def _check_offload_priority_forwarding(self, config_type):
+        kv_cache_config = config_type(max_tokens=64,
+                                      secondary_offload_min_priority=0)
 
         mock_impl = MagicMock()
         mock_impl.get_block_pool_pointers.return_value = torch.empty(0)
@@ -1238,6 +1484,350 @@ class TestResolveWindowSize(unittest.TestCase):
         with self.assertRaises(ValueError):
             mgr._resolve_window_size(None)
         self.assertEqual(mgr._resolve_window_size(8192), 8192)
+
+
+class TestRequestBudget(unittest.TestCase):
+    """Unit tests for the beam-aware KV block budget estimation and the
+    request admission budget check."""
+
+    TOKENS_PER_BLOCK = 8
+
+    class _OptedInKVCacheManager(KVCacheManager):
+        """A subclass that has checked its cost model against the dense one."""
+
+        def kv_block_budget_applies(self):
+            return True
+
+    @classmethod
+    def _make_kv_cache_manager(cls, manager_cls=KVCacheManager):
+        # Build a bare KVCacheManager without touching the GPU (mirrors
+        # TestResolveWindowSize) so we can exercise the pure block math.
+        mgr = manager_cls.__new__(manager_cls)
+        mgr.tokens_per_block = cls.TOKENS_PER_BLOCK
+        mgr.kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+        mgr.is_vswa = False
+        mgr.is_linear_attention = False
+        mgr.num_extra_kv_tokens = 0
+        mgr.max_total_draft_tokens = 0
+        mgr._kv_reserve_draft_tokens = 0
+        mgr.max_seq_len = 4096
+        mgr.max_attention_window_vec = [mgr.max_seq_len]
+        mgr.blocks_in_primary_pool = 32
+        mgr.blocks_in_secondary_pool = 100
+        return mgr
+
+    @staticmethod
+    def _make_request(prompt_len,
+                      max_new_tokens,
+                      beam_width,
+                      encoder_output_len=None):
+        sampling_params = SamplingParams(n=beam_width,
+                                         best_of=beam_width,
+                                         use_beam_search=beam_width > 1)
+        return LlmRequest(
+            request_id=1,
+            max_new_tokens=max_new_tokens,
+            input_tokens=list(range(prompt_len)),
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                sampling_params._get_sampling_config()),
+            is_streaming=False,
+            encoder_output_len=encoder_output_len,
+        )
+
+    def test_num_blocks_beam_one_matches_needed_resource(self):
+        """For beam_width=1 the beam-aware estimate must equal the historical
+        beam-unaware get_needed_resource_to_completion value."""
+        mgr = self._make_kv_cache_manager()
+        for prompt_len, max_new_tokens in [(20, 5), (16, 1), (1, 100), (8, 8)]:
+            req = self._make_request(prompt_len, max_new_tokens, beam_width=1)
+            self.assertEqual(
+                mgr._num_blocks_to_completion(req.orig_prompt_len,
+                                              req.max_new_tokens,
+                                              req.py_beam_width),
+                mgr.get_needed_resource_to_completion(req))
+
+    def test_num_blocks_shares_prompt_across_beams(self):
+        """Only the partial-last-prompt block and generated tokens scale with
+        beam width; full prompt blocks are shared."""
+        mgr = self._make_kv_cache_manager()
+        # prompt_len=20, tpb=8 -> 2 full shared blocks, 4 leftover prompt tokens.
+        # max_new_tokens=5 -> per-beam tokens = 4 + 5 = 9 -> ceil(9/8) = 2 blocks.
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=4)
+        # shared(2) + per_beam(2) * beam(4) = 10
+        self.assertEqual(
+            mgr._num_blocks_to_completion(req.orig_prompt_len,
+                                          req.max_new_tokens,
+                                          req.py_beam_width), 10)
+
+        # Beam width only multiplies the per-beam portion, not the shared prompt.
+        req1 = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=1)
+        self.assertEqual(
+            mgr._num_blocks_to_completion(req1.orig_prompt_len,
+                                          req1.max_new_tokens,
+                                          req1.py_beam_width), 4)
+
+    def test_num_blocks_block_aligned_prompt(self):
+        """A block-aligned prompt contributes no per-beam partial block."""
+        mgr = self._make_kv_cache_manager()
+        # prompt_len=16 (2 full blocks, 0 leftover), max_new_tokens=1.
+        # per-beam tokens = 0 + 1 = 1 -> ceil(1/8) = 1 block per beam.
+        req = self._make_request(prompt_len=16, max_new_tokens=1, beam_width=3)
+        # shared(2) + per_beam(1) * beam(3) = 5
+        self.assertEqual(
+            mgr._num_blocks_to_completion(req.orig_prompt_len,
+                                          req.max_new_tokens,
+                                          req.py_beam_width), 5)
+
+    def test_container_returns_v1_primary_pool_budget(self):
+        mgr = self._make_kv_cache_manager()
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: mgr})
+
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=4)
+        self.assertEqual(
+            resource_manager.get_request_kv_block_budgets(req),
+            [(ResourceManagerType.KV_CACHE_MANAGER, 10,
+              mgr.blocks_in_primary_pool)],
+        )
+
+    def test_container_no_kv_cache_manager_is_explicit_noop(self):
+        resource_manager = ResourceManager({})
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=4)
+        self.assertEqual(resource_manager.get_request_kv_block_budgets(req), [])
+
+    def test_v2_manager_does_not_run_v1_budget_check(self):
+        mgr = KVCacheManagerV2.__new__(KVCacheManagerV2)
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: mgr})
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=1)
+
+        self.assertEqual(resource_manager.get_request_kv_block_budgets(req), [])
+
+    def test_subclass_manager_opts_out_by_default(self):
+        """Sparse/compressed KV and mamba hybrid subclasses hold a different
+        amount of KV per token, so they must not inherit the dense estimate."""
+
+        class _SubclassedKVCacheManager(KVCacheManager):
+            pass
+
+        mgr = self._make_kv_cache_manager(_SubclassedKVCacheManager)
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: mgr})
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=4)
+
+        self.assertEqual(resource_manager.get_request_kv_block_budgets(req), [])
+
+    def test_subclass_manager_can_opt_in(self):
+        """A subclass whose cost model matches opts in by declaring the budget
+        applies, which routes it through the dense estimate."""
+
+        mgr = self._make_kv_cache_manager(self._OptedInKVCacheManager)
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: mgr})
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=4)
+
+        self.assertEqual(
+            resource_manager.get_request_kv_block_budgets(req),
+            [(ResourceManagerType.KV_CACHE_MANAGER, 10,
+              mgr.blocks_in_primary_pool)],
+        )
+
+    def test_windowed_v1_manager_does_not_use_single_pool_budget(self):
+        mgr = self._make_kv_cache_manager()
+        mgr.max_attention_window_vec = [128]
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: mgr})
+        req = self._make_request(prompt_len=200, max_new_tokens=5, beam_width=4)
+
+        self.assertEqual(resource_manager.get_request_kv_block_budgets(req), [])
+
+    def test_validate_request_budget_rejects_oversized_request(self):
+        """_validate_request_budget raises for a request that can never fit and
+        passes for one that fits."""
+        mgr = self._make_kv_cache_manager()
+        mgr.blocks_in_primary_pool = 8
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: mgr})
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.resource_manager = resource_manager
+
+        # shared(25) + per_beam(1) * beam(4) exceeds primary capacity.
+        req = self._make_request(prompt_len=200, max_new_tokens=5, beam_width=4)
+        with self.assertRaisesRegex(
+                ValueError, "KV_CACHE_MANAGER requires 29 KV cache blocks.*"
+                "GPU-primary capacity of 8"):
+            executor._validate_request_budget(req)
+
+        # shared(2) + per_beam(2) * beam(2) = 6, so it fits.
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=2)
+        executor._validate_request_budget(req)
+
+    def test_validate_request_budget_checks_draft_manager(self):
+        mgr = self._make_kv_cache_manager()
+        mgr.blocks_in_primary_pool = 8
+        resource_manager = ResourceManager(
+            {ResourceManagerType.DRAFT_KV_CACHE_MANAGER: mgr})
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.resource_manager = resource_manager
+
+        oversized = self._make_request(prompt_len=200,
+                                       max_new_tokens=5,
+                                       beam_width=4)
+        with self.assertRaisesRegex(
+                ValueError,
+                "DRAFT_KV_CACHE_MANAGER requires 29 KV cache blocks"):
+            executor._validate_request_budget(oversized)
+
+        fitting = self._make_request(prompt_len=20,
+                                     max_new_tokens=5,
+                                     beam_width=2)
+        executor._validate_request_budget(fitting)
+
+    def test_validate_request_budget_checks_cross_manager(self):
+        mgr = self._make_kv_cache_manager()
+        mgr.kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS
+        mgr.blocks_in_primary_pool = 2
+        resource_manager = ResourceManager(
+            {ResourceManagerType.CROSS_KV_CACHE_MANAGER: mgr})
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.resource_manager = resource_manager
+
+        oversized = self._make_request(prompt_len=20,
+                                       max_new_tokens=5,
+                                       beam_width=1,
+                                       encoder_output_len=17)
+        with self.assertRaisesRegex(
+                ValueError,
+                "CROSS_KV_CACHE_MANAGER requires 3 KV cache blocks"):
+            executor._validate_request_budget(oversized)
+
+        fitting = self._make_request(prompt_len=20,
+                                     max_new_tokens=5,
+                                     beam_width=1,
+                                     encoder_output_len=16)
+        executor._validate_request_budget(fitting)
+
+    def test_unchecked_pools_reported_exactly_when_budget_is_skipped(self):
+        """get_unchecked_kv_block_budget_pools must agree with which managers
+        actually produce a budget -- the startup warning names pools from it,
+        so a disagreement would either warn about a checked pool or stay
+        silent about an unchecked one."""
+
+        class _SubclassedKVCacheManager(KVCacheManager):
+            pass
+
+        windowed = self._make_kv_cache_manager()
+        windowed.max_attention_window_vec = [128]
+        cases = [
+            ("dense base manager", self._make_kv_cache_manager(), True),
+            ("subclass opting in",
+             self._make_kv_cache_manager(self._OptedInKVCacheManager), True),
+            ("subclass opting out",
+             self._make_kv_cache_manager(_SubclassedKVCacheManager), False),
+            ("sliding window", windowed, False),
+            ("V2 manager", KVCacheManagerV2.__new__(KVCacheManagerV2), False),
+        ]
+        for name, mgr, is_checked in cases:
+            with self.subTest(manager=name):
+                self._assert_unchecked_matches_budget(mgr, is_checked)
+
+    def _assert_unchecked_matches_budget(self, mgr, is_checked):
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: mgr})
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=4)
+
+        unchecked = resource_manager.get_unchecked_kv_block_budget_pools()
+        has_budget = bool(resource_manager.get_request_kv_block_budgets(req))
+        self.assertEqual(has_budget, is_checked)
+        self.assertEqual(
+            unchecked,
+            [] if is_checked else [ResourceManagerType.KV_CACHE_MANAGER])
+
+    def test_startup_warns_when_beam_search_runs_unchecked(self):
+        """Beam search against a pool that opts out of the budget check gets a
+        warning naming it, since such a request stalls rather than failing."""
+
+        class _SubclassedKVCacheManager(KVCacheManager):
+            pass
+
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.resource_manager = ResourceManager({
+            ResourceManagerType.KV_CACHE_MANAGER:
+            self._make_kv_cache_manager(_SubclassedKVCacheManager)
+        })
+
+        executor.max_beam_width = 4
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger"
+                   ) as mock_logger:
+            executor._warn_if_kv_block_budget_unchecked()
+        mock_logger.warning_once.assert_called_once()
+        message = mock_logger.warning_once.call_args.args[0]
+        self.assertIn("max_beam_width=4", message)
+        self.assertIn("KV_CACHE_MANAGER", message)
+
+        # Greedy and single-beam requests cannot outgrow the pool by beam
+        # width, so the warning would be noise.
+        executor.max_beam_width = 1
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger"
+                   ) as mock_logger:
+            executor._warn_if_kv_block_budget_unchecked()
+        mock_logger.warning_once.assert_not_called()
+
+    def test_startup_silent_when_every_pool_is_checked(self):
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.resource_manager = ResourceManager({
+            ResourceManagerType.KV_CACHE_MANAGER:
+            self._make_kv_cache_manager()
+        })
+        executor.max_beam_width = 4
+
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger"
+                   ) as mock_logger:
+            executor._warn_if_kv_block_budget_unchecked()
+        mock_logger.warning_once.assert_not_called()
+
+
+def _scan(buffer: torch.Tensor) -> Tuple[bool, bool]:
+    has_invalid_values = torch.tensor([False],
+                                      dtype=torch.bool,
+                                      device=buffer.device)
+    skipped = scan_kv_buffer_for_invalid_values(buffer, has_invalid_values)
+    return bool(has_invalid_values), skipped
+
+
+@pytest.mark.parametrize("dtype",
+                         [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_scan_kv_buffer_finds_invalid_value_in_any_slice(
+        monkeypatch, dtype, value):
+    # Three rows per slice, so the buffer spans several slices and a short
+    # last one.
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.resource_manager."
+        "_INVALID_VALUE_SCAN_ELEMS", 3 * 4 * 8)
+    pool = torch.zeros(10, 2, 4, 8, dtype=dtype, device="cuda")
+    assert _scan(pool) == (False, False)
+    for row in (0, 5, 9):
+        pool.zero_()
+        pool[row, 1, 3, 7] = value
+        # A per-layer view of a shared pool is strided along dim 0.
+        assert _scan(pool[:, 1]) == (True, False), f"row {row}"
+        assert _scan(pool[:, 0]) == (False, False), f"row {row}"
+
+
+def test_scan_kv_buffer_keeps_checking_after_unsupported_check(monkeypatch):
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.resource_manager."
+        "_INVALID_VALUE_SCAN_ELEMS", 2 * 16)
+    # isinf is not implemented for float8_e4m3fn, isnan is.
+    buffer = torch.zeros(9, 16, dtype=torch.float8_e4m3fn, device="cuda")
+    assert _scan(buffer) == (False, True)
+    buffer[8, 15] = float("nan")
+    assert _scan(buffer) == (True, True)
+
+
+def test_scan_kv_buffer_accepts_empty_buffer():
+    assert _scan(torch.zeros(0, 8, device="cuda")) == (False, False)
 
 
 if __name__ == "__main__":

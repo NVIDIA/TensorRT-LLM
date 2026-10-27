@@ -19,11 +19,14 @@ mode resolution, a CUDA check that NO_TOPK yields the same distribution as FULL
 when top_k is disabled, and native greedy handling (greedy rows return argmax).
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as su
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
+from tensorrt_llm._torch.speculative.utils import get_spec_metadata
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, DecodingBaseConfig, MTPDecodingConfig
 
 
@@ -84,11 +87,13 @@ def test_resolve_advanced_sampling_filters(mode, expect_top_k_none, expect_top_p
 @pytest.mark.parametrize("top_p_val", [1.0, 0.9])
 def test_no_topk_matches_full(top_p_val):
     """With top_k disabled, NO_TOPK skips the top_k mask kernel (a no-op at k=vocab)
-    and yields the same sampling distribution as FULL. We compare the resulting
-    probability distributions rather than the sampled tokens: the flashinfer top_k mask
-    at k=vocab injects ~1e-8 fp noise that leaves the distribution unchanged but can flip
-    an individual sampled token across GPU archs, so exact-token equality is not portable.
-    A real (non-no-op) filter would move mass by orders of magnitude, far above atol."""
+    and yields the same sampling distribution as FULL. The k=vocab mask is a bit-exact
+    identity, so both modes feed the top-p renorm identical inputs; but that kernel is
+    not run-to-run reproducible right at the nucleus cutoff, so a boundary token can
+    flip between calls. We therefore bound the per-row total probability-mass
+    difference rather than compare pointwise: a boundary flip costs at most one
+    token's mass, while a real (non-no-op) filter moves O(0.1) of mass -- orders of
+    magnitude apart."""
     dev = "cuda"
     torch.manual_seed(0)
     batch, vocab = 64, 32000
@@ -105,7 +110,8 @@ def test_no_topk_matches_full(top_p_val):
     )
     probs_full = su.compute_probs_from_logits(logits.clone(), temperatures, ek_full, ep_full)
     probs_no_topk = su.compute_probs_from_logits(logits.clone(), temperatures, ek_nt, ep_nt)
-    assert torch.allclose(probs_full, probs_no_topk, atol=1e-5, rtol=0)
+    l1_diff = (probs_full - probs_no_topk).abs().sum(-1)
+    assert l1_diff.max().item() < 1e-3
 
 
 @pytest.mark.skipif(
@@ -152,6 +158,19 @@ def test_advanced_mode_accepted_on_all_spec_paths():
         ),
     )
     assert args.speculative_config.advanced_sampling_mode == AdvancedSamplingMode.NO_TOPK
+
+
+@pytest.mark.parametrize("mode", list(AdvancedSamplingMode))
+def test_metadata_carries_the_configured_sampling_mode(mode):
+    """Losing the assignment is silent: admission reads the mode off the config, while the
+    buffer fill and the dispatcher read it off the metadata."""
+    metadata = get_spec_metadata(
+        MTPDecodingConfig(num_nextn_predict_layers=1, advanced_sampling_mode=mode),
+        SimpleNamespace(num_hidden_layers=32, hidden_size=128, vocab_size=1024, torch_dtype=None),
+        max_num_requests=4,
+        max_num_tokens=64,
+    )
+    assert metadata.advanced_sampling_mode == mode
 
 
 if __name__ == "__main__":

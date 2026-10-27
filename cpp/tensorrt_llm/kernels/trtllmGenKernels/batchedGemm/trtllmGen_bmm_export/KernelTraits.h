@@ -16,14 +16,14 @@
  */
 #pragma once
 
-#include "Enums.h"
-#include "trtllm/gen/CommonUtils.h"
+#include <cassert>
+#include <stdexcept>
+#include <cstdio>
 #include "trtllm/gen/DtypeDecl.h"
+#include "trtllm/gen/CommonUtils.h"
 #include "trtllm/gen/MmaDecl.h"
 #include "trtllm/gen/SparsityDecl.h"
-#include <cassert>
-#include <cstdio>
-#include <stdexcept>
+#include "Enums.h"
 
 namespace batchedGemm
 {
@@ -185,8 +185,11 @@ inline int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind, int mmaK, 
     }
     if (mmaKind == tg::MmaKind::MxFp8Fp6Fp4)
     {
-        (void) mmaK;
-        (void) isSparseA;
+        // SM107 2x-mmaK kernels keep MxE2m1 unpadded in smem.
+        if ((!isSparseA && mmaK >= 64) || (isSparseA && mmaK >= 128))
+        {
+            return tg::dtypeGetNumBits(dtype);
+        }
         return 8;
     }
     else
@@ -215,6 +218,8 @@ public:
         : mMmaKind{mmaKind}
         , mFuseUtccpWithUtcmma{fuseUtccpWithUtcmma}
         , mUseMaxTmemOverlap{useMaxTmemOverlap}
+        , mUseTmaStore{useTmaStore}
+        , mUsePersistentScheduler{usePersistentScheduler}
         , mUseCustomizedMma3xNvFp4{useCustomizedMma3xNvFp4}
         , mFusedBiasShuffleMode{fusedBiasShuffleMode}
         , mNumEpilogueWarps{numEpilogueWarps}
@@ -609,6 +614,10 @@ tg::MmaKind mMmaKind{};
 bool mFuseUtccpWithUtcmma{};
 // Whether use the max TMEM overlap trick.
 bool mUseMaxTmemOverlap{};
+// Whether the epilogue stages output in SMEM for an asynchronous TMA store.
+bool mUseTmaStore{};
+// Whether work tiles are assigned by a persistent scheduler.
+bool mUsePersistentScheduler{};
 // Whether use customized MMA for 3xNvFp4
 bool mUseCustomizedMma3xNvFp4{};
 // Which BiasType::Mn preprocessing steps are fused into the kernel instead of the host.

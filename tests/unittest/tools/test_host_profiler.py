@@ -29,7 +29,6 @@ import tempfile
 import pytest
 
 # Add path for test utilities
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
@@ -296,10 +295,15 @@ def test_iteration_aware_profiling():
 
         assert "Timer unit:" in range_content
         assert "_sample_function_to_profile" in range_content
-        range_hits = re.findall(r"^\s+\d+\s+(\d+)\s+", range_content, re.MULTILINE)
-        range_max = max(int(h) for h in range_hits if int(h) > 0)
-        assert range_max == 5, (
-            f"Expected hits from 5 profiled calls, got max {range_max}. "
+        # Count function-call invocations via lines that fire exactly once per call
+        # (e.g. `total = 0`, `return total`). max() picks up the inner-loop body
+        # (~n hits per call) and conflates body iterations with call counts.
+        range_hits = [
+            int(h) for h in re.findall(r"^\s+\d+\s+(\d+)\s+", range_content, re.MULTILINE)
+        ]
+        range_min = min(h for h in range_hits if h > 0)
+        assert range_min == 5, (
+            f"Expected hits from 5 profiled calls, got min once-per-call hits {range_min}. "
             "Iteration filtering may not be working."
         )
 
@@ -325,12 +329,12 @@ def test_iteration_aware_profiling():
             full_content = f.read()
 
         assert "_sample_function_to_profile" in full_content
-        full_hits = re.findall(r"^\s+\d+\s+(\d+)\s+", full_content, re.MULTILINE)
-        full_max = max(int(h) for h in full_hits if int(h) > 0)
-        assert full_max == 20, f"Expected hits == 20 (all iterations), got {full_max}"
+        full_hits = [int(h) for h in re.findall(r"^\s+\d+\s+(\d+)\s+", full_content, re.MULTILINE)]
+        full_min = min(h for h in full_hits if h > 0)
+        assert full_min == 20, f"Expected 20 calls (all iterations), got {full_min}"
 
-        # Sanity: iteration-ranged hits should be much less than full
-        assert range_max < full_max
+        # Sanity: iteration-ranged call count should be much less than full
+        assert range_min < full_min
     finally:
         for p in (range_output, full_output):
             if os.path.exists(p):
@@ -347,15 +351,15 @@ E2E_PROFILE_TARGETS = [
 
 
 @pytest.fixture
-def tinyllama_path():
-    """Get TinyLlama model path."""
-    model_path = llm_models_root() / "llama-models-v2" / "TinyLlama-1.1B-Chat-v1.0"
+def qwen3_model_path():
+    """Get Qwen3-0.6B model path."""
+    model_path = llm_models_root() / "Qwen3" / "Qwen3-0.6B"
     if not model_path.exists():
-        pytest.skip(f"TinyLlama model not found at {model_path}")
+        pytest.skip(f"Qwen3-0.6B model not found at {model_path}")
     return str(model_path)
 
 
-def test_e2e_profiler_with_model(tinyllama_path, mocker):
+def test_e2e_profiler_with_model(qwen3_model_path, mocker):
     """E2E test: verify profiler works with actual model inference.
 
     Clears default profile targets and adds only specific targets,
@@ -381,7 +385,7 @@ def test_e2e_profiler_with_model(tinyllama_path, mocker):
         )
 
         with LLM(
-            model=tinyllama_path,
+            model=qwen3_model_path,
             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.3),
         ) as llm:
             # Generate enough tokens to ensure profiled methods are executed

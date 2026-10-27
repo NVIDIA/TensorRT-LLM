@@ -14,8 +14,9 @@ from transformers import (AutoProcessor, AutoTokenizer, Mistral3Config,
                           MistralConfig, PretrainedConfig, PreTrainedModel)
 from transformers.activations import ACT2FN
 
-from tensorrt_llm._torch.attention_backend import AttentionMetadata
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.attention import Attention
+from tensorrt_llm._torch.attention.backends import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import (
     PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_pixtral
@@ -34,12 +35,12 @@ from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                        _load_weights_impl,
                                                        filter_weights,
                                                        register_auto_model)
-from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
@@ -49,9 +50,9 @@ from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
                                  MultimodalPlaceholderMetadata,
                                  MultimodalPlaceholderPlacement, TextPrompt,
                                  register_input_processor)
-from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
-                                          MultimodalEncoderItemMetadata)
+from tensorrt_llm.inputs.multimodal import (MultimodalItemMetadata,
+                                            MultimodalParams)
+from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.inputs.utils import encode_base64_image
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.logger import logger
@@ -410,11 +411,11 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
-    def get_mm_encoder_item_metadata(
+    def _build_mm_item_metadata(
         self,
         _prompt_token_ids: List[int],
         multimodal_data: Dict[str, Any],
-    ) -> Optional[MultimodalEncoderItemMetadata]:
+    ) -> Optional[MultimodalItemMetadata]:
         """Return Pixtral image items and physical ViT patch counts."""
         image_data = multimodal_data.get("image")
         if not isinstance(image_data, dict):
@@ -439,10 +440,22 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
             token_length // (merge * merge)
             for token_length in encoder_token_lengths
         ]
-        return MultimodalEncoderItemMetadata(
+        return MultimodalItemMetadata(
             item_refs=item_refs,
             encoder_token_lengths=encoder_token_lengths,
             output_embedding_lengths=output_embedding_lengths)
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = (
+            self._build_mm_item_metadata(prompt_token_ids, multimodal_data)
+            if multimodal_data.get("multimodal_embedding") is None else None)
+        return metadata if metadata is not None else super(
+        ).get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
 
     @torch.inference_mode()
     def call_with_text_prompt(
@@ -833,17 +846,25 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         self.llm = llm_class(llm_model_config)
         self.model_config.extra_attrs.update(llm_model_config.extra_attrs)
 
-        # NOTE: current `modelopt` does not support quantizing the vision portion.
-        # NOTE: attn_backend: Pixtral head size not always divisible by 128
-        vision_model_config = self._get_sub_model_config(model_config_cp,
-                                                         "vision_config",
-                                                         attn_backend="TRTLLM",
-                                                         quant_config=None)
+        self._vision_tower = None
+        self._multi_modal_projector = None
+        if not model_config.disable_mm_encoder:
+            # NOTE: current `modelopt` does not support quantizing the vision portion.
+            # NOTE: attn_backend: Pixtral head size not always divisible by 128
+            vision_model_config = self._get_sub_model_config(
+                model_config_cp,
+                "vision_config",
+                attn_backend="TRTLLM",
+                quant_config=None)
 
-        self._vision_tower = modeling_pixtral.PixtralVisionModel(
-            vision_model_config)
-        self._multi_modal_projector = Mistral3MultiModalProjector(
-            model_config).eval()
+            self._vision_tower = modeling_pixtral.PixtralVisionModel(
+                vision_model_config)
+            self._multi_modal_projector = Mistral3MultiModalProjector(
+                model_config).eval()
+        else:
+            logger.info(
+                f"{type(self).__name__}: multimodal encoder disabled "
+                "(disable_mm_encoder=True); serving text-only requests.")
         self._post_config()
 
     # This is necessary because the executor looks at
@@ -864,6 +885,9 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         else:
             self.llm.load_weights(llm_weights)
         logger.debug(f"Successfully loaded weights for {type(self.llm)}")
+
+        if self._vision_tower is None:
+            return
 
         vit_weights = filter_weights(weights=weights, prefix="vision_tower")
         logger.debug(f"Loading weights for {type(self._vision_tower)}")
@@ -897,6 +921,14 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         return self.llm
 
     @property
+    def lora_owner(self) -> DecoderLoraOwner:
+        if not isinstance(self.llm, MistralForCausalLM):
+            raise NotImplementedError(
+                f"{type(self.llm).__name__} does not support decoder LoRA forwarding"
+            )
+        return DecoderLoraOwner(module_path="language_model")
+
+    @property
     def multimodal_token_ids(self) -> torch.Tensor:
         return self._image_token_ids
 
@@ -924,6 +956,9 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         self,
         multimodal_params: Sequence[MultimodalParams],
     ) -> torch.Tensor:
+        if (self._vision_tower is None or self._multi_modal_projector is None):
+            raise ValueError(
+                "Raw multimodal inputs require a local multimodal encoder.")
         mm_embeds = self._vision_forward(list(multimodal_params))
         return mm_embeds[0]
 

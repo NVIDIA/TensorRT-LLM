@@ -8,7 +8,8 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.models import modeling_radio
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from tensorrt_llm._torch.models.modeling_radio import RADIOVisionModel
+from tensorrt_llm._torch.models.modeling_radio import RADIOVisionModel, VisionTransformer
+from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -134,8 +135,44 @@ def _init_finite_weights(model: torch.nn.Module) -> None:
                 param.zero_()
 
 
+def test_radio_run_blocks_lowers_torch_compiling_for_eager_fallback():
+    """A graph miss must keep RADIO attention off the compiled LM path."""
+    x = torch.zeros(1, 4)
+    attn_metadata = mock.Mock()
+    attn_metadata.seq_lens.tolist.return_value = [1]
+
+    observed = []
+    vision_tower = mock.Mock()
+    vision_tower._blocks_graph_runner.maybe_run.side_effect = lambda **_: observed.append(
+        is_torch_compiling()
+    )
+    vision_tower._run_blocks_eager.side_effect = (
+        lambda x, _: observed.append(is_torch_compiling()) or x
+    )
+
+    with torch_compiling(True):
+        output = VisionTransformer._run_blocks(vision_tower, x, attn_metadata)
+        assert is_torch_compiling(), "RADIO must restore the engine's compile flag"
+
+    assert output is x
+    assert observed == [False, False]
+    assert not is_torch_compiling()
+
+
+def test_clear_blocks_cuda_graph_releases_only_at_explicit_boundary():
+    runner = mock.Mock()
+    tower = mock.Mock(_blocks_graph_runner=runner)
+
+    VisionTransformer.clear_blocks_cuda_graph(tower)
+    VisionTransformer.clear_blocks_cuda_graph(tower)
+
+    runner.clear.assert_called_once_with(release_nccl_window_owners=True)
+    assert tower._blocks_graph_runner is None
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_radio_blocks_cuda_graph_matches_eager(tiny_vit_config):
+@pytest.mark.parametrize("automatic", [False, True], ids=["explicit", "automatic"])
+def test_radio_blocks_cuda_graph_matches_eager(tiny_vit_config, automatic):
     """Block-loop CUDA graph wiring must produce the same output as eager.
 
     Runs the tiny ViT once in eager mode to capture a reference, then enables the encoder graph
@@ -152,10 +189,14 @@ def test_radio_blocks_cuda_graph_matches_eager(tiny_vit_config):
         RADIOVisionModel(
             _make_bf16_model_config(),
             disable_quantization=True,
-            encoder_cuda_graph_config=MultimodalEncoderCudaGraphConfig(
-                buckets=[(16, 1)],
-                enable_padding=True,
-                warmup_steps=2,
+            encoder_cuda_graph_config=(
+                MultimodalEncoderCudaGraphConfig(max_batch_size=2, max_num_tokens=16)
+                if automatic
+                else MultimodalEncoderCudaGraphConfig(
+                    buckets=[(16, 1)],
+                    enable_padding=True,
+                    warmup_steps=2,
+                )
             ),
         )
         .to(device)
@@ -164,6 +205,10 @@ def test_radio_blocks_cuda_graph_matches_eager(tiny_vit_config):
     model.eval()
     _init_finite_weights(model)
     assert model.model_config.attn_backend == "FLASHINFER"
+    if automatic:
+        from tensorrt_llm._torch.pyexecutor.engine.multimodal import setup_mm_encoder_attn_metadata
+
+        setup_mm_encoder_attn_metadata(model, object(), 16, None)
 
     with torch.no_grad():
         eager_out = model.forward(pixel_values).clone()

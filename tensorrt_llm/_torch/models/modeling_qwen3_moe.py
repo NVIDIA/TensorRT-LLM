@@ -1,5 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
@@ -7,25 +22,25 @@ from transformers import Qwen3MoeConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
 
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
-                                 RenormalizeMoeRoutingMethod,
-                                 RenormalizeNaiveMoeRoutingMethod,
-                                 RoutingMethodType, TRTLLMGenFusedMoE,
-                                 create_moe, resolve_moe_cls)
-from ..modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (BaseMoeRoutingMethod, ConfigurableMoE,
+                             RenormalizeMoeRoutingMethod,
+                             RenormalizeNaiveMoeRoutingMethod,
+                             RoutingMethodType, create_moe)
+from ..moe.fused_moe.interface import MoEWeightLoadingMode
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
+from .modeling_utils import (DecoderModel, EagerFusionConfig,
+                             moe_experts_quant_config, register_auto_model)
 
 
 class Qwen3Gate(nn.Module):
@@ -38,17 +53,15 @@ class Qwen3Gate(nn.Module):
         dtype: Optional[torch.dtype] = None,
         apply_routing: bool = False,
         routing_method_type: RoutingMethodType = RoutingMethodType.Renormalize,
-        moe_backend_cls: Type[MoE] = CutlassFusedMoE,
     ):
         super().__init__()
         self.top_k = top_k
-        self.moe_backend_cls = moe_backend_cls
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
                                                dtype=dtype),
                                    requires_grad=False)
         self.routing_method_type = routing_method_type
-        # FIXME: out_dtype=float32 does not work
-        # self.out_dtype = torch.float32 if moe_backend_cls == TRTLLMGenFusedMoE else dtype
+        # FIXME: out_dtype=float32 does not work, so the gate emits logits in
+        # the model dtype no matter which backend consumes them.
         self.out_dtype = dtype
 
         assert not apply_routing, "Qwen3Gate routing is called inside MoE"
@@ -70,13 +83,13 @@ class Qwen3Gate(nn.Module):
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
-        output_dtype = torch.bfloat16 if self.moe_backend_cls == TRTLLMGenFusedMoE else torch.float32
+        # Full precision, and a new object per access: only the instance handed
+        # to ``create_moe`` is retargeted (see ``Qwen3MoE.__init__``), so a
+        # direct caller of ``apply`` never gets narrowed scales.
         if self.routing_method_type == RoutingMethodType.RenormalizeNaive:
-            return RenormalizeNaiveMoeRoutingMethod(top_k=self.top_k,
-                                                    output_dtype=output_dtype)
+            return RenormalizeNaiveMoeRoutingMethod(top_k=self.top_k)
         elif self.routing_method_type == RoutingMethodType.Renormalize:
-            return RenormalizeMoeRoutingMethod(top_k=self.top_k,
-                                               output_dtype=output_dtype)
+            return RenormalizeMoeRoutingMethod(top_k=self.top_k)
         else:
             raise ValueError(
                 f"Unsupported routing method: {self.routing_method_type}")
@@ -111,16 +124,6 @@ class Qwen3MoE(nn.Module):
             dtype=config.torch_dtype,
             apply_routing=False,
             routing_method_type=RoutingMethodType.Renormalize,
-            moe_backend_cls=resolve_moe_cls(
-                model_config,
-                routing=RoutingMethodType.Renormalize,
-                # Match the create_moe call below, which passes no bias and no
-                # swiglu alpha/beta. Left unknown, gates that create_moe
-                # rejects abstain here and the gate would name a backend the
-                # layer does not run.
-                swiglu_gptoss_style=False,
-                layer_idx=layer_idx,
-            ),
         )
 
         self.weight_loading_mode = MoEWeightLoadingMode.FUSED_GATE_UP_PROJ if config.model_type == "qwen3_vl_moe_text" else MoEWeightLoadingMode.VANILLA
@@ -133,9 +136,24 @@ class Qwen3MoE(nn.Module):
             dtype=config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
+            # MIXED_PRECISION's global quant_algo reads as unquantized, so the
+            # experts' own format has to be named here.
+            override_quant_config=moe_experts_quant_config(
+                model_config, f"model.layers.{layer_idx}.mlp.experts"),
             layer_idx=layer_idx,
             weight_loading_mode=self.weight_loading_mode,
         )
+
+        # Let the routing kernel write the dtype the bound backend wants
+        # (bfloat16 for TRTLLM-Gen) instead of leaving the scheduler to cast.
+        # Both renormalize ops take the dtype as a kernel argument, so this is
+        # free and saves one elementwise launch per layer per forward. Read
+        # back after binding rather than predicted: a prediction made before
+        # ``create_moe`` can name a backend this layer does not run.
+        if isinstance(self.experts, ConfigurableMoE):
+            scales_dtype = self.experts.backend.input_requirement.routing_scales_dtype
+            if scales_dtype is not None:
+                self.experts.routing_method.output_dtype = scales_dtype
 
     def forward(
         self,
@@ -143,6 +161,7 @@ class Qwen3MoE(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
@@ -160,6 +179,7 @@ class Qwen3MoE(nn.Module):
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
             do_finalize=do_finalize,
+            lora_params=lora_params,
         )
 
         if not do_finalize:
@@ -234,6 +254,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         mrope_config: Optional[Dict[str, torch.Tensor]] = None,
         deepstack_embeds: Optional[List[torch.Tensor]] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -250,6 +271,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
             mrope_config=mrope_config,
+            lora_params=lora_params,
             **kwargs,
         )
 
@@ -281,6 +303,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),
             do_finalize=do_finalize,
+            lora_params=lora_params,
         )
 
         if deepstack_embeds is not None and self.layer_idx in range(

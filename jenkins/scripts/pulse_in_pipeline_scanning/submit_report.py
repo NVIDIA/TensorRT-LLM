@@ -23,10 +23,23 @@ class BuildMetadata(TypedDict):
     build_number: str
     ref: str
     platform: NotRequired[str]
+    scan_mode: NotRequired[str]
 
 
 def safe(value, default=None):
     return value if value else default
+
+
+def _triage_branch(build_metadata: BuildMetadata) -> str:
+    """Return the branch to use when looking up existing triage records.
+
+    Pre-merge scans run against a per-PR commit hash, which never matches a
+    previously triaged branch. Look up against "main" instead so pre-merge
+    scans can reuse tickets already triaged there.
+    """
+    if build_metadata.get("scan_mode") == "pre_merge":
+        return "main"
+    return build_metadata["ref"]
 
 
 def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -> tuple[dict, dict]:
@@ -56,16 +69,17 @@ def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -
             new_tickets[pkg] = url
     license_ticket = ticket_refs.get("license")
     license_info = {}
-    if license_ticket and license_ticket.get("ticket_url"):
-        url = license_ticket["ticket_url"]
+    if license_ticket:
         license_info = license_ticket.get("license_info", {})
-        dep_names = {pkg.get("name") for pkg in (license_ticket.get("dependencies") or [])}
-        if not dep_names:
-            # Agent created a ticket but returned no dependency list — cover all submitted packages
-            dep_names = {doc["s_package_name"] for doc in risk_docs}
-        for name in dep_names:
-            if name:
-                new_tickets[name] = url
+        url = license_ticket.get("ticket_url", "")
+        if url:
+            dep_names = {pkg.get("name") for pkg in (license_ticket.get("dependencies") or [])}
+            if not dep_names:
+                # Agent created a ticket but returned no dependency list — cover all submitted packages
+                dep_names = {doc["s_package_name"] for doc in risk_docs}
+            for name in dep_names:
+                if name:
+                    new_tickets[name] = url
     if new_tickets:
         save_triage_records(
             ES_POST_URL,
@@ -92,7 +106,7 @@ def submit_source_code_vulns(
 ) -> list:
     """Triage untriaged source-code vulnerabilities, save all docs to ES, return untriaged risks."""
     SCAN_TYPE = "source_code_vulnerability"
-    triaged_deps = get_triaged_deps(SCAN_TYPE, build_metadata["ref"])
+    triaged_deps = get_triaged_deps(SCAN_TYPE, _triage_branch(build_metadata))
     ts = int(start_datetime.timestamp() * 1000)
 
     bulk_documents = []
@@ -133,11 +147,11 @@ def submit_source_code_vulns(
             if package_name not in triaged_deps:
                 risks_to_report.append(doc)
             bulk_documents.append(doc)
-        if risks_to_report:
-            new_tickets, _ = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
-            for doc in bulk_documents:
-                if doc["s_package_name"] in new_tickets:
-                    doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
+        # if risks_to_report:
+        #     new_tickets, _ = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+        #     for doc in bulk_documents:
+        #         if doc["s_package_name"] in new_tickets:
+        #             doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
 
         if bulk_documents:
             _, errors = es_post(ES_POST_URL, bulk_documents)
@@ -167,7 +181,7 @@ def submit_source_code_licenses(
     is_permissive, is_nvidia_proprietary).
     """
     SCAN_TYPE = "source_code_license"
-    triaged_deps = get_triaged_deps(SCAN_TYPE, build_metadata["ref"])
+    triaged_deps = get_triaged_deps(SCAN_TYPE, _triage_branch(build_metadata))
     ts = int(start_datetime.timestamp() * 1000)
 
     map_preapproved = get_preapproved_deps_map(SCAN_TYPE)
@@ -226,10 +240,10 @@ def submit_source_code_licenses(
                 "s_bdsa": "N/A",
                 "s_license_ids": ",".join(license_ids),
                 "s_bom_ref": component.get("bom-ref"),
-                "s_component_type": component.get("type"),
+                "s_package_type": component.get("type"),
                 "s_ticket_url": triaged_deps.get(package_name, ""),
             }
-            if not is_preapproved(map_preapproved, package_name, "pypi"):
+            if not is_preapproved(map_preapproved, package_name, component.get("type")):
                 risks_to_report.append(doc)
             sbom_documents.append(doc)
 
@@ -270,7 +284,7 @@ def submit_container_vulns(
 ) -> list:
     """Triage untriaged container vulnerabilities, save all docs to ES, return untriaged risks."""
     SCAN_TYPE = "container_vulnerability"
-    triaged_deps = get_triaged_deps(SCAN_TYPE, build_metadata["ref"])
+    triaged_deps = get_triaged_deps(SCAN_TYPE, _triage_branch(build_metadata))
     ts = int(start_datetime.timestamp() * 1000)
 
     release_data = load_json(input_file)
@@ -308,11 +322,11 @@ def submit_container_vulns(
         if package_name not in triaged_deps:
             risks_to_report.append(doc)
         docs.append(doc)
-    if risks_to_report:
-        new_tickets, _ = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
-        for doc in docs:
-            if doc["s_package_name"] in new_tickets:
-                doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
+    # if risks_to_report:
+    #     new_tickets, _ = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+    #     for doc in docs:
+    #         if doc["s_package_name"] in new_tickets:
+    #             doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
 
     if docs:
         _, errors = es_post(ES_POST_URL, docs)
@@ -344,7 +358,9 @@ def submit_container_licenses(
     base_data = load_json(base_input_file)
     release_image = release_data.get("image_tag", "")
     base_image = base_data.get("image_tag", "")
-    triaged_deps = get_triaged_deps(SCAN_TYPE, build_metadata["ref"], container=release_image)
+    triaged_deps = get_triaged_deps(
+        SCAN_TYPE, _triage_branch(build_metadata), container=release_image
+    )
     ts = int(start_datetime.timestamp() * 1000)
 
     trtllm_deps = diff_licenses(SCAN_TYPE, input_file, base_input_file)

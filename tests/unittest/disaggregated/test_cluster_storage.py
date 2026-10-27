@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, StorageItem, WatchEvent, WatchEventType,
     create_cluster_storage, create_cluster_storage_client, is_loopback_host,
-    validate_http_cluster_storage_scope)
+    jsonify, validate_http_cluster_storage_scope)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -230,7 +230,7 @@ class TestClusterStorage:
                     ]) == {WatchEventType.DELETE, WatchEventType.SET}
 
 
-def http_server_storage(port):
+def http_server_storage(port, expire_block_sec=0):
     cluster_storage = HttpClusterStorageServer("", "")
 
     @contextlib.asynccontextmanager
@@ -240,6 +240,15 @@ def http_server_storage(port):
         await cluster_storage.stop()
 
     app = FastAPI(lifespan=lifespan)
+    if expire_block_sec > 0:
+
+        async def blocked_expire(key: str, ttl: int) -> bool:
+            # Block inside the real HTTP request's event loop so its TTL read
+            # is ordered before the overdue expiry-sweep continuation.
+            time.sleep(expire_block_sec)
+            return await cluster_storage.expire(key, ttl)
+
+        app.add_api_route("/expire", jsonify(blocked_expire), methods=["GET"])
     cluster_storage.add_routes(app)
     server = Server(
         uvicorn.Config(app=app, host="localhost", port=port, log_level="info"))
@@ -269,3 +278,137 @@ class TestEtcdClusterStorage(TestClusterStorage):
             yield self.etcd, "etcd://localhost:2379"
         self.etcd.kill()
         self.etcd.wait()
+
+
+@pytest.mark.asyncio
+async def test_expiry_does_not_charge_the_storage_own_outage():
+    """A worker refreshing its TTL must survive a block longer than that TTL.
+
+    Workers refresh over ``/expire`` on the storage's own event loop, so while
+    that loop is blocked their refreshes sit unread rather than arriving late.
+    Charging the block to the key expires a live worker for the storage's own
+    outage, which evicts it from the routers and fails requests routed there
+    (https://nvbugs/6786712). Uses the tight functional-test timings
+    (ttl=2s, refresh every 1s) against a block that straddles the deadline.
+    """
+    ttl, refresh_sec, block_sec = 2, 1, 2.5
+    storage = HttpClusterStorageServer("", "")
+    await storage.start()
+    try:
+        key = gen_key("outage_key")
+        assert await storage.set(key, "worker", ttl=ttl)
+
+        async def refresh_periodically():
+            while True:
+                await asyncio.sleep(refresh_sec)
+                await storage.expire(key, ttl)
+
+        refresher = asyncio.create_task(refresh_periodically())
+        try:
+            await asyncio.sleep(refresh_sec + 0.2)  # one clean refresh first
+            # Busy-wait, holding the loop exactly as a cold tokenizer build does.
+            block_end = time.monotonic() + block_sec
+            while time.monotonic() < block_end:
+                pass
+            # Let the loop resume so the expiry sweep runs at least once.
+            await asyncio.sleep(storage._check_expired_interval + 0.5)
+            assert await storage.get(key) == "worker", (
+                "a live, refreshing worker was expired for time the storage "
+                "itself could not serve refreshes")
+        finally:
+            refresher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await refresher
+
+        # The clock must still expire a worker that really stopped refreshing,
+        # otherwise the fix above would keep dead workers registered forever.
+        await asyncio.sleep(ttl + storage._check_expired_interval + 0.5)
+        assert await storage.get(key) is None
+    finally:
+        await storage.stop()
+
+
+@pytest.mark.asyncio
+async def test_queued_http_refresh_settles_outage_before_ttl_operations(
+        unused_tcp_port):
+    """A queued HTTP refresh must settle a storage-loop outage first."""
+    ttl, block_sec = 2, 2.5
+    server, storage = http_server_storage(unused_tcp_port,
+                                          expire_block_sec=block_sec)
+
+    with server.run_in_thread():
+        client = create_cluster_storage_client(
+            f"http://localhost:{unused_tcp_port}", "test")
+        try:
+            key = gen_key("queued_outage_key")
+            assert await client.set(key, "worker", ttl=ttl)
+
+            # The /expire handler blocks the uvicorn/storage loop past the
+            # current TTL, then refreshes before the queued sweep can resume.
+            assert await client.expire(key, ttl)
+            assert await client.get(key) == "worker"
+
+            # A refresh made with the stale wall clock would extend this TTL
+            # by the outage duration a second time.
+            await asyncio.sleep(ttl + storage._check_expired_interval + 0.5)
+            assert await client.get(key) is None
+        finally:
+            await client._session.close()
+
+
+@pytest.mark.asyncio
+async def test_consecutive_outages_are_not_charged_to_ttl():
+    """A stall right after a settled one must not expire a live worker.
+
+    Any TTL operation settles the overdue outage sample, and the sampling task
+    cannot arm the next one until the loop gives it a turn -- which it cannot
+    while another ready handler is blocking. Leaving that window unmeasured
+    charges the second stall to the key and deletes a worker whose periodic
+    refresh is merely queued (https://nvbugs/6786712). Same tight
+    functional-test timings as above (ttl=2s, refresh every 1s).
+    """
+    ttl, refresh_sec, block_sec = 2, 1, 2.5
+    storage = HttpClusterStorageServer("", "")
+    await storage.start()
+    try:
+        key = gen_key("consecutive_outage_key")
+        assert await storage.set(key, "worker", ttl=ttl)
+
+        async def refresh_periodically():
+            while True:
+                await asyncio.sleep(refresh_sec)
+                await storage.expire(key, ttl)
+
+        def block_the_loop():
+            # Busy-wait, holding the loop exactly as a cold tokenizer build does.
+            block_end = time.monotonic() + block_sec
+            while time.monotonic() < block_end:
+                pass
+
+        async def stall_then_read():
+            # Settles the first stall's sample before the sweep can resume.
+            block_the_loop()
+            assert await storage.get(key) == "worker"
+
+        async def stall_again():
+            # Already queued, so it runs in the same batch as the handler above
+            # and blocks the loop again before the sweep gets a turn.
+            block_the_loop()
+
+        refresher = asyncio.create_task(refresh_periodically())
+        try:
+            await asyncio.sleep(refresh_sec + 0.2)  # one clean refresh first
+            await asyncio.gather(stall_then_read(), stall_again())
+            assert await storage.get(key) == "worker", (
+                "the second consecutive stall was charged to the key's TTL, "
+                "expiring a live worker for the storage's own outage")
+        finally:
+            refresher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await refresher
+
+        # The clock must still expire a worker that really stopped refreshing.
+        await asyncio.sleep(ttl + storage._check_expired_interval + 0.5)
+        assert await storage.get(key) is None
+    finally:
+        await storage.stop()

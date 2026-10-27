@@ -49,7 +49,14 @@ if TYPE_CHECKING:
 RidSlice = tuple  # the request id and slice id a region serves
 _MIB = 1024 * 1024
 _SCATTER_POLL_S = 0.5  # how often the scatter worker wakes to re-check the stop flag and reclaim
-_RESERVE_TIMEOUT_S = 0.2  # max wait for a bounce region before falling back to per-fragment
+# Send side: a sender (KV transfer worker thread) may wait this long for bounce space before
+# falling back to per-fragment writes.
+_RESERVE_TIMEOUT_S = 0.2
+# Receive side: never wait. The receiver reserves on the executor thread while it admits
+# generation requests, so any wait pauses the whole iteration (and, under attention DP, every rank
+# of the group). If the recv region is full, use the per-fragment path right away; a timed-out
+# wait ends in the same fallback, and the transfer stays asynchronous either way.
+_RECV_RESERVE_TIMEOUT_S = 0.0
 _CLOSE_JOIN_S = 2.0  # max wait for the scatter thread to drain on close
 _QUARANTINE_GRACE_S = 60.0  # how long an orphaned region is held out of reuse
 
@@ -233,34 +240,46 @@ class VmmBounceTransport(BounceTransport):
         recv_req,
         num_writers: int = 1,
         *,
-        timeout: Optional[float] = _RESERVE_TIMEOUT_S,
+        timeout: Optional[float] = _RECV_RESERVE_TIMEOUT_S,
         extra_bytes: int = 0,
     ) -> bool:
         """Reserve a region and create its state, recording the address for the senders. Returns
         False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
         must divide across the writers. ``extra_bytes`` is the non-paged payload the sender appends
         to the same coalesced write (mamba/KDA recurrent state, sized by the receiver via
-        ``MambaPolicy.payload_bytes``); the region must cover it or the write would overrun into the
+        ``mamba_receiver_payload_bytes``); the region must cover it or the write would overrun into the
         neighboring slot."""
         total = 0
-        for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups):
-            if int(block_ids.size) == 0:
-                # Nothing to transfer for this group. Hybrid models (Kimi K3: KDA + MLA) always
-                # carry a trailing empty entry for the mamba layer group — its state is not paged
-                # and rides extra_bytes instead — so an empty group must not disable bounce.
+        has_state_group = False
+        # Block tables are positional with -1 holes (see Chunk); only the
+        # slots the receiver actually accepts are written into the region.
+        valid_counts = [
+            int((block_ids >= 0).sum()) for block_ids in recv_req.block_ids_per_layer_groups
+        ]
+        for g, n_valid in enumerate(valid_counts):
+            if n_valid == 0:
                 continue
-            known = g < len(self._block_bytes_per_group) and self._block_bytes_per_group[g]
-            if not known:
+            if g >= len(self._block_bytes_per_group):
                 return self._skip_bounce(
                     f"layer group {g} has blocks but no known slot size",
                     warn_key="kv-bounce-unknown-slot-size",
                 )
-            total += int(block_ids.size) * self._block_bytes_per_group[g]
-        if extra_bytes > 0 and num_writers > 1:
-            # Each fan-in writer appends its own recurrent-state fragments, whose sizes may differ
-            # per writer (PP stages hold different mamba layers), breaking the equal region split.
+            if not self._block_bytes_per_group[g]:
+                # This group holds recurrent state (mamba/KDA), not paged KV blocks;
+                # its size is accounted for by extra_bytes below, not per-block math.
+                has_state_group = True
+                continue
+            total += n_valid * self._block_bytes_per_group[g]
+        if has_state_group and num_writers > 1:
+            # Fan-in with recurrent-state groups is unsafe: each writer may
+            # append its own state fragments (different PP stages hold different
+            # mamba layers), and the representative extra_bytes (computed from
+            # one sender's page table) may not reflect all participating senders.
+            # Even when extra_bytes == 0 (e.g. the representative rank has no
+            # mamba overlap), another PP sender may still contribute state bytes
+            # that were not reserved in the bounce region.
             return self._skip_bounce(
-                f"fan-in across {num_writers} senders with {extra_bytes}B of recurrent state; the "
+                f"fan-in across {num_writers} senders with STATE groups present; the "
                 f"equal split cannot account for per-writer state fragments",
                 warn_key="kv-bounce-mamba-fanin",
             )
@@ -279,7 +298,7 @@ class VmmBounceTransport(BounceTransport):
         # TODO(TRTLLM-15194): investigate whether the byte-only gate is
         # safe (or better) for plain-KV payloads too, so this special case can be removed and
         # both payload kinds share one gate.
-        nblocks = sum(int(a.size) for a in recv_req.block_ids_per_layer_groups)
+        nblocks = sum(valid_counts)
         if extra_bytes > 0:
             if total < self._min_bytes:
                 return self._skip_bounce(
@@ -303,10 +322,11 @@ class VmmBounceTransport(BounceTransport):
             # Fan-in gives each writer an equal share of the region, which only matches where it
             # writes when all writers send the same bytes. Equal layer count guarantees that only
             # when the per-block sizes match, so require that here, else fall back.
+            # Exclude None entries (STATE groups) — they are already guarded above.
             present_slot_bytes = {
                 self._block_bytes_per_group[g]
-                for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups)
-                if int(block_ids.size) > 0
+                for g, n_valid in enumerate(valid_counts)
+                if n_valid > 0 and self._block_bytes_per_group[g]
             }
             if len(present_slot_bytes) > 1:
                 return self._skip_bounce(
@@ -370,6 +390,13 @@ class VmmBounceTransport(BounceTransport):
         The write can't be aborted, so quarantine the region (reclaimed later) rather than releasing
         or leaking it. Idempotent; a no-op once the transfer has settled."""
         self._apply(rid_slice, lambda ctx: ctx.mark_orphaned())
+
+    def abort_publication(self, rid_slice: RidSlice, published_writers: set[int]) -> None:
+        """Retain a failed fan-out until every successfully published writer drains."""
+        self._apply(
+            rid_slice,
+            lambda ctx: ctx.abort_publication(published_writers),
+        )
 
     def _apply(self, rid_slice: RidSlice, mutate: Callable[[TransferContext], None]) -> None:
         """Mutate the state under the lock, then do what it asks (scatter or settle) with the lock
@@ -502,7 +529,7 @@ class NoBounceTransport(BounceTransport):
         recv_req,
         num_writers: int = 1,
         *,
-        timeout: Optional[float] = _RESERVE_TIMEOUT_S,
+        timeout: Optional[float] = _RECV_RESERVE_TIMEOUT_S,
         extra_bytes: int = 0,
     ) -> bool:
         return False
@@ -517,6 +544,9 @@ class NoBounceTransport(BounceTransport):
         pass
 
     def orphan_reservation(self, rid_slice) -> None:
+        pass
+
+    def abort_publication(self, rid_slice, published_writers: set[int]) -> None:
         pass
 
     def record_result(
@@ -600,13 +630,13 @@ def block_bytes_per_group(page_table: KVCachePageTable) -> list[int | None]:
     only once. Non-attention groups retain a ``None`` placeholder so the result
     remains aligned with receive-request layer-group indices.
     """
-    from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
+    from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
     from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 
     assert page_table is not None
     out: list[int | None] = []
     for lg_idx, lg in enumerate(page_table.layer_groups):
-        if not isinstance(lg, AttentionLayerGroup):
+        if lg.kind != CacheKind.PAGED:
             out.append(None)
             continue
         pool_indices = {pool_view.pool_idx for pool_view in lg.pool_views}

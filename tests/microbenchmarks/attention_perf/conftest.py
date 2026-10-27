@@ -20,15 +20,7 @@ adding their roots here lets those optional imports succeed when present, while
 the harness still degrades gracefully if they are not.
 """
 
-import sys
-from pathlib import Path
-
-_MICROBENCH = Path(__file__).resolve().parents[1]  # tests/microbenchmarks
-_INTEGRATION = _MICROBENCH.parents[0] / "integration"  # tests/integration
-
-for p in (_MICROBENCH, _INTEGRATION):
-    if p.exists() and str(p) not in sys.path:
-        sys.path.insert(0, str(p))
+__extra_import_path__ = ["~/tests/microbenchmarks", "~/tests/integration"]
 
 
 def pytest_configure(config) -> None:

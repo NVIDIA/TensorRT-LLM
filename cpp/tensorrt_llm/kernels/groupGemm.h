@@ -34,6 +34,9 @@ int64_t getGroupedGemmParamsWorkSpaceSize(int64_t problem_count);
 //! cute stride arrays on the device. This function returns the required bytes.
 int64_t getFp8GroupedGemmParamsWorkSpaceSize(int64_t problemCount);
 
+//! @brief Returns whether the FP8 grouped GEMM kernel for an SM version is present in this build.
+bool supportsFp8GroupedGemm(int smVersion);
+
 void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkspace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkspaceSize,

@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <iterator>
 #include <stdexcept>
 #include <utility>
@@ -68,13 +69,19 @@ bool pageCoversBlock(CommittedPage const* page, Block const& block)
 } // namespace
 
 EventManager::EventManager(int maxKvEventEntries, int windowSize, std::optional<int> attentionDpRank,
-    AttentionDpGatherFn attentionDpGather, std::string hashAlgo, std::map<int, int> windowSizeByLayerGroup)
+    AttentionDpGatherFn attentionDpGather, std::string hashAlgo, std::map<int, int> windowSizeByLayerGroup,
+    std::optional<int> mmTokenIdOffset)
     : mMaxKvEventEntries(maxKvEventEntries)
     , mWindowSize(windowSize)
     , mWindowSizeByLayerGroup(std::move(windowSizeByLayerGroup))
     , mAttentionDpRank(attentionDpRank)
     , mAttentionDpGather(std::move(attentionDpGather))
+    , mMmTokenIdOffset(mmTokenIdOffset)
 {
+    if (mMmTokenIdOffset.has_value() && *mMmTokenIdOffset < 0)
+    {
+        throw std::invalid_argument("mm_token_id_offset must be nonnegative");
+    }
     std::tie(mHashAlgo, mHashAlgoName) = parseHashAlgorithm(hashAlgo);
 }
 
@@ -304,6 +311,24 @@ void EventManager::addCacheLevelUpdated(
         lifeCycle.value());
 }
 
+void EventManager::addPriorityUpdated(
+    Digest const& blockKey, Priority oldPriority, Priority newPriority, LifeCycleId lifeCycle)
+{
+    if (mMaxKvEventEntries <= 0)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto const state = mStoredBlocks.find(blockKey);
+    if (state == mStoredBlocks.end() || state->second.lifeCycleIds.count(lifeCycle.value()) == 0)
+    {
+        return;
+    }
+    addEventUnlocked(
+        KVCacheUpdatedData{state->second.blockHash, std::nullopt, KVCacheEventDiff{oldPriority, newPriority}},
+        lifeCycle.value());
+}
+
 void EventManager::addStoredEventUnlocked(KVCacheStoredData data, EventLayerGroupId layerGroupId)
 {
     bool const hasPendingRemovedEvents = !mLatestRemovedBlockHashes.empty();
@@ -479,20 +504,6 @@ int EventManager::getWindowSize(EventLayerGroupId layerGroupId) const
     return windowSize == mWindowSizeByLayerGroup.end() ? mWindowSize : windowSize->second;
 }
 
-std::string EventManager::digestToHex(Digest const& digest)
-{
-    constexpr char kHex[] = "0123456789abcdef";
-    std::string result;
-    result.resize(digest.size() * 2);
-    for (size_t i = 0; i < digest.size(); ++i)
-    {
-        auto const value = std::to_integer<uint8_t>(digest[i]);
-        result[2 * i] = kHex[value >> 4U];
-        result[2 * i + 1] = kHex[value & 0x0FU];
-    }
-    return result;
-}
-
 uint64_t EventManager::truncateDigestToInt64(Digest const& digest)
 {
     uint64_t result = 0;
@@ -537,7 +548,11 @@ std::optional<EventBlockHash> EventManager::parentHashFromBlock(Block const& blo
 std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
     Block const& block, std::optional<std::set<int>> const& lifeCycleIds)
 {
-    CacheLevel cacheLevel = kGpuLevel;
+    if (block.root == nullptr)
+    {
+        throw std::logic_error("Cannot publish an orphan KV cache block");
+    }
+    CacheLevel cacheLevel = kHotLevel;
     Priority priority = kPriorityDefault;
     bool foundPage = false;
     for (LifeCycleId lifeCycle{0}; lifeCycle < block.storage.size(); ++lifeCycle)
@@ -550,7 +565,7 @@ std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
         if (pageCoversBlock(page, block))
         {
             cacheLevel = page->cacheLevel;
-            priority = page->priority;
+            priority = page->priority();
             foundPage = true;
             break;
         }
@@ -560,25 +575,20 @@ std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
         return std::nullopt;
     }
 
+    auto decoded = decodeEventBlock(block, mMmTokenIdOffset);
     std::vector<UniqueToken> tokens;
-    tokens.reserve(block.tokens.size());
-    for (auto const& token : block.tokens)
+    tokens.reserve(decoded.tokenIds.size());
+    for (auto& tokenId : decoded.tokenIds)
     {
-        if (!token.isDigest())
-        {
-            UniqueToken uniqueToken;
-            uniqueToken.tokenId = EventTokenId{std::in_place_index<0>, token.tokenId()};
-            tokens.push_back(std::move(uniqueToken));
-        }
-        else
-        {
-            UniqueToken uniqueToken;
-            uniqueToken.tokenId = EventTokenId{std::in_place_index<1>, digestToHex(token.digest())};
-            tokens.push_back(std::move(uniqueToken));
-        }
+        tokens.push_back(UniqueToken{std::move(tokenId)});
     }
-    return KVCacheStoredBlockData{
-        hashFromBlock(block), std::move(tokens), cacheLevel.value(), priority, {}, std::nullopt};
+    return KVCacheStoredBlockData{hashFromBlock(block), std::move(tokens), cacheLevel.value(), priority,
+        std::move(decoded.mmKeys), block.root->reuseScope.salt};
+}
+
+uint64_t EventManager::hashV1CacheSalt(std::string const& salt)
+{
+    return static_cast<uint64_t>(std::hash<std::string>{}(salt));
 }
 
 uint64_t EventManager::hashV1BlockKey(std::vector<TokenId> const& tokens, uint64_t parentHash,
@@ -632,7 +642,8 @@ uint64_t EventManager::v1HashFromBlock(Block const& block)
     if (current->type() == NodeBase::Type::kROOT_BLOCK)
     {
         auto const& reuseScope = static_cast<RootBlock const*>(current)->reuseScope;
-        rootAttrs = {reuseScope.loraId, reuseScope.salt};
+        rootAttrs = {reuseScope.loraId,
+            reuseScope.salt ? std::optional<uint64_t>(hashV1CacheSalt(*reuseScope.salt)) : std::nullopt};
     }
 
     for (auto chainIter = chain.rbegin(); chainIter != chain.rend(); ++chainIter)

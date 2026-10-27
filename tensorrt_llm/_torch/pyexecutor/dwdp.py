@@ -17,7 +17,8 @@
 This module owns three concerns and delegates the rest:
   * Lifecycle / global singleton (``__enter__`` / ``__exit__`` +
     ``set_global_dwdp_manager`` / ``get_global_dwdp_manager``)
-  * DWDP MPI sub-communicator creation (``_create_dwdp_comm``)
+  * DWDP group creation (``_create_dwdp_comm``): an MPI sub-communicator, or
+    a TCPStore rendezvous for independently launched workers
   * Layer index registration (SSOT: ``add_layer`` → ``_registered_layers``)
     plus runtime entry points that forward to ``DWDPWeightManager``
     (``prefetch_first_layers``, ``wait_and_bind``,
@@ -30,6 +31,7 @@ and is wired up by ``setup_dwdp()`` during ``setup(model)``.
 
 from __future__ import annotations
 
+import weakref
 from typing import List, Optional
 
 import torch
@@ -37,8 +39,14 @@ import torch.nn as nn
 from mpi4py.MPI import COMM_WORLD
 
 from tensorrt_llm._torch.distributed import MPIDist
-from tensorrt_llm._torch.modules.dwdp import DWDPWeightManager, setup_dwdp
-from tensorrt_llm._utils import global_mpi_rank
+from tensorrt_llm._torch.modules.dwdp import (
+    DWDPWeightManager,
+    StoreDwdpGroup,
+    dwdp_global_rank,
+    setup_dwdp,
+    store_rendezvous_enabled,
+    teardown_dwdp,
+)
 from tensorrt_llm.llmapi.llm_args import DwdpConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -58,7 +66,9 @@ def get_global_dwdp_manager() -> Optional["DwdpManager"]:
 class DwdpManager:
     """Lifecycle facade that plumbs the VA-based DWDP pipeline.
 
-    Construction creates the DWDP MPI sub-communicator. ``add_layer`` is the
+    Construction creates the DWDP group: an MPI sub-communicator, or a
+    ``StoreDwdpGroup`` when the context workers are launched independently
+    (see ``modules.dwdp.rendezvous``). ``add_layer`` is the
     Single Source of Truth for MoE layer indices — ``configurable_moe``
     registers each MoE layer during model construction, and ``setup(model)``
     passes that list to ``setup_dwdp()`` so ``collect_moe_params`` never has
@@ -75,15 +85,24 @@ class DwdpManager:
         dist: object,
         mapping: Mapping,
     ) -> None:
-        if not isinstance(dist, MPIDist):
-            raise RuntimeError("DWDP requires MPI backend (MPIDist)")
+        if get_global_dwdp_manager() is not None:
+            raise RuntimeError("DwdpManager already registered globally")
+        # Independently launched workers each have their own MPI world, so the
+        # group rendezvous over a TCPStore instead of COMM_WORLD.
+        self._store_rendezvous = store_rendezvous_enabled()
+        if not self._store_rendezvous and not isinstance(dist, MPIDist):
+            raise RuntimeError(
+                "DWDP requires the MPI backend (MPIDist), or a store "
+                "rendezvous: set TRTLLM_DWDP_RANK and TRTLLM_DWDP_MASTER_ADDR "
+                "when the context workers are launched independently"
+            )
         if not mapping.dwdp_enabled:
             raise RuntimeError(
                 f"DwdpManager requires mapping.dwdp_enabled (dwdp_size > 1); "
                 f"got dwdp_size={mapping.dwdp_size}"
             )
 
-        # Validate DwdpConfig topology against the actual MPI launch.
+        # Validate DwdpConfig topology against the actual launch.
         # `num_groups` declares the user's intended topology — that the launch
         # contains `num_groups × dwdp_size` CTX worker ranks, partitioned into
         # `num_groups` independent DWDP groups of `dwdp_size` ranks each.
@@ -91,7 +110,7 @@ class DwdpManager:
         # is how it was treated up through commit `1fbc0d49`.
         if config.num_groups <= 0:
             raise ValueError(f"DwdpConfig.num_groups must be positive, got {config.num_groups}")
-        self.rank = global_mpi_rank()
+        self.rank = dwdp_global_rank()
         group_id = self.rank // mapping.dwdp_size
         if group_id >= config.num_groups:
             raise ValueError(
@@ -103,8 +122,11 @@ class DwdpManager:
                 f"ranks, or num_groups in the YAML is set too small."
             )
         expected_min_world = config.num_groups * mapping.dwdp_size
-        actual_world = COMM_WORLD.Get_size()
-        if actual_world < expected_min_world:
+        # Under a store rendezvous COMM_WORLD spans only this worker and says
+        # nothing about the launch; the group_id check above bounds the rank,
+        # and a missing peer surfaces as the first store allgather timing out.
+        actual_world = None if self._store_rendezvous else COMM_WORLD.Get_size()
+        if actual_world is not None and actual_world < expected_min_world:
             raise ValueError(
                 f"DwdpConfig declares {config.num_groups} groups × dwdp_size "
                 f"{mapping.dwdp_size} = {expected_min_world} CTX workers, but "
@@ -141,18 +163,29 @@ class DwdpManager:
 
         # Set by setup(model); None until then
         self._weight_manager: Optional[DWDPWeightManager] = None
+        self._model_ref: Optional[weakref.ReferenceType[nn.Module]] = None
 
     # ------------------------------------------------------------------
-    # DWDP MPI group
+    # DWDP group
     # ------------------------------------------------------------------
 
     def _create_dwdp_comm(self):
-        """Create an MPI sub-communicator scoped to this rank's DWDP group.
+        """Create the group handle scoped to this rank's DWDP group.
 
         With num_groups=2, dwdp_size=4:
             Group 0: ranks [0, 1, 2, 3]
             Group 1: ranks [4, 5, 6, 7]
+
+        Returns an MPI sub-communicator, or a ``StoreDwdpGroup`` under a store
+        rendezvous; both expose ``allgather`` / ``Barrier`` / ``Free``.
         """
+        if self._store_rendezvous:
+            return StoreDwdpGroup.from_env(
+                global_rank=self.rank,
+                dwdp_size=self.dwdp_size,
+                num_groups=self.config.num_groups,
+            )
+
         group_id = self.rank // self.dwdp_size
         group_start = group_id * self.dwdp_size
         ranks = list(range(group_start, group_start + self.dwdp_size))
@@ -169,19 +202,44 @@ class DwdpManager:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        self.cleanup()
-        set_global_dwdp_manager(None)
+        try:
+            self.cleanup()
+        finally:
+            set_global_dwdp_manager(None)
         return False
 
     def is_enabled(self) -> bool:
         return self.dwdp_size > 1
 
     def cleanup(self) -> None:
-        """Release MPI sub-communicator and reset weight manager. Idempotent."""
-        self._weight_manager = None
-        if self.dwdp_group is not None:
-            self.dwdp_group.Free()
-            self.dwdp_group = None
+        """Release the DWDP group (MPI sub-communicator or TCPStore) and reset
+        the weight manager. Idempotent."""
+        cleanup_error = None
+        cleanup_traceback = None
+        try:
+            model = self._model_ref() if self._model_ref is not None else None
+            if model is not None and self._weight_manager is not None:
+                teardown_dwdp(model, expected_manager=self._weight_manager)
+            elif self._weight_manager is not None:
+                self._weight_manager.release()
+        except BaseException as exc:
+            cleanup_error = exc
+            cleanup_traceback = exc.__traceback__
+        finally:
+            self._weight_manager = None
+            self._model_ref = None
+            if self.dwdp_group is not None:
+                try:
+                    self.dwdp_group.Free()
+                except BaseException:
+                    if cleanup_error is None:
+                        raise
+                    logger.exception("Failed to free DWDP group after runtime cleanup error")
+                finally:
+                    self.dwdp_group = None
+
+        if cleanup_error is not None:
+            raise cleanup_error.with_traceback(cleanup_traceback)
 
     # ------------------------------------------------------------------
     # Layer registration (SSOT) + setup
@@ -215,6 +273,10 @@ class DwdpManager:
             num_prefetch_experts=self.num_prefetch_experts,
             contention_opt=self.config.contention_opt,
         )
+        self._model_ref = weakref.ref(model)
+        if self._store_rendezvous:
+            # Lets DWDP rank 0, which serves the store, release it once every group is set up.
+            self.dwdp_group.mark_setup_done()
         return self._weight_manager
 
     # ------------------------------------------------------------------
@@ -238,13 +300,19 @@ class DwdpManager:
         self._weight_manager.wait_and_bind(backend_module, layer_idx)
 
     def record_compute_and_prefetch_next(self, layer_idx: int) -> None:
-        """After the current layer finishes compute, kick off the next layer's prefetch.
+        """Record compute and maintain the two-layer prefetch window.
 
-        The WAR signal for the "consumed" slot is recorded inside
-        ``wait_and_bind``; here we just schedule the next prefetch.
+        ``prefetch_first_layers`` warms the first two MoE layers. After each
+        layer's kernel has been enqueued, record consumption of its current
+        buffer slot and prefetch the layer two positions ahead. This avoids
+        duplicate prefetch of the second layer and prevents reuse of a slot
+        before the current kernel has finished reading it.
         """
         if self._weight_manager is None:
             raise RuntimeError("DwdpManager.setup() has not been called yet")
+        self._weight_manager.record_compute(layer_idx)
         next_idx = self._weight_manager.next_moe_layer(layer_idx)
         if next_idx is not None:
-            self._weight_manager.prefetch_layer(next_idx)
+            next_next_idx = self._weight_manager.next_moe_layer(next_idx)
+            if next_next_idx is not None:
+                self._weight_manager.prefetch_layer(next_next_idx)

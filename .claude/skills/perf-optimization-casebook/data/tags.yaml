@@ -1,0 +1,116 @@
+# Controlled vocabulary for casebook case frontmatter (pilot).
+#
+# Case frontmatter fields MUST use canonical terms from this file only.
+# Synonyms live in aliases.yaml and are for QUERY-TIME normalization —
+# never write a synonym into frontmatter. Check by hand when adding a case.
+#
+# Extend by adding a term here first (one term, one meaning); do not invent
+# terms inline in a case file.
+
+family:
+  - runtime-execution
+  - kernel-and-fusion
+  - communication
+
+# Bottleneck classes — aligned with the perf-analysis classification
+# (compute / memory / launch / communication / sync), plus host-overhead,
+# which perf-host-analysis detects as its own verdict and the casebook
+# uses pervasively.
+bottleneck:
+  - compute
+  - memory
+  - launch
+  - communication
+  - sync
+  - host-overhead
+
+# Profile signals — observable evidence that makes a case relevant.
+# A case lists 2–5. Keep this list short; a signal earns its place by
+# appearing in nsys/ncu/log evidence, not by being a paraphrase of a
+# bottleneck class.
+signals:
+  - gpu-idle-between-steps        # nsys: bubbles between forward steps
+  - host-prep-on-critical-path    # nsys: CPU prep serialized before launch
+  - many-small-kernels            # nsys: dense stream of tiny kernels
+  - hbm-roundtrip-between-ops     # intermediates materialized to HBM between ops
+  - kernel-far-from-sol           # ncu: hot kernel well below SOL%
+  - attention-hot-path            # attention kernel dominates the step
+  - routing-hot-path              # MoE router/gating dominates or fragments the step
+  - kv-reads-dominate             # KV-cache bytes dominate decode
+  - long-context                  # large ISL / long KV history
+  - high-concurrency              # many in-flight requests
+  - small-batch-decode            # low-concurrency / latency-bound decode
+  - allreduce-dominates           # TP collective a large share of step time
+  - alltoall-dominates            # EP dispatch/combine a large share of step time
+  - expert-load-imbalance         # ragged expert/DP load across ranks
+  - recompilation-churn           # Triton/torch.compile recompiles on hot path
+  - slow-path-fallback            # config silently fell back to a generic/slow path
+  - draft-forward-exposed         # spec-decode draft not hidden behind target
+  - memory-capacity-bound         # OOM / KV budget caps batch size
+  - gemm-dominates-step           # nsys: (grouped-)GEMM is the largest share of the step
+  - weight-reads-dominate         # decode: expert/weight bytes dominate HBM traffic
+  - mixed-dtype-checkpoint        # checkpoint puts fused-GEMM participants in differing dtypes/quant formats
+  - full-precision-on-wire        # activations cross the collective at bf16/fp16 despite a quantized model
+  - low-accept-rate               # spec-decode acceptance rate low, capping speedup
+
+architectures:
+  - sm80
+  - sm89
+  - sm90
+  - sm100
+  - sm103
+  - any-sm
+
+# Model/architecture applicability. Include `model-agnostic` when the
+# pattern transfers beyond the origin models (most cases — the casebook's
+# whole point); list the origin models too so exact-instance queries hit.
+model_scope:
+  - model-agnostic
+  - dense
+  - moe
+  - mla
+  - gqa
+  - sparse-attention
+  - spec-decode
+  - deepseek-v3r1
+  - deepseek-v32
+  - qwen3-moe
+  - kimi-k2
+  - llama-family
+  - gemma3
+
+phase:
+  - prefill
+  - decode
+  - any-phase
+
+accuracy_risk:
+  - lossless
+  - lossy
+  - mixed
+
+# stub  = skeleton entry, fields present but mechanism not yet distilled
+# full  = distilled from commits/PRs with mechanism + verify + rollback
+# verified-locally = additionally re-measured here, with a run recorded
+maturity:
+  - stub
+  - full
+  - verified-locally
+
+apply_via_kind:
+  - config-knob
+  - env-var
+  - default-on
+  - kernel-change
+  - code-change
+
+# Typed relations for the frontmatter `interactions:` field.
+# depends-on         this case consumes what the target produces (order matters)
+# composes-with      independently applicable; combined effect is the point
+# incompatible-with  mutually exclusive (mechanism auto-disables or breaks)
+# alternative-to     different lever for the same bottleneck; pick one
+relations:
+  - depends-on
+  - composes-with
+  - incompatible-with
+  - alternative-to

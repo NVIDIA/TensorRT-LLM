@@ -43,18 +43,22 @@ if TYPE_CHECKING:
         CacheConfig,
         CacheDiTConfig,
         CompilationConfig,
+        CpuOffloadConfig,
         CudaGraphConfig,
         ParallelConfig,
         QuantAttentionConfig,
+        RuntimeLoRAConfig,
         SkipSoftmaxAttentionConfig,
+        SolAttentionConfig,
         SparseAttentionConfig,
         TeaCacheConfig,
         TorchCompileConfig,
+        VAEConfig,
         VideoSparseAttentionConfig,
         VisualGenArgs,
     )
     from .output import VisualGenMetrics, VisualGenOutput
-    from .params import VisualGenParams
+    from .params import MediaRef, VisualGenParams
     from .visual_gen import ExtraParamSchema, VisualGen, VisualGenResult
 
 # Public name -> providing module.
@@ -67,17 +71,22 @@ _LAZY_ATTRS = {
     "CacheConfig": "tensorrt_llm.visual_gen.args",
     "CacheDiTConfig": "tensorrt_llm.visual_gen.args",
     "CompilationConfig": "tensorrt_llm.visual_gen.args",
+    "CpuOffloadConfig": "tensorrt_llm.visual_gen.args",
     "CudaGraphConfig": "tensorrt_llm.visual_gen.args",
     "ParallelConfig": "tensorrt_llm.visual_gen.args",
     "QuantAttentionConfig": "tensorrt_llm.visual_gen.args",
+    "RuntimeLoRAConfig": "tensorrt_llm.visual_gen.args",
     "SkipSoftmaxAttentionConfig": "tensorrt_llm.visual_gen.args",
+    "SolAttentionConfig": "tensorrt_llm.visual_gen.args",
     "SparseAttentionConfig": "tensorrt_llm.visual_gen.args",
     "TeaCacheConfig": "tensorrt_llm.visual_gen.args",
     "TorchCompileConfig": "tensorrt_llm.visual_gen.args",
     "VideoSparseAttentionConfig": "tensorrt_llm.visual_gen.args",
+    "VAEConfig": "tensorrt_llm.visual_gen.args",
     "VisualGenMetrics": "tensorrt_llm.visual_gen.output",
     "VisualGenOutput": "tensorrt_llm.visual_gen.output",
     "VisualGenParams": "tensorrt_llm.visual_gen.params",
+    "MediaRef": "tensorrt_llm.visual_gen.params",
     "QuantConfig": "tensorrt_llm.models.modeling_utils",
 }
 
@@ -85,7 +94,18 @@ _LAZY_ATTRS = {
 def __getattr__(name):
     module_name = _LAZY_ATTRS.get(name)
     if module_name is not None:
-        value = getattr(importlib.import_module(module_name), name)
+        try:
+            module = importlib.import_module(module_name)
+        except AttributeError as e:
+            # An AttributeError escaping the module is a bug inside it, not a
+            # missing name here. Raised as is, hasattr() and getattr() with a
+            # default would hide it, and ``from ... import`` would run the
+            # module twice (losing the cause unless the name is a submodule).
+            raise ImportError(
+                f"cannot import {name!r} from {__name__!r}: importing {module_name} raised {e!r}",
+                name=__name__,
+            ) from e
+        value = getattr(module, name)
         globals()[name] = value  # cache: subsequent access skips __getattr__
         return value
     # Fall back to plain submodules (tensorrt_llm.visual_gen.sparse_attention,
@@ -99,6 +119,12 @@ def __getattr__(name):
         if e.name != f"{__name__}.{name}":
             raise
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    except AttributeError as e:
+        # Same as above: a bug inside the submodule, not a missing name.
+        raise ImportError(
+            f"cannot import {name!r} from {__name__!r}: importing {__name__}.{name} raised {e!r}",
+            name=__name__,
+        ) from e
 
 
 def __dir__():
@@ -110,6 +136,7 @@ __all__ = [
     "VisualGen",
     "VisualGenArgs",
     "VisualGenParams",
+    "MediaRef",
     "VisualGenResult",
     "VisualGenOutput",
     "VisualGenMetrics",
@@ -117,13 +144,17 @@ __all__ = [
     # Cross-cutting sub-configs
     "CompilationConfig",
     "CudaGraphConfig",
+    "CpuOffloadConfig",
     "TorchCompileConfig",
     "ParallelConfig",
     "AttentionConfig",
     "QuantAttentionConfig",
+    "RuntimeLoRAConfig",
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
     "VideoSparseAttentionConfig",
+    "SolAttentionConfig",
+    "VAEConfig",
     "CacheConfig",
     "TeaCacheConfig",
     "CacheDiTConfig",

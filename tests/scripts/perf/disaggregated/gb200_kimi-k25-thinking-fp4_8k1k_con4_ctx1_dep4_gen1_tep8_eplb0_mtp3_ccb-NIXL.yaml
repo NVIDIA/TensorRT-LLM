@@ -70,13 +70,12 @@ worker_config:
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      max_tokens_in_buffer: 16384
       backend: NIXL
+      transceiver_runtime: PYTHON
     disable_overlap_scheduler: false
     speculative_config: &id001
       decoding_type: Eagle
       max_draft_len: 3
-      eagle3_one_model: true
       speculative_model: Kimi-K2.5-Thinking-Eagle3
     trust_remote_code: true
     num_postprocess_workers: 4
@@ -101,8 +100,8 @@ worker_config:
       backend: CUTEDSL
       use_low_precision_moe_combine: true
     cache_transceiver_config:
-      max_tokens_in_buffer: 16384
       backend: NIXL
+      transceiver_runtime: PYTHON
     disable_overlap_scheduler: false
     speculative_config: *id001
     trust_remote_code: true

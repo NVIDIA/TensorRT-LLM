@@ -1,3 +1,8 @@
+<!--
+SPDX-License-Identifier: Apache-2.0
+Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+-->
+
 # Multimodal Support in TensorRT LLM
 
 TensorRT LLM supports a variety of multimodal models, enabling efficient inference with inputs beyond just text.
@@ -26,6 +31,11 @@ Further optimizations are under development and will be updated as they become a
 
 Please refer to the latest multimodal [support matrix](../models/supported-models.md#multimodal-feature-support-matrix-pytorch-backend).
 
+## Adding a Model
+
+See the [multimodal onboarding guide](../developer-guide/multimodal.md#onboarding-a-model)
+for processor metadata, payload selection, model hooks, and encoder/prefill handoff.
+
 ## Optional dependencies
 
 Video input decoding uses OpenCV (`cv2`) and is not installed by default. Install it only for models with video inputs:
@@ -42,9 +52,13 @@ The following examples demonstrate how to use TensorRT LLM's multimodal support 
 
 ### Quick start
 
-Quickly try out TensorRT LLM's multimodal support using our `LLM-API` and a ready-to-run [example](source:examples/llm-api/quickstart_multimodal.py):
+Quickly try out TensorRT LLM's multimodal support using our `LLM-API` and a ready-to-run [example](source:examples/llm-api/quickstart_multimodal.py). The script imports helpers from its sibling file [`quickstart_advanced.py`](source:examples/llm-api/quickstart_advanced.py), so run it from a checkout of the `examples/llm-api/` directory rather than as a single downloaded file:
 
 ```bash
+# Get the examples directory first; quickstart_multimodal.py imports from
+# quickstart_advanced.py next to it.
+git clone --depth 1 https://github.com/NVIDIA/TensorRT-LLM.git
+cd TensorRT-LLM/examples/llm-api
 python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --modality image --disable_kv_cache_reuse
 ```
 
@@ -57,6 +71,8 @@ trtllm-serve Qwen/Qwen2-VL-7B-Instruct  --backend pytorch
 ```
 
 You can then send OpenAI-compatible requests, such as via curl or API clients, to the server endpoint. See [curl chat client for multimodal script](source:examples/serve/curl_chat_client_for_multimodal.sh) as an example.
+
+`trtllm-serve` renders the chat template itself and marks the resulting `TextPrompt` with `chat_template_applied`, as do the multimodal prompt builders in `tensorrt_llm.inputs.utils`. An input processor that would otherwise apply the chat template to a raw `prompt` should use such a prompt verbatim; see `TextPrompt` in `tensorrt_llm/inputs/data.py`.
 
 ### Run with [`trtllm-bench`](../../source/commands/trtllm-bench.rst)
 

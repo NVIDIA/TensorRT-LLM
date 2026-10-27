@@ -979,11 +979,11 @@ if __name__ == "__main__":
 
     fpA_intB_inl = "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/launchers/fpA_intB_launcher_sm90.inl"
     fpA_intB_sm100_inl = "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/launchers/fpA_intB_launcher_sm100.inl"
-    moe_gemm_inl = "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl"
+    moe_gemm_inl = "tensorrt_llm/kernels/moe/cutlass/launchers/moe_gemm_tma_ws_launcher.inl"
     # moe_gemm_inl = "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl"
-    moe_mixed_gemm_inl = "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.inl"
+    moe_mixed_gemm_inl = "tensorrt_llm/kernels/moe/cutlass/launchers/moe_gemm_tma_ws_mixed_input_launcher.inl"
     # moe_mixed_gemm_inl = "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.inl"
-    sm80_moe_gemm_inl = "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/fused_moe_gemm_launcher_sm80.inl"
+    sm80_moe_gemm_inl = "tensorrt_llm/kernels/moe/cutlass/launchers/fused_moe_gemm_launcher_sm80.inl"
     # sm80_moe_gemm_inl = "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/fused_moe_gemm_launcher_sm80.inl"
 
     inl_map = {
@@ -1005,7 +1005,8 @@ if __name__ == "__main__":
     operations = []
     operations += generate_sm120_operations(has_arch(120) or has_arch(121))
     operations += generate_sm103_operations(has_arch(103))
-    operations += generate_sm100_operations(has_arch(100) or has_arch(103))
+    operations += generate_sm100_operations(
+        any(has_arch(sm) for sm in range(100, 110)))
     operations += generate_sm90_operations(has_arch(90))
     operations += generate_sm80_operations(has_arch(80) or has_arch(89))
 

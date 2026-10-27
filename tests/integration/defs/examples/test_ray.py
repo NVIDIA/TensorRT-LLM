@@ -4,17 +4,20 @@
 import asyncio
 import json
 import os
+import socket
 import subprocess
+import time
 
 import aiohttp
+import psutil
 
 try:
     import ray
 except ImportError:
-    import tensorrt_llm.ray_stub as ray
+    import tensorrt_llm.executor.ray.stub as ray
 
 import pytest
-from defs.common import venv_check_call, wait_for_server
+from defs.common import get_ucx_tls, venv_check_call, wait_for_server
 from defs.conftest import get_device_count, llm_models_root
 from defs.trt_test_alternative import popen
 
@@ -27,7 +30,7 @@ def ray_example_root(llm_root):
 
 def test_llm_inference_async_ray(ray_example_root, llm_venv):
     script_path = os.path.join(ray_example_root, "llm_inference_async_ray.py")
-    model_path = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    model_path = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
     venv_check_call(llm_venv, [script_path, "--model", model_path])
 
 
@@ -60,7 +63,7 @@ def test_llm_inference_distributed_ray(ray_example_root, llm_venv, tp_size,
         model_dir = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
         cmd.extend(["--model_dir", model_dir])
     else:
-        model_dir = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+        model_dir = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
         cmd.extend(["--model_dir", model_dir])
 
     venv_check_call(llm_venv, cmd)
@@ -69,24 +72,98 @@ def test_llm_inference_distributed_ray(ray_example_root, llm_venv, tp_size,
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
 def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
-    _run_ray_disaggregated_serving(ray_example_root, tp_size, "NIXL", "CPP")
+    _run_ray_disaggregated_serving(ray_example_root, tp_size)
 
 
-@pytest.mark.skip_less_device(2)
-@pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
-def test_ray_disaggregated_serving_python(ray_example_root, llm_venv, tp_size):
-    _run_ray_disaggregated_serving(ray_example_root, tp_size, "NIXL", "PYTHON")
+DISAGG_SERVING_PORTS = (8000, 8001, 8002)
+
+IGNORED_PSUTIL_ERRORS = (psutil.NoSuchProcess, psutil.AccessDenied,
+                         psutil.ZombieProcess)
 
 
-def _run_ray_disaggregated_serving(ray_example_root, tp_size,
-                                   transceiver_backend, transceiver_runtime):
+def _cleanup_leftover_servers(ports: tuple = DISAGG_SERVING_PORTS,
+                              timeout: float = 120) -> None:
+    """Kill leaked disagg server processes and wait for their ports to free.
+
+    A passing test can still leave live trtllm-serve/orted subprocesses behind
+    (see nvbugs 6601574): the next test's servers then fail to bind the ports
+    and the proxy never comes up. SO_REUSEADDR only covers sockets left in
+    TIME_WAIT, not ports held by processes that are still alive.
+    """
+    patterns = ("trtllm-serve", "orted")
+    # Never kill our own process tree: importing tensorrt_llm initializes MPI,
+    # which attaches a singleton orted daemon to this very pytest process;
+    # killing it makes Open MPI abort the whole test session.
+    me = psutil.Process()
+    protected = {me.pid}
+    try:
+        protected.update(parent.pid for parent in me.parents())
+        protected.update(child.pid for child in me.children(recursive=True))
+    except IGNORED_PSUTIL_ERRORS:
+        pass
+
+    # Restrict the kill to stale processes: listeners on the disagg ports and
+    # orphans left behind after a previous test's process tree was torn down.
+    # This spares unrelated serving/MPI jobs on shared development machines.
+    try:
+        port_owners = {
+            conn.pid
+            for conn in psutil.net_connections(kind="tcp")
+            if conn.pid and conn.status == psutil.CONN_LISTEN and conn.laddr
+            and conn.laddr.port in ports
+        }
+    except IGNORED_PSUTIL_ERRORS:
+        port_owners = set()
+
+    victims = []
+    for proc in psutil.process_iter(["pid", "ppid", "cmdline"]):
+        try:
+            if proc.info["pid"] in protected:
+                continue
+            cmdline = " ".join(proc.info["cmdline"] or [])
+            if not any(pattern in cmdline for pattern in patterns):
+                continue
+            if proc.info["pid"] in port_owners or proc.info["ppid"] == 1:
+                victims.append(proc)
+        except IGNORED_PSUTIL_ERRORS:
+            pass
+
+    for proc in victims:
+        try:
+            children = proc.children(recursive=True)
+        except IGNORED_PSUTIL_ERRORS:
+            children = []
+        for target in [proc] + children:
+            try:
+                if target.pid not in protected:
+                    target.kill()
+            except IGNORED_PSUTIL_ERRORS:
+                pass
+
+    deadline = time.time() + timeout
+    for port in ports:
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("localhost", port), timeout=1):
+                    pass
+            except OSError:
+                break  # nothing is listening on this port anymore
+            time.sleep(2)
+        else:
+            raise RuntimeError(
+                f"Port {port} is still in use after {timeout}s of cleanup")
+
+
+def _run_ray_disaggregated_serving(ray_example_root, tp_size):
 
     if get_device_count() < tp_size * 2:
         pytest.skip(f"Need {tp_size * 2} GPUs.")
 
+    _cleanup_leftover_servers()
+
     disagg_dir = os.path.join(ray_example_root, "disaggregated")
     script_path = os.path.join(disagg_dir, "disagg_serving_local.sh")
-    model_dir = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    model_dir = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
 
     try:
         runtime_env = {
@@ -104,26 +181,32 @@ def _run_ray_disaggregated_serving(ray_example_root, tp_size,
         env_copy = os.environ.copy()
         env_copy.update({
             "RAY_ADDRESS": f"localhost:{ray_port}",
-            "TLLM_RAY_FORCE_LOCAL_CLUSTER": "0"
+            "TLLM_RAY_FORCE_LOCAL_CLUSTER": "0",
+            # UCX transport allowlist must match test_disaggregated.py: with
+            # UCX auto-selection the NIXL agent AM channel can pick an IB
+            # loopback path that times out on some DGX nodes, turning into a
+            # permanent request hang (https://nvbugs/6670614).
+            "UCX_TLS": get_ucx_tls(),
         })
         with popen(
             [
                 "bash", script_path, "--executor", "ray", "--attach", "--model",
                 model_dir, "--tp_size",
-                str(tp_size), "--transceiver_backend", transceiver_backend,
-                "--transceiver_runtime", transceiver_runtime
+                str(tp_size), "--transceiver_backend", "NIXL",
+                "--transceiver_runtime", "PYTHON"
             ],
                 cwd=disagg_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=env_copy,
         ):
-            assert wait_for_server("localhost", 8000, timeout_seconds=180), \
-                "Disaggregated server failed to start within 3 minutes"
+            assert wait_for_server("localhost", 8000, timeout_seconds=300), \
+                "Disaggregated server failed to start within 5 minutes"
 
             _run_completion_requests()
     finally:
         ray.shutdown()
+        _cleanup_leftover_servers()
 
 
 def _run_completion_requests():
@@ -138,7 +221,7 @@ def _run_completion_requests():
 
     async def send_request(session, prompt):
         payload = {
-            "model": "TinyLlama-1.1B-Chat-v1.0",
+            "model": "Qwen3-0.6B",
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": 0,
@@ -190,11 +273,14 @@ def _run_completion_requests():
         print(f"Request {index} response: {text}")
 
     content = "\n".join(generated_texts)
-    for expected_string in [
-            "The capital of Germany is Berlin",
-            "Asyncio is a Python library",
-    ]:
-        assert expected_string in content, (
-            f"Expected string {expected_string!r} not found in responses")
+    assert "The capital of Germany is Berlin" in content, (
+        "Expected string 'The capital of Germany is Berlin' not found in responses"
+    )
+    # Different models (and sampling runs) phrase the continuation of the raw
+    # asyncio prompt differently, so match case-insensitively on the prompt's
+    # own keyword instead of an exact phrase (see test_disaggregated.py's
+    # run_client_tests for the same rationale).
+    assert "asyncio" in content.lower(), (
+        "Expected 'asyncio' not found in responses")
     assert "Berlin Berlin" not in content, (
         "Unexpected string 'Berlin Berlin' found in responses")

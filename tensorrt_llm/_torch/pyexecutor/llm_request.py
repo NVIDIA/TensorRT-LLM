@@ -2,12 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Python extensions for executor requests."""
 
-import itertools
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import (TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Union,
-                    cast)
+from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Optional,
+                    Sequence, Union, cast)
 
 import torch
 
@@ -16,11 +14,12 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
-from tensorrt_llm.inputs.multimodal import strip_mm_encoder_inputs
-from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
+from tensorrt_llm.inputs.multimodal import (MultimodalEncoderRequestState,
+                                            MultimodalParams,
+                                            get_multimodal_item_metadata)
 from tensorrt_llm.sampling_params import LogprobMode
 
-SamplingConfig = tensorrt_llm.bindings.SamplingConfig
+SamplingConfig = tllm_executor.SamplingConfig
 
 MAX_SPEC_DECODE_POSITIONS = 16
 '''
@@ -39,7 +38,6 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
 ExecutorRequest = tllm_executor.Request
 ExecutorResponse = tllm_executor.Response
-ExecutorSamplingConfig = tllm_executor.SamplingConfig
 FinishReason = tllm_executor.FinishReason
 
 REQUEST_TYPE_MAPPING = {
@@ -59,229 +57,23 @@ ATTENTION_DP_DUMMY_REQUEST_ID = 0
 class MultimodalEncoderRequestError(ValueError):
     """A request-scoped MM encoder state or output contract violation."""
 
-
-class MultimodalEncoderProgress(Enum):
-    """Python-only progress derived from request-local MM item outputs.
-
-    Only `READY` gates control flow today (`is_multimodal_encoder_ready`);
-    `PENDING`/`PARTIAL` are the intermediate states the item-level chunked
-    MM prefill follow-up will consume (per-chunk readiness) and document the
-    FCFS priority in the meantime."""
-
-    PENDING = auto()
-    """No MM item of the request has an encoder output yet."""
-
-    PARTIAL = auto()
-    """Some but not all items are encoded; the request must continue on the
-    item-scheduling path until every item has an output."""
-
-    READY = auto()
-    """No further encoder work is needed: every item is encoded, a
-    precomputed embedding was supplied, or the request has no MM payload."""
+    def __init__(self,
+                 message: str,
+                 *,
+                 request_ids: Optional[Iterable[int]] = None) -> None:
+        super().__init__(message)
+        # A shared cache-entry failure may need to fail multiple requests.
+        self.request_ids = frozenset(request_ids or ())
 
 
-class _Unset:
-    """Sentinel for a memo that has not been computed yet.
-
-    Distinct from `None`, which is a real result: the request cannot build
-    stable cache keys and its items always encode.
-    """
-
-
-_UNSET = _Unset()
-
-
-@dataclass
-class MultimodalEncoderRequestState:
-    """Per-item MM encoder bookkeeping owned by one request.
-
-    Created at admission by `initialize_multimodal_encoder_request` for
-    requests whose raw MM payloads run through the item scheduler; the
-    request's `py_mm_encoder_state` is `None` otherwise. Items are written by
-    the single `record()` writer from two sources — fresh encoder outputs and
-    read-through encoder-cache hits — so validation cannot diverge between
-    them.
-
-    The request's embeddings live in **one contiguous buffer**, sized from the
-    declared item lengths and allocated by the first `record()` (the point at
-    which the encoder's row shape, dtype and device become known). Each item
-    is copied into its own row range, so the buffer is the request's *final*
-    storage: it neither aliases the encoder's batch output nor a cache entry
-    that could be evicted under it, and the prefill path consumes it as-is
-    rather than concatenating per-item tensors into a second full copy.
-
-    That one allocation is the whole of the request's residency, so the byte
-    budget charges it once, from its first item until the request is
-    stripped. The scheduler derives the budget from live states each tick,
-    which makes clearing the state *the* release; there is no release call to
-    forget or replay.
-
-    The state is rank-local and never crosses a serialization boundary:
-    schedule distribution carries request/item IDs only, and every rank
-    constructs its own state at admission.
-    """
-
-    embedding_lengths: List[int]
-    """Declared embedding row count of each atomic item, in prompt order.
-    `record()` validates incoming tensors against these."""
-
-    encoder_token_lengths: List[int]
-    """Validated encoder attention-token cost of each atomic item.
-
-    Admission copies these values from the request metadata so scheduling
-    never has to re-validate user input inside the scheduler loop.
-    """
-
-    recorded: List[bool]
-    """Whether each atomic item has been written into `embeddings`, in prompt
-    order."""
-
-    cache_item_keys: Union[List[Hashable], None, "_Unset"] = _UNSET
-    """Memoized per-item encoder cache keys, or `None` once known to be
-    unkeyable. Derived from the request's content hashes and item metadata,
-    both fixed at admission, so this never goes stale and is computed on the
-    first iteration that schedules any of the request's items rather than on
-    every one. `_UNSET` distinguishes "not computed yet" from "computed, and
-    this request cannot participate in the cache"."""
-
-    embeddings: Optional[torch.Tensor] = None
-    """Contiguous ``[sum(embedding_lengths), ...]`` storage for every item of
-    this request, allocated by the first `record()`. Published by reference at
-    `finalize()` and released when the request is stripped, so its
-    presence is exactly what the byte budget charges."""
-
-    @classmethod
-    def from_embedding_lengths(
-        cls,
-        embedding_lengths: List[int],
-        *,
-        encoder_token_lengths: Optional[List[int]] = None
-    ) -> "MultimodalEncoderRequestState":
-        if encoder_token_lengths is None:
-            encoder_token_lengths = embedding_lengths
-        return cls(embedding_lengths=list(embedding_lengths),
-                   encoder_token_lengths=list(encoder_token_lengths),
-                   recorded=[False] * len(embedding_lengths))
-
-    def __post_init__(self) -> None:
-        if not (len(self.embedding_lengths) == len(self.encoder_token_lengths)
-                == len(self.recorded)):
-            raise ValueError("MM encoder token and embedding lengths must have "
-                             "exactly one entry per item slot")
-        # Row offsets are fixed once the declared lengths are known, so derive
-        # them here rather than re-summing the prefix on every `record()`
-        # (quadratic in the item count, and every caller now routes through
-        # `record`). Has one extra entry so `_row_starts[i + 1]` is the end of
-        # item `i`; the last is the buffer's total row count.
-        self._row_starts = list(
-            itertools.accumulate(self.embedding_lengths, initial=0))
-
-    @property
-    def num_items(self) -> int:
-        return len(self.recorded)
-
-    @property
-    def has_storage(self) -> bool:
-        """Whether this request's embedding buffer is allocated.
-
-        The scheduler reads this to charge the byte budget once per request:
-        the first scheduled item allocates storage for *all* of them, so
-        later items of the same request cost nothing more.
-        """
-        return self.embeddings is not None
-
-    @property
-    def progress(self) -> MultimodalEncoderProgress:
-        if all(self.recorded):
-            return MultimodalEncoderProgress.READY
-        if any(self.recorded):
-            return MultimodalEncoderProgress.PARTIAL
-        return MultimodalEncoderProgress.PENDING
-
-    def pending_item_indices(self) -> List[int]:
-        """Indices of items that still need an encoder output, prompt order."""
-        return [
-            item_idx for item_idx, done in enumerate(self.recorded) if not done
-        ]
-
-    def record(self, item_idx: int, output: torch.Tensor) -> None:
-        """Copy one item's encoder output into its row range of the buffer.
-
-        The first call allocates the buffer for every item of the request,
-        which is why it is deferred to here: the row shape, dtype and device
-        only become known with the first encoder output. ``output`` may be a
-        view of a batched encoder output or a read-through cache entry, and
-        the copy is the single choke point that keeps the request from
-        retaining the whole batch allocation through a view or aliasing a
-        cache entry that can be evicted under it.
-
-        Raises when the tensor does not match the item's declared row count,
-        when the item was already recorded, or when it disagrees with the
-        buffer on trailing shape/dtype/device (items of one request share one
-        contiguous embedding).
-        """
-        expected_rows = self.embedding_lengths[item_idx]
-        if output.shape[0] != expected_rows:
-            raise MultimodalEncoderRequestError(
-                f"MM item {item_idx} produced {output.shape[0]} embeddings; "
-                f"expected {expected_rows}")
-        if self.recorded[item_idx]:
-            raise MultimodalEncoderRequestError(
-                f"MM item {item_idx} was already recorded; items are "
-                "encoded at most once per request")
-        if self.embeddings is None:
-            self.embeddings = torch.empty(
-                (self._row_starts[-1], *output.shape[1:]),
-                dtype=output.dtype,
-                device=output.device)
-        elif (self.embeddings.shape[1:] != output.shape[1:]
-              or self.embeddings.dtype != output.dtype
-              or self.embeddings.device != output.device):
-            raise MultimodalEncoderRequestError(
-                "MM encoder items for one request must have matching "
-                "output shape, dtype, and device")
-        start = self._row_starts[item_idx]
-        self.embeddings[start:start + expected_rows].copy_(output.detach())
-        self.recorded[item_idx] = True
-
-    def resident_output_bytes(self, bytes_per_encoder_embedding: int) -> int:
-        """Bytes of encoder output this request holds on the device.
-
-        The scheduler sums this over live states every tick to derive the
-        occupied share of the encoder output byte budget; there is no
-        separate accounting to keep in sync.
-
-        The buffer covers every item from the first `record()` onward, so a
-        partially encoded request already charges its full footprint — which
-        is what it actually occupies — and keeps charging it after
-        `finalize()` until the request is stripped post-prefill.
-        """
-        if self.embeddings is None:
-            return 0
-        return self._row_starts[-1] * bytes_per_encoder_embedding
-
-    def finalize(self, multimodal_data: Dict[str, Any]) -> bool:
-        """Publish the request's embedding once every item is recorded.
-
-        Attaches the buffer as ``multimodal_embedding`` and drops the raw
-        pre-encoder inputs. The buffer is already the contiguous form the
-        prefill path wants, so publishing is a reference — nothing is copied
-        here and nothing downstream concatenates the items back together.
-
-        The state keeps its own reference so `resident_output_bytes()` still
-        charges the rows, which stay resident until the request is stripped
-        post-prefill. Both references die together at that strip.
-        No-op returning ``False`` while any item is still pending.
-        """
-        if not self.recorded or not all(self.recorded):
-            return False
-        multimodal_data["multimodal_embedding"] = self.embeddings
-        strip_mm_encoder_inputs(multimodal_data)
-        return True
+def make_mm_encoder_transient_cache_key(request_id: int,
+                                        item_idx: int) -> tuple[str, int, int]:
+    """Return a request-local cache key for an item without a stable key."""
+    return ("mm_transient", request_id, item_idx)
 
 
 if TYPE_CHECKING:
-    from .sampler.sampler_strategy import Strategy
+    from ..tensor_lru_cache import TensorLRUCache
 
 
 @dataclass(slots=True)
@@ -640,15 +432,24 @@ class PyResult:
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
 
-    def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
-                             mm_embedding_lengths: List[int]):
+    def append_mm_embeddings(
+        self,
+        mm_embeddings: torch.Tensor,
+        mm_embedding_lengths: List[int],
+        mm_embedding_metadata: list[dict[str, list[int]]]
+        | None = None) -> None:
         """Split concatenated embeddings by per-item lengths and create handles.
 
         Args:
             mm_embeddings: Concatenated multimodal embeddings tensor of shape
                 [total_tokens, hidden_dim].
             mm_embedding_lengths: Per-item encoder-output embedding lengths.
+            mm_embedding_metadata: Optional per-item layout data for prefill.
         """
+        if mm_embedding_metadata is not None and len(
+                mm_embedding_metadata) != len(mm_embedding_lengths):
+            raise ValueError(
+                "Embedding metadata must have one entry per multimodal item")
         split_embeddings = torch.split(mm_embeddings,
                                        mm_embedding_lengths,
                                        dim=0)
@@ -657,6 +458,11 @@ class PyResult:
             SharedTensorContainer.from_tensor(emb).dump_to_dict()
             for emb in split_embeddings
         ]
+        if mm_embedding_metadata is not None:
+            for handle, metadata in zip(self._mm_embeddings,
+                                        mm_embedding_metadata,
+                                        strict=True):
+                handle["metadata"] = metadata
         self.diff.mm_embeddings = self._mm_embeddings
 
     def set_mrope_position(
@@ -831,10 +637,14 @@ class LlmResult:
         # totals from the PyTorch executor; used to backfill
         # RequestPerfMetrics.speculative_decoding on the client side
         # (GenerationResultBase._handle_sequence). None when no drafting ran.
+        self.per_pos_drafted: Optional[List[int]] = None
+        self.per_pos_accepted: Optional[List[int]] = None
         self.spec_dec_totals = None
         # Context-worker usage for gen-first disagg, delivered via the
         # KV-transfer aux buffer (see _maybe_attach_ctx_usage).
         self.ctx_usage = None
+        # Explicit context-to-generation remote-tail replay boundary.
+        self.remote_tail_start: Optional[int] = None
         # Time breakdown metrics for performance analysis
         # Contains: step_metrics (list), ctx_gpu_forward_time (float), ctx_gpu_sample_time (float)
         self.time_breakdown_metrics = time_breakdown_metrics
@@ -899,24 +709,33 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             stop_words_list: list[list[int]] | None = None,
             llm_request: Optional[
                 tensorrt_llm.bindings.internal.batch_manager.LlmRequest] = None,
-            is_draft: bool = False,
             seq_slot: Optional[int] = None,
-            target_seq_slot: Optional[int] = None,
             num_logprobs: int = 0,
-            is_first_draft: bool = False,
             use_chunked_generation_logits: bool = True,
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             logprobs_simple_format: bool = False,
+            return_routed_experts: bool = False,
             **kwargs):
-        self.py_sampling_strategy: "Strategy | None" = None
-
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
+        # Owned entirely on the Python side: the TorchSampler is the only
+        # consumer, so the C++ request no longer carries a copy.
+        self.py_embedding_bias: Optional[torch.Tensor] = kwargs.pop(
+            "embedding_bias", None)
+        self.py_position_ids: list[int] | None = kwargs.pop(
+            "position_ids", None)
+        self.py_guided_decoding_params = kwargs.pop("guided_decoding_params",
+                                                    None)
+        self.py_end_id: Optional[int] = kwargs.pop("end_id", None)
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
-        # Multimodal data
-        self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
-        self.py_mm_item_order = kwargs.pop("py_mm_item_order", None)
+        self.py_lora_ckpt_source: str | None = kwargs.pop(
+            "py_lora_ckpt_source", None)
+        # The request owns one MM aggregate. Compatibility properties below
+        # expose the existing field names without duplicate data or state.
+        mm_data = kwargs.pop("py_multimodal_data", None)
+        self.py_multimodal_params: MultimodalParams | None = (MultimodalParams(
+            multimodal_data=mm_data) if mm_data is not None else None)
         # Per-item MM encoder state, created at admission by
         # `initialize_multimodal_encoder_request` when raw MM payloads must
         # run through the item scheduler; `None` otherwise (also the
@@ -924,38 +743,32 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_mm_encoder_state: Optional[MultimodalEncoderRequestState] = None
         encoder_input_tokens = kwargs.get("encoder_input_tokens")
         encoder_output_len = kwargs.get("encoder_output_len")
-        # Python-side handle to the encoder feature tensor (audio enc-dec
-        # models): the C++ binding takes the kwarg but exposes no getter, so
-        # the encoder step reads it here. Kept for the request's lifetime —
-        # pause() re-enters ENCODER_INIT and re-runs the encoder from it.
-        self.py_encoder_input_features = kwargs.get("encoder_input_features")
-        return_encoder_output = bool(kwargs.get("return_encoder_output", False))
-        if return_encoder_output:
-            kwargs["return_encoder_output"] = False
+        # Python owns the feature payload; native scheduling only needs its
+        # length. Keep the payload across pause() so the encoder can run again.
+        encoder_input_features = kwargs.pop("encoder_input_features", None)
+        self.py_encoder_input_features: Optional[
+            torch.Tensor] = encoder_input_features
+        if encoder_input_features is not None:
+            kwargs["encoder_input_length"] = encoder_input_features.shape[0]
+        return_encoder_output = bool(kwargs.pop("return_encoder_output", False))
         if (llm_request is None and encoder_input_tokens is not None
+                and self.py_encoder_input_features is None
                 and encoder_output_len is None):
             encoder_output_len = len(encoder_input_tokens)
             kwargs["encoder_output_len"] = encoder_output_len
 
         # Cross-iter MM encoder prefetch event: stamped by the side-stream
         # producer in `modeling_multimodal_mixin._dispatch_cross_iter_prefetch`
-        # and consumed (then cleared) in `model_engine._prepare_inputs` when
-        # the request is next scheduled.
+        # and consumed (then cleared) in `DecoderInputPreparer.prepare_inputs`
+        # when the request is next scheduled.
         self.py_mm_encoder_event: Optional[torch.cuda.Event] = None
 
         if llm_request is not None:
             super().__init__(llm_request)
         else:
-            super().__init__(
-                *args,
-                client_id=client_id,
-                return_log_probs=return_log_probs,
-                return_context_logits=False,
-                return_generation_logits=False,
-                return_perf_metrics=return_perf_metrics,
-                stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
-                if stop_words_list else None,
-                **kwargs)
+            super().__init__(*args,
+                             return_perf_metrics=return_perf_metrics,
+                             **kwargs)
         if encoder_output_len is not None and not hasattr(
                 self, "encoder_output_len"):
             self.encoder_output_len = int(encoder_output_len)
@@ -968,63 +781,27 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_client_id = client_id
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
-        self.py_end_id = self.end_id
-        self.py_prompt_len = self.prompt_len
-        self.py_orig_prompt_len = self.orig_prompt_len
-        self.py_max_new_tokens = self.max_new_tokens
-        self.py_min_length = self.sampling_config.min_length
-        # `seqlen_this_rank_cp`, `total_input_len_cp`, and `py_helix_is_inactive_rank` are relevant to helix parallelism.
-        self.seqlen_this_rank_cp = self.prompt_len
-        self.total_input_len_cp = self.prompt_len
+        self.py_min_length = self.sampling_config.min_tokens
         self.py_helix_is_inactive_rank = False
-        self.py_batch_idx = None
-        self.py_draft_pages_allocated = 0
-        self.py_rewind_len = 0
-        # Tokens physically evicted by KV-cache compression; deducted in the engine.
-        self.py_num_compressed_tokens = 0
-        self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens
-        self.py_last_context_chunk = (None, None)
-        self.py_draft_logits = None
-        self.py_target_probs = None
-        self.py_last_draft_tokens = None
-        self.py_num_accepted_draft_tokens = 0
-        # One-model rejection: set per-iteration by _handle_dynamic_draft_len when
-        # this gen request produced 0 real draft tokens, so _prepare_tp_inputs
-        # one-hots its stale draft_probs slot. Consumed (and cleared) there.
-        self.py_needs_onehot_draft_probs = False
-        self.py_num_accepted_draft_tokens_indices = []
-        self.py_rewind_draft_token_separate_adjustment = 0
+        # Manager-owned helix decode-step counter; see
+        # KVCacheManagerV2._set_helix_rank_fields.
+        self.py_helix_decode_group_index = 0
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
         self.py_per_pos_accepted = [0] * MAX_SPEC_DECODE_POSITIONS
         # Cumulative spec-decode counters backing
         # RequestPerfMetrics.speculative_decoding for return_perf_metrics. The
-        # C++ runtime fills that section in updateNumTokensPerIteration(),
-        # which the PyTorch flow (TorchSampler) never calls, so the PyTorch
-        # executor accumulates these instead (exact, unlike the per-pos arrays
-        # capped at MAX_SPEC_DECODE_POSITIONS) and attaches them to the
-        # response (see PyExecutor._handle_responses / LlmResult.spec_dec_totals).
+        # PyTorch executor owns and accumulates these exact counters and
+        # attaches them to the response; unlike these counters, the per-pos
+        # arrays are capped at MAX_SPEC_DECODE_POSITIONS. See
+        # PyExecutor._handle_responses and LlmResult.spec_dec_totals.
         self.py_total_draft_tokens = 0
         self.py_total_accepted_draft_tokens = 0
-        # Denominator paired with py_num_accepted_draft_tokens: the number of
-        # genuinely proposed draft tokens the sampler verified in the step it
-        # wrote that numerator for (CUDA-graph padding excluded). Written by
-        # the samplers' update_requests, consumed (and reset to 0) by
-        # PyExecutor._accumulate_spec_dec_stats so each verified step is
-        # counted exactly once. py_draft_tokens itself cannot serve as the
-        # denominator: it is padded for CUDA graphs and, in the one-model
-        # flow, already holds the NEXT step's drafts by response time.
-        self.py_num_draft_tokens_verified = 0
-        # Number of real draft tokens installed for the upcoming step,
-        # recorded by Drafter.pad_draft_tokens_for_cuda_graph before it pads
-        # py_draft_tokens to the static max. None when no drafter recorded a
-        # count (e.g. one-model flow, which tracks lengths in its sample
-        # state instead).
-        self.py_draft_tokens_effective_len = None
-        self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
+        # Prevent recreation after a send session drops peer registration.
+        self.py_kv_send_session_retired = False
 
         # Encoder-decoder runtime state. ``py_encoder_output`` holds the
         # packed encoder hidden states produced by the encoder iteration as
@@ -1050,32 +827,24 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_num_logprobs = num_logprobs
         self.py_return_log_probs = return_log_probs
         self.py_logprobs_simple_format = logprobs_simple_format
+        # Router Replay: attach routed_experts to this request's output.
+        self.py_return_routed_experts = return_routed_experts
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
         self.py_additional_outputs = additional_outputs
 
         self.py_beam_width = cast(int, self.sampling_config.beam_width)
-        self.py_is_draft = is_draft
-        # The request's sequence slot ID, an index between 0 (inclusive) and max_batch_size (exclusive).
-        self.py_seq_slot = seq_slot
-        # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
-        self.py_target_seq_slot = target_seq_slot
-        self.use_draft_model = is_draft
-        self._cached_tokens = 0
-        self._cached_tokens_set = False
-        # Whether the request is for the first forward of the draft model.
-        self.py_is_first_draft = is_first_draft
-        self.d2t = None
-        self.py_draft_use_greedy_sampling = False
         self.py_disable_speculative_decoding = False
 
         # Chunked logits parameters
         self.py_use_chunked_generation_logits = use_chunked_generation_logits
         self.py_logits_chunk_size = logits_chunk_size if not self.streaming else 1
 
-        # TODO: remove this when use DynamicDecodeOp in pytorch flow.
-        # currently, keep py_stop_words_list as python list, rather than tensor.
+        self._initialize_execution_state(seq_slot=seq_slot,
+                                         orig_prompt_len=self.orig_prompt_len)
+
+        # Keep py_stop_words_list as a python list, rather than a tensor.
         self.py_stop_words_list = stop_words_list
 
         self.py_logprobs_mode = LogprobMode(
@@ -1084,6 +853,16 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_conversation_params = None
 
         self.py_num_connector_matched_tokens = 0
+
+        # Destination pages are reported once per allocation. Destroying the
+        # allocation clears this flag so replay can report its new pages.
+        self.py_connector_allocation_reported = False
+
+        # End of the prefix served from outside the manager (a KV cache
+        # connector's load, or a staging fetch the request resumes from) retained
+        # by this allocation, or 0. This depth survives async parking; local reuse
+        # cannot reconstruct it.
+        self.py_served_prefix_end = 0
 
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
@@ -1099,20 +878,24 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             additional_outputs=additional_outputs)
         self.child_requests = []
 
-        self._py_embedding_bias_1d: Optional[torch.Tensor] = None
-        if hasattr(self, 'embedding_bias') and self.embedding_bias is not None:
-            # Pre-squeeze to 1D if needed (remove batch dimension)
-            if self.embedding_bias.dim() > 1:
-                self._py_embedding_bias_1d = self.embedding_bias.squeeze(0)
-            else:
-                self._py_embedding_bias_1d = self.embedding_bias
-
     def get_beam_width_by_iter(self, for_next_iteration: bool = False) -> int:
         """Beam width of the current (or next) decoding step.
 
         Mirrors the C++ binding for Variable-Beam-Width-Search, clamping the
         decoding-iteration index with the array's own length so that decoding
         past the end of the array holds its last width.
+
+        Indexed with ``py_decoding_iter``, the counter the Python sampling loop
+        advances, rather than the C++ ``decoding_iter``. Under the overlap
+        scheduler ``_handle_responses`` copies the former into the latter only
+        once the step has been sampled, so reading ``decoding_iter`` here trails
+        by one step exactly where the width is consumed: a widening schedule
+        repeats a width instead of advancing, and the run ends narrower than
+        beam_width_array asks for. The two counters are equal wherever the C++
+        side reads the width -- the micro-batch scheduler runs before the
+        sampler advances ``py_decoding_iter`` -- so the clamping formula still
+        agrees with llmRequest.cpp; test_vbws_cpp_formula_matches_past_array_end
+        pins that with the counters held in sync.
 
         The C++ implementation used to clamp with the global
         kMaxBeamWidthArrayLength constant instead, reading past the end of
@@ -1122,19 +905,15 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         would otherwise bind to whatever libtensorrt_llm.so happens to
         provide -- including a prebuilt one from before that fix, against
         which the mismatch starves the request in the micro-batch scheduler
-        and decoding hangs. test_vbws_cpp_formula_matches_past_array_end
-        pins the agreement.
+        and decoding hangs.
 
-        An empty array (``[]`` or ``[[]]``) falls through to the base
-        implementation rather than indexing it, matching the two emptiness
-        guards the C++ side checks before reading element 0.
+        An empty array falls through to the base implementation rather than
+        indexing it, matching the emptiness guard the C++ side checks before
+        reading element 0.
         """
         beam_width_array = self.sampling_config.beam_width_array
         if beam_width_array:
-            if isinstance(beam_width_array[0], (list, tuple)):
-                beam_width_array = beam_width_array[0]
-        if beam_width_array:
-            iteration = self.decoding_iter + (1 if for_next_iteration else 0)
+            iteration = self.py_decoding_iter + (1 if for_next_iteration else 0)
             index = max(min(iteration, len(beam_width_array)) - 1, 0)
             return int(beam_width_array[index])
         return super().get_beam_width_by_iter(for_next_iteration)
@@ -1154,26 +933,111 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             self._cached_tokens = value
             self._cached_tokens_set = True
 
+    def _initialize_execution_state(self,
+                                    *,
+                                    seq_slot: Optional[int],
+                                    orig_prompt_len: int,
+                                    clear_draft_tokens: bool = False) -> None:
+        self.py_prompt_len = self.prompt_len
+        self.py_orig_prompt_len = orig_prompt_len
+        self.py_max_new_tokens = self.max_new_tokens
+        # CP sequence lengths are relevant to helix parallelism.
+        self.seqlen_this_rank_cp = self.prompt_len
+        self.total_input_len_cp = self.prompt_len
+        self.py_batch_idx = None
+        # The request's sequence slot ID, an index between 0 (inclusive) and max_batch_size (exclusive).
+        self.py_seq_slot = seq_slot
+        self.py_draft_pages_allocated = 0
+        self.py_rewind_len = 0
+        # Tokens physically evicted by KV-cache compression; deducted in the engine.
+        self.py_num_compressed_tokens = 0
+        if clear_draft_tokens:
+            self.draft_tokens = []
+            self.py_draft_tokens = []
+        else:
+            self.py_draft_tokens = ([] if self.draft_tokens is None else
+                                    self.draft_tokens)
+        # Number of real draft tokens installed for the upcoming step,
+        # recorded by Drafter.pad_draft_tokens_for_cuda_graph before it pads
+        # py_draft_tokens to the static max. None when no drafter recorded a
+        # count (e.g. one-model flow, which tracks lengths in its sample
+        # state instead).
+        self.py_draft_tokens_effective_len = None
+        self.py_last_context_chunk = (None, None)
+        # Established only after the Global cache claim succeeds. The physical
+        # replay prefix is additional compute, never logical context progress.
+        self.py_ced_replay = None
+        self.py_last_draft_tokens = None
+        self.py_num_accepted_draft_tokens = 0
+        # Denominator paired with py_num_accepted_draft_tokens: the number of
+        # genuinely proposed draft tokens the sampler verified in the step it
+        # wrote that numerator for (CUDA-graph padding excluded). Written by
+        # the samplers' update_requests, consumed (and reset to 0) by
+        # PyExecutor._accumulate_spec_dec_stats so each verified step is
+        # counted exactly once. py_draft_tokens itself cannot serve as the
+        # denominator: it is padded for CUDA graphs and, in the one-model
+        # flow, already holds the NEXT step's drafts by response time.
+        self.py_num_draft_tokens_verified = 0
+        # One-model rejection: set per-iteration by _handle_dynamic_draft_len when
+        # this gen request produced 0 real draft tokens, so _pack_extend_requests
+        # one-hots its stale draft_probs slot. Consumed (and cleared) there.
+        self.py_needs_onehot_draft_probs = False
+        self.py_num_accepted_draft_tokens_indices = []
+        self.py_rewind_draft_token_separate_adjustment = 0
+        self.py_decoding_iter = 0
+        self.py_ctx_pre_resize_cap = None
+        self.py_csa2_remote_tail_mode = None
+        self.py_csa2_remote_tail_start = None
+        self.py_csa2_remote_tail_split = None
+        self._cached_tokens = 0
+        self._cached_tokens_set = False
+
+    def reset_for_recompute(self, max_input_len: int) -> None:
+        """Reset Python-side execution state so the request can replay prefill."""
+        self.pause(max_input_len)
+        self._initialize_execution_state(seq_slot=None,
+                                         orig_prompt_len=self.prompt_len,
+                                         clear_draft_tokens=True)
+
+    @property
     def is_generation_only_request(self):
+        # Must stay a property: the C++ base exposes this as a read-only
+        # property (nanobind/batch_manager/bindings.cpp), and a plain method
+        # here shadows it with something always-truthy for any caller that
+        # reads it as an attribute.
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
 
-    def create_response(self,
-                        use_fast_logits=False,
-                        mpi_world_rank=0) -> LlmResponse | None:
+    @property
+    def context_remaining_length(self):
+        """Context rows left on this worker, accounting for remote-tail handoff."""
+        if getattr(self, "py_csa2_remote_tail_mode", None) == "source":
+            end = self.py_csa2_remote_tail_start
+            if end is not None:
+                # An empty transferred prefix still needs a schedulable source
+                # step. Run the prompt through the encoder only; the generation
+                # worker replays the full prompt from position zero.
+                if end == 0:
+                    end = self.prompt_len
+                return max(0, end - self.context_current_position)
+        return super().context_remaining_length
+
+    @property
+    def is_last_context_chunk(self):
+        """Whether this chunk reaches this worker's effective context end."""
+        if getattr(self, "py_csa2_remote_tail_mode", None) == "source":
+            end = self.py_csa2_remote_tail_start
+            if end is not None:
+                if end == 0:
+                    end = self.prompt_len
+                return self.context_current_position + self.context_chunk_size == end
+        return super().is_last_context_chunk
+
+    def create_response(self) -> LlmResponse | None:
         """Create an LlmResponse from the current request state.
 
         This method generates a response containing the request's execution results,
         including generated tokens, logits, and completion status. It wraps the
         parent class's serialized result in a PyTorch-specific LlmResponse object.
-
-        Args:
-            use_fast_logits (bool, optional, default=False): Only applicable for TRT-backend with speculative decoding enabled. When returning generation logits under speculative decoding,
-            `use_fast_logits=True` replaces tensor payloads with tiny metadata so the target pulls logits
-            directly (zero-copy/IPC), reducing overhead; ignored on PyTorch.
-            mpi_world_rank (int, optional, default=0): Only applicable for TRT-backend, with speculative decoding
-            enabled, and `use_fast_logits=True`. Contains the MPI world rank of the process containing the draft
-            model, that produces the generation logits. This helps transfer logits from the draft model to the
-            target model without going through the serialization/transport path.
 
         Returns:
             LlmResponse | None: An LlmResponse object containing the request results
@@ -1187,8 +1051,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             Returns None if the serialized result is empty (len(result) == 0),
             indicating no output was generated for this request iteration.
         """
-        result, is_final = super().create_serialized_result(
-            use_fast_logits, mpi_world_rank)
+        result, is_final = super().create_serialized_result()
 
         # When using beam search we cannot incrementically update the logprobs in the result.
         # Instead we need to update all logprobs. In that case no deep copy is needed.
@@ -1207,7 +1070,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 self.py_result._log_probs = LogProbStorage()
                 # Initialize the storage and adjust the cum_log_probs to the previous value
                 self.py_result._log_probs._init(py_result.log_probs)
-                self.py_result._log_probs.cum_log_probs = py_result.cum_log_probs
+                self.py_result._log_probs.cum_log_probs = copy(
+                    py_result.cum_log_probs)
 
             # Perform copies of py_result._generation_logits
             if need_deep_copy_generation_logits:
@@ -1244,14 +1108,23 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if not time_breakdown_metrics:
                 time_breakdown_metrics = None
 
+        if len(result) == 0:
+            return None
+        llm_result = LlmResult(
+            result,
+            py_result,
+            is_final,
+            time_breakdown_metrics=time_breakdown_metrics,
+        )
+        if getattr(self, "py_csa2_remote_tail_mode", None) == "source":
+            llm_result.remote_tail_start = self.py_csa2_remote_tail_start
+        llm_result.cached_tokens = self.cached_tokens
         return LlmResponse(
             request_id=self.py_request_id
             if not self.is_child else self.parent_request_id,
-            result=LlmResult(result,
-                             py_result,
-                             is_final,
-                             time_breakdown_metrics=time_breakdown_metrics),
-            client_id=self.py_client_id) if len(result) > 0 else None
+            result=llm_result,
+            client_id=self.py_client_id,
+        )
 
     @property
     def is_dummy(self):
@@ -1262,13 +1135,77 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.state = LlmRequestState.GENERATION_COMPLETE
         self.set_finished_reason(reason, beam)
 
+    @property
+    def py_multimodal_data(self) -> dict[str, Any] | None:
+        """Request-owned processed payload, e.g. ``{"image": {"pixel_values": tensor}}``.
+
+        The same dict stores the common item record under
+        ``MULTIMODAL_ENCODER_ITEM_METADATA_KEY`` and model-specific auxiliary data.
+        """
+        params = self.py_multimodal_params
+        return params.multimodal_data if params is not None else None
+
+    @py_multimodal_data.setter
+    def py_multimodal_data(self, data: dict[str, Any] | None) -> None:
+        if self.py_multimodal_params is None:
+            if data is not None:
+                self.py_multimodal_params = MultimodalParams(
+                    multimodal_data=data)
+        else:
+            self.py_multimodal_params.multimodal_data = data
+
+    @property
+    def py_mm_encoder_state(self) -> MultimodalEncoderRequestState | None:
+        """Item-encoding progress and cache references owned by the request Params.
+
+        Set at encoder admission and cleared by request cleanup. Inline encoding
+        and requests with precomputed embeddings leave it unset.
+        """
+        params = self.py_multimodal_params
+        return params.encoder_state if params is not None else None
+
+    @py_mm_encoder_state.setter
+    def py_mm_encoder_state(
+            self, state: MultimodalEncoderRequestState | None) -> None:
+        if self.py_multimodal_params is None:
+            if state is None:
+                return
+            self.py_multimodal_params = MultimodalParams()
+        self.py_multimodal_params.encoder_state = state
+
+    @property
+    def py_mm_encoder_event(self) -> torch.cuda.Event | None:
+        """Completion event for encoder work queued on the prefetch CUDA stream.
+
+        Consumers wait before reading the staged payload or embeddings; the
+        executor clears the event after that work is consumed or cleaned up.
+        """
+        params = self.py_multimodal_params
+        return params.encoder_event if params is not None else None
+
+    @py_mm_encoder_event.setter
+    def py_mm_encoder_event(self, event: torch.cuda.Event | None) -> None:
+        if self.py_multimodal_params is None:
+            if event is None:
+                return
+            self.py_multimodal_params = MultimodalParams()
+        self.py_multimodal_params.encoder_event = event
+
     def create_child_request(self, child_id):
+        if (self.py_mm_encoder_state is not None
+                or self.py_mm_encoder_event is not None):
+            raise RuntimeError(
+                "Child requests must be created before MM encoder admission")
         child = super().create_child_request(child_id)
         py_request = LlmRequest(llm_request=child)
 
-        # Copy all py_* attributes from parent to child
+        # Encoder features are shared read-only. Before an in-place mutation,
+        # clone and reassign the tensor on the request being modified.
+        # Deep-copy other py_* attributes to preserve child independence.
         for attr_name, attr_value in self.__dict__.items():
-            if attr_name.startswith('py_'):
+            if attr_name == 'py_encoder_input_features':
+                py_request.py_encoder_input_features = attr_value
+            elif attr_name.startswith('py_'):
                 attr_value = getattr(self, attr_name)
                 setattr(py_request, attr_name, deepcopy(attr_value))
             elif attr_name in [
@@ -1287,111 +1224,67 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         assert py_request.is_child
         assert py_request.request_id == child.request_id
         assert py_request.parent_request_id == self.request_id
-        assert py_request.sampling_config.random_seed != self.sampling_config.random_seed
+        assert py_request.sampling_config.seed != self.sampling_config.seed
 
         self.child_requests.append(py_request)
 
 
-def convert_wordlist(word_list) -> List[List[int]]:
-    """Converts a wordlist from format:
-
-    [[word_0 token_0, word_0 token_1, ...], [word_1 token_0, ...], ...]]
-
-    into the TRTLLM word list format. The TRTLLM format expects a list of tokens,
-    and an inclusive prefix sum. A word_list (either bad_words or stop_words) is
-    a list that encodes the list of words that have to be banned / trigger the stop from generated sequences.
-    Its shape is [2, badWordsLength], as explained below, or [batchSize, 2, badWordsLength]
-    when there is a different list for each sequence in the batch.
-
-    The badWordsList and stopWordsList tensors have the same shape [2, length]. Let's consider an example with three words to describe the
-    representation of those lists.  The first word contains tokens [5, 7, 3], the
-    second one contains [9, 2] and the third one is composed of tokens [6, 2, 4, 1]. In total, there are 9 tokens. That's the length. The shape of the tensor
-    is [2, 9].  The first row of the tensor must contain the 9 token IDs and the
-    second row must store the inclusive prefix-sum of the word lengths as shown on the following diagram:
-
-        0           3       5              9
-        |           |       |              |
-        V           V       V              V
-    [  5,  7,  3,  9,  2,  6,  2,  4,  1]
-    [  3,  5,  9, -1, -1, -1, -1, -1, -1]
-    """
-    if not word_list:
-        return []
-    tokens = []
-    offsets = []
-    current_offset = 0
-    for word_tokens in word_list:
-        tokens.extend(word_tokens)
-        current_offset += len(word_tokens)
-        offsets.append(current_offset)
-    if len(tokens) > len(offsets):
-        offsets.extend([-1] * (len(tokens) - len(offsets)))
-    return [tokens, offsets]
-
-
-def _validate_optional_int_list(values: Any,
-                                field_name: str) -> Optional[List[int]]:
+def _validate_optional_int_sequence(values: Any,
+                                    field_name: str) -> Optional[Sequence[int]]:
     if values is None:
         return None
-    if not isinstance(values, list):
-        raise TypeError(f"{field_name} must be a list")
+    if not isinstance(values, (list, tuple)):
+        raise TypeError(f"{field_name} must be a list or tuple")
     if not all(isinstance(value, int) for value in values):
         raise TypeError(f"{field_name} must contain only integers")
     return values
 
 
 def get_multimodal_embedding_lengths(
-        request: LlmRequest) -> Optional[List[int]]:
-    """Return explicit per-item encoder-output lengths for a multimodal request."""
-    py_multimodal_data = request.py_multimodal_data
-    if py_multimodal_data is not None and not isinstance(
-            py_multimodal_data, dict):
-        raise TypeError("py_multimodal_data must be a dict")
-    # `multimodal_embedding_lengths` is Python-side layout metadata, not a
-    # nanobind request field, so validate the flat handoff contract here.
-    multimodal_embedding_lengths = _validate_optional_int_list(
-        py_multimodal_data.get("multimodal_embedding_lengths")
-        if py_multimodal_data is not None else None,
-        "multimodal_embedding_lengths")
+        request: LlmRequest) -> Optional[Sequence[int]]:
+    """Read output rows from the request's common item metadata."""
+    item_metadata = get_multimodal_item_metadata(request.py_multimodal_data)
+    multimodal_embedding_lengths = (item_metadata.output_embedding_lengths
+                                    if item_metadata is not None else None)
+    # Output rows are Python-side metadata, not a nanobind request field.
+    multimodal_embedding_lengths = _validate_optional_int_sequence(
+        multimodal_embedding_lengths, "output_embedding_lengths")
     if multimodal_embedding_lengths is None:
         return None
 
     if any(length < 0 for length in multimodal_embedding_lengths):
-        raise ValueError("multimodal_embedding_lengths must be non-negative")
+        raise ValueError("output_embedding_lengths must be non-negative")
     multimodal_lengths = request.multimodal_lengths
     if multimodal_lengths is not None:
         if len(multimodal_embedding_lengths) != len(multimodal_lengths):
-            raise ValueError("multimodal_embedding_lengths length must match "
+            raise ValueError("output_embedding_lengths length must match "
                              "multimodal_lengths")
         for item_idx, (embedding_length, prompt_length) in enumerate(
                 zip(multimodal_embedding_lengths, multimodal_lengths)):
             if embedding_length > prompt_length:
                 raise ValueError(
-                    f"multimodal_embedding_lengths[{item_idx}] exceeds "
+                    f"output_embedding_lengths[{item_idx}] exceeds "
                     f"multimodal_lengths[{item_idx}]")
 
     return multimodal_embedding_lengths
 
 
 def get_multimodal_encoder_token_lengths(
-        request: LlmRequest) -> Optional[List[int]]:
+        request: LlmRequest) -> Optional[Sequence[int]]:
     """Return per-item physical encoder attention-token costs.
 
-    Field-level validation happens inside
-    `get_multimodal_encoder_item_metadata`; only the request-level
-    cross-check against `multimodal_embedding_lengths` lives here.
+    Validate item metadata and check output rows against the request's
+    prompt spans.
     """
-    item_metadata = get_multimodal_encoder_item_metadata(
-        request.py_multimodal_data)
+    item_metadata = get_multimodal_item_metadata(request.py_multimodal_data)
     if item_metadata is None:
         return None
-    embedding_lengths = get_multimodal_embedding_lengths(request)
-    if embedding_lengths is None:
+    item_metadata.validate()
+    if item_metadata.encoder_token_lengths is None:
+        return None
+    if get_multimodal_embedding_lengths(request) is None:
         raise ValueError("Multimodal encoder item scheduling requires "
-                         "multimodal_embedding_lengths")
-    if item_metadata.output_embedding_lengths != embedding_lengths:
-        raise ValueError("Multimodal encoder item output lengths must match "
-                         "multimodal_embedding_lengths")
+                         "output_embedding_lengths")
     return item_metadata.encoder_token_lengths
 
 
@@ -1401,17 +1294,61 @@ def format_multimodal_encoder_output_budget_error(
     effective_encoder_max_num_tokens: int,
     *,
     request_id: Optional[int] = None,
+    whole_request_output_resident: bool = False,
 ) -> str:
     """Format guidance for a request that exceeds the MM output budget."""
     request_label = ("Multimodal request" if request_id is None else
                      f"Multimodal request {request_id}")
+    chunking_hint = (
+        "; or enable chunked prefill so that only the items of the current "
+        "prompt window must be resident"
+        if whole_request_output_resident else "")
     return (
         f"{request_label} needs {required_bytes} bytes of resident encoder "
         f"output but the encoder output budget is only {budget_bytes} bytes; "
         "effective encoder_max_num_tokens is "
         f"{effective_encoder_max_num_tokens} (it falls back to max_num_tokens "
         "when unset); raise encoder_max_num_tokens to serve inputs of this size"
-    )
+        f"{chunking_hint}")
+
+
+def get_mm_max_resident_embeddings(
+        request: LlmRequest, embedding_lengths: List[int],
+        context_chunk_unit_size: Optional[int]) -> int:
+    """Return the most encoder output rows that prefill needs resident at once.
+
+    Without context chunking, or without `multimodal_embed_mask_cumsum` to
+    place item rows in the prompt, prefill uses every item at once. Otherwise
+    prefill holds only the items of its current chunk and releases each item
+    after consuming it. A chunk can end at any multiple of
+    `context_chunk_unit_size`, so the items that share one unit of the prompt
+    are the ones that must be resident together.
+    """
+    mm_data = request.py_multimodal_data
+    cumsum = (mm_data.get("multimodal_embed_mask_cumsum") if isinstance(
+        mm_data, dict) else None)
+    if context_chunk_unit_size is None or cumsum is None:
+        return sum(embedding_lengths)
+    first_rows, last_rows, lengths = [], [], []
+    row_end = 0
+    for length in embedding_lengths:
+        if length > 0:
+            first_rows.append(row_end + 1)
+            last_rows.append(row_end + length)
+            lengths.append(length)
+        row_end += length
+    # The prompt position of a row is the first position whose cumsum reaches it.
+    positions = torch.searchsorted(
+        cumsum, torch.tensor(first_rows + last_rows,
+                             dtype=cumsum.dtype)).tolist()
+    unit_ranges = [(first // context_chunk_unit_size,
+                    last // context_chunk_unit_size) for first, last in zip(
+                        positions[:len(lengths)], positions[len(lengths):])]
+    # A unit shared by several items is the last unit of the first of them.
+    return max((sum(length
+                    for (first, last), length in zip(unit_ranges, lengths)
+                    if first <= unit <= last) for _, unit in unit_ranges),
+               default=0)
 
 
 def initialize_multimodal_encoder_request(
@@ -1419,15 +1356,16 @@ def initialize_multimodal_encoder_request(
         max_num_tokens: int,
         *,
         max_output_bytes: Optional[int] = None,
-        bytes_per_encoder_embedding: int = 0) -> None:
+        bytes_per_encoder_embedding: int = 0,
+        context_chunk_unit_size: Optional[int] = None) -> None:
     """Initialize immutable request kind and mutable per-item encoder state.
 
     Raises `ValueError` (failing only this request) when raw encoder inputs
     have missing or empty item metadata, an atomic item is larger than the
-    effective encoder token budget, or — when the encoder-output budget is
-    supplied — the request's complete embedding footprint could never fit.
-    Prefill currently waits for every item, so the complete footprint must
-    remain resident until the request becomes LLM-eligible.
+    effective encoder token budget, the items' embedding rows do not match
+    the prompt's embedding slots, or — when the encoder-output budget is
+    supplied — the outputs that must be resident at once could never fit
+    (see `get_mm_max_resident_embeddings`).
     """
     mm_data = request.py_multimodal_data
     has_raw_payload = isinstance(mm_data, dict) and any(
@@ -1458,20 +1396,121 @@ def initialize_multimodal_encoder_request(
         embedding_lengths = get_multimodal_embedding_lengths(request)
         if embedding_lengths is None:
             raise ValueError("Multimodal item scheduling requires "
-                             "multimodal_embedding_lengths")
+                             "output_embedding_lengths")
+        # Prefill slices the cached item outputs by the prompt's embedding
+        # slots, so the items must declare exactly one row per slot.
+        embed_mask_cumsum = mm_data.get("multimodal_embed_mask_cumsum")
+        if embed_mask_cumsum is not None:
+            num_embedding_slots = int(embed_mask_cumsum[-1])
+            if sum(embedding_lengths) != num_embedding_slots:
+                raise ValueError(
+                    f"Multimodal items declare {sum(embedding_lengths)} "
+                    "embedding rows but the prompt has "
+                    f"{num_embedding_slots} embedding slots")
         if (max_output_bytes is not None and bytes_per_encoder_embedding > 0):
-            total_bytes = (sum(embedding_lengths) * bytes_per_encoder_embedding)
-            if total_bytes > max_output_bytes:
+            resident_bytes = get_mm_max_resident_embeddings(
+                request, embedding_lengths,
+                context_chunk_unit_size) * bytes_per_encoder_embedding
+            if resident_bytes > max_output_bytes:
                 raise ValueError(
                     format_multimodal_encoder_output_budget_error(
-                        total_bytes,
+                        resident_bytes,
                         max_output_bytes,
                         max_num_tokens,
                         request_id=request.py_request_id,
+                        whole_request_output_resident=(context_chunk_unit_size
+                                                       is None),
                     ))
-        request.py_mm_encoder_state = (
-            MultimodalEncoderRequestState.from_embedding_lengths(
-                embedding_lengths, encoder_token_lengths=token_lengths))
+        request.py_mm_encoder_state = MultimodalEncoderRequestState(
+            item_metadata=get_multimodal_item_metadata(mm_data),
+            item_ready=[False] * len(embedding_lengths))
+
+
+def get_mm_context_chunk_start(request: LlmRequest) -> int:
+    """Return confirmed prefill progress, including actually reused KV tokens."""
+    return request.context_current_position
+
+
+def get_mm_items_for_chunk(request: LlmRequest, chunk_start: int,
+                           chunk_end: int) -> List[int]:
+    """Return the MM items whose encoder rows a prompt range uses, in prompt order.
+
+    Without `multimodal_embed_mask_cumsum` the prompt rows of an item are
+    unknown, so every item is returned.
+    """
+    state = request.py_mm_encoder_state
+    if state is None or chunk_start >= chunk_end:
+        return []
+    mm_data = request.py_multimodal_data
+    cumsum = (mm_data.get("multimodal_embed_mask_cumsum") if isinstance(
+        mm_data, dict) else None)
+    if cumsum is None:
+        return list(range(state.num_items))
+    num_positions = len(cumsum)
+    chunk_start = min(chunk_start, num_positions)
+    chunk_end = min(chunk_end, num_positions)
+    row_begin = int(cumsum[chunk_start - 1]) if chunk_start > 0 else 0
+    row_end = int(cumsum[chunk_end - 1]) if chunk_end > 0 else 0
+    if row_begin >= row_end:
+        return []
+    item_indices = []
+    item_end = 0
+    for item_idx, length in enumerate(state.embedding_lengths):
+        item_begin, item_end = item_end, item_end + length
+        if item_begin >= row_end:
+            break
+        if item_end > row_begin:
+            item_indices.append(item_idx)
+    return item_indices
+
+
+def get_mm_pending_items(request: LlmRequest) -> List[int]:
+    """Return items the remaining prefill uses whose outputs are not ready.
+
+    Items wholly inside a confirmed reusable KV prefix or behind completed
+    prefill progress are not pending. Estimated reuse cannot skip encoder work.
+    """
+    state = request.py_mm_encoder_state
+    if state is None:
+        return []
+    return [
+        item_idx for item_idx in get_mm_items_for_chunk(
+            request, get_mm_context_chunk_start(request), request.prompt_len)
+        if not state.item_ready[item_idx]
+    ]
+
+
+def is_mm_context_chunk_ready(request: LlmRequest,
+                              begin: Optional[int] = None) -> bool:
+    """Return whether the MM outputs the next context chunk uses are ready.
+
+    The chunk starts at `begin`, or at the request's confirmed KV position.
+    """
+    state = request.py_mm_encoder_state
+    if state is None:
+        return True
+    if begin is None:
+        begin = get_mm_context_chunk_start(request)
+    return all(state.item_ready[item_idx]
+               for item_idx in get_mm_items_for_chunk(
+                   request, begin, begin + request.context_chunk_size))
+
+
+def release_consumed_mm_items(
+        request: LlmRequest, encoder_cache: Optional["TensorLRUCache"]) -> None:
+    """Release the cache entries of items behind confirmed prefill progress."""
+    state = request.py_mm_encoder_state
+    if state is None:
+        return
+    unconsumed_items = set(
+        get_mm_items_for_chunk(request, request.context_current_position,
+                               request.prompt_len))
+    for item_idx, cache_key in enumerate(state.item_cache_keys):
+        if cache_key is None or item_idx in unconsumed_items:
+            continue
+        if encoder_cache is None:
+            raise RuntimeError("MM request state requires an encoder cache")
+        encoder_cache.release(state.clear_item_cache_key(item_idx))
 
 
 def is_multimodal_encoder_ready(request: LlmRequest) -> bool:
@@ -1480,11 +1519,10 @@ def is_multimodal_encoder_ready(request: LlmRequest) -> bool:
     Readiness is purely a function of the request's encoder item state: a
     request without one (text-only, precomputed embedding, or a model
     outside item scheduling) needs no encoder work; otherwise the request
-    is ready once every item slot is filled (finer-grained progress lives
-    on `MultimodalEncoderRequestState.progress`).
+    is ready once every item its remaining prefill uses has an output
+    (finer-grained progress lives on `MultimodalEncoderRequestState.progress`).
     """
-    state = request.py_mm_encoder_state
-    return state is None or state.progress is MultimodalEncoderProgress.READY
+    return not get_mm_pending_items(request)
 
 
 def executor_request_to_llm_request(
@@ -1494,14 +1532,16 @@ def executor_request_to_llm_request(
         exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None,
         position_ids: Optional[List] = None) -> LlmRequest:
-    executor_sampling_config = executor_request.sampling_config
-    sampling_config = SamplingConfig(executor_sampling_config)
+    sampling_config = executor_request.sampling_config
 
     input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
 
     llm_request_type = REQUEST_TYPE_MAPPING[executor_request.request_type]
-    stop_words_list = convert_wordlist(
-        executor_request.stop_words) if executor_request.stop_words else None
+    # Kept in its native list[list[int]] form, like py_bad_words. The
+    # [tokens, prefix_sum] layout convert_wordlist produced was the input format
+    # of the removed C++ stop-words kernel; every reader here just undid it.
+    stop_words_list = [list(word) for word in executor_request.stop_words
+                       ] if executor_request.stop_words else None
 
     # Extract multimodal fields from executor request
     multimodal_hashes = None
@@ -1523,25 +1563,34 @@ def executor_request_to_llm_request(
         multimodal_run_lengths = (
             executor_request.multimodal_input.multimodal_run_lengths)
 
-    # Extract mrope fields
-    mrope_rotary_cos_sin = None
-    mrope_position_deltas = None
+    # Python multimodal data is the canonical source for mRoPE model inputs.
+    # Preserve input-processor values and fill only missing entries when a
+    # directly constructed executor request carries the public MropeConfig.
+    py_multimodal_data = getattr(executor_request, "py_multimodal_data", None)
     if executor_request.mrope_config is not None:
-        mrope_rotary_cos_sin = executor_request.mrope_config.mrope_rotary_cos_sin
+        if py_multimodal_data is None:
+            py_multimodal_data = {}
+        mrope_config = py_multimodal_data.setdefault("mrope_config", {})
+        mrope_config.setdefault(
+            "mrope_rotary_cos_sin",
+            executor_request.mrope_config.mrope_rotary_cos_sin)
         mrope_position_deltas = executor_request.mrope_config.mrope_position_deltas
+        if not isinstance(mrope_position_deltas, torch.Tensor):
+            mrope_position_deltas = torch.tensor([mrope_position_deltas],
+                                                 dtype=torch.int32)
+        mrope_config.setdefault("mrope_position_deltas", mrope_position_deltas)
 
     agent_hierarchy = None
     if getattr(executor_request, "py_scheduling_params", None) is not None:
         agent_hierarchy = executor_request.py_scheduling_params.agent_hierarchy
 
     # Audio encoder-decoder models (e.g. Whisper) carry the encoder input as a
-    # feature tensor, not encoder token ids. Route it into the request's native
-    # encoder_input_features / encoder_output_len fields so the C++ state machine
-    # admits it to the encoder step and cross-KV sizing sees the post-encoder
-    # length rather than a token count.
+    # feature tensor, not encoder token ids. Python owns the payload; native
+    # encoder input/output lengths drive admission and post-encoder cross-KV
+    # sizing.
     encoder_input_features = None
     encoder_output_len = None
-    py_mm_data = getattr(executor_request, "py_multimodal_data", None) or {}
+    py_mm_data = py_multimodal_data or {}
     audio_mm_data = py_mm_data.get("audio") or {}
     if isinstance(audio_mm_data, dict):
         # Only enc-dec input processors emit encoder_input_features (decoder-only
@@ -1564,11 +1613,7 @@ def executor_request_to_llm_request(
         sampling_config=sampling_config,
         is_streaming=executor_request.streaming,
         end_id=executor_request.end_id,
-        pad_id=executor_request.pad_id,
         embedding_bias=executor_request.embedding_bias,
-        bad_words_list=torch.tensor(
-            convert_wordlist(executor_request.bad_words), dtype=torch.int32)
-        if executor_request.bad_words else None,
         stop_words_list=stop_words_list,
         position_ids=position_ids,
         prompt_embedding_table=None if executor_request.prompt_tuning_config
@@ -1582,7 +1627,6 @@ def executor_request_to_llm_request(
         multimodal_item_run_cu_offsets=multimodal_item_run_cu_offsets,
         multimodal_run_positions=multimodal_run_positions,
         multimodal_run_lengths=multimodal_run_lengths,
-        multimodal_embedding=executor_request.multimodal_embedding,
         lora_task_id=executor_request.lora_config.task_id
         if executor_request.lora_config is not None else None,
         lora_weights=executor_request.lora_config.weights
@@ -1590,9 +1634,8 @@ def executor_request_to_llm_request(
         lora_config=executor_request.lora_config.config
         if executor_request.lora_config is not None else None,
         py_lora_path=getattr(executor_request, "py_lora_path", None),
-        mrope_rotary_cos_sin=mrope_rotary_cos_sin,
-        mrope_position_deltas=mrope_position_deltas,
-        lookahead_config=None,
+        py_lora_ckpt_source=getattr(executor_request, "py_lora_ckpt_source",
+                                    None),
         return_log_probs=executor_request.output_config.return_log_probs,
         num_logprobs=getattr(executor_request, "py_num_logprobs", 0),
         return_context_logits=executor_request.output_config.
@@ -1607,11 +1650,8 @@ def executor_request_to_llm_request(
         ] if executor_request.output_config.additional_model_outputs is not None
         else None,
         draft_tokens=getattr(executor_request, "draft_tokens", None),
-        draft_logits=None,
         exclude_input_from_output=executor_request.output_config.
         exclude_input_from_output,
-        logits_post_processor=None,
-        apply_logits_post_processor_batched=False,
         guided_decoding_params=executor_request.guided_decoding_params,
         py_logits_post_processors=getattr(executor_request,
                                           "py_logits_post_processors", None),
@@ -1627,15 +1667,15 @@ def executor_request_to_llm_request(
         context_phase_params=executor_request.context_phase_params,
         cache_salt=executor_request.cache_salt,
         arrival_time=getattr(executor_request, "py_arrival_time", None),
-        py_multimodal_data=getattr(executor_request, "py_multimodal_data",
-                                   None),
-        py_mm_item_order=getattr(executor_request, "py_mm_item_order", None),
+        py_multimodal_data=py_multimodal_data,
         kv_cache_retention_config=executor_request.kv_cache_retention_config,
         agent_hierarchy=agent_hierarchy,
         logprobs_mode=getattr(executor_request, "py_logprobs_mode",
                               LogprobMode.RAW),
         logprobs_simple_format=getattr(executor_request,
                                        "py_logprobs_simple_format", False),
+        return_routed_experts=getattr(executor_request,
+                                      "py_return_routed_experts", False),
     )
 
     # Bad-words list for the TorchSampler path, kept in its native
@@ -1648,7 +1688,7 @@ def executor_request_to_llm_request(
     # No-repeat-ngram size for the TorchSampler path, normalized once here so
     # the per-step sampler gate is a plain attribute read. The C++
     # SamplingConfig rejects negative values up front and 0 means disabled
-    # (same convention as the C++ banRepeatNgram kernel), so falsy == off.
+    # (same convention as the former C++ ban-repeat-ngram kernel), so falsy == off.
     ngram_size = executor_request.sampling_config.no_repeat_ngram_size
     llm_request.py_no_repeat_ngram_size = ngram_size if ngram_size else None
 
@@ -1667,6 +1707,20 @@ def executor_request_to_llm_request(
     return llm_request
 
 
+def rewind_context_after_cache_drop(request: LlmRequest,
+                                    tokens_per_block: int) -> None:
+    """Reset context progress after callers release the request's KV caches."""
+    # The setter requires prepopulated < promptLen. A Helix CP rank that holds
+    # none of the prompt has promptLen 0, so there is nothing to reset.
+    if request.prompt_len > 0:
+        request.set_prepopulated_prompt_len(0, tokens_per_block)
+    # Clearing prepopulation does not rewind the native context cursor.
+    request.context_current_position = 0
+    request.context_chunk_size = request.prompt_len
+    request.estimated_reusable_tokens = 0
+    request.py_ctx_pre_resize_cap = None
+
+
 def get_draft_token_length(request: LlmRequest) -> int:
     """Get the length of draft tokens for a given request.
 
@@ -1679,3 +1733,22 @@ def get_draft_token_length(request: LlmRequest) -> int:
     if request.py_draft_tokens is not None:
         return len(request.py_draft_tokens)
     return 0
+
+
+def get_request_tokens_per_gen_step(request: LlmRequest,
+                                    runtime_tokens_per_gen_step: int) -> int:
+    """How many tokens this request contributes to one generation step.
+
+    Uniform speculation gives every request the batch-wide
+    ``runtime_tokens_per_gen_step`` (1 accepted token + ``runtime_draft_len``
+    draft positions). Ragged verification -- where a scheduler hands each
+    request its own verify window -- records the per-request draft length in
+    ``py_verify_len``.
+
+    ``py_verify_len`` is set only by the ragged path, so every other
+    speculation mode gets the batch-wide value back unchanged.
+    """
+    verify_len = getattr(request, "py_verify_len", None)
+    if verify_len is None:
+        return runtime_tokens_per_gen_step
+    return 1 + int(verify_len)

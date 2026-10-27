@@ -74,6 +74,36 @@ template <typename FmhaOptions_> inline bool isBf16QFp8KvGeneration(FmhaOptions_
          tg::isArchBlackwell(options.mCudaArch);
 }
 
+template <typename FmhaOptions_> inline bool isFp8KNvFp4V(FmhaOptions_ const& options) {
+  return options.mDtypeK == tg::Dtype::E4m3 && options.mDtypeV == tg::Dtype::E2m1;
+}
+
+// Whether the kernel uses the supported Blackwell FP8-Q, FP8-K, and NVFP4-V path.
+template <typename FmhaOptions_> inline bool isFp8QFp8KNvFp4V(FmhaOptions_ const& options) {
+  return options.mDtypeQ == tg::Dtype::E4m3 && isFp8KNvFp4V(options) &&
+         tg::isArchBlackwell(options.mCudaArch);
+}
+
+template <typename FmhaOptions_> inline bool isFp8KNvFp4VGeneration(FmhaOptions_ const& options) {
+  return !isContextKernel(options.mFmhaKernelType) && isFp8KNvFp4V(options);
+}
+
+template <typename FmhaOptions_>
+inline bool isFp8QFp8KNvFp4VGeneration(FmhaOptions_ const& options) {
+  return !isContextKernel(options.mFmhaKernelType) && isFp8QFp8KNvFp4V(options);
+}
+
+// The dtype used by the softmax output P and V operands of BMM2.
+template <typename FmhaOptions_> inline tg::Dtype getDtypeBmm2(FmhaOptions_ const& options) {
+  if (usesKOnlyTransformPipeline(options)) {
+    return options.mDtypeV;
+  }
+  if (isFp8KNvFp4V(options)) {
+    return tg::Dtype::E4m3;
+  }
+  return options.mDtypeK != options.mDtypeQ ? options.mDtypeQ : options.mDtypeV;
+}
+
 // Whether the kernel uses the full BF16Q+FP8KV transform pipeline.
 template <typename FmhaOptions_>
 inline bool isBf16QFp8KvFullTransformGeneration(FmhaOptions_ const& options) {
@@ -93,8 +123,9 @@ inline bool supportsSeparateTransformedKv(FmhaOptions_ const& options) {
   bool const isSupportedHeadDim =
     options.mHeadDimQk == options.mHeadDimV &&
     (options.mHeadDimQk == 64 || options.mHeadDimQk == 128 || options.mHeadDimQk == 256);
-  return isBf16QFp8KvFullTransformGeneration(options) && !options.mIsMlaGen &&
-         options.mNumInstsQ == 1 && options.mNumInstsKv == 1 && isSupportedHeadDim;
+  bool const isSupportedTransform = isBf16QFp8KvFullTransformGeneration(options);
+  return isSupportedTransform && !options.mIsMlaGen && options.mNumInstsQ == 1 &&
+         options.mNumInstsKv == 1 && isSupportedHeadDim;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -169,12 +200,18 @@ struct KernelConfig : public KernelConfigBase {
     }
 
     // The data type of softmax computation.
+#ifdef TLLM_RUBIN_FEATURES
+    if (options.mEnablesFp16Softmax) {
+      // E4m3 kernels will also use Fp16 for softmax computation.
+      mDtypeSoftmax = (mDtypeQ == tg::Dtype::Bfloat16) ? tg::Dtype::Bfloat16 : tg::Dtype::Fp16;
+    }
+#endif // TLLM_RUBIN_FEATURES
 
     // The maximum headDim for K and V.
     mMaxHeadDimKv = std::max(mHeadDimQk, mHeadDimV);
     mPaddedHeadDimQk = mHeadDimQk;
     mPaddedHeadDimV = mHeadDimV;
-    if (mHeadDimQk == mHeadDimV) {
+    if (mHeadDimQk == mHeadDimV && !mSeparateSmemKv) {
       // Equal K/V head dims share one packed SMEM layout. For headDim=80, pad both views to the
       // same 128B-friendly storage width; asymmetric MLA sizes keep their existing unpadded widths.
       auto headSizeBytesK = mHeadDimQk * tg::dtypeGetNumBits(mDtypeK) / 8;
@@ -296,6 +333,25 @@ struct KernelConfig : public KernelConfigBase {
       if (mHeadDimPerStageKv == 0 && keepsMmaAbForDsMlaGen) {
         TLLM_CHECK_ERROR(options.mSeparateSmemKv, "Not supported");
         mNumStagesKv = int32_t{4 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
+#ifdef TLLM_RUBIN_FEATURES
+        if (tg::isArchRubin(options.mCudaArch)) {
+          int32_t const numStagesKvDeep{6 * 8 /*bits*/ / std::max(tg::dtypeGetNumBits(mDtypeQ), 8)};
+          int32_t const estimatedNumBytesPerRowSmemQ{
+            ceilDiv(tg::dtypeGetNumBits(mDtypeQ) * mHeadDimQk / 8, 128) * 128};
+          int64_t const estimatedNumBytesSmemQ{int64_t{mNumStagesQ} * mTileSizeQ *
+                                               estimatedNumBytesPerRowSmemQ};
+          int64_t const estimatedNumBytesSmemKvDeep{
+            numStagesKvDeep * calculateSmemKvStageBytes(mDtypeQ, options.mClusterDimX)};
+          // Keep Q+KV within 200 KiB, reserving space below Rubin's 227-KiB normal dynamic-SMEM
+          // limit for page offsets, epilogue buffers, and barriers. Larger unsplit tiles retain the
+          // four-stage default instead of entering the 328-KiB oversized mode with only 8 KiB L1.
+          bool const fitsDeepKvPipelineSmemBudget{
+            estimatedNumBytesSmemQ + estimatedNumBytesSmemKvDeep <= int64_t{200} * 1024};
+          if (fitsDeepKvPipelineSmemBudget) {
+            mNumStagesKv = numStagesKvDeep;
+          }
+        }
+#endif // TLLM_RUBIN_FEATURES
       } else if (keepsMmaAbForDsMlaGen) {
         // For DS MLA-generation kernels with keepsMmaAb, allocate at most 112 KiB shared memory for
         // 2-CTA mode and 128 KiB shared memory for 1-CTA mode. This preserves the previous stage
@@ -328,6 +384,17 @@ struct KernelConfig : public KernelConfigBase {
       // Apply the KV override after all architecture-specific defaults are selected.
       if (options.mNumStagesKv > 0) {
         mNumStagesKv = options.mNumStagesKv;
+      }
+      if (options.mNumStagesKv == 0 && isFp8QFp8KNvFp4VGeneration(options) &&
+          isSwapsMmaAbForGenerationKernel(options.mFmhaKernelType) && mHeadDimQk == 128 &&
+          mHeadDimV == 128 && mHeadDimPerStageKv == 128) {
+        // V-only conversion has a shorter critical path than the full K/V transform. The SM103
+        // H128 1Qx2KV schedule benefits from two additional raw K/V stages. CGA reduction uses
+        // extra shared memory, so Q16/Q32 retain one/two fewer stages to stay below 228 KiB.
+        mNumStagesKv = mNumInstsKv == 2 ? 11 : 9;
+        if (mNumInstsKv == 2 && isCgaSmemReduction(mMultiCtasKvMode)) {
+          mNumStagesKv -= mTileSizeQ >= 32 ? 2 : (mTileSizeQ >= 16 ? 1 : 0);
+        }
       }
       if (usesKOnlyTransformPipeline(options) && options.mNumStagesKv == 0) {
         // K-only transform needs one BF16 transformed-K stage, while V stays in the raw FP8
@@ -365,6 +432,11 @@ struct KernelConfig : public KernelConfigBase {
 
     // Set the number of tmem cols we will allocate once.
     mNumTmemCols = 512;
+#ifdef TLLM_RUBIN_FEATURES
+    if (isArchRubin(options.mCudaArch)) {
+      mNumTmemCols = 576;
+    }
+#endif // TLLM_RUBIN_FEATURES
     // Set the softmax statistics tile size.
     mTileSizeStats = 32;
     // Set epilogue tile sizes for each instance in the M dimension.
@@ -403,7 +475,7 @@ struct KernelConfig : public KernelConfigBase {
     // The accumulator type for Bmm1.
     mDtypeBmm1Acc = (mDtypeQ == tg::Dtype::Int8) ? tg::Dtype::Int32 : tg::Dtype::Fp32;
     // Input type for Bmm2.
-    auto const dtypeBmm2 = (mDtypeK != mDtypeQ) ? mDtypeQ : mDtypeV;
+    auto const dtypeBmm2 = getDtypeBmm2(options);
     // Number of Bmm2 input elements per 32 bit pack.
     int32_t numEltsPerUInt32P = 32 / tg::dtypeGetNumBits(dtypeBmm2);
     // The maximum tmemCpAtomSizeP.
@@ -533,9 +605,7 @@ struct MmaTraits {
   template <typename FmhaOptions_>
   MmaTraits(FmhaOptions_ const& options)
     : mDtypeBmm1{options.mDtypeQ}
-    , mDtypeBmm2(usesKOnlyTransformPipeline(options)
-                   ? options.mDtypeV
-                   : (options.mDtypeK != options.mDtypeQ ? options.mDtypeQ : options.mDtypeV)) {
+    , mDtypeBmm2{getDtypeBmm2(options)} {
 
     // Whether to use 2-CTA mode for UTCMMA.
     mUseUtcmma2CtaMode = options.mClusterDimX == 2;
@@ -568,6 +638,12 @@ struct MmaTraits {
     // The Atom Mma for Q * K^T.
     mAtomQkM = options.mSwapsMmaAb ? options.mTileSizeKv : options.mTileSizeQ;
     mAtomQkN = options.mSwapsMmaAb ? options.mTileSizeQ : options.mTileSizeKv;
+#ifdef TLLM_RUBIN_FEATURES
+    // For QMMAs with K=64, the M dimension must be 128 for 1cta mode and 256 for 2cta mode.
+    if (tg::isArchRubin(options.mCudaArch) && mAtomQkM == 128) {
+      mAtomQkK = isMma8BitBmm1 ? 64 : 16;
+    } else
+#endif // TLLM_RUBIN_FEATURES
     {
       mAtomQkK = isMma8BitBmm1 ? 32 : 16;
     }
@@ -619,6 +695,11 @@ struct MmaTraits {
     }
 
     // The K dimension.
+#ifdef TLLM_RUBIN_FEATURES
+    if (tg::isArchRubin(options.mCudaArch) && mAtomPvM == 128) {
+      mAtomPvK = isMma8BitBmm2 ? 64 : 16;
+    } else
+#endif // TLLM_RUBIN_FEATURES
     {
       mAtomPvK = isMma8BitBmm2 ? 32 : 16;
     }
@@ -657,6 +738,11 @@ inline int32_t getNumHeadDimStagesV(int headDimPerCtaV, int headDimPerStageKv) {
     numHeadDimStages *= (headDimPerCtaV + headDimPerStageKv - 1) / headDimPerStageKv;
   }
   return numHeadDimStages;
+}
+
+// Return the P-sized, 32-bit TMEM column footprint reserved for one MMA-sum result.
+inline int32_t getNumTmemColsMmaSumPerInst(int32_t tileSizeKv, tg::Dtype dtypeP) {
+  return ceilDiv(tileSizeKv * tg::dtypeGetNumBits(dtypeP), 32);
 }
 
 struct KernelTraits : public KernelConfig, public MmaTraits {
@@ -745,12 +831,12 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
     hasMultiTokensInTwoCta =
       mUseUtcmma2CtaMode && mTileSizeQ == 128 && mIsCausalSpecDecodingGen && mSingleTokenQPerCta;
 
+    // Keep an already-E4M3 K on the raw path; only NVFP4 V needs conversion for FP8 MMA.
     mTransformsK = mDtypeBmm1 != mDtypeK;
     mTransformsV = mDtypeBmm2 != mDtypeV;
 
-    if (mTransformsK && !mTransformsV) {
-      // K-only transform stores transformed K for BMM1 while BMM2 consumes raw V. Keep separate
-      // K/V SMEM views because the two operands no longer share the same element type/layout.
+    if (mTransformsK != mTransformsV) {
+      // A single transformed operand requires independent raw K/V pipeline state.
       mSeparateSmemKv = true;
     }
 
@@ -788,6 +874,13 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
     // Make sure the two MMAs consume the same K width in bits.
     int32_t bmm1KBits = mAtomQkK * tg::dtypeGetNumBits(mDtypeBmm1);
     int32_t bmm2KBits = mAtomPvK * tg::dtypeGetNumBits(mDtypeBmm2);
+#ifdef TLLM_RUBIN_FEATURES
+    // For Rubin, the K dimension of BMM1 and BMM2 can be different.
+    if (tg::isArchRubin(options.mCudaArch)) {
+      TLLM_CHECK_ERROR(bmm1KBits == bmm2KBits || (mAtomQkK == 64 || mAtomPvK == 64),
+                       "BMM1-K and BMM2-K must have equal K width in bits or one of them is 64.");
+    } else
+#endif // TLLM_RUBIN_FEATURES
     {
       // For other architectures, the K width in bits of BMM1 and BMM2 must be the same.
       TLLM_CHECK_ERROR(bmm1KBits == bmm2KBits,
@@ -830,6 +923,11 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
 
     // The HW is designed to have NumEltsIn128B elements consumed by 4 UTC?Mmas in the K
     // dimension.
+#ifdef TLLM_RUBIN_FEATURES
+    if (tg::isArchRubin(options.mCudaArch) && mAtomQkK == 64) {
+      TLLM_CHECK_ERROR(numEltsIn128BQ == mAtomQkK * 2, "Internal error");
+    } else
+#endif // TLLM_RUBIN_FEATURES
     {
       TLLM_CHECK_ERROR(numEltsIn128BQ == mAtomQkK * 4, "Internal error");
     }
@@ -844,13 +942,13 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
 
     // The number of transform stages for SmemTransformedKv.
     mNumSmemTransformStages = 2;
-    if (isBf16QFp8KvGeneration(options)) {
-      // BF16Q+FP8KV transform kernels use one conversion chunk so the SMEM budget goes to raw KV
-      // stages that overlap the E4M3->BF16 conversion.
+    if (isBf16QFp8KvGeneration(options) || isFp8KNvFp4V(options)) {
+      // Mixed-precision kernels use one conversion chunk so the SMEM budget goes to raw KV stages.
       mNumSmemTransformStages = 1;
     }
-    if (options.mSeparateTransformedKv) {
-      // Separate transformed K/V is about producer/consumer ordering, not deeper buffering.
+    if (options.mSeparateTransformedKv || isFp8QFp8KNvFp4V(options)) {
+      // Separate or V-only transformed resources need one publication stage; deeper buffering is
+      // provided by the raw K/V pipeline.
       mNumStagesTransformedKv = 1;
     }
 
@@ -873,7 +971,10 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
     // phase kernels are supported. Only supports E2M1 Kv and E4M3 Q. HeadDimPerStageKv should be
     // 128, this is a limitation of TMA load of type CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B.
     auto transformedKvHeadDim = mHeadDimPerStageKv == 0 ? mHeadDimQk : mHeadDimPerStageKv;
-    mStoreTransformedKvInTmem = options.mDtypeKv == tg::Dtype::E2m1 &&
+    // Mixed H64 is promoted to a 128-wide transform stage, but its raw V page is only H64.
+    // Keep that case on the SMEM transform path instead of constructing an invalid TMEM TMA map.
+    bool const storesMixedVInTmem = isFp8QFp8KNvFp4VGeneration(options) && options.mHeadDimV >= 128;
+    mStoreTransformedKvInTmem = (options.mDtypeKv == tg::Dtype::E2m1 || storesMixedVInTmem) &&
                                 options.mDtypeQ == tg::Dtype::E4m3 &&
                                 (transformedKvHeadDim == 128) && mSwapsMmaAb;
 
@@ -959,13 +1060,50 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
                        "StoreTransformedKvInTmem incompatible with InterleaveTmemSAndP");
     }
 
+    if (mUsesMmaForSoftmaxSum) {
+      // TODO: Extend MMA softmax sum beyond the configurations covered by the current
+      // implementation.
+      bool const isSupportedMmaForSoftmaxSumConfig =
+        tg::isArchBlackwell(mCudaArch) && mDtypeQ == tg::Dtype::E4m3 &&
+        mDtypeK == tg::Dtype::E4m3 && mDtypeBmm2 == tg::Dtype::E4m3 && mTileSizeQ == 128 &&
+        mTileSizeKv == 128 && mNumInstsQ == 2 && mNumInstsKv == 1 && mClusterDimX == 1 &&
+        !mSwapsMmaAb && mNumKPartitionsMmaPv == 1 && mNumKPartitionsTileP == 1 &&
+        !mStoreTransformedKvInTmem;
+      TLLM_CHECK_ERROR(
+        isSupportedMmaForSoftmaxSumConfig,
+        "UsesMmaForSoftmaxSum currently supports Blackwell E4M3 Q/K/P with tileSizeQ=128, "
+        "tileSizeKv=128, numInstsQ=2, numInstsKv=1, clusterDimX=1, P as MMA operand A, a "
+        "single P K-partition, and no transformed K/V in TMEM");
+      TLLM_CHECK_ERROR(!mInterleavesMufuAndSums,
+                       "UsesMmaForSoftmaxSum is mutually exclusive with InterleavesMufuAndSums");
+
+      // Each 128x8 FP32 result uses eight columns, but its TMEM destination base must be aligned to
+      // 32 columns. The supported 128-wide E4M3 P tile occupies 32 columns, so reserve one P-sized
+      // slot per Q instance. This is numInstsQ * tileSizeKv * sizeof(P) / sizeof(uint32_t) for the
+      // supported non-swapped, single-CTA layout.
+      int32_t const numMmaSumCols =
+        mNumInstsQ * getNumTmemColsMmaSumPerInst(mTileSizeKv, mDtypeBmm2);
+      // P contributes columns only when it is physically separate. In the default Pv-first
+      // layout P aliases S; the existing ProtectP handshake transfers ownership to the MMA task,
+      // whose schedule keeps the sum/PV reads ahead of the following QK overwrite.
+      int32_t const numTmemColsP = mSeparateTmemColsForSAndP ? 2 * mNumTmemColsP : 0;
+      int32_t const numTmemColsNeededForMmaSum =
+        numTmemColsS + numTmemColsStats + numTmemColsO + numTmemColsP + numMmaSumCols;
+      TLLM_CHECK_ERROR_FMT(
+        numTmemColsNeededForMmaSum <= mNumTmemCols,
+        "UsesMmaForSoftmaxSum needs %d TMEM columns, but only %d are available",
+        numTmemColsNeededForMmaSum,
+        mNumTmemCols);
+    }
+
     // The size of the K/V tile per stage.
     // Each CtaX in the cluster only needs to load half N of tensor B if the 2Cta Utcmma
     // instruction is used.
     mSmemKvTileSize = tileSizeNB * headSizeKvInDtypeKElts;
-    // Allow NVFP4 only for KV-cache-like input.
+    // Allow asymmetric NVFP4 only for the supported FP8-K, NVFP4-V paths.
     if (mDtypeK == tg::Dtype::E2m1 || mDtypeV == tg::Dtype::E2m1) {
-      TLLM_CHECK_ERROR(mDtypeK == mDtypeV, "E2m1 requires dtypeK == dtypeV.");
+      TLLM_CHECK_ERROR(mDtypeK == mDtypeV || isFp8KNvFp4V(options),
+                       "Asymmetric E2m1 is only supported for E4M3-K, E2M1-V attention.");
     }
     // The size of the K/V scaling factor tile per stage. TMA requires the shared-memory
     // destination address to be 128B aligned. For small paged-KV SF chunks, reserve padded shared
@@ -974,7 +1112,8 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
     mNumSfEltsPerSmemStageKv = 0;
     mNumSfEltsPerTmaKv = 0;
     mNumSfEltsPerTmaPaddedKv = 0;
-    if (mDtypeKv == tg::Dtype::E2m1) {
+    bool const hasNvFp4Input = mDtypeK == tg::Dtype::E2m1 || mDtypeV == tg::Dtype::E2m1;
+    if (hasNvFp4Input) {
       int32_t const numKeysPerSfTma = std::min(mNumKeysPerTile, tileSizeNB);
       int32_t const numSfTmasPerSmemStage = ceilDiv(tileSizeNB, numKeysPerSfTma);
       mNumSfEltsPerTmaKv = numKeysPerSfTma * numSfPerRow;
@@ -1018,9 +1157,8 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
                                               mNumKeysPerTile}))
                          : 1;
     // The reshape factor for K/V SF: aim for box width 128B, limit to numKeysPerTile.
-    mReshapeFactorKvSf = mDtypeKv == tg::Dtype::E2m1
-                           ? std::min(128 / (mMaxHeadDimKv / mNumEltsPerSf), mNumKeysPerTile)
-                           : 1;
+    mReshapeFactorKvSf =
+      hasNvFp4Input ? std::min(128 / (mMaxHeadDimKv / mNumEltsPerSf), mNumKeysPerTile) : 1;
 
     // Calculate the transaction size for K/V.
     mNumTxBytesKv = tileSizeNB * maxHeadSizeBytesKv + smemKvSfTxSize * 1 /*byte per sf element*/;
@@ -1035,8 +1173,14 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
     if (headDimBytesK > 128) {
       mNumTxBytesK = tileSizeNB * ceilDiv(headDimBytesK, 128) * 128;
     }
+    int32_t const numTxBytesKValues = mNumTxBytesK;
+    if (mDtypeK == tg::Dtype::E2m1) {
+      mNumTxBytesK += smemKvSfTxSize;
+    }
     // The K SMEM tile size.
-    mNumEltsPerSmemStageK = (mNumTxBytesK * 8) / tg::dtypeGetNumBits(mDtypeK);
+    mNumEltsPerSmemStageK = mDtypeK == tg::Dtype::E2m1 && !mStoreTransformedKvInTmem
+                              ? numTxBytesKValues + mNumSfEltsPerSmemStageKv
+                              : (mNumTxBytesK * 8) / tg::dtypeGetNumBits(mDtypeK);
 
     // For 2CTA M=256 MLA gen, a CTA cluster only loads half of headDimV.
     if (options.mClusterDimX == 2 && mIsMlaGen && mAtomQkM == 256 && mHeadDimV == 512) {
@@ -1049,8 +1193,14 @@ struct KernelTraits : public KernelConfig, public MmaTraits {
     if (headDimBytesV > 128) {
       mNumTxBytesV = tileSizeNB * ceilDiv(headDimBytesV, 128) * 128;
     }
+    int32_t const numTxBytesVValues = mNumTxBytesV;
+    if (mDtypeV == tg::Dtype::E2m1) {
+      mNumTxBytesV += smemKvSfTxSize;
+    }
     // The V SMEM tile size.
-    mNumEltsPerSmemStageV = (mNumTxBytesV * 8) / tg::dtypeGetNumBits(mDtypeV);
+    mNumEltsPerSmemStageV = mDtypeV == tg::Dtype::E2m1 && !mStoreTransformedKvInTmem
+                              ? numTxBytesVValues + mNumSfEltsPerSmemStageKv
+                              : (mNumTxBytesV * 8) / tg::dtypeGetNumBits(mDtypeV);
   }
 
   // Check if the TMEM allocation is valid.
@@ -1247,6 +1397,26 @@ inline int32_t getTmemAllocationTransformedKv(KernelTraits traits) {
   // The TMEM start offset of the transformed K/V.
   return getTmemAllocationO1(traits) +
          (getTmemAllocationO1(traits) - getTmemAllocationO0(traits)) * (numInstsQkv - 1);
+}
+
+inline int32_t getTmemAllocationMmaSum(KernelTraits traits, int ii) {
+  int32_t const numMmaSumColsPerInst =
+    getNumTmemColsMmaSumPerInst(traits.mTileSizeKv, traits.mDtypeBmm2);
+  int32_t const base = getTmemAllocationTransformedKv(traits);
+  TLLM_CHECK_ERROR(base % numMmaSumColsPerInst == 0,
+                   "TmemMmaSum base must be aligned on 32 TMEM columns");
+  return base + ii * numMmaSumColsPerInst;
+}
+
+inline tg::Expr const* getTmemAllocationMmaSum(tg::Kernel* kernel,
+                                               KernelTraits traits,
+                                               tg::Expr const* instId) {
+  return TLLM_MAKE_OBJ(tg::ExprFromTernaryOp,
+                       kernel,
+                       tg::Dtype::Int32,
+                       TLLM_MAKE_OBJ(tg::BinEq, kernel, instId, kernel->getInt0()),
+                       kernel->getInt(getTmemAllocationMmaSum(traits, 0)),
+                       kernel->getInt(getTmemAllocationMmaSum(traits, 1)));
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1448,7 +1618,10 @@ inline std::string getTmemAllocationDiagram(FmhaOptions_ const& options) {
     oss << "  tmemP0:      (aliased with tmemS1)\n";
     oss << "  tmemP1:      (aliased with tmemS0)\n";
   } else if (!traits.mSwapsMmaAb) {
-    oss << "  tmemP:       (aliased with tmemS)\n";
+    oss << "  tmemP0:      " << range(p0, p0 + traits.mNumTmemColsP)
+        << " (aliased with tmemS0)\n";
+    oss << "  tmemP1:      " << range(p1, p1 + traits.mNumTmemColsP)
+        << " (aliased with tmemS1)\n";
   }
   int32_t const numColsO0 = o1 - o0;
   oss << "  tmemO0:      " << range(o0, o1) << " (" << numColsO0 << " cols)\n";
@@ -1457,6 +1630,16 @@ inline std::string getTmemAllocationDiagram(FmhaOptions_ const& options) {
     int32_t const numColsKv = totalCols - transformedKv;
     oss << "  tmemTransformedKv: " << range(transformedKv, totalCols) << " (" << numColsKv
         << " cols)\n";
+  }
+  if (traits.mUsesMmaForSoftmaxSum) {
+    int32_t const numMmaSumColsPerInst =
+      getNumTmemColsMmaSumPerInst(traits.mTileSizeKv, traits.mDtypeBmm2);
+    int32_t const mmaSum0 = getTmemAllocationMmaSum(traits, 0);
+    int32_t const mmaSum1 = getTmemAllocationMmaSum(traits, 1);
+    oss << "  tmemMmaSum0: " << range(mmaSum0, mmaSum0 + numMmaSumColsPerInst) << " ("
+        << numMmaSumColsPerInst << " cols reserved, 8 used)\n";
+    oss << "  tmemMmaSum1: " << range(mmaSum1, mmaSum1 + numMmaSumColsPerInst) << " ("
+        << numMmaSumColsPerInst << " cols reserved, 8 used)\n";
   }
   oss << "  Total TMEM columns: " << totalCols;
   return oss.str();

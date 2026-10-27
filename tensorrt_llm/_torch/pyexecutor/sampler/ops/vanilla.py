@@ -15,21 +15,12 @@
 """PyTorch-native sampling kernels.
 
 Pure tensor functions that operate on logits and probabilities with no
-dependency on the sampler_strategy interface or other backend implementation modules.
+dependency on the sampler or other backend implementation modules.
 """
 
-import math
-from dataclasses import dataclass
-from typing import Optional, cast
+from typing import Optional
 
 import torch
-
-from tensorrt_llm._utils import prefer_pinned
-
-
-@dataclass(kw_only=True)
-class StrategyMetadata:
-    """Base class for per-strategy-group metadata passed into sample()."""
 
 
 def min_p_renorm_probs(
@@ -49,88 +40,6 @@ def min_p_renorm_probs(
     return probs
 
 
-def top_k_top_p_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    temperature: float,
-    top_k: Optional[int] = None,
-    top_p: float = 1.0,
-    min_p: float = 0.0,
-    generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Temperature + optional min-p / top-k / top-p filtering + multinomial sampling.
-
-    ``top_k=None`` (or ``vocab_size``) disables top-k filtering; ``top_p=1``
-    disables top-p filtering; ``min_p=0`` disables min-p filtering. With all
-    disabled this is plain temperature sampling.
-    """
-    logits_dim = logits.dim()
-    assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
-    assert temperature > 0, "non-greedy sampling requires valid temperature"
-    logits = logits / max(temperature, 1e-5)
-    batch_size, vocab_size = logits.size()
-    # 0 / non-positive means "keep all" (the min_p disabled-top_k sentinel),
-    # matching sanitize_top_k on the flashinfer path.
-    if top_k is None or top_k <= 0:
-        top_k = vocab_size
-
-    assert top_k > 1, "non-greedy sampling requires valid top_k"
-    need_top_k = top_k < vocab_size
-    assert top_p > 0, "non-greedy sampling requires valid top_p"
-    need_top_p = top_p < 1
-    assert 0 <= min_p < 1, "non-greedy sampling requires valid min_p"
-    need_min_p = min_p > 0
-
-    if need_min_p:
-        # Thresholding logits at max_logit + log(min_p) keeps the tokens with
-        # prob >= min_p * max_prob; the softmax below renormalizes.
-        min_values = logits.max(dim=-1, keepdim=True).values + math.log(min_p)
-        logits = torch.where(logits < min_values, torch.full_like(logits, float("-inf")), logits)
-
-    if need_top_k:
-        values, _ = torch.topk(logits, top_k, dim=-1)
-        min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
-        logits = torch.where(logits < min_values, torch.full_like(logits, float("-inf")), logits)
-
-    if need_top_p:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-        probs_sorted = torch.softmax(sorted_logits, dim=-1)
-        # NB: must NOT use out=probs_sorted here — cumulative_probs is reused as
-        # the renormalization denominator below, after probs_sorted is masked.
-        cumulative_probs = torch.cumsum(probs_sorted, dim=-1)
-        mask_to_remove = cumulative_probs >= top_p
-        last_index_to_keep = torch.searchsorted(
-            mask_to_remove.to(torch.int8, non_blocking=True),
-            torch.ones((1,), dtype=torch.int8, device=mask_to_remove.device).expand(
-                (mask_to_remove.size(0), 1)
-            ),
-            right=False,
-            out_int32=True,
-        )
-        mask_to_remove.scatter_(
-            1,
-            last_index_to_keep,
-            torch.zeros((1,), dtype=torch.bool, device=mask_to_remove.device).expand_as(
-                last_index_to_keep
-            ),
-        )
-        probs_sorted.masked_fill_(mask_to_remove, 0.0)
-        probs = torch.empty_like(probs_sorted)
-        probs.scatter_(1, sorted_indices, probs_sorted)
-        probs /= cumulative_probs[
-            torch.arange(
-                cumulative_probs.size(0), dtype=torch.int32, device=cumulative_probs.device
-            ),
-            last_index_to_keep.squeeze(-1),
-        ].unsqueeze(-1)
-        del logits
-    else:
-        probs = torch.softmax(logits, dim=-1)
-
-    next_tokens = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
-    return next_tokens, probs
-
-
 def greedy_search_sampling_batch(
     logits: torch.Tensor,
     *,
@@ -144,47 +53,59 @@ def greedy_search_sampling_batch(
     return next_tokens, softmax
 
 
-def get_rejected_indices(
-    draft_probs: torch.Tensor,
-    target_probs: torch.Tensor,
-    generator: torch.Generator,
-    draft_tokens: list[int],
-) -> torch.Tensor:
-    num_draft_tokens = draft_probs.size(0)
-    draft_tokens = draft_tokens[:num_draft_tokens]
-    token_idx = torch.arange(num_draft_tokens, dtype=torch.int32, device=generator.device)
-    draft_tokens_cuda = torch.tensor(
-        draft_tokens, dtype=torch.int32, pin_memory=prefer_pinned()
-    ).to(device=generator.device, non_blocking=True)
-    p = draft_probs[token_idx, draft_tokens_cuda]
-    q = target_probs.squeeze(0)[token_idx, draft_tokens_cuda]
-    accept_probs = torch.minimum(torch.ones((), device=generator.device, dtype=q.dtype), q / p)
-    rejected_indices = (
-        torch.rand(accept_probs.shape, generator=generator, device=accept_probs.device)
-        > accept_probs
-    ).nonzero()
-    return rejected_indices
-
-
-def sample_rejected(
-    draft_probs: torch.Tensor,
-    target_probs: torch.Tensor,
-    generator: torch.Generator,
-    num_accepted: int,
-) -> int:
-    last_draft = draft_probs[num_accepted]
-    last_target = target_probs[num_accepted]
-    new = last_target - last_draft
-    new = torch.where(new > 0, new, 0.0)
-    new_token = torch.multinomial(new, num_samples=1, generator=generator).squeeze(-1)
-    return cast(int, new_token.item())
-
-
 # Rows whose temperature is at or below this threshold are treated as greedy.
 # Contract with the spec-decoding metadata layer: greedy requests are
 # normalized to a sentinel temperature strictly below this threshold (see
 # DISABLE_TEMP_VAL in speculative/interface.py, which derives from it).
 GREEDY_TEMPERATURE_THRESHOLD = 1e-4
+
+
+def occurrence_penalized_logits(
+    logits: torch.Tensor,
+    *,
+    count: torch.Tensor,
+    seen_for_repetition: torch.Tensor,
+    seen_for_presence: torch.Tensor,
+    repetition: torch.Tensor,
+    presence: torch.Tensor,
+    frequency: torch.Tensor,
+) -> torch.Tensor:
+    """The occurrence-penalty formula, shared by every backend that applies it.
+
+    Single source of truth for the arithmetic, so the eager and CUDA-graph paths
+    cannot drift apart. Callers differ only in how they gather the operands; this
+    function knows nothing about slots, beams or row layouts.
+
+    Args:
+        logits: ``[..., vocab_size]`` raw logits. Not modified; the penalized values
+            are returned, cast back to ``logits.dtype``.
+        count: how often each token has occurred, broadcast against ``logits``.
+        seen_for_repetition: mask of tokens the repetition penalty applies to. Kept
+            separate from ``seen_for_presence`` because a prompt prefix excluded by
+            ``prompt_ignore_length`` still counts as "seen" for repetition.
+        seen_for_presence: mask of tokens presence/frequency apply to.
+        repetition / presence / frequency: per-row penalty parameters, broadcast
+            against ``logits``.
+
+    Repetition is multiplicative and splits on the logit's sign -- dividing a
+    negative logit would raise it -- so a value > 1 always pushes a seen token down.
+    Presence and frequency are plain subtractions.
+    """
+    penalized = logits.float()
+    repeated = torch.where(penalized < 0, penalized * repetition, penalized / repetition)
+    penalized = torch.where(seen_for_repetition, repeated, penalized)
+    penalized = penalized - torch.where(
+        seen_for_presence,
+        presence + frequency * count.to(torch.float32),
+        penalized.new_zeros(()),
+    )
+    # Clamp only what the arithmetic above could have pushed out of range. A logit
+    # that arrived non-finite -- a -inf from an embedding bias, say, since bias runs
+    # before penalties -- must stay that way; clamping it to the finite minimum would
+    # make a token the user masked out eligible for sampling again.
+    limit = torch.finfo(logits.dtype).max
+    clamped = penalized.clamp(-limit, limit)
+    return torch.where(torch.isfinite(logits), clamped, logits.float()).to(logits.dtype)
 
 
 class Fusions:
@@ -380,8 +301,8 @@ class Fusions:
             presence_prefix_cuda[prefix_slots, prefix_tokens] = True
 
     # --- Beam-search occurrence counts --------------------------------------
-    # Counterpart of the per-beam workspace handling in the C++ ``batchApplyPenalty``
-    # kernel (``penaltyKernels.cu:151-171``): a beam does not re-walk its history,
+    # Counterpart of the per-beam workspace handling in the former C++
+    # ``batchApplyPenalty`` kernel: a beam does not re-walk its history,
     # it inherits its parent beam's counts and appends the single token it just
     # emitted. ``counts_cuda`` is flat ``[num_slots * max_beam_width, vocab_size]``;
     # beam ``b`` of slot ``s`` owns row ``s * max_beam_width + b``, which collapses to
@@ -604,16 +525,15 @@ class Fusions:
             # Prompt-ignore-prefix tokens count for repetition only, not presence/frequency.
             seen = seen | prefix_seen_cuda[row_slot]
 
-        penalized = logits.float()
-        repeated = torch.where(penalized < 0, penalized * rep, penalized / rep)
-        penalized = torch.where(seen, repeated, penalized)
-        penalized = penalized - torch.where(
-            count > 0,
-            pre + freq * count.to(torch.float32),
-            penalized.new_zeros(()),
+        penalized = occurrence_penalized_logits(
+            logits,
+            count=count,
+            seen_for_repetition=seen,
+            seen_for_presence=count > 0,
+            repetition=rep,
+            presence=pre,
+            frequency=freq,
         )
-        limit = torch.finfo(logits.dtype).max
-        penalized = penalized.clamp(-limit, limit).to(logits.dtype)
         # Cast before the select so inactive rows stay bit-identical, then write in place.
         logits.copy_(torch.where(row_active.unsqueeze(1), penalized, logits))
 

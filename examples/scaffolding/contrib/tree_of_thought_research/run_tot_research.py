@@ -66,7 +66,7 @@ def _load_config(config_path: str | None) -> dict:
     return {}
 
 
-def _mcp_sse_urls(cfg: dict) -> list[str]:
+def _mcp_streamable_http_urls(cfg: dict) -> list[str]:
     tools = cfg.get("mcp_tools") or {}
     client_host = str(cfg.get("mcp_client_host") or "127.0.0.1")
     urls: list[str] = []
@@ -74,7 +74,7 @@ def _mcp_sse_urls(cfg: dict) -> list[str]:
         tool_cfg = tools.get(name) or {}
         host = tool_cfg.get("client_host") or client_host
         port = int(tool_cfg.get("port", default_port))
-        urls.append(f"http://{host}:{port}/sse")
+        urls.append(f"http://{host}:{port}/mcp")
     return urls
 
 
@@ -135,13 +135,13 @@ async def main() -> None:
             trace_output_dir = Path(f"tot_research_trace_{timestamp}")
         trace_output_dir.mkdir(parents=True, exist_ok=True)
 
-    mcp_urls = _mcp_sse_urls(cfg)
+    mcp_urls = _mcp_streamable_http_urls(cfg)
     client = AsyncOpenAI(api_key=openai_api_key, base_url=base_url)
     generation_worker = TRTOpenaiWorker(client, model)
     mcp_worker = MCPWorker.init_with_urls(mcp_urls)
     await mcp_worker.init_in_asyncio_event_loop()
 
-    print(f"MCP SSE URLs ({len(mcp_urls)}): {mcp_urls}")
+    print(f"MCP Streamable HTTP URLs ({len(mcp_urls)}): {mcp_urls}")
     print(f"Prompt: {args.prompt}")
     llm = create_tot_research_scaffolding_llm(
         generation_worker,

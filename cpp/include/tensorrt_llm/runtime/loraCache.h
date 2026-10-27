@@ -187,12 +187,16 @@ public:
         WorldConfig const& worldConfig, BufferManager const& bufferManager);
 
     /**
-     * \brief Reinitialize an empty cache to store the given data type.
+     * \brief Reinitialize this cache and another cache (e.g. a host/device pair) to store the
+     * given data type and page capacities as a single atomic operation.
      *
-     * The page geometry remains unchanged. This is intended for selecting a
-     * homogeneous LoRA cache dtype before the first task is inserted.
+     * Holds both caches' mutexes for the full duration so a concurrent copyTask (which locks
+     * the same mutexes to verify the two caches agree on dtype before copying) can never
+     * observe one cache already reconfigured to the new dtype while the other still holds the
+     * old one.
      */
-    void setDataType(tensorrt_llm::DataType dataType);
+    void setDataTypeCoordinated(
+        LoraCache& other, tensorrt_llm::DataType dataType, SizeType32 totalNumPages, SizeType32 otherTotalNumPages);
 
     [[nodiscard]] tensorrt_llm::DataType getDataType() const;
 
@@ -443,6 +447,12 @@ private:
     void loadWeights(TaskValue& cacheValue, TensorPtr weights, TensorPtr config);
     void bumpTaskInProgress(TaskIdType taskId);
     [[nodiscard]] ValueStatus getStatus(TaskIdType taskId) const;
+
+    /**
+     * \brief Core of setDataType, assumes mPagesMutex and mCacheMutex are already held by the
+     * caller. Used by setDataTypeCoordinated to reconfigure two caches under one combined lock.
+     */
+    void setDataTypeLocked(tensorrt_llm::DataType dataType, std::optional<SizeType32> totalNumPages = std::nullopt);
 
     /**
      * \brief claim numPages, evicting tasks if needed

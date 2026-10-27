@@ -35,15 +35,15 @@ from kv_transfer_harness import (
 )
 
 from tensorrt_llm import Mapping
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4CacheManager
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_OVERLAP_COMPRESSOR_RATIO,
     DEEPSEEK_V4_SPARSE_RATIO,
     DeepseekV4AttentionType,
 )
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool, get_pool_bytes
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
@@ -51,7 +51,7 @@ from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCach
 # ---------------------------------------------------------------------------
 # Constants matching DeepseekV4CacheManager defaults
 # ---------------------------------------------------------------------------
-HEAD_DIM = 256  # Reduced from 512: test validates transfer, not attention correctness
+HEAD_DIM = 512
 INDEX_HEAD_DIM = 128
 WINDOW_SIZE = 128
 NUM_KV_HEADS = 1
@@ -78,6 +78,7 @@ def _create_deepseek_v4_manager(
     )
     max_num_tokens = MAX_SEQ_LEN * MAX_BATCH_SIZE
     kv_cache_config = KvCacheConfig(
+        dtype="fp8_ds_mla" if get_sm_version() == 90 else "auto",
         enable_block_reuse=False,
         max_tokens=max_num_tokens,
         event_buffer_max_size=0,
@@ -139,6 +140,7 @@ def _init_pool_data(
         seed_base: Base seed offset (different for ctx vs gen to avoid collisions).
         fill_random: If True fill with random data (ctx), if False fill with zeros (gen).
     """
+    initialized_devices = set()
     for rank, mgr in enumerate(managers):
         pp_rank = rank // tp
         page_table = KVRegionExtractorV1(mgr).page_table
@@ -159,6 +161,7 @@ def _init_pool_data(
             pool_tensor = convert_to_torch_tensor(
                 TensorWrapper(pool_base_ptr, DataType.HALF, [pool_size_elements])
             )
+            initialized_devices.add(pool_tensor.device)
             if fill_random:
                 # Same seed for same pp_rank across TP ranks (kv_heads=1)
                 seed = seed_base + pp_rank
@@ -172,6 +175,11 @@ def _init_pool_data(
                 pool_tensor.copy_(random_values)
             else:
                 pool_tensor.zero_()
+
+    # NIXL's worker streams do not inherit this torch stream's dependencies.
+    # Finish synthetic source writes and destination clearing before transfer.
+    for device in initialized_devices:
+        torch.cuda.current_stream(device).synchronize()
 
 
 # ---------------------------------------------------------------------------

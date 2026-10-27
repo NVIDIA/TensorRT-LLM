@@ -56,7 +56,7 @@ Dynamic tree mode enables tree-structured draft generation for EAGLE 3, where th
 
 To enable dynamic tree mode, set `use_dynamic_tree=True` on the `Eagle3DecodingConfig` and provide the following parameters:
 
-* `use_dynamic_tree` (`bool`): Enables dynamic tree draft generation. Mutually exclusive with `eagle_choices` (static tree).
+* `use_dynamic_tree` (`bool`): Enables dynamic tree draft generation.
 * `dynamic_tree_max_topK` (`int`): Maximum number of tokens to expand per node at each draft layer.
 * `max_total_draft_tokens` (`int`, optional): Total draft token budget for the tree. Must satisfy `max_draft_len <= max_total_draft_tokens <= dynamic_tree_max_topK * max_draft_len`. Defaults to `dynamic_tree_max_topK * max_draft_len` if not set.
 
@@ -81,6 +81,10 @@ Dynamic tree mode is currently **not supported** for models that use sliding win
 ```
 
 ### NGram
+
+```{warning}
+NGram speculative decoding is deprecated and will be removed in January 2027. Use standalone Suffix Automaton speculative decoding (`SADecodingConfig`) instead.
+```
 
 The NGram method is an implementation of [this Prompt Lookup Decoding algorithm](https://github.com/apoorvumang/prompt-lookup-decoding).
 
@@ -152,21 +156,59 @@ Reference: [DFlash: Distilled Flash Speculative Decoding](https://arxiv.org/pdf/
 * `speculative_model`: Path or HuggingFace model ID for the DFlash draft model.
 * `mask_token_id`: Token ID used as the mask token for parallel prediction. If not set, it is read from the draft model config.
 * `target_layer_ids`: List of target model layer indices whose hidden states are captured for cross-attention in the draft model. If not set, read from the draft model config.
+* `attention_backend`: Cross-attention backend for the draft model, independent of the drafter's standard attention modules. `"VANILLA"` (the default) uses FlashAttention with a contiguous context K/V cache and runs anywhere. `"TRTLLM"` uses TRTLLM-Gen FMHA (via FlashInfer) over a private paged context K/V cache and supports SM100/SM103 only. `"FA4"` uses the flash-attn CuTe DSL kernels on the same paged cache and supports SM90 only.
 
 ```python
 from tensorrt_llm.llmapi import DFlashDecodingConfig
 
 speculative_config = DFlashDecodingConfig(
-    max_draft_len=4, speculative_model="/path/to/dflash_model")
+    max_draft_len=4,
+    speculative_model="/path/to/dflash_model",
+    attention_backend="TRTLLM",
+)
 
 llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 ```
 
+[DFlash 2](https://inco.ai/blog/dflash2/) is also supported. The same `DFlashDecodingConfig` can be used for DFlash 2; no extra arguments are required.
+
+[LiLiCorr](https://arxiv.org/abs/2608.20530) checkpoints use the same
+`DFlashDecodingConfig`. The draft checkpoint selects LiLiCorr through
+`architectures: ["LiLiCorrDraftModel"]`, `dflash_config.projector_type: "lilicorr"`,
+or `dflash_config.lilicorr_enabled: true`.
+Its candidate scorer correlates the per-position top-k proposals before target
+verification. Load the matching target separately through `LLM(model=...)` and
+set `speculative_model` to the drafter. Both models must share the token vocabulary
+and embedding width; the captured target layers must match the drafter's training.
+The drafter currently uses the generic GQA DFlash backbone; MLA and Laguna-specific
+draft layers require separate adapters.
+
+Set `max_draft_len` to at most `block_size - 1`; for an eight-position checkpoint,
+use up to seven draft tokens. Projection quantization follows the checkpoint's
+global or per-module metadata, including excluded modules. The loader accepts
+dense, FP8, NVFP4 and W4A16 NVFP4 projections. Backbone QKV projections must remain
+unquantized; checkpoints with quantized backbone QKV are rejected during loading.
+It preserves a checkpoint-owned output head when `has_own_lm_head` is set. Grouped
+convolutions are loaded when declared by the checkpoint. Draft attention is
+non-causal, including symmetric windows on sliding-attention layers; causal
+LiLiCorr checkpoints are rejected. The draft attention backend retains the
+hardware restrictions listed above.
+
+LiLiCorr builds proposal rows along a greedy candidate path. With stochastic draft
+sampling, a sampled token can differ from the predecessor used to score the next
+row. Rejection sampling uses the actual proposal distributions, preserving the
+target distribution, but acceptance can decrease.
+
 ### User-provided drafting
+
+```{warning}
+User-provided drafting is deprecated and will be removed in January 2027.
+```
+
 A completely user-defined drafting method can be supplied with a `UserProvidedDecodingConfig` that includes
 * `max_draft_len`: Maximum draft candidate length.
-* `drafter`: An object of type `Drafter` that implements the `prepare_draft_tokens` method (see [Developer Guide](speculative-decoding.md#developer-guide) 7.)
-* `resource_manager`: An optional `ResourceManager` object (see [Developer Guide](speculative-decoding.md#developer-guide) 4.)
+* `drafter`: An object of type `Drafter` that implements the `prepare_draft_tokens` method (see [User-provided drafting](speculative-decoding.md#user-provided-drafting) 7.)
+* `resource_manager`: An optional `ResourceManager` object (see [User-provided drafting](speculative-decoding.md#user-provided-drafting) 4.)
 
 ```python
 from tensorrt_llm.llmapi import UserProvidedDecodingConfig
@@ -187,16 +229,15 @@ SA can be combined with the following speculative decoding techniques:
 * **EAGLE 3** (`Eagle3DecodingConfig`)
 * **PARD** (`PARDDecodingConfig`)
 
-To enable SA combination, set `use_sa_spec=True` on the speculative config. The `sa_spec_threshold` parameter controls the minimum suffix match length required to override the neural draft (default: 4).
+To enable SA combination, set `sa_config=SAEnhancerConfig(...)` on the speculative config. The `threshold` field controls the minimum suffix match length required to override the neural draft (default: 4).
 
 ```python
-from tensorrt_llm.llmapi import Eagle3DecodingConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig, SAEnhancerConfig
 
 speculative_config = Eagle3DecodingConfig(
     max_draft_len=4,
     speculative_model="/path/to/eagle3_model",
-    use_sa_spec=True,
-    sa_spec_threshold=4)
+    sa_config=SAEnhancerConfig(threshold=4))
 
 llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 ```
@@ -223,7 +264,7 @@ Speculative decoding options must be specified via `--config config.yaml` for bo
 
 * `MTP`
 * `Eagle3`
-* `NGram`
+* `NGram` (deprecated; use `SA` instead)
 * `DraftTarget`
 * `PARD`
 * `DFlash`
@@ -251,6 +292,7 @@ speculative_config:
 
 ```yaml
 # Dynamic tree mode
+max_batch_size: 4
 speculative_config:
   decoding_type: Eagle3
   max_draft_len: 6
@@ -258,7 +300,6 @@ speculative_config:
   use_dynamic_tree: true
   dynamic_tree_max_topK: 10
   max_total_draft_tokens: 60
-  max_batch_size: 4
 ```
 
 ```yaml
@@ -267,8 +308,8 @@ speculative_config:
   decoding_type: Eagle3
   max_draft_len: 4
   speculative_model: /path/to/draft/model
-  use_sa_spec: true
-  sa_spec_threshold: 4
+  sa_config:
+    threshold: 4
 ```
 
 ```{note}

@@ -37,19 +37,24 @@ from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ...logger import logger
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.qk_norm_attention import QKNormRoPEAttention
 from ..distributed import AllReduce
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import DeepSeekV3MoeRoutingMethod, create_moe
-from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
 from ..modules.gated_mlp import GatedMLP
-from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import DeepSeekV3MoeRoutingMethod, create_moe
+from ..moe.fused_moe.routing import Deepseekv3RoutingImpl
 from ..utils import AuxStreamType
-from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
+from .modeling_utils import (
+    DecoderModel,
+    DecoderModelForCausalLM,
+    moe_experts_quant_config,
+    register_auto_model,
+)
 
 
 class AfmoeConfig(PretrainedConfig):
@@ -184,6 +189,9 @@ class AfmoeMoE(nn.Module):
             dtype=config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
+            override_quant_config=moe_experts_quant_config(
+                model_config, f"model.layers.{layer_idx}.mlp.experts"
+            ),
             layer_idx=layer_idx,
         )
 
@@ -198,6 +206,7 @@ class AfmoeMoE(nn.Module):
                 overridden_tp_size=1 if self.enable_attention_dp else None,
                 reduce_output=False,
                 layer_idx=layer_idx,
+                is_shared_expert=True,
             )
         else:
             self.shared_experts = None
@@ -215,6 +224,7 @@ class AfmoeMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         router_logits = self.gate(hidden_states)
@@ -224,10 +234,11 @@ class AfmoeMoE(nn.Module):
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=False,
+            lora_params=lora_params,
         )
 
         if self.shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
+            shared_output = self.shared_experts(hidden_states, lora_params=lora_params)
             final_output = shared_output.add_(routed_output)
         else:
             final_output = routed_output
@@ -356,6 +367,7 @@ class AfmoeDecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -368,6 +380,7 @@ class AfmoeDecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            lora_params=lora_params,
             **kwargs,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -375,9 +388,9 @@ class AfmoeDecoderLayer(DecoderLayer):
         hidden_states, residual = self.pre_mlp_layernorm(hidden_states, residual)
 
         if self.moe_enabled:
-            hidden_states = self.mlp(hidden_states, attn_metadata)
+            hidden_states = self.mlp(hidden_states, attn_metadata, lora_params=lora_params)
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, lora_params=lora_params)
 
         hidden_states = self.post_mlp_layernorm(hidden_states)
 

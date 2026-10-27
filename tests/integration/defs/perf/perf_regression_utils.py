@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -62,14 +62,9 @@ def get_job_info():
     is_post_merge = "PostMerge" in job_url
     is_pr_job = not is_post_merge
 
-    # Extract branch from job_url
-    # Pattern: LLM/job/main/job -> branch is "main"
-    branch = ""
+    raw_branch = global_vars.get("build_branch")
+    branch = raw_branch if isinstance(raw_branch, str) else ""
     commit = os.getenv("gitlabCommit", "")
-    if job_url:
-        branch_match = re.search(r"/job/LLM/job/([^/]+)/job/", job_url)
-        if branch_match:
-            branch = branch_match.group(1)
 
     # Initialize PR-specific fields
     trigger_mr_user = ""
@@ -190,8 +185,39 @@ def _percentile(values, p):
     return s[lo] + frac * (s[hi] - s[lo])
 
 
-def _daily_aggregate_values(data_list, metric):
+def _created_ms(data):
+    """``ts_created`` of a history record in epoch milliseconds, or None.
+
+    OpenSearch returns ``ts_created`` as epoch milliseconds; an epoch in seconds
+    is accepted as well. Anything else (absent, ISO string, malformed) is None.
+    """
+    ts = data.get("ts_created")
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    return ts if ts > 1e12 else ts * 1000
+
+
+def _stored_baseline_predates_floor(baseline_threshold, metric, metric_history_floors_ms):
+    """Whether a stored d_baseline_* for *metric* may predate the metric's history floor.
+
+    The stored fields come from one history record (see get_history_data), whose
+    ts_created says when they were set. A metric with no floor is never affected;
+    under a floor, a record of unknown age counts as older than the floor.
+    """
+    floor_ms = (metric_history_floors_ms or {}).get(metric)
+    if floor_ms is None:
+        return False
+    stored_ms = _created_ms(baseline_threshold or {})
+    return stored_ms is None or stored_ms < floor_ms
+
+
+def _daily_aggregate_values(data_list, metric, min_created_ms=None):
     """Aggregate multiple data points on the same day to a single mean value.
+
+    When min_created_ms is given, records created before it are skipped, and so
+    are records whose creation time is unknown (see _created_ms). The record
+    being checked never reaches here with a ts_created, so it is unaffected by
+    construction.
 
     Returns a list of daily-aggregated metric values sorted by date.
     """
@@ -202,6 +228,10 @@ def _daily_aggregate_values(data_list, metric):
         val = data.get(metric)
         if val is None:
             continue
+        if min_created_ms is not None:
+            created_ms = _created_ms(data)
+            if created_ms is None or created_ms < min_created_ms:
+                continue
         ts = data.get("ts_created") or data.get("@timestamp")
         if ts is None:
             continue
@@ -221,14 +251,28 @@ def _daily_aggregate_values(data_list, metric):
     return result
 
 
-def calculate_baseline_metrics(history_data_list, new_data, maximize_metrics, minimize_metrics):
+def calculate_baseline_metrics(
+    history_data_list,
+    new_data,
+    maximize_metrics,
+    minimize_metrics,
+    metric_history_floors_ms=None,
+):
     """Calculate baseline metrics using rolling smooth + percentile algorithm.
 
     For each metric, aggregates data to daily values, applies a trailing
     rolling mean (window=3), then takes:
       - P95 for maximize_metrics (larger is better, e.g. throughput)
       - P5  for minimize_metrics (smaller is better, e.g. latency)
+
+    metric_history_floors_ms optionally maps a metric to an epoch-millisecond
+    ts_created floor: that metric's baseline is computed only from history
+    records created at or after the floor, so values recorded under an older
+    definition of the metric cannot set it. A metric with no history left
+    above its floor gets no baseline, which the caller treats as "nothing to
+    compare against yet".
     """
+    floors = metric_history_floors_ms or {}
     all_data = []
     if history_data_list:
         all_data.extend(history_data_list)
@@ -242,7 +286,7 @@ def calculate_baseline_metrics(history_data_list, new_data, maximize_metrics, mi
 
     baseline_metrics = {}
     for metric in maximize_metrics + minimize_metrics:
-        daily_vals = _daily_aggregate_values(all_data, metric)
+        daily_vals = _daily_aggregate_values(all_data, metric, floors.get(metric))
         if not daily_vals:
             continue
         smoothed = _rolling_smooth(daily_vals, window=3)
@@ -269,6 +313,18 @@ def _calculate_diff(metric, new_value, baseline_value, maximize_metrics):
         return (baseline_value - new_value) / baseline_value * 100
 
 
+def _is_regressive(value, baseline_value, threshold, maximize):
+    """Return True when *value* misses *baseline_value* by more than *threshold*.
+
+    Shared by the pre-merge verdict and by the check on main's own latest value,
+    so the two can never drift apart. The comparison is strict: a value sitting
+    exactly on baseline_value * (1 -/+ threshold) is not a regression.
+    """
+    if maximize:
+        return value < baseline_value * (1 - threshold)
+    return value > baseline_value * (1 + threshold)
+
+
 def prepare_regressive_test_cases(
     latest_history_data_dict,
     latest_baseline_threshold_dict,
@@ -277,15 +333,36 @@ def prepare_regressive_test_cases(
     maximize_metrics,
     minimize_metrics,
     regression_metrics,
+    metric_history_floors_ms=None,
 ):
     """Update regression info for all data in new_data_dict.
 
     Uses baseline/threshold fields from latest_baseline_threshold_dict when
     available, otherwise falls back to calculating baseline from history data.
+    For a metric listed in metric_history_floors_ms, a stored baseline is used only
+    when the record it came from (its ts_created) is at or after the metric's floor;
+    otherwise the floor-filtered calculation is used (see calculate_baseline_metrics).
+    Its threshold is read from latest_baseline_threshold_dict either way.
+
+    Returns the set of pre-merge cmd_idx whose regression must not fail the
+    stage because the latest post-merge record for the same case is itself
+    beyond the pre-merge threshold. Both pipelines compare against one shared
+    baseline, so a regression landed on main would otherwise make every
+    subsequent PR measure the same regressed value and fail for a change it did
+    not introduce.
+
+    The latest post-merge value is re-evaluated here against the same baseline
+    and the same pre-merge threshold, rather than reusing the b_is_regression
+    the post-merge run recorded at its own tighter threshold. That makes the
+    exemption exactly as wide as the failure it prevents: if main sits within
+    the pre-merge threshold, a PR reproducing main's value does not fail the
+    gate, so there is nothing to exempt and the gate stays armed.
     """
+    exempt_cmd_idxs = set()
+
     # If latest_history_data_dict is None (network failure), skip regression check
     if latest_history_data_dict is None:
-        return
+        return exempt_cmd_idxs
 
     for cmd_idx in new_data_dict:
         new_data = new_data_dict[cmd_idx]
@@ -296,6 +373,13 @@ def prepare_regressive_test_cases(
         is_post_merge = new_data.get("b_is_post_merge", False)
         regressive_metrics = []
         info_lines = []
+
+        # The latest post-merge record for this same case, used only to decide
+        # whether a pre-merge regression predates the change under test.
+        latest_post_merge = None if is_post_merge else latest_history_data_dict.get(cmd_idx)
+        if not isinstance(latest_post_merge, dict):
+            latest_post_merge = None
+        post_merge_regressive_metrics = []
 
         # Pre-calculate fallback baseline from history if needed
         fallback_baseline = None
@@ -312,11 +396,23 @@ def prepare_regressive_test_cases(
             # then fall back to calculating from history data
             baseline_key = f"d_baseline_{metric_suffix}"
             baseline_value = baseline_threshold.get(baseline_key) if baseline_threshold else None
+            # A stored baseline recorded before a metric's floor predates the
+            # metric's current definition, so the floored metric recomputes its
+            # baseline from the floor-filtered history instead. One recorded at or
+            # after the floor (or with no floor) is honoured as before.
+            if baseline_value is not None and _stored_baseline_predates_floor(
+                baseline_threshold, metric, metric_history_floors_ms
+            ):
+                baseline_value = None
             if baseline_value is None or baseline_value <= 0:
                 if fallback_baseline is None:
                     history_list = history_data_dict.get(cmd_idx, [])
                     fallback_baseline = calculate_baseline_metrics(
-                        history_list, new_data, maximize_metrics, minimize_metrics
+                        history_list,
+                        new_data,
+                        maximize_metrics,
+                        minimize_metrics,
+                        metric_history_floors_ms=metric_history_floors_ms,
                     )
                 baseline_value = fallback_baseline.get(metric)
                 if baseline_value is None or baseline_value <= 0:
@@ -345,19 +441,42 @@ def prepare_regressive_test_cases(
 
             # Check if this metric is regressive (only for key regression metrics)
             if metric in regression_metrics:
-                if metric in maximize_metrics:
-                    # Regressive if new_value < baseline_value * (1 - threshold)
-                    if new_value < baseline_value * (1 - threshold):
-                        regressive_metrics.append(metric)
-                else:
-                    # Regressive if new_value > baseline_value * (1 + threshold)
-                    if new_value > baseline_value * (1 + threshold):
-                        regressive_metrics.append(metric)
+                maximize = metric in maximize_metrics
+                if _is_regressive(new_value, baseline_value, threshold, maximize):
+                    regressive_metrics.append(metric)
+
+                # Re-evaluate main's own latest value against this same baseline
+                # and this same (pre-merge) threshold. Anything unusable -- field
+                # absent, null, non-numeric, non-positive -- must not exempt, so
+                # a broken post-merge record leaves the gate armed.
+                if latest_post_merge is not None:
+                    prior_value = _safe_float(latest_post_merge.get(metric), None)
+                    if (
+                        prior_value is not None
+                        and prior_value > 0
+                        and _is_regressive(prior_value, baseline_value, threshold, maximize)
+                    ):
+                        post_merge_regressive_metrics.append(metric)
 
         test_case = new_data.get("s_test_case_name", "unknown")
         header = f"Regression in {test_case}:"
         new_data["s_regression_info"] = "\n".join([header] + info_lines)
         new_data["b_is_regression"] = len(regressive_metrics) > 0
+
+        # A pre-merge regression is not this PR's fault when main's own latest
+        # value already misses the same gate. post_merge_regressive_metrics is
+        # only ever populated on a pre-merge run, so post-merge is unaffected.
+        if post_merge_regressive_metrics:
+            exempt_cmd_idxs.add(cmd_idx)
+            if new_data["b_is_regression"]:
+                new_data["s_regression_info"] += (
+                    "\n  Not failing this stage: the latest post-merge run of this test "
+                    "case already misses the same threshold against the same baseline "
+                    f"({', '.join(post_merge_regressive_metrics)}), so this regression "
+                    "predates the change under test."
+                )
+
+    return exempt_cmd_idxs
 
 
 def _safe_float(value, default):
@@ -375,7 +494,11 @@ def _safe_float(value, default):
 
 
 def add_baseline_fields_to_post_merge_data(
-    latest_baseline_threshold_dict, new_data_dict, maximize_metrics, minimize_metrics
+    latest_baseline_threshold_dict,
+    new_data_dict,
+    maximize_metrics,
+    minimize_metrics,
+    metric_history_floors_ms=None,
 ):
     """Embed baseline fields directly into each post-merge data entry.
 
@@ -383,6 +506,10 @@ def add_baseline_fields_to_post_merge_data(
       - d_baseline_{metric_suffix}
       - d_threshold_post_merge_{metric_suffix}
       - d_threshold_pre_merge_{metric_suffix}
+
+    A d_baseline_* that predates the metric's floor in metric_history_floors_ms is
+    not carried forward: the gate no longer uses it, and copying it onto a new
+    record would give it a current ts_created.
     """
     if latest_baseline_threshold_dict is None:
         return
@@ -410,44 +537,64 @@ def add_baseline_fields_to_post_merge_data(
                 new_data[pre_merge_key] = pre_merge_val
 
             baseline_val = _safe_float(baseline_threshold.get(baseline_key), None)
-            if baseline_val is not None and baseline_val > 0:
+            if (
+                baseline_val is not None
+                and baseline_val > 0
+                and not _stored_baseline_predates_floor(
+                    baseline_threshold, metric, metric_history_floors_ms
+                )
+            ):
                 new_data[baseline_key] = baseline_val
 
 
-def check_perf_regression(new_data_dict, fail_on_regression=False):
+def check_perf_regression(new_data_dict, fail_on_regression=False, exempt_cmd_idxs=None):
     """Check performance regression by printing s_regression_info.
 
     Post-merge regressions log warnings. Pre-merge
     regressions raise RuntimeError when fail_on_regression is True.
+
+    Cases in exempt_cmd_idxs are reported as warnings but never raise: their
+    regression is already present on main, so failing here would block a PR for
+    a change it did not introduce. See prepare_regressive_test_cases.
     """
-    regressive_data_list = [
-        data for data in new_data_dict.values() if data.get("b_is_regression", False)
+    exempt_cmd_idxs = exempt_cmd_idxs or set()
+
+    regressive_data_items = [
+        (cmd_idx, data)
+        for cmd_idx, data in new_data_dict.items()
+        if data.get("b_is_regression", False)
     ]
 
-    if not regressive_data_list:
+    if not regressive_data_items:
         print_info("No regression data found.")
         return
 
     post_merge_regressions = [
-        data for data in regressive_data_list if data.get("b_is_post_merge", False)
+        data for _, data in regressive_data_items if data.get("b_is_post_merge", False)
     ]
     pre_merge_regressions = [
-        data for data in regressive_data_list if not data.get("b_is_post_merge", False)
+        (cmd_idx, data)
+        for cmd_idx, data in regressive_data_items
+        if not data.get("b_is_post_merge", False)
     ]
 
     # Print post-merge regression details as warnings
     for data in post_merge_regressions:
         print_warning(data.get("s_regression_info", ""))
 
-    # Print pre-merge regression details and raise error
-    if pre_merge_regressions:
-        error_parts = []
-        for data in pre_merge_regressions:
-            info = data.get("s_regression_info", "")
-            print_warning(info)
+    # Print pre-merge regression details and raise error. An exempt case is
+    # still reported -- the measurement is real -- but withheld from the error.
+    error_parts = []
+    for cmd_idx, data in pre_merge_regressions:
+        info = data.get("s_regression_info", "")
+        print_warning(info)
+        if cmd_idx not in exempt_cmd_idxs:
             error_parts.append(info)
-        if fail_on_regression:
-            raise RuntimeError("\n".join(error_parts))
+
+    # Guard on error_parts, not on pre_merge_regressions: when every regressive
+    # case is exempt there is nothing to report and nothing to fail.
+    if fail_on_regression and error_parts:
+        raise RuntimeError("\n".join(error_parts))
 
 
 def process_and_upload_test_results(
@@ -459,6 +606,7 @@ def process_and_upload_test_results(
     extra_fields: Optional[dict] = None,
     upload_to_db: bool = True,
     fail_on_regression: Optional[bool] = None,
+    metric_history_floors_ms: Optional[Dict[str, int]] = None,
 ):
     """Generic regression pipeline: enrich data, query history, detect regression, upload.
 
@@ -473,6 +621,9 @@ def process_and_upload_test_results(
         upload_to_db: Whether to post results to the database.
         fail_on_regression: Whether to raise on pre-merge regression.
             None = auto (fail for pre-merge only).
+        metric_history_floors_ms: Optional metric -> epoch-ms ts_created floor.
+            History created before a metric's floor is ignored when computing
+            that metric's baseline (see calculate_baseline_metrics).
     """
     if not new_data_dict:
         print_info("No data to upload to database.")
@@ -499,16 +650,26 @@ def process_and_upload_test_results(
             data.update(extra_fields)
         add_id(data)
 
-    # Step 3: Find common values to narrow query scope
-    common_values_dict = get_common_values(new_data_dict, match_keys)
+    # Step 3: For pre-merge, look history up against the baseline branch
+    lookup_data_dict = new_data_dict
+    if not is_post_merge and "s_branch" in match_keys:
+        baseline_branch = os.environ.get("PERF_BASELINE_BRANCH", "main")
+        lookup_data_dict = {
+            cmd_idx: {**data, "s_branch": baseline_branch}
+            for cmd_idx, data in new_data_dict.items()
+        }
 
-    # Step 4: Query history data
+    # Step 4: Find common values to narrow query scope
+    common_values_dict = get_common_values(lookup_data_dict, match_keys)
+
+    # Step 5: Query history data
     latest_history_data_dict, latest_baseline_threshold_dict, history_data_dict = get_history_data(
-        new_data_dict, match_keys, common_values_dict
+        lookup_data_dict, match_keys, common_values_dict
     )
 
-    # Step 5: Compute regression info
-    prepare_regressive_test_cases(
+    # Step 6: Compute regression info. Cases whose regression is already present
+    # on the latest post-merge run are reported but must not fail the stage.
+    exempt_cmd_idxs = prepare_regressive_test_cases(
         latest_history_data_dict,
         latest_baseline_threshold_dict,
         history_data_dict,
@@ -516,19 +677,28 @@ def process_and_upload_test_results(
         maximize_metrics,
         minimize_metrics,
         regression_metrics,
+        metric_history_floors_ms=metric_history_floors_ms,
     )
 
-    # Step 6: For post-merge, embed baseline fields
+    # Step 7: For post-merge, embed baseline fields
     if is_post_merge:
         add_baseline_fields_to_post_merge_data(
-            latest_baseline_threshold_dict, new_data_dict, maximize_metrics, minimize_metrics
+            latest_baseline_threshold_dict,
+            new_data_dict,
+            maximize_metrics,
+            minimize_metrics,
+            metric_history_floors_ms=metric_history_floors_ms,
         )
 
-    # Step 7: Upload to DB
+    # Step 8: Upload to DB
     if upload_to_db:
         post_new_perf_data(new_data_dict)
 
-    # Step 8: Check regression (auto-detect fail behavior if not specified)
+    # Step 9: Check regression (auto-detect fail behavior if not specified)
     if fail_on_regression is None:
         fail_on_regression = not is_post_merge
-    check_perf_regression(new_data_dict, fail_on_regression=fail_on_regression)
+    check_perf_regression(
+        new_data_dict,
+        fail_on_regression=fail_on_regression,
+        exempt_cmd_idxs=exempt_cmd_idxs,
+    )

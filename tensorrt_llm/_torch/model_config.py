@@ -21,21 +21,26 @@ import struct
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar
+from typing import (TYPE_CHECKING, Any, Dict, Generic, Iterator, List, Optional,
+                    Sequence, Tuple, TypeVar)
 
 import filelock
 import torch
 import transformers
 from transformers.utils import HF_MODULES_CACHE
 
+from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.pyexecutor.config_utils import (
+    get_glm5_next_layer_masks, get_glm5_next_num_attention_layers,
     get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
-    is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, load_pretrained_config)
+    is_glm5_next, is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid,
+    is_qwen4_exp, load_pretrained_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
-from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
+from tensorrt_llm.llmapi.llm_args import (CSA2SparseAttentionConfig,
+                                          DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
                                           KvCacheConfig, MoeLoadBalancerConfig,
                                           MultimodalConfig)
@@ -46,8 +51,11 @@ from tensorrt_llm.models.quant_config_utils import \
     update_quant_config_from_compressed_tensors
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.modelopt_config import (
-    is_modelopt_quant_config, read_modelopt_quant_config,
-    warn_if_inline_diverges)
+    canonicalize_quant_algo, is_modelopt_quant_config,
+    read_modelopt_quant_config, warn_if_inline_diverges)
+from tensorrt_llm.quantization.utils.fp4_utils import (
+    NVFP4_SF_VEC_SIZE, W4A16_NVFP4_LINEAR_SF_VEC_SIZES,
+    nvfp4_scaling_vector_size)
 
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
@@ -58,7 +66,38 @@ if TYPE_CHECKING:
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
+# Python's errno module omits Linux's EBADHANDLE value.
+_LINUX_EBADHANDLE = 521
+
+
+@dataclass(frozen=True)
+class KVCacheLayerSpec:
+    """Model-provided, unsharded KV-cache geometry for one attention layer."""
+
+    head_dim: int
+    num_kv_heads: int
+    num_q_heads: int
+    attention_window: Optional[int] = None
+
+
+def _get_kv_cache_layer_specs(
+    model_config: object, ) -> Optional[Sequence[KVCacheLayerSpec]]:
+    """Return concrete per-layer geometry from full or lightweight configs."""
+    layer_specs = getattr(model_config, "kv_cache_layer_specs", None)
+    if not isinstance(layer_specs, Sequence):
+        return None
+    return layer_specs
+
+
 _DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
+# V4.1 shares V4's routed-MoE formats and backend choice, but needs its own
+# dense FP8 policy for both original and ModelOpt-converted checkpoints.
+_DEEPSEEK_V41_ARCHITECTURES = {
+    "DeepseekV41ForCausalLM",
+    "DeepseekV41ForConditionalGeneration",
+}
+# Shared by V4 and V4.1: both name the first routed expert identically, and both
+# encode the routed-MoE format in its dtype (I8 -> MXFP4, U8 -> NVFP4).
 _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
 
 _KIMI_K3_ARCHITECTURES = {
@@ -82,7 +121,7 @@ def _is_lock_infra_error(exc: BaseException) -> bool:
         # (the post-EEXIST is_dir() recheck sees a stale attribute cache).
         # An un-creatable lock dir is broken infra, not contention.
         return exc.errno in (errno.EACCES, errno.EPERM, errno.ENOLCK,
-                             errno.ESTALE, errno.EEXIST)
+                             errno.ESTALE, errno.EEXIST, _LINUX_EBADHANDLE)
     return False
 
 
@@ -90,67 +129,118 @@ def _release_lock_ignoring_infra_errors(lock: "filelock.BaseFileLock") -> None:
     """Release ``lock``, downgrading broken-lock-infra errors to a warning.
 
     NFS can return ENOLCK/ESTALE from the unlock ``flock`` call itself (e.g.
-    lock-daemon exhaustion when many ranks start simultaneously). The config
-    load the lock protected has already completed at release time, so
-    crashing the process here would fail an otherwise healthy executor.
+    lock-daemon exhaustion when many ranks start simultaneously). The work the
+    lock protected has already completed at release time, so crashing the
+    process here would fail an otherwise healthy executor.
     """
     try:
         lock.release()
     except (PermissionError, OSError) as e:
         if not _is_lock_infra_error(e):
             raise
-        logger.warning(f"config lock release failed ({e}), continuing")
+        logger.warning(f"HF remote-code lock release failed ({e}), continuing")
+
+
+def _try_take_lock(lock: "filelock.BaseFileLock") -> bool:
+    """Take ``lock`` without waiting; True if this process now holds it.
+
+    Contention is reported as False rather than raised, so the caller can tell
+    "someone else is already filling the cache" apart from "the lock itself is
+    unusable", which surfaces as PermissionError/OSError.
+    """
+    try:
+        # timeout=0 rather than blocking=False: same immediate semantics, but
+        # available in the older filelock releases huggingface-hub allows.
+        lock.acquire(timeout=0)
+    except filelock.Timeout:
+        # filelock signals "not acquired" with Timeout. Nothing was waited on
+        # here: another process simply holds the lock.
+        return False
+    return True
 
 
 @contextlib.contextmanager
-def config_file_lock(timeout: int = 10):
+def hf_remote_code_lock(timeout: int = 10) -> Iterator[None]:
     """
-    Context manager for file locking when loading pretrained configs.
+    Serialize only the first load of HuggingFace ``trust_remote_code`` files.
 
-    This prevents race conditions when multiple processes try to download/load
-    the same model configuration simultaneously.
+    ``transformers.dynamic_module_utils.get_cached_module_file`` publishes a
+    checkpoint's .py files into the shared ``HF_MODULES_CACHE`` with a plain
+    ``shutil.copy``, which truncates the destination before writing it. That
+    copy takes no lock at all, and the ``threading.Lock`` transformers holds
+    over the subsequent import does not span processes. So a rank can import a
+    file another rank is still writing and observe it as empty: the module
+    loads, but the class it should define is missing.
+
+    Only writes are dangerous. Once the cache is complete, transformers
+    compares each file against the checkpoint and copies nothing, so the
+    remaining ranks can load concurrently. This is therefore a two-step gate
+    rather than a queue: the first arrival fills the cache while holding the
+    lock, and everyone else waits for it, steps aside, then loads in parallel.
+    Cost is one fill plus one concurrent load, independent of the rank count.
+
+    Every caller must share this one lock instead of defining its own:
+    ``AutoTokenizer`` and ``AutoProcessor`` internally call
+    ``AutoConfig.from_pretrained``, so config and processor loads write
+    overlapping sets of files into the same directory.
 
     Args:
-        timeout: Maximum time to wait for lock acquisition in seconds
+        timeout: Maximum time to wait for the filling rank, in seconds.
     """
-    # Use a single global lock file in HF cache directory to serialize loads.
-    lock_path = Path(HF_MODULES_CACHE) / "_remote_code.lock"
-    lock = filelock.FileLock(str(lock_path), timeout=timeout)
-
-    # Guard only acquisition so caller-body exceptions propagate (single-yield).
+    # One lock file inside the cache directory it guards, so that every rank
+    # sharing that cache contends on the same file.
+    lock = filelock.FileLock(str(
+        Path(HF_MODULES_CACHE) / "hf_remote_code.lock"))
     try:
-        lock.acquire(timeout=timeout)
-    except filelock.Timeout:
-        # Contention, not broken infra: a tempdir lock can't serialize against
-        # the holder, so degrade to no lock instead of crashing the process.
-        logger.warning(
-            f"could not acquire config lock within {timeout}s, proceeding without lock"
-        )
-        yield
+        is_filler = _try_take_lock(lock)
     except (PermissionError, OSError) as e:
-        # Broken lock infra (perms / NFS ENOLCK/ESTALE): retry on a tempdir lock.
+        # Broken lock infra (permissions or NFS errors): retry on a tempdir lock.
         if not _is_lock_infra_error(e):
             raise
         tmp_dir = Path(tempfile.gettempdir())
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        tmp_lock = filelock.FileLock(str(tmp_dir / "_remote_code.lock"),
-                                     timeout=timeout)
+        lock = filelock.FileLock(str(tmp_dir / "hf_remote_code.lock"))
         try:
-            tmp_lock.acquire(timeout=timeout)
-        except (PermissionError, OSError, filelock.Timeout):
+            is_filler = _try_take_lock(lock)
+        except (PermissionError, OSError) as tmp_error:
+            if not _is_lock_infra_error(tmp_error):
+                raise
             logger.warning(
-                "tempdir config lock unavailable, proceeding without lock")
+                "no usable HF remote-code lock, loading unserialized; a "
+                "concurrent rank may import a partially written module and "
+                "fail with AttributeError")
             yield
-        else:
-            try:
-                yield
-            finally:
-                _release_lock_ignoring_infra_errors(tmp_lock)
-    else:
+            return
+
+    if is_filler:
+        # Guard only the body's exit so caller exceptions propagate.
         try:
             yield
         finally:
             _release_lock_ignoring_infra_errors(lock)
+        return
+
+    # Another rank is filling the cache. Wait for it to finish, then release at
+    # once: the cache is complete by then, so the waiting ranks load in
+    # parallel instead of queueing behind one another.
+    try:
+        lock.acquire(timeout=timeout)
+    except filelock.Timeout:
+        # Unlike the probe above, this wait genuinely expired: the filling rank
+        # is still holding the lock.
+        logger.warning(
+            f"HF remote-code cache still incomplete after {timeout}s, loading "
+            "unserialized; this rank may import a partially written module "
+            "and fail with AttributeError")
+    except (PermissionError, OSError) as e:
+        if not _is_lock_infra_error(e):
+            raise
+        logger.warning(
+            f"waiting on the HF remote-code lock failed ({e}), loading "
+            "unserialized")
+    else:
+        _release_lock_ignoring_infra_errors(lock)
+    yield
 
 
 @dataclass(kw_only=True)
@@ -172,6 +262,10 @@ class ModelConfig(Generic[TConfig]):
     # draft models so greedy draft sampling can do a lighter TP gather. Defaults
     # to True to preserve behavior for every non-draft model.
     lm_head_gather_output: bool = True
+    # Dtype of the logits written by the LM head GEMM (LlmArgs.lm_head_output_dtype).
+    # None keeps the model dtype; torch.float32 writes the float32 accumulator
+    # directly instead of rounding the logits to bf16/fp16 first.
+    lm_head_output_dtype: Optional[torch.dtype] = None
     lora_config: Optional["LoraConfig"] = None
     sparse_attention_config: Optional["SparseAttentionConfig"] = None
     kv_cache_compression_config: Optional["KvCacheCompressionConfig"] = None
@@ -182,19 +276,28 @@ class ModelConfig(Generic[TConfig]):
     max_seq_len: Optional[int] = None
 
     moe_max_num_tokens: Optional[int] = None
+    # Set in __post_init__; a normal field, not init=False, so that
+    # dataclasses.replace() and copy.copy() carry it.
+    _moe_max_num_tokens_is_default: Optional[bool] = field(default=None,
+                                                           repr=False,
+                                                           compare=False)
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 
     attn_backend: str = 'TRTLLM'
+    # Effective threshold requested for trtllm-gen MLA skip-correction. Zero
+    # disables the optimization; hardware support is resolved by the backend.
+    skip_correction_threshold: float = 0.0
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
+    # The backend the user requested, before AUTO resolution.
+    moe_backend_requested: str = 'AUTO'
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
     # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
     use_low_precision_moe_combine: bool = False
 
     # NVFP4 GEMM backend configuration - list of backends to consider for auto-selection
-    # Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme perf.
     nvfp4_gemm_allowed_backends: List[str] = field(
-        default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'])
+        default_factory=lambda: ['cutlass', 'cublaslt', 'cutedsl', 'cuda_core'])
 
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
@@ -211,11 +314,23 @@ class ModelConfig(Generic[TConfig]):
 
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
+    # Model-provided per-layer KV geometry. It is stored per config rather than
+    # in extra_attrs because one-model drafters share extra_attrs with the
+    # target while sizing their own KV caches.
+    _kv_cache_layer_specs: Optional[Tuple[KVCacheLayerSpec,
+                                          ...]] = field(default=None,
+                                                        repr=False,
+                                                        init=False)
+
     # cute dsl op configs
     use_cute_dsl_blockscaling_mm: bool = False
     use_cute_dsl_blockscaling_bmm: bool = False
     use_cute_dsl_bf16_bmm: bool = False
     use_cute_dsl_bf16_gemm: bool = False
+
+    # locality domain execution policy (controls partitioned linear/MoE execution)
+    locality_domain_policy: LocalityDomainPolicy = field(
+        default_factory=LocalityDomainPolicy)
 
     _frozen: bool = field(default=False, init=False, repr=False)
 
@@ -225,8 +340,8 @@ class ModelConfig(Generic[TConfig]):
     # If true, the multimodal encoder of a multimodal checkpoint is NOT
     # instantiated/loaded and the model serves text-only requests. This is
     # opt-in per model: each model implementation must honor this flag when
-    # building its encoder (currently the Qwen3-VL / Qwen3.5-VL models); a
-    # model that does not check it simply ignores the flag (no-op).
+    # building its encoder (currently Mistral3 and the Qwen3-VL / Qwen3.5-VL
+    # models); a model that does not check it simply ignores the flag (no-op).
     disable_mm_encoder: bool = False
 
     # Video pruning rate for VLM models (None = EVS disabled)
@@ -235,24 +350,51 @@ class ModelConfig(Generic[TConfig]):
     # Multimodal model configuration, e.g. vision encoder CUDA graph buckets.
     multimodal_config: MultimodalConfig | None = None
 
+    # The modeling_v2 target class to build, or None for the built-in
+    # implementation. Set by the model loader, read by `_resolve_class`.
+    modeling_v2_target: Optional[type] = None
+
+    @property
+    def kv_cache_layer_specs(self) -> Optional[Tuple[KVCacheLayerSpec, ...]]:
+        """Return model-provided per-layer KV-cache geometry, if any."""
+        return self._kv_cache_layer_specs
+
+    def set_kv_cache_layer_specs(
+            self, layer_specs: Sequence[KVCacheLayerSpec]) -> None:
+        """Publish unsharded per-layer KV geometry to generic runtime code."""
+        self._kv_cache_layer_specs = tuple(layer_specs)
+
     def __setattr__(self, key, value):
         """
         Prevent modification of frozen instance attributes.
         However, we allow modification of 'extra_attrs' attributes for torch.compile
         and 'pretrained_config' attributes for mutimodal models.
         'quant_config' is allowed to be modified to set different quantization for VLM.
+        '_kv_cache_layer_specs' is set by models that publish per-layer KV geometry.
         All the other attributes are frozen.
         This can be bypassed by manually setting '_frozen' to False. The design is
         to discourage modifying the attributes unintentionally.
         """
         if self._frozen:
             if key not in ('_frozen', 'extra_attrs', 'pretrained_config',
-                           'quant_config'):
+                           'quant_config', '_kv_cache_layer_specs'):
                 raise AttributeError(
                     f"Cannot modify ModelConfig.'{key}' - instance is frozen")
         super().__setattr__(key, value)
 
     def __post_init__(self):
+        if (self.sparse_attention_config is None
+                and getattr(self.pretrained_config, "model_type",
+                            None) in ("deepseek_v41", "deepseek_v41_text")):
+            self.sparse_attention_config = CSA2SparseAttentionConfig()
+        if self.pretrained_config and self.sparse_attention_config:
+            # Sparse geometry can come from the checkpoint. Resolve it once so
+            # cache allocation, CUDA-graph routing, and model layers all read
+            # the same concrete values.
+            self.sparse_attention_config = (
+                self.sparse_attention_config._resolve_checkpoint_defaults(
+                    self.pretrained_config))
+
         if self.pretrained_config:
             self.is_encoder_decoder = self.is_encoder_decoder_model(
                 self.pretrained_config)
@@ -284,8 +426,25 @@ class ModelConfig(Generic[TConfig]):
 
         # Set default moe_max_num_tokens if not specified
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
+        # Record the provenance first: once filled in, a derived size is
+        # indistinguishable from one a deployment configured to the same number.
+        if self._moe_max_num_tokens_is_default is None:
+            self._moe_max_num_tokens_is_default = self.moe_max_num_tokens is None
         if self.moe_max_num_tokens is None:
             self.moe_max_num_tokens = self.max_num_tokens * self.mapping.dp_size
+
+        self.extra_attrs["locality_domain_policy"] = self.locality_domain_policy
+
+    def is_moe_max_num_tokens_default(self) -> bool:
+        """Whether ``moe_max_num_tokens`` was derived rather than configured.
+
+        A MoE backend with a conservative workspace cap uses this to clamp only
+        the derived size. A config rebuilt from another one's
+        ``moe_max_num_tokens`` -- the draft configs in
+        ``modeling_speculative.py`` -- reads as configured, which is safe: the
+        target's first MoE layer has already capped the forwarded size.
+        """
+        return bool(self._moe_max_num_tokens_is_default)
 
     @property
     def torch_dtype(self) -> torch.dtype:
@@ -399,7 +558,8 @@ class ModelConfig(Generic[TConfig]):
         if architecture in _KIMI_K3_ARCHITECTURES:
             return "TRTLLM"
 
-        if architecture in _DEEPSEEK_V4_ARCHITECTURES:
+        if (architecture in _DEEPSEEK_V4_ARCHITECTURES
+                or architecture in _DEEPSEEK_V41_ARCHITECTURES):
             sm_version = get_sm_version()
             if 100 <= sm_version < 120:
                 return "TRTLLM"
@@ -408,7 +568,8 @@ class ModelConfig(Generic[TConfig]):
                           in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4"))
         if is_w4a16_nvfp4:
             sm_version = get_sm_version()
-            # CuteDslB12xFusedMoE on SM120/121, MarlinFusedMoE on Hopper. Any
+            # CuteDslB12xW4a16Nvfp4FusedMoE on SM120/121 (reached through the
+            # CUTEDSL family), MarlinFusedMoE on Hopper. Any
             # other SM falls through to CUTLASS, which dequantizes on the fly.
             if sm_version in (120, 121):
                 return "CUTEDSL"
@@ -443,6 +604,36 @@ class ModelConfig(Generic[TConfig]):
             moe_backend)
 
     @staticmethod
+    def _validate_nvfp4_group_size(quant_config: QuantConfig,
+                                   layer_name: Optional[str] = None) -> None:
+        """Reject NVFP4-family ``group_size`` values no kernel can consume.
+
+        ModelOpt records the scale block width in ``quantization.group_size``.
+        The W4A4 NVFP4 GEMMs are hardware-bound to 16-element blocks, while the
+        weight-only W4A16_NVFP4 path dequantizes in software and also accepts
+        the 32-element blocks that ModelOpt's ``nvfp4_*_weight_only`` recipes
+        may export. Any other width would only surface as a scale-shape
+        mismatch deep inside weight loading, so fail here with the value.
+        """
+        group_size = nvfp4_scaling_vector_size(quant_config)
+        if quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
+            supported = W4A16_NVFP4_LINEAR_SF_VEC_SIZES
+        elif quant_config.quant_algo in (QuantAlgo.NVFP4, QuantAlgo.NVFP4_ARC):
+            supported = (NVFP4_SF_VEC_SIZE, )
+        else:
+            return
+        if layer_name is not None and "experts" in layer_name.split("."):
+            supported = (NVFP4_SF_VEC_SIZE, )
+        if group_size not in supported:
+            where = f" for layer '{layer_name}'" if layer_name else ""
+            raise ValueError(
+                f"hf_quant_config.json declares group_size={group_size}{where} "
+                f"with quant_algo={quant_config.quant_algo.name}, but "
+                f"TensorRT-LLM supports {'/'.join(map(str, supported))}-element "
+                "NVFP4 scale blocks for this algorithm (32-element blocks are "
+                "only supported by the dense W4A16_NVFP4 Linear path).")
+
+    @staticmethod
     def _build_modelopt_quant_config(json_quant_configs, checkpoint_dir,
                                      moe_backend):
         """Build (quant_config, layer_quant_config) from a normalized modelopt 'quantization' inner dict.
@@ -454,9 +645,12 @@ class ModelConfig(Generic[TConfig]):
         quant_config = QuantConfig()
         layer_quant_config = None
 
-        quant_config.quant_algo = (QuantAlgo(json_quant_configs['quant_algo'])
-                                   if json_quant_configs.get('quant_algo')
-                                   is not None else None)
+        # ``canonicalize_quant_algo`` is applied again here (and per layer
+        # below) because the ``quant_cfg.json`` overlay merged in for
+        # MIXED_PRECISION bypasses ``read_modelopt_quant_config``.
+        quant_config.quant_algo = (
+            QuantAlgo(canonicalize_quant_algo(json_quant_configs['quant_algo']))
+            if json_quant_configs.get('quant_algo') is not None else None)
         quant_config.kv_cache_quant_algo = (
             QuantAlgo(json_quant_configs['kv_cache_quant_algo']) if
             json_quant_configs.get('kv_cache_quant_algo') is not None else None)
@@ -508,8 +702,10 @@ class ModelConfig(Generic[TConfig]):
                 layer_cfg = mixed_quant_configs[layer]
                 config = QuantConfig()
                 config.kv_cache_quant_algo = kv_cache_quant_algo
-                config.quant_algo = QuantAlgo(layer_cfg['quant_algo'])
+                config.quant_algo = QuantAlgo(
+                    canonicalize_quant_algo(layer_cfg['quant_algo']))
                 config.group_size = layer_cfg.get('group_size', None)
+                ModelConfig._validate_nvfp4_group_size(config, layer)
                 # AWQ-specific extras emitted by modelopt per-layer.
                 if 'has_zero_point' in layer_cfg:
                     config.has_zero_point = layer_cfg['has_zero_point']
@@ -520,6 +716,7 @@ class ModelConfig(Generic[TConfig]):
         elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             if quant_config.group_size is None:
                 quant_config.group_size = 128
+        ModelConfig._validate_nvfp4_group_size(quant_config)
 
         if (moe_backend == 'TRTLLM'
                 and quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
@@ -694,6 +891,32 @@ class ModelConfig(Generic[TConfig]):
 
         return ModelConfig._detect_deepseek_v4_routed_moe_layout(
             checkpoint_dir) not in ("mxfp4", "nvfp4")
+
+    @staticmethod
+    def _build_deepseek_v41_quant_config(hf_quant_config: dict) -> QuantConfig:
+        """Build the global quant policy for a DeepSeek-V4.1 checkpoint.
+
+        Grouped output and shared-expert GEMMs use ``FP8_BLOCK_SCALES``.
+        CSA2 Linear projections retain native block-32 FP8 weights; routed
+        experts retain their separately detected quantization policy.
+        """
+        block_size = tuple(hf_quant_config.get("weight_block_size") or ())
+        if not block_size:
+            return QuantConfig()
+
+        # ModelOpt metadata describes the experts, not the dense FP8 weights.
+        # Do not let its producer field redispatch this view to ModelOpt.
+        as_128 = {
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert":
+            hf_quant_config.get("modules_to_not_convert"),
+        }
+        if block_size != (128, 128):
+            logger.info("DeepSeek-V4.1: grouped output and shared-expert FP8 "
+                        "weights are requantized from "
+                        f"{list(block_size)} to [128, 128] at load.")
+        return ModelConfig.load_hf_quant_config(as_128, 'TRTLLM')[0]
 
     @staticmethod
     def _has_deepseek_v4_layer_only_modelopt_quant_config(
@@ -918,6 +1141,8 @@ class ModelConfig(Generic[TConfig]):
                 q_split_threshold = sparse_attention_config.q_split_threshold
                 indexer_rope_interleave = sparse_attention_config.indexer_rope_interleave
                 enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                use_self_sampling_topk = sparse_attention_config.use_self_sampling_topk
+                use_gvr_emission = sparse_attention_config.use_gvr_emission
                 indexer_k_dtype = sparse_attention_config.indexer_k_dtype
             else:
                 index_n_heads = pretrained_config.index_n_heads
@@ -927,10 +1152,13 @@ class ModelConfig(Generic[TConfig]):
                 skip_indexer_for_short_seqs = True
                 # Defaults match DeepSeekV4SparseAttentionConfig field defaults.
                 use_cute_dsl_topk = False
-                use_cute_dsl_paged_mqa_logits = False
+                use_cute_dsl_paged_mqa_logits = DeepSeekV4SparseAttentionConfig.model_fields[
+                    'use_cute_dsl_paged_mqa_logits'].default
                 q_split_threshold = 8192
                 indexer_rope_interleave = False
                 enable_heuristic_topk = False
+                use_self_sampling_topk = True
+                use_gvr_emission = False
                 default_sparse_attention_config = DeepSeekV4SparseAttentionConfig(
                 )
                 indexer_k_dtype = default_sparse_attention_config.indexer_k_dtype
@@ -947,12 +1175,14 @@ class ModelConfig(Generic[TConfig]):
             indexer_config['q_split_threshold'] = q_split_threshold
             indexer_config['indexer_rope_interleave'] = indexer_rope_interleave
             indexer_config['enable_heuristic_topk'] = enable_heuristic_topk
+            indexer_config['use_self_sampling_topk'] = use_self_sampling_topk
+            indexer_config['use_gvr_emission'] = use_gvr_emission
             indexer_config['indexer_k_dtype'] = indexer_k_dtype
             return indexer_config
 
         # Use file lock to prevent race conditions when multiple processes
         # try to import/cache the same remote model config file
-        with config_file_lock():
+        with hf_remote_code_lock():
             # When handling the case where model_format is TLLM_ENGINE
             # send cyclic requests to the NONE URL.
             if checkpoint_dir is not None:
@@ -961,6 +1191,14 @@ class ModelConfig(Generic[TConfig]):
                     trust_remote_code=trust_remote_code,
                     **kwargs,
                 )
+                # transformers 5 leaves `_name_or_path` empty when the config
+                # JSON does not carry one, so a config loaded from a local
+                # directory no longer remembers where it came from. Record it:
+                # a model whose weights need a sibling file from the checkpoint
+                # (DeepSeek-V4.1's Engram needs the checkpoint's own tokenizer to
+                # derive its hash multipliers) has no other way to find it.
+                if not getattr(pretrained_config, '_name_or_path', None):
+                    pretrained_config._name_or_path = str(checkpoint_dir)
                 if pretrained_config.architectures[0] in [
                         "DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"
                 ]:
@@ -984,6 +1222,8 @@ class ModelConfig(Generic[TConfig]):
                         use_cute_dsl_paged_mqa_logits = sparse_attention_config.use_cute_dsl_paged_mqa_logits
                         q_split_threshold = sparse_attention_config.q_split_threshold
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                        use_self_sampling_topk = sparse_attention_config.use_self_sampling_topk
+                        use_gvr_emission = sparse_attention_config.use_gvr_emission
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
                         index_share_for_mtp_iteration = sparse_attention_config.index_share_for_mtp_iteration
                     else:
@@ -993,9 +1233,12 @@ class ModelConfig(Generic[TConfig]):
                         indexer_max_chunk_size = None
                         skip_indexer_for_short_seqs = True
                         use_cute_dsl_topk = False
-                        use_cute_dsl_paged_mqa_logits = False
+                        use_cute_dsl_paged_mqa_logits = DeepSeekSparseAttentionConfig.model_fields[
+                            'use_cute_dsl_paged_mqa_logits'].default
                         q_split_threshold = 8192
                         enable_heuristic_topk = False
+                        use_self_sampling_topk = True
+                        use_gvr_emission = False
                         indexer_k_dtype = "fp8"
                         index_share_for_mtp_iteration = None
                     kwargs[
@@ -1012,9 +1255,21 @@ class ModelConfig(Generic[TConfig]):
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave,
                             enable_heuristic_topk=enable_heuristic_topk,
+                            use_self_sampling_topk=use_self_sampling_topk,
+                            use_gvr_emission=use_gvr_emission,
                             indexer_k_dtype=indexer_k_dtype,
                             index_share_for_mtp_iteration=
                             index_share_for_mtp_iteration)
+                elif pretrained_config.architectures[
+                        0] in _DEEPSEEK_V41_ARCHITECTURES:
+                    sparse_config = kwargs.get('sparse_attention_config')
+                    if sparse_config is not None and not isinstance(
+                            sparse_config, CSA2SparseAttentionConfig):
+                        raise ValueError(
+                            "DeepSeek-V4.1 requires CSA2 sparse attention")
+                    kwargs[
+                        'sparse_attention_config'] = sparse_config or CSA2SparseAttentionConfig(
+                        )
                 elif pretrained_config.architectures[
                         0] == "DeepseekV4ForCausalLM":
                     if cls._is_deepseek_v4_base_checkpoint(checkpoint_dir):
@@ -1187,6 +1442,13 @@ class ModelConfig(Generic[TConfig]):
         requested_moe_backend = kwargs.get('moe_backend', 'AUTO')
         architecture = pretrained_config.architectures[
             0] if pretrained_config.architectures else ""
+        hf_quant_config = getattr(pretrained_config, "quantization_config",
+                                  None)
+        has_deepseek_v41_dense_fp8 = (
+            architecture in _DEEPSEEK_V41_ARCHITECTURES
+            and hf_quant_config is not None
+            and hf_quant_config.get("quant_method") == "fp8"
+            and bool(hf_quant_config.get("weight_block_size")))
         # Use an architecture-only backend hint for quant config parsing. Some
         # quant formats choose the quant_algo from the backend name, so the final
         # quant-aware AUTO resolution happens after quant_config is loaded.
@@ -1212,9 +1474,8 @@ class ModelConfig(Generic[TConfig]):
                         quant_config_file))
             quant_config, layer_quant_config = cls._build_modelopt_quant_config(
                 normalized, checkpoint_dir, moe_backend_hint)
-            hf_quant_config = getattr(pretrained_config, "quantization_config",
-                                      None)
-            if quant_config.quant_algo is None and hf_quant_config is not None:
+            if (quant_config.quant_algo is None and hf_quant_config is not None
+                    and not has_deepseek_v41_dense_fp8):
                 hf_quant_config, hf_layer_quant_config = cls.load_hf_quant_config(
                     hf_quant_config,
                     moe_backend_hint,
@@ -1233,6 +1494,19 @@ class ModelConfig(Generic[TConfig]):
                                 **hf_layer_quant_config,
                                 **layer_quant_config,
                             }
+        # DeepSeek-V4.1: 32x32 block-scaled dense FP8, which the generic
+        # FP8_BLOCK_SCALES path cannot represent. Must precede the generic
+        # branch below, which would assert on the block size.
+        elif (architecture in _DEEPSEEK_V41_ARCHITECTURES
+              and hf_quant_config is not None):
+            if is_modelopt_quant_config(hf_quant_config):
+                quant_config, layer_quant_config = cls.load_hf_quant_config(
+                    hf_quant_config,
+                    moe_backend_hint,
+                    checkpoint_dir=checkpoint_dir)
+            else:
+                quant_config = cls._build_deepseek_v41_quant_config(
+                    hf_quant_config)
         # quantized ckpt in other formats
         elif getattr(pretrained_config, "quantization_config",
                      None) is not None:
@@ -1245,13 +1519,26 @@ class ModelConfig(Generic[TConfig]):
             quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
                 quant_config_file, moe_backend_hint)
 
+        if (has_deepseek_v41_dense_fp8 and quant_config.quant_algo
+                in (None, QuantAlgo.MIXED_PRECISION)):
+            # Preserve the parsed expert and KV policies; only dense weights
+            # use the V4.1 remapper's FP8 block-128 layout.
+            dense_quant_config = cls._build_deepseek_v41_quant_config(
+                hf_quant_config)
+            dense_quant_config.kv_cache_quant_algo = quant_config.kv_cache_quant_algo
+            quant_config = dense_quant_config
+
         kwargs['moe_backend'] = cls.resolve_moe_backend(
             requested_moe_backend,
             architecture,
             quant_config=quant_config,
         )
+        kwargs['moe_backend_requested'] = requested_moe_backend
 
-        if architecture in _DEEPSEEK_V4_ARCHITECTURES:
+        # V4.1 names the routed experts exactly as V4 does and encodes MXFP4 the
+        # same way (I8 storage), so the detector and setter apply verbatim.
+        if (architecture in _DEEPSEEK_V4_ARCHITECTURES
+                or architecture in _DEEPSEEK_V41_ARCHITECTURES):
             layer_quant_config = cls._set_deepseek_v4_routed_moe_quant_config(
                 pretrained_config,
                 checkpoint_dir,
@@ -1280,8 +1567,7 @@ class ModelConfig(Generic[TConfig]):
     ) -> "ModelConfigCpp":
         """
         This method is used to construct the bindings config for the model.
-        Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
-        that an engine has been created.
+        Currently it assumes that an engine has been created.
 
         Args:
             tokens_per_block: The number of tokens per block. Please note that in PyTorch flow tokens_per_block is not available in the model config, instead it is defined in the executor config.
@@ -1445,17 +1731,19 @@ class ModelConfig(Generic[TConfig]):
 
         Pure model property: independent of which KV cache manager will run.
         For non-hybrid models this equals num_hidden_layers. For hybrid Mamba
-        models (Nemotron-hybrid, Qwen3-hybrid) it returns only the attention
+        models (Nemotron-hybrid, Qwen3-hybrid, Qwen4-Exp) it returns only the attention
         count derived from the layer pattern; mamba layers are reported by
         ``get_num_mamba_layers``.
         """
         cfg = self.pretrained_config
         if is_nemotron_hybrid(cfg):
             return cfg.hybrid_override_pattern.count("*")
-        if is_qwen3_hybrid(cfg):
+        if is_qwen3_hybrid(cfg) or is_qwen4_exp(cfg):
             return get_qwen3_hybrid_num_attention_layers(cfg)
         if is_kimi_linear(cfg):
             return get_kimi_linear_num_attention_layers(cfg)
+        if is_glm5_next(cfg):
+            return get_glm5_next_num_attention_layers(cfg)
         return cfg.num_hidden_layers
 
     def get_num_mamba_layers(self) -> int:
@@ -1463,12 +1751,17 @@ class ModelConfig(Generic[TConfig]):
         cfg = self.pretrained_config
         if is_nemotron_hybrid(cfg):
             return cfg.hybrid_override_pattern.count("M")
-        if is_qwen3_hybrid(cfg):
+        if is_qwen3_hybrid(cfg) or is_qwen4_exp(cfg):
             return cfg.num_hidden_layers - get_qwen3_hybrid_num_attention_layers(
                 cfg)
         if is_kimi_linear(cfg):
             return cfg.num_hidden_layers - get_kimi_linear_num_attention_layers(
                 cfg)
+        if is_glm5_next(cfg):
+            # From the literal layer_types list: the composite config may not
+            # carry num_hidden_layers at the top level before normalization.
+            _, kda_mask = get_glm5_next_layer_masks(cfg)
+            return sum(kda_mask)
         return 0
 
 

@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Disaggregated Serving
 
 The execution method of disaggregated serving relies on the `trtllm-serve` command. Specifically, compared to the standard usage of `trtllm-serve`, serving requires running this command multiple times to separately start the router and workers (including context and generation) serving components. This document focuses on this approach and provides a detailed guide on how to use it.
@@ -8,41 +11,34 @@ Please note that disaggregated serving is currently an experimental feature, so 
 
 ### Configuration File
 
-The `trtllm-serve` command supports the `extra-llm-config.yaml` parameter. In the extra LLM configuration file, the `cache_transceiver_config` field is specifically used for disaggregated service. It is mainly used to specify additional parameters required for the KV cache transmission process.
+Each worker takes its settings from a `--config` YAML. Disaggregated serving needs
+`cache_transceiver_config.backend` set on every worker; without it the KV cache transceiver
+is disabled and the worker rejects disaggregated requests.
 
-```yaml
-cache_transceiver_config:
-  # KV cache transmission backend. Valid options include `DEFAULT` (i.e., NIXL), `UCX`, `NIXL`.
-  backend: <str>
-  # KV cache buffer size. Set it ≥ the maximum ISL (Input Sequence Length) for best performance.
-  max_tokens_in_buffer: <int>
-  # KV cache transfer timeout in milliseconds
-  # For requests, if they do not send/receive the KV cache in time they are cancelled and cleaned up
-  kv_transfer_timeout_ms: <int>
-  # Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms
-  kv_transfer_sender_future_timeout_ms: <int>
-```
-
-The following is an example, consisting of the `ctx_config.yaml` and `gen_config.yaml` files needed in the sections below.
+These two files are the minimum that runs, and are used by the sections below:
 
 ```yaml
 # ctx_config.yaml
-
-# The overlap scheduler for context servers is currently disabled, as it is
-# not yet supported in disaggregated context server architectures.
 disable_overlap_scheduler: True
 cache_transceiver_config:
-  backend: UCX
-  max_tokens_in_buffer: 2048
+  backend: NIXL
 ```
 
 ```yaml
 # gen_config.yaml
-
 cache_transceiver_config:
-  backend: UCX
-  max_tokens_in_buffer: 2048
+  backend: NIXL
 ```
+
+These examples omit `max_tokens_in_buffer` and leave the runtime at `auto`.
+On the standard PyTorch model-loading path, `backend: DEFAULT` with runtime
+`auto` normally selects NIXL/Python when no legacy backend selector or
+incompatible configuration intervenes. Keep `DEFAULT`/`auto` when the test
+or recipe should follow the supported defaults rather than exercise a
+particular implementation.
+
+Keep `cache_transceiver_config` identical in the two files. For the remaining fields, see
+[Disaggregated Serving](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md).
 
 ## NIXL Backend Configuration
 
@@ -124,7 +120,6 @@ To use NIXL for KV cache exchange, configure the `cache_transceiver_config` with
 disable_overlap_scheduler: True
 cache_transceiver_config:
   backend: NIXL
-  max_tokens_in_buffer: 2048
 ```
 
 **Generation server configuration:**
@@ -132,7 +127,6 @@ cache_transceiver_config:
 # gen_config_nixl.yml
 cache_transceiver_config:
   backend: NIXL
-  max_tokens_in_buffer: 2048
 ```
 
 #### Example 1: Using NIXL with UCX backend (default)
@@ -445,11 +439,9 @@ data:
     disable_overlap_scheduler: true
     cache_transceiver_config:
       backend: NIXL
-      max_tokens_in_buffer: 2048
   generation.yaml: |
     cache_transceiver_config:
       backend: NIXL
-      max_tokens_in_buffer: 2048
 ```
 
 Launch services:
@@ -615,54 +607,6 @@ TensorRT LLM will automatically register any newly launched server with the ETCD
 ### Dynamically removing servers
 
 When removing servers, special attention is required in the current version. You need to first remove the corresponding key from the ETCD server. After you see the log message "Server xxxx is removed," you can then safely shut down the server. This part will be improved soon.
-
-## Startup Procedure with MPI Worker (Deprecated)
-
-In the past, we used `disaggregated_mpi_worker` to allow context nodes and generation nodes to operate within the same MPI world. However, this approach conflicts with the dynamic node addition and removal functionality. As a result, disaggregated_mpi_worker has been marked as deprecated, and the corresponding examples will be gradually removed.
-
-```bash
-mpirun -n <total_num_ranks> trtllm-serve disaggregated_mpi_worker -c disagg_config.yaml
-```
-where `total_num_ranks` is the sum of `TP*PP` for all context and generation servers. For the example above, `total_num_ranks` is 3
-since `TP` and `PP` is 1 for the two context and one generation server.
-
-The `disagg_config.yaml` file must now contain the configuration parameters of the context and generation servers. For example,
-it could look like:
-
-```yaml
-hostname: localhost
-port: 8000
-model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
-backend: "pytorch"
-disable_overlap_scheduler: True
-context_servers:
-  num_instances: 2
-  tensor_parallel_size: 1
-  pipeline_parallel_size: 1
-  kv_cache_config:
-    free_gpu_memory_fraction: 0.9
-  cache_transceiver_config:
-    backend: UCX
-  urls:
-      - "localhost:8001"
-      - "localhost:8002"
-generation_servers:
-  num_instances: 1
-  tensor_parallel_size: 1
-  pipeline_parallel_size: 1
-  cache_transceiver_config:
-    backend: UCX
-  urls:
-      - "localhost:8003"
-```
-
-Once the context and generation servers are launched, you can again launch the disaggregated server with
-
-```bash
-trtllm-serve disaggregated -c disagg_config.yaml
-```
-
-The MPI communication backend for KV cache transfer has been deprecated and may not be supported in the future. When using the MPI backend, the environment variable `TRTLLM_USE_MPI_KVCACHE=1` should be set to avoid conflicts between mpi4py and KV cache transfer.
 
 ## Troubleshooting
 

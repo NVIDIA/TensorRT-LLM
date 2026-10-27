@@ -1,21 +1,38 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import atexit
+import contextlib
 import gc
 import importlib
 import inspect
 import json
 import os
 import secrets
-import select
 import signal
 import socket
 import subprocess  # nosec B404
 import sys
+import tempfile
 import time
 import uuid
 from importlib.util import find_spec
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Sequence, Set
+from types import FrameType
+from typing import (TYPE_CHECKING, Any, Dict, Iterator, NoReturn, Optional,
+                    Sequence, Set)
 
 import click
 import torch
@@ -27,53 +44,114 @@ from torch.cuda import device_count
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
+from tensorrt_llm.commands import _telemetry as _command_telemetry
+from tensorrt_llm.commands._config_overrides import (ConfigOverride,
+                                                     ConfigOverrideError,
+                                                     apply_config_overrides,
+                                                     parse_config_overrides)
 from tensorrt_llm.commands._serve_stability import stability_option
+from tensorrt_llm.commands.mooncake import mooncake_master, mooncake_pool_report
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
-                                              MetadataServerConfig, ServerRole,
-                                              extract_disagg_cluster_config,
-                                              parse_disagg_config_file,
-                                              parse_metadata_server_config_file,
-                                              validate_config_bool)
-from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.disagg_utils import (
+    DisaggClusterConfig, MetadataServerConfig, ServerRole,
+    extract_disagg_cluster_config, parse_disagg_config_file,
+    parse_metadata_server_config_file, validate_config_bool,
+    validate_internal_request_auth_key)
+from tensorrt_llm.llmapi.llm_args import (SERVE_CLI_CONFIG_FIELDS,
+                                          KvCacheConnectorConfig, SleepConfig,
+                                          TorchLlmArgs, build_cli_config)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
-from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
+from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
                                                   resolve_auto_reasoning_parser)
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
+from tensorrt_llm.serve._frontend_processes import (
+    _init_multi_frontend_mode, _signal_frontend_ready,
+    _spawn_attached_frontends, _terminate_attached_frontends)
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
+from tensorrt_llm.usage import TerminalOutcome, apply_usage_session_config
 from tensorrt_llm.usage import config as _telemetry_config
+from tensorrt_llm.usage import (get_observed_signal,
+                                record_termination_observation,
+                                set_lifecycle_phase, set_usage_context)
 
 if TYPE_CHECKING:
     # Type-only: the visual_gen tree is imported lazily inside the VisualGen
     # code paths so plain LLM serving never pays its import cost.
     from tensorrt_llm.visual_gen.args import VisualGenArgs
 
-# Global variable to store the Popen object of the child process
+# Popen for the disaggregated proxy's process guard.
 _child_p_global: Optional[subprocess.Popen] = None
+
+
+class _VisualGenStartupTermination(BaseException):
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+def _terminate_visual_gen_startup(signum: int,
+                                  frame: Optional[FrameType]) -> NoReturn:
+    del frame
+    raise _VisualGenStartupTermination(signum)
+
+
+def _report_observed_child_failure(return_code: int, component: str,
+                                   lifecycle_phase: str) -> None:
+    """Preserve a child failure for the parent's authoritative exit boundary."""
+    # A child terminated as part of an already-observed process signal is a
+    # shutdown consequence, not evidence that the child caused the shutdown.
+    if get_observed_signal():
+        return
+    if return_code < 0:
+        signal_number = -return_code
+        exit_code = 128 + signal_number
+    else:
+        signal_number = 0
+        exit_code = return_code
+    record_termination_observation(
+        TerminalOutcome(
+            termination_kind="worker_failure",
+            component=component,
+            reporting_source="supervisor",
+            exit_code_known=True,
+            exit_code=exit_code,
+            signal_number=signal_number,
+        ),
+        lifecycle_phase=lifecycle_phase,
+    )
+
+
+def _apply_effective_telemetry_config(llm_args: dict,
+                                      *,
+                                      telemetry: bool,
+                                      component: str = "server") -> None:
+    """Apply a parsed config opt-out before later setup can fail."""
+    telemetry_config = llm_args.get("telemetry_config")
+    if telemetry_config is not None:
+        if not telemetry:
+            telemetry_config = telemetry_config.model_copy(
+                update={"disabled": True})
+            llm_args["telemetry_config"] = telemetry_config
+        apply_usage_session_config(
+            telemetry_config,
+            default_usage_context="cli_serve",
+            component=component,
+            lifecycle_phase="config_validation",
+        )
 
 
 def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
     return validate_config_bool(config.pop(key, False), key)
-
-
-def _pop_optional_str_config_option(config: dict[str, Any],
-                                    key: str) -> Optional[str]:
-    value = config.pop(key, None)
-    if value is None:
-        return None
-    if isinstance(value, str) and value:
-        return value
-    raise ValueError(f"{key} must be a non-empty string")
 
 
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
@@ -95,43 +173,7 @@ def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
                              "Must be a class or an async function.")
 
 
-def _signal_handler_cleanup_child(signum, frame):
-    """Signal handler to clean up the child process."""
-    global _child_p_global
-    if _child_p_global and _child_p_global.poll() is None:
-        logger.info(
-            f"Parent process (PID {os.getpid()}) received signal {signal.Signals(signum).name}. Terminating child process (PID {_child_p_global.pid})."
-        )
-        _child_p_global.terminate()
-        try:
-            _child_p_global.wait(
-                timeout=10)  # Allow 10 seconds for graceful termination
-        except subprocess.TimeoutExpired:
-            logger.info(
-                f"Child process (PID {_child_p_global.pid}) did not terminate gracefully after signal. Killing."
-            )
-            _child_p_global.kill()
-            try:
-                _child_p_global.wait(timeout=10)  # Allow 10 seconds for kill
-            except subprocess.TimeoutExpired:
-                logger.info(
-                    f"Child process (PID {_child_p_global.pid}) failed to die even after kill command from signal handler."
-                )
-
-        if _child_p_global.poll() is not None:
-            logger.info(
-                f"Child process (PID {_child_p_global.pid}) confirmed terminated due to signal {signal.Signals(signum).name}."
-            )
-        else:
-            logger.info(
-                f"Child process (PID {_child_p_global.pid}) is still running after cleanup attempt for signal {signal.Signals(signum).name}."
-            )
-
-    # Standard exit code for signal termination
-    sys.exit(128 + signum)
-
-
-def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
+def is_non_default_or_required(param_name, value, explicit_cli_keys):
     """
     Check if a parameter should be explicitly included in llm_args.
 
@@ -158,21 +200,15 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
     # LlmArgs fields built from CLI scalars whose names differ from the field
     # name (e.g. `--free_gpu_memory_fraction` constructs `kv_cache_config`).
     cli_derived_fields = {
-        "kv_cache_config": ("free_gpu_memory_fraction", "kv_cache_dtype"),
+        **SERVE_CLI_CONFIG_FIELDS,
         "build_config":
         ("max_batch_size", "max_num_tokens", "max_beam_width", "max_seq_len"),
-        "multimodal_config": ("video_pruning_rate", ),
     }
     if any(s in explicit_cli_keys
            for s in cli_derived_fields.get(param_name, ())):
         return True
 
-    if backend == "_autodeploy":
-        from tensorrt_llm._torch.auto_deploy.llm_args import \
-            LlmArgs as AutoDeployLlmArgs
-        llm_args_class = AutoDeployLlmArgs
-    else:
-        llm_args_class = TorchLlmArgs
+    llm_args_class = TorchLlmArgs
 
     field_info = llm_args_class.model_fields.get(param_name)
     if not field_info:
@@ -190,6 +226,26 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
 # CLI/API defaults are sourced from the TorchLlmArgs field defaults so they stay
 # in lock-step with the args class and can't drift.
 _LLM_ARGS_FIELDS = TorchLlmArgs.model_fields
+
+
+def _parse_config_overrides(
+        assignments: Sequence[str]) -> tuple[ConfigOverride, ...]:
+    try:
+        return parse_config_overrides(
+            assignments,
+            allowed_roots=_LLM_ARGS_FIELDS,
+        )
+    except ConfigOverrideError as error:
+        raise click.BadParameter(str(error), param_hint="--set") from error
+
+
+def _apply_config_overrides(
+        config: Dict[str, Any],
+        overrides: Sequence[ConfigOverride]) -> Dict[str, Any]:
+    try:
+        return apply_config_overrides(config, overrides)
+    except ConfigOverrideError as error:
+        raise click.BadParameter(str(error), param_hint="--set") from error
 
 
 def get_llm_args(
@@ -216,7 +272,6 @@ def get_llm_args(
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
         reasoning_parser: Optional[str] = None,
-        fail_fast_on_attention_window_too_large: bool = True,
         otlp_traces_endpoint: Optional[str] = None,
         enable_chunked_prefill: bool = False,
         enable_attention_dp: bool = False,
@@ -225,6 +280,7 @@ def get_llm_args(
         agent_percentage: float = 0.0,
         agent_types: Optional[str] = None,
         explicit_cli_keys: Optional[Set[str]] = None,
+        enable_locality_domains: bool = False,
         **llm_args_extra_dict: Any):
 
     explicit_cli_keys = explicit_cli_keys or set()
@@ -260,8 +316,9 @@ def get_llm_args(
         "postprocess_tokenizer_dir":
         tokenizer or model,
         "kv_cache_config":
-        KvCacheConfig(free_gpu_memory_fraction=free_gpu_memory_fraction,
-                      dtype=kv_cache_dtype),
+        build_cli_config("kv_cache_config",
+                         free_gpu_memory_fraction=free_gpu_memory_fraction,
+                         kv_cache_dtype=kv_cache_dtype),
         "cp_config":
         cp_config,
         "scheduler_config":
@@ -294,16 +351,17 @@ def get_llm_args(
         enable_chunked_prefill,
         "enable_attention_dp":
         enable_attention_dp,
+        "enable_locality_domains":
+        enable_locality_domains,
         "revision":
         revision,
         "reasoning_parser":
         reasoning_parser,
         "otlp_traces_endpoint":
         otlp_traces_endpoint,
-        "fail_fast_on_attention_window_too_large":
-        fail_fast_on_attention_window_too_large,
         "multimodal_config":
-        MultimodalConfig(video_pruning_rate=video_pruning_rate)
+        build_cli_config("multimodal_config",
+                         video_pruning_rate=video_pruning_rate)
         if video_pruning_rate is not None else None,
         "telemetry_config":
         _telemetry_config.TelemetryConfig(
@@ -318,7 +376,7 @@ def get_llm_args(
     llm_args = {
         param: value
         for param, value in cli_maybe_overrides.items()
-        if is_non_default_or_required(param, value, backend, explicit_cli_keys)
+        if is_non_default_or_required(param, value, explicit_cli_keys)
     }
 
     return llm_args, llm_args_extra_dict
@@ -345,6 +403,54 @@ def _build_llm_args_from_disagg_server_cfg(other_args: Dict) -> Dict:
     llm_args, llm_args_extra_dict = get_llm_args(
         **other_args, explicit_cli_keys=disagg_explicit_keys)
     return update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
+
+
+def _publish_bound_address(report_addr: Optional[str], host: str,
+                           port: int) -> None:
+    """Write the address this server actually bound to ``report_addr``.
+
+    Lets a launcher pass ``--port 0`` and learn the kernel-assigned port
+    afterwards, instead of picking a port up front and racing whoever grabs it
+    before this process binds. The write is atomic (temp file in the same
+    directory, then rename) so a reader never observes a partial line, which
+    matters on the shared filesystems multi-node tests coordinate through.
+
+    The caller is responsible for making the path unique per run: a stale file
+    from an earlier run points at a dead server, which fails far less obviously
+    than a port conflict.
+
+    A wildcard bind host is replaced by this machine's hostname, since readers
+    use the published value as a URL authority and cannot dial 0.0.0.0 or ::.
+    """
+    if not report_addr:
+        return
+    if host in ("0.0.0.0", "::", ""):  # nosec B104 - reporting, not binding
+        resolved = socket.gethostname()
+        logger.info(f"Reporting hostname {resolved} instead of wildcard bind "
+                    f"address {host!r}, which a reader cannot dial")
+        host = resolved
+    report_addr = os.path.abspath(report_addr)
+    parent = os.path.dirname(report_addr)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=parent or None,
+                                    prefix=os.path.basename(report_addr) + ".",
+                                    suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            # Bracket IPv6 literals so the value is a usable URL authority:
+            # readers build "http://<reported>/..." from it verbatim.
+            reported_host = f"[{host}]" if ":" in host else host
+            f.write(f"{reported_host}:{port}\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, report_addr)
+    finally:
+        # A successful replace already consumed tmp_path; this only cleans up
+        # after a failed write so a partial file is not left behind.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+    logger.info(f"Reported bound address {host}:{port} to {report_addr}")
 
 
 def _diagnose_port_in_use(port: int) -> str:
@@ -378,154 +484,37 @@ def _diagnose_port_in_use(port: int) -> str:
     return "; ".join(details)
 
 
-class MultiFrontendMode(NamedTuple):
-    """This process's role under multi-frontend serving (prototype)."""
-    num_frontends: int
-    is_attached_frontend: bool
+@contextlib.contextmanager
+def _provision_kv_cache_pool(llm_args: dict,
+                             owns_engine: bool = True) -> Iterator[None]:
+    """Bring up the shared cache this server joins, for its lifetime.
 
-    @property
-    def is_launcher(self) -> bool:
-        """Owns the engine and spawns/cleans the attached frontends."""
-        return self.num_frontends > 1 and not self.is_attached_frontend
+    A connector backed by a cluster-wide pool needs that pool reachable before
+    any rank opens a handle, and the LLM constructor spawns the ranks, so this
+    wraps the construction. A deployment that provisions the pool externally is
+    detected and left alone.
 
-
-def _init_multi_frontend_mode(llm_args: dict,
-                              enabled: bool) -> MultiFrontendMode:
-    """Resolve this process's multi-frontend serving role.
-
-    num_serve_frontends=K runs K HTTP frontend processes against ONE
-    executor: the launcher (frontend 0) owns the engine and spawns K-1
-    attached frontends (classic IPC executor path only). enabled=False
-    entry points (e.g. disaggregated MPI workers) never honor the knob.
+    Only the process that owns the engine does this. An attached frontend
+    re-execs this command line but shares the launcher's executor, so it would
+    otherwise render a second client config over the first.
     """
-    if not enabled:
-        if llm_args.pop("num_serve_frontends", 1) > 1:
-            logger.warning("num_serve_frontends is only supported on plain "
-                           "trtllm-serve; ignored on this entry point.")
-        return MultiFrontendMode(1, False)
-
-    mode = MultiFrontendMode(llm_args.get("num_serve_frontends", 1),
-                             os.getenv("TLLM_EXECUTOR_ATTACH_INFO") is not None)
-    if mode.is_launcher and llm_args.get("orchestrator_type") is not None:
-        raise ValueError(
-            "num_serve_frontends > 1 requires the default (classic IPC) "
-            "executor path, not orchestrator_type="
-            f"{llm_args.get('orchestrator_type')!r}")
-    return mode
-
-
-def _spawn_attached_frontends(llm, num_frontends: int) -> list:
-    """Spawn num_frontends - 1 attached serving frontend processes.
-
-    Each child re-execs this trtllm-serve command line with env vars
-    carrying the launcher executor's attach endpoints; its executor
-    attaches to the already-running worker instead of launching one (see
-    GenerationExecutor.create / GenerationExecutorFrontendProxy).
-
-    Blocks until every child signals READY over its inherited pipe: a
-    successful Popen only proves the process exists, while the frontend
-    can still fail during executor attach or server setup. Any child
-    failure (or a missed deadline) fails the whole group, terminating
-    the children already started, so num_serve_frontends=K never
-    silently degrades to fewer frontends.
-    """
-    from tensorrt_llm.executor.proxy import GenerationExecutorProxy
-
-    executor = getattr(llm, "_executor", None)
-    if not isinstance(executor, GenerationExecutorProxy) or (
-            attach_info := executor.multi_frontend_attach_info()) is None:
-        raise ValueError(
-            "num_serve_frontends > 1 requires the classic IPC executor "
-            f"proxy in multi-frontend mode, got {type(executor).__name__}")
-    # Carries the executor HMAC keys; the child deletes it from its env
-    # once consumed (GenerationExecutor.create).
-    attach_env = json.dumps(attach_info)
-
-    children, ready_fds = [], []
-    try:
-        for frontend_id in range(1, num_frontends):
-            # Strip MPI/SLURM identity vars: an inherited rank identity would
-            # make the child's mpi4py try to (re-)join the launcher's job.
-            env, _ = split_mpi_env()
-            env["TLLM_EXECUTOR_ATTACH_INFO"] = attach_env
-            env["TLLM_EXECUTOR_FRONTEND_ID"] = str(frontend_id)
-            env["TLLM_DISABLE_MPI"] = "1"
-            read_fd, write_fd = os.pipe()
-            ready_fds.append(read_fd)
-            env["TLLM_FRONTEND_READY_FD"] = str(write_fd)
-            try:
-                child = subprocess.Popen([sys.executable] + sys.argv,
-                                         env=env,
-                                         pass_fds=(write_fd, ))  # nosec B603
-            finally:
-                # The child now holds the only write end; its exit before
-                # READY surfaces as EOF on read_fd.
-                os.close(write_fd)
-            children.append(child)
-            logger.info(
-                f"Launched attached serving frontend {frontend_id} (pid {child.pid})"
-            )
-        _wait_attached_frontends_ready(children, ready_fds)
-    except BaseException:
-        _terminate_attached_frontends(children)
-        raise
-    finally:
-        for fd in ready_fds:
-            os.close(fd)
-    return children
-
-
-def _wait_attached_frontends_ready(children: list, ready_fds: list) -> None:
-    """Block until every attached frontend writes its READY byte."""
-    timeout = float(os.getenv("TLLM_FRONTEND_READY_TIMEOUT", "300"))
-    deadline = time.monotonic() + timeout
-    pending = dict(zip(ready_fds, children))
-    while pending:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise RuntimeError(
-                f"{len(pending)} attached frontend(s) not ready within "
-                f"{timeout:.0f}s (TLLM_FRONTEND_READY_TIMEOUT)")
-        readable, _, _ = select.select(list(pending), [], [],
-                                       min(remaining, 1.0))
-        for fd in readable:
-            child = pending.pop(fd)
-            if os.read(fd, 1) != b"R":  # EOF: pipe closed without READY
-                raise RuntimeError(
-                    f"Attached frontend (pid {child.pid}) exited before "
-                    "signaling READY")
-            logger.info(f"Attached frontend (pid {child.pid}) is ready")
-        for fd, child in list(pending.items()):
-            if child.poll() is not None:
-                raise RuntimeError(
-                    f"Attached frontend (pid {child.pid}) exited with code "
-                    f"{child.returncode} before signaling READY")
-
-
-def _signal_frontend_ready(multi_frontend: MultiFrontendMode) -> None:
-    """Report READY to the launcher over the inherited pipe.
-
-    Called once everything fallible in an attached frontend's startup
-    (port bind, executor attach, LLM and OpenAIServer construction,
-    middleware registration) has succeeded; the launcher blocks group
-    startup on this byte (see _wait_attached_frontends_ready).
-    """
-    ready_fd = os.environ.pop("TLLM_FRONTEND_READY_FD", None)
-    if not (multi_frontend.is_attached_frontend and ready_fd):
+    if not owns_engine:
+        yield
         return
-    fd = int(ready_fd)
-    os.write(fd, b"R")
-    os.close(fd)
 
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import \
+        maybe_provision_pool
 
-def _terminate_attached_frontends(children: list) -> None:
-    for child in children:
-        child.terminate()
-    for child in children:
-        try:
-            child.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            child.kill()
+    connector_config = llm_args.get("kv_connector_config")
+    if isinstance(connector_config, dict):
+        # A YAML section arrives unvalidated, and the pool has to be described
+        # before the LLM constructor would coerce it. The validated model is
+        # handed on so it is not parsed twice.
+        connector_config = KvCacheConnectorConfig(**connector_config)
+        llm_args["kv_connector_config"] = connector_config
+
+    with maybe_provision_pool(connector_config):
+        yield
 
 
 def launch_server(
@@ -544,12 +533,35 @@ def launch_server(
         num_input_processor_workers: int = 8,
         num_media_load_workers: int = 8,
         multi_frontend_enabled: bool = True,
-        internal_disagg_auth_key: Optional[str] = None):
+        internal_disagg_auth_key: Optional[str] = None,
+        report_addr: Optional[str] = None,
+        enable_runtime_control_endpoints: bool = False,
+        runtime_control_api_key: Optional[str] = None):
+
+    # Publish an explicit serving role before constructing/spawning the model.
+    # Remote-tail context workers use it to omit generation-only weights.
+    if server_role is not None:
+        os.environ[
+            DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = server_role.name.lower()
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
+    if enable_runtime_control_endpoints and multi_frontend.num_frontends > 1:
+        raise click.BadParameter(
+            "Runtime control endpoints require num_serve_frontends=1 because "
+            "replay protection is local to each frontend.")
+    # Same hazard the disaggregated fleet guard covers: _spawn_attached_frontends
+    # re-execs this command line verbatim, so with port 0 every frontend binds
+    # its own kernel-assigned port instead of sharing one, and every frontend
+    # also re-runs _publish_bound_address, leaving the reader with whichever
+    # child wrote last.
+    if (port == 0 or report_addr) and multi_frontend.num_frontends > 1:
+        raise click.BadParameter(
+            "port 0 and --report_addr are only supported with a single serving "
+            f"frontend, but num_serve_frontends={multi_frontend.num_frontends}."
+        )
     if multi_frontend.is_launcher or multi_frontend.is_attached_frontend:
         # The Responses API store is per-process in-memory: with several
         # frontends behind one SO_REUSEPORT port, a follow-up request may
@@ -567,8 +579,17 @@ def launch_server(
     address_family = socket.AF_INET6 if all(
         [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
-        # If disagg cluster config is provided and port is not specified, try to find a free port, otherwise try to bind to the specified port
-        assert port > 0 or disagg_cluster_config is not None, "Port must be specified if disagg cluster config is not provided"
+        # port == 0 lets the kernel pick the port; the caller then needs a way
+        # to learn it, either by service discovery or by report_addr.
+        assert port > 0 or disagg_cluster_config is not None or report_addr, (
+            "Port must be specified unless disagg cluster config or "
+            "--report_addr is provided")
+        # Without SO_REUSEADDR a restart is refused for the whole TIME_WAIT
+        # window (~60s) by the tombstones of connections this server accepted.
+        # The flag has to be set on the socket that owns the port first, since
+        # the TIME_WAIT entry inherits it -- setting it only on the later bind
+        # is not enough.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if multi_frontend.is_launcher or multi_frontend.is_attached_frontend:
             # Every frontend process binds its own listening socket on the
             # same port; the kernel load-balances accepts across them.
@@ -585,54 +606,59 @@ def launch_server(
             raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
                                f"Port holder(s): {holder}")
 
-        if backend == 'pytorch':
-            llm_args.pop("build_config", None)
-            llm = PyTorchLLM(**llm_args)
-        elif backend == '_autodeploy':
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+        # Only now is the address final, and the socket stays bound from here
+        # until uvicorn takes it over, so no one can steal the port in between.
+        _publish_bound_address(report_addr, host, port)
 
-            # AutoDeploy does not support build_config
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
-        else:
-            raise click.BadParameter(
-                f"{backend} is not a known backend, check help for available options.",
-                param_hint="backend")
+        with _provision_kv_cache_pool(
+                llm_args, owns_engine=not multi_frontend.is_attached_frontend):
+            if backend == 'pytorch':
+                llm_args.pop("build_config", None)
+                llm = PyTorchLLM(**llm_args)
+            else:
+                raise click.BadParameter(
+                    f"{backend} is not a known backend, check help for available options.",
+                    param_hint="backend")
 
-        # The finally below is the cleanup boundary for the attached
-        # frontends: it must cover everything from their spawn through
-        # server construction, middleware registration, and runtime, or a
-        # failure in between leaks the child processes.
-        frontend_children = []
-        try:
-            if multi_frontend.is_launcher:
-                frontend_children = _spawn_attached_frontends(
-                    llm, multi_frontend.num_frontends)
+            # The finally below is the cleanup boundary for the attached
+            # frontends: it must cover everything from their spawn through
+            # server construction, middleware registration, and runtime, or a
+            # failure in between leaks the child processes.
+            frontend_children = []
+            try:
+                if multi_frontend.is_launcher:
+                    frontend_children = _spawn_attached_frontends(
+                        llm,
+                        multi_frontend.num_frontends,
+                        report_failure=_report_observed_child_failure)
 
-            server = OpenAIServer(
-                generator=llm,
-                model=model,
-                tool_parser=tool_parser,
-                server_role=server_role,
-                metadata_server_cfg=metadata_server_cfg,
-                disagg_cluster_config=disagg_cluster_config,
-                multimodal_server_config=multimodal_server_config,
-                chat_template=chat_template,
-                allow_request_chat_template=allow_request_chat_template,
-                input_processor_workers=num_input_processor_workers,
-                media_load_workers=num_media_load_workers,
-                internal_disagg_auth_key=internal_disagg_auth_key)
-            _apply_fastapi_middlewares(server.app, middleware)
+                server = OpenAIServer(
+                    generator=llm,
+                    model=model,
+                    tool_parser=tool_parser,
+                    server_role=server_role,
+                    metadata_server_cfg=metadata_server_cfg,
+                    disagg_cluster_config=disagg_cluster_config,
+                    multimodal_server_config=multimodal_server_config,
+                    chat_template=chat_template,
+                    allow_request_chat_template=allow_request_chat_template,
+                    input_processor_workers=num_input_processor_workers,
+                    media_load_workers=num_media_load_workers,
+                    internal_disagg_auth_key=internal_disagg_auth_key,
+                    enable_runtime_control_endpoints=
+                    enable_runtime_control_endpoints,
+                    runtime_control_api_key=runtime_control_api_key)
+                _apply_fastapi_middlewares(server.app, middleware)
 
-            # Optionally disable GC (default: not disabled)
-            if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
-                gc.disable()
+                # Optionally disable GC (default: not disabled)
+                if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+                    gc.disable()
 
-            _signal_frontend_ready(multi_frontend)
-            uvloop.run(server(host, port, sockets=[s]))
-        finally:
-            if frontend_children:
-                _terminate_attached_frontends(frontend_children)
+                _signal_frontend_ready(multi_frontend)
+                uvloop.run(server(host, port, sockets=[s]))
+            finally:
+                if frontend_children:
+                    _terminate_attached_frontends(frontend_children)
 
 
 def launch_mm_encoder_server(
@@ -708,6 +734,26 @@ def _resolve_embedding_architecture_override(
     logger.info(f"Embedding routing: overriding architecture "
                 f"{architectures[0]} -> {target}")
     return {"architectures": [target]}
+
+
+def _reject_embedding_extra_model_inputs(cuda_graph_config: Any) -> None:
+    """Reject encoder CUDA graph extra model inputs for the embeddings server.
+
+    /v1/embeddings has no field for extra model inputs, so the server calls
+    llm.encode() without them and every request would miss the declared inputs.
+    `cuda_graph_config` is the raw --config mapping or a parsed config object.
+    """
+    if isinstance(cuda_graph_config, dict):
+        specs = cuda_graph_config.get("extra_model_inputs")
+    else:
+        specs = getattr(cuda_graph_config, "extra_model_inputs", None)
+    if specs:
+        raise click.BadParameter(
+            "cuda_graph_config.extra_model_inputs is not supported by "
+            "trtllm-serve embeddings: /v1/embeddings has no field for extra "
+            "model inputs. Pass them through the Python llm.encode() API "
+            "instead.",
+            param_hint="config")
 
 
 def launch_embedding_server(
@@ -795,6 +841,9 @@ def launch_visual_gen_server(
     address_family = socket.AF_INET6 if all(
         [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
+        # See launch_server: without this, TIME_WAIT tombstones from the
+        # connections this server accepted refuse a restart for ~60s.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind((host, port))
         except OSError as e:
@@ -807,23 +856,36 @@ def launch_visual_gen_server(
 
         logger.info(f"Initializing VisualGen ({model})")
 
-        visual_gen_model = VisualGen(model=model, args=visual_gen_args)
+        previous_sigterm_handler = signal.signal(signal.SIGTERM,
+                                                 _terminate_visual_gen_startup)
+        visual_gen_model = None
+        try:
+            visual_gen_model = VisualGen(model=model, args=visual_gen_args)
 
-        n_workers = visual_gen_model.args.parallel_config.n_workers
-        logger.info(f"World size: {n_workers}")
-        logger.info(
-            f"CFG size: {visual_gen_model.args.parallel_config.cfg_size}")
-        logger.info(
-            f"Ulysses size: {visual_gen_model.args.parallel_config.ulysses_size}"
-        )
+            n_workers = visual_gen_model.args.parallel_config.n_workers
+            logger.info(f"World size: {n_workers}")
+            logger.info(
+                f"CFG size: {visual_gen_model.args.parallel_config.cfg_size}")
+            logger.info("Ulysses size: "
+                        f"{visual_gen_model.args.parallel_config.ulysses_size}")
 
-        server = OpenAIServer(generator=visual_gen_model,
-                              model=model,
-                              server_role=ServerRole.VISUAL_GEN,
-                              metadata_server_cfg=metadata_server_cfg,
-                              tool_parser=None)
-        _apply_fastapi_middlewares(server.app, middleware)
-        uvloop.run(server(host, port, sockets=[s]))
+            server = OpenAIServer(generator=visual_gen_model,
+                                  model=model,
+                                  server_role=ServerRole.VISUAL_GEN,
+                                  metadata_server_cfg=metadata_server_cfg,
+                                  tool_parser=None)
+            _apply_fastapi_middlewares(server.app, middleware)
+            uvloop.run(server(host, port, sockets=[s]))
+        except _VisualGenStartupTermination as e:
+            if visual_gen_model is not None:
+                visual_gen_model.shutdown()
+            raise SystemExit(128 + e.signum) from None
+        finally:
+            signal.signal(
+                signal.SIGTERM,
+                signal.SIG_DFL if previous_sigterm_handler is None else
+                previous_sigterm_handler,
+            )
 
 
 @click.command("serve")
@@ -867,11 +929,9 @@ def launch_visual_gen_server(
                   status="beta")
 @stability_option(
     "--backend",
-    type=click.Choice(["pytorch", "_autodeploy"]),
+    type=click.Choice(["pytorch"]),
     default="pytorch",
-    help="The backend to use to serve the model. Default is pytorch backend. "
-    "Note: the '_autodeploy' backend is deprecated and will be discontinued "
-    "in a future release; please use the 'pytorch' backend instead.",
+    help="The backend to use to serve the model. Default is pytorch backend.",
     status="deprecated")
 @stability_option(
     "--generation-config",
@@ -978,13 +1038,14 @@ def launch_visual_gen_server(
                   help="Number of workers to postprocess raw responses "
                   "to comply with OpenAI protocol.",
                   status="prototype")
-@stability_option("--num_serve_frontends",
-                  type=click.IntRange(min=1, max=MAX_NUM_FRONTENDS),
-                  default=1,
-                  help="Number of HTTP frontend processes serving one "
-                  "executor; values > 1 share the serving port via "
-                  "SO_REUSEPORT (classic IPC executor path only).",
-                  status="prototype")
+@stability_option(
+    "--num_serve_frontends",
+    type=click.IntRange(min=1, max=MAX_NUM_FRONTENDS),
+    default=1,
+    help="Number of HTTP or OpenEngine frontend processes serving one "
+    "executor; values > 1 share the serving port via "
+    "SO_REUSEPORT (classic IPC executor path only).",
+    status="prototype")
 @stability_option("--num_input_processor_workers",
                   type=click.IntRange(min=1),
                   default=8,
@@ -1020,8 +1081,17 @@ def launch_visual_gen_server(
     type=str,
     default=None,
     help="Path to a YAML configuration file. Explicit CLI flags take precedence "
-    "over values in this file. Can be specified as either --config or "
-    "--extra_llm_api_options.",
+    "over values in this file, while --set overrides both. Can be specified "
+    "as either --config or --extra_llm_api_options.",
+    status="prototype")
+@stability_option(
+    "--set",
+    "config_overrides",
+    type=str,
+    multiple=True,
+    help="Override a canonical LlmArgs path as PATH=YAML_VALUE. Repeatable; "
+    "applied after --config and dedicated CLI flags. Not supported for "
+    "startup, telemetry, environment, server-only, or VisualGen settings.",
     status="prototype")
 @stability_option("--reasoning_parser",
                   type=click.Choice(["auto"] +
@@ -1051,15 +1121,6 @@ def launch_visual_gen_server(
     "MM_ENCODER=multimodal encoder, VISUAL_GEN=visual generation. "
     "Required when using service registry.",
     status="prototype")
-@stability_option(
-    "--fail_fast_on_attention_window_too_large",
-    is_flag=True,
-    default=True,
-    help=
-    "[Deprecated] Exit with runtime error when attention window is too large "
-    "to fit even a single sequence in the KV cache. Now defaults to True. "
-    "This flag only affects the TRT backend and will be removed in a future release.",
-    status="deprecated")
 @stability_option("--otlp_traces_endpoint",
                   type=str,
                   default=None,
@@ -1085,6 +1146,12 @@ def launch_visual_gen_server(
                   default=False,
                   help="Enable attention data parallel.",
                   status="beta")
+@stability_option(
+    "--enable_locality_domains",
+    is_flag=True,
+    default=False,
+    help="Enable locality domain execution for supported PyTorch backend ops.",
+    status="prototype")
 @stability_option("--media_io_kwargs",
                   type=str,
                   default=None,
@@ -1128,9 +1195,19 @@ def launch_visual_gen_server(
     "--grpc",
     is_flag=True,
     default=False,
-    help="Run gRPC server instead of OpenAI HTTP server. "
-    "gRPC server accepts pre-tokenized requests and returns raw token IDs. "
-    "Requires the tensorrt_llm[grpc-smg] extra.",
+    help="Run the selected gRPC protocol instead of the OpenAI HTTP server.",
+    status="prototype")
+@stability_option("--grpc-protocol",
+                  type=click.Choice(["smg", "openengine"]),
+                  default="smg",
+                  help="Protocol used when --grpc is enabled.",
+                  status="prototype")
+@stability_option(
+    "--openengine-enable-load-metrics",
+    is_flag=True,
+    default=False,
+    help=
+    "Expose per-rank KV occupancy for OpenEngine routing, independently of KV events.",
     status="prototype")
 @stability_option(
     "--served_model_name",
@@ -1167,55 +1244,109 @@ def launch_visual_gen_server(
     help=
     "Types of agents to schedule. Now Only Support Open Deep Research agent.",
     status="prototype")
-def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
-          post_processor_hook: Optional[str], host: str, port: int,
-          log_level: str, backend: str, generation_config: str,
-          max_beam_width: int, max_batch_size: int, max_num_tokens: int,
-          max_seq_len: int, tensor_parallel_size: int,
-          pipeline_parallel_size: int, context_parallel_size: int,
-          moe_expert_parallel_size: Optional[int],
-          moe_cluster_parallel_size: Optional[int],
-          gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
-          kv_cache_dtype: str, num_postprocess_workers: int,
-          num_serve_frontends: int, num_input_processor_workers: int,
-          num_media_load_workers: int, trust_remote_code: bool,
-          revision: Optional[str], extra_llm_api_options: Optional[str],
-          reasoning_parser: Optional[str], tool_parser: Optional[str],
-          metadata_server_config_file: Optional[str],
-          server_role: Optional[str],
-          fail_fast_on_attention_window_too_large: bool,
-          otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-          enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
-          media_io_kwargs: Optional[str], agent_percentage: float,
-          agent_types: Optional[str], video_pruning_rate: Optional[float],
-          telemetry: bool, custom_module_dirs: list[Path],
-          chat_template: Optional[str], allow_request_chat_template: bool,
-          middleware: tuple[str, ...], grpc: bool, enable_visual_gen: bool,
-          served_model_name: Optional[str], visual_gen_args: Optional[str]):
+@stability_option(
+    "--report_addr",
+    type=str,
+    default=None,
+    help="Write the host:port this server actually bound to this file, "
+    "atomically, once the socket is bound. Lets --port 0 be used and have the "
+    "launcher read the kernel-assigned port back instead of reserving one up "
+    "front.",
+    status="prototype")
+@stability_option(
+    "--enable_sleep_mode",
+    is_flag=True,
+    default=False,
+    help=
+    "Enable runtime-memory checkpointing and authenticated HTTP control endpoints.",
+    status="prototype")
+def serve(
+    model: str,
+    tokenizer: Optional[str],
+    custom_tokenizer: Optional[str],
+    post_processor_hook: Optional[str],
+    host: str,
+    port: int,
+    log_level: str,
+    backend: str,
+    generation_config: str,
+    max_beam_width: int,
+    max_batch_size: int,
+    max_num_tokens: int,
+    max_seq_len: int,
+    tensor_parallel_size: int,
+    pipeline_parallel_size: int,
+    context_parallel_size: int,
+    moe_expert_parallel_size: Optional[int],
+    moe_cluster_parallel_size: Optional[int],
+    gpus_per_node: Optional[int],
+    free_gpu_memory_fraction: float,
+    kv_cache_dtype: str,
+    num_postprocess_workers: int,
+    num_serve_frontends: int,
+    num_input_processor_workers: int,
+    num_media_load_workers: int,
+    trust_remote_code: bool,
+    revision: Optional[str],
+    extra_llm_api_options: Optional[str],
+    config_overrides: tuple[str, ...],
+    reasoning_parser: Optional[str],
+    tool_parser: Optional[str],
+    metadata_server_config_file: Optional[str],
+    server_role: Optional[str],
+    otlp_traces_endpoint: Optional[str],
+    enable_chunked_prefill: bool,
+    enable_attention_dp: bool,
+    disagg_cluster_uri: Optional[str],
+    media_io_kwargs: Optional[str],
+    agent_percentage: float,
+    agent_types: Optional[str],
+    video_pruning_rate: Optional[float],
+    telemetry: bool,
+    custom_module_dirs: list[Path],
+    chat_template: Optional[str],
+    allow_request_chat_template: bool,
+    middleware: tuple[str, ...],
+    grpc: bool,
+    grpc_protocol: str,
+    openengine_enable_load_metrics: bool,
+    enable_visual_gen: bool,
+    served_model_name: Optional[str],
+    visual_gen_args: Optional[str],
+    report_addr: Optional[str],
+    enable_locality_domains: bool,
+    enable_sleep_mode: bool,
+) -> None:
     """Running an OpenAI API compatible server
 
-    MODEL: model name | HF checkpoint path | TensorRT engine path
+    MODEL: model name or Hugging Face checkpoint path
     """
     logger.set_level(log_level)
+    if enable_sleep_mode and backend != "pytorch":
+        raise click.UsageError(
+            "--enable_sleep_mode is only supported by the PyTorch backend.")
+    if enable_sleep_mode and grpc:
+        raise click.UsageError(
+            "--enable_sleep_mode is only supported by the HTTP server.")
+    runtime_control_api_key = None
+    if enable_sleep_mode:
+        runtime_control_api_key = os.getenv("TRTLLM_RUNTIME_CONTROL_API_KEY")
+        if not runtime_control_api_key:
+            raise click.UsageError(
+                "--enable_sleep_mode requires TRTLLM_RUNTIME_CONTROL_API_KEY.")
 
-    if backend == "_autodeploy":
-        logger.warning(
-            "The '_autodeploy' backend is deprecated and will be discontinued in a "
-            "future release. No new features or models will be added. Please migrate "
-            "to the 'pytorch' backend. See "
-            "https://github.com/NVIDIA/TensorRT-LLM/issues/15638 for details.")
-
+    if not grpc and grpc_protocol != "smg":
+        raise click.UsageError("--grpc-protocol requires --grpc")
+    if openengine_enable_load_metrics and (not grpc
+                                           or grpc_protocol != "openengine"):
+        raise click.UsageError(
+            "--openengine-enable-load-metrics requires --grpc --grpc-protocol openengine"
+        )
     if moe_cluster_parallel_size is not None:
         logger.warning(
             "--moe_cluster_parallel_size / --cluster_size is deprecated and "
             "no longer supported. This option will be removed in a future release."
         )
-
-    if "--fail_fast_on_attention_window_too_large" in sys.argv:
-        logger.warning(
-            "--fail_fast_on_attention_window_too_large is deprecated. "
-            "It now defaults to True and will be removed in a future release. "
-            "This flag only affects the TRT backend.")
 
     if tool_parser == "auto":
         resolved = resolve_auto_tool_parser(model)
@@ -1257,9 +1388,43 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             raise e
 
     explicit_cli_keys = collect_explicit_cli_keys(
-        exclude=("extra_llm_api_options", "config"))
+        exclude=("extra_llm_api_options", "config", "config_overrides"))
+
+    is_visual_gen = (enable_visual_gen or visual_gen_args is not None
+                     or get_is_diffusion_only_model(model))
+    # Honor YAML telemetry opt-out before --set parsing can raise an error.
+    raw_llm_args_extra_dict = {}
+    if not is_visual_gen and extra_llm_api_options is not None:
+        with open(extra_llm_api_options, 'r') as f:
+            raw_llm_args_extra_dict = yaml.safe_load(f)
+        if raw_llm_args_extra_dict is None:
+            raw_llm_args_extra_dict = {}
+        elif not isinstance(raw_llm_args_extra_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
+    if not is_visual_gen:
+        _command_telemetry.apply_raw_config_telemetry_opt_out(
+            raw_llm_args_extra_dict,
+            usage_context=_telemetry_config.UsageContext.CLI_SERVE,
+            component="server",
+            explicit_cli_telemetry="telemetry" in explicit_cli_keys,
+        )
+    if config_overrides and is_visual_gen:
+        raise click.BadParameter(
+            "--set configures LlmArgs and is not supported by VisualGen.",
+            param_hint="--set")
+    parsed_config_overrides = _parse_config_overrides(config_overrides)
+
+    if enable_sleep_mode and is_visual_gen:
+        raise click.UsageError(
+            "--enable_sleep_mode is only supported by the HTTP "
+            "text-generation server.")
 
     def _serve_llm():
+        try:
+            from tensorrt_llm.usage.usage_lib import _mark_llm_startup
+            _mark_llm_startup()
+        except Exception:
+            pass
         nonlocal server_role, allow_request_chat_template
         llm_args, _ = get_llm_args(
             model=model,
@@ -1285,38 +1450,49 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             trust_remote_code=trust_remote_code,
             revision=revision,
             reasoning_parser=reasoning_parser,
-            fail_fast_on_attention_window_too_large=
-            fail_fast_on_attention_window_too_large,
             otlp_traces_endpoint=otlp_traces_endpoint,
             enable_chunked_prefill=enable_chunked_prefill,
             enable_attention_dp=enable_attention_dp,
+            enable_locality_domains=enable_locality_domains,
             video_pruning_rate=video_pruning_rate,
             telemetry=telemetry,
             agent_percentage=agent_percentage,
             agent_types=agent_types,
             explicit_cli_keys=explicit_cli_keys)
 
-        llm_args_extra_dict = {}
-        if extra_llm_api_options is not None:
-            with open(extra_llm_api_options, 'r') as f:
-                llm_args_extra_dict = yaml.safe_load(f)
-            if llm_args_extra_dict is None:
-                llm_args_extra_dict = {}
-            elif not isinstance(llm_args_extra_dict, dict):
-                raise ValueError("Configuration file root must be a mapping.")
+        llm_args_extra_dict = dict(raw_llm_args_extra_dict)
         extra_allow_request_chat_template = _pop_bool_config_option(
             llm_args_extra_dict, "allow_request_chat_template")
         allow_request_chat_template = (allow_request_chat_template
                                        or extra_allow_request_chat_template)
-        internal_disagg_auth_key = _pop_optional_str_config_option(
-            llm_args_extra_dict, "internal_request_auth_key")
+        internal_disagg_auth_key = validate_internal_request_auth_key(
+            llm_args_extra_dict.pop("internal_request_auth_key", None))
+        # Apply to the raw mapping first so a higher-precedence override can
+        # replace an invalid YAML value before nested config construction.
+        llm_args_extra_dict = _apply_config_overrides(llm_args_extra_dict,
+                                                      parsed_config_overrides)
+        set_top_level_fields = {
+            override.path[0]
+            for override in parsed_config_overrides if len(override.path) == 1
+        }
+        merge_explicit_cli_keys = explicit_cli_keys - set_top_level_fields
         llm_args = update_llm_args_with_extra_dict(
-            llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
+            llm_args,
+            llm_args_extra_dict,
+            explicit_cli_keys=merge_explicit_cli_keys)
+        # Reapply to the effective mapping so --set remains the final source
+        # even when an explicit convenience flag targets the same nested field.
+        llm_args = _apply_config_overrides(llm_args, parsed_config_overrides)
+        if enable_sleep_mode and llm_args.get("sleep_config") is None:
+            llm_args["sleep_config"] = SleepConfig()
 
-        # CLI --no-telemetry always wins over YAML config
-        if not telemetry:
-            llm_args["telemetry_config"] = llm_args[
-                "telemetry_config"].model_copy(update={"disabled": True})
+        _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
+        # Preserve requested settings for failures before entering the LLM constructor.
+        try:
+            from tensorrt_llm.usage.usage_lib import _capture_startup_context
+            _capture_startup_context(requested=llm_args)
+        except Exception:
+            pass
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
@@ -1335,9 +1511,10 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             assert (
                 server_role is not None
             ), "server_role is required when metadata_server_cfg or disagg_cluster_config is provided"
+        if server_role is not None:
             try:
                 server_role = ServerRole[server_role.upper()]
-            except ValueError:
+            except KeyError:
                 raise ValueError(f"Invalid server role: {server_role}. " \
                                 f"Must be one of: {', '.join([role.name for role in ServerRole])}")
         # Parse media_io_kwargs from JSON string to dict if provided
@@ -1352,6 +1529,13 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             media_io_kwargs=parsed_media_io_kwargs)
 
         if grpc:
+            effective_num_serve_frontends = llm_args.get(
+                "num_serve_frontends", num_serve_frontends)
+            if effective_num_serve_frontends != 1 and grpc_protocol != "openengine":
+                raise click.UsageError(
+                    "Multiple gRPC frontends require --grpc-protocol openengine."
+                )
+
             # gRPC mode: launch gRPC server instead of OpenAI HTTP server
             # Check for unsupported arguments that are silently ignored in gRPC mode
             unsupported_args = {
@@ -1365,7 +1549,8 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 allow_request_chat_template
                 if allow_request_chat_template else None,
                 "internal_request_auth_key":
-                internal_disagg_auth_key,
+                internal_disagg_auth_key
+                if grpc_protocol != "openengine" else None,
                 "metadata_server_config_file":
                 metadata_server_config_file,
                 "server_role":
@@ -1379,18 +1564,44 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                         f"Argument '{name}' is not supported when running in gRPC mode. "
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
-            if find_spec("smg_grpc_proto") is None:
-                raise ValueError(
-                    "gRPC serving with the SMG protocol requires the optional "
-                    "'smg-grpc-proto' package. Install it with: "
-                    'pip install "tensorrt_llm[grpc-smg]"')
+            if grpc_protocol == "smg":
+                if find_spec("smg_grpc_proto") is None:
+                    raise ValueError(
+                        "gRPC serving with the SMG protocol requires the optional "
+                        "'smg-grpc-proto' package. Install it with: "
+                        'pip install "tensorrt_llm[grpc-smg]"')
 
-            from tensorrt_llm.grpc.smg.server import launch_smg_server
+                from tensorrt_llm.grpc.smg.server import launch_smg_server
 
-            launch_smg_server(host,
-                              port,
-                              llm_args,
-                              served_model_name=served_model_name)
+                launch_smg_server(host,
+                                  port,
+                                  llm_args,
+                                  served_model_name=served_model_name)
+            else:
+                try:
+                    from tensorrt_llm.grpc.openengine.server import \
+                        launch_server as launch_grpc_server
+                except ImportError as error:
+                    raise click.ClickException(
+                        f"Failed to import OpenEngine support: {error}. "
+                        "Restore the required gRPC runtime with `python -m pip "
+                        "install \"grpcio>=1.73.1,<2\" "
+                        "\"grpcio-health-checking>=1.73.1,<1.82\"`.") from error
+
+                grpc_multi_frontend = _init_multi_frontend_mode(llm_args,
+                                                                enabled=True)
+                with _provision_kv_cache_pool(
+                        llm_args,
+                        owns_engine=not grpc_multi_frontend.is_attached_frontend
+                ):
+                    launch_grpc_server(
+                        host,
+                        port,
+                        llm_args,
+                        served_model_name=served_model_name,
+                        report_failure=_report_observed_child_failure,
+                        enable_load_metrics=openengine_enable_load_metrics,
+                        subagent_affinity_auth_key=internal_disagg_auth_key)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(
@@ -1408,7 +1619,10 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 allow_request_chat_template=allow_request_chat_template,
                 num_input_processor_workers=num_input_processor_workers,
                 num_media_load_workers=num_media_load_workers,
-                internal_disagg_auth_key=internal_disagg_auth_key)
+                internal_disagg_auth_key=internal_disagg_auth_key,
+                report_addr=report_addr,
+                enable_runtime_control_endpoints=enable_sleep_mode,
+                runtime_control_api_key=runtime_control_api_key)
 
     def _serve_visual_gen():
         from tensorrt_llm.visual_gen.args import VisualGenArgs
@@ -1422,9 +1636,16 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
         launch_visual_gen_server(host, port, model, parsed_visual_gen_args,
                                  metadata_server_cfg, middleware)
 
-    is_visual_gen = (enable_visual_gen or visual_gen_args is not None
-                     or get_is_diffusion_only_model(model))
+    # Only the OpenAI HTTP path publishes the bound address. Fail loudly rather
+    # than leaving a launcher waiting forever on a file nobody writes.
+    if report_addr and (grpc or is_visual_gen):
+        raise click.BadParameter(
+            "--report_addr is only supported for the OpenAI HTTP server, not "
+            f"the {'gRPC' if grpc else 'VisualGen'} server.")
     if is_visual_gen:
+        if grpc:
+            raise click.UsageError(
+                "--grpc is not supported by the VisualGen server")
         _serve_visual_gen()
     else:
         _serve_llm()
@@ -1518,16 +1739,26 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
     default=True,
     help="Enable or disable anonymous usage telemetry collection.",
     status="beta")
-def serve_encoder(model: str, host: str, port: int, log_level: str,
-                  max_batch_size: int, max_num_tokens: int,
-                  gpus_per_node: Optional[int], trust_remote_code: bool,
-                  extra_encoder_options: Optional[str], revision: Optional[str],
-                  free_gpu_memory_fraction: float, tensor_parallel_size: int,
-                  metadata_server_config_file: Optional[str],
-                  allow_request_chat_template: bool, telemetry: bool):
+def serve_encoder(
+    model: str,
+    host: str,
+    port: int,
+    log_level: str,
+    max_batch_size: int,
+    max_num_tokens: int,
+    gpus_per_node: Optional[int],
+    trust_remote_code: bool,
+    extra_encoder_options: Optional[str],
+    revision: Optional[str],
+    free_gpu_memory_fraction: float,
+    tensor_parallel_size: int,
+    metadata_server_config_file: Optional[str],
+    allow_request_chat_template: bool,
+    telemetry: bool,
+):
     """Running an OpenAI API compatible server
 
-    MODEL: model name | HF checkpoint path | TensorRT engine path
+    MODEL: model name or Hugging Face checkpoint path
     """
     logger.set_level(log_level)
 
@@ -1558,6 +1789,12 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
             encoder_args_extra_dict = {}
         elif not isinstance(encoder_args_extra_dict, dict):
             raise ValueError("Configuration file root must be a mapping.")
+    _command_telemetry.apply_raw_config_telemetry_opt_out(
+        encoder_args_extra_dict,
+        usage_context=_telemetry_config.UsageContext.CLI_SERVE,
+        component="server",
+        explicit_cli_telemetry="telemetry" in explicit_cli_keys,
+    )
     extra_allow_request_chat_template = _pop_bool_config_option(
         encoder_args_extra_dict, "allow_request_chat_template")
     allow_request_chat_template = (allow_request_chat_template
@@ -1565,10 +1802,7 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     encoder_args = update_llm_args_with_extra_dict(
         llm_args, encoder_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
-    # CLI --no-telemetry always wins over YAML config
-    if not telemetry:
-        encoder_args["telemetry_config"] = encoder_args[
-            "telemetry_config"].model_copy(update={"disabled": True})
+    _apply_effective_telemetry_config(encoder_args, telemetry=telemetry)
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
@@ -1641,11 +1875,20 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
               default=True,
               help="Enable or disable anonymous usage telemetry collection.")
 def serve_embedding(
-        model: str, host: str, port: int, log_level: str, max_batch_size: int,
-        max_num_tokens: int, max_queue_delay: float, max_queue_size: int,
-        trust_remote_code: bool, extra_llm_api_options: Optional[str],
-        revision: Optional[str], metadata_server_config_file: Optional[str],
-        telemetry: bool):
+    model: str,
+    host: str,
+    port: int,
+    log_level: str,
+    max_batch_size: int,
+    max_num_tokens: int,
+    max_queue_delay: float,
+    max_queue_size: int,
+    trust_remote_code: bool,
+    extra_llm_api_options: Optional[str],
+    revision: Optional[str],
+    metadata_server_config_file: Optional[str],
+    telemetry: bool,
+):
     """Run an OpenAI-compatible /v1/embeddings server for encoder-only models.
 
     Coalesces concurrent requests with a dynamic batcher and serves them through
@@ -1679,8 +1922,16 @@ def serve_embedding(
             extra_dict = {}
         elif not isinstance(extra_dict, dict):
             raise ValueError("Configuration file root must be a mapping.")
+    _command_telemetry.apply_raw_config_telemetry_opt_out(
+        extra_dict,
+        usage_context=_telemetry_config.UsageContext.CLI_SERVE,
+        component="server",
+        explicit_cli_telemetry="telemetry" in explicit_cli_keys,
+    )
     llm_args = update_llm_args_with_extra_dict(
         llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
+
+    _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
 
     # The CLI does not expose TP/PP/CP, but a --config YAML could still set them. Reject
     # that explicitly rather than hang: the in-process encode-only path cannot shard.
@@ -1694,6 +1945,7 @@ def serve_embedding(
             f"pipeline_parallel_size={effective_pp}, "
             f"context_parallel_size={effective_cp} from --config.",
             param_hint="config")
+    _reject_embedding_extra_model_inputs(llm_args.get("cuda_graph_config"))
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
@@ -1750,6 +2002,20 @@ def serve_embedding(
     help="[Deprecated] The interval of logging metrics in seconds. "
     "This option is not connected to any functionality and will be removed in a future release.",
     status="deprecated")
+@stability_option(
+    "--telemetry/--no-telemetry",
+    default=True,
+    help="Enable or disable anonymous usage telemetry collection.",
+    status="beta")
+@stability_option(
+    "--report_addr",
+    type=str,
+    default=None,
+    help="Write the host:port this server actually bound to this file, "
+    "atomically, once the socket is bound. Lets the config set port 0 and "
+    "have the launcher read the kernel-assigned port back instead of "
+    "reserving one up front.",
+    status="prototype")
 def disaggregated(
     config_file: Optional[str],
     metadata_server_config_file: Optional[str],
@@ -1758,9 +2024,12 @@ def disaggregated(
     log_level: str,
     metrics_log_interval: int,
     schedule_style: str,
+    telemetry: bool,
+    report_addr: Optional[str],
 ):
     """Running server in disaggregated mode"""
 
+    set_usage_context(_telemetry_config.UsageContext.DISAGGREGATED.value)
     logger.set_level(log_level)
     set_prometheus_multiproc_dir()
 
@@ -1772,6 +2041,10 @@ def disaggregated(
     if "--config_file" in sys.argv:
         logger.warning("--config_file is deprecated, use --config instead.")
 
+    _command_telemetry.apply_disaggregated_telemetry_config(
+        config_file,
+        telemetry=telemetry,
+    )
     disagg_cfg = parse_disagg_config_file(config_file)
     if schedule_style:
         disagg_cfg.schedule_style = schedule_style
@@ -1791,6 +2064,18 @@ def disaggregated(
     # (c) url absent, num_workers==1 -> single self-contained server.
     num_workers = disagg_cfg.num_workers
     coordinator_url = disagg_cfg.disagg_coordinator_url
+    os.environ.pop(DisaggLauncherEnvs.TLLM_DISAGG_ROLE, None)
+
+    # Only topology (c) below binds the public socket in this process. The fleet
+    # paths hand the port to N SO_REUSEPORT workers, which with port 0 would each
+    # get a *different* kernel-assigned port instead of sharing one, so reject
+    # the combination rather than publishing an address that serves 1/N requests.
+    if (disagg_cfg.port == 0 or report_addr) and (coordinator_url
+                                                  or num_workers > 1):
+        raise click.BadParameter(
+            "port 0 and --report_addr are only supported for a single "
+            f"self-contained disaggregated server, but num_workers={num_workers} "
+            f"and disagg_coordinator_url={coordinator_url!r} select a fleet.")
 
     if coordinator_url:
         # (a) External coordinator: fork a fleet of delegating servers (or a
@@ -1803,6 +2088,7 @@ def disaggregated(
     if num_workers > 1:
         # (b) Implicit coordinator in this process (on port-1) + a delegating
         # uvicorn fleet (workers=N) on the public port. See below.
+        os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = "coordinator"
         _serve_coordinator_and_fleet(disagg_cfg, config_file,
                                      metadata_server_config_file,
                                      metadata_server_cfg, request_timeout,
@@ -1811,9 +2097,15 @@ def disaggregated(
 
     # (c) num_workers==1, no external coordinator: a single disagg server with an
     # in-process (local) coordinator. Pre-bind the socket (validates port), serve.
+    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = "server_coordinator"
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        # See launch_server: without this, TIME_WAIT tombstones from the
+        # connections this server accepted refuse a restart for ~60s.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind((disagg_cfg.hostname, disagg_cfg.port))
+            if disagg_cfg.port == 0:
+                disagg_cfg.port = s.getsockname()[1]
         except OSError as e:
             holder = _diagnose_port_in_use(disagg_cfg.port)
             logger.error(
@@ -1823,6 +2115,9 @@ def disaggregated(
             raise RuntimeError(
                 f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}. "
                 f"Port holder(s): {holder}")
+
+        _publish_bound_address(report_addr, disagg_cfg.hostname,
+                               disagg_cfg.port)
 
         server = OpenAIDisaggServer(
             config=disagg_cfg,
@@ -1844,6 +2139,7 @@ def disaggregated(
         if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
             gc.disable()
 
+        set_lifecycle_phase("serving")
         uvloop.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
 
 
@@ -1867,6 +2163,8 @@ def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
         if not k.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "UCX_",
                              "I_MPI_", "HYDRA_", "MPI_"))
     }
+    # Fleet frontends delegate to the coordinator; do not inherit its role.
+    base_env.pop(DisaggLauncherEnvs.TLLM_DISAGG_ROLE, None)
     # num_workers is explicit config now; ensure no stale WEB_CONCURRENCY leaks in
     # and re-forks each plain-HTTP worker into a nested fleet.
     base_env.pop("WEB_CONCURRENCY", None)
@@ -1924,13 +2222,9 @@ def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
                 p.kill()
                 p.wait()
 
-    def _handle_signal(signum, _frame):
-        _cleanup()
-        raise SystemExit(128 + signum)
-
     atexit.register(_cleanup)
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _command_telemetry.raise_signal_exit)
+    signal.signal(signal.SIGINT, _command_telemetry.raise_signal_exit)
     return fleet
 
 
@@ -1946,6 +2240,7 @@ def _serve_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
                                  metadata_server_config_file, request_timeout,
                                  server_start_timeout, num_workers,
                                  coordinator_url)
+    set_lifecycle_phase("serving")
     # Block until any worker exits; a nonzero exit from any worker is a failure.
     try:
         while True:
@@ -1953,6 +2248,8 @@ def _serve_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
                 rc = p.poll()
                 if rc is not None:
                     if rc != 0:
+                        _report_observed_child_failure(rc, "disagg_worker",
+                                                       "serving")
                         raise RuntimeError(
                             f"Disagg fleet worker {i} (pid={p.pid}) exited with "
                             f"code {rc}")
@@ -1994,6 +2291,27 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     coord_url = f"unix:{coord_uds}" if coord_uds else \
         f"http://{public_host}:{coord_port}"
 
+    # Bind the coordinator's TCP socket here rather than letting uvicorn bind the
+    # hostname, so this listener starts the same way as the standalone server and
+    # the fleet workers. uvicorn would resolve the name itself, and a hostname
+    # whose AAAA record is link-local resolves to fe80:: with scope id 0 -- which
+    # the kernel always rejects with "invalid argument", because the scope id can
+    # only be derived from an interface name. Binding AF_INET here also surfaces a
+    # port conflict with the same diagnostics as the other two listeners.
+    coord_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    coord_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        coord_socket.bind((public_host, coord_port))
+    except OSError as e:
+        coord_socket.close()
+        holder = _diagnose_port_in_use(coord_port)
+        logger.error(f"Failed to bind coordinator socket to "
+                     f"{public_host}:{coord_port} (pid={os.getpid()}): {e}. "
+                     f"Current port holder(s): {holder}")
+        raise RuntimeError(
+            f"Failed to bind socket to {public_host}:{coord_port}: {e}. "
+            f"Port holder(s): {holder}")
+
     # 1. Launch the delegating fleet pointed at the implicit coordinator we start
     #    below (port-1 for TCP; UDS for the hot path). Workers hold
     #    CoordinatorClients (no core), so they can't race the ZMQ ingest bind.
@@ -2017,9 +2335,11 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         disagg_cfg,
         _client_factory,
         metadata_config=metadata_server_cfg,
-        server_start_timeout_secs=server_start_timeout)
+        server_start_timeout_secs=server_start_timeout,
+        request_timeout_secs=request_timeout)
     logger.info(f"Coordinator serving on {public_host}:{coord_port} "
                 f"(uds={coord_uds}) (fleet on public port {public_port})")
+    set_lifecycle_phase("serving")
 
     async def _serve_and_monitor():
         server_task = asyncio.create_task(
@@ -2027,7 +2347,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
                 public_host,
                 coord_port,
                 uds=coord_uds,
-                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout))
+                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout,
+                sockets=[coord_socket]))
 
         async def _monitor_fleet():
             while True:
@@ -2035,6 +2356,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
                     return_code = process.poll()
                     if return_code is not None:
                         if return_code != 0:
+                            _report_observed_child_failure(
+                                return_code, "disagg_worker", "serving")
                             raise RuntimeError(
                                 f"Disagg fleet worker {i} (pid={process.pid}) "
                                 f"exited with code {return_code}")
@@ -2053,6 +2376,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     try:
         asyncio.run(_serve_and_monitor())
     finally:
+        coord_socket.close()
         for process in fleet:
             if process.poll() is None:
                 process.terminate()
@@ -2130,6 +2454,22 @@ def _run_fleet_worker():
     Each ``Popen`` receives an explicit ``TLLM_DISAGG_WORKER_PROCESS_ID`` and
     binds its own ``SO_REUSEPORT`` socket on the shared public port.
     """
+    apply_usage_session_config(
+        default_usage_context=_telemetry_config.UsageContext.DISAGGREGATED.
+        value,
+        component="server",
+        lifecycle_phase="config_validation",
+    )
+    return _command_telemetry.run_with_terminal_reporting(
+        _run_fleet_worker_impl,
+        default_usage_context=_telemetry_config.UsageContext.DISAGGREGATED.
+        value,
+        infer_signal_from_exit_code=True,
+    )
+
+
+def _run_fleet_worker_impl():
+    """Build and run one fleet worker inside its telemetry boundary."""
     _init_fleet_worker_process()
     server = _build_disagg_server_from_env()
     host, port = server._config.hostname, server._config.port
@@ -2147,6 +2487,7 @@ def _run_fleet_worker():
     pidx = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_WORKER_PROCESS_ID, "0")
     logger.info(f"Fleet worker process_id={pidx} bound {host}:{port} "
                 f"(SO_REUSEPORT)")
+    set_lifecycle_phase("serving")
     asyncio.run(server(host, port, sockets=[s]))
 
 
@@ -2179,9 +2520,19 @@ def set_cuda_device():
                   default='info',
                   help="The logging level.",
                   status="beta")
-def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
+@stability_option(
+    "--telemetry/--no-telemetry",
+    default=True,
+    help="Enable or disable anonymous usage telemetry collection.",
+    status="beta")
+def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
+                             telemetry: bool):
     """Launching disaggregated MPI worker"""
 
+    _command_telemetry.apply_disaggregated_telemetry_config(
+        config_file,
+        telemetry=telemetry,
+    )
     from tensorrt_llm._utils import mpi_rank
     if os.environ.get(DisaggLauncherEnvs.
                       TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
@@ -2342,9 +2693,14 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     # 1. Run the LLM-API Proxy in a separate process for streaming performance.
     #      The Proxy will create a RemoteMpiSessionClient as mpi_session in LLM
     #      class.
+    guard_path = Path(
+        __file__).resolve().parents[1] / "llmapi" / "_llmapi_process_guard.py"
     command = [
-        "python3", sys.argv[0], "disaggregated_mpi_worker", "-c", config_file,
-        "--log_level", log_level
+        sys.executable, "-S",
+        str(guard_path), "--parent-pid",
+        str(os.getpid()), "--term-grace", "5", "--autonomous", "--role",
+        "proxy", "--", "python3", sys.argv[0], "disaggregated_mpi_worker", "-c",
+        config_file, "--log_level", log_level
     ]
     logger.info(
         f"rank {mpi_rank()} step1: preparing to launch command: {command}")
@@ -2354,10 +2710,14 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     original_sigint_handler = signal.getsignal(signal.SIGINT)
 
     # Register new signal handlers
-    signal.signal(signal.SIGTERM, _signal_handler_cleanup_child)
-    signal.signal(signal.SIGINT, _signal_handler_cleanup_child)
+    signal.signal(signal.SIGTERM, _command_telemetry.raise_signal_exit)
+    signal.signal(signal.SIGINT, _command_telemetry.raise_signal_exit)
 
+    _child_p_global = None
+    failure_pending = False
     try:
+        # MPI_Abort and SIGKILL bypass finally. The guard remains the owner of
+        # the proxy group and reclaims it when this leader disappears.
         _child_p_global = subprocess.Popen(
             command,
             env=non_mpi_env,
@@ -2366,7 +2726,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
             start_new_session=True)
 
         logger.info(
-            f"Parent process (PID {os.getpid()}) launched child process (PID {_child_p_global.pid})."
+            f"Parent process (PID {os.getpid()}) launched proxy guard (PID {_child_p_global.pid})."
         )
 
         logger.info(f"rank {mpi_rank()} step2: start the mpi session server")
@@ -2376,6 +2736,9 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
         # This is a blocking call
         launch_remote_mpi_session_server(sub_comm)
 
+    except BaseException:
+        failure_pending = True
+        raise
     finally:
         # Restore original signal handlers
         signal.signal(signal.SIGTERM, original_sigterm_handler)
@@ -2383,26 +2746,23 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
 
         if _child_p_global:  # If Popen was successful and object exists
             logger.info(
-                f"Parent process (PID {os.getpid()}) in finally block. Cleaning up child process (PID: {_child_p_global.pid})."
+                f"Parent process (PID {os.getpid()}) in finally block. Stopping proxy guard (PID: {_child_p_global.pid})."
             )
             # Check if child is still running
             if _child_p_global.poll() is None:
                 _child_p_global.terminate()
                 try:
                     _child_p_global.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    logger.warning(
-                        f"Child process {_child_p_global.pid} timed out on terminate (30s), killing."
+                except subprocess.TimeoutExpired as error:
+                    message = (
+                        f"Proxy guard {_child_p_global.pid} cleanup is "
+                        "still pending after 30s; retaining its process-group ownership"
                     )
-                    _child_p_global.kill()
-                    try:
-                        _child_p_global.wait(timeout=30)
-                    except subprocess.TimeoutExpired:
-                        logger.error(
-                            f"Child process {_child_p_global.pid} failed to be killed even after 30s."
-                        )
-            assert _child_p_global.poll(
-            ) is not None, f"the subprocess should be terminated"
+                    logger.error(message)
+                    # Killing the guard could strand its payload. Leave it
+                    # responsible for cleanup and preserve an existing failure.
+                    if not failure_pending:
+                        raise RuntimeError(message) from error
 
     # Check if the process was launched and assert it's terminated
     if _child_p_global and hasattr(_child_p_global,
@@ -2421,7 +2781,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
         )
 
 
-class DefaultGroup(click.Group):
+class DefaultGroup(_command_telemetry.TelemetryGroup):
     """Custom Click group to allow default command behavior"""
 
     def resolve_command(self, ctx, args):
@@ -2432,12 +2792,18 @@ class DefaultGroup(click.Group):
 
 
 main = DefaultGroup(
+    telemetry_usage_context=_telemetry_config.UsageContext.CLI_SERVE,
+    telemetry_component="server",
     commands={
         "serve": serve,
         "disaggregated": disaggregated,
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
         "mm_embedding_serve": serve_encoder,
-        "embeddings": serve_embedding
+        "embeddings": serve_embedding,
+        # The part of a Mooncake pool that outlives and is shared by every
+        # server, and the report of what they collectively contributed to it.
+        "mooncake_master": mooncake_master,
+        "mooncake_pool_report": mooncake_pool_report,
     })
 
 if __name__ == "__main__":
