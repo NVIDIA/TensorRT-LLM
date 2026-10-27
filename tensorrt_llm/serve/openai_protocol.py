@@ -1043,6 +1043,21 @@ class ChatCompletionToolsParam(OpenAIBaseModel):
     function: FunctionDefinition
 
 
+class NamespacedFunctionToolParam(ChatCompletionToolsParam):
+    """A tool that a Responses request declared inside a namespace.
+
+    ``function`` is what a chat template without namespaces is given: the
+    tool as a function named ``<namespace>.<name>``. That is all a dump
+    carries. The declaration itself is kept beside it, out of every dump, for
+    a model whose renderer reads namespaces (``ServingExtension.serialize_tool``).
+    """
+
+    namespace: str = Field(exclude=True)
+    namespace_description: Optional[str] = Field(default=None, exclude=True)
+    declared_name: str = Field(exclude=True)
+    declared_description: Optional[str] = Field(default=None, exclude=True)
+
+
 class ChatCompletionNamedFunction(OpenAIBaseModel):
     name: str
 
