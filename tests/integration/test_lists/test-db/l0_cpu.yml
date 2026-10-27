@@ -203,6 +203,7 @@ l0_cpu:
   - unittest/grpc/test_grpc_optional.py::test_smg_server_startup_failure_cleans_up
   - unittest/inputs
   - unittest/kv_cache_manager_v2_tests
+  - unittest/llmapi/test_deepseek_v32_encoding.py
   - unittest/llmapi/test_deepseek_v32_tokenizer.py
   - unittest/llmapi/test_deepseek_v41_tokenizer.py
   - unittest/llmapi/apps/test_anthropic_adapter.py
