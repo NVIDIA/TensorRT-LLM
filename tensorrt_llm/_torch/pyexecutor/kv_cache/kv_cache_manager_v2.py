@@ -3615,8 +3615,8 @@ class KVCacheManagerV2(BaseResourceManager):
             raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")
         self.low_precision_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
         self.high_precision_dtype = str_dtype_to_binding(mixed.high)
-        # Native NVFP4 pools (sparse MLA) stay the low-precision pool; twins use mixed.high.
-        if dtype != self.high_precision_dtype and dtype != DataType.NVFP4:
+        # A pool already in the low-precision format stays the low pool; twins use mixed.high.
+        if dtype not in (self.high_precision_dtype, self.low_precision_dtype):
             raise ValueError(
                 f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the retained tokens in "
                 f"{mixed.high}, but the model's KV cache dtype resolved to {dtype}."
@@ -6923,8 +6923,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 return layer.bytes_per_token()
             return layer.bytes_per_token(data_role)
 
-        # A native NVFP4 pool keeps its row format; the inline codec only replaces FP16/BF16/FP8.
-        if self._is_mixed_precision_layer(local_layer_idx) and self.dtype != DataType.NVFP4:
+        # A pool already in the low-precision format keeps its rows; only wider rows are re-encoded.
+        if (
+            self._is_mixed_precision_layer(local_layer_idx)
+            and self.dtype != self.low_precision_dtype
+        ):
             return self._mixed_precision_layer_bytes_per_token(local_layer_idx, data_role)
         if self.dtype not in (
             DataType.FP8,
