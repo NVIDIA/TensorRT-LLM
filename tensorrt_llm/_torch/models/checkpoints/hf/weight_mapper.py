@@ -101,15 +101,21 @@ def convert_compressed_tensors_nvfp4_weights(
         Otherwise a converted mapping of the same kind; other keys are passed
         through unchanged and the caller must not use ``weights`` afterwards
         (see ``ConsumableWeightsDict.take_ownership``).
+
+    Raises:
+        ValueError: two checkpoint tensors map to the same TRT-LLM name (for
+            example both ``x.weight_packed`` and ``x.weight``), which would
+            otherwise keep whichever came last.
     """
     if not any(
             name.endswith(_COMPRESSED_TENSORS_NVFP4_SUFFIXES)
             for name in weights.keys()):
         return weights
 
-    converted = {}
+    converted, sources = {}, {}
     zero_scales, invalid_scales = [], []
     for name, value in weights.items():
+        source = name
         if name.endswith(".weight_packed"):
             name = name[:-len(".weight_packed")] + ".weight"
         elif name.endswith((".weight_global_scale", ".input_global_scale")):
@@ -120,7 +126,12 @@ def convert_compressed_tensors_nvfp4_weights(
             else:
                 name = name[:-len(".input_global_scale")] + ".input_scale"
             value = _invert_compressed_tensors_global_scale(value)
+        if name in converted:
+            raise ValueError(
+                f"compressed-tensors NVFP4 checkpoint maps both {sources[name]!r} "
+                f"and {source!r} to {name!r}")
         converted[name] = value
+        sources[name] = source
     _warn_uninvertible_global_scales(zero_scales, invalid_scales)
     return ConsumableWeightsDict.take_ownership(weights, converted)
 

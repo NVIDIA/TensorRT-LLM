@@ -129,6 +129,24 @@ def test_compressed_tensors_nvfp4_conversion_returns_other_checkpoints_unchanged
     assert convert_compressed_tensors_nvfp4_weights(weights) is weights
 
 
+@pytest.mark.parametrize(
+    "names",
+    [
+        ("model.layers.0.self_attn.o_proj.weight_packed", "model.layers.0.self_attn.o_proj.weight"),
+        (
+            "model.layers.0.mlp.experts.0.w1.weight_global_scale",
+            "model.layers.0.mlp.experts.0.w1.weight_scale_2",
+        ),
+    ],
+    ids=["weight", "weight_scale_2"],
+)
+def test_compressed_tensors_nvfp4_conversion_rejects_colliding_names(names) -> None:
+    weights = {name: torch.tensor([4.0]) for name in names}
+
+    with pytest.raises(ValueError, match="maps both"):
+        convert_compressed_tensors_nvfp4_weights(weights)
+
+
 def test_compressed_tensors_nvfp4_conversion_keeps_consumable_weights() -> None:
     packed = torch.tensor([[1, 2]], dtype=torch.uint8)
     source = ConsumableWeightsDict({"model.layers.0.self_attn.o_proj.weight_packed": packed})
