@@ -22,10 +22,9 @@ from .llm_request import PerfTimingInfo
 
 # GPU timestamps for the executor's timing events (the per-request perf metrics, the iteration log's device step):
 # a model opt-in armed process-wide (arm_gpu_timestamps; the MiniMax-M3.1 sm_107 routing arms it). Kill switch
-# TRTLLM_M31_DISABLE_GPU_TIMESTAMPS=1. TRTLLM_M31_GPU_TIMESTAMPS_TRITON_PROTO=1 is a measurement-only fallback that
-# writes the stamp with a Triton kernel when the native stamp op is not built.
+# TRTLLM_M31_DISABLE_GPU_TIMESTAMPS=1. Needs the native stamp op (trtllm::minimax_m31_globaltimer_stamp).
 _GPU_TIMESTAMPS = False
-_TRITON_PROTO = os.environ.get("TRTLLM_M31_GPU_TIMESTAMPS_TRITON_PROTO", "0") == "1"
+_STAMP_OP = None
 
 
 def _native_stamp_op():
@@ -36,17 +35,17 @@ def _native_stamp_op():
 
 
 def arm_gpu_timestamps() -> bool:
-    """Time the executor with GpuTimestamp in this process, unless killed or no stamp op is available."""
-    global _GPU_TIMESTAMPS
+    """Time the executor with GpuTimestamp in this process, unless killed or the native stamp op is missing."""
+    global _GPU_TIMESTAMPS, _STAMP_OP
     if os.environ.get("TRTLLM_M31_DISABLE_GPU_TIMESTAMPS", "0") == "1":
         _GPU_TIMESTAMPS = False
     else:
+        _STAMP_OP = _native_stamp_op()
         # The stamp lands in pinned host memory with a non-blocking copy; without pinned memory (Confidential
         # Compute) that copy would block the host, so keep timed events there.
-        _GPU_TIMESTAMPS = (_native_stamp_op() is not None or _TRITON_PROTO) and prefer_pinned()
+        _GPU_TIMESTAMPS = _STAMP_OP is not None and prefer_pinned()
     logger.info(
         f"[M31] executor timing: {'GPU timestamps' if _GPU_TIMESTAMPS else 'timed CUDA events'}"
-        f"{' (Triton prototype stamp)' if _GPU_TIMESTAMPS and _native_stamp_op() is None else ''}"
     )
     return _GPU_TIMESTAMPS
 
@@ -72,8 +71,6 @@ class GpuTimestamp:
     stamp as a native op.
     """
 
-    _triton_kernel = None
-
     def __init__(self):
         self._follower: Optional[torch.cuda.Stream] = None
         self._stamp: Optional[torch.Tensor] = None
@@ -95,22 +92,9 @@ class GpuTimestamp:
             handle = CUASSERT(cudart.cudaStreamCreateWithFlags(cudart.cudaStreamNonBlocking))[0]
         return torch.cuda.ExternalStream(int(handle), device=torch.device("cuda", index))
 
-    @classmethod
-    def _write_stamp(cls, out: torch.Tensor) -> None:
-        op = _native_stamp_op()
-        if op is not None:
-            op(out)
-            return
-        if cls._triton_kernel is None:
-            import triton
-            import triton.language as tl
-
-            @triton.jit
-            def _globaltimer_kernel(out_ptr):
-                tl.store(out_ptr, tl.extra.cuda.globaltimer())
-
-            cls._triton_kernel = _globaltimer_kernel
-        cls._triton_kernel[(1,)](out)
+    @staticmethod
+    def _write_stamp(out: torch.Tensor) -> None:
+        (_STAMP_OP or _native_stamp_op())(out)
 
     def record(self, stream: Optional[torch.cuda.Stream] = None) -> None:
         if stream is None:

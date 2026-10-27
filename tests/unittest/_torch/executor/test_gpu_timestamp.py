@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """GpuTimestamp keeps torch.cuda.Event's timing semantics (perf_metrics_manager; armed by arm_gpu_timestamps).
 
-The stamp comes from the native op (trtllm.minimax_m31_globaltimer_stamp) when it is built, otherwise from the
-measurement-only Triton fallback, which these tests force when the op is missing.
+The stamp comes from the native op (trtllm.minimax_m31_globaltimer_stamp). Where the op is not built, these tests
+stand in a test-local Triton kernel that does the same store, so the timestamp's stream and timing logic is still
+covered; production code has no such fallback.
 """
 
 import pytest
@@ -14,10 +15,29 @@ from tensorrt_llm._torch.pyexecutor import perf_metrics_manager as pmm
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 
+_STAND_IN = None
+
+
+def _stand_in_stamp_op():
+    """A test-only %globaltimer store with the native op's signature, for images without the op."""
+    global _STAND_IN
+    if _STAND_IN is None:
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def _globaltimer_test_kernel(out_ptr):
+            tl.store(out_ptr, tl.extra.cuda.globaltimer())
+
+        _STAND_IN = lambda out: _globaltimer_test_kernel[(1,)](out)  # noqa: E731
+    return _STAND_IN
+
+
 @pytest.fixture(autouse=True)
 def _stamp_path(monkeypatch):
+    monkeypatch.setattr(pmm, "_STAMP_OP", None)
     if pmm._native_stamp_op() is None:
-        monkeypatch.setattr(pmm, "_TRITON_PROTO", True)
+        monkeypatch.setattr(pmm, "_native_stamp_op", _stand_in_stamp_op)
 
 
 # A fixed spin of tens of milliseconds on Rubin-class clocks; the tests compare against the span that actually ran
