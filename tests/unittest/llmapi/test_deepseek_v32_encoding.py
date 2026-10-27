@@ -41,6 +41,45 @@ _TOOL = {
 }
 
 
+# The tools preamble as the checkpoint's own encoder renders it, up to the
+# function list: every blank line is part of the prompt the model was trained on.
+_TOOLS_PREAMBLE = (
+    "## Tools\n"
+    "\n"
+    "You have access to a set of tools you can use to answer the user's question.\n"
+    'You can invoke functions by writing a "<｜DSML｜function_calls>" block like the following as part '
+    "of your reply to the user:\n"
+    "<｜DSML｜function_calls>\n"
+    '<｜DSML｜invoke name="$FUNCTION_NAME">\n'
+    '<｜DSML｜parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜parameter>\n'
+    "...\n"
+    "</｜DSML｜invoke>\n"
+    '<｜DSML｜invoke name="$FUNCTION_NAME2">\n'
+    "...\n"
+    "</｜DSML｜invoke>\n"
+    "</｜DSML｜function_calls>\n"
+    "\n"
+    "String and scalar parameters should be specified as is without any escaping or quotes, while "
+    'lists and objects should use JSON format. The "string" attribute should be set to "true" for '
+    'string type parameters and "false" for other types (numbers, booleans, arrays, objects).\n'
+    "\n"
+    "If the thinking_mode is enabled, then after function results you should strongly consider "
+    "outputting a thinking block. Here is an example:\n"
+    "\n"
+    "<｜DSML｜function_calls>\n"
+    "...\n"
+    "</｜DSML｜function_calls>\n"
+    "\n"
+    "<function_results>\n"
+    "...\n"
+    "</function_results>\n"
+    "\n"
+    "<think>...thinking about results</think>\n"
+    "\n"
+    "Here are the functions available in JSONSchema format:\n"
+)
+
+
 def test_tools_preamble_keeps_its_blank_lines():
     """The preamble is rendered as the checkpoint's encoder writes it, blank lines included."""
     prompt = encode_messages(
@@ -51,12 +90,7 @@ def test_tools_preamble_keeps_its_blank_lines():
         thinking_mode="chat",
     )
 
-    assert "## Tools\n\nYou have access to a set of tools" in prompt
-    # Seven blank lines separate the preamble's paragraphs and examples; losing
-    # any of them, as the vendored copy once did, changes the prompt.
-    preamble = prompt[prompt.index("## Tools") : prompt.index("<functions>")]
-    assert preamble.count("\n\n") == 7
-    assert "\n\n\n" not in preamble
+    assert prompt[prompt.index("## Tools") : prompt.index("<functions>")] == _TOOLS_PREAMBLE
 
 
 @pytest.mark.parametrize(
