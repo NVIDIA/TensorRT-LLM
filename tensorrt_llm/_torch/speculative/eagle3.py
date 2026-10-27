@@ -832,8 +832,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # MTP Eagle: step 0's gather ids, hidden rows, later positions and
         # step-0 -> 1 metadata update in one launch (the step-0 epilogue). It
         # reads the pre-loop sequence lengths, since it writes the live ones.
-        use_epilogue = (self.is_mtp_eagle and self.guided_decoder is None
-                        and pre_draft_seq_lens is not None
+        use_epilogue = (pre_draft_seq_lens is not None and self.is_mtp_eagle
+                        and self.guided_decoder is None
                         and hasattr(attn_metadata, "kv_lens_cuda"))
         step0 = None
         # [k + 1, b] int32 token buffer of an epilogue step: row 0 = each
