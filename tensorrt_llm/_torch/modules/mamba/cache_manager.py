@@ -236,7 +236,7 @@ class Mamba2State(MambaStateStorage):
         if self._stochastic_rounding and ssm_states:
             states = ssm_states[0]
             self.rand_seed = allocate_mamba_seed_buffer(
-                context.slot_capacity_bound or states.shape[0],
+                states.shape[0],
                 self._seed_rank_offset,
                 states.device,
                 self.rand_seed,
@@ -387,7 +387,7 @@ class ReplayHistory(MambaStateStorage):
                 context.max_batch_size, dtype=torch.int32, device=device
             )
         self.rand_seed = allocate_mamba_seed_buffer(
-            context.slot_capacity_bound or cache_size,
+            cache_size,
             self._seed_rank_offset,
             device,
             self.rand_seed,

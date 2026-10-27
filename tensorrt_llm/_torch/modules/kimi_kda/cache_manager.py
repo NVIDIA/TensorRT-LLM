@@ -616,7 +616,7 @@ class KDAReplayState(MambaStateStorage):
             )
         if self._stochastic_rounding:
             self.rand_seed = allocate_mamba_seed_buffer(
-                context.slot_capacity_bound or cache_size,
+                cache_size,
                 self._seed_rank_offset,
                 device,
                 self.rand_seed,

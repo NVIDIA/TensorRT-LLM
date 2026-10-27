@@ -191,7 +191,6 @@ def _shutdown_manager(manager, monkeypatch):
     if isinstance(manager, Qwen4ExpHybridCacheManager):
         manager._ple_conv_states = {42: object()}
         manager._ple_ngram_contexts = {42: object()}
-        manager._ple_kernel_caches = {42: (object(), object())}
 
     def check_before_pool_shutdown():
         assert manager.intermediate_state_indices is None

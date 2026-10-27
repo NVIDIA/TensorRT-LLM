@@ -100,8 +100,6 @@ from .hang_diagnostics import create_executor_hang_diagnostics
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
-from .kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import \
-    MambaHybridCacheManagerV2
 from .kv_cache_load import KvLoadTracker, aggregate_load
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
@@ -5688,9 +5686,6 @@ class PyExecutor:
             mgr.impl.adjust()
         except OutOfPagesError as e:
             logger.warning(f"KV pool adjust() failed: {e!r}")
-
-        if isinstance(mgr, MambaHybridCacheManagerV2):
-            mgr.refresh_state_views()
 
         remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
         if remote_tail_adp:

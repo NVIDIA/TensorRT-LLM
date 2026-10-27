@@ -86,12 +86,12 @@ class MambaStateLayout:
     n_groups_per_rank: int
     max_batch_size: int
     state_index_capacity: int
+    # Tensor-view extent; under rebalance this is the fixed-quota ceiling, not
+    # the currently backed slot count. Query KVCM before scanning whole buffers.
     slot_capacity: int | None
     spec_config: object | None
     conv_section_dims: tuple[int, ...] = field(default_factory=tuple)
     conv_state_layout: Literal["x_b_c", "q_k_v"] = "x_b_c"
-    # Fixed-quota ceiling for kernel descriptors and owned per-slot scratch.
-    slot_capacity_bound: int | None = None
 
     def with_slot_capacity(self, slot_capacity: int) -> "MambaStateLayout":
         """Return the post-allocation context for tensor-view binding."""

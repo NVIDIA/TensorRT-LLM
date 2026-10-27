@@ -3988,7 +3988,13 @@ def _rebalance_ssm_fraction(mgr, fraction):
     _introspection.set_last_adjustment_time(mgr.impl, 0.0)
     _introspection.set_target_ratio_list_gpu(mgr.impl, target)
     mgr.impl.adjust()
-    mgr.refresh_state_views()
+
+
+def _backed_ssm_slots(mgr):
+    layer = LayerId(mgr.layer_offsets[mgr.mamba_pp_layers[0]])
+    pages = mgr.impl.get_page_index_upper_bound(layer, MambaRole.SSM_STATE)
+    scale = mgr.impl.get_page_index_scale(layer, MambaRole.SSM_STATE)
+    return (pages + scale - 1) // scale
 
 
 @skip_no_cuda
@@ -4036,7 +4042,10 @@ def test_v2_hybrid_graph_survives_pool_rebalance(manager_cls, replay, tma_write)
     caches = []
     try:
         _rebalance_ssm_fraction(mgr, 0.2)
-        initial_slots = mgr.get_ssm_states(0).shape[0]
+        initial_slots = _backed_ssm_slots(mgr)
+        state_view = mgr.get_ssm_states(0)
+        conv_view = mgr.get_conv_states(0)
+        assert state_view.shape[0] > initial_slots
         mgr.check_invalid_values_in_kv_cache(fill_with_zero=True)
         cache = mgr.mamba_layer_cache(0)
         seed = getattr(mgr._speculative_state, "rand_seed", None)
@@ -4137,7 +4146,8 @@ def test_v2_hybrid_graph_survives_pool_rebalance(manager_cls, replay, tma_write)
         torch.cuda.synchronize()
         kv.suspend()
         _rebalance_ssm_fraction(mgr, 0.8)
-        assert mgr.get_ssm_states(0).shape[0] > initial_slots
+        assert _backed_ssm_slots(mgr) > initial_slots
+        mgr.check_invalid_values_in_kv_cache(fill_with_zero=True)
         assert kv.resume(stream)
         # Hold lower slots until KVCM allocates one beyond the captured live extent.
         while slot < initial_slots:
@@ -4154,10 +4164,15 @@ def test_v2_hybrid_graph_survives_pool_rebalance(manager_cls, replay, tma_write)
                 torch.cuda.synchronize()
                 kv.suspend()
                 _rebalance_ssm_fraction(mgr, fraction)
+                mgr.check_invalid_values_in_kv_cache(fill_with_zero=True)
                 assert kv.resume(stream)
                 slot = kv.get_ssm_block_base_index(mgr.ssm_layer_group_id)
                 assert slot < initial_slots
             current = mgr.mamba_layer_cache(0)
+            assert mgr.get_ssm_states(0) is state_view
+            assert mgr.get_conv_states(0) is conv_view
+            assert current.temporal is state_view
+            assert current.conv is conv_view
             assert current.temporal.shape == cache.temporal.shape
             assert current.temporal.data_ptr() == cache.temporal.data_ptr()
             if seed is not None:
@@ -4180,7 +4195,7 @@ def test_v2_hybrid_graph_survives_pool_rebalance(manager_cls, replay, tma_write)
                 # The reset kernel must have written the current physical slot, too.
                 assert torch.count_nonzero(mgr.get_ssm_states(0)[slot]) == 0
                 assert torch.count_nonzero(mgr.get_conv_states(0)[slot]) == 0
-        assert mgr.get_ssm_states(0).shape[0] == initial_slots
+        assert _backed_ssm_slots(mgr) == initial_slots
     finally:
         graph.reset()
         for kv in caches:

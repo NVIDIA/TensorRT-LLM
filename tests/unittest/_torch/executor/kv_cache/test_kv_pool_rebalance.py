@@ -399,9 +399,7 @@ class TestPaddingDummies:
         assert exe.model_engine.cuda_graph_runner.padding_dummy_requests == {0: dummy}
 
     @pytest.mark.parametrize("adjust_fails", [False, True])
-    def test_hybrid_views_refresh_before_real_and_padding_requests_resume(
-        self, monkeypatch, adjust_fails
-    ):
+    def test_hybrid_real_and_padding_requests_resume_after_adjust(self, monkeypatch, adjust_fails):
         from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
             MambaHybridCacheManagerV2,
         )
@@ -418,12 +416,11 @@ class TestPaddingDummies:
                 raise OutOfPagesError("partial adjustment")
 
         mgr.impl.adjust.side_effect = adjust
-        mgr.refresh_state_views.side_effect = lambda: events.append("refresh")
         mgr.resume_request.side_effect = (
             lambda req: events.append(("resume", req.py_request_id)) or True
         )
         self._fire(exe, monkeypatch)
-        assert events == ["adjust", "refresh", ("resume", 1), ("resume", 999)]
+        assert events == ["adjust", ("resume", 1), ("resume", 999)]
 
     def test_every_captured_draft_length_is_covered(self, monkeypatch):
         """#16072 retains one dummy per captured draft length, not just one."""
