@@ -141,4 +141,58 @@ void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITenso
         dstMaxNumSequences, numBlocksPerSeq, copyIndexPtr, indexScalesPtr, kvOffsetPtr);
 }
 
+// Build per-layer K/V page tables for the active batch directly from pinned
+// host indices, avoiding a full-table device upload. Each entry selects its
+// source pool and request row, applies the layer/role's scale and offset,
+// and preserves BAD_PAGE_INDEX. The copy writes at most maxBlocks columns
+// per row and runs only when the batch has no active scratch slots.
+__global__ void copyPerLayerBlockOffsetsToDeviceKernel(SizeType32 const* __restrict__ input,
+    SizeType32* __restrict__ output, SizeType32 const* __restrict__ copyIndex,
+    SizeType32 const* __restrict__ converters, SizeType32 sourceRows, SizeType32 outputRows, SizeType32 tableWidth,
+    SizeType32 numLayers, SizeType32 numSeqs, SizeType32 maxBlocks)
+{
+    auto const index = static_cast<SizeType32>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (index >= numLayers * numSeqs * 2 * maxBlocks)
+    {
+        return;
+    }
+    auto const block = index % maxBlocks;
+    auto const role = index / maxBlocks % 2;
+    auto const row = index / (maxBlocks * 2) % numSeqs;
+    auto const layer = index / (maxBlocks * 2 * numSeqs);
+    auto const lane = layer * 2 + role;
+    auto const pool = converters[lane * 3];
+    auto const scale = converters[lane * 3 + 1];
+    auto const offset = converters[lane * 3 + 2];
+    auto const base = input[(static_cast<int64_t>(pool) * sourceRows + copyIndex[row]) * 2 * tableWidth + block];
+    auto const destination = ((static_cast<int64_t>(layer) * outputRows + row) * 2 + role) * tableWidth + block;
+    output[destination] = base == BAD_PAGE_INDEX ? BAD_PAGE_INDEX : base * scale + offset;
+}
+
+void copyPerLayerBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
+    ITensor const& converters, SizeType32 maxBlocks, CUstream stream) noexcept
+{
+    auto const& sourceShape = input.getShape();
+    auto const& outputShape = output.getShape();
+    auto const& converterShape = converters.getShape();
+    TLLM_CHECK(sourceShape.nbDims == 4 && outputShape.nbDims == 4);
+    TLLM_CHECK(sourceShape.d[2] == 2 && outputShape.d[2] == 2);
+    TLLM_CHECK(sourceShape.d[3] == outputShape.d[3]);
+    TLLM_CHECK(converterShape.nbDims == 3 && converterShape.d[0] == outputShape.d[0] && converterShape.d[1] == 2
+        && converterShape.d[2] == 3);
+    TLLM_CHECK(maxBlocks >= 0 && maxBlocks <= sourceShape.d[3]);
+    auto const numSeqs = static_cast<SizeType32>(copyIndex.getShape().d[0]);
+    TLLM_CHECK(numSeqs <= outputShape.d[1]);
+    auto const numLayers = static_cast<SizeType32>(outputShape.d[0]);
+    auto const count = numLayers * numSeqs * 2 * maxBlocks;
+    if (count == 0)
+    {
+        return;
+    }
+    copyPerLayerBlockOffsetsToDeviceKernel<<<divUp(count, 256), 256, 0, stream>>>(
+        input.getBufferPtr<SizeType32 const>(), output.getBufferPtr<SizeType32>(),
+        copyIndex.getBufferPtr<SizeType32 const>(), converters.getBufferPtr<SizeType32 const>(), sourceShape.d[1],
+        outputShape.d[1], sourceShape.d[3], numLayers, numSeqs, maxBlocks);
+}
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

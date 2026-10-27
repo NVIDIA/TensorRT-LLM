@@ -115,6 +115,7 @@ def _make_v1_manager(**attributes: object) -> KVCacheManager:
 
 def _make_v2_manager(**attributes: object) -> KVCacheManagerV2:
     manager = object.__new__(KVCacheManagerV2)
+    manager._use_per_layer_page_tables = False
     for name, value in attributes.items():
         setattr(manager, name, value)
     return manager

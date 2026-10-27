@@ -26,6 +26,7 @@ from copy import deepcopy
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
+import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from transformers import AutoConfig, Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig
@@ -2663,6 +2664,41 @@ class TestGemma4HFComparison(unittest.TestCase):
         torch.testing.assert_close(actual_weights, expected_weights.float())
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "source, window, scratch", [(0, 32, True), (2, 32, True), (0, None, True), (0, 32, False)]
+)
+def test_shared_kv_scratch_requires_last_writer(
+    monkeypatch: pytest.MonkeyPatch, source: int, window: int | None, scratch: bool
+) -> None:
+    from tensorrt_llm._torch.attention.qk_norm_attention import QKNormRoPEAttention
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_swa_scratch_reuse = scratch
+    manager.layer_offsets = {layer: layer for layer in range(5)}
+    manager.pp_layers = list(range(5))
+    manager.max_attention_window_vec = [window] * 5
+    manager.impl = SimpleNamespace(get_layer_group_id=lambda _: 0, layer_grouping=[[0, 2, 4]])
+    attn = object.__new__(Gemma4Attention)
+    torch.nn.Module.__init__(attn)
+    attn.is_kv_shared = True
+    attn._num_kv_writing_layers = 4
+    attn._validated_scratch_source = None
+    attn.attn = SimpleNamespace(layer_idx=source)
+    attn.attention_window_size = window
+    monkeypatch.setattr(
+        QKNormRoPEAttention, "forward", lambda *_, **kwargs: kwargs["hidden_states"]
+    )
+    hidden = torch.empty(0)
+    metadata = SimpleNamespace(kv_cache_manager=manager)
+    if scratch and window is not None and source != 2:
+        with pytest.raises(AssertionError, match="last KV-writing layer"):
+            attn.forward(None, hidden, metadata)
+    else:
+        assert attn.forward(None, hidden, metadata) is hidden
+
+
 class TestGemma4ModelDefaults(unittest.TestCase):
     """Tests for Gemma4 model defaults (get_model_defaults)."""
 
@@ -2786,6 +2822,9 @@ class TestGemma4ModelDefaults(unittest.TestCase):
     def test_model_defaults_follow_architecture(self):
         """Preserve TRTLLM on SM100f and FlashInfer FA2 elsewhere."""
         from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
 
         for is_sm100f, expected in ((True, "TRTLLM"), (False, "FLASHINFER")):
             with (
@@ -2796,31 +2835,38 @@ class TestGemma4ModelDefaults(unittest.TestCase):
                 ),
             ):
                 self.assertEqual(
-                    Gemma4ForCausalLM.get_model_defaults(None)["attn_backend"], expected
+                    Gemma4ForCausalLM.get_model_defaults(llm_args)["attn_backend"], expected
                 )
                 self.assertEqual(
-                    Gemma4ForConditionalGeneration.get_model_defaults(None)["attn_backend"],
+                    Gemma4ForConditionalGeneration.get_model_defaults(llm_args)["attn_backend"],
                     expected,
                 )
 
     def test_causal_lm_does_not_disable_cuda_graphs(self):
         """Gemma4ForCausalLM must not disable CUDA graphs."""
-        defaults = Gemma4ForCausalLM.get_model_defaults(None)
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        defaults = Gemma4ForCausalLM.get_model_defaults(TorchLlmArgs(model="/tmp/dummy_model"))
         self.assertNotIn("cuda_graph_config", defaults)
 
     def test_conditional_gen_does_not_disable_cuda_graphs(self):
         """Gemma4ForConditionalGeneration must not disable CUDA graphs."""
         from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
-        defaults = Gemma4ForConditionalGeneration.get_model_defaults(None)
+        defaults = Gemma4ForConditionalGeneration.get_model_defaults(
+            TorchLlmArgs(model="/tmp/dummy_model")
+        )
         self.assertNotIn("cuda_graph_config", defaults)
 
     def test_external_shared_kv_mtp_defaults_to_flashinfer(self):
         """External shared-KV MTP requires FlashInfer attention metadata."""
         from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, TorchLlmArgs
 
-        spec_dec_mode = SimpleNamespace(is_mtp_eagle_one_model=lambda: True)
-        llm_args = SimpleNamespace(speculative_config=SimpleNamespace(spec_dec_mode=spec_dec_mode))
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model", speculative_config=MTPDecodingConfig(max_draft_len=1)
+        )
 
         for is_sm100f in (True, False):
             with (
@@ -2842,6 +2888,9 @@ class TestGemma4ModelDefaults(unittest.TestCase):
     def test_attn_backend_dispatches_by_architecture(self):
         """Verify architecture defaults dispatch to their intended classes."""
         from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
 
         expected_classes = ((True, "TrtllmAttention"), (False, "FlashInferAttention"))
         for is_sm100f, expected_class in expected_classes:
@@ -2856,7 +2905,7 @@ class TestGemma4ModelDefaults(unittest.TestCase):
                     return_value=is_sm100f,
                 ),
             ):
-                defaults = Gemma4ForCausalLM.get_model_defaults(None)
+                defaults = Gemma4ForCausalLM.get_model_defaults(llm_args)
                 backend_cls = get_attention_backend(defaults["attn_backend"])
                 self.assertEqual(backend_cls.__name__, expected_class)
 

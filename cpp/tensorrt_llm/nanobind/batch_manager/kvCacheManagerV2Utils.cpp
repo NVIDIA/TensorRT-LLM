@@ -155,6 +155,22 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         },
         nb::arg("input"), nb::arg("output"), nb::arg("copy_index"), nb::arg("index_scales"), nb::arg("kv_offset"),
         nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(), "Copy batch block indices to device");
+
+    module.def(
+        "copy_per_layer_block_offsets_to_device",
+        [](at::Tensor input, at::Tensor output, at::Tensor copyIndex, at::Tensor converters, SizeType32 maxBlocks,
+            uintptr_t stream)
+        {
+            auto source = tr::TorchView::of(input);
+            auto destination = tr::TorchView::of(output);
+            auto rows = tr::TorchView::of(copyIndex);
+            auto mapping = tr::TorchView::of(converters);
+            copyPerLayerBlockOffsetsToDevice(
+                *source, *destination, *rows, *mapping, maxBlocks, reinterpret_cast<CUstream>(stream));
+        },
+        nb::arg("input"), nb::arg("output"), nb::arg("copy_index"), nb::arg("converters"), nb::arg("max_blocks"),
+        nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
+        "Gather retained per-layer page indices from pinned host buffers");
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
