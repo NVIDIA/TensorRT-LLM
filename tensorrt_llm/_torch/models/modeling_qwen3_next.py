@@ -51,7 +51,7 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, TensorParallelMode
+from ..modules.linear import Linear, TensorParallelMode, static_fp8_input_scale
 from ..modules.low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -131,6 +131,27 @@ def _precompute_fused_norm_weights(module: nn.Module) -> None:
 def _eager_fusion_enabled(enable_attention_dp: bool) -> bool:
     return (os.environ.get("TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
             and not enable_attention_dp)
+
+
+def _attach_norm_fp8_scales(layer: nn.Module,
+                            input_consumer: Optional[Linear]) -> None:
+    """Let the layer's norms emit FP8 for the static-FP8 Linears they feed.
+
+    The input norm runs as the previous layer's ``next_layer_layernorm``, so
+    its (fp8, bf16) output crosses the layer boundary. Pipeline stages send a
+    plain tensor and Helix all-gathers the attention input, so neither gets it.
+    """
+    enabled = not (layer.mapping.has_pp() or layer.mapping.has_cp_helix())
+    shared_expert = getattr(layer.mlp, "shared_expert", None)
+    for norm, consumer in (
+        (layer.input_layernorm, input_consumer),
+        (layer.post_attention_layernorm,
+         getattr(shared_expert, "gate_up_proj", None)),
+    ):
+        scale = static_fp8_input_scale(consumer) if enabled else None
+        # detach() keeps the consumer's scale Parameter out of the norm's
+        # state_dict while sharing its storage.
+        norm.fp8_scale = None if scale is None else scale.detach()
 
 
 def _experts_excluded_from_quant(model_config: ModelConfig[Qwen3NextConfig],
@@ -337,13 +358,17 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
         lora_params: Optional[dict] = None,
         defer_shared_expert_finalize: bool = False,
     ) -> torch.Tensor | _DeferredSharedExpertFinalize:
+        # A (fp8, bf16) pair carries the shared expert's pre-quantized input.
+        shared_expert_fp8_input = None
+        if isinstance(hidden_states, tuple):
+            shared_expert_fp8_input, hidden_states = hidden_states
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
@@ -356,6 +381,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             hidden_states = torch.nn.functional.pad(
                 hidden_states,
                 (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
+
+        shared_expert_input = hidden_states
+        if (shared_expert_fp8_input is not None and not use_dp_padding
+                and not lora_params):
+            shared_expert_input = shared_expert_fp8_input.view(
+                -1, self.hidden_dim)
 
         if not do_finalize:
             # TODO: support do_finalize == False
@@ -377,7 +408,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         def _compute_shared_output():
             shared_expert_output = self.shared_expert(
-                hidden_states,
+                shared_expert_input,
                 lora_params=lora_params,
             )
             shared_expert_gate_logits = self.shared_expert_gate(hidden_states)
@@ -555,10 +586,16 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
         if self.fusion_config.POST_MOE_FUSION and self.mapping.tp_size > 1:
             self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
 
+    def cache_derived_state(self) -> None:
+        _attach_norm_fp8_scales(self, self.linear_attn.in_proj_qkvz)
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
+
     def forward(
         self,
         position_ids: torch.IntTensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
@@ -568,6 +605,10 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        # The input norm may hand over (fp8, bf16); the mixer takes both.
+        mixer_input = hidden_states
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[1]
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             self.fusion_config.POST_MOE_FUSION = False
@@ -575,7 +616,7 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
         ### FIXME: 1. forward_batch; 2. allreduce
         if hidden_states.shape[0] != 0:
             hidden_states = self.linear_attn(
-                hidden_states,
+                mixer_input,
                 attn_metadata,
                 spec_metadata=spec_metadata,
                 all_reduce_params=AllReduceParams(
@@ -744,10 +785,16 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         if self.fusion_config.POST_MOE_FUSION and self.mapping.tp_size > 1:
             self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
 
+    def cache_derived_state(self) -> None:
+        _attach_norm_fp8_scales(self, self.self_attn.qkv_proj)
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
+
     def forward(
         self,
         position_ids: torch.IntTensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
@@ -758,6 +805,9 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        if isinstance(hidden_states, tuple):
+            # qkv_proj takes the FP8 copy unless LoRA needs the bf16 one.
+            hidden_states = hidden_states[1] if lora_params else hidden_states[0]
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             self.fusion_config.POST_MOE_FUSION = False

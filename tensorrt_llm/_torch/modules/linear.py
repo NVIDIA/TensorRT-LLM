@@ -5108,6 +5108,16 @@ def is_dynamic_nvfp4_input_eligible(linear) -> bool:
             and getattr(linear, "weight_scale_2", None) is not None)
 
 
+def static_fp8_input_scale(linear) -> Optional[torch.Tensor]:
+    """Static FP8 input scale of `linear` if it accepts input already
+    quantized with it, else None; LoRA still needs the 16-bit input."""
+    quant_method = getattr(linear, "quant_method", None)
+    if (not isinstance(quant_method, FP8QDQLinearMethod)
+            or quant_method.requires_unquantized_activation):
+        return None
+    return quant_method.get_static_input_scale(linear)
+
+
 class NVFP4ARCLinearMethod(NVFP4LinearMethod):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
