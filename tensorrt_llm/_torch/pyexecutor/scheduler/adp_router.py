@@ -940,6 +940,30 @@ class ConversationAwareADPRouter(ADPRouter):
             while len(self._conv_last_prompt) > self._max_sessions:
                 self._conv_last_prompt.popitem(last=False)
 
+    def _place_pinned_requests(
+        self,
+        requests: List["RequestQueueItem"],
+        all_ranks_new_requests: Dict[int, List["RequestQueueItem"]],
+        all_ranks_num_active_requests: List[int],
+        max_num_active_requests: int,
+    ) -> List["RequestQueueItem"]:
+        """Place each request that strict affinity pins on its rank.
+
+        Admission reserved a slot on that rank for each of them, so they are
+        placed before every other request. Returns the requests left to place.
+        """
+        remaining: List["RequestQueueItem"] = []
+        for req_item in requests:
+            rank = self.admission_rank(req_item)
+            if rank is None or all_ranks_num_active_requests[rank] >= max_num_active_requests:
+                remaining.append(req_item)
+                continue
+            self._record_target_rank(self._conversation_id(req_item), rank)  # LRU touch
+            self._publish_uncached_estimate(req_item, rank, rank)
+            all_ranks_new_requests[rank].append(req_item)
+            all_ranks_num_active_requests[rank] += 1
+        return remaining
+
     def _assign_new_conversation_explicit_dp_ranks(
         self,
         requests: List["RequestQueueItem"],
@@ -997,6 +1021,18 @@ class ConversationAwareADPRouter(ADPRouter):
 
         sorted_requests = sorted(new_requests, key=get_relax_value)
 
+        # 0) Under strict affinity, place the pinned requests on the slots
+        #    admission reserved for them first, so that neither an explicit
+        #    first turn nor a request whose wait expired can take such a slot
+        #    and push a pinned request onto a rank without its prefix.
+        if self._strict_affinity_max_wait_iters > 0:
+            sorted_requests = self._place_pinned_requests(
+                sorted_requests,
+                all_ranks_new_requests,
+                all_ranks_num_active_requests,
+                max_num_active_requests,
+            )
+
         # 1) Honour an explicit attention_dp_rank for a new conversation and
         #    record that placement. Existing conversations keep their binding.
         remaining_unscheduled = self._assign_new_conversation_explicit_dp_ranks(
@@ -1005,14 +1041,6 @@ class ConversationAwareADPRouter(ADPRouter):
             all_ranks_num_active_requests,
             max_num_active_requests,
         )
-
-        if self._strict_affinity_max_wait_iters > 0:
-            # Admission reserved a slot on the pinned rank of each known
-            # conversation; place those first so a new conversation cannot take
-            # the slot and push the pinned request onto another rank.
-            remaining_unscheduled.sort(
-                key=lambda req_item: self._conversation_id(req_item) not in self._conv_to_rank
-            )
 
         # Only allgathered state and broadcast requests enter the estimate;
         # local KV statistics would make ranks disagree on placement.

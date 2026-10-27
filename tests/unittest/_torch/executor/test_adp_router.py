@@ -1487,6 +1487,7 @@ def _make_conv_request_item(
     item = MagicMock()
     item.id = req_id
     item.child_req_ids = None
+    item.adp_affinity_deferrals = 0
     scheduling_params = MagicMock()
     scheduling_params.attention_dp_rank = target_dp_rank
     scheduling_params.attention_dp_relax = attention_dp_relax
@@ -1676,6 +1677,39 @@ class TestConversationAwareADPRouter:
         else:
             # Without strict affinity the pinned turn overflows off its rank.
             assert pos == {2: 0, 3: 1}
+
+    def test_strict_affinity_expired_wait_does_not_take_a_reserved_slot(self) -> None:
+        """A request whose wait expired is placed after the requests still pinned."""
+        router = ConversationAwareADPRouter(
+            dist=_mock_dist(tp_size=2), strict_affinity_max_wait_iters=3
+        )
+        first_turns = [
+            _make_conv_request_item(1, "A", target_dp_rank=0),
+            _make_conv_request_item(2, "B", target_dp_rank=0),
+        ]
+        assert self._route(router, self._states(2), first_turns) == {1: 0, 2: 0}
+
+        # Rank 0 has one free slot. Admission reserved it for B, which is still
+        # pinned, and admitted A without a reservation because its wait expired.
+        expired = _make_conv_request_item(3, "A")
+        expired.adp_affinity_deferrals = 3
+        pinned = _make_conv_request_item(4, "B")
+        pos = self._route(router, self._states(2, active=[1, 0]), [expired, pinned], cap=2)
+        assert pos == {4: 0, 3: 1}
+
+    def test_strict_affinity_explicit_first_turn_does_not_take_a_reserved_slot(self) -> None:
+        """A relaxed explicit-rank first turn is placed after the pinned requests."""
+        router = ConversationAwareADPRouter(
+            dist=_mock_dist(tp_size=2), strict_affinity_max_wait_iters=3
+        )
+        assert self._route(router, self._states(2), [_make_conv_request_item(1, "A")]) == {1: 0}
+
+        # Rank 0 has one free slot, which admission reserved for A. Admission does
+        # not reserve a slot for a relaxed attention_dp_rank, so N goes elsewhere.
+        explicit = _make_conv_request_item(2, "N", target_dp_rank=0)
+        pinned = _make_conv_request_item(3, "A")
+        pos = self._route(router, self._states(2, active=[1, 0]), [explicit, pinned], cap=2)
+        assert pos == {3: 0, 2: 1}
 
     def test_no_conversation_id_falls_back_and_is_not_recorded(self):
         router = self._router(tp_size=4)
