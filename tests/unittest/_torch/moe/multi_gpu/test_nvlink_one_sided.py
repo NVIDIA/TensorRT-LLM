@@ -905,7 +905,8 @@ def test_lamport_workspace_layout(payload_format: str) -> None:
     assert field(layout, "LAMPORT_MAX_NUM_TOKENS_INDEX") == lamport_tokens
     assert field(layout, "LAMPORT_HIDDEN_SIZE_INDEX") == hidden_size
 
-    with pytest.raises(RuntimeError, match="already has Lamport regions"):
+    # Only a layout fresh from moe_a2a_get_workspace_layout can be extended, once.
+    with pytest.raises(RuntimeError, match="must be a layout from moe_a2a_get_workspace_layout"):
         torch.ops.trtllm.moe_a2a_lamport_extend_workspace_layout(
             layout, lamport_tokens, int(thop.MOE_A2A_LAMPORT_FORMAT_BF16), hidden_size
         )
