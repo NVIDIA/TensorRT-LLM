@@ -100,6 +100,7 @@ class FakeMooncakeStore:
         self.registered: dict[int, int] = {}
         self.put_sessions: set[str] = set()
         self.setup_answer = 0
+        self.closed = False
         self._lock = threading.Lock()
         self._steps: dict[str, deque] = defaultdict(deque)
         self._gates: dict[str, deque[Gate]] = defaultdict(deque)
@@ -139,6 +140,7 @@ class FakeMooncakeStore:
 
     def close(self) -> int:
         self._record("close", (), {})
+        self.closed = True
         return 0
 
     def register_buffer(self, buffer_ptr: int, size: int) -> int:
@@ -281,6 +283,8 @@ class FakeMooncakeStore:
 
     def _answer(self, method, args, kwargs, count, real: Callable[[int], int]) -> list[int]:
         call = self._record(method, args, kwargs)
+        if self.closed and method.startswith("batch_"):
+            return []  # a closed 0.3.13 client answers every batch call with no answer at all
         with self._lock:
             gate = self._gates[method].popleft() if self._gates[method] else None
             step = self._steps[method].popleft() if self._steps[method] else None

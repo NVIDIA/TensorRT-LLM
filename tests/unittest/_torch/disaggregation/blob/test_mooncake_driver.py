@@ -961,6 +961,22 @@ def test_drain_returns_at_once_while_a_revocation_would_block() -> None:
     assert bench.fake.put_sessions == set()
 
 
+def test_close_closes_the_client_even_when_the_revocation_raises() -> None:
+    bench = Bench()
+    bench.fill_sources("put", "A")
+    bench.fake.script(PUT_END, [-901])
+    bench.fake.script(PUT_END, [-901])  # the end and its retry go unanswered
+    bench.run("put", "A")
+    assert bench.driver.drain(WAIT_S) is True
+    bench.driver.unregister(bench.handle)
+    bench.fake.script(PUT_REVOKE, SystemExit())  # escapes every handler
+    with pytest.raises(SystemExit):
+        bench.driver.close()
+    assert len(bench.fake.calls_to("close")) == 1
+    bench.driver.close()  # and is done
+    assert len(bench.fake.calls_to("close")) == 1
+
+
 def test_a_put_whose_worker_thread_exits_leaves_its_session_open_for_close(
     thread_escapes: list[BaseException],
 ) -> None:
@@ -1042,7 +1058,7 @@ def test_close_needs_a_drain_that_returned_true() -> None:
     assert len(bench.fake.calls_to("close")) == 1
 
 
-def test_drain_leaves_the_session_of_an_unprovable_put_to_the_master() -> None:
+def test_an_unprovable_put_leaves_its_session_to_the_master() -> None:
     bench = Bench()
     bench.fake.script(PUT_RANGES, RuntimeError("bad pointer"))
     _, access_ended = bench.run("put", "A")

@@ -157,9 +157,11 @@ _instance_ids = itertools.count()  # names each driver's worker threads
 #
 # NOT_READY here departs from the protocol's "only for a hold the store confirmed": 0.3.13 cannot
 # tell a write in progress from a complete replica it cannot read. -703 answers both, and so does
-# batch_is_exist's 0 after a -705; a session left open after a start that raised may not exist.
-# The usual cause is a write in progress, which as a FAULT would stop every fetch that races a
-# writer and count toward isolation; a replica that stays unreadable costs only its rows.
+# batch_is_exist's 0 after a -705. A session left open after a start that raised may not exist,
+# and once the master frees one after put_start_release_timeout_sec, its key stays NOT_READY for
+# this driver's life, as it is never put again. The usual cause is a write in progress, which as
+# a FAULT would stop every fetch that races a writer and count toward isolation; a replica that
+# stays unreadable costs only its rows.
 _SKIP_RESULTS = {
     # get -703: no complete replica, as while the object is written or once its replica's
     # endpoint went stale
@@ -311,7 +313,8 @@ class MooncakeDriver:
          after ``put_start_release_timeout_sec``.
        - for ``close`` to revoke, once no put runs: any other, such as a start that raised or
          miscounted, an end whose outcome is unknown (``_END_OUTCOME_UNKNOWN``), a revoke that
-         failed, or a put stopped by a raise.
+         failed, or a put stopped by a raise. A put stopped by a raise is unprovable, so no drain
+         returns True and ``close`` never comes: the master frees its sessions.
 
     Args:
         store: An SDK store whose ``setup`` returned 0. The driver takes it over: ``close``
@@ -505,10 +508,11 @@ class MooncakeDriver:
 
     def close(self) -> None:
         """The owner's last step, once a drain returned True and every region is unregistered:
-        tries once to revoke the sessions left for close, then closes the SDK client. Both wait on
-        the master and the unmount with the GIL held, so the owner calls it off the executor loop's
-        thread. A session whose revocation fails is freed by the master after
-        ``put_start_release_timeout_sec``; sessions left to the master are never revoked here."""
+        tries once to revoke the sessions left for close, then closes the SDK client, which takes
+        no call after that. The revocation waits on the master, and closing holds the GIL through
+        the unmount, so the owner calls it off the executor loop's thread. A session whose
+        revocation fails is freed by the master after ``put_start_release_timeout_sec``; sessions
+        left to the master are never revoked here."""
         with self._lock:
             if self._closed:
                 return
@@ -519,13 +523,15 @@ class MooncakeDriver:
             self._closed = True
             left = self._sessions_left_open.items()
             to_revoke = [key for key, by in left if by is _LeftOpen.FOR_CLOSE]
-        if to_revoke:  # no put runs any more, so none of them is in use
-            codes = self._metadata_call(self._store.batch_put_session_revoke, to_revoke)
-            with self._lock:
-                for key, code in zip(to_revoke, codes):
-                    if _session_gone(code):
-                        del self._sessions_left_open[key]
-        self._store.close()
+        try:
+            if to_revoke:  # no put runs any more, so none of them is in use
+                codes = self._metadata_call(self._store.batch_put_session_revoke, to_revoke)
+                with self._lock:
+                    for key, code in zip(to_revoke, codes):
+                        if _session_gone(code):
+                            del self._sessions_left_open[key]
+        finally:
+            self._store.close()
 
     def stats(self) -> dict[str, int]:
         """A snapshot for logs and tests; not part of the driver protocol."""
@@ -614,9 +620,9 @@ class MooncakeDriver:
                 if not self._workers_alive:
                     done = self._end_untaken_rows(self._queued_ops(), _NO_WORKER_LEFT)
                 self._lock.notify_all()  # drain waits for every worker thread to exit
-            # Called after this worker stopped counting, so a drain may return True first. Rows
-            # are left queued only once every worker died of a BaseException that left no
-            # operation unprovable, which only an on_change raising against the protocol does.
+            # Called after this worker stopped counting. A drain returns True before them only
+            # once every worker died of a BaseException that left no operation unprovable, which
+            # only an on_change raising against the protocol does.
             for op in done:
                 self._call_on_change(op)
 
