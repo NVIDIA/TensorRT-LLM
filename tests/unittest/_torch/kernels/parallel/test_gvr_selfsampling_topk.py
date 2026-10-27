@@ -1861,3 +1861,178 @@ def test_prefill_small_envelope_tier0_uses_sampled_plan():
         ss_host.run_prefill(lg, rs, re, out, max_row_len=n)
         torch.cuda.synchronize()
         _check_prefill_exact(lg, out, rs, re, k)
+
+
+# ---------------------------------------------------------------------------
+# live-length admission: rows far shorter than the captured envelope run an
+# embedded register-resident engine inside the frozen gvr_main / gvr_clus plans
+# ---------------------------------------------------------------------------
+
+
+def _rung_window(cfg: tuple) -> int:
+    blk_e, _minb_e, vpt = cfg[0], cfg[1], cfg[2]
+    return 4 * blk_e * vpt
+
+
+def test_selfsampling_varlen_live_admission_policy() -> None:
+    """Host policy: gvr_main embeds the four-rung ladder (two dense sub-CTA rungs,
+    8K, 16K), gvr_clus the 8K rung only, gvr_reg_clus and deterministic plans none;
+    rung windows are unique, ascending and capped at 16K columns."""
+    assert ss_host._live_enabled("main", det=False) and ss_host._live_enabled("clus", det=False)
+    assert not ss_host._live_enabled("reg_clus", det=False)
+    assert not ss_host._live_enabled("main", det=True) and not ss_host._live_enabled(
+        "clus", det=True
+    )
+    for blk, minb in ((1024, 1), (512, 2), (256, 4)):
+        for k in (512, 1024, 2048):
+            ladder = ss_host._reg_escape_cfg(
+                8, k, blk, minb, 148, 100, ladder=ss_host._LIVE_LADDERS["main"]
+            )
+            windows = [_rung_window(c) for c in ladder]
+            assert windows == sorted(set(windows)) and windows[-1] <= 16384, (blk, k, windows)
+            assert all(c[0] <= blk and blk % c[0] == 0 for c in ladder), (blk, ladder)
+            assert all(c[-1] == k for c in ladder)
+            dense = [bool(c[5]) for c in ladder]
+            assert dense == sorted(dense, reverse=True), (blk, k, dense)  # dense rungs first
+    clus = ss_host._reg_escape_cfg(
+        32, 1024, 1024, 1, 148, 100, ladder=ss_host._LIVE_LADDERS["clus"]
+    )
+    assert len(clus) == 1 and _rung_window(clus[0]) == 8192 and not clus[0][5]
+
+
+class _StubDeviceModule:
+    """Stands in for the device module: records every compile request (host-only tests)."""
+
+    STATIC_BYTES = 0
+
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        if not name.startswith("get_compiled"):
+            raise AttributeError(name)
+
+        def record(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            return (name, len(self.calls))
+
+        return record
+
+
+def test_selfsampling_varlen_live_admission_switch(monkeypatch) -> None:
+    """TRTLLM_GVR_V2_LIVE_ADMISSION=0 (parsed into _LIVE_ADMISSION): no family embeds
+    the ladder and the main plan's sampled gate is off; the default embeds both. The
+    launcher runs against a stub device module, so no kernel is compiled."""
+    stub = _StubDeviceModule()
+    monkeypatch.setattr(ss_host, "_dev_mod", stub)
+    main_shape = (12, 262144, 512, 262144, 1, 4)  # rows, npad, k, envelope, next_n, cr
+    clus_shape = (48, 262144, 1024, 262144, 1, 4)
+    try:
+        for enabled in (True, False):
+            monkeypatch.setattr(ss_host, "_LIVE_ADMISSION", enabled)
+            ss_host._VARLEN_CACHE.clear()
+            stub.calls.clear()
+            assert ss_host._live_enabled("main", det=False) is enabled
+            assert ss_host._live_enabled("clus", det=False) is enabled
+            assert ss_host._varlen_launcher(*main_shape)[0] == "main"
+            assert ss_host._varlen_launcher(*clus_shape)[0] == "clus"
+            (name_m, _, kw_m), (name_c, _, kw_c) = stub.calls
+            assert (name_m, name_c) == ("get_compiled", "get_compiled__clus")
+            if enabled:
+                assert len(kw_m["reg_escape"]) == 4 and len(kw_c["reg_escape"]) == 1
+                assert kw_m["live_sample_kmult"] == ss_host._LIVE_SAMPLE_KMULT
+            else:
+                assert kw_m["reg_escape"] is None and kw_c["reg_escape"] is None
+                assert kw_m["live_sample_kmult"] == 0
+    finally:
+        ss_host._VARLEN_CACHE.clear()  # launchers built on the stub must not reach the GPU tests
+
+
+def _check_rows_exact(logits, out, kv_lens, next_n, cr, top_k, tag):
+    ref = _reference_varlen_indices(logits, kv_lens, next_n, cr, top_k)
+    for r in range(logits.shape[0]):
+        row = logits[r]
+        got = row[out[r].long().clamp_min(0)].sort().values
+        want = row[ref[r].long().clamp_min(0)].sort().values
+        assert torch.equal(got, want), f"{tag}: row {r} value multiset mismatch"
+        assert torch.equal(out[r] < 0, ref[r] < 0), f"{tag}: row {r} pad mask mismatch"
+        head = out[r][out[r] >= 0]
+        assert int(torch.unique(head).numel()) == head.numel(), f"{tag}: row {r} duplicates"
+
+
+def _live_admission_case(rows, top_k, live_n, seed):
+    """A 262,144-column envelope (DSv4 cr=4 under a 1M-token engine) with per-row
+    live lengths cycling through `live_n`; poison beyond each row's own length."""
+    cr, npad = 4, 262144
+    gen = torch.Generator(device=_DEV).manual_seed(seed)
+    logits = torch.randn((rows, npad), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
+    kv_lens = torch.empty((rows,), dtype=torch.int32, device=_DEV)
+
+    def refresh(shift):
+        n_rows = [live_n[(r + shift) % len(live_n)] for r in range(rows)]
+        kv_lens.copy_(torch.tensor([n * cr for n in n_rows], dtype=torch.int32, device=_DEV))
+        logits.copy_(
+            torch.randn((rows, npad), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
+        )
+        for r in range(rows):
+            logits[r, n_rows[r] :] = 3e38
+        return n_rows
+
+    return logits, kv_lens, refresh
+
+
+@pytest.mark.parametrize("top_k", [512, 2048], ids=lambda k: f"k{k}")
+def test_selfsampling_varlen_live_admission_main_mixed(top_k: int) -> None:
+    """One frozen gvr_main plan (12 rows, 262,144-column envelope) serving rows at
+    every rung boundary of the ladder (dense 1K / 2K, 8K, 16K), rows just above a
+    rung, rows above the widest rung and a short row, in one launch; then the same
+    plan under CUDA-graph replay while the lengths rotate across the rungs."""
+    rows, cr, msl_c = 12, 4, 262144
+    live_n = [top_k + 1, 1500, 2048, 2049, 4096, 8192, 8193, 12288, 16384, 16385, 40000, 200000]
+    logits, kv_lens, refresh = _live_admission_case(rows, top_k, live_n, seed=top_k)
+    n_rows = refresh(0)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, kv_lens, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    torch.cuda.synchronize()
+    key = _varlen_cache_key(rows, msl_c, top_k, msl_c, 1, cr)
+    assert ss_host._VARLEN_CACHE[key][0] == "main", ss_host._VARLEN_CACHE[key][0]
+    _check_rows_exact(logits, out, kv_lens, 1, cr, top_k, f"eager n={n_rows}")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ss_host.run_varlen(
+            logits, kv_lens, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr
+        )
+    for shift in (1, 5, 11):
+        n_rows = refresh(shift)
+        out.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_rows_exact(logits, out, kv_lens, 1, cr, top_k, f"replay shift={shift} n={n_rows}")
+
+
+def test_selfsampling_varlen_live_admission_clus_mixed() -> None:
+    """The gvr_clus family's single 8K rung: 48 rows under the 262,144-column
+    envelope mixing admitted rows (n <= 8K), rows just above the rung and long
+    rows, eager and under CUDA-graph replay with rotating lengths."""
+    rows, top_k, cr, msl_c = 48, 1024, 4, 262144
+    live_n = [1025, 2000, 4096, 8192, 8193, 16384, 30000, 100000]
+    logits, kv_lens, refresh = _live_admission_case(rows, top_k, live_n, seed=48)
+    n_rows = refresh(0)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, kv_lens, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    torch.cuda.synchronize()
+    key = _varlen_cache_key(rows, msl_c, top_k, msl_c, 1, cr)
+    fam = ss_host._VARLEN_CACHE[key][0]
+    assert fam == "clus", fam
+    _check_rows_exact(logits, out, kv_lens, 1, cr, top_k, f"eager {fam} n={n_rows[:8]}")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ss_host.run_varlen(
+            logits, kv_lens, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr
+        )
+    for shift in (3, 7):
+        n_rows = refresh(shift)
+        out.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_rows_exact(logits, out, kv_lens, 1, cr, top_k, f"replay {fam} shift={shift}")
