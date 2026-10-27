@@ -668,31 +668,33 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         # Only VANILLA supports arbitrary padding between packed modalities.
         self._supports_key_padding_mask = self._attn_backend in ("VANILLA", "FA4")
         quant_algo = model_config.quant_config.quant_algo
-        # TODO: Support calibrated checkpoints in load_weights before enabling static quantization.
-        if quant_algo is not None and not (
+        dynamic_weights = model_config.dynamic_weight_quant
+        # Supported recipes: load-time (dynamic) FP8 / FP8_BLOCK_SCALES / NVFP4
+        # quantization of a BF16 checkpoint, or a pre-quantized ModelOpt NVFP4 or
+        # per-tensor FP8 checkpoint whose quantized weights, scales and calibrated
+        # activation scales are loaded as exported.
+        dynamic_supported = (
             quant_algo in (QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4)
-            and model_config.dynamic_weight_quant
-        ):
-            raise NotImplementedError(
-                "MiniMax-H3 supports BF16, or dynamically quantized FP8 / FP8_BLOCK_SCALES / NVFP4 weights only."
-            )
-        # The released checkpoint keeps proj_in / audio_proj_in / proj_out /
-        # audio_proj_out in FP32 and feeds them FP32 activations.  NVFP4
-        # quantizes them like every other Linear (see ``post_load_weights``),
-        # but ``fp4_quantize`` only accepts fp16/bf16/e4m3, so those FP32
-        # activations would be rejected at the kernel boundary.  Hand those
-        # projections the model dtype instead; FP8 has no such restriction and
-        # keeps its validated FP32 activations.
-        self._projection_act_dtype = (
-            model_config.torch_dtype if quant_algo == QuantAlgo.NVFP4 else torch.float32
+            and dynamic_weights
         )
+        static_supported = quant_algo in (QuantAlgo.NVFP4, QuantAlgo.FP8) and not dynamic_weights
+        if quant_algo is not None and not (dynamic_supported or static_supported):
+            raise NotImplementedError(
+                "MiniMax-H3 supports BF16, dynamically quantized FP8 / FP8_BLOCK_SCALES / "
+                "NVFP4 weights, or a pre-quantized NVFP4 / FP8 checkpoint only."
+            )
         # The dynamic loader does not initialize NVFP4's static activation scale.
-        if quant_algo == QuantAlgo.NVFP4 and not model_config.force_dynamic_quantization:
+        if (
+            quant_algo == QuantAlgo.NVFP4
+            and dynamic_weights
+            and not model_config.force_dynamic_quantization
+        ):
             raise NotImplementedError(
                 f"MiniMax-H3 {quant_algo.name} requires force_dynamic_quantization=True; "
                 "the dynamic loader does not calibrate Linear.input_scale, so the "
                 "static activation-scale path would read an uninitialized scale."
             )
+        self._model_dtype = model_config.torch_dtype
 
         # GatedMLP's BF16 gate/up GEMM with SwiGLU in its epilogue is opt-in
         # because the fused GEMM is slightly slower than cuBLAS at small M. H3's
@@ -962,8 +964,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         if static_context.text_embeds.shape[1] != text_indices.numel():
             raise ValueError("text_indices must contain one entry for every cached text embedding.")
 
-        video_embeds = self.proj_in(hidden_states.to(self._projection_act_dtype))
-        audio_embeds = self.audio_proj_in(audio_hidden_states.to(self._projection_act_dtype))
+        video_embeds = self.proj_in(self._projection_input(self.proj_in, hidden_states))
+        audio_embeds = self.audio_proj_in(
+            self._projection_input(self.audio_proj_in, audio_hidden_states)
+        )
         text_embeds = static_context.text_embeds
         packed_hidden_states = text_embeds.new_zeros(
             (text_embeds.shape[0], sequence_length, text_embeds.shape[-1])
@@ -1042,10 +1046,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             unpad_to=sequence_length,
         )
         video_output = self.proj_out(
-            packed_hidden_states.to(self._projection_act_dtype)
+            self._projection_input(self.proj_out, packed_hidden_states)
         ).index_select(1, video_indices)
         audio_output = self.audio_proj_out(
-            packed_hidden_states.to(self._projection_act_dtype)
+            self._projection_input(self.audio_proj_out, packed_hidden_states)
         ).index_select(1, audio_indices)
 
         if not return_dict:
@@ -1055,15 +1059,27 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             audio_sample=audio_output,
         )
 
-    @staticmethod
-    def _remap_feed_forward_weights(weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    # ``ff.net.0.proj`` tensors whose leading dimension is the fused output
+    # width and therefore split into the ``up`` and ``gate`` halves. Every
+    # other tensor of that module (per-tensor scalars such as ``input_scale``,
+    # ``weight_scale_2`` and FP8's ``weight_scale``, input-side
+    # ``pre_quant_scale``) describes the whole module and is given to both.
+    _FEED_FORWARD_ROW_SPLIT_SUFFIXES = frozenset({"weight", "bias", "weight_scale"})
+
+    @classmethod
+    def _remap_feed_forward_weights(
+        cls, weights: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
         remapped = {}
         for key, value in weights.items():
             if ".ff.net.0.proj." in key:
                 prefix, suffix = key.split("net.0.proj.", maxsplit=1)
-                # Diffusers' SwiGLU stores ``[up, gate]`` while TRT-LLM's
-                # fused GatedMLP consumes ``[gate, up]``.
-                up, gate = value.chunk(2, dim=0)
+                if suffix in cls._FEED_FORWARD_ROW_SPLIT_SUFFIXES and value.dim() > 0:
+                    # Diffusers' SwiGLU stores ``[up, gate]`` while TRT-LLM's
+                    # fused GatedMLP consumes ``[gate, up]``.
+                    up, gate = value.chunk(2, dim=0)
+                else:
+                    up = gate = value
                 remapped[f"{prefix}gate.{suffix}"] = gate
                 remapped[f"{prefix}up.{suffix}"] = up
             else:
@@ -1128,6 +1144,20 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 f"MiniMax-H3 checkpoint is missing {len(missing)} required tensors: "
                 f"{preview}{suffix}"
             )
+
+    def _projection_input(self, projection: Linear, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Cast a media-projection input to the dtype that projection runs in.
+
+        The released checkpoint keeps proj_in / audio_proj_in / proj_out /
+        audio_proj_out in FP32 and feeds them FP32 activations
+        (``post_load_weights``). A quantized projection cannot take FP32:
+        ``fp4_quantize`` accepts fp16/bf16/e4m3 only, so it gets the model
+        dtype instead. Whether a projection is quantized depends on the recipe
+        and on the checkpoint's exclusion list, so decide per module.
+        """
+        if projection.has_any_quant and self._model_dtype is not None:
+            return hidden_states.to(self._model_dtype)
+        return hidden_states.to(torch.float32)
 
     def post_load_weights(self) -> None:
         for module in self.modules():
