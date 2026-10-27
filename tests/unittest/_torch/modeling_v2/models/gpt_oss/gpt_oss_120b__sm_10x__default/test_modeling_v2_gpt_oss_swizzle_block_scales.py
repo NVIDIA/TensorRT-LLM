@@ -5,8 +5,8 @@
 Importing the target package loads ``libth_modeling_v2_gpt_oss.so`` through
 ``_native.load_target_ops``, as routing does: a pass here means the family library
 was built for this GPU, packaged, opened, carries the target, and registered the
-fake. The kernel only moves bytes, so it must match the plain-torch swizzle it
-replaces bit for bit.
+fake. The kernel only moves bytes, so it must match the torch swizzle the loader
+runs on the host bit for bit.
 """
 
 import pytest
@@ -24,26 +24,27 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _reference(s: torch.Tensor) -> torch.Tensor:
-    """The plain-torch swizzle the loader used before the kernel."""
-    e, m, c = s.shape
-    v = s.reshape(e, m // 128, 4, 32, c // 4, 4)
-    return v.permute(0, 1, 4, 3, 2, 5).reshape(e, m, c).contiguous()
-
-
 def test_swizzle_block_scales():
     g = torch.Generator(device="cuda").manual_seed(0)
-    # gpt-oss-120b's FC1 and FC2 scales (FC2's 90 scales per row padded to 96), and no experts.
+    # gpt-oss-120b's FC1 and FC2 scales (FC2's 90 scales per row padded to 96), and no experts:
+    # the kernel, on the device, against the torch permutation the loader runs on the host.
     for shape in ((4, 5888, 92), (3, 384, 96), (0, 128, 4)):
         s = torch.randint(0, 256, shape, generator=g, device="cuda", dtype=torch.uint8)
-        assert torch.equal(weights._swizzle_scales(s), _reference(s)), shape
+        assert torch.equal(weights._swizzle_scales(s).cpu(), weights._swizzle_scales(s.cpu())), (
+            shape
+        )
 
-    strided = torch.zeros(2, 128, 8, device="cuda", dtype=torch.uint8)[:, :, :4]
-    with pytest.raises(RuntimeError, match="contiguous"):
-        native_ops.swizzle_block_scales(strided)
+    def scales(rows, cols):
+        return torch.zeros(2, rows, cols, device="cuda", dtype=torch.uint8)
+
+    for bad, match in (
+        (scales(127, 4), "got rows 127, cols 4"),
+        (scales(128, 6), "got rows 128, cols 6"),
+        (scales(128, 8)[:, :, :4], "contiguous"),
+    ):
+        with pytest.raises(RuntimeError, match=match):
+            native_ops.swizzle_block_scales(bad)
 
     with FakeTensorMode():
-        out = native_ops.swizzle_block_scales(
-            torch.empty(2, 256, 8, device="cuda", dtype=torch.uint8)
-        )
+        out = native_ops.swizzle_block_scales(scales(256, 8))
     assert out.shape == (2, 256, 8) and out.dtype == torch.uint8

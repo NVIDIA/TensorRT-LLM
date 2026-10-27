@@ -64,6 +64,7 @@ def ranks(monkeypatch):
 
 def test_off_and_one_rank_exchange_nothing(ranks):
     assert ranks("off", AssertionError("routing ran under off"), []) is None
+    assert ranks.calls == []
     assert ranks("auto", Target, [], world_size=1) is Target
     assert ranks.calls == []
 

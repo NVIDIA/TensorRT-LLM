@@ -186,9 +186,15 @@ def _fc1_perm(rows: int, device) -> torch.Tensor:
 def _swizzle_scales(s: torch.Tensor) -> torch.Tensor:
     """Per-expert 128x4 block-scale swizzle, viewed back as `[E, M, C]`: the
     byte at `(m, c)` moves to flat offset `(m//128)*512*(C//4) + (c//4)*512
-    + (m%32)*16 + ((m%128)//32)*4 + (c%4)`. This target's own kernel
-    (csrc/swizzleBlockScales.cu) moves it in one pass on the device."""
-    return native_ops.swizzle_block_scales(s)
+    + (m%32)*16 + ((m%128)//32)*4 + (c%4)`. On the device this target's own
+    kernel (csrc/swizzleBlockScales.cu) moves it in one pass; on the host,
+    a torch permutation does."""
+    if s.is_cuda:
+        return native_ops.swizzle_block_scales(s)
+    e, m, c = s.shape
+    assert m % 128 == 0 and c % 4 == 0, (m, c)
+    v = s.reshape(e, m // 128, 4, 32, c // 4, 4)  # (e, m/128, (m%128)/32, m%32, c/4, c%4)
+    return v.permute(0, 1, 4, 3, 2, 5).reshape(e, m, c).contiguous()
 
 
 def _experts(t: torch.Tensor, d) -> torch.Tensor:
