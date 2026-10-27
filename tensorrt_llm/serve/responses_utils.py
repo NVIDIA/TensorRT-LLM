@@ -120,6 +120,10 @@ ENABLE_RESPONSES_DEBUG_MSG = os.environ.get("TRTLLM_RESPONSES_DEBUG") == "1"
 # _get_chat_completion_function_tools and _tool_call_output_item.
 CUSTOM_TOOL_INPUT_ARG = "input"
 
+# Each spelling of a declared tool's name -> (namespace, bare name, custom);
+# see _tool_resolution.
+_ToolResolution = dict[str, Tuple[Optional[str], str, bool]]
+
 
 @dataclass
 class StreamedItem:
@@ -765,16 +769,29 @@ def _warn_once(message: str) -> None:
         logger.warning(message)
 
 
-def _qualified_tool_name(item: dict) -> str:
+def _qualified_tool_name(item: dict,
+                         tool_resolution: Optional[_ToolResolution] = None
+                         ) -> str:
     """The name a replayed tool call is known by.
 
     A namespaced call is reported with its namespace in a separate field,
     but the model was offered the qualified name. Replaying the bare name
     shows it a tool that was never on its list, so it cannot match the call
     to the result that follows.
+
+    A client may echo a call back without its namespace. The namespace is then
+    taken from ``tool_resolution``, the request's declared tools, when exactly
+    one namespaced tool and no top-level tool has that bare name; otherwise
+    the name is replayed as received.
     """
     name = item.get("name") or ""
     namespace = item.get("namespace")
+    if not namespace and tool_resolution:
+        declared_namespace, bare, _ = tool_resolution.get(
+            name, (None, name, False))
+        # Any other spelling already names the tool in full.
+        if bare == name:
+            namespace = declared_namespace
     return f"{namespace}.{name}" if namespace else name
 
 
@@ -953,8 +970,14 @@ def _template_renders(template: str, role: str) -> bool:
 
 
 def _response_output_item_to_chat_completion_message(
-    item: Union[dict, ResponseInputOutputItem]
+    item: Union[dict, ResponseInputOutputItem],
+    tool_resolution: Optional[_ToolResolution] = None,
 ) -> Optional[ChatCompletionMessageParam]:
+    """Convert one Responses input item to a chat message.
+
+    ``tool_resolution`` holds the request's declared tools; a tool call is
+    replayed under the name they offered the model (see _qualified_tool_name).
+    """
     if not isinstance(item, dict):
         item = item.model_dump()
 
@@ -1025,7 +1048,7 @@ def _response_output_item_to_chat_completion_message(
                     "id": item.get("call_id") or item.get("id") or "",
                     "type": "function",
                     "function": {
-                        "name": _qualified_tool_name(item),
+                        "name": _qualified_tool_name(item, tool_resolution),
                         "arguments": item.get("arguments") or "",
                     },
                 }],
@@ -1053,7 +1076,7 @@ def _response_output_item_to_chat_completion_message(
                     "type": "function",
                     "function": {
                         "name":
-                        _qualified_tool_name(item),
+                        _qualified_tool_name(item, tool_resolution),
                         "arguments":
                         json.dumps(
                             {CUSTOM_TOOL_INPUT_ARG: item.get("input") or ""}),
@@ -1166,8 +1189,10 @@ def chat_messages_from_responses_input(
         messages.append({"role": "user", "content": request.input})
     else:
         turn_start = len(messages)
+        tool_resolution = _tool_resolution(request.tools)
         for inp in request.input:
-            message = _response_output_item_to_chat_completion_message(inp)
+            message = _response_output_item_to_chat_completion_message(
+                inp, tool_resolution)
             if message is None:
                 continue
             if _fold_tool_calls_into_open_assistant_turn(
@@ -1951,25 +1976,29 @@ def _create_output_content_harmony(
     return output_content, output_messages
 
 
-def _tool_resolution(
-        tools: Optional[list[Tool]]
-) -> dict[str, Tuple[Optional[str], str, bool]]:
+def _tool_resolution(tools: Optional[list[Tool]]) -> _ToolResolution:
     """Every spelling a parsed call may carry -> (namespace, bare name, custom).
 
     A chat template can only describe a flat list of functions, so a namespaced
     tool is offered to the model as "namespace.tool" and has to be reported back
     with the two parts separated again - that is how the client identifies it.
-    Models write the name back both ways, so the bare name resolves too, but
-    only when exactly one declared tool answers to it.
+    Models write the name back in other spellings too. "namespace::tool", the
+    separator some models are trained on (DeepSeek-V4.1), names the same tool
+    as the dotted spelling. The bare name resolves as well, but only when
+    exactly one declared tool answers to it. Neither spelling displaces a name
+    a tool was declared under.
     """
-    resolved: dict[str, Tuple[Optional[str], str, bool]] = {}
+    resolved: _ToolResolution = {}
     bare_claims: dict[str, list[str]] = {}
+    # "namespace::tool" -> the dotted name it stands for.
+    separator_spellings: dict[str, str] = {}
 
     def claim(exposed: str, namespace: Optional[str], bare: str,
               is_custom: bool) -> None:
         resolved[exposed] = (namespace, bare, is_custom)
         if exposed != bare:
             bare_claims.setdefault(bare, []).append(exposed)
+            separator_spellings[f"{namespace}::{bare}"] = exposed
 
     for tool in tools or []:
         tool_type = getattr(tool, "type", None)
@@ -1992,12 +2021,14 @@ def _tool_resolution(
             continue
         if len(exposed_names) == 1:
             resolved[bare] = resolved[exposed_names[0]]
+    for spelling, exposed in separator_spellings.items():
+        resolved.setdefault(spelling, resolved[exposed])
     return resolved
 
 
 def _tool_call_output_item(
     call,
-    tool_resolution: dict[str, Tuple[Optional[str], str, bool]],
+    tool_resolution: _ToolResolution,
     item_id: Optional[str] = None,
     status: Optional[str] = None,
 ) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:

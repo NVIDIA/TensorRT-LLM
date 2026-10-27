@@ -4,7 +4,6 @@
 import functools
 import math
 import os
-from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
 from typing import (Any, Callable, Dict, Hashable, Iterator, List, Optional,
@@ -94,29 +93,6 @@ def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
             and model.spec_decode_fast_paths)
 
 
-class ModelEngine(ABC):
-
-    @abstractmethod
-    def get_max_num_sequences(self) -> int:
-        raise NotImplementedError
-
-    @abstractmethod
-    def forward(self,
-                scheduled_requests: ScheduledRequests,
-                resource_manager: Optional[ResourceManager],
-                new_tensors_device: Optional[SampleStateTensors],
-                cache_indirection_buffer: Optional[torch.Tensor] = None):
-        raise NotImplementedError
-
-    def warmup(self, resource_manager: Optional[ResourceManager]) -> None:
-        """
-        This method is called after runtime resources are initialized. The
-        resource manager is absent for drivers that allocate none. Override to
-        perform warmup actions: instantiating CUDA graphs, torch.compile, etc.
-        """
-        return
-
-
 # Refit only needs the compile wrapper removed before weights are loaded: the
 # wrapper inserts "_orig_mod" into every parameter path, and load_weights()
 # matches checkpoint tensors by dotted path (modeling_utils.py:1141-1160). With
@@ -150,7 +126,8 @@ def _configure_deep_gemm_pdl() -> None:
     _DEEP_GEMM_PDL_CONFIGURED = True
 
 
-class PyTorchModelEngine(ModelEngine):
+class ModelEngine:
+    """Own model setup and coordinate runner execution and resource lifetimes."""
 
     def __init__(
         self,
@@ -594,7 +571,7 @@ class PyTorchModelEngine(ModelEngine):
             self.max_total_draft_tokens = 0
 
         self._metrics: dict[str, float] = defaultdict(float)
-        self.iter_states = {}
+        self.iter_states: dict[str, Any] = {}
         self.lora_model_config: Optional[LoraModelConfig] = None
         self._lora_owner: Optional[DecoderLoraOwner] = None
         self._lora_model: Optional[torch.nn.Module] = None
@@ -810,27 +787,40 @@ class PyTorchModelEngine(ModelEngine):
         return self._runner.cuda_graph_runner
 
     @property
+    def cuda_graph_batch_sizes(self) -> list[int]:
+        """Return the resolved decode graph batch sizes."""
+        return self._cuda_graph_batch_sizes
+
+    @property
+    def cuda_graph_padding_enabled(self) -> bool:
+        """Return whether decode graph batches are padded to capture sizes."""
+        return self._cuda_graph_padding_enabled
+
+    @property
     def metrics(self) -> dict[str, float]:
         """Return model-engine warmup time metrics."""
         return self._metrics
 
-    def register_forward_pass_callable(self, callable: Callable):
+    def register_forward_pass_callable(self, callable: Callable) -> None:
+        """Install the KV connector hook on the decoder runner."""
         if isinstance(self._runner, DecoderRunner):
             self._runner.forward_pass_callable = callable
 
-    def register_sample_in_graph_callable(self, callable: Optional[Callable]):
+    def register_sample_in_graph_callable(self,
+                                          callable: Optional[Callable]) -> None:
         """Register the hook that samples at the tail of the forward graph."""
         if isinstance(self._runner, DecoderRunner):
             self._runner.sample_in_graph_callable = callable
 
-    def register_beam_histories_callable(self, callable: Optional[Callable]):
+    def register_beam_histories_callable(self,
+                                         callable: Optional[Callable]) -> None:
         """Register where logits post-processors get live beam histories."""
         if isinstance(self._runner, DecoderRunner):
             self._runner.start_beam_histories_callable = callable
 
     def register_sample_type_resolver(self,
                                       resolver: Optional[Callable],
-                                      stage: Optional[Callable] = None):
+                                      stage: Optional[Callable] = None) -> None:
         """Register how a batch maps to its sampling tier, for the graph key."""
         assert isinstance(self._runner, DecoderRunner)
         self._runner.register_sample_type_resolver(resolver, stage)
@@ -1120,8 +1110,8 @@ class PyTorchModelEngine(ModelEngine):
         try:
             self.cleanup()
         except (RuntimeError, AttributeError) as e:
-            logger.warning(
-                "PyTorchModelEngine cleanup failed during destruction: %s", e)
+            logger.warning("ModelEngine cleanup failed during destruction: %s",
+                           e)
 
     def _init_max_seq_len(self):
         # Allow user to override the inferred max_seq_len with a warning.
@@ -1461,7 +1451,7 @@ class PyTorchModelEngine(ModelEngine):
 
         return True
 
-    def wait_for_input_copy(self):
+    def wait_for_input_copy(self) -> None:
         """
         Wait for input preparation and H2D copy of previous iteration before modifying host input,
         otherwise the input of previous iteration will be overwritten.
