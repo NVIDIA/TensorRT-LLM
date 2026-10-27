@@ -29,9 +29,9 @@ Each family builds into one torch-op library, libth_modeling_v2_<family>.so,
 installed next to libth_common.so. Nothing in it is linked into
 libtensorrt_llm.so or libth_common.so; the Python loader
 (tensorrt_llm/_torch/_experimental/modeling_v2/_native.py) opens it only when
-routing picks one of the family's targets. modeling_v2/NATIVE.md is the guide
-for authors; cpp/tensorrt_llm/modeling_v2/ holds only what every family shares
-(this discovery, the common/ macros).
+routing picks one of the family's targets. The "Native code" section of the
+modeling_v2 README is the guide for authors; cpp/tensorrt_llm/modeling_v2/
+holds only what every family shares (this discovery, the common/ macros).
 
 A family's csrc/CMakeLists.txt uses three functions; names are the Python
 package names:

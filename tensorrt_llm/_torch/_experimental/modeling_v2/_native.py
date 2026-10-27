@@ -26,7 +26,7 @@ load, or lacks an op a ``fake_ops.py`` declares, is a :class:`NativeLoadError`,
 never a fallback. The family's ``fake_ops.py`` registers when the library opens, a
 target's when the target is found in it.
 
-``NATIVE.md`` next to this module is the guide for authors.
+The "Native code" section of the modeling_v2 README is the guide for authors.
 """
 
 from __future__ import annotations
