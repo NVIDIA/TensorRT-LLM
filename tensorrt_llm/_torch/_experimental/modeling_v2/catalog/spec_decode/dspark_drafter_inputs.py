@@ -32,7 +32,11 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+# acc_stride and nacc_ptr depend on the step's batch composition (the accepted-token buffer's row stride; a view
+# starting after the context requests), so Triton's divisibility-16 specialization of either would compile a new
+# variant at a batch shape warmup never ran (a post-ready late compile, seen at 3 scheduled requests). Both feed
+# scalar per-program loads only, so not specializing them costs nothing.
+@triton.jit(do_not_specialize=["acc_stride"], do_not_specialize_on_alignment=["nacc_ptr"])
 def _inputs_kernel(
     acc_ptr,  # accepted tokens [n, acc_stride] (int32 / int64)
     acc_stride,
