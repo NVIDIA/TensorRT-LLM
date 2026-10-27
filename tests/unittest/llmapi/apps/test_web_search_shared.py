@@ -307,3 +307,59 @@ def test_web_search_is_accepted_only_without_external_access(tool, rejected):
     if rejected:
         external = tool.get("external_web_access") if isinstance(tool, dict) else True
         assert f"tool type 'web_search', external_web_access={external!r}" in reason
+
+
+@pytest.mark.parametrize("provider", [None, "wikipedia"])
+@pytest.mark.parametrize(
+    "tool",
+    [
+        {"type": "web_search"},
+        {"type": "web_search", "external_web_access": True},
+        SimpleNamespace(type="web_search", external_web_access=True, filters=None),
+    ],
+)
+def test_the_ignore_policy_serves_a_web_search_the_server_cannot_honour(
+    monkeypatch, tool, provider
+):
+    """TRTLLM_WEB_SEARCH_UNAVAILABLE=ignore: a deployment whose clients always attach the tool.
+
+    The request is served instead of rejected, with or without a provider; the
+    tool is not offered to the model (see the next test).
+    """
+    monkeypatch.setenv("TRTLLM_WEB_SEARCH_UNAVAILABLE", "ignore")
+    if provider:
+        monkeypatch.setenv("TRTLLM_WEB_SEARCH", provider)
+    from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
+
+    assert web_search_rejection_reason([tool]) is None
+
+
+def test_the_ignore_policy_does_not_offer_the_tool_to_the_model(monkeypatch):
+    monkeypatch.setenv("TRTLLM_WEB_SEARCH_UNAVAILABLE", "ignore")
+    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+    from tensorrt_llm.serve.responses_utils import _get_chat_completion_function_tools
+    from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
+
+    request = ResponsesRequest(
+        model="m",
+        input="hi",
+        tools=[
+            {"type": "web_search", "external_web_access": True},
+            {"type": "function", "name": "exec_command", "parameters": {"type": "object"}},
+        ],
+    )
+
+    assert web_search_rejection_reason(request.tools) is None
+    offered = [tool.function.name for tool in _get_chat_completion_function_tools(request.tools)]
+    assert offered == ["exec_command"]
+
+
+@pytest.mark.parametrize("value", ["reject", " REJECT ", "", "drop"])
+def test_any_other_policy_rejects(monkeypatch, value):
+    """The default, an explicit "reject", and an unknown value all reject."""
+    monkeypatch.setenv("TRTLLM_WEB_SEARCH_UNAVAILABLE", value)
+    from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
+
+    reason = web_search_rejection_reason([{"type": "web_search"}])
+    assert reason is not None
+    assert "no web search provider" in reason
