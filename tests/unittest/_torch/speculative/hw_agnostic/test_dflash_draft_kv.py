@@ -61,14 +61,14 @@ def test_default_dflash_resolves_auto_before_choosing_its_draft_cache(
         ("NIXL", "0", "off", "VANILLA"),
         ("NIXL", "1", "off", "AUTO"),
         ("NIXL", None, "off", "AUTO"),
-        (None, "0", "auto", "VANILLA"),
+        (None, "0", "auto", "AUTO"),
         (None, "0", "off", "AUTO"),
     ],
 )
-def test_auto_keeps_vanilla_where_trtllm_is_refused_or_bypassed(
+def test_auto_keeps_vanilla_where_trtllm_is_refused(
     tmp_path, monkeypatch, transceiver, shared, modeling_v2, resolved
 ) -> None:
-    """Workers keeping a private draft KV refuse TRTLLM; modeling_v2 DFlash compositions need VANILLA."""
+    """Workers keeping a private draft KV refuse TRTLLM; modeling_v2 resolves AUTO like any deployment."""
     from tensorrt_llm.llmapi import CacheTransceiverConfig, TorchLlmArgs, llm_args
 
     # No GPU: whatever stays AUTO is left to the ranks' windowed-and-probe rule.
