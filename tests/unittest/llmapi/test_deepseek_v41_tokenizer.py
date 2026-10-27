@@ -311,6 +311,21 @@ def test_apply_chat_template_passes_through_reasoning_effort(effort, budget):
     assert f"Reasoning Effort: {budget} (range 1-100," in prompt
 
 
+@pytest.mark.parametrize(
+    "effort, budget",
+    [("minimal", 25), ("low", 50), ("medium", 62), ("high", 75), ("xhigh", 87), ("max", 100)],
+)
+def test_apply_chat_template_places_openai_effort_levels_on_the_budget(effort, budget):
+    """OpenAI's level names reach the renderer as budgets; the renderer itself stays strict."""
+    tokenizer = DeepseekV41Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "q"}], thinking=True, reasoning_effort=effort
+    )
+
+    assert f"Reasoning Effort: {budget} (range 1-100," in prompt
+
+
 def test_apply_chat_template_tokenizes_the_rendered_prompt():
     dummy = _DummyTokenizer()
     tokenizer = DeepseekV41Tokenizer(dummy)

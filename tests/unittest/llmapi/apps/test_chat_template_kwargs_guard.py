@@ -469,6 +469,45 @@ class TestServerInjectedControls:
         )
         assert rendered == "rendered"
 
+    @pytest.mark.parametrize(
+        "reasoning, expected",
+        [
+            (None, {}),
+            # The Codex CLI sends a reasoning object without an effort.
+            ({"context": "all_turns"}, {"thinking": True}),
+            ({"effort": "medium"}, {"reasoning_effort": "medium", "thinking": True}),
+            ({"effort": "none"}, {"thinking": False}),
+        ],
+    )
+    def test_responses_reasoning_object_sets_thinking(self, reasoning, expected):
+        from types import SimpleNamespace
+
+        from tensorrt_llm.serve.responses_utils import reasoning_chat_template_kwargs
+
+        request = SimpleNamespace(
+            chat_template_kwargs=None,
+            reasoning=None
+            if reasoning is None
+            else SimpleNamespace(effort=reasoning.get("effort"), context=reasoning.get("context")),
+        )
+
+        assert reasoning_chat_template_kwargs(request) == expected
+
+    def test_responses_caller_thinking_wins_over_the_reasoning_object(self):
+        from types import SimpleNamespace
+
+        from tensorrt_llm.serve.responses_utils import (
+            reasoning_chat_template_kwargs,
+            reasoning_injected_chat_template_keys,
+        )
+
+        request = SimpleNamespace(
+            chat_template_kwargs={"thinking": False}, reasoning=SimpleNamespace(effort=None)
+        )
+
+        assert reasoning_chat_template_kwargs(request) == {"thinking": False}
+        assert reasoning_injected_chat_template_keys(request) == frozenset()
+
     def test_responses_caller_supplied_effort_stays_strict(self):
         # A client that passes `reasoning_effort` itself picked that key, so
         # the guard still judges it against the template.
