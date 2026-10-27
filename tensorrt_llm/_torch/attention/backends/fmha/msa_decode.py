@@ -199,9 +199,7 @@ class MsaDecodeFmha(PhasedFmha):
                 k_global_scale=k_scale,
                 v_global_scale=v_scale,
             )
-        # q may still be FP8 from a fused producer; the kernel widens it
-        # in-register, so it is passed through as it arrives.
-        minimax_m3_sparse_attn_decode(
+        decode_args = (
             params.query_input.view(num_tokens, attn.num_heads, head_dim),
             k_paged,
             v_paged,
@@ -213,11 +211,29 @@ class MsaDecodeFmha(PhasedFmha):
             ),
             block_table,
             seq_lens,
+        )
+        decode_kwargs = dict(
             sm_scale=(head_dim**-0.5) / float(attn.q_scaling),
             output=params.output.view(num_tokens, attn.num_heads, head_dim),
             decode_query_len=params.input_seq_length,
             **nvfp4_args,
         )
+        if nvfp4_args:
+            from ..sparse.minimax_m3.kernels import msa_v1_decode
+
+            # Opt-in MiniMax MSA-v1 Q8KV4 kernel; it declines any call outside
+            # its contract, and the kernel below runs instead.
+            if msa_v1_decode.is_enabled() and msa_v1_decode.try_decode(
+                *decode_args,
+                plan_cache=params.meta.fmha_plan_caches.setdefault(
+                    msa_v1_decode.PLAN_CACHE_KEY, {}
+                ),
+                **decode_kwargs,
+            ):
+                return
+        # q may still be FP8 from a fused producer; the kernel widens it
+        # in-register, so it is passed through as it arrives.
+        minimax_m3_sparse_attn_decode(*decode_args, **decode_kwargs)
 
     def _run_dense(
         self,
