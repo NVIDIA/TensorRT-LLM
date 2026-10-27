@@ -16,6 +16,7 @@
  */
 
 #include "kvCacheManagerV2TestUtils.h"
+#include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/config.h"
 
@@ -44,6 +45,23 @@ TEST(KvCacheManagerV2ConfigTest, ExistingBufferConfigurationDefaultsToDense)
     EXPECT_FALSE(buffer.isSparse);
     EXPECT_EQ(buffer.tokensPerBlockOverride, 2);
     EXPECT_NO_THROW(makeConfig().validate());
+}
+
+TEST(KvCacheManagerV2ConfigTest, ReuseMatchAlignmentMustDivideTokensPerBlock)
+{
+    auto config = makeConfig();
+    ASSERT_EQ(config.tokensPerBlock, 4);
+    EXPECT_EQ(config.reuseMatchAlignment, 1);
+    for (int const alignment : {1, 2, 4})
+    {
+        config.reuseMatchAlignment = alignment;
+        EXPECT_NO_THROW(config.validate()) << "alignment " << alignment;
+    }
+    for (int const alignment : {0, -4, 3, 8})
+    {
+        config.reuseMatchAlignment = alignment;
+        EXPECT_THROW(config.validate(), AssertionError) << "alignment " << alignment;
+    }
 }
 
 TEST(KvCacheManagerV2ConfigTest, SparseBuffersRequireHostMemoryAtLevelOne)
