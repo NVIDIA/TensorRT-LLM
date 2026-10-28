@@ -128,6 +128,8 @@ def _drafter(tp_size=1, tp_rank=0, comm=None, fc=None, all_reduce=True, row_para
         layers=[_layer(all_reduce, row_parallel) for _ in range(2)], norm=_norm()
     )
     drafter.fc = _fc() if fc is None else fc
+    drafter._fc_input_slice = None
+    drafter._fc_all_reduce = None
     drafter.hidden_norm = _hidden_norm()
     drafter.decode_comm = comm
     drafter._k3_zero_rows = None

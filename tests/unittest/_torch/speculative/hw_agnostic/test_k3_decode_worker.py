@@ -94,6 +94,7 @@ def _worker(cls=KimiK3DFlashWorker, **attrs):
     worker = cls.__new__(cls)
     nn.Module.__init__(worker)
     worker.guided_decoder = None
+    worker._vocab_parallel = None
     for name, value in attrs.items():
         setattr(worker, name, value)
     return worker
