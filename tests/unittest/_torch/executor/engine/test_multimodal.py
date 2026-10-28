@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -12,10 +13,12 @@ from _torch.executor.multimodal_utils import (
     make_mm_request,
 )
 
+import tensorrt_llm
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
+    _build_request_multimodal_input,
 )
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
     MultimodalItemScheduler,
@@ -44,6 +47,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MultimodalEncoderCudaGraphConfig,
     MultimodalEncoderSchedulingPolicy,
 )
+from tensorrt_llm.mapping import Mapping
 
 # The item-scheduling surface is pure logic: no kernels, no device transfers.
 pytestmark = pytest.mark.cpu_only
@@ -224,7 +228,6 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     item_scheduling: bool,
 ) -> None:
     from tensorrt_llm._torch.pyexecutor import _util, model_engine
-    from tensorrt_llm.mapping import Mapping
 
     class Encoder(torch.nn.Module, MultimodalEncoderMixin):
         encoder_cuda_graph_modality = "vision"
@@ -819,3 +822,59 @@ def test_cache_hit_only_request_omits_raw_inputs_from_llm_payload() -> None:
     torch.testing.assert_close(multimodal_data["multimodal_embedding"], torch.ones(2, 2))
     # Only the per-forward payload drops the raw inputs.
     assert "image" in request.py_multimodal_data
+
+
+class MultimodalSetupTestCase(unittest.TestCase):
+    def test_build_request_multimodal_input_skips_when_cache_disabled(self) -> None:
+        request = LlmRequest(
+            request_id=1,
+            max_new_tokens=1,
+            input_tokens=[0, 1, 2],
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(1),
+            is_streaming=False,
+            multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            multimodal_positions=[1],
+            multimodal_lengths=[1],
+            multimodal_uuids=["image-0"],
+        )
+
+        # With the encoder cache disabled, nothing consumes `multimodal_input`,
+        # so it should not be built at all.
+        self.assertIsNone(_build_request_multimodal_input(request, cache_enabled=False))
+
+    def test_multimodal_encoder_max_seq_len(self) -> None:
+        class CapturingEncoder(torch.nn.Module, MultimodalEncoderMixin):
+            def __init__(self) -> None:
+                super().__init__()
+                self.setup_args = None
+                self.max_seq_len = None
+
+            def setup_attn_metadata(self, max_num_tokens: int) -> None:
+                self.setup_args = max_num_tokens
+
+            def set_attn_max_seq_len(self, max_seq_len: int) -> None:
+                self.max_seq_len = max_seq_len
+
+        encoder_max_num_tokens = 16384
+        processor_max_num_tokens = 65536
+        cases = [
+            ({"image": processor_max_num_tokens}, processor_max_num_tokens),
+            ({"image": 4096}, encoder_max_num_tokens),
+            ({}, encoder_max_num_tokens),
+            (None, encoder_max_num_tokens),
+        ]
+        for max_tokens_per_item, expected_max_seq_len in cases:
+            with self.subTest(max_tokens_per_item=max_tokens_per_item):
+                encoder = CapturingEncoder()
+                if max_tokens_per_item is None:
+                    input_processor = Mock()
+                else:
+                    input_processor = Mock(spec=BaseMultimodalDummyInputsBuilder)
+                    input_processor.get_mm_max_tokens_per_item.return_value = max_tokens_per_item
+
+                setup_mm_encoder_attn_metadata(
+                    torch.nn.Sequential(encoder), input_processor, encoder_max_num_tokens, None
+                )
+
+                self.assertEqual(encoder.setup_args, encoder_max_num_tokens)
+                self.assertEqual(encoder.max_seq_len, expected_max_seq_len)

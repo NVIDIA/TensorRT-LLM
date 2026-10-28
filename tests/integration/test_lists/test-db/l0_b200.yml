@@ -288,7 +288,7 @@ l0_b200:
   # One-model speculative decoding step-copy kernels and the engine's decode
   # step that runs them (SM 100; they skip on other GPUs).
   - unittest/_torch/kernels/test_spec_step_copies.py
-  - unittest/_torch/executor/test_pytorch_model_engine.py -k "test_spec_decode_graph_step_gather_kernel"
+  - unittest/_torch/executor/engine/runners/decoder/test_inputs.py -k "test_spec_decode_graph_step_gather_kernel"
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
