@@ -118,9 +118,9 @@ Quantizing these operands naively costs accuracy. Across the nine benchmarks of 
 
 NVFP4 MLA therefore keeps one NVFP4 component for NoPE and adds a second FP4 component only for RoPE, holding the quantization error of the first:
 
-$$\widehat{E}_R = \mathcal{Q}_{1\times16}\left(C_R - \widehat{C}_R\right)$$
+$$\widehat E_R = \mathcal Q_{1\times16}\left(C_R - \widehat C_R\right)$$
 
-where $C_R$ is the RoPE part of the cache, $\widehat{C}_R$ its NVFP4 base, and $\mathcal{Q}_{1\times16}$ NVFP4 quantization in 1×16 blocks. The residual uses the same blocks as the RoPE base, with its own scales. Compensating these 64 of the 576 channels lowers the mean reconstruction error (normalized mean squared error, NMSE) of the whole cache by **44.4%** on DeepSeek-R1 and **72.2%** on Kimi K3, with NoPE unchanged. On the RoPE channels themselves, the error drops by 66.8x and 70.4x, to 3.3x and 4.0x below that of keeping RoPE in FP8.
+where $C_R$ is the RoPE part of the cache, $\widehat C_R$ its NVFP4 base, and $\mathcal Q_{1\times16}$ NVFP4 quantization in 1×16 blocks. The residual uses the same blocks as the RoPE base, with its own scales. Compensating these 64 of the 576 channels lowers the mean reconstruction error (normalized mean squared error, NMSE) of the whole cache by **44.4%** on DeepSeek-R1 and **72.2%** on Kimi K3, with NoPE unchanged. On the RoPE channels themselves, the error drops by 66.8x and 70.4x, to 3.3x and 4.0x below that of keeping RoPE in FP8.
 
 <div align="center">
 <figure>
@@ -131,7 +131,7 @@ where $C_R$ is the RoPE part of the cache, $\widehat{C}_R$ its NVFP4 base, and $
 
 Why an FP4 residual instead of keeping RoPE in FP8, which would also fix the error? Because the residual keeps BMM1 a **single** block-scaled FP4 matrix multiplication. The kernel stores the base and the residual as separate FP4 tiles, places them side by side along the reduction dimension, and repeats the RoPE query in front of both:
 
-$$S = \left[\,\widehat{q}_N,\ \widehat{q}_R,\ \widehat{q}_R\,\right]\left[\,\widehat{C}_N,\ \widehat{C}_R,\ \widehat{E}_R\,\right]^{\mathsf T} = \widehat{q}_N\widehat{C}_N^{\mathsf T} + \widehat{q}_R\left(\widehat{C}_R + \widehat{E}_R\right)^{\mathsf T}$$
+$$S = \left[\widehat{q}_N,\ \widehat{q}_R,\ \widehat{q}_R\right]\left[\widehat{C}_N,\ \widehat{C}_R,\ \widehat{E}_R\right]^{\mathsf T} = \widehat{q}_N\widehat{C}_N^{\mathsf T} + \widehat{q}_R\left(\widehat{C}_R + \widehat{E}_R\right)^{\mathsf T}$$
 
 BMM1 is thus one FP4 matrix multiply-accumulate (MMA) over 640 channels with one operand format and one scale layout, and the base and the residual are never merged into a wider tensor. An FP8 RoPE part would need a second MMA at the FP8 rate, with its own operand format and scale layout, and it would also be less accurate. The residual costs 36 bytes per token and layer (32 bytes of values and 4 bytes of scales), 10% of the cache, and it affects BMM1 only, because RoPE does not enter BMM2.
 
