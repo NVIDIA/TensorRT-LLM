@@ -541,8 +541,12 @@ class TestJsonlWriterSurvival:
             real_write(data)
 
         monkeypatch.setattr(writer, "_write", write_failing_once)
+        # Both records are queued before the writer task next runs, so they share one batch.
+        first = _record()
+        first["request_id"] = "41"
+        writer.submit(first)
         writer.submit(_record())
-        await _wait_until(lambda: writer.dropped_records == 1 or writer._task.done())
+        await _wait_until(lambda: writer.dropped_records > 0 or writer._task.done())
         assert not writer._task.done(), "a failed batch write must not end the writer task"
 
         survivor = _record()
@@ -551,8 +555,23 @@ class TestJsonlWriterSurvival:
         await writer.close()
 
         assert _written_request_ids(tmp_path) == [43]
-        assert writer.dropped_records == 1
-        assert any("RuntimeError" in message for message in logged_errors)
+        assert writer.dropped_records == 2, "every record in the failed batch counts as dropped"
+        assert any(
+            "Dropped 2 performance metrics record(s) that failed to write (RuntimeError" in message
+            for message in logged_errors
+        )
+
+    def test_unexpected_errors_are_logged_first_then_every_thousandth(self, logged_errors):
+        writer = PerfMetricsJsonlWriter(None, "test")
+        logged_at = []
+        for count in range(1, 2001):
+            num_logged = len(logged_errors)
+            writer._drop_after_unexpected_error(1, "write", RuntimeError("disk gone"))
+            if len(logged_errors) > num_logged:
+                logged_at.append(count)
+
+        assert logged_at == [1, 1000, 2000]
+        assert writer.dropped_records == 2000
 
     @pytest.mark.asyncio
     async def test_close_still_cancels_a_stuck_write(self, tmp_path, monkeypatch):
