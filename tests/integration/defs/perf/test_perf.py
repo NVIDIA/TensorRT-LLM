@@ -33,7 +33,8 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
 
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
-from ..conftest import get_device_count, llm_models_root, trt_environment
+from ..conftest import (get_device_count, get_gpu_device_list, llm_models_root,
+                        trt_environment)
 from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
 from .pytorch_model_config import get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
@@ -61,6 +62,11 @@ NEMOTRON_SUPER_MODELS = {
     "nemotron_3.5_lightning_30b_nvfp4_mtp",
     "nemotron_3.5_lightning_30b_bf16_mtp",
 }
+
+# Models that run out of memory on H100 at the default KV cache fraction, mapped
+# to the largest fraction they run with there. The profiled KV budget leaves
+# too little free memory for the eager full-batch logits.float() allocation.
+_H100_KV_CACHE_FRACTION_CAPS = {"qwen3.5_122b_a10b": 0.8}
 
 KIMI_K3_MODELS = {"kimi_k3"}
 DEEPSEEK_V41_MODELS = {
@@ -958,6 +964,23 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def get_test_name(self) -> str:
         return str(self._config)
 
+    def _get_kv_cache_free_gpu_mem_fraction(self) -> float:
+        """KV cache fraction to run with.
+
+        Keeps the test name, and thus its perf history, unchanged while capping
+        the fraction for models that are known to run out of memory on H100
+        at the default.
+        """
+        fraction = self._config.kv_cache_free_gpu_mem_fraction
+        cap = _H100_KV_CACHE_FRACTION_CAPS.get(self._config.model_name)
+        if cap is not None and cap < fraction and any(
+                "H100" in gpu for gpu in get_gpu_device_list()):
+            print_info(f"Capping kv_cache_free_gpu_mem_fraction "
+                       f"{fraction} -> {cap} for {self._config.model_name} "
+                       f"on H100.")
+            return cap
+        return fraction
+
     def set_runtime_configs(self,
                             llm_root,
                             working_dir,
@@ -1134,7 +1157,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f"--max_batch_size={self._config.max_batch_size}",
             f"--max_num_tokens={self._config.max_num_tokens}",
             f"--report_json={report_path}",
-            f"--kv_cache_free_gpu_mem_fraction={self._config.kv_cache_free_gpu_mem_fraction}",
+            f"--kv_cache_free_gpu_mem_fraction={self._get_kv_cache_free_gpu_mem_fraction()}",
         ]
         benchmark_cmd += [f"--backend={self._config.backend}"]
         if self._config.num_reqs > 0:
@@ -1201,7 +1224,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         serve_config.setdefault('max_num_tokens', self._config.max_num_tokens)
         kv_cache_cfg = serve_config.setdefault('kv_cache_config', {})
         kv_cache_cfg.setdefault('free_gpu_memory_fraction',
-                                self._config.kv_cache_free_gpu_mem_fraction)
+                                self._get_kv_cache_free_gpu_mem_fraction())
         if self._config.tp_size > 1:
             serve_config.setdefault('tensor_parallel_size',
                                     self._config.tp_size)
