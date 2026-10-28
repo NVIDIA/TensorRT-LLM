@@ -6283,6 +6283,7 @@ class CheckpointIOPolicy(StrEnum):
     AUTO = "auto"
     NATIVE = "native"
     RANK_STRIPED_READ_AHEAD = "rank_striped_read_ahead"
+    MODEL_STREAMER = "model_streamer"
 
 
 class LoadFormat(Enum):
@@ -6950,7 +6951,11 @@ class TorchLlmArgs(BaseLlmArgs):
         "'native' preserves the existing loader. "
         "'rank_striped_read_ahead' lets node-local ranks read disjoint "
         "SafeTensors extents while native mapping, materialization, and H2D "
-        "continue. Incompatible configurations select native I/O before "
+        "continue. 'model_streamer' streams node-selected SafeTensors to GPU "
+        "using Model Streamer (Kimi K3 only; requires load_format='AUTO', "
+        "checkpoint_format='HF', and a wheel with tensor_names support). "
+        "Model Streamer rejects unsupported configurations. For auto and "
+        "rank_striped_read_ahead, incompatible configurations select native I/O before "
         "optimized reader or collective setup. Runtime-ineligible loads fall "
         "back to native before model mutation.",
         status="prototype",
@@ -7818,6 +7823,24 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = CheckpointFormat.HF
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_model_streamer_config(self) -> 'TorchLlmArgs':
+        if self.checkpoint_io_policy != CheckpointIOPolicy.MODEL_STREAMER:
+            return self
+        if self.load_format != LoadFormat.AUTO:
+            raise ValueError(
+                "checkpoint_io_policy='model_streamer' requires load_format='AUTO'"
+            )
+        if self.checkpoint_loader is not None or self.checkpoint_format != CheckpointFormat.HF:
+            raise ValueError(
+                "checkpoint_io_policy='model_streamer' requires the built-in HF "
+                "checkpoint loader (checkpoint_format='HF')")
+        if self.is_partial_model_loading:
+            raise ValueError(
+                "checkpoint_io_policy='model_streamer' does not support partial model loading"
+            )
         return self
 
     @model_validator(mode="after")
