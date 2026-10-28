@@ -56,7 +56,8 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import FP8QDQLinearMethod, Linear, TensorParallelMode
 from ..modules.low_m_gemm import (_should_apply_low_m_gemm, apply_low_m_gemm,
                                   low_m_gemm_dispatcher, prepare_low_m_gemm)
-from ..modules.low_m_mma_gemm import (low_m_mma_gemm, swiglu_pairs,
+from ..modules.low_m_mma_gemm import (fused_shared_expert,
+                                      fused_shared_expert_weights,
                                       warp_mma_supported)
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.multi_stream_utils import (do_multi_stream,
@@ -531,12 +532,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 and not FORCE_SEPARATED_ROUTING)
 
     def _shared_expert_low_m_weights(self):
-        """Weights of the shared expert's two-launch low-M path, built from the loaded (rescaled) weights.
-
-        Decode-sized batches can run the FP8 shared expert as two low-M launches: (1) gate_up with the SwiGLU in
-        the epilogue (FP8 output at down_proj's input scale) plus shared_expert_gate as a BF16 segment; (2)
-        down_proj. The gate_up rows are re-paired into a copy; the original stays for larger batches. A rebuild
-        (weight reload) writes into the existing copies, whose addresses captured graphs hold.
+        """Weights of the shared expert's two-launch low-M path (``fused_shared_expert``), built from the loaded
+        (rescaled) weights, or None when the shared expert does not qualify. A rebuild (weight reload) writes
+        into the existing copies, whose addresses captured graphs hold.
         """
         mlp = self.shared_expert
         gate_up = getattr(mlp, "gate_up_proj", None)
@@ -554,22 +552,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 return None
         if (mlp.activation is not torch.nn.functional.silu
                 or not mlp._is_plain_swiglu() or mlp.swiglu_limit is not None
-                or gate.weight.dtype != torch.bfloat16
-                or gate.weight.shape[0] != 1 or gate.bias is not None):
+                or gate.bias is not None):
             return None
-        inter, k = gate_up.weight.shape[0] // 2, gate_up.weight.shape[1]
-        if inter % 8 or k % 64 or down.weight.shape[1] % 64:
-            return None
-        pairs = swiglu_pairs(gate_up.weight.data)
-        gate_w = torch.zeros((8, k),
-                             dtype=gate.weight.dtype,
-                             device=gate.weight.device)
-        gate_w[:1].copy_(gate.weight)
-        if self._shared_expert_low_m is not None:
-            self._shared_expert_low_m[0].copy_(pairs)
-            self._shared_expert_low_m[1].copy_(gate_w)
-            return self._shared_expert_low_m
-        return pairs, gate_w
+        return fused_shared_expert_weights(gate_up.weight.data,
+                                           gate.weight,
+                                           down.weight,
+                                           out=self._shared_expert_low_m)
 
     def _shared_expert_low_m_forward(self, x: torch.Tensor):
         """(shared expert output, gate logits [M, 1]) from two warp-MMA launches, where the low-M race picked
@@ -582,49 +570,17 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         dispatcher = low_m_gemm_dispatcher(gate_up)
         if dispatcher is None:
             return None
-        m = x.shape[0]
-        gate_up_scale = gate_up.quant_method.get_static_input_scale(gate_up)
-        down_scale = down.quant_method.get_static_input_scale(down)
-        gate_up_tactic = dispatcher.warp_mma_tactic(m, gate_up.weight,
-                                                    gate_up.weight_scale,
-                                                    gate_up_scale)
-        # down_proj takes the E4M3 SwiGLU output, as in the plain MLP.
-        down_tactic = dispatcher.warp_mma_tactic(m,
-                                                 down.weight,
-                                                 down.weight_scale,
-                                                 down_scale,
-                                                 quantize=False)
-        if gate_up_tactic is None or down_tactic is None:
-            return None
-        k_warps, n_tiles, ksplit, swap, min_blocks = gate_up_tactic
-        if n_tiles % 2:
-            # A SwiGLU segment's CTAs hold whole (gate, up) tile pairs.
-            n_tiles *= 2
-            if gate_up.weight.shape[0] % (8 * n_tiles):
-                return None
-        pairs, gate_w = weights
-        inter = pairs.shape[0] // 2
-        hidden, gate_logits = low_m_mma_gemm(
-            x16=x,
-            w_fp8=pairs,
-            weight_scale=gate_up.weight_scale,
-            input_scale=gate_up_scale,
-            swiglu_fp8=True,
-            w_bf16=gate_w,
-            split_out=inter,
-            n_valid=inter + 1,
-            out_scale=down_scale,
-            out_dtype=x.dtype,
-            tactic=(k_warps, n_tiles, ksplit, swap, min_blocks),
-        )
-        out = low_m_mma_gemm(x8=hidden,
-                             w_fp8=down.weight,
-                             weight_scale=down.weight_scale,
-                             input_scale=down_scale,
-                             fp8_act="fp8",
-                             out_dtype=x.dtype,
-                             tactic=down_tactic)
-        return out, gate_logits
+        return fused_shared_expert(
+            dispatcher,
+            x,
+            weights,
+            gate_up_weight=gate_up.weight,
+            gate_up_weight_scale=gate_up.weight_scale,
+            gate_up_input_scale=gate_up.quant_method.get_static_input_scale(
+                gate_up),
+            down_weight=down.weight,
+            down_weight_scale=down.weight_scale,
+            down_input_scale=down.quant_method.get_static_input_scale(down))
 
     def forward(
         self,

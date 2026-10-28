@@ -3,7 +3,8 @@
 """Launcher of the low-M warp-MMA GEMM (``kernels/blackwell/low_m_mma_gemm``) and its tactic heuristic.
 
 Plain projections reach it through the low-M GEMM race of ``modules/low_m_gemm.py``; fused users (GDN input
-projection + conv, shared-expert SwiGLU, GEMM + all-reduce) launch it with the tactic that race picked.
+projection + conv, shared-expert SwiGLU (``fused_shared_expert``), GEMM + all-reduce) launch it with the
+tactic that race picked.
 """
 
 from __future__ import annotations
@@ -454,11 +455,116 @@ def swiglu_pairs(gate_up: torch.Tensor) -> torch.Tensor:
     return torch.stack((gate, up), dim=1).reshape(rows, k).contiguous()
 
 
+def fused_shared_expert_weights(
+    gate_up_weight: torch.Tensor,
+    gate_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Weights of :func:`fused_shared_expert` for a SwiGLU MLP with a sigmoid gate, or None when the shapes do
+    not fit the kernel.
+
+    Args:
+        gate_up_weight: [2I, K] E4M3, rows ``[gate; up]``. down_weight: [H, I] E4M3.
+        gate_weight: [1, K] BF16 weight of the gate.
+        out: the result of an earlier call, rewritten in place (captured graphs hold its addresses).
+
+    Returns:
+        (gate_up in ``swiglu_pairs`` order, gate weight zero-padded to one 8-row tile); the originals stay
+        for larger batches.
+    """
+    rows, k = gate_up_weight.shape
+    if (
+        rows % 16
+        or k % 64
+        or down_weight.shape[1] % 64
+        or gate_weight.dtype != torch.bfloat16
+        or tuple(gate_weight.shape) != (1, k)
+    ):
+        return None
+    pairs = swiglu_pairs(gate_up_weight)
+    gate_rows = torch.zeros((8, k), dtype=gate_weight.dtype, device=gate_weight.device)
+    gate_rows[:1].copy_(gate_weight)
+    if out is None:
+        return pairs, gate_rows
+    out[0].copy_(pairs)
+    out[1].copy_(gate_rows)
+    return out
+
+
+def fused_shared_expert(
+    dispatcher,
+    x: torch.Tensor,
+    weights: Tuple[torch.Tensor, torch.Tensor],
+    *,
+    gate_up_weight: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    gate_up_input_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    down_input_scale: torch.Tensor,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """(MLP output, gate logits [M, 1]) of a SwiGLU MLP with a sigmoid gate in two launches, or None.
+
+    (1) gate_up with the SwiGLU in the epilogue (E4M3 output at ``down_input_scale``) plus the gate as a BF16
+    segment; (2) down_proj on that E4M3 output. Each launch takes the warp-MMA tactic ``dispatcher``'s low-M
+    race picked for the plain projection (BF16 input for gate_up, E4M3 for down_proj), so it runs only where
+    the plain path would run this kernel; None when the race picked another runner or the gate_up tactic has
+    no SwiGLU form.
+
+    Args:
+        dispatcher: the ``LowMGemmDispatcher`` of the projections.
+        x: [M, K] BF16.
+        weights: :func:`fused_shared_expert_weights` of the projections.
+    """
+    gate_up_tactic = dispatcher.warp_mma_tactic(
+        x.shape[0], gate_up_weight, gate_up_weight_scale, gate_up_input_scale
+    )
+    down_tactic = dispatcher.warp_mma_tactic(
+        x.shape[0], down_weight, down_weight_scale, down_input_scale, quantize=False
+    )
+    if gate_up_tactic is None or down_tactic is None:
+        return None
+    pairs, gate_rows = weights
+    k_warps, n_tiles, ksplit, swap, min_blocks = _tactic3(gate_up_tactic)
+    if n_tiles % 2:
+        # A SwiGLU segment's CTAs hold whole (gate, up) tile pairs.
+        n_tiles *= 2
+        if pairs.shape[0] % (8 * n_tiles):
+            return None
+    inter = pairs.shape[0] // 2
+    hidden, gate_logits = low_m_mma_gemm(
+        x16=x,
+        w_fp8=pairs,
+        weight_scale=gate_up_weight_scale,
+        input_scale=gate_up_input_scale,
+        swiglu_fp8=True,
+        w_bf16=gate_rows,
+        split_out=inter,
+        n_valid=inter + 1,
+        out_scale=down_input_scale,
+        out_dtype=x.dtype,
+        tactic=(k_warps, n_tiles, ksplit, swap, min_blocks),
+    )
+    out = low_m_mma_gemm(
+        x8=hidden,
+        w_fp8=down_weight,
+        weight_scale=down_weight_scale,
+        input_scale=down_input_scale,
+        fp8_act="fp8",
+        out_dtype=x.dtype,
+        tactic=down_tactic,
+    )
+    return out, gate_logits
+
+
 __all__ = [
     "MAX_M",
     "candidate_tactics",
     "conv_supported",
     "default_tactic",
+    "fused_shared_expert",
+    "fused_shared_expert_weights",
     "low_m_mma_gemm",
     "swiglu_pairs",
     "warp_mma_supported",
