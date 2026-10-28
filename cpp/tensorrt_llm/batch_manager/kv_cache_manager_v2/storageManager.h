@@ -295,8 +295,17 @@ public:
     TypedVec<PoolGroupIndex, float> toPoolGroupRatio(
         CacheLevel level, TypedVec<LifeCycleId, float> const& lifeCycleRatio) const;
 
-    // Apply stored min_slots constraint to a ratio list for GPU level.
+    // Apply the stored min_slots constraint and fixed slot counts to a ratio list for GPU level.
     TypedVec<PoolGroupIndex, float> constrainPoolGroupRatio(TypedVec<PoolGroupIndex, float> const& ratio) const;
+
+    // Fixed slot count of each hot-tier pool group (see KVCacheManagerConfig::maxLiveKvCaches). Ratio-based
+    // sizing at construction, in adjustCacheLevel() and in tuner targets leaves these groups at that size.
+    FixedSlotCounts const& fixedSlotCounts() const noexcept
+    {
+        return mFixedSlots;
+    }
+
+    bool hasFixedPoolGroups() const noexcept;
 
     // Byte address of a slot's buffer in GPU memory (per-layer, with offset).
     MemAddress getMemPoolBaseAddress(LayerId layerId, DataRole role) const;
@@ -379,7 +388,8 @@ private:
 
     TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-        TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
+        TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+        FixedSlotCounts const& fixedSlots = {}) const;
     size_t minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
 
@@ -464,7 +474,10 @@ private:
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotDesc>> mSlotDescLists;
     // Slot sizes per (level, pool group), built from mSlotDescLists.
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>>> mSlotSizes;
+    // Hot-tier slot floors; a fixed-capacity group's floor is its fixed slot count.
     TypedVec<PoolGroupIndex, SlotCount> mMinSlots;
+    // Hot-tier fixed slot counts, one entry per pool group.
+    FixedSlotCounts mFixedSlots;
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
     RetentionExpiryQueue mRetentionExpiries;

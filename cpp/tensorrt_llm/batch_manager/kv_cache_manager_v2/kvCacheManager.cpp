@@ -201,6 +201,13 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    // Suspended caches count: they keep their private SSM pages, which the fixed pool sizes for this bound.
+    if (mConfig.maxLiveKvCaches.has_value() && mLivingKvCaches.size() >= static_cast<size_t>(*mConfig.maxLiveKvCaches))
+    {
+        throw LogicError("Cannot create a KV cache: " + std::to_string(mLivingKvCaches.size())
+            + " living (active or suspended) KV caches already reach max_live_kv_caches="
+            + std::to_string(*mConfig.maxLiveKvCaches) + "; close one first");
+    }
     if (!priorityCb)
     {
         priorityCb = [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; };

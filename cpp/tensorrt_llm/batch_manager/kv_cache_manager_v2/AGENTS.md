@@ -309,6 +309,23 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
 - Every cache level has storage and a per-level eviction controller; each pool
   group has a priority-sorted set of LRU queues. Lower priority is evicted first,
   then least-recently-used within that priority.
+- Hot-tier pool groups are sized by ratio: per-lifecycle demand (from
+  `initialPoolRatio`, `typicalStep`, `constraints` or the tuner's averages)
+  becomes a byte ratio that splits the GPU quota above the constraint floors in
+  `mMinSlots`. `CacheLevelStorage::ratioToSlotCountList` does this at
+  construction, in `adjustCacheLevel()` (`resize()`/`adjust()`) and for tuner
+  targets (`constrainPoolGroupRatio()`). When `maxLiveKvCaches` is set, the
+  PRIVATE SSM lifecycle instead gets a pool group of its own with a fixed
+  capacity of `ceil(maxLiveKvCaches / maxUtilForResume)` slots
+  (`StorageConfig::fixedSlotCounts`): its pages never enter the radix tree and
+  each living cache holds exactly one, so that capacity keeps the group at or
+  below the resume gate. All three call sites take fixed groups out of the quota
+  first and split the rest by ratio; their ratio entries are ignored, `adjust()`
+  never resizes them, and their tuner target is their actual size.
+  `createKvCache()` enforces the bound (suspended caches count) and
+  `setBeamWidth()` rejects widths above one. Other PRIVATE lifecycles, such as
+  windowed attention, stay ratio-sized because their per-cache demand depends on
+  sequence length; cold tiers are sized as before.
 - `NodeRef` is a stable `std::list` iterator, but only within the exact
   `LRUEvictionPolicy` that issued it. Iterators from different lists are not
   comparable or interchangeable.

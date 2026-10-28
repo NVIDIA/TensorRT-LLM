@@ -927,10 +927,12 @@ size_t CacheLevelStorage::grainsForSlots(
 TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size_t quota,
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& sizeLists,
     TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
-    TypedVec<PoolGroupIndex, SlotCount> const& minSlots)
+    TypedVec<PoolGroupIndex, SlotCount> const& minSlots, FixedSlotCounts const& fixedSlots)
 {
     PoolGroupIndex numPg = sizeLists.size();
     TLLM_CHECK_DEBUG(ratioList.size() == numPg);
+    TLLM_CHECK_WITH_INFO(fixedSlots.empty() || fixedSlots.size() == numPg,
+        "ratioToSlotCountList: fixed slot counts must be empty or cover every pool group");
     TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(ratioList.begin(), ratioList.end(), [](auto x) { return x > 0; }),
         "ratioToSlotCountList: all ratios must be positive");
     TLLM_CHECK_DEBUG(quota % granularity == 0);
@@ -946,8 +948,23 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
 
     TypedVec<PoolGroupIndex, SlotCount> slotCntList(numPg, 0);
     size_t remainingGrains = totalGrains;
-    std::vector<PoolGroupIndex> activePgs(toSizeT(numPg));
-    std::iota(activePgs.begin(), activePgs.end(), PoolGroupIndex{0});
+    auto const isFixed = [&fixedSlots](PoolGroupIndex pgIdx) { return !fixedSlots.empty() && fixedSlots[pgIdx]; };
+    std::vector<PoolGroupIndex> activePgs;
+    activePgs.reserve(toSizeT(numPg));
+    for (PoolGroupIndex pgIdx{0}; pgIdx < numPg; ++pgIdx)
+    {
+        if (!isFixed(pgIdx))
+        {
+            activePgs.push_back(pgIdx);
+            continue;
+        }
+        // Fixed groups take their exact slot count before the ratio distribution sees the quota.
+        SlotCount const numSlots = *fixedSlots[pgIdx];
+        size_t const used = grainsForSlots(numSlots, sizeLists[pgIdx], granularity);
+        TLLM_CHECK_WITH_INFO(used <= remainingGrains, "Insufficient quota for fixed-capacity pool groups");
+        remainingGrains -= used;
+        slotCntList[pgIdx] = numSlots;
+    }
 
     // Iteratively peel off constrained PGs until all active PGs are
     // unconstrained:
@@ -1042,9 +1059,11 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
 
     // _g2s may under-count slots due to imperfect grain distribution
     // across pools. Try bumping each PG's slot count while it still fits
-    // within the same grain budget.
+    // within the same grain budget. Fixed groups keep their exact count.
     for (PoolGroupIndex pgIdx{0}; pgIdx < sizeLists.size(); ++pgIdx)
     {
+        if (isFixed(pgIdx))
+            continue;
         size_t grainsNow = grainsForSlots(slotCntList[pgIdx], sizeLists[pgIdx], granularity);
         while (grainsForSlots(slotCntList[pgIdx] + 1, sizeLists[pgIdx], granularity) <= grainsNow)
             slotCntList[pgIdx] += 1;
@@ -1056,11 +1075,11 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
 // Instance convenience wrapper.
 TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::computeSlotCountList(
     TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
-    std::optional<size_t> quota) const
+    std::optional<size_t> quota, FixedSlotCounts const& fixedSlots) const
 {
     size_t q = quota.value_or(totalQuota());
     TLLM_CHECK_DEBUG(ratioList.size() == mPoolGroups.size());
-    return ratioToSlotCountList(q, slotSizeLists(), ratioList, poolSizeGranularity(), minSlots);
+    return ratioToSlotCountList(q, slotSizeLists(), ratioList, poolSizeGranularity(), minSlots, fixedSlots);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

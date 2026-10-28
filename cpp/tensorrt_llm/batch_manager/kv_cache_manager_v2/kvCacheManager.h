@@ -127,7 +127,8 @@ public:
 
     // ---- KvCache creation -------------------------------------------------
 
-    // Create a new KvCache. Returned cache is SUSPENDED; call resume() with a stream.
+    // Create a new KvCache. Returned cache is SUSPENDED; call resume() with a stream. Throws LogicError
+    // when KVCacheManagerConfig::maxLiveKvCaches caches are already living (not yet closed).
     // input_tokens:         optional sequence to match against existing cached blocks.
     // priorityCb:           optional priority override per block.
     // expectedPromptLength: full prompt token count marking the prefill->generation boundary.

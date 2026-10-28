@@ -136,6 +136,7 @@ class _KVCacheManagerConfigFieldSpec:
     enable_partial_commit: bool = True
     pool_rebalance: object = None
     cold_tier_offload_min_priority: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
+    max_live_kv_caches: object = None
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__

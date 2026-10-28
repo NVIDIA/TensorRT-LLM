@@ -24,6 +24,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -234,6 +235,99 @@ TEST(KvCacheManagerV2ConfigTest, SsmBufferReusePoliciesSplitLayerLifecycles)
     EXPECT_NE(grouping[required], grouping[privateLc]);
     EXPECT_NE(grouping[required], grouping[optional]);
     EXPECT_NE(grouping[privateLc], grouping[optional]);
+}
+
+TEST(KvCacheManagerV2ConfigTest, MaxLiveKvCachesMustBePositive)
+{
+    auto config = makeConfig();
+    EXPECT_FALSE(config.maxLiveKvCaches.has_value());
+    for (int const value : {1, 64})
+    {
+        config.maxLiveKvCaches = value;
+        EXPECT_NO_THROW(config.validate());
+    }
+    for (int const value : {0, -1})
+    {
+        config.maxLiveKvCaches = value;
+        EXPECT_THROW(config.validate(), std::invalid_argument);
+    }
+
+    // The fixed private SSM capacity divides by max_util_for_resume.
+    config.maxLiveKvCaches = 8;
+    for (float const util : {0.0F, -0.5F, 1.5F})
+    {
+        config.maxUtilForResume = util;
+        EXPECT_THROW(config.validate(), std::invalid_argument);
+    }
+    config.maxUtilForResume = 1.0F;
+    EXPECT_NO_THROW(config.validate());
+}
+
+TEST(KvCacheManagerV2ConfigTest, MaxLiveKvCachesGivesPrivateSsmLifecycleAFixedPoolGroup)
+{
+    using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeReservedSsmConfig;
+    LifeCycleId const attention{0};
+    LifeCycleId const requiredSsm{1};
+    LifeCycleId const privateSsm{2};
+    LifeCycleId const privateAttention{3};
+
+    // Without the bound the PRIVATE SSM and PRIVATE attention lifecycles share a pool group of equal slots.
+    auto const elastic = createStorageConfig(makeReservedSsmConfig(32 << 20, std::nullopt));
+    auto const elasticGrouping = elastic.lifeCycleGrouping();
+    EXPECT_EQ(elasticGrouping.raw(),
+        (std::vector<PoolGroupIndex>{PoolGroupIndex{0}, PoolGroupIndex{1}, PoolGroupIndex{2}, PoolGroupIndex{2}}));
+    ASSERT_EQ(elastic.fixedSlotCounts.size(), PoolGroupIndex{3});
+    for (auto const& fixed : elastic.fixedSlotCounts)
+    {
+        EXPECT_FALSE(fixed.has_value());
+    }
+
+    // ceil(N / maxUtilForResume) slots, in a group of its own; the other groups keep their order.
+    for (auto const& [maxUtilForResume, expectedSlots] : {std::pair{0.97F, 9}, std::pair{0.8F, 10}, std::pair{1.0F, 8}})
+    {
+        SCOPED_TRACE(maxUtilForResume);
+        auto config = makeReservedSsmConfig(32 << 20, 8);
+        config.maxUtilForResume = maxUtilForResume;
+        ASSERT_NO_THROW(config.validate());
+        auto const reserved = createStorageConfig(config);
+        auto const grouping = reserved.lifeCycleGrouping();
+        EXPECT_EQ(reserved.slotDescList.size(), PoolGroupIndex{4});
+        EXPECT_EQ(grouping[attention], PoolGroupIndex{0});
+        EXPECT_EQ(grouping[requiredSsm], PoolGroupIndex{1});
+        EXPECT_EQ(grouping[privateAttention], PoolGroupIndex{2});
+        EXPECT_EQ(grouping[privateSsm], PoolGroupIndex{3});
+        EXPECT_EQ(reserved.slotDescList[grouping[privateSsm]].variants.size(), 1U);
+        EXPECT_EQ(reserved.slotDescList[grouping[privateSsm]].slotSizeList(),
+            reserved.slotDescList[grouping[privateAttention]].slotSizeList());
+        ASSERT_EQ(reserved.fixedSlotCounts.size(), PoolGroupIndex{4});
+        for (PoolGroupIndex pgIdx{0}; pgIdx < reserved.fixedSlotCounts.size(); ++pgIdx)
+        {
+            if (pgIdx == grouping[privateSsm])
+            {
+                EXPECT_EQ(reserved.fixedSlotCounts[pgIdx], std::optional<SlotCount>{expectedSlots});
+            }
+            else
+            {
+                EXPECT_FALSE(reserved.fixedSlotCounts[pgIdx].has_value());
+            }
+        }
+    }
+
+    // The bound alone changes nothing without a PRIVATE SSM lifecycle.
+    auto config = makeReservedSsmConfig(32 << 20, 8);
+    for (auto& layer : config.layers)
+    {
+        if (auto* ssm = std::get_if<SsmLayerConfig>(&layer))
+        {
+            ssm->buffers.back().reusePolicy.reset();
+        }
+    }
+    auto const withoutPrivateSsm = createStorageConfig(config);
+    EXPECT_EQ(withoutPrivateSsm.slotDescList.size(), PoolGroupIndex{3});
+    for (auto const& fixed : withoutPrivateSsm.fixedSlotCounts)
+    {
+        EXPECT_FALSE(fixed.has_value());
+    }
 }
 
 } // namespace

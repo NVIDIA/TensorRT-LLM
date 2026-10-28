@@ -502,7 +502,8 @@ public:
     // for new beams and are shared through cache indirection; the writable tail,
     // including preallocated blocks, is copied from beam 0. The boundary is
     // expectedPromptLength from createKvCache(). Decreasing the width discards
-    // the removed alternatives.
+    // the removed alternatives. Widths greater than one are rejected when
+    // maxLiveKvCaches gives the private SSM layer group a fixed capacity.
     void setBeamWidth(BeamIndex beamWidth);
 
     CUstream cudaStream() const;

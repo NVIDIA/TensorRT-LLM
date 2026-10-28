@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Python bindings for native OPTIONAL selection; storage contracts live in C++."""
 
+import dataclasses
 import time
 from datetime import timedelta
 
@@ -376,4 +377,89 @@ def test_scratch_addresses_with_unequal_buffer_membership(split):
             assert all(end <= following for (_, end), (following, _) in zip(spans, spans[1:]))
     finally:
         cache.close()
+        manager.shutdown()
+
+
+def _split_ssm_layers():
+    return [
+        kv.AttentionLayerConfig(layer_id=0, buffers=[kv.BufferConfig(role="key", size=4096)]),
+        *[
+            kv.SsmLayerConfig(
+                layer_id=i,
+                buffers=[
+                    kv.BufferConfig(role="state", size=4096),
+                    kv.BufferConfig(role="conv", size=4096),
+                    kv.BufferConfig(role="old_x", size=2048, reuse_policy=kv.ReusePolicy.PRIVATE),
+                ],
+            )
+            for i in (1, 2)
+        ],
+    ]
+
+
+def _bounded_config(quota=16 << 20, **kwargs):
+    return kv.KVCacheManagerConfig(
+        tokens_per_block=4,
+        cache_tiers=[kv.GpuCacheTierConfig(quota=quota)],
+        layers=_split_ssm_layers(),
+        commit_min_snapshot=True,
+        enable_partial_commit=False,
+        **kwargs,
+    )
+
+
+def test_max_live_kv_caches_config():
+    config = _bounded_config()
+    assert config.max_live_kv_caches is None
+    config = _bounded_config(max_live_kv_caches=8)
+    assert config.max_live_kv_caches == 8
+    # The executor's config helpers rebuild configs with dataclasses.replace().
+    assert dataclasses.replace(config, enable_stats=False).max_live_kv_caches == 8
+    config.max_live_kv_caches = None
+    assert config.max_live_kv_caches is None
+    for value in (0, -1):
+        with pytest.raises(ValueError, match="max_live_kv_caches must be positive"):
+            _bounded_config(max_live_kv_caches=value)
+    with pytest.raises(ValueError, match="max_util_for_resume"):
+        _bounded_config(max_live_kv_caches=8, max_util_for_resume=1.5)
+
+
+def test_max_live_kv_caches_reserves_private_ssm_pool():
+    stream = torch.cuda.Stream()
+    # ceil(4096 / 0.8) private slots of 4 KiB do not fit in 16 MiB.
+    with pytest.raises(ValueError, match="max_live_kv_caches"):
+        kv.KVCacheManager(_bounded_config(max_util_for_resume=0.8, max_live_kv_caches=4096))
+    manager = kv.KVCacheManager(_bounded_config(max_util_for_resume=0.8, max_live_kv_caches=4))
+    caches = []
+    try:
+        private = manager.get_buffer_group_id(1, "old_x")
+        pools = manager.get_life_cycle_pool_group_indices(0)
+        assert len(set(pools)) == len(pools)
+        # ceil(4 / 0.8) slots, whatever share the ratio would give the group.
+        assert manager.get_storage_statistics(0)[pools[private]].total == 5
+        assert manager.get_quota(0) == 16 << 20
+
+        for _ in range(4):
+            caches.append(manager.create_kv_cache(input_tokens=[]))
+            assert caches[-1].resume(stream.cuda_stream)
+            assert caches[-1].resize(8)
+        with pytest.raises(kv.LogicError, match="max_live_kv_caches=4"):
+            manager.create_kv_cache(input_tokens=[])
+        for cache in caches:
+            cache.suspend()
+        with pytest.raises(kv.LogicError, match="max_live_kv_caches=4"):
+            manager.create_kv_cache(input_tokens=[])
+        for cache in caches:
+            assert cache.resume(stream.cuda_stream)
+        stats = manager.get_storage_statistics(0)[pools[private]]
+        assert (stats.total, stats.free) == (5, 1)
+        with pytest.raises(ValueError, match="beam_width"):
+            caches[0].beam_width = 2
+
+        caches.pop(0).close()
+        caches.append(manager.create_kv_cache(input_tokens=[]))
+        assert caches[-1].resume(stream.cuda_stream)
+    finally:
+        for cache in caches:
+            cache.close()
         manager.shutdown()

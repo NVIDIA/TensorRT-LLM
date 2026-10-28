@@ -580,14 +580,17 @@ public:
     // Compute slot counts per pool group for a given ratio, min_slots, and optional quota.
     // Instance convenience method — delegates to the static version below.
     TypedVec<PoolGroupIndex, SlotCount> computeSlotCountList(TypedVec<PoolGroupIndex, float> const& ratioList,
-        TypedVec<PoolGroupIndex, SlotCount> const& minSlots, std::optional<size_t> quota = std::nullopt) const;
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots, std::optional<size_t> quota = std::nullopt,
+        FixedSlotCounts const& fixedSlots = {}) const;
 
     // Static version: compute slot counts from quota, slot size lists, ratio, granularity, and min_slots.
-    // Mirrors Python CacheLevelStorage.ratio_to_slot_count_list.
+    // A pool group with a fixed slot count gets exactly that many slots, taken from the quota first; the
+    // rest of the quota is distributed among the other groups by ratio, and fixed groups' ratios are
+    // ignored. Mirrors Python CacheLevelStorage.ratio_to_slot_count_list, which has no fixed groups.
     static TypedVec<PoolGroupIndex, SlotCount> ratioToSlotCountList(size_t quota,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         TypedVec<PoolGroupIndex, float> const& ratioList, size_t granularity,
-        TypedVec<PoolGroupIndex, SlotCount> const& minSlots);
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots, FixedSlotCounts const& fixedSlots = {});
 
     // Distribute grains among pools within a pool group.
     // Returns {num_slots, grains_consumed}.

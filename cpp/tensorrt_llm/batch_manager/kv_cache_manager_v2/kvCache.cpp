@@ -2072,6 +2072,11 @@ void KvCache::setBeamWidth(BeamIndex beamWidth)
     KVCM2_API_GUARD();
     if (beamWidth < BeamIndex{1})
         throw std::invalid_argument("beam_width must be positive");
+    // A fixed-capacity private SSM pool holds one slot per living cache, so it cannot back extra beams.
+    if (beamWidth > BeamIndex{1} && mManager->storage().hasFixedPoolGroups())
+        throw std::invalid_argument(
+            "beam_width > 1 is not supported when max_live_kv_caches gives the private SSM layer group a fixed "
+            "capacity");
     if (beamWidth == mBeamWidth)
         return;
     if (mStatus == Status::CLOSED)

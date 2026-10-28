@@ -55,6 +55,20 @@ void KVCacheManagerConfig::validate() const
 
     poolRebalance.validate();
 
+    if (maxLiveKvCaches.has_value())
+    {
+        if (*maxLiveKvCaches <= 0)
+        {
+            throw std::invalid_argument("KVCacheManagerConfig: max_live_kv_caches must be positive");
+        }
+        // The fixed private SSM capacity divides by it.
+        if (!(maxUtilForResume > 0.0F && maxUtilForResume <= 1.0F))
+        {
+            throw std::invalid_argument(
+                "KVCacheManagerConfig: max_util_for_resume must be in (0, 1] when max_live_kv_caches is set");
+        }
+    }
+
     // These mirror Python's KVCacheManagerConfig.__post_init__ asserts, so they
     // throw AssertionError (translated in the binding layer) rather than ValueError.
     if (cacheTiers.empty() || cacheTierOf(cacheTiers[0]) != CacheTier::GPU_MEM)
