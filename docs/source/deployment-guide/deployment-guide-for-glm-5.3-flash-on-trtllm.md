@@ -94,6 +94,10 @@ If you want to use the latest main branch, you can build from source: [https://n
 
 Use these configurations as starting points for 4x B200 with FP8 weights and a BF16 KV cache. Tune the batch size and token budget for your workload.
 
+For low-concurrency serving of long prompts, run the routed experts tensor-parallel with `--ep_size 1` instead of `--ep_size 4`. With prompts of more than 10K tokens, short outputs, MTP (`max_draft_len: 3`) and an FP8 KV cache, EP1 raised per-user output speed at concurrency 1 by about 6% on 4x B300, with concurrency-8 throughput about the same, because it avoids the expert-parallel load imbalance in the MoE all-reduce. This applies to the tensor-parallel configurations; keep `--ep_size 4` with attention data parallelism, which targets high concurrency, where expert-parallel load evens out. The chart in [Performance](#performance) shows where each configuration is fastest.
+
+For latency-sensitive serving, consider `TRTLLM_LOW_M_GEMM_BACKEND=auto` before launching the server. It routes BF16 projections with at most 32 rows to autotuned low-M GEMM kernels, so it is worth trying when decoding steps run with few tokens in flight. The kernel tuning it triggers adds minutes to every server start, so it suits long-running servers rather than ones that restart often.
+
 #### B200 FP8 Config
 
 ```bash
@@ -445,6 +449,6 @@ $$
 
 ## Performance
 
-The chart below shows the Pareto frontier of output-token throughput per GPU versus per-user output speed on 4x B200 with GLM-5.3-Flash FP8, a BF16 KV cache, and MTP enabled, at ISL 1024 / OSL 1024. The frontier is the efficient boundary of the measured TP4 / EP4 and attention DP4 / EP4 configurations with MTP: no other measured point is better on both axes. Other settings or workloads can give different results. Benchmarks were run using the `benchmark_serving` client above against TensorRT LLM 1.3.0rc29.
+The chart below shows the Pareto frontier of output-token throughput per GPU versus per-user output speed on 4x B300 with GLM-5.3-Flash FP8, an FP8 KV cache, and MTP enabled (`max_draft_len: 3`), at ISL 10240 / OSL 1024. The frontier is the efficient boundary of the measured TP4 / EP1, TP4 / EP4 and attention DP4 / EP4 configurations: no other measured point is better on both axes. TP4 / EP1 forms it up to concurrency 32 and attention DP4 / EP4 from concurrency 64. Other settings or workloads can give different results. Benchmarks were run with the aiperf client against a TensorRT LLM development build that includes these changes.
 
-![GLM-5.3-Flash FP8 Performance on 4x B200 with MTP](../media/glm_5_3_flash_fp8_perf.png)
+![GLM-5.3-Flash FP8 Performance on 4x B300 with MTP](../media/glm_5_3_flash_fp8_perf.png)
