@@ -38,7 +38,6 @@ from .....helpers.ptx_helpers import (
     cp_async_bulk_s2g,
     cp_reduce_async_bulk_add_bf16_s2g,
     cvt_f32_to_fp8_to_f32,
-    fence_proxy_async_global,
     movmatrix_b16,
     red_add_relaxed_sys_v2_bf16x2,
 )
@@ -2614,9 +2613,6 @@ def fc2_stg_store_function(
             src_i = cute.make_tensor(copy_src[None, local_iter].iterator, single_copy_layout)
             dst_i = cute.make_tensor(dst_ptr, single_copy_layout)
             cute.copy(copy_atom_vec, cute.recast_tensor(src_i, cutlass.Int32), cute.recast_tensor(dst_i, cutlass.Int32))
-    if cutlass.const_expr(epi.token_back_push_data):
-        # Generic-proxy pool rows are read back by the combine warps' TMA: fence before the fc2_done release.
-        fence_proxy_async_global()
 
 
 @cute.jit

@@ -772,10 +772,8 @@ class _MetadataPushRouter(KernelComponent):
                     score = cute.arch.load(source_scores + route, cutlass.Float32)
                     stg_f32(destination_scores_base + peer_offset + Int64(destination_position) * Int64(4), score)
                 if cutlass.const_expr(self.fc1_activation_per_token_scale):
-                    # The scale is per source token, not per route, so it is not sorted: gather it
-                    # here by the token the metadata already names (low 32 bits, see
-                    # TokenSrcMetadata) and push it into the same pool slot as the score.
-                    source_token = Int32(Int64(metadata) & Int64(0xFFFFFFFF))
+                    # Gather the source token's scale into the same pool slot as its metadata.
+                    source_token = TokenSrcMetadata.unpack(metadata).src_token
                     activation_scale = self._router_activation_scales[source_token]
                     stg_f32(
                         destination_activation_scales_base + peer_offset + Int64(destination_position) * Int64(4),

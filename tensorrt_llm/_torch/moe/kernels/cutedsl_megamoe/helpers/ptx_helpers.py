@@ -553,22 +553,6 @@ def cvt_rn_bf16x2_f32x2(acc2, *, loc: Optional[ir.Location] = None, ip: Optional
     return Int32(packed)
 
 
-@dsl_user_op
-def fence_proxy_async_global(*, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> None:
-    """Order this thread's generic-proxy global accesses before its later async-proxy (TMA) accesses."""
-    llvm.inline_asm(
-        None,
-        [],
-        "fence.proxy.async.global;",
-        "",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
 @cute.jit
 def cvt_f32x4_to_f8x4_pack_i32(fp32x4: cute.Tensor, fp8_type, *, loc=None, ip=None) -> Int32:
     """Round four f32 lanes to the selected FP8 format and pack them into one i32."""
@@ -834,7 +818,6 @@ __all__ = [
     "stg_f32",
     "tma_load_1d",
     "fence_acq_rel_gpu",
-    "fence_proxy_async_global",
     "f32x2_pack",
     "fma_rn_f32x2_bf16x2",
     "cvt_rn_bf16x2_f32x2",
