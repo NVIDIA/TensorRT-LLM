@@ -449,6 +449,44 @@ def test_multiple_overlap():
     assert overlap == expected_overlap
 
 
+def _tp_rank_info(name, tp_size, tp_rank, total_heads=8):
+    """Rank ``tp_rank`` of a TP ``tp_size`` instance holding its share of ``total_heads`` heads."""
+    heads = total_heads // tp_size
+    return make_rankinfo(
+        instance_name=name,
+        instance_rank=tp_rank,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        kv_heads_per_rank=heads,
+        page_table=make_page_table(
+            block_bytes=[4 * 32 * heads], mamba_tp=tp_size, tp_rank=tp_rank, kv_heads=heads
+        ),
+    )
+
+
+@pytest.mark.parametrize("src_tp,dst_tp", [(1, 2), (2, 1), (2, 4), (4, 2), (8, 2), (2, 8)])
+def test_every_sender_whose_bytes_reach_a_receiver_is_one_it_pairs_with(src_tp, dst_tp):
+    """No elected sender goes unheard.
+
+    The sender ranks a receiver contacts (get_peer_overlap) include every rank whose runs reach it.
+    """
+    views = [(0, 0), (1, 0), (1, 1)]  # K/V, conv state, SSM state
+    for dst_rank in range(dst_tp):
+        receiver = _tp_rank_info("gen", dst_tp, dst_rank)
+        contacted = _make_peer_registrar(receiver).get_peer_overlap(
+            _tp_rank_info("ctx", src_tp, 0), peer_dp_rank=0
+        )
+        senders = {
+            src_rank
+            for src_rank in range(src_tp)
+            for view in views
+            if not _make_peer_registrar(_tp_rank_info("ctx", src_tp, src_rank))
+            .get_kv_map(receiver, view, view)
+            .empty
+        }
+        assert senders and senders <= set(contacted.ranks), (dst_rank, senders, contacted.ranks)
+
+
 def _make_peer_registrar(self_rankinfo):
     pt = self_rankinfo.page_table if self_rankinfo.page_table else make_page_table()
     real_kv_extractor = KVRegionExtractorV1(pt)

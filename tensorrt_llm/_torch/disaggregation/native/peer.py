@@ -32,6 +32,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
     BufferRuns,
+    fan,
     map_buffers,
     merge_runs,
 )
@@ -385,20 +386,6 @@ class PeerRegistrar:
         self._kv_map_cache[cache_key] = mapper
         return mapper
 
-    @staticmethod
-    def _find_overlap(self_val, peer_val, self_rank, peer_rank=None):
-        if self_val <= peer_val:
-            overlap = peer_val // self_val
-            start = self_rank * overlap + (peer_rank * peer_val if peer_rank is not None else 0)
-            end = start + overlap
-        else:
-            ratio = self_val // peer_val
-            start = (self_rank // ratio) + (peer_rank * peer_val if peer_rank is not None else 0)
-            overlap = 1
-            end = start + overlap
-
-        return overlap, start, end
-
     def get_peer_overlap(self, peer_rank_info: RankInfo, peer_dp_rank: int) -> PeerOverlap:
         peer_ri = peer_rank_info
         key = self._unique_key(peer_ri.instance_name, peer_dp_rank)
@@ -427,21 +414,19 @@ class PeerRegistrar:
         overlap_pp_size = len(tgt_pp_ranks)
         peer_end_pp = peer_start_pp + overlap_pp_size
 
+        # The peer ranks whose share of each dimension overlaps this rank's (layout_mapping.fan),
+        # the same pairing map_buffers elects senders within; tensor ranks count within the
+        # peer's data-parallel group peer_dp_rank.
         self_tp_per_dp = self._ri.tp_size_per_dp_group
         peer_tp_per_dp = peer_ri.tp_size_per_dp_group
-        self_tp_rank_in_dp = self._ri.tp_rank % self_tp_per_dp
-
-        overlap_tp_size, peer_start_tp, peer_end_tp = self._find_overlap(
-            self_tp_per_dp, peer_tp_per_dp, self_tp_rank_in_dp, peer_dp_rank
-        )
-        overlap_cp_size, peer_start_cp, peer_end_cp = self._find_overlap(
-            self._ri.cp_size, peer_ri.cp_size, self._ri.cp_rank
-        )
+        tp_fan = fan(peer_tp_per_dp, self_tp_per_dp, self._ri.tp_rank % self_tp_per_dp)
+        cp_fan = fan(peer_ri.cp_size, self._ri.cp_size, self._ri.cp_rank)
+        tp_offset = peer_dp_rank * peer_tp_per_dp
 
         ranks: List[int] = []
         for pp in range(peer_start_pp, peer_end_pp):
-            for tp in range(peer_start_tp, peer_end_tp):
-                for cp in range(peer_start_cp, peer_end_cp):
+            for tp in range(tp_offset + tp_fan.start, tp_offset + tp_fan.stop):
+                for cp in cp_fan:
                     # CP-minor flat rank (ppRank*(TP*CP) + tpRank*CP +
                     # cpRank), matching Mapping and the C++ transceiver; a
                     # TP-minor formula mis-routes when tp > 1 and cp > 1.
@@ -453,8 +438,8 @@ class PeerRegistrar:
 
         targets = PeerOverlap(
             overlap_pp_size=overlap_pp_size,
-            overlap_tp_size=overlap_tp_size,
-            overlap_cp_size=overlap_cp_size,
+            overlap_tp_size=len(tp_fan),
+            overlap_cp_size=len(cp_fan),
             duplicate_head_factor=dup_head,
             peer_duplicate_head_factor=peer_dup_head,
             ranks=ranks,

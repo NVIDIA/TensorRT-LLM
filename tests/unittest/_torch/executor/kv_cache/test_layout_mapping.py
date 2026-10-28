@@ -15,7 +15,8 @@
 """``layout_mapping`` against a byte oracle: each rank's page holds, at every byte of every tensor,
 the id of the global element there; after every source rank of an instance sends what
 ``map_buffers`` gives it, every byte a destination rank holds of every buffer both transfer has
-arrived exactly once, holding its own global element, and only from source ranks it pairs with."""
+arrived exactly once, holding its own global element, and only from source ranks it pairs with;
+a pairing whose source ranks do not hold everything a destination holds is refused."""
 
 from __future__ import annotations
 
@@ -175,12 +176,9 @@ class Oracle:
         return mem
 
 
-def check(
-    src: Instance, dst: Instance, specs: list[Spec], *, src_dp: int = 0, in_fan: bool = True
-) -> None:
+def check(src: Instance, dst: Instance, specs: list[Spec], *, src_dp: int = 0) -> None:
     """Every destination rank of every data-parallel group gets each byte it holds exactly once,
-    holding the right element, and, under contiguous splits (``in_fan``), only from source ranks
-    of its fan."""
+    holding the right element, and only from source ranks of its fan."""
     oracle = Oracle()
     sources = [(t, layout(t, src.stages[t.pp_rank], specs)) for t in src.ranks(src_dp)]
     src_memory = {id(page): oracle.memory(page) for _, page in sources}
@@ -191,7 +189,7 @@ def check(
             writes = {g: np.zeros(w[0], dtype=np.int64) for g, w in page.pool_slot_bytes.items()}
             for src_topology, src_page in sources:
                 maps = map_buffers(src_page, page)
-                if maps and in_fan:
+                if maps:
                     tp_fan = fan(
                         _tp(src_topology),
                         _tp(dst_topology),
@@ -227,15 +225,38 @@ def check(
 TPS = (1, 2, 4, 8)
 
 
+def fan_holds(held_by: Callable[[int, int], set], src_n: int, dst_n: int) -> bool:
+    """Whether every destination rank's indices lie on the source ranks of its fan, given
+    ``held_by(rank, count)``: the indices rank ``rank`` of ``count`` holds."""
+    return all(
+        held_by(d, dst_n) <= set().union(*(held_by(s, src_n) for s in fan(src_n, dst_n, d)))
+        for d in range(dst_n)
+    )
+
+
+def contiguous_heads(total: int) -> Callable[[int, int], set]:
+    return lambda rank, count: set(
+        range(rank * total // count, rank * total // count + -(-total // count))
+    )
+
+
 @pytest.mark.parametrize("heads", [1, 2, 4, 8, 6])
 @pytest.mark.parametrize("kv_layout", ["hnd", "nhd"])
 @pytest.mark.parametrize("src_tp,dst_tp", list(itertools.product(TPS, TPS)))
 def test_attention_heads_reshard_over_tensor_ranks(heads, kv_layout, src_tp, dst_tp):
-    """Heads split unevenly (6 over 4 or 8 ranks) reshard too, though a destination may then take
-    a head from a source rank outside its fan."""
+    """Heads reshard wherever each destination's fan holds its heads; a split that leaves a
+    destination's head outside its fan (6 heads over 8 ranks to 4) is refused."""
     specs = [("key", kv(heads, kv_layout), "attention"), ("index", whole(24), "attention")]
-    aligned = all(heads % tp == 0 or tp % heads == 0 for tp in (src_tp, dst_tp))
-    check(Instance(tp=src_tp), Instance(tp=dst_tp), specs, in_fan=aligned)
+    if fan_holds(contiguous_heads(heads), src_tp, dst_tp):
+        check(Instance(tp=src_tp), Instance(tp=dst_tp), specs)
+    else:
+        with pytest.raises(ValueError, match="no source rank it pairs with"):
+            check(Instance(tp=src_tp), Instance(tp=dst_tp), specs)
+
+
+def test_some_uneven_head_splits_are_refused():
+    """The refusal above is reached: 6 heads over 8 ranks leave head 1 of TP4 rank 0 on rank 2."""
+    assert not fan_holds(contiguous_heads(6), 8, 4)
 
 
 @pytest.mark.parametrize("src_adp,dst_adp", [(True, False), (False, True), (True, True)])
@@ -299,12 +320,23 @@ def test_a_two_dimensional_split_reshards_both_axes():
 
 
 def test_a_cyclic_split_hands_each_rank_every_nth_index():
+    """A cyclic split reshards to or from a single rank; between other rank counts a destination's
+    rows lie outside its fan, which is refused."""
+
     def tensors(topology):
         return (Tensor((Axis("row", 12, HEAD, ("tp",), cyclic=True), Axis("byte", HEAD, 1))),)
 
+    def rows(rank, count):
+        return set(range(rank, 12, count))
+
     specs = [("rows", tensors, "attention")]
-    for src_tp, dst_tp in [(1, 3), (3, 1), (2, 4), (4, 2), (3, 2)]:
-        check(Instance(tp=src_tp), Instance(tp=dst_tp), specs, in_fan=False)
+    for src_tp, dst_tp in [(1, 3), (3, 1), (2, 2), (2, 4), (4, 2), (3, 2)]:
+        if fan_holds(rows, src_tp, dst_tp):
+            check(Instance(tp=src_tp), Instance(tp=dst_tp), specs)
+        else:
+            with pytest.raises(ValueError, match="no source rank it pairs with"):
+                check(Instance(tp=src_tp), Instance(tp=dst_tp), specs)
+    assert not fan_holds(rows, 2, 4)
 
 
 def test_runs_merge_where_both_sides_continue():

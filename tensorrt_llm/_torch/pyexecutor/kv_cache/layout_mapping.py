@@ -20,14 +20,16 @@ both hold, the byte runs the source sends: the indices both hold, of which the s
 elected sender, as runs that are contiguous on both sides. Nothing here knows a cache kind, a
 mapper kind or a model.
 
-Election: ranks split each parallel dimension into equal shares in rank order, and a destination
-rank pairs with the source ranks whose share overlaps its own (``fan``). An index of an axis
-split over source dimensions is sent by one of the source ranks holding it, preferring those the
-destination pairs with; a source dimension no axis of the tensor splits holds the same bytes on
-each of its ranks, and the destination takes them from one rank of its fan. Of several such
-ranks, the one at position ``key`` modulo their count sends, ``key`` being the destination's
-attention data-parallel rank, so that destinations of several data-parallel groups spread over
-the sources. Under contiguous splits every sender is a rank of the destination's fan.
+Pairing and election: ranks split each parallel dimension into equal shares in rank order, and a
+destination rank pairs with the source ranks whose share overlaps its own (``fan``); a
+destination hears from no other rank, so the native transfer contacts exactly these. An index of
+an axis split over source dimensions is sent by one of the paired source ranks holding it; a
+source dimension no axis of the tensor splits holds the same bytes on each of its ranks, and the
+destination takes them from one rank of its fan. Of several such ranks, the one at position
+``key`` modulo their count sends, ``key`` being the destination's attention data-parallel rank,
+so that destinations of several data-parallel groups spread over the sources. A destination
+holding an index no paired source rank holds, as an uneven head split or a cyclic split between
+different rank counts can make, is refused rather than left without it.
 """
 
 from __future__ import annotations
@@ -103,24 +105,38 @@ def _elected(candidates: Sequence[int], key: int) -> int:
     return candidates[key % len(candidates)]
 
 
-def _owned(axis: Axis, src: RankTopology, fans: dict[str, range], key: int) -> list[Progression]:
+def _owned(
+    axis: Axis, src: RankTopology, fans: dict[str, range], key: int, wanted: Progression
+) -> list[Progression]:
     """The runs of indices of ``axis`` that the source rank sends: the whole axis when it does not
-    split it, else the indices it is elected for among the ranks holding them."""
+    split it, else the indices it is elected for among the paired ranks holding them.
+
+    Raises:
+        ValueError: If the destination holds (``wanted``) an index no paired rank holds.
+    """
     if not axis.split:
         return [Progression(0, 1, axis.extent)]
-    if axis.cyclic:
-        return [held(axis, src)]  # one rank holds each index
     n, r = grid_place(src, axis.split)
-    runs = [(rank * axis.extent // n, rank * axis.extent // n + axis.held) for rank in range(n)]
     sizes = [_dims(src)[dim][0] for dim in axis.split]
-    paired = {_flat(c, sizes) for c in itertools.product(*(fans[dim] for dim in axis.split))}
+    paired = sorted(
+        {_flat(c, sizes) for c in itertools.product(*(fans[dim] for dim in axis.split))}
+    )
+    if axis.cyclic:
+        # One rank holds each index: index i lies on rank i modulo n.
+        for rank in range(n):
+            if rank not in paired and rank < axis.extent:
+                _refuse_unpaired(
+                    axis, Progression(rank, n, len(range(rank, axis.extent, n))), wanted
+                )
+        return [held(axis, src)] if r in paired else []
+    runs = [(rank * axis.extent // n, rank * axis.extent // n + axis.held) for rank in range(n)]
     bounds = sorted({0, axis.extent} | {min(b, axis.extent) for run in runs for b in run})
     out: list[Progression] = []
     for lo, hi in zip(bounds, bounds[1:]):
-        holders = [rank for rank, (a, b) in enumerate(runs) if a <= lo and hi <= b]
-        if not holders:
+        candidates = [rank for rank in paired if runs[rank][0] <= lo and hi <= runs[rank][1]]
+        if not candidates:
+            _refuse_unpaired(axis, Progression(lo, 1, hi - lo), wanted)
             continue
-        candidates = [rank for rank in holders if rank in paired] or holders
         if _elected(candidates, key) != r:
             continue
         if out and out[-1].last + 1 == lo:
@@ -128,6 +144,16 @@ def _owned(axis: Axis, src: RankTopology, fans: dict[str, range], key: int) -> l
         else:
             out.append(Progression(lo, 1, hi - lo))
     return out
+
+
+def _refuse_unpaired(axis: Axis, indices: Progression, wanted: Progression) -> None:
+    """Raise if the destination holds any of ``indices``, which no paired source rank holds."""
+    missing = indices.intersect(wanted)
+    if missing is not None:
+        raise ValueError(
+            f"axis {axis.name!r} (extent {axis.extent}, split over {axis.split}): index "
+            f"{missing.start} of the destination is held by no source rank it pairs with"
+        )
 
 
 def _sends_replicas(tensor: Tensor, src: RankTopology, fans: dict[str, range], key: int) -> bool:
@@ -172,7 +198,7 @@ def _tensor_runs(
             )
         src_held, dst_held = held(src_axis, src), held(dst_axis, dst)
         parts = []
-        for owned in _owned(src_axis, src, fans, key):
+        for owned in _owned(src_axis, src, fans, key, dst_held):
             part = owned.intersect(src_held)
             part = None if part is None else part.intersect(dst_held)
             if part is not None:
@@ -267,7 +293,8 @@ def map_buffers(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> 
             data-parallel rank by default.
 
     Raises:
-        ValueError: If two matched buffers' tensors or axes differ in name or extent.
+        ValueError: If two matched buffers' tensors or axes differ in name or extent, or the
+            destination holds an index no source rank it pairs with holds.
     """
     key = dst.topology.dp_rank if key is None else key
     fans = _fans(src.topology, dst.topology)
