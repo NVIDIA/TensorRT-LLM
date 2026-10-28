@@ -2771,6 +2771,13 @@ class KimiLinearModel(DecoderModel):
             if any(sliced)
             else None
         )
+        # The FP4 MLA backend writes a generation-only step's metadata on this
+        # stream ahead of the first MLA layer; every MLA layer has the same
+        # per-rank query heads.
+        self._mla_num_heads = next(
+            (layer.self_attn.mixer.num_heads_tp for layer in self.layers if not layer.is_kda), 0
+        )
+        self._fp4_mla_metadata_stream = torch.cuda.Stream() if self._mla_num_heads > 0 else None
         self.norm = RMSNorm(hidden_size=cfg.hidden_size, eps=cfg.rms_norm_eps, dtype=dtype)
 
         # KimiK3RMSNorm (not RMSNorm): consumed field-wise (.weight/.eps)
@@ -2817,6 +2824,16 @@ class KimiLinearModel(DecoderModel):
                 f"{hidden_states.shape[0]} rows, metadata says {num_tokens} tokens)."
             )
 
+        fp4_mla_state = getattr(attn_metadata, "fp4_mla_state", None)
+        if (
+            fp4_mla_state is not None
+            and self._fp4_mla_metadata_stream is not None
+            and do_multi_stream()
+        ):
+            fp4_mla_state.launch_generation_metadata_ahead(
+                attn_metadata, num_heads=self._mla_num_heads, stream=self._fp4_mla_metadata_stream
+            )
+
         block_residual = hidden_states.new_empty(
             self.num_attn_res_snapshots,
             hidden_states.shape[0],
@@ -2859,6 +2876,9 @@ class KimiLinearModel(DecoderModel):
                 helix_a2a=self.helix_a2a,
                 defer_moe_residual=i + 1 < len(self.layers),
             )
+        if fp4_mla_state is not None:
+            # Joined by the first MLA layer; a no-op unless no layer read it.
+            fp4_mla_state.join_generation_metadata()
         sliced = self.helix_a2a is not None
 
         # The last layer has no successor, so this one recompute is

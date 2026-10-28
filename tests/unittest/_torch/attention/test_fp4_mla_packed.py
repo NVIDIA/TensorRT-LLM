@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Packed FP4 MLA decode: row layout policy and the CuTe DSL split reducer."""
+"""Packed FP4 MLA decode: row layout policy, the CuTe DSL split reducer and the step metadata written ahead."""
 
 import importlib
 import math
@@ -9,9 +9,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import tensorrt_llm._torch.attention.backends.fp4_mla.cache_update as fp4_mla_cache_update
 import tensorrt_llm._torch.attention.backends.fp4_mla.config as fp4_mla_config
 import tensorrt_llm._torch.attention.backends.fp4_mla.metadata as fp4_mla_metadata
 import tensorrt_llm._torch.attention.backends.fp4_mla.packed_plan as fp4_mla_packed_plan
+import tensorrt_llm._torch.attention.backends.fp4_mla.state as fp4_mla_state_module
+from tensorrt_llm._torch.attention.backends.fp4_mla.state import Fp4MlaState
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
@@ -619,3 +622,265 @@ def test_packed_split_reduce_matches_reference_and_replays(
     graph.replay()
     torch.cuda.synchronize()
     check()
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# A generation-only step's metadata written ahead of its first FP4 MLA layer
+# (Fp4MlaState.launch_generation_metadata_ahead / join_generation_metadata)
+# ----------------------------------------------------------------------------------------------------------------
+
+
+def _ahead_metadata(num_contexts=0, num_seqs=2, num_tokens=8, device_page_table=True):
+    device = torch.device("cuda", torch.cuda.current_device())
+    return SimpleNamespace(
+        num_contexts=num_contexts,
+        num_seqs=num_seqs,
+        num_tokens=num_tokens,
+        helix_position_offsets=None,
+        helix_is_inactive_rank=None,
+        fp4_mla_state=Fp4MlaState(
+            device_page_table=device_page_table,
+            generation_kv_lens=torch.zeros(4, dtype=torch.int32, device=device),
+        ),
+    )
+
+
+def test_generation_metadata_ahead_runs_on_its_stream_and_the_layer_joins(monkeypatch) -> None:
+    """Planning stays on the current stream, the length / plan and page-table launches run on the given stream after
+    the work queued before, and the first generation cache update orders its stream after them."""
+    main = torch.cuda.current_stream()
+    side = torch.cuda.Stream()
+    metadata = _ahead_metadata()
+    state = metadata.fp4_mla_state
+    calls = []
+    geometry = object()
+    written = torch.zeros(1, dtype=torch.int64, device="cuda")
+
+    def plan_geometry(md, **kwargs):
+        calls.append(("geometry", torch.cuda.current_stream(), kwargs))
+        return geometry
+
+    def lengths(md, num_tokens, num_gen, plan_geometry=None):
+        calls.append(("lengths", torch.cuda.current_stream(), (num_tokens, num_gen, plan_geometry)))
+        # A slow writer: the reader below sees its value only if it was ordered after it.
+        torch.cuda._sleep(20_000_000)
+        written.fill_(7)
+        return state.generation_kv_lens[:num_gen], None
+
+    def page_table(md, generation_kv_lens):
+        calls.append(("page_table", torch.cuda.current_stream(), generation_kv_lens))
+
+    monkeypatch.setattr(fp4_mla_state_module, "_fp4_mla_packed_plan_geometry", plan_geometry)
+    monkeypatch.setattr(fp4_mla_state_module, "_fp4_mla_uniform_generation_lengths", lengths)
+    monkeypatch.setattr(
+        fp4_mla_state_module, "_materialize_fp4_mla_device_page_table_for_forward", page_table
+    )
+
+    assert state.launch_generation_metadata_ahead(metadata, num_heads=96, stream=side)
+    assert [name for name, _, _ in calls] == ["geometry", "lengths", "page_table"]
+    assert calls[0][1] == main
+    assert calls[0][2] == dict(
+        num_heads=96,
+        query_len=4,
+        num_requests=2,
+        device=state.generation_kv_lens.device,
+        helix_kv_bounds=None,
+    )
+    assert calls[1][1] == side and calls[1][2] == (8, 2, geometry)
+    assert calls[2][1] == side
+    assert calls[2][2].data_ptr() == state.generation_kv_lens.data_ptr()
+    assert state.generation_metadata_ready is not None
+
+    # The first FP4 MLA kernel of the step (the generation cache update) joins
+    # before anything else; it rejects this empty batch right after.
+    with pytest.raises(ValueError, match="at least one latent token"):
+        fp4_mla_cache_update.scatter_fp4_mla_kv_cache(
+            metadata,
+            torch.empty(0, 576, dtype=torch.bfloat16, device="cuda"),
+            0,
+            token_offset=0,
+            phase="generation",
+            local_layer=0,
+            v_head_dim=512,
+        )
+    assert state.generation_metadata_ready is None
+    seen = written.clone()
+    torch.cuda.synchronize()
+    assert seen.item() == 7
+    # Joined once: later joins are no-ops.
+    state.join_generation_metadata()
+
+
+@pytest.mark.parametrize(
+    "num_contexts,num_seqs,num_tokens,device_page_table,num_heads",
+    [
+        (1, 3, 9, True, 96),  # a context request in the step
+        (0, 3, 8, True, 96),  # a non-uniform generation batch
+        (0, 0, 0, True, 96),  # no generation request
+        (0, 2, 8, False, 96),  # no device page table
+        (0, 2, 8, True, 0),  # no query heads
+    ],
+)
+def test_generation_metadata_ahead_declines_other_steps(
+    num_contexts, num_seqs, num_tokens, device_page_table, num_heads
+) -> None:
+    """Such steps keep writing the metadata in the first FP4 MLA layer: nothing is launched or left to join."""
+    metadata = _ahead_metadata(num_contexts, num_seqs, num_tokens, device_page_table)
+    state = metadata.fp4_mla_state
+    assert not state.launch_generation_metadata_ahead(
+        metadata, num_heads=num_heads, stream=torch.cuda.Stream()
+    )
+    assert state.generation_metadata_ready is None and state._generation_metadata_events is None
+
+
+def _step_metadata(*, is_cuda_graph: bool, num_gen: int, query_len: int, max_pages: int):
+    """A generation-only FP4 MLA step: shuffled block offsets in two pools (FP4 cache and HP ring), KV lengths across
+    many pages and the overlap scheduler's stale prompt lengths."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    generator = torch.Generator(device="cpu").manual_seed(3)
+    max_seqs = num_gen + 2
+    page_size = fp4_mla_config.FP4_MLA_TOKENS_PER_BLOCK
+
+    def i32(values):
+        return torch.tensor(values, dtype=torch.int32, device=device)
+
+    offsets = torch.randperm(2 * max_seqs * 2 * max_pages, generator=generator)
+    block_offsets = (offsets.view(2, max_seqs, 2, max_pages) * 2).to(torch.int32).to(device)
+    kv_lens = torch.randint(page_size, (max_pages - 4) * page_size, (num_gen,), generator=generator)
+    pages = max_seqs * max_pages
+    state = Fp4MlaState(
+        generation_kv_lens=torch.full((max_seqs,), -1, dtype=torch.int32, device=device),
+        generation_append_lens=torch.full((max_seqs,), -1, dtype=torch.int32, device=device),
+        _paged_kv_indices=torch.full((pages,), -1, dtype=torch.int32, device=device),
+        hp_page_indices=torch.full((pages,), -1, dtype=torch.int32, device=device),
+        _paged_kv_indptr=torch.full((max_seqs + 1,), -1, dtype=torch.int32, device=device),
+        paged_kv_indptr_decode=torch.full((max_seqs + 1,), -1, dtype=torch.int32, device=device),
+        device_page_table=True,
+        page_table_stride=max_pages,
+        cache_pool_id=0,
+        cache_page_index_scale=2,
+        hp_pool_id=1,
+        hp_page_index_scale=2,
+        # Larger than any plan here, so that the geometry reuses it (also in a
+        # graph capture) and its slots past the plan compare equal.
+        workspaces={
+            "_fp4_mla_packed_plan": torch.full((4096,), -1, dtype=torch.int32, device=device)
+        },
+    )
+    return SimpleNamespace(
+        num_contexts=0,
+        num_seqs=num_gen,
+        num_tokens=num_gen * query_len,
+        num_ctx_tokens=0,
+        page_size=page_size,
+        is_cuda_graph=is_cuda_graph,
+        kv_cache_block_offsets=block_offsets,
+        kv_lens_cuda_runtime=i32(kv_lens.tolist()),
+        prompt_lens_cuda_runtime=i32([1] * num_gen),
+        helix_position_offsets=None,
+        helix_is_inactive_rank=None,
+        _helix_spec_tokens_valid=False,
+        fp4_mla_state=state,
+    )
+
+
+def _first_layer_metadata(metadata, num_heads: int) -> None:
+    """What the step's first FP4 MLA generation cache update writes (_scatter_fp4_mla_kv_cache_2d_generation)."""
+    num_gen = metadata.num_seqs
+    geometry = fp4_mla_packed_plan._fp4_mla_packed_plan_geometry(
+        metadata,
+        num_heads=num_heads,
+        query_len=metadata.num_tokens // num_gen,
+        num_requests=num_gen,
+        device=metadata.fp4_mla_state.generation_kv_lens.device,
+        helix_kv_bounds=None,
+    )
+    kv_lens, _ = fp4_mla_metadata._fp4_mla_uniform_generation_lengths(
+        metadata, metadata.num_tokens, num_gen, plan_geometry=geometry
+    )
+    fp4_mla_metadata._materialize_fp4_mla_device_page_table_for_forward(metadata, kv_lens)
+    return geometry
+
+
+def _step_outputs(metadata) -> dict:
+    state = metadata.fp4_mla_state
+    return {
+        "generation_kv_lens": state.generation_kv_lens,
+        "generation_append_lens": state.generation_append_lens,
+        "paged_kv_indices": state._paged_kv_indices,
+        "hp_page_indices": state.hp_page_indices,
+        "paged_kv_indptr": state._paged_kv_indptr,
+        "paged_kv_indptr_decode": state.paged_kv_indptr_decode,
+        "plan": state.workspaces["_fp4_mla_packed_plan"],
+    }
+
+
+def _assert_step_outputs_equal(got: dict, want: dict) -> None:
+    for name, tensor in want.items():
+        assert torch.equal(got[name], tensor), name
+
+
+def _no_layer_launch(monkeypatch) -> None:
+    """The first layer finds the metadata current: any metadata launch fails."""
+
+    def fail(*args, **kwargs):
+        raise AssertionError("the first FP4 MLA layer relaunched the step metadata")
+
+    monkeypatch.setattr(fp4_mla_metadata, "populate_fp4_mla_generation_lengths", fail)
+    monkeypatch.setattr(fp4_mla_metadata, "_launch_fp4_mla_packed_plan", fail)
+    monkeypatch.setattr(fp4_mla_metadata, "materialize_fp4_mla_device_page_table", fail)
+
+
+@pytest.mark.parametrize("num_gen,query_len,num_heads", [(4, 8, 96), (1, 8, 96), (3, 4, 12)])
+def test_generation_metadata_ahead_is_bitwise_eager_and_in_a_graph(
+    monkeypatch, num_gen: int, query_len: int, num_heads: int
+) -> None:
+    """The metadata written ahead on a side stream is bit-identical to the first layer's, eager and in a captured
+    and replayed CUDA graph, and the layer then launches no metadata kernel."""
+    monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_KV", raising=False)
+    monkeypatch.setenv(fp4_mla_config.FP4_MLA_PACKED_Q_ENV, "1")
+    monkeypatch.setenv(fp4_mla_config.FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, "0")
+    monkeypatch.setattr(fp4_mla_config, "_fp4_mla_attention_backend", lambda: "cutedsl")
+    side = torch.cuda.Stream()
+    shape = dict(num_gen=num_gen, query_len=query_len, max_pages=48)
+
+    for is_cuda_graph in (False, True):
+        reference = _step_metadata(is_cuda_graph=is_cuda_graph, **shape)
+        geometry = _first_layer_metadata(reference, num_heads)
+        assert geometry is not None and geometry.plan is not None, "the step must plan its splits"
+        ahead = _step_metadata(is_cuda_graph=is_cuda_graph, **shape)
+        with monkeypatch.context() as patch:
+            assert ahead.fp4_mla_state.launch_generation_metadata_ahead(
+                ahead, num_heads=num_heads, stream=side
+            )
+            ahead.fp4_mla_state.join_generation_metadata()
+            _no_layer_launch(patch)
+            _first_layer_metadata(ahead, num_heads)
+        torch.cuda.synchronize()
+        _assert_step_outputs_equal(_step_outputs(ahead), _step_outputs(reference))
+
+    # A CUDA graph (its first eager step above compiled the kernels and sized the
+    # plan workspace): the fork and join are captured with the step.
+    captured = _step_metadata(is_cuda_graph=True, **shape)
+    _first_layer_metadata(captured, num_heads)
+    captured.fp4_mla_state.invalidate_generation_lengths()
+    captured.fp4_mla_state.device_page_table_valid = False
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        assert captured.fp4_mla_state.launch_generation_metadata_ahead(
+            captured, num_heads=num_heads, stream=side
+        )
+        captured.fp4_mla_state.join_generation_metadata()
+        _first_layer_metadata(captured, num_heads)
+    for step in range(3):
+        # The next step's lengths at the same addresses; outputs reset to the
+        # reference's initial contents.
+        captured.kv_lens_cuda_runtime.add_(fp4_mla_config.FP4_MLA_TOKENS_PER_BLOCK // 2 + step)
+        for tensor in _step_outputs(captured).values():
+            tensor.fill_(-1)
+        graph.replay()
+        reference = _step_metadata(is_cuda_graph=True, **shape)
+        reference.kv_lens_cuda_runtime.copy_(captured.kv_lens_cuda_runtime)
+        _first_layer_metadata(reference, num_heads)
+        torch.cuda.synchronize()
+        _assert_step_outputs_equal(_step_outputs(captured), _step_outputs(reference))

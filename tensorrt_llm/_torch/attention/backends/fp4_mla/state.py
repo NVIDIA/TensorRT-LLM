@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING
 import torch
 
 from .config import FP4_MLA_KV_GLOBAL_SCALE, FP4_MLA_Q_GLOBAL_SCALE, HP_BLOCK_SIZE
-from .metadata import configure_fp4_mla_device_page_table, populate_fp4_mla_append_metadata
+from .metadata import (
+    _fp4_mla_uniform_generation_lengths,
+    _materialize_fp4_mla_device_page_table_for_forward,
+    configure_fp4_mla_device_page_table,
+    populate_fp4_mla_append_metadata,
+)
+from .packed_plan import _fp4_mla_helix_plan_bounds, _fp4_mla_packed_plan_geometry
 
 if TYPE_CHECKING:
     from ....memory_buffer_utils import Buffers
@@ -67,6 +73,10 @@ class Fp4MlaState:
     full_pages_cache: tuple[tuple, bool] | None = None
     workspaces: dict[str, torch.Tensor] = field(default_factory=dict)
     v_packed_cache_tags: dict[str, tuple] = field(default_factory=dict)
+    # Recorded after the generation metadata written ahead of the step's first
+    # FP4 MLA layer (launch_generation_metadata_ahead); None once joined.
+    generation_metadata_ready: torch.cuda.Event | None = None
+    _generation_metadata_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
 
     @property
     def paged_kv_indices(self) -> torch.Tensor:
@@ -167,6 +177,72 @@ class Fp4MlaState:
             self.invalidate_generation_lengths()
             if metadata.num_contexts > 0:
                 self.populate_append_metadata(metadata)
+
+    def launch_generation_metadata_ahead(
+        self,
+        metadata: TrtllmAttentionMetadata,
+        *,
+        num_heads: int,
+        stream: torch.cuda.Stream,
+    ) -> bool:
+        """Write a generation-only step's metadata on ``stream`` ahead of its first FP4 MLA layer.
+
+        This is what the step's first FP4 MLA generation cache update writes
+        otherwise: the generation lengths fused with the packed split plan of
+        ``num_heads`` query heads, then the device page table. ``stream`` runs
+        it after the work already queued on the current stream; the first FP4
+        MLA layer joins it (``join_generation_metadata``) and then finds the
+        metadata current, so it launches none of these kernels itself. The
+        kernels and their inputs are the same as in the layer.
+
+        Returns whether it launched: not for a step with context requests, a
+        non-uniform generation batch or without the device page table.
+        """
+        num_contexts = int(metadata.num_contexts)
+        num_gen = int(metadata.num_seqs) - num_contexts
+        num_tokens = int(metadata.num_tokens)
+        if (
+            not self.device_page_table
+            or num_contexts != 0
+            or num_gen <= 0
+            or num_tokens % num_gen != 0
+            or num_heads <= 0
+        ):
+            return False
+        # Host-side planning (and any workspace allocation) stays on the
+        # current stream; only the kernels move to ``stream``.
+        use_helix = (
+            metadata.helix_position_offsets is not None
+            or metadata.helix_is_inactive_rank is not None
+        )
+        plan_geometry = _fp4_mla_packed_plan_geometry(
+            metadata,
+            num_heads=num_heads,
+            query_len=num_tokens // num_gen,
+            num_requests=num_gen,
+            device=self.generation_kv_lens.device,
+            helix_kv_bounds=_fp4_mla_helix_plan_bounds(metadata, num_tokens, use_helix=use_helix),
+        )
+        if self._generation_metadata_events is None:
+            self._generation_metadata_events = (torch.cuda.Event(), torch.cuda.Event())
+        fork, ready = self._generation_metadata_events
+        fork.record()
+        with torch.cuda.stream(stream):
+            fork.wait()
+            generation_kv_lens, _ = _fp4_mla_uniform_generation_lengths(
+                metadata, num_tokens, num_gen, plan_geometry=plan_geometry
+            )
+            _materialize_fp4_mla_device_page_table_for_forward(metadata, generation_kv_lens)
+            ready.record()
+        self.generation_metadata_ready = ready
+        return True
+
+    def join_generation_metadata(self) -> None:
+        """Order the current stream after the generation metadata written ahead, if any is pending."""
+        ready = self.generation_metadata_ready
+        if ready is not None:
+            self.generation_metadata_ready = None
+            torch.cuda.current_stream().wait_event(ready)
 
     def update_for_spec_dec(self, metadata: TrtllmAttentionMetadata) -> None:
         num_seqs = metadata.num_seqs

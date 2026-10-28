@@ -811,6 +811,8 @@ def scatter_fp4_mla_kv_cache(
     phase updated the HP pool.
     """
     if phase == "generation":
+        # The first FP4 MLA kernel of a step: it reads the step's metadata.
+        metadata.fp4_mla_state.join_generation_metadata()
         metadata.fp4_mla_state.generation_cache_scattered = False
         metadata.fp4_mla_state.prequantized_q = None
         metadata.fp4_mla_state.prequantized_q_sf = None
