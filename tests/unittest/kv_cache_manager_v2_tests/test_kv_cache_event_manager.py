@@ -471,8 +471,11 @@ def test_streaming_uuid_hints_are_bounded_and_do_not_replace_content_hashes():
         assert first.hash != second.hash
         manager.remember_multimodal_uuids([(a, "x" * 257)])
         assert len(source._uuids) == 1
-        with pytest.raises(ValueError, match="Conflicting UUIDs"):
-            manager.remember_multimodal_uuids([(b, "different-hint")])
+        manager.remember_multimodal_uuids([(b, "different-hint")])
+        assert source._multimodal_key((b, 0)).uuid is None
+        manager.remember_multimodal_uuids([(b, "same-routing-hint")])
+        assert source._multimodal_key((b, 0)).uuid is None
+        assert len(source._uuids) == 1
     finally:
         manager.shutdown()
 

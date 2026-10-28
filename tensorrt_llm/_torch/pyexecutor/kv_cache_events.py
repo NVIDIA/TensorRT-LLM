@@ -563,7 +563,7 @@ class _StreamingEventSource:
         self._include_mm_keys = mm_token_id_offset is not None
         self._mm_token_id_offset = mm_token_id_offset
         self._uuid_capacity = max_entries
-        self._uuids: OrderedDict[bytes, str] = OrderedDict()
+        self._uuids: OrderedDict[bytes, str | None] = OrderedDict()
         self._uuid_lock = threading.Lock()
         self._event_sink = kv_cache_manager_v2_runtime.StreamingEventSink(
             max_entries=max_entries,
@@ -580,10 +580,11 @@ class _StreamingEventSource:
             if len(uuid.encode("utf-8")) > 256:
                 continue
             with self._uuid_lock:
-                previous = self._uuids.get(digest)
-                if previous is not None and previous != uuid:
-                    raise ValueError("Conflicting UUIDs for a multimodal content digest")
-                self._uuids[digest] = uuid
+                if digest in self._uuids and self._uuids[digest] != uuid:
+                    # Keep conflicting hints ambiguous until their bounded entry is evicted.
+                    self._uuids[digest] = None
+                else:
+                    self._uuids[digest] = uuid
                 self._uuids.move_to_end(digest)
                 while len(self._uuids) > self._uuid_capacity:
                     self._uuids.popitem(last=False)
@@ -627,9 +628,7 @@ class _StreamingEventSource:
                             )
                             if mm_keys is not None
                             and self._mm_token_id_offset is not None
-                            and any(
-                                key.uuid is not None for block_keys in mm_keys for key in block_keys
-                            )
+                            and any(mm_keys)
                             else None
                         ),
                     )

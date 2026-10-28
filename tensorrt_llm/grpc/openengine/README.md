@@ -126,7 +126,7 @@ block reuse enabled, and ZMQ event publishing. Image passthrough separately
 requires `supports_multimodal` and `extra.trtllm_supported_modalities` to advertise
 image support. Video, audio, and disaggregated image routing are not advertised.
 
-For image blocks with caller UUIDs, `BlockStored.trtllm_image_routing` contains
+For image blocks, `BlockStored.trtllm_image_routing` contains
 `version`, `token_id_offset` (the vocabulary size), and `keys`, aligned with the
 stored blocks. Each key carries its native content `hash`, `start_offset`, and
 optional `uuid`. Native image tokens start with a digest and continue with IDs
@@ -135,7 +135,9 @@ sent in `MediaItem.uuid`. Native block hashes, parent chains, and removals retai
 their existing meaning. Cache hashing continues to include image content.
 
 The publisher retains at most `max_entries` digest-to-UUID associations and skips
-UUIDs longer than 256 UTF-8 bytes. Eviction can leave UUIDs unavailable. Consumers
+UUIDs longer than 256 UTF-8 bytes. Conflicting hints mark a digest ambiguous until
+its entry is evicted, without failing inference. Missing, evicted, or ambiguous
+hints omit the UUID while retaining the image-routing metadata. Consumers
 must ignore unmapped image stores while continuing to process removals. Routing
 identities must refer to stable media content. This extension does not change the
 OpenEngine schema.

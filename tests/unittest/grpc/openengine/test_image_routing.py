@@ -67,8 +67,8 @@ def test_streaming_image_hints_are_bounded_and_content_sensitive(monkeypatch, uu
         assert source._multimodal_key((bytes.fromhex(hashes[1]), 0)).uuid == uuid
         manager.remember_multimodal_uuids([(bytes.fromhex(hashes[0]), "x" * 257)])
         assert len(source._uuids) == 1
-        with pytest.raises(ValueError, match="Conflicting UUIDs"):
-            manager.remember_multimodal_uuids([(bytes.fromhex(hashes[1]), "other")])
+        manager.remember_multimodal_uuids([(bytes.fromhex(hashes[1]), "other")])
+        assert source._multimodal_key((bytes.fromhex(hashes[1]), 0)).uuid is None
     finally:
         source._event_sink = native_sink
         manager.shutdown()
@@ -138,3 +138,79 @@ def test_request_uuid_pairs_preserve_partial_uuid_slots():
         assert dict(event_manager._event_source._uuids) == {digest: "image-a"}
     finally:
         event_manager.shutdown()
+
+
+def test_conflicting_request_hints_preserve_inference_cache_keys():
+    manager = events.StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+        max_entries=1,
+        mm_token_id_offset=1000,
+    )
+    cache = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    cache.vocab_size = 1000
+    cache.event_manager = manager
+    hashes = [tuple(range(8))]
+    digest = b"".join(value.to_bytes(4, "big", signed=True) for value in hashes[0])
+    results = []
+    try:
+        for uuid in ["image-a", "image-b", "image-a"]:
+            request = SimpleNamespace(
+                multimodal_hashes=hashes,
+                multimodal_uuids=[uuid],
+                multimodal_positions=[0],
+                multimodal_lengths=[1],
+                multimodal_item_run_cu_offsets=None,
+                multimodal_run_positions=None,
+                multimodal_run_lengths=None,
+            )
+            results.append(cache._augment_tokens_for_block_reuse([1, 2], request))
+            hint = manager._event_source._multimodal_key((digest, 0)).uuid
+            assert hint == ("image-a" if len(results) == 1 else None)
+        assert results[0] == results[1] == results[2]
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("hint_state", ["absent", "evicted", "ambiguous"])
+def test_unmapped_integer_image_continuations_keep_routing_metadata(monkeypatch, hint_state):
+    manager = events.StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+        max_entries=1,
+        mm_token_id_offset=1000,
+    )
+    source = manager._event_source
+    native_sink = source._event_sink
+    digest = bytes(range(32))
+    try:
+        if hint_state != "absent":
+            manager.remember_multimodal_uuids([(digest, "image-a")])
+            if hint_state == "evicted":
+                manager.remember_multimodal_uuids([(bytes(reversed(digest)), "image-b")])
+            else:
+                manager.remember_multimodal_uuids([(digest, "image-b")])
+
+        class Stored:
+            block_hashes = [123]
+            parent_block_hash = 122
+            token_ids = [1003, 1004, 1005, 7]
+            lora_id = None
+            mm_keys = [[(digest, 3)]]
+
+        monkeypatch.setattr(events.kv_cache_manager_v2_runtime, "StreamingBlockStoredData", Stored)
+        source._event_sink = SimpleNamespace(drain_iteration_events=lambda: [Stored()])
+        wire = msgspec.msgpack.decode(msgspec.msgpack.encode(source.drain_events()[0]))
+        metadata = wire["trtllm_image_routing"]
+        assert metadata["version"] == 1 and metadata["token_id_offset"] == 1000
+        key = metadata["keys"][0][0]
+        assert key["hash"] == digest.hex() and key["start_offset"] == 3
+        assert key.get("uuid") is None
+        assert wire["token_ids"] == Stored.token_ids
+    finally:
+        source._event_sink = native_sink
+        manager.shutdown()
