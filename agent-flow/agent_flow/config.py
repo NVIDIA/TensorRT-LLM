@@ -16,8 +16,8 @@ CODEX_DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-6-astra")
 class BackendConfig:
     kind: BackendKind
     model: str
-    # Provider reasoning tier. ``None`` retains the backend's historical
-    # maximum-effort default.
+    # Provider reasoning tier. ``None`` leaves it to the backend: Claude
+    # Code's maximum, or the effort Codex's own configuration sets.
     reasoning_effort: str | None = None
     disabled_skills: tuple[str, ...] = ()
     tools: list[Any] | None = None
@@ -39,11 +39,18 @@ class BackendConfig:
     # diff the session cwd's git HEAD and must target the task's repo,
     # not the framework repo.
     cwd: Path | None = None
+    # Directories besides ``cwd`` the agent writes. A Codex session the site
+    # confines to a workspace-write sandbox may write them without approval;
+    # Claude Code, which runs unsandboxed, ignores them.
+    writable_roots: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class SessionConfig:
     mode: SessionMode = "stateless"
+    # Start as a fork of this earlier session (its backend id): with its
+    # history, under a new id. Only backends that can fork accept it.
+    fork_from: str | None = None
 
 
 @dataclass(frozen=True)

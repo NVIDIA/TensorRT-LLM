@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Translate the pinned Codex app-server protocol into shared backend events."""
 
 from __future__ import annotations
@@ -50,12 +53,12 @@ _TOKEN_FIELDS = {
 }
 
 
-def _usage(token_usage: dict[str, Any], baseline: dict[str, int]) -> UsageInfo:
+def _usage(token_usage: dict[str, Any], baseline: dict[str, int] | None) -> UsageInfo:
     # Thread totals are cumulative; ResultEvent describes this send_message call.
     fields: dict[str, Any] = {}
     for source, target in _TOKEN_FIELDS.items():
         current = _integer(token_usage.get("total", {}).get(source))
-        if current is not None:
+        if current is not None and baseline is not None:
             previous = baseline.get(source, 0)
             fields[target] = current - previous if current >= previous else current
     context = _integer(token_usage.get("last", {}).get("totalTokens"))
@@ -173,12 +176,15 @@ class CodexClient(BackendClient):
         transport: CodexTransport,
         thread_id: str,
         session_init: SessionInitEvent | None = None,
+        *,
+        inherited_history: bool = False,
     ) -> None:
         self._transport = transport
         self._thread_id = thread_id
         self._session_init = session_init
         self._initialized = False
         self._totals: dict[str, int] = {}
+        self._usage_baseline_known = not inherited_history
         self._context: UsageInfo | None = None
         self._parents: dict[str, str] = {}
         self._labels: dict[str, str] = {}
@@ -258,7 +264,7 @@ class CodexClient(BackendClient):
             for event in self._rate_updates(initial_limits, complete=True):
                 yield event
 
-        baseline = dict(self._totals)
+        baseline = dict(self._totals) if self._usage_baseline_known else None
         latest_usage: UsageInfo | None = None
         final_text = ""
         fallback_text = ""
@@ -411,10 +417,12 @@ class CodexClient(BackendClient):
                     estimate = _integer(thread_usage.get("estimatedUsageUsdMicros"))
                     if thread_usage.get("threadId") == self._thread_id and estimate is not None:
                         usage.estimated_thread_cost_usd = estimate / 1_000_000
+                    self._usage_baseline_known = bool(self._totals)
                     yield ResultEvent(
                         text=final_text or fallback_text,
                         usage=usage,
                         permission_denials=permission_denials,
+                        session_id=self._thread_id,
                     )
                     return
         raise RuntimeError("Codex notification stream ended before the main turn completed")
