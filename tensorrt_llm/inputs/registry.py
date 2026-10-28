@@ -213,10 +213,18 @@ class BaseMultimodalInputProcessor(ABC):
                                     if enable_tokenization_cache else None)
 
     def _encode_with_tokenization_cache(
-            self, prompt: str,
-            sampling_params: Optional[SamplingParams]) -> Optional[List[int]]:
-        if (self._prefix_token_cache is None or sampling_params is None
-                or sampling_params.add_special_tokens
+        self,
+        prompt: str,
+        sampling_params: Optional[SamplingParams],
+        adds_no_special_tokens: bool = False,
+    ) -> Optional[List[int]]:
+        """Cached ids of `prompt`, or None to tokenize it in full.
+
+        `adds_no_special_tokens`: the caller verified that its tokenizer adds no
+        special tokens, so `add_special_tokens=True` does not change the ids.
+        """
+        if (self._prefix_token_cache is None or sampling_params is None or
+            (sampling_params.add_special_tokens and not adds_no_special_tokens)
                 or sampling_params.truncate_prompt_tokens is not None):
             return None
         return self._prefix_token_cache.encode(

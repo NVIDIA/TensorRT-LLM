@@ -1293,8 +1293,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         # serving the prefill worker re-registers that tensor as a CUDA IPC
         # handle no one ever consumes.
         if not mm_data:
-            ids = self._encode_with_tokenization_cache(text_prompt,
-                                                       sampling_params)
+            # The cache exists only for a tokenizer that adds no special
+            # tokens (__init__), so add_special_tokens cannot change the ids.
+            ids = self._encode_with_tokenization_cache(
+                text_prompt, sampling_params, adds_no_special_tokens=True)
             if ids is not None:
                 return ids, None
             input_ids = self.tokenizer(text_prompt,

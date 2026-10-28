@@ -361,12 +361,16 @@ def _qwen2vl_processor(monkeypatch: pytest.MonkeyPatch, tokenizer: Any):
     )
 
 
-def test_qwen2vl_processor_text_prompts_use_the_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+# Default SamplingParams add special tokens, a no-op for this tokenizer.
+@pytest.mark.parametrize("add_special_tokens", [True, False])
+def test_qwen2vl_processor_text_prompts_use_the_cache(
+    monkeypatch: pytest.MonkeyPatch, add_special_tokens: bool
+) -> None:
     processor = _qwen2vl_processor(monkeypatch, _NoSpecialTokensMergeTokenizer())
     assert type(processor).supports_tokenization_cache
     cache = processor._prefix_token_cache
     assert cache is not None
-    params = SamplingParams(add_special_tokens=False)
+    params = SamplingParams() if add_special_tokens else SamplingParams(add_special_tokens=False)
     for prompt in _turns(4):
         ids, extra = processor.call_with_text_prompt({"prompt": prompt}, params)
         assert ids == _MergeTokenizer()(prompt)["input_ids"]
