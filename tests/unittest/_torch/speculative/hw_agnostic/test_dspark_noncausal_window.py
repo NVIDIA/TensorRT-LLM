@@ -200,6 +200,18 @@ def test_dspark_honors_explicit_window_causality_metadata(metadata, expected):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("metadata", [{"is_causal": True}, {"sliding_window_non_causal": False}])
+def test_dspark_causal_metadata_applies_to_a_use_swa_only_window(metadata):
+    """A window that comes only from ``dflash_config.use_swa`` (no top-level
+    ``sliding_window``) still gets the causal decode when the config says so."""
+    config = SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2, **metadata)
+    wrapper = _wrapper(GQADSparkForCausalLM, config, layer_windows=[(511, 511)] * 2)
+    assert wrapper._get_attention_mask_args(0) == (True, (511, 0))
+    assert wrapper._resolve_block_attention(0)[0] is True
+    assert wrapper.validate_block_attention_windows() == ["causal decode"] * 2
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("head_dim", [72, 80, 96])
 def test_windowed_layers_are_not_held_to_the_context_kernel_head_sizes(head_dim):
     """Regression: a windowed non-causal layer is lowered to the block decode,

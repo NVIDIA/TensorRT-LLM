@@ -2802,6 +2802,14 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         """
         base = super()._get_attention_mask_args(layer_idx)
         if self._declares_causal_window():
+            causal, _ = base
+            layer_window = (
+                self._layer_windows[layer_idx] if layer_idx < len(self._layer_windows) else (-1, -1)
+            )
+            if not causal and layer_window[0] >= 0:
+                # The window comes from ``dflash_config.use_swa`` alone, which
+                # the DFlash default reads as a full-attention layer.
+                return True, (layer_window[0], 0)
             return base
         _, (window_left, _) = base
         return False, (window_left, window_left)
