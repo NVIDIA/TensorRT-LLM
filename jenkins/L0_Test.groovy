@@ -215,6 +215,9 @@ ENABLE_INFRA_SCOPED_FAILFAST = env.ENABLE_INFRA_SCOPED_FAILFAST ? env.ENABLE_INF
 // to fail, we treat it as a timeout.
 SLURM_TIMEOUT_RETRY_FRACTION = 0.9
 
+// A Slurm job whose console/log shows no new output for this long is considered hung and cancelled.
+NO_LOG_TIMEOUT_SECONDS = 7200
+
 // SLURM states in which the job is still alive (no terminal verdict yet). When a
 // monitor/agent exception surfaces while the job is in one of these, the failure
 // is a transient infra blip (lost SSH/agent) -- not a test result -- so the stage
@@ -1496,7 +1499,11 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             return err
         }
         try {
-            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
+            // Abort if the console shows no new output for NO_LOG_TIMEOUT_SECONDS (the same
+            // threshold the sbatch tracker uses); the finally block below then scancels the job.
+            timeout(time: NO_LOG_TIMEOUT_SECONDS, unit: 'SECONDS', activity: true) {
+                executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
+            }
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -2505,7 +2512,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     tail -n +1 -F -- "${slurmJobLogPath}" &
                     tailPid=\$!
 
-                    noLogTimeoutSecs=7200
+                    noLogTimeoutSecs=${NO_LOG_TIMEOUT_SECONDS}
                     lastLogSize=-1
                     lastLogChangeEpoch=\$(date +%s)
 
