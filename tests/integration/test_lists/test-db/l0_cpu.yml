@@ -225,6 +225,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
   - unittest/llmapi/apps/test_openai_chat_multimodal_prompt.py
+  - unittest/llmapi/apps/test_openai_protocol_chat_agent_fields.py
   - unittest/llmapi/apps/test_openai_protocol_chat_store.py
   - unittest/llmapi/apps/test_openai_server_iteration_stats.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
