@@ -786,6 +786,10 @@ and `org-b/model` share a directory name while meaning different weights. `segme
 rank against a per-node memory limit, so a node's demand is `ranks_on_node × segment_size` and is
 checked against available memory at startup.
 
+A server publishes a block only once the forward pass that computes its last token has been queued
+for saving, so pages it allocates ahead of computation, such as those of a context chunk trimmed to
+the token budget, never reach the pool.
+
 ### Roles
 
 Capacity and traffic are separate: every role lends the memory its config asks for, and the role
