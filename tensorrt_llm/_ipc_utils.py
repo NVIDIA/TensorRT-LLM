@@ -40,6 +40,32 @@ def _raise_if_error(error: cudart.cudaError_t | cuda.CUresult):
             raise RuntimeError(f"CUDA Driver API error: {error!r}")
 
 
+# cudaError_t names meaning "this system cannot do CUDA IPC between these GPUs", as
+# opposed to a misuse of the API. Only these fall back to NCCL, see
+# IpcMemory.open_ipc_memory. github.com/NVIDIA/TensorRT-LLM/issues/16899 is
+# cudaErrorInvalidDevice from cudaIpcOpenMemHandle on GPUs that report P2P.
+_IPC_CAPABILITY_ERROR_NAMES = (
+    "cudaErrorInvalidDevice",
+    "cudaErrorNotSupported",
+    "cudaErrorPeerAccessUnsupported",
+)
+
+
+def _ipc_capability_errors() -> set:
+    return {
+        int(getattr(cudart.cudaError_t, name))
+        for name in _IPC_CAPABILITY_ERROR_NAMES
+        if hasattr(cudart.cudaError_t, name)
+    }
+
+
+def _cuda_error_name(code: int) -> str:
+    try:
+        return repr(cudart.cudaError_t(code))
+    except ValueError:
+        return f"cudaError_t({code})"
+
+
 def _ipc_mem_handle_to_bytes(handle) -> bytes:
     """Serialize a cudaIpcMemHandle across cuda-python / cuda-bindings versions."""
     reserved = getattr(handle, "reserved", None)
@@ -144,8 +170,9 @@ class IpcMemory:
         Returns None when CUDA IPC is not usable. `cudaDeviceCanAccessPeer` only reports that the
         GPUs can address each other's memory, it does not guarantee that IPC handles can be
         exported/imported: that additionally fails on GPUs without CUDA IPC support and when the
-        ranks do not share an IPC namespace. The outcome is agreed upon by the whole TP group, so
-        that either every rank gets IPC buffers or none of them does.
+        ranks do not share an IPC namespace. Only those capability errors fall back, any other
+        IPC error still raises. The outcome is agreed upon by the whole TP group, so that either
+        every rank gets IPC buffers, or none of them does, or all of them raise.
         """
 
         def align_size(size, alignment):
@@ -165,36 +192,59 @@ class IpcMemory:
         if set_to_zero:
             _raise_if_error(cudart.cudaMemset(local_ptr, 0, aligned_size)[0])
 
-        def disable_ipc(reason: str, opened_ptrs: List[int]) -> None:
+        def release(opened_ptrs: List[int]) -> None:
+            for ptr in opened_ptrs:
+                _raise_if_error(cudart.cudaIpcCloseMemHandle(ptr)[0])
+            _raise_if_error(cudart.cudaFree(local_ptr)[0])
+
+        def agree(api: str, errors: List[Optional[int]], opened_ptrs: List[int]) -> bool:
+            """Group-wide verdict on one IPC step, from every rank's error code.
+
+            Returns True when every rank succeeded. When the only failures are
+            capability errors, i.e. this system cannot do CUDA IPC at all, releases
+            this rank's buffers and returns False so the caller falls back to NCCL.
+            Any other error is a real bug (a corrupted handle for instance) and
+            raises, so it is not hidden behind a silent NCCL fallback. Every rank
+            sees the same codes, so every rank takes the same branch.
+            """
+            failed = [(rank, code) for rank, code in enumerate(errors) if code is not None]
+            if not failed:
+                return True
+            release(opened_ptrs)
+            failures = ", ".join(f"rank {rank}: {_cuda_error_name(code)}" for rank, code in failed)
+            if not all(code in _ipc_capability_errors() for _, code in failed):
+                raise RuntimeError(f"{api} failed on the TP group ({failures})")
             # Every rank of the group takes this path, including the ones whose own
-            # handles were fine, so log unconditionally: otherwise a rank that is
+            # call was fine, so log unconditionally: otherwise a rank that is
             # falling back because of a peer would degrade silently.
+            local_error = errors[mapping.tp_rank]
+            reason = (
+                f"{api} failed with {_cuda_error_name(local_error)}."
+                if local_error is not None
+                else f"{api} failed on a peer rank of the TP group ({failures})."
+            )
             logger.warning_once(
                 f"CUDA IPC is not usable on this system: {reason} "
                 "Custom all-reduce kernels are disabled, falling back to NCCL.",
                 key="cuda-ipc-unavailable",
             )
-            for ptr in opened_ptrs:
-                _raise_if_error(cudart.cudaIpcCloseMemHandle(ptr)[0])
-            _raise_if_error(cudart.cudaFree(local_ptr)[0])
+            return False
 
-        # A rank that cannot export its handle contributes None instead of an
-        # uninitialized `cudaIpcMemHandle_t`, so that no rank ever hands garbage to
+        # A rank that cannot export its handle contributes its error code instead of
+        # an uninitialized `cudaIpcMemHandle_t`, so that no rank ever hands garbage to
         # `cudaIpcOpenMemHandle`. This single collective carries both the payload and
-        # the agreement on whether exporting worked everywhere.
+        # what every rank needs to agree on the outcome of exporting.
         error, local_handle = cudart.cudaIpcGetMemHandle(local_ptr)
-        get_error = None if error == cudart.cudaError_t.cudaSuccess else error
         handles_reserved = dist.tp_allgather(
-            _ipc_mem_handle_to_bytes(local_handle) if get_error is None else None
+            _ipc_mem_handle_to_bytes(local_handle)
+            if error == cudart.cudaError_t.cudaSuccess
+            else int(error)
         )
-
-        if any(reserved is None for reserved in handles_reserved):
-            disable_ipc(
-                f"cudaIpcGetMemHandle failed with {get_error!r}."
-                if get_error is not None
-                else "cudaIpcGetMemHandle failed on a peer rank of the TP group.",
-                [],
-            )
+        if not agree(
+            "cudaIpcGetMemHandle",
+            [reserved if isinstance(reserved, int) else None for reserved in handles_reserved],
+            [],
+        ):
             return None
 
         peer_ptrs = []
@@ -207,18 +257,12 @@ class IpcMemory:
             handle = _ipc_mem_handle_from_bytes(reserved)
             error, ptr = cudart.cudaIpcOpenMemHandle(handle, cudart.cudaIpcMemLazyEnablePeerAccess)
             if error != cudart.cudaError_t.cudaSuccess:
-                open_error = error
+                open_error = int(error)
                 break
             peer_ptrs.append(ptr)
             opened_ptrs.append(ptr)
 
-        if not all(dist.tp_allgather(open_error is None)):
-            disable_ipc(
-                f"cudaIpcOpenMemHandle failed with {open_error!r}."
-                if open_error is not None
-                else "cudaIpcOpenMemHandle failed on a peer rank of the TP group.",
-                opened_ptrs,
-            )
+        if not agree("cudaIpcOpenMemHandle", dist.tp_allgather(open_error), opened_ptrs):
             return None
 
         return peer_ptrs, local_ptr

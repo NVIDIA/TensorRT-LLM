@@ -18,7 +18,8 @@ Tests for the CUDA IPC fallback in IpcMemory and its effect on strategy selectio
 `cudaDeviceCanAccessPeer` reporting P2P does not guarantee that IPC handles can be
 exported/imported.  When IPC turns out to be unusable, IpcMemory keeps null pointers
 so the runtime falls back to NCCL instead of raising, and the whole TP group agrees
-on that.
+on that.  Only capability errors fall back: any other IPC error still raises, on
+every rank, so a real bug is not hidden behind NCCL.
 
 A workspace with no IPC buffers because P2P was never there (inter-node TP) is not a
 failure though, and must not change the strategy, or MNNVL never gets selected.
@@ -31,6 +32,7 @@ workspace helper it drives allocates device tensors.
     pytest tests/unittest/_torch/distributed/test_ipc_memory_fallback.py -v
 """
 
+import contextlib
 from enum import IntEnum
 from unittest.mock import patch
 
@@ -62,7 +64,11 @@ TP_SIZE = 2
 
 class FakeCudaError(IntEnum):
     cudaSuccess = 0
+    cudaErrorInvalidValue = 1
     cudaErrorInvalidDevice = 101
+    cudaErrorPeerAccessUnsupported = 217
+    cudaErrorInvalidResourceHandle = 400
+    cudaErrorNotSupported = 801
 
 
 class FakeIpcMemHandle:
@@ -122,19 +128,28 @@ class FakeCudart:
 class FakeDist:
     """`tp_allgather` over a fake TP group where the peers mirror this rank.
 
-    `peer_exports` and `peer_ipc_ok` override what the peers contribute, which
-    lets a test exercise "this rank succeeded but another one did not".
+    `peer_export_error` and `peer_open_error` set the CUDA error the peers report
+    for the handle export and import steps, which lets a test exercise "this rank
+    succeeded but another one did not".  None means the peers succeeded.
     """
 
-    def __init__(self, tp_size, peer_exports=True, peer_ipc_ok=True):
+    def __init__(self, tp_size, peer_export_error=None, peer_open_error=None):
         self.tp_size = tp_size
-        self.peer_exports = peer_exports
-        self.peer_ipc_ok = peer_ipc_ok
+        self.peer_export_error = peer_export_error
+        self.peer_open_error = peer_open_error
+        self.calls = 0
 
     def tp_allgather(self, obj):
-        if isinstance(obj, bool):
-            return [obj] + [self.peer_ipc_ok] * (self.tp_size - 1)
-        peer = obj if self.peer_exports else None
+        self.calls += 1
+        if self.calls == 1:
+            # Handle export: the peers send their handle bytes, or an error code.
+            if self.peer_export_error is None:
+                peer = b"\xcd" * 64
+            else:
+                peer = int(self.peer_export_error)
+        else:
+            # Handle import: the peers send None, or an error code.
+            peer = None if self.peer_open_error is None else int(self.peer_open_error)
         return [obj] + [peer] * (self.tp_size - 1)
 
 
@@ -153,21 +168,35 @@ def _patched(cudart, dist):
 
 
 def _run(mapping, cudart, dist, open_ipc=True):
+    """Builds an IpcMemory that is expected to end up without IPC buffers."""
     cudart_patch, dist_patch = _patched(cudart, dist)
     with cudart_patch, dist_patch:
-        return IpcMemory(mapping, 1 << 20, open_ipc)
+        ipc_memory = IpcMemory(mapping, 1 << 20, open_ipc)
+    # Nothing for __del__ to release, so it never reaches the real CUDA runtime
+    # with the fake pointers once the patches are gone.
+    assert not ipc_memory.open_ipc
+    return ipc_memory
 
 
 def test_ipc_ok(mapping):
     cudart = FakeCudart()
+    cudart_patch, dist_patch = _patched(cudart, FakeDist(TP_SIZE))
 
-    ipc_memory = _run(mapping, cudart, FakeDist(TP_SIZE))
+    with cudart_patch, dist_patch:
+        ipc_memory = IpcMemory(mapping, 1 << 20, True)
 
-    assert ipc_memory.open_ipc
-    assert not ipc_memory.ipc_failed
-    assert ipc_memory.local_ptr != 0
-    assert all(ptr != 0 for ptr in ipc_memory.peer_ptrs)
-    assert len(cudart.opened) == TP_SIZE - 1
+        assert ipc_memory.open_ipc
+        assert not ipc_memory.ipc_failed
+        assert ipc_memory.local_ptr != 0
+        assert all(ptr != 0 for ptr in ipc_memory.peer_ptrs)
+        assert len(cudart.opened) == TP_SIZE - 1
+
+        # Release the fake buffers while the fake runtime is still in place.
+        IpcMemory.close_ipc_memory(mapping, ipc_memory.peer_ptrs)
+        ipc_memory.open_ipc = False
+
+    assert not cudart.allocated
+    assert not cudart.opened
 
 
 def test_local_open_fails(mapping):
@@ -175,9 +204,12 @@ def test_local_open_fails(mapping):
     # fails with cudaErrorInvalidDevice even though cudaDeviceCanAccessPeer passed.
     cudart = FakeCudart(open_handle_error=FakeCudaError.cudaErrorInvalidDevice)
 
-    ipc_memory = _run(mapping, cudart, FakeDist(TP_SIZE, peer_ipc_ok=False))
+    ipc_memory = _run(
+        mapping,
+        cudart,
+        FakeDist(TP_SIZE, peer_open_error=FakeCudaError.cudaErrorInvalidDevice),
+    )
 
-    assert not ipc_memory.open_ipc
     assert ipc_memory.ipc_failed
     assert ipc_memory.local_ptr == 0
     assert ipc_memory.peer_ptrs == [0] * TP_SIZE
@@ -189,9 +221,12 @@ def test_peer_open_fails(mapping):
     # fall back as well, otherwise it would use buffers the peers never mapped.
     cudart = FakeCudart()
 
-    ipc_memory = _run(mapping, cudart, FakeDist(TP_SIZE, peer_ipc_ok=False))
+    ipc_memory = _run(
+        mapping,
+        cudart,
+        FakeDist(TP_SIZE, peer_open_error=FakeCudaError.cudaErrorNotSupported),
+    )
 
-    assert not ipc_memory.open_ipc
     assert ipc_memory.ipc_failed
     assert ipc_memory.local_ptr == 0
     assert ipc_memory.peer_ptrs == [0] * TP_SIZE
@@ -204,22 +239,84 @@ def test_local_export_fails(mapping):
 
     ipc_memory = _run(mapping, cudart, FakeDist(TP_SIZE))
 
-    assert not ipc_memory.open_ipc
     assert ipc_memory.ipc_failed
+    assert cudart.open_calls == []
     assert not cudart.allocated
 
 
 def test_peer_export_fails(mapping):
-    # A rank that cannot export contributes None rather than an uninitialized
-    # cudaIpcMemHandle_t, so the peers never import a garbage handle.
+    # A rank that cannot export contributes its error code rather than an
+    # uninitialized cudaIpcMemHandle_t, so the peers never import a garbage handle.
     cudart = FakeCudart()
 
-    ipc_memory = _run(mapping, cudart, FakeDist(TP_SIZE, peer_exports=False))
+    ipc_memory = _run(
+        mapping,
+        cudart,
+        FakeDist(TP_SIZE, peer_export_error=FakeCudaError.cudaErrorPeerAccessUnsupported),
+    )
 
-    assert not ipc_memory.open_ipc
     assert ipc_memory.ipc_failed
     assert cudart.open_calls == []
     assert not cudart.allocated
+
+
+def _expect_raise(mapping, cudart, dist, match):
+    cudart_patch, dist_patch = _patched(cudart, dist)
+    with cudart_patch, dist_patch:
+        with pytest.raises(RuntimeError, match=match):
+            IpcMemory(mapping, 1 << 20, True)
+    assert not cudart.allocated, "the local buffer must be released before raising"
+    assert not cudart.opened, "opened handles must be closed before raising"
+
+
+def test_local_open_bug_raises(mapping):
+    # Not a capability gap: a broken handle round-trip must not be papered over
+    # by a silent NCCL fallback.
+    cudart = FakeCudart(open_handle_error=FakeCudaError.cudaErrorInvalidResourceHandle)
+
+    _expect_raise(
+        mapping,
+        cudart,
+        FakeDist(TP_SIZE, peer_open_error=FakeCudaError.cudaErrorInvalidResourceHandle),
+        "cudaIpcOpenMemHandle failed.*cudaErrorInvalidResourceHandle",
+    )
+
+
+def test_peer_open_bug_raises(mapping):
+    # This rank opened every handle, but a peer hit a non-capability error: every
+    # rank must raise, not only the one that saw it.
+    cudart = FakeCudart()
+
+    _expect_raise(
+        mapping,
+        cudart,
+        FakeDist(TP_SIZE, peer_open_error=FakeCudaError.cudaErrorInvalidResourceHandle),
+        "cudaIpcOpenMemHandle failed.*rank 1: .*cudaErrorInvalidResourceHandle",
+    )
+
+
+def test_peer_export_bug_raises(mapping):
+    cudart = FakeCudart()
+
+    _expect_raise(
+        mapping,
+        cudart,
+        FakeDist(TP_SIZE, peer_export_error=FakeCudaError.cudaErrorInvalidValue),
+        "cudaIpcGetMemHandle failed.*cudaErrorInvalidValue",
+    )
+    assert cudart.open_calls == []
+
+
+def test_mixed_errors_raise(mapping):
+    # One rank lacks the capability, another hit a real error: the real error wins.
+    cudart = FakeCudart(open_handle_error=FakeCudaError.cudaErrorInvalidDevice)
+
+    _expect_raise(
+        mapping,
+        cudart,
+        FakeDist(TP_SIZE, peer_open_error=FakeCudaError.cudaErrorInvalidResourceHandle),
+        "cudaIpcOpenMemHandle failed",
+    )
 
 
 def test_ipc_not_requested(mapping):
@@ -229,7 +326,6 @@ def test_ipc_not_requested(mapping):
 
     ipc_memory = _run(mapping, cudart, FakeDist(TP_SIZE), open_ipc=False)
 
-    assert not ipc_memory.open_ipc
     assert not ipc_memory.ipc_failed
     assert not cudart.allocated
 
@@ -240,28 +336,35 @@ def test_inter_node_tp():
 
     ipc_memory = _run(inter_node, cudart, FakeDist(16))
 
-    assert not ipc_memory.open_ipc
     assert not ipc_memory.ipc_failed
 
 
 class FakeMNNVLAllReduce:
     @staticmethod
-    def is_mnnvl(mapping, dtype):
+    def is_mnnvl(mapping, dtype, explicitly_requested=False):
         return True
 
     def __init__(self, mapping, dtype):
         self.mapping = mapping
 
 
-def _build_allreduce(mapping, strategy, ipc_failed):
-    """Builds an AllReduce with the workspace and MNNVL support both stubbed out."""
+@contextlib.contextmanager
+def _patched_workspace(ipc_failed):
     from tensorrt_llm._torch.distributed import ops
 
     workspace = torch.zeros(1, dtype=torch.int64)
     with (
-        patch.object(ops, "get_allreduce_workspace", lambda _mapping: (workspace, ipc_failed)),
-        patch.object(ops, "MNNVLAllReduce", FakeMNNVLAllReduce),
+        patch.object(ops, "get_allreduce_workspace", lambda _mapping: workspace),
+        patch.object(ops, "allreduce_workspace_ipc_failed", lambda _mapping: ipc_failed),
     ):
+        yield workspace
+
+
+def _build_allreduce(mapping, strategy, ipc_failed):
+    """Builds an AllReduce with the workspace and MNNVL support both stubbed out."""
+    from tensorrt_llm._torch.distributed import ops
+
+    with _patched_workspace(ipc_failed), patch.object(ops, "MNNVLAllReduce", FakeMNNVLAllReduce):
         return ops.AllReduce(mapping=mapping, strategy=strategy, dtype=torch.bfloat16)
 
 
@@ -291,10 +394,40 @@ def test_moe_allreduce_raises(mapping):
     # than dereference the null peer pointers inside the kernel.
     from tensorrt_llm._torch.distributed import ops
 
-    workspace = torch.zeros(1, dtype=torch.int64)
-    with patch.object(ops, "get_allreduce_workspace", lambda _mapping: (workspace, True)):
+    with _patched_workspace(ipc_failed=True):
         with pytest.raises(RuntimeError, match="requires CUDA IPC"):
             ops.MoEAllReduce(mapping)
+
+
+@requires_allreduce_op
+def test_minimax_allreduce_rms_raises(mapping):
+    from tensorrt_llm._torch.distributed import ops
+
+    with _patched_workspace(ipc_failed=True):
+        with pytest.raises(RuntimeError, match="requires CUDA IPC"):
+            ops.MiniMaxAllReduceRMS(mapping)
+
+
+@requires_allreduce_op
+@pytest.mark.parametrize("ipc_failed", [False, True])
+def test_group_args_fall_back_to_nccl(mapping, ipc_failed):
+    # The raw-op entry builds its own workspace argument: it must not hand null
+    # peer pointers to a custom kernel either.
+    from tensorrt_llm import _utils
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import allreduce as entry
+
+    with (
+        _patched_workspace(ipc_failed) as workspace,
+        patch.object(_utils, "mpi_disabled", lambda: False),
+    ):
+        args = entry.allreduce_group_args(mapping)
+
+    if ipc_failed:
+        assert args["strategy"] == int(AllReduceStrategy.NCCL)
+        assert args["workspace"] is None
+    else:
+        assert args["strategy"] == int(AllReduceStrategy.AUTO)
+        assert args["workspace"] is workspace
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -305,7 +438,9 @@ def test_lamport_skipped(mapping):
     from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
 
     cudart = FakeCudart(open_handle_error=FakeCudaError.cudaErrorInvalidDevice)
-    cudart_patch, dist_patch = _patched(cudart, FakeDist(TP_SIZE, peer_ipc_ok=False))
+    cudart_patch, dist_patch = _patched(
+        cudart, FakeDist(TP_SIZE, peer_open_error=FakeCudaError.cudaErrorInvalidDevice)
+    )
     calls = []
 
     with (
