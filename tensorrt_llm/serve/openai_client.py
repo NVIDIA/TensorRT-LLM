@@ -510,18 +510,25 @@ class OpenAIHttpClient(OpenAIClient):
                                 role,
                                 response_metrics,
                             )
-                    if not is_stream and "text/event-stream" in content_type:
-                        raise ValueError(
-                            "Received an event-stream although request stream was False"
-                        )
+                    # The status decides how the caller and the retries below treat
+                    # an error response, whatever its content type, and a body that
+                    # cannot be read only loses the message.
                     if http_response.status >= 400:
-                        error_body = await http_response.text()
+                        read_error = None
+                        try:
+                            error_body = await http_response.text(errors="replace")
+                        except (aiohttp.ClientError, OSError) as error:
+                            error_body, read_error = "", error
                         raise aiohttp.ClientResponseError(
                             http_response.request_info,
                             http_response.history,
                             status=http_response.status,
                             message=f"{http_response.reason}: {error_body[:2048]}",
                             headers=http_response.headers,
+                        ) from read_error
+                    if not is_stream and "text/event-stream" in content_type:
+                        raise ValueError(
+                            "Received an event-stream although request stream was False"
                         )
                     if is_stream:
                         if "text/event-stream" not in content_type:
