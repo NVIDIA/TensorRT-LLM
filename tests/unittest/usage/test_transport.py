@@ -292,3 +292,81 @@ class TestStagingEndpoint:
 
             status = _post_to_staging(payload)
             assert status == 200, f"Staging rejected ingressPoint={context_value!r}: HTTP {status}"
+
+    @staticmethod
+    def _startup_exit_report(category, prior, state_status):
+        return schema.TrtllmExitReport(
+            exitCodeKnown=True,
+            exitCode=1,
+            signalNumber=0,
+            terminationKind="exception",
+            lifecyclePhase="model_initialization",
+            component="server",
+            reportingSource="self",
+            ingressPoint="cli_serve",
+            llmInitializationAttempts=1,
+            llmInitializationFailures=1,
+            errorCategory=category,
+            priorStartupFailures=prior,
+            startupStateStatus=state_status,
+        )
+
+    def test_exit_report_startup_fields_accepted(self):
+        """Staging accepts every errorCategory and startupStateStatus value."""
+        import uuid
+        from typing import get_args
+
+        categories = get_args(schema.ErrorCategory)
+        statuses = get_args(schema.StartupStateStatus)
+        priors = (0, 3, 1000)
+        for i, category in enumerate(categories):
+            report = self._startup_exit_report(
+                category, priors[i % len(priors)], statuses[i % len(statuses)]
+            )
+            payload = schema.build_gxt_payload(
+                event=report,
+                session_id=uuid.uuid4().hex,
+                trtllm_version="0.0.0-test",
+            )
+
+            status = _post_to_staging(payload)
+            assert status == 200, f"Staging rejected {report!r}: HTTP {status}"
+
+    def test_partial_initial_report_with_exit_report_accepted(self):
+        """Staging accepts a failed start's partial initial report sent with its exit report."""
+        import json
+        import platform as plat
+        import uuid
+
+        payload = schema.build_gxt_payload(
+            event=self._startup_exit_report("resource", 3, "persisted"),
+            session_id=uuid.uuid4().hex,
+            trtllm_version="0.0.0-test",
+        )
+        terminal = payload["events"][0]
+        initial = schema.TrtllmInitialReport(
+            trtllmVersion="0.0.0-test",
+            pythonVersion=plat.python_version(),
+            cpuArchitecture=plat.machine(),
+            backend="pytorch",
+            tensorParallelSize=2,
+            pipelineParallelSize=0,
+            contextParallelSize=0,
+            llmApiConfigMetaJson=json.dumps(
+                {"report_context": "pre_initialization_exit", "source": "unavailable"}
+            ),
+            ingressPoint="cli_serve",
+            llmInitializationAttempts=1,
+            llmInitializationFailures=1,
+            priorStartupFailures=3,
+            startupStateStatus="persisted",
+        )
+        context_event = schema.GxtEvent(
+            ts=terminal["ts"],
+            name="trtllm_initial_report",
+            parameters=initial.model_dump(by_alias=True),
+        ).model_dump(by_alias=True)
+        payload["events"] = [context_event, terminal]
+
+        status = _post_to_staging(payload)
+        assert status == 200, f"Expected HTTP 200, got {status}"

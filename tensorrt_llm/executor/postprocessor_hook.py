@@ -18,6 +18,8 @@ import importlib
 import logging
 from typing import List, Optional, Protocol, runtime_checkable
 
+from .._errors import ConfigInputError
+
 __all__ = [
     "PostProcessorHookAction",
     "PostProcessorHookChunk",
@@ -50,13 +52,13 @@ def load_post_processor_hook(import_path: str) -> "PostProcessorHook":
         hook_class = getattr(module, class_name)
         hook = hook_class()
     except (ValueError, ImportError, AttributeError, TypeError) as e:
-        raise ValueError(
+        raise ConfigInputError(
             f"Failed to load post-processor hook '{import_path}': {e}. "
             "Expected format: 'module.path.ClassName' resolving to a "
             "no-arg-constructible callable class."
         ) from e
     if not callable(hook):
-        raise ValueError(
+        raise ConfigInputError(
             f"Failed to load post-processor hook '{import_path}': resolved "
             f"object is not callable (got {type(hook).__name__}); expected an "
             "instance implementing __call__(chunk)."

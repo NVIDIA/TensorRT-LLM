@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from typing import Generic, Optional, Type
 
+from ..._errors import UnsupportedError
 from ..model_config import ModelConfig
 from ..utils import model_extra_attrs
 from .modeling_utils import (DecoderModelForCausalLM, TConfig, TModel,
@@ -59,14 +60,14 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
             model_arch = config.pretrained_config.architectures[0]
             vision_encoder_info = get_registered_vision_encoder(model_arch)
             if vision_encoder_info is None:
-                raise ValueError(
+                raise UnsupportedError(
                     f"Unknown architecture for AutoModelForMultimodalEncoder: {model_arch}"
                 )
             vision_encoder_cls, vlm_base_model = vision_encoder_info
             return vision_encoder_cls(config, vlm_base_model)
         cls = AutoModelForCausalLM._resolve_class(config)
         if cls is None:
-            raise ValueError(
+            raise UnsupportedError(
                 f"Unknown architecture for AutoModelForCausalLM: {config.pretrained_config.architectures[0]}"
             )
         if issubclass(cls, DecoderModelForCausalLM):

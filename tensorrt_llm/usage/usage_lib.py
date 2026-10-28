@@ -33,6 +33,8 @@ Environment variables:
     TRTLLM_USAGE_HEARTBEAT_INTERVAL: Heartbeat interval in seconds (default 600).
     TRTLLM_USAGE_FORCE_ENABLED: Set to "1" to force-enable telemetry even in
         CI/test environments (e.g., for staging deployments run via CI).
+    TRTLLM_USAGE_STATE_DIR: Directory of the local consecutive startup failure
+        count (default ~/.cache/tensorrt_llm/usage).
 
 CI/Test auto-detection:
     Telemetry is automatically disabled when running in CI environments or
@@ -57,9 +59,9 @@ import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, TypeVar
+from typing import Any, Callable, Dict, Optional, TypeVar, get_args
 
-from tensorrt_llm.usage import schema
+from tensorrt_llm.usage import schema, startup_state
 from tensorrt_llm.usage._startup import REPORT_CONTEXT, bounded_gpu_fields, requested_fields
 from tensorrt_llm.usage.architecture_allowlist import PUBLIC_MODEL_ARCHITECTURES
 from tensorrt_llm.usage.config import UsageContext
@@ -79,9 +81,12 @@ _DISAGG_DEPLOYMENT_ID_ENV = "TRTLLM_DISAGG_DEPLOYMENT_ID"
 _DEFAULT_ENDPOINT = "https://events.gfe.nvidia.com/v1.1/events/json"
 _HTTP_TIMEOUT = 2.0
 _TERMINAL_FLUSH_TIMEOUT = 0.5
+_STARTUP_STATE_TIMEOUT = 0.1
 _ALLOWED_USAGE_CONTEXTS = frozenset(context.value for context in UsageContext)
 _ARCHITECTURE_HASH_DOMAIN = b"trtllm-architecture-class-v1\0"
 _ARCHITECTURE_HASH_PREFIX = "sha256:"
+_ERROR_CATEGORIES = frozenset(get_args(schema.ErrorCategory)) - {""}
+_STARTUP_PHASES = frozenset(("cli_parsing", "config_validation", "model_initialization"))
 _T = TypeVar("_T")
 
 
@@ -243,7 +248,9 @@ _USAGE_NOTICE = (
     "TRT-LLM collects anonymous usage data to help improve the product. "
     "This data cannot be traced back to any individual user. "
     "No user-identifying information, persistent identifiers, or prompts "
-    "are collected. To disable, set TRTLLM_NO_USAGE_STATS=1, "
+    "are collected. A small local file counts consecutive failed starts of "
+    "the same launch; only a coarse count is sent. "
+    "To disable, set TRTLLM_NO_USAGE_STATS=1, "
     "TELEMETRY_DISABLED=true, or pass "
     "TelemetryConfig(disabled=True). "
     "See https://github.com/NVIDIA/TensorRT-LLM for details."
@@ -609,6 +616,11 @@ def _clamp_str(value: str, max_len: int) -> str:
     return value[:max_len] if len(value) > max_len else value
 
 
+def _allowed_error_category(error_category: str) -> str:
+    """Map anything outside the reported categories to ``other``."""
+    return error_category if error_category in _ERROR_CATEGORIES else "other"
+
+
 def _background_reporter(
     llm_args: Any,
     pretrained_config: Any,
@@ -650,6 +662,14 @@ def _background_reporter(
 
         # Use the latest process counters after the collection work above.
         event_snapshot = _event_snapshot(usage_context)
+        # This reporter starts after an LLM initialized: record a successful start.
+        # Bounded like the exit path, so a stalled file system cannot hold back
+        # the initial report and heartbeats.
+        prior_failures, state_status = _bounded_startup_state(
+            session,
+            "reset" if event_snapshot["llmInstancesCreated"] > 0 else "read",
+            time.monotonic() + _STARTUP_STATE_TIMEOUT,
+        )
 
         # --- Build initial report event ---
         # All fields are required by the SMS schema. Use empty string / 0
@@ -688,6 +708,8 @@ def _background_reporter(
             featuresJson=features_json,
             llmApiConfigJson=llm_api_config_json,
             llmApiConfigMetaJson=llm_api_config_meta_json,
+            priorStartupFailures=prior_failures,
+            startupStateStatus=state_status,
             **_session_event_fields(event_snapshot),
         )
 
@@ -773,6 +795,13 @@ class _TelemetrySession:
         self.active_llm_instances = 0
         self.max_concurrent_llm_instances = 0
         self.llm_initialization_failures = 0
+        self.error_category = ""
+        self.visual_gen = False
+        # Fixed at session creation from version, host name, argv and environment only.
+        self.startup_state_key = startup_state.launch_key(self.trtllm_version)
+        self.startup_state: Optional[tuple[int, str]] = None
+        # Held across state-file I/O, so it never blocks the session lock.
+        self.startup_state_lock = threading.Lock()
 
         self.disabled = False
         self.initial_reported = False
@@ -846,11 +875,31 @@ class _TelemetrySession:
             self._refresh_metadata_unlocked()
             return True
 
-    def record_llm_initialization_failure(self) -> None:
-        """Increment the initialization failure counter."""
+    def record_llm_initialization_failure(self, error_category: str = "") -> None:
+        """Increment the initialization failure counter and keep the failure's category."""
         with self.lock:
             if not self.disabled and not self.terminal_reported:
                 self.llm_initialization_failures = self._increment(self.llm_initialization_failures)
+                if error_category:
+                    self.error_category = _allowed_error_category(error_category)
+
+    def record_startup_error_category(self, error_category: str) -> None:
+        """Keep the category of a startup failure unless an LLM attempt recorded one."""
+        with self.lock:
+            if (
+                not self.disabled
+                and not self.terminal_reported
+                and not self.llm_instances_created
+                and not self.error_category
+                and error_category
+            ):
+                self.error_category = _allowed_error_category(error_category)
+
+    def mark_visual_gen(self) -> None:
+        """Exclude this VisualGen session from startup failure reporting."""
+        with self.lock:
+            if not self.disabled and not self.terminal_reported:
+                self.visual_gen = True
 
     def record_llm_initialized(self) -> bool:
         """Record a successfully constructed and active LLM object."""
@@ -864,6 +913,7 @@ class _TelemetrySession:
                 self.active_llm_instances,
             )
             self.lifecycle_phase = "serving"
+            self.error_category = ""
             return True
 
     def record_llm_shutdown(self) -> None:
@@ -921,6 +971,8 @@ class _TelemetrySession:
             "lifecyclePhase": self.lifecycle_phase,
             "component": self.component,
             "observedSignal": self.observed_signal,
+            "errorCategory": self.error_category,
+            "visualGen": self.visual_gen,
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -932,6 +984,27 @@ class _TelemetrySession:
         """Return the observed signal without building a full snapshot."""
         with self.lock:
             return self.observed_signal
+
+    def consult_startup_state(self, action: startup_state.StartupStateAction) -> tuple[int, str]:
+        """Apply ``action`` to the local startup state once and return its fields.
+
+        Returns the bucketed prior failure count and the state status. The first
+        call does the file I/O; later calls return its result, so a process reads
+        and writes the state file at most once. Disabled and VisualGen sessions
+        never touch it.
+        """
+        with self.startup_state_lock:
+            if self.startup_state is None:
+                # Under the session lock: a consult that has not passed this check
+                # when disable() returns never touches the file.
+                with self.lock:
+                    skip = self.disabled or self.visual_gen
+                if skip:
+                    self.startup_state = (0, "")
+                else:
+                    prior, status = startup_state.consult(self.startup_state_key, action)
+                    self.startup_state = (startup_state.bucket(prior), status)
+            return self.startup_state
 
     def claim_terminal(
         self, outcome: TerminalOutcome, lifecycle_phase: Optional[schema.LifecyclePhase] = None
@@ -1082,6 +1155,8 @@ def _empty_event_snapshot(usage_context: str = "") -> dict[str, Any]:
         "lifecyclePhase": "unknown",
         "component": "unknown",
         "observedSignal": 0,
+        "errorCategory": "",
+        "visualGen": False,
     }
 
 
@@ -1280,14 +1355,27 @@ def record_llm_initialization_attempt(
     )
 
 
-def record_llm_initialization_failure() -> None:
-    """Record a handled Python exception from an LLM constructor."""
-    _session_call(lambda session: session.record_llm_initialization_failure(), None)
+def record_llm_initialization_failure(error_category: str = "") -> None:
+    """Record a handled Python exception from an LLM constructor and its category."""
+    _session_call(lambda session: session.record_llm_initialization_failure(error_category), None)
+
+
+def record_startup_error_category(error_category: str) -> None:
+    """Record the category of an uncaught startup failure at a process boundary.
+
+    A category recorded by the failed LLM constructor takes precedence.
+    """
+    _session_call(lambda session: session.record_startup_error_category(error_category), None)
 
 
 def _mark_llm_startup() -> None:
     """Mark an existing session as an LLM startup path without collecting any data."""
     _session_call(lambda session: session.mark_llm_startup(), None)
+
+
+def _mark_visual_gen() -> None:
+    """Mark the session as VisualGen: no error category or startup state is reported."""
+    _session_call(lambda session: session.mark_visual_gen(), None)
 
 
 def _capture_startup_context(
@@ -1468,6 +1556,10 @@ def _send_terminal(pending: _PendingTerminal) -> None:
                 else "unavailable",
             )
             event_fields = _session_event_fields(terminal["parameters"])
+            event_fields.update(
+                priorStartupFailures=terminal["parameters"]["priorStartupFailures"],
+                startupStateStatus=terminal["parameters"]["startupStateStatus"],
+            )
             defaults = dict(tensorParallelSize=0, pipelineParallelSize=0, contextParallelSize=0)
             initial = schema.TrtllmInitialReport(
                 **(defaults | fields),
@@ -1486,6 +1578,75 @@ def _send_terminal(pending: _PendingTerminal) -> None:
     if not is_usage_stats_enabled():
         pending.session.disable()
     _send_if_session_active(pending.session, payload)
+
+
+def _bounded_startup_state(
+    session: _TelemetrySession, action: startup_state.StartupStateAction, deadline: float
+) -> tuple[int, str]:
+    """Spend at most 100 ms, and nothing past ``deadline``, on the local startup state.
+
+    The file I/O, and any wait for another thread's I/O under the state lock,
+    run on a helper thread. If it has not finished in time, for example on a
+    stalled file system, the state is reported as ``unavailable``.
+    """
+    # Set once under startup_state_lock; a reporter's earlier result needs no I/O.
+    cached = session.startup_state
+    if cached is not None:
+        return cached
+    result: list[tuple[int, str]] = []
+    try:
+        thread = threading.Thread(
+            target=lambda: result.append(session.consult_startup_state(action)),
+            daemon=True,
+            name="trtllm-usage-state",
+        )
+        thread.start()
+    except Exception:
+        # Python 3.12.0 and 3.12.1 cannot start threads from an atexit callback.
+        return 0, "unavailable"
+    # A timed-out consult cannot be cancelled; a late write is still atomic.
+    thread.join(min(_STARTUP_STATE_TIMEOUT, max(0.0, deadline - time.monotonic())))
+    return result[0] if result else (0, "unavailable")
+
+
+def _exit_startup_fields(
+    session: _TelemetrySession,
+    snapshot: dict[str, Any],
+    outcome: TerminalOutcome,
+    deadline: float,
+) -> dict[str, Any]:
+    """Classify the exit for startup failure reporting and update the local count.
+
+    A process that created an LLM or reached serving started successfully: the
+    count is reset. An exception or worker failure during startup, or an LLM API
+    exit after a failed ``LLM()``, is a failed start: the count is incremented
+    and, unless a supervisor observed a child, the failure's category is
+    reported. Other outcomes, such as signals, only read the count.
+    """
+    if snapshot["visualGen"]:
+        return {"errorCategory": "", "priorStartupFailures": 0, "startupStateStatus": ""}
+    kind = outcome.termination_kind
+    phase = snapshot["lifecyclePhase"]
+    failed_start = (kind in ("exception", "worker_failure") and phase in _STARTUP_PHASES) or (
+        kind == "unknown"
+        and phase == "model_initialization"
+        and snapshot["llmInitializationFailures"] > 0
+    )
+    error_category = ""
+    if snapshot["llmInstancesCreated"] > 0 or phase == "serving":
+        action = "reset"
+    elif failed_start:
+        action = "increment"
+        if outcome.reporting_source == "self" and kind in ("exception", "unknown"):
+            error_category = snapshot["errorCategory"] or "other"
+    else:
+        action = "read"
+    prior, status = _bounded_startup_state(session, action, deadline)
+    return {
+        "errorCategory": error_category,
+        "priorStartupFailures": prior,
+        "startupStateStatus": status,
+    }
 
 
 def report_exit(
@@ -1537,6 +1698,7 @@ def report_exit(
         ):
             return True
 
+        startup_fields = _exit_startup_fields(session, snapshot, outcome, deadline)
         _show_usage_notification()
 
         exit_code_known = outcome.exit_code_known is True
@@ -1559,6 +1721,7 @@ def report_exit(
             component=outcome.component or snapshot["component"],
             reportingSource=outcome.reporting_source,
             **_session_event_fields(snapshot),
+            **startup_fields,
         )
         payload = schema.build_gxt_payload(
             event=event,

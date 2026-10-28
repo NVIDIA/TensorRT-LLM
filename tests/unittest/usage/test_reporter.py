@@ -1412,7 +1412,8 @@ class TestProcessTelemetrySession:
 
         def track_thread(*args, **kwargs):
             thread = real_thread(*args, **kwargs)
-            terminal_threads.append(thread)
+            if thread.name == "trtllm-usage-terminal":
+                terminal_threads.append(thread)
             return thread
 
         started = time.monotonic()
@@ -1604,3 +1605,426 @@ else:
 
         assert results.count(True) == 1
         assert len(sent) == 1
+
+
+# ---------------------------------------------------------------------------
+# Startup failure category and local consecutive failure count
+# ---------------------------------------------------------------------------
+
+
+def _restart_process() -> None:
+    """Drop the session as a process exit would; the launch key stays the same."""
+    usage_lib._HEARTBEAT_STOP.set()
+    session = usage_lib._SESSION
+    if session is not None and isinstance(session.terminal_thread, threading.Thread):
+        session.terminal_thread.join(timeout=2)
+    usage_lib._SESSION = None
+    usage_lib._SESSION_DISABLED = False
+    usage_lib._REPORTER_STARTED = False
+    usage_lib._REPORTER_ACTIVE = False
+    usage_lib._HEARTBEAT_STOP = threading.Event()
+
+
+class TestStartupFailureReporting:
+    """errorCategory, priorStartupFailures and startupStateStatus on the wire."""
+
+    @pytest.fixture
+    def consults(self, monkeypatch):
+        """Record every state-file action while keeping the real behavior."""
+        actions = []
+        real_consult = usage_lib.startup_state.consult
+
+        def spy(key, action, **kwargs):
+            actions.append(action)
+            return real_consult(key, action, **kwargs)
+
+        monkeypatch.setattr(usage_lib.startup_state, "consult", spy)
+        return actions
+
+    @staticmethod
+    def _report_exit(outcome, lifecycle_phase=None):
+        sent = []
+        with patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append):
+            usage_lib.report_exit(outcome, lifecycle_phase=lifecycle_phase)
+        return sent
+
+    @staticmethod
+    def _failed_start(category="resource", kind="exception"):
+        """One process whose LLM constructor failed; returns the exit parameters."""
+        assert usage_lib.record_llm_initialization_attempt(default_usage_context="cli_serve")
+        usage_lib.record_llm_initialization_failure(category)
+        sent = TestStartupFailureReporting._report_exit(
+            usage_lib.TerminalOutcome(kind, exit_code_known=True, exit_code=1)
+        )
+        _restart_process()
+        return sent[0]["events"][-1]["parameters"]
+
+    @pytest.mark.parametrize(
+        "kind,phase,source,failures,created,action,category",
+        [
+            ("exception", "model_initialization", "self", 1, 0, "increment", "resource"),
+            ("exception", "config_validation", "self", 0, 0, "increment", "other"),
+            ("exception", "cli_parsing", "self", 0, 0, "increment", "other"),
+            ("worker_failure", "config_validation", "supervisor", 0, 0, "increment", ""),
+            ("timeout", "model_initialization", "self", 0, 0, "read", ""),
+            ("unknown", "model_initialization", "self", 1, 0, "increment", "resource"),
+            ("unknown", "model_initialization", "self", 0, 0, "read", ""),
+            ("signal", "model_initialization", "self", 1, 0, "read", ""),
+            ("clean", "model_initialization", "self", 1, 0, "read", ""),
+            ("exception", "unknown", "self", 0, 0, "read", ""),
+            ("exception", "serving", "self", 0, 0, "reset", ""),
+            ("signal", "serving", "self", 0, 1, "reset", ""),
+            ("exception", "model_initialization", "self", 1, 1, "reset", ""),
+        ],
+    )
+    def test_exit_rules(
+        self, enable_telemetry, consults, kind, phase, source, failures, created, action, category
+    ):
+        assert usage_lib.apply_usage_session_config(default_usage_context="cli_serve")
+        if failures or created:
+            assert usage_lib.record_llm_initialization_attempt()
+        if failures:
+            usage_lib.record_llm_initialization_failure("resource")
+        if created:
+            assert usage_lib.record_llm_initialization_attempt()
+            assert usage_lib.record_llm_initialized()
+        outcome = usage_lib.TerminalOutcome(kind, reporting_source=source)
+
+        sent = self._report_exit(outcome, lifecycle_phase=phase)
+
+        params = sent[0]["events"][-1]["parameters"]
+        assert consults == [action]
+        assert params["errorCategory"] == category
+        assert params["priorStartupFailures"] == 0
+        assert params["startupStateStatus"] == "new"
+
+    def test_restart_loop_reports_buckets_until_success(self, enable_telemetry):
+        reports = [self._failed_start() for _ in range(5)]
+        assert [p["priorStartupFailures"] for p in reports] == [0, 1, 2, 3, 3]
+        assert [p["startupStateStatus"] for p in reports] == ["new"] + ["persisted"] * 4
+        assert {p["errorCategory"] for p in reports} == {"resource"}
+
+        assert usage_lib.record_llm_initialization_attempt()
+        assert usage_lib.record_llm_initialized()
+        sent = self._report_exit(usage_lib.TerminalOutcome("signal", signal_number=2))
+        params = sent[0]["events"][-1]["parameters"]
+        assert (params["priorStartupFailures"], params["startupStateStatus"]) == (3, "persisted")
+        assert params["errorCategory"] == ""
+        _restart_process()
+
+        assert self._failed_start()["priorStartupFailures"] == 0
+
+    def test_background_reporter_resets_once_per_process(
+        self, enable_telemetry, consults, isolated_startup_state_dir
+    ):
+        for _ in range(2):
+            self._failed_start()
+        assert usage_lib.record_llm_initialization_attempt()
+        assert usage_lib.record_llm_initialized()
+
+        sent = []
+        stop_event = threading.Event()
+        stop_event.set()
+        with (
+            patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
+        ):
+            usage_lib._background_reporter(None, None, "cli_serve")
+        initial = sent[0]["events"][0]["parameters"]
+        assert (initial["priorStartupFailures"], initial["startupStateStatus"]) == (2, "persisted")
+        (state_file,) = isolated_startup_state_dir.iterdir()
+        assert json.loads(state_file.read_text())["streak"] == 0
+
+        sent = self._report_exit(usage_lib.TerminalOutcome("exception"), "serving")
+        params = sent[0]["events"][-1]["parameters"]
+        assert (params["priorStartupFailures"], params["startupStateStatus"]) == (2, "persisted")
+        assert consults == ["increment", "increment", "reset"]
+
+    def test_partial_initial_report_carries_the_same_state(self, enable_telemetry):
+        self._failed_start()
+        usage_lib._mark_llm_startup()
+        assert usage_lib.record_llm_initialization_attempt()
+        usage_lib.record_llm_initialization_failure("model_load")
+
+        sent = self._report_exit(usage_lib.TerminalOutcome("exception", exit_code_known=True))
+        initial, terminal = (event["parameters"] for event in sent[0]["events"])
+        assert terminal["errorCategory"] == "model_load"
+        for params in (initial, terminal):
+            assert (params["priorStartupFailures"], params["startupStateStatus"]) == (
+                1,
+                "persisted",
+            )
+        assert "errorCategory" not in initial
+
+    def test_category_recording_rules(self, enable_telemetry):
+        assert usage_lib.record_llm_initialization_attempt()
+        usage_lib.record_llm_initialization_failure("not-a-category")
+        assert usage_lib._SESSION.snapshot()["errorCategory"] == "other"
+        usage_lib.record_llm_initialization_failure("resource")
+        usage_lib.record_startup_error_category("config_input")
+        assert usage_lib._SESSION.snapshot()["errorCategory"] == "resource"
+
+        assert usage_lib.record_llm_initialization_attempt()
+        assert usage_lib.record_llm_initialized()
+        assert usage_lib._SESSION.snapshot()["errorCategory"] == ""
+        usage_lib.record_startup_error_category("config_input")
+        assert usage_lib._SESSION.snapshot()["errorCategory"] == ""
+
+    def test_boundary_category_fills_an_empty_slot(self, enable_telemetry):
+        assert usage_lib.apply_usage_session_config(lifecycle_phase="config_validation")
+        usage_lib.record_startup_error_category("config_input")
+        sent = self._report_exit(usage_lib.TerminalOutcome("exception", exit_code_known=True))
+        assert sent[0]["events"][-1]["parameters"]["errorCategory"] == "config_input"
+
+    def test_visual_gen_session_reports_sentinels_without_file_access(
+        self, enable_telemetry, consults, isolated_startup_state_dir
+    ):
+        assert usage_lib.apply_usage_session_config(lifecycle_phase="config_validation")
+        usage_lib._mark_visual_gen()
+        usage_lib.record_startup_error_category("resource")
+
+        sent = self._report_exit(usage_lib.TerminalOutcome("exception", exit_code_known=True))
+
+        params = sent[0]["events"][-1]["parameters"]
+        assert params["errorCategory"] == ""
+        assert (params["priorStartupFailures"], params["startupStateStatus"]) == (0, "")
+        assert consults == []
+        assert not isolated_startup_state_dir.exists()
+
+    def test_help_probe_and_non_reporting_rank_touch_no_file(
+        self, enable_telemetry, consults, isolated_startup_state_dir
+    ):
+        assert usage_lib.apply_usage_session_config(lifecycle_phase="cli_parsing")
+        assert self._report_exit(usage_lib.TerminalOutcome("clean", exit_code_known=True)) == []
+        _restart_process()
+
+        assert usage_lib.apply_usage_session_config(lifecycle_phase="config_validation")
+        with patch.object(usage_lib, "_is_reporting_rank", return_value=False):
+            assert self._report_exit(usage_lib.TerminalOutcome("exception")) == []
+
+        assert consults == []
+        assert not isolated_startup_state_dir.exists()
+
+    @pytest.mark.parametrize("opt_out", ["env", "config", "ci"])
+    def test_opt_out_touches_no_file(
+        self, monkeypatch, enable_telemetry, consults, isolated_startup_state_dir, opt_out
+    ):
+        assert usage_lib.record_llm_initialization_attempt()
+        usage_lib.record_llm_initialization_failure("resource")
+        telemetry_config = None
+        if opt_out == "env":
+            monkeypatch.setenv("TRTLLM_NO_USAGE_STATS", "1")
+        elif opt_out == "config":
+            telemetry_config = SimpleNamespace(disabled=True, usage_context="cli_serve")
+        else:
+            monkeypatch.delenv("TRTLLM_USAGE_FORCE_ENABLED")
+            monkeypatch.setenv("CI", "true")
+
+        sent = []
+        with patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append):
+            assert not usage_lib.report_exit(
+                usage_lib.TerminalOutcome("exception"), telemetry_config=telemetry_config
+            )
+            usage_lib.report_usage(telemetry_config=telemetry_config)
+            usage_lib._report_process_exit()
+
+        assert sent == []
+        assert consults == []
+        assert not isolated_startup_state_dir.exists()
+
+    @pytest.mark.parametrize("hook", ["_collect_system_info", "_event_snapshot"])
+    def test_late_opt_out_in_reporter_touches_no_file(
+        self, monkeypatch, enable_telemetry, consults, isolated_startup_state_dir, hook
+    ):
+        """Opt-out before ("read") or after ("reset") the reporter's snapshot."""
+        assert usage_lib.record_llm_initialization_attempt(default_usage_context="cli_serve")
+        assert usage_lib.record_llm_initialized()
+        original = getattr(usage_lib, hook)
+
+        def opt_out_after(*args, **kwargs):
+            result = original(*args, **kwargs)
+            usage_lib._deactivate_usage_session()
+            return result
+
+        monkeypatch.setattr(usage_lib, hook, opt_out_after)
+        with patch.object(usage_lib, "_send_to_gxt") as send:
+            usage_lib._background_reporter(None, None, "cli_serve")
+
+        send.assert_not_called()
+        assert consults == []
+        assert not isolated_startup_state_dir.exists()
+
+    def test_late_opt_out_on_exit_path_touches_no_file(
+        self, monkeypatch, enable_telemetry, consults, isolated_startup_state_dir
+    ):
+        assert usage_lib.record_llm_initialization_attempt(default_usage_context="cli_serve")
+        usage_lib.record_llm_initialization_failure("resource")
+        session = usage_lib._SESSION
+        original_claim = session.claim_terminal
+
+        def claim_then_opt_out(*args, **kwargs):
+            result = original_claim(*args, **kwargs)
+            usage_lib._deactivate_usage_session()
+            return result
+
+        monkeypatch.setattr(session, "claim_terminal", claim_then_opt_out)
+        assert self._report_exit(usage_lib.TerminalOutcome("exception", exit_code=1)) == []
+        assert consults == []
+        assert not isolated_startup_state_dir.exists()
+
+    @staticmethod
+    def _assert_unavailable_exit(sent, elapsed):
+        """The failed start's report went out in time, with the state unavailable."""
+        assert elapsed < usage_lib._TERMINAL_FLUSH_TIMEOUT
+        initial, terminal = (event["parameters"] for event in sent[0]["events"])
+        assert terminal["errorCategory"] == "resource"
+        for params in (initial, terminal):
+            assert (params["priorStartupFailures"], params["startupStateStatus"]) == (
+                0,
+                "unavailable",
+            )
+
+    @staticmethod
+    def _join_state_threads():
+        """Wait for the exit path's helper threads once the stalled consult is released."""
+        for thread in threading.enumerate():
+            if thread.name == "trtllm-usage-state":
+                thread.join(timeout=5)
+                assert not thread.is_alive()
+
+    def test_exit_does_not_wait_for_stalled_state_io(self, monkeypatch, enable_telemetry):
+        monkeypatch.setattr(usage_lib, "bounded_gpu_fields", lambda deadline: {})
+        release = threading.Event()
+        actions = []
+
+        def stalled_consult(key, action, **kwargs):
+            actions.append(action)
+            release.wait(timeout=5)
+            return 1, "persisted"
+
+        monkeypatch.setattr(usage_lib.startup_state, "consult", stalled_consult)
+        assert usage_lib.record_llm_initialization_attempt(default_usage_context="cli_serve")
+        usage_lib.record_llm_initialization_failure("resource")
+        try:
+            started = time.monotonic()
+            sent = self._report_exit(usage_lib.TerminalOutcome("exception", exit_code=1))
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            self._join_state_threads()
+
+        self._assert_unavailable_exit(sent, elapsed)
+        assert actions == ["increment"]
+
+    def test_exit_does_not_wait_for_reporter_holding_state_lock(
+        self, monkeypatch, enable_telemetry
+    ):
+        sent = []
+        monkeypatch.setattr(usage_lib, "_send_to_gxt", sent.append)
+        entered = threading.Event()
+        release = threading.Event()
+        actions = []
+
+        def stalled_consult(key, action, **kwargs):
+            actions.append(action)
+            entered.set()
+            release.wait(timeout=5)
+            return 1, "persisted"
+
+        monkeypatch.setattr(usage_lib.startup_state, "consult", stalled_consult)
+        assert usage_lib.record_llm_initialization_attempt(default_usage_context="cli_serve")
+        assert usage_lib.record_llm_initialized()
+        reporter = threading.Thread(
+            target=usage_lib._background_reporter, args=(None, None, "cli_serve")
+        )
+        reporter.start()
+        try:
+            assert entered.wait(timeout=5)
+            started = time.monotonic()
+            assert usage_lib.report_exit(
+                usage_lib.TerminalOutcome("signal", signal_number=2), lifecycle_phase="serving"
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            reporter.join(timeout=5)
+            self._join_state_threads()
+
+        assert not reporter.is_alive()
+        assert actions == ["reset"]
+        assert elapsed < usage_lib._TERMINAL_FLUSH_TIMEOUT
+        # The reporter stops waiting too, so its initial report may also have gone out.
+        events = [event for payload in sent for event in payload["events"]]
+        assert "trtllm_exit_report" in [event["name"] for event in events]
+        for event in events:
+            params = event["parameters"]
+            assert (params["priorStartupFailures"], params["startupStateStatus"]) == (
+                0,
+                "unavailable",
+            )
+
+    @pytest.mark.parametrize("stall", ["file_io", "state_lock"])
+    def test_initial_report_does_not_wait_for_stalled_state(
+        self, monkeypatch, enable_telemetry, stall
+    ):
+        release = threading.Event()
+        actions = []
+
+        def stalled_consult(key, action, **kwargs):
+            actions.append(action)
+            release.wait(timeout=5)
+            return 1, "persisted"
+
+        monkeypatch.setattr(usage_lib.startup_state, "consult", stalled_consult)
+        assert usage_lib.record_llm_initialization_attempt(default_usage_context="cli_serve")
+        assert usage_lib.record_llm_initialized()
+        state_lock = usage_lib._SESSION.startup_state_lock
+        if stall == "state_lock":
+            state_lock.acquire()
+        sent = []
+        stop_event = threading.Event()
+        stop_event.set()
+        try:
+            with (
+                patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
+                patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
+            ):
+                usage_lib._background_reporter(None, None, "cli_serve")
+        finally:
+            if stall == "state_lock":
+                state_lock.release()
+            release.set()
+            self._join_state_threads()
+
+        (payload,) = sent
+        initial = payload["events"][0]
+        assert initial["name"] == "trtllm_initial_report"
+        params = initial["parameters"]
+        assert (params["priorStartupFailures"], params["startupStateStatus"]) == (0, "unavailable")
+        # The late consult still records the successful start.
+        assert actions == ["reset"]
+
+    def test_exit_without_a_state_thread_reports_unavailable(
+        self, monkeypatch, enable_telemetry, consults
+    ):
+        monkeypatch.setattr(usage_lib, "bounded_gpu_fields", lambda deadline: {})
+        real_thread = threading.Thread
+
+        def thread(*args, **kwargs):
+            if kwargs.get("name") == "trtllm-usage-state":
+                raise RuntimeError("can't create new thread at interpreter shutdown")
+            return real_thread(*args, **kwargs)
+
+        assert usage_lib.record_llm_initialization_attempt(default_usage_context="cli_serve")
+        usage_lib.record_llm_initialization_failure("resource")
+        with patch.object(usage_lib.threading, "Thread", side_effect=thread):
+            started = time.monotonic()
+            sent = self._report_exit(usage_lib.TerminalOutcome("exception", exit_code=1))
+            elapsed = time.monotonic() - started
+
+        self._assert_unavailable_exit(sent, elapsed)
+        assert consults == []
+
+    def test_heartbeat_has_no_startup_fields(self):
+        fields = {f.alias for f in usage_lib.schema.TrtllmHeartbeat.model_fields.values()}
+        assert not fields & {"errorCategory", "priorStartupFailures", "startupStateStatus"}

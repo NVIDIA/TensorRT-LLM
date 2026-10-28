@@ -43,6 +43,7 @@ from torch.cuda import device_count
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
+from tensorrt_llm._errors import ConfigInputError
 from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
 from tensorrt_llm.commands import _telemetry as _command_telemetry
 from tensorrt_llm.commands._config_overrides import (ConfigOverride,
@@ -67,6 +68,7 @@ from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
                                                   resolve_auto_reasoning_parser)
+from tensorrt_llm.llmapi.startup_checks import no_visible_gpu_error
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
@@ -86,6 +88,7 @@ from tensorrt_llm.usage import config as _telemetry_config
 from tensorrt_llm.usage import (get_observed_signal,
                                 record_termination_observation,
                                 set_lifecycle_phase, set_usage_context)
+from tensorrt_llm.usage.usage_lib import _mark_visual_gen
 
 if TYPE_CHECKING:
     # Type-only: the visual_gen tree is imported lazily inside the VisualGen
@@ -292,7 +295,7 @@ def get_llm_args(
     if gpus_per_node is None:
         gpus_per_node = device_count()
         if gpus_per_node == 0:
-            raise ValueError("No GPU devices found on the node")
+            raise no_visible_gpu_error()
 
     # TODO: This manual cp_type conversion can be removed once cp_config
     # is refactored to a typed Pydantic model with enum coercion
@@ -1557,6 +1560,9 @@ def serve(
 
     is_visual_gen = (enable_visual_gen or visual_gen_args is not None
                      or get_is_diffusion_only_model(model))
+    if is_visual_gen:
+        # VisualGen reports no startup error category or startup state.
+        _mark_visual_gen()
     # Honor YAML telemetry opt-out before --set parsing can raise an error.
     raw_llm_args_extra_dict = {}
     if not is_visual_gen and extra_llm_api_options is not None:
@@ -1565,7 +1571,7 @@ def serve(
         if raw_llm_args_extra_dict is None:
             raw_llm_args_extra_dict = {}
         elif not isinstance(raw_llm_args_extra_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
+            raise ConfigInputError("Configuration file root must be a mapping.")
     if not is_visual_gen:
         _command_telemetry.apply_raw_config_telemetry_opt_out(
             raw_llm_args_extra_dict,
@@ -1734,13 +1740,13 @@ def serve(
             }
             for name, value in unsupported_args.items():
                 if value is not None:
-                    raise ValueError(
+                    raise ConfigInputError(
                         f"Argument '{name}' is not supported when running in gRPC mode. "
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
             if grpc_protocol == "smg":
                 if find_spec("smg_grpc_proto") is None:
-                    raise ValueError(
+                    raise ConfigInputError(
                         "gRPC serving with the SMG protocol requires the optional "
                         "'smg-grpc-proto' package. Install it with: "
                         'pip install "tensorrt_llm[grpc-smg]"')
@@ -1965,7 +1971,7 @@ def serve_encoder(
         if encoder_args_extra_dict is None:
             encoder_args_extra_dict = {}
         elif not isinstance(encoder_args_extra_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
+            raise ConfigInputError("Configuration file root must be a mapping.")
     _command_telemetry.apply_raw_config_telemetry_opt_out(
         encoder_args_extra_dict,
         usage_context=_telemetry_config.UsageContext.CLI_SERVE,
@@ -2098,7 +2104,7 @@ def serve_embedding(
         if extra_dict is None:
             extra_dict = {}
         elif not isinstance(extra_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
+            raise ConfigInputError("Configuration file root must be a mapping.")
     _command_telemetry.apply_raw_config_telemetry_opt_out(
         extra_dict,
         usage_context=_telemetry_config.UsageContext.CLI_SERVE,

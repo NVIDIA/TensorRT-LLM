@@ -20,6 +20,7 @@ import yaml
 import tensorrt_llm.profiler as profiler
 
 from .. import LLM as PyTorchLLM
+from .._errors import ConfigInputError
 from ..evaluate import (AALCR, AIME2025, AIME2026, GSM8K, HLE, MMLU, MMMU,
                         ArenaHard, CnnDailymail, CoVoST2, GPQADiamond,
                         GPQAExtended, GPQAMain, GPQANemoSkills, GSM8KInferenceX,
@@ -227,7 +228,7 @@ def main(ctx, model: str, tokenizer: Optional[str],
         if llm_args_extra_dict is None:
             llm_args_extra_dict = {}
         elif not isinstance(llm_args_extra_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
+            raise ConfigInputError("Configuration file root must be a mapping.")
         apply_raw_config_telemetry_opt_out(
             llm_args_extra_dict,
             usage_context=_telemetry_config.UsageContext.CLI_EVAL,

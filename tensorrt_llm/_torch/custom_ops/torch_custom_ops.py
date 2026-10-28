@@ -27,6 +27,7 @@ from torch._higher_order_ops.effects import _EffectType, _register_effectful_op
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm import deep_gemm
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
@@ -395,7 +396,7 @@ def fused_moe(
     except RuntimeError as e:
         error_msg = str(e)
         if "DeepGEMM only supports Hopper" in error_msg:
-            raise RuntimeError(
+            raise UnsupportedError(
                 f"{error_msg}"
                 "Note: This is the Cutlass backend with DeepGemm JIT path. "
                 "For Blackwell (SM100+) support, please use the DEEPGEMM backend instead."

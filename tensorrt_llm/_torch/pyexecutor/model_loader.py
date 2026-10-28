@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterator, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._errors import ConfigInputError, UnsupportedError
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
@@ -136,7 +137,7 @@ def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
         or state_config.additional_snapshot_offsets_from_end)
     if (has_additional_snapshots
             and kv_cache_config.use_kv_cache_manager_v2 is not True):
-        raise ValueError(
+        raise ConfigInputError(
             "Mamba additional snapshot offsets require "
             "kv_cache_config.use_kv_cache_manager_v2=True after resolving "
             "the model configuration.")
@@ -262,13 +263,14 @@ def validate_fp4_mla_config(model_config: ModelConfig,
             and model_config.quant_config.quant_mode.has_fp4_kv_cache()):
         return
     if not supports_fp4_mla_attention(model_config):
-        raise ValueError("Dense FP4 MLA requires the TRTLLM attention backend.")
+        raise UnsupportedError(
+            "Dense FP4 MLA requires the TRTLLM attention backend.")
     mapping = model_config.mapping
     if mapping.cp_size != 1 and not mapping.has_cp_helix():
-        raise ValueError(
+        raise UnsupportedError(
             "FP4 MLA supports context parallelism only through Helix.")
     if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
-        raise ValueError("FP4 MLA requires use_kv_cache_manager_v2=True.")
+        raise ConfigInputError("FP4 MLA requires use_kv_cache_manager_v2=True.")
 
     spec_config = model_config.spec_config
     if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
@@ -293,7 +295,7 @@ def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
     """
     if model_config.is_encoder_decoder:
         if kv_cache_config.cross_kv_cache_fraction is None:
-            raise ValueError(
+            raise ConfigInputError(
                 "Encoder-decoder models require kv_cache_config.cross_kv_cache_fraction to be set."
             )
         if (kv_cache_config.use_kv_cache_manager_v2 is True
@@ -308,7 +310,7 @@ def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
         return
 
     if kv_cache_config.cross_kv_cache_fraction is not None:
-        raise ValueError(
+        raise ConfigInputError(
             "kv_cache_config.cross_kv_cache_fraction should only be set for encoder-decoder models."
         )
 
@@ -320,22 +322,22 @@ def validate_encoder_decoder_tp_scope(model_config: ModelConfig) -> None:
 
     mapping = model_config.mapping
     if mapping.enable_attention_dp:
-        raise ValueError(
+        raise UnsupportedError(
             "Encoder-decoder models do not support attention DP yet. "
             "Set enable_attention_dp=False.")
 
     if mapping.cp_size > 1:
-        raise ValueError(
+        raise UnsupportedError(
             "Encoder-decoder models do not support context parallelism yet. "
             "Set context_parallel_size=1.")
 
     if mapping.pp_size > 1:
-        raise ValueError(
+        raise UnsupportedError(
             "Encoder-decoder models do not support pipeline parallelism yet. "
             "Set pipeline_parallel_size=1.")
 
     if mapping.tp_size > 1 and model_config.attn_backend != "TRTLLM":
-        raise ValueError(
+        raise UnsupportedError(
             "Encoder-decoder tensor parallelism currently supports "
             f"attn_backend='TRTLLM' only, but got "
             f"attn_backend='{model_config.attn_backend}'.")
@@ -1095,7 +1097,7 @@ class ModelLoader:
         locality_domain_policy = getattr(config, "locality_domain_policy", None)
         if (load_format == LoadFormat.GMS
                 and getattr(locality_domain_policy, "enabled", False)):
-            raise ValueError(
+            raise ConfigInputError(
                 "LoadFormat.GMS is incompatible with locality domain localized weights. "
                 "GMS shares registered parameters, while locality domain execution "
                 "releases those parameters after creating partition-local "
@@ -1134,7 +1136,7 @@ class ModelLoader:
                                        and checkpoint_loader.checkpoint_format
                                        != "MX")
             if requires_standard_hf_loading and not uses_standard_hf_loader:
-                raise ValueError(
+                raise UnsupportedError(
                     "Host-resident model weights currently require the standard "
                     "Hugging Face AUTO loader; DUMMY, VISION_ONLY, GMS, and MX "
                     "loaders cannot materialize them")

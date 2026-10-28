@@ -333,7 +333,7 @@ class TestFactory:
         cfg.algorithm = "triattention"
         with (
             patch.object(util_mod, "is_sm_100f", return_value=False),
-            pytest.raises(RuntimeError, match="SM100-family"),
+            pytest.raises(ValueError, match="SM100-family"),
         ):
             util_mod.validate_kv_cache_compression_compatibility(
                 cfg,

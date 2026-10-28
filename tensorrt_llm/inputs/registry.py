@@ -30,6 +30,7 @@ from torch import Tensor, nn
 from transformers import (AutoProcessor, PretrainedConfig,
                           PreTrainedTokenizerBase)
 
+from .._errors import ConfigInputError, UnsupportedError
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
@@ -1160,7 +1161,8 @@ def create_input_processor(
             model_cls, _ = get_model_architecture(config)
             input_processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type \
                 .get(model_cls)
-        except RuntimeError:  # unregistered model
+        except (RuntimeError, ConfigInputError,
+                UnsupportedError):  # unregistered model
             logger.info("Unregistered model, using DefaultInputProcessor")
             input_processor_cls = None
         if input_processor_cls is not None:
