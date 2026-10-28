@@ -53,12 +53,12 @@ from .decoder import DecoderRunner, DecoderRunnerConfig, ExtraInputsCollector
 from .decoder.dummy_requests import DummyRequestFactory
 from .decoder.graphs import DecoderCudaGraphs
 from .decoder.inputs import DecoderInputPreparer
-from .encoder import EncoderConfigMixin, EncoderMixin, EncoderPreparedInputs
-from .interface import PreparedInputs, RunnerConfig, ScheduledInputs
+from .encoder import EncoderConfig, EncoderMixin, EncoderPreparedInputs
+from .interface import PreparedInputs, ScheduledInputs
 
 
 @dataclass(frozen=True)
-class EncoderStageConfig(EncoderConfigMixin, RunnerConfig):
+class EncoderStageConfig(EncoderConfig):
     """Configuration for the encoder stage of an encoder-decoder model."""
 
 

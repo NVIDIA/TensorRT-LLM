@@ -10839,13 +10839,11 @@ def _val__regclus(frags, s: int):
 
 
 class GvrRegClusKernel:
-    """gvr_reg_clus<BLK, VPT, CS>."""
+    """gvr_reg_clus<BLK, VPT, CS, K>; K specializes only hint-slot unrolling."""
 
     def __init__(
         self,
-        blk: int,
-        vpt: int,
-        cs: int,
+        tpl: tuple[int, int, int, int],
         pdl: bool = False,
         varlen: bool = False,
         next_n: int = 1,
@@ -10853,6 +10851,9 @@ class GvrRegClusKernel:
         hint_free: bool = False,
         det: bool = False,
     ) -> None:
+        blk, vpt, cs, k = tpl
+        assert 0 < k <= 2 * blk, "reg_clus supports at most two hint slots per thread"
+        self.top_k = k
         self.det = bool(det)
         assert blk == BLKC, "all instantiations BLK=BLKC=1024"
         assert vpt in (1, 2, 4) and cs in (2, 4, 8)
@@ -10869,7 +10870,7 @@ class GvrRegClusKernel:
         self.cr_shift = int(cr_shift)
         if self.varlen:
             assert self.next_n >= 1 and self.cr_shift in (0, 2)
-        # hint-free: P0 samples the first k row elements (coalesced) instead of the hint
+        # hint-free: P0 samples K values in uniform contiguous blocks instead of the hint
         self.hint_free = bool(hint_free)
         self.S = vpt * 4
         self.span = blk * vpt  # float4 per CTA
@@ -10889,6 +10890,10 @@ class GvrRegClusKernel:
         CS = cutlass.const_expr(self.cs)
         S = cutlass.const_expr(self.S)
         NW = cutlass.const_expr(self.blk // 32)
+        # Keep tensor shapes dynamic: specializing selection arithmetic can
+        # regress the exact-rescue path. Static K only controls slot unrolling.
+        K = cutlass.const_expr(self.top_k)
+        HINT_SLOTS = cutlass.const_expr((K + self.blk - 1) // self.blk)
 
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()  # knob default off
@@ -10927,11 +10932,13 @@ class GvrRegClusKernel:
                 n = nv
             if short != cutlass.Int32(0):
                 if rank == cutlass.Int32(0):
-                    if tid < kq:
-                        ov = cutlass.Int32(-1)
-                        if tid < nv:
-                            ov = tid
-                        out[row, tid] = ov
+                    for h in cutlass.range_constexpr(HINT_SLOTS):
+                        th = tid + cutlass.Int32(h * self.blk)
+                        if th < kq:
+                            ov = cutlass.Int32(-1)
+                            if th < nv:
+                                ov = th
+                            out[row, th] = ov
 
         # ------------------------------------------------------------------
         # Predeclarations (DSL AST rule: every scalar (re)assigned under a
@@ -10972,6 +10979,7 @@ class GvrRegClusKernel:
         nT = cutlass.Int32(0)
         tie_m = cutlass.Int32(0)
         pv0 = cutlass.Int32(-1)
+        pv1 = cutlass.Int32(-1)
         okc = cutlass.Int32(0)
         whole = cutlass.Int32(0)
         degen = cutlass.Int32(0)
@@ -11034,15 +11042,34 @@ class GvrRegClusKernel:
             base4 = rank * cutlass.Int32(self.span)
             tix = (n4 << cutlass.Int32(2)) + tid  # CUDA `tidx`
 
-            # ---- P0: redundant hint gather, EVERY CTA (k<=BLK by dispatch
-            # gate). One coalesced word per thread, NO cluster barrier —
+            # ---- P0: redundant hint gather, EVERY CTA (ceil(K/BLK) slots).
+            # One coalesced word per thread per slot, NO cluster barrier —
             # GMIN/GMAX identical everywhere by construction.
             if cutlass.const_expr(self.hint_free):
+                # Exactly K distinct values in endpoint-inclusive uniform blocks.
                 if tid < k:
                     pv0 = tid
+                if cutlass.const_expr(HINT_SLOTS == 2):
+                    if tid + cutlass.Int32(self.blk) < k:
+                        pv1 = tid + cutlass.Int32(self.blk)
+                if k == cutlass.Int32(512) or k == cutlass.Int32(1024) or k == cutlass.Int32(2048):
+                    sample_blocks = k // cutlass.Int32(64)
+                    if tid < k:
+                        pv0 = ((tid // cutlass.Int32(64)) * (n - cutlass.Int32(64))) // (
+                            sample_blocks - cutlass.Int32(1)
+                        ) + tid % cutlass.Int32(64)
+                    if cutlass.const_expr(HINT_SLOTS == 2):
+                        sample_id = tid + cutlass.Int32(self.blk)
+                        if sample_id < k:
+                            pv1 = ((sample_id // cutlass.Int32(64)) * (n - cutlass.Int32(64))) // (
+                                sample_blocks - cutlass.Int32(1)
+                            ) + sample_id % cutlass.Int32(64)
             else:
                 if tid < k:
                     pv0 = ld_g_i32(p_addr, tid)
+                if cutlass.const_expr(HINT_SLOTS == 2):
+                    if tid + cutlass.Int32(self.blk) < k:
+                        pv1 = ld_g_i32(p_addr, tid + cutlass.Int32(self.blk))
 
             # ---- P1: row load — predicated flat float4[VPT] batch (the CUDA
             # has NO exact-fit peel here, guard is per-load). Issue all loads
@@ -11077,6 +11104,13 @@ class GvrRegClusKernel:
                 uk = fkey(ldg_f32(x_addr, pv0))  # __ldg(X+pv0)
                 lmin = uk
                 lmax = uk
+            if cutlass.const_expr(HINT_SLOTS == 2):
+                if cutlass.Uint32(pv1) < cutlass.Uint32(n):
+                    uk = fkey(ldg_f32(x_addr, pv1))
+                    if uk < lmin:
+                        lmin = uk
+                    if uk > lmax:
+                        lmax = uk
             lmin = warp_min_u32(lmin)
             lmax = warp_max_u32(lmax)
             if lane == cutlass.Int32(0):
@@ -11116,15 +11150,21 @@ class GvrRegClusKernel:
             CQ0 = cutlass.Float32(1.0) - Tv * SC
             CQ = CQ0 + cutlass.Float32(1e-6) * (_fabsf__regclus(CQ0) + cutlass.Float32(1.0))
 
-            # ---- P4: histogram; tval add UNCONDITIONAL (trash bin swallows
-            # -INFINITY via the saturating cvt).
-            for s in cutlass.range_constexpr(S):
-                qv = _fmaf__regclus(_val__regclus(frags, s), SC, CQ)
+            if okc != cutlass.Int32(0) or cutlass.const_expr(not self.hint_free):
+                # ---- P4: histogram; tval add UNCONDITIONAL (trash bin swallows
+                # -INFINITY via the saturating cvt).
+                for s in cutlass.range_constexpr(S):
+                    qv = _fmaf__regclus(_val__regclus(frags, s), SC, CQ)
+                    bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
+                    atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
+                qv = _fmaf__regclus(tval, SC, CQ)
                 bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
                 atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
-            qv = _fmaf__regclus(tval, SC, CQ)
-            bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
-            atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
+
+            else:
+                # Publish a scan sentinel; exact rescue uses all valid row keys.
+                if rank == cutlass.Int32(0) and tid == cutlass.Int32(0):
+                    s_hist[NB__regclus - 1] = k
 
             # ---- P5: cluster merge
             _cluster_sync_aligned()  # histograms complete on every rank
@@ -11159,11 +11199,17 @@ class GvrRegClusKernel:
             if need >= m:
                 whole = cutlass.Int32(1)
             degen = cutlass.Int32(0)
-            if m > cutlass.Int32(CS * CMPC):
+            rescue_limit = cutlass.Int32(CS * CMPC)
+            if cutlass.const_expr(self.hint_free):
+                # Serial refinement becomes expensive before the candidate buffer fills.
+                # Cap work independently of K so K=2048 also takes the parallel escape.
+                rescue_limit = min(rescue_limit, cutlass.Int32(32) * k)
+                rescue_limit = min(rescue_limit, cutlass.Int32(16384))
+            if m > rescue_limit:
                 degen = cutlass.Int32(1)
             # The sentinel bracket also has infinite width. Bypass its
             # collapsed histogram and enter the exact whole-row key-space
-            # fallback on rank 0, where fkey(+inf) is the maximum key.
+            # fallback, where fkey(+inf) is the maximum key.
             if okc == cutlass.Int32(0):
                 whole = cutlass.Int32(0)
                 degen = cutlass.Int32(1)
@@ -11451,8 +11497,317 @@ class GvrRegClusKernel:
             cute.arch.barrier()
             _cluster_sync_aligned()
 
+            if cutlass.const_expr(self.hint_free):
+                # All cluster CTAs retain their register fragments for exact rescue.
+                # Only complete float4 loads are resident; rank 0 owns the scalar tail.
+                if degen != cutlass.Int32(0):
+                    rlo = cutlass.Uint32(0)
+                    rhi = cutlass.Uint32(0xFFFFFFFF)
+                    needC = k
+                    aboveC = cutlass.Int32(0)
+                    mm = n
+                    done = cutlass.Int32(0)
+                    tie_m = cutlass.Int32(1)
+                    ethr = cutlass.Int64(0)
+                    for level in cutlass.range_constexpr(4):
+                        if done == cutlass.Int32(0):
+                            if needC == mm:
+                                ethr = cutlass.Int64(cutlass.Uint32(rlo)) - cutlass.Int64(1)
+                                aboveC = k
+                                needC = cutlass.Int32(0)
+                                tie_m = cutlass.Int32(0)
+                                done = cutlass.Int32(1)
+
+                        if done == cutlass.Int32(0):
+                            sh2 = cutlass.Int32(0)
+                            if cutlass.const_expr(level < 3):
+                                sh2 = cutlass.Int32(22 - level * 10)
+                            for z in cutlass.range_constexpr(NB__regclus // self.blk):
+                                s_hist[tid + cutlass.Int32(z * self.blk)] = cutlass.Int32(0)
+                            cute.arch.barrier()
+                            for s in cutlass.range_constexpr(S):
+                                idx = (
+                                    (base4 + tid + cutlass.Int32((s // 4) * self.blk))
+                                    << cutlass.Int32(2)
+                                ) + cutlass.Int32(s % 4)
+                                uk = fkey(_val__regclus(frags, s))
+                                if (
+                                    idx < (n4 << cutlass.Int32(2))
+                                    and cutlass.Uint32(uk) >= cutlass.Uint32(rlo)
+                                    and cutlass.Uint32(uk) <= cutlass.Uint32(rhi)
+                                ):
+                                    bn = (
+                                        cutlass.Uint32(uk) - cutlass.Uint32(rlo)
+                                    ) >> cutlass.Uint32(sh2)
+                                    atomic_add_cta(
+                                        s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1)
+                                    )
+                            if rank == cutlass.Int32(0) and tid < ntail:
+                                uk = fkey(tval)
+                                if cutlass.Uint32(uk) >= cutlass.Uint32(rlo) and cutlass.Uint32(
+                                    uk
+                                ) <= cutlass.Uint32(rhi):
+                                    bn = (
+                                        cutlass.Uint32(uk) - cutlass.Uint32(rlo)
+                                    ) >> cutlass.Uint32(sh2)
+                                    atomic_add_cta(
+                                        s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1)
+                                    )
+                            _cluster_sync_aligned()
+                            for z in cutlass.range_constexpr(NB__regclus // self.blk):
+                                i = tid + cutlass.Int32(z * self.blk)
+                                tot_a = cutlass.Int32(0)
+                                for r in cutlass.range_constexpr(CS):
+                                    ma = _mapa_shared_cluster_addr(
+                                        hist_addr + (i << cutlass.Int32(2)), cutlass.Int32(r)
+                                    )
+                                    tot_a = tot_a + _ld_shared_cluster_i32(ma)
+                                s_mrg[i] = tot_a
+                            cute.arch.barrier()
+                            find_cross(s_mrg, needC, tid, s_res, nb=NB__regclus)
+                            cute.arch.barrier()
+                            aboveC = aboveC + s_res[RES_ABOVE]
+                            needC = needC - s_res[RES_ABOVE]
+                            mm = s_res[RES_M]
+                            rlo = cutlass.Uint32(rlo) + (
+                                cutlass.Uint32(s_res[RES_B]) << cutlass.Uint32(sh2)
+                            )
+                            rhi = cutlass.Uint32(rlo) + (
+                                (cutlass.Uint32(1) << cutlass.Uint32(sh2)) - cutlass.Uint32(1)
+                            )
+                            ethr = cutlass.Int64(cutlass.Uint32(rlo))
+                            _cluster_sync_aligned()
+                    if cutlass.const_expr(self.det):
+                        # Deterministic rescue: count full fragments separately from the
+                        # tail owned by rank 0, whose logical indices follow every rank.
+                        masks_a = cutlass.Int32(0)
+                        masks_t = cutlass.Int32(0)
+                        for s in cutlass.range_constexpr(S):
+                            idx = (
+                                (base4 + tid + cutlass.Int32((s // 4) * self.blk))
+                                << cutlass.Int32(2)
+                            ) + cutlass.Int32(s % 4)
+                            uk = fkey(_val__regclus(frags, s))
+                            if idx < (n4 << cutlass.Int32(2)):
+                                if cutlass.Int64(cutlass.Uint32(uk)) > ethr:
+                                    masks_a = masks_a | cutlass.Int32(1 << s)
+                                if (
+                                    tie_m != cutlass.Int32(0)
+                                    and cutlass.Int64(cutlass.Uint32(uk)) == ethr
+                                ):
+                                    masks_t = masks_t | cutlass.Int32(1 << s)
+                        count_a = cutlass.Int32(warp_add_i32(popc(masks_a)))
+                        count_t = cutlass.Int32(warp_add_i32(popc(masks_t)))
+                        if lane == cutlass.Int32(0):
+                            s_dw[dw] = count_a
+                            s_dw[32 + dw] = count_t
+                        cute.arch.barrier()
+                        ca = cutlass.Int32(0)
+                        ct = cutlass.Int32(0)
+                        if lane < cutlass.Int32(NW):
+                            ca = s_dw[lane]
+                            ct = s_dw[32 + lane]
+                        ca = cutlass.Int32(warp_add_i32(ca))
+                        ct = cutlass.Int32(warp_add_i32(ct))
+                        if tid == cutlass.Int32(0):
+                            s_cnt[0] = ca
+                            s_cnt[1] = ct
+                        _cluster_sync_aligned()
+                        rank_a = cutlass.Int32(0)
+                        rank_t = cutlass.Int32(0)
+                        full_a = cutlass.Int32(0)
+                        full_t = cutlass.Int32(0)
+                        for r in cutlass.range_constexpr(CS):
+                            ma = _mapa_shared_cluster_addr(
+                                sbase + cutlass.Int32(6 * 4), cutlass.Int32(r)
+                            )
+                            ca = _ld_shared_cluster_i32(ma)
+                            ma = _mapa_shared_cluster_addr(
+                                sbase + cutlass.Int32(7 * 4), cutlass.Int32(r)
+                            )
+                            ct = _ld_shared_cluster_i32(ma)
+                            if cutlass.Int32(r) < rank:
+                                rank_a = rank_a + ca
+                                rank_t = rank_t + ct
+                            full_a = full_a + ca
+                            full_t = full_t + ct
+                        _cluster_sync_aligned()
+                        run_a = rank_a
+                        run_t = rank_t
+                        lml = cutlass.Int32(cute.arch.lanemask_lt())
+                        # Order is rank, float4 fragment, thread, then component.
+                        # Thus the first needC equal keys have the smallest indices.
+                        for u in cutlass.range_constexpr(VPT):
+                            bits_a = (masks_a >> cutlass.Int32(4 * u)) & cutlass.Int32(15)
+                            bits_t = (masks_t >> cutlass.Int32(4 * u)) & cutlass.Int32(15)
+                            ca = popc(bits_a)
+                            ct = popc(bits_t)
+                            wa = cutlass.Int32(warp_add_i32(ca))
+                            wt = cutlass.Int32(warp_add_i32(ct))
+                            xa = cutlass.Int32(0)
+                            xt = cutlass.Int32(0)
+                            for bit in cutlass.range_constexpr(3):
+                                ba = ballot(
+                                    ((ca >> cutlass.Int32(bit)) & cutlass.Int32(1))
+                                    != cutlass.Int32(0)
+                                )
+                                bt = ballot(
+                                    ((ct >> cutlass.Int32(bit)) & cutlass.Int32(1))
+                                    != cutlass.Int32(0)
+                                )
+                                xa = xa + (popc(ba & lml) << cutlass.Int32(bit))
+                                xt = xt + (popc(bt & lml) << cutlass.Int32(bit))
+                            if lane == cutlass.Int32(0):
+                                s_dw[dw] = wa
+                                s_dw[32 + dw] = wt
+                            cute.arch.barrier()
+                            va = cutlass.Int32(0)
+                            vt = cutlass.Int32(0)
+                            if lane < cutlass.Int32(NW):
+                                va = s_dw[lane]
+                                vt = s_dw[32 + lane]
+                            total_a = cutlass.Int32(warp_add_i32(va))
+                            total_t = cutlass.Int32(warp_add_i32(vt))
+                            if lane >= dw:
+                                va = cutlass.Int32(0)
+                                vt = cutlass.Int32(0)
+                            pa = run_a + cutlass.Int32(warp_add_i32(va)) + xa
+                            pt = run_t + cutlass.Int32(warp_add_i32(vt)) + xt
+                            cute.arch.barrier()
+                            for z in cutlass.range_constexpr(4):
+                                idx = (
+                                    (base4 + tid + cutlass.Int32(u * self.blk)) << cutlass.Int32(2)
+                                ) + cutlass.Int32(z)
+                                if (bits_a & cutlass.Int32(1 << z)) != cutlass.Int32(0):
+                                    if pa < aboveC:
+                                        out_row[pa] = idx
+                                    pa = pa + cutlass.Int32(1)
+                                if (bits_t & cutlass.Int32(1 << z)) != cutlass.Int32(0):
+                                    if pt < needC:
+                                        out_row[aboveC + pt] = idx
+                                    pt = pt + cutlass.Int32(1)
+                            run_a = run_a + total_a
+                            run_t = run_t + total_t
+                        if rank == cutlass.Int32(0):
+                            uk = fkey(tval)
+                            qa = cutlass.Int32(0)
+                            qt = cutlass.Int32(0)
+                            if tid < ntail:
+                                qa = cutlass.Int32(cutlass.Int64(cutlass.Uint32(uk)) > ethr)
+                                qt = cutlass.Int32(
+                                    tie_m != cutlass.Int32(0)
+                                    and cutlass.Int64(cutlass.Uint32(uk)) == ethr
+                                )
+                            ba = ballot(qa != cutlass.Int32(0))
+                            bt = ballot(qt != cutlass.Int32(0))
+                            pa = full_a + popc(ba & lml)
+                            pt = full_t + popc(bt & lml)
+                            if qa != cutlass.Int32(0) and pa < aboveC:
+                                out_row[pa] = tix
+                            if qt != cutlass.Int32(0) and pt < needC:
+                                out_row[aboveC + pt] = tix
+                    else:
+                        # Count each rank's strict winners and equal-threshold candidates.
+                        if tid == cutlass.Int32(0):
+                            s_cnt[0] = cutlass.Int32(0)
+                            s_cnt[1] = cutlass.Int32(0)
+                        cute.arch.barrier()
+                        for s in cutlass.range_constexpr(S + 1):
+                            idx = tix
+                            uk = fkey(tval)
+                            q1f = cutlass.Int32(0)
+                            q2f = cutlass.Int32(0)
+                            if cutlass.const_expr(s < S):
+                                idx = (
+                                    (base4 + tid + cutlass.Int32((s // 4) * self.blk))
+                                    << cutlass.Int32(2)
+                                ) + cutlass.Int32(s % 4)
+                                uk = fkey(_val__regclus(frags, s))
+                                if idx < (n4 << cutlass.Int32(2)):
+                                    q1f = cutlass.Int32(cutlass.Int64(cutlass.Uint32(uk)) > ethr)
+                                    q2f = cutlass.Int32(
+                                        tie_m != cutlass.Int32(0)
+                                        and cutlass.Int64(cutlass.Uint32(uk)) == ethr
+                                    )
+                            else:
+                                if rank == cutlass.Int32(0) and tid < ntail:
+                                    q1f = cutlass.Int32(cutlass.Int64(cutlass.Uint32(uk)) > ethr)
+                                    q2f = cutlass.Int32(
+                                        tie_m != cutlass.Int32(0)
+                                        and cutlass.Int64(cutlass.Uint32(uk)) == ethr
+                                    )
+                            n1 = ballot(q1f != cutlass.Int32(0))
+                            n2 = ballot(q2f != cutlass.Int32(0))
+                            if lane == cutlass.Int32(0):
+                                if n1 != cutlass.Int32(0):
+                                    atomic_add_cta(s_cnt.iterator, popc(n1))
+                                if n2 != cutlass.Int32(0):
+                                    atomic_add_cta(s_cnt.iterator + 1, popc(n2))
+                        _cluster_sync_aligned()
+                        p1e = cutlass.Int32(0)
+                        p2e = cutlass.Int32(0)
+                        for r in cutlass.range_constexpr(CS):
+                            if cutlass.Int32(r) < rank:
+                                ma = _mapa_shared_cluster_addr(
+                                    sbase + cutlass.Int32(6 * 4), cutlass.Int32(r)
+                                )
+                                p1e = p1e + _ld_shared_cluster_i32(ma)
+                                ma = _mapa_shared_cluster_addr(
+                                    sbase + cutlass.Int32(7 * 4), cutlass.Int32(r)
+                                )
+                                p2e = p2e + _ld_shared_cluster_i32(ma)
+                        _cluster_sync_aligned()
+                        if tid == cutlass.Int32(0):
+                            s_cnt[0] = p1e
+                            s_cnt[1] = p2e
+                        cute.arch.barrier()
+                        lml = cutlass.Int32(cute.arch.lanemask_lt())
+                        for s in cutlass.range_constexpr(S + 1):
+                            idx = tix
+                            uk = fkey(tval)
+                            q1f = cutlass.Int32(0)
+                            q2f = cutlass.Int32(0)
+                            if cutlass.const_expr(s < S):
+                                idx = (
+                                    (base4 + tid + cutlass.Int32((s // 4) * self.blk))
+                                    << cutlass.Int32(2)
+                                ) + cutlass.Int32(s % 4)
+                                uk = fkey(_val__regclus(frags, s))
+                                if idx < (n4 << cutlass.Int32(2)):
+                                    q1f = cutlass.Int32(cutlass.Int64(cutlass.Uint32(uk)) > ethr)
+                                    q2f = cutlass.Int32(
+                                        tie_m != cutlass.Int32(0)
+                                        and cutlass.Int64(cutlass.Uint32(uk)) == ethr
+                                    )
+                            else:
+                                if rank == cutlass.Int32(0) and tid < ntail:
+                                    q1f = cutlass.Int32(cutlass.Int64(cutlass.Uint32(uk)) > ethr)
+                                    q2f = cutlass.Int32(
+                                        tie_m != cutlass.Int32(0)
+                                        and cutlass.Int64(cutlass.Uint32(uk)) == ethr
+                                    )
+                            n1 = ballot(q1f != cutlass.Int32(0))
+                            n2 = ballot(q2f != cutlass.Int32(0))
+                            b1 = cutlass.Int32(0)
+                            b2 = cutlass.Int32(0)
+                            if lane == cutlass.Int32(0):
+                                if n1 != cutlass.Int32(0):
+                                    b1 = atomic_add_cta(s_cnt.iterator, popc(n1))
+                                if n2 != cutlass.Int32(0):
+                                    b2 = atomic_add_cta(s_cnt.iterator + 1, popc(n2))
+                            b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(0))
+                            b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(0))
+                            p1e = b1 + popc(n1 & lml)
+                            p2e = b2 + popc(n2 & lml)
+                            if q1f != cutlass.Int32(0) and p1e < aboveC:
+                                out_row[p1e] = idx
+                            if q2f != cutlass.Int32(0) and p2e < needC:
+                                out_row[aboveC + p2e] = idx
+
             # ---- P9: rank-0 selection
-            if rank == cutlass.Int32(0):
+            if rank == cutlass.Int32(0) and (
+                degen == cutlass.Int32(0) or cutlass.const_expr(not self.hint_free)
+            ):
                 if whole == cutlass.Int32(0):
                     mc = m
                     if degen == cutlass.Int32(1):
@@ -12112,7 +12467,7 @@ def get_compiled__regclus(
     hint_free: bool = False,
     det: bool = False,
 ) -> Any:
-    """Compile (or fetch) the variant for constexpr tuple (BLK, VPT, CS)."""
+    """Compile (or fetch) the variant for constexpr tuple (BLK, VPT, CS, K)."""
     key = (
         tuple(tpl),
         bool(pdl),
@@ -12126,11 +12481,8 @@ def get_compiled__regclus(
     if compiled is None:
         from cutlass.cute import runtime as _crt
 
-        blk, vpt, cs = tpl
         kernel = GvrRegClusKernel(
-            blk,
-            vpt,
-            cs,
+            tpl,
             pdl=pdl,
             varlen=varlen,
             next_n=next_n,

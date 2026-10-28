@@ -52,7 +52,7 @@ from pathlib import Path
 root = Path(os.environ["LAUNCHER_TEST_ROOT"])
 mode = os.environ["LAUNCHER_TEST_MODE"]
 role = "task" if sys.argv[1] == "task" else "server"
-if "--action" in sys.argv:
+if "--action" in sys.argv or Path(sys.argv[1]).name == "_llmapi_mpi_stop.py":
     role = "stop"
 if sys.argv[1] == "-S":
     if "--parent-pid" in sys.argv and "--role" in sys.argv:
