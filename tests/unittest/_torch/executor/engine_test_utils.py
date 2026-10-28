@@ -168,7 +168,7 @@ def create_model_engine_and_kvcache(
         try:
             yield engine, manager
         finally:
-            engine.release_executor_resources()
+            engine.release_executor_resources(release_model_owned_graphs=True)
 
 
 @contextlib.contextmanager
@@ -290,6 +290,7 @@ def _model_engine_with_runner(
     kv_cache_manager: object | None,
 ) -> tuple[ModelEngine, Mock]:
     engine = object.__new__(ModelEngine)
+    engine._cleanup_done = True
     engine._model_caller = Mock()
     engine.model = SimpleNamespace(extra_attrs={})
     if runner is None:

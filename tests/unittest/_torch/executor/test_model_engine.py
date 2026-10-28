@@ -3,6 +3,7 @@
 
 import unittest
 import weakref
+from ast import literal_eval
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -34,9 +35,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     DecoderInputPreparer,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
-from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ModelRunner, ScheduledInputs
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -109,34 +108,53 @@ def _install_graph_runner_stub(runner: DecoderRunner, key: KeyType | None = None
 
 
 @pytest.mark.cpu_only
-def test_cleanup_releases_runner_model_before_release_gc() -> None:
-    class Model:
-        pass
-
+@pytest.mark.parametrize("failure_stage", [None, "loader", "graphs", "gc"])
+def test_cleanup_releases_runner_model_before_release_gc(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str | None,
+) -> None:
     engine = object.__new__(ModelEngine)
-    model = Model()
+    model = torch.nn.Linear(1, 1)
     model_ref = weakref.ref(model)
+    error = RuntimeError("release failed")
+    loader = Mock()
+    if failure_stage == "loader":
+        loader.cleanup.side_effect = [error, None]
+    release_graphs = Mock(side_effect=[error, None] if failure_stage == "graphs" else None)
     engine._cleanup_done = False
-    engine.model_loader = None
-    engine._runner = SimpleNamespace(_model=model)
+    engine.model_loader = loader
+    engine._runner = SimpleNamespace(_model=model, release_graphs=release_graphs)
+    engine._torch_compile_backend = None
     engine._model_caller = ModelCaller(model)
     engine._mm_item_scheduler = None
     engine._lora_model = model
     engine._lora_owner = None
     engine.model = model
-    engine._release_cuda_graphs = Mock()
     engine.input_processor = None
     del model
 
-    def assert_model_released() -> None:
+    def collect() -> None:
         assert model_ref() is None
+        if failure_stage == "gc" and release_gc.call_count == 1:
+            raise error
 
-    with patch(
-        "tensorrt_llm._torch.pyexecutor.model_engine.release_gc", side_effect=assert_model_released
-    ) as release_gc:
-        engine.cleanup()
-
-    release_gc.assert_called_once_with()
+    release_gc = Mock(side_effect=collect)
+    monkeypatch.setattr(model_engine_module, "release_gc", release_gc)
+    if failure_stage is not None:
+        with pytest.raises(RuntimeError, match="release failed"):
+            engine.cleanup()
+        assert not engine._cleanup_done
+        if failure_stage != "gc":
+            assert model_ref() is not None
+        assert engine.model_loader is (loader if failure_stage == "loader" else None)
+    engine.cleanup()
+    engine.cleanup()
+    assert engine._cleanup_done
+    assert model_ref() is None
+    assert loader.cleanup.call_count == (2 if failure_stage == "loader" else 1)
+    assert release_graphs.call_count == (2 if failure_stage == "graphs" else 1)
+    release_graphs.assert_called_with(release_nccl_window_owners=False)
+    assert release_gc.call_count == (2 if failure_stage == "gc" else 1)
 
 
 class GraphOwnerTeardownTestCase(unittest.TestCase):
@@ -375,6 +393,31 @@ class DecoderForwardTestCase(unittest.TestCase):
             for request, token in zip(requests, tokens):
                 request.add_new_token(token, 0)
 
+    def test_forward_callback_observes_eager_and_replay_execution(self) -> None:
+        for graph_hit in (False, True):
+            with self.subTest(graph_hit=graph_hit):
+                engine, manager, resources, graphs = self._make_engine()
+                request = self._request([11, 22, 33], 1, 0)
+                self._prefill(engine, manager, resources, request)
+                request.add_new_token(44, 0)
+                batch = ScheduledRequests()
+                batch.generation_requests = [request]
+                graphs.key = KeyType(batch_size=1, draft_len=0) if graph_hit else None
+                observed = []
+
+                def after_forward() -> None:
+                    inputs = (
+                        graphs.replayed_inputs[-1]
+                        if graph_hit
+                        else engine.model.recorded_kwargs[-1]
+                    )
+                    observed.append(inputs["input_ids"].tolist())
+
+                engine.register_forward_pass_callable(after_forward)
+                self._forward(engine, manager, resources, batch)
+                self.assertEqual(observed, [[44]])
+                self.assertEqual(graphs.replay.call_count, int(graph_hit))
+
     def _make_mrope_engine(self):
         return self._make_engine(DummyModel(torch.half, rope_scaling={"type": "mrope"}))
 
@@ -566,49 +609,6 @@ class ModelEngineTestCase(unittest.TestCase):
         self.assertTrue(is_multimodal(engine.model, engine.input_processor))
         engine._validate_breakable_cuda_graph_compatibility()
 
-    def test_restore_after_refit_rewraps_without_recapture(self) -> None:
-        """Restore re-wraps torch.compile and does nothing else.
-
-        Refit moves no tensor, so the piecewise captures stay valid across it;
-        recapturing them costs a full re-capture per refit and leaves PWCG cold
-        in between. This pins the cheap path -- reintroducing the recapture,
-        the torch.compiler.reset() or the gc.collect() fails here.
-
-        Replaces test_piecewise_refit_recapture_preserves_padding_dummy_requests,
-        which asserted the refit path recaptures. That path no longer exists.
-        """
-        cuda_graph_runner = SimpleNamespace(
-            padding_dummy_requests={0: object()},
-            allow_capture=lambda: nullcontext(),
-        )
-        model_engine = SimpleNamespace(
-            warmup_scope=nullcontext,
-            _torch_compile_backend=object(),
-            llm_args=SimpleNamespace(torch_compile_config=SimpleNamespace(enable_fullgraph=False)),
-            cuda_graph_runner=cuda_graph_runner,
-            _apply_torch_compile=Mock(),
-            _capture_piecewise_cuda_graphs=Mock(),
-        )
-
-        with patch("torch.compiler.reset") as reset, patch("gc.collect") as collect:
-            ModelEngine.restore_compiled_model_after_refit(model_engine, resource_manager=object())
-
-        model_engine._apply_torch_compile.assert_called_once()
-        model_engine._capture_piecewise_cuda_graphs.assert_not_called()
-        reset.assert_not_called()
-        # No full collection either: it ran for seconds inside the refit
-        # bubble and the replaced wrapper is freed by reference count.
-        collect.assert_not_called()
-
-    def test_restore_after_refit_noop_when_torch_compile_disabled(self) -> None:
-        """An eager engine must not be silently handed a compiled wrapper."""
-        model_engine = SimpleNamespace(
-            _torch_compile_backend=None,
-            _apply_torch_compile=Mock(),
-        )
-        ModelEngine.restore_compiled_model_after_refit(model_engine, resource_manager=object())
-        model_engine._apply_torch_compile.assert_not_called()
-
     def test_restore_after_refit_never_touches_the_kv_cache(self) -> None:
         """The re-wrap hook must not run the warm-up KV-cache cleanup.
 
@@ -632,61 +632,14 @@ class ModelEngineTestCase(unittest.TestCase):
                     ),
                     _apply_torch_compile=Mock(),
                 )
-                with patch("gc.collect"):
+                with patch("gc.collect") as collect, patch("torch.compiler.reset") as reset:
                     ModelEngine.restore_compiled_model_after_refit(model_engine, resource_manager)
                 resource_manager.get_resource_manager.assert_not_called()
+                collect.assert_not_called()
+                reset.assert_not_called()
                 self.assertEqual(
                     model_engine._apply_torch_compile.call_count, 1 if compile_enabled else 0
                 )
-
-    def test_unwrap_for_refit_gates_on_torch_compile_not_piecewise(self) -> None:
-        """Compile-on/piecewise-off must still unwrap.
-
-        This is the original defect: the hook was gated on the piecewise flag,
-        so TorchCompileConfig() -- compile on, piecewise off -- got no refit
-        lifecycle and refit loaded into a wrapped model, matching nothing.
-        """
-        for piecewise in (True, False):
-            with self.subTest(piecewise=piecewise):
-                model_engine = SimpleNamespace(
-                    llm_args=SimpleNamespace(
-                        prefill_cuda_graph_backend=(
-                            PrefillCudaGraphBackend.PIECEWISE if piecewise else None
-                        )
-                    ),
-                    _torch_compile_backend=Mock(),
-                    _remove_torch_compile=Mock(),
-                )
-                unwrap_core = ModelEngine.unwrap_compiled_model_for_refit
-                with patch("torch.cuda.synchronize"):
-                    unwrap_core(model_engine)
-                model_engine._remove_torch_compile.assert_called_once()
-                # The captures are kept, not cleared: refit moves no tensor, so
-                # clearing them only forces PWCG cold for no benefit.
-                model_engine._torch_compile_backend.clear_piecewise_cuda_graphs.assert_not_called()
-
-        # Eager engine: the hook must be a no-op.
-        eager = SimpleNamespace(
-            _torch_compile_backend=None,
-            _remove_torch_compile=Mock(),
-        )
-        ModelEngine.unwrap_compiled_model_for_refit(eager)
-        eager._remove_torch_compile.assert_not_called()
-
-    def test_refit_lifecycle_aliases_point_at_renamed_hooks(self) -> None:
-        """NeMo-RL resolves these with getattr() and falls back to doing nothing.
-
-        Dropping an alias would therefore not raise -- it would silently skip
-        the unwrap and reintroduce the refit corruption.
-        """
-        self.assertIs(
-            ModelEngine.release_piecewise_cuda_graphs_for_refit,
-            ModelEngine.unwrap_compiled_model_for_refit,
-        )
-        self.assertIs(
-            ModelEngine.recapture_piecewise_cuda_graphs_after_refit,
-            ModelEngine.restore_compiled_model_after_refit,
-        )
 
     def test_decoder_buffers_are_allocated_only_for_decoder_runner(self) -> None:
         llm_args = TorchLlmArgs(
@@ -734,8 +687,9 @@ class ModelEngineTestCase(unittest.TestCase):
                         is_generation=False,
                     )
 
+    @pytest.mark.cpu_only
     def test_runner_engine_shared_entries_skip_decoder_state(self) -> None:
-        runner = Mock()
+        runner = Mock(spec=NoKVCacheRunner)
         engine = object.__new__(ModelEngine)
         engine._runner = runner
         engine._torch_compile_backend = None
@@ -746,7 +700,6 @@ class ModelEngineTestCase(unittest.TestCase):
 
         runner.wait_for_input_copy.assert_called_once_with()
         runner.release_graphs.assert_called_once_with(release_nccl_window_owners=True)
-        runner.init_cuda_graph_lora_manager.assert_not_called()
 
     def test_decoder_engine_shared_entries_use_decoder_state(self) -> None:
         engine = object.__new__(ModelEngine)
@@ -881,32 +834,6 @@ class ModelEngineTestCase(unittest.TestCase):
         self.assertEqual({}, model_engine.cuda_graph_runner.padding_dummy_requests)
         self.assertEqual(num_free_before, kv_cache_manager.get_num_free_blocks())
 
-    def test_layerwise_nvtx_marker(self):
-        llm_args = TorchLlmArgs(
-            model="dummy",
-            enable_layerwise_nvtx_marker=True,
-            cuda_graph_config=CudaGraphConfig(enable_padding=True),
-        )
-        (model_engine, kv_cache_manager) = self.enterContext(
-            create_model_engine_and_kvcache(llm_args)
-        )
-        resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
-
-        prompt_len = 32
-        requests = [_create_request(prompt_len, 0)]
-
-        batch = ScheduledRequests()
-        batch.context_requests_last_chunk = requests
-        _prepare_kv_cache_resources(kv_cache_manager, batch)
-        model_engine.forward(batch, resource_manager)
-
-        expected_prefill_pos_ids = torch.arange(
-            0, prompt_len, dtype=torch.int32, device="cuda"
-        ).unsqueeze(0)
-        torch.testing.assert_close(
-            model_engine.model.recorded_position_ids, expected_prefill_pos_ids, atol=0, rtol=0
-        )
-
     def test_cuda_graph_padding_filters_huge_batch_size(self):
         llm_args = TorchLlmArgs(
             model="dummy",
@@ -918,86 +845,6 @@ class ModelEngineTestCase(unittest.TestCase):
 
         self.assertEqual(model_engine.cuda_graph_batch_sizes, [1, 2, 3, model_engine.max_seq_len])
         self.assertTrue(model_engine.cuda_graph_padding_enabled)
-
-    def test_forward_pass_callable_on_cuda_graph_on(self):
-        llm_args = TorchLlmArgs(
-            model="dummy",
-            cuda_graph_config=CudaGraphConfig(
-                enable_padding=True,
-            ),
-        )
-        (model_engine, kv_cache_manager) = self.enterContext(
-            create_model_engine_and_kvcache(llm_args)
-        )
-
-        mock_callable = Mock()
-        model_engine.register_forward_pass_callable(mock_callable)
-
-        resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
-
-        prompt_len = 32
-        requests = [_create_request(prompt_len, 0)]
-
-        batch = ScheduledRequests()
-        batch.context_requests_last_chunk = requests
-        _prepare_kv_cache_resources(kv_cache_manager, batch)
-        model_engine.forward(batch, resource_manager)
-
-        mock_callable.assert_called_once()
-
-    def test_forward_pass_callable_on_cuda_graph_off(self):
-        (model_engine, kv_cache_manager) = self.enterContext(create_model_engine_and_kvcache())
-
-        mock_callable = Mock()
-        model_engine.register_forward_pass_callable(mock_callable)
-
-        resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
-
-        prompt_len = 32
-        requests = [_create_request(prompt_len, 0)]
-
-        batch = ScheduledRequests()
-        batch.context_requests_last_chunk = requests
-        _prepare_kv_cache_resources(kv_cache_manager, batch)
-        model_engine.forward(batch, resource_manager)
-
-        mock_callable.assert_called_once()
-
-    def test_foward_pass_callable_off(self):
-        (model_engine, kv_cache_manager) = self.enterContext(create_model_engine_and_kvcache())
-        self.assertTrue(
-            model_engine._runner.forward_pass_callable is None,
-            "forward_pass_callback should be None by default",
-        )
-
-        # Assert we can run `forward` without a forward_pass_callback without error
-        resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
-
-        prompt_len = 32
-        requests = [_create_request(prompt_len, 0)]
-
-        batch = ScheduledRequests()
-        batch.context_requests_last_chunk = requests
-        _prepare_kv_cache_resources(kv_cache_manager, batch)
-        model_engine.forward(batch, resource_manager)
-
-    def test_foward_pass_callable_backward_compat(self):
-        (model_engine, kv_cache_manager) = self.enterContext(create_model_engine_and_kvcache())
-        self.assertTrue(
-            model_engine._runner.forward_pass_callable is None,
-            "forward_pass_callback should be None by default",
-        )
-
-        # Assert we can run `forward` without a forward_pass_callback without error
-        resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
-
-        prompt_len = 32
-        requests = [_create_request(prompt_len, 0)]
-
-        batch = ScheduledRequests()
-        batch.context_requests_last_chunk = requests
-        _prepare_kv_cache_resources(kv_cache_manager, batch)
-        model_engine.forward(batch, resource_manager)
 
     def test_kv_cache_manager_with_execution_stream(self) -> None:
         """Test that KVCacheManagerV2 uses the provided execution_stream."""
@@ -1174,25 +1021,6 @@ def test_pcg_fx_fallback_policy_is_model_specific(
 
 class TestWarmupCleanup(unittest.TestCase):
     @pytest.mark.cpu_only
-    def test_no_kv_cache_warmup_delegates_runner_lifecycle(self):
-        """Verify no-KV-cache warmup delegates warmup and graph capture to the runner."""
-        model_engine = object.__new__(ModelEngine)
-        model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
-        model_engine.moe_load_balancer = None
-        model_engine._metrics = {}
-        model_engine._warmup_depth = 0
-        model_engine._runner = Mock(spec=NoKVCacheRunner)
-        resource_manager = Mock()
-        resource_manager.get_resource_manager.return_value = None
-
-        model_engine.warmup(resource_manager)
-
-        self.assertEqual(
-            model_engine._runner.method_calls,
-            [call.warmup(resource_manager)],
-        )
-
-    @pytest.mark.cpu_only
     def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self):
         """Verify a no-KV-cache runner rejects an allocated KV cache before warmup."""
         model_engine = object.__new__(ModelEngine)
@@ -1263,29 +1091,6 @@ class TestWarmupCleanup(unittest.TestCase):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    ("runner_type", "initializer_name"),
-    [
-        (EncoderRunner, "_initialize_encoder_runner"),
-        (EncoderDecoderRunner, "_initialize_encoder_decoder_runner"),
-        (NoKVCacheRunner, "_initialize_no_kv_cache_runner"),
-        (DecoderRunner, "_initialize_decoder_runner"),
-    ],
-)
-def test_model_engine_initializes_runner_by_family(
-    runner_type: type[ModelRunner], initializer_name: str
-) -> None:
-    engine = object.__new__(ModelEngine)
-    engine._model_caller = Mock()
-    expected = Mock(spec=runner_type)
-    initializer = Mock(return_value=expected)
-    setattr(engine, initializer_name, initializer)
-
-    assert engine._initialize_runner(runner_type) is expected
-    initializer.assert_called_once_with(runner_type)
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
     ("cuda_graph_config", "expected_encode_config"),
     [
         (None, False),
@@ -1345,39 +1150,6 @@ def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
 
 
 @pytest.mark.cpu_only
-def test_model_engine_rejects_unregistered_runner_family() -> None:
-    class UnregisteredRunner:
-        pass
-
-    engine = object.__new__(ModelEngine)
-    engine._model_caller = Mock()
-
-    with pytest.raises(TypeError, match="No runner initializer registered"):
-        engine._initialize_runner(UnregisteredRunner)
-
-
-@pytest.mark.cpu_only
-def test_model_engine_forward_delegates_to_resolved_runner() -> None:
-    runner = Mock(spec=NoKVCacheRunner)
-    expected_outputs = {"logits": object()}
-    runner.forward.return_value = expected_outputs
-    engine, resource_manager = _model_engine_with_runner(
-        runner,
-        kv_cache_manager=None,
-    )
-    batch = ScheduledRequests()
-
-    actual_outputs = engine.forward(batch, resource_manager)
-
-    assert actual_outputs is expected_outputs
-    runner.forward.assert_called_once_with(
-        ScheduledInputs(batch=batch),
-        resource_manager=resource_manager,
-        is_dummy=False,
-    )
-
-
-@pytest.mark.cpu_only
 def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> None:
     runner = Mock(spec=EncoderDecoderRunner)
     hidden_states = object()
@@ -1408,21 +1180,14 @@ def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> Non
 
 
 @pytest.mark.cpu_only
-def test_model_engine_releases_runner_owned_graphs() -> None:
-    engine = object.__new__(ModelEngine)
-    engine._model_caller = Mock()
-    engine._runner = Mock(spec=EncoderRunner)
-    engine._torch_compile_backend = None
-
-    engine.release_executor_resources(release_model_owned_graphs=False)
-
-    engine._runner.release_graphs.assert_called_once_with(release_nccl_window_owners=True)
-
-
-@pytest.mark.cpu_only
+@pytest.mark.parametrize("enable_spec_decode", [False, True])
 @pytest.mark.parametrize("effective_length", [None, 0, 3])
 @pytest.mark.parametrize("is_dummy", [False, True])
-def test_engine_passes_call_state_and_returns_length_update(effective_length, is_dummy):
+def test_engine_passes_call_state_and_returns_length_update(
+    effective_length: int | None,
+    is_dummy: bool,
+    enable_spec_decode: bool,
+) -> None:
     runner = Mock(spec=NoKVCacheRunner)
     outputs = {"logits": object()}
     if effective_length is not None:
@@ -1432,14 +1197,27 @@ def test_engine_passes_call_state_and_returns_length_update(effective_length, is
     engine._warmup_depth = int(is_dummy)
     batch = ScheduledRequests()
     batch.context_requests_last_chunk = [SimpleNamespace(py_return_context_logits=True)]
-
-    assert engine.forward(batch, resources, enable_spec_decode=True, runtime_draft_len=2) is outputs
-
+    new_tokens = SimpleNamespace(new_tokens=torch.tensor([17]))
+    cache_indirection = torch.tensor([0], dtype=torch.int32)
+    runtime_draft_len = 2 if enable_spec_decode else 0
+    assert (
+        engine.forward(
+            batch,
+            resources,
+            new_tokens,
+            cache_indirection,
+            enable_spec_decode=enable_spec_decode,
+            runtime_draft_len=runtime_draft_len,
+        )
+        is outputs
+    )
     inputs = runner.forward.call_args.args[0]
     assert inputs.batch is batch
+    assert inputs.new_tensors_device is new_tokens
+    assert inputs.cache_indirection_buffer is cache_indirection
     assert inputs.gather_context_logits
-    assert inputs.enable_spec_decode
-    assert inputs.runtime_draft_len == 2
+    assert inputs.enable_spec_decode is enable_spec_decode
+    assert inputs.runtime_draft_len == runtime_draft_len
     assert runner.forward.call_args.kwargs["is_dummy"] is is_dummy
     assert outputs.get("runtime_draft_len") == effective_length
 
@@ -1455,3 +1233,171 @@ def test_engine_forward_preserves_raw_decoder_outputs(raw_output, is_dummy):
     assert engine.forward(ScheduledRequests(), resources, runtime_draft_len=2) is raw_output
     assert engine._runner._forward_decoder.call_args.args[0].runtime_draft_len == 2
     assert engine._runner._forward_decoder.call_args.kwargs == {"is_dummy": is_dummy}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("compile_enabled", [False, True])
+@pytest.mark.parametrize("prefill_only", [False, True])
+def test_refit_updates_compiled_weights_without_invalidating_graphs(
+    compile_enabled: bool,
+    prefill_only: bool,
+) -> None:
+    model = DecoderModelForCausalLM.__new__(DecoderModelForCausalLM)
+    torch.nn.Module.__init__(model)
+    eager = model.model = torch.nn.Linear(2, 2, bias=False)
+    storage = eager.weight.data_ptr()
+    engine = object.__new__(ModelEngine)
+    engine._cleanup_done = True
+    engine.model = model
+    engine._torch_compile_backend = "eager" if compile_enabled else None
+    engine._warmup_depth = 0
+    engine.moe_load_balancer = None
+    engine.llm_args = SimpleNamespace(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE
+        if prefill_only
+        else PrefillCudaGraphBackend.DISABLED,
+        torch_compile_config=SimpleNamespace(
+            compile_only_piecewise_graphs=prefill_only, enable_fullgraph=False
+        ),
+    )
+    graphs = {KeyType(batch_size=1, draft_len=0): object()}
+    padding = {0: object()}
+    engine._runner = Mock(spec=DecoderRunner)
+    engine._runner.cuda_graph_runner = SimpleNamespace(
+        graphs=graphs.copy(), padding_dummy_requests=padding.copy()
+    )
+    resources = Mock()
+    inputs = torch.tensor([[1.0, 2.0]])
+    with (
+        patch("torch.cuda.synchronize") as synchronize,
+        patch(
+            "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
+            return_value=True,
+        ),
+    ):
+        if compile_enabled:
+            engine._apply_torch_compile("eager", False)
+        for value, unwrap, restore in (
+            (
+                2.0,
+                engine.unwrap_compiled_model_for_refit,
+                engine.restore_compiled_model_after_refit,
+            ),
+            (
+                3.0,
+                engine.release_piecewise_cuda_graphs_for_refit,
+                engine.recapture_piecewise_cuda_graphs_after_refit,
+            ),
+        ):
+            synchronize.reset_mock()
+            unwrap()
+            if compile_enabled:
+                synchronize.assert_called_once_with()
+            else:
+                synchronize.assert_not_called()
+            replacement = torch.full_like(eager.weight, value)
+            model.load_state_dict({"model.weight": replacement})
+            restore(resources)
+            torch.testing.assert_close(model.model(inputs), inputs @ replacement.t())
+            assert eager.weight.data_ptr() == storage
+            assert engine.cuda_graph_runner.graphs == graphs
+            assert engine.cuda_graph_runner.padding_dummy_requests == padding
+    resources.get_resource_manager.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("architectures", [None, ["Decoder", "Wrapper"]])
+def test_layerwise_nvtx_flag_controls_real_forward_markers(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+    architectures: list[str] | None,
+) -> None:
+    from tensorrt_llm._torch.pyexecutor import _util
+
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2, bias=False), torch.nn.ReLU())
+    model.model_config = DummyModel(torch.float32).model_config
+    model.config = model.model_config.pretrained_config
+    model.config.architectures = architectures
+    with torch.no_grad():
+        model[0].weight.fill_(1)
+    engine = object.__new__(ModelEngine)
+    engine._cleanup_done = True
+    engine.model = model
+    engine.mapping = Mapping()
+    engine.dist = None
+    engine.enable_in_graph_sampling = False
+    engine.max_beam_width = 1
+    engine.batch_size = 4
+    engine.is_spec_decode = False
+    engine.input_processor = None
+    engine.encoder_max_num_tokens = 16
+    engine.llm_args = TorchLlmArgs(
+        model="dummy", disable_overlap_scheduler=True, enable_layerwise_nvtx_marker=enabled
+    )
+    engine._init_model_capacity = Mock()
+    monkeypatch.setattr(_util, "should_enable_overlap_headroom", Mock(return_value=False))
+    monkeypatch.setattr(_util, "resolved_kv_cache_manager_is_v2", Mock(return_value=False))
+    monkeypatch.setattr(_util, "compute_max_num_sequences", Mock(return_value=4))
+    events = []
+    monkeypatch.setattr(
+        torch.cuda.nvtx,
+        "range_push",
+        lambda label: events.append(("push", literal_eval(label)["Module"])),
+    )
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: events.append(("pop", None)))
+    engine._init_from_model()
+    torch.testing.assert_close(model(torch.tensor([[1.0, 2.0]])), torch.tensor([[3.0, 3.0]]))
+    prefix = "|".join(architectures) if architectures else "Model"
+    assert events == (
+        [
+            ("push", prefix),
+            ("push", prefix + ".0"),
+            ("pop", None),
+            ("push", prefix + ".1"),
+            ("pop", None),
+            ("pop", None),
+        ]
+        if enabled
+        else []
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fails", [False, True])
+def test_warmup_restores_serving_state_after_success_or_failure(fails: bool) -> None:
+    runner = Mock(spec=NoKVCacheRunner)
+    engine, resources = _model_engine_with_runner(runner, kv_cache_manager=None)
+    engine._metrics = {}
+    balancer = engine.moe_load_balancer = Mock()
+    batch = ScheduledRequests()
+
+    def warmup(resource_manager: ResourceManager) -> None:
+        assert resource_manager is resources
+        engine.forward(batch, resources)
+        if fails:
+            raise RuntimeError("warmup failed")
+
+    runner.warmup.side_effect = warmup
+    with patch.object(model_engine_module, "set_moe_comm_warmup") as communication_mode:
+        with engine.warmup_scope():
+            if fails:
+                with pytest.raises(RuntimeError, match="warmup failed"):
+                    engine.warmup(resources)
+            else:
+                engine.warmup(resources)
+            engine.forward(batch, resources)
+            assert balancer.set_iter_info.call_args_list == [
+                call(enable_statistic=False, enable_update_weights=False)
+            ]
+        engine.forward(batch, resources)
+    assert [entry.kwargs["is_dummy"] for entry in runner.forward.call_args_list] == [
+        True,
+        True,
+        False,
+    ]
+    assert balancer.set_iter_info.call_args_list == [
+        call(enable_statistic=False, enable_update_weights=False),
+        call(enable_statistic=True, enable_update_weights=True),
+    ]
+    assert communication_mode.call_args_list == [call(True), call(False)]
