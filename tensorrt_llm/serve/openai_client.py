@@ -115,6 +115,22 @@ def _encode_request_body(request: _SerializableRequest) -> bytes:
 
 _ResponseT = TypeVar("_ResponseT", bound=BaseModel)
 
+# The 4xx statuses that ask the client to try again later.
+_RETRYABLE_CLIENT_ERROR_STATUSES = frozenset((408, 429))
+
+
+def _is_worker_rejection(error: Exception) -> bool:
+    """Whether a worker rejected the request itself.
+
+    A retry would send the same request to the same worker and be rejected the
+    same way, so the rejection goes to the caller as it is.
+    """
+    return (
+        isinstance(error, aiohttp.ClientResponseError)
+        and 400 <= error.status < 500
+        and error.status not in _RETRYABLE_CLIENT_ERROR_STATUSES
+    )
+
 
 def _metrics_phase(role: ServerRole) -> str:
     return "ctx" if role is ServerRole.CONTEXT else "gen"
@@ -498,7 +514,21 @@ class OpenAIHttpClient(OpenAIClient):
                         raise ValueError(
                             "Received an event-stream although request stream was False"
                         )
+                    if http_response.status >= 400:
+                        error_body = await http_response.text()
+                        raise aiohttp.ClientResponseError(
+                            http_response.request_info,
+                            http_response.history,
+                            status=http_response.status,
+                            message=f"{http_response.reason}: {error_body[:2048]}",
+                            headers=http_response.headers,
+                        )
                     if is_stream:
+                        if "text/event-stream" not in content_type:
+                            raise ValueError(
+                                f"Received Content-Type {content_type!r} although request "
+                                "stream was True"
+                            )
                         # do NOT return generator directly here or the response will go
                         # out of scope and get destroyed
                         async with aclosing(
@@ -516,15 +546,6 @@ class OpenAIHttpClient(OpenAIClient):
                                 lines_yielded += 1
                                 yield line
                     else:
-                        if http_response.status >= 400:
-                            error_body = await http_response.text()
-                            raise aiohttp.ClientResponseError(
-                                http_response.request_info,
-                                http_response.history,
-                                status=http_response.status,
-                                message=f"{http_response.reason}: {error_body[:2048]}",
-                                headers=http_response.headers,
-                            )
                         response_dict = await http_response.json()
                         # yield here since python forbids return statements in async generators
                         yield response_dict
@@ -533,6 +554,8 @@ class OpenAIHttpClient(OpenAIClient):
                         )
                 break  # break and skip retries if the whole response is processed without exception
             except (aiohttp.ClientError, OSError) as e:
+                if _is_worker_rejection(e):
+                    raise
                 if lines_yielded > 0:
                     logger.error(
                         f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",
@@ -582,10 +605,7 @@ class OpenAIHttpClient(OpenAIClient):
         req_id: Optional[int] = None,
         response_clock: Optional[AdjustedSteadyClock] = None,
     ) -> AsyncGenerator[Any, None]:
-        assert request.stream, "Request is not streaming"
-        assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
-            "Response is not streaming"
-        )
+        """Relay a worker's event-stream; the caller has checked its status and content type."""
         try:
             last_token_time = start_time
             chunk_count = 0

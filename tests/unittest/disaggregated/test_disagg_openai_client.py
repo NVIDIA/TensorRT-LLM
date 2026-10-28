@@ -805,6 +805,108 @@ class TestHttpErrorBodyPreservation:
         assert body[:20] in str(exc_info.value.message)
 
 
+class TestWorkerErrorStatus:
+    """A worker's error status reaches the caller with the worker's message.
+
+    A 4xx other than 408 and 429 rejects the request itself, so it is sent once;
+    408, 429 and 5xx keep their retries. Streamed and non-streamed requests
+    follow the same rule.
+    """
+
+    _BODY = '{"object": "error", "message": "bad field X", "type": "BadRequestError"}'
+
+    @classmethod
+    def _response(cls, status: int, content_type: str = "application/json") -> AsyncMock:
+        response = AsyncMock()
+        response.status = status
+        response.reason = "Reason"
+        response.headers = {"Content-Type": content_type}
+        response.text = AsyncMock(return_value=cls._BODY)
+        response.request_info = MagicMock()
+        response.history = ()
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        return response
+
+    @staticmethod
+    def _make_client(session) -> tuple[OpenAIHttpClient, AsyncMock]:
+        _reset_prometheus_registry()
+        router = AsyncMock(spec=Router)
+        router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+        # One retry, the disaggregated server's default.
+        client = OpenAIHttpClient(
+            router=router,
+            role=ServerRole.CONTEXT,
+            timeout_secs=10,
+            max_retries=1,
+            retry_interval_sec=0,
+            session=session,
+        )
+        return client, router
+
+    @staticmethod
+    async def _send(client: OpenAIHttpClient, stream: bool) -> None:
+        request = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=stream,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=1
+            ),
+        )
+        response = await client.send_request(request)
+        if stream:
+            _ = [chunk async for chunk in response]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True], ids=["non_stream", "stream"])
+    @pytest.mark.parametrize("status", [400, 403, 404, 413, 422])
+    async def test_a_rejection_reaches_the_caller_once_with_its_status_and_message(
+        self, status, stream
+    ):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._response(status)
+        client, router = self._make_client(session)
+
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+            await self._send(client, stream)
+
+        assert exc_info.value.status == status
+        assert "bad field X" in exc_info.value.message
+        assert session.post.call_count == 1, "a worker's rejection must not be retried"
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True], ids=["non_stream", "stream"])
+    @pytest.mark.parametrize("status", [408, 429, 500, 502, 503])
+    async def test_a_retryable_status_is_retried(self, status, stream):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._response(status)
+        client, router = self._make_client(session)
+
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+            await self._send(client, stream)
+
+        assert exc_info.value.status == status
+        assert session.post.call_count == 2, "the first attempt and one retry"
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_2xx_that_is_not_an_event_stream_is_a_protocol_error(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._response(200)
+        client, router = self._make_client(session)
+
+        with pytest.raises(ValueError, match="'application/json' although request stream was True"):
+            await self._send(client, stream=True)
+
+        assert session.post.call_count == 1
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+
 class TestDisaggIdRegenOnRetry:
     """Test that disagg_request_id is regenerated on retry (TRTLLM-11123)."""
 
