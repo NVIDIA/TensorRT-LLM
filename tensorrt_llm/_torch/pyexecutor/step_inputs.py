@@ -61,9 +61,6 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import (  # noqa: F401
-    fake_ops as _m3_fake_ops,  # registers trtllm::step_inputs_scatter's fake impl
-)
 from tensorrt_llm._utils import prefer_pinned
 
 
@@ -146,6 +143,12 @@ def _parallel_ok(h2d: list[tuple[int, int, int]], d2d: list[tuple[int, int, int]
     if not _disjoint(dsts):
         return False
     return all(_disjoint(dsts + [(src, n)]) for _, src, n in d2d)
+
+
+@torch.library.register_fake("trtllm::step_inputs_scatter")
+def _step_inputs_scatter_fake(stage: torch.Tensor) -> None:
+    # Writes the staged rows into their destinations; returns nothing.
+    return None
 
 
 class StepInputPack:
