@@ -127,10 +127,11 @@ requires `supports_multimodal` and `extra.trtllm_supported_modalities` to advert
 image support. Video, audio, and disaggregated image routing are not advertised.
 
 For image blocks, `BlockStored.trtllm_image_routing` contains
-`version`, `token_id_offset` (the vocabulary size), and `keys`, aligned with the
-stored blocks. Each key carries its native content `hash`, `start_offset`, and
-optional `uuid`. Native image tokens start with a digest and continue with IDs
-above `token_id_offset`; a router can normalize those tokens using identities it
+`version` and `token_id_offset` (the vocabulary size). The existing
+`BlockStored.mm_keys` contains the keys, aligned with the stored blocks. Each key
+retains its native content `hash` and `start_offset` and gains an optional `uuid`.
+Keys are serialized only in `mm_keys`. Native image tokens start with a digest
+and continue with IDs above `token_id_offset`; a router can normalize those tokens using identities it
 sent in `MediaItem.uuid`. Native block hashes, parent chains, and removals retain
 their existing meaning. Cache hashing continues to include image content.
 

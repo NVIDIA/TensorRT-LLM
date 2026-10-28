@@ -52,8 +52,12 @@ def test_streaming_image_hints_are_bounded_and_content_sensitive(monkeypatch, uu
         wire = msgspec.msgpack.decode(msgspec.msgpack.encode(source.drain_events()[0]))
         metadata = wire["trtllm_image_routing"]
         assert metadata["version"] == 1 and metadata["token_id_offset"] == 1000
-        assert metadata["keys"][0][0]["uuid"] == uuid
-        assert metadata["keys"][0][0]["hash"] == hashes[0]
+        assert set(metadata) == {"version", "token_id_offset"}
+        assert wire["mm_keys"][0][0]["uuid"] == uuid
+        assert wire["mm_keys"][0][0]["hash"] == hashes[0]
+        encoded = msgspec.msgpack.encode(source.drain_events()[0])
+        assert encoded.count(hashes[0].encode()) == 2  # Token stream and mm_keys.
+        assert encoded.count(uuid.encode()) == 1
         assert wire["token_ids"] == Stored.token_ids
 
         Stored.token_ids = [1, 2, 3, 4]
@@ -207,7 +211,8 @@ def test_unmapped_integer_image_continuations_keep_routing_metadata(monkeypatch,
         wire = msgspec.msgpack.decode(msgspec.msgpack.encode(source.drain_events()[0]))
         metadata = wire["trtllm_image_routing"]
         assert metadata["version"] == 1 and metadata["token_id_offset"] == 1000
-        key = metadata["keys"][0][0]
+        assert set(metadata) == {"version", "token_id_offset"}
+        key = wire["mm_keys"][0][0]
         assert key["hash"] == digest.hex() and key["start_offset"] == 3
         assert key.get("uuid") is None
         assert wire["token_ids"] == Stored.token_ids

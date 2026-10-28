@@ -88,7 +88,6 @@ class ImageRoutingMetadata(msgspec.Struct, frozen=True, gc=False):
 
     version: int
     token_id_offset: int
-    keys: list[list[MultimodalKey]]
 
 
 class BlockStored(KVCacheWireEvent):
@@ -624,7 +623,7 @@ class _StreamingEventSource:
                         mm_keys=mm_keys,
                         trtllm_image_routing=(
                             ImageRoutingMetadata(
-                                version=1, token_id_offset=self._mm_token_id_offset, keys=mm_keys
+                                version=1, token_id_offset=self._mm_token_id_offset
                             )
                             if mm_keys is not None
                             and self._mm_token_id_offset is not None

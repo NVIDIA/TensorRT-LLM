@@ -440,7 +440,7 @@ def test_native_streaming_sink_preserves_multimodal_event_data(real_block_factor
         assert manager.stored_blocks == 4
         assert stored.trtllm_image_routing.version == 1
         assert stored.trtllm_image_routing.token_id_offset == 1000
-        assert [[key.uuid for key in keys] for keys in stored.trtllm_image_routing.keys] == [
+        assert [[key.uuid for key in keys] for keys in stored.mm_keys] == [
             ["dynamo-image-v1:0123456789abcdef"],
             [],
             ["dynamo-image-v1:0123456789abcdef"] * 2,

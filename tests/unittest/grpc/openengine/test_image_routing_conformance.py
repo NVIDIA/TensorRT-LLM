@@ -115,7 +115,7 @@ def test_real_image_routing_keeps_cache_identity_content_sensitive(unused_tcp_po
                 metadata = event.get("trtllm_image_routing")
                 if not metadata:
                     continue
-                for keys in metadata["keys"]:
+                for keys in event["mm_keys"]:
                     for key in keys:
                         assert key["uuid"] == "dynamo-image-v1:0123456789abcdef"
                         hashes.add(key["hash"])
