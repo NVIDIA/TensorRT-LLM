@@ -172,9 +172,9 @@ class TestWrapperScopesCarryTheDomain(unittest.TestCase):
 
     def test_placement_sends_a_request_to_the_domain_holding_its_prefix(self) -> None:
         # Round-robin would start at domain 0, so place another request first to move it to 1.
-        self.assertEqual(self.wrapper.pick_locality_domain(1), 0)
-        self.assertEqual(self.wrapper.pick_locality_domain(2, self.tokens), 0)
-        self.assertEqual(self.wrapper.pick_locality_domain(3, [10**6 + t for t in self.tokens]), 1)
+        self.assertEqual(self.wrapper.pick_locality_domain(), 0)
+        self.assertEqual(self.wrapper.pick_locality_domain(self.tokens), 0)
+        self.assertEqual(self.wrapper.pick_locality_domain([10**6 + t for t in self.tokens]), 1)
 
     def test_prefetch_builds_a_domain_scope(self) -> None:
         self.wrapper.prefetch_for_context_tokens([_request(4, 1), _request(5, 0)])
