@@ -137,6 +137,45 @@ def _read_torch(device_index: int) -> TorchReading:
     return TorchReading(reserved=torch.cuda.memory_reserved(device_index), live=live)
 
 
+#: Tags the executor sets during startup, mapped onto ledger categories.
+#: A tag with no mapping is still reported, under its own name, rather than
+#: dropped -- an unmapped tag is a gap in this table, not absent memory.
+_TAG_CATEGORIES = {
+    "WEIGHTS": Category.WEIGHTS,
+    "SAMPLER": Category.SAMPLER,
+}
+
+
+def _tag_entries() -> list[Entry]:
+    """Ledger entries for the frozen startup tags.
+
+    Returns nothing when tagging is unsupported or the startup window never
+    ran, so the torch-side rows stay absent rather than appearing as zeros.
+
+    ``untagged`` is deliberately not emitted here: the frame already derives
+    an ``unattributed_live`` row from ``torch_live`` minus the tagged total,
+    and emitting both would double count.
+    """
+    from .tagging import UNTAGGED, get_frozen_map, live_bytes_by_tag
+
+    by_tag = live_bytes_by_tag(get_frozen_map())
+    entries: list[Entry] = []
+    for label, size in sorted(by_tag.items()):
+        if label == UNTAGGED or not size:
+            continue
+        entries.append(
+            Entry(
+                category=_TAG_CATEGORIES.get(label, Category.TAGGED_OTHER),
+                size_bytes=size,
+                source=Source.TAG,
+                placement=Placement.TORCH,
+                basis=Basis.LOGICAL,
+                owner=label,
+            )
+        )
+    return entries
+
+
 def capture(
     *,
     tag: str = "",
@@ -163,7 +202,7 @@ def capture(
     if entries is None:
         from .providers import collect_all
 
-        entries = collect_all()
+        entries = collect_all() + _tag_entries()
 
     return LedgerCapture(
         frame=build_frame(_read_device(device_index), _read_torch(device_index), entries),
