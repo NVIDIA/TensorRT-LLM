@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Per-stage rerun policy for failed tests in L0 test stages, read by
+# jenkins/scripts/test_rerun.py (generate_rerun_tests_list --stage-name).
+#
+# `default` applies to every stage and must set every key below; it is the only
+# place the default values are defined. Each `stages` rule names a stage with
+# `match` (exact name, or `*` wildcards as in the stage filters of
+# L0_Test.groovy) and overrides any of the keys below; only the first matching
+# rule applies. Keys a rule leaves out keep their `default` value.
+#
+# Keys:
+#   rerun_enabled               Rerun failed tests at all.
+#   rerun_twice_max_duration_s  A failed test that ran this long or less is
+#                               rerun twice.
+#   rerun_once_max_duration_s   A failed test that ran this long or less is
+#                               rerun once. A longer one is rerun once only when
+#                               its failure matches a known failure signature.
+#   max_failed_tests            When more tests than this failed or terminated
+#                               unexpectedly, rerun none of them. null: no limit.
+#                               Counted per run: the stage's regular tests
+#                               together, and each isolated test on its own.
+#   rerun_timeout_tests         Rerun tests that timed out, i.e. were still running
+#                               when the pytest process ended (CI runs pytest-timeout
+#                               with --timeout-method=thread, which ends the process
+#                               on a timeout). Each is rerun once.
+#   rerun_timeout_max_tests     With rerun_timeout_tests, rerun at most this many
+#                               timed-out tests, in test list order; the rest are
+#                               not rerun.
+#
+# Tests that never started because an earlier test ended the pytest process are
+# rerun once whenever rerun_enabled is true.
+
+default:
+  rerun_enabled: true
+  rerun_twice_max_duration_s: 300
+  rerun_once_max_duration_s: 600
+  max_failed_tests: null
+  rerun_timeout_tests: false
+  rerun_timeout_max_tests: 1
+
+stages: []
+# Example:
+# stages:
+#   - match: "*-PerfSanity-*"
+#     rerun_enabled: false
+#   - match: "DGX_B200-8_GPUs-PyTorch-*"
+#     max_failed_tests: 10
+#   - match: "GB200-4_GPUs-PyTorch-1"
+#     rerun_timeout_tests: true
+#     rerun_timeout_max_tests: 2
