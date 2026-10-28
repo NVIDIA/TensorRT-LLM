@@ -21,54 +21,9 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegion,
     SpecRegionPair,
 )
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.runs import RunsMapper
 
 pytestmark = pytest.mark.cpu_only
-
-
-def make_rankinfo(
-    kv_heads_per_rank=2,
-    tokens_per_block=4,
-    dims_per_head=2,
-    element_bytes=1,
-    tp_size=2,
-    tp_rank=0,
-    dp_size=1,
-    dp_rank=0,
-    pp_size=1,
-    pp_rank=0,
-    cp_size=1,
-    cp_rank=0,
-    is_mla=False,
-):
-    return RankInfo(
-        instance_name="rank",
-        instance_rank=0,
-        tp_size=tp_size,
-        tp_rank=tp_rank,
-        dp_size=dp_size,
-        dp_rank=dp_rank,
-        pp_size=pp_size,
-        pp_rank=pp_rank,
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-        device_id=0,
-        layer_num_per_pp=[1],
-        sender_endpoints=[],
-        self_endpoint="",
-        transfer_engine_info=b"",
-        attention=AttentionInfo(
-            kv_heads_per_rank=kv_heads_per_rank,
-            tokens_per_block=tokens_per_block,
-            dims_per_head=dims_per_head,
-            element_bytes=element_bytes,
-            enable_attention_dp=False,
-            is_mla=is_mla,
-        ),
-        aux_meta=None,
-    )
 
 
 def test_mem_region_group():
@@ -127,10 +82,3 @@ def test_runs_mapper_shifts_each_side_by_its_own_offset():
     np.testing.assert_array_equal(result.dst.memory.ptrs, [62, 72])
     assert result.src.memory.bytes_per_region == 32
     assert result.dst.memory.bytes_per_region == 32
-
-
-def test_rankinfo_kv_factor():
-    ri1 = make_rankinfo(is_mla=False)
-    ri2 = make_rankinfo(is_mla=True)
-    assert ri1.attention.kv_factor == 2
-    assert ri2.attention.kv_factor == 1

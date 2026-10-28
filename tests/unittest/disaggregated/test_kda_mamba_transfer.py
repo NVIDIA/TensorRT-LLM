@@ -30,8 +30,8 @@ Synthetic loopback coverage of the KDA recurrent-state transfer path:
       replica under attention-DP.
 
 * ``test_kda_layer_group_descriptors`` checks that the V2 page table
-  describes BOTH slots with exact byte sizes and that the matched-TP
-  ``MambaPolicy`` descriptors tile each layer's slot bytes exactly.
+  describes BOTH slots with exact byte sizes and that a matched-TP
+  receiver receives each layer's slot bytes exactly.
 
 * ``test_kda_transfer`` performs a real single-node NIXL loopback transfer
   and bitwise-compares both dtypes on the gen side: matched and
@@ -55,10 +55,6 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
-    MambaPolicy,
-    mamba_receiver_payload_bytes,
-)
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
@@ -67,6 +63,7 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
 from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_params
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import check_compatible, received_bytes
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -234,13 +231,9 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
             i for i, m in enumerate(_KDA_MASK) if m
         ]
 
-        # Matched-parallelism payload: receiver_payload_bytes must equal
-        # NUM_KDA_LAYERS * (conv + ssm) for matched TP.
-        payload = mamba_receiver_payload_bytes(
-            sender_page_table=pt,
-            receiver_page_table=pt,
-            dst_slot=1,
-        )
+        # Matched-parallelism payload: a receiver receives
+        # NUM_KDA_LAYERS * (conv + ssm) of recurrent state.
+        payload = received_bytes(pt.layout, pt.layout, "state")
         assert payload == NUM_KDA_LAYERS * (CONV_SLOT_BYTES + SSM_SLOT_BYTES)
     finally:
         mgr.shutdown()
@@ -251,9 +244,9 @@ def test_kda_hetero_tp_sharded_accepted():
 
     With attention-DP off, production builds a head-sharded per-rank KDA
     state (the manager divides num_heads/n_groups/conv_dim by tp_size,
-    matching ``KimiKDARuntime``'s head-sharded compute), so
-    ``per_rank_slot_bytes * tp`` is TP-invariant and the global-size gate in
-    ``MambaPolicy.validate_peer_compatible`` accepts hetero ctx/gen TP.
+    matching ``KimiKDARuntime``'s head-sharded compute), so both sides
+    describe the same global state and the page layouts correspond across
+    hetero ctx/gen TP.
     """
     ctx_mgrs = _create_kda_managers(2, enable_attention_dp=False)
     gen_mgrs = _create_kda_managers(4, enable_attention_dp=False)
@@ -286,7 +279,7 @@ def test_kda_hetero_tp_sharded_accepted():
 
         ctx_ri = RankInfo.from_kv_cache_manager("kda_ctx", ctx_mgr, device_id=0)
         gen_ri = RankInfo.from_kv_cache_manager("kda_gen", gen_mgr, device_id=0)
-        MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, gen_pt)
+        check_compatible(ctx_pt.layout, gen_pt.layout)
 
         # And via the registrar entry point used at runtime.
         registrar = PeerRegistrar(ctx_ri, KVRegionExtractorV1(ctx_pt))
@@ -318,94 +311,55 @@ def test_kda_peer_validation_accepts_supported_shapes(ctx_cfg, gen_cfg):
     try:
         ctx_pt = build_page_table_from_manager(ctx_mgr)
         gen_pt = build_page_table_from_manager(gen_mgr)
-        ctx_ri = RankInfo.from_kv_cache_manager("kda_ctx", ctx_mgr, device_id=0)
-        gen_ri = RankInfo.from_kv_cache_manager("kda_gen", gen_mgr, device_id=0)
-        MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, gen_pt)
+        check_compatible(ctx_pt.layout, gen_pt.layout)
     finally:
         for mgr in ctx_mgrs + gen_mgrs:
             mgr.shutdown()
 
 
-def _synthetic_kda_page_table(ssm_slot_bytes: int, conv_slot_bytes: int, layer_ids=None):
-    """MambaLayerGroup-only page table with fake addresses (no CUDA needed)."""
-    import numpy as np
+def _synthetic_kda_layout(tp: int, adp: bool, denom: int, layer_ids=None):
+    """A KDA layer group's page layout as a rank of TP ``tp`` (attention DP ``adp``) declares it.
 
-    from tensorrt_llm._torch.disaggregation.resource.page import (
-        BUFFER_ENTRY_DTYPE,
-        MAMBA_CONV_ROLE,
-        MAMBA_SSM_ROLE,
-        KVCachePageTable,
-        LocalLayer,
-        MapperKind,
-        PhysicalPool,
-        PhysicalPoolGroup,
-        PoolView,
+    Each per-rank slot is ``1 / denom`` of the full one (no CUDA needed).
+    """
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+        BufferDesc,
+        LayerGroupDesc,
+        PageLayout,
+        RankTopology,
+        head_major,
+        sectioned,
     )
 
     if layer_ids is None:
         layer_ids = range(1, NUM_KDA_LAYERS + 1)
-    local_layers = [
-        LocalLayer(local_layer_id=i, global_layer_id=glid) for i, glid in enumerate(layer_ids)
-    ]
-    sorted_lids = [ll.local_layer_id for ll in local_layers]
-    conv_pool = PhysicalPool(base_address=0x1000, slot_bytes=conv_slot_bytes, num_slots=8)
-    ssm_pool = PhysicalPool(base_address=0x2000000, slot_bytes=ssm_slot_bytes, num_slots=8)
-    pool_views = [
-        PoolView(
-            pool_idx=0,
-            buffer_entries=np.array(
-                [(lid, 0, conv_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
-            ),
-            pool_role=MAMBA_CONV_ROLE,
-            mapper_kind=MapperKind.SECTIONED,
-            bytes_per_layer=conv_slot_bytes,
-            section_bytes=[conv_slot_bytes // 3] * 3,
-        ),
-        PoolView(
-            pool_idx=1,
-            buffer_entries=np.array(
-                [(lid, 0, ssm_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
-            ),
-            pool_role=MAMBA_SSM_ROLE,
-            mapper_kind=MapperKind.INDEXED,
-            bytes_per_layer=ssm_slot_bytes,
-            bytes_per_head=KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize,
-        ),
-    ]
-    mlg = MambaLayerGroup(
-        pool_group_idx=0,
-        local_layers=local_layers,
-        pool_views=pool_views,
-    )
-    return KVCachePageTable(
-        tokens_per_block=8,
-        layer_groups=[mlg],
-        pool_groups=[PhysicalPoolGroup(pools=[conv_pool, ssm_pool])],
-    )
-
-
-def _synthetic_rank_info(tp: int, adp: bool):
-    from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
-
-    return RankInfo(
-        instance_name="syn",
-        instance_rank=0,
-        tp_size=tp,
-        tp_rank=0,
-        pp_size=1,
-        pp_rank=0,
-        layer_num_per_pp=[_NUM_TOTAL_LAYERS],
-        sender_endpoints=[],
-        self_endpoint="",
-        transfer_engine_info=b"",
-        attention=AttentionInfo(
-            kv_heads_per_rank=4,
-            tokens_per_block=8,
-            dims_per_head=64,
-            element_bytes=2,
-            enable_attention_dp=adp,
-            is_mla=False,
-        ),
+    layer_ids = tuple(layer_ids)
+    ranks = 1 if adp else tp
+    head = KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
+    conv = CONV_SLOT_BYTES // denom
+    ssm = KDA_NUM_HEADS * head // denom
+    buffers = []
+    for i, layer in enumerate(layer_ids):
+        buffers.append(
+            BufferDesc(layer, "conv_state", 0, 0, i * conv, conv, sectioned([conv // 3] * 3, ranks))
+        )
+        buffers.append(
+            BufferDesc(
+                layer,
+                "ssm_state",
+                0,
+                1,
+                i * ssm,
+                ssm,
+                head_major(ssm, ssm // head, ssm // head * ranks, ("tp", "cp")),
+            )
+        )
+    return PageLayout(
+        tokens_per_page=8,
+        pool_slot_bytes={0: (max(len(layer_ids), 1) * conv, max(len(layer_ids), 1) * ssm)},
+        layer_groups=(LayerGroupDesc("state", None, 0, 0, layer_ids),) if layer_ids else (),
+        buffers=tuple(buffers),
+        topology=RankTopology(tp_size=tp, dp_size=tp if adp else 1, attention_dp=adp),
     )
 
 
@@ -436,24 +390,14 @@ def _synthetic_rank_info(tp: int, adp: bool):
     ],
 )
 def test_kda_peer_validation_synthetic_cpu(ctx, gen, ok):
-    """CPU-only reject/accept matrix for the global-size guard (no CUDA manager)."""
-    full_ssm = KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
-    full_conv = CONV_SLOT_BYTES
-
-    def build(cfg):
-        tp, adp, denom = cfg
-        return (
-            _synthetic_rank_info(tp, adp),
-            _synthetic_kda_page_table(full_ssm // denom, full_conv // denom),
-        )
-
-    ctx_ri, ctx_pt = build(ctx)
-    gen_ri, gen_pt = build(gen)
+    """CPU-only reject/accept matrix: the two sides' state must be the same global tensors."""
+    ctx_layout = _synthetic_kda_layout(*ctx)
+    gen_layout = _synthetic_kda_layout(*gen)
     if ok:
-        MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, gen_pt)
+        check_compatible(ctx_layout, gen_layout)
     else:
-        with pytest.raises(ValueError, match="TP-aggregated"):
-            MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, gen_pt)
+        with pytest.raises(ValueError, match="do not correspond"):
+            check_compatible(ctx_layout, gen_layout)
 
 
 @pytest.mark.cpu_only
@@ -466,33 +410,24 @@ def test_kda_peer_validation_allows_pipeline_parallel_layer_split():
     recurrent-layer sets are all legitimate stage pairings and must pass
     validation as long as the per-slot size invariants hold.
     """
-    full_ssm = KDA_NUM_HEADS * KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
-    full_conv = CONV_SLOT_BYTES
-    ctx_ri = _synthetic_rank_info(2, False)
-    gen_ri = _synthetic_rank_info(2, False)
-
     # Partially overlapping stages (ctx PP split differs from gen's).
-    ctx_pt = _synthetic_kda_page_table(full_ssm, full_conv, layer_ids=[1, 2, 3])
-    gen_pt = _synthetic_kda_page_table(full_ssm, full_conv, layer_ids=[3, 4, 5])
-    MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, gen_pt)
+    ctx_layout = _synthetic_kda_layout(2, False, 2, layer_ids=[1, 2, 3])
+    gen_layout = _synthetic_kda_layout(2, False, 2, layer_ids=[3, 4, 5])
+    check_compatible(ctx_layout, gen_layout)
 
     # Disjoint stages: this pair simply moves no recurrent state.
-    gen_pt = _synthetic_kda_page_table(full_ssm, full_conv, layer_ids=[7, 8])
-    MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, gen_pt)
+    check_compatible(ctx_layout, _synthetic_kda_layout(2, False, 2, layer_ids=[7, 8]))
 
-    # One side holds a recurrent-layer-free stage of the hybrid model
-    # (no MambaLayerGroup at all): nothing to validate.
-    from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
+    # One side holds a recurrent-layer-free stage of the hybrid model: nothing to compare.
+    empty = _synthetic_kda_layout(2, False, 2, layer_ids=[])
+    check_compatible(ctx_layout, empty)
+    check_compatible(empty, gen_layout)
 
-    empty_pt = KVCachePageTable(tokens_per_block=8, layer_groups=[], pool_groups=[])
-    MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, empty_pt)
-    MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, empty_pt, gen_pt)
-
-    # Size invariants still apply on the overlap: mismatched global state
-    # sizes are rejected even when the layer sets differ.
-    bad_gen_pt = _synthetic_kda_page_table(full_ssm // 2, full_conv // 2, layer_ids=[3, 4, 5])
-    with pytest.raises(ValueError, match="TP-aggregated"):
-        MambaPolicy.validate_peer_compatible(ctx_ri, gen_ri, ctx_pt, bad_gen_pt)
+    # The state must still be the same on the overlap: a different global size is refused even
+    # when the layer sets differ.
+    bad_gen = _synthetic_kda_layout(2, False, 4, layer_ids=[3, 4, 5])
+    with pytest.raises(ValueError, match="do not correspond"):
+        check_compatible(ctx_layout, bad_gen)
 
 
 # ---------------------------------------------------------------------------

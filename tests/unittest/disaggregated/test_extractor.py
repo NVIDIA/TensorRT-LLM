@@ -16,6 +16,7 @@
 import numpy as np
 import pytest
 import torch
+from layout_test_utils import native_page_table
 
 from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
@@ -253,9 +254,7 @@ def _page_table(groups, pool_slot_bytes, buffers, bases, view_partition=None):
     Each group has one internal layer per global layer, in order; device pools lie at
     ``bases[group]``.
     """
-    from tensorrt_llm._torch.disaggregation.resource.kv_extractor import page_table_from_layout
     from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import PageLayout
-    from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import DevicePool, ManagerLayout
 
     layout = PageLayout(
         tokens_per_page=16,
@@ -263,29 +262,13 @@ def _page_table(groups, pool_slot_bytes, buffers, bases, view_partition=None):
         layer_groups=groups,
         buffers=buffers,
     )
-    table = ManagerLayout(
-        page_layout=layout,
-        tokens_per_block=16,
-        pool_group_of=tuple(g.pool_group for g in groups),
-        windows=tuple(g.kept_window for g in groups),
-        sink_blocks=tuple(g.num_sink_blocks for g in groups),
-        recurrent=tuple(g.kind == "state" for g in groups),
-        sparse=tuple(False for _ in groups),
-        layers=tuple(g.layers for g in groups),
-        shards=tuple((1, 0) for _ in groups),
-        page_bytes={g: sum(widths) for g, widths in pool_slot_bytes.items()},
-        device_pools={
-            g: tuple(
-                DevicePool(group=g, index=i, base=base, slot_bytes=width, num_slots=4)
-                for i, (base, width) in enumerate(zip(bases[g], widths))
-            )
-            for g, widths in pool_slot_bytes.items()
-        },
-        named_groups=tuple(True for _ in groups),
-        local_layers=tuple(tuple(enumerate(g.layers)) for g in groups),
-        kv_heads=tuple(1 if g.kind == "attention" else 0 for g in groups),
+    return native_page_table(
+        layout,
+        bases,
+        kv_heads=1,
+        num_slots=4,
+        view_partition=view_partition,
     )
-    return page_table_from_layout(table, view_partition=view_partition)
 
 
 def _attention_page_table(buffers, pool_slot_bytes, view_partition=None):

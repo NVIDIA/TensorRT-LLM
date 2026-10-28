@@ -52,7 +52,7 @@ from .page_layout import (
     held,
 )
 
-__all__ = ["BufferRuns", "fan", "map_buffers", "merge_runs"]
+__all__ = ["BufferRuns", "check_compatible", "fan", "map_buffers", "merge_runs", "received_bytes"]
 
 
 def fan(src_size: int, dst_size: int, dst_rank: int) -> range:
@@ -333,3 +333,65 @@ def map_buffers(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> 
         sizes = np.concatenate([np.full(p[0].size, p[2], dtype=np.int64) for p in parts])
         out.append(BufferRuns(src_buffer, dst_buffer, *merge_runs(src_offsets, dst_offsets, sizes)))
     return out
+
+
+def group_kinds(layout: PageLayout) -> dict[tuple[int, int], str]:
+    """(pool group, global layer) -> the kind of the layer group the layer's buffers there belong
+    to ("attention" or "state")."""
+    return {(g.pool_group, layer): g.kind for g in layout.layer_groups for layer in g.layers}
+
+
+def _transferred(layout: PageLayout) -> dict[tuple[int, str], BufferDesc]:
+    return {(b.layer, b.role): b for b in layout.buffers if b.transferred}
+
+
+def check_compatible(a: PageLayout, b: PageLayout) -> None:
+    """Check that two ranks' pages correspond, whichever sends.
+
+    On the layers both hold, every buffer either rank transfers the other transfers too, as the
+    same tensors: the same names, axes and extents over all ranks, however each splits them. Pages
+    pair one to one, so where both transfer attention buffers their pages hold as many tokens.
+
+    Raises:
+        ValueError: Naming every difference found.
+    """
+    problems = []
+    layers = {x.layer for x in a.buffers} & {x.layer for x in b.buffers}
+    ta, tb = _transferred(a), _transferred(b)
+    for key in sorted(k for k in set(ta) | set(tb) if k[0] in layers):
+        x, y = ta.get(key), tb.get(key)
+        if x is None or y is None:
+            problems.append(f"buffer {key} is transferred by one rank only")
+            continue
+        xs, ys = {t.name: t for t in x.tensors}, {t.name: t for t in y.tensors}
+        if set(xs) != set(ys):
+            problems.append(f"buffer {key}: tensors {sorted(xs)} against {sorted(ys)}")
+            continue
+        for name, tx in xs.items():
+            ex = {axis.name: axis.extent for axis in tx.axes}
+            ey = {axis.name: axis.extent for axis in ys[name].axes}
+            if ex != ey:
+                problems.append(f"buffer {key} tensor {name!r}: axes {ex} against {ey}")
+    kinds_a, kinds_b = group_kinds(a), group_kinds(b)
+    paged = any(
+        kinds_a.get((ta[k].pool_group, k[0])) == "attention"
+        and kinds_b.get((tb[k].pool_group, k[0])) == "attention"
+        for k in set(ta) & set(tb)
+    )
+    if paged and a.tokens_per_page != b.tokens_per_page:
+        problems.append(f"pages of {a.tokens_per_page} tokens against {b.tokens_per_page}")
+    if problems:
+        raise ValueError("page layouts do not correspond: " + "; ".join(problems))
+
+
+def received_bytes(src: PageLayout, dst: PageLayout, kind: str) -> int:
+    """Bytes the destination receives into one page of its layer groups of ``kind`` from the
+    sources laid out as ``src``: those of each buffer it transfers that ``src`` transfers too, all
+    of which arrive (a destination its paired sources leave short is refused)."""
+    sent = _transferred(src)
+    kinds = group_kinds(dst)
+    return sum(
+        b.size
+        for key, b in _transferred(dst).items()
+        if key in sent and kinds.get((b.pool_group, b.layer)) == kind
+    )

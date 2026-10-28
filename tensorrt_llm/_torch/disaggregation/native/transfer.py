@@ -67,11 +67,6 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
 )
 from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
-    MambaPolicy,
-    mamba_receiver_payload_bytes,
-)
 from tensorrt_llm._torch.disaggregation.native.ownership import (
     PhysicalOperationState as _PhysicalOperationState,  # noqa: F401 -- native diagnostic alias
 )
@@ -88,9 +83,10 @@ from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import received_bytes
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import CUASSERT, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
@@ -2762,12 +2758,13 @@ class Receiver(ReceiverBase):
     def _fanin_bounce_safe(
         overlap: PeerOverlap,
         peer_ri: RankInfo,
-        receiver_page_table: Optional[KVCachePageTable],
+        writers_send_alike: bool,
     ) -> bool:
         """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
         The split assumes every writer contributes the same size, which holds when:
-          * duplicate_head_factor == 1 -- else some ranks don't send KV yet still count in
-            expected_transfers, so the live writers overflow their slots;
+          * every writer sends the same bytes per page (``writers_send_alike``, from
+            PeerRegistrar.writers_send_alike) -- else, as when one rank sends a head or an index
+            cache every rank holds, the live writers overflow their slots;
           * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
             for PP fan-in, every overlapping stage must hold the same number of layers
             (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
@@ -2775,25 +2772,12 @@ class Receiver(ReceiverBase):
         Otherwise fall back to the per-fragment path (correct, just not coalesced).
         Equal layer count means equal bytes only when the per-block sizes match; reserve() rejects
         the mismatched case, so this only needs the count to split evenly."""
-        if overlap.duplicate_head_factor != 1:
+        if not writers_send_alike:
             return False
         if overlap.overlap_pp_size > 1:
             lpp = getattr(peer_ri, "layer_num_per_pp", None)
             if not lpp or len(lpp) < overlap.overlap_pp_size or len(set(lpp)) != 1:
                 return False
-        # Replicated pools (e.g. MiniMax M3 index-key) are sent by one elected
-        # fan-in owner only, so with multiple writers their contributions
-        # differ in size and the equal split is invalid. Inspect both endpoints:
-        # a masked PP stage may advertise no replicated view even though another
-        # stage owns one that is visible in the receiver's page table.
-        if len(overlap.ranks) > 1:
-            for page_table in (peer_ri.page_table, receiver_page_table):
-                if page_table is None:
-                    continue
-                for layer_group in page_table.layer_groups:
-                    for pool_view in getattr(layer_group, "pool_views", ()):
-                        if pool_view.mapper_kind == MapperKind.REPLICATED:
-                            return False
         return True
 
     def _get_mamba_slot(self, req_info: RecvReqInfo) -> Optional[int]:
@@ -2884,7 +2868,7 @@ class Receiver(ReceiverBase):
             and self._fanin_bounce_safe(
                 topo_overlap,
                 peer_infos,
-                self._registrar.self_extractor.page_table,
+                self._registrar.writers_send_alike(peer_infos, topo_overlap),
             )
         )
         # Recurrent (mamba/KDA) state rides the SAME coalesced write as the KV blocks,
@@ -2895,10 +2879,10 @@ class Receiver(ReceiverBase):
             if peer_infos.page_table is None:
                 allow_bounce = False  # cannot size the recurrent-state payload
             else:
-                extra_bytes = mamba_receiver_payload_bytes(
-                    sender_page_table=peer_infos.page_table,
-                    receiver_page_table=self._registrar.self_extractor.page_table,
-                    dst_slot=mamba_dst_slot,
+                extra_bytes = received_bytes(
+                    peer_infos.page_table.layout,
+                    self._registrar.self_extractor.page_table.layout,
+                    "state",
                 )
         bounced = allow_bounce and self._bounce.reserve(
             receiver_req, task.expected_transfers, extra_bytes=extra_bytes
@@ -3015,17 +2999,13 @@ class Receiver(ReceiverBase):
             # (handled in dispatch_task) so only requests targeting this peer
             # fail, and cached so later requests fail fast.
             try:
-                self._registrar.validate_bounded_replay_compatible(sender_info)
-                MambaPolicy.validate_peer_compatible(
-                    self._registrar.self_rank_info,
-                    sender_info,
-                    self._registrar.self_extractor.page_table,
-                    sender_info.page_table,
-                )
-                AttentionPolicy.validate_peer_compatible(
-                    self._registrar.self_extractor.page_table,
-                    sender_info.page_table,
-                )
+                self._registrar.check_peer_compatible(sender_info)
+                # Every data-parallel group of writers covers this rank's pages
+                # (map_buffers refuses a pairing that leaves it short).
+                for dp_rank in range(sender_info.dp_size):
+                    self._registrar.writers_send_alike(
+                        sender_info, self._registrar.get_peer_overlap(sender_info, dp_rank)
+                    )
             except ValueError as e:
                 msg = (
                     f"context peer at '{info_endpoint}' is incompatible: {e} "

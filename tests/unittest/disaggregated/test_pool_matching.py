@@ -34,7 +34,6 @@ called out in the refactor commit message.
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
@@ -143,8 +142,6 @@ def _rank_info(
     rank=0,
     layer_num_per_pp=None,
     page_table=None,
-    is_mla=False,
-    kv_heads=2,
 ):
     if layer_num_per_pp is None:
         layer_num_per_pp = [2]
@@ -163,14 +160,7 @@ def _rank_info(
         layer_num_per_pp=layer_num_per_pp,
         self_endpoint="",
         transfer_engine_info=b"",
-        attention=AttentionInfo(
-            kv_heads_per_rank=kv_heads,
-            tokens_per_block=16,
-            dims_per_head=8,
-            element_bytes=2,
-            enable_attention_dp=False,
-            is_mla=is_mla,
-        ),
+        enable_attention_dp=False,
         aux_meta=None,
         page_table=page_table,
         sender_endpoints=[],
@@ -217,8 +207,8 @@ def test_mla_kv_only_full_overlap():
     self_lg = _attn_lg(0, [(0, 0), (1, 1)], [_key_only_pool_view(0, [0, 1])])
     peer_lg = _attn_lg(0, [(0, 0), (1, 1)], [_key_only_pool_view(0, [0, 1])])
 
-    reg = _registrar(_page_table([self_lg]), is_mla=True)
-    peer_ri = _rank_info(name="peer", rank=1, page_table=_page_table([peer_lg]), is_mla=True)
+    reg = _registrar(_page_table([self_lg]))
+    peer_ri = _rank_info(name="peer", rank=1, page_table=_page_table([peer_lg]))
 
     mapping = reg.get_pool_mapping(peer_ri)
     assert mapping == {(0, 0): (0, 0)}

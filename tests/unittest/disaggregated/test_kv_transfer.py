@@ -44,6 +44,7 @@ import pytest
 import torch
 
 import tensorrt_llm
+import tensorrt_llm._torch.disaggregation.native.peer as native_peer
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 import tensorrt_llm.bindings
 
@@ -1842,7 +1843,7 @@ def test_incompatible_peer_fails_only_affected_requests(
     gen_tw = setup_good["gen_transfer_workers"][0]
     receiver = gen_tw._receiver
     bad_endpoint = setup_bad["ctx_info_endpoint"]
-    expected_error = "synthetic recurrent-state mismatch"
+    expected_error = "synthetic page layout mismatch"
     expected_validate_calls = 1
     if replay_flags is not None:
         local_replay, peer_replay = replay_flags
@@ -1890,11 +1891,11 @@ def test_incompatible_peer_fails_only_affected_requests(
 
     def raiser(*args, **kwargs):
         validate_calls.append(1)
-        raise ValueError("synthetic recurrent-state mismatch")
+        raise ValueError("synthetic page layout mismatch")
 
     try:
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(transfer_mod.MambaPolicy, "validate_peer_compatible", staticmethod(raiser))
+            mp.setattr(native_peer, "check_compatible", raiser)
 
             # (a) First request to the incompatible peer: receive() must not
             # raise; the session fails with the diagnostic preserved.

@@ -13,29 +13,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxTransferLayout
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.runs import RunsMapper
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_layer_to_layer_group,
     get_pool_view_global_layer_ids,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
     BufferRuns,
+    check_compatible,
     fan,
+    group_kinds,
     map_buffers,
     merge_runs,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import PageLayout
 
 # Type alias for (lg_idx, pool_idx) pair
 LGPoolKey = Tuple[int, int]
@@ -46,22 +48,12 @@ class PeerOverlap:
     overlap_pp_size: int = 0
     overlap_tp_size: int = 0
     overlap_cp_size: int = 0
-    duplicate_head_factor: int = 1
-    peer_duplicate_head_factor: int = 1
     ranks: List[int] = field(default_factory=list)
 
 
 class PeerRegistrar:
-    # Registry: CacheKind -> the policy that checks a peer's compatibility for
-    # that life cycle. Which bytes move comes from the page layouts.
-    _POLICY_CLASSES = {
-        CacheKind.PAGED: AttentionPolicy,
-        CacheKind.STATE: MambaPolicy,
-    }
-
     def __init__(self, self_rank_info: RankInfo, self_extractor: KVRegionExtractorV1):
         self._ri = self_rank_info
-        self._policies: Dict[CacheKind, Union[AttentionPolicy, MambaPolicy]] = {}
         self._peer_ri_cache: Dict[str, RankInfo] = {}
         self._kv_map_cache: Dict[
             tuple, RunsMapper
@@ -71,6 +63,8 @@ class PeerRegistrar:
         self._self_ext_cache = self_extractor
         self._peer_ext_cache: Dict[str, KVRegionExtractorV1] = {}
         self._overlap_cache: Dict[str, PeerOverlap] = {}
+        # (peer instance, writer ranks) -> whether those writers send alike.
+        self._writers_alike_cache: Dict[Tuple[str, Tuple[int, ...]], bool] = {}
         self._aux_transfer_layout_cache: Dict[str, AuxTransferLayout] = {}
         self._lg_pool_mapping_cache: Dict[
             str, Dict[LGPoolKey, LGPoolKey]
@@ -78,43 +72,37 @@ class PeerRegistrar:
 
     def register(self, peer_name: str, peer_rank: int, peer_ri: RankInfo):
         assert self._self_ext_cache is not None
-        if not self._check_peer_compatible(peer_ri):
-            raise ValueError(
-                f"PeerRegistrar.register: peer {peer_name} (rank={peer_rank}) is incompatible with local rank."
-            )
+        self.check_peer_compatible(peer_ri)
         key = self._unique_key(peer_name, peer_rank)
         self._peer_ri_cache[key] = peer_ri
         self._aux_transfer_layout_cache.pop(key, None)
         peer_ri = self.get_peer_rank_info(peer_name, peer_rank)
         extractor = KVRegionExtractorV1(peer_ri.page_table)
         self._peer_ext_cache[key] = extractor
+        self._warn_fragmented_pages(peer_ri)
 
-        head_match, _ = self._get_policy(CacheKind.PAGED).head_match(peer_ri)
-        if not head_match:
-            self_page_table = self._self_ext_cache.page_table
-            nhd_fragments_per_token = sum(
-                len(
-                    self_page_table.layer_groups[layer_group_id].pool_views[pool_idx].buffer_entries
-                )
-                for layer_group_id, pool_idx in self.get_pool_mapping(peer_ri)
-                if self_page_table.layer_groups[layer_group_id].pool_views[pool_idx].mapper_kind
-                == MapperKind.NHD
+    def _warn_fragmented_pages(self, peer_ri: RankInfo) -> None:
+        """Warn when the paged buffers this rank sends the peer move in more fragments than there
+        are buffers: the two sides order a buffer's bytes differently, such as token-major KV over
+        different head counts, and every page then costs that many transfer descriptors."""
+        own = self._self_ext_cache.page_table
+        buffers = fragments = 0
+        for (lg, pi), peer_key in self.get_pool_mapping(peer_ri).items():
+            if own.layer_groups[lg].kind != CacheKind.PAGED:
+                continue
+            mapper = self.get_kv_map(peer_ri, (lg, pi), peer_key)
+            if not mapper.empty:
+                buffers += len(own.layer_groups[lg].pool_views[pi].buffer_entries)
+                fragments += mapper.runs_per_slot
+        if fragments > buffers:
+            logger.warning_once(
+                f"Disaggregated KV transfer to {peer_ri.instance_name} moves each page in "
+                f"{fragments} fragments for {buffers} buffers, as the two sides order the buffers' "
+                "bytes differently (such as token-major KV over different head counts); every page "
+                "costs that many NIXL descriptors per peer, so long-context transfers may have high "
+                "latency.",
+                key=f"native-fragmented-pages-{fragments}-{buffers}",
             )
-            if nhd_fragments_per_token:
-                local_heads = self._ri.attention.kv_heads_per_rank
-                peer_heads = peer_ri.attention.kv_heads_per_rank
-                logger.warning_once(
-                    "NHD head-mismatched disaggregated KV transfer has no "
-                    "contiguous staging path and will emit approximately "
-                    f"{nhd_fragments_per_token} NIXL descriptors per transferred "
-                    "token per peer, excluding block-level replicated pools "
-                    f"(local_kv_heads={local_heads}, peer_kv_heads={peer_heads}). "
-                    "Long-context TEP/DEP transfers may have high latency.",
-                    key=(
-                        "native-nhd-head-mismatch-"
-                        f"{local_heads}-{peer_heads}-{nhd_fragments_per_token}"
-                    ),
-                )
 
     def peer_extractor(self, peer_name: str, peer_rank: int) -> KVRegionExtractorV1:
         return self._peer_ext_cache[self._unique_key(peer_name, peer_rank)]
@@ -168,24 +156,25 @@ class PeerRegistrar:
                 f"peer={peer_ri.bounded_replay_on_generation})."
             )
 
-    def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
-        self.validate_bounded_replay_compatible(peer_ri)
-        if not self._get_policy(CacheKind.PAGED).check_peer_compatible(peer_ri):
-            return False
+    def check_peer_compatible(self, peer_ri: RankInfo) -> None:
+        """Check that this rank and the peer rank can exchange pages: the same generation replay
+        mode, context parallelism on at most one side (Helix pairs a context instance without it
+        with a generation instance using it), and page layouts that correspond
+        (``layout_mapping.check_compatible``). Ranks holding different layers are allowed: only
+        the layers both hold move.
 
-        # Recurrent-state (Mamba/KDA) layout gate. Raises ValueError with a
-        # field-level diagnostic instead of returning False, so the precise
-        # mismatch reaches the caller of register().
-        self_page_table = (
-            self._self_ext_cache.page_table if self._self_ext_cache is not None else None
+        Raises:
+            ValueError: Naming what differs.
+        """
+        self.validate_bounded_replay_compatible(peer_ri)
+        if self._ri.cp_size > 1 and peer_ri.cp_size > 1:
+            raise ValueError(
+                "PeerRegistrar: context parallelism on both sides is unsupported "
+                f"(local cp_size={self._ri.cp_size}, peer cp_size={peer_ri.cp_size})"
+            )
+        check_compatible(
+            _layout_of(self._self_ext_cache.page_table), _layout_of(peer_ri.page_table)
         )
-        MambaPolicy.validate_peer_compatible(
-            self._ri,
-            peer_ri,
-            self_page_table,
-            peer_ri.page_table,
-        )
-        AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
@@ -199,7 +188,56 @@ class PeerRegistrar:
                 "allowing partial layer transfer."
             )
 
-        return True
+    def writers_send_alike(self, peer_ri: RankInfo, overlap: PeerOverlap) -> bool:
+        """Whether the peer ranks writing this rank's pages (``overlap.ranks``) each send it the
+        same bytes per page of its attention groups, so that one region split evenly among them
+        holds each writer's share.
+
+        Only the writers on the stage whose page layout the peer rank info carries are computed,
+        each from that layout with the writer's place put in, as the ranks of one stage lay out
+        pages alike apart from where they stand. Writers on other stages may hold other layers,
+        so with several stages any attention buffer every rank holds whole, of which one writer
+        sends all, counts as unequal.
+
+        Raises:
+            ValueError: If a writer's pages do not correspond to this rank's (``map_buffers``).
+        """
+        cache_key = (peer_ri.instance_name, tuple(overlap.ranks))
+        if cache_key in self._writers_alike_cache:
+            return self._writers_alike_cache[cache_key]
+        own = _layout_of(self._self_ext_cache.page_table)
+        template = _layout_of(peer_ri.page_table)
+        kinds = group_kinds(own)
+        place = template.topology
+        per_stage = peer_ri.tp_size * peer_ri.cp_size
+        sent = set()
+        for rank in overlap.ranks:
+            pp, rest = divmod(rank, per_stage)
+            if pp != place.pp_rank:
+                continue
+            tp, cp = divmod(rest, peer_ri.cp_size)
+            writer = dataclasses.replace(
+                place, tp_rank=tp, cp_rank=cp, dp_rank=tp if place.attention_dp else place.dp_rank
+            )
+            sent.add(
+                sum(
+                    int(runs.sizes.sum())
+                    for runs in map_buffers(
+                        dataclasses.replace(template, topology=writer),
+                        own,
+                        key=own.topology.dp_rank,
+                    )
+                    if kinds.get((runs.dst.pool_group, runs.dst.layer)) == "attention"
+                )
+            )
+        alike = len(sent) <= 1
+        if alike and overlap.overlap_pp_size > 1 and len(overlap.ranks) > 1:
+            alike = not any(
+                b.transferred and not b.split and kinds.get((b.pool_group, b.layer)) == "attention"
+                for b in own.buffers
+            )
+        self._writers_alike_cache[cache_key] = alike
+        return alike
 
     def get_pool_mapping(self, peer_ri: RankInfo) -> Dict[LGPoolKey, LGPoolKey]:
         """Get mapping from (self_lg_idx, self_pool_idx) -> (peer_lg_idx, peer_pool_idx).
@@ -325,12 +363,6 @@ class PeerRegistrar:
         self._lg_pool_mapping_cache[key] = mapping
         return mapping
 
-    def _get_policy(self, kind: CacheKind) -> Union[AttentionPolicy, MambaPolicy]:
-        """Return the policy for a CacheKind (lazily instantiated)."""
-        if kind not in self._policies:
-            self._policies[kind] = self._POLICY_CLASSES[kind](self._ri)
-        return self._policies[kind]
-
     def get_kv_map(
         self,
         peer_ri: RankInfo,
@@ -353,17 +385,10 @@ class PeerRegistrar:
 
         self_pt = self._self_ext_cache.page_table
         peer_pt = peer_ri.page_table
-        assert self_pt is not None
-        assert peer_pt is not None
-        if self_pt.layout is None or peer_pt.layout is None:
-            raise ValueError(
-                "PeerRegistrar.get_kv_map: a page table carries no page layout; build it from "
-                "the manager's page table (build_page_table_from_manager)"
-            )
         runs = self._buffer_runs_cache.get(peer_key)
         if runs is None:
             # Ties between ranks holding the same bytes rotate by the destination's DP rank.
-            runs = map_buffers(self_pt.layout, peer_pt.layout, key=peer_ri.dp_rank)
+            runs = map_buffers(_layout_of(self_pt), _layout_of(peer_pt), key=peer_ri.dp_rank)
             self._buffer_runs_cache[peer_key] = runs
         self_view = _view_buffers(self_pt, *self_pool_key)
         peer_view = _view_buffers(peer_pt, *peer_pool_key)
@@ -434,14 +459,10 @@ class PeerRegistrar:
                     # ascending order.
                     ranks.append(pp * peer_ri.tp_size * peer_ri.cp_size + tp * peer_ri.cp_size + cp)
 
-        dup_head, peer_dup_head = self._get_policy(CacheKind.PAGED).duplicate_head_factors(peer_ri)
-
         targets = PeerOverlap(
             overlap_pp_size=overlap_pp_size,
             overlap_tp_size=len(tp_fan),
             overlap_cp_size=len(cp_fan),
-            duplicate_head_factor=dup_head,
-            peer_duplicate_head_factor=peer_dup_head,
             ranks=ranks,
         )
         self._overlap_cache[key] = targets
@@ -478,3 +499,13 @@ def _view_buffers(
         (global_of[int(e["local_layer_id"])], view.pool_idx, int(e["offset"]))
         for e in view.buffer_entries
     }
+
+
+def _layout_of(page_table: Optional[KVCachePageTable]) -> PageLayout:
+    """The page layout a page table carries."""
+    if page_table is None or page_table.layout is None:
+        raise ValueError(
+            "PeerRegistrar: a page table carries no page layout; build it from the manager's page "
+            "table (build_page_table_from_manager)"
+        )
+    return page_table.layout

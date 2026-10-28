@@ -63,6 +63,11 @@ class RunsMapper(RegionMapperBase):
         """Bytes moved per slot or block."""
         return sum(size * src.size for size, src, _ in self._groups)
 
+    @property
+    def runs_per_slot(self) -> int:
+        """Fragments, and so transfer descriptors, per slot or block."""
+        return sum(src.size for _, src, _ in self._groups)
+
     @nvtx_range("RunsMapper.map")
     def map(
         self, src_regions: SpecRegion, dst_regions: SpecRegion

@@ -20,6 +20,7 @@ a pairing whose source ranks do not hold everything a destination holds is refus
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 from dataclasses import dataclass, field
 from typing import Callable
@@ -27,7 +28,13 @@ from typing import Callable
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import fan, map_buffers, merge_runs
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
+    check_compatible,
+    fan,
+    map_buffers,
+    merge_runs,
+    received_bytes,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     Axis,
     BufferDesc,
@@ -370,3 +377,67 @@ def test_mismatched_tensors_are_refused():
     b = layout(topology, (0,), [("key", kv(8), "attention")])
     with pytest.raises(ValueError, match="extent"):
         map_buffers(a, b)
+
+
+def test_layouts_of_one_model_correspond_across_parallelism():
+    """Ranks of different TP, attention DP and pipeline stages describe the same global tensors."""
+    specs = [
+        ("key", kv(8), "attention"),
+        ("index", whole(24), "attention"),
+        ("ssm", state_heads(8), "state"),
+        ("conv", conv((16, 8, 8)), "state"),
+    ]
+    pages = [
+        layout(t, layers, specs)
+        for instance, layers in [
+            (Instance(tp=1), (0, 1)),
+            (Instance(tp=4), (0, 1)),
+            (Instance(tp=4, attention_dp=True), (0,)),
+            (Instance(tp=2, cp=2), (1, 2)),
+        ]
+        for t in instance.ranks(0)[:1]
+    ]
+    for a, b in itertools.product(pages, pages):
+        check_compatible(a, b)
+
+
+def test_layouts_that_do_not_correspond_are_refused():
+    topology = Instance().ranks(0)[0]
+    base = layout(topology, (0,), [("key", kv(4), "attention"), ("ple", whole(12), "state")])
+    with pytest.raises(ValueError, match=r"\(0, 'key'\) tensor '': axes \{'head': 4"):
+        check_compatible(
+            base, layout(topology, (0,), [("key", kv(8), "attention"), ("ple", whole(12), "state")])
+        )
+    with pytest.raises(ValueError, match=r"\(0, 'ple'\) is transferred by one rank only"):
+        check_compatible(base, layout(topology, (0,), [("key", kv(4), "attention")]))
+    untransferred = dataclasses.replace(
+        base,
+        buffers=tuple(dataclasses.replace(b, transferred=b.role != "ple") for b in base.buffers),
+    )
+    with pytest.raises(ValueError, match="transferred by one rank only"):
+        check_compatible(base, untransferred)
+    with pytest.raises(ValueError, match="pages of 4 tokens against 8"):
+        check_compatible(base, dataclasses.replace(base, tokens_per_page=8))
+    # Layers only one rank holds are not compared: they simply do not move.
+    check_compatible(base, layout(topology, (1,), [("key", kv(8), "attention")]))
+
+
+def test_state_pages_of_other_token_counts_correspond():
+    """Recurrent state holds no tokens, so only attention pages must hold as many."""
+    topology = Instance().ranks(0)[0]
+    state = layout(topology, (0,), [("ssm", state_heads(4), "state")])
+    check_compatible(state, dataclasses.replace(state, tokens_per_page=8))
+
+
+def test_received_bytes_count_what_both_transfer_of_one_kind():
+    topology = Instance(tp=2).ranks(0)[0]
+    specs = [
+        ("key", kv(4), "attention"),
+        ("ssm", state_heads(4), "state"),
+        ("ple", whole(12), "state"),
+    ]
+    dst = layout(topology, (0, 1), specs)
+    src = layout(Instance().ranks(0)[0], (1, 2), specs)
+    # Layer 1 only: its SSM share (2 of 4 heads) and its replicated PLE.
+    assert received_bytes(src, dst, "state") == 2 * HEAD + 12
+    assert received_bytes(src, dst, "attention") == 2 * HEAD

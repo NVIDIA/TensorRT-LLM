@@ -165,7 +165,7 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
             assert info.instance_rank == info.tp_rank == info.dp_rank == (dp_rank or 0)
             assert info.tp_size == info.dp_size == (4 if dp_rank is not None else 1)
             assert info.tp_size_per_dp_group == 1
-            assert info.attention.enable_attention_dp == (dp_rank is not None)
+            assert info.enable_attention_dp == (dp_rank is not None)
         registrar.register("generation", target_info.instance_rank, target_info)
         assert registrar.get_peer_overlap(target_info, target_info.dp_rank).ranks == [
             target_info.instance_rank

@@ -693,11 +693,11 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
     receiver._build_recv_req_info = Mock(return_value=receiver_req)
     overlap = SimpleNamespace(
         ranks=[0, 1],
-        duplicate_head_factor=1,
         overlap_pp_size=1,
     )
     receiver._registrar = SimpleNamespace(
         get_peer_overlap=Mock(return_value=overlap),
+        writers_send_alike=Mock(return_value=True),
         self_extractor=SimpleNamespace(page_table=None),
         self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0, cp_size=1),
     )
@@ -882,7 +882,6 @@ def test_cancel_after_publication_cannot_overtake_request_data(
             pp_size=1,
             cp_size=1,
             dp_size=1,
-            attention=None,
         )
     )
 

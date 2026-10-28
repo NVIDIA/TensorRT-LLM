@@ -43,11 +43,11 @@ The control plane — discovery, per-request metadata, and completion notices �
 
 ### Peer Registrar and Mappers
 
-`native/peer.py` resolves which peer ranks hold the same layers when context and generation use different TP/PP/DP configurations, and elects exactly one owner per destination so nothing is transferred twice. `native/mixers/` holds the per-architecture layout policies that turn a matched pool pair into `(src_ptrs, dst_ptrs, sizes)` — separate mappers for matching head counts, for head-major and token-major mismatches, for replicated pools, and for Mamba conv and SSM state.
+`native/peer.py` pairs each rank with the peer ranks whose share of every parallel dimension overlaps its own (`layout_mapping.fan`), checks at registration that the two ranks' page layouts correspond, and builds the mapper of each matched pool pair. Which bytes a rank sends a peer rank follows from the two ranks' page layouts alone (`kv_cache/layout_mapping.py`, `map_buffers`): every buffer is the local pieces of tensors whose axes say how they split over tensor and context ranks, and of the indices both ranks hold the source sends those it is elected for among the paired ranks holding them, so nothing is sent twice and no cache kind or model is special-cased. `native/runs.py`'s `RunsMapper` adds the resulting byte runs to each block's or slot's base pointers.
 
 ### Page Table
 
-`resource/page.py` describes a rank's KV storage independently of which cache manager produced it, which is what lets a V1 context worker talk to a V2 generation worker. `resource/kv_extractor.py` builds it from either manager generation and turns block IDs into slot pointers; `resource/cache_reuse.py` reports the cached prefix length uniformly, so context-side reuse, generation-side reuse, and sliding-window stale prefixes all resolve without a special case.
+`KVCacheManagerV2.get_page_table()` describes how the manager lays out its pages (`kv_cache/page_layout.py`): each buffer's tensors, where it lies in its pool slot, and where the rank stands. `resource/kv_extractor.py` turns that table into the views of `resource/page.py`, which index the pools and layer groups for transfer, and turns block IDs into slot pointers; `resource/cache_reuse.py` reports the cached prefix length uniformly, so context-side reuse, generation-side reuse, and sliding-window stale prefixes all resolve without a special case.
 
 ### Transfer Agent
 
@@ -63,9 +63,9 @@ Note also that `cpp/tensorrt_llm/executor/cache_transmission/nixl_utils/` outliv
 
 ### Supporting a New Cache Layout
 
-A new storage layout usually means a new mapper under `native/mixers/` plus a page-table builder change in `resource/kv_extractor.py`. Both peers must agree: pool role and mapper kind are matched exactly, and a mismatch raises rather than silently transferring a subset.
+A new cache's manager declares how its buffers spread over ranks by overriding a few `KVCacheManagerV2` hooks: `_page_buffer_tensors` (built from `page_layout`'s `head_major`, `token_major`, `sectioned` and `replicated`, or declaring axes of its own), `_page_untransferred_roles` and `_page_rebuilds_untransferred` for buffers that never move, and, when its layers or heads differ from the base manager's, `_page_layer_ids` and `_page_kv_heads`. The transfer itself needs no change. Peers whose layouts do not correspond — a buffer one side transfers that the other lacks, tensors of different extents, or a pairing that leaves a destination short — are refused at registration rather than silently transferring a subset.
 
-Unit tests for these seams live in `tests/unittest/disaggregated/` — byte-level transfer checks, topology and mapper selection, page-table construction, and multi-process end-to-end coverage.
+Unit tests for these seams live in `tests/unittest/disaggregated/` — byte-level transfer checks, rank pairing, page-table construction, and multi-process end-to-end coverage; `tests/unittest/_torch/executor/kv_cache/test_layout_mapping.py` checks the mapping byte by byte across TP, attention DP, Helix, PP and uneven head splits.
 
 ## Current Limitations
 

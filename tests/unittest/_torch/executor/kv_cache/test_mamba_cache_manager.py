@@ -4834,11 +4834,10 @@ def test_v2_kda_replay_survives_cache_lifecycle(snapshot, kda_draft_records):
 def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
     """A context server without replay caches and a generation server with them describe the same transferable
     recurrent state, and the generation server seeds its replay caches from the transferred conv state."""
-    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
-        MambaPolicy,
-        mamba_receiver_payload_bytes,
+    from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
+        check_compatible,
+        received_bytes,
     )
-    from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
     ctx = _build_kda_replay_manager(is_disagg=True)
@@ -4852,14 +4851,12 @@ def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
         dst_slot = gen.get_state_indices([101])[0]
         src_table = build_page_table_from_manager(ctx)
         dst_table = build_page_table_from_manager(gen)
-        src_rank = RankInfo.from_kv_cache_manager("ctx", ctx, device_id=0)
-        dst_rank = RankInfo.from_kv_cache_manager("gen", gen, device_id=0)
-        MambaPolicy.validate_peer_compatible(src_rank, dst_rank, src_table, dst_table)
+        check_compatible(src_table.layout, dst_table.layout)
         src_group = next(g for g in src_table.layer_groups if isinstance(g, MambaLayerGroup))
         dst_group = next(g for g in dst_table.layer_groups if isinstance(g, MambaLayerGroup))
         for group in (src_group, dst_group):
             assert {pv.pool_role for pv in group.pool_views} == {MAMBA_CONV_ROLE, MAMBA_SSM_ROLE}
-        assert mamba_receiver_payload_bytes(src_table, dst_table, dst_slot) == sum(
+        assert received_bytes(src_table.layout, dst_table.layout, "state") == sum(
             gen.mamba_layer_cache(i).conv[dst_slot].numel() * 2
             + gen.mamba_layer_cache(i).temporal[dst_slot].numel() * 4
             for i in range(2)

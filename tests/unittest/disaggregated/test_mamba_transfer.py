@@ -17,7 +17,6 @@ import threading
 import uuid
 from typing import Dict, List
 
-import numpy as np
 import pytest
 import torch
 
@@ -33,9 +32,6 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm import peer
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.config_utils import Qwen4ExpPLECacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
@@ -299,193 +295,60 @@ def _zero_mamba_states(manager):
             state.zero_()
 
 
-def test_mamba_receiver_payload_bytes_matched_tp():
-    """mamba_receiver_payload_bytes returns correct size for matched-TP page tables."""
-    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
-        mamba_receiver_payload_bytes,
-    )
-    from tensorrt_llm._torch.disaggregation.resource.page import (
-        BUFFER_ENTRY_DTYPE,
-        MAMBA_CONV_ROLE,
-        MAMBA_SSM_ROLE,
-        KVCachePageTable,
-        LocalLayer,
-        MambaLayerGroup,
-        MapperKind,
-        PhysicalPool,
-        PhysicalPoolGroup,
-        PoolView,
+def _state_layout(*, side_bytes=128):
+    """A recurrent layer group of layers 1 and 2.
+
+    Each layer has conv state of three sections and SSM state of 64-byte heads; with
+    ``side_bytes``, layer 2 also has replicated PLE n-gram context.
+    """
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+        BufferDesc,
+        LayerGroupDesc,
+        PageLayout,
+        head_major,
+        replicated,
+        sectioned,
     )
 
-    conv_slot_bytes = 1024
-    ssm_slot_bytes = 2048
-    side_slot_bytes = 128
-    sorted_lids = [0, 1]
-
-    conv_pool = PhysicalPool(base_address=0xA000, slot_bytes=conv_slot_bytes, num_slots=8)
-    ssm_pool = PhysicalPool(base_address=0xB000, slot_bytes=ssm_slot_bytes, num_slots=8)
-    pool_views = [
-        PoolView(
-            pool_idx=0,
-            buffer_entries=np.array(
-                [(lid, 0, conv_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
-            ),
-            pool_role=MAMBA_CONV_ROLE,
-            mapper_kind=MapperKind.SECTIONED,
-            bytes_per_layer=conv_slot_bytes,
-            section_bytes=[512, 256, 256],
-        ),
-        PoolView(
-            pool_idx=1,
-            buffer_entries=np.array(
-                [(lid, 0, ssm_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
-            ),
-            pool_role=MAMBA_SSM_ROLE,
-            mapper_kind=MapperKind.INDEXED,
-            bytes_per_layer=ssm_slot_bytes,
-            bytes_per_head=64,
-        ),
-        PoolView(
-            pool_idx=2,
-            buffer_entries=np.array([(1, 0, side_slot_bytes)], dtype=BUFFER_ENTRY_DTYPE),
-            pool_role=frozenset({"ple_ngram_context"}),
-            mapper_kind=MapperKind.REPLICATED,
-            bytes_per_layer=side_slot_bytes,
-        ),
-    ]
-    local_layers = [
-        LocalLayer(local_layer_id=0, global_layer_id=1),
-        LocalLayer(local_layer_id=1, global_layer_id=2),
-    ]
-
-    mlg = MambaLayerGroup(
-        pool_group_idx=1,
-        local_layers=local_layers,
-        pool_views=pool_views,
-    )
-    pt = KVCachePageTable(
-        tokens_per_block=8,
-        layer_groups=[mlg],
-        pool_groups=[
-            PhysicalPoolGroup(pools=[]),  # idx 0 placeholder
-            PhysicalPoolGroup(
-                pools=[
-                    conv_pool,
-                    ssm_pool,
-                    PhysicalPool(
-                        base_address=0xC000,
-                        slot_bytes=side_slot_bytes,
-                        num_slots=8,
-                    ),
-                ]
-            ),
-        ],
+    conv, ssm = 1024, 2048
+    buffers = []
+    for i, layer in enumerate((1, 2)):
+        buffers.append(
+            BufferDesc(layer, "conv_state", 1, 0, i * conv, conv, sectioned([512, 256, 256], 1))
+        )
+        buffers.append(BufferDesc(layer, "ssm_state", 1, 1, i * ssm, ssm, head_major(ssm, 32, 32)))
+    widths = [2 * conv, 2 * ssm]
+    if side_bytes is not None:
+        buffers.append(
+            BufferDesc(2, "ple_ngram_context", 1, 2, 0, side_bytes, replicated(side_bytes))
+        )
+        widths.append(side_bytes)
+    return PageLayout(
+        tokens_per_page=8,
+        pool_slot_bytes={1: tuple(widths)},
+        layer_groups=(LayerGroupDesc("state", None, 0, 1, (1, 2)),),
+        buffers=tuple(buffers),
     )
 
-    got = mamba_receiver_payload_bytes(sender_page_table=pt, receiver_page_table=pt, dst_slot=3)
+
+def test_received_state_bytes_matched_tp():
+    """A receiver of the same layout receives all of its recurrent state."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import received_bytes
+
+    layout = _state_layout()
     # Standard state covers both layers; the side role exists only on layer 2.
-    assert got == 2 * (conv_slot_bytes + ssm_slot_bytes) + side_slot_bytes
+    assert received_bytes(layout, layout, "state") == 2 * (1024 + 2048) + 128
 
 
-def _make_rank_info(*, tp_size: int, tp_rank: int = 0) -> RankInfo:
-    return RankInfo(
-        instance_name="test",
-        instance_rank=tp_rank,
-        tp_size=tp_size,
-        tp_rank=tp_rank,
-        pp_size=1,
-        pp_rank=0,
-        layer_num_per_pp=[2],
-        sender_endpoints=[],
-        self_endpoint="",
-        transfer_engine_info=b"",
-    )
+def test_incompatible_replicated_side_state_is_refused():
+    from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import check_compatible
 
-
-def _make_side_state_page_table(*, include_side: bool = True):
-    from tensorrt_llm._torch.disaggregation.resource.page import (
-        BUFFER_ENTRY_DTYPE,
-        MAMBA_CONV_ROLE,
-        MAMBA_SSM_ROLE,
-        KVCachePageTable,
-        LocalLayer,
-        MambaLayerGroup,
-        MapperKind,
-        PhysicalPool,
-        PhysicalPoolGroup,
-        PoolView,
-    )
-
-    local_layers = [
-        LocalLayer(local_layer_id=0, global_layer_id=1),
-        LocalLayer(local_layer_id=1, global_layer_id=2),
-    ]
-    pools = [
-        PhysicalPool(base_address=1000, slot_bytes=16, num_slots=4),
-        PhysicalPool(base_address=2000, slot_bytes=16, num_slots=4),
-    ]
-    views = [
-        PoolView(
-            pool_idx=0,
-            buffer_entries=np.array([(0, 0, 16), (1, 16, 16)], dtype=BUFFER_ENTRY_DTYPE),
-            pool_role=MAMBA_CONV_ROLE,
-            mapper_kind=MapperKind.SECTIONED,
-            bytes_per_layer=16,
-            section_bytes=[4, 4, 8],
-        ),
-        PoolView(
-            pool_idx=1,
-            buffer_entries=np.array([(0, 0, 16), (1, 16, 16)], dtype=BUFFER_ENTRY_DTYPE),
-            pool_role=MAMBA_SSM_ROLE,
-            mapper_kind=MapperKind.INDEXED,
-            bytes_per_layer=16,
-            bytes_per_head=16,
-        ),
-    ]
-    if include_side:
-        pools.append(PhysicalPool(base_address=3000, slot_bytes=8, num_slots=4))
-        views.append(
-            PoolView(
-                pool_idx=2,
-                buffer_entries=np.array([(1, 0, 8)], dtype=BUFFER_ENTRY_DTYPE),
-                pool_role=frozenset({"ple_ngram_context"}),
-                mapper_kind=MapperKind.REPLICATED,
-                bytes_per_layer=8,
-            )
-        )
-    return KVCachePageTable(
-        tokens_per_block=8,
-        layer_groups=[
-            MambaLayerGroup(
-                pool_group_idx=0,
-                local_layers=local_layers,
-                pool_views=views,
-            )
-        ],
-        pool_groups=[PhysicalPoolGroup(pools=pools)],
-    )
-
-
-def test_mamba_policy_rejects_incompatible_replicated_side_state():
-    rank_info = _make_rank_info(tp_size=1)
-    pt_with_side = _make_side_state_page_table()
-    pt_without_side = _make_side_state_page_table(include_side=False)
-
-    # Replicated recurrent state is validated by MambaPolicy; the attention
-    # policy only looks at PAGED groups and must not reject this pair.
-    with pytest.raises(ValueError, match="differ on overlapping layers"):
-        peer.MambaPolicy.validate_peer_compatible(
-            rank_info, rank_info, pt_with_side, pt_without_side
-        )
-    AttentionPolicy.validate_peer_compatible(pt_with_side, pt_without_side)
-
-    # Same roles but a different per-layer size is rejected up front.
-    pt_wider_side = _make_side_state_page_table()
-    side_view = pt_wider_side.layer_groups[0].pool_views[2]
-    side_view.buffer_entries = np.array([(1, 0, 16)], dtype=side_view.buffer_entries.dtype)
-    side_view.bytes_per_layer = 16
-    with pytest.raises(ValueError, match="replicated state size differs"):
-        peer.MambaPolicy.validate_peer_compatible(rank_info, rank_info, pt_with_side, pt_wider_side)
+    # Side state one rank lacks would leave the other's zeroed.
+    with pytest.raises(ValueError, match="ple_ngram_context.*transferred by one rank only"):
+        check_compatible(_state_layout(), _state_layout(side_bytes=None))
+    # Same roles but a different per-layer size is refused up front.
+    with pytest.raises(ValueError, match="ple_ngram_context"):
+        check_compatible(_state_layout(), _state_layout(side_bytes=256))
 
 
 # ---------------------------------------------------------------------------

@@ -19,11 +19,9 @@ from typing import List, Optional
 import msgpack
 
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_size_in_bytes
 
 
 @dataclass
@@ -45,22 +43,19 @@ class RankInfo:
     cp_rank: int = 0
     device_id: int = 0
 
-    attention: Optional[AttentionInfo] = None
+    enable_attention_dp: bool = False
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
     bounded_replay_on_generation: bool = False
 
     @property
     def tp_size_per_dp_group(self) -> int:
-        if self.attention is None:
-            return self.tp_size
-        return self.tp_size // self.dp_size if self.attention.enable_attention_dp else self.tp_size
+        return self.tp_size // self.dp_size if self.enable_attention_dp else self.tp_size
 
     def to_bytes(self) -> bytes:
         # Shallow, field by field: the page table converts itself (to_dict), and a deep copy would
         # fail on its page layout's read-only mappings.
         data = {f.name: getattr(self, f.name) for f in fields(self)}
-        data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
         return msgpack.packb(data)
@@ -76,19 +71,6 @@ class RankInfo:
         m = kv_cache_manager.mapping
         kvm = kv_cache_manager
         enable_attention_dp = m.enable_attention_dp
-        # Keep AttentionInfo on attention-free PP stages so it can still carry
-        # the attention-DP topology used by Mamba transfers.  A zero head count
-        # means that this rank has no local attention cache; AttentionPolicy
-        # must not perform head-ratio arithmetic for such ranks.
-        kv_heads_per_rank = next((h for h in kvm.num_kv_heads_per_layer if h > 0), 0)
-        # Eight is the smallest element count guaranteed to occupy whole bytes
-        # for every supported sub-byte cache dtype (including NVFP4).
-        bytes_for_eight_elements = get_size_in_bytes(8, kvm.dtype)
-        element_bytes = (
-            bytes_for_eight_elements // 8
-            if bytes_for_eight_elements % 8 == 0
-            else bytes_for_eight_elements / 8
-        )
         return cls(
             instance_name=instance_name,
             instance_rank=m.rank,
@@ -105,14 +87,7 @@ class RankInfo:
             sender_endpoints=[],
             self_endpoint="",
             transfer_engine_info=bytes(),
-            attention=AttentionInfo(
-                kv_heads_per_rank=kv_heads_per_rank,
-                tokens_per_block=kvm.tokens_per_block,
-                dims_per_head=kvm.head_dim,
-                element_bytes=element_bytes,
-                enable_attention_dp=enable_attention_dp,
-                is_mla=kvm.kv_factor == 1,
-            ),
+            enable_attention_dp=enable_attention_dp,
             aux_meta=aux_buffer_meta,
             page_table=build_page_table_from_manager(kvm),
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
@@ -121,8 +96,6 @@ class RankInfo:
     @classmethod
     def from_bytes(cls, data: bytes) -> "RankInfo":
         unpacked = msgpack.unpackb(data, strict_map_key=False)
-        if unpacked.get("attention") is not None:
-            unpacked["attention"] = AttentionInfo.from_dict(unpacked["attention"])
         if unpacked.get("page_table") is not None:
             unpacked["page_table"] = KVCachePageTable.from_dict(unpacked["page_table"])
         if unpacked.get("aux_meta") is not None:

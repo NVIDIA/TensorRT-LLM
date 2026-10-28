@@ -15,6 +15,7 @@
 
 import numpy as np
 import pytest
+from layout_test_utils import native_page_table
 
 import tensorrt_llm._torch.disaggregation.native.peer as peer_module
 from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
@@ -22,17 +23,11 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBufferMeta,
     build_aux_transfer_layout,
 )
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.runs import RunsMapper
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
-    KVRegionExtractorV1,
-    page_table_from_layout,
-)
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
     LayerGroupDesc,
@@ -43,42 +38,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     sectioned,
     token_major,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import DevicePool, ManagerLayout
 
 pytestmark = pytest.mark.cpu_only
 
 MAMBA_LAYERS = (100, 101)
 SSM_HEAD_BYTES = 64
-
-
-def manager_layout(layout, pool_bases, kv_heads=0):
-    """The plain-value page table a manager would build around ``layout``.
-
-    Each layer group has one internal layer per global layer, in order; device pools lie at
-    ``pool_bases[group]``.
-    """
-    return ManagerLayout(
-        page_layout=layout,
-        tokens_per_block=layout.tokens_per_page,
-        pool_group_of=tuple(g.pool_group for g in layout.layer_groups),
-        windows=tuple(g.kept_window for g in layout.layer_groups),
-        sink_blocks=tuple(g.num_sink_blocks for g in layout.layer_groups),
-        recurrent=tuple(g.kind == "state" for g in layout.layer_groups),
-        sparse=tuple(False for _ in layout.layer_groups),
-        layers=tuple(g.layers for g in layout.layer_groups),
-        shards=tuple((g.shard.count, g.shard.index) for g in layout.layer_groups),
-        page_bytes={g: sum(widths) for g, widths in layout.pool_slot_bytes.items()},
-        device_pools={
-            g: tuple(
-                DevicePool(group=g, index=i, base=base, slot_bytes=width, num_slots=128)
-                for i, (base, width) in enumerate(zip(pool_bases[g], widths))
-            )
-            for g, widths in layout.pool_slot_bytes.items()
-        },
-        named_groups=tuple(True for _ in layout.layer_groups),
-        local_layers=tuple(tuple(enumerate(g.layers)) for g in layout.layer_groups),
-        kv_heads=tuple(kv_heads if g.kind == "attention" else 0 for g in layout.layer_groups),
-    )
 
 
 def make_page_table(
@@ -93,6 +57,7 @@ def make_page_table(
     attention="head_major",
     tokens_per_block=16,
     side_state_bytes=None,
+    index_key_bytes=None,
 ):
     """A native page table built, as a manager's is, from its page layout.
 
@@ -101,8 +66,9 @@ def make_page_table(
     ("head_major", "token_major" over ``tokens_per_block`` tokens, or "replicated"). The recurrent
     group (layers 100 and 101) is the ``mamba_tp`` share of a fixed global state, a conv state of
     three sections and an SSM state of 64-byte heads, so page tables built for different TP degrees
-    stay peer-compatible under MambaPolicy's global size check; with ``side_state_bytes`` it also
-    holds that many bytes per layer of replicated side state (e.g. PLE) in a third pool.
+    describe the same global tensors; with ``side_state_bytes`` it also holds that many bytes per
+    layer of replicated side state (e.g. PLE) in a third pool, and with ``index_key_bytes`` the
+    attention group holds that many bytes per layer of replicated index-K in a second pool.
     ``topology`` defaults to rank ``tp_rank`` of ``mamba_tp`` tensor-parallel ranks.
     """
     if pool_ptrs is None:
@@ -127,6 +93,21 @@ def make_page_table(
         for i, layer in enumerate(global_layer_ids)
         for j, role in enumerate(("key", "value"))
     ]
+    attention_slots = [block_bytes[0]]
+    if index_key_bytes is not None:
+        attention_slots.append(len(global_layer_ids) * index_key_bytes)
+        buffers.extend(
+            BufferDesc(
+                layer,
+                "index_key",
+                0,
+                1,
+                i * index_key_bytes,
+                index_key_bytes,
+                replicated(index_key_bytes),
+            )
+            for i, layer in enumerate(global_layer_ids)
+        )
 
     sections = [1024 // mamba_tp, 512 // mamba_tp, 512 // mamba_tp]
     conv_bytes = sum(sections)
@@ -166,7 +147,7 @@ def make_page_table(
 
     layout = PageLayout(
         tokens_per_page=tokens_per_block,
-        pool_slot_bytes={0: (block_bytes[0],), 1: tuple(state_slots)},
+        pool_slot_bytes={0: tuple(attention_slots), 1: tuple(state_slots)},
         layer_groups=(
             LayerGroupDesc("attention", None, 0, 0, tuple(global_layer_ids)),
             LayerGroupDesc("state", None, 0, 1, MAMBA_LAYERS),
@@ -174,8 +155,8 @@ def make_page_table(
         buffers=tuple(buffers),
         topology=topology,
     )
-    return page_table_from_layout(
-        manager_layout(layout, {0: pool_ptrs, 1: [0xA000, 0xB000, 0xC000]}, kv_heads)
+    return native_page_table(
+        layout, {0: [*pool_ptrs, 0xD000], 1: [0xA000, 0xB000, 0xC000]}, kv_heads=kv_heads
     )
 
 
@@ -208,11 +189,6 @@ def make_rankinfo(
     dp_rank=0,
     cp_size=1,
     cp_rank=0,
-    kv_heads_per_rank=2,
-    tokens_per_block=16,
-    dims_per_head=8,
-    element_bytes=2,
-    is_mla=False,
     enable_attention_dp=False,
     layer_num_per_pp=None,
     page_table=None,
@@ -234,14 +210,7 @@ def make_rankinfo(
         layer_num_per_pp=layer_num_per_pp,
         self_endpoint="",
         transfer_engine_info=b"",
-        attention=AttentionInfo(
-            kv_heads_per_rank=kv_heads_per_rank,
-            tokens_per_block=tokens_per_block,
-            dims_per_head=dims_per_head,
-            element_bytes=element_bytes,
-            enable_attention_dp=enable_attention_dp,
-            is_mla=is_mla,
-        ),
+        enable_attention_dp=enable_attention_dp,
         aux_meta=None,
         page_table=page_table,
         sender_endpoints=[],
@@ -264,12 +233,7 @@ def _make_peer_registrar_and_peer_ri(self_ri, peer_ri):
             dp_rank=peer_ri.dp_rank,
             cp_size=peer_ri.cp_size,
             cp_rank=peer_ri.cp_rank,
-            kv_heads_per_rank=peer_ri.attention.kv_heads_per_rank,
-            tokens_per_block=peer_ri.attention.tokens_per_block,
-            dims_per_head=peer_ri.attention.dims_per_head,
-            element_bytes=peer_ri.attention.element_bytes,
-            is_mla=peer_ri.attention.is_mla,
-            enable_attention_dp=peer_ri.attention.enable_attention_dp,
+            enable_attention_dp=peer_ri.enable_attention_dp,
             layer_num_per_pp=peer_ri.layer_num_per_pp,
             page_table=make_page_table(),
         )
@@ -329,37 +293,6 @@ def test_no_overlap():
     overlap = reg.get_peer_overlap(peer_ri, 0)
     assert overlap.overlap_pp_size == 0
     assert overlap.ranks == []
-
-
-@pytest.mark.parametrize(
-    ("self_heads", "peer_heads"),
-    [(0, 0), (0, 2), (2, 0)],
-)
-def test_attention_free_stage_has_no_head_duplication(
-    self_heads: int,
-    peer_heads: int,
-) -> None:
-    self_ri = make_rankinfo(
-        "self",
-        tp_size=2,
-        tp_rank=0,
-        kv_heads_per_rank=self_heads,
-        layer_num_per_pp=[2],
-    )
-    peer_ri = make_rankinfo(
-        "peer",
-        tp_size=2,
-        tp_rank=0,
-        kv_heads_per_rank=peer_heads,
-        layer_num_per_pp=[2],
-    )
-    reg, peer_ri = _make_peer_registrar_and_peer_ri(self_ri, peer_ri)
-
-    overlap = reg.get_peer_overlap(peer_ri, peer_dp_rank=0)
-
-    assert overlap.duplicate_head_factor == 1
-    assert overlap.peer_duplicate_head_factor == 1
-    assert overlap.ranks == [0]
 
 
 def test_pp_ratio_peer_smaller():
@@ -442,8 +375,6 @@ def test_multiple_overlap():
         overlap_pp_size=2,
         overlap_tp_size=2,
         overlap_cp_size=2,
-        duplicate_head_factor=1,
-        peer_duplicate_head_factor=2,
         ranks=[26, 27, 30, 31, 42, 43, 46, 47],
     )
     assert overlap == expected_overlap
@@ -457,7 +388,6 @@ def _tp_rank_info(name, tp_size, tp_rank, total_heads=8):
         instance_rank=tp_rank,
         tp_size=tp_size,
         tp_rank=tp_rank,
-        kv_heads_per_rank=heads,
         page_table=make_page_table(
             block_bytes=[4 * 32 * heads], mamba_tp=tp_size, tp_rank=tp_rank, kv_heads=heads
         ),
@@ -627,10 +557,13 @@ def test_peer_registration_allows_asymmetric_aux_layout_for_context_first():
 def test_peer_registrar_incompatible_peer_raises():
     self_rankinfo = make_rankinfo(instance_name="local")
     reg = _make_peer_registrar(self_rankinfo)
+    # Twice the heads per rank at the same TP: the K/V tensors are of 8 heads, not 4.
     peer_ri = make_rankinfo(
-        instance_name="peer", instance_rank=3, is_mla=True, page_table=make_page_table()
+        instance_name="peer",
+        instance_rank=3,
+        page_table=make_page_table(block_bytes=[2048], kv_heads=4),
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="do not correspond"):
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
@@ -687,7 +620,6 @@ def test_peer_registrar_get_kv_map_head_mismatch():
         make_page_table(),
         make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4),
         tp_size=1,
-        kv_heads_per_rank=4,
         layer_num_per_pp=[2],
     )
     # 256B buffers of 2 x 128B heads into 512B buffers of 4.
@@ -707,7 +639,6 @@ def test_peer_registrar_get_kv_map_head_mismatch_second_rank():
     peer_ri = make_rankinfo(
         instance_name="peer",
         tp_size=1,
-        kv_heads_per_rank=4,
         page_table=make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4),
     )
     assert runs_of(reg.get_kv_map(peer_ri, (0, 0), (0, 0))) == [
@@ -772,7 +703,6 @@ def test_rank_info_carries_the_page_layout_to_peers():
     peer_ri = make_rankinfo(
         instance_name="peer",
         tp_size=1,
-        kv_heads_per_rank=4,
         page_table=make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4, side_state_bytes=8),
     )
     received = RankInfo.from_bytes(peer_ri.to_bytes())
@@ -792,18 +722,20 @@ def test_peer_registrar_get_kv_map_is_cached_until_unregister():
     assert reg.get_kv_map(peer_ri, (0, 0), (0, 0)) is not mapper
 
 
-def test_peer_registrar_get_kv_map_requires_a_page_layout():
-    reg, peer_ri = _registered(make_page_table(), make_page_table(), layer_num_per_pp=[2])
+def test_peer_registrar_requires_a_page_layout():
+    reg = _make_peer_registrar(make_rankinfo(instance_name="local"))
+    peer_ri = make_rankinfo(instance_name="peer", page_table=make_page_table())
     peer_ri.page_table.layout = None
     with pytest.raises(ValueError, match="carries no page layout"):
         reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    with pytest.raises(ValueError, match="carries no page layout"):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
-def test_replicated_pool_ignores_kv_head_mismatch():
+def test_replicated_pool_moves_whole_buffers_across_tensor_ranks():
     reg = _make_peer_registrar(
         make_rankinfo(
             instance_name="local",
-            kv_heads_per_rank=1,
             page_table=make_page_table(attention="replicated"),
         )
     )
@@ -811,7 +743,6 @@ def test_replicated_pool_ignores_kv_head_mismatch():
         instance_name="peer",
         instance_rank=3,
         tp_size=1,
-        kv_heads_per_rank=8,
         layer_num_per_pp=[2],
         page_table=make_page_table(attention="replicated", mamba_tp=1),
     )
@@ -865,48 +796,20 @@ def test_replicated_pool_sender_rotates_by_destination_dp_rank(peer_dp_rank):
     assert senders.index(True) == peer_dp_rank % 8
 
 
-def test_peer_registrar_tpb_divisible_warns_but_compatible():
-    # local=16, peer=32: 32 % 16 == 0 → compatible with warning, register succeeds
-    self_rankinfo = make_rankinfo(instance_name="local", tokens_per_block=16)
-    reg = _make_peer_registrar(self_rankinfo)
-    peer_ri = make_rankinfo(
-        instance_name="peer",
-        instance_rank=5,
-        tokens_per_block=32,
-        layer_num_per_pp=[2],
-        page_table=make_page_table(),
-    )
-    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
-    assert reg.get_peer_rank_info(peer_ri.instance_name, peer_ri.instance_rank) is not None
+@pytest.mark.parametrize("attention", ["head_major", "token_major", "replicated"])
+@pytest.mark.parametrize("peer_tokens", [8, 32])
+def test_peer_registrar_rejects_pages_of_other_token_counts(attention, peer_tokens):
+    """Ranks whose pages hold different token counts cannot exchange them.
 
-
-def test_peer_registrar_tpb_not_divisible_raises():
-    # local=16, peer=24: 24 % 16 != 0 → incompatible, register raises ValueError
-    self_rankinfo = make_rankinfo(instance_name="local", tokens_per_block=16)
-    reg = _make_peer_registrar(self_rankinfo)
-    peer_ri = make_rankinfo(
-        instance_name="peer",
-        instance_rank=6,
-        tokens_per_block=24,
-        layer_num_per_pp=[2],
-        page_table=make_page_table(),
-    )
-    with pytest.raises(ValueError):
-        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
-
-
-@pytest.mark.parametrize("attention", ["token_major", "replicated"])
-def test_peer_registrar_exact_tpb_layout_rejects_divisible_mismatch(attention):
-    self_ri = make_rankinfo(page_table=make_page_table(attention=attention), tokens_per_block=16)
+    Pages pair one to one by ordinal, whether or not one count divides the other.
+    """
+    reg = _make_peer_registrar(make_rankinfo(page_table=make_page_table(attention=attention)))
     peer_ri = make_rankinfo(
         instance_name="peer",
         instance_rank=7,
-        page_table=make_page_table(attention=attention, tokens_per_block=32),
-        tokens_per_block=32,
+        page_table=make_page_table(attention=attention, tokens_per_block=peer_tokens),
     )
-    reg = _make_peer_registrar(self_ri)
-
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="pages of 16 tokens against"):
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
@@ -967,59 +870,7 @@ def test_non_uniform_view_geometry_is_rejected_when_building_the_page_table():
         ),
     )
     with pytest.raises(ValueError, match="not uniform"):
-        page_table_from_layout(manager_layout(layout, {0: [0x1000]}))
-
-
-def test_peer_registrar_allows_byte_aligned_subbyte_head_mismatch():
-    """Byte-aligned sub-byte head slicing is allowed.
-
-    Per-head bytes are integral here: tpb=16 x dims=8 x 0.5B = 64B.
-    """
-    self_ri = make_rankinfo(
-        element_bytes=0.5,
-        kv_heads_per_rank=2,
-        tp_size=2,
-        page_table=make_page_table(),
-    )
-    peer_ri = make_rankinfo(
-        instance_name="peer",
-        element_bytes=0.5,
-        kv_heads_per_rank=4,
-        tp_size=1,
-        page_table=make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4),
-    )
-    reg = _make_peer_registrar(self_ri)
-    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
-
-    assert not reg.get_kv_map(peer_ri, (0, 0), (0, 0)).empty
-
-
-def test_peer_registrar_rejects_misaligned_subbyte_head_mismatch():
-    """Head slicing that lands mid-byte must fail at registration.
-
-    tpb=1 x dims=1 x 0.5B = 0.5B per head is not byte-aligned.
-    """
-    self_ri = make_rankinfo(
-        element_bytes=0.5,
-        kv_heads_per_rank=2,
-        tokens_per_block=1,
-        dims_per_head=1,
-        tp_size=2,
-        page_table=make_page_table(),
-    )
-    peer_ri = make_rankinfo(
-        instance_name="peer",
-        element_bytes=0.5,
-        kv_heads_per_rank=4,
-        tokens_per_block=1,
-        dims_per_head=1,
-        tp_size=1,
-        page_table=make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4),
-    )
-    reg = _make_peer_registrar(self_ri)
-
-    with pytest.raises(ValueError):
-        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        native_page_table(layout, {0: [0x1000]})
 
 
 def test_peer_registrar_token_major_head_mismatch_slices_each_token():
@@ -1028,7 +879,6 @@ def test_peer_registrar_token_major_head_mismatch_slices_each_token():
         make_page_table(attention="token_major"),
         make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4, attention="token_major"),
         tp_size=1,
-        kv_heads_per_rank=4,
     )
     mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
 
@@ -1040,13 +890,11 @@ def test_peer_registrar_token_major_head_mismatch_slices_each_token():
     ]
 
 
-def test_peer_registrar_warns_for_nhd_head_mismatch(monkeypatch):
-    self_ri = make_rankinfo(
-        kv_heads_per_rank=2, tp_size=2, page_table=make_page_table(attention="token_major")
-    )
+def test_peer_registrar_warns_when_pages_move_in_fragments(monkeypatch):
+    """Token-major K/V over different head counts moves a fragment per token and buffer."""
+    self_ri = make_rankinfo(tp_size=2, page_table=make_page_table(attention="token_major"))
     peer_ri = make_rankinfo(
         instance_name="peer",
-        kv_heads_per_rank=4,
         tp_size=1,
         page_table=make_page_table(
             block_bytes=[2048], mamba_tp=1, kv_heads=4, attention="token_major"
@@ -1067,9 +915,9 @@ def test_peer_registrar_warns_for_nhd_head_mismatch(monkeypatch):
 
     assert len(warnings) == 1
     message, key = warnings[0]
-    assert "4 NIXL descriptors per transferred token per peer" in message
-    assert "local_kv_heads=2, peer_kv_heads=4" in message
-    assert key == "native-nhd-head-mismatch-2-4-4"
+    # 4 buffers of 16 tokens, each token's two heads a fragment of its own.
+    assert "64 fragments for 4 buffers" in message
+    assert key == "native-fragmented-pages-64-4"
 
 
 def test_peer_registrar_token_major_head_match_moves_whole_slots():
@@ -1094,15 +942,8 @@ def make_tp1_peer(**page_table_kwargs):
     return make_rankinfo(
         instance_name="peer",
         tp_size=1,
-        kv_heads_per_rank=4,
         page_table=make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4, **page_table_kwargs),
     )
-
-
-def test_policy_dispatch_keys_on_cache_kind_only():
-    reg = _make_peer_registrar(make_rankinfo(instance_name="local"))
-    assert isinstance(reg._get_policy(CacheKind.PAGED), AttentionPolicy)
-    assert isinstance(reg._get_policy(CacheKind.STATE), MambaPolicy)
 
 
 def test_state_views_carry_the_geometry_peers_check():
@@ -1184,21 +1025,60 @@ def test_mamba_ssm_heads_reshard_under_tp_mismatch():
     ]
 
 
-def test_attention_replicated_validation_ignores_state_groups():
-    """A STATE-only replicated-role mismatch is MambaPolicy's to reject."""
-    self_pt = make_page_table(side_state_bytes=8)
-    peer_pt = make_page_table()
-    AttentionPolicy.validate_peer_compatible(self_pt, peer_pt)
-    ri = make_rankinfo(instance_name="local", page_table=self_pt)
-    with pytest.raises(ValueError, match="MambaPolicy.*differ on overlapping layers"):
-        MambaPolicy.validate_peer_compatible(ri, ri, self_pt, peer_pt)
+def test_a_buffer_one_rank_lacks_is_refused():
+    """Side state transferred by one rank only would leave the other's zeroed."""
+    reg = _make_peer_registrar(
+        make_rankinfo(instance_name="local", page_table=make_page_table(side_state_bytes=8))
+    )
+    peer_ri = make_rankinfo(instance_name="peer", page_table=make_page_table())
+    with pytest.raises(ValueError, match="ple_ngram_context.*transferred by one rank only"):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
-def test_attention_replicated_validation_rejects_missing_index_key_view():
-    self_pt = make_page_table(global_layer_ids=[0])
-    view = self_pt.layer_groups[0].pool_views[0]
-    view.pool_role = frozenset({"index_key"})
-    view.mapper_kind = MapperKind.REPLICATED
-    peer_pt = make_page_table(global_layer_ids=[0])
-    with pytest.raises(ValueError, match="AttentionPolicy.*differ on overlapping layers"):
-        AttentionPolicy.validate_peer_compatible(self_pt, peer_pt)
+def test_an_index_cache_one_rank_lacks_is_refused():
+    reg = _make_peer_registrar(
+        make_rankinfo(instance_name="local", page_table=make_page_table(index_key_bytes=32))
+    )
+    peer_ri = make_rankinfo(instance_name="peer", page_table=make_page_table())
+    with pytest.raises(ValueError, match="index_key.*transferred by one rank only"):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+def test_side_state_of_another_size_is_refused():
+    reg = _make_peer_registrar(
+        make_rankinfo(instance_name="local", page_table=make_page_table(side_state_bytes=8))
+    )
+    peer_ri = make_rankinfo(instance_name="peer", page_table=make_page_table(side_state_bytes=16))
+    with pytest.raises(ValueError, match="'byte': 8.*'byte': 16"):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+def test_context_parallelism_on_both_sides_is_refused():
+    reg = _make_peer_registrar(make_rankinfo(instance_name="local", cp_size=2))
+    peer_ri = make_rankinfo(instance_name="peer", cp_size=2, page_table=make_page_table())
+    with pytest.raises(ValueError, match="context parallelism on both sides"):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+def test_index_cache_moves_whole_from_one_writer():
+    """A replicated index cache comes from one of two writers, so they do not send alike."""
+    receiver = make_rankinfo(
+        instance_name="gen",
+        tp_size=1,
+        page_table=make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4, index_key_bytes=32),
+    )
+    sender = make_rankinfo(
+        instance_name="ctx", tp_size=2, page_table=make_page_table(index_key_bytes=32)
+    )
+    reg = _make_peer_registrar(receiver)
+    overlap = reg.get_peer_overlap(sender, peer_dp_rank=0)
+    assert overlap.ranks == [0, 1]
+    assert not reg.writers_send_alike(sender, overlap)
+    plain = make_rankinfo(instance_name="ctx2", tp_size=2, page_table=make_page_table())
+    receiver_plain = make_rankinfo(
+        instance_name="gen2",
+        tp_size=1,
+        page_table=make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4),
+    )
+    reg_plain = _make_peer_registrar(receiver_plain)
+    assert reg_plain.writers_send_alike(plain, reg_plain.get_peer_overlap(plain, peer_dp_rank=0))
