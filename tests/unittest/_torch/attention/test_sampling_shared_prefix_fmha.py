@@ -19,6 +19,7 @@ end-to-end tests run Qwen3-0.6B n-sampling with and without the library and
 require a GPU plus the model checkpoint.
 """
 
+import contextlib
 import math
 import os
 
@@ -1051,10 +1052,13 @@ def test_fused_sampling_attention_matches_dense(
     cached = [c if r < sharing_rows else c + 70 for r, c in enumerate(cached)]
     own_blocks = [(c + 1 + tpb - 1) // tpb for c in cached]
     num_pages = groups * prefix_pages + 1 + sum(own_blocks)
-    pool = torch.randn(num_pages, 2, num_kv_heads, tpb, head_dim, device=device).bfloat16()
-    q = torch.randn(rows, num_heads, head_dim, device=device).bfloat16()
-    k = torch.randn(rows, num_kv_heads, head_dim, device=device).bfloat16()
-    v = torch.randn(rows, num_kv_heads, head_dim, device=device).bfloat16()
+    dgen = torch.Generator(device=device).manual_seed(2)
+    pool = torch.randn(
+        num_pages, 2, num_kv_heads, tpb, head_dim, generator=dgen, device=device
+    ).bfloat16()
+    q = torch.randn(rows, num_heads, head_dim, generator=dgen, device=device).bfloat16()
+    k = torch.randn(rows, num_kv_heads, head_dim, generator=dgen, device=device).bfloat16()
+    v = torch.randn(rows, num_kv_heads, head_dim, generator=dgen, device=device).bfloat16()
     perm = torch.randperm(rows, generator=gen) if shuffled else torch.arange(rows)
     placeholder_page = groups * prefix_pages
     page = placeholder_page + 1
@@ -1166,11 +1170,14 @@ def _fused_spec_case(
     need = [(c + q_len + tpb - 1) // tpb for c in cached]
     blocks = [n + (1 if overshoot else 0) for n in need]
     num_pages = groups * prefix_pages + 1 + sum(blocks)
-    pool = (0.7 * torch.randn(num_pages, 2, num_kv_heads, tpb, head_dim, device=device)).bfloat16()
+    dgen = torch.Generator(device=device).manual_seed(seed)
+    pool = (
+        0.7 * torch.randn(num_pages, 2, num_kv_heads, tpb, head_dim, generator=dgen, device=device)
+    ).bfloat16()
     ntok = rows * q_len
-    q = torch.randn(ntok, num_heads, head_dim, device=device).bfloat16()
-    k = torch.randn(ntok, num_kv_heads, head_dim, device=device).bfloat16()
-    v = torch.randn(ntok, num_kv_heads, head_dim, device=device).bfloat16()
+    q = torch.randn(ntok, num_heads, head_dim, generator=dgen, device=device).bfloat16()
+    k = torch.randn(ntok, num_kv_heads, head_dim, generator=dgen, device=device).bfloat16()
+    v = torch.randn(ntok, num_kv_heads, head_dim, generator=dgen, device=device).bfloat16()
     perm = torch.randperm(rows, generator=gen) if shuffled else torch.arange(rows)
     placeholder_page = groups * prefix_pages
     page, own = placeholder_page + 1, []
@@ -1188,7 +1195,7 @@ def _fused_spec_case(
             None, :, None
         ]
         q = (q.float().abs() * 80.0 * sign + 0.0 * q.float()).bfloat16()
-        q[:, ::2] = (torch.randn_like(q[:, ::2].float()) * 80.0).bfloat16()
+        q[:, ::2] = (torch.randn(q[:, ::2].shape, generator=dgen, device=device) * 80.0).bfloat16()
         k = (k.float().abs() * 600.0).bfloat16()
     if peaked:
         # Attention dominated by the newest keys (as in a real model, unlike flat random
@@ -1197,7 +1204,7 @@ def _fused_spec_case(
         # along it. A wrong tail length (a dropped newest token, an unwritten or stale slot read
         # instead) then changes the output by O(1), not by the 1/length of flat attention.
         gs = num_heads // num_kv_heads
-        u = torch.randn(num_heads, head_dim, device=device)
+        u = torch.randn(num_heads, head_dim, generator=dgen, device=device)
         u = u / u.norm(dim=-1, keepdim=True) * math.sqrt(head_dim)
         q = (6.0 * u).bfloat16()[None].expand(ntok, -1, -1).contiguous()
         ukv = u.view(num_kv_heads, gs, head_dim)[:, 0]
@@ -1463,6 +1470,34 @@ def test_fused_spec_attention_graph_replay_is_bit_exact(q_len):
         assert torch.equal(pool, eager_pool)
 
 
+@contextlib.contextmanager
+def _accepted_drafts():
+    """Counts the draft tokens the speculative worker accepts.
+
+    ``LLM.get_stats`` returns nothing for this configuration, so the executor's per-iteration
+    stats are read as they are produced; the executor must run in this process
+    (``TLLM_WORKER_USE_SINGLE_PROCESS=1``).
+    """
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    counts = {"accepted": 0, "requests": 0}
+    original = PyExecutor._update_iter_stats
+
+    def update(self, stats, *args, **kwargs):
+        result = original(self, stats, *args, **kwargs)
+        spec = getattr(stats, "specdec_stats", None)
+        if spec is not None and spec.num_requests_with_draft_tokens > 0:
+            counts["accepted"] += spec.num_accepted_tokens
+            counts["requests"] += spec.num_requests_with_draft_tokens
+        return result
+
+    PyExecutor._update_iter_stats = update
+    try:
+        yield counts
+    finally:
+        PyExecutor._update_iter_stats = original
+
+
 def _eagle3_paths():
     """(target, draft) checkpoints of the EAGLE-3 e2e test, from the environment."""
     target = os.environ.get("TLLM_TEST_EAGLE3_TARGET")
@@ -1490,6 +1525,7 @@ def test_eagle3_n_sampling_with_fused_library_keeps_acceptance_e2e():
     n, max_tokens = 8, 96
 
     def run(env):
+        env = {"TLLM_WORKER_USE_SINGLE_PROCESS": "1", **env}
         previous = {key: os.environ.get(key) for key in env}
         os.environ.update(env)
         try:
@@ -1508,19 +1544,13 @@ def test_eagle3_n_sampling_with_fused_library_keeps_acceptance_e2e():
                 skip_tokenizer_init=True,
                 enable_iter_perf_stats=True,
             )
-            with llm:
+            with _accepted_drafts() as counts, llm:
                 sampling = SamplingParams(
                     n=n, temperature=1.0, max_tokens=max_tokens, ignore_eos=True, end_id=-1
                 )
                 outputs = llm.generate(prompts, sampling_params=sampling)
-                stats = llm.get_stats(2) or []
-            accepted = requests = 0
-            for stat in stats:
-                spec = stat.get("specDecodingStats") if isinstance(stat, dict) else None
-                if spec and spec.get("numRequestsWithDraftTokens", 0) > 0:
-                    accepted += spec["numAcceptedTokens"]
-                    requests += spec["numRequestsWithDraftTokens"]
             assert all(len(c.token_ids) == max_tokens for o in outputs for c in o.outputs)
+            accepted, requests = counts["accepted"], counts["requests"]
             return (accepted + requests) / requests if requests else None
         finally:
             for key, value in previous.items():
@@ -1538,5 +1568,5 @@ def test_eagle3_n_sampling_with_fused_library_keeps_acceptance_e2e():
             "TLLM_SAMPLING_SHARED_PREFIX_MIN_GROUP": "2",
         }
     )
-    if off is not None and on is not None:
-        assert abs(on - off) <= 0.05 * off, (on, off)
+    assert off is not None and on is not None, "no speculative-decoding stats reported"
+    assert abs(on - off) <= 0.05 * off, (on, off)
