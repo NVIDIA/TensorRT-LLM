@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Mapping, Sequence
 
-from .page_layout import MapperKind, PageLayout, RankTopology, RoleLayout, ShardDesc
+from .page_layout import PageLayout, RankTopology, ShardDesc
 
 if TYPE_CHECKING:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, SsmLayerConfig
@@ -177,24 +177,6 @@ def attention_shard(tp_size: int, tp_rank: int, heads: int, total: int | None) -
     # share that every rank holds.
     count = max(total // heads, 1)
     return ShardDesc(count, min((tp_rank * total // tp_size) // heads, count - 1))
-
-
-def buffer_geometry(
-    declared: object, mapper: MapperKind, size: int, heads: int, state: bool
-) -> RoleLayout:
-    """A buffer's head geometry: declared sections or head size, completed per buffer.
-    ``ValueError`` if the declared or completed geometry has a size that is not positive."""
-    declared = RoleLayout(
-        getattr(declared, "section_bytes", None), getattr(declared, "bytes_per_head", None)
-    )
-    if mapper in (MapperKind.REPLICATED, MapperKind.SECTIONED):
-        return declared
-    bytes_per_head = declared.bytes_per_head
-    if bytes_per_head is None and not state and heads > 0 and size % heads == 0:
-        bytes_per_head = size // heads
-    if bytes_per_head is None or size % bytes_per_head:
-        return declared
-    return RoleLayout(declared.section_bytes, bytes_per_head)
 
 
 # A layer group is whole when every transferred buffer holds the same bytes on every rank

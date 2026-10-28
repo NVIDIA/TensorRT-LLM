@@ -135,14 +135,25 @@ from ..resource_manager import (
 )
 from ..scheduler import ScheduledRequests
 from . import _lender_hooks
-from .page_layout import BufferDesc, LayerGroupDesc, PageLayout, ShardDesc
+from .page_layout import (
+    Axis,
+    BufferDesc,
+    LayerGroupDesc,
+    PageLayout,
+    ShardDesc,
+    Tensor,
+    grid_place,
+    head_major,
+    replicated,
+    sectioned,
+    token_major,
+)
 from .page_table import (
     ALL_ROLE,
     DevicePool,
     ManagerLayout,
     attention_shard,
     buffer_expansions,
-    buffer_geometry,
     group_shard,
     has_sparse_buffers,
     is_non_required_layer,
@@ -3478,11 +3489,12 @@ class KVCacheManagerV2(BaseResourceManager):
         """This manager's page table: its page layout, device pools and the facts of its layer
         groups, which whoever lends or moves its pages reads instead of the manager.
 
-        Built from the runtime config and storage, the per-role declarations
-        (``get_disagg_role_mapper_kinds``, ``get_disagg_role_layouts``) and the hooks below
-        (``_page_layer_ids``, ``_page_kv_heads``, ``_page_untransferred_roles``,
-        ``_page_quant_mode``); a subclass overrides the hook whose answer differs. ``ValueError``
-        if its layer groups, layer configs and declarations do not agree."""
+        Built from the runtime config and storage and the hooks below: how each buffer's bytes
+        spread over ranks (``_page_buffer_tensors``), how layers are named (``_page_layer_ids``),
+        the KV heads (``_page_kv_heads``), which roles never travel
+        (``_page_untransferred_roles``) and the quantization (``_page_quant_mode``); a subclass
+        overrides the hook whose answer differs. ``ValueError`` if its layer groups, layer configs
+        and declarations do not agree."""
         tokens_per_block = int(self.tokens_per_block)
         layer_cfg = self._page_layer_configs()
         grouping = [[int(layer) for layer in group] for group in self.impl.layer_grouping]
@@ -3504,21 +3516,6 @@ class KVCacheManagerV2(BaseResourceManager):
             if is_recurrent_layer(layer_cfg[group[0]]):
                 state_groups.add(lg)
 
-        # TODO: the base manager declares head-major K/V whichever backend writes its pages, so a
-        # token-major backend's manager gets a head-major layout_id unless it declares its own.
-        mappers = {
-            str(role): MapperKind(int(kind))
-            for role, kind in self.get_disagg_role_mapper_kinds().items()
-        }
-        if ALL_ROLE not in mappers:
-            raise ValueError(
-                "the manager declares no mapper kind for Role.ALL, the fallback of the roles it "
-                "does not list"
-            )
-        default_mapper = mappers[ALL_ROLE]
-        declared_layouts = {
-            str(role): layout for role, layout in self.get_disagg_role_layouts().items()
-        }
         untransferred = self._page_untransferred_roles()
         expansions = {
             lid: buffer_expansions(cfg, tokens_per_block) for lid, cfg in layer_cfg.items()
@@ -3560,27 +3557,29 @@ class KVCacheManagerV2(BaseResourceManager):
                     for j, buffer_id in enumerate(coalesced.buffer_ids):
                         lid = int(buffer_id.layer_id)
                         role = str(buffer_id.role)
-                        mapper = mappers.get(role, default_mapper)
                         transfer = role not in untransferred
-                        heads, total = kv_heads[lid]
-                        buffers.append(
-                            BufferDesc(
-                                layer=global_of.get(lid, lid),
-                                role=role,
-                                pool_group=g,
-                                pool_index=pool_index,
-                                slot_offset=j * size,
-                                size=size,
-                                mapper=mapper,
-                                geometry=buffer_geometry(
-                                    declared_layouts.get(role), mapper, size, heads, state
-                                ),
-                                transferred=transfer,
-                                expansion=expansions.get(lid, {}).get(role, 1),
+                        expansion = expansions.get(lid, {}).get(role, 1)
+                        try:
+                            tensors = self._page_buffer_tensors(
+                                lid, role, size, tokens_per_block // expansion, state
                             )
+                        except ValueError as error:
+                            raise ValueError(f"buffer ({lid}, {role}): {error}") from error
+                        desc = BufferDesc(
+                            layer=global_of.get(lid, lid),
+                            role=role,
+                            pool_group=g,
+                            pool_index=pool_index,
+                            slot_offset=j * size,
+                            size=size,
+                            tensors=tensors,
+                            transferred=transfer,
+                            expansion=expansion,
                         )
-                        if not transfer or mapper is MapperKind.REPLICATED:
+                        buffers.append(desc)
+                        if not transfer or not desc.split:
                             continue
+                        heads, total = kv_heads[lid]
                         shards[lg].append(
                             state_shard
                             if state
@@ -3704,6 +3703,55 @@ class KVCacheManagerV2(BaseResourceManager):
             return per_rank, None
         value = total[int(self.pp_layers[layer])]
         return per_rank, None if value is None else int(value)
+
+    def _page_buffer_tensors(
+        self, layer_id: int, role: str, size: int, tokens: int, state: bool
+    ) -> tuple[Tensor, ...]:
+        """How the bytes of internal layer ``layer_id``'s ``role`` buffer spread over ranks: the
+        tensors whose local pieces its ``size`` bytes hold, for ``tokens`` tokens of a page, in a
+        layer of recurrent ``state`` or of attention.
+
+        Translated from the role declarations (``get_disagg_role_mapper_kinds``,
+        ``get_disagg_role_layouts``): replicated roles alike on every rank; head-major (INDEXED)
+        or token-major (NHD) roles split by KV head; sectioned roles split by byte, section by
+        section. Attention splits over the tensor-parallel ranks, recurrent state over tensor
+        times context ranks. A role whose heads the declarations do not give is this rank's own
+        share. A subclass whose buffers spread otherwise overrides this method.
+        """
+        mappers = {
+            str(r): MapperKind(int(kind)) for r, kind in self.get_disagg_role_mapper_kinds().items()
+        }
+        if ALL_ROLE not in mappers:
+            raise ValueError(
+                "the manager declares no mapper kind for Role.ALL, the fallback of the roles it "
+                "does not list"
+            )
+        mapper = mappers.get(role, mappers[ALL_ROLE])
+        if mapper is MapperKind.REPLICATED:
+            return replicated(size)
+        declared = {str(r): layout for r, layout in self.get_disagg_role_layouts().items()}.get(
+            role, RoleLayout()
+        )
+        split = ("tp", "cp") if state else ("tp",)
+        ranks, _ = grid_place(rank_topology(self.mapping), split)
+        if mapper is MapperKind.SECTIONED:
+            if declared.section_bytes is None or sum(declared.section_bytes) != size:
+                raise ValueError(f"sections {declared.section_bytes} do not make up {size} bytes")
+            return sectioned(declared.section_bytes, ranks, split)
+        heads, total = self._page_kv_heads(layer_id)
+        head_bytes = declared.bytes_per_head
+        if head_bytes is None and not state and heads > 0 and size % heads == 0:
+            head_bytes = size // heads
+        if head_bytes is None or size % head_bytes:
+            # Bytes this rank alone holds, in a split the declarations do not give.
+            return (
+                Tensor((Axis("shard", ranks, size, split, 1), Axis("byte", size, 1)), name="own"),
+            )
+        heads = size // head_bytes
+        total = total if total and not state else heads * ranks
+        if mapper is MapperKind.NHD:
+            return token_major(size, tokens, heads, total, split)
+        return head_major(size, heads, total, split)
 
     def _page_untransferred_roles(self) -> frozenset[str]:
         """Roles whose buffers hold no state a peer needs, kept in local copies of whole pages but

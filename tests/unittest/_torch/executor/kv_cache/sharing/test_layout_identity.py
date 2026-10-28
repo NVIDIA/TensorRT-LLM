@@ -39,6 +39,7 @@ import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.kv_cache import page_layout, page_table, sharing
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+    Axis,
     BufferDesc,
     LayerGroupDesc,
     MapperKind,
@@ -46,6 +47,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     RankTopology,
     RoleLayout,
     ShardDesc,
+    Tensor,
+    head_major,
+    replicated,
+    sectioned,
+    token_major,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import attention_shard
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
@@ -173,9 +179,10 @@ def test_layout_id_leaves_out_what_does_not_decide_how_bytes_read(variant):
         lambda: make_layout(tokens_per_block=64),
         lambda: make_layout(layers=((0, 1), (2,))),
         lambda: make_layout(slot_bytes=(104, 40)),
-        lambda: _replace_buffers(make_layout(), mapper=MapperKind.REPLICATED),
-        lambda: _replace_buffers(make_layout(), geometry=RoleLayout(bytes_per_head=10)),
-        lambda: _replace_buffers(make_layout(), geometry=RoleLayout(section_bytes=(15, 5))),
+        lambda: _replace_buffers(make_layout(), tensors=head_major(20, 2, 4)),
+        lambda: _replace_buffers(make_layout(), tensors=head_major(20, 4, 8)),
+        lambda: _replace_buffers(make_layout(), tensors=token_major(20, 2, 2, 4)),
+        lambda: _replace_buffers(make_layout(), tensors=sectioned((15, 5), 2)),
         lambda: _replace_buffers(make_layout(), transferred=False),
         lambda: _replace_buffers(make_layout(), expansion=2),
         lambda: _replace_buffers(make_layout(), role="scale2"),
@@ -192,8 +199,9 @@ def test_layout_id_leaves_out_what_does_not_decide_how_bytes_read(variant):
         "tokens_per_block",
         "layer_membership",
         "slot_width",
-        "mapper",
-        "head_geometry",
+        "split_by_head",
+        "head_size",
+        "token_major",
         "sections",
         "transfer",
         "expansion",
@@ -217,7 +225,7 @@ def test_canonical_order_sorts_groups_by_smallest_layer():
 
 
 @pytest.mark.cpu_only
-def test_layout_id_is_the_hash_of_the_documented_version_3_encoding():
+def test_layout_id_is_the_hash_of_the_documented_version_4_encoding():
     """The canonical encoding, spelled out here byte for byte so a change to it cannot pass
     unnoticed."""
     layout = make_layout(layers=((0,), (1,)))
@@ -227,9 +235,9 @@ def test_layout_id_is_the_hash_of_the_documented_version_3_encoding():
         '{"layer":0,"offset":100,"role":"scale","size":20},'
         '{"layer":1,"offset":0,"role":"key","size":64}],'
         '"groups":[{"layers":[0],"slot_bytes":[100,40]},{"layers":[1],"slot_bytes":[64]}],'
-        '"tokens_per_block":32,"v":3}'
+        '"tokens_per_block":32,"v":4}'
     ).encode()
-    assert LAYOUT_ID_VERSION == 3
+    assert LAYOUT_ID_VERSION == 4
     assert canonical_bytes(layout_document(layout)) == expected
     assert layout_id(layout) == hashlib.sha256(expected).digest()
 
@@ -240,16 +248,19 @@ def test_named_keys_at_their_defaults_are_left_out_and_others_are_written():
     plain = layout_document(layout)["buffers"][1]
     assert set(plain) == {"layer", "role", "offset", "size"}
     changed = layout_document(
-        _replace_buffers(
-            layout,
-            mapper=MapperKind.SECTIONED,
-            geometry=RoleLayout(section_bytes=(15, 5)),
-            transferred=False,
-            expansion=4,
-        )
+        _replace_buffers(layout, tensors=sectioned((15, 5), 2), transferred=False, expansion=4)
     )["buffers"][1]
-    assert changed["mapper"] == "SECTIONED"
-    assert changed["geometry"] == {"section_bytes": [15, 5]}
+    assert changed["tensors"] == [
+        {
+            "axes": [{"name": "byte", "extent": 30, "stride": 1, "split": ["tp"], "held": 15}],
+            "name": "s0",
+        },
+        {
+            "axes": [{"name": "byte", "extent": 10, "stride": 1, "split": ["tp"], "held": 5}],
+            "name": "s1",
+            "offset": 15,
+        },
+    ]
     assert changed["transfer"] is False
     assert changed["expansion"] == 4
     assert layout_document(_first_group(layout, kind="state"))["groups"][0]["kind"] == "state"
@@ -257,10 +268,9 @@ def test_named_keys_at_their_defaults_are_left_out_and_others_are_written():
 
 
 @pytest.mark.cpu_only
-def test_enums_encode_by_name_and_the_hnd_alias_is_indexed():
-    hnd = _replace_buffers(make_layout(), mapper=MapperKind.HND)
-    indexed = _replace_buffers(make_layout(), mapper=MapperKind.INDEXED)
-    assert layout_id(hnd) == layout_id(indexed) == layout_id(make_layout())
+def test_enums_encode_by_name_and_a_whole_buffer_is_its_default_tensor():
+    whole = _replace_buffers(make_layout(), tensors=replicated(20))
+    assert whole == make_layout() and layout_id(whole) == layout_id(make_layout())
 
     class Color(enum.IntEnum):
         RED = 3
@@ -294,11 +304,29 @@ def test_a_document_refuses_what_the_layout_does_not_hold():
 
 
 @pytest.mark.cpu_only
-def test_a_geometry_that_does_not_fit_its_buffer_is_refused():
-    with pytest.raises(ValueError, match="sum"):
-        BufferDesc(0, "conv", 0, 0, 0, 30, geometry=RoleLayout(section_bytes=(10, 10)))
-    with pytest.raises(ValueError, match="heads"):
-        BufferDesc(0, "k", 0, 0, 0, 30, geometry=RoleLayout(bytes_per_head=8))
+def test_tensors_that_do_not_fit_their_buffer_are_refused():
+    with pytest.raises(ValueError, match="reaches byte 40"):
+        BufferDesc(0, "conv", 0, 0, 0, 30, tensors=sectioned((20, 20), 2))
+    with pytest.raises(ValueError, match="reaches byte 32"):
+        BufferDesc(0, "k", 0, 0, 0, 30, tensors=head_major(32, 4, 8))
+    with pytest.raises(ValueError, match="whole number"):
+        head_major(30, 8, 8)
+    with pytest.raises(ValueError, match="repeat"):
+        BufferDesc(0, "k", 0, 0, 0, 30, tensors=replicated(30) + replicated(30))
+
+
+@pytest.mark.cpu_only
+def test_an_axis_says_how_its_split_holds():
+    with pytest.raises(ValueError, match="says how many indices"):
+        Axis("head", 8, 4, ("tp",))
+    with pytest.raises(ValueError, match="says how many indices"):
+        Axis("head", 8, 4, held=2)
+    with pytest.raises(ValueError, match="not split"):
+        Axis("row", 8, 4, cyclic=True)
+    with pytest.raises(ValueError, match="splits over"):
+        Axis("head", 8, 4, ("pp",), 2)
+    with pytest.raises(ValueError, match="splits two axes"):
+        Tensor((Axis("a", 4, 4, ("tp",), 2), Axis("b", 4, 1, ("tp",), 2)))
 
 
 @pytest.mark.cpu_only
@@ -338,6 +366,20 @@ def test_validation_refuses_sizes_that_are_not_positive(fields):
         RoleLayout(**fields)
 
 
+def described(b):
+    """(kind, heads on this rank, bytes per head) a buffer's tensors amount to: "REPLICATED" alike
+    on every rank, "SECTIONED" split by byte, else "NHD" or "INDEXED" by where its head axis lies;
+    heads and bytes are None without a head axis."""
+    if not b.split:
+        return "REPLICATED", None, None
+    (tensor, *rest) = b.tensors
+    axes = {a.name: a for a in tensor.axes}
+    if rest or "head" not in axes:
+        return "SECTIONED", None, None
+    kind = "NHD" if tensor.axes[0].name == "token" else "INDEXED"
+    return kind, axes["head"].held, b.size // axes["head"].held
+
+
 # -- a stand-in manager --------------------------------------------------------------------------
 
 TPB = 4
@@ -358,6 +400,7 @@ class Manager:
     builds its page table with ``KVCacheManagerV2``'s methods, from the state that manager keeps."""
 
     get_page_table = KVCacheManagerV2.get_page_table
+    _page_buffer_tensors = KVCacheManagerV2._page_buffer_tensors
     _page_layer_configs = KVCacheManagerV2._page_layer_configs
     _page_layer_ids = KVCacheManagerV2._page_layer_ids
     _page_kv_heads = KVCacheManagerV2._page_kv_heads
@@ -505,8 +548,8 @@ def check_token_major_kv_has_its_own_layout_id():
     head_major = derive_layout(attention(1, 0, 4)).page_layout
     token_major = derive_layout(attention(1, 0, 4, mappers={"all": MapperKind.NHD})).page_layout
     assert layout_id(head_major) != layout_id(token_major), TOKEN_MAJOR_SHARES
-    assert {b.mapper for b in token_major.buffers} == {MapperKind.NHD}
-    assert {b.mapper for b in head_major.buffers} == {MapperKind.INDEXED}
+    assert {described(b)[0] for b in token_major.buffers} == {"NHD"}
+    assert {described(b)[0] for b in head_major.buffers} == {"INDEXED"}
     hnd = derive_layout(attention(1, 0, 4, mappers={"all": MapperKind.HND})).page_layout
     assert layout_id(hnd) == layout_id(head_major), "HND is the default head-major layout"
 
@@ -673,9 +716,8 @@ def test_recurrent_state_is_described_and_sharded_by_rank():
     assert group.kind == "state" and group.shard == ShardDesc(2, 1)
     assert geometry.recurrent == (True,) and geometry.windows == (None,)
     by_role = {b.role: b for b in layout.buffers}
-    assert by_role["conv_state"].mapper is MapperKind.SECTIONED
-    assert by_role["conv_state"].geometry == RoleLayout(section_bytes=(32, 32, 32))
-    assert by_role["ssm_state"].geometry == RoleLayout(bytes_per_head=32)
+    assert by_role["conv_state"].tensors == sectioned((32, 32, 32), 2, ("tp", "cp"))
+    assert by_role["ssm_state"].tensors == head_major(128, 4, 8, ("tp", "cp"))
 
 
 def tensor_ranks_per_group(topology):
@@ -908,8 +950,7 @@ def test_replicas_are_every_rank_of_the_instance_holding_the_bytes():
 def test_head_geometry_is_described_per_buffer():
     layout = derive_layout(attention(2, 0, num_kv_heads=8)).page_layout
     for b in layout.buffers:
-        assert b.mapper is MapperKind.INDEXED
-        assert b.geometry == RoleLayout(bytes_per_head=HEAD_BYTES)
+        assert b.tensors == head_major(b.size, 4, 8)
 
 
 @pytest.mark.cpu_only
@@ -1237,11 +1278,11 @@ def test_a_manager_whose_parts_disagree_is_refused():
                 num_kv_heads=8,
                 mappers={"index_key": MapperKind.REPLICATED},
             ),
-            "e8a8378ec0430a16702157b939896f4860cf84991690fefa58d9327fe8fce336",
+            "fd26ca16e4400324b2590f51fdff89ce93369776249ffdeb08e10ecaf07c3652",
         ),
         (
             recurrent_state,
-            "dc4dec839ff549b22e6908e20f81ca77b3ddd5449417db1c2ba92cc52d85e86f",
+            "ddbb463ba7a5ec34551df4ac7de306d27cd28d4bbf984e9645004ec26f005747",
         ),
     ],
     ids=["head_sharded_with_expanded_replicated_role", "recurrent_state"],
@@ -1321,9 +1362,8 @@ def test_a_full_attention_cache_is_one_layer_group_over_one_pool_group(real_mana
         # K and V are head-sharded (INDEXED): four heads of ``tokens_per_block * head_dim`` fp16
         # values on this rank.
         for b in layout.buffers:
-            assert b.mapper is MapperKind.INDEXED
+            assert described(b) == ("INDEXED", 4, REAL_TPB * 64 * 2)
             assert b.transferred and b.expansion == 1
-            assert b.geometry == RoleLayout(bytes_per_head=REAL_TPB * 64 * 2)
         assert group.shard == ShardDesc()
 
 
@@ -1511,7 +1551,7 @@ def test_retained_precision_twins_describe_their_original_layer_s_head_stride(ki
             actual = mgr.get_buffers(original, "HND", mixed_precision_pool="high")
             head_bytes = actual.stride(-3) * actual.element_size()
             buffers = [b for b in layout.buffers if b.layer == global_layer]
-            assert buffers and all(b.geometry.bytes_per_head == head_bytes for b in buffers)
+            assert buffers and all(described(b)[2] == head_bytes for b in buffers)
 
 
 @pytest.mark.cpu_only
@@ -1586,28 +1626,16 @@ def check_minimax_m3_nvfp4(mgr, layout):
     """Every buffer once, with the size, mapper and heads its storage has: FP8 K/V on dense layers,
     half-width K/V plus one scale byte per 16 elements on the sparse layer, replicated index-K."""
     check_buffers(mgr, layout)
-    fp8 = (M3_TPB * M3_KV_HEADS * M3_HEAD_DIM, MapperKind.INDEXED, M3_KV_HEADS)
-    packed = (fp8[0] // 2, MapperKind.INDEXED, M3_KV_HEADS)
-    scale = (fp8[0] // 16, MapperKind.INDEXED, M3_KV_HEADS)
+    fp8 = (M3_TPB * M3_KV_HEADS * M3_HEAD_DIM, "INDEXED", M3_KV_HEADS)
+    packed = (fp8[0] // 2, "INDEXED", M3_KV_HEADS)
+    scale = (fp8[0] // 16, "INDEXED", M3_KV_HEADS)
     expected = {(layer, role): fp8 for layer in range(4) for role in ("key", "value")}
     expected.update({(M3_SPARSE_LAYER, role): packed for role in ("key", "value")})
     expected.update(
         {(M3_SPARSE_LAYER, role): scale for role in ("key_block_scale", "value_block_scale")}
     )
-    expected[(M3_SPARSE_LAYER, "index_key")] = (
-        M3_TPB * M3_INDEX_DIM * 2,
-        MapperKind.REPLICATED,
-        None,
-    )
-    described = {
-        (b.layer, b.role): (
-            b.size,
-            b.mapper,
-            (b.size // b.geometry.bytes_per_head if b.geometry.bytes_per_head else None),
-        )
-        for b in layout.buffers
-    }
-    assert described == expected
+    expected[(M3_SPARSE_LAYER, "index_key")] = (M3_TPB * M3_INDEX_DIM * 2, "REPLICATED", None)
+    assert {(b.layer, b.role): (b.size, *described(b)[:2]) for b in layout.buffers} == expected
     assert all(b.transferred and b.expansion == 1 for b in layout.buffers)
     assert sorted(layer for group in layout.layer_groups for layer in group.layers) == [0, 1, 2, 3]
     assert all(group.shard == ShardDesc() for group in layout.layer_groups)
@@ -1629,9 +1657,14 @@ def minimax_m3_nvfp4_lies(layout):
         "scale dropped": buffers(b for b in layout.buffers if b is not scale),
         "scale on a dense layer": buffers((*layout.buffers, dataclasses.replace(scale, layer=0))),
         "scale as wide as its data": swap(
-            scale, dataclasses.replace(scale, size=scale.size * 8, geometry=RoleLayout())
+            scale,
+            dataclasses.replace(
+                scale, size=scale.size * 8, tensors=head_major(scale.size * 8, 1, M3_KV_HEADS)
+            ),
         ),
-        "index-K head-sharded": swap(index, dataclasses.replace(index, mapper=MapperKind.NHD)),
+        "index-K head-sharded": swap(
+            index, dataclasses.replace(index, tensors=token_major(index.size, M3_TPB, 1, 1))
+        ),
     }
 
 
@@ -2231,7 +2264,18 @@ def test_a_manager_whose_regions_overlap_attaches_no_lender(real_manager, monkey
 
 # -- the public layout types ---------------------------------------------------------------------
 
-LAYOUT_TYPES = (PageLayout, LayerGroupDesc, BufferDesc, RankTopology, ShardDesc, RoleLayout)
+LAYOUT_TYPES = (
+    PageLayout,
+    LayerGroupDesc,
+    BufferDesc,
+    RankTopology,
+    ShardDesc,
+    RoleLayout,
+    Tensor,
+    Axis,
+)
+# Each layout type's public names beyond its fields and ``unchecked``.
+LAYOUT_TYPE_EXTRAS = {BufferDesc: {"split"}, Tensor: {"split"}}
 
 
 def pinned_fields(cls):
@@ -2249,7 +2293,18 @@ def test_the_layout_types_keep_their_module_fields_and_members():
 
     assert native.MapperKind is MapperKind and native.RoleLayout is RoleLayout
     assert sorted(page_layout.__all__) == sorted(
-        [*(t.__name__ for t in (*LAYOUT_TYPES, MapperKind)), "replica_ranks"]
+        [
+            *(t.__name__ for t in (*LAYOUT_TYPES, MapperKind)),
+            "GRID_DIMENSIONS",
+            "Progression",
+            "grid_place",
+            "head_major",
+            "held",
+            "replica_ranks",
+            "replicated",
+            "sectioned",
+            "token_major",
+        ]
     )
     assert not hasattr(sharing, "PageLayout") and "PageLayout" not in sharing.__all__
     assert _layout.ManagerLayout is page_table.ManagerLayout
@@ -2265,9 +2320,10 @@ def test_the_layout_types_keep_their_module_fields_and_members():
         "read_window=None model_layers=None"
     )
     assert pinned_fields(BufferDesc) == (
-        "layer role pool_group pool_index slot_offset size mapper=<MapperKind.INDEXED: 0> "
-        "geometry=RoleLayout(section_bytes=None, bytes_per_head=None) transferred=True expansion=1"
+        "layer role pool_group pool_index slot_offset size tensors=() transferred=True expansion=1"
     )
+    assert pinned_fields(Tensor) == "axes offset=0 name=''"
+    assert pinned_fields(Axis) == "name extent stride split=() held=None cyclic=False"
     assert pinned_fields(RankTopology) == (
         "tp_size=1 tp_rank=0 pp_size=1 pp_rank=0 cp_size=1 cp_rank=0 dp_size=1 dp_rank=0 "
         "attention_dp=False"
@@ -2282,12 +2338,13 @@ def test_the_layout_types_keep_their_module_fields_and_members():
     )
     layout = every_field_set()
     group, buffer = layout.layer_groups[0], layout.buffers[0]
-    for value in (layout, group, buffer, layout.topology, group.shard, buffer.geometry):
+    tensor, axis = buffer.tensors[0], buffer.tensors[0].axes[0]
+    for value in (layout, group, buffer, layout.topology, group.shard, tensor, axis):
         cls = type(value)
         assert cls.__dataclass_params__.frozen, cls
         named = {f.name for f in dataclasses.fields(cls)}
         beyond = {name for obj in (cls, value) for name in dir(obj) if not name.startswith("_")}
-        assert beyond - named == {"unchecked"}, (cls, beyond - named)
+        assert beyond - named == {"unchecked", *LAYOUT_TYPE_EXTRAS.get(cls, ())}, cls
 
 
 @pytest.mark.cpu_only
@@ -2482,10 +2539,23 @@ def every_field_set():
             LayerGroupDesc("state", None, 0, 1, (1,)),
         ),
         buffers=(
-            BufferDesc(0, "key", 0, 0, 0, 64, MapperKind.NHD, RoleLayout(bytes_per_head=16)),
-            BufferDesc(2, "scale", 0, 1, 8, 8, MapperKind.REPLICATED, transferred=False),
+            BufferDesc(0, "key", 0, 0, 0, 64, token_major(64, 4, 2, 8)),
+            BufferDesc(2, "scale", 0, 1, 8, 8, transferred=False),
+            BufferDesc(1, "conv", 1, 0, 0, 48, sectioned((16, 32), 2), expansion=2),
             BufferDesc(
-                1, "conv", 1, 0, 0, 48, MapperKind.SECTIONED, RoleLayout((16, 32)), expansion=2
+                1,
+                "rows",
+                1,
+                0,
+                0,
+                48,
+                (
+                    Tensor(
+                        (Axis("row", 12, 8, ("tp",), cyclic=True), Axis("byte", 8, 1)),
+                        offset=8,
+                        name="r",
+                    ),
+                ),
             ),
         ),
         topology=RankTopology(4, 3, 2, 1, 2, 1, 4, 3, True),
@@ -2538,7 +2608,15 @@ def test_an_unchecked_rebuild_equals_the_checked_layout(build):
     layout = build()
     again = rebuilt(layout)
     assert again == layout and hash(again) == hash(layout) and typed(again) == typed(layout)
-    parts = (*layout.layer_groups, *layout.buffers, layout.topology, RoleLayout((16, 32), 16))
+    tensors = [t for b in layout.buffers for t in b.tensors]
+    parts = (
+        *layout.layer_groups,
+        *layout.buffers,
+        layout.topology,
+        RoleLayout((16, 32), 16),
+        *tensors,
+        *(a for t in tensors for a in t.axes),
+    )
     for value in (layout, ShardDesc(2, 1), *parts):
         fields = {f.name: getattr(value, f.name) for f in dataclasses.fields(value)}
         unchecked = type(value).unchecked(**fields)

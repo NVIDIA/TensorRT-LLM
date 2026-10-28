@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Mapping, Sequence
 
 import numpy as np
 
-from ..page_layout import BufferDesc, MapperKind, PageLayout
+from ..page_layout import BufferDesc, PageLayout, replicated
 from ..page_table import DevicePool, ManagerLayout  # noqa: F401  DevicePool: the lender's pools
 
 if TYPE_CHECKING:
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 # A new field left out at its default keeps the version; changing the encoding or the meaning of
 # an existing field bumps it.
-LAYOUT_ID_VERSION = 3
+LAYOUT_ID_VERSION = 4
 
 
 # Enums encode as the member name, floats as "f64:" plus the 16 hex digits of their big-endian
@@ -83,16 +83,29 @@ def canonical_order(layers: Sequence[Sequence[int]]) -> list[int]:
     return canonical
 
 
-def _geometry_document(buffer: BufferDesc) -> dict:
-    geometry = buffer.geometry
-    indexed = buffer.mapper not in (MapperKind.REPLICATED, MapperKind.SECTIONED)
-    return {
-        "section_bytes": None if geometry.section_bytes is None else list(geometry.section_bytes),
-        "bytes_per_head": geometry.bytes_per_head,
-        "num_heads": buffer.size // geometry.bytes_per_head
-        if indexed and geometry.bytes_per_head
-        else None,
-    }
+def _tensors_document(buffer: BufferDesc) -> list[dict] | None:
+    """The buffer's tensors, or None for the whole buffer alike on every rank."""
+    if buffer.tensors == replicated(buffer.size):
+        return None
+    out = []
+    for tensor in buffer.tensors:
+        axes = []
+        for axis in tensor.axes:
+            doc = {"name": axis.name, "extent": int(axis.extent), "stride": int(axis.stride)}
+            if axis.split:
+                doc["split"] = list(axis.split)
+            if axis.held is not None:
+                doc["held"] = int(axis.held)
+            if axis.cyclic:
+                doc["cyclic"] = True
+            axes.append(doc)
+        doc = {"axes": axes}
+        if tensor.name:
+            doc["name"] = tensor.name
+        if tensor.offset:
+            doc["offset"] = int(tensor.offset)
+        out.append(doc)
+    return out
 
 
 def _buffer_document(layout: PageLayout, b: BufferDesc) -> dict:
@@ -109,11 +122,9 @@ def _buffer_document(layout: PageLayout, b: BufferDesc) -> dict:
         "offset": sum(widths[: b.pool_index]) + int(b.slot_offset),
         "size": int(b.size),
     }
-    if b.mapper is not MapperKind.INDEXED:
-        doc["mapper"] = b.mapper.name
-    geometry = {k: v for k, v in _geometry_document(b).items() if v is not None}
-    if geometry:
-        doc["geometry"] = geometry
+    tensors = _tensors_document(b)
+    if tensors is not None:
+        doc["tensors"] = tensors
     if not b.transferred:
         doc["transfer"] = False
     if int(b.expansion) != 1:
@@ -122,8 +133,9 @@ def _buffer_document(layout: PageLayout, b: BufferDesc) -> dict:
 
 
 def layout_document(layout: PageLayout) -> dict:
-    """Hash canonical global layer groups, slot widths, kinds and buffer geometry, but no addresses,
-    windows, sinks, shards, topology, head counts, dtypes or local region numbering."""
+    """Hash canonical global layer groups, slot widths, kinds and each buffer's tensors, but no
+    addresses, windows, sinks, shards, topology, total head counts, dtypes or local region
+    numbering."""
     canonical = canonical_order([desc.layers for desc in layout.layer_groups])
     groups = [None] * len(layout.layer_groups)
     for local, desc in enumerate(layout.layer_groups):
