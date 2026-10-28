@@ -2012,5 +2012,94 @@ def test_indexer_q_prewarm_skips_indexers_of_other_pp_stages() -> None:
     owner.dist.tp_allgather.assert_called_once_with(1)
 
 
+def _fmha_prewarm_owner(modules: list, pp_size: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        model=SimpleNamespace(modules=lambda: iter(modules)),
+        mapping=SimpleNamespace(pp_size=pp_size),
+    )
+
+
+def _attention_layer(
+    uses_flashinfer_fmha: bool = True, trtllm_backend: bool = True, other_pp_stage: bool = False
+) -> Mock:
+    from tensorrt_llm._torch.attention.attention import Attention
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+
+    layer = Mock(spec=Attention)
+    layer.attn = Mock(spec=TrtllmAttention) if trtllm_backend else Mock()
+    layer.attn.has_fmha_library.return_value = uses_flashinfer_fmha
+    if other_pp_stage:
+        # remove_weights() marks every module of a layer owned by another pipeline stage.
+        layer._weights_removed = True
+    return layer
+
+
+@pytest.mark.cpu_only
+def test_flashinfer_fmha_prewarm_builds_once_under_pipeline_parallelism() -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import FlashInferTrtllmGenFmha
+
+    remote_layer = _attention_layer(other_pp_stage=True)
+    local_layers = [_attention_layer(), _attention_layer()]
+    owner = _fmha_prewarm_owner([torch.nn.Linear(2, 2), remote_layer, *local_layers], pp_size=4)
+
+    with (
+        patch.object(FlashInferTrtllmGenFmha, "serves_only_extra_page_sizes", return_value=False),
+        patch.object(FlashInferTrtllmGenFmha, "prewarm") as prewarm,
+    ):
+        DecoderWarmup._prewarm_flashinfer_trtllm_gen_fmha(owner)
+
+    prewarm.assert_called_once_with()
+    remote_layer.attn.has_fmha_library.assert_not_called()
+    local_layers[0].attn.has_fmha_library.assert_called_once_with(FlashInferTrtllmGenFmha)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "case",
+    [
+        "no_pipeline_parallelism",
+        "layers_of_other_pp_stage",
+        "no_flashinfer_fmha",
+        "other_backend",
+        "extra_page_sizes_only",
+    ],
+)
+def test_flashinfer_fmha_prewarm_is_noop(case: str) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import FlashInferTrtllmGenFmha
+
+    layer = _attention_layer(
+        uses_flashinfer_fmha=case != "no_flashinfer_fmha",
+        trtllm_backend=case != "other_backend",
+        other_pp_stage=case == "layers_of_other_pp_stage",
+    )
+    pp_size = 1 if case == "no_pipeline_parallelism" else 2
+    owner = _fmha_prewarm_owner([torch.nn.Linear(2, 2), layer], pp_size=pp_size)
+
+    with (
+        patch.object(
+            FlashInferTrtllmGenFmha,
+            "serves_only_extra_page_sizes",
+            return_value=case == "extra_page_sizes_only",
+        ),
+        patch.object(FlashInferTrtllmGenFmha, "prewarm") as prewarm,
+    ):
+        DecoderWarmup._prewarm_flashinfer_trtllm_gen_fmha(owner)
+
+    prewarm.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_trtllm_attention_reports_its_fmha_libraries() -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import FallbackFmha, FlashInferTrtllmGenFmha
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+
+    attn = object.__new__(TrtllmAttention)
+    attn._fmha_manager = SimpleNamespace(fmha_libs=[object.__new__(FallbackFmha)])
+    assert not attn.has_fmha_library(FlashInferTrtllmGenFmha)
+
+    attn._fmha_manager.fmha_libs.insert(0, object.__new__(FlashInferTrtllmGenFmha))
+    assert attn.has_fmha_library(FlashInferTrtllmGenFmha)
+
+
 if __name__ == "__main__":
     unittest.main()

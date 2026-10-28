@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
@@ -389,6 +389,8 @@ class DecoderWarmup:
         )
 
         log_mem_snapshot("warmup/before_warmup")
+        with self._warmup_timer.phase("flashinfer_fmha_prewarm"):
+            self._prewarm_flashinfer_trtllm_gen_fmha()
         # Compile the DSv4 indexer-Q CuTe DSL kernels before the first
         # collective-bearing forward, so their JIT cost is not charged against the
         # MoE all-to-all completion-flag deadline.
@@ -649,6 +651,37 @@ class DecoderWarmup:
                     f"skipping bucket. {type(e).__name__}: {e}"
                 )
         torch.cuda.synchronize()
+
+    def _prewarm_flashinfer_trtllm_gen_fmha(self) -> None:
+        """Build flashinfer's TRTLLM-Gen FMHA module before the first warmup forward.
+
+        flashinfer builds the module on first use, and MPI workers keep a
+        flashinfer workspace per process by default, so every rank builds its
+        own copy. Under pipeline parallelism the first warmup forward reaches
+        the ranks one after another, so builds left to that forward run in turn
+        and startup grows with the pipeline depth. Building here lets the ranks
+        build at the same time. Without pipeline parallelism there is nothing
+        to overlap, and where the library serves only extra KV cache page sizes
+        most layers never use it, so there the module stays built on first use.
+        """
+        if self.mapping.pp_size == 1:
+            return
+        from tensorrt_llm._torch.attention.attention import Attention
+        from tensorrt_llm._torch.attention.backends.fmha import FlashInferTrtllmGenFmha
+
+        if FlashInferTrtllmGenFmha.serves_only_extra_page_sizes():
+            return
+        for module in self.model.modules():
+            # Layers of other pipeline stages keep their modules but not their
+            # weights; they never run on this rank.
+            if (
+                isinstance(module, Attention)
+                and not getattr(module, "_weights_removed", False)
+                and isinstance(module.attn, TrtllmAttention)
+                and module.attn.has_fmha_library(FlashInferTrtllmGenFmha)
+            ):
+                FlashInferTrtllmGenFmha.prewarm()
+                return
 
     def _prewarm_cute_dsl_indexer_q(self) -> None:
         """Pre-compile the DSv4 indexer-Q CuTe DSL kernels, then barrier.
