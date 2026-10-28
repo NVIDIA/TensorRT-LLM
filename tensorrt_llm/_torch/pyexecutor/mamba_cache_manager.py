@@ -4176,6 +4176,23 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         super().shutdown()
 
 
+# K3_PUB_GENGAP_ADMIT=1 (default off): admitting a request on a disaggregated
+# GEN server (reset / relocate / seed of the KDA replay slots) must not stall
+# the host on the decode step that is still running, and should not launch
+# hundreds of tiny per-layer kernels. See the K3_PUB_GENGAP_ADMIT README.
+_K3_PUB_GENGAP_ADMIT = os.environ.get("K3_PUB_GENGAP_ADMIT", "0") == "1"
+_k3_pub_gengap_admit_noted = False
+
+
+def _k3_pub_gengap_admit_note() -> None:
+    global _k3_pub_gengap_admit_noted
+    if not _k3_pub_gengap_admit_noted:
+        _k3_pub_gengap_admit_noted = True
+        logger.info("K3_PUB_GENGAP_ADMIT=1: KDA replay-slot admission uses "
+                    "pinned non-blocking index uploads and batched seeding "
+                    "(no host wait on the running decode step).")
+
+
 class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
     """V2 hybrid cache manager with Kimi KDA replay state.
 
@@ -4330,11 +4347,32 @@ class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
         if (not self._use_kda_replay_update
                 or self.prev_num_accepted_tokens is None):
             return
+        if _K3_PUB_GENGAP_ADMIT:
+            _k3_pub_gengap_admit_note()
+            if not isinstance(slots, torch.Tensor):
+                slots = self._gengap_index_tensor(list(slots)) if len(
+                    slots) > 0 else None
+            if slots is not None and slots.numel() > 0:
+                self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
+            return
         slots = torch.as_tensor(slots,
                                 dtype=torch.long,
                                 device=self.prev_num_accepted_tokens.device)
         if slots.numel() > 0:
             self.prev_num_accepted_tokens[slots] = 0
+
+    def _gengap_index_tensor(self, values: List[int]) -> torch.Tensor:
+        """Host list -> device int64 index without stalling the host.
+
+        ``torch.tensor(values, device="cuda")`` copies from pageable memory
+        and then synchronizes the stream, so the host waits for the decode
+        step that is still running. A pinned staging tensor with a
+        non-blocking copy is ordered on the stream and returns at once.
+        """
+        host = torch.tensor(values,
+                            dtype=torch.long,
+                            pin_memory=prefer_pinned())
+        return host.to(self.prev_num_accepted_tokens.device, non_blocking=True)
 
     def _relocate_kda_replay_slots(self, old_slots: List[int],
                                    new_slots: List[int]) -> None:
@@ -4348,12 +4386,18 @@ class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
             return
 
         device = self.prev_num_accepted_tokens.device
-        source_slots = torch.tensor([old for old, _ in moves],
-                                    dtype=torch.long,
-                                    device=device)
-        destination_slots = torch.tensor([new for _, new in moves],
-                                         dtype=torch.long,
-                                         device=device)
+        if _K3_PUB_GENGAP_ADMIT:
+            _k3_pub_gengap_admit_note()
+            source_slots = self._gengap_index_tensor([old for old, _ in moves])
+            destination_slots = self._gengap_index_tensor(
+                [new for _, new in moves])
+        else:
+            source_slots = torch.tensor([old for old, _ in moves],
+                                        dtype=torch.long,
+                                        device=device)
+            destination_slots = torch.tensor([new for _, new in moves],
+                                             dtype=torch.long,
+                                             device=device)
         replay_buffers = (
             self.kda_conv_q,
             self.kda_conv_k,
@@ -4443,6 +4487,11 @@ class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
         if not slots:
             return
 
+        if _K3_PUB_GENGAP_ADMIT:
+            _k3_pub_gengap_admit_note()
+            self._seed_kda_replay_slots_batched(sorted(set(slots)))
+            return
+
         device = self.prev_num_accepted_tokens.device
         state_indices = torch.tensor(sorted(set(slots)),
                                      dtype=torch.long,
@@ -4468,6 +4517,34 @@ class KDAHybridCacheManagerV2(MambaHybridCacheManagerV2):
                               self.kda_beta_cache):
             replay_buffer.index_fill_(1, state_indices, 0)
         self.prev_num_accepted_tokens[state_indices] = 0
+
+    def _seed_kda_replay_slots_batched(self, host_slots: List[int]) -> None:
+        """Same result as the per-layer seeding loop, with no host sync.
+
+        The slots are already Python ints, so they index the buffers
+        directly (no device index tensor); the per-layer conv windows are
+        gathered once per slot and written with one copy per section instead
+        of one index_select / index_fill / index_copy per layer and section.
+        """
+        committed_window = self.conv_state_shape[1]
+        section_offsets = [0]
+        for section_dim in self.conv_section_dims:
+            section_offsets.append(section_offsets[-1] + section_dim)
+        replay_conv_buffers = (self.kda_conv_q, self.kda_conv_k,
+                               self.kda_conv_v)
+        for slot in host_slots:
+            # [layers, conv channels, committed window]
+            conv = torch.stack([state[slot] for state in self.all_conv_states])
+            for section_idx, replay_buffer in enumerate(replay_conv_buffers):
+                replay_slot = replay_buffer[:, slot]
+                replay_slot.zero_()
+                replay_slot[:, :, :committed_window].copy_(
+                    conv[:, section_offsets[section_idx]:
+                         section_offsets[section_idx + 1], :])
+            for replay_buffer in (self.kda_kg_cache, self.kda_v_cache,
+                                  self.kda_beta_cache):
+                replay_buffer[:, slot].zero_()
+            self.prev_num_accepted_tokens[slot].zero_()
 
     def mamba_layer_cache(
         self, layer_idx: int

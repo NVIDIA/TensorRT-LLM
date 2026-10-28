@@ -55,6 +55,7 @@ from ..utils import (
     maybe_compiled_cat,
     maybe_compiled_copy_,
 )
+from . import mla_ctx_k_triton
 from .attention import (
     _helix_cp_allgather_input,
     _helix_cp_output_projection,
@@ -228,6 +229,13 @@ def fp8_block_scaling_bmm_out(
     else:
         raise NotImplementedError(f"SM{sm_version} is not supported")
 
+
+
+def _cat_k_nope_pe(k_nope: torch.Tensor, k_pe: torch.Tensor, num_heads: int) -> torch.Tensor:
+    """K = concat(k_nope [T,H,dn], k_pe [T,1,dr] broadcast over heads) -> [T,H,dn+dr]."""
+    if mla_ctx_k_triton.is_enabled() and k_nope.is_cuda:
+        return mla_ctx_k_triton.mla_concat_k(k_nope, k_pe)
+    return maybe_compiled_cat((k_nope, k_pe.expand(-1, num_heads, -1)), dim=-1)
 
 class MLA(nn.Module):
     def __init__(
@@ -1225,9 +1233,7 @@ class MLA(nn.Module):
 
         full_k_nope = full_k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
         full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
-        full_k = maybe_compiled_cat(
-            (full_k_nope, full_k_pe.expand(-1, self.num_heads_tp, -1)), dim=-1
-        )
+        full_k = _cat_k_nope_pe(full_k_nope, full_k_pe, self.num_heads_tp)
         full_k = full_k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
         # release pytorch activation memory
@@ -1303,13 +1309,7 @@ class MLA(nn.Module):
                 self.qk_nope_head_dim,
             )
             partition_k_pe = partition_k_pe.view(-1, 1, self.qk_rope_head_dim)
-            partition_k = maybe_compiled_cat(
-                (
-                    partition_k_nope,
-                    partition_k_pe.expand(-1, self.num_heads_tp, -1),
-                ),
-                dim=-1,
-            )
+            partition_k = _cat_k_nope_pe(partition_k_nope, partition_k_pe, self.num_heads_tp)
             return partition_k.view(-1, self.num_heads_tp * self.qk_head_dim), partition_v
 
         def run_partition(
@@ -1453,9 +1453,7 @@ class MLA(nn.Module):
 
             chunked_k_nope = chunked_k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
             chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
-            chunked_k = maybe_compiled_cat(
-                (chunked_k_nope, chunked_k_pe.expand(-1, self.num_heads_tp, -1)), dim=-1
-            )
+            chunked_k = _cat_k_nope_pe(chunked_k_nope, chunked_k_pe, self.num_heads_tp)
             chunked_k = chunked_k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
             # release pytorch activation memory
@@ -1515,7 +1513,7 @@ class MLA(nn.Module):
 
         k_nope = k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        k = maybe_compiled_cat((k_nope, k_pe.expand(-1, self.num_heads_tp, -1)), dim=-1)
+        k = _cat_k_nope_pe(k_nope, k_pe, self.num_heads_tp)
         k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
         # copy q_lens to replace kv_lens_runtime

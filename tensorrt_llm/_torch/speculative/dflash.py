@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
@@ -34,6 +35,30 @@ from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DFlashDecodingConfig
+
+# K3_PUB_GENGAP_ADMIT=1 (default off): ``ctx_len[slot] = 0`` on a CUDA tensor
+# copies the scalar from pageable host memory and then synchronizes the stream,
+# so the host waits for the decode step that is still running. SpecMetadata
+# .prepare() does this for every request that leaves the batch and
+# _assign_slot() for every request that joins it. ``ctx_len[slot].zero_()``
+# writes the same value on the same stream without the host wait.
+_K3_PUB_GENGAP_ADMIT = os.environ.get("K3_PUB_GENGAP_ADMIT", "0") == "1"
+_k3_pub_gengap_admit_noted = False
+
+
+def _reset_ctx_len_slot(ctx_len: torch.Tensor, slot: int) -> None:
+    """``ctx_len[slot] = 0`` (see the K3_PUB_GENGAP_ADMIT note above)."""
+    global _k3_pub_gengap_admit_noted
+    if _K3_PUB_GENGAP_ADMIT:
+        if not _k3_pub_gengap_admit_noted:
+            _k3_pub_gengap_admit_noted = True
+            logger.info(
+                "K3_PUB_GENGAP_ADMIT=1: drafter slot resets use an on-stream zero "
+                "(no host wait on the running decode step)."
+            )
+        ctx_len[slot].zero_()
+    else:
+        ctx_len[slot] = 0
 
 
 def dflash_draft_slot_ids(
@@ -146,7 +171,7 @@ class DFlashSpecMetadata(SpecMetadata):
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
-                    worker._ctx_len[slot] = 0
+                    _reset_ctx_len_slot(worker._ctx_len, slot)
                     worker._free_slots.append(slot)
 
             # Give every real generation request a slot even though it never
@@ -724,14 +749,14 @@ class DFlashWorker(SpecWorkerBase):
         """
         if reset and req_id in self._req_to_slot:
             old_slot = self._req_to_slot.pop(req_id)
-            self._ctx_len[old_slot] = 0
+            _reset_ctx_len_slot(self._ctx_len, old_slot)
             self._free_slots.append(old_slot)
         if req_id not in self._req_to_slot:
             if not self._free_slots:
                 return None
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
-            self._ctx_len[slot] = 0
+            _reset_ctx_len_slot(self._ctx_len, slot)
         return self._req_to_slot[req_id]
 
     def _store_context_kv_paged(
