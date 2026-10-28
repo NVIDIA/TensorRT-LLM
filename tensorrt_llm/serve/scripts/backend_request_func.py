@@ -52,6 +52,9 @@ class RequestFuncInput:
     ignore_eos: bool = False
     language: Optional[str] = None
     multi_modal_content: Optional[dict] = None
+    # JSON encoding of the prompt (e.g. b"[1, 2, 3]"). When set, it is sent in
+    # place of `prompt`, so long token-id prompts are not re-encoded per request.
+    prompt_json: Optional[bytes] = None
 
 
 @dataclass
@@ -68,6 +71,21 @@ class RequestFuncOutput:
     error: str = ""
     avg_decoded_tokens_per_iter: float = 0.0  # Average tokens decoded per iteration
     exception_type: str = None  # unset
+    # Prompt tokens served from the server's KV cache, from
+    # usage.prompt_tokens_details.cached_tokens; None if not reported.
+    cached_tokens: Optional[int] = None
+
+
+def _cached_tokens_from_usage(usage: Optional[dict]) -> Optional[int]:
+    details = (usage or {}).get("prompt_tokens_details")
+    return details.get("cached_tokens") if details else None
+
+
+def _encode_payload(payload: dict, prompt_key: str,
+                    prompt_json: bytes) -> bytes:
+    """JSON-encode a non-empty `payload` plus `prompt_key` set to `prompt_json`."""
+    return (b'{"' + prompt_key.encode() + b'": ' + prompt_json + b", " +
+            json.dumps(payload).encode()[1:])
 
 
 async def async_request_trt_llm(
@@ -197,6 +215,15 @@ async def async_request_openai_completions(
     if request_func_input.extra_body:
         payload.update(request_func_input.extra_body)
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+    if request_func_input.prompt_json is not None:
+        del payload["prompt"]
+        post_kwargs = dict(data=_encode_payload(payload, "prompt",
+                                                request_func_input.prompt_json),
+                           headers={
+                               **headers, "Content-Type": "application/json"
+                           })
+    else:
+        post_kwargs = dict(json=payload, headers=headers)
 
     output = RequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
@@ -205,9 +232,7 @@ async def async_request_openai_completions(
     st = time.perf_counter()
     most_recent_timestamp = st
     try:
-        async with request_session.post(url=api_url,
-                                        json=payload,
-                                        headers=headers) as response:
+        async with request_session.post(url=api_url, **post_kwargs) as response:
             if response.status == 200:
                 if streaming:
                     first_chunk_received = False
@@ -243,6 +268,8 @@ async def async_request_openai_completions(
                         elif usage := data.get("usage"):
                             output.output_tokens = usage.get(
                                 "completion_tokens")
+                            output.cached_tokens = _cached_tokens_from_usage(
+                                usage)
                     if first_chunk_received:
                         output.success = True
                     else:
@@ -262,6 +289,8 @@ async def async_request_openai_completions(
                     output.ttft = -1
                     output.itl = []
                     output.output_tokens = data["usage"]["completion_tokens"]
+                    output.cached_tokens = _cached_tokens_from_usage(
+                        data["usage"])
                     # Extract avg_decoded_tokens_per_iter if available
                     choice = data["choices"][0]
                     if "avg_decoded_tokens_per_iter" in choice:
@@ -374,6 +403,8 @@ async def async_request_openai_chat_completions(
                         elif usage := data.get("usage"):
                             output.output_tokens = usage.get(
                                 "completion_tokens")
+                            output.cached_tokens = _cached_tokens_from_usage(
+                                usage)
 
                         most_recent_timestamp = timestamp
 
@@ -385,6 +416,8 @@ async def async_request_openai_chat_completions(
                     output.generated_text = data["choices"][0]["message"][
                         "content"]
                     output.output_tokens = data["usage"]["completion_tokens"]
+                    output.cached_tokens = _cached_tokens_from_usage(
+                        data["usage"])
                     output.itl = []
                     output.latency = time.perf_counter() - st
                     output.ttft = -1

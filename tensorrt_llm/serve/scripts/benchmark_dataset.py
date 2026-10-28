@@ -210,6 +210,85 @@ class SampleRequest:
     prompt_len: int
     expected_output_len: int
     multi_modal_data: Optional[dict] = None
+    # Multi-turn conversation of the request, sent as
+    # conversation_params.conversation_id; None for independent requests.
+    conversation_id: Optional[str] = None
+
+
+def _encode_token_ids(token_ids: np.ndarray) -> bytes:
+    """JSON-encode token ids without the enclosing brackets, e.g. b"1, 2, 3"."""
+    return json.dumps(token_ids.tolist())[1:-1].encode()
+
+
+class RandomConversations:
+    """Multi-turn conversations of random token ids for cached-context runs.
+
+    Every conversation starts with a random history (turn 0) that is sent once
+    to prime the server's KV cache. Measured turn k appends new random tokens
+    to the prompt of turn k - 1, so a server with KV cache block reuse serves
+    the previous prompt from cache and computes only the new tokens. Prompts
+    are kept JSON-encoded and extended in place, so a long prompt is not
+    re-encoded on every turn.
+    """
+
+    def __init__(self, conversation_ids: list[str], histories: list[np.ndarray],
+                 turns: list[list[np.ndarray]],
+                 output_lens: list[list[int]]) -> None:
+        self.conversation_ids = conversation_ids
+        self._prompts = [_encode_token_ids(history) for history in histories]
+        self._turns = turns
+        self._next_turn = [0] * len(conversation_ids)
+        # One output token is enough for turn 0 to prefill the history.
+        self.priming_requests = [
+            SampleRequest(prompt=None,
+                          prompt_len=len(history),
+                          expected_output_len=1,
+                          conversation_id=conversation_id)
+            for conversation_id, history in zip(conversation_ids, histories)
+        ]
+        # The measured turns, and for each conversation the indices of its
+        # turns in `requests`.
+        self.requests: list[SampleRequest] = []
+        self._request_indices: list[list[int]] = []
+        for conversation_id, history, conversation_turns, turn_output_lens in zip(
+                conversation_ids, histories, turns, output_lens):
+            prompt_len = len(history)
+            indices = []
+            for new_tokens, output_len in zip(conversation_turns,
+                                              turn_output_lens):
+                prompt_len += len(new_tokens)
+                indices.append(len(self.requests))
+                self.requests.append(
+                    SampleRequest(prompt=None,
+                                  prompt_len=prompt_len,
+                                  expected_output_len=output_len,
+                                  conversation_id=conversation_id))
+            self._request_indices.append(indices)
+
+    @property
+    def num_conversations(self) -> int:
+        return len(self.conversation_ids)
+
+    def priming_prompt_json(self, conversation: int) -> bytes:
+        """Return the JSON prompt of turn 0; valid until the first next_turn."""
+        if self._next_turn[conversation] != 0:
+            raise RuntimeError("Priming must precede the measured turns.")
+        return b"[" + self._prompts[conversation] + b"]"
+
+    def next_turn(self, conversation: int) -> Optional[tuple[int, bytes]]:
+        """Append the next turn to the conversation's prompt.
+
+        Returns the turn's index in `requests` and its JSON prompt, or None if
+        the conversation has no turns left.
+        """
+        turn = self._next_turn[conversation]
+        if turn == len(self._turns[conversation]):
+            return None
+        self._next_turn[conversation] = turn + 1
+        self._prompts[conversation] += b", " + _encode_token_ids(
+            self._turns[conversation][turn])
+        return (self._request_indices[conversation][turn],
+                b"[" + self._prompts[conversation] + b"]")
 
 
 # -----------------------------------------------------------------------------
@@ -560,6 +639,77 @@ class RandomDataset(BenchmarkDataset):
                         expected_output_len=int(output_lens[i]),
                     ))
         return requests
+
+    def sample_conversations(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        num_requests: int,
+        num_conversations: int,
+        cached_len: int,
+        range_ratio: float = DEFAULT_RANGE_RATIO,
+        input_len: int = DEFAULT_INPUT_LEN,
+        output_len: int = DEFAULT_OUTPUT_LEN,
+    ) -> RandomConversations:
+        """Sample multi-turn conversations whose turns reuse the KV cache.
+
+        The `num_requests` measured turns are spread evenly over
+        `num_conversations` conversations. Each turn appends new tokens, a
+        count drawn from [input_len * (1 - range_ratio),
+        input_len * (1 + range_ratio)], to the previous turn's prompt. The
+        histories are sized so that the cached part of a turn (the previous
+        turn's prompt) averages `cached_len` tokens over all measured turns.
+
+        Lengths follow the dataset seed. Token ids are drawn fresh on every
+        call, so a rerun against the same server does not hit the cached
+        prompts of an earlier run.
+        """
+        if range_ratio >= 1.0:
+            raise ValueError(
+                "random_range_ratio must be < 1.0 to ensure a valid sampling range"
+            )
+        if not 0 < num_conversations <= num_requests:
+            raise ValueError(
+                f"The number of conversations ({num_conversations}) must be "
+                f"between 1 and the number of prompts ({num_requests}).")
+        turns_per_conversation = num_requests / num_conversations
+        history_len = round(cached_len -
+                            (turns_per_conversation - 1) / 2 * input_len)
+        if history_len < 1:
+            raise ValueError(
+                f"A mean cached length of {cached_len} tokens is too short for "
+                f"{turns_per_conversation:g} turns of {input_len} new tokens "
+                "per conversation.")
+
+        input_low = max(1, int(input_len * (1 - range_ratio)))
+        input_high = max(input_low, int(input_len * (1 + range_ratio)))
+        output_low = max(1, int(output_len * (1 - range_ratio)))
+        output_high = max(output_low, int(output_len * (1 + range_ratio)))
+        length_rng = np.random.default_rng(
+            [self.random_seed, num_requests, num_conversations])
+        token_rng = np.random.default_rng()
+        vocab_size = tokenizer.vocab_size
+        run_tag = f"{token_rng.integers(1 << 32):08x}"
+
+        conversation_ids, histories, turns, output_lens = [], [], [], []
+        base_turns, extra_turns = divmod(num_requests, num_conversations)
+        for conversation in range(num_conversations):
+            num_turns = base_turns + int(conversation < extra_turns)
+            conversation_ids.append(f"cached-{run_tag}-{conversation}")
+            histories.append(
+                token_rng.integers(0,
+                                   vocab_size,
+                                   size=history_len,
+                                   dtype=np.int32))
+            turns.append([
+                token_rng.integers(0, vocab_size, size=n, dtype=np.int32)
+                for n in length_rng.integers(
+                    input_low, input_high + 1, size=num_turns)
+            ])
+            output_lens.append(
+                length_rng.integers(output_low, output_high + 1,
+                                    size=num_turns).tolist())
+        return RandomConversations(conversation_ids, histories, turns,
+                                   output_lens)
 
 
 # -----------------------------------------------------------------------------
