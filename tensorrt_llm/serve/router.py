@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import asyncio
+import sys
 import time
 from abc import ABC, abstractmethod
+from array import array
 from collections import OrderedDict
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional
 
@@ -59,6 +61,8 @@ ROUTE_AFFINITY_TOKEN_PREFIX = 256
 # conversation_ids, to place later new conversation_ids by prefix match.
 CONVERSATION_CONTENT_STRIDE = 8
 CONVERSATION_CONTENT_CACHE_SIZE = 4096
+# blake3 key of the first link of a conversation's content-key chain (32 bytes).
+CONVERSATION_CONTENT_HASH_SEED = b"TensorRT-LLM-conv-content-v1!!!!"
 # Route-info flag of a get_next_server_by_key answer that placed nothing: the
 # caller must repeat it with ConversationRouter.content_routing_key().
 ROUTING_CONTENT_REQUIRED = "routing_content_required"
@@ -1307,6 +1311,22 @@ class _BlockHashTrie:
         return len(node.session_ids)
 
 
+def _chained_chunk_hashes(data: bytes, chunk_bytes: int) -> list[int]:
+    """One key per full *chunk_bytes* chunk of *data*.
+
+    Each chunk is hashed with keyed blake3 under the previous chunk's full
+    digest, so each key identifies the whole prefix up to its chunk; the low 8
+    bytes of the digest are the key.
+    """
+    view = memoryview(data)
+    key = CONVERSATION_CONTENT_HASH_SEED
+    hashes = []
+    for start in range(0, len(view) - chunk_bytes + 1, chunk_bytes):
+        key = blake3(view[start:start + chunk_bytes], key=key).digest()
+        hashes.append(int.from_bytes(key[:8], "little"))
+    return hashes
+
+
 class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     """Router that provides session affinity for multi-turn conversations.
 
@@ -1643,13 +1663,31 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 and not self._is_routable_session(conv_id, exclude_server))
 
     def _conversation_content_hashes(self, request: OpenAIRequest) -> list[int]:
-        """Every ``CONVERSATION_CONTENT_STRIDE``-th block hash of *request*.
+        """One key per ``CONVERSATION_CONTENT_STRIDE`` blocks of *request*.
 
-        Block hashes are chained, so each kept hash identifies the whole
-        prefix up to its block and the strided list is a valid trie path.
+        Each key identifies the whole prefix up to its chunk (chained keyed
+        blake3), so the list is a valid trie path. The keys are only compared
+        with each other, also between the workers and the coordinator of a
+        two-step setup, never with worker block keys; hashing bytes in a few
+        calls keeps a long first request cheap on the event loop. The input is
+        chosen as in ``_request_to_block_hashes``: token ids when the request
+        carries them or ``use_token_ids`` is set (as int32), else the text's
+        code points (as UTF-32), after ``hash_skip_count`` leading elements.
         """
-        stride = CONVERSATION_CONTENT_STRIDE
-        return self._request_to_block_hashes(request)[stride - 1::stride]
+        token_ids = self._try_extract_token_ids(request)
+        if token_ids is None and self._use_token_ids:
+            token_ids = self._tokenize(request)
+        if token_ids is not None:
+            tokens = array("i", token_ids[0][self._hash_skip_count:])
+            if sys.byteorder != "little":
+                tokens.byteswap()
+            data = tokens.tobytes()
+        else:
+            skip = self._hash_skip_count * self.CHAR_PER_TOKEN
+            data = self._extract_text(request)[skip:].encode(
+                "utf-32-le", errors="surrogatepass")
+        chunk_bytes = 4 * CONVERSATION_CONTENT_STRIDE * self._tokens_per_block
+        return _chained_chunk_hashes(data, chunk_bytes)
 
     def _remember_conversation_content(self, conv_id: str,
                                        content_hashes: list[int]):

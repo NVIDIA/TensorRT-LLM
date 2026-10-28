@@ -32,7 +32,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 FunctionDefinition,
                                                 ResponsesRequest)
 from tensorrt_llm.serve.responses_utils import request_preprocess
-from tensorrt_llm.serve.router import (COORDINATOR_SELECT_MAX_ATTEMPTS,
+from tensorrt_llm.serve.router import (CONVERSATION_CONTENT_STRIDE,
+                                       COORDINATOR_SELECT_MAX_ATTEMPTS,
                                        KV_CACHE_HASH_ALGO_V1,
                                        KV_CACHE_HASH_ALGO_V2,
                                        KV_CACHE_HASH_ALGO_V2_SHA256_64,
@@ -1838,13 +1839,13 @@ def _conv_token_request(conversation_id, tokens):
 
 def _count_hashing(router):
     calls = []
-    original = router._request_to_block_hashes
+    original = router._conversation_content_hashes
 
     def counting(request):
         calls.append(request.conversation_params.conversation_id)
         return original(request)
 
-    router._request_to_block_hashes = counting
+    router._conversation_content_hashes = counting
     return calls
 
 
@@ -2021,6 +2022,97 @@ def test_conversation_router_rejects_a_negative_min_match():
         ConversationRouter(server_role=None,
                            servers=["s"],
                            new_conversation_min_match_blocks=-1)
+
+
+def _conv_text_request(conversation_id, text):
+    return CompletionRequest(
+        model="TinyLlama",
+        prompt=text,
+        disaggregated_params=DisaggregatedParams(request_type="context_only"),
+        conversation_params=ConversationParams(conversation_id=conversation_id))
+
+
+def _common_prefix_len(a, b):
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def test_conversation_content_keys_chain_over_the_prefix():
+    """Each content key covers the whole prefix up to its chunk."""
+    # tokens_per_block=4: one key per 32 code points.
+    router = ConversationRouter(server_role=None,
+                                servers=["s"],
+                                tokens_per_block=4)
+    base = "".join(chr(0x41 + i % 26) for i in range(100))
+    keys = router._conversation_content_hashes(_conv_text_request("a", base))
+    assert len(keys) == 3
+    longer = router._conversation_content_hashes(
+        _conv_text_request("b", base + "z" * 64))
+    assert len(longer) == 5 and longer[:3] == keys
+    changed = router._conversation_content_hashes(
+        _conv_text_request("c", "#" + base[1:]))
+    assert all(x != y for x, y in zip(changed, keys))
+
+
+def test_conversation_content_keys_are_stable():
+    """Workers and the coordinator of a two-step setup compare these keys."""
+    router = ConversationRouter(server_role=None,
+                                servers=["s"],
+                                tokens_per_block=4)
+    text = "".join(chr(0x61 + i % 26) for i in range(64))
+    text_keys = router._conversation_content_hashes(
+        _conv_text_request("a", text))
+    assert text_keys == [0x6036382F7AB6B531, 0x1F704CBF233854E5]
+    token_keys = router._conversation_content_hashes(
+        _conv_token_request("b", list(range(64))))
+    assert token_keys == [0x88A907F253DA0B03, 0xC684840ED9185A7A]
+
+
+def test_conversation_content_keys_follow_the_hashed_input():
+    """Token ids when the request carries them; hash_skip_count is applied."""
+    tokens = list(range(1000, 1100))
+    router = ConversationRouter(server_role=None,
+                                servers=["s"],
+                                tokens_per_block=4)
+    skipping = ConversationRouter(server_role=None,
+                                  servers=["s"],
+                                  tokens_per_block=4,
+                                  hash_skip_count=4)
+    keys = router._conversation_content_hashes(
+        _conv_token_request("a", tokens[4:]))
+    assert len(keys) == 3
+    assert skipping._conversation_content_hashes(
+        _conv_token_request("b", tokens)) == keys
+    text = "".join(chr(0x41 + i % 26) for i in range(120))
+    skip = 4 * ConversationRouter.CHAR_PER_TOKEN
+    assert skipping._conversation_content_hashes(_conv_text_request(
+        "c", text)) == router._conversation_content_hashes(
+            _conv_text_request("d", text[skip:]))
+
+
+def test_conversation_content_keys_match_as_deep_as_block_hashes():
+    """A pair shares as many content keys as strided block hashes."""
+    rng = random.Random(7)
+    stride = CONVERSATION_CONTENT_STRIDE
+    router = ConversationRouter(server_role=None,
+                                servers=["s"],
+                                tokens_per_block=4)
+    for _ in range(50):
+        prefix = [rng.randrange(1, 50000) for _ in range(rng.randrange(0, 600))]
+        tail = [rng.randrange(1, 50000) for _ in range(200)]
+        a = _conv_token_request("a", prefix + tail)
+        b = _conv_token_request("b", prefix + [tail[0] + 1] + tail[1:])
+        old = _common_prefix_len(
+            router._request_to_block_hashes(a)[stride - 1::stride],
+            router._request_to_block_hashes(b)[stride - 1::stride],
+        )
+        new = _common_prefix_len(router._conversation_content_hashes(a),
+                                 router._conversation_content_hashes(b))
+        assert new == old
 
 
 @pytest.mark.asyncio
