@@ -219,8 +219,9 @@ def test_vanilla_indexer_q_projection_supports_fp8_block_weight(
     monkeypatch.setattr(linear_mod, "get_sm_version", lambda: sm_version)
     monkeypatch.setattr(linear_mod, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", rubin_available)
     # Pick an amax where amax / 448.0 is not a power of two so UE8M0 vs
-    # float32 activation scales produce distinct QDQ values.
-    qr = torch.linspace(-300.0, 300.0, 128, dtype=torch.bfloat16).reshape(1, 128)
+    # float32 activation scales produce distinct QDQ values. The range is
+    # asymmetric so quantization errors do not cancel in the all-ones projection.
+    qr = torch.linspace(-120.0, 300.0, 128, dtype=torch.bfloat16).reshape(1, 128)
     weight = torch.ones(129, 128, dtype=torch.float8_e4m3fn)
     raw_weight_scale = torch.tensor([[0.25], [0.5]], dtype=torch.float32)
     weight_scale = (
@@ -256,6 +257,82 @@ def test_vanilla_indexer_q_projection_supports_fp8_block_weight(
     expected = torch.nn.functional.linear(
         qdq_qr.to(torch.bfloat16),
         (weight.float() * expanded_scale[:129, :128]).to(torch.bfloat16),
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize("use_ue8m0", [False, True])
+def test_vanilla_indexer_fp8_block_qdq_matches_native_quantizer(monkeypatch, use_ue8m0):
+    num_tokens = 4
+    in_features = 256
+    out_features = 129
+    num_blocks = in_features // 128
+    torch.manual_seed(0)
+    # Rows span several magnitudes so block scales cover small, unit, and
+    # large amax values in both scale formats.
+    row_scales = torch.tensor([[1e-3], [1.0], [30.0], [300.0]])
+    qr = (torch.randn(num_tokens, in_features) * row_scales).to(torch.bfloat16)
+
+    q_fp8, activation_scales = torch.ops.trtllm.fp8_quantize_1x128(qr.cuda(), use_ue8m0=use_ue8m0)
+    # fp8_quantize_1x128 stores scales block-major as [num_blocks, M padded to
+    # 4]; M == 4 keeps that layout identical on SM90 and SM100.
+    native_scales = activation_scales.reshape(-1)[: num_blocks * num_tokens]
+    native_scales = native_scales.view(num_blocks, num_tokens).T
+    native_qdq_qr = (
+        (q_fp8.float().view(num_tokens, num_blocks, 128) * native_scales.unsqueeze(-1))
+        .reshape(num_tokens, in_features)
+        .to(qr.dtype)
+        .cpu()
+    )
+
+    # Compare QDQ values directly so the projection cannot hide a mismatch.
+    vanilla_qdq_qr = DSAVanillaIndexer._qdq_fp8_blocks(qr, use_ue8m0=use_ue8m0)
+    if use_ue8m0:
+        torch.testing.assert_close(vanilla_qdq_qr, native_qdq_qr, atol=0, rtol=0)
+    else:
+        # The kernel is built with --use_fast_math, so its float32 448 / amax
+        # and reciprocal can differ from IEEE division by one ulp. Compare E4M3
+        # codes and allow only rare moves to an adjacent code.
+        vanilla_codes = (
+            (
+                vanilla_qdq_qr.float().view(num_tokens, num_blocks, 128)
+                / native_scales.cpu().unsqueeze(-1)
+            )
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+            .int()
+        )
+        native_codes = q_fp8.cpu().view(num_tokens, num_blocks, 128).view(torch.uint8).int()
+        code_diff = (vanilla_codes - native_codes).abs()
+        assert code_diff.max().item() <= 1
+        assert (code_diff != 0).float().mean().item() <= 0.01
+
+    monkeypatch.setattr(
+        DSAVanillaIndexer,
+        "_fp8_block_scales_uses_ue8m0",
+        staticmethod(lambda linear: use_ue8m0),
+    )
+    weight = torch.randn(out_features, in_features).to(torch.float8_e4m3fn)
+    weight_scale = torch.tensor([[0.25, 0.125], [0.5, 1.0]], dtype=torch.float32)
+    linear = SimpleNamespace(
+        weight=weight,
+        weight_scale=weight_scale,
+        input_scale=torch.tensor(1.0),
+        force_dynamic_quantization=False,
+        in_features=in_features,
+        out_features=out_features,
+        dtype=torch.bfloat16,
+    )
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    # The QDQ input is pinned to the native quantizer above, so the projection
+    # check covers how _wq_projection_reference applies it and the weight scales.
+    expanded_scale = weight_scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    expected = torch.nn.functional.linear(
+        vanilla_qdq_qr,
+        (weight.float() * expanded_scale[:out_features, :in_features]).to(torch.bfloat16),
     )
     torch.testing.assert_close(actual, expected)
 

@@ -575,8 +575,14 @@ class DSAVanillaIndexer(nn.Module):
 
         Each block of the last dimension gets its own 1x128 scale, rounded up
         to a UE8M0 power of two when the target FP8 block-scaled GEMM path
-        uses UE8M0 activation scales or left as float32 ``amax / 448``
-        otherwise.
+        uses UE8M0 activation scales or left as float32 otherwise.
+
+        The arithmetic follows ``fp8_quantize_1x128``'s kernel: it forms
+        ``quant = 448 / amax``, stores ``dequant = 1 / quant``, and quantizes
+        ``x * quant``. UE8M0 results match the kernel exactly. Float32 scales
+        can differ by one ulp because the kernel is built with
+        ``--use_fast_math``, which occasionally moves an element to the
+        adjacent E4M3 code.
 
         Args:
             x: [..., K] activations; K must be divisible by ``block_size``.
@@ -593,12 +599,15 @@ class DSAVanillaIndexer(nn.Module):
             )
         blocks = rows.view(rows.shape[0], -1, block_size)
         # fp8_quantize_1x128 uses this floor before encoding the 1x128 scale.
-        amax = blocks.abs().float().amax(dim=-1).clamp_min(1e-10)
-        scale = amax / cls.FP8_MAX
+        amax = blocks.abs().float().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+        quant_scale = cls.FP8_MAX / amax
+        dequant_scale = 1.0 / quant_scale
         if use_ue8m0:
-            scale = cls.ceil_to_ue8m0(scale)
-        qdq = cls._qdq_fp8(blocks, scale.unsqueeze(-1))
-        return qdq.reshape_as(x)
+            dequant_scale = cls.ceil_to_ue8m0(dequant_scale)
+            quant_scale = 1.0 / dequant_scale
+        scaled = (blocks.float() * quant_scale).clamp(-cls.FP8_MAX, cls.FP8_MAX)
+        qdq = scaled.to(torch.float8_e4m3fn).float() * dequant_scale
+        return qdq.to(x.dtype).reshape_as(x)
 
     @staticmethod
     def _fp8_block_scales_uses_ue8m0(linear: Linear) -> bool:
