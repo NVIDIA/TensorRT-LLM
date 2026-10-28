@@ -416,15 +416,12 @@ class _SessionCheckpointLoader(HfCheckpointLoader):
     def __init__(
         self,
         events: list[str],
-        weights: dict[str, object] | None = None,
         *,
-        weights_preloaded: bool = False,
         target_weight_mapper: object | None = None,
     ) -> None:
         super().__init__()
         self.events = events
-        self.weights = {"model.weight": object()} if weights is None else weights
-        self.weights_preloaded = weights_preloaded
+        self.weights = {"model.weight": object()}
         self.target_weight_mapper = (
             object() if target_weight_mapper is None else target_weight_mapper
         )
@@ -445,9 +442,6 @@ class _SessionCheckpointLoader(HfCheckpointLoader):
         finally:
             status.finalization_seconds = 3.0
             self.events.append(f"session_exit:{checkpoint_dir}")
-
-    def is_weights_preloaded(self) -> bool:
-        return self.weights_preloaded
 
     def get_initialized_weight_mapper(self, model: object, config: object) -> object:
         del model, config
@@ -519,16 +513,11 @@ def test_sessionless_loader_times_its_read_as_preparation(
     }
 
 
-@pytest.mark.parametrize("weights_preloaded", [False, True])
 def test_target_mapper_is_initialized_before_weight_session(
-    monkeypatch: pytest.MonkeyPatch, weights_preloaded: bool
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events = []
-    # A preloading loader (MX P2P) writes the weights into the model itself
-    # and returns none to copy.
-    checkpoint_loader = _SessionCheckpointLoader(
-        events, weights={} if weights_preloaded else None, weights_preloaded=weights_preloaded
-    )
+    checkpoint_loader = _SessionCheckpointLoader(events)
     _record_weight_copies(monkeypatch, events)
     model = SimpleNamespace(load_weights=object())
     config, mapping, source_identity = _model_config(), object(), object()
@@ -549,12 +538,14 @@ def test_target_mapper_is_initialized_before_weight_session(
     )
 
     assert weight_mapper is checkpoint_loader.target_weight_mapper
-    assert loaded_weights_preloaded is weights_preloaded
-    expected_events = ["mapper_init", "session_enter:/checkpoint"]
-    if not weights_preloaded:
-        expected_events.append("materialize")
-    expected_events.append("session_exit:/checkpoint")
-    assert events == expected_events
+    # Only an MX P2P load writes the weights into the model itself.
+    assert loaded_weights_preloaded is False
+    assert events == [
+        "mapper_init",
+        "session_enter:/checkpoint",
+        "materialize",
+        "session_exit:/checkpoint",
+    ]
     # The target read gets the model, so a context-only worker reads lazily.
     assert checkpoint_loader.session_kwargs == {
         "/checkpoint": {
@@ -567,7 +558,7 @@ def test_target_mapper_is_initialized_before_weight_session(
     # HF loaders report the timings their weight session recorded.
     assert metrics["checkpoint_preparation_seconds"] == 2.0
     assert metrics["checkpoint_finalization_seconds"] == 3.0
-    assert ("weight_population_seconds" in metrics) is not weights_preloaded
+    assert "weight_population_seconds" in metrics
 
 
 def test_shadow_plan_disabled_does_not_call_inspection_hooks(
