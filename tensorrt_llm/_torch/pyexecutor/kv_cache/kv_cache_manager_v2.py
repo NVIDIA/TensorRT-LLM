@@ -1218,9 +1218,10 @@ def _update_kv_cache_draft_token_location(
 ) -> None:
     run_kv_cache_relocation = False
     for request in scheduled_batch.generation_requests:
-        if (
-            request.state != LlmRequestState.GENERATION_COMPLETE or include_finished_requests
-        ) and request.py_num_accepted_draft_tokens > 0:
+        # Most steps accept no draft token: test that before the costlier state read.
+        if request.py_num_accepted_draft_tokens > 0 and (
+            include_finished_requests or request.state != LlmRequestState.GENERATION_COMPLETE
+        ):
             if len(request.py_num_accepted_draft_tokens_indices) > 0:
                 run_kv_cache_relocation = True
     if not run_kv_cache_relocation:
@@ -1485,6 +1486,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # the class for instances built without running __init__.
     _commit_branch_snapshots = False
     _record_branch_snapshots = False
+
+    _window_log_enabled: Optional[bool] = None
+    """Whether sliding-window crossings are logged (debug level); resolved on first use."""
 
     def __init__(
         self,
@@ -2984,11 +2988,22 @@ class KVCacheManagerV2(BaseResourceManager):
         Debug level only, and the guard runs before any of the strings or the
         page-index scan are built, so a default run does no additional work.
         """
-        if new_capacity <= pre_capacity or not logger.is_debug_enabled():
+        if new_capacity <= pre_capacity:
             return
-        for layer_group_id, window_size in self._get_windowed_layer_group_sizes().items():
-            if not (pre_capacity <= window_size < new_capacity):
-                continue
+        # ``is_debug_enabled`` walks the call stack to find the caller's module and this
+        # runs once per generation request per step, so the answer is kept.
+        if self._window_log_enabled is None:
+            self._window_log_enabled = logger.is_debug_enabled()
+        if not self._window_log_enabled:
+            return
+        crossed = [
+            (layer_group_id, window_size)
+            for layer_group_id, window_size in self._get_windowed_layer_group_sizes().items()
+            if pre_capacity <= window_size < new_capacity
+        ]
+        if not crossed:
+            return
+        for layer_group_id, window_size in crossed:
             logger.debug(
                 f"[KVCacheManagerV2] request {req.py_request_id} crossed the sliding window "
                 f"during {phase}: layer_group_id={layer_group_id}, window={window_size}, "

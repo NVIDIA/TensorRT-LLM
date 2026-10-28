@@ -21,7 +21,7 @@ from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha
 PRIMS_TS = "prims_ts"
 PRIMS_TS_BLOCK_SPARSE = "prims_ts_block_sparse"
 PRIMS_TS_SPARSE_MLA = "prims_ts_sparse_mla"
-BEAM_SHARED_PREFIX = "beam_shared_prefix"
+SAMPLING_SHARED_PREFIX = "sampling_shared_prefix"
 
 
 def _canonical_names() -> tuple[str, ...]:
@@ -51,20 +51,21 @@ def test_default_fmha_libs_exclude_prims_ts(monkeypatch: pytest.MonkeyPatch) -> 
     assert _enabled_names() == registry.DEFAULT_FMHA_LIBS
 
 
-def test_beam_shared_prefix_is_opt_in_and_precedes_fallback(
-    monkeypatch: pytest.MonkeyPatch, ) -> None:
+def test_sampling_shared_prefix_is_opt_in_and_precedes_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
-    assert BEAM_SHARED_PREFIX not in registry.DEFAULT_FMHA_LIBS
-    assert not registry.is_fmha_lib_enabled(BEAM_SHARED_PREFIX)
+    assert SAMPLING_SHARED_PREFIX not in registry.DEFAULT_FMHA_LIBS
+    assert not registry.is_fmha_lib_enabled(SAMPLING_SHARED_PREFIX)
 
     names = _canonical_names()
-    assert names.index(BEAM_SHARED_PREFIX) < names.index("fallback")
+    assert names.index(SAMPLING_SHARED_PREFIX) < names.index("fallback")
 
-    monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{BEAM_SHARED_PREFIX}")
-    assert registry.is_fmha_lib_enabled(BEAM_SHARED_PREFIX)
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{SAMPLING_SHARED_PREFIX}")
+    assert registry.is_fmha_lib_enabled(SAMPLING_SHARED_PREFIX)
     enabled = _enabled_names()
-    assert BEAM_SHARED_PREFIX in enabled
-    assert enabled.index(BEAM_SHARED_PREFIX) < enabled.index("fallback")
+    assert SAMPLING_SHARED_PREFIX in enabled
+    assert enabled.index(SAMPLING_SHARED_PREFIX) < enabled.index("fallback")
 
 
 def test_only_the_block_sparse_fmha_declares_block_sparse_support() -> None:

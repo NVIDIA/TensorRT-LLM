@@ -747,6 +747,7 @@ class DecoderCudaGraphs:
             label: str,
             force_lora_graph: bool,
             sample_type: SampleType | None = None,
+            attn_variant: int | None = None,
         ) -> None:
             assert self._force_lora_graph_for_capture is None
             self._force_lora_graph_for_capture = force_lora_graph
@@ -757,6 +758,7 @@ class DecoderCudaGraphs:
             # which is what a batch resolving to FULL replays.
             pinned_tier = sample_type or SampleType.FULL
             self.cuda_graph_runner.set_capture_sample_type(pinned_tier)
+            self.cuda_graph_runner.set_capture_attn_variant(attn_variant)
             try:
                 for bs, draft_len in graphs_to_capture:
                     if bs > self._config.max_batch_size:
@@ -814,6 +816,7 @@ class DecoderCudaGraphs:
             finally:
                 self._force_lora_graph_for_capture = None
                 self.cuda_graph_runner.set_capture_sample_type(None)
+                self.cuda_graph_runner.set_capture_attn_variant(None)
 
         if self._lora.cuda_graph_manager is None:
             lora_graph_cases = [False]
@@ -847,12 +850,19 @@ class DecoderCudaGraphs:
                 variant_label = label
                 if self._lora.cuda_graph_manager is not None:
                     variant_label += ", LoRA" if use_lora_graph else ", base-only"
-                _run_capture_pass(
-                    force_non_greedy=force_non_greedy,
-                    label=variant_label,
-                    force_lora_graph=use_lora_graph,
-                    sample_type=sample_type,
-                )
+                # One pass per attention variant (two with the shared-prefix
+                # library, whose size gate picks the graph at runtime).
+                for attn_variant in self.cuda_graph_runner.attn_variants():
+                    _run_capture_pass(
+                        force_non_greedy=force_non_greedy,
+                        label=variant_label
+                        + (f", attn variant {attn_variant}" if attn_variant else ""),
+                        force_lora_graph=use_lora_graph,
+                        sample_type=sample_type,
+                        attn_variant=attn_variant
+                        if self.cuda_graph_runner.attn_variants_enabled
+                        else None,
+                    )
 
         if uses_own_spec_decoder:
             # One-engine spec branch: the greedy argmax fast path plus the
