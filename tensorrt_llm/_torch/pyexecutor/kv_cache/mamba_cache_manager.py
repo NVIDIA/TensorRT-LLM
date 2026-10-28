@@ -32,11 +32,15 @@ if TYPE_CHECKING:
     from tensorrt_llm.sampling_params import SamplingParams
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
-from tensorrt_llm._torch.disaggregation.resource.page import (MapperKind,
-                                                              RoleLayout)
 from tensorrt_llm._torch.pyexecutor.kv_cache import _lender_hooks
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS, BlockReusePolicy, KVCacheManagerV2, Role)
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (Tensor,
+                                                                 grid_place,
+                                                                 replicated,
+                                                                 sectioned)
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import \
+    rank_topology as page_topology
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
     KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -3562,53 +3566,53 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return None
         return conv, ngram
 
-    def get_disagg_role_mapper_kinds(self) -> Dict[DataRole, MapperKind]:
-        """Recurrent roles and how they reshard across TP.
+    def _page_buffer_tensors(self, layer_id: int, role: str, size: int,
+                             tokens: int, state: bool) -> Tuple[Tensor, ...]:
+        """Recurrent roles and how they spread over ranks.
 
-        Convolution state is SECTIONED: its flat per-layer buffer is a
+        Convolution state is sectioned: its flat per-layer buffer is a
         concatenation of sections (Mamba2 ``[x | B | C]``, GDN ``[Q | K | V]``)
-        that are each TP-sharded independently. SSM state keeps the INDEXED
-        default (sharded by head). PLE state is computed from replicated
-        inputs, so every rank holds identical bytes and the transfer copies
-        whole per-layer regions.
+        each split by byte over the ranks recurrent state splits over. SSM
+        state is split by head. PLE state is computed from replicated inputs,
+        so every rank holds identical bytes; so do the generation-local KDA
+        replay buffers.
         """
-        return {
-            **super().get_disagg_role_mapper_kinds(),
-            MambaRole.CONV_STATE:
-            MapperKind.SECTIONED,
-            MambaRole.PLE_CONV_STATE:
-            MapperKind.REPLICATED,
-            MambaRole.PLE_NGRAM_CONTEXT:
-            MapperKind.REPLICATED,
-        }
-
-    def get_disagg_role_layouts(self) -> Dict[DataRole, RoleLayout]:
-        """Per-layer geometry for resharding conv and SSM state."""
-        if self.local_num_mamba_layers == 0:
-            return {}
-        d_conv_m1 = int(self.conv_state_shape[1])
-        conv_elem_size = self.conv_state_dtype.itemsize
-        _, head_dim, d_state = self.ssm_state_shape
-        return {
-            MambaRole.CONV_STATE:
-            RoleLayout(section_bytes=tuple(
+        if role == MambaRole.CONV_STATE:
+            d_conv_m1 = int(self.conv_state_shape[1])
+            conv_elem_size = self.conv_state_dtype.itemsize
+            ranks, _ = grid_place(page_topology(self.mapping), ("tp", "cp"))
+            return sectioned([
                 int(dim) * d_conv_m1 * conv_elem_size
-                for dim in self.conv_section_dims)),
-            MambaRole.SSM_STATE:
-            RoleLayout(bytes_per_head=int(head_dim) * int(d_state) *
-                       self.ssm_state_dtype.itemsize),
-        }
+                for dim in self.conv_section_dims
+            ], ranks, ("tp", "cp"))
+        if role == MambaRole.SSM_STATE:
+            _, head_dim, d_state = self.ssm_state_shape
+            return self._page_head_split(layer_id,
+                                         size,
+                                         tokens,
+                                         state,
+                                         head_bytes=int(head_dim) *
+                                         int(d_state) *
+                                         self.ssm_state_dtype.itemsize)
+        if role in (MambaRole.PLE_CONV_STATE, MambaRole.PLE_NGRAM_CONTEXT
+                    ) or role in self._kda_replay_roles():
+            return replicated(size)
+        return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
 
-    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
+    def _page_untransferred_roles(self) -> frozenset[str]:
         """Keep the KDA replay buffers out of disaggregated transfers.
 
         They are generation-local: a context server allocates none, and a
         generation server seeds them from the transferred conv state.
         """
-        replay_roles = {DataRole(name) for name in self._kda_replay_layout()}
+        return super()._page_untransferred_roles() | self._kda_replay_roles()
+
+    def _kda_replay_roles(self) -> frozenset[str]:
+        """The roles of the KDA replay buffers, or none without them."""
+        replay_roles = {str(name) for name in self._kda_replay_layout()}
         if replay_roles:
-            replay_roles.add(_KDA_REPLAY_COUNT_ROLE)
-        return super().get_disagg_ignored_roles() | frozenset(replay_roles)
+            replay_roles.add(str(_KDA_REPLAY_COUNT_ROLE))
+        return frozenset(replay_roles)
 
     @property
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:

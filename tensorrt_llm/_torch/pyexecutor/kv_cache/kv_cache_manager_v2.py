@@ -36,7 +36,6 @@ import numpy as np
 import torch
 from strenum import StrEnum
 
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.model_config import _get_kv_cache_layer_specs
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
@@ -145,11 +144,9 @@ from .page_layout import (
     grid_place,
     head_major,
     replicated,
-    sectioned,
     token_major,
 )
 from .page_table import (
-    ALL_ROLE,
     DevicePool,
     ManagerLayout,
     attention_shard,
@@ -3640,6 +3637,7 @@ class KVCacheManagerV2(BaseResourceManager):
             total_kv_heads_by_layer=total_kv_heads,
             dtype=self._page_dtype(),
             quant_mode=self._page_quant_mode(),
+            rebuilds_untransferred=self._page_rebuilds_untransferred(),
         )
         return ManagerLayout(
             page_layout=page_layout,
@@ -3662,6 +3660,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 not any(is_non_required_layer(layer_cfg[lid]) for lid in group)
                 for group in grouping
             ),
+            local_layers=tuple(tuple((lid, global_of[lid]) for lid in group) for group in grouping),
+            kv_heads=tuple(kv_heads[group[0]][0] for group in grouping),
         )
 
     def _page_layer_configs(self) -> dict[int, AttentionLayerConfig | SsmLayerConfig]:
@@ -3711,52 +3711,56 @@ class KVCacheManagerV2(BaseResourceManager):
         tensors whose local pieces its ``size`` bytes hold, for ``tokens`` tokens of a page, in a
         layer of recurrent ``state`` or of attention.
 
-        Translated from the role declarations (``get_disagg_role_mapper_kinds``,
-        ``get_disagg_role_layouts``): replicated roles alike on every rank; head-major (INDEXED)
-        or token-major (NHD) roles split by KV head; sectioned roles split by byte, section by
-        section. Attention splits over the tensor-parallel ranks, recurrent state over tensor
-        times context ranks. A role whose heads the declarations do not give is this rank's own
-        share. A subclass whose buffers spread otherwise overrides this method.
+        The base manager's buffers are plain attention: ``Role.INDEX_KEY`` alike on every rank,
+        since every index-key side cache so far (DSA indexer-K, MiniMax M3) projects replicated
+        across TP ranks, and every other role head-major (HND) by the layer's KV heads, as the
+        TRTLLM attention kernels write K/V and their block scales. A subclass whose buffers
+        spread otherwise overrides this method, building tensors with ``page_layout``'s
+        ``head_major``, ``token_major``, ``sectioned`` and ``replicated`` or declaring its own.
         """
-        mappers = {
-            str(r): MapperKind(int(kind)) for r, kind in self.get_disagg_role_mapper_kinds().items()
-        }
-        if ALL_ROLE not in mappers:
-            raise ValueError(
-                "the manager declares no mapper kind for Role.ALL, the fallback of the roles it "
-                "does not list"
-            )
-        mapper = mappers.get(role, mappers[ALL_ROLE])
-        if mapper is MapperKind.REPLICATED:
+        if role == Role.INDEX_KEY:
             return replicated(size)
-        declared = {str(r): layout for r, layout in self.get_disagg_role_layouts().items()}.get(
-            role, RoleLayout()
-        )
+        return self._page_head_split(layer_id, size, tokens, state)
+
+    def _page_head_split(
+        self,
+        layer_id: int,
+        size: int,
+        tokens: int,
+        state: bool,
+        *,
+        head_bytes: Optional[int] = None,
+        token_major_: bool = False,
+    ) -> tuple[Tensor, ...]:
+        """A buffer split by head over the ranks attention splits over (tensor ranks) or recurrent
+        state does (tensor times context ranks): ``size // head_bytes`` heads, by default the
+        layer's KV heads on this rank, head-major or, with ``token_major_``, token-major. A buffer
+        whose heads are unknown is this rank's own share."""
         split = ("tp", "cp") if state else ("tp",)
         ranks, _ = grid_place(rank_topology(self.mapping), split)
-        if mapper is MapperKind.SECTIONED:
-            if declared.section_bytes is None or sum(declared.section_bytes) != size:
-                raise ValueError(f"sections {declared.section_bytes} do not make up {size} bytes")
-            return sectioned(declared.section_bytes, ranks, split)
         heads, total = self._page_kv_heads(layer_id)
-        head_bytes = declared.bytes_per_head
         if head_bytes is None and not state and heads > 0 and size % heads == 0:
             head_bytes = size // heads
         if head_bytes is None or size % head_bytes:
-            # Bytes this rank alone holds, in a split the declarations do not give.
             return (
                 Tensor((Axis("shard", ranks, size, split, 1), Axis("byte", size, 1)), name="own"),
             )
         heads = size // head_bytes
         total = total if total and not state else heads * ranks
-        if mapper is MapperKind.NHD:
+        if token_major_:
             return token_major(size, tokens, heads, total, split)
         return head_major(size, heads, total, split)
 
+    def _page_rebuilds_untransferred(self) -> bool:
+        """Whether the untransferred buffers derive from the others and are rebuilt after the
+        native transfer imports a request's pages. False by default."""
+        return False
+
     def _page_untransferred_roles(self) -> frozenset[str]:
-        """Roles whose buffers hold no state a peer needs, kept in local copies of whole pages but
-        never moved: those native's transfer skips (``get_disagg_ignored_roles``)."""
-        return frozenset(str(role) for role in self.get_disagg_ignored_roles())
+        """Roles whose buffers hold no state a peer needs, such as storage-only buffers that
+        satisfy a pool's layout: they stay in local copies of whole pages but are never moved.
+        None by default."""
+        return frozenset()
 
     def _page_dtype(self) -> str | None:
         """The element type of the KV data by name, such as ``"BF16"`` or ``"NVFP4"``; None for a
@@ -3784,60 +3788,6 @@ class KVCacheManagerV2(BaseResourceManager):
             types_of.setdefault(int(layer), (int(model_layer), int(attn_type.value)))
         # Every member of the enum counts, so stages holding different attention types agree.
         return types_of, max(int(member.value) for member in type(next(iter(virtual))[1])) + 1
-
-    def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
-        """Map native cache roles to disaggregation mapper kinds.
-
-        ``Role.ALL`` is the required fallback for roles without an explicit
-        entry. The default is the head-major (HND) ``INDEXED`` layout written
-        by the TRTLLM attention kernels — correct for V1 and standard V2
-        managers. ``Role.INDEX_KEY`` defaults to ``REPLICATED``: every
-        index-key side cache shipped so far (DSA indexer-K on V1, MiniMax M3
-        on V2) computes its projection replicated across TP ranks, so the
-        cache bytes are identical per rank; the entry is inert unless a
-        subclass actually registers ``INDEX_KEY`` buffers via
-        ``_extra_buffers_per_layer``. Model-specific managers may declare
-        logical layouts without requiring the shared extractor to inspect
-        private attributes or role names. MiniMax M3, for example, maps
-        ordinary K/V to ``HND`` for its MSA backend and ``NHD`` for its
-        Triton backend, while keeping index-key ``REPLICATED``.
-
-        This declaration does not influence storage pooling: V2 storage
-        coalesces buffers purely by ``(life_cycle, buffer size)``, so roles
-        with different transfer semantics may share a pool slot when their
-        per-block sizes coincide (e.g. MiniMax M3 at TP degrees where
-        K == V == INDEX_KEY bytes per block). The disagg page-table builder
-        splits each physical pool into one logical view per mapper kind, so
-        transfer correctness never depends on the coalescing outcome.
-
-        Pool memory is layout-agnostic; this declaration describes what the
-        manager's paired attention backend actually writes. A static mapping
-        is valid only for a fixed manager/backend pair. A manager whose backend
-        selects the layout at runtime must derive the mapping from that
-        backend's configuration.
-        """
-        return {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
-
-    def get_disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
-        """Resharding geometry for roles whose mapper kind needs it.
-
-        SECTIONED roles declare ``section_bytes``; INDEXED roles whose head
-        count is not derivable from the attention topology declare
-        ``bytes_per_head``. Attention K/V and replicated roles need none, so
-        the base manager declares nothing. The page-table builder copies the
-        layout onto the role's ``PoolView``.
-        """
-        return {}
-
-    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
-        """Return local-only buffer roles excluded from disaggregation.
-
-        Specialized managers may register storage-only buffers to satisfy
-        physical pool layout constraints. Such buffers remain part of local
-        slot copies, but contain no model state that needs to be transferred
-        between disaggregated workers.
-        """
-        return frozenset()
 
     @property
     def draft_prompt_lookahead(self) -> int:

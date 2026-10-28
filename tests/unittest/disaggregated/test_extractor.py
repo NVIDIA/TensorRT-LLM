@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import Mock
-
 import numpy as np
 import pytest
 import torch
@@ -34,11 +32,8 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_physical_pool,
     get_unique_layers,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    MambaHybridCacheManagerV2,
-    MambaRole,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaRole
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
     DataType,
@@ -252,91 +247,96 @@ def test_layer_group_meta_serialization():
     assert len(restored_lg.pool_views[0].buffer_entries) == 2
 
 
-def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_list=(640,)):
-    """Build a minimal duck-typed KVCacheManagerV2 for _build_page_table_v2.
+def _page_table(groups, pool_slot_bytes, buffers, bases, view_partition=None):
+    """Native's page table of a manager's page table with these layer groups and buffers.
 
-    ``attrs`` keeps the storage-layer shape ``{(layer_id, role):
-    (life_cycle_id, pool_index, offset, size)}``; the fake synthesizes the
-    public ``pool_group_descs`` view from it. Buffer order within a
-    coalesced buffer follows ascending offset, mirroring how the real
-    storage config assigns offsets in ``buffer_ids`` order.
+    Each group has one internal layer per global layer, in order; device pools lie at
+    ``bases[group]``.
     """
-    from types import SimpleNamespace
+    from tensorrt_llm._torch.disaggregation.resource.kv_extractor import page_table_from_layout
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import PageLayout
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import DevicePool, ManagerLayout
 
-    base = 0x1000
-
-    per_pool: dict[int, list] = {}
-    for (layer_id, role), attr in attrs.items():
-        per_pool.setdefault(int(attr.pool_index), []).append(
-            (int(attr.offset), layer_id, role, int(attr.size))
-        )
-
-    coalesced_buffers = []
-    for pool_idx in range(num_pools):
-        buffers = sorted(per_pool.get(pool_idx, []))
-        sizes = {size for _, _, _, size in buffers}
-        assert len(sizes) == 1, "buffers in a coalesced buffer are uniform-size by construction"
-        coalesced_buffers.append(
-            SimpleNamespace(
-                single_buffer_size=sizes.pop(),
-                buffer_ids=[
-                    SimpleNamespace(layer_id=layer_id, role=role)
-                    for _, layer_id, role, _ in buffers
-                ],
+    layout = PageLayout(
+        tokens_per_page=16,
+        pool_slot_bytes=pool_slot_bytes,
+        layer_groups=groups,
+        buffers=buffers,
+    )
+    table = ManagerLayout(
+        page_layout=layout,
+        tokens_per_block=16,
+        pool_group_of=tuple(g.pool_group for g in groups),
+        windows=tuple(g.kept_window for g in groups),
+        sink_blocks=tuple(g.num_sink_blocks for g in groups),
+        recurrent=tuple(g.kind == "state" for g in groups),
+        sparse=tuple(False for _ in groups),
+        layers=tuple(g.layers for g in groups),
+        shards=tuple((1, 0) for _ in groups),
+        page_bytes={g: sum(widths) for g, widths in pool_slot_bytes.items()},
+        device_pools={
+            g: tuple(
+                DevicePool(group=g, index=i, base=base, slot_bytes=width, num_slots=4)
+                for i, (base, width) in enumerate(zip(bases[g], widths))
             )
+            for g, widths in pool_slot_bytes.items()
+        },
+        named_groups=tuple(True for _ in groups),
+        local_layers=tuple(tuple(enumerate(g.layers)) for g in groups),
+        kv_heads=tuple(1 if g.kind == "attention" else 0 for g in groups),
+    )
+    return page_table_from_layout(table, view_partition=view_partition)
+
+
+def _attention_page_table(buffers, pool_slot_bytes, view_partition=None):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import LayerGroupDesc
+
+    return _page_table(
+        (LayerGroupDesc("attention", None, 0, 0, (0, 1)),),
+        {0: pool_slot_bytes},
+        buffers,
+        {0: [0x1000] * len(pool_slot_bytes)},
+        view_partition,
+    )
+
+
+def _kv(layer, role, pool, offset, size=128, tensors=None):
+    """A K/V buffer of 16 tokens of one head, token-major, or ``tensors``."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import BufferDesc, token_major
+
+    return BufferDesc(
+        layer,
+        role,
+        0,
+        pool,
+        offset,
+        size,
+        token_major(size, 16, 1, 1) if tensors is None else tensors,
+    )
+
+
+def _index_key(layer, pool, offset, size=128):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import BufferDesc, replicated
+
+    return BufferDesc(layer, "index_key", 0, pool, offset, size, replicated(size))
+
+
+def test_page_table_stamps_homogeneous_pool_kinds():
+    """Split token-major K/V and replicated INDEX_KEY pools get NHD and REPLICATED views."""
+    views = (
+        _attention_page_table(
+            (
+                _kv(0, "key", 0, 0),
+                _kv(0, "value", 0, 128),
+                _kv(1, "key", 0, 256),
+                _kv(1, "value", 0, 384),
+                _index_key(1, 1, 0),
+            ),
+            (512, 128),
         )
-
-    pg_desc = SimpleNamespace(
-        pool_group_index=0,
-        num_slots=4,
-        pools=[
-            SimpleNamespace(pool_index=pi, base_address=base, slot_bytes=sb)
-            for pi, sb in enumerate(slot_bytes_list)
-        ],
-        slot_desc=SimpleNamespace(
-            variants=[SimpleNamespace(layer_group_id=0, coalesced_buffers=coalesced_buffers)]
-        ),
+        .layer_groups[0]
+        .pool_views
     )
-
-    impl = SimpleNamespace(
-        layer_grouping=((0, 1),),
-        init_config=SimpleNamespace(
-            tokens_per_block=16,
-            layers=[SimpleNamespace(window_size=None), SimpleNamespace(window_size=None)],
-        ),
-        pool_group_descs=[pg_desc],
-    )
-    return Mock(
-        spec=KVCacheManagerV2,
-        get_disagg_pool_view_partition=None,
-        get_disagg_ignored_roles=lambda: frozenset(),
-        impl=impl,
-        pp_layers=[0, 1],
-        num_kv_heads_per_layer=[1, 1],
-        get_disagg_role_mapper_kinds=lambda: role_mapper_kinds,
-        get_disagg_role_layouts=lambda: {},
-    )
-
-
-def test_v2_builder_stamps_homogeneous_pool_kinds():
-    """Split KV / INDEX_KEY pools get NHD and REPLICATED views respectively."""
-    from types import SimpleNamespace
-
-    attrs = {
-        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
-        (0, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
-        (1, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=256, size=128),
-        (1, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=384, size=128),
-        (1, Role.INDEX_KEY): SimpleNamespace(life_cycle_id=0, pool_index=1, offset=0, size=128),
-    }
-    manager = _make_fake_v2_manager(
-        attrs,
-        {Role.ALL: MapperKind.NHD, Role.INDEX_KEY: MapperKind.REPLICATED},
-        num_pools=2,
-        slot_bytes_list=(512, 128),
-    )
-
-    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
     assert len(views) == 2
     assert views[0].pool_role == frozenset({"key", "value"})
     assert views[0].mapper_kind == MapperKind.NHD
@@ -346,31 +346,28 @@ def test_v2_builder_stamps_homogeneous_pool_kinds():
     assert get_unique_layers(views[1]) == {1}
 
 
-def test_v2_builder_splits_mixed_kind_pool_into_per_class_views():
-    """A pool coalescing several role classes yields one view per class.
+def test_page_table_splits_mixed_kind_pool_into_per_class_views():
+    """A pool holding several kinds of buffers yields one view per kind.
 
-    Miniature of the MiniMax M3 layout at TP degrees where
-    K == V == INDEX_KEY bytes per block: V2 storage coalesces all three
-    into one pool and the slot interleaves the sparse layer's INDEX_KEY
-    between the layers' K/V regions. The builder must split the pool into
-    a NHD K/V view (non-uniform layer offsets, uniform per-layer size)
-    and a REPLICATED INDEX_KEY view covering only the sparse layer.
+    Miniature of the MiniMax M3 layout at TP degrees where K == V == INDEX_KEY bytes per block:
+    one pool whose slot interleaves the sparse layer's INDEX_KEY between the layers' K/V. Native
+    sees a NHD K/V view (non-uniform layer offsets, uniform per-layer size) and a REPLICATED
+    INDEX_KEY view covering only the sparse layer.
     """
-    from types import SimpleNamespace
-
-    attrs = {
-        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
-        (0, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
-        (0, Role.INDEX_KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=256, size=128),
-        (1, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=384, size=128),
-        (1, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=512, size=128),
-    }
-    manager = _make_fake_v2_manager(
-        attrs,
-        {Role.ALL: MapperKind.NHD, Role.INDEX_KEY: MapperKind.REPLICATED},
+    views = (
+        _attention_page_table(
+            (
+                _kv(0, "key", 0, 0),
+                _kv(0, "value", 0, 128),
+                _index_key(0, 0, 256),
+                _kv(1, "key", 0, 384),
+                _kv(1, "value", 0, 512),
+            ),
+            (640,),
+        )
+        .layer_groups[0]
+        .pool_views
     )
-
-    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
     assert len(views) == 2
     kv_view, idx_view = views
     # Both views address the same physical pool.
@@ -393,59 +390,59 @@ def test_v2_builder_splits_mixed_kind_pool_into_per_class_views():
     assert idx_starts == {0: 256}
 
 
-def test_v2_builder_validates_role_mapper_declaration():
-    from types import SimpleNamespace
+def test_page_table_reads_view_kinds_off_tensors():
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+        Axis,
+        BufferDesc,
+        Tensor,
+        head_major,
+    )
 
-    attrs = {
-        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
-        (0, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
-        (1, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=256, size=128),
-        (1, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=384, size=128),
-    }
+    def kv(tensors):
+        return tuple(
+            _kv(layer, role, 0, 256 * layer + 128 * j, tensors=tensors)
+            for layer in (0, 1)
+            for j, role in enumerate(("key", "value"))
+        )
 
-    # Default INDEXED declaration keeps the whole-slot HND view.
+    # Head-major heads, and a rank's own share whose heads go undeclared, are both INDEXED.
+    own = (Tensor((Axis("shard", 2, 128, ("tp",), 1), Axis("byte", 128, 1)), name="own"),)
+    for tensors in (head_major(128, 1, 2), own):
+        (view,) = _attention_page_table(kv(tensors), (512,)).layer_groups[0].pool_views
+        assert view.mapper_kind == MapperKind.INDEXED
+        assert view.bytes_per_layer == 256
+
+    # Buffers peers do not transfer are in no view.
+    buffers = kv(None) + tuple(
+        BufferDesc(layer, "scale", 0, 0, 512 + 64 * layer, 64, transferred=False)
+        for layer in (0, 1)
+    )
+    (view,) = _attention_page_table(buffers, (640,)).layer_groups[0].pool_views
+    assert view.pool_role == frozenset({"key", "value"})
+    assert [tuple(int(x) for x in e) for e in view.buffer_entries] == [
+        (0, 0, 128),
+        (0, 128, 128),
+        (1, 256, 128),
+        (1, 384, 128),
+    ]
+
+
+def test_page_table_view_partition_splits_views():
+    """Buffers of one pool and kind whose partition keys differ get views of their own."""
     views = (
-        build_page_table_from_manager(_make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}))
+        _attention_page_table(
+            tuple(
+                _kv(layer, role, 0, 256 * layer + 128 * j)
+                for layer in (0, 1)
+                for j, role in enumerate(("key", "value"))
+            ),
+            (512,),
+            view_partition=lambda layer, role: layer,
+        )
         .layer_groups[0]
         .pool_views
     )
-    assert len(views) == 1
-    assert views[0].mapper_kind == MapperKind.INDEXED
-
-    # V2 managers must expose the capability method explicitly.
-    missing_capability = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED})
-    del missing_capability.get_disagg_role_mapper_kinds
-    with pytest.raises(AttributeError, match="get_disagg_role_mapper_kinds"):
-        build_page_table_from_manager(missing_capability)
-
-    with pytest.raises(ValueError, match="must define Role.ALL"):
-        build_page_table_from_manager(
-            _make_fake_v2_manager(attrs, {Role.INDEX_KEY: MapperKind.REPLICATED})
-        )
-
-    with pytest.raises(ValueError, match="Invalid disaggregation mapper kind 'HND'"):
-        build_page_table_from_manager(_make_fake_v2_manager(attrs, {Role.ALL: "HND"}))
-
-    with pytest.raises(ValueError, match="INDEXED is only valid as the Role.ALL mapping"):
-        build_page_table_from_manager(
-            _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.NHD, Role.KEY: MapperKind.INDEXED})
-        )
-
-    # INDEXED as the Role.ALL fallback coexists with side-cache roles that
-    # declare their own kind (the base-manager default for INDEX_KEY); with
-    # no INDEX_KEY buffers registered the declaration is inert.
-    views = (
-        build_page_table_from_manager(
-            _make_fake_v2_manager(
-                attrs,
-                {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED},
-            )
-        )
-        .layer_groups[0]
-        .pool_views
-    )
-    assert len(views) == 1
-    assert views[0].mapper_kind == MapperKind.INDEXED
+    assert [get_unique_layers(v) for v in views] == [{0}, {1}]
 
 
 @pytest.mark.cpu_only
@@ -530,95 +527,46 @@ def test_mamba_layer_group_serialization():
     assert legacy_pool.slot_stride_bytes == legacy_pool.slot_bytes
 
 
-def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
-    """Duck-typed MambaHybridCacheManagerV2 whose descriptors hold two life cycles.
+def _recurrent_page_table(conv_sections=(16, 16, 32), ple_on_layer=1):
+    """A page table of a recurrent and an attention layer group.
 
-    Life cycle 0 is recurrent (layers 0 and 1): SSM and conv state coalesce
-    into one 64-byte pool in ``[ssm, conv]`` order per layer, and PLE n-gram
-    context lives in a second, 32-byte pool on ``ple_on_layer`` only. Life
-    cycle 1 is attention (layer 2) with K/V in its own pool group.
+    Group 0 is recurrent (layers 0 and 1): SSM and conv state share one 256-byte pool,
+    ``[ssm, conv]`` per layer, and PLE n-gram context lives in a second, 32-byte pool on
+    ``ple_on_layer`` only. Group 1 is attention (layer 2) with K/V in a pool group of its own.
     """
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
-
-    def buf(layer_id, role):
-        return SimpleNamespace(layer_id=layer_id, role=role)
-
-    recurrent_pg = SimpleNamespace(
-        pool_group_index=0,
-        num_slots=4,
-        pools=[
-            SimpleNamespace(pool_index=0, base_address=0x10000, slot_bytes=256),
-            SimpleNamespace(pool_index=1, base_address=0x20000, slot_bytes=32),
-        ],
-        slot_desc=SimpleNamespace(
-            variants=[
-                SimpleNamespace(
-                    layer_group_id=0,
-                    coalesced_buffers=[
-                        SimpleNamespace(
-                            single_buffer_size=64,
-                            buffer_ids=[
-                                buf(0, MambaRole.SSM_STATE),
-                                buf(0, MambaRole.CONV_STATE),
-                                buf(1, MambaRole.SSM_STATE),
-                                buf(1, MambaRole.CONV_STATE),
-                            ],
-                        ),
-                        SimpleNamespace(
-                            single_buffer_size=32,
-                            buffer_ids=[buf(ple_on_layer, MambaRole.PLE_NGRAM_CONTEXT)],
-                        ),
-                    ],
-                )
-            ]
-        ),
-    )
-    attention_pg = SimpleNamespace(
-        pool_group_index=1,
-        num_slots=8,
-        pools=[SimpleNamespace(pool_index=0, base_address=0x30000, slot_bytes=128)],
-        slot_desc=SimpleNamespace(
-            variants=[
-                SimpleNamespace(
-                    layer_group_id=1,
-                    coalesced_buffers=[
-                        SimpleNamespace(
-                            single_buffer_size=64,
-                            buffer_ids=[buf(2, Role.KEY), buf(2, Role.VALUE)],
-                        )
-                    ],
-                )
-            ]
-        ),
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+        BufferDesc,
+        LayerGroupDesc,
+        head_major,
+        replicated,
+        sectioned,
     )
 
-    manager = object.__new__(MambaHybridCacheManagerV2)
-    manager.impl = SimpleNamespace(
-        layer_grouping=((0, 1), (2,)),
-        init_config=SimpleNamespace(
-            tokens_per_block=16,
-            layers=[SimpleNamespace(window_size=None) for _ in range(3)],
-        ),
-        pool_group_descs=[recurrent_pg, attention_pg],
+    buffers = []
+    for layer in (0, 1):
+        # ssm: [2 heads, 4, 4] fp16 = 64 bytes, 32 bytes per head
+        buffers.append(BufferDesc(layer, "ssm_state", 0, 0, 128 * layer, 64, head_major(64, 2, 2)))
+        buffers.append(
+            BufferDesc(layer, "conv_state", 0, 0, 128 * layer + 64, 64, sectioned(conv_sections, 1))
+        )
+    buffers.append(
+        BufferDesc(ple_on_layer, str(MambaRole.PLE_NGRAM_CONTEXT), 0, 1, 0, 32, replicated(32))
     )
-    manager.pp_layers = [0, 1, 2]
-    manager._mamba_layer_mask = [True, True, False]
-    manager.local_num_mamba_layers = 2
-    manager.num_kv_heads_per_layer = [1, 1, 1]
-    # conv: [8, 4] fp16 = 64 bytes as sections [2, 2, 4] * 4 * 2 = [16, 16, 32]
-    manager.conv_state_shape = [8, 4]
-    manager.conv_state_dtype = torch.float16
-    manager.conv_section_dims = [2, 2, 4]
-    # ssm: [2 heads, 4, 4] fp16 = 64 bytes, 32 bytes per head
-    manager.ssm_state_shape = [2, 4, 4]
-    manager.ssm_state_dtype = torch.float16
-    return manager
+    buffers.append(BufferDesc(2, "key", 1, 0, 0, 64))
+    buffers.append(BufferDesc(2, "value", 1, 0, 64, 64))
+    return _page_table(
+        (
+            LayerGroupDesc("state", None, 0, 0, (0, 1)),
+            LayerGroupDesc("attention", None, 0, 1, (2,)),
+        ),
+        {0: (256, 32), 1: (128,)},
+        tuple(buffers),
+        {0: [0x10000, 0x20000], 1: [0x30000]},
+    )
 
 
-def test_v2_builder_describes_recurrent_life_cycle_from_descriptors():
-    """Conv, SSM and PLE views all come from pool_group_descs, geometry included."""
+def test_page_table_describes_a_recurrent_group():
+    """Conv, SSM and PLE views come from the page layout, geometry included."""
     from tensorrt_llm._torch.disaggregation.resource.page import (
         MAMBA_CONV_ROLE,
         MAMBA_SSM_ROLE,
@@ -626,15 +574,12 @@ def test_v2_builder_describes_recurrent_life_cycle_from_descriptors():
         MambaLayerGroup,
     )
 
-    manager = _make_fake_v2_mamba_manager()
-    page_table = build_page_table_from_manager(manager)
+    page_table = _recurrent_page_table()
 
     assert len(page_table.layer_groups) == 2
     recurrent, attention = page_table.layer_groups
     assert isinstance(recurrent, MambaLayerGroup)
     assert isinstance(attention, AttentionLayerGroup)
-    # The recurrent group uses the shared descriptor pool group, not a
-    # dedicated tensor-derived one, and keeps V2 layer numbering.
     assert recurrent.pool_group_idx == 0
     assert [(ll.local_layer_id, ll.global_layer_id) for ll in recurrent.local_layers] == [
         (0, 0),
@@ -672,48 +617,25 @@ def test_v2_builder_describes_recurrent_life_cycle_from_descriptors():
     assert ple.bytes_per_layer == 32
     assert [tuple(int(x) for x in e) for e in ple.buffer_entries] == [(1, 0, 32)]
 
-    # extract_slot addresses layer regions inside the descriptor slot.
-    # (Look views up by role: PoolView.__eq__ compares numpy entries.)
+    # A recurrent request's slot is addressed by its base pointer; the runs of the mapper place
+    # each layer's bytes within it. (Look views up by role: PoolView.__eq__ compares numpy entries.)
     extractor = KVRegionExtractorV1(page_table)
     view_index = {pv.pool_role: idx for idx, pv in enumerate(recurrent.pool_views)}
     conv_idx = view_index[MAMBA_CONV_ROLE]
     ple_idx = view_index[frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)})]
-    assert extractor.extract_slot(2, 0, conv_idx).memory.ptrs.tolist() == [
-        0x10000 + 2 * 256 + 64,
-        0x10000 + 2 * 256 + 192,
-    ]
-    assert extractor.extract_slot(3, 0, ple_idx).memory.ptrs.tolist() == [0x20000 + 3 * 32]
+    conv_region = extractor.extract(np.array([2]), 0, conv_idx).memory
+    assert conv_region.ptrs.tolist() == [0x10000 + 2 * 256]
+    assert conv_region.bytes_per_region == 256
+    assert extractor.extract(np.array([3]), 0, ple_idx).memory.ptrs.tolist() == [0x20000 + 3 * 32]
 
-    # Attention life cycle is untouched by the recurrent one.
+    # The attention group is untouched by the recurrent one.
     assert attention.pool_group_idx == 1
     assert [ll.global_layer_id for ll in attention.local_layers] == [2]
 
 
-def test_v2_builder_rejects_sectioned_view_in_attention_life_cycle():
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
-
-    attrs = {
-        (0, Role.KEY): SimpleNamespace(pool_index=0, offset=0, size=64),
-        (0, Role.VALUE): SimpleNamespace(pool_index=0, offset=64, size=64),
-        (1, Role.KEY): SimpleNamespace(pool_index=0, offset=128, size=64),
-        (1, Role.VALUE): SimpleNamespace(pool_index=0, offset=192, size=64),
-    }
-    manager = _make_fake_v2_manager(
-        attrs,
-        {Role.ALL: MapperKind.INDEXED, Role.KEY: MapperKind.SECTIONED},
-        slot_bytes_list=(256,),
-    )
-    with pytest.raises(ValueError, match="no mapper for SECTIONED"):
-        build_page_table_from_manager(manager)
-
-
-def test_v2_builder_rejects_section_bytes_that_do_not_cover_the_layer():
-    manager = _make_fake_v2_mamba_manager()
-    manager.conv_section_dims = [2, 2, 2]  # 48 bytes, but the conv buffer is 64
-    with pytest.raises(ValueError, match="do not sum to bytes_per_layer"):
-        build_page_table_from_manager(manager)
+def test_page_table_rejects_sections_that_do_not_cover_the_buffer():
+    with pytest.raises(ValueError, match="do not cover its 64 bytes"):
+        _recurrent_page_table(conv_sections=(16, 16, 16))
 
 
 def test_v2_mamba_registration_uses_coalesced_physical_pool():
@@ -906,8 +828,6 @@ def test_get_memory_pool_block_indices_vswa():
     - return non-negative pool indices that match what
       `KVRegionExtractorV1.extract` plugs into `base_ptr + idx * slot_bytes`.
     """
-    import torch
-
     import tensorrt_llm
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm.sampling_params import SamplingParams
@@ -1011,8 +931,6 @@ def test_get_memory_pool_block_indices_with_offload_onboard():
          pointers computed from the translated slot indices match
          `primary_pool_base + slot_idx * slot_bytes`.
     """
-    import torch
-
     import tensorrt_llm
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm.bindings.internal.testing import (

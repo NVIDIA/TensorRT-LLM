@@ -39,6 +39,7 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExt
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool, get_pool_bytes
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import head_major, replicated, token_major
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -86,13 +87,19 @@ def test_minimax_cache_indices_support_block_count_limit() -> None:
     ]
 
 
-def test_v2_disagg_role_mapper_kind_defaults() -> None:
-    manager = object.__new__(KVCacheManagerV2)
+def _with_two_of_four_heads(manager: KVCacheManagerV2) -> KVCacheManagerV2:
+    """The manager as rank 0 of TP2 holding 2 of a layer's 4 KV heads."""
+    manager.mapping = SimpleNamespace(tp_size=2, tp_rank=0)
+    manager._page_kv_heads = lambda layer: (2, 4)
+    return manager
 
-    assert manager.get_disagg_role_mapper_kinds() == {
-        Role.ALL: MapperKind.INDEXED,
-        Role.INDEX_KEY: MapperKind.REPLICATED,
-    }
+
+def test_v2_page_buffer_tensor_defaults() -> None:
+    manager = _with_two_of_four_heads(object.__new__(KVCacheManagerV2))
+
+    # K/V split by head, head-major; the index-key side cache alike on every rank.
+    assert manager._page_buffer_tensors(0, Role.KEY, 256, 16, False) == head_major(256, 2, 4)
+    assert manager._page_buffer_tensors(0, Role.INDEX_KEY, 128, 16, False) == replicated(128)
 
 
 @pytest.mark.cpu_only
@@ -104,7 +111,7 @@ def test_v2_disagg_role_mapper_kind_defaults() -> None:
         ("triton", DataType.NVFP4, MapperKind.NHD),
     ],
 )
-def test_minimax_disagg_role_mapper_kinds(
+def test_minimax_page_buffer_tensors(
     monkeypatch: pytest.MonkeyPatch,
     implementation: str,
     cache_dtype: DataType,
@@ -129,10 +136,15 @@ def test_minimax_disagg_role_mapper_kinds(
         ),
     )
 
-    assert manager.get_disagg_role_mapper_kinds() == {
-        Role.ALL: expected_main_mapper,
-        Role.INDEX_KEY: MapperKind.REPLICATED,
-    }
+    assert manager._main_kv_mapper_kind == expected_main_mapper
+    _with_two_of_four_heads(manager)
+    expected_kv = (
+        token_major(256, 16, 2, 4)
+        if expected_main_mapper == MapperKind.NHD
+        else head_major(256, 2, 4)
+    )
+    assert manager._page_buffer_tensors(0, Role.KEY, 256, 16, False) == expected_kv
+    assert manager._page_buffer_tensors(0, Role.INDEX_KEY, 128, 16, False) == replicated(128)
     if implementation == "triton":
         fp8_manager = MiniMaxM3KVCacheManagerV2(
             num_layers=0,
@@ -143,7 +155,10 @@ def test_minimax_disagg_role_mapper_kinds(
                 implementation="triton", indexer_kv_dtype="bf16"
             ),
         )
-        assert fp8_manager.get_disagg_role_mapper_kinds()[Role.ALL] == MapperKind.NHD
+        _with_two_of_four_heads(fp8_manager)
+        assert fp8_manager._page_buffer_tensors(0, Role.KEY, 256, 16, False) == token_major(
+            256, 16, 2, 4
+        )
         assert fp8_manager._dense_native_layer_ids == ()
 
 
@@ -721,9 +736,9 @@ def test_minimax_m3_msa_hnd_head_mismatch_transfer(
 
 
 # Multiple sparse layers spread across PP stages: the replicated index-key
-# pool overlaps only partially between peers, exercising the layer-strided
-# ReplicatedMapper offsets (a single-sparse-layer model always fully
-# overlaps and would degenerate to a whole-slot copy).
+# pool overlaps only partially between peers, exercising layer-strided
+# replicated runs (a single-sparse-layer model always fully overlaps and
+# would degenerate to a whole-slot copy).
 MULTI_SPARSE_LAYERS = [1, 2, 3]
 
 

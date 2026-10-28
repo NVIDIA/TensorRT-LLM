@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import hashlib
 import json
@@ -173,5 +174,12 @@ def layout_id(layout: PageLayout) -> bytes:
 
 
 def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
-    """The page table the manager builds (``KVCacheManagerV2.get_page_table``)."""
-    return manager.get_page_table()
+    """The page table the manager builds (``KVCacheManagerV2.get_page_table``), as a lender
+    reads it: buffers the manager rebuilds after a native import travel too, since lending invokes
+    no rebuild."""
+    table = manager.get_page_table()
+    layout = table.page_layout
+    if not layout.rebuilds_untransferred:
+        return table
+    buffers = tuple(dataclasses.replace(b, transferred=True) for b in layout.buffers)
+    return dataclasses.replace(table, page_layout=dataclasses.replace(layout, buffers=buffers))

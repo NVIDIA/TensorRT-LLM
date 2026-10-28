@@ -169,6 +169,7 @@ def _make_projection_sender() -> Sender:
     )
 
     mapper = MagicMock()
+    mapper.empty = False
     mapper.map.side_effect = lambda src_region, dst_region: SimpleNamespace(
         src=src_region,
         dst=dst_region,

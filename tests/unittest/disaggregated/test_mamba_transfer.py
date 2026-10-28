@@ -487,28 +487,6 @@ def test_mamba_policy_rejects_incompatible_replicated_side_state():
     with pytest.raises(ValueError, match="replicated state size differs"):
         peer.MambaPolicy.validate_peer_compatible(rank_info, rank_info, pt_with_side, pt_wider_side)
 
-    # REPLICATED state under the STATE life cycle uses the per-layer-pointer
-    # head-match mapper and requires equal per-layer sizes.
-    state_lg = pt_with_side.layer_groups[0]
-    common = dict(
-        peer_ri=rank_info,
-        mapper_kind=peer.MapperKind.REPLICATED,
-        self_layer_offsets=np.array([0], dtype=np.int64),
-        peer_layer_offsets=np.array([0], dtype=np.int64),
-        src_layer_off=0,
-        dst_layer_off=0,
-        self_lg=state_lg,
-        peer_lg=state_lg,
-    )
-    with pytest.raises(ValueError, match="Replicated state size differs"):
-        peer.MambaPolicy(rank_info).build_mapper(
-            self_bytes_per_layer=8, peer_bytes_per_layer=16, **common
-        )
-    mapper = peer.MambaPolicy(rank_info).build_mapper(
-        self_bytes_per_layer=8, peer_bytes_per_layer=8, **common
-    )
-    assert isinstance(mapper, peer.MambaHeadMatchMapper)
-
 
 # ---------------------------------------------------------------------------
 # Ground truth: generate, shard, write, compute expected, read actual

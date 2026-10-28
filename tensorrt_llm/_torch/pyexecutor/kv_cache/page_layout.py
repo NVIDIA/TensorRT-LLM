@@ -49,6 +49,8 @@ __all__ = [
     "grid_place",
     "head_major",
     "held",
+    "layout_from_dict",
+    "layout_to_dict",
     "replica_ranks",
     "replicated",
     "sectioned",
@@ -739,6 +741,9 @@ class PageLayout:
         device_region_index: (pool group, pool index) -> device region index in Lender.regions.
         staging_region_index: Pool group -> staging region index in Lender.regions; empty when the
             lender stages nothing.
+        rebuilds_untransferred: Whether the buffers peers do not transfer derive from the others,
+            which the manager rebuilds after the native transfer imports a request's pages; a
+            reader that invokes no rebuild, such as the lender, moves them too.
 
     Raises:
         ValueError: If tokens_per_page, a slot width or a KV head count is not a positive integer; a
@@ -756,6 +761,7 @@ class PageLayout:
     quant_mode: Literal["fp8", "nvfp4", "fp8_ds_mla"] | None = None
     device_region_index: Mapping[tuple[int, int], int] = field(default_factory=dict)
     staging_region_index: Mapping[int, int] = field(default_factory=dict)
+    rebuilds_untransferred: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -781,6 +787,7 @@ class PageLayout:
             for g, i in self.staging_region_index.items()
         }
         object.__setattr__(self, "staging_region_index", _frozen(staging))
+        object.__setattr__(self, "rebuilds_untransferred", bool(self.rebuilds_untransferred))
         object.__setattr__(self, "layer_groups", tuple(self.layer_groups))
         object.__setattr__(self, "buffers", tuple(self.buffers))
         if self.quant_mode is not None and self.quant_mode not in _QUANT_MODES:
@@ -807,6 +814,7 @@ class PageLayout:
         quant_mode: Literal["fp8", "nvfp4", "fp8_ds_mla"] | None = None,
         device_region_index: Mapping[tuple[int, int], int] = _NO_ENTRIES,
         staging_region_index: Mapping[int, int] = _NO_ENTRIES,
+        rebuilds_untransferred: bool = False,
     ) -> PageLayout:
         """The constructor's layout of these values, without its checks and conversions.
 
@@ -829,6 +837,7 @@ class PageLayout:
             quant_mode=quant_mode,
             device_region_index=_frozen(dict(device_region_index)),
             staging_region_index=_frozen(dict(staging_region_index)),
+            rebuilds_untransferred=rebuilds_untransferred,
         )
         return layout
 
@@ -928,3 +937,119 @@ def replica_ranks(
                 continue
         out.append(other_rank)
     return tuple(out)
+
+
+def _axis_to_dict(axis: Axis) -> dict:
+    return {
+        "name": axis.name,
+        "extent": axis.extent,
+        "stride": axis.stride,
+        "split": list(axis.split),
+        "held": axis.held,
+        "cyclic": axis.cyclic,
+    }
+
+
+def layout_to_dict(layout: PageLayout) -> dict:
+    """``layout`` as plain values (dicts, lists, ints, strings) for a peer, which
+    ``layout_from_dict`` reads back; the lender's region maps stay local and are left out."""
+    return {
+        "tokens_per_page": layout.tokens_per_page,
+        "pool_slot_bytes": {int(g): list(w) for g, w in layout.pool_slot_bytes.items()},
+        "layer_groups": [
+            {
+                "kind": d.kind,
+                "kept_window": d.kept_window,
+                "num_sink_blocks": d.num_sink_blocks,
+                "pool_group": d.pool_group,
+                "layers": list(d.layers),
+                "shard": [d.shard.count, d.shard.index],
+                "read_window": d.read_window,
+                "model_layers": list(d.model_layers),
+            }
+            for d in layout.layer_groups
+        ],
+        "buffers": [
+            {
+                "layer": b.layer,
+                "role": b.role,
+                "pool_group": b.pool_group,
+                "pool_index": b.pool_index,
+                "slot_offset": b.slot_offset,
+                "size": b.size,
+                "tensors": [
+                    {
+                        "axes": [_axis_to_dict(a) for a in t.axes],
+                        "offset": t.offset,
+                        "name": t.name,
+                    }
+                    for t in b.tensors
+                ],
+                "transferred": b.transferred,
+                "expansion": b.expansion,
+            }
+            for b in layout.buffers
+        ],
+        "topology": dataclasses.asdict(layout.topology),
+        "total_kv_heads_by_layer": {int(k): v for k, v in layout.total_kv_heads_by_layer.items()},
+        "dtype": layout.dtype,
+        "quant_mode": layout.quant_mode,
+        "rebuilds_untransferred": layout.rebuilds_untransferred,
+    }
+
+
+def layout_from_dict(data: Mapping) -> PageLayout:
+    """The layout ``layout_to_dict`` wrote, checked as the constructors check it."""
+    return PageLayout(
+        tokens_per_page=data["tokens_per_page"],
+        pool_slot_bytes={int(g): tuple(w) for g, w in data["pool_slot_bytes"].items()},
+        layer_groups=tuple(
+            LayerGroupDesc(
+                kind=d["kind"],
+                kept_window=d["kept_window"],
+                num_sink_blocks=d["num_sink_blocks"],
+                pool_group=d["pool_group"],
+                layers=tuple(d["layers"]),
+                shard=ShardDesc(*d["shard"]),
+                read_window=d["read_window"],
+                model_layers=tuple(d["model_layers"]),
+            )
+            for d in data["layer_groups"]
+        ),
+        buffers=tuple(
+            BufferDesc(
+                layer=b["layer"],
+                role=b["role"],
+                pool_group=b["pool_group"],
+                pool_index=b["pool_index"],
+                slot_offset=b["slot_offset"],
+                size=b["size"],
+                tensors=tuple(
+                    Tensor(
+                        tuple(
+                            Axis(
+                                a["name"],
+                                a["extent"],
+                                a["stride"],
+                                tuple(a["split"]),
+                                a["held"],
+                                a["cyclic"],
+                            )
+                            for a in t["axes"]
+                        ),
+                        t["offset"],
+                        t["name"],
+                    )
+                    for t in b["tensors"]
+                ),
+                transferred=b["transferred"],
+                expansion=b["expansion"],
+            )
+            for b in data["buffers"]
+        ),
+        topology=RankTopology(**data["topology"]),
+        total_kv_heads_by_layer={int(k): v for k, v in data["total_kv_heads_by_layer"].items()},
+        dtype=data["dtype"],
+        quant_mode=data["quant_mode"],
+        rebuilds_untransferred=data["rebuilds_untransferred"],
+    )

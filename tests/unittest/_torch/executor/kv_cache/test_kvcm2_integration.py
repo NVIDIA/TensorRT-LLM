@@ -2767,20 +2767,21 @@ def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
     assert cold_group.stats.secondary_peak_evictable_num_blocks == 5
 
 
-def test_disagg_role_mapper_kinds_default_to_indexed():
-    from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+def test_page_buffer_tensors_default_to_head_major():
+    from types import SimpleNamespace
+
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import head_major, replicated
 
     manager = object.__new__(KVCacheManagerV2)
+    manager.mapping = SimpleNamespace(tp_size=2, tp_rank=0)
+    manager._page_kv_heads = lambda layer: (2, 4)
 
-    # K/V default to the TRTLLM head-major layout; the index-key side cache
-    # defaults to REPLICATED (every shipped index-K — DSA V1, MiniMax M3 —
-    # is TP-replicated). The INDEX_KEY entry is inert unless a subclass
-    # registers such buffers.
-    assert manager.get_disagg_role_mapper_kinds() == {
-        Role.ALL: MapperKind.INDEXED,
-        Role.INDEX_KEY: MapperKind.REPLICATED,
-    }
+    # K/V default to the TRTLLM head-major layout, split by head over TP; the index-key side
+    # cache is alike on every rank (every shipped index-K, DSA V1 and MiniMax M3, is
+    # TP-replicated).
+    assert manager._page_buffer_tensors(0, Role.KEY, 256, 16, False) == head_major(256, 2, 4)
+    assert manager._page_buffer_tensors(0, Role.INDEX_KEY, 128, 16, False) == replicated(128)
 
 
 def _index_mapper_capacity_for(

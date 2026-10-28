@@ -16,7 +16,6 @@
 manager scripting TP ranks, pipeline stages and recurrent groups (CPU) and real ``KVCacheManagerV2``
 instances (GPU): each description's source and what moves the id. Part names: ``test_names.py``."""
 
-import ast
 import dataclasses
 import enum
 import hashlib
@@ -26,7 +25,6 @@ import subprocess
 import sys
 import types
 import weakref
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence
 
@@ -35,7 +33,6 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
-import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.kv_cache import page_layout, page_table, sharing
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
@@ -400,11 +397,11 @@ class Manager:
     builds its page table with ``KVCacheManagerV2``'s methods, from the state that manager keeps."""
 
     get_page_table = KVCacheManagerV2.get_page_table
-    _page_buffer_tensors = KVCacheManagerV2._page_buffer_tensors
+    _page_head_split = KVCacheManagerV2._page_head_split
+    _page_rebuilds_untransferred = KVCacheManagerV2._page_rebuilds_untransferred
     _page_layer_configs = KVCacheManagerV2._page_layer_configs
     _page_layer_ids = KVCacheManagerV2._page_layer_ids
     _page_kv_heads = KVCacheManagerV2._page_kv_heads
-    _page_untransferred_roles = KVCacheManagerV2._page_untransferred_roles
     _page_dtype = KVCacheManagerV2._page_dtype
     _page_quant_mode = KVCacheManagerV2._page_quant_mode
     _virtual_layers = KVCacheManagerV2._virtual_layers
@@ -500,14 +497,29 @@ class Manager:
         """Attention reads the whole window it keeps."""
         return self.windows[layer_group]
 
-    def get_disagg_role_mapper_kinds(self):
-        return self.mappers
+    def _page_buffer_tensors(self, layer_id, role, size, tokens, state):
+        """Each role spread as ``mappers`` names it ("all" for the roles it does not list):
+        replicated, sectioned by ``layouts``' section bytes, or split by head, head-major (INDEXED)
+        or token-major (NHD), ``layouts``' bytes per head or the layer's KV heads apart."""
+        kind = self.mappers.get(role, self.mappers["all"])
+        layout = self.layouts.get(role, RoleLayout())
+        if kind == MapperKind.REPLICATED:
+            return replicated(size)
+        if kind == MapperKind.SECTIONED:
+            split = ("tp", "cp") if state else ("tp",)
+            ranks, _ = page_layout.grid_place(page_table.rank_topology(self.mapping), split)
+            return sectioned(layout.section_bytes, ranks, split)
+        return self._page_head_split(
+            layer_id,
+            size,
+            tokens,
+            state,
+            head_bytes=layout.bytes_per_head,
+            token_major_=kind == MapperKind.NHD,
+        )
 
-    def get_disagg_role_layouts(self):
-        return self.layouts
-
-    def get_disagg_ignored_roles(self):
-        return self.ignored
+    def _page_untransferred_roles(self):
+        return frozenset(self.ignored)
 
 
 def kv_group(lids=(0, 1), heads_per_rank=1, extra=()):
@@ -1575,9 +1587,10 @@ def test_fp4_mla_installs_its_model_layers_beside_its_layer_ids():
     )
     Fp4MlaV2CacheLayoutPolicy.install_manager_capabilities(manager)
     assert manager._page_layer_ids() == {0: (8, 4), 1: (14, 7), 2: (9, 4), 3: (15, 7)}
-    # Native's transfer skips the V sidecars, which the receiver rebuilds; a page table lends them.
-    assert manager.get_disagg_ignored_roles()
-    assert manager._page_untransferred_roles() == frozenset()
+    # Native's transfer skips the V sidecars, which the receiver rebuilds; the page table says so,
+    # and a lender, which invokes no rebuild, lends them too.
+    assert manager._page_untransferred_roles()
+    assert manager._page_rebuilds_untransferred()
 
 
 M3_TPB = 128
@@ -2169,52 +2182,6 @@ def test_attach_requires_a_window_for_every_non_required_group(monkeypatch, poli
 
 
 @pytest.mark.cpu_only
-def test_a_manager_declaring_no_role_all_mapper_derives_no_layout():
-    """A manager declaring no ``Role.ALL`` mapper, or no mappers, derives no layout."""
-    partial = attention(1, 0, 4)
-    partial.mappers = {"key": MapperKind.INDEXED}
-    with pytest.raises(ValueError, match="Role.ALL"):
-        derive_layout(partial)
-    bare = attention(1, 0, 4)
-    bare.mappers = {}
-    with pytest.raises(ValueError, match="Role.ALL"):
-        derive_layout(bare)
-
-
-def role_all_omissions(source):
-    """Classes of ``source`` whose mapper declaration neither lists nor inherits ``Role.ALL``."""
-    missing = []
-    for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.ClassDef):
-            continue
-        for item in node.body:
-            if not isinstance(item, ast.FunctionDef) or item.name != "get_disagg_role_mapper_kinds":
-                continue
-            expands = "super().get_disagg_role_mapper_kinds()" in ast.unparse(item)
-            lists = any(
-                isinstance(d, ast.Dict)
-                and any(k is not None and ast.unparse(k) == "Role.ALL" for k in d.keys)
-                for d in ast.walk(item)
-            )
-            if not (expands or lists):
-                missing.append(node.name)
-    return missing
-
-
-@pytest.mark.cpu_only
-def test_every_override_of_the_mapper_declaration_keeps_role_all():
-    """Each override of the mapper declaration lists ``Role.ALL`` or expands its parent's."""
-    root = Path(tensorrt_llm.__file__).resolve().parent
-    found = {}
-    for path in sorted(root.rglob("*.py")):
-        source = path.read_text()
-        if "def get_disagg_role_mapper_kinds" in source:
-            found[str(path.relative_to(root))] = role_all_omissions(source)
-    assert len(found) >= 6, found
-    assert not any(found.values()), found
-
-
-@pytest.mark.cpu_only
 @pytest.mark.parametrize("attention_dp", [False, True], ids=["tp", "attention_dp"])
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 def test_a_state_group_splits_over_the_grid_its_kind_sets(tp_size, attention_dp):
@@ -2233,15 +2200,17 @@ def test_a_state_group_splits_over_the_grid_its_kind_sets(tp_size, attention_dp)
 
 
 @gpu
-def test_a_v2_manager_without_a_role_all_mapper_attaches_no_lender(real_manager, monkeypatch):
-    """A V2 manager declaring no ``Role.ALL`` mapper fails to attach and keeps no lender."""
+def test_a_v2_manager_whose_tensors_overrun_a_buffer_attaches_no_lender(real_manager, monkeypatch):
+    """A V2 manager declaring a tensor that reaches past its buffer fails to attach and keeps no
+    lender."""
     with real_manager() as mgr:
-        declared = mgr.get_disagg_role_mapper_kinds()
-        kept = {role: kind for role, kind in declared.items() if str(role) != "all"}
-        assert len(kept) < len(declared), "inconclusive: no Role.ALL to drop"
-        monkeypatch.setattr(mgr, "get_disagg_role_mapper_kinds", lambda: kept)
-        with pytest.raises(ValueError, match="Role.ALL"):
-            attach_lender(mgr, scope=b"no-role-all", staging=StagingOptions(64))
+        monkeypatch.setattr(
+            mgr,
+            "_page_buffer_tensors",
+            lambda layer, role, size, tokens, state: replicated(size + 1),
+        )
+        with pytest.raises(ValueError, match="reaches byte"):
+            attach_lender(mgr, scope=b"overrun", staging=StagingOptions(64))
         assert mgr._sharing is None
 
 
@@ -2300,6 +2269,8 @@ def test_the_layout_types_keep_their_module_fields_and_members():
             "grid_place",
             "head_major",
             "held",
+            "layout_from_dict",
+            "layout_to_dict",
             "replica_ranks",
             "replicated",
             "sectioned",
@@ -2313,7 +2284,7 @@ def test_the_layout_types_keep_their_module_fields_and_members():
         "tokens_per_page pool_slot_bytes layer_groups buffers topology=RankTopology(tp_size=1, "
         "tp_rank=0, pp_size=1, pp_rank=0, cp_size=1, cp_rank=0, dp_size=1, dp_rank=0, "
         "attention_dp=False) total_kv_heads_by_layer={} dtype=None quant_mode=None "
-        "device_region_index={} staging_region_index={}"
+        "device_region_index={} staging_region_index={} rebuilds_untransferred=False"
     )
     assert pinned_fields(LayerGroupDesc) == (
         "kind kept_window num_sink_blocks pool_group layers shard=ShardDesc(count=1, index=0) "

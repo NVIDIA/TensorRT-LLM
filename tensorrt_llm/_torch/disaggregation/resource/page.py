@@ -21,7 +21,12 @@ from typing import FrozenSet, List, Optional
 import numpy as np
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import MapperKind
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+    MapperKind,
+    PageLayout,
+    layout_from_dict,
+    layout_to_dict,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import RoleLayout as RoleLayout
 
 BUFFER_ENTRY_DTYPE = np.dtype(
@@ -305,21 +310,28 @@ class MambaLayerGroup(LayerGroup):
 
 @dataclass
 class KVCachePageTable:
+    """A rank's pools and views, indexed for transfer, and the page layout (``layout``) the manager
+    described them by, from which ``layout_mapping`` relates two ranks' pages."""
+
     tokens_per_block: int
     layer_groups: List[LayerGroup]
     pool_groups: List[PhysicalPoolGroup]  # indexed by LayerGroup.pool_group_idx
+    layout: Optional[PageLayout] = None
 
     def to_dict(self) -> dict:
         return {
             "tokens_per_block": int(self.tokens_per_block),
             "layer_groups": [lg.to_dict() for lg in self.layer_groups],
             "pool_groups": [pg.to_dict() for pg in self.pool_groups],
+            "layout": None if self.layout is None else layout_to_dict(self.layout),
         }
 
     @staticmethod
     def from_dict(data: dict) -> "KVCachePageTable":
+        layout = data.get("layout")
         return KVCachePageTable(
             tokens_per_block=int(data["tokens_per_block"]),
             layer_groups=[LayerGroup.from_dict(lg) for lg in data.get("layer_groups", [])],
             pool_groups=[PhysicalPoolGroup.from_dict(pg) for pg in data.get("pool_groups", [])],
+            layout=None if layout is None else layout_from_dict(layout),
         )

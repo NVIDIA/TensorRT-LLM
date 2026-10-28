@@ -27,9 +27,6 @@ from .page_layout import PageLayout, RankTopology, ShardDesc
 if TYPE_CHECKING:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, SsmLayerConfig
 
-# The fallback entry of the manager's per-role declarations (``Role.ALL``).
-ALL_ROLE = "all"
-
 
 @dataclass(frozen=True)
 class DevicePool:
@@ -66,6 +63,10 @@ class ManagerLayout:
     named_groups: tuple[bool, ...] = field(kw_only=True)
     # Per layer group, whether every layer must cover a reused prefix; ``()``: every group's.
     prefix_required: tuple[bool, ...] = field(default=(), kw_only=True)
+    # Per layer group, its (internal layer id, global layer id) pairs in storage order.
+    local_layers: tuple[tuple[tuple[int, int], ...], ...] = field(default=(), kw_only=True)
+    # Per layer group, the KV heads on this rank of its first layer.
+    kv_heads: tuple[int, ...] = field(default=(), kw_only=True)
     # Whether every windowed layer group's stale range is the runtime's window formula of its
     # window and sink blocks at each history, as the manager answered for every history probed.
     stale_ranges_by_formula: bool = field(default=False, kw_only=True)

@@ -1477,9 +1477,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # _build_cache_config, so their buffer sizes are only placeholders.
         return 1
 
-    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
-        """Exclude storage-only NVFP4 alignment pages from KV transfer."""
-        return self._disagg_ignored_roles
+    def _page_untransferred_roles(self) -> frozenset[str]:
+        """Storage-only NVFP4 alignment pages, which hold no state a peer needs."""
+        return frozenset(str(role) for role in self._disagg_ignored_roles)
 
     def _page_quant_mode(self) -> Optional[str]:
         """``"fp8_ds_mla"`` for FP8 pages carrying their own scales."""

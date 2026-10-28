@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, fields
 from typing import List, Optional
 
 import msgpack
@@ -57,7 +57,9 @@ class RankInfo:
         return self.tp_size // self.dp_size if self.attention.enable_attention_dp else self.tp_size
 
     def to_bytes(self) -> bytes:
-        data = asdict(self)
+        # Shallow, field by field: the page table converts itself (to_dict), and a deep copy would
+        # fail on its page layout's read-only mappings.
+        data = {f.name: getattr(self, f.name) for f in fields(self)}
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None

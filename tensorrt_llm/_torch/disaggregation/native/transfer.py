@@ -1372,26 +1372,29 @@ class Sender(SenderBase):
         src_block_ids_per_groups = task._chunk.block_ids_per_layer_groups
 
         # Aggregate fragments from all matching pools using numpy concatenation.
-        # Send ownership is per pool: replicated pools elect one fan-in
-        # owner, sharded pools keep head-duplication routing.
+        # The mapper of a pool pair holds the runs this rank is elected to send
+        # (layout_mapping); an empty one means another rank sends that pair.
         for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
             if (self_lg, self_pi) in task._chunk.excluded_pool_views:
                 continue
-            if not self._registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
+            mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
+            if mapper.empty:
                 continue
 
             lg_info = extractor.page_table.layer_groups[self_lg]
             src_block_ids = src_block_ids_per_groups[self_lg]
             dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
-            # Extract regions: STATE = per-layer ptrs, PAGED = per-block ptrs
+            # Extract slot base pointers: one slot per request for STATE, one per block for PAGED.
             if lg_info.kind == CacheKind.STATE:
                 if src_block_ids.size == 0 or dst_block_ids.size == 0:
                     continue
-                if not MambaPolicy.is_paired(self._registrar.self_rank_info, peer_ri):
-                    continue
-                src_region = extractor.extract_slot(int(src_block_ids[0]), self_lg, self_pi)
-                dst_region = peer_extractor.extract_slot(int(dst_block_ids[0]), peer_lg, peer_pi)
+                src_region = extractor.extract(
+                    np.asarray(src_block_ids[:1], dtype=np.int64), self_lg, self_pi
+                )
+                dst_region = peer_extractor.extract(
+                    np.asarray(dst_block_ids[:1], dtype=np.int64), peer_lg, peer_pi
+                )
             else:
                 src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
                 dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
@@ -1418,7 +1421,6 @@ class Sender(SenderBase):
                 dst_region = peer_extractor.extract(dst_block_ids, peer_lg, peer_pi)
 
             # Map and collect fragments (same for all layer types)
-            mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
             region_pair = mapper.map(src_region, dst_region)
             region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
             for rp in region_pairs:

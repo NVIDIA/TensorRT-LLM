@@ -56,6 +56,14 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PhysicalPoolGroup,
     PoolView,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import map_buffers
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+    BufferDesc,
+    LayerGroupDesc,
+    PageLayout,
+    RankTopology,
+    head_major,
+)
 
 _MIB = 1024 * 1024
 
@@ -876,40 +884,56 @@ class TestMambaHelixCP:
             7,
         )
 
+    @staticmethod
+    def _state_layout(topology, grid):
+        """This rank's share of one recurrent-state buffer of 8 heads of 64 B.
+
+        The heads split over the ``grid`` ranks of the tp x cp state grid.
+        """
+        heads = 8 // grid
+        size = heads * 64
+        return PageLayout(
+            tokens_per_page=32,
+            pool_slot_bytes={0: (size,)},
+            layer_groups=(LayerGroupDesc("state", None, 0, 0, (0,)),),
+            buffers=(
+                BufferDesc(0, "ssm_state", 0, 0, 0, size, head_major(size, heads, 8, ("tp", "cp"))),
+            ),
+            topology=topology,
+        )
+
+    def _runs(self, sender_tp_rank, gen_cp_size, gen_cp_rank):
+        sender = self._state_layout(RankTopology(tp_size=2, tp_rank=sender_tp_rank), 2)
+        receiver = self._state_layout(
+            RankTopology(cp_size=gen_cp_size, cp_rank=gen_cp_rank), gen_cp_size
+        )
+        return [
+            (int(s), int(d), int(n))
+            for runs in map_buffers(sender, receiver)
+            for s, d, n in zip(runs.src_offsets, runs.dst_offsets, runs.sizes)
+        ]
+
     def test_equal_width_unpaired_sender_sends_nothing(self):
-        # Regression lock for the fan-in collapse: with equal shard widths the
-        # mapper is a whole-slot copy, so an unpaired sender must return zero
-        # bytes instead of overwriting the receiver slot with the wrong heads.
+        # Regression lock for the fan-in collapse: with equal shard widths the copy is a whole
+        # slot, so an unpaired sender must send nothing instead of overwriting the receiver slot
+        # with the wrong heads.
         for sender_rank in range(2):
             for gen_cp_rank in range(2):
-                sender_ri = _k3_rank_info(tp_size=2, tp_rank=sender_rank)
-                peer_ri = _k3_rank_info(cp_size=2, cp_rank=gen_cp_rank)
-                paired = MambaPolicy.is_paired(sender_ri, peer_ri)
+                runs = self._runs(sender_rank, 2, gen_cp_rank)
                 if sender_rank == gen_cp_rank:
-                    assert paired
+                    assert runs == [(0, 0, 256)]
                 else:
-                    assert not paired
+                    assert runs == []
 
     def test_narrow_to_wide_pairing_follows_covering_tree(self):
-        # Sender grid 2, receiver grid 4: receiver g pairs with sender g // 2.
+        # Sender grid 2, receiver grid 4: receiver g takes half of sender g // 2's heads.
         for sender_rank in range(2):
             for gen_cp_rank in range(4):
-                sender_ri = _k3_rank_info(tp_size=2, tp_rank=sender_rank)
-                peer_ri = _k3_rank_info(cp_size=4, cp_rank=gen_cp_rank)
-                paired = MambaPolicy.is_paired(sender_ri, peer_ri)
+                runs = self._runs(sender_rank, 4, gen_cp_rank)
                 if gen_cp_rank // 2 == sender_rank:
-                    assert paired, (sender_rank, gen_cp_rank)
+                    assert runs == [(gen_cp_rank % 2 * 128, 0, 128)], (sender_rank, gen_cp_rank)
                 else:
-                    assert not paired, (sender_rank, gen_cp_rank)
-
-    def test_is_paired_unpaired_vs_paired(self):
-        # Unpaired: sender rank 0 is not paired with receiver cp_rank 1
-        sender_ri = _k3_rank_info(tp_size=2, tp_rank=0)
-        peer_ri = _k3_rank_info(cp_size=2, cp_rank=1)
-        assert not MambaPolicy.is_paired(sender_ri, peer_ri)
-        # Paired sender
-        paired_ri = _k3_rank_info(tp_size=2, tp_rank=1)
-        assert MambaPolicy.is_paired(paired_ri, peer_ri)
+                    assert runs == [], (sender_rank, gen_cp_rank)
 
 
 # --------------------------------------------------------------------------- #

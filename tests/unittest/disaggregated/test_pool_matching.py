@@ -48,7 +48,10 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PhysicalPoolGroup,
     PoolView,
 )
-from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_to_layer_group
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    compute_layer_byte_ranges,
+    get_layer_to_layer_group,
+)
 
 # ---------------------------------------------------------------------------
 # Builders
@@ -357,8 +360,8 @@ def test_skewed_buffer_entries_per_layer_raises():
     but is not a uniform per-layer layout — must raise, not return 2.
     """
     view = _pool_view(0, [(0, "key"), (1, "key"), (1, "key"), (1, "key")])
-    with pytest.raises(ValueError, match="not evenly distributed"):
-        PeerRegistrar._get_buffers_per_layer(view, layer_group_id=0, pool_idx=0)
+    with pytest.raises(ValueError, match="not uniform"):
+        compute_layer_byte_ranges(view.buffer_entries)
 
 
 def test_duplicate_global_layer_id_across_lgs_raises():
@@ -453,5 +456,3 @@ def test_mixed_mapper_kinds_are_rejected(self_mapper_kind, peer_mapper_kind):
 
     with pytest.raises(ValueError, match="incompatible mapper kinds"):
         reg.get_pool_mapping(peer_ri)
-    with pytest.raises(ValueError, match="incompatible mapper kinds"):
-        reg.get_kv_map(peer_ri, (0, 0), (0, 0))

@@ -39,10 +39,7 @@ from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native.extent import Chunk
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
-    IntactMapper,
-    ReplicatedMapper,
-)
+from tensorrt_llm._torch.disaggregation.native.runs import RunsMapper
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVRecvTask,
@@ -60,8 +57,8 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PhysicalPoolGroup,
     PoolView,
 )
-from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import merge_runs
 
 pytestmark = pytest.mark.cpu_only
 
@@ -522,13 +519,11 @@ def _summed_sender_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:
         for view_idx, pool_view in enumerate(layer_group.pool_views):
             if (lg_idx, view_idx) in chunk.excluded_pool_views:
                 continue
-            # Offsets in physical slot order, as get_kv_map builds them.
-            starts, bytes_per_layer = get_layer_byte_ranges(pool_view)
-            offsets = np.array(sorted(starts.values()), dtype=np.int64)
-            mapper_cls = (
-                ReplicatedMapper if pool_view.mapper_kind == MapperKind.REPLICATED else IntactMapper
-            )
-            mapper = mapper_cls(offsets, offsets, bytes_per_layer, bytes_per_layer)
+            # Each buffer of the view whole, merged, as get_kv_map yields them for a peer of the
+            # same layout.
+            offsets = pool_view.buffer_entries["offset"].astype(np.int64)
+            sizes = pool_view.buffer_entries["size"].astype(np.int64)
+            mapper = RunsMapper(*merge_runs(offsets, offsets.copy(), sizes))
             region = extractor.extract(block_ids, lg_idx, view_idx)
             pairs = mapper.map(region, region)
             for pair in pairs if isinstance(pairs, list) else [pairs]:

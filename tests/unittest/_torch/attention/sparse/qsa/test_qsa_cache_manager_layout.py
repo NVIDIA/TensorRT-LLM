@@ -251,7 +251,7 @@ _LAYOUTS = {"tp1": (1, False), "tp2": (2, False), "adp2": (2, True)}
 @pytest.mark.parametrize("dtype", [DataType.BF16, DataType.FP8, DataType.NVFP4])
 def test_transfer_views_do_not_depend_on_the_kv_head_split(dtype: DataType) -> None:
     """Disaggregated peers compare the replicated side roles each layer registers and copy
-    their pages byte for byte, so roles, mapper kinds and every side view's page (shape,
+    their pages byte for byte, so roles, their tensors and every side view's page (shape,
     dtype, bytes) must not depend on how many KV heads a rank holds; where pages sit in
     their pools may. At TP2 an FP8 K/V page (1 head x 256 x 32 tokens) is the size of an
     index page; under NVFP4 the same holds at TP1 and ADP2 (2 heads x 128 bytes x 32
@@ -270,7 +270,15 @@ def test_transfer_views_do_not_depend_on_the_kv_head_split(dtype: DataType) -> N
             views = {layer: cm.get_index_k_buffer(layer) for layer in _QSA_LAYERS}
             views["position"] = cm.get_qsa_position_buffer()
             logical = {key: _logical_page(view) for key, view in views.items()}
-            seen[name] = (roles, logical, cm.get_disagg_role_mapper_kinds())
+            # How each side buffer spreads over ranks, as the page table declares it.
+            tensors = {
+                (layer, role): cm._page_buffer_tensors(
+                    cm.layer_offsets[layer], role, size, _TPB, False
+                )
+                for layer, layer_roles in roles.items()
+                for role, size in layer_roles
+            }
+            seen[name] = (roles, logical, tensors)
         finally:
             cm.shutdown()
     assert seen["tp1"] == seen["tp2"] == seen["adp2"]
