@@ -441,8 +441,11 @@ to run after the writers are done. Only the **gen** workers announce that
 workers and the disaggregated server do not. `wait_for_perf_metrics_files` therefore
 polls the discovered set until its total size holds still for
 `PERF_METRICS_SETTLE_SECONDS`, bounded by `PERF_METRICS_SETTLE_TIMEOUT`, before
-anything is read, and then compares the largest file's complete-record count against
-the client's `--num-prompts`. Both a still-growing set at the timeout and a census
+anything is read, and then compares the census against the client's `--num-prompts`.
+The census counts the complete records of one server role (the disaggregated server,
+the ctx workers, the gen workers, or an aggregated server), summed over that role's
+files: a role writes one file per instance and per frontend process
+(`num_serve_frontends`). Both a still-growing set at the timeout and a census
 shortfall are logged as warnings, not failures — a nearly-complete file still yields
 usable statistics, and the numbers are not regression-gated. This matters because a
 truncated read is otherwise **invisible**: all 108 fields are still populated and the
@@ -452,8 +455,8 @@ file would silently reroute the per-request groups to same-role worker fallbacks
 which produce plausible values for the wrong phase.
 
 The servers also append records of the e2e connection warmup's and the warmup pass's
-requests to these files. The harness therefore waits until the largest file holds a
-record for every successful warmup request and the files hold still, then notes each
+requests to these files. The harness therefore waits until the census holds a record
+for every successful warmup request and the files hold still, then notes each
 file's line count; the aggregation skips those leading lines and leaves
 them out of the census. Unlike the measured run's census, this one is a failure: if
 the count is not reached within `PERF_METRICS_SETTLE_TIMEOUT`, the test fails rather

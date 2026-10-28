@@ -35,7 +35,10 @@ Stdlib-only, so unit tests can load it without torch.
 """
 
 import os
-from typing import List, Mapping, Optional, Sequence
+import re
+import subprocess
+import time
+from typing import Callable, List, Mapping, Optional, Sequence
 
 WARMUP_PASS_ENV = "TRTLLM_PERF_SANITY_WARMUP_PASS"
 
@@ -53,6 +56,9 @@ _SAVE_TIME_BREAKDOWN_FLAG = "--save-request-time-breakdown"
 _FLAGS_WITH_REPLACED_VALUE = (_NUM_PROMPTS_FLAG, _SEED_FLAG, _SAVE_TIME_BREAKDOWN_FLAG)
 # benchmark_serving's --seed default.
 _BENCHMARK_SERVING_DEFAULT_SEED = 0
+# benchmark_serving's "Failed requests:" summary line, its only failure signal:
+# benchmark_serving exits 0 even when requests fail.
+_FAILED_REQUESTS_RE = re.compile(r"^Failed requests:\s+(\d+)", re.MULTILINE)
 
 
 def warmup_pass_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
@@ -126,3 +132,69 @@ def build_warmup_pass_cmd(measured_cmd: Sequence[str], num_requests: int) -> Lis
         str(measured_seed + 1),
         _NO_TEST_INPUT_FLAG,
     ]
+
+
+def count_failed_requests(output: str) -> int:
+    """Return the failed requests a ``benchmark_serving`` output reports, or 0."""
+    match = _FAILED_REQUESTS_RE.search(output)
+    return int(match.group(1)) if match else 0
+
+
+def send_warmup_pass(
+    warmup_cmd: List[str],
+    num_requests: int,
+    run_benchmark: Callable[[List[str]], str],
+    log_path: str,
+    timeout: float,
+    log_info: Callable[[str], None] = print,
+    log_warning: Callable[[str], None] = print,
+) -> int:
+    """Send the warmup pass; return how many of its requests succeeded.
+
+    If only some requests fail, the pass still warmed the shapes it reached, so it
+    logs a warning and the measured client decides whether the test passes.
+
+    Args:
+        warmup_cmd: The ``build_warmup_pass_cmd`` command, with the server's host
+            and port.
+        num_requests: Requests the command sends.
+        run_benchmark: Runs a command and returns its output. Raises
+            ``subprocess.CalledProcessError`` if the command exits non-zero, and
+            ``subprocess.TimeoutExpired`` after ``timeout`` seconds.
+        log_path: Where ``run_benchmark`` writes the output; named in messages.
+        timeout: The time limit ``run_benchmark`` applies, in seconds.
+        log_info: Receives progress messages.
+        log_warning: Receives the message about a partial failure.
+
+    Returns:
+        The number of warmup requests that succeeded.
+
+    Raises:
+        RuntimeError: The command exited non-zero, timed out, or had every
+            request fail.
+    """
+    log_info(f"Warmup pass: sending {num_requests} requests. cmd is {warmup_cmd}")
+    start = time.monotonic()
+    try:
+        output = run_benchmark(warmup_cmd)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"Warmup pass: benchmark_serving exited with code {e.returncode}. See {log_path}"
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"Warmup pass: {num_requests} requests did not finish within {timeout:.0f}s. "
+            f"See {log_path}"
+        ) from e
+    elapsed = time.monotonic() - start
+    failed_count = count_failed_requests(output)
+    if failed_count >= num_requests:
+        raise RuntimeError(f"Warmup pass: all {num_requests} requests failed. See {log_path}")
+    if failed_count:
+        log_warning(
+            f"Warmup pass: {failed_count} of {num_requests} requests failed ({elapsed:.0f}s). "
+            f"See {log_path}"
+        )
+    else:
+        log_info(f"Warmup pass: {num_requests} requests done in {elapsed:.0f}s")
+    return num_requests - failed_count

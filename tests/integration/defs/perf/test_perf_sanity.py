@@ -54,7 +54,13 @@ from .time_breakdown_metrics import (
     format_metric_log_lines,
     wait_for_perf_metrics_files,
 )
-from .warmup_pass import build_warmup_pass_cmd, warmup_pass_applies, warmup_pass_enabled
+from .warmup_pass import (
+    build_warmup_pass_cmd,
+    count_failed_requests,
+    send_warmup_pass,
+    warmup_pass_applies,
+    warmup_pass_enabled,
+)
 
 SUPPORTED_GPU_MAPPING = {
     "GB200": "gb200",
@@ -218,9 +224,6 @@ CONNECTION_WARMUP_REQUESTS_PER_RANK_PAIR = 2
 # cold 32-rank gen server finished in 42 s on oci-jhb), so reaching this bound means
 # the servers are wedged.
 CONNECTION_WARMUP_TIMEOUT = 600
-# benchmark_serving's "Failed requests:" summary line, its only failure signal:
-# benchmark_serving exits 0 even when requests fail.
-_FAILED_REQUESTS_RE = re.compile(r"^Failed requests:\s+(\d+)", re.MULTILINE)
 
 
 def server_ready_timeout(default: int, mode: str) -> int:
@@ -1821,9 +1824,6 @@ def run_warmup_pass(
 ) -> int:
     """Send the warmup pass for one measured client; see warmup_pass.py.
 
-    If only some requests fail, the pass still warmed the shapes it reached, so it
-    logs a warning and the measured client decides whether the test passes.
-
     Args:
         client_cmd: The measured client's command, without host and port.
         client_config: The measured client's config; its env is reused.
@@ -1840,35 +1840,17 @@ def run_warmup_pass(
         RuntimeError: benchmark_serving exited non-zero, timed out, or had every
             request fail.
     """
-    cmd = add_host_port_to_cmd(build_warmup_pass_cmd(client_cmd, num_requests), hostname, port)
     env = copy.deepcopy(os.environ)
     env.update(client_config.to_env())
-    print_info(f"Warmup pass: sending {num_requests} requests. cmd is {cmd}")
-    start = time.monotonic()
-    try:
-        output = _run_benchmark_with_log(cmd, env, log_path, timeout=timeout)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(
-            f"Warmup pass: benchmark_serving exited with code {e.returncode}. See {log_path}"
-        ) from e
-    except subprocess.TimeoutExpired as e:
-        raise RuntimeError(
-            f"Warmup pass: {num_requests} requests did not finish within {timeout:.0f}s. "
-            f"See {log_path}"
-        ) from e
-    elapsed = time.monotonic() - start
-    failed_match = _FAILED_REQUESTS_RE.search(output)
-    failed_count = int(failed_match.group(1)) if failed_match else 0
-    if failed_count >= num_requests:
-        raise RuntimeError(f"Warmup pass: all {num_requests} requests failed. See {log_path}")
-    if failed_count:
-        print_warning(
-            f"Warmup pass: {failed_count} of {num_requests} requests failed ({elapsed:.0f}s). "
-            f"See {log_path}"
-        )
-    else:
-        print_info(f"Warmup pass: {num_requests} requests done in {elapsed:.0f}s")
-    return num_requests - failed_count
+    return send_warmup_pass(
+        add_host_port_to_cmd(build_warmup_pass_cmd(client_cmd, num_requests), hostname, port),
+        num_requests,
+        run_benchmark=lambda cmd: _run_benchmark_with_log(cmd, env, log_path, timeout=timeout),
+        log_path=log_path,
+        timeout=timeout,
+        log_info=print_info,
+        log_warning=print_warning,
+    )
 
 
 def wait_for_unmeasured_line_counts(
@@ -1880,10 +1862,11 @@ def wait_for_unmeasured_line_counts(
     written after this snapshot would count as measured. Each server queues a
     request's record before it finishes answering that request, so every warmup
     record is already queued when the warmup client exits; this waits for them to
-    be written. First, the largest file must reach num_unmeasured_requests lines.
-    That file belongs to a server that saw every warmup request: the disagg server,
-    or a lone ctx, gen or aggregated server. Then the files must hold still for
-    PERF_METRICS_SETTLE_SECONDS, so the other servers' queued records are written
+    be written. First, one server role must hold num_unmeasured_requests records,
+    summed over its files: each role (the disagg server, the ctx workers, the gen
+    workers, or an aggregated server) sees every request, but writes one file per
+    instance and per frontend process. Then the files must hold still for
+    PERF_METRICS_SETTLE_SECONDS, so the other roles' queued records are written
     too.
 
     Args:
@@ -1906,9 +1889,9 @@ def wait_for_unmeasured_line_counts(
     )
     if not settle_info["stable"]:
         raise RuntimeError(
-            f"Expected {num_unmeasured_requests} warmup records in the largest "
-            f"perf_metrics file under {perf_metrics_output_dir}, but the files did not "
-            f"reach that count and stop growing within {PERF_METRICS_SETTLE_TIMEOUT:.0f}s "
+            f"Expected {num_unmeasured_requests} warmup records from one server role "
+            f"under {perf_metrics_output_dir}, but the perf_metrics files did not reach "
+            f"that count and stop growing within {PERF_METRICS_SETTLE_TIMEOUT:.0f}s "
             f"(line counts: {settle_info['line_counts']}). Failing so that late warmup "
             "records are not counted as measured in d_tb_*."
         )
@@ -2870,8 +2853,9 @@ class AggrTestCmds(NamedTuple):
                             timeout=min(self.timeout, DEFAULT_TIMEOUT),
                         )
                     # The time breakdown skips only leading lines, so count them
-                    # once, before the first measured client. A time_breakdown
-                    # lane has a single client.
+                    # once, before the first measured client. CI's time_breakdown
+                    # lanes have a single client; with more, a later client's pass
+                    # joins the breakdown.
                     if (
                         collect_time_breakdown
                         and num_unmeasured_requests
@@ -3540,8 +3524,7 @@ class DisaggTestCmds(NamedTuple):
                 f"{timeout_seconds}s, so the servers look wedged. See {log_path}"
             ) from e
         elapsed = time.monotonic() - start
-        failed_match = _FAILED_REQUESTS_RE.search(output)
-        failed_count = int(failed_match.group(1)) if failed_match else 0
+        failed_count = count_failed_requests(output)
         if failed_count >= num_requests:
             raise RuntimeError(
                 f"Connection warmup: all {num_requests} requests failed. See {log_path}"
@@ -3860,12 +3843,18 @@ class DisaggTestCmds(NamedTuple):
                     only_run_accuracy = bool(client_config and client_config.only_run_accuracy)
 
                     if not only_run_accuracy:
-                        # Before the gen-log snapshot below, so the device step
-                        # time leaves the pass's iterations out.
                         num_warmup_requests = warmup_pass_requests_for(
                             client_config, benchmark_mode_for_idx
                         )
                         if num_warmup_requests:
+                            # The pass runs between two clients' gen-log windows,
+                            # so neither one's device step time counts its
+                            # iterations: close the previous client's window
+                            # here, and open this client's after the pass.
+                            if collect_device_step_time and pending_device_step_time:
+                                pending_device_step_time[-1]["end_offsets"] = gen_worker_log_sizes(
+                                    self.test_output_dir, self.num_gen_servers
+                                )
                             num_unmeasured_requests += run_warmup_pass(
                                 client_cmd,
                                 client_config,
@@ -3876,8 +3865,9 @@ class DisaggTestCmds(NamedTuple):
                                 timeout=min(self.timeout, DEFAULT_TIMEOUT),
                             )
                         # The time breakdown skips only leading lines, so count
-                        # them once, before the first measured client. A disagg
-                        # lane has a single client.
+                        # them once, before the first measured client. CI's
+                        # time_breakdown lanes have a single client; with more, a
+                        # later client's pass joins the breakdown.
                         if (
                             collect_time_breakdown
                             and num_unmeasured_requests
@@ -3897,11 +3887,12 @@ class DisaggTestCmds(NamedTuple):
                         print_info(f"Starting benchmark. cmd is {client_cmd_with_port}")
 
                         # Snapshot gen_server log sizes so each client's stats
-                        # cover only iterations driven by that client. This is
-                        # also the *end* bound of the previous client's window
-                        # (see the fixup below): taken here, it is necessarily
-                        # after that client returned, so it absorbs whatever
-                        # the gen workers flushed late. Modes outside
+                        # cover only iterations driven by that client. Unless a
+                        # warmup pass closed it above, this is also the *end*
+                        # bound of the previous client's window (see the fixup
+                        # below): taken here, it is necessarily after that
+                        # client returned, so it absorbs whatever the gen
+                        # workers flushed late. Modes outside
                         # DEVICE_STEP_TIME_MODES skip this and must not wait for
                         # the GEN teardown sentinel.
                         gen_log_start_offsets = None
@@ -3909,7 +3900,10 @@ class DisaggTestCmds(NamedTuple):
                             gen_log_start_offsets = gen_worker_log_sizes(
                                 self.test_output_dir, self.num_gen_servers
                             )
-                            if pending_device_step_time:
+                            if (
+                                pending_device_step_time
+                                and pending_device_step_time[-1]["end_offsets"] is None
+                            ):
                                 # Close the previous client's window here rather
                                 # than at its own return: this snapshot is the
                                 # first byte of the current client's segment, so

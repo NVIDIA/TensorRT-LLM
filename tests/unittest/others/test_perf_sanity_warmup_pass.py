@@ -12,28 +12,38 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The perf-sanity warmup pass must send the measured traffic shape and nothing else.
+"""The perf-sanity warmup pass must send the measured traffic shape and stay unmeasured.
 
 A pass whose command drifts from the measured one warms the wrong prefill shapes, and
 one that reuses the measured prompts lets measured requests hit its KV cache blocks;
-either way the measured numbers move without any runtime change.
+either way the measured numbers move without any runtime change. The servers also
+record the pass's requests in the perf_metrics JSONLs the d_tb_* time breakdown reads,
+so those records must be left out, however many files they are split across.
 """
 
 import importlib.util
+import json
+import subprocess
 from pathlib import Path
-from typing import List, Sequence
+from typing import Callable, List, Sequence, Tuple
 
 import pytest
 
 pytestmark = pytest.mark.cpu_only
 
-# Loaded by path: importing it through the ``defs`` package pulls in torch.
-_SPEC = importlib.util.spec_from_file_location(
-    "warmup_pass",
-    Path(__file__).resolve().parents[2] / "integration/defs/perf/warmup_pass.py",
-)
-warmup_pass = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(warmup_pass)
+
+def _load_perf_module(name: str):
+    # Loaded by path: importing it through the ``defs`` package pulls in torch.
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).resolve().parents[2] / f"integration/defs/perf/{name}.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+warmup_pass = _load_perf_module("warmup_pass")
+tbm = _load_perf_module("time_breakdown_metrics")
 
 _BENCHMARK_SERVING = ["python", "-m", "tensorrt_llm.serve.scripts.benchmark_serving"]
 
@@ -156,3 +166,162 @@ def test_warmup_pass_env_switch(environ: dict, enabled: bool) -> None:
 )
 def test_warmup_pass_modes(benchmark_mode, applies: bool) -> None:
     assert warmup_pass.warmup_pass_applies(benchmark_mode) is applies
+
+
+def _send_warmup_pass(
+    run_benchmark: Callable[[List[str]], str], num_requests: int = 4
+) -> Tuple[int, List[str]]:
+    """Return send_warmup_pass's successful requests and the warnings it logged."""
+    warnings: List[str] = []
+    succeeded = warmup_pass.send_warmup_pass(
+        ["benchmark_serving"],
+        num_requests,
+        run_benchmark,
+        log_path="warmup-pass.log",
+        timeout=60.0,
+        log_info=lambda _message: None,
+        log_warning=warnings.append,
+    )
+    return succeeded, warnings
+
+
+def _benchmark_summary(successful: int, failed: int) -> str:
+    return f"Successful requests:   {successful}\nFailed requests:   {failed}\n"
+
+
+@pytest.mark.parametrize(
+    ("output", "expected_succeeded", "warns"),
+    [
+        (_benchmark_summary(4, 0), 4, False),
+        # The pass still warmed the shapes it reached; the measured client decides.
+        (_benchmark_summary(3, 1), 3, True),
+    ],
+)
+def test_warmup_pass_returns_its_successful_requests(
+    output: str, expected_succeeded: int, warns: bool
+) -> None:
+    sent: List[List[str]] = []
+
+    def run_benchmark(cmd: List[str]) -> str:
+        sent.append(cmd)
+        return output
+
+    succeeded, warnings = _send_warmup_pass(run_benchmark)
+
+    assert sent == [["benchmark_serving"]]
+    assert succeeded == expected_succeeded
+    assert bool(warnings) is warns
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        subprocess.CalledProcessError(1, ["benchmark_serving"]),
+        subprocess.TimeoutExpired(["benchmark_serving"], 60.0),
+    ],
+)
+def test_warmup_pass_client_error_fails_the_test(error: subprocess.SubprocessError) -> None:
+    def run_benchmark(_cmd: List[str]) -> str:
+        raise error
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _send_warmup_pass(run_benchmark)
+    assert excinfo.value.__cause__ is error
+
+
+def test_warmup_pass_with_every_request_failed_fails_the_test() -> None:
+    with pytest.raises(RuntimeError):
+        _send_warmup_pass(lambda _cmd: _benchmark_summary(0, 4))
+
+
+class _FakeClock:
+    """Drives wait_for_perf_metrics_files without wall time; calls on_sleep at each poll."""
+
+    def __init__(self, on_sleep: Callable[[], None] = lambda: None):
+        self.now = 0.0
+        self._on_sleep = on_sleep
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        self._on_sleep()
+
+
+def _aggregated_server_record(arrival: float, ctx_queue_s: float) -> str:
+    """One JSONL line of an aggregated server (a ctx_only case), with the fields read here."""
+    timing = {"arrival_time": arrival, "first_scheduled_time": arrival + ctx_queue_s}
+    return json.dumps({"perf_metrics": {"timing_metrics": timing}}) + "\n"
+
+
+def test_warmup_records_split_across_frontend_files_are_skipped(tmp_path: Path) -> None:
+    # A ctx_only server with two frontend processes (num_serve_frontends: 2). Each
+    # process writes its own file, so each file holds only its share of the warmup
+    # records, and the second has not written its last one yet.
+    frontend_files = [tmp_path / f"perf_metrics-server-node0-{pid}-x.jsonl" for pid in (11, 12)]
+    warmup_records = [_aggregated_server_record(i * 0.001, ctx_queue_s=5.0) for i in range(8)]
+    frontend_files[0].write_text("".join(warmup_records[0::2]))
+    frontend_files[1].write_text("".join(warmup_records[1:-1:2]))
+    late_records = warmup_records[-1:]
+
+    def flush_late_records() -> None:
+        with frontend_files[1].open("a") as handle:
+            handle.writelines(late_records)
+        late_records.clear()
+
+    clock = _FakeClock(on_sleep=flush_late_records)
+    _, after_warmup = tbm.wait_for_perf_metrics_files(
+        str(tmp_path),
+        expected_requests=len(warmup_records),
+        wait_for_expected_requests=True,
+        stable_seconds=0,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+    assert after_warmup["stable"]
+    # Does nothing if the wait saw the late record. Otherwise the record lands after the
+    # snapshot, and the assertion below catches the leak.
+    flush_late_records()
+
+    for frontend_idx, path in enumerate(frontend_files):
+        with path.open("a") as handle:
+            handle.writelines(
+                _aggregated_server_record(100.0 + frontend_idx + i * 0.01, ctx_queue_s=0.1)
+                for i in range(30)
+            )
+    metrics, _ = tbm.compute_time_breakdown_metrics(
+        [str(path) for path in frontend_files],
+        "ctx_only",
+        leading_lines_to_skip=after_warmup["line_counts"],
+    )
+
+    assert metrics["d_tb_ctx_queue_mean"] == pytest.approx(100.0)
+
+
+def test_warmup_census_does_not_add_up_server_roles(tmp_path: Path) -> None:
+    # A disagg e2e run: the disagg server, the ctx worker and the gen worker each record
+    # every request. Each has written two of the four warmup records so far, which is
+    # not all four, however many files hold them.
+    first_records = {
+        "perf_metrics-disagg-node0-1-x.jsonl": {"ctx_perf_metrics": {}, "gen_perf_metrics": {}},
+        "perf_metrics-server-node1-2-x.jsonl": {
+            "time_breakdown_metrics": {"ctx_chunk_metrics": []}
+        },
+        "perf_metrics-server-node2-3-x.jsonl": {"time_breakdown_metrics": {"step_metrics": []}},
+    }
+    for name, record in first_records.items():
+        (tmp_path / name).write_text((json.dumps(record) + "\n") * 2)
+
+    clock = _FakeClock()
+    _, info = tbm.wait_for_perf_metrics_files(
+        str(tmp_path),
+        expected_requests=4,
+        wait_for_expected_requests=True,
+        stable_seconds=0,
+        timeout_seconds=5.0,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+
+    assert not info["stable"]
