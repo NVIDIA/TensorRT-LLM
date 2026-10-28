@@ -310,10 +310,9 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
     //
     // boltOptimizeWheel, by contrast, IS declared, so it reliably arrives. Key
     // off it and let a BOLT request carry itself past both gates. The bypass is
-    // deliberately narrow -- one arch, one dockerfile stage, only when BOLT was
-    // asked for -- so the nvbug's blast radius stays at the SBSA release image
-    // instead of being reopened for every image this job builds.
-    def boltWheelRequired = BOLT_OPTIMIZE_WHEEL && arch == "sbsa" && dockerfileStage == "release"
+    // limited to SBSA release images that request BOLT optimization.
+    def isReleaseStage = dockerfileStage in ["release", "tritonrelease"]
+    def boltWheelRequired = BOLT_OPTIMIZE_WHEEL && arch == "sbsa" && isReleaseStage
 
     if (!boltWheelRequired) {
         if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE) {
@@ -340,8 +339,8 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
         return ""
     }
 
-    if (dockerfileStage != "release") {
-        echo "prepareWheelFromBuildStage: ${dockerfileStage} is not release"
+    if (!isReleaseStage) {
+        echo "prepareWheelFromBuildStage: ${dockerfileStage} is not a release image stage"
         return ""
     }
 

@@ -1,0 +1,175 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# MiniMax-M3 NVFP4 + EAGLE3-GQA decode at a fixed long context, for the
+# gen_only_no_context lane: one TP4 gen worker on one GB300 node decodes 64 requests
+# of exactly 153600 input / 1024 output random tokens. This is the "TP4, 150K
+# context, B64" decode proxy of the MiniMax-M3 ctx-only / gen-only optimization
+# study, on that study's base2 gen worker: MSA sparse attention with an FP8 indexer,
+# NVFP4 KV cache on KV cache manager v2, TRTLLM MoE with low-precision combine,
+# Eagle3 draft 3 with acceptance forced to 1.78 drafted tokens per step (the base2
+# setting), CUDA graphs for batch 1-64. worker_config and the env are the base2
+# worker configs (bench/sweeps/gen-tp4) as written; the sweep's command-line shape
+# (gen TP4, batch 64, 512 tokens; ctx TP2, batch 64, 16384 tokens) is written into
+# the yaml, the retired max_tokens_in_buffer is dropped, three env vars main does
+# not read are left out and TLLM_LOG_LEVEL=INFO is added, as in every perf-sanity
+# config. The ctx section (the study's TP2 prefill worker) is not started by
+# gen_only_no_context.
+#
+# modeling_v2 is pinned `off` on the gen worker: at B=64 #20306's MiniMax-M3 TP4
+# target took 47.5 ms per decode step here against 45.6 ms for the built-in model
+# (median, same wheel, GB300), so this lane keeps the built-in model. The con1
+# lane, where that target is faster, uses `auto`.
+#
+# On the ctx worker, block reuse and its 180 GiB host tier (the study's AgentX prefix
+# reuse) are off: the fixed random prompts share no prefix, and with reuse on the
+# first measured ctx_only request would reuse the warmup request's prompt.
+metadata:
+  model_name: minimax_m3_fp4
+  precision: fp4
+  model_dir_name: MiniMax-M3-NVFP4
+  supported_gpus:
+  - GB300
+  script_file: disaggr_torch.slurm
+  benchmark_type: 150k1k
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: <partition>
+  account: <account>
+  job_time: 02:00:00
+  job_name: unified-benchmark
+  extra_args: --gres=gpu:4
+  numa_bind: true
+benchmark:
+  mode: e2e
+  use_nv_sa_benchmark: false
+  multi_round: 5
+  benchmark_ratio: 0.0
+  streaming: true
+  concurrency_list: '64'
+  input_length: 153600
+  output_length: 1024
+  dataset_file: <dataset_file>
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
+environment:
+  container_mount: <container_mount>
+  container_image: <container_image>
+  model_path: <model_path>
+  trtllm_repo: ''
+  build_wheel: false
+  work_dir: <full_path_to_work_dir>
+  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1
+    NCCL_GRAPH_MIXING_SUPPORT=0 TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=0 TRTLLM_KV_TRANSFER_NUM_THREADS=4 MIMALLOC_PURGE_DELAY=0
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1.78 TRTLLM_NIXL_BOUNCE_ENABLE=1
+    TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES=32MiB TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST=8 TRTLLM_NIXL_BOUNCE_COPY_STREAM_COUNT=8
+    TRTLLM_NIXL_BOUNCE_SCATTER_WORKER_COUNT=4 TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT=1024 TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES=16KiB
+    TRTLLM_NIXL_BOUNCE_ENABLE_EAGER_GATHER=1 TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS=1 TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1
+  gen_worker_env_var: TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL=0
+  server_env_var: TRTLLM_SERVER_DISABLE_GC=1
+profiling:
+  nsys_on: false
+worker_config:
+  gen:
+    modeling_v2: 'off'
+    print_iter_log: true
+    max_batch_size: 64
+    max_num_tokens: 512
+    tensor_parallel_size: 4
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: false
+    enable_lm_head_tp_in_adp: false
+    trust_remote_code: true
+    max_seq_len: 1048576
+    num_postprocess_workers: 8
+    reasoning_parser: minimax_m3
+    stream_interval: 20
+    enable_autotuner: true
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+        27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
+        53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64]
+    moe_config:
+      backend: TRTLLM
+      use_low_precision_moe_combine: true
+    sparse_attention_config:
+      algorithm: minimax_m3
+      implementation: msa
+      indexer_kv_dtype: fp8
+      sparse_disable_index_value: true
+      fuse_qkv_index_projection: true
+    kv_cache_config:
+      dtype: nvfp4
+      tokens_per_block: 128
+      use_kv_cache_manager_v2: true
+      free_gpu_memory_fraction: 0.94
+      enable_block_reuse: false
+      event_buffer_max_size: 0
+      avg_seq_len: 220000
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      kv_transfer_timeout_ms: 600000
+      kv_cache_bounce_size_mb: 1024
+      agent_bounce_buffer_enable: true
+    scheduler_config:
+      capacity_scheduler_policy: MAX_UTILIZATION
+    return_perf_metrics: false
+    speculative_config:
+      decoding_type: Eagle3
+      max_draft_len: 3
+      speculative_model: MiniMax-M3-EAGLE3-GQA
+    moe_expert_parallel_size: 1
+  ctx:
+    print_iter_log: true
+    max_batch_size: 64
+    max_num_tokens: 16384
+    tensor_parallel_size: 2
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: false
+    trust_remote_code: true
+    max_seq_len: 1048576
+    num_postprocess_workers: 8
+    reasoning_parser: minimax_m3
+    torch_compile_config:
+      enable_fullgraph: true
+      enable_inductor: false
+      enable_piecewise_cuda_graph: true
+      capture_num_tokens: [1, 512, 1024, 2048]
+      enable_userbuffers: true
+      max_num_streams: 3
+    enable_chunked_prefill: true
+    enable_autotuner: true
+    stream_interval: 20
+    moe_config:
+      backend: TRTLLM
+      use_low_precision_moe_combine: true
+    sparse_attention_config:
+      algorithm: minimax_m3
+      implementation: msa
+      indexer_kv_dtype: fp8
+      sparse_disable_index_value: true
+      fuse_qkv_index_projection: true
+    kv_cache_config:
+      dtype: nvfp4
+      tokens_per_block: 128
+      use_kv_cache_manager_v2: true
+      free_gpu_memory_fraction: 0.94
+      event_buffer_max_size: 0
+      enable_block_reuse: false
+    speculative_config:
+      decoding_type: Eagle3
+      max_draft_len: 3
+      speculative_model: MiniMax-M3-EAGLE3-GQA
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      kv_transfer_timeout_ms: 600000
+      kv_cache_bounce_size_mb: 1024
+      agent_bounce_buffer_enable: true
+    moe_expert_parallel_size: 1
