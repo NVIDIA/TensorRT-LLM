@@ -421,7 +421,7 @@ def _make_manager_for_cache_tier_test(
         None,
     )
     if fake_impl is not None:
-        fake_impl.layer_grouping = [[0]]
+        fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
         fake_impl.pool_group_descs = []
         fake_impl.get_layer_group_id.side_effect = lambda _: 0
         fake_impl.all_buffer_ids = [BufferId(LayerId(0), Role.KEY)]
@@ -1057,10 +1057,10 @@ def test_layer_group_helpers_describe_split_ssm_layers() -> None:
         manager._layer_group_life_cycles = None
 
         attention = impl.get_layer_group_id(LayerId(0))
-        required = impl.get_layer_group_id(LayerId(1), DataRole("ssm_state"))
-        private = impl.get_layer_group_id(LayerId(1), DataRole("old_x"))
+        required = impl.get_buffer_group_id(LayerId(1), DataRole("ssm_state"))
+        private = impl.get_buffer_group_id(LayerId(1), DataRole("old_x"))
         assert len({attention, required, private}) == 3
-        assert sorted(impl.layer_grouping[private]) == [1, 2]
+        assert sorted({buffer.layer_id for buffer in impl.buffer_grouping[private]}) == [1, 2]
 
         assert manager._get_event_window_sizes_by_layer_group(attention_only=True) == {attention: 8}
         assert manager._get_event_window_sizes_by_layer_group() == {
@@ -1103,7 +1103,11 @@ def test_event_window_sizes_filter_attention_without_backend_internals(
     )
     # Match the C++ binding surface: layer_grouping is public, while the
     # Python implementation's private _life_cycles registry is absent.
-    manager.impl = SimpleNamespace(layer_grouping=[[0], [1]] if attention_first else [[1], [0]])
+    manager.impl = SimpleNamespace(
+        buffer_grouping=[
+            [BufferId(LayerId(i), Role.KEY)] for i in ([0, 1] if attention_first else [1, 0])
+        ]
+    )
 
     attention_group_id = 0 if attention_first else 1
     window_size = MAX_SEQ_LEN if sliding_window_size is None else sliding_window_size
@@ -3245,7 +3249,7 @@ def _index_mapper_capacity_for(
     """
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     fake_impl = Mock()
-    fake_impl.layer_grouping = [[0]]
+    fake_impl.buffer_grouping = [[BufferId(LayerId(0), Role.KEY)]]
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
     fake_impl.all_buffer_ids = [BufferId(LayerId(0), Role.KEY)]
@@ -4081,3 +4085,41 @@ def test_try_commit_generation_blocks_honors_guards(
     manager.try_commit_generation_blocks(request)
 
     assert kv_cache.committed_tokens is None
+
+
+@pytest.mark.parametrize("role", [Role.VALUE, Role.KEY_BLOCK_SCALE])
+def test_default_attention_rejects_split_coupled_buffers(monkeypatch, role):
+    original = KVCacheManagerV2._build_cache_config
+
+    def build_config(self, config):
+        config = original(self, config)
+        layers = list(config.layers)
+        layer = layers[0]
+        buffers = [
+            BufferConfig(
+                role=buffer.role,
+                size=buffer.size,
+                reuse_policy=ReusePolicy.PRIVATE if buffer.role == role else None,
+            )
+            for buffer in layer.buffers
+        ]
+        if role == Role.KEY_BLOCK_SCALE:
+            buffers.append(BufferConfig(role=role, size=128, reuse_policy=ReusePolicy.PRIVATE))
+        layers[0] = AttentionLayerConfig(layer_id=layer.layer_id, buffers=buffers)
+        return replace(config, layers=layers)
+
+    monkeypatch.setattr(KVCacheManagerV2, "_build_cache_config", build_config)
+    with pytest.raises(ValueError, match="requires one shared page-index table"):
+        KVCacheManagerV2(
+            KvCacheConfig(max_gpu_total_bytes=4 << 20, host_cache_size=0),
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=1,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=16,
+        )

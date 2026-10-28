@@ -51,11 +51,7 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, int tokensPerBlock)
 LifeCycle makeLifeCycle(LayerConfig const& layer, BufferConfig const& buffer, int tokensPerBlock)
 {
     LifeCycle lc = makeLifeCycle(layer, tokensPerBlock);
-    // Attention layers reject buffer policies that differ from the layer's, so only SSM lifecycles change here.
-    if (auto* ssm = std::get_if<SsmLifeCycle>(&lc))
-    {
-        ssm->reusePolicy = buffer.effectiveReusePolicy(ssm->reusePolicy);
-    }
+    std::visit([&buffer](auto& value) { value.reusePolicy = buffer.effectiveReusePolicy(value.reusePolicy); }, lc);
     return lc;
 }
 

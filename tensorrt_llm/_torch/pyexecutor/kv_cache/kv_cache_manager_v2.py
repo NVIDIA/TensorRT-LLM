@@ -2401,10 +2401,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 self._get_event_layer_group_ids(),
             )
 
-        # Both backends build layer_grouping on demand, and the layer order
+        # Buffer membership has no physical ordering guarantee. The layer order
         # within a group is not part of its contract. Cache a stable physical-
         # layout representative for each role from the public pool descriptors.
-        self.num_pools = len(self.impl.layer_grouping)
+        self.num_pools = len(self._layer_ids_by_group)
         self._pool_layer_ids_by_role: Dict[Tuple[int, DataRole], LayerId] = {}
         for pool_group in self.impl.pool_group_descs:
             for variant in pool_group.slot_desc.variants:
@@ -2414,10 +2414,16 @@ class KVCacheManagerV2(BaseResourceManager):
                         self._pool_layer_ids_by_role.setdefault(
                             (pool_id, buffer_id.role), buffer_id.layer_id
                         )
-        num_layers = len(config.layers)
-        self.layer_to_pool_mapping_dict: dict[int, int] = {
-            layer_id: self.impl.get_layer_group_id(layer_id)
-            for layer_id in typed_range(LayerId(num_layers))
+        groups_by_layer: dict[int, set[int]] = defaultdict(set)
+        self.buffer_to_pool_mapping_dict: dict[tuple[int, DataRole], int] = {}
+        for group_id, buffers in enumerate(self.impl.buffer_grouping):
+            for buffer in buffers:
+                groups_by_layer[int(buffer.layer_id)].add(group_id)
+                self.buffer_to_pool_mapping_dict[(int(buffer.layer_id), buffer.role)] = group_id
+        self.layer_to_pool_mapping_dict = {
+            layer_id: next(iter(groups))
+            for layer_id, groups in groups_by_layer.items()
+            if len(groups) == 1
         }
 
         self.kv_cache_map: dict[int, _KVCache] = {}
@@ -2577,7 +2583,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._sparse_layer_group_ids = tuple(
             sorted(
                 {
-                    self.layer_to_pool_mapping_dict[buf.layer_id]
+                    self.impl.get_buffer_group_id(buf.layer_id, buf.role)
                     for buf in self.impl.all_buffer_ids
                     if self.impl.is_sparse(buf.layer_id, buf.role)
                 }
@@ -2833,7 +2839,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 fill_stream = torch.cuda.current_stream(device=self._stream.device)
                 fill_stream.wait_stream(self._stream)
             for layer_idx in self.pp_layers:
-                if self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]] != pool_id:
+                if self._get_layer_execution_group(self.layer_offsets[layer_idx]) != pool_id:
                     continue
                 buffer = self.get_buffers(layer_idx)
                 if buffer is None:
@@ -2892,6 +2898,21 @@ class KVCacheManagerV2(BaseResourceManager):
             return self.layer_specs[local_layer_id].kv_factor
         return self.kv_factor
 
+    @property
+    def _layer_ids_by_group(self) -> list[list[int]]:
+        # A split layer can occur in several groups. This is membership metadata,
+        # not the partition promised by the deprecated layer_grouping API.
+        return [
+            sorted({int(buffer.layer_id) for buffer in buffers})
+            for buffers in self.impl.buffer_grouping
+        ]
+
+    def _get_layer_execution_group(self, layer_id: int) -> int:
+        group = self.layer_to_pool_mapping_dict.get(layer_id)
+        if group is not None:
+            return group
+        return int(self.impl.get_buffer_group_id(layer_id, Role.KEY))
+
     def _get_layer_page_table_roles(
         self, local_layer_id: int, pool_id: int
     ) -> Tuple[DataRole, Optional[DataRole]]:
@@ -2930,7 +2951,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         if self._use_per_layer_page_tables:
             for layer_id in typed_range(LayerId(self.num_local_layers)):
-                pool_id = self.impl.get_layer_group_id(layer_id)
+                pool_id = self._get_layer_execution_group(layer_id)
                 role_a, _ = self._get_layer_page_table_roles(layer_id, pool_id)
                 kv_cache_pool_pointers_list.append(
                     [
@@ -2992,7 +3013,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     block_scale_pool_pointers_list.append([scale_base_addr, 0])
 
             for layer_id in typed_range(LayerId(self.num_local_layers)):
-                layer_group_id = self.impl.get_layer_group_id(layer_id)
+                layer_group_id = self._get_layer_execution_group(layer_id)
                 role_a, role_b = self._get_pool_roles(layer_group_id)
                 index_base_addr = kv_cache_pool_pointers_list[layer_group_id][0]
                 if role_a == Role.KEY:
@@ -3064,6 +3085,19 @@ class KVCacheManagerV2(BaseResourceManager):
         return kv_cache_pool_pointers, kv_cache_pool_mapping
 
     def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
+        # The default attention view shares indices between K/V and their scales.
+        # Custom backends with separate tables override this initializer.
+        for layer in self.kv_cache_manager_py_config.layers:
+            if isinstance(layer, AttentionLayerConfig):
+                groups = {
+                    self.impl.get_buffer_group_id(layer.layer_id, buffer.role)
+                    for buffer in layer.buffers
+                }
+                if len(groups) > 1:
+                    raise ValueError(
+                        f"Attention layer {layer.layer_id} has different buffer reuse policies; "
+                        "the default attention backend requires one shared page-index table"
+                    )
         # Keep role-dependent checks in this default page-table initializer:
         # custom layouts such as DeepSeek V4 override it with their own roles.
         # A lifecycle group can contain different page sizes in separate
@@ -3079,7 +3113,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 }
             )
             > 1
-            for pool_id, layer_ids in enumerate(self.impl.layer_grouping)
+            for pool_id, layer_ids in enumerate(self._layer_ids_by_group)
         )
         if self.layer_specs is not None:
             storage_layouts = {(layer.dtype, layer.kv_factor) for layer in self.layer_specs}
@@ -3282,7 +3316,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return [int(tier.quota // bytes_per_block) for tier in cache_tiers]
 
     def _get_event_layer_group_ids(self) -> List[int]:
-        return [int(layer_group_id) for layer_group_id in range(len(self.impl.layer_grouping))]
+        return [int(layer_group_id) for layer_group_id in range(len(self._layer_ids_by_group))]
 
     def _get_windowed_layer_group_sizes(self) -> Dict[int, int]:
         """Layer-group id -> window size, for groups whose window is smaller than max_seq_len.
@@ -3353,8 +3387,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # which is how `impl.layer_grouping` groups layers today. Only the
         # first layer's window is read; if the grouping policy ever permits
         # mixed windows in one group, this needs to fan out per-layer. A layer
-        # listed under several groups is an SSM layer whose buffers use
-        # different reuse policies, so it describes each of them as SSM.
+        # can belong to several groups through buffer policy overrides.
         #
         # `attention_only` is set for the streaming event manager, which tracks
         # attention prefix reuse only: excluding SSM and other non-attention life cycles
@@ -3367,7 +3400,7 @@ class KVCacheManagerV2(BaseResourceManager):
             return self.max_seq_len if window_size is None else int(window_size)
 
         window_sizes: Dict[int, int] = {}
-        for layer_group_id, layer_ids in enumerate(self.impl.layer_grouping):
+        for layer_group_id, layer_ids in enumerate(self._layer_ids_by_group):
             # Native bindings expose grouping, not the private Python lifecycle registry.
             layer_config = self.kv_cache_manager_py_config.layers[int(layer_ids[0])]
             if attention_only and not isinstance(layer_config, AttentionLayerConfig):
@@ -3422,7 +3455,7 @@ class KVCacheManagerV2(BaseResourceManager):
         scratch_pages = torch.empty_like(scales)
         for local_layer_idx in range(self.num_local_layers):
             layer_id = LayerId(local_layer_idx)
-            pool_id = self.layer_to_pool_mapping_dict[layer_id]
+            pool_id = self._get_layer_execution_group(layer_id)
             role_a, role_b = self._get_layer_page_table_roles(layer_id, pool_id)
             roles = [
                 role_a,
@@ -4090,7 +4123,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         local = self.layer_offsets[layer_idx]
         for role, layer in enumerate((local, self.high_layers[local])):
-            pool_id = int(self.impl.get_layer_group_id(layer))
+            pool_id = int(self.impl.get_buffer_group_id(layer, Role.KEY))
             scale = int(self.impl.get_page_index_converter(layer, Role.KEY).scale)
             for row, req_id in enumerate(request_ids):
                 kv_cache = self.kv_cache_map[req_id]
@@ -5438,8 +5471,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         The layers listed in a group share its window and sinks, which is how
         ``impl.layer_grouping`` groups layers, so the first layer describes the
-        group. A layer listed under several groups is an SSM layer whose buffers
-        use different reuse policies; it has no window in any of them. A group
+        group, including when buffer policies split a layer. A group
         with no window -- full attention, or a group whose layers carry no
         window at all -- yields an empty stale range.
         """
@@ -5451,7 +5483,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     getattr(layer, "num_sink_tokens", None),
                     self.tokens_per_block,
                 )
-                for layer in (layers[int(layer_ids[0])] for layer_ids in self.impl.layer_grouping)
+                for layer in (layers[int(layer_ids[0])] for layer_ids in self._layer_ids_by_group)
             ]
         return self._layer_group_life_cycles
 
@@ -5495,10 +5527,10 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         kv_cache = self.kv_cache_map.get(request.py_request_id)
         if kv_cache is None:
-            return [[] for _ in range(len(self.impl.layer_grouping))]
+            return [[] for _ in range(len(self._layer_ids_by_group))]
         history_length = kv_cache.history_length
         by_group: List[List[int]] = []
-        for layer_group_id in range(len(self.impl.layer_grouping)):
+        for layer_group_id in range(len(self._layer_ids_by_group)):
             indices = list(kv_cache.get_aggregated_page_indices(layer_group_id, valid_only=False))
             stale_start, stale_end = self._stale_block_range(layer_group_id, history_length)
             for ordinal in range(stale_start, min(stale_end, len(indices))):
@@ -6127,11 +6159,10 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
         metadata: dict[int, tuple[int, Optional[int], str]] = {}
-        for life_cycle_id, layer_ids in enumerate(self.impl.layer_grouping):
+        for life_cycle_id, layer_ids in enumerate(self._layer_ids_by_group):
             if not layer_ids:
                 continue
-            # A layer listed under several groups is an SSM layer whose buffers use
-            # different reuse policies, so its kind describes each of those groups.
+            # Buffer policies can split a layer without changing its kind or window.
             layer = self.kv_cache_manager_py_config.layers[int(layer_ids[0])]
             is_attention = isinstance(layer, AttentionLayerConfig)
             metadata[life_cycle_id] = (
@@ -7109,7 +7140,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 else self.kv_factor
             )
         else:
-            pool_id = self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]]
+            pool_id = self._get_layer_execution_group(self.layer_offsets[layer_idx])
             index_scale = 1 if raw_indices else self.get_layer_page_index_scale(layer_idx)
             kv_factor = self.get_layer_kv_factor(layer_idx)
         return self._get_batch_cache_indices_by_pool_id(
@@ -7189,7 +7220,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 else self.kv_factor
             )
         else:
-            pool_id = self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]]
+            pool_id = self._get_layer_execution_group(self.layer_offsets[layer_idx])
             # Layers sharing a pool can still require different page-index
             # scales (e.g. Gemma4 sliding/global head_dim). Use the per-layer
             # scale so this flat block table matches get_batch_cache_indices()
@@ -7321,7 +7352,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 # layouts that coalesce extra buffers alongside K/V.
                 yield layer_id, buffer
                 continue
-            pool_id = self.layer_to_pool_mapping_dict[layer_offset]
+            pool_id = self._get_layer_execution_group(layer_offset)
             if pool_id in pool_handled:
                 continue
             yield layer_id, buffer

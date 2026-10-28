@@ -230,15 +230,30 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // their page sizes. Nothing may read a cold level before then.
     TLLM_CHECK(appendLevelSlotDescList(config.slotDescList) == kHotLevel);
 
-    // Compute layer attributes and slot utilization fractions for scratch support.
-    mLayerAttributes = config.layerAttributes();
+    // A scratch slot serves one layer at a time. Reserve the largest layer share
+    // across the coalesced pools of each lifecycle, retaining exact fractions.
     mSlotUtilFracMax.resize(lifeCycles.size(), Rational{0, 1});
-    for (auto const& [key, layerAttr] : mLayerAttributes)
+    for (auto const& slotDesc : config.slotDescList)
     {
-        LifeCycleId const lcIdx = layerAttr.lifeCycleId;
-        if (layerAttr.slotUtilFracMax > mSlotUtilFracMax[lcIdx])
+        for (auto const& variant : slotDesc.variants)
         {
-            mSlotUtilFracMax[lcIdx] = layerAttr.slotUtilFracMax;
+            for (auto const& buffers : variant.coalescedBuffers)
+            {
+                std::unordered_map<LayerId, int> counts;
+                for (auto const& buffer : buffers.bufferIds)
+                {
+                    ++counts[buffer.layerId];
+                }
+                for (auto const& [layer, count] : counts)
+                {
+                    Rational const fraction{count, buffers.numBuffers()};
+                    auto& maximum = mSlotUtilFracMax[variant.lifeCycleId];
+                    if (fraction > maximum)
+                    {
+                        maximum = fraction;
+                    }
+                }
+            }
         }
     }
 
@@ -1762,14 +1777,6 @@ TypedVec<PoolGroupIndex, PoolGroupDesc> StorageManager::poolGroupDescs() const
         result.push_back(PoolGroupDesc{pgIdx, numSlots(pgIdx, kHotLevel), descList.at(pgIdx), std::move(pools)});
     }
     return result;
-}
-
-LayerAttr const& StorageManager::getLayerAttr(LayerId layerId, LifeCycleId lifeCycle) const
-{
-    auto it = mLayerAttributes.find(LayerLifeCycleKey{layerId, lifeCycle});
-    if (it == mLayerAttributes.end())
-        throw std::out_of_range("Unknown (LayerId, LifeCycleId) for LayerAttr");
-    return it->second;
 }
 
 SlotCount StorageManager::numSlots(PoolGroupIndex pgIdx, CacheLevel level) const

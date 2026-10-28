@@ -474,7 +474,7 @@ KVCacheManagerConfig makeSplitSsmConfig(bool withHostTier)
 // Address of a buffer within the SSM page that `beam` of `cache` currently holds.
 MemAddress ssmBufferAddress(KvCacheManager const& manager, KvCache const& cache, SplitSsmBuffer const& buffer, int beam)
 {
-    auto const slot = cache.getSsmBlockBaseIndex(manager.getLayerGroupId(buffer.layer, buffer.role), BeamIndex{beam});
+    auto const slot = cache.getSsmBlockBaseIndex(manager.getBufferGroupId(buffer.layer, buffer.role), BeamIndex{beam});
     EXPECT_GE(slot, 0);
     return manager.getMemPoolBaseAddress(buffer.layer, buffer.role)
         + static_cast<size_t>(slot) * manager.getPageIndexScale(buffer.layer, buffer.role)
@@ -491,9 +491,9 @@ TEST_F(ReplayCacheTest, SsmBufferPolicySplitsLayerAcrossGroups)
 {
     auto manager = std::make_shared<KvCacheManager>(makeSplitSsmConfig(/*withHostTier=*/true));
     auto const attention = manager->getLayerGroupId(LayerId{0});
-    auto const required = manager->getLayerGroupId(1, "state");
-    auto const privateGroup = manager->getLayerGroupId(1, "old_x");
-    EXPECT_EQ(manager->getLayerGroupId(0, "key"), attention);
+    auto const required = manager->getBufferGroupId(1, "state");
+    auto const privateGroup = manager->getBufferGroupId(1, "old_x");
+    EXPECT_EQ(manager->getBufferGroupId(0, "key"), attention);
     EXPECT_EQ(manager->lifeCycles().size(), LifeCycleId{3});
     EXPECT_NE(required, privateGroup);
     EXPECT_TRUE(requiresPrefixCoverage(manager->lifeCycles()[required]));
@@ -501,24 +501,28 @@ TEST_F(ReplayCacheTest, SsmBufferPolicySplitsLayerAcrossGroups)
     for (auto const& buffer : splitSsmBuffers())
     {
         SCOPED_TRACE(std::to_string(buffer.layer) + "/" + buffer.role);
-        EXPECT_EQ(manager->getLayerGroupId(buffer.layer, buffer.role), buffer.isPrivate ? privateGroup : required);
+        EXPECT_EQ(manager->getBufferGroupId(buffer.layer, buffer.role), buffer.isPrivate ? privateGroup : required);
         EXPECT_THROW(manager->getLayerGroupId(buffer.layer), std::invalid_argument);
     }
-    EXPECT_THROW(manager->getLayerGroupId(1, "missing"), std::out_of_range);
+    EXPECT_THROW(manager->getBufferGroupId(1, "missing"), std::out_of_range);
 
     EXPECT_EQ(manager->numLayers(), 4);
     auto layerIds = manager->layerIds();
     std::sort(layerIds.begin(), layerIds.end());
     EXPECT_EQ(layerIds, (std::vector<LayerId>{0, 1, 2, 3}));
-    auto grouping = manager->layerGrouping();
+    EXPECT_THROW(manager->layerGrouping(), std::invalid_argument);
+    auto const grouping = manager->bufferGrouping();
     ASSERT_EQ(grouping.size(), LayerGroupId{3});
-    for (auto& layers : grouping)
+    size_t count = 0;
+    for (LayerGroupId group{0}; group < grouping.size(); ++group)
     {
-        std::sort(layers.begin(), layers.end());
+        for (auto const& buffer : grouping[group])
+        {
+            EXPECT_EQ(manager->getBufferGroupId(buffer.layerId, buffer.role), group);
+            ++count;
+        }
     }
-    EXPECT_EQ(grouping[attention], (std::vector<LayerId>{0}));
-    EXPECT_EQ(grouping[required], (std::vector<LayerId>{1, 2, 3}));
-    EXPECT_EQ(grouping[privateGroup], (std::vector<LayerId>{1, 2, 3}));
+    EXPECT_EQ(count, manager->allBufferIds().size());
     for (auto const level : {kHotLevel, CacheLevel{1}})
     {
         EXPECT_NE(manager->storage().getPoolGroupIndex(level, required),
@@ -541,7 +545,7 @@ TEST_F(ReplayCacheTest, SsmBufferPolicySplitsLayerAcrossGroups)
         EXPECT_EQ(converter.scratchPagesPerBlock, scratchPages.at(buffer.role));
         EXPECT_EQ(manager->getPageStride(buffer.layer, buffer.role), static_cast<int>(buffer.size));
         int const slot
-            = cache->getSsmBlockBaseIndex(manager->getLayerGroupId(buffer.layer, buffer.role), kDefaultBeamIndex);
+            = cache->getSsmBlockBaseIndex(manager->getBufferGroupId(buffer.layer, buffer.role), kDefaultBeamIndex);
         ASSERT_GE(slot, 0);
         auto const perLayerIndex = converter(std::vector<int>{slot}, PageIndexMode::PER_LAYER).at(0);
         auto const sharedIndex = converter(std::vector<int>{slot}, PageIndexMode::SHARED).at(0);
@@ -563,8 +567,8 @@ TEST_F(ReplayCacheTest, PrivateSsmBuffersStayOutOfSnapshotsAndFollowBeams)
     {
         SCOPED_TRACE(length);
         auto manager = std::make_shared<KvCacheManager>(makeSplitSsmConfig(/*withHostTier=*/false));
-        auto const required = manager->getLayerGroupId(1, "state");
-        auto const privateGroup = manager->getLayerGroupId(1, "old_x");
+        auto const required = manager->getBufferGroupId(1, "state");
+        auto const privateGroup = manager->getBufferGroupId(1, "old_x");
         auto const tokens = makeTokens(length);
         TokenSpan const span{tokens.data(), length};
         auto fill = [&](KvCache const& cache, SplitSsmBuffer const& buffer, int salt)
@@ -656,8 +660,8 @@ TEST_F(ReplayCacheTest, PrivateSsmBuffersStayOutOfSnapshotsAndFollowBeams)
 TEST_F(ReplayCacheTest, SuspendedSsmStateSurvivesOffloadAndSlotChange)
 {
     auto manager = std::make_shared<KvCacheManager>(makeSplitSsmConfig(/*withHostTier=*/true));
-    auto const required = manager->getLayerGroupId(1, "state");
-    auto const privateGroup = manager->getLayerGroupId(1, "old_x");
+    auto const required = manager->getBufferGroupId(1, "state");
+    auto const privateGroup = manager->getBufferGroupId(1, "old_x");
     auto const tokens = makeTokens(8);
     TokenSpan const span{tokens.data(), 8};
     auto cache = manager->createKvCache({}, {}, 1);
@@ -706,7 +710,7 @@ TEST_F(ReplayCacheTest, SuspendedSsmStateSurvivesOffloadAndSlotChange)
     ASSERT_EQ(oldSlotReservations.size(), 2);
     for (auto const& buffer : splitSsmBuffers())
     {
-        auto const group = manager->getLayerGroupId(buffer.layer, buffer.role);
+        auto const group = manager->getBufferGroupId(buffer.layer, buffer.role);
         auto const address = manager->getMemPoolBaseAddress(buffer.layer, buffer.role)
             + static_cast<size_t>(oldSlots[group]) * manager->getPageIndexScale(buffer.layer, buffer.role)
                 * manager->getPageStride(buffer.layer, buffer.role);

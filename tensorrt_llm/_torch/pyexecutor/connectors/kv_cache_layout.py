@@ -261,7 +261,7 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
     so the addresses are device addresses only because tiers below GPU are
     rejected while a connector is attached
     (``PyExecutor._reject_non_gpu_cache_tiers``). Reads only the manager's
-    public layout API -- ``layer_grouping``, ``all_buffer_ids``,
+    public layout API -- ``buffer_grouping``, ``all_buffer_ids``,
     ``get_aggregated_pages``, ``pool_group_descs`` -- so it assumes nothing
     about dimension order, kv factor, or pool count.
     """
@@ -276,20 +276,14 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
         for variant in pool_group.slot_desc.variants:
             slots_by_group[int(variant.layer_group_id)] = int(pool_group.num_slots)
 
-    buffers_by_layer: Dict[int, List] = {}
-    for buffer_id in impl.all_buffer_ids:
-        buffers_by_layer.setdefault(int(buffer_id.layer_id), []).append(buffer_id)
-
     groups: List[KvCacheLayerGroupLayout] = []
-    for layer_group_id, local_layer_ids in enumerate(impl.layer_grouping):
-        local_layer_ids = [int(lid) for lid in local_layer_ids]
+    for layer_group_id, buffer_ids in enumerate(impl.buffer_grouping):
+        local_layer_ids = sorted({int(buffer.layer_id) for buffer in buffer_ids})
         if not local_layer_ids:
             continue
 
         num_slots = slots_by_group[layer_group_id]
         global_by_local = dict(zip(local_layer_ids, _global_layer_ids(manager, local_layer_ids)))
-
-        buffer_ids = [b for lid in local_layer_ids for b in buffers_by_layer.get(lid, ())]
 
         regions: List[KvCacheRegion] = []
         for desc in impl.get_aggregated_pages(buffer_ids):

@@ -404,7 +404,10 @@ class Manager:
                 slot_desc=SimpleNamespace(variants=[variant]),
             )
         self.impl = SimpleNamespace(
-            layer_grouping=[list(lids) for _, lids, _ in groups],
+            buffer_grouping=[
+                [SimpleNamespace(layer_id=lid, role=role) for lid in lids for role, _, _ in roles]
+                for _, lids, roles in groups
+            ],
             pool_group_descs=list(descs.values()),
             get_life_cycle_pool_group_indices=lambda: list(pool_group_of),
             init_config=SimpleNamespace(layers=layers),

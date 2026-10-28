@@ -2937,22 +2937,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("layer_ids", &kv::KvCacheManager::layerIds)
         .def_prop_ro(
             "layer_grouping", [](kv::KvCacheManager const& self) { return self.layerGrouping().raw(); },
-            "Layers grouped by shared lifecycle/pool allocation. A layer whose buffers span several "
-            "layer groups is listed under each of them. The iteration order of the "
-            "layer lists (and of the groups) is NOT an API contract and may differ across "
-            "backends/runs; do not rely on it for buffer/pool memory order -- use "
-            "pool_group_descs (PoolGroupDesc.pools[i].base_address + coalesced_buffers) instead.")
+            "Deprecated: use buffer_grouping. Partitions uniform layers by lifecycle; raises ValueError "
+            "if any layer spans several groups. Member order does not describe physical memory order.")
+        .def_prop_ro(
+            "buffer_grouping", [](kv::KvCacheManager const& self) { return self.bufferGrouping().raw(); },
+            "Buffer membership indexed by lifecycle group ID. Each buffer appears once; member order is unspecified.")
         .def(
             "get_layer_group_id",
             [](kv::KvCacheManager const& self, kv::LayerId layerId) { return self.getLayerGroupId(layerId).value(); },
             nb::arg("layer_id"),
-            "Layer group of every buffer of the layer. Raises ValueError when the layer's buffers span "
-            "several layer groups; pass the buffer role instead.")
+            "Deprecated: use get_buffer_group_id. Returns a uniform layer's group; raises ValueError for a split "
+            "layer.")
         .def(
-            "get_layer_group_id",
+            "get_buffer_group_id",
             [](kv::KvCacheManager const& self, kv::LayerId layerId, kv::DataRole const& role)
-            { return self.getLayerGroupId(layerId, role).value(); },
-            nb::arg("layer_id"), nb::arg("role"), "Layer group of one buffer of the layer.")
+            { return self.getBufferGroupId(layerId, role).value(); },
+            nb::arg("layer_id"), nb::arg("role"), "Lifecycle group of one buffer of the layer.")
         .def("get_page_index_converter", &kv::KvCacheManager::getPageIndexConverter, nb::arg("layer_id"),
             nb::arg("data_role"))
         .def(

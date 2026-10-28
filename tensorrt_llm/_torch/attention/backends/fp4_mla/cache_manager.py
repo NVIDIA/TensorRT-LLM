@@ -471,7 +471,7 @@ class Fp4MlaV2CacheLayoutPolicy:
             if bf16_pool_id in (cache_pool_id, hp_pool_id):
                 raise RuntimeError("FP4 MLA, BF16 MLA, and HP state must use distinct lifecycles.")
 
-        num_pools = len(self.impl.layer_grouping)
+        num_pools = len(self._layer_ids_by_group)
         pool_pointers = [[[0, 0], [0, 0]] for _ in range(num_pools)]
         pool_pointers[cache_pool_id] = [
             [
@@ -957,7 +957,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         )
 
     def get_disagg_global_layer_ids(self, layer_group_id: int) -> list[int]:
-        local_layer_ids = list(self.impl.layer_grouping[layer_group_id])
+        local_layer_ids = list(self._layer_ids_by_group[layer_group_id])
         cache_local = {
             int(layer_id): self._fp4_mla_compact_to_local[compact_layer]
             for compact_layer, layer_id in enumerate(self._cache_manager_layer_ids)

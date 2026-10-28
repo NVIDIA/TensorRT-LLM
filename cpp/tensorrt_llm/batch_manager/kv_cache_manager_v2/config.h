@@ -162,9 +162,8 @@ struct BufferConfig
     //! This does not change their lifecycle or shared slot allocation.
     int coalescingGroup = 0;
 
-    //! Reuse policy of this buffer; nullopt uses the layer's policy. Only SSM layers accept a
-    //! policy that differs from the layer's. Such a buffer belongs to the SSM lifecycle of its
-    //! own policy while keeping its layer ID, so one SSM layer can span several layer groups.
+    //! Reuse policy of this buffer; nullopt inherits the layer's policy. Overrides can
+    //! place buffers of one attention or SSM layer in different lifecycle groups.
     std::optional<ReusePolicy> reusePolicy;
 
     [[nodiscard]] ReusePolicy effectiveReusePolicy(ReusePolicy layerPolicy) const noexcept
@@ -231,12 +230,6 @@ struct AttentionLayerConfig
             if (buf.isSparse != buffers.front().isSparse)
             {
                 throw std::invalid_argument("Sparse and non-sparse buffers cannot share an attention layer lifecycle");
-            }
-            if (buf.effectiveReusePolicy(reusePolicy) != reusePolicy)
-            {
-                throw std::invalid_argument("Attention buffer '" + buf.role
-                    + "' sets a reuse policy that differs from its layer's; per-buffer reuse policies are only "
-                      "supported for SSM layers");
             }
         }
     }

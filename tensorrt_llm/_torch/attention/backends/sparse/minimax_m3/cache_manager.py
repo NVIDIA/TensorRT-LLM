@@ -995,7 +995,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         pool-mapping loop meaningful).
         """
         layers_by_addr = sorted(
-            self.impl.layer_grouping[int(layer_group_id)],
+            self._layer_ids_by_group[int(layer_group_id)],
             key=lambda lid: self.impl.get_mem_pool_base_address(
                 lid, Role.KEY, PageIndexMode.SHARED
             ),

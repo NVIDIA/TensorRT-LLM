@@ -69,6 +69,11 @@ std::map<BufferId, BufferAttr> StorageConfig::bufferAttributes() const
             for (PoolIndex poolIndex{0}; poolIndex < variant.coalescedBuffers.size(); ++poolIndex)
             {
                 auto const& cb = variant.coalescedBuffers[poolIndex];
+                std::unordered_map<LayerId, int> buffersPerLayer;
+                for (auto const& bufId : cb.bufferIds)
+                {
+                    ++buffersPerLayer[bufId.layerId];
+                }
                 size_t offset = 0;
                 for (auto const& bufId : cb.bufferIds)
                 {
@@ -77,7 +82,8 @@ std::map<BufferId, BufferAttr> StorageConfig::bufferAttributes() const
                     if (it != expansion.end())
                         exp = it->second;
 
-                    ret[bufId] = BufferAttr{lcId, poolIndex, offset, cb.singleBufferSize, exp};
+                    ret[bufId] = BufferAttr{
+                        lcId, poolIndex, offset, cb.singleBufferSize, exp, buffersPerLayer.at(bufId.layerId)};
                     offset += cb.singleBufferSize;
                 }
             }
@@ -102,51 +108,6 @@ std::unordered_map<LayerId, std::vector<LifeCycleId>> StorageConfig::layerToLife
         std::sort(ids.begin(), ids.end());
     }
     return map;
-}
-
-std::map<LayerLifeCycleKey, LayerAttr> StorageConfig::layerAttributes() const
-{
-    std::map<LayerLifeCycleKey, LayerAttr> ret;
-    for (auto const& pg : slotDescList)
-    {
-        for (auto const& variant : pg.variants)
-        {
-            LifeCycleId lcId = variant.lifeCycleId;
-            for (PoolIndex poolIndex{0}; poolIndex < variant.coalescedBuffers.size(); ++poolIndex)
-            {
-                auto const& cb = variant.coalescedBuffers[poolIndex];
-                // Count how many buffers per layer in this coalesced buffer.
-                std::unordered_map<LayerId, int> slotUtilPerLayer;
-                for (auto const& bufId : cb.bufferIds)
-                {
-                    slotUtilPerLayer[bufId.layerId] += 1;
-                }
-                int buffersPerSlot = cb.numBuffers();
-
-                for (auto const& [layerId, count] : slotUtilPerLayer)
-                {
-                    LayerLifeCycleKey const key{layerId, lcId};
-                    auto it = ret.find(key);
-                    if (it == ret.end())
-                    {
-                        LayerAttr attr;
-                        attr.lifeCycleId = lcId;
-                        attr.slotUtil.resize(variant.coalescedBuffers.size(), 0);
-                        attr.slotUtilFracMax = Rational{0, 1};
-                        it = ret.emplace(key, std::move(attr)).first;
-                    }
-                    auto& attr = it->second;
-                    attr.slotUtil[poolIndex] = count;
-                    Rational frac{count, buffersPerSlot};
-                    if (frac > attr.slotUtilFracMax)
-                    {
-                        attr.slotUtilFracMax = frac;
-                    }
-                }
-            }
-        }
-    }
-    return ret;
 }
 
 // ---------------------------------------------------------------------------

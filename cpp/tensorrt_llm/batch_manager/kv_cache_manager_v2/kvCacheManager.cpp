@@ -334,11 +334,9 @@ bool KvCacheManager::isSparse(LayerId layerId, DataRole role) const
 PageIndexConverter KvCacheManager::getPageIndexConverter(LayerId layerId, DataRole role) const
 {
     auto const& attr = mStorage->getBufferAttr(layerId, role);
-    auto const& layerAttr = mStorage->getLayerAttr(layerId, attr.lifeCycleId);
     int scale = mStorage->mSlotToPageIndices.at(attr.lifeCycleId).at(attr.poolIndex);
     int offset = exactDiv(static_cast<int>(attr.offset), static_cast<int>(attr.size));
-    int scratchPages = layerAttr.slotUtil.at(attr.poolIndex);
-    return PageIndexConverter{scale, attr.expansion, offset, scratchPages};
+    return PageIndexConverter{scale, attr.expansion, offset, attr.scratchPagesPerBlock};
 }
 
 std::optional<bool> KvCacheManager::supportsIndexMode(PageIndexMode mode) const
@@ -468,12 +466,12 @@ LayerGroupId KvCacheManager::getLayerGroupId(LayerId layerId) const
         throw std::invalid_argument("Layer " + std::to_string(layerId) + " has buffers in "
             + std::to_string(lifeCycles.size())
             + " layer groups because its buffers use different reuse policies; look up its layer group per "
-              "buffer with getLayerGroupId(layerId, role)");
+              "buffer with get_buffer_group_id(layer_id, role) / getBufferGroupId(layerId, role)");
     }
     return lifeCycles.front();
 }
 
-LayerGroupId KvCacheManager::getLayerGroupId(LayerId layerId, DataRole const& role) const
+LayerGroupId KvCacheManager::getBufferGroupId(LayerId layerId, DataRole const& role) const
 {
     return mStorage->getBufferAttr(layerId, role).lifeCycleId;
 }
@@ -484,10 +482,17 @@ TypedVec<LayerGroupId, std::vector<LayerId>> KvCacheManager::layerGrouping() con
     TypedVec<LayerGroupId, std::vector<LayerId>> result(numLc);
     for (auto const& [lid, lifeCycles] : mStorage->layerToLifeCycleIds())
     {
-        for (auto const lc : lifeCycles)
-        {
-            result.at(lc).push_back(lid);
-        }
+        result.at(getLayerGroupId(lid)).push_back(lid);
+    }
+    return result;
+}
+
+TypedVec<LayerGroupId, std::vector<BufferId>> KvCacheManager::bufferGrouping() const
+{
+    TypedVec<LayerGroupId, std::vector<BufferId>> result(mLifeCycles.size());
+    for (auto const& buffer : allBufferIds())
+    {
+        result.at(getBufferGroupId(buffer.layerId, buffer.role)).push_back(buffer);
     }
     return result;
 }
