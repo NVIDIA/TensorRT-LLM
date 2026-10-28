@@ -82,4 +82,33 @@ inline KVCacheManagerConfig makeHybridTieredConfig()
     return config;
 }
 
+//! REQUIRED full attention (layer 0), two SSM layers whose 2 KiB old_x replay buffers are PRIVATE
+//! (layers 1-2), and PRIVATE windowed attention (layer 3) on a GPU tier of `gpuQuota` bytes.
+//!
+//! Layer groups are registered in buffer order: 0 is the attention layer, 1 the REQUIRED SSM state, 2
+//! the PRIVATE SSM replay buffers and 3 the PRIVATE attention layer. The PRIVATE SSM slot (two 2 KiB
+//! buffers) is as large as the PRIVATE attention slot, so both share one pool group unless
+//! maxLiveKvCaches gives the PRIVATE SSM group a fixed capacity.
+inline KVCacheManagerConfig makeReservedSsmConfig(size_t gpuQuota, std::optional<int> maxLiveKvCaches)
+{
+    KVCacheManagerConfig config;
+    config.tokensPerBlock = 4;
+    config.cacheTiers.emplace_back(GpuCacheTierConfig{gpuQuota});
+    config.commitMinSnapshot = true;
+    config.maxLiveKvCaches = maxLiveKvCaches;
+    config.layers.emplace_back(
+        AttentionLayerConfig{.layerId = 0, .buffers = {BufferConfig{.role = "key", .size = 4096}}});
+    for (LayerId layerId : {1, 2})
+    {
+        config.layers.emplace_back(SsmLayerConfig{.layerId = layerId,
+            .buffers = {BufferConfig{.role = "state", .size = 4096}, BufferConfig{.role = "conv", .size = 4096},
+                BufferConfig{.role = "old_x", .size = 2048, .reusePolicy = ReusePolicy::PRIVATE}}});
+    }
+    config.layers.emplace_back(AttentionLayerConfig{.layerId = 3,
+        .buffers = {BufferConfig{.role = "key", .size = 4096}},
+        .slidingWindowSize = 8,
+        .reusePolicy = ReusePolicy::PRIVATE});
+    return config;
+}
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2::test

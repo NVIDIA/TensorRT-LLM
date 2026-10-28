@@ -45,6 +45,7 @@ namespace
 using namespace tensorrt_llm::batch_manager::kv_cache_manager_v2;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeConfig;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeHybridTieredConfig;
+using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeReservedSsmConfig;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeTieredConfig;
 
 class ReplayCacheTest : public ::testing::Test
@@ -745,6 +746,276 @@ TEST_F(ReplayCacheTest, SuspendedSsmStateSurvivesOffloadAndSlotChange)
     }
     cache->close();
     manager->shutdown();
+}
+
+// GPU slot count of every hot-tier pool group.
+std::vector<SlotCount> hotSlotCounts(KvCacheManager const& manager)
+{
+    std::vector<SlotCount> counts;
+    for (auto const& stats : manager.getStorageStatistics(kHotLevel))
+    {
+        counts.push_back(stats.total);
+    }
+    return counts;
+}
+
+// Hot-tier pool group of every layer group.
+std::vector<int> hotPoolGroups(KvCacheManager const& manager)
+{
+    std::vector<int> groups;
+    for (auto const poolGroup : manager.getLifeCyclePoolGroupIndices(kHotLevel))
+    {
+        groups.push_back(poolGroup.value());
+    }
+    return groups;
+}
+
+TEST_F(ReplayCacheTest, FixedPrivateSsmCapacityTakesItsSlotsBeforeRatioSizing)
+{
+    // Hot-tier slot counts of makeReservedSsmConfig() without the bound, recorded before maxLiveKvCaches
+    // existed.
+    std::map<size_t, std::vector<SlotCount>> const elasticSlots{
+        {32 << 20, {3072, 384, 3584}}, {64 << 20, {6656, 768, 6656}}};
+    std::map<size_t, std::vector<SlotCount>> reservedSlots;
+    for (auto const& [quota, expected] : elasticSlots)
+    {
+        SCOPED_TRACE(quota);
+        auto elastic = std::make_shared<KvCacheManager>(makeReservedSsmConfig(quota, std::nullopt));
+        EXPECT_EQ(hotPoolGroups(*elastic), (std::vector<int>{0, 1, 2, 2}));
+        EXPECT_EQ(hotSlotCounts(*elastic), expected);
+        elastic->shutdown();
+
+        auto manager = std::make_shared<KvCacheManager>(makeReservedSsmConfig(quota, 8));
+        EXPECT_EQ(manager->getBufferGroupId(1, "old_x"), LifeCycleId{2});
+        EXPECT_EQ(hotPoolGroups(*manager), (std::vector<int>{0, 1, 3, 2}));
+        auto const slots = hotSlotCounts(*manager);
+        ASSERT_EQ(slots.size(), 4U);
+        // ceil(8 / 0.97) slots at every quota; the other groups split the rest of it.
+        EXPECT_EQ(slots[3], 9);
+        EXPECT_EQ(manager->getQuota(kHotLevel), quota);
+        EXPECT_EQ(manager->poolGroupDescs()[PoolGroupIndex{3}].numSlots, 9);
+        // Both old_x buffers share each slot, at offsets 0 and 1.
+        EXPECT_EQ(manager->getPageIndexUpperBound(1, "old_x"), 18U);
+        EXPECT_EQ(manager->getPageIndexUpperBound(2, "old_x"), 17U);
+        reservedSlots[quota] = slots;
+        manager->shutdown();
+    }
+    for (size_t pgIdx = 0; pgIdx < 3; ++pgIdx)
+    {
+        EXPECT_GT(reservedSlots.at(64 << 20)[pgIdx], reservedSlots.at(32 << 20)[pgIdx]) << pgIdx;
+    }
+
+    // initialPoolRatio keeps an entry for the fixed group, which the hot tier ignores.
+    std::optional<std::vector<SlotCount>> previous;
+    for (float const privateSsmWeight : {0.1F, 0.7F})
+    {
+        SCOPED_TRACE(privateSsmWeight);
+        auto config = makeReservedSsmConfig(32 << 20, 8);
+        float const otherWeight = (1.0F - privateSsmWeight) / 3.0F;
+        config.initialPoolRatio = std::vector<float>{otherWeight, otherWeight, privateSsmWeight, otherWeight};
+        auto manager = std::make_shared<KvCacheManager>(config);
+        auto const slots = hotSlotCounts(*manager);
+        EXPECT_EQ(slots.at(3), 9);
+        if (previous.has_value())
+        {
+            EXPECT_EQ(slots, *previous);
+        }
+        previous = slots;
+        manager->shutdown();
+    }
+}
+
+TEST_F(ReplayCacheTest, TunerLeavesFixedPrivateSsmCapacityAlone)
+{
+    auto config = makeReservedSsmConfig(32 << 20, 8);
+    config.poolRebalance.minSampledKvCaches = 4;
+    config.poolRebalance.cooldownSecs = 0.0;
+    config.poolRebalance.targetRatioUpdateInterval = 1;
+    auto manager = std::make_shared<KvCacheManager>(config);
+    EXPECT_EQ(manager->storage().getPoolGroupIndex(kHotLevel, LifeCycleId{2}), PoolGroupIndex{3});
+    auto const before = hotSlotCounts(*manager);
+    auto sampleCaches = [&](int count)
+    {
+        for (int i = 0; i < count; ++i)
+        {
+            auto cache = manager->createKvCache({}, {}, i);
+            ASSERT_TRUE(cache->resume(mStream));
+            ASSERT_TRUE(cache->resize(16));
+            cache->close();
+        }
+    };
+
+    // Short requests move the elastic targets far from the initial 2048-token sizing. The fixed group's
+    // 9 slots of 4 KiB fill one 2 MiB allocation unit, which its target must count as the current ratio
+    // does, or the tuner would keep requesting adjustments that cannot change it.
+    EXPECT_FLOAT_EQ(manager->storage().getRatioList(kHotLevel)[PoolGroupIndex{3}], 1.0F / 16.0F);
+    sampleCaches(4);
+    ASSERT_TRUE(manager->needAdjustment());
+    manager->adjust();
+    auto const after = hotSlotCounts(*manager);
+    EXPECT_EQ(after.at(3), 9);
+    EXPECT_NE(after, before);
+    EXPECT_EQ(manager->getQuota(kHotLevel), size_t{32 << 20});
+    EXPECT_FALSE(manager->needAdjustment());
+
+    sampleCaches(4);
+    EXPECT_FALSE(manager->needAdjustment());
+    manager->adjust();
+    EXPECT_EQ(hotSlotCounts(*manager), after);
+
+    // An explicit resize moves only the elastic groups too.
+    ASSERT_TRUE(manager->resize(kHotLevel, 48 << 20));
+    auto const grown = hotSlotCounts(*manager);
+    EXPECT_EQ(grown.at(3), 9);
+    for (size_t pgIdx = 0; pgIdx < 3; ++pgIdx)
+    {
+        EXPECT_GT(grown[pgIdx], after[pgIdx]) << pgIdx;
+    }
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, LiveKvCacheBoundCountsSuspendedCaches)
+{
+    // ceil(4 / 0.8) = 5 private slots: resuming the last of four caches finds the group at exactly 80%.
+    auto config = makeSplitSsmConfig(/*withHostTier=*/false);
+    config.cacheTiers.front() = GpuCacheTierConfig{32 << 20};
+    config.maxLiveKvCaches = 4;
+    config.maxUtilForResume = 0.8F;
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto& storage = manager->storage();
+    auto const privatePool = storage.getPoolGroupIndex(kHotLevel, manager->getBufferGroupId(1, "old_x"));
+    EXPECT_NE(privatePool, storage.getPoolGroupIndex(kHotLevel, manager->getBufferGroupId(1, "state")));
+    EXPECT_EQ(storage.numSlots(privatePool), 5);
+
+    auto fill = [&](KvCache const& cache, int salt)
+    {
+        for (auto const& buffer : splitSsmBuffers())
+        {
+            EXPECT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(ssmBufferAddress(*manager, cache, buffer, 0)),
+                          splitSsmPattern(buffer, salt), buffer.size, mStream),
+                cudaSuccess);
+        }
+    };
+    auto check = [&](KvCache const& cache, int salt)
+    {
+        EXPECT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+        for (auto const& buffer : splitSsmBuffers())
+        {
+            std::vector<uint8_t> data(buffer.size);
+            EXPECT_EQ(
+                cudaMemcpy(data.data(), reinterpret_cast<void const*>(ssmBufferAddress(*manager, cache, buffer, 0)),
+                    data.size(), cudaMemcpyDeviceToHost),
+                cudaSuccess);
+            auto const pattern = splitSsmPattern(buffer, salt);
+            EXPECT_TRUE(std::all_of(data.begin(), data.end(), [pattern](uint8_t value) { return value == pattern; }))
+                << buffer.layer << "/" << buffer.role << " salt " << salt;
+        }
+    };
+
+    std::vector<std::shared_ptr<KvCache>> caches;
+    for (int i = 0; i < 4; ++i)
+    {
+        caches.push_back(manager->createKvCache({}, {}, i));
+        ASSERT_TRUE(caches.back()->resume(mStream));
+        ASSERT_TRUE(caches.back()->resize(8));
+        fill(*caches.back(), i);
+    }
+    EXPECT_THROW(manager->createKvCache({}, {}, 4), LogicError);
+    caches.front()->suspend();
+    EXPECT_THROW(manager->createKvCache({}, {}, 4), LogicError);
+
+    // The rebalance pattern: suspend every cache, then resume them all.
+    for (size_t i = 1; i < caches.size(); ++i)
+    {
+        caches[i]->suspend();
+    }
+    for (auto const& cache : caches)
+    {
+        ASSERT_TRUE(cache->resume(mStream));
+    }
+    auto const stats = storage.getStatistics(kHotLevel, privatePool);
+    EXPECT_EQ(stats.total, 5);
+    EXPECT_EQ(stats.free, 1);
+    for (int i = 0; i < 4; ++i)
+    {
+        check(*caches[i], i);
+    }
+
+    // Closing a cache frees its place.
+    caches.front()->close();
+    caches.front() = manager->createKvCache({}, {}, 4);
+    ASSERT_TRUE(caches.front()->resume(mStream));
+    for (auto const& cache : caches)
+    {
+        cache->close();
+    }
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, FixedPrivateSsmCapacityRejectsBeamSearch)
+{
+    for (bool const bounded : {false, true})
+    {
+        SCOPED_TRACE(bounded);
+        auto config = makeSplitSsmConfig(/*withHostTier=*/false);
+        config.cacheTiers.front() = GpuCacheTierConfig{32 << 20};
+        if (bounded)
+        {
+            config.maxLiveKvCaches = 4;
+        }
+        auto manager = std::make_shared<KvCacheManager>(config);
+        auto cache = manager->createKvCache({}, {}, 1);
+        ASSERT_TRUE(cache->resume(mStream));
+        ASSERT_TRUE(cache->resize(8));
+        if (bounded)
+        {
+            EXPECT_THROW(cache->setBeamWidth(BeamIndex{2}), std::invalid_argument);
+            EXPECT_EQ(cache->beamWidth(), BeamIndex{1});
+            EXPECT_NO_THROW(cache->setBeamWidth(BeamIndex{1}));
+        }
+        else
+        {
+            EXPECT_NO_THROW(cache->setBeamWidth(BeamIndex{2}));
+            EXPECT_EQ(cache->beamWidth(), BeamIndex{2});
+            cache->setBeamWidth(BeamIndex{1});
+        }
+        cache->close();
+        manager->shutdown();
+    }
+
+    // Without a PRIVATE SSM layer group the bound reserves nothing, so beams stay available.
+    auto config = makeConfig();
+    config.enablePartialCommit = false;
+    config.maxLiveKvCaches = 4;
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto cache = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(cache->resume(mStream));
+    ASSERT_TRUE(cache->resize(8));
+    EXPECT_NO_THROW(cache->setBeamWidth(BeamIndex{2}));
+    cache->setBeamWidth(BeamIndex{1});
+    cache->close();
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, FixedPrivateSsmCapacityMustFitTheGpuQuota)
+{
+    // 8 MiB holds the elastic layout and a 9-slot fixed group, but not ceil(2048 / 0.97) = 2112 slots of
+    // 4 KiB, which take 5 allocation units of 2 MiB before the other groups' minimum slots.
+    auto elastic = std::make_shared<KvCacheManager>(makeReservedSsmConfig(8 << 20, std::nullopt));
+    elastic->shutdown();
+    auto small = std::make_shared<KvCacheManager>(makeReservedSsmConfig(8 << 20, 8));
+    EXPECT_EQ(hotSlotCounts(*small).at(3), 9);
+    small->shutdown();
+    try
+    {
+        auto const manager = std::make_shared<KvCacheManager>(makeReservedSsmConfig(8 << 20, 2048));
+        manager->shutdown();
+        ADD_FAILURE() << "an undersized GPU quota was accepted";
+    }
+    catch (std::invalid_argument const& error)
+    {
+        EXPECT_NE(std::string(error.what()).find("max_live_kv_caches"), std::string::npos) << error.what();
+    }
 }
 
 TEST_F(ReplayCacheTest, ClosingScratchCacheReleasesEverySlotExactlyOnce)
