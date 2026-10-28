@@ -48,7 +48,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | Text-to-Video |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video |
-| `MiniMaxAI/MiniMax-H3` | Text-to-Video (with Audio), First/Last-Frame-to-Video (with Audio) |
+| `MiniMaxAI/MiniMax-H3` | Text-to-Video, First/Last-Frame-to-Video, Reference-to-Video (all with Audio) |
 | `zai-org/GLM-Image` | Text-to-Image |
 
 
@@ -65,7 +65,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | Yes |
-| **MiniMax-H3** | Yes | Yes | No | No | No | No | Yes | Yes | No | Yes | Yes | No | No | No | No |
+| **MiniMax-H3** | Yes | Yes | No | No | No | No | Yes | Yes | No | Yes | Yes | No | No | Yes | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No |
@@ -165,8 +165,15 @@ The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/
 ## MiniMax-H3 Notes
 
 MiniMax-H3 parallel VAE uses independent spatial tiles via
-`parallel_config.parallel_vae_size`, with size from 1 through the Ulysses world size.
+`parallel_config.parallel_vae_size`, with size from 1 through the world size (`tp_size * ulysses_size`).
 Tile geometry and blending follow the loaded Diffusers VAE.
+
+Tensor parallelism shards the DiT attention and gated MLP weights via
+`parallel_config.tp_size`. The text encoder, AdaLN modulation, and media
+input/output projections remain replicated. TP can be combined with Ulysses;
+Ulysses requires VANILLA or FA4 attention. CFG, ring, and Attention2D parallelism
+are not supported. See the
+[2-GPU TP config](../../../examples/visual_gen/configs/minimax-h3-bf16-tp2.yaml).
 
 - Text-to-video (T2VA), first/last-frame-to-video (FL2VA), and reference-to-video
   with audio (Ref2VA) are supported on one GPU. Enable Ref2VA with
