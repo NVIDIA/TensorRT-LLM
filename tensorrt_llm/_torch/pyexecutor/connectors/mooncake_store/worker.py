@@ -26,11 +26,12 @@ Saves are asynchronous and gated on a CUDA event, since the pages are complete
 only once the forward pass that wrote them has retired and blocking the
 executor loop on an RDMA write is the cost the store exists to avoid. The
 scheduler reports such a request as saving asynchronously, which keeps its
-pages pinned until `get_finished` says the writes landed. A save that fails is
-logged and dropped: a write that did not land costs a future cache miss and
-nothing else, so the request retires either way. Only the save thread failing
-to start is fatal, because that would strand every request behind pages
-nothing will release.
+pages pinned until `get_finished` says the writes landed. It counts a save as
+stored once `wait_for_save` has queued it, so saves bound for a pass that never
+ran are emitted again. A save that fails is logged and dropped: a write that
+did not land costs a future cache miss and nothing else, so the request retires
+either way. Only the save thread failing to start is fatal, because that would
+strand every request behind pages nothing will release.
 
 A capacity-only worker opens its handle and stops there, with no layout, no
 buffer registration and no save thread, so a node can lend host memory to the
@@ -241,6 +242,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # Requests the runtime has told us are done producing KV. Their pages
         # stay pinned until we report them back through `get_finished`.
         self._closed_requests: Set[int] = set()
+        # Requests whose saves the last `wait_for_save` queued. The scheduler
+        # adapter takes them at its next `build_connector_meta` and only then
+        # counts those blocks as stored; see `take_submitted_saves`. Executor
+        # thread only.
+        self._submitted_saves: Set[int] = set()
         # Why the save thread never reached its transfer loop, read back by
         # `register_kv_cache_layout`. A failure inside the loop is dropped
         # there instead.
@@ -622,6 +628,23 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             for transfers in metadata.saves:
                 self._outstanding_saves[transfers.request_id] += 1
         self._save_queue.put((event, list(metadata.saves)))
+        # Replaced rather than accumulated: only the adapter colocated with
+        # rank 0's worker takes these, so the other ranks must not grow the
+        # set every pass.
+        self._submitted_saves = {transfers.request_id for transfers in metadata.saves}
+
+    def take_submitted_saves(self) -> Set[int]:
+        """Requests whose saves the last `wait_for_save` handed to the save thread.
+
+        A pass that was bound but never ran never reaches `wait_for_save`, so
+        its saves are not reported and the scheduler adapter emits them again
+        instead of counting them as stored. Cleared on return.
+
+        Returns:
+            The request ids of the saves the last `wait_for_save` queued.
+        """
+        submitted, self._submitted_saves = self._submitted_saves, set()
+        return submitted
 
     def get_finished(
         self, finished_gen_req_ids: List[int], started_loading_req_ids: List[int]
