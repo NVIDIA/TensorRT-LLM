@@ -1348,6 +1348,10 @@ class AllReduce(nn.Module):
         # read it here and stash the values as class-level attributes that
         # AllReduceRunner.forward can use during the autotuner warm-up phase.
         extra_attrs = get_model_extra_attrs()
+        # Declared by the model: never run or tune NCCL_SYMMETRIC (plain NCCL instead).
+        self._exclude_nccl_symmetric = bool(
+            extra_attrs
+            and extra_attrs.get("allreduce_exclude_nccl_symmetric", False))
         prealloc_max_num_tokens = prealloc_hidden_size = None
         if extra_attrs:
             from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
@@ -1548,6 +1552,12 @@ class AllReduce(nn.Module):
         if allreduce_strategy in (AllReduceStrategy.MNNVL,
                                   AllReduceStrategy.SYMM_MEM):
             allreduce_strategy = AllReduceStrategy.AUTO
+        # Without NCCL_SYMMETRIC, an explicit NCCL_SYMMETRIC runs NCCL, and AUTO keeps the Python tactic
+        # selection, whose cache-miss fallback is NCCL rather than the native lookup's NCCL_SYMMETRIC.
+        exclude_nccl_symmetric = self._exclude_nccl_symmetric
+        if (allreduce_strategy == AllReduceStrategy.NCCL_SYMMETRIC
+                and exclude_nccl_symmetric):
+            allreduce_strategy = AllReduceStrategy.NCCL
 
         additional_args = {}
         if self._disable_mpi:
@@ -1565,7 +1575,9 @@ class AllReduce(nn.Module):
         if allreduce_strategy == AllReduceStrategy.AUTO and not disable_allreduce_autotune and not self._disable_mpi:
             # Use native lookup after tuning unless its Python/C++ contract
             # failed; then retain the existing Python cache and selection path.
-            if _ALLREDUCE_AUTOTUNER_TUNING_MODE or not _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED:
+            if (_ALLREDUCE_AUTOTUNER_TUNING_MODE
+                    or not _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED
+                    or exclude_nccl_symmetric):
                 output = torch.ops.trtllm.tunable_allreduce(
                     input=input,
                     residual=all_reduce_params.residual,
@@ -1579,6 +1591,7 @@ class AllReduce(nn.Module):
                     eps=all_reduce_params.eps,
                     trigger_completion_at_end=all_reduce_params.
                     trigger_completion_at_end,
+                    exclude_nccl_symmetric=exclude_nccl_symmetric,
                 )
             else:
                 output = torch.ops.trtllm.autotuned_allreduce(
