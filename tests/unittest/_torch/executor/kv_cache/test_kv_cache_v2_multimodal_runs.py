@@ -23,6 +23,7 @@ _OTHER_HASH_INTS = (8, 7, 6, 5, 4, 3, 2, 1)
 def _make_manager(vocab_size: int):
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
     manager.vocab_size = vocab_size
+    manager.event_manager = None
     return manager
 
 
