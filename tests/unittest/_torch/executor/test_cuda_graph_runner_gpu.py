@@ -13,7 +13,12 @@ import torch
 from _torch.executor.engine_test_utils import DummyModel, _create_request
 from _torch.executor.engine_test_utils import kv_cache_manager as managed_kv_cache
 
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
+    CUDAGraphRunner,
+    CUDAGraphRunnerConfig,
+    KeyType,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.mapping import Mapping
@@ -25,7 +30,10 @@ if TYPE_CHECKING:
 
 
 @contextlib.contextmanager
-def cuda_graph_runner_and_kv_cache() -> Iterator[tuple[CUDAGraphRunner, KVCacheManagerV2]]:
+def cuda_graph_runner_and_kv_cache(
+    *,
+    execution_stream: torch.cuda.Stream | None = None,
+) -> Iterator[tuple[CUDAGraphRunner, KVCacheManagerV2]]:
     runner = CUDAGraphRunner(
         CUDAGraphRunnerConfig(
             use_cuda_graph=True,
@@ -46,7 +54,9 @@ def cuda_graph_runner_and_kv_cache() -> Iterator[tuple[CUDAGraphRunner, KVCacheM
             kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
         )
     )
-    with managed_kv_cache(model=DummyModel(torch.half)) as manager:
+    with managed_kv_cache(
+        model=DummyModel(torch.half), execution_stream=execution_stream
+    ) as manager:
         try:
             yield runner, manager
         finally:
@@ -241,33 +251,58 @@ class CudaGraphPaddingTestCase(unittest.TestCase):
 
 class ExecutionStreamTestCase(unittest.TestCase):
     def test_cuda_graph_replay_observes_execution_stream_dependency(self) -> None:
-        """A graph replay on the KV manager stream waits for restored KV data."""
+        """KV resume orders graph replay after pending writes on the cache's prior stream."""
         execution_stream = torch.cuda.Stream()
-        transfer_stream = torch.cuda.Stream()
-        kv_cache_manager = self.enterContext(
-            managed_kv_cache(model=DummyModel(torch.half), execution_stream=execution_stream)
+        writer_stream = torch.cuda.Stream()
+        runner, kv_cache_manager = self.enterContext(
+            cuda_graph_runner_and_kv_cache(execution_stream=execution_stream)
         )
+        self.addCleanup(execution_stream.synchronize)
+        self.addCleanup(writer_stream.synchronize)
 
-        source = torch.zeros(1, dtype=torch.int32, device="cuda")
-        observed = torch.zeros_like(source)
-        graph = torch.cuda.CUDAGraph()
-        self.addCleanup(graph.reset)
+        request = _create_request(1, 0)
+        self.assertTrue(kv_cache_manager.prepare_context(request))
+        self.assertTrue(kv_cache_manager.resize_context(request, 1))
+        cache = kv_cache_manager.kv_cache_map[request.py_request_id]
+        self.assertGreater(cache.capacity, 0)
+
+        source = kv_cache_manager.get_buffers(0)
+        assert source is not None
+        source.zero_()
+        observed = torch.zeros((), dtype=torch.float32, device="cuda")
+        key = KeyType(batch_size=1, draft_len=0)
+        inputs = {
+            "input_ids": runner.shared_static_tensors["input_ids"][:1],
+            "position_ids": runner.shared_static_tensors["position_ids"][:, :1],
+            "attn_metadata": AttentionMetadata(
+                max_num_requests=1, max_num_tokens=1, kv_cache_manager=kv_cache_manager
+            ),
+        }
+
+        def forward(_inputs: dict[str, object]) -> torch.Tensor:
+            observed.copy_(source.sum(dtype=torch.float32))
+            return observed
+
         torch.cuda.synchronize()
-        with torch.cuda.graph(graph, stream=execution_stream):
-            observed.copy_(source)
-
-        ready = torch.cuda.Event()
-        with torch.cuda.stream(transfer_stream):
-            # Model the async host-to-device restore completed by the local
-            # offload manager. Recording the event after the write is the same
-            # dependency shape that refreshBlocks/resume installs.
-            source.fill_(7)
-            ready.record()
-
-        manager_stream = torch.cuda.ExternalStream(kv_cache_manager._stream.cuda_stream)
-        with torch.cuda.stream(manager_stream):
-            manager_stream.wait_event(ready)
-            graph.replay()
+        with torch.cuda.stream(execution_stream):
+            runner.capture(key, forward, inputs)
         torch.cuda.synchronize()
 
-        self.assertEqual(observed.item(), 7)
+        for value in (7, 11):
+            cache.cuda_stream = writer_stream.cuda_stream
+            writes_done = torch.cuda.Event()
+            with torch.cuda.stream(writer_stream):
+                torch.cuda._sleep(1 << 29)
+                source.fill_(value)
+                writes_done.record()
+
+            kv_cache_manager.suspend_request(request)
+            self.assertFalse(cache.is_active)
+            self.assertFalse(writes_done.query(), "the KV write must still be in flight")
+            self.assertTrue(kv_cache_manager.resume_request(request))
+            with torch.cuda.stream(execution_stream):
+                runner.replay(key, inputs)
+            execution_stream.synchronize()
+
+            self.assertTrue(writes_done.query())
+            self.assertEqual(observed.item(), source.numel() * value)
