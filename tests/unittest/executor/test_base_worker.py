@@ -1,8 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+import importlib
+import importlib.util
+import sys
 import time
 import warnings
-from types import MethodType, SimpleNamespace
+from pathlib import Path
+from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -505,10 +509,46 @@ def test_submit_cleans_up_failed_enqueue(
         assert worker._client_id_to_request_id == {7: 70, 8: 80}
 
 
+def _load_ray_executor(monkeypatch: pytest.MonkeyPatch) -> type:
+    """Load the real Ray executor with cluster-only imports stubbed."""
+    importlib.import_module("tensorrt_llm.executor.ray.utils")
+    dependencies = {
+        name: ModuleType(name)
+        for name in (
+            "ray",
+            "ray.util",
+            "ray.util.placement_group",
+            "ray.util.scheduling_strategies",
+            "tensorrt_llm.executor.ray.gpu_worker",
+        )
+    }
+    placement = dependencies["ray.util.placement_group"]
+    placement.get_current_placement_group = MagicMock()
+    placement.placement_group = MagicMock()
+    dependencies[
+        "ray.util.scheduling_strategies"].PlacementGroupSchedulingStrategy = MagicMock(
+        )
+    gpu_worker = dependencies["tensorrt_llm.executor.ray.gpu_worker"]
+    gpu_worker.RayGPUWorker = MagicMock()
+    gpu_worker.RayWorkerWrapper = MagicMock()
+    for name, module in dependencies.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    source = Path(base_worker.__file__).parent / "ray" / "executor.py"
+    spec = importlib.util.spec_from_file_location(
+        "tensorrt_llm.executor.ray._submit_test", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.RayExecutor
+
+
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("executor_kind", ["rpc", "ray"])
 @pytest.mark.parametrize("unsupported_adapter", [False, True])
 def test_rpc_submit_rejects_prompt_adapters_before_dispatch(
+        monkeypatch: pytest.MonkeyPatch, executor_kind: str,
         unsupported_adapter: bool) -> None:
+    executor_class = RpcExecutorMixin if executor_kind == "rpc" else _load_ray_executor(
+        monkeypatch)
     if unsupported_adapter:
         with pytest.warns(DeprecationWarning,
                           match="prompt_adapter_request is deprecated"):
@@ -529,13 +569,13 @@ def test_rpc_submit_rejects_prompt_adapters_before_dispatch(
     if unsupported_adapter:
         with pytest.raises(RequestError,
                            match="Prompt adapters are not supported"):
-            RpcExecutorMixin.submit(proxy, request)
+            executor_class.submit(proxy, request)
         proxy.rpc_client.submit.assert_not_called()
         proxy._get_next_client_id.assert_not_called()
         assert request.id is None
         assert proxy._results == {8: peer_result}
     else:
-        result = RpcExecutorMixin.submit(proxy, request)
+        result = executor_class.submit(proxy, request)
         proxy.rpc_client.submit.assert_called_once_with(request)
         proxy.rpc_client.submit.return_value.remote.assert_called_once_with(
             need_response=False)
