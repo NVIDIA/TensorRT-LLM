@@ -31,6 +31,7 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 import pytest
 import torch
+from utils.page_layout_oracle import assert_layouts_reshard
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm._torch.pyexecutor.kv_cache import page_layout, page_table, sharing
@@ -2157,6 +2158,42 @@ def test_attach_requires_a_window_for_every_non_required_group(monkeypatch, poli
             _lender._checked_layout(manager)
     else:
         assert _lender._checked_layout(manager).windows == (None, 64)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("src_tp,dst_tp", [(1, 2), (2, 1), (2, 4), (4, 2), (1, 4)])
+def test_declared_layouts_reshard_byte_for_byte(src_tp, dst_tp):
+    """The page layouts a manager declares at different TP sizes carry every byte to where it
+    belongs (utils.page_layout_oracle), for attention heads and sectioned and head-split state."""
+
+    def kv_ranks(tp):
+        return [derive_layout(attention(tp, rank, 4)).page_layout for rank in range(tp)]
+
+    def state_ranks(tp):
+        return [
+            derive_layout(
+                Manager(
+                    [
+                        (
+                            SsmLayerConfig,
+                            [0, 1],
+                            [("conv_state", 96 // tp, None), ("ssm_state", 128 // tp, None)],
+                        )
+                    ],
+                    tp_size=tp,
+                    tp_rank=rank,
+                    mappers={"conv_state": "sectioned"},
+                    layouts={
+                        "conv_state": dict(section_bytes=(32 // tp,) * 3),
+                        "ssm_state": dict(bytes_per_head=32),
+                    },
+                )
+            ).page_layout
+            for rank in range(tp)
+        ]
+
+    assert_layouts_reshard(kv_ranks(src_tp), kv_ranks(dst_tp))
+    assert_layouts_reshard(state_ranks(src_tp), state_ranks(dst_tp))
 
 
 class BaseDeclarations(Manager):
