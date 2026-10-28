@@ -24,6 +24,7 @@ merges the two into the file this reads back.
 """
 
 import json
+import math
 import os
 import re
 import socket
@@ -332,6 +333,9 @@ class MooncakeStoreConnectorConfig:
     #: Put every page of a block, across layer groups and attention shards,
     #: into one eviction group, so the master evicts a block whole.
     group_blocks: bool = False
+    #: Seconds between each rank's prefix-hole and load statistics lines, or
+    #: `None` to count nothing.
+    stats_interval: Optional[float] = None
 
     def __post_init__(self) -> None:
         """Reject settings that would fail later, inside a transfer."""
@@ -347,6 +351,11 @@ class MooncakeStoreConnectorConfig:
             raise ValueError(
                 f"soft_pin_ttl_ms must be > 0, or absent to leave pages unpinned; "
                 f"got {self.soft_pin_ttl_ms}"
+            )
+        if self.stats_interval is not None and not 0 < self.stats_interval < math.inf:
+            raise ValueError(
+                f"stats_interval must be a finite number of seconds > 0, or absent "
+                f"to count nothing; got {self.stats_interval}"
             )
 
     @property
@@ -387,6 +396,9 @@ class MooncakeStoreConnectorConfig:
                 int(raw["soft_pin_ttl_ms"]) if raw.get("soft_pin_ttl_ms") is not None else None
             ),
             group_blocks=_json_bool(raw, "group_blocks", False, path),
+            stats_interval=(
+                float(raw["stats_interval"]) if raw.get("stats_interval") is not None else None
+            ),
         )
 
     @staticmethod

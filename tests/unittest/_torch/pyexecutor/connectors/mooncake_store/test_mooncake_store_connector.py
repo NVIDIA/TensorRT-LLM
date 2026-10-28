@@ -1457,6 +1457,181 @@ def test_replicate_config_names_the_binding_it_needs(monkeypatch):
         worker_module._replicate_config(None, ["a"])
 
 
+# ---- diagnostics ----
+
+
+def _store_blocks(fake_store, worker, hashes, blocks):
+    for block in blocks:
+        fake_store.objects.add(worker._namespaces[0].key(hashes[block]))
+
+
+def test_worker_counts_a_single_block_hole(store_config, fake_store):
+    set_pool_setting(store_config, stats_interval=60)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        hashes = [bytes([index]) * 16 for index in range(5)]
+        # Block 2 was evicted from the middle of a chain the pool still holds.
+        _store_blocks(fake_store, worker, hashes, [0, 1, 3, 4])
+
+        # The hit is unchanged: it stops at the hole's index.
+        assert worker.count_prefix_hit(hashes) == 2
+
+        stats = worker._hole_stats
+        assert (stats.lookups, stats.lookup_blocks, stats.hit_blocks) == (1, 5, 2)
+        assert (stats.holes, stats.hole_blocks) == (1, 1)
+        assert stats.holed_tokens == 2 * TOKENS_PER_BLOCK
+        assert stats.max_holed_tokens == 2 * TOKENS_PER_BLOCK
+        # No extra store traffic: holes come from the one existence probe.
+        assert len(fake_store.exist_calls) == 1
+
+        # Not due yet, so nothing is logged and nothing is reset.
+        assert worker._maybe_log_hole_stats() is None
+        line = worker._maybe_log_hole_stats(force=True)
+        assert line is not None
+        assert "holes=1" in line
+        assert f"holed_tokens={2 * TOKENS_PER_BLOCK}" in line
+        assert stats.lookups == 0
+
+
+def test_worker_hole_stats_ignore_a_clean_prefix(store_config, fake_store):
+    set_pool_setting(store_config, stats_interval=60)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        hashes = [bytes([index]) * 16 for index in range(4)]
+        _store_blocks(fake_store, worker, hashes, [0, 1])
+
+        assert worker.count_prefix_hit(hashes) == 2
+        assert worker._hole_stats.lookups == 1
+        assert worker._hole_stats.holes == 0
+        assert worker._hole_stats.holed_tokens == 0
+
+
+def test_worker_hole_stats_log_once_per_interval(store_config, fake_store, monkeypatch):
+    set_pool_setting(store_config, stats_interval=60)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        hashes = [bytes([index]) * 16 for index in range(3)]
+        _store_blocks(fake_store, worker, hashes, [0, 2])
+        lines = []
+        monkeypatch.setattr(worker_module.logger, "info", lines.append)
+
+        worker.count_prefix_hit(hashes)
+        assert lines == []
+        worker._hole_stats_last -= worker._stats_interval
+        worker.count_prefix_hit(hashes)
+        assert len(lines) == 1
+        assert "prefix-hole stats" in lines[0]
+        assert "lookups=2" in lines[0] and "holes=2" in lines[0]
+
+        # Shutdown flushes what accumulated since the last line.
+        worker.count_prefix_hit(hashes)
+        worker.shutdown()
+        assert len(lines) == 2
+        assert "lookups=1" in lines[1]
+
+
+def test_worker_hole_stats_off_by_default(store_config, fake_store):
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        hashes = [bytes([index]) * 16 for index in range(5)]
+        _store_blocks(fake_store, worker, hashes, [0, 1, 3, 4])
+
+        assert worker.count_prefix_hit(hashes) == 2
+        assert worker._hole_stats is None
+        assert worker._load_stats is None
+        assert worker._maybe_log_hole_stats(force=True) is None
+        assert worker._maybe_log_load_stats(force=True) is None
+        assert len(fake_store.exist_calls) == 1
+
+
+def test_worker_that_never_reads_the_pool_counts_nothing(store_config, fake_store):
+    """Only a role that loads looks prefixes up, so a producer has nothing to count."""
+    set_pool_setting(store_config, role="producer", stats_interval=60)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        assert worker._hole_stats is None
+        assert worker._load_stats is None
+
+
+def _load_stats_lines(lines):
+    return [line for line in lines if "mooncake-store load stats" in line]
+
+
+def test_worker_load_stats_time_each_phase(store_config, fake_store, monkeypatch):
+    """A zero-copy load waits on the fence and has nothing to scatter."""
+    set_pool_setting(store_config, stats_interval=60)
+    lines = []
+    monkeypatch.setattr(worker_module.logger, "info", lines.append)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        # Nothing loaded yet, so even a forced line has nothing to say.
+        assert worker._maybe_log_load_stats(force=True) is None
+
+        worker.bind_allocation_fence(AllocationFence(fake_store))
+        bind_one_load(worker, fake_store, b"\x04" * 16)
+        worker.start_load_kv(None)
+
+        stats = worker._load_stats
+        for phase in ("resolve", "fence", "describe", "get"):
+            assert stats.phase_wall[phase] > 0, phase
+        assert stats.phase_wall["unstage"] == stats.phase_wall["sync"] == 0
+
+        # Not due yet.
+        assert worker.get_finished([], []) == ([], [])
+        assert _load_stats_lines(lines) == []
+
+        worker._load_stats_last -= worker._stats_interval
+        worker.get_finished([], [])
+        (line,) = _load_stats_lines(lines)
+        assert "loads=1 pages=1 batches=1 " in line
+        for phase in worker_module._LOAD_PHASES:
+            assert f" {phase}=" in line
+        # The counters start over, so a quiet interval logs nothing.
+        assert stats.loads == 0
+        worker._load_stats_last -= worker._stats_interval
+        worker.get_finished([], [])
+        assert len(_load_stats_lines(lines)) == 1
+
+
+def test_worker_load_stats_time_the_staged_scatter(store_config, fake_store, staged_copies):
+    """A staged load has no fence to wait on, and scatters and syncs every batch."""
+    set_pool_setting(store_config, stats_interval=60, transfer_batch_size=1)
+    with make_staged_worker(fake_store, store_config, layout=make_layout()) as worker:
+        hashes = [bytes([index]) * 16 for index in range(2)]
+        _store_blocks(fake_store, worker, hashes, [0, 1])
+        worker.bind_connector_meta(
+            SimpleNamespace(
+                loads=[
+                    RequestTransfers(
+                        7, [PageTransfer(hashes[0], 0, 1), PageTransfer(hashes[1], 0, 2)]
+                    )
+                ],
+                saves=[],
+            )
+        )
+        worker.start_load_kv(None)
+
+        stats = worker._load_stats
+        assert (stats.loads, stats.pages, stats.batches) == (1, 2, 2)
+        assert stats.loaded_bytes == 2 * 64
+        for phase in ("resolve", "describe", "get", "unstage", "sync"):
+            assert stats.phase_wall[phase] > 0, phase
+        assert stats.phase_wall["fence"] == 0
+
+        line = worker._maybe_log_load_stats(force=True)
+        assert "mooncake-store load stats" in line
+        assert "loads=1 pages=2 batches=2 " in line
+        assert worker._maybe_log_load_stats(force=True) is None
+
+
+def test_worker_load_stats_are_flushed_at_shutdown(store_config, fake_store, monkeypatch):
+    set_pool_setting(store_config, stats_interval=60)
+    lines = []
+    monkeypatch.setattr(worker_module.logger, "info", lines.append)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        worker.bind_allocation_fence(AllocationFence(fake_store))
+        bind_one_load(worker, fake_store, b"\x05" * 16)
+        worker.start_load_kv(None)
+        worker.shutdown()
+        assert len(_load_stats_lines(lines)) == 1
+    # Shut down again on the way out, with nothing left to flush.
+    assert len(_load_stats_lines(lines)) == 1
+
+
 # ---- attention data parallelism ----
 
 
