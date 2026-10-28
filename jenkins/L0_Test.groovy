@@ -2111,27 +2111,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     fi
                     export enrootImagePath="\$containerDir/container-\${imageDigest}.sqsh"
 
-                    # mksquashfs exits 0 even when it cannot read some files of the
-                    # unpacked image; it stores them as empty files or leaves them out.
-                    # Treat such an import as failed so it is never published.
-                    enrootImportChecked() {
-                        local docker_uri=\$1
-                        local tmp_path=\$2
-                        local log_path
-                        local rc
-
-                        log_path=\$(mktemp)
-                        { enroot import -o "\$tmp_path" -- "docker://\$docker_uri"; echo \$? > "\${log_path}.rc"; } 2>&1 | tee "\$log_path"
-                        rc=\$(cat "\${log_path}.rc" 2>/dev/null || echo 1)
-                        if [ "\$rc" -eq 0 ] && grep -q -E 'Failed to read file|Cannot stat dir/file' "\$log_path"
-                        then
-                            echo "enroot import could not read some image files; discarding \$tmp_path"
-                            rc=1
-                        fi
-                        rm -f "\$log_path" "\${log_path}.rc"
-                        return "\$rc"
-                    }
-
                     importContainerWithRetries() {
                         local docker_uri=\$1
                         local output_path=\$2
@@ -2139,6 +2118,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         local delay=\${4:-60}
                         local attempt=1
                         local tmp_path
+                        local import_tmp_dir
 
                         # Best-effort lock so racing jobs don't all import the same
                         # image. flock may be a no-op on some shared filesystems;
@@ -2160,12 +2140,21 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         tmp_path="\${output_path}.\${SLURM_JOB_ID}.tmp"
                         rm -f "\$tmp_path"
 
-                        until enrootImportChecked "\$docker_uri" "\$tmp_path"
+                        # Unpack the image in a job-private directory instead of the
+                        # node's shared ENROOT_TEMP_PATH. The Slurm prolog of every job
+                        # that starts on the node changes the owner of the directories in
+                        # the shared path, so mksquashfs can lose read access to our files
+                        # in the middle of the import and store them as empty files.
+                        import_tmp_dir=\$(mktemp -d /tmp/enroot-import.XXXXXX)
+                        echo "Enroot import temp dir: \$import_tmp_dir (\$(df -hP "\$import_tmp_dir" | awk 'NR==2 {print \$4 " free"}'))"
+
+                        until ENROOT_TEMP_PATH="\$import_tmp_dir" enroot import -o "\$tmp_path" -- "docker://\$docker_uri"
                         do
                             if ((attempt >= max_attempts))
                             then
                                 echo "enroot import failed after \$max_attempts attempts"
                                 rm -f "\$tmp_path"
+                                rm -rf "\$import_tmp_dir"
                                 flock -u 9 || true
                                 return 1
                             fi
@@ -2176,6 +2165,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             attempt=\$((attempt + 1))
                         done
 
+                        rm -rf "\$import_tmp_dir"
                         mv -f "\$tmp_path" "\$output_path"
                         flock -u 9 || true
                     }
