@@ -26,7 +26,7 @@ vendors:
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     branch: feat/engine-shutdown-rpc
-    commit: 648c0bd84121d06aec30acec1a6bef0262e327ab
+    commit: 78ac56152781559b5e4e8ae9ef357aaee833f19f
     source: proto/openengine/v1
     destination: tensorrt_llm/grpc/openengine/proto/openengine/v1
     include:
