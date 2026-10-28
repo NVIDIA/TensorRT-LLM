@@ -240,6 +240,35 @@ kv_cache_compression_config:
   skip_rope_quantization: true
 ```
 
+#### Keeping the First and Last Tokens at the Active Precision
+
+`mixed_precision_first_n` and `mixed_precision_last_n` keep the leading and the
+most recent N tokens of every sequence at the active-cache precision in the cold
+tiers; the rest of the history is stored in NVFP4. This is the cold-page
+counterpart of the mixed-precision KV cache
+(`KvCacheConfig(dtype="mixed_nvfp4_...")`): the KV cache manager adds the same
+retained-token layer group, Attention reads both pools through the same staging
+copy, and the retained group migrates to Host or Disk unchanged while the
+history pool is quantized. The GPU keeps the full history at the active
+precision, plus one window-sized copy of the retained tokens per Attention
+layer.
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  host_cache_size: 8589934592
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  quant: nvfp4
+  mixed_precision_first_n: 256
+  mixed_precision_last_n: 256
+```
+
+The option is a prototype and shares the mixed-precision KV cache's limits: the
+standard dense KV cache manager, the TRTLLM or FlashInfer Attention backend,
+single-beam decoding without speculative decoding, and no KV connector. It
+cannot be combined with `dtype="mixed_nvfp4_..."`.
+
 ### TriAttention
 
 [TriAttention](https://arxiv.org/abs/2604.04921) (ICML 2026) periodically scores
