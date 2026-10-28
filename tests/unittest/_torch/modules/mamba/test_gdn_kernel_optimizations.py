@@ -871,7 +871,7 @@ def test_conv1d_verify_update_hoist_and_pdl_wait_bitwise(conv_dim, num_decodes, 
     slots = torch.tensor([3, 11, 6, 9, 1][:num_decodes], dtype=torch.int32, device="cuda")
     rows = torch.arange(num_decodes, dtype=torch.int32, device="cuda")
 
-    def run(state, **options):
+    def run(state, x=x, **options):
         windows = torch.zeros(
             num_decodes, draft_token_num, conv_dim, 3, dtype=torch.bfloat16, device="cuda"
         )
@@ -889,11 +889,13 @@ def test_conv1d_verify_update_hoist_and_pdl_wait_bitwise(conv_dim, num_decodes, 
         return out, state, windows
 
     ref = run(state0.clone())
-    # The hoisted x rows and the PDL wait on a producer that writes the conv state late.
-    _assert_late_copy_overlaps(state0)
-    state = torch.empty_like(state0)
-    _late_copy(state, state0)
-    got = run(state, launch_dependent_kernels=True, launch_with_pdl_wait=True, hoist_x=True)
+    # The hoisted x rows and the PDL wait on a producer that writes x late (the conv state, slots and accepted
+    # counts are data of earlier steps, read before the wait).
+    _assert_late_copy_overlaps(x)
+    late = torch.empty_like(x)
+    state = state0.clone()
+    _late_copy(late, x)
+    got = run(state, x=late, launch_dependent_kernels=True, launch_with_pdl_wait=True, hoist_x=True)
     torch.cuda.synchronize()
     for a, b in zip(got, ref):
         assert torch.equal(a, b)

@@ -629,10 +629,6 @@ def _causal_conv1d_update_kernel(
 ):
     if LAUNCH_DEPENDENT_KERNELS:
         tl.extra.cuda.gdc_launch_dependents()
-    if WAIT_PRODUCER:
-        # PDL dependent of the producer of x: every input is read after the dependency wait.
-        gdc_wait_with_memory_clobber()
-
     # ruff: noqa: E501
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
@@ -716,6 +712,10 @@ def _causal_conv1d_update_kernel(
         & (idx_feats < dim)[None, :]
     )
     conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
+    if WAIT_PRODUCER:
+        # PDL dependent of the producer of x: the slot, accepted-count and conv-state reads above (data of
+        # earlier steps, which the producer does not write) overlap it; x is read after the dependency wait.
+        gdc_wait_with_memory_clobber()
 
     VAL = state_len - seqlen
     x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
@@ -1032,8 +1032,8 @@ def causal_conv1d_update(
         which can profitably start fetching already available inputs
         like the state before needing the output of this kernel.
         Ignored on hardware that doesn't support PDL (sm < 90).
-    launch_with_pdl_wait: If true, launch as a PDL dependent of the producer of x; every input is read after
-        griddepcontrol.wait.
+    launch_with_pdl_wait: If true, launch as a PDL dependent of the producer of x; x is read after
+        griddepcontrol.wait, the slots, accepted counts and conv state (data of earlier steps) before it.
         Ignored on hardware that doesn't support PDL (sm < 90).
     hoist_x: If true (width 4, no tree / num_accepted_tokens), load the x rows of all tokens before the first
         store. Same values and arithmetic.
