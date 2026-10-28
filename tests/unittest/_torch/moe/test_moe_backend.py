@@ -2675,6 +2675,7 @@ def _fused_comm_scheduler(
     enable_attention_dp: bool = False,
     reduce_results: bool = False,
     accepts_global_routed_output: bool = False,
+    run_moe_reuses_buffers: bool = False,
 ) -> FusedCommMoEScheduler:
     mapping = Mapping(
         world_size=tp_size,
@@ -2691,6 +2692,7 @@ def _fused_comm_scheduler(
             "reduce_results",
             "accepts_global_routed_output",
             "mapping",
+            "backend",
         ]
     )
     moe.parallel_size = tp_size
@@ -2698,6 +2700,10 @@ def _fused_comm_scheduler(
     moe.reduce_results = reduce_results
     moe.accepts_global_routed_output = accepts_global_routed_output
     moe.mapping = mapping
+    # ``forward`` reads the declaration off the backend before it chunks.
+    moe.backend = SimpleNamespace(
+        input_requirement=MoEInputRequirement(run_moe_reuses_buffers=run_moe_reuses_buffers)
+    )
     return FusedCommMoEScheduler(moe)
 
 
@@ -2796,6 +2802,26 @@ def test_fused_comm_forward_returns_what_the_caller_reduces(
             assert torch.equal(output, global_output)
         else:
             assert not output.any()
+
+
+@pytest.mark.cpu_only
+def test_fused_comm_forward_refuses_a_backend_that_reuses_its_buffers() -> None:
+    """``_run_chunks`` keeps the tensor each chunk returned, so a backend whose
+    next ``run_moe`` overwrites it would collect the same storage for every
+    chunk. Only ``ExternalCommMoEScheduler`` copies chunks out; here the
+    combination is a named refusal rather than the last chunk's rows repeated."""
+    scheduler = _fused_comm_scheduler(rank=0, run_moe_reuses_buffers=True)
+
+    with pytest.raises(NotImplementedError, match="run_moe_reuses_buffers"):
+        scheduler.forward(
+            torch.randn(5, 16, dtype=torch.bfloat16),
+            torch.randn(5, 8),
+            do_finalize=True,
+            output_dtype=torch.bfloat16,
+            all_rank_num_tokens=None,
+            use_dp_padding=None,
+            input_ids=None,
+        )
 
 
 @pytest.mark.cpu_only

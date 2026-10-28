@@ -83,7 +83,8 @@ class MoEInputRequirement:
     # returns may be a view of one, overwritten by the next call, and two calls
     # in flight on different streams would share the same scratch. A multi-chunk
     # forward therefore runs every chunk on one stream and copies each chunk's
-    # output before the next chunk runs.
+    # output before the next chunk runs. ``FusedCommMoEScheduler`` copies no
+    # chunk output, so it refuses a backend that declares this.
     run_moe_reuses_buffers: bool = False
 
     # No sentinel for invalid_token_expert_id: every Communication uses -1.
