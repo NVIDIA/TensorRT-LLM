@@ -16,6 +16,7 @@ Event delivery is direct ZMQ; ``SubscribeKvEvents`` remains unimplemented.
 import asyncio
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any, Optional
 
 import grpc
@@ -103,7 +104,9 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         kv_transfer_backend: str = "",
         frontend: FrontendClient | None = None,
         instance_id: str | None = None,
+        shutdown: Callable[[str, grpc.aio.ServicerContext], Awaitable[bool]] | None = None,
     ) -> None:
+        self._shutdown = shutdown
         self._frontend = frontend
         self._instance_id = (
             instance_id if instance_id is not None else str(getattr(llm, "llm_id", "") or "")
@@ -400,6 +403,30 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
 
     # -- Health and lifecycle ----------------------------------------------
 
+    async def Shutdown(
+        self,
+        request: lifecycle_pb2.ShutdownRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> lifecycle_pb2.ShutdownResponse:
+        expected = request.expected_instance_id
+        if not expected:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, "expected_instance_id is required"
+            )
+        if expected != self._instance_id:
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "Engine instance ID mismatch")
+        if self._shutdown is None:
+            await context.abort(grpc.StatusCode.UNIMPLEMENTED, "No engine lifecycle owner")
+        already_stopping = await self._shutdown(expected, context)
+        return lifecycle_pb2.ShutdownResponse(
+            instance_id=expected,
+            status=(
+                lifecycle_pb2.SHUTDOWN_STATUS_ALREADY_STOPPING
+                if already_stopping
+                else lifecycle_pb2.SHUTDOWN_STATUS_ACCEPTED
+            ),
+        )
+
     async def Health(
         self,
         request: lifecycle_pb2.HealthRequest,
@@ -413,7 +440,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             )
         ]
 
-        model_ready = self._engine_is_healthy()
+        model_ready = not self._inference.stopping and self._engine_is_healthy()
         if self._frontend is not None:
             try:
                 status = await self._frontend.request("status")
@@ -441,17 +468,37 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
                 )
             )
 
-        if request.include_inference_probe and (self._frontend is None or model_ready):
+        if (
+            request.include_inference_probe
+            and not self._inference.stopping
+            and (self._frontend is None or model_ready)
+        ):
             try:
                 checks.append(await self._inference_probe(request.model or self._model))
             except CoordinationError as error:
                 await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
 
-        state = lifecycle_pb2.HEALTH_STATE_READY
-        for check in checks:
-            if check.state != lifecycle_pb2.HEALTH_STATE_READY:
-                state = check.state
-                break
+        # An awaited probe may have overlapped group shutdown acceptance.
+        stopping = self._inference.stopping
+        if request.include_inference_probe and self._frontend is not None:
+            try:
+                stopping = stopping or (await self._frontend.request("status"))["stopping"]
+            except CoordinationError:
+                stopping = True
+        if stopping:
+            checks.append(
+                lifecycle_pb2.HealthCheck(
+                    name="shutdown", state=lifecycle_pb2.HEALTH_STATE_NOT_READY, message="stopping"
+                )
+            )
+        state = (
+            lifecycle_pb2.HEALTH_STATE_NOT_READY if stopping else lifecycle_pb2.HEALTH_STATE_READY
+        )
+        if not stopping:
+            for check in checks:
+                if check.state != lifecycle_pb2.HEALTH_STATE_READY:
+                    state = check.state
+                    break
         return lifecycle_pb2.HealthResponse(state=state, checks=checks)
 
     async def _inference_probe(self, model: str) -> lifecycle_pb2.HealthCheck:
@@ -483,6 +530,12 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         # itself on running_requests must see it.
         probe_id = f"__openengine_health_probe__{uuid.uuid4().hex}"
         try:
+            if self._inference.stopping:
+                return lifecycle_pb2.HealthCheck(
+                    name="inference_probe",
+                    state=lifecycle_pb2.HEALTH_STATE_NOT_READY,
+                    message="stopping",
+                )
             if self._frontend is not None:
                 reservation = await self._frontend.reserve(probe_id)
                 if reservation.aborted:
@@ -521,7 +574,8 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
                 message=str(error),
             )
         finally:
-            self._inference.untrack_request(probe_id, handle)
+            if handle is not None:
+                self._inference.untrack_request(probe_id, handle)
             if reservation is not None:
                 await asyncio.shield(reservation.release())
 

@@ -58,4 +58,4 @@ __all__ = [
 
 SCHEMA_REVISION = int(_MANIFEST["schema_revision"])
 MINIMUM_CLIENT_REVISION = int(_MANIFEST["minimum_client_revision"])
-SCHEMA_RELEASE = str(_MANIFEST["bsr"]["release"])
+SCHEMA_RELEASE = str(_MANIFEST["bsr"]["release"] or _MANIFEST["source"]["commit"])

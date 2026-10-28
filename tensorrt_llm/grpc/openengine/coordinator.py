@@ -108,7 +108,9 @@ class Coordinator:
         instance_id: str,
         healthy: Callable[[], bool],
         fail: Callable[[str], None],
+        request_shutdown: Callable[[], bool] | None = None,
     ) -> None:
+        self._request_shutdown = request_shutdown
         self.instance_id = instance_id
         self.ready = False
         self.stopping = False
@@ -167,6 +169,16 @@ class Coordinator:
 
     async def _dispatch(self, message: dict, context: grpc.aio.ServicerContext) -> dict:
         operation = message["operation"]
+        if operation == "shutdown":
+            matched = bool(message.get("expected_instance_id")) and (
+                message["expected_instance_id"] == self.instance_id
+            )
+            result = {"matched": matched, "supported": self._request_shutdown is not None}
+            if matched and self._request_shutdown is not None:
+                # The launcher callback withdraws the group and sets its stop
+                # event synchronously. Cancellation cannot undo acceptance.
+                result["already_stopping"] = self._request_shutdown()
+            return result
         if operation == "heartbeat":
             # Check expiry before refreshing: a late heartbeat cannot resurrect
             # a group that has already lost a frontend's responsiveness guarantee.
@@ -180,6 +192,11 @@ class Coordinator:
                 "count": len(self._requests),
                 "stopping": self.stopping,
             }
+        if operation == "failure":
+            self.ready = False
+            self.stopping = True
+            self._fail(f"OpenEngine frontend {message['frontend']} failed: {message['reason']}")
+            return {}
         if operation == "withdraw":
             self.ready = False
             if not self.stopping:

@@ -96,6 +96,203 @@ async def test_cross_frontend_ownership_load_and_abort():
 
 
 @pytest.mark.asyncio
+async def test_forwarded_shutdown_rejections_do_not_fail_group():
+    """A frontend with stale identity must not turn rejection into engine death."""
+    from conftest import AbortError, FakeServicerContext
+
+    async with group() as (coordinator, (first, second), failures):
+        transitions = []
+
+        def stop():
+            already = coordinator.stopping
+            if not already:
+                transitions.append("stop")
+            coordinator.ready = False
+            coordinator.stopping = True
+            return already
+
+        coordinator._request_shutdown = stop
+        llm = SimpleNamespace(
+            args=SimpleNamespace(guided_decoding_backend=None),
+            tokenizer=None,
+            llm_id="old-engine",
+            _check_health=lambda: True,
+        )
+        server = OpenEngineServer(
+            "127.0.0.1", 0, llm, "test", frontend=first, instance_id="old-engine"
+        )
+        await server.start()
+        control = server._control
+        try:
+            for expected, code in [
+                ("", grpc.StatusCode.INVALID_ARGUMENT),
+                ("old-engine", grpc.StatusCode.FAILED_PRECONDITION),
+            ]:
+                with pytest.raises(AbortError) as rejected:
+                    await control.Shutdown(
+                        lifecycle_pb2.ShutdownRequest(expected_instance_id=expected),
+                        FakeServicerContext(),
+                    )
+                assert rejected.value.code == code
+                assert (await second.request("status"))["ready"]
+                assert not failures
+                assert not transitions
+
+            control._instance_id = "shared-engine"
+            replies = await asyncio.gather(
+                *(
+                    control.Shutdown(
+                        lifecycle_pb2.ShutdownRequest(expected_instance_id="shared-engine"),
+                        FakeServicerContext(),
+                    )
+                    for _ in range(3)
+                )
+            )
+            assert sorted(reply.status for reply in replies) == [
+                lifecycle_pb2.SHUTDOWN_STATUS_ACCEPTED,
+                lifecycle_pb2.SHUTDOWN_STATUS_ALREADY_STOPPING,
+                lifecycle_pb2.SHUTDOWN_STATUS_ALREADY_STOPPING,
+            ]
+            with pytest.raises(CoordinationError):
+                await second.reserve("after-stop")
+            assert transitions == ["stop"]
+            assert not failures
+        finally:
+            await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_shutdown_keeps_launcher_commit():
+    """Losing the forwarding reply must not undo the launcher's stop event."""
+    committed, release_reply = asyncio.Event(), asyncio.Event()
+
+    class DelayedShutdown(Coordinator):
+        async def _dispatch(self, message, context):
+            result = await super()._dispatch(message, context)
+            if message["operation"] == "shutdown":
+                committed.set()
+                await release_reply.wait()
+            return result
+
+    async with group(DelayedShutdown) as (coordinator, (first, second), failures):
+
+        def stop():
+            already = coordinator.stopping
+            coordinator.stopping = True
+            coordinator.ready = False
+            return already
+
+        coordinator._request_shutdown = stop
+        request = asyncio.create_task(
+            first.request("shutdown", expected_instance_id="shared-engine")
+        )
+        try:
+            await asyncio.wait_for(committed.wait(), 2)
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+            assert (await second.request("status"))["stopping"]
+            with pytest.raises(CoordinationError):
+                await second.reserve("after-cancel")
+            assert not failures
+        finally:
+            release_reply.set()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_wins_over_pending_group_probe_admission():
+    """A probe rejected by stopping group admission must report NOT_READY."""
+    from conftest import FakeServicerContext
+
+    from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer
+
+    async with group() as (coordinator, (first, _), failures):
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_reserve = first.reserve
+
+        async def delayed_reserve(request_id):
+            entered.set()
+            await release.wait()
+            return await original_reserve(request_id)
+
+        first.reserve = delayed_reserve
+        from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer
+
+        llm = SimpleNamespace(
+            args=SimpleNamespace(guided_decoding_backend=None),
+            tokenizer=None,
+            _check_health=lambda: True,
+        )
+        control = OpenEngineControlServicer(
+            llm,
+            "test",
+            OpenEngineInferenceServicer(llm, "test", frontend=first),
+            frontend=first,
+            instance_id="shared-engine",
+        )
+        task = asyncio.create_task(
+            control.Health(
+                lifecycle_pb2.HealthRequest(include_inference_probe=True), FakeServicerContext()
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            coordinator.ready = False
+            coordinator.stopping = True
+            release.set()
+            response = await asyncio.wait_for(task, 2)
+            assert response.state == lifecycle_pb2.HEALTH_STATE_NOT_READY
+            assert not failures
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+
+@pytest.mark.asyncio
+async def test_forwarded_shutdown_withdraws_health_before_owner_cleanup():
+    """An attached frontend must publish unready before acknowledging shutdown."""
+    async with group() as (coordinator, (_, frontend), failures):
+
+        def request_stop():
+            already = coordinator.stopping
+            coordinator.ready = False
+            coordinator.stopping = True
+            return already
+
+        coordinator._request_shutdown = request_stop
+        llm = SimpleNamespace(
+            args=SimpleNamespace(guided_decoding_backend=None),
+            llm_id="shared-engine",
+            tokenizer=None,
+            _check_health=lambda: True,
+        )
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test", frontend=frontend)
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                control = openengine_pb2_grpc.ControlStub(channel)
+                response = await control.Shutdown(
+                    lifecycle_pb2.ShutdownRequest(expected_instance_id="shared-engine"), timeout=3
+                )
+                assert response.status == lifecycle_pb2.SHUTDOWN_STATUS_ACCEPTED
+                health = health_pb2_grpc.HealthStub(channel)
+                assert (
+                    await health.Check(
+                        health_pb2.HealthCheckRequest(service="inference"), timeout=3
+                    )
+                ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                assert (
+                    await health.Check(health_pb2.HealthCheckRequest(service="liveness"), timeout=3)
+                ).status == health_pb2.HealthCheckResponse.SERVING
+                assert not failures
+        finally:
+            await server.stop(grace=0)
+
+
+@pytest.mark.asyncio
 async def test_cancelled_reservation_releases_after_commit_before_reply():
     """Cancellation at the IPC boundary must not permanently occupy an ID."""
     committed, reply_allowed = asyncio.Event(), asyncio.Event()

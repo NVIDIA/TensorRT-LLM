@@ -25,13 +25,13 @@ vendors:
     digest: sha256-tree-v1:f2f444f7e6d4ad688fbf4e1e9eed11ff7c78d835cfd0af5ef9d7660780b059e0
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
-    tag: v0.1.0
-    commit: b5f2bd93721f7b888d3e2440679e0ae7012939d1
+    branch: feat/engine-shutdown-rpc
+    commit: 648c0bd84121d06aec30acec1a6bef0262e327ab
     source: proto/openengine/v1
     destination: tensorrt_llm/grpc/openengine/proto/openengine/v1
     include:
     - '*.proto'
-    digest: sha256-tree-v1:54c95724673b50dee9f27ba72f98ed13b3009209f858f80e044ccd13974770f4
+    digest: sha256-tree-v1:3c2988a9c6a18b96d3df77df2073efac9d5c6d99e8d25d03458c4849d135ac8d
   sana-sol-attn:
     url: https://github.com/NVlabs/Sana.git
     branch: sol-engine

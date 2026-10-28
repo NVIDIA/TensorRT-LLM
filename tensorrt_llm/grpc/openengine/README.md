@@ -26,6 +26,16 @@ trtllm-serve <model> \
 
 Existing `--grpc` invocations continue to select SMG. OpenEngine and VisualGen cannot be enabled together.
 
+## Engine shutdown
+
+`Control.Shutdown` requests orderly shutdown of the entire engine serving group. Pass the intended lifetime's `GetServerInfo.instance_id` as `ShutdownRequest.expected_instance_id`. Missing IDs return `INVALID_ARGUMENT`; mismatches return `FAILED_PRECONDITION` without changing the running group. Identity is checked again by the launcher when an attached frontend forwards the request. The ID is a lifetime fence, not an authentication credential.
+
+`ACCEPTED` acknowledges that the launcher has committed to shutdown and closed new inference admission. `ALREADY_STOPPING` acknowledges a repeat for that same lifetime. Neither response means that process exit or engine cleanup has completed. Accepted shutdown proceeds after RPC cancellation or a lost reply. After an uncertain outcome, check lifecycle and identity and retry only with the original expected ID. Older servers return `UNIMPLEMENTED`. An embedded `OpenEngineServer` without an injected engine lifecycle owner also returns `UNIMPLEMENTED`; stopping its listener alone would leave the engine running.
+
+Shutdown uses the same stop event and cleanup path as SIGTERM/SIGINT. Inference health becomes `NOT_SERVING` before the shutdown acknowledgement, including when owner cleanup is deferred; `Control.Health` reports not-ready and suppresses new inference probes. Healthy liveness remains `SERVING` until listener closure, and known fatal failures retain their fatal status. Late health results cannot restore readiness. Work admitted before shutdown follows the existing grace policy: the gRPC listener allows up to five seconds for active RPCs, then cancels them; attached frontends receive SIGTERM and share a ten-second termination deadline before SIGKILL. The launcher then closes coordination and shuts down the engine. These grace periods are not a total cleanup deadline: media-pool drain and engine shutdown can take longer. An independent fatal failure remains a failure even when it races an intentional shutdown.
+
+The listener's existing trusted-network/TLS-proxy requirements also apply to this destructive control operation. Engine shutdown does not authenticate a caller merely because the expected identity matches.
+
 ## Health checks
 
 OpenEngine serves the standard `grpc.health.v1.Health` service on the same gRPC port as Inference and Control.
@@ -73,7 +83,7 @@ The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyT
 
 Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.
 
-Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority metadata. Attention-DP rank hints are validated and used for first-turn placement. With conversation affinity on, the first hint establishes the conversation's rank, and later turns retain that rank even if their hints differ; the request must carry a stable conversation ID. `ServerInfo.extra.trtllm_supports_dp_rank_targeting` advertises this support. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `GetKvEventSources`, `Health` and `Abort`; its LoRA lifecycle and `SubscribeKvEvents` RPCs return `UNIMPLEMENTED`.
+Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority metadata. Attention-DP rank hints are validated and used for first-turn placement. With conversation affinity on, the first hint establishes the conversation's rank, and later turns retain that rank even if their hints differ; the request must carry a stable conversation ID. `ServerInfo.extra.trtllm_supports_dp_rank_targeting` advertises this support. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `GetKvEventSources`, `Health`, `Abort`, and `Shutdown`; its LoRA lifecycle and `SubscribeKvEvents` RPCs return `UNIMPLEMENTED`.
 
 ### Disaggregated serving
 
@@ -170,7 +180,7 @@ Multiple frontends require the default classic IPC executor and a nonzero port. 
 
 ## Schema and binding provenance
 
-The schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.1.0`](https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0), Git commit `b5f2bd93721f7b888d3e2440679e0ae7012939d1`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `768a93c7b44e40f28c692ad0b471a8f2`.
+The schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository. This shutdown implementation uses source commit `648c0bd84121d06aec30acec1a6bef0262e327ab`, recorded in the vendor lock and schema manifest. It is an unpublished protocol revision: `bsr.release` is unset and `ServerInfo.schema_release` reports the source commit. Before upstream release, land the canonical protocol change and refresh both the immutable source pin and any published BSR release metadata. Do not reuse the earlier `v0.1.0` BSR release identifier for the extended schema.
 
 TensorRT-LLM vendors that immutable schema under `tensorrt_llm/grpc/openengine/proto/`. `3rdparty/vendor_sources.lock.yaml` pins the upstream commit and verifies that the schema files are exact upstream copies. The adjacent `manifest.json` records protocol metadata, generator versions, and runtime floors. The deterministic private bindings under `tensorrt_llm.grpc.openengine._generated` are checked in so ordinary wheel and editable builds do not require a protocol compiler or network access.
 
