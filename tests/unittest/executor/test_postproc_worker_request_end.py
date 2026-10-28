@@ -21,10 +21,12 @@ lives. These tests drive the worker's own loop over both paths.
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
 from tensorrt_llm.executor.postproc_worker import PostprocWorker
+from tensorrt_llm.executor.result import CompletionOutput, DetokenizedGenerationResultBase
 from tensorrt_llm.executor.utils import ErrorResponse
 
 pytestmark = pytest.mark.cpu_only
@@ -67,6 +69,53 @@ class _BrokenResponse:
     @property
     def result(self):
         raise RuntimeError("unreadable result")
+
+
+class _Response:
+    """A readable response for a request the worker has no record for yet."""
+
+    def __init__(self, client_id):
+        self.client_id = client_id
+        self.request_id = client_id
+        self.result = SimpleNamespace(context_logits=None, generation_logits=None)
+
+
+class _NewRecord:
+    """The record the worker creates for a new request; each response runs its hook."""
+
+    def __init__(self, inp, tokenizer):
+        self.id = inp.rsp.client_id
+        self.outputs = [CompletionOutput(index=0, text="hello")]
+        self._done = False
+        self._aborted = False
+        self._streaming = True
+
+    def _handle_response(self, response):
+        DetokenizedGenerationResultBase._apply_post_processor_hook(self)
+
+
+class _FailingHook(_Hook):
+    """Keeps state for each request it sees, then raises on the chunk."""
+
+    def __init__(self):
+        super().__init__()
+        self.state = {}
+
+    def __call__(self, chunk):
+        self.state[chunk.request_id] = chunk.text
+        raise RuntimeError("hook bug")
+
+    def on_request_end(self, request_id, reason):
+        super().on_request_end(request_id, reason)
+        self.state.pop(request_id, None)
+
+
+class _HookWithRaisingEndLookup(_Hook):
+    """A hook whose ``on_request_end`` raises as soon as it is looked up."""
+
+    @property
+    def on_request_end(self):
+        raise RuntimeError("broken property")
 
 
 def _worker(hook, inputs):
@@ -115,6 +164,39 @@ def test_a_postprocessing_exception_releases_the_request_in_the_hook():
     )
     assert isinstance(batches[0][0], ErrorResponse)
     assert batches[0][0].client_id == 8
+
+
+def test_a_hook_exception_releases_the_request_in_the_hook():
+    hook = _FailingHook()
+    worker = _worker(hook, [[PostprocWorker.Input(rsp=_Response(8))]])
+    worker._record_creator = _NewRecord
+    worker._tokenizer = None
+
+    batches = asyncio.run(_drain(worker))
+
+    assert isinstance(batches[0][0], ErrorResponse)
+    assert batches[0][0].client_id == 8
+    assert "hook bug" in batches[0][0].error_msg, "the hook itself must be what raised"
+    assert worker._records == {}
+    assert hook.ended == [(8, "postprocessing_error")]
+    assert hook.state == {}, "the state the hook kept for the request must be released"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [ErrorResponse(7, "boom", 7), _BrokenResponse(7)],
+    ids=["executor_error", "postprocessing_error"],
+)
+def test_a_raising_on_request_end_lookup_still_forwards_the_error(response):
+    hook = _HookWithRaisingEndLookup()
+    worker = _worker(hook, [[PostprocWorker.Input(rsp=response)]])
+    worker._records[7] = _Record(7, hook)
+
+    batches = asyncio.run(_drain(worker))
+
+    assert worker._records == {}
+    assert isinstance(batches[0][0], ErrorResponse)
+    assert batches[0][0].client_id == 7
 
 
 def test_an_error_for_a_request_the_worker_never_saw_is_harmless():

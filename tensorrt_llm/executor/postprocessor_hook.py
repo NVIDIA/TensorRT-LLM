@@ -172,11 +172,11 @@ def end_post_processor_hook(
         reason: ``"error"`` when the executor reported an error for the request,
             ``"postprocessing_error"`` when its post-processing raised.
     """
-    on_request_end = getattr(hook, "on_request_end", None)
-    if not callable(on_request_end):
-        return
     try:
-        on_request_end(request_id, reason)
+        # The lookup is guarded too: a property or ``__getattr__`` can raise.
+        on_request_end = getattr(hook, "on_request_end", None)
+        if callable(on_request_end):
+            on_request_end(request_id, reason)
     except Exception:
         logger.exception("Post-processor hook on_request_end failed for request %s.", request_id)
 
