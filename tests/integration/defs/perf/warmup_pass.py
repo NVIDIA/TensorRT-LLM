@@ -36,8 +36,6 @@ is that command's own ``--warmup`` requests, raised to one wave.
 
 ``TRTLLM_PERF_WARMUP_PASS=0`` turns it off in both, e.g. to reproduce a JIT stall
 the pass would otherwise absorb.
-
-Stdlib-only, so unit tests can load it without torch.
 """
 
 import os

@@ -203,9 +203,6 @@ AGG_CONFIG_FOLDER=my/custom/agg DISAGG_CONFIG_FOLDER=my/custom/disagg \
   python jenkins/scripts/perf/local/submit.py ...
 ```
 
-`TRTLLM_PERF_WARMUP_PASS=0`, read by `test_perf_sanity.py` itself, skips the
-warmup pass; see [Warmup pass](#warmup-pass).
-
 ## Configuration Files
 
 There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (disagg).
@@ -344,47 +341,13 @@ queue (nvbugs/6564113). Notes:
 ### Warmup pass
 
 Before each measured client of a normal aggregated, `ctx_only` or disaggregated `e2e`
-test, the harness (`run_warmup_pass`, `warmup_pass.py`) sends one un-measured wave of
-the same traffic. How many prompts arrive together, how they are chunked against
-`max_num_tokens` and which decode tokens share a step with them are only known once
-traffic arrives, so the server's startup warmup cannot compile every JIT kernel those
-prefill shapes need. The pass makes them compile before the measured window. Its
-command is the measured client's own `benchmark_serving` command with:
-- `--num-prompts` set to the client's concurrency (one wave);
-- `--seed` set to the measured seed + 1, so the pass sends other prompts of the same
-  lengths: other random token ids, or another shuffle of the same dataset file;
-- `--no-test-input` added, and the output-file flags (`--save-request-time-breakdown`,
-  `--save-result`, `--save-detailed`, `--result-dir`, `--result-filename`) dropped.
-
-Notes:
-- Not run for `gen_only` / `gen_only_no_context` (they measure decode only, and the
-  gen server's benchmark fill gate opens once, so warmup requests would open it
-  early), for AgentX clients (they run their own warmup) or for accuracy-only
-  clients. In e2e it runs after the connection warmup.
-- `TRTLLM_PERF_WARMUP_PASS=0` (also `false`, `no`, `off`) skips it, e.g. to
-  reproduce a JIT stall inside the measured window. CI leaves it on. With
-  `jenkins/scripts/perf/local/submit.py`, set
-  `EXTRA_CONTAINER_EXPORTS='TRTLLM_PERF_WARMUP_PASS=0'`; it reaches the
-  aggregated ranks and every disaggregated role. The same switch controls the
-  single-node perf tests' warmup pass (`test_perf.py`; see `README.md`).
-- Client log: `trtllm-benchmark-warmup-pass.<server_idx>.<client_idx>.log`, not parsed
-  for metrics. The test fails if the pass's benchmark_serving exits non-zero, times
-  out or has every request fail; if only some fail, it logs a warning and the measured
-  client runs.
-- The pass's perf_metrics records are excluded from the time breakdown (see below),
-  and in e2e its iterations come before the measured client's gen-log window, so
-  neither `d_tb_*` nor the gen-worker device step time includes it.
-- With the time breakdown on, only a server's first measured client gets a pass. The
-  breakdown pools every record after the first measured client's start, so it cannot
-  leave a later pass out; the later clients log a warning and upload
-  `l_warmup_pass_requests` 0. CI's time_breakdown lanes have one client per server.
-- Uploaded rows carry `l_warmup_pass_requests` (0 when no pass ran). It is not a match
-  key.
-- With a dataset file, a few of the pass's prompts can coincide with the measured
-  sample (about concurrency / dataset size of them). This only matters for configs
-  with `enable_block_reuse` on.
-- It costs one wave, about 1 / `iterations` of the measured run. Iteration-based nsys
-  ranges count its iterations too.
+test, the harness sends one un-measured wave (`concurrency` requests) of the client's
+own `benchmark_serving` command with `--seed` + 1, so JIT kernels for the real prefill
+shapes compile outside the measured window. `gen_only` modes, AgentX and accuracy-only
+clients get none. Its log (`trtllm-benchmark-warmup-pass.*.log`) is not parsed, and its
+records stay out of `d_tb_*` and the device step time; with the time breakdown on, only
+the first measured client gets one. `TRTLLM_PERF_WARMUP_PASS=0` turns it off (locally,
+via `EXTRA_CONTAINER_EXPORTS`).
 
 ### The optional instrumentation modifier
 
@@ -447,11 +410,9 @@ to run after the writers are done. Only the **gen** workers announce that
 workers and the disaggregated server do not. `wait_for_perf_metrics_files` therefore
 polls the discovered set until its total size holds still for
 `PERF_METRICS_SETTLE_SECONDS`, bounded by `PERF_METRICS_SETTLE_TIMEOUT`, before
-anything is read, and then compares the census against the client's `--num-prompts`.
-The census counts the complete records of one server role (the disaggregated server,
-the ctx workers, the gen workers, or an aggregated server), summed over that role's
-files: a role writes one file per instance and per frontend process
-(`num_serve_frontends`). Both a still-growing set at the timeout and a census
+anything is read, and then compares the census (the complete records of one server
+role, summed over its files) against the client's `--num-prompts`. Both a
+still-growing set at the timeout and a census
 shortfall are logged as warnings, not failures — a nearly-complete file still yields
 usable statistics, and the numbers are not regression-gated. This matters because a
 truncated read is otherwise **invisible**: all 108 fields are still populated and the

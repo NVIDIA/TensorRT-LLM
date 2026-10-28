@@ -33,10 +33,7 @@ If a CI run fails `sanity_perf_check.py`, it will upload a patch file as an arti
 This patch will only update the metrics that had a difference which was over the accepted threshold. The patch will also remove/add metrics according to the removed or added tests.
 
 ## Warmup pass
-Before measuring, `test_perf.py` sends one un-measured wave of each benchmark's own traffic: as many requests as the client keeps in flight (its concurrency, or `min(reqs, maxbs)` without one). How many prompts arrive together and how they are chunked against `max_num_tokens` are only known once traffic arrives, so the server's startup warmup cannot compile every JIT kernel those prefill shapes need; the pass compiles them outside the measured window.
-- `bench` cases raise `trtllm-bench throughput --warmup` to one wave, never below what it is without the pass (trtllm-bench's default of 2, or 2 per GPU on multi-GPU cases). trtllm-bench runs those requests in the measured process and reports none of them. They are drawn from the measured dataset, so a case whose config enables KV cache block reuse keeps the smaller warmup.
-- `serve` cases send it before each measured client: the client's own `benchmark_serving` command with other prompts of the same lengths (`--seed` + 1; a real-text client gets the articles after the measured ones) and none of its output files. Its log is `benchmark-warmup-pass-*.log` in the working directory. The test fails if it exits non-zero or every request fails.
-- `TRTLLM_PERF_WARMUP_PASS=0` (also `false`, `no`, `off`) turns it off, e.g. to reproduce a JIT stall inside the measured window. `test_perf_sanity.py` reads the same switch.
+Before measuring, `test_perf.py` warms up with one un-measured wave of the benchmark's own traffic (its concurrency, or `min(reqs, maxbs)` without one), so JIT kernels for the real prefill shapes compile outside the measured window: `bench` cases raise `trtllm-bench --warmup` to that wave, and `serve` cases send it with other prompts before each client. `TRTLLM_PERF_WARMUP_PASS=0` turns it off.
 
 ## Running locally
 Given a `target_perf_csv_path` you can compare it to another perf csv file.
