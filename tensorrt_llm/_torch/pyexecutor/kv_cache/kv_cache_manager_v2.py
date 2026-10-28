@@ -15,6 +15,7 @@
 import math
 import os
 import sys
+import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -1806,6 +1807,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # `query_connector_at_admission`), on the class for the same reason: the
     # connector prefix path reads it on instances tests build without __init__.
     _connector_admission_epoch: int = 0
+    # Per-iteration connector offer counters for TLLM_CTX_PARK_STATS, or None
+    # while disabled; see `enable_connector_offer_stats`.
+    _connector_offer_stats: Optional[Dict[str, float]] = None
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -5860,9 +5864,12 @@ class KVCacheManagerV2(BaseResourceManager):
             # Both forms are offered; the manager picks the one this connector
             # implements. With several layer groups the flat list is empty,
             # because a page index is scoped to a group.
+            started = time.perf_counter()
             by_group = self.get_page_indices_by_layer_group(request)
             flat = by_group[0] if len(by_group) == 1 else []
             self.kv_connector_manager.update_state_after_alloc(request, flat, by_group)
+            if self._connector_offer_stats is not None:
+                self._connector_offer_stats["report_ms"] += (time.perf_counter() - started) * 1e3
 
         if served_any:
             # A served prefix can carry a request past its last chunk boundary,
@@ -6031,9 +6038,12 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             return False
         local_end = kv_cache.num_committed_tokens
+        started = time.perf_counter()
         num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
             req, local_end
         )
+        if self._connector_offer_stats is not None:
+            self._connector_offer_stats["query_ms"] += (time.perf_counter() - started) * 1e3
         offer = ConnectorAdmissionOffer(
             self._connector_admission_epoch, local_end, num_tokens, load_async
         )
@@ -6091,12 +6101,86 @@ class KVCacheManagerV2(BaseResourceManager):
         if target <= pre_cap:
             return True
         grown = kv_cache.resize(target)
+        if self._connector_offer_stats is not None:
+            self._connector_offer_stats["pregrown" if grown else "pregrow_failed"] += 1
         if not grown:
             return False
         if req.py_ctx_pre_resize_cap is None:
             # As in `_resize_for_served_prefix`: a revert must undo this growth.
             req.py_ctx_pre_resize_cap = pre_cap
         return True
+
+    def enable_connector_offer_stats(self) -> None:
+        """Count connector offers per iteration (TLLM_CTX_PARK_STATS); read by `take_connector_offer_stats`."""
+        self._connector_offer_stats = self._new_connector_offer_stats()
+
+    @staticmethod
+    def _new_connector_offer_stats() -> Dict[str, float]:
+        return {
+            "queries": 0,
+            "admission_used": 0,
+            "offers": 0,
+            "async_offers": 0,
+            "offered_tokens": 0,
+            "honoured_tokens": 0,
+            "in_chunk": 0,
+            "shifted": 0,
+            "capped": 0,
+            "not_honoured": 0,
+            # Admission-time grows for a shifting offer (`cover_admission_offer`).
+            "pregrown": 0,
+            "pregrow_failed": 0,
+            # Host time (ms) in the leader query and its broadcast, in fitting the
+            # served prefix into the allocation, and in reporting the pages.
+            "query_ms": 0.0,
+            "reserve_ms": 0.0,
+            "report_ms": 0.0,
+        }
+
+    def take_connector_offer_stats(self) -> Optional[Dict[str, float]]:
+        """This iteration's connector offer counters, reset on read.
+
+        Returns:
+            The counters since the last call, or None while they are disabled.
+        """
+        if self._connector_offer_stats is None:
+            return None
+        stats = self._connector_offer_stats
+        self._connector_offer_stats = self._new_connector_offer_stats()
+        return stats
+
+    def _count_connector_offer(
+        self,
+        used_admission: bool,
+        num_tokens: int,
+        load_async: bool,
+        local_end: int,
+        offered_end: int,
+        chunk_end: int,
+        position: int,
+    ) -> None:
+        """Book one answered query into the TLLM_CTX_PARK_STATS counters.
+
+        The categories follow ``_reserve_connector_prefix``: an offer inside the
+        scheduled chunk, the shifted window, or the capped fallback.
+        """
+        stats = self._connector_offer_stats
+        stats["queries"] += 1
+        stats["admission_used"] += int(used_admission)
+        if offered_end <= local_end:
+            return
+        stats["offers"] += 1
+        stats["async_offers"] += int(load_async)
+        stats["offered_tokens"] += offered_end - local_end
+        stats["honoured_tokens"] += position - local_end
+        if position == local_end:
+            stats["not_honoured"] += 1
+        elif offered_end < chunk_end:
+            stats["in_chunk"] += 1
+        elif position == offered_end:
+            stats["shifted"] += 1
+        else:
+            stats["capped"] += 1
 
     def _connector_may_serve(self, req: LlmRequest) -> bool:
         """Whether the connector is allowed to serve a prefix for ``req``."""
@@ -6144,18 +6228,30 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"taken at {offer.local_end} but the cache is now at {local_end}"
                 )
             num_tokens, load_async = offer.num_tokens, offer.load_async
+            used_admission = True
         else:
+            started = time.perf_counter()
             num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
                 req, local_end
             )
+            if self._connector_offer_stats is not None:
+                self._connector_offer_stats["query_ms"] += (time.perf_counter() - started) * 1e3
+            used_admission = False
         offered_end = min(local_end + num_tokens, req.prompt_len - 1)
+        chunk_end = min(local_end + req.context_chunk_size, req.prompt_len)
 
         position = local_end
+        started = time.perf_counter()
         if offered_end > local_end:
             fitted = self._reserve_connector_prefix(req, kv_cache, local_end, offered_end)
             if fitted is not None:
                 position, chunk_size = fitted
                 self._mark_connector_prefix_populated(req, position, chunk_size)
+        if self._connector_offer_stats is not None:
+            self._connector_offer_stats["reserve_ms"] += (time.perf_counter() - started) * 1e3
+            self._count_connector_offer(
+                used_admission, num_tokens, load_async, local_end, offered_end, chunk_end, position
+            )
 
         # The honoured amount, not `num_tokens`: `build_scheduler_output`
         # reports `context_current_position - recorded` as the range computed

@@ -78,6 +78,10 @@ class BudgetTracker:
         # Requests admitted with a 0-token charge because the KV connector will
         # park them for an asynchronous load; they still count in num_requests.
         self.num_uncharged_parks = 0
+        # First-chunk context requests passed over because the token budget was
+        # spent: the pass was limited by budget, not by queued work. Read only
+        # by the TLLM_CTX_PARK_STATS diagnostics.
+        self.num_ctx_budget_skips = 0
 
         # PEFT accounting
         self._peft_cache_manager = peft_cache_manager
@@ -164,6 +168,7 @@ class KVCacheV2Scheduler(RequestScheduler):
     _connector_admission_query: bool = False
     _admission_pass_active: bool = False
     uncharged_park_ids: frozenset = frozenset()
+    last_pass_ctx_budget_skips: int = 0
 
     def __init__(
         self,
@@ -348,6 +353,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         #: Request ids admitted with a 0-token charge in the last pass. The
         #: executor checks that each one parked.
         self.uncharged_park_ids = frozenset()
+        #: `BudgetTracker.num_ctx_budget_skips` of the last pass, for the
+        #: TLLM_CTX_PARK_STATS diagnostics.
+        self.last_pass_ctx_budget_skips = 0
         if connector_admission_query:
             if ctx_chunk_config is None:
                 logger.warning(
@@ -753,8 +761,11 @@ class KVCacheV2Scheduler(RequestScheduler):
                 and req.state_value == self._context_init_state_value
                 and not self._has_context_chunk_budget(budget)
             ):
+                if req.is_first_context_chunk:
+                    budget.num_ctx_budget_skips += 1
                 continue
             if scheduled_ctx and self._first_chunk_waits_for_budget(req, budget):
+                budget.num_ctx_budget_skips += 1
                 continue
             if req.py_request_id in preempted_ids:
                 continue
@@ -857,6 +868,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._ctx_demote_skips = {
                 rid: self._ctx_demote_skips.get(rid, 0) + 1 for rid in demoted_ids
             }
+
+        self.last_pass_ctx_budget_skips = budget.num_ctx_budget_skips
 
         # Phase and frozen-membership deferrals are not KV capacity stalls.
         self._detect_deadlock(

@@ -113,7 +113,9 @@ from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
                        make_mpi_progress_exit_hook, make_mpi_progress_pump)
-from .profiling import PROFILE_START_STOP_ENV_VAR_NAME, PyExecutorProfileManager
+from .profiling import (GIL_PROBE_ENV_VAR_NAME, PARK_STATS_ENV_VAR_NAME,
+                        PROFILE_START_STOP_ENV_VAR_NAME, GilProbe, ParkStats,
+                        PyExecutorProfileManager)
 from .profiling import load_iteration_indexes as _load_iteration_indexes
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             derive_attention_dp_per_rank_request_cap,
@@ -480,6 +482,9 @@ class PyExecutor:
     # The scheduler that runs admission-time connector queries, or None; see
     # `_resolve_admission_query_scheduler`.
     _admission_query_scheduler: Optional[KVCacheV2Scheduler] = None
+    # Debug-only context-park diagnostics; see `ParkStats` and `GilProbe`.
+    _park_stats: Optional[ParkStats] = None
+    _gil_probe: Optional[GilProbe] = None
 
     def __init__(
         self,
@@ -634,6 +639,14 @@ class PyExecutor:
                                           None)
         self.guided_decoder = guided_decoder
         self.disable_overlap_scheduler = disable_overlap_scheduler
+        # Debug-only context-park diagnostics appended to the iteration log
+        # line (TLLM_CTX_PARK_STATS=1); the GIL probe reports on that suffix,
+        # so it runs only with it.
+        self._park_stats = (ParkStats() if os.environ.get(
+            PARK_STATS_ENV_VAR_NAME, "0") == "1" else None)
+        gil_probe_us = int(os.environ.get(GIL_PROBE_ENV_VAR_NAME, "0") or 0)
+        self._gil_probe = (GilProbe(gil_probe_us) if gil_probe_us > 0
+                           and self._park_stats is not None else None)
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
         # Iteration throttle for the KV pool rebalance check.  See
         # _can_pause_for_rebalance / _agreed_need_adjustment.
@@ -761,6 +774,9 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
+        if self._park_stats is not None and hasattr(
+                self.kv_cache_manager, "enable_connector_offer_stats"):
+            self.kv_cache_manager.enable_connector_offer_stats()
         self.draft_kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
@@ -2155,6 +2171,8 @@ class PyExecutor:
         # every shutdown path.  A no-op when the executor loop already
         # unwound its own profiling state.
         self._profile_manager.cleanup()
+        if self._gil_probe is not None:
+            self._gil_probe.stop()
         if self.hang_detector.detected():
             # Early return here to avoid waiting for hanging threads.
             # Since `on_detected` has sent the error message as response,
@@ -4759,6 +4777,62 @@ class PyExecutor:
                 f"Context requests {unparked} were admitted with no token "
                 "charge for an asynchronous connector load but did not park")
 
+    def _park_phase(self, name: str):
+        """Time one executor-loop phase for TLLM_CTX_PARK_STATS, else a no-op."""
+        stats = self._park_stats
+        return stats.phase(name) if stats is not None else nullcontext()
+
+    def _format_park_stats(self) -> str:
+        """The ``ctx_park`` suffix of the iteration log line, or ''."""
+        stats = self._park_stats
+        if stats is None:
+            return ""
+        scheduler = self._find_kv_cache_v2_scheduler()
+        if scheduler is not None:
+            stats.budget_skips = scheduler.last_pass_ctx_budget_skips
+        take_offers = getattr(self.kv_cache_manager,
+                              "take_connector_offer_stats", None)
+        stats.offer = take_offers() if take_offers is not None else None
+        probe = self._gil_probe
+        return stats.format(probe.take() if probe is not None else None)
+
+    def _reset_park_stats(self) -> None:
+        """Start the next iteration's ctx_park counters on every rank."""
+        stats = self._park_stats
+        if stats is None:
+            return
+        stats.reset()
+        if self._gil_probe is not None:
+            self._gil_probe.take()
+        # Ranks that print no log line drain the offer counters here.
+        take_offers = getattr(self.kv_cache_manager,
+                              "take_connector_offer_stats", None)
+        if take_offers is not None:
+            take_offers()
+
+    def _record_parked_chunks(self, chunks_before: Dict[int, int],
+                              batch: ScheduledRequests) -> None:
+        """Book the context chunks the connector parked into the ctx_park counters.
+
+        Args:
+            chunks_before: Chunk size of each context request before the
+                connector took its parked requests out of the batch.
+            batch: The batch after the connector took them out.
+        """
+        stats = self._park_stats
+        parked = dict(chunks_before)
+        for req in batch.context_requests:
+            stats.fwd_ctx_tokens += parked.pop(req.py_request_id, 0)
+        stats.parked_reqs += len(parked)
+        stats.parked_tokens += sum(parked.values())
+        scheduler = self._admission_query_scheduler
+        if scheduler is not None:
+            # Only those that reached the connector: a request admitted
+            # without a charge can be dropped before prepare_resources.
+            stats.uncharged += sum(
+                1 for request_id in scheduler.uncharged_park_ids
+                if request_id in chunks_before)
+
     def _kv_connector_start_batch(
             self, scheduled_batch: ScheduledRequests) -> tuple[bool, bool]:
         """Prepare connector work and return fleet/local compute readiness."""
@@ -4947,9 +5021,17 @@ class PyExecutor:
             req for req in scheduled_batch.context_requests
             if self.kv_connector_manager.has_pending_load(req)
         ] if self.enable_attention_dp else [])
+        stats = self._park_stats
+        if stats is not None:
+            chunks_before = {
+                req.py_request_id: req.context_chunk_size
+                for req in scheduled_batch.context_requests
+            }
         self.kv_connector_manager.take_scheduled_requests_pending_load(
             scheduled_batch)
         self._check_uncharged_parks_left_batch(scheduled_batch)
+        if stats is not None:
+            self._record_parked_chunks(chunks_before, scheduled_batch)
         self._pad_attention_dp_batch_emptied_by_connector(scheduled_batch)
         self._kv_connector_start_loads(scheduled_batch)
         return loading_context
@@ -5546,7 +5628,9 @@ class PyExecutor:
 
                 self.disagg.handle_errors_synced()
 
-                scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+                with self._park_phase("sched"):
+                    scheduled_batch, iter_stats = self._prepare_and_schedule_batch(
+                    )
 
                 if scheduled_batch is None:
                     # handle_errors_synced() can buffer a non-fatal response
@@ -5609,16 +5693,19 @@ class PyExecutor:
 
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
-                    self.resource_manager.prepare_resources(scheduled_batch)
+                    with self._park_phase("prep"):
+                        self.resource_manager.prepare_resources(scheduled_batch)
 
                 if self._kv_connector_moves_kv:
-                    self.kv_connector_manager.handle_metadata()
+                    with self._park_phase("meta"):
+                        self.kv_connector_manager.handle_metadata()
 
                 if can_queue:
                     # Connector preparation can change the batch. Its status
                     # vote also supplies the updated fleet queue decision.
-                    can_queue, _ = self._kv_connector_start_batch(
-                        scheduled_batch)
+                    with self._park_phase("start"):
+                        can_queue, _ = self._kv_connector_start_batch(
+                            scheduled_batch)
                 elif self._kv_connector_moves_kv:
                     can_queue, _ = self._can_queue(scheduled_batch)
 
@@ -5687,7 +5774,9 @@ class PyExecutor:
                                 gpu_forward_end) as fwd_timing:
                             if self.dwdp_manager is not None:
                                 self.dwdp_manager.prefetch_first_layers()
-                            batch_outputs = self._forward_step(scheduled_batch)
+                            with self._park_phase("fwd"):
+                                batch_outputs = self._forward_step(
+                                    scheduled_batch)
 
                         # None: _forward_step hit an exception and
                         # _handle_errors already failed the affected requests
@@ -5733,8 +5822,9 @@ class PyExecutor:
                                     scheduled_batch, spec_metadata)
 
                         self._update_request_states(scheduled_batch)
-                        self._update_requests(sample_state,
-                                              self.resource_manager)
+                        with self._park_phase("upd"):
+                            self._update_requests(sample_state,
+                                                  self.resource_manager)
                         if self.speculation_gate is not None:
                             self._update_batch_acceptance_rate(
                                 scheduled_batch,
@@ -5784,7 +5874,8 @@ class PyExecutor:
                     only_with_context_sends=True)
 
                 if not self.enable_attention_dp:
-                    self._kv_connector_terminate_requests()
+                    with self._park_phase("term"):
+                        self._kv_connector_terminate_requests()
 
                 # This is the one ADP-synchronized response flush for a
                 # completed executor-loop pass. It is deliberately outside

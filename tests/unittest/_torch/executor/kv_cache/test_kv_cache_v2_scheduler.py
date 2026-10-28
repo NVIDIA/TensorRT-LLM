@@ -3536,6 +3536,20 @@ class TestChunkedContext:
         assert mgr.prepare_context.call_args_list == [call(started)]
         mgr.free_resources.assert_not_called()
 
+    def test_force_chunk_wait_counts_as_a_budget_skip(self):
+        """Both first chunks waiting on the 20-token leftover were limited by budget."""
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr, max_num_tokens=150, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 32)
+        )
+        started = self._started_ctx_ending_at_snapshot(0, 1000, 1130)
+        waiting = [make_ctx_request(1, 4000), make_ctx_request(2, 4000)]
+
+        out = sched.schedule_request([started, *waiting], set())
+
+        assert ids(out.context_requests) == [0]
+        assert sched.last_pass_ctx_budget_skips == 2
+
     def test_force_chunk_first_chunk_that_fits_leftover_still_runs(self):
         mgr = make_kv_cache_manager(tokens_per_block=32)
         sched = make_scheduler(
@@ -5465,6 +5479,8 @@ class TestConnectorAdmission:
         assert ids(out.context_requests) == [0]
         assert long_second.context_chunk_size == 0
         assert short.context_chunk_size == 0
+        # Both were passed over for budget, which the park diagnostics report.
+        assert sched.last_pass_ctx_budget_skips == 2
 
     def test_a_follower_gets_the_whole_budget(self):
         sched = self._scheduler(self._parking_manager({0}), parks=1)
@@ -5703,3 +5719,18 @@ class TestConnectorAdmission:
         assert req.context_chunk_size == 512
         mgr.resize_context.assert_called_once_with(req, 512)
         assert sched.uncharged_park_ids == frozenset({0})
+
+    def test_budget_skips_are_reported(self):
+        sched = self._scheduler(make_kv_cache_manager(tokens_per_block=64), admission=False)
+        sched.schedule_request(
+            [make_ctx_request(0, context_remaining_length=20000), make_ctx_request(1, 1000)], set()
+        )
+        assert sched.last_pass_ctx_budget_skips == 1
+
+    def test_budget_skips_count_only_first_chunks(self):
+        """A continuation passed over for budget is not a new request starved of it."""
+        sched = self._scheduler(make_kv_cache_manager(tokens_per_block=64), admission=False)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        continuation = make_ctx_request(1, 12000, is_first_context_chunk=False)
+        sched.schedule_request([head, continuation, make_ctx_request(2, 1000)], set())
+        assert sched.last_pass_ctx_budget_skips == 1

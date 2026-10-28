@@ -430,6 +430,19 @@ not booked at admission; `prepare_resources` grows them as on the final-batch pa
 configuration rather than environment variables because they change admission behavior and can
 differ between the context and generation servers of one disaggregated deployment.
 
+For debugging, `TLLM_CTX_PARK_STATS=1` appends a flat `, ctx_park = key=value ...` suffix to every
+`print_iter_log` line of the non-overlap executor loop, covering the iteration the line reports:
+
+| Field | Meaning |
+|---|---|
+| `parked`, `parked_tok` | Context requests the connector parked for an asynchronous load, and their chunk tokens. |
+| `unc` | Of those, the requests admitted without a token charge. |
+| `fwd_tok` | Context chunk tokens left for the forward pass. |
+| `bskip` | First chunks the scheduler passed over because the token budget was spent. |
+| `<phase>_ms=wall/cpu` | Wall and executor-thread CPU time of the `sched`, `prep`, `meta`, `start`, `fwd`, `upd` and `term` loop phases. |
+| `offer_*` | KV cache manager V2 connector offers: queries (`admission_used` of them answered at admission), offers and asynchronous offers, offered and honoured tokens, how each was placed (`in_chunk`, `shifted`, `capped`, `not_honoured`), admission-time grows (`pregrown`, `pregrow_failed`), and host time in the query, the placement and the page report (`query_ms`, `reserve_ms`, `report_ms`). |
+| `gil=max/p99/n` | With `TLLM_GIL_PROBE_US=<period>`, how late a probe thread sleeping that many microseconds woke up, in ms, a proxy for GIL contention. |
+
 ##### Completion headroom on disaggregated servers
 
 A disaggregated server with KV cache manager V2 can reserve logical GPU-page headroom for each

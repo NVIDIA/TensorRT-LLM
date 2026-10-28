@@ -43,11 +43,13 @@ isolating the lifecycle logic in this module for review.
 
 import functools
 import os
+import threading
 import time
 import uuid
 import weakref
+from collections import deque
 from contextlib import contextmanager
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -62,6 +64,127 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import get_glo
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+# Debug-only suffixes of the iteration log line; see `ParkStats` and `GilProbe`.
+PARK_STATS_ENV_VAR_NAME = "TLLM_CTX_PARK_STATS"
+GIL_PROBE_ENV_VAR_NAME = "TLLM_GIL_PROBE_US"
+
+
+class GilProbe:
+    """Measure how late a sleeping thread wakes, as a proxy for GIL contention.
+
+    A daemon thread sleeps ``period_us`` in a loop and records how far past the
+    period each wake-up lands. A thread waiting for the GIL wakes late, so the
+    overshoot bounds how long other threads held it. Opt-in through
+    ``TLLM_GIL_PROBE_US`` together with ``TLLM_CTX_PARK_STATS``; the samples
+    are drained once per executor iteration and kept to the last ~60 s in case
+    nothing drains them.
+    """
+
+    def __init__(self, period_us: int):
+        """Start the probe thread.
+
+        Args:
+            period_us: Sleep period of the probe thread, in microseconds.
+        """
+        self._period = period_us / 1e6
+        self._samples: deque = deque(maxlen=max(1, int(60.0 / self._period)))
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="gil-probe", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        period = self._period
+        while not self._stop.is_set():
+            start = time.perf_counter()
+            time.sleep(period)
+            self._samples.append((time.perf_counter() - start - period) * 1e3)
+
+    def take(self) -> Optional[Tuple[float, float, int]]:
+        """Drain the samples taken since the last call.
+
+        Returns:
+            The maximum and p99 wake-up overshoot in ms and the sample count,
+            or None when there is no sample.
+        """
+        # popleft never races the probe's append: a late sample stays for the next call.
+        samples = [self._samples.popleft() for _ in range(len(self._samples))]
+        if not samples:
+            return None
+        samples.sort()
+        return samples[-1], samples[min(len(samples) - 1, int(0.99 * len(samples)))], len(samples)
+
+    def stop(self) -> None:
+        """Ask the probe thread to exit after its current sleep."""
+        self._stop.set()
+
+
+class ParkStats:
+    """Per-iteration context-park diagnostics (opt-in through ``TLLM_CTX_PARK_STATS=1``).
+
+    Wall and executor-thread CPU time of each loop phase, the requests parked
+    for an asynchronous KV connector load and their chunk tokens, the requests
+    admitted without a token charge, the context tokens left for the forward
+    pass, and the first-chunk requests the scheduler passed over for lack of
+    budget. Printed at the end of the iteration log line so existing parsers
+    keep working.
+    """
+
+    PHASES = ("sched", "prep", "meta", "start", "fwd", "upd", "term")
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        """Zero every counter for the next iteration."""
+        self.wall_ms = dict.fromkeys(self.PHASES, 0.0)
+        self.cpu_ms = dict.fromkeys(self.PHASES, 0.0)
+        self.parked_reqs = 0
+        self.parked_tokens = 0
+        self.uncharged = 0
+        self.fwd_ctx_tokens = 0
+        self.budget_skips = 0
+        self.offer: Optional[Dict[str, float]] = None
+
+    @contextmanager
+    def phase(self, name: str):
+        """Add the wall and thread CPU time of the block to phase ``name``."""
+        wall, cpu = time.perf_counter(), time.thread_time()
+        try:
+            yield
+        finally:
+            self.wall_ms[name] += (time.perf_counter() - wall) * 1e3
+            self.cpu_ms[name] += (time.thread_time() - cpu) * 1e3
+
+    def format(self, gil: Optional[Tuple[float, float, int]]) -> str:
+        """Render the ``ctx_park`` suffix of the iteration log line.
+
+        Flat ``key=value`` tokens with no braces, so parsers of the
+        ``states = {...}`` field before it still match.
+
+        Args:
+            gil: A ``GilProbe.take`` result, or None.
+
+        Returns:
+            The suffix, starting with ``", ctx_park = "``.
+        """
+        parts = [
+            f"parked={self.parked_reqs}",
+            f"parked_tok={self.parked_tokens}",
+            f"unc={self.uncharged}",
+            f"fwd_tok={self.fwd_ctx_tokens}",
+            f"bskip={self.budget_skips}",
+        ]
+        parts += [
+            f"{name}_ms={self.wall_ms[name]:.1f}/{self.cpu_ms[name]:.1f}" for name in self.PHASES
+        ]
+        if self.offer is not None:
+            parts += [
+                f"offer_{key}={value:.1f}" if isinstance(value, float) else f"offer_{key}={value}"
+                for key, value in self.offer.items()
+            ]
+        if gil is not None:
+            parts.append(f"gil={gil[0]:.2f}/{gil[1]:.2f}/{gil[2]}")
+        return ", ctx_park = " + " ".join(parts)
 
 
 @functools.cache
@@ -779,6 +902,7 @@ class PyExecutorProfileManager:
                         f"num_fetched = {num_fetched}, "
                         f"num_dummy = {executor.num_dummy_requests}, "
                         f"num_unscheduled = {executor.num_unscheduled_requests}"
+                        f"{executor._format_park_stats()}"
                     )
 
             # profile_step runs at the start of each executor loop after
@@ -786,6 +910,8 @@ class PyExecutorProfileManager:
             # batch records its ADP dummy work.
             executor._iter_adp_dummy_ctx_tokens = 0
             executor._iter_adp_dummy_gen_tokens = 0
+            # Same cadence, including passes whose line is not printed.
+            executor._reset_park_stats()
             it += 1
 
             if executor.iter_counter in executor.profile_start_iters and not executor.is_warmup:

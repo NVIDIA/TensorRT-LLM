@@ -1212,6 +1212,40 @@ class TestAdmissionQuery:
             connector.prefix_reservations_enabled = True
         assert manager.connector_admission_query_enabled() is (change is None)
 
+    def test_offer_stats_classify_the_served_prefix(self):
+        connector, manager, req, _ = self._admitted()
+        manager.enable_connector_offer_stats()
+        assert manager.query_connector_at_admission(req)
+
+        manager._run_kv_connector_hooks(scheduled(req))
+        stats = manager.take_connector_offer_stats()
+
+        assert stats["queries"] == 1 and stats["admission_used"] == 1
+        assert stats["offers"] == 1 and stats["async_offers"] == 1
+        assert stats["offered_tokens"] == 64 and stats["honoured_tokens"] == 64
+        assert stats["in_chunk"] == 1
+        assert stats["shifted"] == stats["capped"] == stats["not_honoured"] == 0
+        assert manager.take_connector_offer_stats()["queries"] == 0
+
+    def test_a_final_batch_query_is_counted_too(self):
+        connector = FakeConnectorManager(num_matched=64)
+        manager = make_manager(connector)
+        manager.enable_connector_offer_stats()
+        req = FakeRequest()
+        manager.kv_cache_map[req.py_request_id] = FakeKvCache(committed=0, capacity=PROMPT_LEN)
+
+        manager._run_kv_connector_hooks(scheduled(req))
+        stats = manager.take_connector_offer_stats()
+
+        assert stats["queries"] == 1 and stats["admission_used"] == 0
+        assert stats["offers"] == 1 and stats["async_offers"] == 0
+
+    def test_offer_stats_are_off_by_default(self):
+        _, manager, req, _ = self._admitted()
+        assert manager.query_connector_at_admission(req)
+        manager._run_kv_connector_hooks(scheduled(req))
+        assert manager.take_connector_offer_stats() is None
+
 
 class TestAdmissionGrow:
     """``cover_admission_offer``: an admission-time offer past the chunk gets its pages before later admissions."""
@@ -1222,6 +1256,7 @@ class TestAdmissionGrow:
         connector.admission_query_capable = True
         manager = make_manager(connector)
         manager.enable_swa_scratch_reuse = scratch_reuse
+        manager.enable_connector_offer_stats()
         req = FakeRequest()
         req.context_chunk_size = chunk
         kv_cache = FakeKvCache(committed=0, capacity=capacity, grow_ok=grow_ok)
@@ -1240,10 +1275,12 @@ class TestAdmissionGrow:
         assert req.py_ctx_pre_resize_cap == 64
 
         manager._run_kv_connector_hooks(scheduled(req))
+        stats = manager.take_connector_offer_stats()
 
         assert req.context_current_position == 128 and req.context_chunk_size == 64
         assert kv_cache.capacity == 192
         assert connector.commits == [(0, 128, True)]
+        assert stats["pregrown"] == 1 and stats["shifted"] == 1 and stats["capped"] == 0
 
     def test_without_pages_the_cover_fails_and_leaves_the_allocation(self):
         _, manager, req, kv_cache = self._asked(grow_ok=False)
@@ -1252,6 +1289,7 @@ class TestAdmissionGrow:
 
         assert kv_cache.capacity == 64 and kv_cache.history_length == 0
         assert req.py_ctx_pre_resize_cap is None
+        assert manager.take_connector_offer_stats()["pregrow_failed"] == 1
 
     @pytest.mark.parametrize("num_matched", [0, 32])
     def test_a_miss_or_an_offer_inside_the_chunk_needs_no_pages(self, num_matched):
