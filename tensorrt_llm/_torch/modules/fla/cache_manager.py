@@ -540,7 +540,9 @@ class GDNReplayState:
                 "GDN cached replay all-layer commit requires V2 replay state buffers."
             )
 
-        mamba_metadata = attention_metadata.mamba_metadata
+        from ...attention.backends.features import RecurrentMetadata
+
+        mamba_metadata = attention_metadata.ext(RecurrentMetadata).mamba_metadata
         if mamba_metadata.replay_num_decodes != num_decodes:
             raise RuntimeError(
                 "GDN replay metadata contains "

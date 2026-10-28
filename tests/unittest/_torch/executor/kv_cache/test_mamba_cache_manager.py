@@ -12,13 +12,10 @@ import pytest
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
-<<<<<<< HEAD
+from tensorrt_llm._torch.attention.backends.features import RecurrentMetadata
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
     Glm5NextCacheManager,
 )
-=======
-from tensorrt_llm._torch.attention.backends.features import RecurrentMetadata
->>>>>>> e7e42e77dd ([None][feat] Attach feature and sparse metadata state as extensions)
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import (
     MAMBA_CONV_ROLE,
@@ -5366,13 +5363,8 @@ def test_v2_gdn_replay_all_layer_commit_matches_contiguous_layout():
             history_size=policy.replay_history_size,
         )
 
-<<<<<<< HEAD
         policy.commit_all_layers(
-            SimpleNamespace(
-=======
-        mgr._commit_gdn_cached_replay_history_layers(
             _recurrent_stub(
->>>>>>> e7e42e77dd ([None][feat] Attach feature and sparse metadata state as extensions)
                 mamba_metadata=SimpleNamespace(
                     replay_num_decodes=batch_size,
                     replay_work_items=replay_work_items,

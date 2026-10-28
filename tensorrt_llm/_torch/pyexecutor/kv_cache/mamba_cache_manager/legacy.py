@@ -1980,7 +1980,9 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
         ):
             raise RuntimeError("GDN cached replay all-layer commit requires replay state buffers.")
 
-        mamba_metadata = attn_metadata.mamba_metadata
+        from ....attention.backends.features import RecurrentMetadata
+
+        mamba_metadata = attn_metadata.ext(RecurrentMetadata).mamba_metadata
         if mamba_metadata.replay_num_decodes != num_decodes:
             raise RuntimeError(
                 "GDN replay metadata contains "
@@ -2118,7 +2120,7 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
             position_source_is_token_count = False
         # Match the API of MambaCacheManager.update_mamba_states: callers
         # may pass per-request state slot indices explicitly (e.g. MTP via
-        # attn_metadata.mamba_metadata.state_indices). Fall back to this
+        # RecurrentMetadata.mamba_metadata.state_indices). Fall back to this
         # manager's own slot mapping when not provided.
         if state_indices is None:
             state_indices = self.get_state_indices()

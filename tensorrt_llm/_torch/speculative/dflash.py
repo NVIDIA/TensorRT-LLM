@@ -30,11 +30,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
-<<<<<<< HEAD
-from ..modules.logits_processor import LogitsProcessor
-=======
 from ..attention.backends.features import DraftKVMetadata, RecurrentMetadata
->>>>>>> e7e42e77dd ([None][feat] Attach feature and sparse metadata state as extensions)
+from ..modules.logits_processor import LogitsProcessor
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.resource_manager import BaseResourceManager

@@ -244,9 +244,9 @@ class DeepseekV4Metadata(DSAMetadata):
         # lengths and the fused output RoPE). The DSA base allocates them only
         # for the fp8_ds_mla layout, so provide them for every DSv4 cache mode.
         if getattr(self, "token_positions_cuda", None) is None:
-            self.token_positions_cuda = self.get_empty(
-                self.cuda_graph_buffers,
-                (self.max_num_tokens,),
+            self.token_positions_cuda = md.get_empty(
+                md.cuda_graph_buffers,
+                (md.max_num_tokens,),
                 cache_name="token_positions_cuda",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
@@ -324,17 +324,17 @@ class DeepseekV4Metadata(DSAMetadata):
         # per step next to sparse_mla_topk_lens: SWA rows live per token
         # (min(pos + 1, window)) and compressed rows live per compress ratio
         # (sparse_mla_topk_lens[ratio] - window). Shape: [max_num_tokens].
-        self.sparse_mla_swa_lens = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.max_num_tokens,),
+        self.sparse_mla_swa_lens = md.get_empty(
+            md.cuda_graph_buffers,
+            (md.max_num_tokens,),
             cache_name="sparse_mla_swa_lens",
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
         self.sparse_mla_extra_lens = {
-            compress_ratio: self.get_empty(
-                self.cuda_graph_buffers,
-                (self.max_num_tokens,),
+            compress_ratio: md.get_empty(
+                md.cuda_graph_buffers,
+                (md.max_num_tokens,),
                 cache_name=f"sparse_mla_extra_lens_{compress_ratio}",
                 dtype=torch.int32,
                 capture_graph=capture_graph,

@@ -9,12 +9,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.attention.backends.sparse.hooks import get_sparse_attention_hooks
 from tensorrt_llm._torch.attention.backends.sparse.qsa import (
-<<<<<<< HEAD
-    QSAAttentionMetadata,
-=======
-    QSAMambaHybridCacheManagerV2,
     QSAMetadata,
->>>>>>> e7e42e77dd ([None][feat] Attach feature and sparse metadata state as extensions)
     QSASparseMetadataParams,
     QSASparseParams,
 )
@@ -230,14 +225,8 @@ def test_qsa_empty_batch_keeps_the_regular_backend_path() -> None:
     assert output is None
 
 
-<<<<<<< HEAD
-def test_qsa_metadata_allows_a_pp_rank_without_local_sparse_layers(monkeypatch) -> None:
-    monkeypatch.setattr(TrtllmAttentionMetadata, "__post_init__", lambda self: None)
-    manager = object.__new__(Qwen4ExpHybridCacheManager)
-=======
 def test_qsa_metadata_allows_a_pp_rank_without_local_sparse_layers() -> None:
-    manager = object.__new__(QSAMambaHybridCacheManagerV2)
->>>>>>> e7e42e77dd ([None][feat] Attach feature and sparse metadata state as extensions)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.qsa_position_layer_id = None
     metadata = object.__new__(TrtllmAttentionMetadata)
     metadata.kv_cache_manager = manager

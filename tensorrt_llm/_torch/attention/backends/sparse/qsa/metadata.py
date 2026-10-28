@@ -22,31 +22,8 @@ class QSAMetadata(SparseAlgorithmExtension, MTPIndexShareExtension):
 
     def allocate(self, buffers) -> None:
         """Allocate the fixed-shape QSA buffers updated before each graph replay."""
-<<<<<<< HEAD
-        sparse_attention_config = kwargs.pop("sparse_attention_config", None)
-        if kwargs.get("sparse_metadata_params") is None and sparse_attention_config is not None:
-            kwargs["sparse_metadata_params"] = sparse_attention_config.to_sparse_metadata_params()
-        # The generated parent initializer dispatches to this class's
-        # ``__post_init__``; keep QSA validation there so both constructor forms
-        # (lowered params or the legacy user config) enforce the same contract.
-        super().__init__(*args, **kwargs)
-
-    def __post_init__(self) -> None:
         from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
 
-        super().__post_init__()
-        # Draft-loop state; set by the speculative driver, read by the indexer.
-        self.qsa_in_mtp_draft_loop = False
-        self.qsa_indexer_skip_topk = False
-        self.qsa_mtp_num_accepted: Optional[torch.Tensor] = None
-        self.qsa_shared_topk_indices: Optional[torch.Tensor] = None
-        self.qsa_shared_topk_visible_blocks: Optional[torch.Tensor] = None
-        self.qsa_shared_topk_captured_slots: set[int] = set()
-        self.qsa_draft_block_table: Optional[torch.Tensor] = None
-        if not isinstance(self.kv_cache_manager, Qwen4ExpHybridCacheManager):
-            raise TypeError("QSA sparse attention requires Qwen4ExpHybridCacheManager")
-        if not isinstance(self.sparse_metadata_params, QSASparseMetadataParams):
-=======
         md = self.metadata
         self.needs_speculative_snapshot = False
         # Draft-loop state; set by the speculative driver, read by the indexer.
@@ -57,11 +34,10 @@ class QSAMetadata(SparseAlgorithmExtension, MTPIndexShareExtension):
         self.shared_topk_visible_blocks: Optional[torch.Tensor] = None
         self.shared_topk_captured_slots: set[int] = set()
         self.draft_block_table: Optional[torch.Tensor] = None
-        if not isinstance(md.kv_cache_manager, QSAMambaHybridCacheManagerV2):
-            raise TypeError("QSA sparse attention requires QSAMambaHybridCacheManagerV2")
+        if not isinstance(md.kv_cache_manager, Qwen4ExpHybridCacheManager):
+            raise TypeError("QSA sparse attention requires Qwen4ExpHybridCacheManager")
         params = md.sparse_metadata_params
         if not isinstance(params, QSASparseMetadataParams):
->>>>>>> e7e42e77dd ([None][feat] Attach feature and sparse metadata state as extensions)
             raise TypeError("QSA sparse attention requires QSASparseMetadataParams")
         self.params = params
         self.has_local_layers = md.kv_cache_manager.qsa_position_layer_id is not None
@@ -151,14 +127,10 @@ class QSAMetadata(SparseAlgorithmExtension, MTPIndexShareExtension):
         forward and this one in the draft loop; ``prepare()`` refreshes both
         before every replay.
         """
-<<<<<<< HEAD
         from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
 
-        draft_manager = self.draft_kv_cache_manager
-=======
         md = self.metadata
         draft_manager = md.draft_kv_cache_manager
->>>>>>> e7e42e77dd ([None][feat] Attach feature and sparse metadata state as extensions)
         if (
             not isinstance(draft_manager, Qwen4ExpHybridCacheManager)
             or draft_manager.qsa_position_layer_id is None

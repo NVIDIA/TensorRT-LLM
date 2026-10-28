@@ -1939,13 +1939,8 @@ def _create_mock_metadata(
                 tpb = tpb // _effective_compress_ratio_divisor(dsa._indexer_compress_ratio)
             dsa._tokens_per_block = tpb
             self.kv_lens_cuda_runtime = kv_lens.cuda()
-<<<<<<< HEAD
-            self.indexer_k_cache_block_offsets = torch.zeros(
-                [batch_size, self.kv_cache_manager.max_blocks_per_seq],
-=======
             dsa.indexer_k_cache_block_offsets = torch.zeros(
-                [batch_size, cache_manager.max_blocks_per_seq],
->>>>>>> e7e42e77dd ([None][feat] Attach feature and sparse metadata state as extensions)
+                [batch_size, self.kv_cache_manager.max_blocks_per_seq],
                 device="cuda",
                 dtype=torch.int32,
             )

@@ -2055,27 +2055,28 @@ def test_native_staging_pools_cover_tma_fetch_window(
     dtype: torch.dtype, shared_rows: int | None
 ) -> None:
     q = torch.empty(1, 8, 512, device="cuda", dtype=torch.bfloat16)
-    metadata = CSA2TrtllmMetadata.for_query_tile(
+    metadata = CSA2Metadata.for_query_tile(
         q,
         0,
         staging_dtype=dtype,
         context_lengths=[1] if shared_rows is not None else None,
         shared_rows=shared_rows,
     )
+    csa2 = metadata.ext(CSA2Metadata)
     if shared_rows is None:
-        assert metadata.swa_pool.shape == (1, 128, 512)
-        assert metadata.extra_pool.shape == (1, 1, 512)
+        assert csa2.swa_pool.shape == (1, 128, 512)
+        assert csa2.extra_pool.shape == (1, 1, 512)
     else:
-        assert metadata.shared_pool.shape == (shared_rows, 512)
-        assert metadata.swa_pool is metadata.extra_pool is metadata.shared_pool
-    for pool in (metadata.swa_pool, metadata.extra_pool):
+        assert csa2.shared_pool.shape == (shared_rows, 512)
+        assert csa2.swa_pool is csa2.extra_pool is csa2.shared_pool
+    for pool in (csa2.swa_pool, csa2.extra_pool):
         assert pool.dtype == dtype and pool.is_contiguous()
         # TMA's encoded row domain is larger than these small logical pools.
         # Padding must be mapped memory retained by the view itself.
         backing = pool.untyped_storage()
         available = backing.nbytes() - (pool.data_ptr() - backing.data_ptr())
         assert available >= 128 * 1024
-    assert metadata.host_kv_cache_pool_pointers[0, 0].item() == metadata.swa_pool.data_ptr()
+    assert metadata.host_kv_cache_pool_pointers[0, 0].item() == csa2.swa_pool.data_ptr()
 
 
 @skip_pre_blackwell
