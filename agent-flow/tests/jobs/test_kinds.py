@@ -39,3 +39,35 @@ def test_local_cancel_terminates_a_live_process():
 def test_local_cancel_on_dead_pid_is_swallowed():
     # A pid that is not a live process must not raise (best-effort cancel).
     LocalKind().cancel({"pid": 2**31 - 1})
+
+
+def test_local_cancel_stops_the_commands_a_detached_job_started():
+    import subprocess
+    import time
+
+    proc = subprocess.Popen(["bash", "-c", "sleep 30; true"], start_new_session=True)
+    try:
+        for _ in range(50):
+            children = subprocess.run(
+                ["pgrep", "-P", str(proc.pid)], capture_output=True, text=True
+            ).stdout.split()
+            if children:
+                break
+            time.sleep(0.1)
+        (child,) = map(int, children)
+
+        LocalKind().cancel({"pid": proc.pid})
+
+        proc.wait(timeout=10)
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("the job's command outlived the cancel")
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
