@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from fmha_test_utils import metadata_stub
 
 from tensorrt_llm._torch.attention.backends.fmha import registry
 from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import (
@@ -1006,7 +1007,7 @@ def test_kernel_variants_are_warmed_once_per_profile(monkeypatch) -> None:
     profile = dict(
         device=torch.device("cuda"), q_dtype=torch.bfloat16, has_sinks=False, fused_groups=None
     )
-    eager = SimpleNamespace(
+    eager = metadata_stub(
         fmha_plan_caches={},
         max_num_tokens=20,
         max_num_requests=20,
@@ -1018,7 +1019,7 @@ def test_kernel_variants_are_warmed_once_per_profile(monkeypatch) -> None:
     assert planned == [(20, 512), (15, 512), (7, 512)]  # one per signature, largest first
     lib._warm_kernel_variants(metadata=eager, extra=512, **profile)
     assert len(planned) == 3  # same profile: already warmed in this process
-    graph = SimpleNamespace(
+    graph = metadata_stub(
         fmha_plan_caches={},
         max_num_tokens=20,
         max_num_requests=20,
@@ -1047,7 +1048,7 @@ def test_warm_set_covers_the_speculative_decoding_rows(monkeypatch) -> None:
     attn, profile, _ = _attn_and_profile()
     lib = PrimsTSSparseMlaFmha(attn)
 
-    mtp = SimpleNamespace(
+    mtp = metadata_stub(
         fmha_plan_caches={},
         max_num_tokens=256,
         max_num_requests=4,
@@ -1064,7 +1065,7 @@ def test_warm_set_covers_the_speculative_decoding_rows(monkeypatch) -> None:
     # The step's token budget bounds the rows even when the MTP ceiling is larger.
     planned.clear()
     monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
-    budget = SimpleNamespace(
+    budget = metadata_stub(
         fmha_plan_caches={},
         max_num_tokens=10,
         max_num_requests=4,
@@ -1134,7 +1135,7 @@ def _attn_and_profile():
     profile = dict(
         device=torch.device("cuda", 0), q_dtype=torch.bfloat16, has_sinks=False, fused_groups=None
     )
-    eager = SimpleNamespace(
+    eager = metadata_stub(
         fmha_plan_caches={},
         max_num_tokens=20,
         max_num_requests=20,
@@ -1207,7 +1208,7 @@ def test_warm_up_fans_out_only_when_a_variant_is_missing(monkeypatch) -> None:
     monkeypatch.setattr(mod, "_WARMED_PROFILES", set())
     monkeypatch.setenv("TLLM_PRIMTS_WARM_STRICT", "0")  # the module fixture sets strict mode
     planned.clear()
-    fresh = SimpleNamespace(  # a new metadata object: the earlier plans are cached on `eager`
+    fresh = metadata_stub(  # a new metadata object: the earlier plans are cached on `eager`
         fmha_plan_caches={},
         max_num_tokens=20,
         max_num_requests=20,

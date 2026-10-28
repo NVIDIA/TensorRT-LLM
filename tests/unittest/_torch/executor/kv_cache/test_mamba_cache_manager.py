@@ -5417,14 +5417,14 @@ def test_v2_gdn_replay_commits_before_advancing_bookkeeping(monkeypatch):
     if not hasattr(mgr, "_dummy_request_mask"):
         mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(64, dtype=torch.bool))
     mgr.update_mamba_states(
-        SimpleNamespace(
-            num_seqs=batch_size,
-            num_contexts=0,
+        _recurrent_stub(
             mamba_metadata=SimpleNamespace(
                 replay_num_decodes=batch_size,
                 replay_work_items=torch.empty((batch_size, 4), dtype=torch.int32),
                 replay_n_writes=torch.empty(1, dtype=torch.int32),
             ),
+            num_seqs=batch_size,
+            num_contexts=0,
         ),
         torch.full((batch_size,), 3, dtype=torch.int32),
         state_indices=torch.arange(batch_size, dtype=torch.int32),
