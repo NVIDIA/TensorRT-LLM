@@ -2996,7 +2996,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             expanded = value_scale.repeat_interleave(_FP8_BLOCK, -2).repeat_interleave(
                 _FP8_BLOCK, -1
             )
-            attention.helix_v_b_proj_full = (value_weight.float() * expanded).to(torch.bfloat16)
+            attention._bind_helix_v_up_weight((value_weight.float() * expanded).to(torch.bfloat16))
         value_weight = _helix_cp_v_b_shard(
             value_weight,
             num_heads_tp_cp=attention.num_heads_tp_cp,
@@ -3315,7 +3315,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 )
                 mla_mixer.v_b_proj = nn.Parameter(v_weight, requires_grad=False)
                 if _K3_HELIX_V_UP_BEFORE_A2A and mla_mixer.mapping.has_cp_helix():
-                    mla_mixer.helix_v_b_proj_full = param[h * n :].view(h, v, kv)
+                    mla_mixer._bind_helix_v_up_weight(param[h * n :].view(h, v, kv))
                 return
             if name.endswith(".A_log") and src.numel() != param.numel():
                 # The checkpoint pads A_log from [num_heads] to [head_dim]

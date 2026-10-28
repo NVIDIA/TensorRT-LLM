@@ -37,7 +37,10 @@ l0_dgx_b200:
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_eviction
   # ------------- VisualGen multi-GPU tests ---------------
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_parallel_vae.py
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-2-1]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-2-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_ulysses_and_parallel_vae
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_tp2_example_lpips TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-VANILLA] TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FA4] TIMEOUT (30)
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxParallelism::test_ulysses_2gpu_correctness
@@ -58,6 +61,10 @@ l0_dgx_b200:
       orchestrator: mpi
   tests:
   - unittest/disaggregated/test_transfer_lifecycle_gpu.py
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-4-1]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-4-1]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-2-2]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-2-2]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_partial_vae_groups
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[4-3-VANILLA] TIMEOUT (30)
   # Synthetic weights cover Engram head/row shards and TP/EP shared-expert collectives.
