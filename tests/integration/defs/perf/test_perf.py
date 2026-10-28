@@ -54,6 +54,11 @@ TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
 # trtllm-bench throughput's --warmup default.
 TRTLLM_BENCH_DEFAULT_WARMUP = 2
 
+
+class NotEnoughSamplesError(ValueError):
+    """A real-text source holds fewer usable articles than a dataset file asks for."""
+
+
 # Models served with the Nemotron reasoning/tool parsers, a long max model len
 # and a longer server-start timeout. "nano-v3" and "nemotron-v3" are two
 # registered names for the same reasoning parser, so Lightning belongs here too.
@@ -1366,7 +1371,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     break
 
         if req_count < num_reqs:
-            raise ValueError(
+            raise NotEnoughSamplesError(
                 f"Cannot sample enough requests from cnn_dailymail: requested={num_reqs}, sampled={req_count}"
             )
         print_info(f"Generated {req_count} samples from {dataset_source} to "
@@ -1468,7 +1473,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         A real-text client gets a prompt file of its own, with the articles
         after the measured ones. The measured file holds exactly the measured
         prompts, so another shuffle of it would resend them, and KV cache block
-        reuse would then serve their prefixes to the measured requests.
+        reuse would then serve their prefixes to the measured requests. If the
+        source has no articles to spare, the client gets no pass.
         """
         if not warmup_pass_enabled():
             return None
@@ -1483,13 +1489,20 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             warmup_dataset_path = os.path.join(
                 engine_dir,
                 f"dataset_custom_{input_len}_{output_len}_warmup_pass.jsonl")
-            self.generate_trtllm_custom_dataset(
-                warmup_dataset_path,
-                input_len,
-                output_len,
-                dataset_source=dataset_source,
-                num_requests=num_requests,
-                skip_requests=self._config.num_reqs)
+            try:
+                self.generate_trtllm_custom_dataset(
+                    warmup_dataset_path,
+                    input_len,
+                    output_len,
+                    dataset_source=dataset_source,
+                    num_requests=num_requests,
+                    skip_requests=self._config.num_reqs)
+            except NotEnoughSamplesError as error:
+                print_warning(
+                    f"Warmup pass: none for this client, since {dataset_source} "
+                    f"has no {num_requests} articles to spare after the "
+                    f"{self._config.num_reqs} measured ones: {error}")
+                return None
             client_cmd = self.get_trtllm_serve_client_command(
                 engine_dir,
                 input_len,
