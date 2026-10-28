@@ -2399,12 +2399,19 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     sbatch_attempt=1
                     while true; do
                         # Silence xtrace around the capture and prints: it would re-echo the
-                        # multi-line sbatch output in every traced command.
+                        # multi-line sbatch output in every traced command. Restore it only
+                        # if it was on, so a caller that turned it off stays off.
+                        case \$- in
+                            *x*) xtrace_was_on=1 ;;
+                            *)   xtrace_was_on=0 ;;
+                        esac
                         { set +x; } 2>/dev/null
                         sbatch_rc=0
                         sbatch_output=\$(${SlurmConfig.withGpuBudget(pipeline, partition.clusterName, "sbatch ${scriptLaunchPathNode}", gpuCount)} 2>&1) || sbatch_rc=\$?
                         printf '%s\\n' "\${sbatch_output}" > "${jobWorkspace}/sbatch_output.txt"
-                        { set -x; } 2>/dev/null
+                        if [ "\${xtrace_was_on}" -eq 1 ]; then
+                            set -x
+                        fi
                         if [ "\${sbatch_rc}" -eq 0 ]; then
                             break
                         fi
@@ -6687,7 +6694,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // pre-merge gating is one stage on one node: the two DeepSeek-V4-Pro ctx_only cases.
         "GB300-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 1, 4, 1, true, false],
         // PerfSanity post-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 6, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 6, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 6, 4, 1, true, false],
