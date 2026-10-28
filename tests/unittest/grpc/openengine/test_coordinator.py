@@ -281,7 +281,7 @@ async def test_forwarded_shutdown_withdraws_health_before_owner_cleanup():
                 health = health_pb2_grpc.HealthStub(channel)
                 assert (
                     await health.Check(
-                        health_pb2.HealthCheckRequest(service="inference"), timeout=3
+                        health_pb2.HealthCheckRequest(service="readiness"), timeout=3
                     )
                 ).status == health_pb2.HealthCheckResponse.NOT_SERVING
                 assert (
@@ -460,7 +460,7 @@ async def test_standard_health_tracks_frontend_group_readiness():
             async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
                 health = health_pb2_grpc.HealthStub(channel)
                 control = openengine_pb2_grpc.ControlStub(channel)
-                request = health_pb2.HealthCheckRequest(service="inference")
+                request = health_pb2.HealthCheckRequest(service="readiness")
                 assert (
                     await health.Check(request, timeout=5)
                 ).status == health_pb2.HealthCheckResponse.SERVING

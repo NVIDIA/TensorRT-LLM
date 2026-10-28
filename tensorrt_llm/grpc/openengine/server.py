@@ -231,7 +231,7 @@ class OpenEngineServer:
         self._inference_serving = False
         if self._shutdown_health_task is None:
             self._shutdown_health_task = asyncio.create_task(
-                self._health.set("inference", health_pb2.HealthCheckResponse.NOT_SERVING)
+                self._health.set("readiness", health_pb2.HealthCheckResponse.NOT_SERVING)
             )
         return self._shutdown_health_task
 
@@ -260,7 +260,7 @@ class OpenEngineServer:
             if ready != self._inference_serving:
                 self._inference_serving = ready
                 await self._health.set(
-                    "inference",
+                    "readiness",
                     health_pb2.HealthCheckResponse.SERVING
                     if ready
                     else health_pb2.HealthCheckResponse.NOT_SERVING,
@@ -301,7 +301,7 @@ class OpenEngineServer:
                 logger.error(f"OpenEngine inference health monitor failed: {error}")
                 self._engine_healthy = False
                 self._inference_serving = False
-                await self._health.set("inference", health_pb2.HealthCheckResponse.NOT_SERVING)
+                await self._health.set("readiness", health_pb2.HealthCheckResponse.NOT_SERVING)
 
     async def stop(self, grace: float = 5.0) -> None:
         """Stop accepting OpenEngine requests.
