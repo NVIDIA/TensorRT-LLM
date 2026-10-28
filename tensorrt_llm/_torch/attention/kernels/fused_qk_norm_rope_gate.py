@@ -221,11 +221,16 @@ def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
 
 
 def _use_tiled_qkv_rope(
-    qkv: torch.Tensor, num_q_heads: int, num_kv_heads: int, head_dim: int, rotary_dim: int
+    qkv: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    enable_tiling: bool,
 ) -> bool:
     return (
         # Opt in because changing tile layouts can change Q/K rounding.
-        _QKV_ROPE_TILING_ENABLED
+        enable_tiling
         # Restrict tiling to the full- and partial-RoPE geometries benchmarked.
         and (head_dim, rotary_dim) in ((128, 128), (256, 64))
         # Count Q, K, and V head rows so small TP-local head counts still need
@@ -254,6 +259,7 @@ def _fused_qkv_gemma_rmsnorm_rope_gate(
     use_mrope: bool,
     mrope_section1: int,
     mrope_section2: int,
+    enable_tiling: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert qkv.dim() == 2 and qkv.stride(-1) == 1
     assert qkv.dtype in (torch.bfloat16, torch.float16)
@@ -293,7 +299,7 @@ def _fused_qkv_gemma_rmsnorm_rope_gate(
     # one token and four warps.
     block_tokens, num_warps = (
         (8, 2)
-        if _use_tiled_qkv_rope(qkv, num_q_heads, num_kv_heads, head_dim, rotary_dim)
+        if _use_tiled_qkv_rope(qkv, num_q_heads, num_kv_heads, head_dim, rotary_dim, enable_tiling)
         else (1, 4)
     )
     # Eight-token tiles reduce program count; token masks handle the final tile.
@@ -346,6 +352,7 @@ def _(
     use_mrope: bool,
     mrope_section1: int,
     mrope_section2: int,
+    enable_tiling: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     num_tokens = qkv.shape[0]
     qkv_width = (num_q_heads + 2 * num_kv_heads) * head_dim
@@ -367,21 +374,21 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
     head_dim: int,
     rotary_dim: int,
     mrope_section: Optional[Tuple[int, int, int]] = None,
+    *,
+    enable_tiling: bool = _QKV_ROPE_TILING_ENABLED,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Prepare packed QKV and gate with one Triton kernel.
 
-    ``TRTLLM_ENABLE_QKV_ROPE_TILING=1`` opts into eight-token
-    tiles for at least 256 tokens with (head dim, rotary dim) equal to
-    (128, 128) or (256, 64) and at least 3072 token/head pairs across Q/K/V.
-    Head counts can vary with tensor parallelism. The flag is read at import.
+    `TRTLLM_ENABLE_QKV_ROPE_TILING=1` opts into eight-token tiles for at least 256 tokens with
+    (head dim, rotary dim) equal to (128, 128) or (256, 64) and at least 3072 token/head pairs
+    across Q/K/V.
+    Head counts can vary with tensor parallelism. The flag sets the default at import; callers can
+    override it with `enable_tiling`.
     Other calls use the single-token kernel.
 
-    Tiling is benchmarked on B200 and Rubin. Other GPU architectures can opt in,
-    but their performance is not established by those measurements.
-
-    Tiled FP32 reductions and compiler contraction can change Q/K rounding.
-    With tiling enabled, changing a request's batch size across a dispatch
-    boundary can change its Q/K values, cached K, and generated tokens.
+    Tiled FP32 reductions and compiler contraction can change Q/K rounding. With tiling enabled,
+    changing a request's batch size across a dispatch boundary can change its Q/K values, cached K,
+    and generated tokens.
     Leave the flag off when batch-invariant results are required.
 
     Args:
@@ -399,6 +406,8 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
         rotary_dim: Prefix dimension receiving NeoX RoPE.
         mrope_section: Temporal/height/width rotary-half dimensions. ``None``
             selects plain RoPE; a tuple selects Qwen-style interleaved MRoPE.
+        enable_tiling: Allow eight-token tiling for eligible workloads. Defaults
+            to the import-time environment flag; ``True`` does not bypass eligibility.
 
     Returns:
         Packed QKV ``[num_tokens, q_size + 2 * kv_size]`` and gate
@@ -427,6 +436,7 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
         use_mrope,
         mrope_section1,
         mrope_section2,
+        enable_tiling,
     )
 
 

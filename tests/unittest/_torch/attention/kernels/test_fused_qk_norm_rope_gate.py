@@ -309,11 +309,13 @@ def test_fused_sigmoid_mul_inplace_supports_flat_gate():
     torch.testing.assert_close(actual.float(), expected, atol=0.005, rtol=0.005)
 
 
-@pytest.mark.usefixtures("qkv_launch")
+@pytest.mark.parametrize("enabled", (False, True))
 @pytest.mark.parametrize("backend", ("eager", "inductor"))
-def test_fused_qkv_gemma_rmsnorm_rope_gate_supports_torch_compile(backend: str) -> None:
+def test_fused_qkv_gemma_rmsnorm_rope_gate_supports_torch_compile(
+    backend: str, enabled: bool
+) -> None:
     torch.manual_seed(2027)
-    num_tokens, num_q_heads, num_kv_heads = 7, 8, 2
+    num_tokens, num_q_heads, num_kv_heads = 257, 8, 2
     head_dim, rotary_dim = 128, 128
     q_size = num_q_heads * head_dim
     kv_size = num_kv_heads * head_dim
@@ -324,7 +326,7 @@ def test_fused_qkv_gemma_rmsnorm_rope_gate_supports_torch_compile(backend: str) 
     )
     q_weight = torch.randn((head_dim,), dtype=torch.bfloat16, device="cuda") * 0.1
     k_weight = torch.randn((head_dim,), dtype=torch.bfloat16, device="cuda") * 0.1
-    cos_sin = _make_cos_sin(128, rotary_dim)
+    cos_sin = _make_cos_sin(num_tokens, rotary_dim)
     positions = torch.arange(num_tokens, dtype=torch.int32, device="cuda")
 
     compiled = torch.compile(
@@ -343,6 +345,7 @@ def test_fused_qkv_gemma_rmsnorm_rope_gate_supports_torch_compile(backend: str) 
         num_kv_heads,
         head_dim,
         rotary_dim,
+        enable_tiling=enabled,
     )
     expected = fused_qkv_gemma_rmsnorm_rope_gate(
         qkv,
@@ -355,6 +358,7 @@ def test_fused_qkv_gemma_rmsnorm_rope_gate_supports_torch_compile(backend: str) 
         num_kv_heads,
         head_dim,
         rotary_dim,
+        enable_tiling=enabled,
     )
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
@@ -430,12 +434,11 @@ def test_tiled_qkv_rope_matches_stock_and_replays(
 
 @pytest.mark.parametrize("enabled", (False, True))
 def test_qkv_rope_tiling_dispatch_is_architecture_independent(
-    monkeypatch: pytest.MonkeyPatch, enabled: bool
+    enabled: bool,
 ) -> None:
-    monkeypatch.setattr(_kernel_module, "_QKV_ROPE_TILING_ENABLED", enabled)
     qkv = torch.empty((256, 1024), device="cuda")
     with patch.object(torch.cuda, "get_device_properties") as query:
-        assert _kernel_module._use_tiled_qkv_rope(qkv, 16, 2, 256, 64) == enabled
+        assert _kernel_module._use_tiled_qkv_rope(qkv, 16, 2, 256, 64, enabled) == enabled
         query.assert_not_called()
 
 
@@ -443,12 +446,9 @@ def test_qkv_rope_tiling_dispatch_is_architecture_independent(
     "num_tokens,head_dim,rotary_dim",
     ((0, 256, 64), (255, 256, 64), (256, 128, 64), (256, 192, 96), (256, 256, 256)),
 )
-def test_qkv_rope_tiling_excluded_shapes(
-    monkeypatch: pytest.MonkeyPatch, num_tokens: int, head_dim: int, rotary_dim: int
-) -> None:
-    monkeypatch.setattr(_kernel_module, "_QKV_ROPE_TILING_ENABLED", True)
+def test_qkv_rope_tiling_excluded_shapes(num_tokens: int, head_dim: int, rotary_dim: int) -> None:
     qkv = torch.empty((num_tokens, 1024), device="cuda")
-    assert not _kernel_module._use_tiled_qkv_rope(qkv, 16, 2, head_dim, rotary_dim)
+    assert not _kernel_module._use_tiled_qkv_rope(qkv, 16, 2, head_dim, rotary_dim, True)
 
 
 @pytest.mark.parametrize("enabled", (False, True))
@@ -456,7 +456,6 @@ def test_qkv_rope_tiling_excluded_shapes(
 @pytest.mark.parametrize("q_heads,dim,rotary", ((16, 256, 64), (8, 128, 128)))
 @pytest.mark.parametrize("tokens", (257, 32737, 32768, 32769))
 def test_qkv_rope_tiling_production_dispatch(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     enabled: bool,
     dtype: torch.dtype,
@@ -465,7 +464,6 @@ def test_qkv_rope_tiling_production_dispatch(
     rotary: int,
     tokens: int,
 ) -> None:
-    monkeypatch.setattr(_kernel_module, "_QKV_ROPE_TILING_ENABLED", enabled)
     kv_heads = 2
     qkv = torch.randn((tokens, 2 * (q_heads + kv_heads) * dim), device="cuda", dtype=dtype)
     weight = torch.randn(dim, device="cuda", dtype=dtype) * 0.1
@@ -474,7 +472,17 @@ def test_qkv_rope_tiling_production_dispatch(
 
     def run() -> tuple[torch.Tensor, torch.Tensor]:
         return fused_qkv_gemma_rmsnorm_rope_gate(
-            qkv, weight, weight, table, positions, 1e-6, q_heads, kv_heads, dim, rotary
+            qkv,
+            weight,
+            weight,
+            table,
+            positions,
+            1e-6,
+            q_heads,
+            kv_heads,
+            dim,
+            rotary,
+            enable_tiling=enabled,
         )
 
     run()
@@ -526,23 +534,20 @@ def test_qkv_rope_tiling_production_dispatch(
     ),
 )
 def test_qkv_rope_tiling_accepts_tp_head_counts(
-    monkeypatch: pytest.MonkeyPatch, tokens: int, q_heads: int, kv_heads: int, expected: bool
+    tokens: int, q_heads: int, kv_heads: int, expected: bool
 ) -> None:
-    monkeypatch.setattr(_kernel_module, "_QKV_ROPE_TILING_ENABLED", True)
     qkv = torch.empty((tokens, 2 * (q_heads + kv_heads) * 256), device="cuda", dtype=torch.bfloat16)
-    assert _kernel_module._use_tiled_qkv_rope(qkv, q_heads, kv_heads, 256, 64) == expected
+    assert _kernel_module._use_tiled_qkv_rope(qkv, q_heads, kv_heads, 256, 64, True) == expected
 
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize("q_heads,head_dim,rotary_dim", ((8, 128, 128), (16, 256, 64)))
 def test_qkv_rope_tiling_batch_boundaries(
-    monkeypatch: pytest.MonkeyPatch,
     dtype: torch.dtype,
     q_heads: int,
     head_dim: int,
     rotary_dim: int,
 ) -> None:
-    monkeypatch.setattr(_kernel_module, "_QKV_ROPE_TILING_ENABLED", True)
     torch.manual_seed(2030)
     kv_heads, prefix_tokens = 2, 255
     qkv = torch.randn((32769, 2 * (q_heads + kv_heads) * head_dim), device="cuda", dtype=dtype)
@@ -565,6 +570,7 @@ def test_qkv_rope_tiling_batch_boundaries(
             head_dim,
             rotary_dim,
             sections,
+            enable_tiling=True,
         )
         prefix = tuple(value[:prefix_tokens].clone() for value in actual)
         if reference is None:
