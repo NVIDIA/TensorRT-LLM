@@ -24,7 +24,7 @@ import json
 import os
 import re
 import shutil
-from typing import Dict, List, NamedTuple
+from typing import Dict, List, NamedTuple, Optional
 
 import pytest
 import yaml
@@ -40,6 +40,8 @@ from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfMetricType, PerfServeScriptTestCmds,
                     generate_test_nodes)
+from .warmup_pass import (WarmupPass, build_warmup_pass_cmd, one_wave_requests,
+                          warmup_pass_enabled)
 
 if not hasattr(re, "Pattern"):
     re.Pattern = type(re.compile(""))
@@ -48,6 +50,9 @@ ALLOWED_CONFIGS_CACHE = None  # Cache to avoid modifying sys.path many times.
 MAP_BY_SOCKET = None
 
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
+
+# trtllm-bench throughput's --warmup default.
+TRTLLM_BENCH_DEFAULT_WARMUP = 2
 
 # Models served with the Nemotron reasoning/tool parsers, a long max model len
 # and a longer server-start timeout. "nano-v3" and "nemotron-v3" are two
@@ -1115,6 +1120,29 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
         return data_cmd
 
+    def _get_bench_warmup_requests(self) -> int:
+        """Return trtllm-bench's --warmup for this case, or 0 for its default.
+
+        trtllm-bench runs these requests in its own process before the measured
+        ones, at the same concurrency, and reports none of them. With the warmup
+        pass on, they are one wave of the measured traffic (see warmup_pass.py),
+        and never fewer than without it. They are drawn from the measured
+        dataset, though, so a case whose config reuses KV cache blocks keeps the
+        fewer requests it has without the pass: otherwise its measured requests
+        would hit the warmup's cached prefixes.
+        """
+        without_pass = 2 * self._config.num_gpus if self._config.num_gpus > 1 else 0
+        if not warmup_pass_enabled():
+            return without_pass
+        kv_cache_config = self._get_model_yaml_config().get(
+            'kv_cache_config') or {}
+        if kv_cache_config.get('enable_block_reuse'):
+            return without_pass
+        wave = one_wave_requests(self._config.concurrency,
+                                 self._config.num_reqs,
+                                 self._config.max_batch_size)
+        return max(without_pass or TRTLLM_BENCH_DEFAULT_WARMUP, wave)
+
     def get_trtllm_bench_command(self, engine_dir):
         model_dir = self.get_trtllm_bench_model()
         model_name = self._config.model_name
@@ -1149,8 +1177,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += [f"--pp={self._config.pp_size}"]
         if self._config.streaming == "streaming":
             benchmark_cmd += [f"--streaming"]
-        if self._config.num_gpus > 1:
-            benchmark_cmd += [f"--warmup={2 * self._config.num_gpus}"]
+        warmup_requests = self._get_bench_warmup_requests()
+        if warmup_requests:
+            benchmark_cmd += [f"--warmup={warmup_requests}"]
 
         # Add extra-llm-api-config.yml for the PyTorch backend.
         if self._config.backend == "pytorch":
@@ -1227,9 +1256,20 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
         return server_cmd
 
-    def generate_trtllm_custom_dataset(self, dst_dataset_path: str,
-                                       input_len: int, output_len: int,
-                                       dataset_source: str):
+    def generate_trtllm_custom_dataset(self,
+                                       dst_dataset_path: str,
+                                       input_len: int,
+                                       output_len: int,
+                                       dataset_source: str,
+                                       num_requests: Optional[int] = None,
+                                       skip_requests: int = 0):
+        """Write a real-text dataset of fixed-length prompts.
+
+        Args:
+            num_requests: Samples to write; the case's request count if None.
+            skip_requests: Leading usable articles to skip, so that another
+                file can hold prompts this one does not.
+        """
         # Currently only support cnn_dailymail dataset source.
         if dataset_source != "cnn_dailymail":
             raise ValueError(
@@ -1260,8 +1300,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if not os.path.exists(os.path.dirname(dst_dataset_path)):
             os.makedirs(os.path.dirname(dst_dataset_path), exist_ok=True)
 
-        num_reqs = self._config.num_reqs
+        num_reqs = self._config.num_reqs if num_requests is None else num_requests
         req_count = 0
+        num_skipped = 0
         with open(dst_dataset_path, "w", encoding="utf-8") as f:
             for req in dataset:
                 article = req.get("article")
@@ -1281,6 +1322,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         prompt_ids = (prompt_ids * repeats)[:input_len]
                     elif len(prompt_ids) > input_len:
                         prompt_ids = prompt_ids[:input_len]
+                if num_skipped < skip_requests:
+                    num_skipped += 1
+                    continue
                 prompt_text = tokenizer.decode(prompt_ids,
                                                skip_special_tokens=False)
                 if self._config.model_name in DEEPSEEK_V41_MODELS:
@@ -1416,6 +1460,44 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             client_cmd += ["--trust-remote-code"]
         return client_cmd
 
+    def _get_serve_warmup_pass(self, engine_dir: str, input_len: int,
+                               output_len: int,
+                               client_cmd: List[str]) -> Optional[WarmupPass]:
+        """Return the warmup pass before a serve client, or None; see warmup_pass.py.
+
+        A real-text client gets a prompt file of its own, with the articles
+        after the measured ones. The measured file holds exactly the measured
+        prompts, so another shuffle of it would resend them, and KV cache block
+        reuse would then serve their prefixes to the measured requests.
+        """
+        if not warmup_pass_enabled():
+            return None
+        num_requests = one_wave_requests(self._config.concurrency,
+                                         self._config.num_reqs,
+                                         self._config.max_batch_size)
+        if num_requests < 1:
+            return None
+        dataset_source = SPEC_DEC_REAL_DATASET_MODELS.get(
+            self._config.model_name)
+        if dataset_source is not None:
+            warmup_dataset_path = os.path.join(
+                engine_dir,
+                f"dataset_custom_{input_len}_{output_len}_warmup_pass.jsonl")
+            self.generate_trtllm_custom_dataset(
+                warmup_dataset_path,
+                input_len,
+                output_len,
+                dataset_source=dataset_source,
+                num_requests=num_requests,
+                skip_requests=self._config.num_reqs)
+            client_cmd = self.get_trtllm_serve_client_command(
+                engine_dir,
+                input_len,
+                output_len,
+                real_dataset_path=warmup_dataset_path)
+        return WarmupPass(build_warmup_pass_cmd(client_cmd, num_requests),
+                          num_requests)
+
     def get_commands(self):
         num_gpus = self._config.num_gpus
 
@@ -1428,6 +1510,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if self._config.runtime == "serve":
             server_cmd = self.get_trtllm_serve_server_command(engine_dir)
             client_cmds = []
+            warmup_passes = []
             data_cmds = []
             for bs in self._config.batch_sizes:
                 for len_idx, input_len in enumerate(self._config.input_lens):
@@ -1453,6 +1536,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         output_len,
                         real_dataset_path=real_dataset_path)
                     client_cmds.append(client_cmd)
+                    warmup_passes.append(
+                        self._get_serve_warmup_pass(engine_dir, input_len,
+                                                    output_len, client_cmd))
             server_env = os.environ.copy()
             if self._config.model_name.startswith("qwen3.8_flash_next_"):
                 server_env["TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD"] = "1"
@@ -1490,7 +1576,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                            client_cmds=client_cmds,
                                            data_cmds=data_cmds,
                                            server_env=server_env,
-                                           server_timeout=server_timeout)
+                                           server_timeout=server_timeout,
+                                           warmup_passes=warmup_passes)
 
         # PyTorch loads model checkpoints directly.
         build_cmd = []

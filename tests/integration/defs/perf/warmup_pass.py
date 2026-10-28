@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The un-measured warmup pass perf-sanity sends before each measured client.
+"""The un-measured warmup pass the perf tests send before each measured client.
 
 The server's own startup warmup cannot reach every prefill shape a benchmark
 produces: how many prompts arrive together, how they are chunked against
@@ -20,15 +20,21 @@ produces: how many prompts arrive together, how they are chunked against
 once real traffic arrives. JIT kernels keyed on those shapes would otherwise
 compile inside the first measured requests. The warmup pass sends that traffic
 once beforehand: the measured client's own ``benchmark_serving`` command, cut to
-one wave of ``concurrency`` requests with different prompts. Nothing it prints is
-parsed or uploaded.
+one wave of requests with different prompts. Nothing it prints is parsed or
+uploaded.
 
-It runs for plain aggregated cases, ``ctx_only`` and disagg ``e2e``, whose
-measured window contains prefill. The ``gen_only`` modes never get one: they
-measure decode only, and their generation server's benchmark fill gate opens
-once, so warmup requests would open it before the measured burst arrives.
+perf-sanity (``test_perf_sanity.py``) runs it for plain aggregated cases,
+``ctx_only`` and disagg ``e2e``, whose measured window contains prefill. The
+``gen_only`` modes never get one: they measure decode only, and their generation
+server's benchmark fill gate opens once, so warmup requests would open it before
+the measured burst arrives.
 
-``TRTLLM_PERF_SANITY_WARMUP_PASS=0`` turns it off, e.g. to reproduce a JIT stall
+The single-node perf tests (``test_perf.py``) run it for both runtimes. A
+``serve`` case sends it before each measured client. A ``bench`` case measures
+inside the ``trtllm-bench throughput`` process that loads the model, so its pass
+is that command's own ``--warmup`` requests, raised to one wave.
+
+``TRTLLM_PERF_WARMUP_PASS=0`` turns it off in both, e.g. to reproduce a JIT stall
 the pass would otherwise absorb.
 
 Stdlib-only, so unit tests can load it without torch.
@@ -38,9 +44,9 @@ import os
 import re
 import subprocess
 import time
-from typing import Callable, List, Mapping, Optional, Sequence
+from typing import Callable, List, Mapping, NamedTuple, Optional, Sequence
 
-WARMUP_PASS_ENV = "TRTLLM_PERF_SANITY_WARMUP_PASS"
+WARMUP_PASS_ENV = "TRTLLM_PERF_WARMUP_PASS"
 
 # Benchmark modes that get a warmup pass. A plain aggregated case has no
 # benchmark mode, which the runner carries as "".
@@ -51,9 +57,17 @@ _DISABLED_VALUES = ("0", "false", "no", "off")
 _NUM_PROMPTS_FLAG = "--num-prompts"
 _SEED_FLAG = "--seed"
 _NO_TEST_INPUT_FLAG = "--no-test-input"
-_SAVE_TIME_BREAKDOWN_FLAG = "--save-request-time-breakdown"
-# Flags whose value the warmup pass replaces or drops.
-_FLAGS_WITH_REPLACED_VALUE = (_NUM_PROMPTS_FLAG, _SEED_FLAG, _SAVE_TIME_BREAKDOWN_FLAG)
+# Flags whose value the warmup pass replaces or drops: the request count, the seed,
+# and where the measured client writes its time breakdown and result file.
+_FLAGS_WITH_REPLACED_VALUE = (
+    _NUM_PROMPTS_FLAG,
+    _SEED_FLAG,
+    "--save-request-time-breakdown",
+    "--result-dir",
+    "--result-filename",
+)
+# Flags without a value that the warmup pass drops; it adds --no-test-input back.
+_DROPPED_FLAGS = (_NO_TEST_INPUT_FLAG, "--save-result", "--save-detailed")
 # benchmark_serving's --seed default.
 _BENCHMARK_SERVING_DEFAULT_SEED = 0
 # benchmark_serving's "Failed requests:" summary line, its only failure signal:
@@ -64,8 +78,8 @@ _FAILED_REQUESTS_RE = re.compile(r"^Failed requests:\s+(\d+)", re.MULTILINE)
 def warmup_pass_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
     """Return whether the warmup pass is on.
 
-    It is on unless ``TRTLLM_PERF_SANITY_WARMUP_PASS`` is ``0``, ``false``, ``no``
-    or ``off`` (any case).
+    It is on unless ``TRTLLM_PERF_WARMUP_PASS`` is ``0``, ``false``, ``no`` or
+    ``off`` (any case).
 
     Args:
         environ: Environment to read; ``os.environ`` when None.
@@ -84,6 +98,30 @@ def warmup_pass_applies(benchmark_mode: Optional[str]) -> bool:
     return (benchmark_mode or "") in WARMUP_PASS_MODES
 
 
+def one_wave_requests(concurrency: int, num_requests: int, max_batch_size: int) -> int:
+    """Return the requests in one wave of a benchmark: those it keeps in flight at once.
+
+    That is the client's concurrency limit. A client without one sends every
+    request at once, so the server's batch size caps the wave. A wave never holds
+    more requests than the benchmark sends.
+
+    Args:
+        concurrency: The client's concurrency limit; 0 or less for none.
+        num_requests: Requests the benchmark sends; 0 or less if unknown.
+        max_batch_size: The server's maximum batch size.
+    """
+    wave = concurrency if concurrency > 0 else max_batch_size
+    return min(wave, num_requests) if num_requests > 0 else wave
+
+
+class WarmupPass(NamedTuple):
+    """The warmup pass to send before one measured client."""
+
+    # The build_warmup_pass_cmd command, without host and port.
+    cmd: List[str]
+    num_requests: int
+
+
 def build_warmup_pass_cmd(measured_cmd: Sequence[str], num_requests: int) -> List[str]:
     """Derive the warmup pass's ``benchmark_serving`` command from the measured one.
 
@@ -96,10 +134,12 @@ def build_warmup_pass_cmd(measured_cmd: Sequence[str], num_requests: int) -> Lis
       prompts with the same length distribution: other random token ids, or
       another shuffle of the same dataset file.
     * ``--no-test-input`` is added, so no single test request goes first.
-    * ``--save-request-time-breakdown`` and its value are dropped.
+    * ``--save-request-time-breakdown``, ``--save-result``, ``--save-detailed``,
+      ``--result-dir`` and ``--result-filename`` are dropped with their values,
+      so the pass writes none of the measured client's output files.
 
     The measured command must pass each flag and its value as separate items, as
-    the runner builds it. The caller adds host and port.
+    the runners build it. The caller adds host and port.
 
     Args:
         measured_cmd: The measured client's ``benchmark_serving`` command.
@@ -122,7 +162,7 @@ def build_warmup_pass_cmd(measured_cmd: Sequence[str], num_requests: int) -> Lis
             if arg == _SEED_FLAG and value is not None:
                 measured_seed = int(value)
             continue
-        if arg == _NO_TEST_INPUT_FLAG:
+        if arg in _DROPPED_FLAGS:
             continue
         warmup_cmd.append(arg)
     return warmup_cmd + [
@@ -145,7 +185,7 @@ def send_warmup_pass(
     num_requests: int,
     run_benchmark: Callable[[List[str]], str],
     log_path: str,
-    timeout: float,
+    timeout: Optional[float] = None,
     log_info: Callable[[str], None] = print,
     log_warning: Callable[[str], None] = print,
 ) -> int:
@@ -160,9 +200,10 @@ def send_warmup_pass(
         num_requests: Requests the command sends.
         run_benchmark: Runs a command and returns its output. Raises
             ``subprocess.CalledProcessError`` if the command exits non-zero, and
-            ``subprocess.TimeoutExpired`` after ``timeout`` seconds.
+            ``subprocess.TimeoutExpired`` if it applies a time limit that runs out.
         log_path: Where ``run_benchmark`` writes the output; named in messages.
-        timeout: The time limit ``run_benchmark`` applies, in seconds.
+        timeout: The time limit ``run_benchmark`` applies, in seconds; None if it
+            applies none.
         log_info: Receives progress messages.
         log_warning: Receives the message about a partial failure.
 
@@ -182,9 +223,9 @@ def send_warmup_pass(
             f"Warmup pass: benchmark_serving exited with code {e.returncode}. See {log_path}"
         ) from e
     except subprocess.TimeoutExpired as e:
+        limit = f" within {timeout:.0f}s" if timeout is not None else ""
         raise RuntimeError(
-            f"Warmup pass: {num_requests} requests did not finish within {timeout:.0f}s. "
-            f"See {log_path}"
+            f"Warmup pass: {num_requests} requests did not finish{limit}. See {log_path}"
         ) from e
     elapsed = time.monotonic() - start
     failed_count = count_failed_requests(output)

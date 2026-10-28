@@ -203,7 +203,7 @@ AGG_CONFIG_FOLDER=my/custom/agg DISAGG_CONFIG_FOLDER=my/custom/disagg \
   python jenkins/scripts/perf/local/submit.py ...
 ```
 
-`TRTLLM_PERF_SANITY_WARMUP_PASS=0`, read by `test_perf_sanity.py` itself, skips the
+`TRTLLM_PERF_WARMUP_PASS=0`, read by `test_perf_sanity.py` itself, skips the
 warmup pass; see [Warmup pass](#warmup-pass).
 
 ## Configuration Files
@@ -353,18 +353,20 @@ command is the measured client's own `benchmark_serving` command with:
 - `--num-prompts` set to the client's concurrency (one wave);
 - `--seed` set to the measured seed + 1, so the pass sends other prompts of the same
   lengths: other random token ids, or another shuffle of the same dataset file;
-- `--no-test-input` added and `--save-request-time-breakdown` dropped.
+- `--no-test-input` added, and the output-file flags (`--save-request-time-breakdown`,
+  `--save-result`, `--save-detailed`, `--result-dir`, `--result-filename`) dropped.
 
 Notes:
 - Not run for `gen_only` / `gen_only_no_context` (they measure decode only, and the
   gen server's benchmark fill gate opens once, so warmup requests would open it
   early), for AgentX clients (they run their own warmup) or for accuracy-only
   clients. In e2e it runs after the connection warmup.
-- `TRTLLM_PERF_SANITY_WARMUP_PASS=0` (also `false`, `no`, `off`) skips it, e.g. to
+- `TRTLLM_PERF_WARMUP_PASS=0` (also `false`, `no`, `off`) skips it, e.g. to
   reproduce a JIT stall inside the measured window. CI leaves it on. With
   `jenkins/scripts/perf/local/submit.py`, set
-  `EXTRA_CONTAINER_EXPORTS='TRTLLM_PERF_SANITY_WARMUP_PASS=0'`; it reaches the
-  aggregated ranks and every disaggregated role.
+  `EXTRA_CONTAINER_EXPORTS='TRTLLM_PERF_WARMUP_PASS=0'`; it reaches the
+  aggregated ranks and every disaggregated role. The same switch controls the
+  single-node perf tests' warmup pass (`test_perf.py`; see `README.md`).
 - Client log: `trtllm-benchmark-warmup-pass.<server_idx>.<client_idx>.log`, not parsed
   for metrics. The test fails if the pass's benchmark_serving exits non-zero, times
   out or has every request fail; if only some fail, it logs a warning and the measured
