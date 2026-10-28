@@ -271,7 +271,7 @@ def test_visual_gen_records_external_world_size_failure():
     with (
         patch(
             "tensorrt_llm.visual_gen.visual_gen._detect_external_launch",
-            return_value=(0, 0, 2, "localhost", 1234),
+            return_value=(0, 0, 2, "localhost", 1234, "torchrun", 1),
         ),
         patch.object(usage, "record_visual_gen_initialization_attempt", return_value=True),
         patch.object(usage, "record_visual_gen_initialization_failure") as record_failure,

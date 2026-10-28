@@ -252,7 +252,7 @@ class VisualGen:
         # workers and never return to user code.
         ext = _detect_external_launch()
         if ext is not None:
-            rank, local_rank, world_size, master_addr, master_port = ext
+            rank, local_rank, world_size, master_addr, master_port, _, _ = ext
             n_workers = self.args.parallel_config.n_workers
             if rank != 0:
                 if world_size != n_workers:

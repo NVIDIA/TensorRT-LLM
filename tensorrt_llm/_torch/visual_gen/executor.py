@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import atexit
 import os
@@ -54,34 +57,6 @@ _start_coordinator_watchdog = start_coordinator_watchdog
 # /metrics endpoint.  Mirrors the LLM ``iter_stats_max_iterations`` default.
 _DEFAULT_ITER_STATS_MAX = 1000
 _TELEMETRY_TRANSFORMER_COMPONENTS = frozenset(("transformer", "transformer_2"))
-
-
-def _visual_gen_launch_metadata(
-    external_launch: Optional[Tuple[int, int, int, str, int]],
-) -> Tuple[str, int]:
-    """Return a bounded launch mode and best-known deployment node count."""
-    if external_launch is None:
-        return "local_spawn", 1
-
-    if "SLURM_PROCID" in os.environ:
-        launch_mode = "slurm"
-        node_count_value = os.environ.get("SLURM_NNODES")
-    else:
-        launch_mode = "torchrun"
-        node_count_value = os.environ.get("GROUP_WORLD_SIZE")
-
-    try:
-        node_count = int(node_count_value) if node_count_value is not None else 0
-    except ValueError:
-        node_count = 0
-    if node_count <= 0:
-        try:
-            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "0"))
-            world_size = external_launch[2]
-            node_count = (world_size + local_world_size - 1) // local_world_size
-        except (TypeError, ValueError, ZeroDivisionError):
-            node_count = 0
-    return launch_mode, max(node_count, 0)
 
 
 def _quant_algo_name(quant_config: Any) -> str:
@@ -456,46 +431,57 @@ def get_ip_address() -> str:
         s.close()
 
 
-def _detect_external_launch() -> Optional[Tuple[int, int, int, str, int]]:
+def _detect_external_launch() -> tuple[int, int, int, str, int, str, int] | None:
     """Detect whether the process was launched by an external distributed launcher.
 
     Checks for torchrun (``RANK`` + ``WORLD_SIZE``) and then SLURM
     (``SLURM_PROCID`` + ``SLURM_NTASKS``).  Returns a
-    ``(rank, local_rank, world_size, master_addr, master_port)`` tuple when a
+    ``(rank, local_rank, world_size, master_addr, master_port, launch_mode, node_count)`` tuple when a
     multi-process launcher is detected (world_size > 1), or ``None`` for
     single-process / single-node ``mp.Process`` mode.
+    Node count is best-effort metadata; zero means it could not be determined.
     """
-    # torchrun / torchelastic sets RANK and WORLD_SIZE
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        if world_size > 1:
-            local_rank = int(os.environ.get("LOCAL_RANK", rank))
-            master_addr = os.environ.get("MASTER_ADDR")
-            if master_addr is None:
+    for launch_mode, rank_env, world_size_env, local_rank_env, node_count_env in (
+        ("torchrun", "RANK", "WORLD_SIZE", "LOCAL_RANK", "GROUP_WORLD_SIZE"),
+        ("slurm", "SLURM_PROCID", "SLURM_NTASKS", "SLURM_LOCALID", "SLURM_NNODES"),
+    ):
+        if rank_env not in os.environ or world_size_env not in os.environ:
+            continue
+        rank = int(os.environ[rank_env])
+        world_size = int(os.environ[world_size_env])
+        if world_size <= 1:
+            continue
+        local_rank = int(os.environ.get(local_rank_env, rank))
+        master_addr = os.environ.get("MASTER_ADDR")
+        if master_addr is None:
+            if launch_mode == "torchrun":
                 raise RuntimeError(
                     "MASTER_ADDR must be set for multi-node torchrun runs. "
                     "Add --master-addr=<node0-ip> to your torchrun command, or set "
                     "MASTER_ADDR in the environment before launching."
                 )
-            master_port = int(os.environ.get("MASTER_PORT", 29500))
-            return rank, local_rank, world_size, master_addr, master_port
+            raise RuntimeError(
+                "MASTER_ADDR must be set for multi-node SLURM runs. "
+                "Add to your sbatch script:\n"
+                "  MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -1)"
+            )
+        master_port = int(os.environ.get("MASTER_PORT", 29500))
 
-    # SLURM: srun --ntasks-per-node=GPUS_PER_NODE sets SLURM_PROCID / SLURM_NTASKS
-    if "SLURM_PROCID" in os.environ and "SLURM_NTASKS" in os.environ:
-        rank = int(os.environ["SLURM_PROCID"])
-        world_size = int(os.environ["SLURM_NTASKS"])
-        if world_size > 1:
-            local_rank = int(os.environ.get("SLURM_LOCALID", rank))
-            master_addr = os.environ.get("MASTER_ADDR")
-            if master_addr is None:
-                raise RuntimeError(
-                    "MASTER_ADDR must be set for multi-node SLURM runs. "
-                    "Add to your sbatch script:\n"
-                    "  MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -1)"
-                )
-            master_port = int(os.environ.get("MASTER_PORT", 29500))
-            return rank, local_rank, world_size, master_addr, master_port
+        try:
+            node_count = int(os.environ.get(node_count_env, "0"))
+        except ValueError:
+            node_count = 0
+        if node_count <= 0:
+            try:
+                local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "0"))
+            except ValueError:
+                local_world_size = 0
+            node_count = (
+                (world_size + local_world_size - 1) // local_world_size
+                if local_world_size > 0
+                else 0
+            )
+        return rank, local_rank, world_size, master_addr, master_port, launch_mode, node_count
 
     return None
 
@@ -1071,9 +1057,9 @@ class DiffusionRemoteClient:
 
         # --- Detect external launcher (torchrun / srun) ---
         ext = _detect_external_launch()
-        self.launch_mode, self.node_count = _visual_gen_launch_metadata(ext)
 
         if ext is None:
+            self.launch_mode, self.node_count = "local_spawn", 1
             # Single-node: coordinator spawns all workers locally
             # Setup distributed env
             self.master_addr = "127.0.0.1"
@@ -1090,7 +1076,15 @@ class DiffusionRemoteClient:
 
         else:
             # rank == 0 guaranteed — ranks 1..N-1 exited in VisualGen.__init__
-            rank, local_rank, world_size, master_addr, master_port = ext
+            (
+                rank,
+                local_rank,
+                world_size,
+                master_addr,
+                master_port,
+                self.launch_mode,
+                self.node_count,
+            ) = ext
             req_port = find_free_port()
             resp_port = find_free_port()
             self.master_addr = master_addr

@@ -733,28 +733,6 @@ class TestPipelineMetadataBridging:
 
         return pickle.loads(pickle.dumps(response))
 
-    @pytest.mark.parametrize(
-        ("external_launch", "environment", "expected"),
-        [
-            (None, {}, ("local_spawn", 1)),
-            ((0, 0, 8, "localhost", 1234), {"GROUP_WORLD_SIZE": "2"}, ("torchrun", 2)),
-            (
-                (0, 0, 8, "localhost", 1234),
-                {"SLURM_PROCID": "0", "SLURM_NNODES": "4"},
-                ("slurm", 4),
-            ),
-        ],
-    )
-    def test_launch_metadata_is_bounded(self, monkeypatch, external_launch, environment, expected):
-        from tensorrt_llm._torch.visual_gen.executor import _visual_gen_launch_metadata
-
-        for name in ("SLURM_PROCID", "SLURM_NNODES", "GROUP_WORLD_SIZE", "LOCAL_WORLD_SIZE"):
-            monkeypatch.delenv(name, raising=False)
-        for name, value in environment.items():
-            monkeypatch.setenv(name, value)
-
-        assert _visual_gen_launch_metadata(external_launch) == expected
-
     def test_pipeline_telemetry_metadata_is_fail_silent(self, monkeypatch):
         from types import SimpleNamespace
 
