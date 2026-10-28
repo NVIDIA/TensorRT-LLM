@@ -72,6 +72,12 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
     MooncakeStoreConnectorWorker,
 )
+from tensorrt_llm.llmapi.llm_args import (
+    Eagle3DecodingConfig,
+    MTPDecodingConfig,
+    NGramDecodingConfig,
+    SADecodingConfig,
+)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 pytestmark = pytest.mark.cpu_only
@@ -293,6 +299,7 @@ def make_llm_args(
     run_dir: str | None = None,
     enable_attention_dp: bool = False,
     local_reuse_backoff: str = "off",
+    speculative_config=None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         model="/models/test-model",
@@ -302,6 +309,7 @@ def make_llm_args(
         pipeline_parallel_size=1,
         context_parallel_size=1,
         sparse_attention_config=None,
+        speculative_config=speculative_config,
         # How a rank reaches settings the process that rendered the client
         # config could not hand it; see config.pool_config.
         kv_connector_config=SimpleNamespace(
@@ -336,6 +344,7 @@ def make_worker(
     run_dir: str | None = None,
     enable_attention_dp: bool = False,
     local_reuse_backoff: str = "off",
+    speculative_config=None,
 ) -> Iterator[MooncakeStoreConnectorWorker]:
     """Build a worker and shut it down before the test call phase ends.
 
@@ -348,6 +357,7 @@ def make_worker(
             run_dir=run_dir,
             enable_attention_dp=enable_attention_dp,
             local_reuse_backoff=local_reuse_backoff,
+            speculative_config=speculative_config,
         )
     )
     fake_store.workers.append(worker)
@@ -1414,6 +1424,85 @@ def test_mooncake_asks_for_block_aligned_local_reuse_only_where_it_loads(
     assert MooncakeStoreConnectorWorker.drops_reuse_match_backoff is False
 
 
+# ---- speculative prefill ----
+
+
+def _eagle3(*, separate_draft_cache: bool) -> Eagle3DecodingConfig:
+    config = Eagle3DecodingConfig(max_draft_len=3, speculative_model="draft")
+    # The executor creator turns this off on a disaggregated server, before the
+    # connector is built.
+    config._allow_separate_draft_kv_cache = separate_draft_cache
+    return config
+
+
+def _mtp(*, separate_draft_cache: bool, vanilla: bool = False) -> MTPDecodingConfig:
+    config = MTPDecodingConfig(max_draft_len=2 if vanilla else 1, use_mtp_vanilla=vanilla)
+    config._allow_separate_draft_kv_cache = separate_draft_cache
+    return config
+
+
+def test_mooncake_declares_speculative_prefill_support():
+    assert MooncakeStoreConnectorScheduler.supports_speculative_prefill is True
+    assert MooncakeStoreConnectorWorker.supports_speculative_prefill is True
+    # The check the executor creator and the connector manager run.
+    assert KvCacheConnectorManager.declares_speculative_prefill(
+        MooncakeStoreConnectorWorker, MooncakeStoreConnectorScheduler
+    )
+
+
+@pytest.mark.parametrize(
+    "make_spec_config, match",
+    [
+        (lambda: _eagle3(separate_draft_cache=True), "separate draft KV cache"),
+        (lambda: _mtp(separate_draft_cache=True), "separate draft KV cache"),
+        (lambda: SADecodingConfig(max_draft_len=4), "mode SA"),
+        (
+            lambda: NGramDecodingConfig(max_draft_len=3, max_matching_ngram_size=2),
+            "mode NGRAM",
+        ),
+    ],
+    ids=["eagle3_separate_cache", "mtp_separate_cache", "suffix_automaton", "ngram"],
+)
+def test_worker_refuses_a_drafter_it_cannot_key(
+    store_config, fake_store, monkeypatch, make_spec_config, match
+):
+    """Refused before a segment is mounted, since the store would serve stale draft KV."""
+    opened = []
+    monkeypatch.setattr(
+        worker_module, "_open_store", lambda config: opened.append(config) or (fake_store, "")
+    )
+    with pytest.raises(NotImplementedError, match=match):
+        MooncakeStoreConnectorWorker(make_llm_args(speculative_config=make_spec_config()))
+    assert opened == []
+
+
+@pytest.mark.parametrize(
+    "role, make_spec_config",
+    [
+        ("both", lambda: _eagle3(separate_draft_cache=False)),
+        ("both", lambda: _mtp(separate_draft_cache=False)),
+        ("consumer", lambda: _mtp(separate_draft_cache=False, vanilla=True)),
+        # A capacity role addresses no page, so its drafter does not matter.
+        ("capacity", lambda: _eagle3(separate_draft_cache=True)),
+        ("capacity", lambda: NGramDecodingConfig(max_draft_len=3, max_matching_ngram_size=2)),
+    ],
+    ids=[
+        "eagle3",
+        "mtp_eagle",
+        "mtp_vanilla_consumer",
+        "capacity_separate_cache",
+        "capacity_ngram",
+    ],
+)
+def test_worker_accepts_shared_one_model_draft_and_capacity_role(
+    store_config, fake_store, role, make_spec_config
+):
+    set_pool_setting(store_config, role=role)
+    with make_worker(fake_store, speculative_config=make_spec_config()) as worker:
+        assert worker.capacity_only is (role == "capacity")
+    assert len(fake_store.workers) == 1
+
+
 # ---- host staging ----
 
 
@@ -1737,8 +1826,10 @@ def submit_saves(scheduler, metadata):
     scheduler._worker.submitted = {transfers.request_id for transfers in metadata.saves}
 
 
-def make_scheduler(store_config, hit_blocks=0):
-    scheduler = MooncakeStoreConnectorScheduler(make_llm_args())
+def make_scheduler(store_config, hit_blocks=0, speculative_config=None):
+    scheduler = MooncakeStoreConnectorScheduler(
+        make_llm_args(speculative_config=speculative_config)
+    )
     scheduler._worker = FakeWorker(hit_blocks)
     return scheduler
 
@@ -1984,8 +2075,16 @@ def test_scheduler_publishes_only_computed_full_blocks(store_config):
 
 
 @pytest.mark.parametrize("local_blocks", [0, 1])
-def test_scheduler_saves_computed_tail_after_restore(store_config, local_blocks):
-    scheduler = make_scheduler(store_config, hit_blocks=2)
+@pytest.mark.parametrize("use_mtp", [False, True], ids=["no_draft", "mtp"])
+def test_scheduler_saves_computed_tail_after_restore(store_config, local_blocks, use_mtp):
+    """The same saves with and without a one-model draft's prompt lookahead.
+
+    The prompt runs one token past its last full block, so a lookahead of one
+    leaves every block hashable and the bound is the computed position alone.
+    """
+    config = MTPDecodingConfig(max_draft_len=1) if use_mtp else None
+    scheduler = make_scheduler(store_config, hit_blocks=2, speculative_config=config)
+    assert scheduler._prompt_lookahead == (1 if use_mtp else 0)
     tokens = list(range(6 * TOKENS_PER_BLOCK + 1))
     request = make_request(1, tokens)
     assert scheduler.get_num_new_matched_tokens(request, local_blocks * TOKENS_PER_BLOCK) == (
@@ -2025,6 +2124,110 @@ def test_scheduler_saves_computed_tail_after_restore(store_config, local_blocks)
     metadata = scheduler.build_connector_meta(SchedulerOutput(cached_requests=[data]))
     assert metadata.loads == []
     assert [page.page_index for page in metadata.saves[0].pages] == [11 + tail_block]
+
+
+def test_scheduler_mtp_keys_require_matching_lookahead(store_config):
+    """Block keys cover the prompt token a one-model draft reads past each block."""
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    other_tokens = list(tokens)
+    # The first token of block 1: the draft's lookahead past block 0.
+    other_tokens[TOKENS_PER_BLOCK] += 1000
+    scheduler = make_scheduler(
+        store_config, hit_blocks=99, speculative_config=MTPDecodingConfig(max_draft_len=1)
+    )
+    assert scheduler._prompt_lookahead == 1
+
+    scheduler.get_num_new_matched_tokens(make_request(1, tokens), 0)
+    other = make_request(2, other_tokens)
+    assert scheduler.get_num_new_matched_tokens(other, 0) == (2 * TOKENS_PER_BLOCK, False)
+    first, second = scheduler._worker.queries
+    assert first == list(BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=1).extend(tokens))
+    assert first[0] != second[0]
+    # Pages a server without the draft wrote are a different key space.
+    assert first[0] != BlockHashChain(TOKENS_PER_BLOCK).extend(tokens)[0]
+
+    pages = [4, 5, 6]
+    settle_offer(scheduler, other, 2 * TOKENS_PER_BLOCK, pages)
+    data = request_data(
+        2, other_tokens, pages, computed_position=0, num_scheduled_tokens=TOKENS_PER_BLOCK
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    assert [page.page_index for page in metadata.loads[0].pages] == [4, 5]
+    # The pass computes the final block, but the prompt holds no token past it
+    # for the draft to have read, so it has no key and is not saved.
+    assert metadata.saves == []
+
+
+def test_scheduler_mtp_vanilla_lookahead_is_the_draft_length(store_config):
+    """Vanilla MTP chains its draft layers, so it reads `max_draft_len` tokens ahead."""
+    config = MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True)
+    assert config.spec_dec_mode.is_mtp_vanilla()
+    scheduler = make_scheduler(store_config, hit_blocks=99, speculative_config=config)
+    assert scheduler._prompt_lookahead == 2
+
+    # Block 2's lookahead runs one token past this prompt, so it is not offered,
+    # where a server without a draft offers it.
+    tokens = list(range(3 * TOKENS_PER_BLOCK + 1))
+    assert scheduler.get_num_new_matched_tokens(make_request(1, tokens), 0) == (
+        2 * TOKENS_PER_BLOCK,
+        False,
+    )
+    assert scheduler._worker.queries[0] == list(
+        BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=2).extend(tokens)
+    )
+    without_draft = make_scheduler(store_config, hit_blocks=99)
+    assert without_draft._prompt_lookahead == 0
+    assert without_draft.get_num_new_matched_tokens(make_request(1, tokens), 0) == (
+        3 * TOKENS_PER_BLOCK,
+        False,
+    )
+
+
+def test_scheduler_eagle3_lookahead_is_one(store_config):
+    config = Eagle3DecodingConfig(max_draft_len=3, speculative_model="draft")
+    scheduler = make_scheduler(store_config, speculative_config=config)
+    assert scheduler._prompt_lookahead == 1
+
+
+def test_scheduler_requires_resolved_spec_config(store_config):
+    """An unresolved draft length would key draft KV as if it read nothing ahead."""
+    config = MTPDecodingConfig()
+    assert config.max_draft_len is None
+    with pytest.raises(RuntimeError, match="resolved"):
+        make_scheduler(store_config, speculative_config=config)
+
+
+def test_scheduler_does_not_save_capacity_pages_past_the_chunk(store_config):
+    """One-model speculation allocates pages past every context chunk.
+
+    `num_extra_kv_tokens` (`max_draft_len - 1`) gives the block after a chunk
+    that ends on a block boundary a page before any pass has computed it, so
+    each block is published only by the chunk that computes it.
+    """
+    scheduler = make_scheduler(
+        store_config, hit_blocks=0, speculative_config=MTPDecodingConfig(max_draft_len=3)
+    )
+    tokens = list(range(4 * TOKENS_PER_BLOCK + 1))
+    assert scheduler.get_num_new_matched_tokens(make_request(1, tokens), 0) == (0, False)
+
+    for ordinal in range(4):
+        # The first chunk computes one block and is allocated two pages.
+        new_pages = [10, 11] if ordinal == 0 else [11 + ordinal]
+        data = request_data(
+            1,
+            tokens if ordinal == 0 else [],
+            new_pages,
+            computed_position=ordinal * TOKENS_PER_BLOCK,
+            num_scheduled_tokens=TOKENS_PER_BLOCK + (1 if ordinal == 3 else 0),
+        )
+        output = (
+            SchedulerOutput(new_requests=[data])
+            if ordinal == 0
+            else SchedulerOutput(cached_requests=[data])
+        )
+        metadata = scheduler.build_connector_meta(output)
+        assert saved_pages(metadata) == [10 + ordinal]
+        submit_saves(scheduler, metadata)
 
 
 def test_scheduler_rebuild_in_the_same_iteration_emits_the_same_saves(store_config):

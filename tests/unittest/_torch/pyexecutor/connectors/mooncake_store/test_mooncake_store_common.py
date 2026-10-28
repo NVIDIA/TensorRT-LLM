@@ -294,6 +294,143 @@ def test_hash_chain_rejects_tokens_outside_int64(token):
     assert list(chain.hashes) == before
 
 
+@pytest.mark.parametrize("lookahead", [1, TOKENS_PER_BLOCK + 1])
+def test_hash_chain_requires_lookahead_and_matches_incremental_extension(lookahead):
+    """A block is hashed once the draft's lookahead past it is in the prompt too."""
+    tokens = list(range(4 * TOKENS_PER_BLOCK + lookahead))
+    chain = BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead)
+    assert chain.prompt_lookahead == lookahead
+    assert list(chain.extend(tokens[: TOKENS_PER_BLOCK + lookahead - 1])) == []
+    assert len(chain.extend(tokens[: TOKENS_PER_BLOCK + lookahead])) == 1
+    for end in range(TOKENS_PER_BLOCK + lookahead + 1, len(tokens) + 1):
+        chain.extend(tokens[:end])
+    assert len(chain.hashes) == 4
+    one_shot = BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(tokens)
+    assert list(chain.hashes) == list(one_shot)
+
+    # The last lookahead token of block 0 is part of its identity; the token
+    # after it is not.
+    covered = list(tokens)
+    covered[TOKENS_PER_BLOCK + lookahead - 1] += 1000
+    assert (
+        chain.hashes[0]
+        != BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(covered)[0]
+    )
+    beyond = list(tokens)
+    beyond[TOKENS_PER_BLOCK + lookahead] += 1000
+    assert (
+        chain.hashes[0]
+        == BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(beyond)[0]
+    )
+
+
+def test_hash_chain_rejects_negative_lookahead():
+    with pytest.raises(ValueError, match="prompt_lookahead"):
+        BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=-1)
+
+
+def test_hash_chain_lookahead_separates_keys():
+    """Servers whose drafts read different lookaheads never share a page.
+
+    Nor does a speculative server share one with a server without a draft, and
+    the request scope still separates keys under a lookahead.
+    """
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    first_blocks = {
+        BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(tokens)[0]
+        for lookahead in (0, 1, 2)
+    }
+    assert len(first_blocks) == 3
+
+    scopes = [
+        ReuseScope(),
+        ReuseScope(cache_salt="tenant-a"),
+        ReuseScope(cache_salt="tenant-b"),
+        ReuseScope(multimodal_digests=(b"\x01" * 32,)),
+        ReuseScope(multimodal_digests=(b"\x02" * 32,)),
+    ]
+    scoped = {
+        BlockHashChain(TOKENS_PER_BLOCK, scope=scope, prompt_lookahead=1).extend(tokens)[0]
+        for scope in scopes
+    }
+    assert len(scoped) == len(scopes)
+
+
+def _hand_built_chain(lookahead, cache_salt, multimodal_digests, tokens, tokens_per_block):
+    """Expected key bytes, built from the specification rather than from `ReuseScope`.
+
+    The seed is blake2b-128 over the length-framed, presence-tagged salt and
+    the multimodal digests. A non-zero lookahead re-digests it with
+    `b"prompt-lookahead"` and the lookahead as 8 little-endian bytes. Each block
+    is then blake2b-128 over its parent and its tokens plus the lookahead tokens
+    after it, as signed 8-byte little-endian ids, at a one-block stride.
+    """
+
+    def digest(*parts: bytes) -> bytes:
+        hasher = hashlib.blake2b(digest_size=16)
+        for part in parts:
+            hasher.update(part)
+        return hasher.digest()
+
+    salt_bytes = b"\x00" if cache_salt is None else b"\x01" + cache_salt.encode("utf-8")
+    framed = b"".join(
+        len(part).to_bytes(4, "little") + part for part in (salt_bytes, *multimodal_digests)
+    )
+    parent = digest(framed)
+    if lookahead:
+        parent = digest(parent, b"prompt-lookahead", lookahead.to_bytes(8, "little"))
+    hashes = []
+    for start in range(0, len(tokens) - lookahead - tokens_per_block + 1, tokens_per_block):
+        window = tokens[start : start + tokens_per_block + lookahead]
+        parent = digest(parent, b"".join(t.to_bytes(8, "little", signed=True) for t in window))
+        hashes.append(parent)
+    return hashes
+
+
+@pytest.mark.parametrize(
+    "lookahead, cache_salt, multimodal_digests",
+    [
+        (0, None, ()),
+        (0, "tenant-a", ()),
+        (0, None, (b"\x01" * 32,)),
+        (1, None, ()),
+        (3, None, ()),
+        (1, "tenant-a", ()),
+        (3, None, (b"\x01" * 32,)),
+    ],
+    ids=[
+        "no_lookahead",
+        "no_lookahead_salted",
+        "no_lookahead_multimodal",
+        "lookahead_1",
+        "lookahead_3",
+        "lookahead_1_salted",
+        "lookahead_3_multimodal",
+    ],
+)
+def test_hash_chain_key_bytes_follow_the_framed_scope_and_lookahead(
+    lookahead, cache_salt, multimodal_digests
+):
+    """Pins the bytes of every stored key, with and without a draft lookahead.
+
+    Lookahead 0 pins the keys pools already hold. The token list covers both
+    ends of int64 and -1, and is fed in pieces that end mid-block.
+    """
+    tokens = [7, -1, 2**63 - 1, -(2**63), 0, 151_000] * 5 + list(range(23))
+    expected = _hand_built_chain(
+        lookahead, cache_salt, multimodal_digests, tokens, TOKENS_PER_BLOCK
+    )
+    assert len(expected) == (len(tokens) - lookahead) // TOKENS_PER_BLOCK
+
+    scope = ReuseScope(cache_salt=cache_salt, multimodal_digests=multimodal_digests)
+    chain = BlockHashChain(TOKENS_PER_BLOCK, scope=scope, prompt_lookahead=lookahead)
+    for end in (5, 6, 17, len(tokens)):
+        chain.extend(tokens[:end])
+    assert list(chain.hashes) == expected
+    one_shot = BlockHashChain(TOKENS_PER_BLOCK, scope=scope, prompt_lookahead=lookahead)
+    assert list(one_shot.extend(tuple(tokens))) == expected
+
+
 def test_key_namespace_separates_every_dimension():
     base = dict(
         namespace="trtllm",

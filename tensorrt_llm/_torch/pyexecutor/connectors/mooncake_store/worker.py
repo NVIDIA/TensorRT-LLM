@@ -45,6 +45,10 @@ did not land costs a future cache miss and nothing else, so the request retires
 either way. Only the save thread failing to start is fatal, because that would
 strand every request behind pages nothing will release.
 
+Next to one-model MTP or EAGLE3 on a disaggregated context server, the draft
+layers share the target pool, so they move with every page. Any other drafter,
+or draft layers in a separate KV cache, is refused at construction.
+
 A capacity-only worker opens its handle and stops there, with no layout, no
 buffer registration and no save thread, so a node can lend host memory to the
 pool without an HCA that can pin GPU pages.
@@ -85,7 +89,12 @@ from .staging import (
     unstage_batch_after_get,
 )
 from .staging import sync_stream as _sync_stream
-from .validation import validate_layout, validate_llm_args, validate_node_budget
+from .validation import (
+    validate_layout,
+    validate_llm_args,
+    validate_node_budget,
+    validate_speculative_config,
+)
 
 __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
 
@@ -209,6 +218,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     #: shards of one page and cannot restart a request alone, so there a failed
     #: page stays fatal.
     reports_failed_loads = True
+    #: Loads and saves move whole pages of every layer group in the registered
+    #: layout, which includes one-model draft layers sharing the target pool;
+    #: the per-layer hooks are no-ops. `validate_speculative_config` refuses a
+    #: drafter whose KV lives anywhere else.
+    supports_speculative_prefill = True
     #: Registering pages drops the automatic host tier, and a prefix restore is
     #: chosen only after the final batch, so on a disaggregated server the
     #: pages each admitted request needs to finish have to stay free.
@@ -219,6 +233,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         validate_llm_args(llm_args)
         self._config = MooncakeStoreConnectorConfig.resolve(llm_args)
+        # Before the store is opened, so a drafter this connector cannot key
+        # fails before a segment is mounted.
+        validate_speculative_config(llm_args, self._config)
         loads = self._config.role.loads
         #: Read by `KVCacheManagerV2`, which is built after the connector. An
         #: offer starts at the local match and covers whole blocks, so a role

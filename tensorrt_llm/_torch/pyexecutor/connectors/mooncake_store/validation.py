@@ -17,7 +17,9 @@
 Every rejection here is a configuration whose failure mode is a wrong answer
 rather than a slow one: KV replayed without all of the state it was computed
 with. Beam search and Mamba caches are rejected for all connectors in
-`py_executor`, so they are not repeated here.
+`py_executor`, and so is speculative decoding outside the speculative-prefill-only
+mode, so they are not repeated here. What is left for speculation is the
+drafter: only one whose KV this connector keys and moves may run next to it.
 
 Checks run at construction, before any request is admitted, so a bad deployment
 fails at startup instead of after the first cache hit.
@@ -33,7 +35,12 @@ if TYPE_CHECKING:
     from ..kv_cache_layout import KvCacheLayout
     from .config import MooncakeStoreConnectorConfig
 
-__all__ = ["validate_layout", "validate_llm_args", "validate_node_budget"]
+__all__ = [
+    "validate_layout",
+    "validate_llm_args",
+    "validate_node_budget",
+    "validate_speculative_config",
+]
 
 _GIB = 1 << 30
 
@@ -72,6 +79,65 @@ def validate_llm_args(llm_args: TorchLlmArgs) -> None:
             "so it is neither described to the connector nor transferred; a "
             "replayed prefix would carry index-K from the store alongside stale "
             "index-V. This is the same restriction disaggregated serving applies."
+        )
+
+
+def validate_speculative_config(
+    llm_args: TorchLlmArgs, config: "MooncakeStoreConnectorConfig"
+) -> None:
+    """Reject a drafter whose KV this connector cannot key or restore.
+
+    Only one-model MTP and EAGLE3 keep their draft KV in the target pool, which
+    is registered with the connector, with an established prompt lookahead the
+    block keys cover. Any other drafter's state would be missing or stale after
+    a restored prefix. Runs before the store is opened, since the cache managers
+    that would otherwise refuse a separate draft KV cache are built after the
+    connector.
+
+    Args:
+        llm_args: The engine arguments.
+        config: The resolved connector configuration. A capacity-only role
+            addresses no page, so its drafter does not matter.
+
+    Raises:
+        NotImplementedError: When a server that transfers KV runs a drafter
+            other than one-model MTP or EAGLE3, or keeps the draft layers in a
+            separate KV cache.
+    """
+    spec_config = getattr(llm_args, "speculative_config", None)
+    if spec_config is None or config.capacity_only:
+        return
+    # Imported here: the speculative package pulls in every drafter, which a
+    # process that imports this package without serving does not need.
+    from tensorrt_llm._torch.speculative import (
+        draft_prompt_lookahead,
+        should_use_separate_draft_kv_cache,
+    )
+
+    mode = spec_config.spec_dec_mode
+    if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
+        raise NotImplementedError(
+            f"The mooncake-store connector does not support speculative decoding "
+            f"mode {mode.name}. Only one-model MTP and EAGLE3 keep their draft KV "
+            "in the target KV cache with an established prompt lookahead, which "
+            "the block keys cover; any other drafter's state would be missing or "
+            "stale after a restored prefix. Run one-model MTP or EAGLE3 on a "
+            "disaggregated context server, or use role 'capacity'."
+        )
+    if draft_prompt_lookahead(spec_config) is None:
+        # Both admitted modes define it; kept so a future change cannot key
+        # draft KV with a lookahead nobody established.
+        raise NotImplementedError(
+            f"The mooncake-store connector needs the prompt lookahead of "
+            f"speculative decoding mode {mode.name}, which is not established."
+        )
+    if should_use_separate_draft_kv_cache(spec_config):
+        raise NotImplementedError(
+            "The mooncake-store connector does not support a separate draft KV "
+            "cache: the draft layers would live in a cache the connector never "
+            "sees, so a restored prefix would carry stale draft KV. Run on a "
+            "disaggregated context server, where one-model draft layers share "
+            "the target KV cache."
         )
 
 
