@@ -74,13 +74,9 @@ def test_locality_domains_reject_sparse_attention_at_manager_creation():
         creator._create_kv_cache_manager(Mock())
 
 
-def test_placement_alternates_domains_when_ids_advance_in_even_steps():
-    # n=2 sampling gives each request a parent and a child id, so new requests
-    # arrive with ids 0, 2, 4, ...; parity placement would put them all on domain 0.
+def test_placement_round_robins_over_arrival_order():
     manager = SimpleNamespace(num_locality_domains=2, _next_locality_domain=0)
-    picks = [
-        KVCacheManagerV2.pick_locality_domain(manager, request_id) for request_id in (0, 2, 4, 6)
-    ]
+    picks = [KVCacheManagerV2.pick_locality_domain(manager) for _ in range(4)]
     assert picks == [0, 1, 0, 1]
 
 
@@ -98,20 +94,20 @@ def _placer(matches, load=(0, 0)):
 def test_placement_follows_the_domain_holding_the_prompt_prefix():
     manager = _placer(matches=(0, 96))
     tokens = list(range(128))
-    assert KVCacheManagerV2.pick_locality_domain(manager, 0, tokens) == 1
-    assert KVCacheManagerV2.pick_locality_domain(manager, 1, tokens) == 1
+    assert KVCacheManagerV2.pick_locality_domain(manager, tokens) == 1
+    assert KVCacheManagerV2.pick_locality_domain(manager, tokens) == 1
 
 
 def test_placement_round_robins_without_a_full_block_match():
     manager = _placer(matches=(0, 31))
-    picks = [KVCacheManagerV2.pick_locality_domain(manager, i, list(range(64))) for i in range(4)]
+    picks = [KVCacheManagerV2.pick_locality_domain(manager, list(range(64))) for _ in range(4)]
     assert picks == [0, 1, 0, 1]
 
 
 def test_placement_does_not_pile_a_hot_prefix_onto_a_loaded_domain():
     # Domain 1 already holds 30 more live requests than domain 0, past max(8, total // 4).
     manager = _placer(matches=(0, 96), load=(10, 40))
-    assert KVCacheManagerV2.pick_locality_domain(manager, 0, list(range(128))) == 0
+    assert KVCacheManagerV2.pick_locality_domain(manager, list(range(128))) == 0
 
 
 def _manager(num_locality_domains, is_draft):
@@ -130,7 +126,7 @@ def test_draft_manager_with_a_different_domain_count_gets_a_valid_domain(
     target = _manager(target_domains, is_draft=False)
     draft = _manager(draft_domains, is_draft=True)
     for request_id in range(4):
-        request = _request(request_id, target.pick_locality_domain(request_id))
+        request = _request(request_id, target.pick_locality_domain())
         assert target._request_locality_domain_id(request) == request.py_locality_domain_id
         draft_domain = draft._request_locality_domain_id(request)
         if draft_domains == 1:
