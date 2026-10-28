@@ -446,6 +446,17 @@ class CachedModelLoader:
         # TODO: Unify the logics with those in tensorrt_llm/_torch/model_config.py
         self.model_loader._update_from_hf_quant_config()
 
+        # Issue #11083 — context-aware defaults (two-stage loading, stage 1):
+        # read the on-disk config.json (pure Python, no GPU), resolve the
+        # model class, and apply model-specific default overrides to llm_args
+        # **before** weight loading. This surfaces model-aware defaults early
+        # enough for LLM construction, telemetry, and user inspection of
+        # llm.args. The same resolution runs a second time inside
+        # ModelLoader.load_config_and_apply_defaults during executor creation,
+        # but that richer pass is GPU-dependent.
+        if self.llm_args.backend == "pytorch":
+            apply_early_model_defaults(self._hf_model_dir, self.llm_args)
+
         return self._hf_model_dir
 
     @print_traceback_on_error
@@ -487,6 +498,7 @@ __all__ = [
     'update_llm_args_with_extra_dict',
     'update_llm_args_with_extra_options',
     'apply_model_defaults_to_llm_args',
+    'apply_early_model_defaults',
 ]
 
 
@@ -507,6 +519,77 @@ def _deep_merge(base: Dict[str, Any], *overlays: Dict[str,
                 result[key] = value
 
     return result
+
+
+def _capture_pydantic_fields_set(model: Any) -> Dict[int, set]:
+    """Recursively snapshot ``__pydantic_fields_set__`` for a Pydantic model tree.
+
+    ``__pydantic_fields_set__`` is a live mutable ``set`` that Pydantic mutates
+    in place on every ``setattr``.  Capturing with ``set(...)`` keeps a stable
+    snapshot; a bare reference would be silently mutated by the subsequent
+    field assignments in :func:`apply_model_defaults_to_llm_args`.
+
+    Returns a mapping ``{id(model): set_copy}`` consumable by
+    :func:`_restore_pydantic_fields_set`.
+    """
+    from pydantic import BaseModel
+    snapshots: Dict[int, set] = {}
+
+    def _walk(node: Any) -> None:
+        if not isinstance(node, BaseModel):
+            return
+        snapshots[id(node)] = set(node.__pydantic_fields_set__)
+        for child in node.__dict__.values():
+            _walk(child)
+
+    _walk(model)
+    return snapshots
+
+
+def _restore_pydantic_fields_set(model: Any,
+                                 snapshots: Dict[int, set]) -> None:
+    """Restore ``__pydantic_fields_set__`` from a :func:`_capture_pydantic_fields_set` snapshot.
+
+    Operates **in-place** on the existing live set via ``.clear()`` +
+    ``.update()``.  Reassigning a fresh set would break Pydantic's internal
+    handler — later ``setattr`` calls rely on ``__pydantic_fields_set__``
+    supporting ``.add``.
+
+    Relies on :func:`apply_model_defaults_to_llm_args` preserving object
+    identity for nested Pydantic models, so ``id(node)`` matches between
+    capture and restore.
+    """
+    from pydantic import BaseModel
+
+    def _walk(node: Any) -> None:
+        if not isinstance(node, BaseModel):
+            return
+        if id(node) in snapshots:
+            node.__pydantic_fields_set__.clear()
+            node.__pydantic_fields_set__.update(snapshots[id(node)])
+        for child in node.__dict__.values():
+            _walk(child)
+
+    _walk(model)
+
+
+def _deep_copy_values_to(target: Any, source: Any) -> None:
+    """Copy field values from *source* to *target*, preserving *target*'s identity.
+
+    When both sides are Pydantic ``BaseModel`` instances, each field is set
+    individually so nested model objects retain their ``id`` — this is
+    essential for :func:`_restore_pydantic_fields_set` to match snapshots.
+    """
+    from pydantic import BaseModel
+    if isinstance(target, BaseModel) and isinstance(source, BaseModel):
+        for field_name in target.model_fields:
+            src_val = getattr(source, field_name)
+            dst_val = getattr(target, field_name)
+            if isinstance(src_val, BaseModel) and isinstance(
+                    dst_val, BaseModel):
+                _deep_copy_values_to(dst_val, src_val)
+            else:
+                setattr(target, field_name, src_val)
 
 
 def apply_model_defaults_to_llm_args(
@@ -533,10 +616,33 @@ def apply_model_defaults_to_llm_args(
     base_state = llm_args.model_dump()
     merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
 
+    # Snapshot the original "explicitly set" field state before any in-place
+    # mutation.  Naive setattr below marks every touched field as "user-set"
+    # from Pydantic's perspective, which would break downstream
+    # ``model_dump(exclude_unset=True)`` calls and block later defaults
+    # passes from overriding values the user never explicitly provided.
+    # We capture recursively (including nested Pydantic models) and restore
+    # after mutation — but only because ``_deep_copy_values_to`` preserves
+    # object identity for nested models.
+    original_fields_set = _capture_pydantic_fields_set(llm_args)
+
     new_args = llm_args.__class__(**merged_state)
 
+    # Copy merged values back into llm_args.  When both sides hold a
+    # BaseModel (e.g. a user-set nested config), do a deep field-by-field
+    # copy so the target object retains its identity — otherwise the
+    # recursive fields_set snapshot would be orphaned and couldn't be
+    # restored.
+    from pydantic import BaseModel
     for field_name in type(llm_args).model_fields:
-        setattr(llm_args, field_name, getattr(new_args, field_name))
+        src_val = getattr(new_args, field_name)
+        dst_val = getattr(llm_args, field_name)
+        if isinstance(src_val, BaseModel) and isinstance(dst_val, BaseModel):
+            _deep_copy_values_to(dst_val, src_val)
+        else:
+            setattr(llm_args, field_name, src_val)
+
+    _restore_pydantic_fields_set(llm_args, original_fields_set)
 
     def _compute_applied(defaults: Dict[str, Any],
                          overrides: Dict[str, Any]) -> Dict[str, Any]:
@@ -558,6 +664,116 @@ def apply_model_defaults_to_llm_args(
         return applied
 
     return _compute_applied(model_defaults_dict, user_overrides)
+
+
+def apply_early_model_defaults(model_dir: Union[str, Path],
+                               llm_args: 'TorchLlmArgs') -> Dict[str, Any]:
+    """Read config.json and apply model-specific LLM API defaults before weight loading.
+
+    This is the two-stage loading step described in Issue #11083: we read only
+    the on-disk ``config.json`` (a pure-Python, no-GPU operation), identify the
+    model architecture, and ask the resolved model class for its
+    :meth:`get_model_defaults` overrides. The overrides are merged into
+    ``llm_args`` without touching any field the user explicitly set.
+
+    The same resolution happens a second time inside
+    :meth:`ModelLoader.load_config_and_apply_defaults` during executor creation.
+    That second pass operates on a richer ``ModelConfig`` produced by the
+    checkpoint loader (spec config, quant config, etc.) and also resolves
+    ``"auto"`` sentinel values. This helper is intentionally lean: it does
+    **not** replicate any of that. Its job is merely to surface model-aware
+    defaults early enough that :class:`LLM` construction, telemetry, and any
+    user inspection of ``llm.args`` see the same defaults the executor will.
+
+    Safe to call with no GPU. Returns the applied-defaults dict (empty if no
+    model class matched or no defaults were produced). Never raises for
+    missing/unknown config — falls back silently so a malformed or unsupported
+    checkpoint cannot crash LLM construction.
+    """
+    if not isinstance(llm_args, TorchLlmArgs):
+        return {}
+
+    config_path = Path(model_dir) / "config.json"
+    if not config_path.is_file():
+        logger.debug(
+            f"apply_early_model_defaults: no config.json at {config_path}; "
+            "skipping early defaults.")
+        return {}
+
+    # Pure-Python config read — no transformers, no torch, no GPU required.
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            hf_config = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.debug(
+            f"apply_early_model_defaults: failed to read {config_path}: {exc}; "
+            "skipping early defaults.")
+        return {}
+
+    # Validate parsed config is a JSON object (not e.g. a bare array).
+    if not isinstance(hf_config, dict):
+        logger.debug(
+            f"apply_early_model_defaults: config.json did not parse as a "
+            f"JSON object (got {type(hf_config).__name__}); "
+            "skipping early defaults.")
+        return {}
+
+    # Validate architectures is a nonempty list of strings.
+    architectures = hf_config.get("architectures")
+    if not (isinstance(architectures, list) and architectures
+            and all(isinstance(a, str) for a in architectures)):
+        model_type = hf_config.get("model_type") or "(unknown)"
+        logger.debug(
+            f"apply_early_model_defaults: config.json has no valid "
+            f"'architectures' list (model_type={model_type}); "
+            "cannot resolve a model class for early defaults.")
+        return {}
+
+    # Lazy import: the model registry lives under _torch.models and is only
+    # populated on demand. Importing it here does not pull in CUDA.
+    try:
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+    except Exception as exc:
+        logger.debug(
+            f"apply_early_model_defaults: cannot import model registry: {exc}; "
+            "skipping early defaults.")
+        return {}
+
+    model_cls = get_registered_model_class(architectures[0])
+    if model_cls is None:
+        logger.debug(
+            f"apply_early_model_defaults: no registered class for "
+            f"architecture {architectures[0]!r}; skipping early defaults.")
+        return {}
+
+    if not hasattr(model_cls, "get_model_defaults"):
+        return {}
+
+    try:
+        model_defaults = model_cls.get_model_defaults(llm_args) or {}
+    except Exception as exc:
+        logger.debug(
+            f"apply_early_model_defaults: {model_cls.__name__}.get_model_defaults "
+            f"raised {exc}; skipping early defaults.")
+        return {}
+
+    if not model_defaults:
+        return {}
+
+    try:
+        applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
+    except Exception as exc:
+        logger.debug(
+            f"apply_early_model_defaults: applying defaults for "
+            f"{model_cls.__name__} raised {exc}; skipping early defaults.")
+        return {}
+
+    if applied:
+        logger.info(
+            f"[early] Applied model defaults for {model_cls.__name__}: "
+            f"{applied}")
+    return applied
 
 
 def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
