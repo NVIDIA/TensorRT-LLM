@@ -19,11 +19,12 @@ of the table, such as the lender, never look into the manager."""
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-from .page_layout import PageLayout, RankTopology, ShardDesc
+from .page_layout import PageLayout, RankTopology, ShardDesc, layout_from_dict, layout_to_dict
 
 if TYPE_CHECKING:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, SsmLayerConfig
@@ -81,6 +82,51 @@ class ManagerLayout:
     def pool_groups(self) -> tuple[int, ...]:
         """The device pool groups, sorted; staging regions follow this order."""
         return tuple(sorted(self.device_pools))
+
+
+def page_table_to_dict(table: ManagerLayout) -> dict:
+    """``table`` as plain values (dicts, lists, ints, strings) for a peer, which
+    ``page_table_from_dict`` reads back; its page layout as ``layout_to_dict`` writes it."""
+    data: dict[str, Any] = {}
+    for f in dataclasses.fields(table):
+        value = getattr(table, f.name)
+        if f.name == "page_layout":
+            value = layout_to_dict(value)
+        elif f.name == "device_pools":
+            value = {int(g): [list(dataclasses.astuple(p)) for p in ps] for g, ps in value.items()}
+        elif f.name == "page_bytes":
+            value = {int(g): int(n) for g, n in value.items()}
+        else:
+            value = _lists(value)
+        data[f.name] = value
+    return data
+
+
+def page_table_from_dict(data: Mapping) -> ManagerLayout:
+    """The page table ``page_table_to_dict`` wrote."""
+    values: dict[str, Any] = {}
+    for f in dataclasses.fields(ManagerLayout):
+        if f.name not in data:
+            continue
+        value = data[f.name]
+        if f.name == "page_layout":
+            value = layout_from_dict(value)
+        elif f.name == "device_pools":
+            value = {int(g): tuple(DevicePool(*p) for p in ps) for g, ps in value.items()}
+        elif f.name == "page_bytes":
+            value = {int(g): int(n) for g, n in value.items()}
+        else:
+            value = _tuples(value)
+        values[f.name] = value
+    return ManagerLayout(**values)
+
+
+def _lists(value: Any) -> Any:
+    return [_lists(v) for v in value] if isinstance(value, (tuple, list)) else value
+
+
+def _tuples(value: Any) -> Any:
+    return tuple(_tuples(v) for v in value) if isinstance(value, (tuple, list)) else value
 
 
 def virtual_layers(

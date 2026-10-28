@@ -2774,28 +2774,21 @@ def test_a_held_attention_commit_catches_up_without_a_fetch(kit, real_manager):
 def test_a_state_group_s_regions_are_the_pools_native_names_and_its_row_the_state_slot(
     kit, hybrid_manager
 ):
-    from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
-        build_page_table_from_manager,
-    )
-    from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
-
     with hybrid_manager() as mgr:
         lender = attach(mgr)
         assert kit.staging_regions(lender) == ()
         lg = state_group(mgr)
-        page_table = build_page_table_from_manager(mgr)
-        native = page_table.layer_groups[lg]
-        assert native.kind == CacheKind.STATE
-        pools = sorted(
-            page_table.pool_groups[native.pool_group_idx].pools, key=lambda p: int(p.base_address)
-        )
+        page_table = mgr.get_page_table()
+        native = page_table.page_layout.layer_groups[lg]
+        assert native.kind == "state"
+        pools = sorted(page_table.device_pools[native.pool_group], key=lambda p: int(p.base))
         source = computed_to(mgr, kit.make_request(SOURCE, PROMPT), len(PROMPT))
         lease = lender.lend_read(source, 0, len(PROMPT), **kit.DEVICE_ALL)
         view = kit.ready_view(lease, mgr)
         run = next(g for g in view.groups if g.layer_group_index == lg)
         regions = sorted((lender.regions[r] for r in run.region_indices), key=lambda r: r.address)
         assert [(r.address, r.slot_bytes, r.slot_count) for r in regions] == [
-            (int(p.base_address), int(p.slot_bytes), int(p.num_slots)) for p in pools
+            (int(p.base), int(p.slot_bytes), int(p.num_slots)) for p in pools
         ]
         slot = kit.kv(mgr, source).get_ssm_block_base_index(lg)
         assert run.page_ordinals.tolist() == [0] and run.slots.tolist() == [slot]
@@ -3189,9 +3182,6 @@ def test_a_csa2_receive_of_every_row_lends_each_group_what_native_receives(
 ):
     """Each CSA2 group receives its retained pages beyond its independently restored prefix."""
     from tensorrt_llm._torch.disaggregation.resource.cache_reuse import _CacheReuseAdapterV2
-    from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
-        build_page_table_from_manager,
-    )
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
     from tensorrt_llm.bindings import SamplingConfig
     from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
@@ -3236,13 +3226,13 @@ def test_a_csa2_receive_of_every_row_lends_each_group_what_native_receives(
         assert lease.failure is None, lease.failure
         view = kit.ready_view(lease, mgr)
         lent = {run.layer_group_index: run.page_ordinals.tolist() for run in view.groups}
-        page_table = build_page_table_from_manager(mgr)
+        groups = mgr.get_page_table().page_layout.layer_groups
         cached = _CacheReuseAdapterV2(mgr).get_cached_token_count_per_layer_group(
-            target, page_table.layer_groups
+            target, len(groups)
         )
         native = {
-            lg: kept_page_ordinals(group.sliding_window_size, prompt, tpb, cached[lg])
-            for lg, group in enumerate(page_table.layer_groups)
+            lg: kept_page_ordinals(group.kept_window, prompt, tpb, cached[lg])
+            for lg, group in enumerate(groups)
         }
         assert lent == native, (policy, lent, native, cached)
         bounds = return_write(lender, target, lease, view.row_masks(True))
@@ -3256,9 +3246,6 @@ def test_a_csa2_remote_tail_source_lends_what_native_sends_once_its_context_is_c
     kit, monkeypatch, tail
 ):
     """A completed remote-tail source lends each group's retained pages below the tail."""
-    from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
-        build_page_table_from_manager,
-    )
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
     from tensorrt_llm.bindings import SamplingConfig
 
@@ -3286,10 +3273,9 @@ def test_a_csa2_remote_tail_source_lends_what_native_sends_once_its_context_is_c
         assert lease.failure is None, lease.failure
         view = kit.ready_view(lease, mgr)
         lent = {run.layer_group_index: run.page_ordinals.tolist() for run in view.groups}
-        page_table = build_page_table_from_manager(mgr)
         native = {
-            lg: kept_page_ordinals(group.sliding_window_size, tail, tpb)
-            for lg, group in enumerate(page_table.layer_groups)
+            lg: kept_page_ordinals(group.kept_window, tail, tpb)
+            for lg, group in enumerate(mgr.get_page_table().page_layout.layer_groups)
         }
         assert lent == native, (lent, native)
         windowed = [

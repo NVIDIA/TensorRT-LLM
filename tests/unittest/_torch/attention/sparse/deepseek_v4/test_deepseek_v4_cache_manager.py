@@ -32,10 +32,6 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
-    KVRegionExtractorV1,
-    build_page_table_from_manager,
-)
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import (
     Nvfp4ColdPageQuantizationCompression,
 )
@@ -1925,8 +1921,8 @@ class TestDeepseekV4CacheManager:
         )
 
         try:
-            page_table = build_page_table_from_manager(cache_manager)
-            transferred = [b for b in page_table.layout.buffers if b.transferred]
+            page_table = cache_manager.get_page_table()
+            transferred = [b for b in page_table.page_layout.buffers if b.transferred]
             assert transferred
             for buffer in transferred:
                 # Roles carry the manager-native names, all DSv4 attention-type names like
@@ -1960,7 +1956,7 @@ class TestDeepseekV4CacheManager:
         try:
             ctx_rank_info = RankInfo.from_kv_cache_manager("ctx", ctx_cache_manager, 0)
             gen_rank_info = RankInfo.from_kv_cache_manager("gen", gen_cache_manager, 0)
-            registrar = PeerRegistrar(gen_rank_info, KVRegionExtractorV1(gen_cache_manager))
+            registrar = PeerRegistrar(gen_rank_info)
             registrar.register("ctx", 0, ctx_rank_info)
 
             assert registrar.get_kv_maps(ctx_rank_info)

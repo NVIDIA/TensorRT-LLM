@@ -101,7 +101,7 @@ def test_rank_info_roundtrip_with_aux_meta():
 
 
 def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch) -> None:
-    monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _: None)
+    monkeypatch.setattr(rank_info_module, "manager_page_table", lambda _: None)
     mapping = SimpleNamespace(
         rank=0,
         tp_size=1,
@@ -136,7 +136,7 @@ def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch) -> 
 def test_from_kv_cache_manager_preserves_attention_dp_on_attention_free_stage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _: None)
+    monkeypatch.setattr(rank_info_module, "manager_page_table", lambda _: None)
     mapping = SimpleNamespace(
         rank=1,
         tp_size=2,

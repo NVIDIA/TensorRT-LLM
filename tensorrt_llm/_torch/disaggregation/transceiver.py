@@ -56,6 +56,7 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
 )
+from tensorrt_llm._torch.disaggregation.resource.utils import get_cache_kinds
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor import hang_detector
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
@@ -532,29 +533,28 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         manager = self._kv_cache_manager
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
-        layer_groups = self._page_table.layer_groups
+        kinds = get_cache_kinds(self._page_table)
         transfer_len = manager.disagg_transfer_length(req)
         prompt_blocks = (transfer_len + tpb - 1) // tpb
 
         is_gen_only = req.is_generation_only_request
         cached_per_lg = (
-            adapter.get_cached_token_count_per_layer_group(req, layer_groups)
+            adapter.get_cached_token_count_per_layer_group(req, len(kinds))
             if is_gen_only
-            else [0] * len(layer_groups)
+            else [0] * len(kinds)
         )
 
         empty = np.array([], dtype=np.int64)
         groups = []
-        kinds = [lg.kind for lg in layer_groups]
-        for idx, lg in enumerate(layer_groups):
-            if lg.kind == CacheKind.STATE:
+        for idx, kind in enumerate(kinds):
+            if kind == CacheKind.STATE:
                 slot = manager.disagg_state_slot(req)
                 group = np.array([slot], dtype=np.int64) if slot is not None else empty
             else:
                 # Block lists carry beam 0 only (beam-search attention reads
                 # prompt positions through beam 0's block table), so the
                 # positional path applies to every beam width.
-                ordinals = adapter.get_block_ordinals(req, idx, lg)
+                ordinals = adapter.get_block_ordinals(req, idx)
                 group = self._positional_window(ordinals, prompt_blocks, cached_per_lg[idx] // tpb)
             groups.append(group)
 
@@ -595,7 +595,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         pt = self._page_table
         if pt is None:
             return 0
-        layout = pt.layout
+        layout = pt.page_layout
         total = 0
         for lg_id, block_ids in enumerate(chunk.block_ids_per_layer_groups):
             if block_ids is None or block_ids.size == 0:
@@ -614,9 +614,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             )
             # STATE: one slot per request, moved once whatever the block count; attention: n
             # blocks.
-            total += (
-                page_bytes if pt.layer_groups[lg_id].kind == CacheKind.STATE else n * page_bytes
-            )
+            total += page_bytes if desc.kind == "state" else n * page_bytes
         return total
 
     @staticmethod
@@ -1017,8 +1015,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         all_block_ids = whole.block_ids_per_layer_groups
         chunk_block_ids = []
         assert self._page_table is not None
-        for lg, block_ids in zip(self._page_table.layer_groups, all_block_ids):
-            window_size = getattr(lg, "sliding_window_size", None)
+        for desc, block_ids in zip(self._page_table.page_layout.layer_groups, all_block_ids):
+            window_size = desc.kept_window
             if window_size is not None and window_size < req.prompt_len:
                 # SWA pages can leave the active window between chunks. Defer
                 # the group and send its complete final active window at once.

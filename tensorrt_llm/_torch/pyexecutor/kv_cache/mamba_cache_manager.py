@@ -968,8 +968,8 @@ class PythonMambaCacheManager(BaseResourceManager):
         """Seed the fused-verify KDA replay conv caches from the conv pool.
 
         On a disaggregated generation server the ctx->gen transfer populates
-        only the base ``conv`` / ``temporal`` pools (see
-        ``disaggregation/resource/page.py``); the per-slot ``kda_conv_*``
+        only the base ``conv`` / ``temporal`` pools (the KDA replay buffers
+        are untransferred, see ``_page_untransferred_roles``); the per-slot ``kda_conv_*``
         replay caches consumed by ``trtllm::kda_mtp_decode`` are normally
         seeded by a *local* prefill/decode via
         ``_sync_kda_replay_conv_window`` and would otherwise hold zeros (or a

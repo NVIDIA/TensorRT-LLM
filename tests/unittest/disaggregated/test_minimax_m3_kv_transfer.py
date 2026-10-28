@@ -35,8 +35,7 @@ import torch
 
 from tensorrt_llm import Mapping
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3KVCacheManagerV2
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool, get_pool_bytes
+from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import head_major, replicated, token_major
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
@@ -255,12 +254,9 @@ def test_minimax_m3_buffer_placement_coalesced_vs_separate() -> None:
     stride). TP=1 doubles K/V, so index-K gets its own pool and strides are
     uniform.
     """
-    from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
-        build_page_table_from_manager,
-    )
 
     def transferred(manager):
-        layout = build_page_table_from_manager(manager).layout
+        layout = manager.get_page_table().page_layout
         return {(b.layer, b.role): b for b in layout.buffers if b.transferred}
 
     key, value, index = str(Role.KEY), str(Role.VALUE), str(Role.INDEX_KEY)
@@ -331,12 +327,11 @@ def _create_managers(
 
 
 def _zero_physical_pools(manager: MiniMaxM3KVCacheManagerV2) -> None:
-    page_table = KVRegionExtractorV1(manager).page_table
     unique_pools = {}
-    for pool_group in page_table.pool_groups:
-        for pool in pool_group.pools:
-            unique_pools[pool.base_address] = max(
-                unique_pools.get(pool.base_address, 0), get_pool_bytes(pool)
+    for pools in manager.get_page_table().device_pools.values():
+        for pool in pools:
+            unique_pools[pool.base] = max(
+                unique_pools.get(pool.base, 0), pool.slot_bytes * pool.num_slots
             )
     for base_address, size in unique_pools.items():
         tensor = convert_to_torch_tensor(TensorWrapper(base_address, DataType.INT8, [size]))
@@ -348,19 +343,19 @@ def _get_nvfp4_scale_view(
 ) -> torch.Tensor | None:
     if not manager.is_nvfp4_layer(layer_idx):
         return None
-    page_table = KVRegionExtractorV1(manager).page_table
+    page_table = manager.get_page_table()
     local_layer_id = manager.layer_offsets[layer_idx]
     scale_roles = frozenset({"key_block_scale", "value_block_scale"})
-    for layer_group_id, layer_group in enumerate(page_table.layer_groups):
-        global_of = {ll.local_layer_id: ll.global_layer_id for ll in layer_group.local_layers}
+    for layer_group_id, local_layers in enumerate(page_table.local_layers):
+        global_of = dict(local_layers)
         if local_layer_id not in global_of:
             continue
-        desc = page_table.layout.layer_groups[layer_group_id]
+        desc = page_table.page_layout.layer_groups[layer_group_id]
         # Scale buffers land in their own pool (smaller size class); the layer's scale buffers
         # lie back to back within its slot.
         scales = [
             b
-            for b in page_table.layout.buffers
+            for b in page_table.page_layout.buffers
             if b.role in scale_roles
             and b.pool_group == desc.pool_group
             and b.layer == global_of[local_layer_id]
@@ -371,7 +366,7 @@ def _get_nvfp4_scale_view(
         pool = get_physical_pool(page_table, layer_group_id, pool_index)
         raw_slots = convert_to_torch_tensor(
             TensorWrapper(
-                pool.base_address,
+                pool.base,
                 DataType.INT8,
                 [pool.num_slots, pool.slot_bytes],
             )

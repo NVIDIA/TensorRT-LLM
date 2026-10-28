@@ -12,9 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Native page tables built from hand-written page layouts, as a manager's are built."""
+"""Manager page tables built around hand-written page layouts."""
 
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import page_table_from_layout
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import DevicePool, ManagerLayout
 
 
@@ -48,8 +47,3 @@ def manager_layout(layout, pool_bases, kv_heads=0, num_slots=128):
         local_layers=tuple(tuple(enumerate(g.layers)) for g in groups),
         kv_heads=tuple(kv_heads if g.kind == "attention" else 0 for g in groups),
     )
-
-
-def native_page_table(layout, pool_bases, *, kv_heads=0, num_slots=128):
-    """Native's page table of ``manager_layout(layout, ...)`` (``page_table_from_layout``)."""
-    return page_table_from_layout(manager_layout(layout, pool_bases, kv_heads, num_slots))

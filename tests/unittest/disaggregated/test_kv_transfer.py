@@ -59,7 +59,6 @@ from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -277,8 +276,8 @@ def _send_prefill_chunks(
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
-    transceiver._page_table.layer_groups = [
-        SimpleNamespace(sliding_window_size=None) for _ in all_block_ids
+    transceiver._page_table.page_layout.layer_groups = [
+        SimpleNamespace(kept_window=None) for _ in all_block_ids
     ]
     transceiver._send_reqs = {}
 
@@ -341,7 +340,7 @@ def test_build_prefill_chunk_slices_chunk_window_from_whole_prompt():
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._kv_cache_manager.kv_cache_map = {}
-    transceiver._page_table.layer_groups = [SimpleNamespace(sliding_window_size=None)]
+    transceiver._page_table.page_layout.layer_groups = [SimpleNamespace(kept_window=None)]
     transceiver._send_reqs = {}
     # A full-attention group keeps the whole prompt resident from block 0, so
     # _describe_local describes every block regardless of prefill progress.
@@ -394,21 +393,21 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     prompt_blocks = 16
     window_blocks = 4
 
-    layer_group = SimpleNamespace(
-        kind=CacheKind.PAGED, sliding_window_size=window_blocks * tokens_per_block
-    )
+    layer_group = SimpleNamespace(kind="attention", kept_window=window_blocks * tokens_per_block)
 
-    def _unexpected_get_block_ids(req, idx, lg):
+    def _unexpected_get_block_ids(req, idx):
         raise AssertionError("context-side transfer must use get_block_ordinals, not get_block_ids")
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
-        get_cached_token_count_per_layer_group=lambda req, layer_groups: [0],
+        get_cached_token_count_per_layer_group=lambda req, num_layer_groups: [0],
         get_block_ids=_unexpected_get_block_ids,
-        get_block_ordinals=lambda req, idx, lg: source_block_ids,
+        get_block_ordinals=lambda req, idx: source_block_ids,
     )
-    transceiver._page_table = SimpleNamespace(layer_groups=[layer_group])
+    transceiver._page_table = SimpleNamespace(
+        page_layout=SimpleNamespace(layer_groups=[layer_group])
+    )
     transceiver._kv_cache_manager = SimpleNamespace(
         tokens_per_block=tokens_per_block,
         num_extra_kv_tokens=0,
@@ -605,13 +604,13 @@ def create_transfer_worker_setup(
         )
         # V2: Initialize pools using page_table
         random_seed = 0 if is_mla else None
-        page_table = KVRegionExtractorV1(ctx_kv_cache_manager).page_table
+        page_table = ctx_kv_cache_manager.get_page_table()
 
-        # Collect unique pools (deduplicate by base_address)
-        unique_pools = {}  # base_address -> pool_bytes
-        for pg in page_table.pool_groups:
-            for pool_desc in pg.pools:
-                key = pool_desc.base_address
+        # Collect unique pools (deduplicate by base address)
+        unique_pools = {}  # base address -> pool_bytes
+        for pools in page_table.device_pools.values():
+            for pool_desc in pools:
+                key = pool_desc.base
                 pool_bytes = pool_desc.slot_bytes * pool_desc.num_slots
                 if key not in unique_pools or pool_bytes > unique_pools[key]:
                     unique_pools[key] = pool_bytes
@@ -688,11 +687,11 @@ def create_transfer_worker_setup(
             vocab_size=vocab_size,
         )
         # Initialize gen pool to zeros to verify transfer correctness
-        gen_page_table = KVRegionExtractorV1(gen_kv_cache_manager).page_table
+        gen_page_table = gen_kv_cache_manager.get_page_table()
         gen_unique_pools = {}
-        for pg in gen_page_table.pool_groups:
-            for pool_desc in pg.pools:
-                key = pool_desc.base_address
+        for pools in gen_page_table.device_pools.values():
+            for pool_desc in pools:
+                key = pool_desc.base
                 pool_bytes = pool_desc.slot_bytes * pool_desc.num_slots
                 if key not in gen_unique_pools or pool_bytes > gen_unique_pools[key]:
                     gen_unique_pools[key] = pool_bytes
@@ -816,7 +815,7 @@ def get_block_ids_per_layer_groups(
     prompt_blocks = (prompt_len + tokens_per_block - 1) // tokens_per_block
     tables: List[np.ndarray] = []
 
-    for group_id, group_meta in enumerate(page_table.layer_groups):
+    for group_id in range(len(page_table.page_layout.layer_groups)):
         ordinals = list(
             kv_cache_manager.kv_cache_map[request_id].get_aggregated_page_indices(
                 group_id, valid_only=False
@@ -1548,7 +1547,9 @@ def test_session_cancel_after_send():
         # avoid depending on KVCacheManager's sequence-management API (which
         # changed shape across versions).
         page_table = ctx_transfer_worker._rank_info.page_table
-        block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
+        block_ids_per_groups = [
+            np.array([], dtype=np.int64) for _ in page_table.page_layout.layer_groups
+        ]
         kv_slice = Chunk(
             block_ids_per_layer_groups=block_ids_per_groups,
             kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
@@ -1795,7 +1796,9 @@ def test_session_has_transferring_tasks_false():
 
         # TxSession: after send(), task is INIT (no receiver → not yet dispatched)
         page_table = ctx_transfer_worker._rank_info.page_table
-        block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
+        block_ids_per_groups = [
+            np.array([], dtype=np.int64) for _ in page_table.page_layout.layer_groups
+        ]
         kv_slice = Chunk(
             block_ids_per_layer_groups=block_ids_per_groups,
             kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
@@ -1882,7 +1885,9 @@ def test_incompatible_peer_fails_only_affected_requests(
     # empty per-layer-group block lists suffice (no KV sequence needed).
     page_table = gen_tw._rank_info.page_table
     empty_slice = Chunk(
-        block_ids_per_layer_groups=[np.array([], dtype=np.int64) for _ in page_table.layer_groups],
+        block_ids_per_layer_groups=[
+            np.array([], dtype=np.int64) for _ in page_table.page_layout.layer_groups
+        ],
         kind_per_layer_group=[CacheKind.PAGED],
         token_range=TokenRange(start=0, end=0),
         is_last=True,

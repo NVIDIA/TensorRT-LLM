@@ -23,8 +23,6 @@ from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxTransferLayout
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.runs import RunsMapper
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable
 from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
     BufferRuns,
     check_compatible,
@@ -35,6 +33,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
     sent_bytes,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import PageLayout
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ManagerLayout
 
 # (layer group index, pool index within the layer group's pool group)
 LGPoolKey = Tuple[int, int]
@@ -51,15 +50,13 @@ class PeerOverlap:
 
 
 class PeerRegistrar:
-    def __init__(self, self_rank_info: RankInfo, self_extractor: KVRegionExtractorV1):
+    def __init__(self, self_rank_info: RankInfo):
         self._ri = self_rank_info
         self._peer_ri_cache: Dict[str, RankInfo] = {}
         # (peer_key, excluded buffers) -> what this rank sends that peer rank, by pool pair.
         self._kv_map_cache: Dict[tuple, Dict[PoolPair, RunsMapper]] = {}
         # peer_key -> what this rank sends that peer rank, buffer by buffer, by pool pair.
         self._buffer_runs_cache: Dict[str, Dict[PoolPair, List[BufferRuns]]] = {}
-        self._self_ext_cache = self_extractor
-        self._peer_ext_cache: Dict[str, KVRegionExtractorV1] = {}
         self._overlap_cache: Dict[str, PeerOverlap] = {}
         # peer_key of a rank writing this rank's pages -> what it sends per page of each of this
         # rank's layer groups.
@@ -67,28 +64,24 @@ class PeerRegistrar:
         self._aux_transfer_layout_cache: Dict[str, AuxTransferLayout] = {}
 
     def register(self, peer_name: str, peer_rank: int, peer_ri: RankInfo):
-        assert self._self_ext_cache is not None
         self.check_peer_compatible(peer_ri)
         key = self._unique_key(peer_name, peer_rank)
         self._peer_ri_cache[key] = peer_ri
         self._aux_transfer_layout_cache.pop(key, None)
-        peer_ri = self.get_peer_rank_info(peer_name, peer_rank)
-        extractor = KVRegionExtractorV1(peer_ri.page_table)
-        self._peer_ext_cache[key] = extractor
         self._warn_fragmented_pages(peer_ri)
 
     def _warn_fragmented_pages(self, peer_ri: RankInfo) -> None:
         """Warn when the paged buffers this rank sends the peer move in more fragments than there
         are buffers: the two sides order a buffer's bytes differently, such as token-major KV over
         different head counts, and every page then costs that many transfer descriptors."""
-        own = self._self_ext_cache.page_table
+        own = _layout_of(self._ri.page_table)
         maps = self.get_kv_maps(peer_ri)
         runs = self._buffer_runs_cache[
             self._unique_key(peer_ri.instance_name, peer_ri.instance_rank)
         ]
         buffers = fragments = 0
         for pair, mapper in maps.items():
-            if own.layer_groups[pair[0][0]].kind == CacheKind.PAGED:
+            if own.layer_groups[pair[0][0]].kind == "attention":
                 buffers += len(runs[pair])
                 fragments += mapper.runs_per_slot
         if fragments > buffers:
@@ -101,20 +94,10 @@ class PeerRegistrar:
                 key=f"native-fragmented-pages-{fragments}-{buffers}",
             )
 
-    def peer_extractor(self, peer_name: str, peer_rank: int) -> KVRegionExtractorV1:
-        return self._peer_ext_cache[self._unique_key(peer_name, peer_rank)]
-
-    @property
-    def self_extractor(self) -> KVRegionExtractorV1:
-        assert self._self_ext_cache is not None
-        return self._self_ext_cache
-
     def unregister(self, peer_name: str, peer_rank: int):
         key = self._unique_key(peer_name, peer_rank)
         if key in self._peer_ri_cache:
             del self._peer_ri_cache[key]
-        if key in self._peer_ext_cache:
-            del self._peer_ext_cache[key]
         self._aux_transfer_layout_cache.pop(key, None)
         # Clean up kv_map_cache entries for this peer
         keys_to_remove = [k for k in self._kv_map_cache if k[0] == key]
@@ -167,9 +150,7 @@ class PeerRegistrar:
                 "PeerRegistrar: context parallelism on both sides is unsupported "
                 f"(local cp_size={self._ri.cp_size}, peer cp_size={peer_ri.cp_size})"
             )
-        check_compatible(
-            _layout_of(self._self_ext_cache.page_table), _layout_of(peer_ri.page_table)
-        )
+        check_compatible(_layout_of(self._ri.page_table), _layout_of(peer_ri.page_table))
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
@@ -192,7 +173,7 @@ class PeerRegistrar:
             ValueError: If the writer's pages do not correspond to this rank's, or the ranks it
                 pairs with leave this rank's short (``map_buffers``).
         """
-        own = _layout_of(self._self_ext_cache.page_table)
+        own = _layout_of(self._ri.page_table)
         theirs = _layout_of(writer.page_table)
         check_compatible(theirs, own)
         share = sent_bytes(theirs, own, key=self._ri.dp_rank)
@@ -221,7 +202,7 @@ class PeerRegistrar:
 
         runs = self._buffer_runs_cache.get(peer_key)
         if runs is None:
-            own = _layout_of(self._self_ext_cache.page_table)
+            own = _layout_of(self._ri.page_table)
             peer = _layout_of(peer_ri.page_table)
             own_group, peer_group = layer_group_of(own), layer_group_of(peer)
             runs = defaultdict(list)
@@ -326,11 +307,11 @@ class PeerRegistrar:
         return False
 
 
-def _layout_of(page_table: Optional[KVCachePageTable]) -> PageLayout:
-    """The page layout a page table carries."""
-    if page_table is None or page_table.layout is None:
+def _layout_of(page_table: Optional[ManagerLayout]) -> PageLayout:
+    """The page layout of a rank's page table."""
+    if page_table is None:
         raise ValueError(
-            "PeerRegistrar: a page table carries no page layout; build it from the manager's page "
-            "table (build_page_table_from_manager)"
+            "PeerRegistrar: a rank info carries no page table; build it from the manager "
+            "(KVCacheManagerV2.get_page_table)"
         )
-    return page_table.layout
+    return page_table.page_layout

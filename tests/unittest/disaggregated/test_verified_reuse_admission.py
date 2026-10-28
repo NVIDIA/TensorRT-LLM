@@ -32,7 +32,7 @@ from unittest.mock import MagicMock, Mock
 
 import numpy as np
 import pytest
-from layout_test_utils import native_page_table
+from layout_test_utils import manager_layout
 
 import tensorrt_llm._torch.disaggregation.native.bounce as bounce_mod
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
@@ -47,8 +47,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     RxSession,
     TaskStatus,
 )
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
+from tensorrt_llm._torch.disaggregation.resource.utils import slot_pointers
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
@@ -58,6 +57,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     replicated,
     token_major,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ManagerLayout
 
 pytestmark = pytest.mark.cpu_only
 
@@ -413,7 +413,7 @@ def _make_block_chunk(num_blocks: int) -> Chunk:
     )
 
 
-def _attention_page_table(buffers, slot_units: int) -> KVCachePageTable:
+def _attention_page_table(buffers, slot_units: int) -> ManagerLayout:
     """One attention layer group of layers 0 to 3 over one pool of ``slot_units`` units."""
     layout = PageLayout(
         tokens_per_page=16,
@@ -421,10 +421,10 @@ def _attention_page_table(buffers, slot_units: int) -> KVCachePageTable:
         layer_groups=(LayerGroupDesc("attention", None, 0, 0, (0, 1, 2, 3)),),
         buffers=tuple(buffers),
     )
-    return native_page_table(layout, {0: [0x10000]}, kv_heads=1, num_slots=8)
+    return manager_layout(layout, {0: [0x10000]}, kv_heads=1, num_slots=8)
 
 
-def _coalesced_page_table() -> KVCachePageTable:
+def _coalesced_page_table() -> ManagerLayout:
     """Coalesced-pool page table mirroring the MiniMax M3 TP=2 layout.
 
     K == V == index-K bytes per block, so V2 coalesces all three roles into
@@ -452,7 +452,7 @@ _KV_BUFFERS = frozenset((layer, role) for layer in range(4) for role in ("key", 
 _INDEX_BUFFERS = frozenset({(1, "index_key")})
 
 
-def _ignored_role_page_table() -> KVCachePageTable:
+def _ignored_role_page_table() -> ManagerLayout:
     """Page table whose slot holds regions no transfer moves.
 
     The slot interleaves a local-only buffer after each layer's K region
@@ -469,29 +469,29 @@ def _ignored_role_page_table() -> KVCachePageTable:
     return _attention_page_table(buffers, 4)
 
 
-def _expected_write_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:
+def _expected_write_bytes(page_table: ManagerLayout, chunk: Chunk) -> int:
     """The receiver-side expectation, exactly as the transceiver computes it."""
     return KvCacheTransceiverV2._chunk_num_bytes(SimpleNamespace(_page_table=page_table), chunk)
 
 
-def _summed_sender_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:
+def _summed_sender_bytes(page_table: ManagerLayout, chunk: Chunk) -> int:
     """Destination bytes a matched-layout sender submits for *chunk*.
 
-    The extract -> get_kv_maps -> WriteMeta.sizes path of
+    The slot_pointers -> get_kv_maps -> WriteMeta.sizes path of
     Sender._build_kv_write_meta, run per pool pair against itself as the
     peer. This is the quantity each writer attests on completion and the
     receiver sums into verified_write_bytes.
     """
-    extractor = KVRegionExtractorV1(page_table)
-    registrar = PeerRegistrar(SimpleNamespace(), extractor)
+    registrar = PeerRegistrar(SimpleNamespace(page_table=page_table))
     peer = SimpleNamespace(page_table=page_table, instance_name="peer", instance_rank=0, dp_rank=0)
     total = 0
     maps = registrar.get_kv_maps(peer, excluded=chunk.excluded_buffers)
     for ((lg_idx, pool_idx), _), mapper in maps.items():
-        region = extractor.extract(chunk.block_ids_per_layer_groups[lg_idx], lg_idx, pool_idx)
-        pairs = mapper.map(region, region)
-        for pair in pairs if isinstance(pairs, list) else [pairs]:
-            total += int(pair.src.memory.ptrs.size) * int(pair.src.memory.bytes_per_region)
+        bases = slot_pointers(
+            page_table, lg_idx, pool_idx, chunk.block_ids_per_layer_groups[lg_idx]
+        )
+        for src, _, size in mapper.map(bases, bases):
+            total += int(src.size) * size
     return total
 
 

@@ -17,7 +17,6 @@ from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.transfer import RecvReqInfo, Sender
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import create_cache_reuse_adapter
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import map_buffers
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
@@ -80,7 +79,7 @@ def _request(request_id: int, length: int, source: bool) -> LlmRequest:
 def _slice(manager: CSA2CacheManager, request: LlmRequest):
     transceiver = KvCacheTransceiverV2.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
-    transceiver._page_table = KVRegionExtractorV1(manager).page_table
+    transceiver._page_table = manager.get_page_table()
     transceiver._reuse_adapter = create_cache_reuse_adapter(manager)
     return transceiver._create_chunk(request)
 
@@ -159,7 +158,7 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
                 "generation", target, torch.cuda.current_device()
             ).to_bytes()
         )
-        registrar = PeerRegistrar(source_info, KVRegionExtractorV1(source))
+        registrar = PeerRegistrar(source_info)
         for info, dp_rank in ((source_info, source_dp_rank), (target_info, target_dp_rank)):
             assert info.instance_rank == info.tp_rank == info.dp_rank == (dp_rank or 0)
             assert info.tp_size == info.dp_size == (4 if dp_rank is not None else 1)
@@ -169,13 +168,15 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
         assert registrar.get_peer_overlap(target_info, target_info.dp_rank).ranks == [
             target_info.instance_rank
         ]
-        receiver_registrar = PeerRegistrar(target_info, KVRegionExtractorV1(target))
+        receiver_registrar = PeerRegistrar(target_info)
         assert receiver_registrar.get_peer_overlap(source_info, source_info.dp_rank).ranks == [
             source_info.instance_rank
         ]
         assert registrar.get_kv_maps(target_info)
         runs = map_buffers(
-            source_info.page_table.layout, target_info.page_table.layout, key=target_info.dp_rank
+            source_info.page_table.page_layout,
+            target_info.page_table.page_layout,
+            key=target_info.dp_rank,
         )
         # Every buffer that moves is alike on every rank, so each moves whole to its counterpart.
         assert all(not r.src.split and not r.dst.split for r in runs)

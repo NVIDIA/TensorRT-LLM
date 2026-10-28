@@ -57,11 +57,6 @@ import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
-    KVRegionExtractorV1,
-    build_page_table_from_manager,
-)
-from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
 from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_params
 from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import check_compatible, sent_bytes
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
@@ -184,15 +179,16 @@ def _create_kda_managers(
     return managers
 
 
-def _get_mamba_layer_group(page_table) -> MambaLayerGroup:
-    mlgs = [lg for lg in page_table.layer_groups if isinstance(lg, MambaLayerGroup)]
-    assert len(mlgs) == 1, f"expected exactly one MambaLayerGroup, got {len(mlgs)}"
-    return mlgs[0]
+def _state_group(page_table) -> int:
+    """The index of the page table's one recurrent-state layer group."""
+    groups = [i for i, g in enumerate(page_table.page_layout.layer_groups) if g.kind == "state"]
+    assert len(groups) == 1, f"expected exactly one state layer group, got {len(groups)}"
+    return groups[0]
 
 
 def _state_buffer(page_table, role):
     """The page layout's ``role`` buffer of the first recurrent layer."""
-    return next(b for b in page_table.layout.buffers if b.role == str(role))
+    return next(b for b in page_table.page_layout.buffers if b.role == str(role))
 
 
 # ---------------------------------------------------------------------------
@@ -203,8 +199,8 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
     """V2 page table must describe BOTH KDA slots with exact byte extents."""
     mgr = _create_kda_managers(1, enable_attention_dp=enable_attention_dp)[0]
     try:
-        pt = build_page_table_from_manager(mgr)
-        mlg = _get_mamba_layer_group(pt)
+        pt = mgr.get_page_table()
+        state = _state_group(pt)
 
         layer_id = next(iter(mgr.mamba_layer_offsets))
         conv = mgr.get_conv_states(layer_id)
@@ -233,14 +229,14 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
         assert ssm_buffer.size // head.held == KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
         assert head.held == KDA_NUM_HEADS
 
-        # local_layers cover exactly the KDA layers (by global_layer_id).
-        assert sorted(ll.global_layer_id for ll in mlg.local_layers) == [
+        # The state group holds exactly the KDA layers (by global layer id).
+        assert sorted(pt.page_layout.layer_groups[state].layers) == [
             i for i, m in enumerate(_KDA_MASK) if m
         ]
 
         # Matched-parallelism payload: a receiver receives
         # NUM_KDA_LAYERS * (conv + ssm) of recurrent state.
-        payload = sent_bytes(pt.layout, pt.layout)[pt.layer_groups.index(mlg)]
+        payload = sent_bytes(pt.page_layout, pt.page_layout)[state]
         assert payload == NUM_KDA_LAYERS * (CONV_SLOT_BYTES + SSM_SLOT_BYTES)
     finally:
         mgr.shutdown()
@@ -259,8 +255,8 @@ def test_kda_hetero_tp_sharded_accepted():
     gen_mgrs = _create_kda_managers(4, enable_attention_dp=False)
     ctx_mgr, gen_mgr = ctx_mgrs[0], gen_mgrs[1]
     try:
-        ctx_pt = build_page_table_from_manager(ctx_mgr)
-        gen_pt = build_page_table_from_manager(gen_mgr)
+        ctx_pt = ctx_mgr.get_page_table()
+        gen_pt = gen_mgr.get_page_table()
 
         # Production per-rank slots are the global sizes divided by tp.
         ctx_conv_bpl = _state_buffer(ctx_pt, MambaRole.CONV_STATE).size
@@ -274,10 +270,10 @@ def test_kda_hetero_tp_sharded_accepted():
 
         ctx_ri = RankInfo.from_kv_cache_manager("kda_ctx", ctx_mgr, device_id=0)
         gen_ri = RankInfo.from_kv_cache_manager("kda_gen", gen_mgr, device_id=0)
-        check_compatible(ctx_pt.layout, gen_pt.layout)
+        check_compatible(ctx_pt.page_layout, gen_pt.page_layout)
 
         # And via the registrar entry point used at runtime.
-        registrar = PeerRegistrar(ctx_ri, KVRegionExtractorV1(ctx_pt))
+        registrar = PeerRegistrar(ctx_ri)
         registrar.register("kda_gen", 1, gen_ri)
     finally:
         for mgr in ctx_mgrs + gen_mgrs:
@@ -304,9 +300,9 @@ def test_kda_peer_validation_accepts_supported_shapes(ctx_cfg, gen_cfg):
     gen_mgrs = _create_kda_managers(gen_tp, enable_attention_dp=gen_adp)
     ctx_mgr, gen_mgr = ctx_mgrs[0], gen_mgrs[-1]
     try:
-        ctx_pt = build_page_table_from_manager(ctx_mgr)
-        gen_pt = build_page_table_from_manager(gen_mgr)
-        check_compatible(ctx_pt.layout, gen_pt.layout)
+        ctx_pt = ctx_mgr.get_page_table()
+        gen_pt = gen_mgr.get_page_table()
+        check_compatible(ctx_pt.page_layout, gen_pt.page_layout)
     finally:
         for mgr in ctx_mgrs + gen_mgrs:
             mgr.shutdown()

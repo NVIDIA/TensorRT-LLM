@@ -23,11 +23,10 @@ pools by role or by kind.
 from collections import defaultdict
 
 import pytest
-from layout_test_utils import native_page_table
+from layout_test_utils import manager_layout
 
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
     LayerGroupDesc,
@@ -76,7 +75,7 @@ def page_table(groups, topology=RankTopology()):
         g: [0x100000 * (g + 1) + 0x10000 * p for p in range(len(w))]
         for g, w in layout.pool_slot_bytes.items()
     }
-    return native_page_table(layout, bases)
+    return manager_layout(layout, bases)
 
 
 def rank(name, table, *, tp_size=1, tp_rank=0, layers=(2,)):
@@ -104,7 +103,7 @@ def rank(name, table, *, tp_size=1, tp_rank=0, layers=(2,)):
 
 def kv_maps(own, peer, excluded=frozenset()):
     """{pool pair: bytes per slot} of what ``own``'s rank sends ``peer``'s."""
-    maps = PeerRegistrar(own, KVRegionExtractorV1(own.page_table)).get_kv_maps(peer, excluded)
+    maps = PeerRegistrar(own).get_kv_maps(peer, excluded)
     return {pair: mapper.bytes_per_slot for pair, mapper in maps.items()}
 
 

@@ -25,7 +25,6 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     _CacheReuseAdapterV2,
 )
-from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
 pytestmark = pytest.mark.cpu_only
@@ -128,12 +127,7 @@ def _build_transceiver_for_kv_slice(
     modeled by prepending the manager-reported SWA holes, as V2 reports
     them via valid_only=False.
     """
-    layer_group = AttentionLayerGroup(
-        pool_group_idx=0,
-        kv_head_num_per_rank=1,
-        sliding_window_size=sliding_window_size,
-        local_layers=[LocalLayer(local_layer_id=0, global_layer_id=0)],
-    )
+    layer_group = SimpleNamespace(kind="attention", kept_window=sliding_window_size)
     total_blocks = (prompt_len + num_extra_kv_tokens + tokens_per_block - 1) // tokens_per_block
     if block_ids is None:
         block_ids = np.arange(total_blocks, dtype=np.int64)
@@ -145,7 +139,7 @@ def _build_transceiver_for_kv_slice(
     # valid window blocks, the speculative/scratch tail, and the ctx
     # first-token over-hang. `block_ids` here is the stale-stripped chain, so
     # prepend the -1 holes, as V2 reports via valid_only=False.
-    def get_block_ordinals(req, idx, lg):
+    def get_block_ordinals(req, idx):
         transfer_len = getattr(req, "py_csa2_remote_tail_start", None)
         if transfer_len is None:
             transfer_len = prompt_len
@@ -156,13 +150,13 @@ def _build_transceiver_for_kv_slice(
 
     reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
-        get_cached_token_count_per_layer_group=lambda req, layer_groups: (
-            [cached_tokens] * len(layer_groups)
+        get_cached_token_count_per_layer_group=lambda req, num_layer_groups: (
+            [cached_tokens] * num_layer_groups
         ),
-        get_block_ids=lambda req, idx, lg: block_ids,
+        get_block_ids=lambda req, idx: block_ids,
         get_block_ordinals=get_block_ordinals,
     )
-    page_table = SimpleNamespace(layer_groups=[layer_group])
+    page_table = SimpleNamespace(page_layout=SimpleNamespace(layer_groups=[layer_group]))
 
     def transfer_length(req):
         # A CSA2 manager under remote-tail replay moves the prompt before the remote tail.
@@ -200,9 +194,9 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     # Native lifecycle IDs, not physical pool IDs, index reuse_status. Two
     # distinct window groups can share a physical pool without sharing reuse.
     groups = [
-        AttentionLayerGroup(pool_group_idx=0, kv_head_num_per_rank=1),
-        AttentionLayerGroup(pool_group_idx=1, kv_head_num_per_rank=1, sliding_window_size=128),
-        AttentionLayerGroup(pool_group_idx=1, kv_head_num_per_rank=1, sliding_window_size=128),
+        SimpleNamespace(kind="attention", kept_window=None),
+        SimpleNamespace(kind="attention", kept_window=128),
+        SimpleNamespace(kind="attention", kept_window=128),
     ]
     pages = [[10, 11, 12], [-1, 21, 22], [-1, 31, 32]]
     cache = SimpleNamespace(
@@ -219,8 +213,8 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     )
     adapter = _CacheReuseAdapterV2(manager)
     transceiver._reuse_adapter = adapter
-    transceiver._page_table.layer_groups = groups
-    assert adapter.get_cached_token_count_per_layer_group(req, groups) == [
+    transceiver._page_table.page_layout.layer_groups = groups
+    assert adapter.get_cached_token_count_per_layer_group(req, len(groups)) == [
         256,
         256 if encoder_hit else 0,
         0,
@@ -234,14 +228,14 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     # A later commit must not make newly allocated, unreceived pages look like
     # an admission-time prefix hit.
     cache.num_committed_tokens = 384
-    assert adapter.get_cached_token_count_per_layer_group(req, groups)[0] == 256
+    assert adapter.get_cached_token_count_per_layer_group(req, len(groups))[0] == 256
     cache.reuse_status[1].complete = False  # manager declined an available OPTIONAL group
-    assert adapter.get_cached_token_count_per_layer_group(req, groups) == [256, 0, 0]
+    assert adapter.get_cached_token_count_per_layer_group(req, len(groups)) == [256, 0, 0]
     manager.enable_block_reuse = False
-    assert adapter.get_cached_token_count_per_layer_group(req, groups) == [0, 0, 0]
+    assert adapter.get_cached_token_count_per_layer_group(req, len(groups)) == [0, 0, 0]
     manager.enable_block_reuse = True
     manager.kv_cache_map.clear()
-    assert adapter.get_cached_token_count_per_layer_group(req, groups) == [0, 0, 0]
+    assert adapter.get_cached_token_count_per_layer_group(req, len(groups)) == [0, 0, 0]
 
 
 class TestCreateKvSliceBlockSpan:
@@ -574,10 +568,10 @@ class _StubAdapter(CacheReuseAdapter):
     def _global_cached_token_count(self, req):  # noqa: ARG002
         return self._scalar
 
-    def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
+    def get_block_ids(self, req, group_idx):  # noqa: ARG002
         return np.array([], dtype=np.int64)
 
-    def get_block_ordinals(self, req, group_idx, lg):  # noqa: ARG002
+    def get_block_ordinals(self, req, group_idx):  # noqa: ARG002
         return np.array([], dtype=np.int64)
 
     def commit_blocks_for_reuse(self, req):  # noqa: ARG002
@@ -587,14 +581,6 @@ class _StubAdapter(CacheReuseAdapter):
 class _FakeReq:
     def __init__(self, prompt_len: int):
         self.prompt_len = prompt_len
-
-
-def _lg(window=None):
-    return AttentionLayerGroup(
-        pool_group_idx=0,
-        sliding_window_size=window,
-        local_layers=[LocalLayer(local_layer_id=0, global_layer_id=0)],
-    )
 
 
 class TestAdapterBlockOrdinals:
@@ -620,7 +606,7 @@ class TestAdapterBlockOrdinals:
         req = _FakeReq(prompt_len=7)
         req.py_request_id = 7
         req.py_beam_width = 1
-        ordinals = _CacheReuseAdapterV2(mgr).get_block_ordinals(req, 0, _lg(window=512))
+        ordinals = _CacheReuseAdapterV2(mgr).get_block_ordinals(req, 0)
         np.testing.assert_array_equal(ordinals, [-1, -1, 12, 13])
         # Must request the positional view (holes kept), not the compact one.
         assert mgr.kv_cache_map[7].valid_only is False
@@ -633,22 +619,22 @@ class TestAdapterPerLayerGroup:
 
     def test_reuse_disabled(self):
         ad = _StubAdapter(scalar=128, tpb=self.TPB, enabled=False)
-        out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), [_lg(), _lg(window=64)])
+        out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), 2)
         assert out == [0, 0]
 
     def test_zero_scalar(self):
         ad = _StubAdapter(scalar=0, tpb=self.TPB)
-        out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), [_lg(), _lg(window=64)])
+        out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), 2)
         assert out == [0, 0]
 
     def test_full_attn_passthrough(self):
         ad = _StubAdapter(scalar=64, tpb=self.TPB)
-        out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), [_lg(), _lg()])
+        out = ad.get_cached_token_count_per_layer_group(_FakeReq(256), 2)
         assert out == [64, 64]
 
     def test_swa_passthrough_above_stale(self):
         ad = _StubAdapter(scalar=24, tpb=self.TPB)
-        out = ad.get_cached_token_count_per_layer_group(_FakeReq(32), [_lg(window=16)])
+        out = ad.get_cached_token_count_per_layer_group(_FakeReq(32), 1)
         assert out == [24]
 
     def test_swa_passthrough_below_stale(self):
@@ -656,14 +642,12 @@ class TestAdapterPerLayerGroup:
         # table (where it may fall inside the SWA holes anyway) is
         # _create_chunk's job.
         ad = _StubAdapter(scalar=8, tpb=self.TPB)
-        out = ad.get_cached_token_count_per_layer_group(_FakeReq(32), [_lg(window=16)])
+        out = ad.get_cached_token_count_per_layer_group(_FakeReq(32), 1)
         assert out == [8]
 
     def test_mixed_groups(self):
         ad = _StubAdapter(scalar=8, tpb=self.TPB)
-        out = ad.get_cached_token_count_per_layer_group(
-            _FakeReq(32), [_lg(), _lg(window=16), _lg(window=32)]
-        )
+        out = ad.get_cached_token_count_per_layer_group(_FakeReq(32), 3)
         assert out == [8, 8, 8]
 
 

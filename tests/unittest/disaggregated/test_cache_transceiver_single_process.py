@@ -46,8 +46,6 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
@@ -424,12 +422,12 @@ def _init_pool_data_v2(
     for rank, mgr in enumerate(managers):
         pp_rank = rank // tp
         tp_rank = rank % tp
-        page_table = KVRegionExtractorV1(mgr).page_table
+        page_table = mgr.get_page_table()
 
         unique_pools: Dict[int, int] = {}
-        for pg in page_table.pool_groups:
-            for pool_desc in pg.pools:
-                key = pool_desc.base_address
+        for pools in page_table.device_pools.values():
+            for pool_desc in pools:
+                key = pool_desc.base
                 pool_bytes = pool_desc.slot_bytes * pool_desc.num_slots
                 if key not in unique_pools or pool_bytes > unique_pools[key]:
                     unique_pools[key] = pool_bytes
@@ -750,10 +748,9 @@ def _get_layer_to_window_size(
     for pp_rank in range(pp):
         manager = managers[pp_rank * tp]
 
-        page_table = KVRegionExtractorV1(manager).page_table
-        for lg in page_table.layer_groups:
-            for layer_id in get_global_layer_ids(lg):
-                layer_to_window[layer_id] = lg.sliding_window_size
+        for desc in manager.get_page_table().page_layout.layer_groups:
+            for layer_id in desc.layers:
+                layer_to_window[layer_id] = desc.kept_window
 
     return layer_to_window
 

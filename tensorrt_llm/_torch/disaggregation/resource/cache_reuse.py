@@ -15,14 +15,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import List, Sequence
+from typing import List
 
 import numpy as np
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-
-from .page import AttentionLayerGroup
 
 
 class CacheReuseAdapter(ABC):
@@ -43,40 +41,31 @@ class CacheReuseAdapter(ABC):
     def get_cached_token_count_per_layer_group(
         self,
         req: LlmRequest,
-        layer_groups: Sequence[AttentionLayerGroup],
+        num_layer_groups: int,
     ) -> List[int]:
-        """Per-layer-group cached prefix in tokens (block-aligned).
+        """Per-layer-group cached prefix in tokens (block-aligned), for each of the manager's
+        ``num_layer_groups`` layer groups.
 
         Returns the reuse-hit prefix only; SWA stale-region handling lives at
         the transfer call site (it is a transport concern, not a cache one).
         """
         if not self.enable_block_reuse:
-            return [0] * len(layer_groups)
+            return [0] * num_layer_groups
         scalar = max(0, self._global_cached_token_count(req))
-        return [scalar] * len(layer_groups)
+        return [scalar] * num_layer_groups
 
     @abstractmethod
-    def get_block_ids(
-        self,
-        req: LlmRequest,
-        group_idx: int,
-        lg: AttentionLayerGroup,
-    ) -> np.ndarray:
+    def get_block_ids(self, req: LlmRequest, group_idx: int) -> np.ndarray:
         """Per-layer-group block identifiers for *req* (dtype ``int64``).
 
         Returned values are **primary memory-pool slot indices**, not raw block IDs:
-        ``KVRegionExtractorV1.extract`` and downstream transfer code do
+        ``resource.utils.slot_pointers`` and downstream transfer code do
         ``base_ptr + slot_idx * slot_bytes`` and require the value to be a current
         primary-pool offset. V2 reports these pool slot indices directly.
         """
 
     @abstractmethod
-    def get_block_ordinals(
-        self,
-        req: LlmRequest,
-        group_idx: int,
-        lg: AttentionLayerGroup,
-    ) -> np.ndarray:
+    def get_block_ordinals(self, req: LlmRequest, group_idx: int) -> np.ndarray:
         """Positional block table for *req* (dtype ``int64``, beam 0).
 
         Entry ``i`` is the primary-pool slot for tokens ``[i * tpb, ...)``, or
@@ -121,7 +110,7 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
     def get_cached_token_count_per_layer_group(
         self,
         req: LlmRequest,
-        layer_groups: Sequence[AttentionLayerGroup],
+        num_layer_groups: int,
     ) -> List[int]:
         """Skip only groups actually restored by admission and normal resume.
 
@@ -131,15 +120,15 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         """
         scalar = self._global_cached_token_count(req)
         if scalar == 0:
-            return [0] * len(layer_groups)
+            return [0] * num_layer_groups
         statuses = self._mgr.kv_cache_map[req.py_request_id].reuse_status
         tpb = self.tokens_per_block
         return [
             min(scalar, statuses[group].endpoint // tpb * tpb) if statuses[group].complete else 0
-            for group in range(len(layer_groups))
+            for group in range(num_layer_groups)
         ]
 
-    def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
+    def get_block_ids(self, req, group_idx):
         # V2 already returns per-cache-level pool slot indices (not logical block
         # IDs), and active sequences GPU-lock their pages (_UniqPageLock enforces
         # cache_level==GPU), so the slot_ids yielded here are already the right
@@ -151,7 +140,7 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
             dtype=np.int64,
         )
 
-    def get_block_ordinals(self, req, group_idx, lg):  # noqa: ARG002
+    def get_block_ordinals(self, req, group_idx):
         # valid_only=False yields one entry per block ordinal, with -1
         # (BAD_PAGE_INDEX) for out-of-window (SWA-evicted) and unbound blocks.
         # Position is the index; no length arithmetic needed.

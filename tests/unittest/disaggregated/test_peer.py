@@ -18,10 +18,9 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from layout_test_utils import native_page_table
+from layout_test_utils import manager_layout
 
 import tensorrt_llm._torch.disaggregation.native.peer as peer_module
-from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
 from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBufferMeta,
     build_aux_transfer_layout,
@@ -29,7 +28,6 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.runs import RunsMapper
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
     LayerGroupDesc,
@@ -157,7 +155,7 @@ def make_page_table(
         buffers=tuple(buffers),
         topology=topology,
     )
-    return native_page_table(
+    return manager_layout(
         layout, {0: [*pool_ptrs, 0xD000], 1: [0xA000, 0xB000, 0xC000]}, kv_heads=kv_heads
     )
 
@@ -178,16 +176,10 @@ def runs_of(mapper, src_base=1000, dst_base=2000):
     """
     if mapper is None:
         return []
-    pairs = mapper.map(
-        SpecRegion(memory=MemRegionGroup(ptrs=np.array([src_base]), bytes_per_region=1)),
-        SpecRegion(memory=MemRegionGroup(ptrs=np.array([dst_base]), bytes_per_region=1)),
-    )
-    if not isinstance(pairs, list):
-        pairs = [pairs]
     return sorted(
-        (int(s) - src_base, int(d) - dst_base, p.src.memory.bytes_per_region)
-        for p in pairs
-        for s, d in zip(p.src.memory.ptrs, p.dst.memory.ptrs)
+        (int(s) - src_base, int(d) - dst_base, size)
+        for src, dst, size in mapper.map(np.array([src_base]), np.array([dst_base]))
+        for s, d in zip(src, dst)
     )
 
 
@@ -231,9 +223,9 @@ def make_rankinfo(
 
 
 def _make_peer_registrar_and_peer_ri(self_ri, peer_ri):
-    pt = make_page_table()
-    real_kv_extractor = KVRegionExtractorV1(pt)
-    reg = PeerRegistrar(self_ri, real_kv_extractor)
+    if self_ri.page_table is None:
+        self_ri.page_table = make_page_table()
+    reg = PeerRegistrar(self_ri)
     if peer_ri.page_table is None:
         peer_ri = make_rankinfo(
             instance_name=peer_ri.instance_name,
@@ -432,10 +424,9 @@ def test_every_sender_whose_bytes_reach_a_receiver_is_one_it_pairs_with(src_tp, 
 
 
 def _make_peer_registrar(self_rankinfo):
-    pt = self_rankinfo.page_table if self_rankinfo.page_table else make_page_table()
-    real_kv_extractor = KVRegionExtractorV1(pt)
-    reg = PeerRegistrar(self_rankinfo, real_kv_extractor)
-    return reg
+    if self_rankinfo.page_table is None:
+        self_rankinfo.page_table = make_page_table()
+    return PeerRegistrar(self_rankinfo)
 
 
 @pytest.mark.parametrize(
@@ -606,14 +597,10 @@ def test_peer_registrar_kv_map_identity():
     # Same layout on both sides: one whole-slot fragment per block.
     assert isinstance(mapper, RunsMapper)
     assert runs_of(mapper) == [(0, 0, 1024)]
-    pair = mapper.map(
-        SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000, 5000]), bytes_per_region=1024)),
-        SpecRegion(memory=MemRegionGroup(ptrs=np.array([2000, 6000]), bytes_per_region=1024)),
-    )
-    assert not isinstance(pair, list)
-    assert pair.src.memory.ptrs.tolist() == [1000, 5000]
-    assert pair.dst.memory.ptrs.tolist() == [2000, 6000]
-    assert pair.src.memory.bytes_per_region == 1024
+    ((src, dst, size),) = mapper.map(np.array([1000, 5000]), np.array([2000, 6000]))
+    assert src.tolist() == [1000, 5000]
+    assert dst.tolist() == [2000, 6000]
+    assert size == 1024
 
 
 def test_peer_registrar_kv_map_partial_layer_overlap():
@@ -690,13 +677,10 @@ def test_peer_registrar_kv_map_non_contiguous_overlap_splits_fragments():
     )
     mapper = kv_map(reg, peer_ri, (0, 0), (0, 0))
     assert runs_of(mapper) == [(0, 0, 512), (1024, 512, 512)]
-    pair = mapper.map(
-        SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=1536)),
-        SpecRegion(memory=MemRegionGroup(ptrs=np.array([2000]), bytes_per_region=1024)),
-    )
-    # Fragments of one size share a region group.
-    assert pair.src.memory.ptrs.tolist() == [1000, 2024]
-    assert pair.dst.memory.ptrs.tolist() == [2000, 2512]
+    # Fragments of one size share a group.
+    ((src, dst, _),) = mapper.map(np.array([1000]), np.array([2000]))
+    assert src.tolist() == [1000, 2024]
+    assert dst.tolist() == [2000, 2512]
 
 
 def test_peer_registrar_kv_map_merges_non_monotonic_contiguous_layout():
@@ -720,7 +704,7 @@ def test_rank_info_carries_the_page_layout_to_peers():
         page_table=make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4, side_state_bytes=8),
     )
     received = RankInfo.from_bytes(peer_ri.to_bytes())
-    assert received.page_table.layout == peer_ri.page_table.layout
+    assert received.page_table.page_layout == peer_ri.page_table.page_layout
 
     reg = _make_peer_registrar(make_rankinfo(instance_name="local", page_table=make_page_table()))
     assert runs_of(kv_map(reg, received, (0, 0), (0, 0))) == runs_of(
@@ -744,13 +728,12 @@ def test_peer_registrar_kv_maps_are_cached_until_unregister():
     assert reg.get_kv_maps(peer_ri) is not maps
 
 
-def test_peer_registrar_requires_a_page_layout():
+def test_peer_registrar_requires_a_page_table():
     reg = _make_peer_registrar(make_rankinfo(instance_name="local"))
-    peer_ri = make_rankinfo(instance_name="peer", page_table=make_page_table())
-    peer_ri.page_table.layout = None
-    with pytest.raises(ValueError, match="carries no page layout"):
+    peer_ri = make_rankinfo(instance_name="peer", page_table=None)
+    with pytest.raises(ValueError, match="carries no page table"):
         reg.get_kv_maps(peer_ri)
-    with pytest.raises(ValueError, match="carries no page layout"):
+    with pytest.raises(ValueError, match="carries no page table"):
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
@@ -843,19 +826,15 @@ def test_runs_mapper_groups_fragments_by_size():
     )
     assert mapper.bytes_per_slot == 320
 
-    pairs = mapper.map(
-        SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000, 5000]), bytes_per_region=448)),
-        SpecRegion(memory=MemRegionGroup(ptrs=np.array([2000, 6000]), bytes_per_region=384)),
-    )
+    (small, large) = mapper.map(np.array([1000, 5000]), np.array([2000, 6000]))
 
-    assert isinstance(pairs, list) and len(pairs) == 2
-    assert pairs[0].src.memory.bytes_per_region == 64
-    assert pairs[0].src.memory.ptrs.tolist() == [1192, 5192]
-    assert pairs[0].dst.memory.ptrs.tolist() == [2128, 6128]
+    assert small[2] == 64
+    assert small[0].tolist() == [1192, 5192]
+    assert small[1].tolist() == [2128, 6128]
     # Slot-major: each slot's fragments of one size are adjacent.
-    assert pairs[1].src.memory.bytes_per_region == 128
-    assert pairs[1].src.memory.ptrs.tolist() == [1000, 1320, 5000, 5320]
-    assert pairs[1].dst.memory.ptrs.tolist() == [2000, 2256, 6000, 6256]
+    assert large[2] == 128
+    assert large[0].tolist() == [1000, 1320, 5000, 5320]
+    assert large[1].tolist() == [2000, 2256, 6000, 6256]
 
 
 def test_runs_mapper_without_runs_moves_nothing():
@@ -871,10 +850,7 @@ def test_runs_mapper_rejects_unequal_run_arrays():
 def test_runs_mapper_rejects_unequal_region_counts():
     mapper = RunsMapper(np.array([0]), np.array([0]), np.array([8]))
     with pytest.raises(ValueError, match="must match"):
-        mapper.map(
-            SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000, 2000]), bytes_per_region=8)),
-            SpecRegion(memory=MemRegionGroup(ptrs=np.array([3000]), bytes_per_region=8)),
-        )
+        mapper.map(np.array([1000, 2000]), np.array([3000]))
 
 
 def test_peer_registrar_token_major_head_mismatch_slices_each_token():

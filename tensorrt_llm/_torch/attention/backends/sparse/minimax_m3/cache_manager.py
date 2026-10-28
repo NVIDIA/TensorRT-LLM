@@ -1005,7 +1005,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         views (built by :meth:`get_buffers` /
         :meth:`get_index_k_buffer`) directly by slot id.
         ``BAD_PAGE_INDEX`` slots remain ``-1`` here because disaggregation's
-        :class:`KVRegionExtractorV1` filters ``region_ids >= 0``.
+        ``slot_pointers`` leaves out slots below 0.
         :meth:`get_block_ids_per_seq` maps them to zero for the attention
         metadata's padded tensor.
 

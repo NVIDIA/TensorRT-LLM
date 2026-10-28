@@ -1140,12 +1140,10 @@ def test_a_resume_below_the_end_starts_where_the_read_window_leaves_the_margin_b
 def test_a_group_counts_a_claimed_prefix_as_native_s_transfer_does_and_its_own_commits_always():
     """Each group's committed blocks of a claim are what native's transfer counts as cached."""
     from tensorrt_llm._torch.disaggregation.resource.cache_reuse import _CacheReuseAdapterV2
-    from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
 
     manager = Manager()
     manager.enable_block_reuse = True
     adapter = _CacheReuseAdapterV2(manager)
-    groups = [AttentionLayerGroup(pool_group_idx=g, kv_head_num_per_rank=1) for g in range(GROUPS)]
     req = request()
     rng = random.Random(0)
     for _ in range(2000):
@@ -1156,7 +1154,7 @@ def test_a_group_counts_a_claimed_prefix_as_native_s_transfer_does_and_its_own_c
         got = _manager.committed_by_group(kv, GROUPS)
         if committed <= endpoint:
             manager.kv_cache_map[RID] = kv
-            want = adapter.get_cached_token_count_per_layer_group(req, groups)
+            want = adapter.get_cached_token_count_per_layer_group(req, GROUPS)
             assert [t // TPB * TPB for t in got] == want, (committed, endpoint, complete, got)
         else:
             assert got == (committed,) * GROUPS, (committed, endpoint, complete, got)

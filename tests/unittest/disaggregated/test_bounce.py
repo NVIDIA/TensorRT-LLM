@@ -23,7 +23,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from layout_test_utils import native_page_table
+from layout_test_utils import manager_layout
 
 from tensorrt_llm._torch.disaggregation.native.bounce import config as bcfg
 
@@ -42,7 +42,6 @@ try:
 except ImportError:  # pragma: no cover - CPU-only env without CUDA bindings
     _HAVE_TRANSPORT = False
 
-from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import map_buffers, sent_bytes
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
@@ -53,6 +52,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     head_major,
     sectioned,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ManagerLayout
 
 _MIB = 1024 * 1024
 
@@ -601,7 +601,7 @@ _K3_KDA_PAYLOAD_BYTES = (
 _K3_MLA_LAYER_BYTES = _K3_MLA_BLOCK_BYTES // 24
 
 
-def _k3_page_table(kda: bool = True) -> KVCachePageTable:
+def _k3_page_table(kda: bool = True) -> ManagerLayout:
     """A K3-shaped page table as the manager builds it.
 
     The attention layer group comes first and the KDA layer group after it, recurrent state
@@ -628,7 +628,7 @@ def _k3_page_table(kda: bool = True) -> KVCachePageTable:
         groups.append(LayerGroupDesc("state", None, 0, 1, tuple(kda_layers)))
         widths[1] = (_K3_KDA_LAYERS * _K3_CONV_SLOT_BYTES, _K3_KDA_LAYERS * _K3_SSM_SLOT_BYTES)
     layout = PageLayout(32, widths, tuple(groups), tuple(buffers))
-    return native_page_table(layout, {0: [0x100000], 1: [0x200000, 0x300000]}, kv_heads=1)
+    return manager_layout(layout, {0: [0x100000], 1: [0x200000, 0x300000]}, kv_heads=1)
 
 
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
@@ -645,7 +645,7 @@ class TestHybridK3Bounce:
             monkeypatch, state_groups=btr.state_groups(page_table), min_bytes=2 * _MIB
         )
         req = _recv_req([67, 1])  # 67 MLA blocks (~2144 tokens) + the KDA slot
-        share = sent_bytes(page_table.layout, page_table.layout)
+        share = sent_bytes(page_table.page_layout, page_table.page_layout)
         assert t.reserve(req, [share]) is True
         assert req.bounce_dst_base == 0x100000
         # the region covers the MLA KV blocks plus the appended KDA state
@@ -671,12 +671,12 @@ class TestHybridK3Bounce:
         assert t.writer_base((req.unique_rid, req.slice_id), 1) == 0x100000 + 264
 
     def test_writer_share_matches_k3_geometry(self):
-        layout = _k3_page_table().layout
+        layout = _k3_page_table().page_layout
         assert sent_bytes(layout, layout) == {0: _K3_MLA_BLOCK_BYTES, 1: _K3_KDA_PAYLOAD_BYTES}
 
     def test_writer_share_has_no_state_without_kda_on_either_side(self):
-        layout = _k3_page_table().layout
-        attention_only = _k3_page_table(kda=False).layout
+        layout = _k3_page_table().page_layout
+        attention_only = _k3_page_table(kda=False).page_layout
         assert sent_bytes(attention_only, layout) == {0: _K3_MLA_BLOCK_BYTES}
         assert sent_bytes(layout, attention_only) == {0: _K3_MLA_BLOCK_BYTES}
 

@@ -37,6 +37,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TaskStatus,
     TxSession,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import DevicePool
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, LlmRequestType
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
@@ -135,12 +136,7 @@ def _projection_token_range(start_block: int, end_block: int) -> TokenRange:
 
 
 def _make_projection_sender() -> Sender:
-    """Create a Sender wired to a stub registrar with two full-attention layer groups.
-
-    Full attention is spelled as a window the prompt never outgrows, which is
-    how both extractor paths build it; they read max_attention_window_vec, so an
-    attention group never carries None.
-    """
+    """Create a Sender wired to a stub registrar with two attention layer groups."""
     peer_ri = SimpleNamespace(
         dp_rank=0,
         device_id=0,
@@ -151,36 +147,24 @@ def _make_projection_sender() -> Sender:
         cp_rank=0,
     )
 
-    extractor = MagicMock()
-    extractor.page_table = SimpleNamespace(
-        tokens_per_block=_PROJECTION_TPB,
-        layer_groups=[
-            SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=_PROJECTION_PROMPT_TOKENS),
-            SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=_PROJECTION_PROMPT_TOKENS),
-        ],
+    # Every pool's slot ``s`` starts at ``s``, so the fragment pointers read as slots.
+    page_table = SimpleNamespace(
+        page_layout=SimpleNamespace(
+            tokens_per_page=_PROJECTION_TPB,
+            layer_groups=[SimpleNamespace(kind="attention", pool_group=g) for g in range(2)],
+        ),
+        device_pools={g: (DevicePool(g, 0, 0, 1, 1 << 20),) for g in range(2)},
     )
-    # extract(region_ids, layer_group_id, pool_idx) - the caller passes the
-    # layer-group and pool indices positionally, so swallow them.
-    extractor.extract.side_effect = lambda block_ids, *_, **__: SimpleNamespace(
-        memory=SimpleNamespace(
-            ptrs=np.asarray(block_ids, dtype=np.int64),
-            bytes_per_region=1,
-        )
-    )
+    peer_ri.page_table = page_table
 
     mapper = MagicMock()
-    mapper.map.side_effect = lambda src_region, dst_region: SimpleNamespace(
-        src=src_region,
-        dst=dst_region,
-    )
+    mapper.map.side_effect = lambda src_bases, dst_bases: [(src_bases, dst_bases, 1)]
 
     registrar = MagicMock()
-    registrar.self_rank_info = SimpleNamespace(cp_size=1, cp_rank=0)
-    registrar.self_extractor = extractor
+    registrar.self_rank_info = SimpleNamespace(cp_size=1, cp_rank=0, page_table=page_table)
     registrar.get_peer_rank_info.return_value = peer_ri
     registrar.get_peer_overlap.return_value = SimpleNamespace(ranks=[0])
     registrar.should_send_kv.return_value = True
-    registrar.peer_extractor.return_value = extractor
     registrar.get_kv_maps.return_value = {
         ((0, 0), (0, 0)): mapper,
         ((1, 0), (1, 0)): mapper,
@@ -247,9 +231,6 @@ def test_build_kv_write_meta_pairs_holes_by_ordinal():
 def test_final_swa_slice_keeps_the_receivers_complete_active_window():
     """The final SWA transfer is not projected down to the final context chunk."""
     sender = _make_projection_sender()
-    sender._registrar.self_extractor.page_table.layer_groups[0].sliding_window_size = (
-        6 * _PROJECTION_TPB
-    )
     task = KVSendTask(
         Chunk(
             block_ids_per_layer_groups=[
@@ -302,7 +283,7 @@ def _projection_task_for(start_block: int, end_block: int) -> KVSendTask:
 def test_context_parallelism_is_refused_only_for_a_piece_short_of_the_prompt():
     """The guard only fires for a piece short of the whole prompt; a sole whole-prompt piece passes."""
     sender = _make_projection_sender()
-    sender._registrar.self_rank_info = SimpleNamespace(cp_size=2, cp_rank=0)
+    sender._registrar.self_rank_info.cp_size = 2
 
     sender._build_kv_write_meta(_projection_task_for(0, 8), _make_projection_req_info())
     with pytest.raises(ValueError, match="context parallelism"):
@@ -957,10 +938,12 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
     transceiver._reuse_adapter = SimpleNamespace(
         tokens_per_block=tokens_per_block,
         get_block_ids=_unexpected_get_block_ids,
-        get_block_ordinals=lambda _req, _idx, _lg: source_block_ids,
+        get_block_ordinals=lambda _req, _idx: source_block_ids,
     )
     transceiver._page_table = SimpleNamespace(
-        layer_groups=[SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=None)]
+        page_layout=SimpleNamespace(
+            layer_groups=[SimpleNamespace(kind="attention", kept_window=None)]
+        )
     )
     transceiver._kv_cache_manager = SimpleNamespace(tokens_per_block=tokens_per_block)
     transceiver._dp_rank = 0
@@ -1058,9 +1041,9 @@ def _build_prefill_chunk_tokens_for(
     transceiver._kv_cache_manager.tokens_per_block = _REUSE_TPB
     transceiver._describe_local = MagicMock(return_value=whole)
     transceiver._page_table = SimpleNamespace(
-        layer_groups=[
-            SimpleNamespace(kind=CacheKind.PAGED, sliding_window_size=sliding_window_size)
-        ]
+        page_layout=SimpleNamespace(
+            layer_groups=[SimpleNamespace(kind="attention", kept_window=sliding_window_size)]
+        )
     )
     transceiver._send_reqs = {}
 

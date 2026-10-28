@@ -82,9 +82,10 @@ from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, per
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
-from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_unique_pool_memory_descs,
+    slot_pointers,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import CUASSERT, nvtx_range
@@ -1349,20 +1350,18 @@ class Sender(SenderBase):
         task.expected_transfers = expected_transfers
 
         # Aggregate fragment pointers from every pool pair this rank sends the peer of.
-        # Each pool pair produces one or more region pairs (rp), each containing
-        # a numpy array of src/dst pointers and a uniform bytes_per_region.
+        # Each pool pair produces one or more fragment groups, each a numpy array of src/dst
+        # pointers of one fragment size.
         src_frag_parts: list[np.ndarray] = []
         dst_frag_parts: list[np.ndarray] = []
-        # Instead of calling np.full() per region pair to build a size array and
-        # then np.concatenate() all of them, we record (count, bytes_per_region)
+        # Instead of calling np.full() per fragment group to build a size array and
+        # then np.concatenate() all of them, we record (count, fragment size)
         # tuples and construct the final sizes array with a single np.repeat().
         # For 48k+ items this avoids many small allocations in the hot loop.
         size_specs: list[tuple[int, int]] = []
         dst_device_id = peer_ri.device_id
-        extractor = self._registrar.self_extractor
-        peer_extractor = self._registrar.peer_extractor(
-            peer_ri.instance_name, peer_ri.instance_rank
-        )
+        self_table = self_ri.page_table
+        peer_table = peer_ri.page_table
         dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
         src_block_ids_per_groups = task._chunk.block_ids_per_layer_groups
 
@@ -1371,20 +1370,15 @@ class Sender(SenderBase):
         # (layout_mapping); pairs another rank sends are absent.
         kv_maps = self._registrar.get_kv_maps(peer_ri, excluded=task._chunk.excluded_buffers)
         for ((self_lg, self_pi), (peer_lg, peer_pi)), mapper in kv_maps.items():
-            lg_info = extractor.page_table.layer_groups[self_lg]
             src_block_ids = src_block_ids_per_groups[self_lg]
             dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
-            # Extract slot base pointers: one slot per request for STATE, one per block for PAGED.
-            if lg_info.kind == CacheKind.STATE:
+            # Slot base pointers: one slot per request for state, one per block for attention.
+            if self_table.page_layout.layer_groups[self_lg].kind == "state":
                 if src_block_ids.size == 0 or dst_block_ids.size == 0:
                     continue
-                src_region = extractor.extract(
-                    np.asarray(src_block_ids[:1], dtype=np.int64), self_lg, self_pi
-                )
-                dst_region = peer_extractor.extract(
-                    np.asarray(dst_block_ids[:1], dtype=np.int64), peer_lg, peer_pi
-                )
+                src_bases = slot_pointers(self_table, self_lg, self_pi, src_block_ids[:1])
+                dst_bases = slot_pointers(peer_table, peer_lg, peer_pi, dst_block_ids[:1])
             else:
                 src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
                 dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
@@ -1394,7 +1388,7 @@ class Sender(SenderBase):
                     # table is the strided subset of ours; block reuse is
                     # rejected under helix.
                     src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
-                tpb = extractor.page_table.tokens_per_block
+                tpb = self_table.page_layout.tokens_per_page
                 dst_start_block = (
                     req_info.dst_start_token // tpb if req_info.dst_start_token is not None else 0
                 )
@@ -1407,22 +1401,20 @@ class Sender(SenderBase):
                 )
                 if src_block_ids.size == 0:
                     continue
-                src_region = extractor.extract(src_block_ids, self_lg, self_pi)
-                dst_region = peer_extractor.extract(dst_block_ids, peer_lg, peer_pi)
+                src_bases = slot_pointers(self_table, self_lg, self_pi, src_block_ids)
+                dst_bases = slot_pointers(peer_table, peer_lg, peer_pi, dst_block_ids)
 
             # Map and collect fragments (same for all layer types)
-            region_pair = mapper.map(src_region, dst_region)
-            region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
-            for rp in region_pairs:
-                src_frag_parts.append(rp.src.memory.ptrs)
-                dst_frag_parts.append(rp.dst.memory.ptrs)
-                size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
+            for src_ptrs, dst_ptrs, size in mapper.map(src_bases, dst_bases):
+                src_frag_parts.append(src_ptrs)
+                dst_frag_parts.append(dst_ptrs)
+                size_specs.append((src_ptrs.size, size))
 
         if src_frag_parts:
             src_frags = np.concatenate(src_frag_parts)
             dst_frags = np.concatenate(dst_frag_parts)
             # Build the kv_sizes array in one shot: np.repeat expands each
-            # bytes_per_region value by its count, e.g.:
+            # fragment size by its count, e.g.:
             #   values=[4096, 8192], counts=[100, 200]
             #   → [4096]*100 ++ [8192]*200
             counts, values = zip(*size_specs)
@@ -4161,8 +4153,7 @@ class TransferWorker:
 
     def _setup_peer_infrastructure(self, kvm: KVCacheManagerV2):
         self._rank_info_server = RankInfoServer(self._rank_info) if kvm.mapping.rank == 0 else None
-        self._kv_extractor = KVRegionExtractorV1(kvm)
-        self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
+        self._peer_registrar = PeerRegistrar(self._rank_info)
 
     def _setup_transfer_engine(self):
         torch.cuda.set_device(self._config.device_id)

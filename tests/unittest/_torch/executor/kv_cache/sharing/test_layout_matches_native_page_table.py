@@ -25,8 +25,6 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import ShardDesc, head_major, replicated
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     MemoryKind,
@@ -407,22 +405,24 @@ def project(layout, desc, pools):
 
 
 def native_groups(page_table):
-    """What native's page table says per layer group: its own pools, named by base address, layer
-    groups and heads, and the transferred buffers its page layout places in them."""
+    """What the manager's page table, which native transfers by, says per layer group: its device
+    pools, named by base address, its internal layers' global ids and its heads, and the
+    transferred buffers its page layout places in them."""
     out = []
-    for lg, desc in zip(page_table.layer_groups, page_table.layout.layer_groups):
+    layout = page_table.page_layout
+    for lg, desc in enumerate(layout.layer_groups):
         pools = [
-            (int(p.base_address), int(p.slot_bytes), int(p.num_slots))
-            for p in page_table.pool_groups[lg.pool_group_idx].pools
+            (int(p.base), int(p.slot_bytes), int(p.num_slots))
+            for p in page_table.device_pools[desc.pool_group]
         ]
-        state = lg.kind == CacheKind.STATE
-        rows, roles, geometry, _, _ = project(page_table.layout, desc, pools)
+        state = desc.kind == "state"
+        rows, roles, geometry, _, _ = project(layout, desc, pools)
         out.append(
             {
-                "kind": "state" if state else "attention",
-                "window": None if state else lg.sliding_window_size,
-                "heads": None if state else int(lg.kv_head_num_per_rank),
-                "layers": sorted(int(ll.global_layer_id) for ll in lg.local_layers),
+                "kind": desc.kind,
+                "window": None if state else desc.kept_window,
+                "heads": None if state else int(page_table.kv_heads[lg]),
+                "layers": sorted(int(g) for _, g in page_table.local_layers[lg]),
                 "pools": pools,
                 "rows": rows,
                 "roles": roles,
@@ -539,7 +539,7 @@ def test_the_public_layout_matches_what_native_builds(
         lender = attach(mgr)
         layout, regions = lender.page_layout, lender.regions
         spec.check(mgr, layout)
-        page_table = build_page_table_from_manager(mgr)
+        page_table = mgr.get_page_table()
         native = native_groups(page_table)
         derived = public_groups(layout, regions)
 
@@ -548,7 +548,10 @@ def test_the_public_layout_matches_what_native_builds(
             region = regions[position]
             assert region.memory_kind is MemoryKind.DEVICE, (g, p, region)
             assert region.slot_bytes == layout.pool_slot_bytes[g][p], (g, p, region)
-        assert layout.tokens_per_page * layout.topology.cp_size == page_table.tokens_per_block
+        assert (
+            layout.tokens_per_page * layout.topology.cp_size
+            == page_table.page_layout.tokens_per_page
+        )
         assert len(derived) == len(native), derived[len(native) :]
         assert all(group["rows"] for group in native)
         for lg, (ours, theirs) in enumerate(zip(derived, native)):
@@ -561,10 +564,10 @@ def test_the_public_layout_matches_what_native_builds(
         assert layout.quant_mode == spec.quant, layout.quant_mode
         if spec.total_heads is not None:
             expected = {
-                int(layer.global_layer_id): spec.total_heads
-                for group in page_table.layer_groups
-                if group.kind != CacheKind.STATE
-                for layer in group.local_layers
+                int(layer): spec.total_heads
+                for group in page_table.page_layout.layer_groups
+                if group.kind != "state"
+                for layer in group.layers
             }
             assert dict(layout.total_kv_heads_by_layer) == expected
 
@@ -575,9 +578,9 @@ def test_the_public_layout_matches_what_native_builds(
         # Every buffer sits where the runtime keeps its layer and role. The rows above list roles
         # per pool and spread, so a layer's K and V trading places shows only here.
         internal = {
-            int(ll.global_layer_id): int(ll.local_layer_id)
-            for lg in page_table.layer_groups
-            for ll in lg.local_layers
+            int(global_id): int(local_id)
+            for pairs in page_table.local_layers
+            for local_id, global_id in pairs
         }
         for b in layout.buffers:
             lid = internal[b.layer]

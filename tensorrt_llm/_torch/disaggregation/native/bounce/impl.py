@@ -44,7 +44,7 @@ from .core import BounceTransport, Disposition, Settlement, TransferContext
 from .gather_scatter import Plan, gather_contiguous, scatter_contiguous
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ManagerLayout
 
 RidSlice = tuple  # the request id and slice id a region serves
 _MIB = 1024 * 1024
@@ -578,10 +578,8 @@ def decode_result_tail(message):
     return None, None, None
 
 
-def state_groups(page_table: KVCachePageTable) -> frozenset[int]:
+def state_groups(page_table: ManagerLayout) -> frozenset[int]:
     """The layer groups of ``page_table`` holding recurrent state."""
-    from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
-
     return frozenset(
-        g for g, lg in enumerate(page_table.layer_groups) if lg.kind == CacheKind.STATE
+        g for g, desc in enumerate(page_table.page_layout.layer_groups) if desc.kind == "state"
     )

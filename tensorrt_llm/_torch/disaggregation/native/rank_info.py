@@ -19,9 +19,24 @@ from typing import List, Optional
 import msgpack
 
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import (
+    ManagerLayout,
+    page_table_from_dict,
+    page_table_to_dict,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+
+
+def manager_page_table(manager: KVCacheManager) -> ManagerLayout:
+    """The page table of a cache manager (``KVCacheManagerV2.get_page_table``).
+
+    Raises:
+        ValueError: If the manager is not a ``KVCacheManagerV2``.
+    """
+    if not isinstance(manager, KVCacheManagerV2):
+        raise ValueError("Python KV cache transfer requires KVCacheManagerV2; V1 is unsupported.")
+    return manager.get_page_table()
 
 
 @dataclass
@@ -45,7 +60,7 @@ class RankInfo:
 
     enable_attention_dp: bool = False
     aux_meta: Optional[AuxBufferMeta] = None
-    page_table: Optional[KVCachePageTable] = None
+    page_table: Optional[ManagerLayout] = None
     bounded_replay_on_generation: bool = False
 
     @property
@@ -53,11 +68,13 @@ class RankInfo:
         return self.tp_size // self.dp_size if self.enable_attention_dp else self.tp_size
 
     def to_bytes(self) -> bytes:
-        # Shallow, field by field: the page table converts itself (to_dict), and a deep copy would
-        # fail on its page layout's read-only mappings.
+        # Shallow, field by field: the page table converts separately (page_table_to_dict), and a
+        # deep copy would fail on its page layout's read-only mappings.
         data = {f.name: getattr(self, f.name) for f in fields(self)}
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
-        data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
+        data["page_table"] = (
+            page_table_to_dict(self.page_table) if self.page_table is not None else None
+        )
         return msgpack.packb(data)
 
     @classmethod
@@ -89,7 +106,7 @@ class RankInfo:
             transfer_engine_info=bytes(),
             enable_attention_dp=enable_attention_dp,
             aux_meta=aux_buffer_meta,
-            page_table=build_page_table_from_manager(kvm),
+            page_table=manager_page_table(kvm),
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
         )
 
@@ -97,7 +114,7 @@ class RankInfo:
     def from_bytes(cls, data: bytes) -> "RankInfo":
         unpacked = msgpack.unpackb(data, strict_map_key=False)
         if unpacked.get("page_table") is not None:
-            unpacked["page_table"] = KVCachePageTable.from_dict(unpacked["page_table"])
+            unpacked["page_table"] = page_table_from_dict(unpacked["page_table"])
         if unpacked.get("aux_meta") is not None:
             unpacked["aux_meta"] = AuxBufferMeta.from_dict(unpacked["aux_meta"])
         return cls(**unpacked)

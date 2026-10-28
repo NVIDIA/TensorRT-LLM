@@ -13,27 +13,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import msgpack
 import numpy as np
 import pytest
 import torch
-from layout_test_utils import native_page_table
+from layout_test_utils import manager_layout
 
-from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
-    KVRegionExtractorV1,
-    build_page_table_from_manager,
-)
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
+from tensorrt_llm._torch.disaggregation.base import CacheKind
 from tensorrt_llm._torch.disaggregation.resource.utils import (
-    get_global_layer_ids,
-    get_layer_to_layer_group,
-    get_num_layer_groups,
-    get_num_layers,
+    get_cache_kinds,
     get_physical_pool,
     get_transferred_pool_indices,
+    get_unique_pool_memory_descs,
+    slot_pointers,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaRole
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+    BufferDesc,
+    LayerGroupDesc,
+    PageLayout,
+    head_major,
+    replicated,
+    sectioned,
+    token_major,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import (
+    page_table_from_dict,
+    page_table_to_dict,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
     DataType,
@@ -44,33 +52,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 
 
-class DummyRankInfo:
-    instance_name = "dummy"
-    instance_rank = 0
-    tp_size = 1
-    tp_rank = 0
-    pp_size = 1
-    pp_rank = 0
-    dp_size = 1
-    dp_rank = 0
-    cp_size = 1
-    cp_rank = 0
-    device_id = 0
-    kv_heads_per_rank = 8
-    tokens_per_block = 32
-    dims_per_head = 16
-    element_bytes = 2
-    enable_attention_dp = False
-    is_mla = False
-    layer_num_per_pp = [1]
-
-    @property
-    def kv_factor(self) -> int:
-        return 2 if not self.is_mla else 1
-
-
 @pytest.mark.cuda
-def test_extract():
+def test_slot_pointers_address_a_manager_s_pool():
     num_layers = 1
     num_kv_heads = 8
     head_dim = 16
@@ -107,27 +90,20 @@ def test_extract():
         vocab_size=32000,
     )
 
-    extractor = KVRegionExtractorV1(manager)
-    region_ids = np.array([0, 1], dtype=np.int64)
-    spec_region = extractor.extract(region_ids)
+    page_table = manager.get_page_table()
+    region_ids = np.array([0, -1, 1], dtype=np.int64)
+    pointers = slot_pointers(page_table, 0, 0, region_ids)
 
-    assert isinstance(spec_region, SpecRegion)
-    memory = spec_region.memory
-    assert isinstance(memory, MemRegionGroup)
-    assert len(memory.ptrs) == len(region_ids)
-    assert memory.bytes_per_region > 0
-
-    pool_base_ptr = extractor.page_table.pool_groups[0].pools[0].base_address
-    assert isinstance(memory.ptrs, np.ndarray)
-    expected_block_bytes = memory.bytes_per_region
-    expected_ptrs = [pool_base_ptr + block_id * expected_block_bytes for block_id in region_ids]
-    np.testing.assert_array_equal(memory.ptrs, expected_ptrs)
+    pool = get_physical_pool(page_table, 0, 0)
+    assert pool.slot_bytes > 0
+    # Slots not held (-1) are left out.
+    np.testing.assert_array_equal(pointers, [pool.base, pool.base + pool.slot_bytes])
 
     manager.shutdown()
 
 
 @pytest.mark.cuda
-def test_build_page_table():
+def test_a_manager_s_page_table_places_its_buffers():
     num_layers = 8
     num_kv_heads = 8
     head_dim = 128
@@ -153,105 +129,47 @@ def test_build_page_table():
         max_num_tokens=max_tokens,
     )
 
-    page_table = build_page_table_from_manager(manager)
+    page_table = manager.get_page_table()
+    layout = page_table.page_layout
 
-    assert page_table.tokens_per_block == 64
-    assert get_num_layers(page_table) == 8
-    assert get_num_layer_groups(page_table) > 0
+    assert layout.tokens_per_page == 64
+    assert get_cache_kinds(page_table) == [CacheKind.PAGED] * len(layout.layer_groups)
+    assert sorted(layer for g in layout.layer_groups for layer in g.layers) == list(range(8))
 
-    lg = page_table.layer_groups[0]
     (pool_idx,) = get_transferred_pool_indices(page_table, 0)
     pool = get_physical_pool(page_table, 0, pool_idx)
-    assert pool.base_address > 0
+    assert pool.base > 0
     # V2 reserves additional slots beyond the requested token capacity.
     assert pool.num_slots >= max_tokens // tokens_per_block
-    assert len(get_global_layer_ids(lg)) > 0
 
-    layer = get_global_layer_ids(lg)[0]
+    layer = layout.layer_groups[0].layers[0]
     key, value = sorted(
-        (b for b in page_table.layout.buffers if b.layer == layer), key=lambda b: b.slot_offset
+        (b for b in layout.buffers if b.layer == layer), key=lambda b: b.slot_offset
     )
     assert (key.role, value.role) == ("key", "value")
     assert key.pool_index == value.pool_index == pool_idx
-    ptr_key = int(pool.base_address) + key.slot_offset
-    ptr_value = int(pool.base_address) + value.slot_offset
-    assert ptr_key > 0
-    assert ptr_value > ptr_key
-
-    # Verify layer_groups are populated
-    assert page_table.layer_groups is not None
-    assert len(page_table.layer_groups) == get_num_layer_groups(page_table)
-    assert len(get_global_layer_ids(page_table.layer_groups[0])) > 0
-    assert page_table.layer_groups[0].kv_head_num_per_rank == num_kv_heads
-
-    layer_to_lg = get_layer_to_layer_group(page_table)
-    assert layer_to_lg is not None
-    assert len(layer_to_lg) == num_layers
-
-    print(
-        f"Page table created: {get_num_layer_groups(page_table)} layer_groups,"
-        f" tokens_per_block={page_table.tokens_per_block},"
-        f" num_layers={get_num_layers(page_table)}"
-    )
+    assert pool.base + value.slot_offset > pool.base + key.slot_offset > 0
+    assert page_table.kv_heads[0] == num_kv_heads
 
     manager.shutdown()
 
 
-@pytest.mark.cpu_only
-def test_layer_group_meta_serialization():
-    from tensorrt_llm._torch.disaggregation.resource.page import (
-        AttentionLayerGroup,
-        KVCachePageTable,
-        LocalLayer,
-        PhysicalPool,
-        PhysicalPoolGroup,
-    )
-
-    kv_pool = PhysicalPool(base_address=1000, slot_bytes=512, num_slots=10)
-    local_layers = [
-        LocalLayer(local_layer_id=0, global_layer_id=0),
-        LocalLayer(local_layer_id=1, global_layer_id=1),
-    ]
-    lg = AttentionLayerGroup(
-        pool_group_idx=0,
-        kv_head_num_per_rank=4,
-        sliding_window_size=512,
-        local_layers=local_layers,
-    )
-    page_table = KVCachePageTable(
-        tokens_per_block=16,
-        layer_groups=[lg],
-        pool_groups=[PhysicalPoolGroup(pools=[kv_pool])],
-    )
-    d = page_table.to_dict()
-    restored = KVCachePageTable.from_dict(d)
-    restored_lg = restored.layer_groups[0]
-    assert isinstance(restored.layer_groups[0], AttentionLayerGroup)
-    assert restored_lg.sliding_window_size == 512
-    assert restored_lg.kv_head_num_per_rank == 4
-    assert restored_lg.local_layers == local_layers
-
-
-def _page_table(groups, pool_slot_bytes, buffers, bases):
-    """Native's page table of a manager's page table with these layer groups and buffers.
+def _page_table(groups, pool_slot_bytes, buffers, bases, num_slots=4):
+    """The page table of a manager with these layer groups and buffers.
 
     Each group has one internal layer per global layer, in order; device pools lie at
     ``bases[group]``.
     """
-    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import PageLayout
-
     layout = PageLayout(
         tokens_per_page=16,
         pool_slot_bytes=pool_slot_bytes,
         layer_groups=groups,
         buffers=buffers,
     )
-    return native_page_table(layout, bases, kv_heads=1, num_slots=4)
+    return manager_layout(layout, bases, kv_heads=1, num_slots=num_slots)
 
 
 def _attention_page_table(buffers, pool_slot_bytes):
-    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import LayerGroupDesc
-
     return _page_table(
         (LayerGroupDesc("attention", None, 0, 0, (0, 1)),),
         {0: pool_slot_bytes},
@@ -262,8 +180,6 @@ def _attention_page_table(buffers, pool_slot_bytes):
 
 def _kv(layer, role, pool, offset, size=128, tensors=None):
     """A K/V buffer of 16 tokens of one head, token-major, or ``tensors``."""
-    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import BufferDesc, token_major
-
     return BufferDesc(
         layer,
         role,
@@ -276,8 +192,6 @@ def _kv(layer, role, pool, offset, size=128, tensors=None):
 
 
 def _index_key(layer, pool, offset, size=128):
-    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import BufferDesc, replicated
-
     return BufferDesc(layer, "index_key", 0, pool, offset, size, replicated(size))
 
 
@@ -287,8 +201,6 @@ def test_a_layer_group_transfers_the_pools_holding_its_transferred_buffers():
     Pools are listed by index within the group's pool group, once however many buffers share
     them; a pool holding only buffers peers do not transfer is left out.
     """
-    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import BufferDesc
-
     kv = (
         _kv(0, "key", 0, 0),
         _kv(0, "value", 0, 128),
@@ -305,41 +217,6 @@ def test_a_layer_group_transfers_the_pools_holding_its_transferred_buffers():
     assert get_transferred_pool_indices(page_table, 0) == [0, 2]
 
 
-@pytest.mark.cpu_only
-def test_mamba_layer_group_serialization():
-    from tensorrt_llm._torch.disaggregation.resource.page import (
-        LayerGroup,
-        LocalLayer,
-        MambaLayerGroup,
-        PhysicalPool,
-    )
-
-    local_layers = [
-        LocalLayer(local_layer_id=0, global_layer_id=10),
-        LocalLayer(local_layer_id=1, global_layer_id=11),
-        LocalLayer(local_layer_id=2, global_layer_id=12),
-    ]
-    mlg = MambaLayerGroup(pool_group_idx=1, local_layers=local_layers)
-
-    d = mlg.to_dict()
-    assert d["slot_major_layout"] is True
-    assert d["kind"] == int(CacheKind.STATE)
-    assert "mamba_layer_offsets" not in d
-    assert "conv_section_bytes" not in d
-
-    restored = LayerGroup.from_dict(d)
-    assert isinstance(restored, MambaLayerGroup)
-    assert restored.pool_group_idx == 1
-    assert [(ll.local_layer_id, ll.global_layer_id) for ll in restored.local_layers] == [
-        (0, 10),
-        (1, 11),
-        (2, 12),
-    ]
-
-    legacy_pool = PhysicalPool.from_dict({"base_address": 1000, "slot_bytes": 128, "num_slots": 10})
-    assert legacy_pool.slot_stride_bytes == legacy_pool.slot_bytes
-
-
 def _recurrent_page_table(conv_sections=(16, 16, 32), ple_on_layer=1):
     """A page table of a recurrent and an attention layer group.
 
@@ -347,14 +224,6 @@ def _recurrent_page_table(conv_sections=(16, 16, 32), ple_on_layer=1):
     ``[ssm, conv]`` per layer, and PLE n-gram context lives in a second, 32-byte pool on
     ``ple_on_layer`` only. Group 1 is attention (layer 2) with K/V in a pool group of its own.
     """
-    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
-        BufferDesc,
-        LayerGroupDesc,
-        head_major,
-        replicated,
-        sectioned,
-    )
-
     buffers = []
     for layer in (0, 1):
         # ssm: [2 heads, 4, 4] fp16 = 64 bytes, 32 bytes per head
@@ -378,45 +247,28 @@ def _recurrent_page_table(conv_sections=(16, 16, 32), ple_on_layer=1):
     )
 
 
-def test_page_table_describes_a_recurrent_group():
-    """The recurrent group's layers and pools come from the page layout; its buffers stay there."""
-    from tensorrt_llm._torch.disaggregation.resource.page import (
-        AttentionLayerGroup,
-        MambaLayerGroup,
-    )
+def test_a_page_table_addresses_a_recurrent_group_by_slot():
+    """A recurrent group's pools come from its pool group.
 
+    A request's slot of each is addressed by its base pointer, where the runs place each layer's
+    bytes.
+    """
     page_table = _recurrent_page_table()
 
-    assert len(page_table.layer_groups) == 2
-    recurrent, attention = page_table.layer_groups
-    assert isinstance(recurrent, MambaLayerGroup)
-    assert isinstance(attention, AttentionLayerGroup)
-    assert recurrent.pool_group_idx == 0
-    assert [(ll.local_layer_id, ll.global_layer_id) for ll in recurrent.local_layers] == [
-        (0, 0),
-        (1, 1),
-    ]
-    pools = page_table.pool_groups[recurrent.pool_group_idx].pools
-    assert (pools[0].base_address, pools[0].slot_bytes, pools[0].num_slots) == (0x10000, 256, 4)
+    assert get_cache_kinds(page_table) == [CacheKind.STATE, CacheKind.PAGED]
+    pool = get_physical_pool(page_table, 0, 0)
+    assert (pool.base, pool.slot_bytes, pool.num_slots) == (0x10000, 256, 4)
+    assert get_physical_pool(page_table, 1, 0).base == 0x30000
 
     # SSM and conv state share pool 0, PLE context lies in pool 1.
     assert get_transferred_pool_indices(page_table, 0) == [0, 1]
-    by_role = {b.role: b for b in page_table.layout.buffers if b.layer == 1}
+    by_role = {b.role: b for b in page_table.page_layout.buffers if b.layer == 1}
     assert (by_role["ssm_state"].pool_index, by_role["ssm_state"].slot_offset) == (0, 128)
     assert (by_role["conv_state"].pool_index, by_role["conv_state"].slot_offset) == (0, 192)
     assert by_role[str(MambaRole.PLE_NGRAM_CONTEXT)].pool_index == 1
 
-    # A recurrent request's slot is addressed by its base pointer; the runs of the mapper place
-    # each layer's bytes within it.
-    extractor = KVRegionExtractorV1(page_table)
-    conv_region = extractor.extract(np.array([2]), 0, 0).memory
-    assert conv_region.ptrs.tolist() == [0x10000 + 2 * 256]
-    assert conv_region.bytes_per_region == 256
-    assert extractor.extract(np.array([3]), 0, 1).memory.ptrs.tolist() == [0x20000 + 3 * 32]
-
-    # The attention group is untouched by the recurrent one.
-    assert attention.pool_group_idx == 1
-    assert [ll.global_layer_id for ll in attention.local_layers] == [2]
+    assert slot_pointers(page_table, 0, 0, np.array([2])).tolist() == [0x10000 + 2 * 256]
+    assert slot_pointers(page_table, 0, 1, np.array([3])).tolist() == [0x20000 + 3 * 32]
 
 
 def test_page_table_rejects_sections_that_do_not_cover_the_buffer():
@@ -424,15 +276,21 @@ def test_page_table_rejects_sections_that_do_not_cover_the_buffer():
         _recurrent_page_table(conv_sections=(16, 16, 16))
 
 
-def test_v2_mamba_registration_uses_coalesced_physical_pool():
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
-    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
-        BufferDesc,
-        LayerGroupDesc,
-        head_major,
-        sectioned,
+@pytest.mark.cpu_only
+def test_a_page_table_travels_to_a_peer_whole():
+    """A rank info carries its manager's page table as plain values, read back as they were."""
+    page_table = _recurrent_page_table()
+    received = page_table_from_dict(
+        msgpack.unpackb(msgpack.packb(page_table_to_dict(page_table)), strict_map_key=False)
     )
+    assert received.page_layout == page_table.page_layout
+    assert received.device_pools == page_table.device_pools
+    for name in ("tokens_per_block", "windows", "recurrent", "layers", "local_layers", "kv_heads"):
+        assert getattr(received, name) == getattr(page_table, name), name
+    assert slot_pointers(received, 0, 1, np.array([3])).tolist() == [0x20000 + 3 * 32]
 
+
+def test_v2_mamba_registration_uses_coalesced_physical_pool():
     state_bytes = 64
     num_layers = 2
     num_slots = 8
@@ -459,8 +317,8 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
         {0: (physical_slot_bytes,)},
         tuple(buffers),
         {0: [1000]},
+        num_slots=num_slots,
     )
-    page_table.pool_groups[0].pools[0].num_slots = num_slots
 
     # V2 interleaved: one shared pool registered once
     assert get_unique_pool_memory_descs(page_table, device_id=3) == [
@@ -468,69 +326,9 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
     ]
 
 
-@pytest.mark.cpu_only
-def test_mixed_page_table_serialization():
-    from tensorrt_llm._torch.disaggregation.resource.page import (
-        AttentionLayerGroup,
-        KVCachePageTable,
-        LocalLayer,
-        MambaLayerGroup,
-        PhysicalPool,
-        PhysicalPoolGroup,
-    )
-
-    attn_lg = AttentionLayerGroup(
-        pool_group_idx=0,
-        kv_head_num_per_rank=4,
-        local_layers=[LocalLayer(0, 0)],
-    )
-    mamba_local_layers = [
-        LocalLayer(local_layer_id=0, global_layer_id=1),
-        LocalLayer(local_layer_id=1, global_layer_id=2),
-    ]
-    mamba_lg = MambaLayerGroup(pool_group_idx=1, local_layers=mamba_local_layers)
-
-    page_table = KVCachePageTable(
-        tokens_per_block=16,
-        layer_groups=[attn_lg, mamba_lg],
-        pool_groups=[
-            PhysicalPoolGroup(pools=[PhysicalPool(1000, 512, 10)]),
-            PhysicalPoolGroup(pools=[PhysicalPool(2000, 1024, 10), PhysicalPool(3000, 2048, 10)]),
-        ],
-    )
-
-    d = page_table.to_dict()
-    restored = KVCachePageTable.from_dict(d)
-
-    assert len(restored.layer_groups) == 2
-    assert isinstance(restored.layer_groups[0], AttentionLayerGroup)
-    assert isinstance(restored.layer_groups[1], MambaLayerGroup)
-    assert restored.layer_groups[0].kv_head_num_per_rank == 4
-    assert [
-        (ll.local_layer_id, ll.global_layer_id) for ll in restored.layer_groups[1].local_layers
-    ] == [
-        (0, 1),
-        (1, 2),
-    ]
-
-    # Verify utils work correctly with mixed page table
-    from tensorrt_llm._torch.disaggregation.resource.utils import (
-        get_layer_to_layer_group,
-        get_num_layer_groups,
-        get_num_layers,
-    )
-
-    assert get_num_layer_groups(restored) == 2
-    # get_num_layers counts only attention layers
-    assert get_num_layers(restored) == 1
-    # get_layer_to_layer_group maps only attention layers
-    layer_map = get_layer_to_layer_group(restored)
-    assert layer_map == {0: 0}
-
-
 # ---------------------------------------------------------------------------
 # Boundary tests for block_id -> primary memory-pool slot translation
-# (see kv_extractor.py / cache_reuse.py: when host offload is enabled, a
+# (see cache_reuse.py: when host offload is enabled, a
 #  block's logical ID can diverge from its primary-pool slot index after an
 #  offload+onboard cycle, and the cache transceiver must translate before
 #  doing pointer arithmetic).
@@ -545,7 +343,7 @@ def test_get_memory_pool_block_indices_vswa():
     (no offload has happened), and the wrapper must:
     - dispatch correctly per window_size,
     - return non-negative pool indices that match what
-      `KVRegionExtractorV1.extract` plugs into `base_ptr + idx * slot_bytes`.
+      `slot_pointers` plugs into `base_ptr + idx * slot_bytes`.
     """
     import tensorrt_llm
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -600,7 +398,7 @@ def test_get_memory_pool_block_indices_vswa():
 
         # For each unique window, look up that window's first layer to fetch
         # its block IDs, then translate and confirm the pool-slot indices
-        # match what KVRegionExtractorV1.extract would compute against
+        # match what slot_pointers would compute against
         # the live primary pool.
         unique_windows = sorted(set(max_attention_window_vec))
         assert len(unique_windows) >= 2, "Test premise: at least 2 windows"

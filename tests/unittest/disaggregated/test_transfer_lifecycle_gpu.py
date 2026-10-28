@@ -370,31 +370,33 @@ def _regions(transceiver: KvCacheTransceiverV2, request: LlmRequest) -> list[tor
     """
     import torch
 
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_transferred_pool_indices
+    from tensorrt_llm._torch.disaggregation.resource.utils import (
+        get_transferred_pool_indices,
+        slot_pointers,
+    )
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
     from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 
     chunk = transceiver._create_chunk(request)
-    extractor = transceiver._transfer_worker._peer_registrar.self_extractor
-    page_table = extractor.page_table
+    page_table = transceiver._transfer_worker._peer_registrar.self_rank_info.page_table
     result = []
     seen = set()
     roles = set()
     for group, blocks in enumerate(chunk.block_ids_per_layer_groups):
-        desc = page_table.layout.layer_groups[group]
+        desc = page_table.page_layout.layer_groups[group]
         for pool in get_transferred_pool_indices(page_table, group):
-            memory = extractor.extract(blocks, group, pool).memory
+            pointers = slot_pointers(page_table, group, pool, blocks)
             buffers = [
                 b
-                for b in page_table.layout.buffers
+                for b in page_table.page_layout.buffers
                 if b.transferred
                 and b.pool_group == desc.pool_group
                 and b.pool_index == pool
                 and b.layer in desc.layers
             ]
-            assert len(memory.ptrs) > 0 and buffers
+            assert len(pointers) > 0 and buffers
             roles.update(b.role for b in buffers)
-            for pointer in memory.ptrs:
+            for pointer in pointers:
                 for b in buffers:
                     key = (int(pointer) + b.slot_offset, b.size)
                     assert key[0] > 0 and key[1] > 0, "allocated role extent must be nonempty"
