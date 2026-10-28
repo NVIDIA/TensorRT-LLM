@@ -927,6 +927,11 @@ class HalfOpenRange:
     def __len__(self) -> int: ...
     def __eq__(self, other: object) -> bool: ...
 
+class ScratchDesc:
+    range: HalfOpenRange
+    slot_ids: Sequence[int]
+    def __bool__(self) -> bool: ...
+
 @dataclass(slots=True, frozen=True)
 class PageIndexConverter:
     scale: int
