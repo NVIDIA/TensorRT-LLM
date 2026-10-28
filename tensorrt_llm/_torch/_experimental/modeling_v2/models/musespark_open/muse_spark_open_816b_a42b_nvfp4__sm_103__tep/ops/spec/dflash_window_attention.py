@@ -45,6 +45,14 @@ programs, in no defined order -- as ``index_put`` with duplicate indices does.
 Nothing reads a dummy slot's block, so only which padding row lands there
 differs.
 
+The context may instead live in pages, as a KV cache manager keeps it
+(``page_table``): the caches are then pools ``[pages, page_size, Hkv, D]`` (the
+planes of an HND pool, transposed), and ``cache_batch_idx`` names each request's
+table row, which lists its pages in token order, so column ``c`` is row
+``c % page_size`` of page ``page_table[row, c // page_size]``. A paged call
+differs from a dense one only in which cache row a column is read from or
+appended to; on the same values the two are bitwise equal.
+
 Numerics follow FlashAttention-2's split path: fp32 scores, base-2 online
 softmax, the probabilities rounded to the operand dtype for the P.V product
 with the row sum taken from the fp32 values, each split normalized and merged
@@ -93,6 +101,30 @@ MAX_WINDOW_SPAN = MAX_SPLITS * MAX_TILES * SPLIT_BLOCK_N
 
 
 @triton.jit
+def _context_rows(table, cols, mask, page_rows, PAGE: tl.constexpr):
+    """The cache rows of context columns ``cols``: the columns of a dense slot, or row
+    ``c % PAGE`` of page ``table[c // PAGE]`` in a pool whose pages are ``page_rows`` apart."""
+    if PAGE:
+        page = tl.load(table + cols // PAGE, mask=mask, other=0).to(tl.int64)
+        rows = page * page_rows + cols % PAGE
+    else:
+        rows = cols.to(tl.int64)
+    return rows
+
+
+def _page_arguments(k_cache, v_cache, page_table, cache_batch_idx):
+    """The split kernel's ``(page_table, PAGE, page_rows, stride_pt, stride_ks, stride_vs)``.
+
+    A dense call reads its slot's columns (``PAGE`` 0, the table unused); a paged
+    call reads rows of the whole pool through its table row (slot strides 0).
+    """
+    if page_table is None:
+        return cache_batch_idx, 0, 0, 0, k_cache.stride(0), v_cache.stride(0)
+    page_rows = k_cache.stride(0) // k_cache.stride(1)
+    return page_table, k_cache.shape[1], page_rows, page_table.stride(0), 0, 0
+
+
+@triton.jit
 def _window_attention_split_kernel(
     q_ptr,
     k_ptr,
@@ -101,6 +133,7 @@ def _window_attention_split_kernel(
     v_new_ptr,
     seqlens_ptr,
     batch_idx_ptr,
+    page_table_ptr,
     out_ptr,
     o_part_ptr,
     lse_part_ptr,
@@ -115,6 +148,8 @@ def _window_attention_split_kernel(
     stride_vs,
     stride_vn,
     stride_vh,
+    stride_pt,
+    page_rows,
     stride_knt,
     stride_knh,
     stride_vnt,
@@ -135,6 +170,7 @@ def _window_attention_split_kernel(
     APPEND: tl.constexpr,
     DIRECT: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    PAGE: tl.constexpr,
 ):
     split = tl.program_id(0)
     bh = tl.program_id(1)
@@ -153,6 +189,8 @@ def _window_attention_split_kernel(
         return
     slot = tl.load(batch_idx_ptr + b).to(tl.int64)
     dims = tl.arange(0, D)
+    # A paged call's slot names the request's page-table row; its slot strides are 0.
+    table = page_table_ptr + slot * stride_pt
     k_base = k_ptr + slot * stride_ks + kvh * stride_kh
     v_base = v_ptr + slot * stride_vs + kvh * stride_vh
     block_start = seqlen - M
@@ -166,7 +204,7 @@ def _window_attention_split_kernel(
             j = tl.arange(0, M_P2)
             j_ok = j < M
             new_rows = new_row0 + j
-            cols = (block_start + j).to(tl.int64)
+            kv_rows = _context_rows(table, block_start + j, j_ok, page_rows, PAGE)
             k_blk = tl.load(
                 k_new_ptr + new_rows[:, None] * stride_knt + kvh * stride_knh + dims[None, :],
                 mask=j_ok[:, None],
@@ -175,8 +213,12 @@ def _window_attention_split_kernel(
                 v_new_ptr + new_rows[:, None] * stride_vnt + kvh * stride_vnh + dims[None, :],
                 mask=j_ok[:, None],
             )
-            tl.store(k_base + cols[:, None] * stride_kn + dims[None, :], k_blk, mask=j_ok[:, None])
-            tl.store(v_base + cols[:, None] * stride_vn + dims[None, :], v_blk, mask=j_ok[:, None])
+            tl.store(
+                k_base + kv_rows[:, None] * stride_kn + dims[None, :], k_blk, mask=j_ok[:, None]
+            )
+            tl.store(
+                v_base + kv_rows[:, None] * stride_vn + dims[None, :], v_blk, mask=j_ok[:, None]
+            )
 
     # Packed tile row r = g * M + i: query head kvh * GROUP + g, block row i,
     # which sits at key position seqlen - M + i (bottom-right aligned).
@@ -202,7 +244,7 @@ def _window_attention_split_kernel(
     for t in tl.static_range(TILES):
         cols = start + t * BLOCK_N + tl.arange(0, BLOCK_N)
         col_ok = cols < seqlen
-        cols64 = cols.to(tl.int64)
+        kv_rows = _context_rows(table, cols, col_ok, page_rows, PAGE)
         # Both loads are issued before the products: V's latency hides behind
         # QK^T and the softmax.
         if APPEND:
@@ -210,7 +252,7 @@ def _window_attention_split_kernel(
             in_arena = col_ok & (cols < block_start)
             new_rows = new_row0 + (cols - block_start)
             k = tl.load(
-                k_base + cols64[:, None] * stride_kn + dims[None, :],
+                k_base + kv_rows[:, None] * stride_kn + dims[None, :],
                 mask=in_arena[:, None],
                 other=0.0,
             )
@@ -224,7 +266,7 @@ def _window_attention_split_kernel(
                 k,
             )
             v = tl.load(
-                v_base + cols64[:, None] * stride_vn + dims[None, :],
+                v_base + kv_rows[:, None] * stride_vn + dims[None, :],
                 mask=in_arena[:, None],
                 other=0.0,
             )
@@ -239,12 +281,12 @@ def _window_attention_split_kernel(
             )
         else:
             k = tl.load(
-                k_base + cols64[:, None] * stride_kn + dims[None, :],
+                k_base + kv_rows[:, None] * stride_kn + dims[None, :],
                 mask=col_ok[:, None],
                 other=0.0,
             )
             v = tl.load(
-                v_base + cols64[:, None] * stride_vn + dims[None, :],
+                v_base + kv_rows[:, None] * stride_vn + dims[None, :],
                 mask=col_ok[:, None],
                 other=0.0,
             )
@@ -369,11 +411,13 @@ def window_attention_launch(
     num_warps: int,
     merge_warps: int,
     merge_entry_trigger: bool = False,
+    page_table: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Launch the split and merge kernels with an explicit split geometry.
 
     ``merge_entry_trigger`` (with ``enable_pdl``): the merge kernel releases its
     dependent before its own wait instead of at its exit (the PDL chain's ``pdl_merge``).
+    ``page_table``: the caches are pools of pages (see the module docstring).
 
     Raises:
         ValueError: if the geometry cuts the window into more than ``MAX_SPLITS`` splits.
@@ -399,6 +443,9 @@ def window_attention_launch(
     append = k_new is not None
     if not append:
         k_new = v_new = k_cache  # unused
+    page_table, page, page_rows, stride_pt, stride_ks, stride_vs = _page_arguments(
+        k_cache, v_cache, page_table, cache_batch_idx
+    )
     direct = num_splits == 1
     if direct:
         o_part = lse_part = out  # unused
@@ -417,6 +464,7 @@ def window_attention_launch(
         v_new,
         cache_seqlens,
         cache_batch_idx,
+        page_table,
         out,
         o_part,
         lse_part,
@@ -425,12 +473,14 @@ def window_attention_launch(
         q.stride(0),
         q.stride(1),
         q.stride(2),
-        k_cache.stride(0),
+        stride_ks,
         k_cache.stride(1),
         k_cache.stride(2),
-        v_cache.stride(0),
+        stride_vs,
         v_cache.stride(1),
         v_cache.stride(2),
+        stride_pt,
+        page_rows,
         k_new.stride(0),
         k_new.stride(1),
         v_new.stride(0),
@@ -451,6 +501,7 @@ def window_attention_launch(
         APPEND=append,
         DIRECT=direct,
         LAUNCH_WITH_PDL=enable_pdl,
+        PAGE=page,
         num_warps=num_warps,
         launch_pdl=enable_pdl,
     )
@@ -491,8 +542,9 @@ class DflashWindowAttention(OpWrapper):
     """Non-causal sliding-window attention of a DFlash block over its slot's pooled K/V.
 
     ``__call__(q, k_cache, v_cache, cache_seqlens, cache_batch_idx, window_size,
-    softmax_scale=None, enable_pdl=False, k_new=None, v_new=None)`` takes the
-    arguments the drafter hands ``flash_attn_with_kvcache`` (non-causal):
+    softmax_scale=None, enable_pdl=False, k_new=None, v_new=None,
+    merge_entry_trigger=False, page_table=None)`` takes the arguments the drafter
+    hands ``flash_attn_with_kvcache`` (non-causal):
 
     * ``q`` ``[B, M, Hq, D]``: the block's queries, unit last-dim stride;
     * ``k_cache`` / ``v_cache`` ``[slots, capacity, Hkv, D]``: one layer's view
@@ -513,7 +565,11 @@ class DflashWindowAttention(OpWrapper):
       kernel triggers its dependents before its ``griddepcontrol.wait``
       instead of at its exit. It reads only the split's partials and the
       lengths, all after that wait; its dependent must read the output after
-      its own wait. The same values.
+      its own wait. The same values;
+    * ``page_table`` ``[rows, max_pages]`` int32, unit last stride: the caches
+      are pools ``[pages, page_size, Hkv, D]`` whose page stride is the same
+      whole number of rows for both, and ``cache_batch_idx`` names table rows
+      (see the module docstring).
 
     Returns ``[B, M, Hq, D]`` in ``q``'s dtype, contiguous.
 
@@ -544,9 +600,18 @@ class DflashWindowAttention(OpWrapper):
         k_new: torch.Tensor | None = None,
         v_new: torch.Tensor | None = None,
         merge_entry_trigger: bool = False,
+        page_table: torch.Tensor | None = None,
     ) -> None:
         reason = unsupported_reason(
-            q, k_cache, v_cache, cache_seqlens, cache_batch_idx, window_size, k_new, v_new
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens,
+            cache_batch_idx,
+            window_size,
+            k_new,
+            v_new,
+            page_table,
         )
         if reason is not None:
             raise ValueError(f"dflash_window_attention: {reason}")
@@ -564,6 +629,7 @@ class DflashWindowAttention(OpWrapper):
         k_new: torch.Tensor | None = None,
         v_new: torch.Tensor | None = None,
         merge_entry_trigger: bool = False,
+        page_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
         m, num_q_heads = q.shape[1], q.shape[2]
         group = num_q_heads // k_cache.shape[2]
@@ -581,6 +647,7 @@ class DflashWindowAttention(OpWrapper):
             v_new,
             **config,
             merge_entry_trigger=merge_entry_trigger,
+            page_table=page_table,
         )
 
     def reference(
@@ -705,6 +772,7 @@ def unsupported_reason(
     window_size: tuple[int, int],
     k_new: torch.Tensor | None = None,
     v_new: torch.Tensor | None = None,
+    page_table: torch.Tensor | None = None,
 ) -> str | None:
     """Why the kernels would answer these inputs wrongly, or None if they take them."""
     if q.dim() != 4 or k_cache.dim() != 4 or v_cache.dim() != 4:
@@ -738,6 +806,17 @@ def unsupported_reason(
             return "k_new / v_new must have the operands' dtype"
         if k_new.stride(2) != 1 or v_new.stride(2) != 1:
             return "k_new / v_new head dimension must have unit stride"
+    if page_table is not None:
+        if page_table.dtype != torch.int32 or page_table.dim() != 2 or page_table.stride(1) != 1:
+            return "page_table must be [rows, max_pages] int32 with unit last stride"
+        if not page_table.is_cuda:
+            return "all tensors must be on the GPU"
+        page_rows = k_cache.stride(0) // k_cache.stride(1)
+        if (k_cache.stride(0), v_cache.stride(0)) != (
+            page_rows * k_cache.stride(1),
+            page_rows * v_cache.stride(1),
+        ):
+            return "a page's stride must be the same whole number of rows for K and V"
     return None
 
 

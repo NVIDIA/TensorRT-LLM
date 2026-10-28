@@ -61,6 +61,7 @@ class WideWindowAttention:
         enable_pdl: bool,
         k_new: torch.Tensor,
         v_new: torch.Tensor,
+        page_table: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """``dflash_window_attention_wide`` with the block decode's arguments (default scale)."""
         return dflash_window_attention_wide(
@@ -74,6 +75,7 @@ class WideWindowAttention:
             enable_pdl,
             k_new,
             v_new,
+            page_table,
         )
 
 

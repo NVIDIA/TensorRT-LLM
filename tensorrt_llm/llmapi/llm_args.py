@@ -3316,7 +3316,7 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "on the same paged cache and supports SM90 only. AUTO (the default) "
         "resolves to TRTLLM where it can run and every drafter layer is "
         "windowed, and to VANILLA otherwise, including on a disaggregated worker "
-        "with TRTLLM_DISAGG_SHARED_DRAFT_KV=0 and under modeling_v2. In "
+        "with TRTLLM_DISAGG_SHARED_DRAFT_KV=0. In "
         "disaggregated serving a TRTLLM drafter keeps its KV with the target's, "
         "so the context server's drafter context reaches the generation server; "
         "both servers need the same speculative_config.")
@@ -7086,14 +7086,13 @@ class TorchLlmArgs(BaseLlmArgs):
                           and self.cache_transceiver_config.backend is not None)
                 shared_draft_kv = disagg_shares_draft_kv(
                     self.speculative_config)
-                # An unshared disaggregated worker refuses a windowed TRTLLM draft pool; modeling_v2 drafts on VANILLA.
+                # An unshared disaggregated worker refuses a windowed TRTLLM draft pool.
                 if (self.speculative_config.attention_backend == "AUTO"
-                        and ((disagg and not shared_draft_kv)
-                             or self.modeling_v2 != "off")):
+                        and disagg and not shared_draft_kv):
                     self.speculative_config.attention_backend = "VANILLA"
                     logger.info(
                         "DFlash attention_backend AUTO resolved to VANILLA "
-                        "(modeling_v2, or a disaggregated worker with "
+                        "(a disaggregated worker with "
                         "TRTLLM_DISAGG_SHARED_DRAFT_KV=0).")
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
                 # From the disaggregated-serving-benchmarking overlay (TRT-LLM aa7db814):

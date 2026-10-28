@@ -39,6 +39,7 @@ def _worker(lengths, bases=None):
         _ctx_base=None if bases is None else torch.tensor(bases, dtype=torch.long, device="cuda"),
     )
     w._advance_ctx_len = partial(DFlashWorker._advance_ctx_len, w)
+    w._empty_dummy_slot = partial(DFlashWorker._empty_dummy_slot, w)
     return w
 
 

@@ -545,8 +545,8 @@ def dflash_linear(spec_config: Any) -> bool:
     """Whether ``spec_config`` is DFlash drafting a linear chain of ``DRAFT_LEN`` tokens.
 
     That is the drafter every composition's drafter, worker and head paths are
-    written for: one draft per position (no tree), a fixed draft length (no
-    schedule), and the drafter's VANILLA pooled-context attention.
+    written for: one draft per position (no tree) and a fixed draft length (no
+    schedule).
     """
     from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
 
@@ -559,7 +559,6 @@ def dflash_linear(spec_config: Any) -> bool:
         and getattr(spec_config, "max_draft_len", None) == DRAFT_LEN
         and getattr(spec_config, "max_total_draft_tokens", None) == DRAFT_LEN
         and getattr(spec_config, "draft_len_schedule", None) is None
-        and getattr(spec_config, "attention_backend", None) == "VANILLA"
     )
 
 
@@ -572,8 +571,7 @@ def describe_speculation(spec_config: Any) -> str:
         f"{getattr(mode, 'name', type(spec_config).__name__)} "
         f"max_draft_len={getattr(spec_config, 'max_draft_len', None)} "
         f"max_total_draft_tokens={getattr(spec_config, 'max_total_draft_tokens', None)} "
-        f"draft_len_schedule={getattr(spec_config, 'draft_len_schedule', None)} "
-        f"attention_backend={getattr(spec_config, 'attention_backend', None)}"
+        f"draft_len_schedule={getattr(spec_config, 'draft_len_schedule', None)}"
     )
 
 
@@ -604,7 +602,7 @@ def served_compositions(compositions: Mapping[CompositionKey, TargetPaths]) -> s
     return (
         f"{keys}, each with DFlash drafting a linear chain of {DRAFT_LEN} tokens "
         "(max_draft_len = max_total_draft_tokens = "
-        f"{DRAFT_LEN}, no draft_len_schedule, VANILLA attention_backend) and an NVFP4 checkpoint"
+        f"{DRAFT_LEN}, no draft_len_schedule) and an NVFP4 checkpoint"
     )
 
 
@@ -1143,7 +1141,11 @@ def compose(
             f"{TAG} no fast path for this deployment ({reason}); running the built-in forward"
         )
         return NO_PATHS
-    windowed = windowed_context_arena(spec_worker)
+    from tensorrt_llm._torch.speculative.dflash import _PAGED_ATTENTION_BACKENDS
+
+    # The worker pages the drafter's context on these backends, and windows only a dense arena.
+    paged = getattr(spec_worker, "_dflash_attention_backend", None) in _PAGED_ATTENTION_BACKENDS
+    windowed = windowed_context_arena(spec_worker) and not paged
     paths, gated = capacity_gated(frozenset(served.served), max_batch_size)
     paths, yields = yielded(paths)
     if windowed:
@@ -1169,6 +1171,8 @@ def compose(
     plan = Plan(paths)
     if windowed:
         composed += f" with {_WINDOWED_ARENA}"
+    if paged:
+        composed += " with a paged drafter context"
     for gate in gated:
         composed += (
             f" without {gate.path} (max_batch_size {max_batch_size} above {gate.most_requests};"

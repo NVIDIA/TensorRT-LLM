@@ -50,3 +50,5 @@ l0_gb300_musespark:
   - unittest/disaggregated/test_kv_transfer.py
   - unittest/disaggregated/test_bounce.py
   - accuracy/test_disaggregated_serving.py::TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv
+  # The Muse modeling_v2 composition over a TRTLLM drafter's paged context.
+  - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/test_modeling_v2_drafter_context.py

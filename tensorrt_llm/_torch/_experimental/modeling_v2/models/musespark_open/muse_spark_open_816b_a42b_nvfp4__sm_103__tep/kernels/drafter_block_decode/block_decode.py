@@ -25,14 +25,15 @@ the built-in ones.
 
 ``drafter_block_decode``, second part: the block decode itself is this module's
 ``windowed_block_decode`` -- the built-in ``dflash_forward`` written out for
-the one path this drafter takes (VANILLA arena, fused QK-norm + RoPE, DFlash 2
-block convolutions, non-causal windowed layers, no output gate) over the
-built-in modules -- with the block's K/V append done inside the attention op
-instead of two ``index_put`` launches per layer, and without the built-in's
-unused RoPE table gather. This part is installed only when every layer's
-attention geometry is one the op takes (it calls the op directly; selected for
-a drafter outside that path, the install raises); a step outside that path
-runs the built-in forward (with the windowed attention).
+the one path this drafter takes (fused QK-norm + RoPE, DFlash 2 block
+convolutions, non-causal windowed layers, no output gate) over the built-in
+modules -- with the block's K/V append done inside the attention op instead of
+the built-in's per-layer append, and without the built-in's unused RoPE table
+gather. The op reads the context where the DFlash worker keeps it: the dense
+arena, or the worker's pages through its page table. This part is installed
+only when every layer's attention geometry is one the op takes (it calls the op
+directly; selected for a drafter outside that path, the install raises); a step
+outside that path runs the built-in forward.
 
 ``wide_drafter_window_attention`` (tep4 on sm_103 only) binds a ``WideWindowAttention``
 to the drafter (``kernels/wide_drafter_window_attention``); a block decode of the
@@ -205,11 +206,11 @@ def install_windowed_block_attention(draft_model: nn.Module, enable_pdl: bool) -
 def block_decode_unsupported_reason(draft_model: nn.Module) -> str | None:
     """Why ``windowed_block_decode`` cannot stand in for this drafter's forward, or None.
 
-    Besides the class and backend checks, every layer's attention geometry --
-    a block of ``draft_model.block_size`` rows, its query / KV head counts and
-    head width, its window, bf16 operands -- must be one the attention op
-    takes: ``windowed_block_decode`` calls the op directly, with no per-call
-    fallback to the built-in attention.
+    Besides the class checks, every layer's attention geometry -- a block of
+    ``draft_model.block_size`` rows, its query / KV head counts and head width,
+    its window, bf16 operands -- must be one the attention op takes:
+    ``windowed_block_decode`` calls the op directly, with no per-call fallback
+    to the built-in attention.
     """
     if not isinstance(draft_model, DFlashForCausalLM):
         return f"not a DFlashForCausalLM ({type(draft_model).__name__})"
@@ -219,8 +220,6 @@ def block_decode_unsupported_reason(draft_model: nn.Module) -> str | None:
         return f"{type(draft_model).__name__} gates the attention output"
     if not getattr(draft_model, "_uses_worker_attention_backend", False):
         return "the drafter brings its own attention"
-    if getattr(draft_model, "dflash_attention_backend", None) != "VANILLA":
-        return "the drafter's attention backend is not VANILLA"
     block_size = getattr(draft_model, "block_size", None)
     if not block_size:
         return "the drafter declares no block size"
@@ -253,12 +252,13 @@ def windowed_block_decode(
     ctx_kv_cache: torch.Tensor | None = None,
     ctx_page_table: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """The built-in ``DFlashForCausalLM.dflash_forward``, VANILLA / fused-RoPE path, append fused.
+    """The built-in ``DFlashForCausalLM.dflash_forward``, fused-RoPE path, append fused.
 
     Bound to the drafter as ``dflash_forward`` by ``install_block_decode``.
-    Same modules, same order, same arena state afterwards; the per-layer
-    ``index_put`` of the block K/V and the block attention are one
-    ``dflash_window_attention`` call with ``k_new`` / ``v_new``. Steps the
+    Same modules, same order, same context state afterwards; the per-layer
+    append of the block K/V and the block attention are one
+    ``dflash_window_attention`` call with ``k_new`` / ``v_new``, over the dense
+    arena or, given ``ctx_page_table``, the pages of ``ctx_kv_cache``. Steps the
     written-out path does not cover (fp16/fp32 activations, a drafter without
     the fused QK-norm + RoPE, a block wider than the one ``install_block_decode``
     checked the attention geometry for) run the built-in forward.
@@ -266,12 +266,17 @@ def windowed_block_decode(
     if self._fused_kv_weight is None:
         self._build_fused_kv_buffers()
     attn0 = self.model.layers[0].self_attn
+    if ctx_page_table is None:
+        caches = [(ctx_k_cache[:, i], ctx_v_cache[:, i]) for i in range(ctx_k_cache.shape[1])]
+    else:
+        # Each layer's [pages, K/V, Hkv, page, D] pool as two pools of [page, Hkv, D] rows.
+        caches = [(pool[:, 0].transpose(1, 2), pool[:, 1].transpose(1, 2)) for pool in ctx_kv_cache]
+    k0, v0 = caches[0]
     if not (
         self._use_fused_qk_norm_rope
-        and noise_embedding.dtype == ctx_k_cache.dtype == ctx_v_cache.dtype == torch.bfloat16
-        and ctx_k_cache.dim() == 5
-        and ctx_k_cache.stride(-1) == 1
-        and ctx_v_cache.stride(-1) == 1
+        and noise_embedding.dtype == k0.dtype == v0.dtype == torch.bfloat16
+        and k0.stride(-1) == 1
+        and v0.stride(-1) == 1
         and noise_embedding.shape[1] <= self.block_size
     ):
         return DFlashForCausalLM.dflash_forward(
@@ -355,23 +360,25 @@ def windowed_block_decode(
         v_new = qkv_query[:, q_size + kv_size :].reshape(-1, num_kv_heads_per_rank, head_dim)
 
         _, window_size = self._resolve_block_attention(layer_idx)
+        k_cache, v_cache = caches[layer_idx]
         if wide is not None:
             out = wide(
                 q_bshd,
-                ctx_k_cache[:, layer_idx],
-                ctx_v_cache[:, layer_idx],
+                k_cache,
+                v_cache,
                 seq_lens_after,
                 cache_batch_idx_i32,
                 window_size,
                 enable_pdl,
                 k_new,
                 v_new,
+                ctx_page_table,
             )
         else:
             out = dflash_window_attention(
                 q_bshd,
-                ctx_k_cache[:, layer_idx],
-                ctx_v_cache[:, layer_idx],
+                k_cache,
+                v_cache,
                 seq_lens_after,
                 cache_batch_idx_i32,
                 window_size,
@@ -380,6 +387,7 @@ def windowed_block_decode(
                 k_new,
                 v_new,
                 merge_entry,
+                ctx_page_table,
             )
         attn_output = out.reshape(B * block_size, q_size)
 
@@ -474,8 +482,8 @@ def install(draft_model: nn.Module | None, block_conv: bool, block_decode: bool)
 
     Raises:
         ValueError: if one asked for cannot be installed on this drafter
-            (``block_conv``: no DFlash 2 block convolutions; ``block_decode``: no
-            VANILLA block attention, or ``block_decode_unsupported_reason``).
+            (``block_conv``: no DFlash 2 block convolutions; ``block_decode``:
+            ``block_decode_unsupported_reason``).
         TypeError: from ``install_fused_block_conv``.
     """
     if block_conv:
@@ -514,11 +522,11 @@ def _install_windowed_attention(draft_model: nn.Module | None, block_decode: boo
     wrapped = isinstance(
         getattr(draft_model, "_dflash_flash_attention", None), WindowedBlockAttention
     )
-    if draft_model is None or not install_windowed_block_attention(draft_model, enable_pdl):
-        raise ValueError(
-            "[musespark_open] drafter_block_decode cannot run here: the drafter has no VANILLA block attention"
-        )
-    if not wrapped:
+    if (
+        draft_model is not None
+        and install_windowed_block_attention(draft_model, enable_pdl)
+        and not wrapped
+    ):
         logger.info(
             f"[musespark_open] drafter_block_decode: windowed DFlash block attention on the drafter (pdl={enable_pdl})"
         )
