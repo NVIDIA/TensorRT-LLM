@@ -1086,11 +1086,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
     presence_penalty: Optional[float] = 0.0
     response_format: Optional[ResponseFormat] = None
     seed: Optional[int] = Field(None)
-    # Standard OpenAI field, accepted for compatibility and otherwise ignored:
-    # the server has no service tiers. Scheduling priority is the separate
-    # `priority` field.
     service_tier: Optional[Literal["auto", "default", "flex", "scale",
-                                   "priority", "fast"]] = None
+                                   "priority", "fast"]] = Field(
+                                       default=None,
+                                       description=(
+                                           "Accepted for OpenAI compatibility "
+                                           "and ignored: the server has no "
+                                           "service tiers. Scheduling priority "
+                                           "is the separate `priority` field."))
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
     # Standard OpenAI field, accepted for compatibility and otherwise ignored:
     # the server keeps no copy of a chat completion, so there is nothing to
@@ -1123,10 +1126,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
     thinking: Optional[ChatCompletionThinkingParam] = None
     thinking_token_budget: Optional[int] = None
     prompt_ignore_length: Optional[int] = 0
-    # Not an OpenAI field: opaque per-request metadata that agent clients
-    # attach, a map of strings to strings (as Codex CLI declares it). Accepted
-    # and otherwise ignored.
-    client_metadata: Optional[Dict[str, str]] = None
+    client_metadata: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=("Not an OpenAI field: opaque per-request metadata that "
+                     "agent clients attach, a map of strings to strings. "
+                     "Accepted and ignored."))
 
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None

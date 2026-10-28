@@ -93,6 +93,13 @@ def test_accepted_fields_do_not_change_sampling_params():
     assert tagged == plain, "service_tier and client_metadata are accepted and ignored"
 
 
+@pytest.mark.parametrize("field", ["service_tier", "client_metadata"])
+def test_the_api_schema_says_the_field_is_ignored(field):
+    description = ChatCompletionRequest.model_json_schema()["properties"][field]["description"]
+
+    assert "ignored" in description
+
+
 @pytest.mark.parametrize("field", ["service_tiers", "client_meta_data"])
 def test_unknown_fields_remain_rejected(field):
     with pytest.raises(ValidationError) as caught:
