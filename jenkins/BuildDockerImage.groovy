@@ -156,7 +156,7 @@ def globalVars = [
 @Field
 def imageKeyToTag = [:]
 
-def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
+def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false, stageName = null)
 {
     def targetCould = "kubernetes-cpu"
     def containerConfig = ""
@@ -265,7 +265,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
         """.stripIndent(),
     ]
 
-    return podConfig
+    return ciNodePolicy.apply(podConfig, [pipeline: "BuildDockerImage", stage: stageName])
 }
 
 
@@ -893,7 +893,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
                 config[defaultKey] = defaultValue
             }
         }
-        config.podConfig = createKubernetesPodConfig("build", config.arch, config.build_wheel)
+        config.podConfig = createKubernetesPodConfig("build", config.arch, config.build_wheel, key)
     }
     echo "Build configs:"
     println buildConfigs
