@@ -17,6 +17,7 @@ translation (CPU only; no drafter module is built here)."""
 
 import json
 import pathlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -35,6 +36,10 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     build_minimax_dspark_draft_config,
     load_pretrained_config,
 )
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
+
+pytestmark = pytest.mark.cpu_only
 
 # The shipped drafter config.json, reduced to the fields the loaders read. The
 # backbone geometry sits under text_config; the dspark_* / dflash_config knobs
@@ -198,6 +203,28 @@ def test_mxfp8_dequantization_matches_per_block_reference() -> None:
     got = dequantize_mxfp8_weight(quantized, exponents, torch.bfloat16)
     assert got.dtype == torch.bfloat16
     torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
+def test_mxfp8_dequantization_reads_the_scale_exponent_bytes() -> None:
+    """The scale is the UE8M0 code, whichever dtype safetensors hands back."""
+    weight = torch.randn(4, 64).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[127, 128], [126, 130], [127, 127], [120, 135]], dtype=torch.uint8)
+    expected = dequantize_mxfp8_weight(weight, scale, torch.bfloat16)
+    e8m0 = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0 is not None:
+        torch.testing.assert_close(
+            dequantize_mxfp8_weight(weight, scale.view(e8m0), torch.bfloat16), expected
+        )
+    with pytest.raises(ValueError, match="UE8M0"):
+        dequantize_mxfp8_weight(weight, scale.to(torch.float32), torch.bfloat16)
+
+
+def test_minimax_drafter_refuses_a_quantized_draft_config() -> None:
+    """A hf_quant_config.json next to the checkpoint would quantize the
+    backbone the loader hands bf16 tensors to; the drafter refuses to build."""
+    draft_config = SimpleNamespace(quant_config=QuantConfig(quant_algo=QuantAlgo.MXFP8))
+    with pytest.raises(ValueError, match="hf_quant_config.json"):
+        MiniMaxDSparkForCausalLM(draft_config)
 
 
 def test_prepare_weights_dequantizes_and_folds_gemma_norms() -> None:

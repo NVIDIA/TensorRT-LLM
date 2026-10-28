@@ -122,7 +122,7 @@ from .modeling_deepseekv4 import (
     _rename_deepseek_v4_attn_subkey,
     _rename_deepseek_v4_ffn_subkey,
 )
-from .modeling_dflash import DFlashForCausalLM, resolve_dspark_head_config
+from .modeling_dflash import TRTLLM_GEN_LSE_LN2, DFlashForCausalLM, resolve_dspark_head_config
 from .modeling_speculative import (
     DSparkConfidenceHead,
     SpecDecOneEngineForCausalLM,
@@ -2466,8 +2466,6 @@ _DSPARK_HEAD_WEIGHT_ALIASES = {
     "confidence_proj.bias": ("confidence_head.proj.bias", "confidence_proj.bias"),
 }
 
-
-_LN2 = math.log(2.0)
 # flashinfer sizes its own scratch from this; the MLA decode path is the only
 # consumer here and 256 MiB is what the DFlash TRTLLM buffers already reserve.
 _MLA_DECODE_WORKSPACE_BYTES = 256 * 1024 * 1024
@@ -2796,9 +2794,25 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         :class:`_DSparkHeadMixin`), and a windowed layer bounds both sides by
         the window, as the HF flash path they are trained under does (see
         ``dspark_layer_window_size``).
+
+        Explicit checkpoint metadata wins over this default: a config that
+        declares a causal window (``is_causal: true``, or the speculators
+        schema's ``sliding_window_non_causal: false``) keeps the DFlash
+        resolution, the causal windowed decode.
         """
-        _, (window_left, _) = super()._get_attention_mask_args(layer_idx)
+        base = super()._get_attention_mask_args(layer_idx)
+        if self._declares_causal_window():
+            return base
+        _, (window_left, _) = base
         return False, (window_left, window_left)
+
+    def _declares_causal_window(self) -> bool:
+        """Whether the drafter config states that its sliding window is causal."""
+        is_causal = getattr(self.config, "is_causal", None)
+        if is_causal is not None:
+            return bool(is_causal)
+        non_causal = getattr(self.config, "sliding_window_non_causal", None)
+        return non_causal is not None and not bool(non_causal)
 
     def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
         """Take the DSpark head weights, then hand the rest to DFlash."""
@@ -3212,7 +3226,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # --- log-sum-exp merge (flash-decoding combine), kernel LSE is base 2 ---
         # w_u / (w_l + w_u) == sigmoid(lse_u - lse_l): one sigmoid and one lerp, no
         # explicit max needed. The last query's triangle is empty, so sigmoid is 0.
-        lse_l = lse_lower.view(batch, block_size, num_heads).float() * _LN2
+        lse_l = lse_lower.view(batch, block_size, num_heads).float() * TRTLLM_GEN_LSE_LN2
         weight_upper = torch.sigmoid(lse_upper - lse_l).unsqueeze(-1)
         merged = torch.lerp(out_lower.float(), out_upper.float(), weight_upper)
         return merged.to(query.dtype)
@@ -3641,6 +3655,15 @@ def dequantize_mxfp8_weight(
     """``weight`` (e4m3, ``[out, in]``) times ``2 ** (scale_inv - 127)`` per
     ``[1, 32]`` block (``scale_inv``: UE8M0 as uint8, ``[out, in / 32]``), in
     ``dtype``."""
+    if scale_inv.dtype != torch.uint8:
+        # The exponent code is wanted, not the value it encodes: ``.to`` of a
+        # float8_e8m0fnu tensor would convert ``2 ** k``, not ``k``.
+        if scale_inv.element_size() != 1:
+            raise ValueError(
+                "MXFP8 weight_scale_inv must hold UE8M0 bytes (uint8 or "
+                f"float8_e8m0fnu), got {scale_inv.dtype}"
+            )
+        scale_inv = scale_inv.view(torch.uint8)
     w = weight.to(torch.float32)
     exponent = scale_inv.to(torch.int32) - 127
     scale = torch.exp2(exponent.to(torch.float32))
@@ -3656,6 +3679,9 @@ def prepare_minimax_dspark_weights(weights: Dict, dtype: torch.dtype) -> Dict:
     tensor and every Gemma norm weight incremented by one.
     """
     renamed = {remap_minimax_dspark_weight_name(k): v for k, v in weights.items()}
+    # Every tensor is materialized whole on the host, and the dequantization
+    # goes through float32, before any TP slicing: sized for this five-layer
+    # drafter, not a pattern for a full backbone.
     out = {}
     for name, value in renamed.items():
         if name.endswith(_MXFP8_SCALE_SUFFIX):
@@ -3808,6 +3834,21 @@ class MiniMaxDSparkForCausalLM(GQADSparkForCausalLM):
     the checkpoint (namespace, MXFP8 dequantization, Gemma norm fold) before
     the DFlash loader sees it. See :func:`prepare_minimax_dspark_weights`.
     """
+
+    def __init__(self, draft_config, *args: Any, **kwargs: Any) -> None:
+        # The backbone must be built unquantized: the loader hands it bf16
+        # tensors. ``quantization_config`` is dropped from config.json by
+        # ``build_minimax_dspark_draft_config``, but a ``hf_quant_config.json``
+        # next to the checkpoint would still quantize the Linears.
+        quant_algo = getattr(draft_config.quant_config, "quant_algo", None)
+        if quant_algo is not None:
+            raise ValueError(
+                "The MiniMax DSpark drafter dequantizes its MXFP8 weights at "
+                f"load and must be built unquantized; the draft config carries "
+                f"quant_algo={quant_algo}. Remove hf_quant_config.json from the "
+                "drafter directory."
+            )
+        super().__init__(draft_config, *args, **kwargs)
 
     def load_weights(self, weights: Dict, weight_mapper: Any = None, **kwargs: Any) -> Any:
         weights = prepare_minimax_dspark_weights(weights, self.config.torch_dtype)

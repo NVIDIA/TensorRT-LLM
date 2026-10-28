@@ -28,6 +28,8 @@ from tensorrt_llm._torch.models.modeling_dflash import (
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.llmapi.llm_args import is_dflash2_checkpoint
 
+pytestmark = pytest.mark.cpu_only
+
 # ---------------------------------------------------------------------------
 # Two-tap dynamic depthwise convolution
 # ---------------------------------------------------------------------------

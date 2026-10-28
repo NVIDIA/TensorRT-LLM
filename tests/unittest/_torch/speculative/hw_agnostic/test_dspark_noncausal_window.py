@@ -13,6 +13,7 @@ over a paged cache (SM100/SM103 only).
 
 import math
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -23,6 +24,10 @@ from tensorrt_llm._torch.models.modeling_dflash import (
     dflash_trtllm_windowed_block_attention,
 )
 from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
+from tensorrt_llm._torch.speculative.dflash_attention import (
+    DFLASH_CONTEXT_LOWERING,
+    validate_dflash_trtllm_gen_runtime,
+)
 
 # ---------------------------------------------------------------------------
 # Dense oracle
@@ -68,6 +73,7 @@ def _oracle(query, keys, values, ctx_lens, window_left, window_right, causal):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("block_size", [1, 2, 4, 7])
 @pytest.mark.parametrize("window", [3, 8, 64])
 @pytest.mark.parametrize("heads", [(4, 1), (8, 2)])
@@ -96,6 +102,7 @@ def test_merge_matches_the_non_causal_oracle(block_size, window, heads):
         assert not torch.allclose(out_causal, expected, atol=1e-3)
 
 
+@pytest.mark.cpu_only
 def test_merge_bounds_the_future_keys_by_the_right_window():
     """A right window smaller than the block hides block keys more than
     window_right ahead of the query."""
@@ -143,6 +150,7 @@ def _minimax_like_config(num_layers=5, window=4096):
     )
 
 
+@pytest.mark.cpu_only
 def test_dspark_windowed_layers_are_non_causal_and_two_sided():
     """The MiniMax-M3.1 drafter: five sliding layers, window 4096, plus the
     use_swa window the config flattening adds."""
@@ -154,6 +162,7 @@ def test_dspark_windowed_layers_are_non_causal_and_two_sided():
     assert wrapper.validate_block_attention_windows() == ["causal decode + future-block merge"] * 5
 
 
+@pytest.mark.cpu_only
 def test_dspark_unwindowed_layers_stay_non_causal():
     config = SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2)
     wrapper = _wrapper(GQADSparkForCausalLM, config)
@@ -161,10 +170,58 @@ def test_dspark_unwindowed_layers_stay_non_causal():
     assert wrapper.validate_block_attention_windows() == ["non-causal context"] * 2
 
 
+@pytest.mark.cpu_only
 def test_plain_dflash_keeps_reading_a_windowed_layer_as_causal():
     """No-regression: the DSpark override does not reach DFlash drafters."""
     wrapper = _wrapper(DFlashForCausalLM, _minimax_like_config(num_layers=2, window=512))
     assert wrapper._get_attention_mask_args(0) == (True, (511, 0))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "metadata, expected",
+    [
+        ({"is_causal": True}, (True, (511, 0))),
+        ({"sliding_window_non_causal": False}, (True, (511, 0))),
+        ({"is_causal": False}, (False, (511, 511))),
+        ({"sliding_window_non_causal": True}, (False, (511, 511))),
+        ({"is_causal": False, "sliding_window_non_causal": False}, (False, (511, 511))),
+    ],
+)
+def test_dspark_honors_explicit_window_causality_metadata(metadata, expected):
+    """A config that states its window is causal keeps the DFlash resolution
+    (causal windowed decode); ``is_causal`` outranks the speculators spelling."""
+    config = _minimax_like_config(num_layers=2, window=512)
+    for key, value in metadata.items():
+        setattr(config, key, value)
+    wrapper = _wrapper(GQADSparkForCausalLM, config)
+    assert wrapper._get_attention_mask_args(0) == expected
+    assert wrapper._resolve_block_attention(0) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("head_dim", [72, 80, 96])
+def test_windowed_layers_are_not_held_to_the_context_kernel_head_sizes(head_dim):
+    """Regression: a windowed non-causal layer is lowered to the block decode,
+    so the context kernel's head-size limits must not reject it; an unwindowed
+    non-causal layer still is."""
+    windowed = _wrapper(GQADSparkForCausalLM, _minimax_like_config(num_layers=2, window=512))
+    lowerings = windowed.validate_block_attention_windows()
+    assert DFLASH_CONTEXT_LOWERING not in lowerings
+    unwindowed = _wrapper(
+        GQADSparkForCausalLM,
+        SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2),
+    )
+    assert DFLASH_CONTEXT_LOWERING in unwindowed.validate_block_attention_windows()
+    shape = dict(
+        dtype=torch.bfloat16, num_heads=16, num_kv_heads=2, head_dim=head_dim, tokens_per_block=32
+    )
+    with patch("tensorrt_llm._torch.speculative.dflash_attention.get_dflash_trtllm_gen_ops"):
+        validate_dflash_trtllm_gen_runtime(
+            **shape, has_context_attention=DFLASH_CONTEXT_LOWERING in lowerings
+        )
+        with pytest.raises(RuntimeError, match="head dimension"):
+            validate_dflash_trtllm_gen_runtime(**shape, has_context_attention=True)
 
 
 # ---------------------------------------------------------------------------

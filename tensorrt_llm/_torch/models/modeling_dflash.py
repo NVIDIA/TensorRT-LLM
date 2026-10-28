@@ -23,6 +23,7 @@ except ImportError:
 from ..distributed import AllReduce
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
 from ..speculative.dflash_attention import (
+    DFLASH_CONTEXT_LOWERING,
     dflash_trtllm_gen_unavailability_reason,
     get_dflash_fa4_fwd,
     get_dflash_flash_attention,
@@ -32,6 +33,11 @@ from ..speculative.dflash_attention import (
 from ..speculative.interface import SpeculativeDecodingMode
 from ..speculative.spec_tail_kernels import DraftBlockPlacement
 from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, register_draft_model
+
+# trtllm-gen reports the log-sum-exp in base 2; the merge and the MLA fixup
+# (modeling_dspark) multiply by this to get the natural-log LSE flashinfer's
+# merge expects. One constant, so a flashinfer convention change is fixed once.
+TRTLLM_GEN_LSE_LN2 = math.log(2.0)
 
 
 def dspark_layer_window_size(
@@ -181,8 +187,7 @@ def dflash_trtllm_windowed_block_attention(
         multi_ctas_kv_counter_buffer=counters,
     )
     if merge_future:
-        # trtllm-gen reports the log-sum-exp in base 2.
-        lse = decoded[1] * math.log(2.0)
+        lse = decoded[1] * TRTLLM_GEN_LSE_LN2
         out.copy_(
             dflash_merge_future_block_attention(
                 out, lse, query, block_key, block_value, head_dim**-0.5, window_right
@@ -1515,7 +1520,7 @@ class DFlashForCausalLM(nn.Module):
             elif window_size[0] >= 0:
                 lowering = "causal decode + future-block merge"
             else:
-                lowering = "non-causal context"
+                lowering = DFLASH_CONTEXT_LOWERING
             logger.info_once(
                 f"DFlash draft layer {layer_idx}: causal={causal}, "
                 f"window={window_size}, TRTLLM lowering: {lowering}.",
