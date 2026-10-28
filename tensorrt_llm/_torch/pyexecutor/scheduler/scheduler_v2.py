@@ -1752,6 +1752,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             # Suspending frees nothing in aggregated helix's single hot GPU
             # pool. The request still sits out this step, so clear its stale
             # batch index.
+            logger.debug(
+                f"[V2Scheduler] Helix request {req.py_request_id} found no pages or victim; waiting"
+            )
             self._clear_request_runtime_state(req)
         elif self.kv_cache_manager.is_request_active(
             req.py_request_id

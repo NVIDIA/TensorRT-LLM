@@ -268,6 +268,9 @@ def test_agg_helix_preempts_identically_and_re_prefills_correctly(scenario_name:
             if request.py_request_id in recompute_paused:
                 preempted_at_tokens[request.py_request_id] = request.get_num_tokens(0)
                 preemptions[request.py_request_id] += 1
+                # A repeat preemption replays a longer prompt; check that one too.
+                re_prefilled.discard(request.py_request_id)
+                decoded_after_re_prefill.discard(request.py_request_id)
         for request_id, _ in ctx:
             if request_id in preempted_at_tokens and request_id not in re_prefilled:
                 for rank_active in active:
