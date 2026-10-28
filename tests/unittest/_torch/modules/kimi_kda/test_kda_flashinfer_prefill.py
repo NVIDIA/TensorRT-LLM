@@ -272,7 +272,7 @@ def test_graph_replay_refreshes_packed_lengths(mode: str, conv_mode: str) -> Non
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @torch.inference_mode()
 def test_production_forward_updates_live_cache(state_dtype: torch.dtype) -> None:
-    """The model entry point updates recurrent, convolution and replay caches."""
+    """Prefill updates live checkpoints without modifying replay histories."""
     heads, hidden = 6, 768
     attention = make_attention(heads, hidden_size=hidden)
     reference = make_attention(heads, hidden_size=hidden)
@@ -289,18 +289,30 @@ def test_production_forward_updates_live_cache(state_dtype: torch.dtype) -> None
     ref_state, ref_conv = state.clone(), batch.conv.clone()
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import PythonMambaCacheManager
 
-    replay_caches = {}
-    for label in ("q", "k", "v"):
-        replay_caches[f"kda_conv_{label}"] = torch.randn(
-            state.shape[0], 7, heads * 128, device="cuda", dtype=torch.bfloat16
-        ).transpose(-1, -2)
+    history_shape = (state.shape[0], heads, 20, 128)
+    replay_caches = {
+        name: torch.randn(history_shape, device="cuda", dtype=dtype)
+        for name, dtype in (
+            ("old_x", torch.bfloat16),
+            ("old_B", torch.bfloat16),
+            ("old_dt", torch.float32),
+        )
+    }
+    replay_caches["intermediate_conv_window"] = torch.randn(
+        batch.n, 4, 3 * heads * 128, device="cuda", dtype=torch.bfloat16
+    )
+    replay_caches["prev_num_accepted_tokens"] = torch.full(
+        (state.shape[0],), 7, device="cuda", dtype=torch.int32
+    )
+    # The manager resets prefill slots before the model sees their checkpoints.
+    replay_caches["prev_num_accepted_tokens"][batch.indices.long()] = 0
     cache = PythonMambaCacheManager.SpeculativeState(
         conv=batch.conv.clone(),
         temporal=state,
-        kda_k_cache=torch.empty(1, device="cuda"),
         **replay_caches,
     )
-    old_replay = [getattr(cache, f"kda_conv_{label}").clone() for label in ("q", "k", "v")]
+    assert cache.has_kda_replay_caches
+    old_replay = {name: tensor.clone() for name, tensor in replay_caches.items()}
     metadata = SimpleNamespace(
         mamba_metadata=batch.metadata,
         num_contexts=batch.n,
@@ -327,9 +339,5 @@ def test_production_forward_updates_live_cache(state_dtype: torch.dtype) -> None
     torch.testing.assert_close(batch.hidden, original, rtol=0, atol=0)
     untouched = [0, batch.n + 1]
     torch.testing.assert_close(state[untouched], initial_state[untouched], rtol=0, atol=0)
-    for i, label in enumerate(("q", "k", "v")):
-        replay = getattr(cache, f"kda_conv_{label}")
-        selected = cache.conv[batch.indices.long(), i * heads * 128 : (i + 1) * heads * 128]
-        torch.testing.assert_close(replay[batch.indices.long(), :, :3], selected, rtol=0, atol=0)
-        torch.testing.assert_close(replay[untouched], old_replay[i][untouched], rtol=0, atol=0)
-        torch.testing.assert_close(replay[..., 3:], old_replay[i][..., 3:], rtol=0, atol=0)
+    for name, expected_history in old_replay.items():
+        torch.testing.assert_close(getattr(cache, name), expected_history, rtol=0, atol=0)

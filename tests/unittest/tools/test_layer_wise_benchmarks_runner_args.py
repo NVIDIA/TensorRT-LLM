@@ -18,8 +18,16 @@ No GPU and no checkpoint: ModelLoader is replaced by a stub that records its
 arguments and stops construction before any model is built.
 """
 
-import pytest
+from types import SimpleNamespace
 
+import pytest
+import torch
+
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    MambaHybridCacheManagerV2,
+    MixedMambaHybridCacheManager,
+)
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.tools.layer_wise_benchmarks import runner as runner_module
 
@@ -87,3 +95,86 @@ def test_runner_llm_args_follow_mapping_and_model_defaults(monkeypatch):
     assert llm_args.max_beam_width == 3
     # ... and are resolved from the text-only config the model loads with.
     assert recorded["config_loader"] == "load_pretrained_config_text_only"
+
+
+@pytest.mark.parametrize(
+    "manager_cls,state_dtype,draft_len,replay_enabled",
+    [
+        (MixedMambaHybridCacheManager, torch.float32, 3, False),
+        (MambaHybridCacheManagerV2, torch.float32, 3, True),
+        (MambaHybridCacheManagerV2, torch.bfloat16, 3, True),
+        (MambaHybridCacheManagerV2, torch.float16, 3, False),
+        (MambaHybridCacheManagerV2, torch.float32, None, False),
+    ],
+)
+def test_kimi_cache_factory_enables_replay_only_for_supported_v2(
+    monkeypatch, manager_cls, state_dtype, draft_len, replay_enabled
+):
+    recorded = {}
+
+    class RecordingManager(manager_cls):
+        def __init__(self, *args, **kwargs):
+            recorded.update(kwargs)
+
+        def add_dummy_requests(self, *args, **kwargs):
+            return []
+
+    config = SimpleNamespace(
+        architectures=["KimiLinearForCausalLM"],
+        model_type="kimi_linear",
+        torch_dtype=torch.bfloat16,
+        num_hidden_layers=2,
+        kv_lora_rank=32,
+        qk_rope_head_dim=8,
+        linear_attn_config={"gate_lower_bound": -5.0},
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=config,
+        quant_config=SimpleNamespace(kv_cache_quant_algo=None),
+        enable_flash_mla=False,
+    )
+    mamba_params = SimpleNamespace(
+        state_size=128,
+        conv_kernel=4,
+        num_heads=6,
+        n_groups=6,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        mamba_ssm_cache_dtype=state_dtype,
+    )
+    monkeypatch.setattr(runner_module.ModelConfig, "from_pretrained", lambda *_: model_config)
+    monkeypatch.setattr(runner_module, "validate_and_set_kv_cache_quant", lambda *_: None)
+    monkeypatch.setattr(runner_module, "validate_and_set_mamba_ssm_cache_dtype", lambda *_: None)
+    monkeypatch.setattr(runner_module, "get_kv_cache_manager_cls", lambda *_: RecordingManager)
+    monkeypatch.setattr(
+        runner_module, "extract_mamba_kv_cache_params", lambda *_, **__: mamba_params
+    )
+    monkeypatch.setattr(
+        runner_module, "get_kimi_linear_layer_masks", lambda *_: ([False, True], [True, False])
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.kda_mtp_replay_num_spec",
+        lambda count: count,
+    )
+
+    runner_module.Runner.create_kv_cache_manager(
+        "/nonexistent/checkpoint",
+        mapping=Mapping(world_size=1),
+        tokens_per_block=64,
+        max_batch_size=4,
+        max_seq_len=128,
+        kv_cache_dtype="auto",
+        mamba_ssm_cache_dtype="auto",
+        layer_indices=[0, 1],
+        spec_config=MTPDecodingConfig(max_draft_len=draft_len) if draft_len is not None else None,
+    )
+
+    if replay_enabled:
+        assert recorded["kda_replay_num_spec"] == draft_len
+    else:
+        assert "kda_replay_num_spec" not in recorded
+    if issubclass(manager_cls, MambaHybridCacheManagerV2):
+        assert recorded["conv_state_layout"] == "q_k_v"
+        assert "model_type" not in recorded
+    else:
+        assert recorded["model_type"] == "qwen3_next"

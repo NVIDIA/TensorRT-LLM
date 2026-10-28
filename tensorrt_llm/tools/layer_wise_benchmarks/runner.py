@@ -37,7 +37,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     load_pretrained_config,
     unwrap_kimi_text_config,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MixedMambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     ModelLoader,
     _construct_checkpoint_loader,
@@ -989,11 +989,20 @@ class Runner:
                 for i in range(text_config.num_hidden_layers)
             ]
             kimi_extra_kwargs = {}
-            if spec_config is not None and issubclass(
-                kv_cache_manager_cls, MixedMambaHybridCacheManager
+            if (
+                spec_config is not None
+                and spec_config.tokens_per_gen_step >= 2
+                and not getattr(spec_config, "use_dynamic_tree", False)
+                and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
+                and mamba_params.dtype == torch.bfloat16
+                and mamba_params.mamba_ssm_cache_dtype in (torch.bfloat16, torch.float32)
+                and mamba_params.state_size == 128
+                and mamba_params.head_dim == 128
+                and mamba_params.conv_kernel == 4
+                and text_config.linear_attn_config.get("gate_lower_bound") == -5.0
             ):
-                # Multi-token verify reads per-slot replay caches when the fused
-                # kernel is available, else the legacy per-step buffers.
+                # Replay uses V2's accepted histories and all-layer commit.
+                # Other managers keep per-step states for sequential verification.
                 from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (
                     kda_mtp_replay_num_spec,
                 )
