@@ -371,16 +371,22 @@ def _wait_for_server_ready(url: str,
 class PerfServeScriptTestCmds:
     """Commands for serve runtime perf tests (server-client model)."""
 
-    def __init__(self, server_cmd: List[str], client_cmds: List[List[str]],
-                 data_cmds: List[List[str]], server_env: Dict[str, str],
-                 server_timeout: int):
+    def __init__(self,
+                 server_cmd: List[str],
+                 client_cmds: List[List[str]],
+                 data_cmds: List[List[str]],
+                 server_env: Dict[str, str],
+                 server_timeout: int,
+                 server_log_dir: str | None = None):
         self.server_cmd = server_cmd
         self.client_cmds = client_cmds
         self.data_cmds = data_cmds
         self.server_env = server_env
         self.server_timeout = server_timeout
+        self._server_log_dir = server_log_dir
         self._server_proc = None
         self._server_log_path = None
+        self._server_log_file = None
 
     def start_server(self) -> None:
         if self._server_proc is not None:
@@ -393,13 +399,15 @@ class PerfServeScriptTestCmds:
             str(self._port)
         ]
         print_info(f"Starting trtllm-serve: {' '.join(cmd)}")
-        # Cluster jobs can share a working directory. Create a unique log for
-        # each launch so another server cannot truncate its startup metrics.
+        log_dir = os.path.abspath(self._server_log_dir or os.getcwd())
+        os.makedirs(log_dir, exist_ok=True)
+        # Write directly to the results directory so failed startups survive
+        # workspace cleanup. Concurrent launches must not truncate each other.
         self._server_log_file = tempfile.NamedTemporaryFile(
             mode="w",
             prefix="trtllm-serve-perf-",
             suffix=".log",
-            dir=os.getcwd(),
+            dir=log_dir,
             delete=False)
         self._server_log_path = self._server_log_file.name
         print_info(f"trtllm-serve log: {self._server_log_path}")
@@ -434,6 +442,25 @@ class PerfServeScriptTestCmds:
                   encoding='utf-8',
                   errors='replace') as f:
             return f.read()
+
+    def print_server_log_tail(self) -> None:
+        """Include bounded server diagnostics in captured pytest failure output."""
+        if not self._server_log_path:
+            return
+        try:
+            with open(self._server_log_path, "rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, stream.tell() - 64 * 1024))
+                tail = stream.read(64 * 1024).decode("utf-8", errors="replace")
+        except OSError as error:
+            # Diagnostic failures must not replace the original test error.
+            print_error(
+                f"Cannot read server log {self._server_log_path}: {error}")
+            return
+        print_error(f"--- trtllm-serve stdout/stderr (last up to 200 lines, "
+                    f"64 KiB); full log: {self._server_log_path} ---")
+        print("\n".join(tail.splitlines()[-200:]) or "<empty>")
+        print_error("--- end trtllm-serve log ---")
 
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
@@ -663,6 +690,10 @@ class AbstractPerfScriptTestClass(abc.ABC):
             self._result_state = "failed"
             self._error = e
             print_error(f"Test command failed. Error: {e}")
+            # run_cmd may fail before its redirected output is returned. The
+            # server's file is independent of CalledProcessError stdout/stderr.
+            if isinstance(commands, PerfServeScriptTestCmds):
+                commands.print_server_log_tail()
             partial_output = None
             if isinstance(e, subprocess.CalledProcessError):
                 if e.stdout:

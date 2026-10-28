@@ -1486,11 +1486,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 server_timeout = 1800
             else:
                 server_timeout = 600
-            return PerfServeScriptTestCmds(server_cmd=server_cmd,
-                                           client_cmds=client_cmds,
-                                           data_cmds=data_cmds,
-                                           server_env=server_env,
-                                           server_timeout=server_timeout)
+            return PerfServeScriptTestCmds(
+                server_cmd=server_cmd,
+                client_cmds=client_cmds,
+                data_cmds=data_cmds,
+                server_env=server_env,
+                server_timeout=server_timeout,
+                server_log_dir=os.path.abspath(
+                    os.path.join(self._output_dir, "detailed_results",
+                                 os.path.basename(engine_dir))))
 
         # PyTorch loads model checkpoints directly.
         build_cmd = []
