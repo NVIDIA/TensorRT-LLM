@@ -491,12 +491,23 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         self._saved_position_offsets = None
         self._saved_position_offsets_cpp = None
         self._saved_generation_lengths = None
+        # Set by set_draft_model: the MTP layer applies the draft loop's
+        # deferred kv_lens increment itself.
+        self._draft_folds_kv_lens_increment = False
         # MXFP8 copy of the LM head for greedy draft tokens (MTP Eagle), set
         # by the model once its weights are loaded.
         self.draft_head = None
         self._samples_sharded_target = (key_exchange is not None
                                         and supports_sharded_target_sampling(
                                             spec_config, mapping))
+
+    def set_draft_model(self, draft_model) -> None:
+        super().set_draft_model(draft_model)
+        # Import here to avoid a circular import.
+        from ..models.modeling_speculative import MTPForCausalLM
+        self._draft_folds_kv_lens_increment = (
+            self.is_mtp_eagle and isinstance(draft_model, MTPForCausalLM)
+            and draft_model.folds_kv_lens_increment)
 
     @property
     def max_draft_len(self) -> int:
@@ -1147,7 +1158,13 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     attn_metadata.use_spec_decoding = False
                 else:
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
-                        attn_metadata.kv_lens_cuda[:batch_size] += 1
+                        if (step0 is not None and i + 1 < runtime_draft_len
+                                and self._draft_folds_kv_lens_increment):
+                            # The next MTP pass applies it (in its fused
+                            # input launch when it takes one).
+                            inputs["kv_lens_increment"] = batch_size
+                        else:
+                            attn_metadata.kv_lens_cuda[:batch_size] += 1
                         attn_metadata.update_for_spec_dec()
         next_new_tokens = None
         if token_buffer is not None:

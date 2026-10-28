@@ -1154,8 +1154,13 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        kv_lens_increment: int = 0,
         **kwargs,
     ) -> torch.Tensor:
+        """``kv_lens_increment``: ``attn_metadata.kv_lens_cuda[:n] += 1`` with
+        ``n = kv_lens_increment``, deferred by the draft loop to this pass and
+        applied before anything reads kv_lens (inside the fused input launch
+        when this pass takes it)."""
         # Install this draft step's attention-DP token distribution: the draft
         # loop passes it as a kwarg and leaves attn_metadata alone, matching
         # Eagle3DraftModel.forward. The MoE below reads the per-rank counts off
@@ -1178,13 +1183,21 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
                 # the row-parallel chunk in one launch (modules/q35_mtp_glue.py).
                 from ..modules.q35_mtp_glue import mtp_fused_input
                 hidden_states = mtp_fused_input(
-                    input_ids, embed_tokens.weight, hidden_states,
+                    input_ids,
+                    embed_tokens.weight,
+                    hidden_states,
                     self.pre_fc_norm_embedding.weight,
                     self.pre_fc_norm_hidden.weight,
                     self.pre_fc_norm_embedding.variance_epsilon,
                     self.pre_fc_norm_hidden.variance_epsilon,
-                    tp_size if chunked else 1, tp_rank if chunked else 0)
+                    tp_size if chunked else 1,
+                    tp_rank if chunked else 0,
+                    kv_lens=attn_metadata.kv_lens_cuda
+                    if kv_lens_increment else None,
+                    kv_rows=kv_lens_increment)
             else:
+                if kv_lens_increment:
+                    attn_metadata.kv_lens_cuda[:kv_lens_increment] += 1
                 hidden_states = self._fc_input(input_ids, hidden_states,
                                                embed_tokens, chunked, tp_size,
                                                tp_rank)

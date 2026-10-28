@@ -1374,6 +1374,9 @@ class MTPForCausalLM(nn.Module):
         model_type = model_config.pretrained_config.model_type
         mtp_layer = None
         lm_head_quant_config = None
+        # Whether the MTP layer's forward takes the draft loop's deferred
+        # ``kv_lens_increment``.
+        folds_kv_lens_increment = False
         match model_type:
             case "glm4_moe":
                 from .modeling_glm import Glm4MTP
@@ -1390,6 +1393,7 @@ class MTPForCausalLM(nn.Module):
             case "qwen3_next" | "qwen3_5_text" | "qwen3_5_moe_text":
                 from .modeling_qwen3_next import Qwen3NextMTP
                 mtp_layer = Qwen3NextMTP
+                folds_kv_lens_increment = True
             case "qwen4_exp_text":
                 from .modeling_qwen4_exp import Qwen4ExpMTP
                 mtp_layer = Qwen4ExpMTP
@@ -1438,6 +1442,7 @@ class MTPForCausalLM(nn.Module):
                       model.aux_stream_dict)
             for layer_idx in range(mtp_num_layers)
         ])
+        self.folds_kv_lens_increment = folds_kv_lens_increment
         self.owns_lm_head = lm_head_quant_config is not None
         if self.owns_lm_head:
             if getattr(model_config.pretrained_config, "tie_word_embeddings",

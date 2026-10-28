@@ -41,11 +41,18 @@ def _q35_mtp_input_kernel(
     eps_hid,
     chunk_lo,
     chunk_w,
+    kv_ptr,
+    kv_rows,
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    HAS_KV: tl.constexpr,
 ):
     row = tl.program_id(0)
     half = tl.program_id(1)  # 0: embedding half [0, H), 1: hidden half [H, 2H) of the concat
+    if HAS_KV:
+        # The draft loop's deferred per-pass ``kv_lens_cuda[:rows] += 1``.
+        if (half == 0) & (row < kv_rows):
+            tl.store(kv_ptr + row, tl.load(kv_ptr + row) + 1)
     lo = tl.maximum(chunk_lo, half * H)
     hi = tl.minimum(chunk_lo + chunk_w, (half + 1) * H)
     if lo < hi:  # this half intersects the rank's fc input chunk
@@ -86,9 +93,12 @@ def mtp_fused_input(
     eps_hid: float,
     tp_size: int = 1,
     tp_rank: int = 0,
+    kv_lens: torch.Tensor | None = None,
+    kv_rows: int = 0,
 ) -> torch.Tensor:
     """``chunk(concat([gemma_rmsnorm(embed(ids)), gemma_rmsnorm(hidden)], -1), tp_size)[tp_rank]`` (contiguous
-    ``[rows, 2H / tp_size]``) in one launch. ``embed_weight`` is the full ``[V, H]`` table."""
+    ``[rows, 2H / tp_size]``) in one launch. ``embed_weight`` is the full ``[V, H]`` table. With ``kv_lens``, the
+    same launch also applies ``kv_lens[:kv_rows] += 1`` (``kv_rows <= rows``)."""
     rows = input_ids.numel()
     h = hidden_states.shape[-1]
     assert embed_weight.shape[1] == h and hidden_states.shape[0] == rows, (
@@ -102,6 +112,8 @@ def mtp_fused_input(
     if rows == 0:
         return out
     block_h = triton.next_power_of_2(h)
+    has_kv = kv_lens is not None and kv_rows > 0
+    assert not has_kv or kv_rows <= rows, (kv_rows, rows)
     _q35_mtp_input_kernel[(rows, 2)](
         input_ids.reshape(-1),
         embed_weight,
@@ -116,8 +128,11 @@ def mtp_fused_input(
         float(eps_hid),
         tp_rank * chunk_w,
         chunk_w,
+        kv_lens if has_kv else out,
+        kv_rows if has_kv else 0,
         H=h,
         BLOCK_H=block_h,
+        HAS_KV=has_kv,
         num_warps=8 if block_h >= 4096 else 4,
     )
     return out

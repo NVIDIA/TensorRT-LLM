@@ -60,3 +60,34 @@ def test_fused_input_matches_stock(rows, tp):
             emb_cols = max(0, min(hi, H) - lo)
             if rows > 2 and emb_cols:
                 assert torch.all(got[1, :emb_cols] == 0) and torch.all(got[2, :emb_cols] == 0)
+
+
+@pytest.mark.parametrize("tp", [1, 8])
+def test_fused_input_applies_the_deferred_kv_increment_once(tp):
+    """The deferred draft-loop kv_lens[:kv_rows] += 1 is applied exactly once on every rank, whichever half its
+    chunk lies in."""
+    from tensorrt_llm._torch.modules.q35_mtp_glue import mtp_fused_input
+
+    V, H, eps = 512, 4096, 1e-6
+    emb, n_e, n_h, g = _modules(V, H, eps, seed=13)
+    ids = torch.randint(0, V, (4,), generator=g, device="cuda", dtype=torch.int32)
+    hidden = torch.randn((4, H), generator=g, device="cuda").to(torch.bfloat16)
+    with torch.inference_mode():
+        for rank in range(tp):
+            kv = torch.arange(100, 108, device="cuda", dtype=torch.int32)
+            got = mtp_fused_input(
+                ids,
+                emb.weight,
+                hidden,
+                n_e.weight,
+                n_h.weight,
+                eps,
+                eps,
+                tp,
+                rank,
+                kv_lens=kv,
+                kv_rows=3,
+            )
+            ref = _stock(ids, hidden, emb, n_e, n_h, tp, rank)
+            torch.testing.assert_close(got.float(), ref.float(), rtol=8e-3, atol=1e-5)
+            assert kv.tolist() == [101, 102, 103, 103, 104, 105, 106, 107], (rank, kv.tolist())
