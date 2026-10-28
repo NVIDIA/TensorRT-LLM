@@ -1488,7 +1488,8 @@ class KVCacheManagerV2(BaseResourceManager):
     _record_branch_snapshots = False
 
     _window_log_enabled: Optional[bool] = None
-    """Whether sliding-window crossings are logged (debug level); resolved on first use."""
+    """Whether sliding-window crossings are logged (debug level) at ``_window_log_level``."""
+    _window_log_level: Optional[str] = None
 
     def __init__(
         self,
@@ -2992,7 +2993,8 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         # ``is_debug_enabled`` walks the call stack to find the caller's module and this
         # runs once per generation request per step, so the answer is kept.
-        if self._window_log_enabled is None:
+        if self._window_log_level != logger.level:
+            self._window_log_level = logger.level
             self._window_log_enabled = logger.is_debug_enabled()
         if not self._window_log_enabled:
             return
