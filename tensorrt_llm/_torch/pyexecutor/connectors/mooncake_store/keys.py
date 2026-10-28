@@ -29,6 +29,8 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
+import numpy as np
+
 __all__ = [
     "BlockHashChain",
     "KeyNamespace",
@@ -118,20 +120,33 @@ class BlockHashChain:
         Returns:
             The full chain, indexed by block ordinal.
         """
-        num_full_blocks = len(tokens) // self._tokens_per_block
-        if num_full_blocks < len(self._hashes):
+        tokens_per_block = self._tokens_per_block
+        num_full_blocks = len(tokens) // tokens_per_block
+        first_new = len(self._hashes)
+        if num_full_blocks < first_new:
             raise ValueError(
-                f"token list shrank from {len(self._hashes)} to {num_full_blocks} "
+                f"token list shrank from {first_new} to {num_full_blocks} "
                 "full blocks; a hash chain belongs to exactly one request"
             )
-        for ordinal in range(len(self._hashes), num_full_blocks):
-            start = ordinal * self._tokens_per_block
-            block = tokens[start : start + self._tokens_per_block]
-            parent = self._hashes[-1] if self._hashes else self._seed
-            # Fixed-width little-endian token ids: a delimiter-free encoding
-            # would let two different token sequences serialize identically.
-            payload = b"".join(int(token).to_bytes(8, "little", signed=True) for token in block)
-            self._hashes.append(_digest(parent, payload))
+        if num_full_blocks == first_new:
+            return self._hashes
+        # Fixed-width little-endian token ids: a delimiter-free encoding would
+        # let two different token sequences serialize identically. '<i8' is the
+        # signed 8-byte little-endian encoding `int.to_bytes` produces, so the
+        # keys are unchanged; it is done in one call for every new block because
+        # per-token encoding dominated the lookup of a long prompt. A token
+        # outside int64 raises OverflowError before any block is appended.
+        payload = memoryview(
+            np.asarray(
+                tokens[first_new * tokens_per_block : num_full_blocks * tokens_per_block],
+                dtype="<i8",
+            ).tobytes()
+        )
+        block_bytes = 8 * tokens_per_block
+        parent = self._hashes[-1] if self._hashes else self._seed
+        for offset in range(0, (num_full_blocks - first_new) * block_bytes, block_bytes):
+            parent = _digest(parent, payload[offset : offset + block_bytes])
+            self._hashes.append(parent)
         return self._hashes
 
 
