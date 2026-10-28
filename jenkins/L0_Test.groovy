@@ -2141,12 +2141,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         rm -f "\$tmp_path"
 
                         # Unpack the image in a job-private directory instead of the
-                        # node's shared ENROOT_TEMP_PATH. The Slurm prolog of every job
-                        # that starts on the node changes the owner of the directories in
-                        # the shared path, so mksquashfs can lose read access to our files
-                        # in the middle of the import and store them as empty files.
+                        # node's shared ENROOT_TEMP_PATH. See TRTLLMINF-548
                         import_tmp_dir=\$(mktemp -d /tmp/enroot-import.XXXXXX)
-                        echo "Enroot import temp dir: \$import_tmp_dir (\$(df -hP "\$import_tmp_dir" | awk 'NR==2 {print \$4 " free"}'))"
+                        echo "Enroot import temp dir: \$import_tmp_dir"
+                        df -hP "\$import_tmp_dir" || true
 
                         until ENROOT_TEMP_PATH="\$import_tmp_dir" enroot import -o "\$tmp_path" -- "docker://\$docker_uri"
                         do
