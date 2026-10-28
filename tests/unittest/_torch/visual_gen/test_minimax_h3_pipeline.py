@@ -49,6 +49,19 @@ from tensorrt_llm.visual_gen.args import ParallelConfig, TorchCompileConfig, Vis
 pytestmark = pytest.mark.cpu_only
 
 
+def _ulysses_mapping(world_size: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        world_size=world_size,
+        tp_size=1,
+        cfg_size=1,
+        ulysses_size=world_size,
+        cp_size=1,
+        ring_size=1,
+        attn2d_row_size=1,
+        attn2d_col_size=1,
+    )
+
+
 class _FakeMiniMaxH3Transformer:
     def __init__(self) -> None:
         self.device = torch.device("cpu")
@@ -479,7 +492,7 @@ def test_text_encoder_residency_skips_non_owner_rank(
     config = SimpleNamespace(
         extra_attrs={},
         mapping=SimpleNamespace(world_size=2, tp_size=1),
-        visual_gen_mapping=SimpleNamespace(world_size=2, ulysses_size=2),
+        visual_gen_mapping=_ulysses_mapping(2),
         parallel=ParallelConfig(ulysses_size=2, text_encoder_tp_size=1),
         attention=SimpleNamespace(backend="VANILLA"),
         cache=None,
@@ -530,7 +543,7 @@ def test_subset_tensor_parallel_text_encoder_loads_on_participant_rank(
     config = SimpleNamespace(
         extra_attrs={},
         mapping=SimpleNamespace(world_size=4, tp_size=1),
-        visual_gen_mapping=SimpleNamespace(world_size=4, ulysses_size=4),
+        visual_gen_mapping=_ulysses_mapping(4),
         parallel=ParallelConfig(ulysses_size=4, text_encoder_tp_size=2),
         attention=SimpleNamespace(backend="VANILLA"),
         cache=None,
@@ -603,7 +616,7 @@ def test_tensor_parallel_text_encoder_loader_prefetch_matches_rank_residency(
     config = SimpleNamespace(
         extra_attrs={},
         mapping=SimpleNamespace(world_size=world_size, tp_size=1),
-        visual_gen_mapping=SimpleNamespace(world_size=world_size, ulysses_size=world_size),
+        visual_gen_mapping=_ulysses_mapping(world_size),
         parallel=ParallelConfig(ulysses_size=world_size, text_encoder_tp_size=2),
         attention=SimpleNamespace(backend="VANILLA"),
         cache=None,
@@ -637,7 +650,7 @@ def test_subset_tensor_parallel_text_encoder_skips_nonparticipant_rank(
     config = SimpleNamespace(
         extra_attrs={},
         mapping=SimpleNamespace(world_size=4, tp_size=1),
-        visual_gen_mapping=SimpleNamespace(world_size=4, ulysses_size=4),
+        visual_gen_mapping=_ulysses_mapping(4),
         parallel=ParallelConfig(ulysses_size=4, text_encoder_tp_size=2),
         attention=SimpleNamespace(backend="VANILLA"),
         cache=None,
@@ -675,7 +688,7 @@ def test_subset_text_encoder_tp_rejects_mpi_before_group_creation(
     monkeypatch.setattr(h3_pipeline.dist, "new_group", unexpected_group_creation)
     config = SimpleNamespace(
         mapping=SimpleNamespace(world_size=4, tp_size=1, rank=rank),
-        visual_gen_mapping=SimpleNamespace(world_size=4, ulysses_size=4),
+        visual_gen_mapping=_ulysses_mapping(4),
         parallel=ParallelConfig(ulysses_size=4, text_encoder_tp_size=2),
         attention=SimpleNamespace(backend="VANILLA"),
     )
@@ -1588,15 +1601,7 @@ def _ulysses_pipeline_config(world_size: int = 8) -> SimpleNamespace:
     return SimpleNamespace(
         mapping=SimpleNamespace(world_size=1, tp_size=1),
         parallel=SimpleNamespace(parallel_vae_size=1),
-        visual_gen_mapping=SimpleNamespace(
-            world_size=world_size,
-            cfg_size=1,
-            ulysses_size=world_size,
-            cp_size=1,
-            ring_size=1,
-            attn2d_row_size=1,
-            attn2d_col_size=1,
-        ),
+        visual_gen_mapping=_ulysses_mapping(world_size),
         attention=SimpleNamespace(backend="VANILLA"),
         cache=None,
         cpu_offload_config=SimpleNamespace(enable=False),
