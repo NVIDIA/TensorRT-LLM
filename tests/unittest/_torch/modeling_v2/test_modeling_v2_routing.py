@@ -38,6 +38,7 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import (
     routing as qwen4_exp_routing,
 )
+from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
@@ -538,6 +539,185 @@ def test_routes_on_the_kv_cache_algorithm_the_engine_runs(
     assert modeling_v2_resolve(config, _llm_args("auto", **args)) is None
     with pytest.raises(ValueError, match="KV cache"):
         modeling_v2_resolve(config, _llm_args("require", **args))
+
+
+_SM100 = (10, 0)
+_TP16_MOETP4EP4 = dict(world_size=16, tp_size=16, moe_tp_size=4, moe_ep_size=4)
+_TP16_MOETP16EP1 = dict(world_size=16, tp_size=16, moe_tp_size=16, moe_ep_size=1)
+_K3_TARGET = (
+    "models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling."
+    "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4"
+)
+_K3_TARGET_B = (
+    "models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.modeling."
+    "ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1"
+)
+
+# The quantization the MXFP4 checkpoint declares in its config.json, inside ``text_config``.
+_K3_CHECKPOINT_QUANTIZATION = {
+    "quant_method": "compressed-tensors",
+    "format": "mxfp4-pack-quantized",
+    "config_groups": {
+        "group_0": {
+            "format": "mxfp4-pack-quantized",
+            "input_activations": None,
+            "output_activations": None,
+            "targets": ["Linear"],
+            "weights": {
+                "group_size": 32,
+                "num_bits": 4,
+                "strategy": "group",
+                "symmetric": True,
+                "type": "float",
+            },
+        }
+    },
+    "ignore": [
+        "re:.*self_attn.*",
+        "re:.*shared_experts.*",
+        r"re:.*mlp\.(gate|up|gate_up|down)_proj.*",
+        "re:.*lm_head.*",
+        "re:.*vision_tower.*",
+        "re:.*mm_projector.*",
+    ],
+    "kv_cache_scheme": None,
+}
+
+_K3_NVFP4_QUANTIZATION = {
+    "quant_method": "compressed-tensors",
+    "format": "nvfp4-pack-quantized",
+    "config_groups": {
+        "group_0": {
+            "format": "nvfp4-pack-quantized",
+            "input_activations": {
+                "group_size": 16,
+                "num_bits": 4,
+                "strategy": "tensor_group",
+                "type": "float",
+            },
+            "output_activations": None,
+            "targets": ["Linear"],
+            "weights": {
+                "group_size": 16,
+                "num_bits": 4,
+                "strategy": "tensor_group",
+                "symmetric": True,
+                "type": "float",
+            },
+        }
+    },
+    "ignore": ["re:.*lm_head.*"],
+    "kv_cache_scheme": None,
+}
+
+
+def _k3_config(text_as_dict=False, quantization=_K3_CHECKPOINT_QUANTIZATION, **text_overrides):
+    """The shape Kimi K3's own config.json declares: a vision-language wrapper whose language model is
+    ``text_config``, with the quantization ``KimiK3Config`` surfaces from it."""
+    text = dict(
+        model_type="kimi_linear",
+        num_hidden_layers=93,
+        hidden_size=7168,
+        num_experts=896,
+        routed_expert_hidden_size=3584,
+    )
+    text.update(text_overrides)
+    fields = dict(
+        architectures=["KimiK3ForConditionalGeneration"],
+        model_type="kimi_k3",
+        text_config=text if text_as_dict else PretrainedConfig(**text),
+    )
+    if quantization is not None:
+        fields["quantization_config"] = quantization
+    return PretrainedConfig(**fields)
+
+
+@pytest.fixture
+def _on_sm100(monkeypatch):
+    """Route as if this were a GB200."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: _SM100)
+
+
+def test_kimi_k3_config_surfaces_the_text_config_quantization():
+    config = KimiK3Config(
+        text_config=dict(quantization_config=_K3_CHECKPOINT_QUANTIZATION),
+        architectures=["KimiK3ForConditionalGeneration"],
+    )
+    quant_config, layer_quant_config = ModelConfig.load_hf_quant_config(
+        config.quantization_config, "TRTLLM"
+    )
+    assert layer_quant_config is None
+    assert quant_config.quant_algo == QuantAlgo.W4A16_MXFP4
+    assert quant_config.group_size == 32
+
+
+@pytest.mark.usefixtures("_on_sm100")
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("text_as_dict", [False, True], ids=["text-config", "text-dict"])
+@pytest.mark.parametrize(
+    "mapping_kwargs, target",
+    [(_TP16_MOETP4EP4, _K3_TARGET), (_TP16_MOETP16EP1, _K3_TARGET_B)],
+    ids=["tp16_moetp4ep4", "tp16_moetp16ep1"],
+)
+def test_kimi_k3_targets_match(mode, text_as_dict, mapping_kwargs, target):
+    """Route B is the experts split 16 ways by tensor, set explicitly."""
+    config = _model_config(_k3_config(text_as_dict=text_as_dict), **mapping_kwargs)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == target
+
+
+@pytest.mark.usefixtures("_on_sm100")
+@pytest.mark.parametrize(
+    "quantization",
+    [_K3_NVFP4_QUANTIZATION, None],
+    ids=["nvfp4", "unquantized"],
+)
+def test_kimi_k3_other_quantizations_do_not_match(quantization):
+    """An NVFP4 declaration and an unquantized checkpoint have the MXFP4 checkpoint's shape; the quantization is
+    what keeps them out of a target whose loader reads packed MXFP4 experts."""
+    config = _model_config(_k3_config(quantization=quantization), **_TP16_MOETP4EP4)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match="quantization"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.usefixtures("_on_sm100")
+@pytest.mark.parametrize(
+    "text_overrides, mapping_kwargs, missed",
+    [
+        # a Kimi-family checkpoint of another depth
+        (dict(num_hidden_layers=61), _TP16_MOETP4EP4, "shape"),
+        # the expert split left unset: the mapping resolves to moe_tp 16 x moe_ep 1, but the built-in model runs
+        # that default as expert parallelism over the 16 ranks, a layout no target serves
+        (dict(), dict(world_size=16, tp_size=16), "split_set=False"),
+        # experts split 16 ways by expert, set explicitly
+        (dict(), dict(world_size=16, tp_size=16, moe_tp_size=1, moe_ep_size=16), "moe_ep=16"),
+        # attention data parallelism splits the requests, not the heads
+        (dict(), dict(_TP16_MOETP4EP4, enable_attention_dp=True), "attention_dp=True"),
+        (dict(), dict(_TP16_MOETP16EP1, enable_attention_dp=True), "attention_dp=True"),
+        # pipeline parallelism over the 16 ranks
+        (
+            dict(),
+            dict(world_size=16, tp_size=8, pp_size=2, moe_tp_size=8, moe_ep_size=1),
+            "pp=2",
+        ),
+        # one tray instead of four
+        (dict(), dict(world_size=4, tp_size=4, moe_tp_size=1, moe_ep_size=4), "ws=4"),
+    ],
+)
+def test_kimi_k3_near_misses_do_not_match(text_overrides, mapping_kwargs, missed):
+    config = _model_config(_k3_config(**text_overrides), **mapping_kwargs)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+def test_kimi_k3_on_another_sm_does_not_match(monkeypatch):
+    """Routed as a GB300 (sm 10.3), the K3 targets, sm 10.0 only, match nothing."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 3))
+    config = _model_config(_k3_config(), **_TP16_MOETP4EP4)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=r"compute capability \(10, 3\)"):
+        modeling_v2_resolve(config, _llm_args("require"))
 
 
 # --- qwen4_exp: one-model MTP-Eagle over a linear chain, one rank ---------------
