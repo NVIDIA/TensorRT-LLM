@@ -220,6 +220,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         last_position = max_length - 1 + delta
         if not 0 <= last_position < max_positions:
             raise ValueError("Qwen mRoPE decode positions exceed model bounds")
+        arrays["mrope_position_deltas"] = arrays[
+            "mrope_position_deltas"].astype(np.int32)
         return {
             "mrope_config": {
                 name: torch.from_numpy(array)

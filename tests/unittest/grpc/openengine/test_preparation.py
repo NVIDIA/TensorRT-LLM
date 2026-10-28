@@ -13,7 +13,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
+from tensorrt_llm._torch.models.modeling_qwen2vl import (
+    Qwen2VLInputProcessorBase,
+    _prepare_qwen_vl_mrope_config,
+)
 from tensorrt_llm.grpc.openengine.bindings import generation_pb2, kv_pb2
 from tensorrt_llm.grpc.openengine.disagg import _struct_to_dict, disaggregated_params_from_request
 from tensorrt_llm.grpc.openengine.preparation import (
@@ -137,8 +140,36 @@ def test_qwen_prepared_decode_roundtrip_preserves_tokens_and_positions():
     try:
         params.to_tensor("multimodal_data")
         assert torch.equal(params.multimodal_data["mrope_config"]["mrope_position_ids"], positions)
+        assert params.multimodal_data["mrope_config"]["mrope_position_ids"].dtype == positions.dtype
         assert params.multimodal_data["mrope_config"]["mrope_position_deltas"].tolist() == [[-2]]
+        assert params.multimodal_data["mrope_config"]["mrope_position_deltas"].dtype == torch.int32
         assert set(params.multimodal_data) == {"mrope_config"}
+    finally:
+        params.release_handles()
+
+
+def test_restored_qwen_delta_writes_to_engine_cache():
+    llm, request, capture, _ = _fixture()
+    _handoff(request, _decode_preparation(request, llm, capture))
+    restored = _prepared_decode_from_request(request, llm)
+    params = restored.multimodal_params
+    try:
+        params.to_tensor("multimodal_data")
+        cache = torch.full((4,), 99, dtype=torch.int32)
+        slots = torch.tensor([2], dtype=torch.int64)
+        config = _prepare_qwen_vl_mrope_config(
+            multimodal_params=[params],
+            num_generation_requests=1,
+            position_ids=None,
+            rotary_emb=None,
+            mrope_position_deltas_cache=cache,
+            mrope_rotary_cos_sin_workspace=torch.empty((1, 0)),
+            mrope_delta_write_seq_slots=slots,
+            mrope_delta_read_seq_slots=slots,
+        )
+        assert cache.tolist() == [99, 99, -2, 99]
+        assert config["mrope_position_deltas"].dtype == torch.int32
+        assert config["mrope_position_deltas"].tolist() == [[-2]]
     finally:
         params.release_handles()
 
