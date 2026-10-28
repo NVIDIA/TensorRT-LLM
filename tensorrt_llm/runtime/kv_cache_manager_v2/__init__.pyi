@@ -273,6 +273,11 @@ class DiskCacheTierConfig:
 class BufferConfig:
     """One buffer of a layer's KV cache.
 
+    ``reuse_policy`` of ``None`` uses the layer's policy. Attention and SSM
+    buffers can override the layer's policy; the buffer then belongs to the
+    layer group for its effective policy and lifecycle properties while keeping
+    its layer ID, so one layer can span several layer groups.
+
     ``is_sparse`` marks a buffer whose history is too large for device memory and is read
     through a per-request device cache rather than directly (see
     :meth:`KVCacheManager.is_sparse`).
