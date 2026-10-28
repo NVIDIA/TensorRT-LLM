@@ -3816,8 +3816,9 @@ def run_backend_moe(
     - MegaMoE backends: token_selected_experts=int64, output_dtype
 
     Args:
-        trtllm_use_router_logits: If True, TRTLLM backend uses router_logits for routing.
-            If False, uses token_selected_experts and token_final_scales.
+        trtllm_use_router_logits: If True, TRTLLM backend uses router_logits for routing,
+            unless the backend routes outside its kernel. Otherwise it uses
+            token_selected_experts and token_final_scales.
             Note: When both are provided, TRTLLM only uses (topk_ids and topk_weights).
     """
     # Common args for all backends (default: token_final_scales=float32)
@@ -3834,7 +3835,9 @@ def run_backend_moe(
         args["output_dtype"] = dtype
     elif backend_type == MoeBackendType.TRTLLM:
         args["token_final_scales"] = token_final_scales.to(torch.bfloat16)
-        if trtllm_use_router_logits:
+        # A leaf whose kernel cannot route (e.g. FlashInfer BF16) takes top-k
+        # from the host, as the scheduler supplies it in production.
+        if trtllm_use_router_logits and not backend._routes_outside_the_kernel():
             # Use router_logits for routing (TRTLLM will compute topk internally)
             args["router_logits"] = router_logits
             args["token_selected_experts"] = None
@@ -4597,9 +4600,9 @@ def test_moe_backend(
 # =====================================================================
 # BF16 (unquantized) TRTLLM-Gen MoE: DeepSeekV3 / Renormalize routing
 # =====================================================================
-# The main test_moe_backend skips TRTLLM + quant_algo=None, so cover the BF16
-# FlashInfer path here (Nemotron-H enablement): DeepSeekV3/Renormalize routing
-# x Relu2/Swiglu, via both fused and separated routing.
+# Covers the BF16 FlashInfer path beyond the Renormalize/SwiGLU cases of the
+# main test_moe_backend matrix (Nemotron-H enablement): DeepSeekV3/Renormalize
+# routing x Relu2/Swiglu, via both fused and separated routing.
 
 # DeepSeekV3 trtllm-gen routing requires num_experts >= 22, multiple of 4.
 _BF16_UNQUANT_NUM_EXPERTS = 72
