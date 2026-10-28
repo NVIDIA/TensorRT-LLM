@@ -135,6 +135,7 @@ def test_malformed_lora_request_raises_dataset_format_error(lora_request, messag
     assert message in str(exc_info.value)
     # The offending request is named so it can be found in a large dataset.
     assert "'task_id': 1" in str(exc_info.value)
+    assert f"'lora_request': {lora_request!r}" in str(exc_info.value)
 
 
 def test_lora_request_is_parsed():
