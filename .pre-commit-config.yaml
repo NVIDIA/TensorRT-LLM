@@ -1551,6 +1551,13 @@ repos:
         additional_dependencies: [jinja2]
         always_run: true
         pass_filenames: false
+    -   id: serve-ci-coverage
+        name: check trtllm-serve CI coverage (multi-GPU list, CBTS VisualGen prefixes, CODEOWNERS)
+        entry: python scripts/check_serve_ci_coverage.py
+        language: python
+        additional_dependencies: [PyYAML]
+        pass_filenames: false
+        files: ^(\.github/CODEOWNERS|jenkins/L0_MergeRequest\.groovy|jenkins/scripts/cbts/cbts/rules/visual_gen\.py|scripts/check_serve_ci_coverage\.py|scripts/serve_ci_coverage\.yml|tensorrt_llm/serve/|tensorrt_llm/commands/|tests/unittest/serve/|tests/test_common/serve/)
     -   id: vendor-sources-check
         name: verify vendored sources are in sync
         entry: python scripts/vendor/manage.py check

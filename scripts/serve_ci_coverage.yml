@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Data for scripts/check_serve_ci_coverage.py: CI-coverage invariants of the
+# trtllm-serve refactor (epic TRTLLM-17056). Change it together with the files it
+# describes. See tensorrt_llm/serve/AGENTS.md.
+version: 1
+
+multi_gpu:
+  file: jenkins/L0_MergeRequest.groovy
+  managed_prefix: tensorrt_llm/serve/
+  required:
+    - {path: tensorrt_llm/serve/chat_tokenization.py, why: "renderer used on the disaggregated path (KV-aware router, gpt-oss)"}
+    - {path: tensorrt_llm/serve/_base/, why: "_MsgspecRoute decodes the msgpack bodies the disaggregated frontend sends; shared service types"}
+    - {path: tensorrt_llm/serve/api/ops/, why: "/health is the disaggregated readiness probe"}
+    - {path: tensorrt_llm/serve/middleware/, why: "both middlewares run on the disaggregated app"}
+    - {path: tensorrt_llm/serve/api/anthropic/serving.py, why: "contains the disaggregated /v1/messages path"}
+    - {path: tensorrt_llm/serve/api/anthropic/api_router.py, why: "contains the disaggregated /v1/messages path"}
+    - {path: tensorrt_llm/serve/api/openai/embeddings/, why: "code from openai_server.py (aggregated server); moved code keeps its multi-GPU trigger"}
+    - {path: tensorrt_llm/serve/api/openai/mm_encoder/, why: "code from openai_server.py (aggregated server); moved code keeps its multi-GPU trigger"}
+    - {path: tensorrt_llm/serve/api/openai/completions/, why: "the disaggregated multi-GPU e2e tests send completions"}
+    - {path: tensorrt_llm/serve/api/openai/chat/, why: "the disaggregated multi-GPU e2e tests send chat"}
+    - {path: tensorrt_llm/serve/api/openai/tokenize/, why: "code from openai_server.py (aggregated server); moved code keeps its multi-GPU trigger"}
+    - {path: tensorrt_llm/serve/api/openai/responses/, why: "code from responses_utils.py; moved code keeps its multi-GPU trigger"}
+    - {path: tensorrt_llm/serve/exception_handling/, why: "code from both servers, runs on the disaggregated path"}
+    - {path: tensorrt_llm/serve/app.py, why: "composition root"}
+    - {path: tensorrt_llm/serve/disagg/, why: "the disaggregated serving package"}
+  forbidden:
+    - {path: tensorrt_llm/serve/, why: "covers all of serve; every serve change would start the 31 multi-GPU stages"}
+    - {path: tensorrt_llm/serve/api/, why: "one entry per subpackage; a subtree entry drags unrelated code into the 31 multi-GPU stages"}
+    - {path: tensorrt_llm/serve/api/openai/, why: "one entry per subpackage; a subtree entry drags unrelated code into the 31 multi-GPU stages"}
+    - {path: tensorrt_llm/serve/api/visual_gen/, why: "deliberately not added: no VisualGen serving test runs on a multi-GPU stage, and CBTS Tier 1 claims VisualGen-only PRs"}
+
+visual_gen:
+  file: jenkins/scripts/cbts/cbts/rules/visual_gen.py
+  tuples: [_VG_SRC_PREFIXES, _VG_OUTWARD_PREFIXES]
+
+codeowners:
+  file: .github/CODEOWNERS
+  managed_prefixes: [/tensorrt_llm/serve, /tensorrt_llm/commands/serve]
+  required:
+    - {path: tensorrt_llm/serve, owners: ["@NVIDIA/trt-llm-runtime-devs"]}
+    - {path: tensorrt_llm/serve/openai_disagg_server.py, owners: ["@NVIDIA/trt-llm-disagg-devs"]}
+    - {path: tensorrt_llm/commands/serve.py, owners: ["@NVIDIA/trt-llm-runtime-devs"]}
+    - {path: tensorrt_llm/serve/api/visual_gen, owners: ["@NVIDIA/trt-llm-torch-visual-gen-devs"]}
+    - {path: tensorrt_llm/serve/disagg, owners: ["@NVIDIA/trt-llm-disagg-devs"]}
+    - {path: tensorrt_llm/commands/serve_cli, owners: ["@NVIDIA/trt-llm-runtime-devs"]}

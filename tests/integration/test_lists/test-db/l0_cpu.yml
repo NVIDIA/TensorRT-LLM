@@ -295,6 +295,8 @@ l0_cpu:
   - unittest/quantization/test_mode.py
   - unittest/scaffolding
   - unittest/scripts
+  # Also collected by unittest/scripts; listed on its own so CBTS keeps it for VisualGen-only PRs.
+  - unittest/scripts/visual_gen/test_serve_ci_coverage_visual_gen.py
   - unittest/tools
   - unittest/usage
   - unittest/utils/test_logger.py
