@@ -5830,12 +5830,7 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp4(
                 FULLCTX_DECODE_MAX_KV_LEN,
                 FULLCTX_DECODE_OWN_REDUCER and _fullctx_decode_kernel.has_own_reducer(),
                 get_env_enable_pdl(),
-                fused_rope_mode=(
-                    DRAFTER_ROPE_MODE
-                    if DRAFTER_ROPE_FUSED
-                    and hasattr(torch.ops.trtllm, "minimax_m3_sm107tp4_drafter_rope_fp8_kv")
-                    else None
-                ),
+                fused_rope_mode=(DRAFTER_ROPE_MODE if DRAFTER_ROPE_FUSED else None),
                 on_rope_taken=lambda rows, what: taken(DRAFTER_ROPE_PATH, rows, what),
                 on_taken=lambda rows: taken(path, rows),
                 on_uncovered=lambda reason: uncovered(path, reason),

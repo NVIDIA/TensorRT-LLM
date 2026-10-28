@@ -268,34 +268,30 @@ def _check_layout(cfg, qlen: int, splits: int) -> None:
         raise RuntimeError("PrimTS recipe outside the BF16 merge's layout: " + "; ".join(problems))
 
 
-# The split-KV merge runs the TP8 copy of the BF16 reducer when the op library carries it (the same bits).
+# Select the TP8 copy of the BF16 reducer; both copies use the same per-row arithmetic.
 TP8_REDUCER = True
 
 
 def _reduce_op():
-    """The BF16 split-KV merge: the TP8 copy (one row per CTA, its dependent released right after its wait) when the
-    TP8 op library carries it, else the image's TP2 op; the same per-row arithmetic, so the same bits."""
-    ops = torch.ops.trtllm
-    if TP8_REDUCER and hasattr(ops, "minimax_m3_sm107tp8_fullctx_reduce"):
-        return ops.minimax_m3_sm107tp8_fullctx_reduce
-    return ops.minimax_m3_sm107_tp2_fullctx_reduce
+    """The BF16 split-KV merge selected by TP8_REDUCER."""
+    if TP8_REDUCER:
+        return torch.ops.trtllm.minimax_m3_sm107tp8_fullctx_reduce
+    return torch.ops.trtllm.minimax_m3_sm107_tp2_fullctx_reduce
 
 
 def _tp8_reduce_op():
-    return getattr(torch.ops.trtllm, "minimax_m3_sm107tp8_fullctx_reduce", None)
+    return torch.ops.trtllm.minimax_m3_sm107tp8_fullctx_reduce
 
 
 def emits_mxfp8() -> bool:
-    """Whether the merge run uses can also write the o_proj MXFP8 hand-off (the TP8 copy of the merge)."""
-    return _tp8_reduce_op() is not None and _reduce_op() is _tp8_reduce_op()
+    """Whether the selected merge writes the TP8 o_proj MXFP8 hand-off."""
+    return _reduce_op() is _tp8_reduce_op()
 
 
 def has_own_reducer() -> bool:
-    """Whether this build carries a BF16 split-KV merge op (the TP8 copy or the image's TP2 op)."""
-    ops = torch.ops.trtllm
-    return hasattr(ops, "minimax_m3_sm107tp8_fullctx_reduce") or hasattr(
-        ops, "minimax_m3_sm107_tp2_fullctx_reduce"
-    )
+    """Require the selected BF16 split-KV merge op supplied by this target build."""
+    _reduce_op()
+    return True
 
 
 def plan_for(

@@ -258,8 +258,9 @@ def _check_layout(cfg, qlen: int, splits: int) -> None:
 
 
 def has_own_reducer() -> bool:
-    """Whether this build carries the BF16 split-KV merge op."""
-    return hasattr(torch.ops.trtllm, "minimax_m3_sm107_tp2_fullctx_reduce")
+    """Require the BF16 split-KV merge op supplied by this target build."""
+    torch.ops.trtllm.minimax_m3_sm107_tp2_fullctx_reduce
+    return True
 
 
 def plan_for(

@@ -2018,12 +2018,7 @@ def _qk_norm_rope(core, i: int, qkv: torch.Tensor, position_ids, out_fp8: bool) 
 def _dense_fp8_op_applies(qkv: torch.Tensor, position_ids) -> bool:
     """Whether a dense layer's FP8 q/k/v come from this target's op (``minimax_m3_sm107_tp2_dense_qk_norm_rope_fp8``,
     else the BF16 fused_qk_norm_rope output cast to FP8)."""
-    return (
-        DENSE_QKV_FP8_VIA_BF16
-        and hasattr(torch.ops.trtllm, "minimax_m3_sm107_tp2_dense_qk_norm_rope_fp8")
-        and position_ids is not None
-        and qkv.dtype == torch.bfloat16
-    )
+    return DENSE_QKV_FP8_VIA_BF16 and position_ids is not None and qkv.dtype == torch.bfloat16
 
 
 def _dense_qk_norm_rope_fp8(
@@ -2031,7 +2026,7 @@ def _dense_qk_norm_rope_fp8(
 ) -> torch.Tensor:
     """A dense layer's FP8 q/k/v: QK norm + RoPE with Q/K rounded to BF16 and then to E4M3 and V cast, the bits of the
     BF16 fused_qk_norm_rope output cast to FP8 (K is stored in the FP8 cache), in one launch of this target's op
-    (``DENSE_QKV_FP8_VIA_BF16``); without the op, the BF16 kernel and the cast.
+    (``DENSE_QKV_FP8_VIA_BF16``); outside its supported inputs, the BF16 kernel and the cast.
 
     With ``kv_dest`` = (the layer's HND pool view, the step's int32 cache slots, live tokens, a [tokens, q heads, 128]
     FP8 buffer) the op also stores the live tokens' K and V rows into the pool (the bytes ``write_msa_phase_kv``
@@ -3720,7 +3715,6 @@ class DecodeTarget:
             and fp8
             and DENSE_KV_INSERT_FUSED
             and _dense_fp8_op_applies(qkv, position_ids)
-            and hasattr(torch.ops.trtllm, "minimax_m3_sm107_tp2_dense_qk_norm_rope_fp8_kv")
         ):
             kv_dest = (
                 step["kv_cache_manager"].get_buffers(i, kv_layout="HND"),
@@ -6045,12 +6039,7 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp8(
                 FULLCTX_DECODE_MAX_KV_LEN,
                 FULLCTX_DECODE_OWN_REDUCER and m3_fullctx_decode_kernel.has_own_reducer(),
                 get_env_enable_pdl(),
-                fused_rope_mode=(
-                    DRAFTER_ROPE_MODE
-                    if DRAFTER_ROPE_FUSED
-                    and hasattr(torch.ops.trtllm, "minimax_m3_sm107tp8_drafter_rope_fp8_kv")
-                    else None
-                ),
+                fused_rope_mode=(DRAFTER_ROPE_MODE if DRAFTER_ROPE_FUSED else None),
                 on_rope_taken=lambda rows, what: taken(DRAFTER_ROPE_PATH, rows, what),
                 on_taken=lambda rows: taken(path, rows),
                 on_uncovered=lambda reason: uncovered(path, reason),

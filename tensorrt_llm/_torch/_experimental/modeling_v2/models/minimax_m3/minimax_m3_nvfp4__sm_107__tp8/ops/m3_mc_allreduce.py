@@ -319,7 +319,8 @@ def m3_mc_finalize_allreduce_norm(
 
 @functools.lru_cache(maxsize=None)
 def _own_op_loaded() -> bool:
-    return getattr(torch.ops.trtllm, "minimax_m3_sm107_tp8_mc_allreduce_norm", None) is not None
+    torch.ops.trtllm.minimax_m3_sm107_tp8_mc_allreduce_norm
+    return True
 
 
 # The boundary all-reduces run this target's op (trtllm::minimax_m3_sm107_tp8_mc_allreduce_norm) rather than the
@@ -329,17 +330,10 @@ OWN_OP_PATH = "m3_mc_ar_own_op"
 
 
 def own_op() -> bool:
-    """OWN_OP when this target's op is loaded (trtllm::minimax_m3_sm107_tp8_mc_allreduce_norm), with
-    its engagement line; else the image's op. The same library is loaded on every rank, so the ranks agree."""
+    """Select this target's all-reduce when OWN_OP is enabled, requiring its compiled op."""
     if not OWN_OP:
         return False
-    if not _own_op_loaded():
-        m3_report.missed(
-            OWN_OP_PATH,
-            None,
-            "trtllm::minimax_m3_sm107_tp8_mc_allreduce_norm is not loaded (the image's op runs)",
-        )
-        return False
+    _own_op_loaded()
     m3_report.taken(OWN_OP_PATH, None, "the boundary all-reduces run this target's op")
     return True
 
@@ -353,9 +347,7 @@ def capture_supported() -> bool:
         if own_op()
         else "minimax_m3_sm107_tp2_mc_allreduce_norm"
     )
-    op = getattr(torch.ops.trtllm, name, None)
-    if op is None:
-        return False
+    op = getattr(torch.ops.trtllm, name)
     return any(a.name == "cap_out" for a in op.default._schema.arguments)
 
 

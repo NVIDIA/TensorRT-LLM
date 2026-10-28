@@ -270,13 +270,14 @@ def _check_layout(cfg, qlen: int, splits: int) -> None:
 
 def emits_mxfp8() -> bool:
     """Whether the loaded merge op can also write the o_proj MXFP8 hand-off (its schema takes q8 / sf)."""
-    op = getattr(torch.ops.trtllm, "minimax_m3_sm107tp4_fullctx_reduce", None)
-    return op is not None and "q8" in str(op.default._schema)
+    op = torch.ops.trtllm.minimax_m3_sm107tp4_fullctx_reduce
+    return "q8" in str(op.default._schema)
 
 
 def has_own_reducer() -> bool:
-    """Whether this build carries the BF16 split-KV merge op."""
-    return hasattr(torch.ops.trtllm, "minimax_m3_sm107tp4_fullctx_reduce")
+    """Require the BF16 split-KV merge op supplied by this target build."""
+    torch.ops.trtllm.minimax_m3_sm107tp4_fullctx_reduce
+    return True
 
 
 def plan_for(
