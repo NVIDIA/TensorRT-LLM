@@ -65,8 +65,8 @@ l0_gb300:
   - unittest/_torch/modules/test_embedding_lookup.py
   # GQA decode FMHA libraries (SM100 runs them with unittest/_torch/attention in l0_b200).
   - unittest/_torch/attention/test_gqa_decode_fmha.py
-  # One-model speculative decoding on SM103: step copies, MXFP8 draft head, MTP fc input, steady prepare.
-  - unittest/_torch/kernels/test_spec_step_copies.py
+  # One-model speculative decoding on SM103: fused store scatter, MXFP8 draft head, MTP fc input, steady prepare.
+  - unittest/_torch/speculative/test_spec_store_scatter.py
   - unittest/_torch/modules/test_mxfp8_draft_head.py
   - unittest/_torch/modules/test_q35_mtp_glue.py
   - unittest/_torch/executor/test_steady_spec_prepare.py
