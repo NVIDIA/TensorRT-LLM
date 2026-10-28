@@ -402,12 +402,7 @@ exposed through `LLM.get_kv_cache_events()` / `LLM.get_kv_cache_events_async()`,
 
 #### Streaming path (prototype)
 
-Configured with ```kv_cache_config.kv_events_config```. Streaming is intended to reduce event
-publishing overhead under attention data parallelism: each emitting rank publishes its own
-events over a ZeroMQ `PUB` socket, removing the rank-0 gather and the consumer pull through the
-LLM API. Each emitting rank still drains its local native event source, converts the events to
-wire structs and enqueues one batch at the iteration boundary. A background thread performs
-msgpack encoding and socket I/O.
+Configured with ```kv_cache_config.kv_events_config```. Streaming is intended to reduce event publishing overhead under attention data parallelism: each emitting rank publishes its own events over a ZeroMQ `PUB` socket, removing the rank-0 gather and the consumer pull through the LLM API. Each emitting rank drains its local native event source, converts the events to wire structs and enqueues a batch at iteration boundaries and when a prefix-cache reset completes. A background thread performs msgpack encoding and socket I/O.
 
 ```python
 from tensorrt_llm.llmapi import KvCacheConfig, KVEventsConfig
@@ -450,13 +445,7 @@ port must be at least *ranks-per-host* away from ```endpoint```'s rather than `N
 Overlapping ranges are rejected at startup. For `ipc://` and `inproc://` endpoints, which
 have no port, each rank appends a `_dp<rank>` suffix instead.
 
-**Wire format.** Each batch is sent as three ZeroMQ frames: the subscription ```topic```,
-an 8-byte big-endian sequence number, and a msgpack payload
-`[timestamp, [events], data_parallel_rank]`. Each event is a map tagged with a `type` key —
-`BlockStored` or `BlockRemoved` — carrying int64 block hashes derived from the V2 radix block
-keys. This is the format documented for custom router backends; it differs from vLLM's
-positional-array encoding of the individual events, though the batch envelope is positional in
-both.
+**Wire format.** Each batch is sent as three ZeroMQ frames: the subscription ```topic```, an 8-byte big-endian sequence number, and a msgpack payload `[timestamp, [events], data_parallel_rank]`. Each event is a map tagged with a `type` key: `BlockStored`, `BlockRemoved`, or `AllBlocksCleared`. Stored and removed events carry int64 block hashes derived from the V2 radix block keys. `AllBlocksCleared` has no additional fields. This is the format documented for custom router backends; it differs from vLLM's positional-array encoding of the individual events, though the batch envelope is positional in both.
 
 **Delivery guarantees.** Delivery is best effort, and batch loss is observable. Every accepted
 batch reserves a sequence number up front, so a batch dropped by a full publisher queue
