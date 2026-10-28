@@ -3250,6 +3250,58 @@ def test_sm107_nvfp4_finalize_accepts_two_cta_n_tiling():
     assert runner_cls._is_n_tiling_compatible(n=256, mma_n=128, cluster_n=2)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="This test requires the public Rubin CuTe DSL package",
+)
+def test_sm107_nvfp4_gather_act_fusion_cache_key_ignores_inplace_output_rows(monkeypatch):
+    monkeypatch.setattr(cute_dsl_custom_ops, "get_sm_version", lambda: 107)
+    runner = cute_dsl_custom_ops.Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+        num_experts=1, top_k=1, num_local_experts=1, local_expert_offset=0, tile_size=128
+    )
+    tuning_config = runner.get_tuning_config()
+    shard_n, packed_k, tile_size = 512, 128, 128
+
+    def input_shapes(m: int) -> tuple[torch.Size, ...]:
+        num_tiles, num_tokens, scale_k = m // tile_size, m // 2, packed_k * 2 // 16
+        return (
+            torch.Size((num_tokens, packed_k)),
+            torch.Size((1, shard_n, packed_k)),
+            torch.Size((num_tokens, scale_k)),
+            torch.Size((1, shard_n, scale_k)),
+            torch.Size((1,)),
+            torch.Size((num_tiles,)),
+            torch.Size((num_tiles,)),
+            torch.Size((m,)),
+            torch.Size((1,)),
+            torch.Size((1,)),
+            # Inplace output and output scale factors, sized from the actual m.
+            torch.Size((m, shard_n // 2)),
+            torch.Size((m * shard_n // 16,)),
+        )
+
+    def cache_key(m: int) -> tuple:
+        return AutoTuner._find_nearest_profile(
+            input_shapes(m),
+            tuning_config.dynamic_tensor_specs,
+            tuning_config.constraint_specs,
+            tuning_config.tune_max_num_tokens,
+            True,
+        )
+
+    # Two permuted-token counts in one tuning bucket must share a cache entry.
+    bucket_map = tuning_config.dynamic_tensor_specs[0].map_to_tuning_buckets
+    assert bucket_map(1024) == bucket_map(1152)
+    assert cache_key(1024) == cache_key(1152)
+
+    # Profiling sizes the scale-factor buffer as the kernel asserts it.
+    inputs = [torch.empty(shape, dtype=torch.uint8, device="meta") for shape in input_shapes(1152)]
+    for profile in AutoTuner.get()._optimization_profiles(tuning_config, inputs):
+        shapes = profile.get_opt_shapes()
+        assert shapes[11] == (shapes[7][0] * shard_n // 16,)
+
+
 def _get_registered_rubin_moe_op(name: str):
     try:
         return getattr(torch.ops.trtllm, name)

@@ -38,10 +38,8 @@ def _skip_legacy_cutlass_mlir_helpers() -> None:
 
 IS_CUTLASS_DSL_AVAILABLE = False
 
-# Whether the public CuTe DSL package provides the SM107/Rubin helper module.
-# Rubin kernels stay disabled when it is absent and callers retain their
-# existing fallback paths.
-# TODO: flips to True once a Rubin-capable CuTe DSL package ships in the image.
+# Whether the installed CuTe DSL provides ``cutlass.utils.rubin_helpers``; set
+# by the import probe below. Rubin kernels stay disabled when it is absent.
 IS_CUTLASS_DSL_RUBIN_AVAILABLE = False
 
 if platform.system() != "Windows":
