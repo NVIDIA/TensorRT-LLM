@@ -729,12 +729,9 @@ class DecoderInputPreparer:
         buffers, and the attention and speculative metadata are prepared.
         """
         set_per_request_prefill_cuda_graph_flag(False)
-        if self.mapping is not None and "cp_type" in self.mapping.cp_config:
+        if "cp_type" in self.mapping.cp_config:
             cp_type = self.mapping.cp_config["cp_type"]
-            if cp_type in (CpType.HELIX, CpType.ULYSSES):
-                # Prepared like any other batch.
-                pass
-            else:
+            if cp_type not in (CpType.HELIX, CpType.ULYSSES):
                 raise NotImplementedError(
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}."
                 )
@@ -913,13 +910,8 @@ class DecoderInputPreparer:
                 host, kv_cache_manager, attn_metadata, spec_metadata, new_tokens_device, lora_params
             )
 
-        gather_ids_device = (
-            self._gather_ids_buffer.tensor[: len(host.lists.gather_ids)]
-            if enable_spec_decode
-            else None
-        )
         return self._finish_prepared(
-            PreparedInputs(inputs, gather_ids_device),
+            PreparedInputs(inputs),
             scheduled_requests,
             kv_cache_manager,
             runtime_draft_len,

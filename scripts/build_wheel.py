@@ -792,6 +792,31 @@ def has_sm90_or_newer(cuda_architectures: str) -> bool:
     return False
 
 
+def install_modeling_v2_libs(mv2_build_dir: Path, lib_dir: Path,
+                             install_file) -> None:
+    """Install the modeling_v2 family libraries the way deep_ep and flash_mla are.
+
+    Each family's build directory holds cuda_architectures.txt, written at
+    configure time: the architectures its library was built for, empty when
+    there is none (cpp/cmake/modules/modeling_v2.cmake). As deep_ep's package
+    is, a family library installed by an earlier build that this build did not
+    produce is removed, so it is neither loaded nor shipped.
+    """
+    installed = set()
+    for arch_file in sorted(mv2_build_dir.glob("*/cuda_architectures.txt")):
+        if not arch_file.read_text().strip().strip(";"):
+            continue
+        libraries = list(arch_file.parent.glob("libth_modeling_v2_*.so"))
+        assert len(libraries) == 1, (
+            "Exactly one modeling_v2 library should be present in "
+            f"{arch_file.parent}: {libraries}")
+        install_file(libraries[0], lib_dir / libraries[0].name)
+        installed.add(libraries[0].name)
+    for stale in lib_dir.glob("libth_modeling_v2_*.so"):
+        if stale.name not in installed:
+            stale.unlink()
+
+
 def stage_nccl_extensions_package(wheel: Path, staging_dir: Path) -> None:
     """Stage NCCL-EP namespace packages from the intermediate wheel."""
     package_root = staging_dir / "3rdparty" / "nccl_extensions"
@@ -1018,7 +1043,7 @@ def main(*,
 
     targets = [
         "tensorrt_llm", "th_common", "bindings", "deep_ep", "deep_gemm",
-        "pg_utils", "flash_mla"
+        "pg_utils", "flash_mla", "modeling_v2_libs"
     ]
     build_nccl_extensions_enabled = has_sm90_or_newer(cuda_architectures)
     if build_nccl_extensions_enabled:
@@ -1341,6 +1366,8 @@ def main(*,
                      lib_dir / "libtensorrt_llm.so")
         install_file(build_dir / "tensorrt_llm/thop/libth_common.so",
                      lib_dir / "libth_common.so")
+        install_modeling_v2_libs(build_dir / "tensorrt_llm/modeling_v2",
+                                 lib_dir, install_file)
         if os.path.exists(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so"
