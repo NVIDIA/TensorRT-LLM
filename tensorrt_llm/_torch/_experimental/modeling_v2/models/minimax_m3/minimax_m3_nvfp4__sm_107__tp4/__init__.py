@@ -2,4 +2,4 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax-M3 NVFP4 / sm_107 / tp4."""
 
-from .. import fake_ops  # noqa: F401
+from ..kernels import fake_ops  # noqa: F401
