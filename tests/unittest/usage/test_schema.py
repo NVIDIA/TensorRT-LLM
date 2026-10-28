@@ -15,11 +15,13 @@
 """Tests for Pydantic schema models, GXT payload format, and SMS schema compliance."""
 
 import json
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
 
-from tensorrt_llm.usage import schema, schemas
+from tensorrt_llm import _errors
+from tensorrt_llm.usage import schema, schemas, startup_state
 
 pytestmark = pytest.mark.cpu_only
 
@@ -251,7 +253,7 @@ class TestSchemaConstants:
         [
             ("CLIENT_ID", "616561816355034"),
             ("EVENT_PROTOCOL", "1.6"),
-            ("EVENT_SCHEMA_VER", "0.7"),
+            ("EVENT_SCHEMA_VER", "0.8"),
             ("EVENT_SYS_VER", "trtllm-telemetry/1.0"),
         ],
     )
@@ -484,6 +486,8 @@ class TestSchemaCompliance:
             "activeLlmInstances",
             "maxConcurrentLlmInstances",
             "llmInitializationFailures",
+            "priorStartupFailures",
+            "startupStateStatus",
         }
 
         missing = expected_fields - props
@@ -654,6 +658,8 @@ class TestSchemaCompliance:
             llmApiConfigMetaJson='{"capture_succeeded":true}',
             disaggRole="",
             deploymentId="",
+            priorStartupFailures=3,
+            startupStateStatus="new",
         )
         payload = report.model_dump(by_alias=True)
         initial_schema = sms_schema["definitions"]["events"]["trtllm_initial_report"].copy()
@@ -685,6 +691,9 @@ class TestSchemaCompliance:
             component="server",
             reportingSource="self",
             ingressPoint="cli_serve",
+            errorCategory="resource",
+            priorStartupFailures=30,
+            startupStateStatus="persisted",
         )
         payload = report.model_dump(by_alias=True)
         exit_schema = sms_schema["definitions"]["events"]["trtllm_exit_report"].copy()
@@ -759,3 +768,57 @@ class TestPydanticValidation:
         """Lifecycle counters enforce the unsigned 32-bit wire bounds."""
         with pytest.raises(ValidationError):
             schema.TrtllmInitialReport(**{field_name: invalid_value})
+
+
+class TestStartupFailureFields:
+    """The startup failure fields are closed and match their sources."""
+
+    def _exit_report(self, **fields):
+        return schema.TrtllmExitReport(
+            exitCodeKnown=True,
+            exitCode=1,
+            signalNumber=0,
+            terminationKind="exception",
+            lifecyclePhase="model_initialization",
+            component="llm",
+            reportingSource="self",
+            **fields,
+        )
+
+    def test_error_categories_match_the_classifier(self):
+        assert get_args(schema.ErrorCategory) == ("",) + _errors.ERROR_CATEGORIES
+
+    def test_prior_failure_buckets_match_the_state_module(self):
+        assert get_args(schema.PriorStartupFailures) == startup_state.PRIOR_STARTUP_FAILURE_BUCKETS
+
+    def test_json_enums_match_the_models(self):
+        events = json.loads(schemas.SMS_SCHEMA_PATH.read_text())["definitions"]["events"]
+        exit_props = events["trtllm_exit_report"]["properties"]
+        assert tuple(exit_props["errorCategory"]["enum"]) == get_args(schema.ErrorCategory)
+        for event_name in ("trtllm_initial_report", "trtllm_exit_report"):
+            props = events[event_name]["properties"]
+            assert tuple(props["startupStateStatus"]["enum"]) == get_args(schema.StartupStateStatus)
+            assert props["priorStartupFailures"] == {"$ref": "#/definitions/types/PositiveInt"}
+
+    def test_defaults_are_sentinels(self):
+        params = self._exit_report().model_dump(by_alias=True)
+        assert params["errorCategory"] == ""
+        assert params["priorStartupFailures"] == 0
+        assert params["startupStateStatus"] == ""
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"errorCategory": "internal"},
+            {"errorCategory": "ValueError: bad"},
+            {"priorStartupFailures": 4},
+            {"priorStartupFailures": -1},
+            {"startupStateStatus": "missing"},
+        ],
+    )
+    def test_rejects_values_outside_the_allowlist(self, fields):
+        with pytest.raises(ValidationError):
+            self._exit_report(**fields)
+        if "errorCategory" not in fields:
+            with pytest.raises(ValidationError):
+                schema.TrtllmInitialReport(**fields)
