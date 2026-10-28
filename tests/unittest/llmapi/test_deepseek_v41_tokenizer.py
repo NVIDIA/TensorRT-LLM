@@ -335,6 +335,35 @@ def test_tools_argument_is_folded_into_a_leading_system_message():
     assert "## Tools" in prompt
 
 
+def test_tools_argument_joins_the_leading_system_message():
+    """Tools render after the leading system message's content, in one system block."""
+    tokenizer = DeepseekV41Tokenizer(_DummyTokenizer())
+    conversation = [
+        {"role": "system", "content": "You are terse."},
+        {"role": "user", "content": "weather?"},
+    ]
+
+    prompt = tokenizer.apply_chat_template(conversation, tools=_TOOL)
+
+    expected = copy.deepcopy(conversation)
+    expected[0]["tools"] = _TOOL
+    assert prompt == encode_messages(expected, thinking_mode="chat")
+    assert prompt.count("<｜System｜>") == 1
+    assert prompt.index("You are terse.") < prompt.index("## Tools")
+    assert "tools" not in conversation[0]
+
+
+@pytest.mark.parametrize("tools", [None, _TOOL])
+def test_developer_message_renders_as_a_system_message(tools):
+    tokenizer = DeepseekV41Tokenizer(_DummyTokenizer())
+
+    def render(role):
+        conversation = [{"role": role, "content": "Be brief."}, {"role": "user", "content": "hi"}]
+        return tokenizer.apply_chat_template(conversation, tools=tools)
+
+    assert render("developer") == render("system")
+
+
 def test_server_chat_template_path_uses_v41_custom_tokenizer():
     tokenizer = DeepseekV41Tokenizer(_DummyTokenizer())
 
@@ -462,6 +491,26 @@ DIFFERENTIAL_CASES = {
         }
     ],
 }
+
+
+@pytest.mark.parametrize("thinking", [False, True])
+@pytest.mark.parametrize("case_name", ["sys_user", "single_user"])
+def test_tools_argument_matches_the_checkpoint_encoder(case_name, thinking):
+    """The ``tools`` argument renders as the checkpoint renders a system message's tools."""
+    vendor = _load_vendor_encoding()
+    conversation = DIFFERENTIAL_CASES[case_name]
+    with_tools = copy.deepcopy(conversation)
+    if with_tools[0]["role"] == "system":
+        with_tools[0]["tools"] = _TOOL
+    else:
+        with_tools.insert(0, {"role": "system", "content": "", "tools": _TOOL})
+
+    expected = vendor.encode_messages(with_tools, thinking_mode="thinking" if thinking else "chat")
+    actual = DeepseekV41Tokenizer(_DummyTokenizer()).apply_chat_template(
+        copy.deepcopy(conversation), tools=_TOOL, thinking=thinking
+    )
+
+    assert actual == expected
 
 
 @pytest.mark.parametrize(

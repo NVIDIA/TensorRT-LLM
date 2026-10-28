@@ -16,7 +16,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, Trtll
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import EncoderCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners import encoder as encoder_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import (
-    EncoderConfigMixin,
+    EncoderConfig,
     EncoderPreparedInputs,
     EncoderRunner,
     EncoderRunnerConfig,
@@ -37,7 +37,7 @@ def _encoder_config(
     declares_feature_spec: bool,
     tp_size: int = 1,
     encoder_decoder: bool = False,
-) -> tuple[EncoderConfigMixin, tuple[tuple[int, ...], torch.dtype, int]]:
+) -> tuple[EncoderConfig, tuple[tuple[int, ...], torch.dtype, int]]:
     feature_spec = ((480_000,), torch.float32, 1_500)
 
     class _Model:

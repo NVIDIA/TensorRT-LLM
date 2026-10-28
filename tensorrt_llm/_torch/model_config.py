@@ -383,6 +383,11 @@ class ModelConfig(Generic[TConfig]):
         super().__setattr__(key, value)
 
     def __post_init__(self):
+        # Fused expert reduction can change accumulation order between runs.
+        if (os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+                or os.getenv("FORCE_MOE_KERNEL_DETERMINISTIC", "0") == "1"):
+            self.moe_disable_finalize_fusion = True
+
         if (self.sparse_attention_config is None
                 and getattr(self.pretrained_config, "model_type",
                             None) in ("deepseek_v41", "deepseek_v41_text")):

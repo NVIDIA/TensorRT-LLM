@@ -30,7 +30,7 @@ from tensorrt_llm._torch.pyexecutor.engine.lora import (
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
@@ -851,7 +851,7 @@ def test_engine_reuses_owner_and_shares_lora_config_across_resource_reinitializa
     graph_lora_settings: tuple[LoraConfig, LoraModelConfig], graphs_enabled: bool
 ) -> None:
     model = _MultimodalLoraModel()
-    engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
+    engine = ModelEngine.__new__(ModelEngine)
     engine._cleanup_done = True
     engine.model = model
     engine.input_processor = _MultimodalInputProcessor()
@@ -907,7 +907,7 @@ def test_executor_shares_lora_configuration_with_real_cache_constructor(
     )
     model.model_config.pretrained_config = SimpleNamespace(num_hidden_layers=8)
     model.model_config.get_bindings_model_config = lambda **kwargs: binding_config
-    engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
+    engine = ModelEngine.__new__(ModelEngine)
     engine._cleanup_done = True
     engine.model = model
     engine.input_processor = _MultimodalInputProcessor()

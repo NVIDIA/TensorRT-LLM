@@ -10,7 +10,7 @@ import os
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, cast
+from typing import Any
 
 import torch
 from torch import nn
@@ -61,7 +61,7 @@ from .interface import PackedInputs, PackedModelRunner, PreparedInputs, RunnerCo
 
 
 @dataclass(frozen=True, kw_only=True)
-class EncoderConfigMixin:
+class EncoderConfig(RunnerConfig):
     """Encoder-specific fields shared by runner configuration types."""
 
     enable_autotuner: bool
@@ -220,7 +220,7 @@ class EncoderConfigMixin:
 
 
 @dataclass(frozen=True)
-class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
+class EncoderRunnerConfig(EncoderConfig):
     """Configuration for the EncoderOnly model runner."""
 
     @classmethod
@@ -272,7 +272,7 @@ class EncoderMixin:
     def _initialize_encoder(
         self,
         model: nn.Module,
-        config: EncoderConfigMixin,
+        config: EncoderConfig,
         *,
         mapping: Mapping,
         dist: Distributed | None,
@@ -284,7 +284,7 @@ class EncoderMixin:
         self._dist = dist
         self._moe_load_balancer = moe_load_balancer
         self._attention_runtime_features = attention_runtime_features
-        self._config = cast(RunnerConfig, config)
+        self._config = config
         self._encoder_config = config
         self._initialize_encoder_cuda_graph()
 

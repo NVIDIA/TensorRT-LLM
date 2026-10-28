@@ -174,6 +174,7 @@ class KimiKDALinearAttention(nn.Module):
         allreduce_strategy=AllReduceStrategy.AUTO,
         aux_stream: Optional[torch.cuda.Stream] = None,
         model_config: Optional[ModelConfig] = None,
+        reduce_output: bool = True,
     ) -> None:
         super().__init__()
         lin = cfg.linear_attn_config
@@ -192,9 +193,11 @@ class KimiKDALinearAttention(nn.Module):
         else:
             self._kda_tp_size = 1
         self._kda_tp_rank = mapping.tp_rank if self._kda_tp_size > 1 else 0
+        # reduce_output=False returns the row-sharded o_proj partials; the
+        # caller owns the reduction (helix_a2a reduce-scatters them).
         self._o_allreduce = (
             AllReduce(mapping=mapping, strategy=allreduce_strategy, dtype=torch.bfloat16)
-            if self._kda_tp_size > 1
+            if self._kda_tp_size > 1 and reduce_output
             else None
         )
 

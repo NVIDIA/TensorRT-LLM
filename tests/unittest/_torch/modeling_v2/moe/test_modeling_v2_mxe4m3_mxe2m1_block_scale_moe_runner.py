@@ -8,11 +8,16 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (
+    Mxe4m3Mxe2m1BlockScaleMoeRunner,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (  # noqa: E501
     mxe4m3_mxe2m1_block_scale_moe_runner as moe,
 )
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mxe4m3_mxe2m1_block_scale_moe_runner requires a CUDA device"
@@ -1621,7 +1626,117 @@ def _window(args, ref, offset: int, num_local: int):
     return sub, sub_ref
 
 
-@pytest.mark.parametrize("cell", moe.CELLS, ids=[c.why[:44] for c in moe.CELLS])
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "gpt_oss/gpt_oss_120b__sm_10x__default": (
+        Cell(
+            why="the gpt-oss target's own call: router entry point, all 128 experts local",
+            spec=dict(
+                tokens=64,
+                routed_by_kernel=True,
+                local_expert_offset=0,
+                local_num_experts=128,
+                **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
+            ),
+        ),
+        Cell(
+            why="default ep4: the kernel routes all 128 ids and runs this rank's window of 32",
+            spec=dict(
+                tokens=64,
+                routed_by_kernel=True,
+                local_expert_offset=64,
+                local_num_experts=32,
+                **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
+            ),
+        ),
+        Cell(
+            why="default ep8: the kernel routes all 128 ids and runs this rank's window of 16",
+            spec=dict(
+                tokens=64,
+                routed_by_kernel=True,
+                local_expert_offset=112,
+                local_num_experts=16,
+                **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
+            ),
+        ),
+        Cell(
+            why="default moe_tp2: 1440 intermediate columns padded to 1536",
+            spec=dict(
+                tokens=64,
+                routed_by_kernel=True,
+                local_expert_offset=0,
+                local_num_experts=128,
+                **{
+                    **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
+                    "intermediate": 1440,
+                    "intermediate_pad": 1536,
+                },
+            ),
+        ),
+        Cell(
+            why="default moe_tp4, ranks 0-2: 768 intermediate columns, no padding",
+            spec=dict(
+                tokens=64,
+                routed_by_kernel=True,
+                local_expert_offset=0,
+                local_num_experts=128,
+                **{
+                    **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
+                    "intermediate": 768,
+                    "intermediate_pad": 768,
+                },
+            ),
+        ),
+        Cell(
+            why="default moe_tp4, rank 3: 576 real columns inside a 768-wide operand",
+            spec=dict(
+                tokens=64,
+                routed_by_kernel=True,
+                local_expert_offset=0,
+                local_num_experts=128,
+                **{
+                    **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
+                    "intermediate": 576,
+                    "intermediate_pad": 768,
+                },
+            ),
+        ),
+        Cell(
+            why="default moe_tp8, ranks 0-6: 384 intermediate columns, no padding",
+            spec=dict(
+                tokens=64,
+                routed_by_kernel=True,
+                local_expert_offset=0,
+                local_num_experts=128,
+                **{
+                    **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
+                    "intermediate": 384,
+                    "intermediate_pad": 384,
+                },
+            ),
+        ),
+        Cell(
+            why="default moe_tp8, rank 7: 192 real columns inside a 384-wide operand",
+            spec=dict(
+                tokens=64,
+                routed_by_kernel=True,
+                local_expert_offset=0,
+                local_num_experts=128,
+                **{
+                    **Mxe4m3Mxe2m1BlockScaleMoeRunner.GPT_OSS,
+                    "intermediate": 192,
+                    "intermediate_pad": 384,
+                },
+            ),
+        ),
+    ),
+}
+
+CELLS = certified_cells(moe, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell):
     """Drive every configuration the entry claims, through the entry's own
     reference and its own gate.

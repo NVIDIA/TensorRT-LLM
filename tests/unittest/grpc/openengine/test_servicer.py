@@ -281,6 +281,39 @@ def test_disaggregated_params_context_only_from_extra() -> None:
     assert params.request_type == "context_only"
 
 
+def test_independent_prefill_handoffs_keep_distinct_transfer_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm.llmapi.disagg_utils import MIN_GLOBAL_ID
+
+    nonces = iter((0, (1 << 63) - MIN_GLOBAL_ID - 1))
+
+    def next_nonce(upper: int) -> int:
+        assert upper == (1 << 63) - MIN_GLOBAL_ID
+        return next(nonces)
+
+    monkeypatch.setattr("secrets.randbelow", next_nonce)
+    transfer_ids = []
+    for worker in range(2):
+        request = generation_pb2.GenerateRequest()
+        request.extra.update({"request_type": "context_only"})
+        params = oe_disagg.disaggregated_params_from_request(request)
+        assert params is not None
+        # Independent prefill engines can return the same local context ID.
+        params.ctx_request_id = 274
+        params.ctx_info_endpoint = f"tcp://127.0.0.1:{7001 + worker}"
+        response = oe_disagg.prefill_ready_response("req", params, "NIXL")
+        handoff = generation_pb2.GenerateResponse.FromString(response.SerializeToString())
+        follow_up = generation_pb2.GenerateRequest()
+        follow_up.kv.session.CopyFrom(handoff.prefill_ready.kv_session)
+        decoded = oe_disagg.disaggregated_params_from_request(follow_up)
+        assert decoded is not None
+        assert decoded.ctx_request_id == 274
+        transfer_ids.append(decoded.disagg_request_id)
+
+    assert transfer_ids == [MIN_GLOBAL_ID, (1 << 63) - 1]
+
+
 def test_disaggregated_params_invalid_request_type() -> None:
     request = generation_pb2.GenerateRequest()
     request.extra.update({"request_type": "bogus"})

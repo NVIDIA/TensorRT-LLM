@@ -177,6 +177,19 @@ def test_config_validation(
 
 
 @pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize("field", ["transfer_timeout_sec", "control_grace_sec"])
+@pytest.mark.parametrize(("value", "valid"), [(0.5, True), (0.0, False), (-1.0, False)])
+def test_connector_timeout_constraints(
+    schemas: dict[str, dict], filename: str, field: str, value: float, valid: bool
+) -> None:
+    config = {"kv_connector_config": {"connector": "lmcache", field: value}}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
 @pytest.mark.parametrize("section", ["block_reuse_config", "mamba_state_config"])
 @pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("invalid", False)])
 def test_branch_snapshot_field_types(

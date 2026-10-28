@@ -25,7 +25,7 @@ import torch
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import BaseResourceManager
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
@@ -147,7 +147,7 @@ def _get_worker_cuda_graph_runner(
     if worker.engine.draft_kv_cache_manager is not None:
         assert isinstance(worker.engine.draft_kv_cache_manager, KVCacheManagerV2)
     model_engine = worker.engine.model_engine
-    assert isinstance(model_engine, PyTorchModelEngine)
+    assert isinstance(model_engine, ModelEngine)
     return model_engine.cuda_graph_runner
 
 

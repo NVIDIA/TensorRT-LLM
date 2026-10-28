@@ -27,7 +27,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
 )
-from tensorrt_llm._torch.utils import is_gdn_replay_enabled
+from tensorrt_llm._torch.utils import (
+    is_gdn_flashinfer_replay_enabled,
+    is_gdn_flashinfer_replay_required,
+    is_gdn_replay_enabled,
+)
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.logger import logger
 
@@ -69,6 +73,28 @@ def _advance_replay_state(
         next_cache_buffer = torch.where(is_dummy_request, cache_buffer, next_cache_buffer)
     replay_metadata.prev_num_accepted_tokens[slots] = next_accepted
     replay_metadata.cache_buf_idx[slots] = next_cache_buffer
+
+
+def _advance_ring_start(
+    cache_base: torch.Tensor,
+    replay_metadata: ReplayStateUpdateMetadata,
+    state_indices: torch.Tensor,
+    is_dummy_request: torch.Tensor | None = None,
+) -> None:
+    """Move each flushed slot's ring start past its folded history rows.
+
+    Reads the pre-step history lengths, so it must run before
+    ``_advance_replay_state`` overwrites them.
+    """
+    from .flashinfer_cached_replay import FLASHINFER_REPLAY_RING_SIZE
+
+    slots = state_indices.long()
+    prev_len = replay_metadata.prev_num_accepted_tokens[slots]
+    flushed = prev_len + replay_metadata.replay_step_width > replay_metadata.replay_history_size
+    if is_dummy_request is not None:
+        flushed = flushed & ~is_dummy_request
+    base = cache_base[slots]
+    cache_base[slots] = torch.where(flushed, (base + prev_len) % FLASHINFER_REPLAY_RING_SIZE, base)
 
 
 _MAMBA_SSM_SEED_MASK = (1 << 62) - 1
@@ -147,6 +173,13 @@ class GDNLayerCache(MambaLayerCache):
     old_B: torch.Tensor | None = None
     old_dt: torch.Tensor | None = None
     old_dA_cumsum: torch.Tensor | None = None
+    cache_base: torch.Tensor | None = field(
+        default=None,
+        metadata={"slot_shared": True},
+    )
+    k_ring: torch.Tensor | None = None
+    u_ring: torch.Tensor | None = None
+    g_ring: torch.Tensor | None = None
 
 
 class GDNIntermediateState:
@@ -237,7 +270,7 @@ class GDNIntermediateState:
 class GDNReplayState:
     """Own GDN replay buffers, bookkeeping, and checkpoint commits."""
 
-    def __init__(self, tokens_per_gen_step: int) -> None:
+    def __init__(self, tokens_per_gen_step: int, use_flashinfer_ring: bool = False) -> None:
         self._ssm_states: tuple[torch.Tensor, ...] = ()
         self._conv_states: tuple[torch.Tensor, ...] = ()
         self._stacked_conv: torch.Tensor | None = None
@@ -246,6 +279,7 @@ class GDNReplayState:
         self.rand_seed: torch.Tensor | None = None
         self._seed_request_counter = 0
         self._seed_rank_offset = 0
+        self.use_flashinfer_ring = use_flashinfer_ring
         self.replay_step_width = tokens_per_gen_step
         self.replay_history_size = max(MIN_REPLAY_HISTORY_SIZE, tokens_per_gen_step)
         self.prev_num_accepted_tokens: torch.Tensor | None = None
@@ -254,6 +288,10 @@ class GDNReplayState:
         self.old_B: torch.Tensor | None = None
         self.old_dt: torch.Tensor | None = None
         self.old_dA_cumsum: torch.Tensor | None = None
+        self.cache_base: torch.Tensor | None = None
+        self.k_ring: torch.Tensor | None = None
+        self.u_ring: torch.Tensor | None = None
+        self.g_ring: torch.Tensor | None = None
         self._state_descriptors: torch.Tensor | None = None
         self._state_strides: tuple[int, int, int] | None = None
 
@@ -312,9 +350,30 @@ class GDNReplayState:
         self.rand_seed = allocate_mamba_seed_buffer(cache_size, self._seed_rank_offset, device)
 
         num_heads, head_dim, d_state = context.ssm_state_shape
-        common_replay_shape = [len(context.mamba_pp_layers), cache_size, 2]
         self.prev_num_accepted_tokens = torch.zeros(cache_size, dtype=torch.int32, device=device)
         self.cache_buf_idx = torch.zeros(cache_size, dtype=torch.int32, device=device)
+        if self.use_flashinfer_ring:
+            from .flashinfer_cached_replay import FLASHINFER_REPLAY_RING_SIZE
+
+            ring_shape = [len(context.mamba_pp_layers), cache_size]
+            self.cache_base = torch.zeros(cache_size, dtype=torch.int32, device=device)
+            self.k_ring = torch.zeros(
+                ring_shape + [context.n_groups_per_rank, FLASHINFER_REPLAY_RING_SIZE, d_state],
+                dtype=context.conv_state_dtype,
+                device=device,
+            )
+            self.u_ring = torch.zeros(
+                ring_shape + [num_heads, FLASHINFER_REPLAY_RING_SIZE, head_dim],
+                dtype=context.conv_state_dtype,
+                device=device,
+            )
+            self.g_ring = torch.zeros(
+                ring_shape + [num_heads, FLASHINFER_REPLAY_RING_SIZE],
+                dtype=torch.float32,
+                device=device,
+            )
+            return
+        common_replay_shape = [len(context.mamba_pp_layers), cache_size, 2]
         self.old_x = torch.zeros(
             common_replay_shape + [self.replay_history_size, num_heads, head_dim],
             dtype=context.conv_state_dtype,
@@ -387,16 +446,27 @@ class GDNReplayState:
         )
 
     def _layer_cache_fields(self, layer_offset: int) -> dict[str, torch.Tensor | None]:
-        return {
+        fields = {
             "mamba_ssm_rand_seed": self.rand_seed,
             "intermediate_conv_window": self.intermediate_conv[layer_offset],
             "prev_num_accepted_tokens": self.prev_num_accepted_tokens,
             "cache_buf_idx": self.cache_buf_idx,
-            "old_x": self.old_x[layer_offset],
-            "old_B": self.old_B[layer_offset],
-            "old_dt": self.old_dt[layer_offset],
-            "old_dA_cumsum": self.old_dA_cumsum[layer_offset],
         }
+        if self.use_flashinfer_ring:
+            fields.update(
+                cache_base=self.cache_base,
+                k_ring=self.k_ring[layer_offset],
+                u_ring=self.u_ring[layer_offset],
+                g_ring=self.g_ring[layer_offset],
+            )
+        else:
+            fields.update(
+                old_x=self.old_x[layer_offset],
+                old_B=self.old_B[layer_offset],
+                old_dt=self.old_dt[layer_offset],
+                old_dA_cumsum=self.old_dA_cumsum[layer_offset],
+            )
+        return fields
 
     def make_layer_cache(
         self,
@@ -415,7 +485,12 @@ class GDNReplayState:
             return
         self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
         self.cache_buf_idx.index_fill_(0, slots, 0)
-        for buffer in (self.old_x, self.old_B, self.old_dt, self.old_dA_cumsum):
+        if self.use_flashinfer_ring:
+            self.cache_base.index_fill_(0, slots, 0)
+            history_buffers = (self.k_ring, self.u_ring, self.g_ring)
+        else:
+            history_buffers = (self.old_x, self.old_B, self.old_dt, self.old_dA_cumsum)
+        for buffer in history_buffers:
             buffer.index_fill_(1, slots, 0)
         if self.rand_seed is not None:
             self._seed_request_counter += 1
@@ -429,11 +504,18 @@ class GDNReplayState:
 
     def update(self, batch: MambaAcceptanceBatch) -> None:
         num_decodes = batch.num_generations
-        if num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
+        if not self.use_flashinfer_ring and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
             self.commit_all_layers(batch.attention_metadata, num_decodes)
         metadata = self.get_replay_metadata()
         if metadata is None:
             raise RuntimeError("GDN replay buffers are not bound")
+        if self.use_flashinfer_ring:
+            _advance_ring_start(
+                self.cache_base,
+                metadata,
+                batch.destination_state_indices,
+                batch.is_dummy_request,
+            )
         _advance_replay_state(
             metadata,
             batch.destination_state_indices,
@@ -503,6 +585,10 @@ class GDNReplayState:
         self.old_B = None
         self.old_dt = None
         self.old_dA_cumsum = None
+        self.cache_base = None
+        self.k_ring = None
+        self.u_ring = None
+        self.g_ring = None
         self._state_descriptors = None
         self._state_strides = None
 
@@ -551,24 +637,70 @@ def select_gdn_replay_state(
     return GDNReplayState(spec_config.tokens_per_gen_step) if use_replay else None
 
 
+def _use_flashinfer_ring_replay(manager: MambaHybridCacheManagerV2, replay_enabled: bool) -> bool:
+    """Whether GDN replay should use the FlashInfer ring-buffer kernel.
+
+    Decided once at load: the ring and double-buffer history layouts differ,
+    so the kernel cannot be switched per call.
+    """
+    layout = manager._state_layout
+    # Managers without local GDN layers (e.g. the one-model MTP draft) hold no history.
+    if not is_gdn_flashinfer_replay_enabled() or not layout.mamba_pp_layers:
+        return False
+    from .flashinfer_cached_replay import is_flashinfer_cached_replay_available
+
+    _, head_dim, d_state = layout.ssm_state_shape
+    reason = None
+    if not replay_enabled:
+        reason = "requires GDN replay to be enabled"
+    elif layout.conv_state_layout != "q_k_v":
+        reason = "requires the q_k_v convolution state layout"
+    elif not is_flashinfer_cached_replay_available():
+        reason = "needs FlashInfer and an SM90/SM100/SM103 GPU"
+    elif layout.conv_state_dtype != torch.bfloat16 or layout.ssm_state_dtype != torch.bfloat16:
+        reason = "requires bf16 model and SSM state dtypes"
+    elif d_state != 128 or head_dim != 128:
+        reason = "requires key and value head size 128"
+    elif manager.spec_config.tokens_per_gen_step not in (4, 8):
+        reason = (
+            "supports 4 or 8 tokens per generation step, got "
+            f"{manager.spec_config.tokens_per_gen_step}"
+        )
+    if reason is None:
+        return True
+    if is_gdn_flashinfer_replay_required():
+        raise RuntimeError(
+            f"TRTLLM_USE_GDN_FLASHINFER_REPLAY=force but FlashInfer GDN replay {reason}"
+        )
+    logger.warning(
+        f"TRTLLM_USE_GDN_FLASHINFER_REPLAY=1 ignored: FlashInfer GDN replay {reason}; "
+        "using the Triton replay kernel"
+    )
+    return False
+
+
 def create_gdn_state(
-    manager: MambaHybridCacheManagerV2, use_replay: bool | None
+    manager: MambaHybridCacheManagerV2,
+    use_replay: bool | None,
+    allow_flashinfer_ring: bool = False,
 ) -> GDNIntermediateState | GDNReplayState:
     """Shared selection for the Qwen3.5 and Qwen4 cache managers."""
     if use_replay is False:
-        return GDNIntermediateState()
-    if use_replay is True:
+        state = None
+    elif use_replay is True:
         if manager.spec_config is None:
             raise ValueError("GDN replay requires speculative decoding")
-        return GDNReplayState(manager.spec_config.tokens_per_gen_step)
-    return (
-        select_gdn_replay_state(
+        state = GDNReplayState(manager.spec_config.tokens_per_gen_step)
+    else:
+        state = select_gdn_replay_state(
             spec_config=manager.spec_config,
             ssm_cache_dtype=manager.ssm_state_dtype,
             manager_cls=type(manager),
         )
-        or GDNIntermediateState()
-    )
+    if allow_flashinfer_ring and _use_flashinfer_ring_replay(manager, state is not None):
+        logger.info("GDN replay kernel: FlashInfer ring buffer")
+        return GDNReplayState(manager.spec_config.tokens_per_gen_step, use_flashinfer_ring=True)
+    return state or GDNIntermediateState()
 
 
 def validate_gdn_layout(
@@ -594,7 +726,7 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
 
     @override
     def _initialize_spec_state(self) -> GDNIntermediateState | GDNReplayState:
-        state = create_gdn_state(self, self._requested_replay)
+        state = create_gdn_state(self, self._requested_replay, allow_flashinfer_ring=True)
 
         validate_gdn_layout(self, state)
         return state
@@ -602,6 +734,11 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
     def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
         state = self._speculative_state
         return state.get_replay_metadata() if isinstance(state, GDNReplayState) else None
+
+    @property
+    def use_gdn_flashinfer_ring_replay(self) -> bool:
+        state = self._speculative_state
+        return isinstance(state, GDNReplayState) and state.use_flashinfer_ring
 
     @property
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:

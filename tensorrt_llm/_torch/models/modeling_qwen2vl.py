@@ -1568,7 +1568,8 @@ class Qwen2_5_VLVisionAttention(Attention):
                    v: Optional[torch.Tensor],
                    position_ids: Optional[torch.IntTensor] = None,
                    position_embeddings: Optional[Tuple[torch.Tensor,
-                                                       torch.Tensor]] = None):
+                                                       torch.Tensor]] = None,
+                   packed_qk: Optional[torch.Tensor] = None):
         seq_len, _ = q.size()
         cos, sin = position_embeddings
 
@@ -1614,6 +1615,15 @@ class Qwen2_5_VLVisionAttention(Attention):
             k.copy_(
                 RotaryEmbedding.apply_rotary_pos_emb(
                     k.unsqueeze(0), cos, sin, unsqueeze_dim=1).squeeze(0))
+        elif packed_qk is not None:
+            # The caller supplies the Q/K prefix of the fused projection, so
+            # its provenance is explicit and the excluded V suffix is untouched.
+            qk = packed_qk.view(1, seq_len, 2 * q.shape[1], self.head_dim)
+            _flash_attn_apply_rotary(qk,
+                                     cos,
+                                     sin,
+                                     interleaved=False,
+                                     inplace=True)
         else:
             # flash_attn Triton kernel: single launch per tensor. cos/sin
             # are expected as `[seqlen, head_dim/2]`. The PyTorch path
@@ -1653,7 +1663,14 @@ class Qwen2_5_VLVisionAttention(Attention):
         q, k, v = qkv, None, None
         q, k, v = self.split_qkv(q, k, v)
 
-        q, k, v = self.apply_rope(q, k, v, position_ids, position_embeddings)
+        packed_qk = (qkv[..., :self.q_size +
+                         self.kv_size] if q.shape == k.shape else None)
+        q, k, v = self.apply_rope(q,
+                                  k,
+                                  v,
+                                  position_ids,
+                                  position_embeddings,
+                                  packed_qk=packed_qk)
         reuse_qkv = False
         if self.support_fused_qkv:
             # Only reuse the projection when RoPE preserves every original

@@ -31,7 +31,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import (
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
@@ -175,7 +175,7 @@ def test_resolve_runner_checks_mm_encoder_before_non_generation() -> None:
 def test_model_engine_initializes_runner_by_family(
     runner_type: type[ModelRunner], initializer_name: str
 ) -> None:
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._model_caller = Mock()
     expected = Mock(spec=runner_type)
     initializer = Mock(return_value=expected)
@@ -198,7 +198,7 @@ def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
     expected_encode_config: bool,
 ) -> None:
     """Encode-only takes its buckets from `cuda_graph_config`, never from llm_args."""
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._model_caller = Mock()
     engine.model = object()
     engine.mapping = object()
@@ -248,7 +248,7 @@ def test_model_engine_rejects_unregistered_runner_family() -> None:
     class UnregisteredRunner:
         pass
 
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._model_caller = Mock()
 
     with pytest.raises(TypeError, match="No runner initializer registered"):
@@ -259,8 +259,8 @@ def _model_engine_with_runner(
     runner: Mock | None,
     *,
     kv_cache_manager: object | None,
-) -> tuple[PyTorchModelEngine, Mock]:
-    engine = object.__new__(PyTorchModelEngine)
+) -> tuple[ModelEngine, Mock]:
+    engine = object.__new__(ModelEngine)
     engine._model_caller = Mock()
     engine.model = SimpleNamespace(extra_attrs={})
     if runner is None:
@@ -319,7 +319,7 @@ def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> Non
         "encoder_hidden_states": hidden_states,
         "encoder_seq_lens": [2, 3],
     }
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._model_caller = Mock()
     engine.model = SimpleNamespace(
         model_config=SimpleNamespace(is_encoder_decoder=True),
@@ -342,7 +342,7 @@ def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> Non
 
 
 def test_model_engine_releases_runner_owned_graphs() -> None:
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(ModelEngine)
     engine._model_caller = Mock()
     engine._runner = Mock(spec=EncoderRunner)
     engine._torch_compile_backend = None

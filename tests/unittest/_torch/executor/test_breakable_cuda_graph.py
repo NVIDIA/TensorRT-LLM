@@ -25,7 +25,7 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import (
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInputs
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import make_weak_ref
 
@@ -304,7 +304,7 @@ def test_runner_warmup_capture_execute_and_shared_output(through_model_engine):
         decoder_runner = object.__new__(DecoderRunner)
         decoder_runner._forward_decoder = decoder_forward
         decoder_runner._model = SimpleNamespace(extra_attrs={})
-        engine = object.__new__(PyTorchModelEngine)
+        engine = object.__new__(ModelEngine)
         engine._runner = decoder_runner
         engine._warmup_depth = 1
 
