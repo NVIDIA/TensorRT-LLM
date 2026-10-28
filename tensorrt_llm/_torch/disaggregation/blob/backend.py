@@ -356,8 +356,8 @@ class _GroupRows(NamedTuple):
     """One group's arrays, taken from the view at submission."""
 
     object_keys: np.ndarray  # uint8 [rows, width]
-    addresses: np.ndarray  # int64 [rows]
-    region_index: int
+    addresses: np.ndarray  # int64 [rows, regions]
+    region_indices: tuple[int, ...]
 
 
 @dataclass(eq=False)
@@ -534,6 +534,7 @@ class BlobBackend:
         self._name = name = f"blob-backend-{next(_instance_ids)}"
         driver_capabilities = self._driver.capabilities
         self._max_rows_per_op = driver_capabilities.max_rows_per_op
+        self._driver_multi_span = driver_capabilities.multi_span
         self._driver_reads_hints = driver_capabilities.hints
         self._driver_cancels = driver_capabilities.cancel
         # Every call goes to the driver as it is submitted, so the backend can cancel only by
@@ -651,7 +652,7 @@ class BlobBackend:
             raise InvalidSubmission(f"the store driver cannot {'get' if is_fetch else 'put'}")
         groups = [self._checked_group_rows(group) for group in view.groups]
         if is_fetch:
-            _refuse_shared_destinations(groups)
+            _refuse_shared_destinations(groups, self._regions)
         label = f"attempt:{next(self._attempt_ids)}"
         attempt = BlobAttempt(self, label, is_fetch, groups, self._call_ranges(groups), hint)
         batches = [self._row_batch(groups, call) for call in attempt._calls]
@@ -671,10 +672,10 @@ class BlobBackend:
 
     def _checked_group_rows(self, group: LayerGroupRows) -> _GroupRows:
         where = f"layer group {group.layer_group_index}"
-        if group.object_keys is None or group.addresses is None or group.region_index is None:
-            raise InvalidSubmission(f"{where}: rows need object keys, addresses and a region")
+        if group.object_keys is None or group.slots is None or group.region_indices is None:
+            raise InvalidSubmission(f"{where}: rows need object keys, slots and regions")
         keys = np.asarray(group.object_keys)
-        addresses = np.asarray(group.addresses)
+        slots = np.asarray(group.slots)
         rows = len(group)
         if keys.dtype != np.uint8 or keys.ndim != 2 or keys.shape[0] != rows or keys.shape[1] == 0:
             raise InvalidSubmission(
@@ -682,21 +683,44 @@ class BlobBackend:
                 f"{keys.shape}"
             )
         keys = np.ascontiguousarray(keys)  # one key twice is allowed: _call_bounds cuts there
-        if addresses.dtype != np.int64 or addresses.shape != (rows,):
+        if slots.dtype != np.int64 or slots.shape != (rows,):
             raise InvalidSubmission(
-                f"{where}: addresses must be int64 [{rows}], got {addresses.dtype} "
-                f"{addresses.shape}"
+                f"{where}: slots must be int64 [{rows}], got {slots.dtype} {slots.shape}"
             )
+        indices = group.region_indices
+        if (
+            not isinstance(indices, tuple)
+            or not indices
+            or any(type(index) is not int for index in indices)
+            or len(set(indices)) != len(indices)
+        ):
+            raise InvalidSubmission(
+                f"{where}: region indices must be a nonempty tuple of distinct ints"
+            )
+        if len(indices) > 1 and not self._driver_multi_span:
+            raise InvalidSubmission(f"{where}: the store driver cannot transfer multiple spans")
         # Refused, never skipped: the driver must not be handed memory it never registered.
-        if group.region_index not in self._binding.served_region_indices:
-            raise InvalidSubmission(f"{where}: region {group.region_index} is not registered")
-        region = self._regions[group.region_index]
-        # Known limit: numpy lets go of the GIL for arrays of more than about 500 elements, so a
-        # group that large may wait here behind a busy thread.
-        slot, misalignment = np.divmod(addresses - region.address, region.slot_bytes)
-        if np.any((slot < 0) | (slot >= region.slot_count) | (misalignment != 0)):
-            raise InvalidSubmission(f"{where}: an address is not a slot of its region")
-        return _GroupRows(keys, addresses, group.region_index)
+        regions: list[SlotRegion] = []
+        for index in indices:
+            if index not in self._binding.served_region_indices:
+                raise InvalidSubmission(f"{where}: region {index} is not registered")
+            region = self._regions[index]
+            if np.any((slots < 0) | (slots >= region.slot_count)):
+                raise InvalidSubmission(f"{where}: a slot is outside region {index}")
+            if region.address + region.slot_bytes * region.slot_count > np.iinfo(np.int64).max:
+                raise InvalidSubmission(f"{where}: region {index} exceeds int64 addresses")
+            regions.append(region)
+        addresses = np.column_stack(
+            [region.address + slots * region.slot_bytes for region in regions]
+        )
+        for column, region in enumerate(regions):
+            for previous, other in enumerate(regions[:column]):
+                if np.any(
+                    (addresses[:, column] < addresses[:, previous] + other.slot_bytes)
+                    & (addresses[:, previous] < addresses[:, column] + region.slot_bytes)
+                ):
+                    raise InvalidSubmission(f"{where}: a row's spans overlap")
+        return _GroupRows(keys, addresses, indices)
 
     def _call_ranges(self, groups: list[_GroupRows]) -> list[tuple[int, int, int]]:
         """``(group position, start, stop)`` of each call: one per group, split where the driver
@@ -713,13 +737,13 @@ class BlobBackend:
     def _row_batch(self, groups: list[_GroupRows], call: _Call) -> RowBatch:
         group_rows = groups[call.group_position]
         rows = slice(call.start, call.stop)
-        region_index = group_rows.region_index
-        return RowBatch.of_slots(
+        indices = group_rows.region_indices
+        return RowBatch.of_spans(
             self._key_stem,
             group_rows.object_keys[rows],
             group_rows.addresses[rows],
-            self._regions[region_index].slot_bytes,
-            self._region_extents[region_index],
+            tuple(self._regions[index].slot_bytes for index in indices),
+            tuple(self._region_extents[index] for index in indices),
         )
 
     def _hand_over(self, attempt: BlobAttempt, batches: list[RowBatch]) -> None:
@@ -1059,12 +1083,15 @@ def _call_bounds(keys: np.ndarray, step: int) -> list[tuple[int, int]]:
     return bounds
 
 
-def _refuse_shared_destinations(groups: list[_GroupRows]) -> None:
+def _refuse_shared_destinations(groups: list[_GroupRows], regions: Sequence[SlotRegion]) -> None:
     """Two fetched rows in one slot would let one report READY over the other's bytes. A publish
-    only reads its slots, so only a fetch is checked. A Python set, not np.unique, whose sort lets
-    go of the GIL."""
-    seen: set[int] = set()
-    for rows in groups:
-        seen.update(rows.addresses.tolist())
-    if len(seen) != sum(len(rows.addresses) for rows in groups):
+    only reads its slots, so only a fetch is checked. Spans are checked across all regions and
+    groups before any driver call."""
+    spans = sorted(
+        (address, address + regions[index].slot_bytes)
+        for group in groups
+        for column, index in enumerate(group.region_indices)
+        for address in group.addresses[:, column].tolist()
+    )
+    if any(start < previous_end for (_, previous_end), (start, _) in zip(spans, spans[1:])):
         raise InvalidSubmission("two rows of a fetch write the same slot")

@@ -16,12 +16,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import IntEnum
-from typing import FrozenSet, List, Optional, Tuple
+from typing import FrozenSet, List, Optional
 
 import numpy as np
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import MapperKind
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import RoleLayout as RoleLayout
 
 BUFFER_ENTRY_DTYPE = np.dtype(
     [
@@ -31,69 +32,6 @@ BUFFER_ENTRY_DTYPE = np.dtype(
         ("size", np.uint32),
     ]
 )
-
-
-class MapperKind(IntEnum):
-    """Transfer semantics of one physical pool's bytes.
-
-    Every PoolView carries ``buffer_entries`` listing
-    ``(local_layer_id, offset, size)`` per buffer; the view's exact layer
-    set always comes from those entries (a view may cover a subset of the
-    LG when V2 splits an LG into multiple pools by buffer-size class, or
-    when a role class exists only on some layers). The kind selects how
-    bytes move between heterogeneous topologies:
-
-    INDEXED/HND: Head-major (HND) K/V — the layout written by the TRTLLM
-        attention kernels and the default for standard V2 managers.
-        Heterogeneous-head transfer selects one contiguous head-major range
-        per K/V buffer.
-    REPLICATED: The pool holds bytes that are identical on every TP rank
-        (MiniMax M3 index-key, DSA indexer K). Copied without KV-head
-        remapping using per-layer strides; fan-in routing elects one owning
-        sender per destination so each peer receives exactly one copy.
-    NHD: Ordinary K/V whose per-buffer storage is token-major
-        ``[token, head, dim]``. Heterogeneous-head transfer must select the
-        corresponding head slice inside every token rather than a single
-        contiguous head-major range.
-
-    A physical pool may hold roles of different kinds: V2 storage coalesces
-    buffers purely by ``(life_cycle, buffer size)``, so e.g. MiniMax M3's
-    replicated index-K shares the K/V pool at TP degrees where their
-    per-block sizes coincide. The page-table builder therefore emits one
-    PoolView per ``(physical pool, mapper kind)`` — a view covers exactly
-    the bytes of one role class, and its per-layer byte ranges come from
-    ``buffer_entries`` (offsets are per layer because another class may
-    interleave between layers; only the per-layer size is uniform, recorded
-    in ``bytes_per_layer``). View count per layer group is bounded by the
-    number of role classes, never by layer count.
-
-    Mamba state pools use SECTIONED for convolution state, INDEXED for SSM
-    state, and REPLICATED for auxiliary recurrent state. The policy is chosen
-    by the layer group's :class:`CacheKind` (PAGED -> ``AttentionPolicy``,
-    STATE -> ``MambaPolicy``); each policy then picks the mapper for a view
-    from its mapper kind, copying REPLICATED views whole per layer.
-    """
-
-    INDEXED = 0
-    HND = INDEXED
-    REPLICATED = 1
-    NHD = 2
-    SECTIONED = 3  # Sectioned layout: [Sec0|Sec1|...], each section independently TP-sharded
-
-
-@dataclass(frozen=True)
-class RoleLayout:
-    """Resharding geometry a cache manager declares for one role.
-
-    Carried onto the role's :class:`PoolView` by the page-table builder.
-    ``section_bytes`` describes a SECTIONED role (one entry per section, in
-    slot order); ``bytes_per_head`` describes an INDEXED role whose head
-    count is not derivable from ``RankInfo.attention`` (recurrent SSM state).
-    Roles with neither need no geometry (REPLICATED, attention K/V).
-    """
-
-    section_bytes: Optional[Tuple[int, ...]] = None
-    bytes_per_head: Optional[int] = None
 
 
 @dataclass

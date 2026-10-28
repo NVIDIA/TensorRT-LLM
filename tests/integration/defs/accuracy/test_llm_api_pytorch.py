@@ -2409,6 +2409,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
     )
 
     @DEEPSEEKV4_PARALLELISM
+    @pytest.mark.private_mpi_session
     def test_gsm8k_megamoe_deepgemm(self, tp_size, attention_dp):
         _skip_unless_deepseekv4_tp_size(
             tp_size,
