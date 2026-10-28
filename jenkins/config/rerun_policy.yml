@@ -40,7 +40,19 @@ default:
   rerun_timeout_tests: false
   rerun_timeout_max_tests: 1
 
-stages: []
+stages:
+  # TEMPORARY (rerun policy validation): exercises this rule with deliberate
+  # failures in l0_cpu.yml entries, which take about 20 s each in CI:
+  #   unittest/utils/test_logger.py         fails once  -> rerun twice, passes
+  #   unittest/utils/test_llm_data.py       always fails -> rerun twice, fails
+  #   unittest/visual_gen/test_output.py    fails after 150 s -> not rerun
+  #   unittest/executor/test_base_worker.py hangs once, TIMEOUT (1) -> rerun once, passes
+  # Remove this rule and revert those tests before merging.
+  - match: "CPU-Generic-*"
+    rerun_twice_max_duration_s: 60
+    rerun_once_max_duration_s: 120
+    rerun_timeout_tests: true
+    rerun_timeout_max_tests: 1
 # Example:
 # stages:
 #   - match: "*-PerfSanity-*"
