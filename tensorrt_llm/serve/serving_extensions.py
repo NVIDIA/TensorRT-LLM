@@ -34,13 +34,19 @@ import is deferred to call time because the built-ins import
 
 import enum
 import importlib
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Literal, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple
 
 if TYPE_CHECKING:
     from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
 
 RequiredToolChoiceMode = Literal["template", "grammar"]
+
+# Copies of one degenerate token in a row that end a generation: far more than
+# any valid output repeats a token it never writes, and few enough decoding steps
+# to waste before the request fails.
+DEGENERATE_TOKEN_RUN_LENGTH = 20
 
 
 class OutputMode(enum.Enum):
@@ -50,6 +56,47 @@ class OutputMode(enum.Enum):
     TEXT = "text"
     # Raw token ids go through the Harmony adapter (gpt-oss).
     HARMONY_TOKENS = "harmony_tokens"
+
+
+@dataclass(frozen=True)
+class DegenerateTokens:
+    """Token ids whose run marks a generation that has broken down.
+
+    A model can fall into repeating a token it never writes in valid output (its
+    pad token, an unused placeholder) until its token budget runs out. Such tokens
+    are special, so they vanish from the detokenized text and the client receives
+    an empty or truncated reply as if it were complete. ``run_length`` consecutive
+    copies of one of ``token_ids`` end the generation, and the request fails
+    without output instead. Matching is by token id: text that merely spells such
+    a token is ordinary tokens and never matches.
+    """
+
+    token_ids: Tuple[int, ...]
+    run_length: int = DEGENERATE_TOKEN_RUN_LENGTH
+
+    def __post_init__(self) -> None:
+        if not self.token_ids:
+            raise ValueError("DegenerateTokens needs at least one token id")
+        if any(
+            isinstance(token_id, bool) or not isinstance(token_id, int) or token_id < 0
+            for token_id in self.token_ids
+        ):
+            raise ValueError(f"Token ids must be non-negative integers, got {self.token_ids}")
+        if self.run_length < 1:
+            raise ValueError(f"run_length must be at least 1, got {self.run_length}")
+
+
+def last_vocabulary_id(hf_config: Any) -> Optional[int]:
+    """The highest token id of the model's vocabulary, or None if not configured.
+
+    Read from the text configuration of a composite (multimodal) config.
+    """
+    get_text_config = getattr(hf_config, "get_text_config", None)
+    text_config = get_text_config() if callable(get_text_config) else hf_config
+    vocab_size = getattr(text_config, "vocab_size", None)
+    if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size < 1:
+        return None
+    return vocab_size - 1
 
 
 class ServingExtension:
@@ -119,6 +166,14 @@ class ServingExtension:
         grammar) to be placed relative to the model's reasoning markup.
         Returning ``None`` applies the raw grammar from the first generated
         token instead of a structural tag.
+        """
+        return None
+
+    def degenerate_tokens(self, hf_config: Any) -> Optional[DegenerateTokens]:
+        """Tokens whose run marks a broken-down generation; see :class:`DegenerateTokens`.
+
+        ``hf_config`` is the checkpoint's loaded configuration. ``None``, the
+        default, leaves the stop conditions of every request unchanged.
         """
         return None
 

@@ -17,7 +17,8 @@
 Implements the Kimi/Moonshot API semantics layered on the OpenAI chat surface:
 message-level (dynamic) tool validation, the optional pinned sampling-parameter
 policy, default streaming usage, request-field to chat-template-kwarg
-derivation, and the K3 XTML placement of guided-decoding constraints.
+derivation, and the K3 XTML placement of guided-decoding constraints. It also
+declares ``[PAD]`` as the token whose run marks a broken-down generation.
 """
 
 import os
@@ -29,7 +30,12 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     StreamOptions,
 )
-from tensorrt_llm.serve.serving_extensions import ServingExtension, register_serving_extension
+from tensorrt_llm.serve.serving_extensions import (
+    DegenerateTokens,
+    ServingExtension,
+    last_vocabulary_id,
+    register_serving_extension,
+)
 
 # Valid function-tool name for message-level tools: no leading digit, word
 # chars/dash only, at most 256 chars.
@@ -267,3 +273,13 @@ class KimiK3ServingExtension(ServingExtension):
             ],
             "stop_after_first": True,
         }
+
+    def degenerate_tokens(self, hf_config: Any) -> Optional[DegenerateTokens]:
+        """``[PAD]``, the last vocabulary id, which K3 never writes in valid output.
+
+        Taken from the vocabulary size rather than ``pad_token_id``, which the
+        composite config defaults to 0 when the checkpoint leaves it out. The
+        text "[PAD]" in code the model writes is ordinary tokens, not this id.
+        """
+        pad_token_id = last_vocabulary_id(hf_config)
+        return None if pad_token_id is None else DegenerateTokens(token_ids=(pad_token_id,))

@@ -1113,6 +1113,15 @@ async def _iter_openai_sse_lines(
         yield buffer.rstrip("\r")
 
 
+def _openai_stream_error_message(payload: Any) -> Optional[str]:
+    """The message of an OpenAI in-stream error frame, or None for any other payload."""
+    if not isinstance(payload, dict) or "error" not in payload:
+        return None
+    error = payload["error"]
+    message = error.get("message") if isinstance(error, dict) else None
+    return message if isinstance(message, str) and message else "Internal server error"
+
+
 async def reframe_openai_stream(
     openai_sse: AsyncIterator[Union[str, bytes]], model: str
 ) -> AsyncIterator[str]:
@@ -1143,8 +1152,17 @@ async def reframe_openai_stream(
                 done = True
                 continue
             try:
-                chunk = ChatCompletionStreamResponse(**json.loads(data))
-            except (json.JSONDecodeError, ValueError) as e:
+                payload = json.loads(data)
+            except json.JSONDecodeError as e:
+                raise AnthropicResponseError("Malformed upstream stream chunk") from e
+            upstream_error = _openai_stream_error_message(payload)
+            if upstream_error is not None:
+                # The request failed after its stream began: end the message
+                # with an error rather than as a finished turn.
+                raise AnthropicResponseError(upstream_error)
+            try:
+                chunk = ChatCompletionStreamResponse(**payload)
+            except ValueError as e:
                 raise AnthropicResponseError("Malformed upstream stream chunk") from e
             for frame in reframer.process_chunk(chunk):
                 yield frame
@@ -1162,8 +1180,9 @@ async def reframe_openai_stream(
         )
     except AnthropicResponseError as e:
         # Raised only on upstream framing this module can describe precisely,
-        # so the text originates here and carries no internal detail: pass it
-        # through rather than flattening it to a generic message.
+        # or on an upstream error frame, whose message the chat route already
+        # shows its own clients. Either way the text carries no internal
+        # detail: pass it through rather than flattening it to a generic message.
         logger.error(f"Anthropic stream failed: {e}")
         for frame in reframer.error(str(e)):
             yield frame

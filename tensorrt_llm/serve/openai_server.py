@@ -45,7 +45,9 @@ from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.rpc import RPCError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
-                                         is_context_length_exceeded_message)
+                                         RequestError,
+                                         is_context_length_exceeded_message,
+                                         is_degenerate_generation_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import BaseMediaIO
@@ -82,7 +84,8 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicMessagesRequest)
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
-                                           parse_chat_messages_coroutines)
+                                           parse_chat_messages_coroutines,
+                                           resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
@@ -136,7 +139,9 @@ from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
 from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.runtime_control_auth import (
     RuntimeControlReplayCache, validate_runtime_control_request)
-from tensorrt_llm.serve.serving_extensions import load_builtin_extensions
+from tensorrt_llm.serve.serving_extensions import (DegenerateTokens,
+                                                   get_serving_extension,
+                                                   load_builtin_extensions)
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
@@ -313,6 +318,28 @@ def _record_generator_termination(generator) -> None:
             exit_code_known=False
             if termination_kind == "worker_failure" else None,
         ))
+
+
+def _sse_error_frame(message: str) -> str:
+    """An in-stream error event; OpenAI clients raise it as an API error."""
+    error_data = json.dumps({
+        "error": {
+            "message": message,
+            "type": "server_error",
+            "code": None,
+            "param": None,
+        }
+    })
+    return f"data: {error_data}\n\n"
+
+
+def _degenerate_stream_end(error: RequestError) -> List[str]:
+    """The frames that end a chat stream whose generation broke down.
+
+    The response has started, so the failure is reported in-stream, and the
+    client drops what it has received instead of keeping a truncated reply.
+    """
+    return [_sse_error_frame(str(error)), "data: [DONE]\n\n"]
 
 
 def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
@@ -1229,14 +1256,51 @@ class OpenAIServer(_VideoRoutesMixin):
             return self.tokenizer.tokenizer.vocab_size
         return None
 
+    @functools.cached_property
+    def _degenerate_tokens(self) -> Optional[DegenerateTokens]:
+        """The degenerate tokens the served model's extension declares, if any.
+
+        Computed on first use, so servers built without ``__init__`` (unit
+        tests) read the ``model_config`` they were given.
+        """
+        hf_config = getattr(self, "model_config", None)
+        if hf_config is None:
+            return None
+        degenerate = get_serving_extension(
+            resolve_top_level_model_type(hf_config)).degenerate_tokens(
+                hf_config)
+        if degenerate is not None:
+            logger.info(
+                f"A generation that writes one of token ids "
+                f"{list(degenerate.token_ids)} {degenerate.run_length} times in "
+                "a row fails without output.")
+        return degenerate
+
+    def _stop_on_degenerate_tokens(self,
+                                   sampling_params: SamplingParams) -> None:
+        """Fail the request on a run of the model's degenerate tokens.
+
+        A no-op for models that declare none (see
+        ``ServingExtension.degenerate_tokens``).
+        """
+        degenerate = self._degenerate_tokens
+        if degenerate is not None:
+            sampling_params._set_degenerate_token_runs(degenerate.token_ids,
+                                                       degenerate.run_length)
+
     @staticmethod
     def create_error_response(
             message: str,
             err_type: str = "BadRequestError",
             status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
-        # Over-length prompts are detected from the message text because they
-        # cross the executor IPC boundary as plain strings (RequestError), so
-        # no exception type survives to here.
+        # Over-length prompts and degenerate generations are detected from the
+        # message text because they cross the executor IPC boundary as plain
+        # strings (RequestError), so no exception type survives to here.
+        if is_degenerate_generation_message(message):
+            # The server's failure, not the request's: a 5xx, which clients
+            # retry, whatever the caller's default.
+            err_type = "InternalServerError"
+            status_code = HTTPStatus.INTERNAL_SERVER_ERROR
         code: Union[int, str] = status_code.value
         if is_context_length_exceeded_message(message):
             code = CONTEXT_LENGTH_EXCEEDED_CODE
@@ -2089,6 +2153,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 yield "data: [DONE]\n\n"
                 await self._extract_metrics(res, raw_request)
                 nvtx_mark("generation ends")
+            except RequestError as e:
+                if not is_degenerate_generation_message(str(e)):
+                    logger.error(traceback.format_exc())
+                    raise
+                for frame in _degenerate_stream_end(e):
+                    yield frame
             except Exception:
                 # Only failures are logged: a consumer that stops reading closes
                 # the stream with GeneratorExit, and a client that disconnects
@@ -2118,6 +2188,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            self._stop_on_degenerate_tokens(sampling_params)
             if required_tool_grammar:
                 _validate_required_tool_grammar_request(
                     request,
@@ -3008,15 +3079,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 # chunk, so we cannot change the status code.  Yield
                 # an SSE error event so the stream terminates cleanly
                 # instead of breaking the HTTP connection.
-                error_data = json.dumps({
-                    "error": {
-                        "message": str(e),
-                        "type": "server_error",
-                        "code": None,
-                        "param": None,
-                    }
-                })
-                yield f"data: {error_data}\n\n"
+                yield _sse_error_frame(str(e))
                 yield "data: [DONE]\n\n"
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
@@ -3071,6 +3134,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 backend=self.generator.args.backend)
+            self._stop_on_degenerate_tokens(sampling_params)
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.generator.args.reasoning_parser,
@@ -3194,6 +3258,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self._extract_metrics(res, raw_request)
             except asyncio.CancelledError:
                 raise
+            except RequestError as e:
+                if not is_degenerate_generation_message(str(e)):
+                    logger.error(traceback.format_exc())
+                    raise
+                for frame in _degenerate_stream_end(e):
+                    yield frame
             except Exception:
                 logger.error(traceback.format_exc())
                 raise
@@ -3245,6 +3315,7 @@ class OpenAIServer(_VideoRoutesMixin):
             sampling_params = request.to_sampling_params(
                 vocab_size=self._logit_bias_vocab_size(),
                 reasoning_parser="gpt_oss")
+            self._stop_on_degenerate_tokens(sampling_params)
             if sampling_params.thinking_token_budget is not None:
                 raise ValueError(
                     "thinking_token_budget is not supported by the Harmony "
@@ -3464,6 +3535,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 chat_template=self.chat_template
                 if not self.use_harmony else None,
             )
+            # A run fails the request before any item it would have closed:
+            # the stream ends in response.failed (guard_responses_stream), a
+            # non-streamed request in an error response.
+            self._stop_on_degenerate_tokens(sampling_params)
 
             streaming_processor = None
             if request.stream:
