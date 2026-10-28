@@ -1574,7 +1574,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.num_layers = max(num_layers, max(self.pp_layers, default=-1) + 1)
         # Appended draft layers keep a plain cache.
         self._first_spec_layer_id: Optional[int] = None
-        if spec_config is not None:
+        if spec_config is not None and self.low_precision_dtype is not None:
             from tensorrt_llm._torch.speculative import get_num_spec_layers
 
             if get_num_spec_layers(spec_config) > 0:
@@ -3795,10 +3795,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 np.where(base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale // self.kv_factor),
             )
 
-    def fill_retained_page_table(
+    def fill_high_precision_page_table(
         self, request_ids: List[int], layer_idx: int, out: np.ndarray
     ) -> None:
-        """Write the ``(batch, pages)`` page table of ``layer_idx``'s retained-token twin."""
+        """Write the ``(batch, pages)`` page table of ``layer_idx``'s high-precision twin."""
         self._fill_page_table(self.high_layers[self.layer_offsets[layer_idx]], request_ids, out)
 
     def get_mixed_precision_page_tables(

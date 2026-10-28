@@ -1392,8 +1392,9 @@ class _Prefixes:
         self.mla_ctx_cu_q_seqlens = torch.zeros(size,
                                                 dtype=torch.int32,
                                                 device=device)
-        # `enable_flash_mla` is the only other attribute the two hooks read.
+        # The hooks also read `enable_flash_mla` and the staging view.
         self.enable_flash_mla = False
+        self.mixed_precision_staging = None
         self._invalidate_mla_scheduler_buffers()
 
     def rebuild(self):

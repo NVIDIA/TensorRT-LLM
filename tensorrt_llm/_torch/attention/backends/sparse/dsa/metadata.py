@@ -2109,7 +2109,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
             # Every twin shares one pool and page scale, so one table serves all layers.
             local = next(iter(self.kv_cache_manager.high_layers))
-            self.kv_cache_manager.fill_retained_page_table(
+            self.kv_cache_manager.fill_high_precision_page_table(
                 self.request_ids, self.kv_cache_manager.pp_layers[local], table.numpy()
             )
             high_table[: self.num_seqs, :max_blocks_used].copy_(table, non_blocking=True)
