@@ -179,15 +179,22 @@ class MiniMaxH3Pipeline(BasePipeline):
         vgm = pipeline_config.visual_gen_mapping
         world_size = vgm.world_size if vgm is not None else pipeline_config.mapping.world_size
         if world_size != 1:
-            is_pure_ulysses = vgm is not None and vgm.ulysses_size == world_size
-            if not is_pure_ulysses:
+            supports_topology = (
+                vgm is not None
+                and vgm.cfg_size == 1
+                and vgm.cp_size == 1
+                and vgm.ring_size == 1
+                and vgm.attn2d_row_size == 1
+                and vgm.attn2d_col_size == 1
+                and vgm.ulysses_size * pipeline_config.mapping.tp_size == world_size
+            )
+            if not supports_topology:
                 raise NotImplementedError(
-                    "MiniMax-H3 multi-GPU support is currently limited to pure "
-                    "Ulysses sequence parallelism: cfg_size=1, tp_size=1, "
-                    "ring_size=1, attn2d_size=(1, 1), and "
-                    "ulysses_size=world_size."
+                    "MiniMax-H3 supports tensor parallelism and Ulysses: "
+                    "cfg_size=1, ring_size=1, attn2d_size=(1, 1), and "
+                    "tp_size * ulysses_size=world_size."
                 )
-            if pipeline_config.attention.backend not in ("VANILLA", "FA4"):
+            if vgm.ulysses_size > 1 and pipeline_config.attention.backend not in ("VANILLA", "FA4"):
                 raise NotImplementedError(
                     "MiniMax-H3 Ulysses requires VANILLA or FA4 attention. "
                     "Other attention backends do not support the required "
@@ -218,9 +225,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         self.workflow = pipeline_config.extra_attrs.get("workflow", "fl2va")
         vae_size = pipeline_config.parallel.parallel_vae_size
         if not 1 <= vae_size <= world_size:
-            raise ValueError(
-                "MiniMax-H3 parallel_vae_size must be between 1 and ulysses_size=world_size."
-            )
+            raise ValueError("MiniMax-H3 parallel_vae_size must be between 1 and world_size.")
         self.audio_vae = None
         self.audio_scheduler = None
         self.processor = None

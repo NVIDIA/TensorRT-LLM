@@ -18,15 +18,20 @@
 from __future__ import annotations
 
 import difflib
+import json
 from pathlib import Path
 
 import pytest
 
+from ._dataclass_helpers import ADDED_DATACLASS, added_dataclass_change
+
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
 from cbts.blocks import Block, Stage, YAMLIndex
+from cbts.command.main import Selector, _load_pr_inputs
 from cbts.coverage.selection.selector import CoverageSelector
 from cbts.coverage.tier import apply_coverage_tier
 from cbts.rules.base import PRInputs
+from cbts.rules.docs import CPU_TEST_YAML_STEM, DOCS_STAGE, DocsRule
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -198,6 +203,141 @@ def test_selector_uses_local_caller_rows_for_no_data_import_consumer() -> None:
     assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
     assert result.no_data_funcs == ["tensorrt_llm/example.py::helper"]
     assert result.caller_bounded_funcs == ["tensorrt_llm/example.py::helper"]
+
+
+@pytest.mark.parametrize("covered_caller", (True, False))
+def test_selector_bounds_new_dataclass_methods_by_existing_binding_consumers(
+    covered_caller: bool,
+) -> None:
+    source, diff = added_dataclass_change(ADDED_DATACLASS)
+    checked_bindings: set[str] = set()
+
+    def external(_path: str, names: set[str]) -> set[str]:
+        checked_bindings.update(names)
+        return set()
+
+    db = _FakeDB()
+    if not covered_caller:
+        db.rows["caller"] = set()
+    selector = CoverageSelector(
+        db, REPO_ROOT, read_source=lambda _path: source, external_references=external
+    )
+
+    result = selector.decide(["tensorrt_llm/example.py"], {"tensorrt_llm/example.py": diff})
+
+    assert result.ok, result.reason
+    assert "Budget" in checked_bindings
+    assert result.impacted == {
+        "A10-PyTorch": {"test_caller"} | (set() if covered_caller else {"test_unrelated"})
+    }
+    assert result.skippable == {"A10-PyTorch": {"test_unrelated"} if covered_caller else set()}
+    assert result.caller_bounded_funcs == (
+        ["tensorrt_llm/example.py::helper"] if covered_caller else []
+    )
+
+
+def test_selector_preserves_external_references_to_new_dataclasses() -> None:
+    source, diff = added_dataclass_change(ADDED_DATACLASS)
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, names: names & {"Budget"},
+    )
+
+    result = selector.decide(["tensorrt_llm/example.py"], {"tensorrt_llm/example.py": diff})
+
+    assert not result.ok
+    assert "external binding" in result.reason
+
+
+@pytest.mark.parametrize(
+    ("imports", "expression"),
+    (
+        ("", "dir(module)"),
+        ("", "getattr(__import__(__name__), name)"),
+        ("import importlib\n", "getattr(importlib.import_module(__name__), name)"),
+        (
+            "from importlib import import_module as load\n",
+            "getattr(load(__name__), name)",
+        ),
+    ),
+)
+def test_selector_declines_reflective_new_dataclass_consumers(
+    imports: str, expression: str
+) -> None:
+    prefix = "from dataclasses import dataclass\n" + imports + "\n"
+    discover = f"def discover(module, name):\n    return {expression}\n"
+    before = prefix + discover
+    source = prefix + ADDED_DATACLASS + "\n" + discover
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    db = _FakeDB()
+    db.rows["discover"] = {"A10-PyTorch-1/test_caller"}
+    selector = CoverageSelector(
+        db,
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide(["tensorrt_llm/example.py"], {"tensorrt_llm/example.py": diff})
+
+    assert not result.ok
+    assert "class/signature import change" in result.reason
+    assert not result.skippable
+
+
+@pytest.mark.parametrize(
+    "reference_path",
+    (
+        None,
+        "tests/unittest/pkg/test_consumer.py",
+        "tensorrt_llm/consumer.py",
+        "tests/unittest/missing/test_missing.py",
+    ),
+)
+def test_selector_checks_new_dataclass_external_references_without_local_consumers(
+    reference_path: str | None,
+) -> None:
+    prefix = "from dataclasses import dataclass\n\n"
+    source = prefix + ADDED_DATACLASS
+    diff = "".join(difflib.unified_diff(prefix.splitlines(True), source.splitlines(True)))
+    checked_bindings: set[str] = set()
+
+    def external(_path: str, names: set[str]) -> dict[str, set[str]]:
+        checked_bindings.update(names)
+        return {"Budget": {reference_path}} if reference_path and "Budget" in names else {}
+
+    db = _ExternalTestReferenceDB()
+    selector = CoverageSelector(
+        db, REPO_ROOT, read_source=lambda _path: source, external_reference_paths=external
+    )
+
+    result = selector.decide(["tensorrt_llm/example.py"], {"tensorrt_llm/example.py": diff})
+
+    assert checked_bindings == {"Budget"}
+    if reference_path is None:
+        assert result.ok
+        assert not result.impacted
+        assert result.skippable == db.known_by_family()
+    elif reference_path == "tests/unittest/pkg/test_consumer.py":
+        assert result.ok
+        assert result.impacted == {
+            "CPU-Generic-x86": {"test_unittests.py::test_unittests_v2[unittest/pkg]"},
+            "B300-PyTorch": {
+                "test_unittests.py::test_unittests_v2[unittest/pkg/test_consumer.py::test_one]",
+                "test_unittests.py::test_unittests_v2[unittest/pkg/test_consumer.py::test_two]",
+            },
+        }
+        assert result.skippable == {
+            family: tests - result.impacted[family]
+            for family, tests in db.known_by_family().items()
+        }
+    else:
+        assert not result.ok
+        assert "external binding" in result.reason
+        assert reference_path in result.reason
+        assert not result.skippable
 
 
 @pytest.mark.parametrize("reference_api", ("names", "paths"))
@@ -604,3 +744,74 @@ def test_ordinary_no_data_function_change_keeps_file_fallback() -> None:
     assert result.ok
     assert result.impacted == {"A10-PyTorch": {"test_caller", "test_unrelated"}}
     assert result.caller_bounded_funcs == []
+
+
+@pytest.mark.parametrize("method_change", (False, True))
+def test_class_docstring_and_code_changes_preserve_coverage_decision(
+    tmp_path: Path, method_change: bool
+) -> None:
+    path = "tensorrt_llm/example.py"
+    before = (
+        'class Example:\n    "old docs"\n    VALUE = 1\n    def caller(self):\n        return 1\n'
+    )
+    source = (
+        'class Example:\n    "new docs"\n'
+        f"    VALUE = {1 if method_change else 2}\n"
+        f"    def caller(self):\n        return {2 if method_change else 1}\n"
+    )
+    source_path = tmp_path / path
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(source)
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    input_path = tmp_path / "input.json"
+    input_path.write_text(json.dumps({"changed_files": [path], "diffs": {path: diff}}))
+    pr = _load_pr_inputs(input_path, tmp_path)
+    yaml_index = YAMLIndex()
+    yaml_index.blocks = [
+        Block(
+            yaml_stem=CPU_TEST_YAML_STEM,
+            block_index=0,
+            condition={},
+            tests=["unittest/api_stability"],
+        ),
+        Block(
+            yaml_stem="l0_a10",
+            block_index=0,
+            condition={},
+            tests=["test_caller", "test_unrelated"],
+        ),
+    ]
+    stages = {
+        name: Stage(
+            name=name,
+            yaml_stem=stem,
+            cpu_arch="x86_64",
+            split_id=1,
+            total_splits=1,
+        )
+        for name, stem in (
+            ("CPU-Generic-x86-1", CPU_TEST_YAML_STEM),
+            ("A10-PyTorch-1", "l0_a10"),
+        )
+    }
+    selector = Selector(stages)
+    result = selector.run(pr, [DocsRule(yaml_index, stages)])
+    db = _FakeDB()
+    db.rows["Example"] = {"A10-PyTorch-1/test_unrelated"}
+    db.rows["Example.caller"] = {"A10-PyTorch-1/test_caller"}
+
+    tier, note = apply_coverage_tier(
+        pr, selector.pairs, selector.handled, stages, yaml_index, tmp_path, db
+    )
+
+    assert result.scope is None
+    assert pr.docstring_files == {path}
+    assert not pr.docstring_only_files
+    assert not selector.handled
+    if method_change:
+        assert tier is not None, note
+        assert tier.removed == {("l0_a10", 0): {"test_unrelated"}}
+        assert tier.affected_stages == set(stages) | {DOCS_STAGE}
+    else:
+        assert tier is None
+        assert "class/signature import change" in note

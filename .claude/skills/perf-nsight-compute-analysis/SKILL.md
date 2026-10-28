@@ -42,11 +42,12 @@ Do NOT use this skill for:
 | Dependency | Version | Notes |
 |------------|---------|-------|
 | CUDA Toolkit | >=11.0 | Includes `ncu` |
-| `ncu` binary | Match CUDA version | Or set `$NCU` env var |
-| NVIDIA GPU | Kepler+ | Volta+ recommended |
+| `ncu` binary | One the driver supports | Nsight Compute 2026.3 needs a driver compatible with CUDA 13. Or set `$NCU` env var |
+| NVIDIA GPU | Turing+ | Volta needs Nsight Compute 2025.2 or older |
 
 Permissions: `ncu` may require `sudo`, `CAP_SYS_ADMIN`, or `--privileged`
-in containers. Check with `ncu -v` first.
+in containers. `ncu -v` only prints the version; missing permission shows up
+as `ERR_NVGPUCTRPERM` when the first kernel is profiled.
 
 ## Principles
 
@@ -68,10 +69,10 @@ an authoritative source.** Follow these rules without exception:
 ### SOL% Mental Model
 
 Speed of Light (SOL%) measures how close a kernel runs to the GPU's theoretical peak:
-- **Compute SOL%** = actual compute throughput / peak compute throughput
-- **Memory SOL%** = actual memory throughput / peak memory throughput
+- **Compute SOL%** (`Compute (SM) Throughput`) = the busiest SM unit's throughput as a % of its peak
+- **Memory SOL%** (`Memory Throughput`) = the busiest memory unit's throughput (DRAM, L2, L1, shared memory) as a % of its peak
 
-A kernel cannot saturate both simultaneously. The higher metric reveals the bottleneck type. Use this as the primary classification signal.
+The higher metric usually reveals the bottleneck type. Use this as the primary classification signal. Both can be high at once: the kernel is then near the hardware limit for its algorithm.
 
 ### Classification Thresholds
 
@@ -81,6 +82,7 @@ A kernel cannot saturate both simultaneously. The higher metric reveals the bott
 | <40 | >60 | **Memory-bound** | MemoryWorkloadAnalysis section |
 | <40 | <40 | **Latency-bound** | LaunchStats + Occupancy sections |
 | 40-60 | 40-60 | **Balanced** | Profile deeper with detailed sections |
+| >60 | >60 | **Near hardware limits** | Algorithmic change; check both workload sections |
 
 Additional signals:
 - Duration <10us with many launches -> **Launch-overhead bound** (use nsys first)
@@ -168,7 +170,7 @@ ncu --section SpeedOfLight --section MemoryWorkloadAnalysis --csv \
 Example -- compute-bound deep dive:
 ```bash
 ncu --section SpeedOfLight --section ComputeWorkloadAnalysis --csv \
-    --kernel-name regex:"gemm" \
+    --kernel-name regex:"gemm|nvjet" \
     --launch-count 3 -- python script.py
 ```
 
@@ -181,10 +183,13 @@ ncu --section SpeedOfLight --section LaunchStats --section Occupancy --csv \
 
 ### Step 3: Roofline Analysis (Optional)
 
-For visual understanding of compute vs memory balance:
+For visual understanding of compute vs memory balance. The roofline sections
+are charts: on the CLI they print only with `--print-details all`, which lists
+the numbers behind the chart (achieved and peak work and traffic). To see the
+chart, save a report with `-o` and open it in the Nsight Compute UI.
 
 ```bash
-ncu --section SpeedOfLight_RooflineChart \
+ncu --section SpeedOfLight_RooflineChart --print-details all \
     --kernel-name regex:"KERNEL" -- COMMAND
 ```
 
@@ -192,11 +197,11 @@ For precision-specific hierarchical roofline:
 
 ```bash
 # FP16 kernels
-ncu --section SpeedOfLight_HierarchicalHalfRooflineChart \
+ncu --section SpeedOfLight_HierarchicalHalfRooflineChart --print-details all \
     --kernel-name regex:"KERNEL" -- COMMAND
 
 # Tensor core kernels
-ncu --section SpeedOfLight_HierarchicalTensorRooflineChart \
+ncu --section SpeedOfLight_HierarchicalTensorRooflineChart --print-details all \
     --kernel-name regex:"KERNEL" -- COMMAND
 ```
 
@@ -256,7 +261,7 @@ Alternative: use `--launch-skip N` to skip autotuning launches. See
 
 ## Programmatic Report Analysis
 
-Extract metrics from `.ncu-rep` files using the `ncu_report` Python module
+Extract metrics from `.ncu-rep` or `.ncu-repz` files using the `ncu_report` Python module
 (in `extras/python/` of the Nsight Compute installation):
 
 ```python
@@ -266,8 +271,9 @@ ctx = ncu_report.load_report("report.ncu-rep")
 for rng in ctx:
     for action in rng:
         name = action.name()
+        # SpeedOfLight's "Compute (SM) Throughput" and "Memory Throughput"
         compute = action["sm__throughput.avg.pct_of_peak_sustained_elapsed"].as_double()
-        memory = action["dram__throughput.avg.pct_of_peak_sustained_elapsed"].as_double()
+        memory = action["gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"].as_double()
         duration = action["gpu__time_duration.sum"].as_uint64()
 
         if compute > 60:
@@ -290,21 +296,38 @@ ncu --csv --section SpeedOfLight --kernel-name regex:"KERNEL" -- COMMAND
 ncu --csv --page raw --section SpeedOfLight -- COMMAND   # All metrics flat
 ```
 
+The default CSV has one row per metric. Its columns include `ID` (the
+profiled launch), `Kernel Name`, `Section Name`, `Metric Name`, `Metric Unit`
+and `Metric Value`; rule results are rows that fill `Rule Name`,
+`Rule Description` and `Estimated Speedup` instead. A `Metric Name` can repeat
+across sections (`Memory Throughput` is % in SpeedOfLight and byte/s in
+MemoryWorkloadAnalysis), so filter on `Section Name` too. `--page raw` gives one
+row per launch, a column per metric, and a second row of units. Values are in
+base units (`ns`, `hz`, `%`).
+
+While profiling, ncu's `==PROF==` lines and the application's own output share
+stdout with the CSV. For clean CSV, write a report and read it back:
+
 **Report files** (for later analysis):
 ```bash
-ncu -o report --section SpeedOfLight -- COMMAND
-ncu --import report.ncu-rep --csv --page raw            # Export to CSV
+ncu -o report.ncu-rep --section SpeedOfLight -- COMMAND
+ncu --import report.ncu-rep --csv                       # One row per metric
+ncu --import report.ncu-rep --csv --page raw            # One row per launch
 ```
 
-**Key CSV columns:**
+Give `-o` the extension: without one, Nsight Compute 2026.3 and newer write the
+zstd-compressed `report.ncu-repz`, and older versions write `report.ncu-rep`.
+`--import` and `ncu_report` read both.
 
-| Column | Meaning |
-|--------|---------|
-| `Kernel Name` | CUDA kernel function name |
-| `Duration` | Execution time (nanoseconds) |
-| `Compute (SM) Throughput` | % of peak compute |
-| `Memory Throughput` | % of peak memory bandwidth |
-| `Achieved Occupancy` | Active warps / max warps (%) |
+**Key metric rows** (`Metric Name` values):
+
+| Metric Name | Section | Meaning |
+|-------------|---------|---------|
+| `Duration` | SpeedOfLight | Execution time |
+| `Compute (SM) Throughput` | SpeedOfLight | % of peak compute |
+| `Memory Throughput` | SpeedOfLight | % of peak of the busiest memory unit |
+| `SM Frequency` | SpeedOfLight | Clock the profile ran at |
+| `Achieved Occupancy` | Occupancy | Active warps / max warps (%) |
 
 **Success indicators:**
 - SOL% values present in output -> profiling succeeded
@@ -315,46 +338,55 @@ ncu --import report.ncu-rep --csv --page raw            # Export to CSV
 
 ### Example: Classify a GEMM Kernel
 
+cuBLAS GEMM kernels on Blackwell are named `nvjet_*`, so match both names:
+
 ```bash
 ncu --section SpeedOfLight --csv \
-    --kernel-name regex:"gemm" \
+    --kernel-name regex:"gemm|nvjet" \
     --launch-skip 5 --launch-count 3 \
     -- python train.py
 ```
 
-Output:
+Output for an FP16 4096x4096 matmul on B200 (columns and rows abridged):
 ```
-"Kernel Name","Duration","Compute (SM) Throughput","Memory Throughput"
-"ampere_fp16_gemm",1250000,78.5,35.2
+"ID",...,"Kernel Name",...,"Section Name","Metric Name","Metric Unit","Metric Value",...
+"0",...,"nvjet_sm100_hsh_128x256_64x6_2x2f_2cta_h_bz_NNT",...,"GPU Speed Of Light Throughput","Memory Throughput","%","38.38",
+"0",...,"nvjet_sm100_hsh_128x256_64x6_2x2f_2cta_h_bz_NNT",...,"GPU Speed Of Light Throughput","Duration","ns","97600",
+"0",...,"nvjet_sm100_hsh_128x256_64x6_2x2f_2cta_h_bz_NNT",...,"GPU Speed Of Light Throughput","Compute (SM) Throughput","%","77.11",
 ```
 
-Interpretation: compute-bound (78.5% compute, 35.2% memory). Next step:
+Interpretation: compute-bound (77.1% compute, 38.4% memory). Next step:
 check tensor core usage with `--section ComputeWorkloadAnalysis`.
 
 ### Example: Diagnose a Memory-Bound Embedding Kernel
 
+PyTorch's embedding lookup runs `vectorized_gather_kernel`, so match it too:
+
 ```bash
 ncu --section SpeedOfLight --section MemoryWorkloadAnalysis --csv \
-    --kernel-name regex:"embedding" \
+    --kernel-name regex:"gather|index|embedding" \
     --launch-count 3 -- python train.py
 ```
 
-Check L1/L2 cache hit rates and coalescing efficiency in output. Low hit rates
-suggest poor data locality; low coalescing efficiency suggests scattered access.
+Check L1/L2 cache hit rates in the output: low hit rates suggest poor data
+locality. For scattered access, add `--section SourceCounters` and look for
+excessive global sectors per instruction.
 
 ## Error Handling
 
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `ncu: command not found` | Not in PATH | `export PATH=$PATH:/usr/local/cuda/bin` or set `$NCU` |
-| `Permission denied` | Needs elevated privileges | `sudo ncu ...` or `--cap-add=SYS_ADMIN` in containers |
+| `ERR_NVGPUCTRPERM` (no permission to access GPU performance counters) | Counters are restricted to admin users | `sudo ncu ...`, `--cap-add=SYS_ADMIN` in containers, or [enable non-admin profiling](https://developer.nvidia.com/ERR_NVGPUCTRPERM) |
+| `Profiling failed because a driver resource was unavailable` | Another tool, such as DCGM, is collecting profiling data | Stop that collection while `ncu` runs |
 | No kernels captured | Name regex doesn't match | Run without `--kernel-name` first to see actual names |
 | Profiling extremely slow | Using `--set full` or many sections | Use `--section SpeedOfLight` only; reduce `--launch-count` |
 | Autotuning pollutes results | JIT kernel warmup captured | Use `--profile-from-start off` with profiler markers |
 | Metrics show 0% tensor cores | Kernel doesn't use tensor cores | Check with `--section InstructionStats`; verify dimensions align to 8/16 |
 | Report file too large | `--set full` with many kernels | Use targeted sections; limit with `--kernel-name` and `--launch-count` |
 | Out-of-range metric values | Async GPU activity or short kernels | Profile on isolated GPU; increase workload size |
-| `ncu` hangs on MPI app | Dependent kernels across ranks | Use `--communicator=tcp --lockstep-kernel-launch` |
+| `ncu` hangs on a multi-process app | A profiled kernel waits on another rank (NCCL, NVSHMEM) | `--communicator shmem` (one `ncu` over the node) or `--communicator=tcp --lockstep-kernel-launch` (one `ncu` per rank); see `references/advanced-profiling.md` |
+| `Failed to save memory for replay` on NCCL kernels | NCCL's NVLS buffers cannot be saved for kernel replay | `NCCL_NVLS_ENABLE=0` for the profiling run, or `--replay-mode application` |
 
 ## Finding More Information
 
@@ -384,9 +416,10 @@ Grep for keywords across `references/` -- headers are grep-friendly:
 
 If Tiers 1-2 don't answer:
 - [Profiling Guide](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html) -- Metrics, hardware model, analysis concepts
+- [Compute Triage Guide](https://docs.nvidia.com/nsight-compute/ComputeTriage/index.html) -- NVIDIA's top-down bottleneck workflow (Nsight Compute 2026.3+)
 - [CLI Reference](https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html) -- Full CLI options
 - [Python Report Interface](https://docs.nvidia.com/nsight-compute/PythonReportInterface/index.html) -- `ncu_report` API
 - [Customization Guide](https://docs.nvidia.com/nsight-compute/CustomizationGuide/index.html) -- Section files, rules
 
 WebFetch or WebSearch these URLs for the latest content. Consider distilling
-new findings back into `references/`.
+new findings back into `references/`. A distilled file opens with a `**Source:**` paragraph above its first `##` section: a markdown link to the original, `Distilled <YYYY-MM-DD>` and the revision distilled, and what the original still answers.

@@ -7,7 +7,7 @@ import weakref
 from contextlib import ExitStack
 from dataclasses import dataclass
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -16,9 +16,11 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer, WorkspaceShrinkPolicy
 
 _RUNNER_MODULE = "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner"
+_WARMUP_MODULE = "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup"
 pytestmark = pytest.mark.cpu_only
 
 
@@ -168,30 +170,35 @@ class TestEagerWorkspaceReclaimer(unittest.TestCase):
 
 class TestEagerWorkspaceEngine(unittest.TestCase):
     def setUp(self) -> None:
-        self.engine = object.__new__(DecoderRunner)
-        self.engine._eager_workspace_reclaimer = None
-        self.engine._config = SimpleNamespace(
-            is_spec_decode=False, torch_compile_prefill_only=False
-        )
-        self.engine._moe_workspace_reclaimer = None
-        self.engine.mapping = SimpleNamespace(cp_size=1)
-        self.engine.sparse_attention_config = None
-        self.engine._torch_compile_backend = None
-        self.engine.breakable_cuda_graph_runner = None
+        self.warmup = object.__new__(DecoderWarmup)
+        self.warmup._eager_workspace_reclaimable = True
+        self.warmup._config = SimpleNamespace(is_spec_decode=False, torch_compile_enabled=False)
+        self.warmup.mapping = SimpleNamespace(cp_size=1)
+        self.warmup.sparse_attention_config = None
+        self.warmup._graphs = SimpleNamespace(breakable_cuda_graph_runner=None)
         self.metadata = object.__new__(TrtllmAttentionMetadata)
         self.metadata._num_tokens = 128
         self.metadata.workspace = torch.empty(4096, dtype=torch.int8)
-        self.engine.attn_metadata = self.metadata
-        self.engine.model = SimpleNamespace(
+        self.warmup._metadata = SimpleNamespace(attn_metadata=self.metadata)
+        self.engine = object.__new__(DecoderRunner)
+        self.engine._warmup = SimpleNamespace(
+            run=lambda _resource_manager: self.warmup._freeze_eager_workspace_floor()
+        )
+        self.engine._eager_workspace_reclaimer = None
+        self.engine._moe_workspace_reclaimer = None
+        self.engine._config = SimpleNamespace(is_spec_decode=False, torch_compile_enabled=False)
+        self.engine._mapping = SimpleNamespace(cp_size=1)
+        self.engine._graphs = self.warmup._graphs
+        self.engine._model = SimpleNamespace(
             model_config=SimpleNamespace(extra_attrs={}), forward=Mock(return_value=42)
         )
-        self.engine._model_caller = ModelCaller(self.engine.model)
-        reclaimer_patch = patch(f"{_RUNNER_MODULE}.EagerWorkspaceReclaimer", autospec=True)
+        self.engine._model_caller = ModelCaller(self.engine._model)
+        reclaimer_patch = patch(f"{_WARMUP_MODULE}.EagerWorkspaceReclaimer", autospec=True)
         self.reclaimer_class = reclaimer_patch.start()
         self.addCleanup(reclaimer_patch.stop)
 
     def freeze(self) -> None:
-        self.engine._freeze_eager_workspace_floor()
+        self.engine.warmup(resource_manager=None)
 
     def call(self, *, is_dummy: bool = False) -> int:
         with (
@@ -204,7 +211,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
                 return_value=False,
             ),
         ):
-            return self.engine.model_forward(is_dummy=is_dummy, attn_metadata=self.metadata)
+            return self.engine._model_forward(is_dummy=is_dummy, attn_metadata=self.metadata)
 
     def test_forward_scope_and_warmup_bypass(self) -> None:
         with patch.dict(os.environ, {"TRTLLM_RECLAIM_WORKSPACE": "0"}):
@@ -223,21 +230,14 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
             scope.return_value.__enter__.assert_called_once()
             return 42
 
-        self.engine.model.forward.side_effect = forward
+        self.engine._model.forward.side_effect = forward
         self.assertEqual(self.call(), 42)
         scope.assert_called_once_with(self.metadata)
         scope.return_value.__exit__.assert_called_once_with(None, None, None)
 
     def test_runner_warmup_preserves_moe_owner_on_success_and_failure(self) -> None:
-        self.engine.kv_cache_manager_key = object()
-        self.engine._metrics = {}
-        resource_manager = Mock()
-        resource_manager.get_resource_manager.return_value = None
         with (
             patch(f"{_RUNNER_MODULE}.CutlassWorkspaceReclaimer") as factory,
-            patch(f"{_RUNNER_MODULE}.warmup_sampling_module") as sampling,
-            patch.object(self.engine, "_prewarm_engram_kernels"),
-            patch.object(self.engine, "_prewarm_csa2_sparse_indexer"),
             patch.dict(os.environ, {"TRTLLM_RECLAIM_WORKSPACE": "1"}),
         ):
             factory.side_effect = Mock
@@ -245,15 +245,15 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
             owner = self.engine._moe_workspace_reclaimer
             for fail in (False, False, True):
                 with self.subTest(fail=fail):
-                    self.engine._warmup_timer = MagicMock()
-                    sampling.side_effect = RuntimeError("warmup failed") if fail else None
+                    self.engine._warmup = SimpleNamespace(
+                        run=Mock(side_effect=RuntimeError("warmup failed") if fail else None)
+                    )
                     if fail:
                         with self.assertRaisesRegex(RuntimeError, "warmup failed"):
-                            self.engine.warmup(resource_manager)
+                            self.engine.warmup(resource_manager=None)
                     else:
-                        self.engine.warmup(resource_manager)
+                        self.engine.warmup(resource_manager=None)
                     self.assertIs(self.engine._moe_workspace_reclaimer, owner)
-                    self.engine._warmup_timer.__exit__.assert_called_once()
             factory.assert_called_once()
 
     def test_moe_scope_tracks_warmup_profiling_and_serving(self) -> None:
@@ -286,10 +286,10 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
             factory.assert_called_once()
             for target, name, value in [
                 (self.engine._config, "is_spec_decode", True),
-                (self.engine.mapping, "cp_size", 2),
+                (self.engine._mapping, "cp_size", 2),
                 (self.engine, "_eager_workspace_reclaim_supported", False),
-                (self.engine, "_torch_compile_backend", object()),
-                (self.engine, "breakable_cuda_graph_runner", object()),
+                (self.engine._config, "torch_compile_enabled", True),
+                (self.engine._graphs, "breakable_cuda_graph_runner", object()),
             ]:
                 with patch.object(target, name, value):
                     self.engine._initialize_moe_workspace_reclaimer()
@@ -297,20 +297,20 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
             factory.assert_called_once()
 
     def test_ineligible_modes_and_workspaces_do_not_create_reclaimer(self) -> None:
-        with patch.object(self.engine, "_eager_workspace_reclaim_supported", False):
+        with patch.object(self.warmup, "_eager_workspace_reclaimable", False):
             self.freeze()
         self.assertIsNone(self.engine._eager_workspace_reclaimer)
         self.reclaimer_class.assert_not_called()
         for target, name, value in [
-            (self.engine._config, "is_spec_decode", True),
-            (self.engine, "_torch_compile_backend", object()),
-            (self.engine, "breakable_cuda_graph_runner", object()),
-            (self.engine, "sparse_attention_config", object()),
+            (self.warmup._config, "is_spec_decode", True),
+            (self.warmup._config, "torch_compile_enabled", True),
+            (self.warmup._graphs, "breakable_cuda_graph_runner", object()),
+            (self.warmup, "sparse_attention_config", object()),
         ]:
             with self.subTest(mode=name), patch.object(target, name, value):
                 self.freeze()
                 self.assertIsNone(self.engine._eager_workspace_reclaimer)
-        with patch.object(self.engine.mapping, "cp_size", 2):
+        with patch.object(self.warmup.mapping, "cp_size", 2):
             self.freeze()
             self.assertIsNone(self.engine._eager_workspace_reclaimer)
         self.metadata.workspace_reclaimable = False

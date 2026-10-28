@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import base64
 import copy
+import os
 import random
 import threading
 from pathlib import Path
@@ -11,21 +13,25 @@ from unittest import mock
 
 import aiohttp
 import msgpack
+import numpy as np
 import pytest
+from llmapi.apps.render_helpers import use_harmony_vocab
+from utils.llm_data import llm_datasets_root, llm_models_root
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
-from tensorrt_llm.runtime.kv_cache_hash import (get_cache_salt_id,
-                                                hash_v1_block_key,
+from tensorrt_llm.runtime.kv_cache_hash import (hash_v1_block_key,
                                                 truncate_sha256_hash_to_int64)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
-    ReuseScope, sequence_to_blockchain_keys)
+    KVCacheEventManager, ReuseScope, sequence_to_blockchain_keys)
 # yapf: disable
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionToolsParam,
                                                 CompletionRequest,
                                                 ConversationParams,
                                                 DisaggregatedParams,
-                                                FunctionDefinition)
+                                                FunctionDefinition,
+                                                ResponsesRequest)
+from tensorrt_llm.serve.responses_utils import request_preprocess
 from tensorrt_llm.serve.router import (COORDINATOR_SELECT_MAX_ATTEMPTS,
                                        KV_CACHE_HASH_ALGO_V1,
                                        KV_CACHE_HASH_ALGO_V2,
@@ -35,7 +41,8 @@ from tensorrt_llm.serve.router import (COORDINATOR_SELECT_MAX_ATTEMPTS,
                                        KvCacheAwareRouter,
                                        KvCacheAwareServerState,
                                        LoadBalancingRouter, RoundRobinRouter,
-                                       block_key_hasher, create_router)
+                                       block_key_hasher, create_router,
+                                       responses_request_text)
 
 # yapf: enable
 
@@ -500,18 +507,18 @@ def test_v2_sha256_64_block_hashes_match_truncated_kv_cache_manager_v2(servers):
     assert all(isinstance(block_hash, int) for block_hash in block_hashes[0])
 
 
-def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
+@pytest.mark.parametrize("cache_salt", ["", "tenant-a", "租户", "a\0b"])
+def test_cache_aware_router_block_hashes_include_cache_salt(
+        servers, cache_salt):
     tokens_per_block = 4
-    cache_salt_id = 123
+    cache_salt_id = KVCacheEventManager._hash_cache_salt(cache_salt)
     token_lists = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]
     router = KvCacheAwareRouter(server_role=None,
                                 servers=servers,
                                 tokens_per_block=tokens_per_block)
 
     salted_v1_block_hashes = router._compute_block_hashes(
-        token_lists,
-        hash_algo=KV_CACHE_HASH_ALGO_V1,
-        cache_salt_id=cache_salt_id)
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V1, cache_salt=cache_salt)
     expected_v1_block_hashes = []
     parent_hash = None
     for t in range(0, len(token_lists[0]) - 1, tokens_per_block):
@@ -523,10 +530,8 @@ def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
         expected_v1_block_hashes.append(parent_hash)
 
     salted_v2_block_hashes = router._compute_block_hashes(
-        token_lists,
-        hash_algo=KV_CACHE_HASH_ALGO_V2,
-        cache_salt_id=cache_salt_id)
-    reuse_scope = ReuseScope(salt=cache_salt_id)
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2, cache_salt=cache_salt)
+    reuse_scope = ReuseScope(salt=cache_salt)
     expected_v2_block_hashes = [
         block_key.hex()
         for token_block, block_key in sequence_to_blockchain_keys(
@@ -536,7 +541,7 @@ def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
     salted_v2_64_block_hashes = router._compute_block_hashes(
         token_lists,
         hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64,
-        cache_salt_id=cache_salt_id)
+        cache_salt=cache_salt)
     expected_v2_64_block_hashes = [
         truncate_sha256_hash_to_int64(block_key)
         for token_block, block_key in sequence_to_blockchain_keys(
@@ -552,16 +557,6 @@ def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
         token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2)
     assert salted_v2_64_block_hashes != router._compute_block_hashes(
         token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64)
-
-
-def test_cache_salt_id_derivation_matches_worker_path():
-    from tensorrt_llm.inputs.utils import \
-        get_cache_salt_id as worker_get_cache_salt_id
-
-    assert get_cache_salt_id("abc") == 3697813978277427044
-    assert get_cache_salt_id("tenant-a") == get_cache_salt_id("tenant-a")
-    assert get_cache_salt_id("tenant-a") != get_cache_salt_id("tenant-b")
-    assert get_cache_salt_id("tenant-a") == worker_get_cache_salt_id("tenant-a")
 
 
 @pytest.mark.asyncio
@@ -666,8 +661,7 @@ async def test_kv_cache_aware_router_routes_to_v2_server(servers):
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_routes_with_cache_salt(
-        servers, monkeypatch):
+async def test_kv_cache_aware_router_routes_with_cache_salt(servers):
 
     class SaltedRequest:
         model = "TinyLlama"
@@ -677,15 +671,12 @@ async def test_kv_cache_aware_router_routes_with_cache_salt(
             self.prompt = prompt
 
     tokens_per_block = 4
-    cache_salt_id = 123
     token_lists = [[1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]]
     router = KvCacheAwareRouter(server_role=None,
                                 servers=servers,
                                 use_tokens=False,
                                 max_batch_size=32,
                                 tokens_per_block=tokens_per_block)
-    monkeypatch.setattr("tensorrt_llm.serve.router_utils.get_cache_salt_id",
-                        lambda cache_salt: cache_salt_id)
     for server in servers:
         router._server_info[server] = {
             "kv_cache_hash_algo": KV_CACHE_HASH_ALGO_V2
@@ -694,7 +685,7 @@ async def test_kv_cache_aware_router_routes_with_cache_salt(
     salted_block_hashes = router._compute_block_hashes(
         token_lists,
         hash_algo=KV_CACHE_HASH_ALGO_V2,
-        cache_salt_id=cache_salt_id)
+        cache_salt=SaltedRequest.cache_salt)
     unsalted_block_hashes = router._compute_block_hashes(
         token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2)
     salted_server = servers[1]
@@ -1882,7 +1873,9 @@ def test_block_hash_mixin_routes_through_transformers_tokenizer():
     tokenize prompts differently from the rest of TRT-LLM when computing
     block hashes for cache hits. The request's model is client-controlled, so
     it must not enable remote tokenizer code unless an operator configured a
-    fixed tokenizer directory.
+    fixed tokenizer directory. The router loads through ``load_hf_tokenizer``,
+    the loader a worker uses, so its tokenizer options (and rendering
+    fingerprint) are the worker's.
     """
 
     class _Probe(BlockHashMixin):
@@ -1898,7 +1891,11 @@ def test_block_hash_mixin_routes_through_transformers_tokenizer():
             return_value=wrapper) as routed:
         out = probe._get_tokenizer("dummy/model")
 
-    routed.assert_called_once_with("dummy/model", trust_remote_code=False)
+    routed.assert_called_once()
+    assert routed.call_args.args == ("dummy/model", )
+    assert routed.call_args.kwargs["trust_remote_code"] is False
+    # The worker's loader options, which the fingerprint's tokenizer identity includes.
+    assert routed.call_args.kwargs["legacy"] is False
     # The cached tokenizer must be the raw HF tokenizer used by _tokenize,
     # not the TransformersTokenizer wrapper.
     assert out is inner
@@ -1914,7 +1911,9 @@ def test_block_hash_mixin_routes_through_transformers_tokenizer():
             return_value=fixed_wrapper) as routed:
         fixed_out = fixed_probe._get_tokenizer("dummy/model")
 
-    routed.assert_called_once_with("/trusted/tokenizer", trust_remote_code=True)
+    routed.assert_called_once()
+    assert routed.call_args.args == ("/trusted/tokenizer", )
+    assert routed.call_args.kwargs["trust_remote_code"] is True
     assert fixed_out is fixed_inner
     assert fixed_probe._tokenizers["dummy/model"] is fixed_inner
 
@@ -2002,8 +2001,13 @@ def test_router_model_type_uses_checkpoint_config(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
+async def test_gpt_oss_router_tokens_match_chat_harmony_server_input(
+        monkeypatch: pytest.MonkeyPatch) -> None:
     """KV-cache routing must hash the same Harmony tokens used by the server."""
+    use_harmony_vocab(monkeypatch)
+    from tensorrt_llm.serve.chat_tokenization import \
+        tokenize_harmony_chat_request
+    from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
     router = KvCacheAwareRouter(server_role=None,
@@ -2013,10 +2017,7 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
                                 tokens_per_block=32,
                                 model_path="/models/gpt-oss-checkpoint")
     router_tokenizer = _mock_tokenizer(token_ids=[900, 901, 902])
-    harmony_tokens = [100, 101, 102, 103]
-    harmony_adapter = mock.MagicMock()
-    harmony_adapter.openai_to_harmony_tokens.return_value = harmony_tokens
-    harmony_adapter.get_stop_tokens.return_value = [42]
+    harmony_adapter = get_harmony_adapter()
     promise = mock.MagicMock()
     promise.prompt_token_ids = []
 
@@ -2037,6 +2038,7 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
     )
     router_request = copy.deepcopy(request)
     server_request = copy.deepcopy(request)
+    harmony_tokens = tokenize_harmony_chat_request(copy.deepcopy(request))
 
     server = OpenAIServer.__new__(OpenAIServer)
     server.allow_request_chat_template = False
@@ -2050,15 +2052,20 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
     server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(
         vocab_size=1000))
 
-    with mock.patch.object(
-            router, "_get_tokenizer",
-            return_value=router_tokenizer), mock.patch(
-                "tensorrt_llm.serve.harmony_adapter."
-                "get_harmony_adapter",
-                return_value=harmony_adapter), mock.patch(
-                    "tensorrt_llm.serve.router_utils."
-                    "resolve_model_type_from_config",
-                    return_value="gpt_oss") as resolve_model_type:
+    with mock.patch.object(router,
+                           "_get_tokenizer",
+                           return_value=router_tokenizer), mock.patch(
+                               "tensorrt_llm.serve.router_utils."
+                               "resolve_model_type_from_config",
+                               return_value="gpt_oss") as resolve_model_type:
+        # Tokens are forwarded only to workers that report the router's
+        # rendering fingerprint.
+        router._server_info = {
+            "server1": {
+                "render_fingerprint":
+                router._render_resources(request.model).fingerprint()
+            }
+        }
         router_token_ids = router._tokenize(router_request)[0]
         await server.chat_harmony(server_request, raw_request=None)
 
@@ -2066,9 +2073,7 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
         "inputs"]
     assert router_token_ids == server_token_ids
     assert router_request.prompt_token_ids == harmony_tokens
-    first_call, second_call = harmony_adapter.openai_to_harmony_tokens.call_args_list
-    assert first_call.args == second_call.args
-    assert first_call.kwargs == second_call.kwargs
+    assert server_token_ids == harmony_tokens
     resolve_model_type.assert_called_once_with("/models/gpt-oss-checkpoint")
     router_tokenizer.apply_chat_template.assert_not_called()
 
@@ -2327,6 +2332,11 @@ class _PrefixCacheFakeTokenizer:
 
     _SPECIAL = {"<bos>": 1, "<sys>": 2, "<user>": 3, "<asst>": 4, "<eot>": 5}
 
+    # A stable serialization of the encoding, so the rendering fingerprint can
+    # identify this tokenizer (one without it is never trusted for write-back).
+    backend_tokenizer = SimpleNamespace(
+        to_str=lambda: '{"fake": "prefix-cache"}')
+
     def apply_chat_template(self,
                             messages,
                             add_generation_prompt=False,
@@ -2390,6 +2400,15 @@ def test_prefix_cache_tokenize_matches_full_encode(servers):
                                 tokens_per_block=4)
     tok = _PrefixCacheFakeTokenizer()
     with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        # Tokens are forwarded only when every active worker reports the
+        # router's rendering fingerprint.
+        fingerprint = router._render_resources("mock").fingerprint()
+        router._server_info = {
+            server: {
+                "render_fingerprint": fingerprint
+            }
+            for server in servers
+        }
         for convo in _grow_conversation():
             req = ChatCompletionRequest(model="mock", messages=convo)
             rendered = tok.apply_chat_template(
@@ -2525,23 +2544,23 @@ _V2_GOLDEN_PARTIAL_TAIL = [
     "2c2a73c72b0bccbf74a5d46d131499ca726b1d2a650836cb548a10fb3c8acf2e",
 ]
 _V2_GOLDEN_SALTED = [
-    "db459ee4f851fc0f200670146f089ab0ec5180332f6e5ef79c89f005da17d385",
-    "4a7983401932bc87d9894dd530d5f5e4aa998d7a71e457d8b6e049669962db4c",
-    "1a5e8d70d15180a91358f33109a4caf41be7bf78597a1263dbaf73a54433aff9",
+    "a4d74f1c7ca3c3fb866d0fb1751a3e4431cc384c95dbe6539b858939667f311c",
+    "dc54b040e0ffc44a80522d97de70e1c399ceaf3d9d48fca3f2acae3de49e15d6",
+    "05267ddc7c6829554466d192b19827fa7be6a1db807a60d89cb6a6978dabed11",
 ]
 
 
 @pytest.mark.parametrize(
-    "tokens,cache_salt_id,expected",
+    "tokens,cache_salt,expected",
     [
         ([1, 2, 3, 4, 5, 6, 7, 8], None, _V2_GOLDEN_BOUNDARY_EXACT),
         ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], None, _V2_GOLDEN_PARTIAL_TAIL),
-        ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 4242, _V2_GOLDEN_SALTED),
+        ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "4242", _V2_GOLDEN_SALTED),
     ],
     ids=["boundary_exact", "partial_tail", "salted"],
 )
-def test_v2_block_hashes_match_frozen_wire_values(servers, tokens,
-                                                  cache_salt_id, expected):
+def test_v2_block_hashes_match_frozen_wire_values(servers, tokens, cache_salt,
+                                                  expected):
     """Pin the V2 routing hash to fixed values, not to whatever the engine computes.
 
     The other V2 cases here build their expectation with the same
@@ -2556,7 +2575,7 @@ def test_v2_block_hashes_match_frozen_wire_values(servers, tokens,
 
     block_hashes = router._compute_block_hashes([tokens],
                                                 hash_algo=KV_CACHE_HASH_ALGO_V2,
-                                                cache_salt_id=cache_salt_id)
+                                                cache_salt=cache_salt)
 
     assert block_hashes == [expected]
 
@@ -2577,3 +2596,137 @@ def test_v2_sha256_64_block_hashes_are_big_endian_prefix_of_frozen_values(
         for key in _V2_GOLDEN_PARTIAL_TAIL
     ]
     assert block_hashes == [expected]
+
+
+# ── ResponsesRequest routing ──
+
+
+def _message(role: str, content: str) -> dict[str, str]:
+    return {"role": role, "content": content}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_harmony", [False, True])
+async def test_kv_cache_aware_router_routes_responses_turns(
+        servers, use_harmony, monkeypatch):
+    """A later turn of a Responses conversation follows its cached prefix."""
+    if use_harmony:
+        # Load the Harmony vocab from the datasets root instead of downloading it.
+        cache_dir = os.path.join(llm_datasets_root(), "tiktoken_vocab")
+        monkeypatch.setenv("TIKTOKEN_RS_CACHE_DIR", cache_dir)
+        monkeypatch.setenv("TIKTOKEN_ENCODINGS_BASE", cache_dir)
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                use_harmony=use_harmony)
+    history = [_message("user", "plan a trip " * 10)]
+    turn1 = ResponsesRequest(model="m", instructions="Be brief.", input=history)
+    turn2 = ResponsesRequest(
+        model="m",
+        instructions="Be brief.",
+        input=history +
+        [_message("assistant", "day one"),
+         _message("user", "add food")])
+    with mock.patch.object(router,
+                           "_get_tokenizer",
+                           return_value=_PrefixCacheFakeTokenizer()):
+        home, _ = await router.get_next_server(turn1)
+        await router.finish_request(turn1)
+        server, info = await router.get_next_server(turn2)
+    assert server == home and info["match_length"] > 0
+    # Routing ids are not stored on the request: the context worker renders
+    # the prompt itself.
+    assert turn1.prompt_token_ids is None
+    if use_harmony:
+        worker_ids, _ = await request_preprocess(turn2,
+                                                 None,
+                                                 None,
+                                                 enable_store=False,
+                                                 use_harmony=True)
+        assert router._tokenize(turn2) == [worker_ids]
+
+
+@pytest.mark.asyncio
+async def test_responses_routing_tokens_match_the_worker_for_a_developer_message(
+        servers):
+    """Qwen3's chat template has no developer role; both sides render it as system."""
+    from transformers import AutoConfig
+
+    from tensorrt_llm.tokenizer import tokenizer_factory
+
+    model_dir = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                tokenizer_dir=model_dir,
+                                use_harmony=False)
+    request = ResponsesRequest(model="m",
+                               input=[
+                                   _message("developer", "Answer in French."),
+                                   _message("user", "plan a trip")
+                               ])
+    worker_ids, _ = await request_preprocess(
+        request,
+        None,
+        None,
+        enable_store=False,
+        use_harmony=False,
+        tokenizer=tokenizer_factory(model_dir),
+        model_config=AutoConfig.from_pretrained(model_dir))
+    assert router._tokenize(request) == [worker_ids]
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_tells_responses_conversations_apart():
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2", "server3"])
+    home_a, _ = await router.get_next_server(
+        ResponsesRequest(model="m", input="topic A " * 200))
+    home_b, _ = await router.get_next_server(
+        ResponsesRequest(model="m", input="topic B " * 200))
+    later_a = ResponsesRequest(model="m",
+                               input=[
+                                   _message("user", "topic A " * 200),
+                                   _message("assistant", "done"),
+                                   _message("user", "again")
+                               ])
+    assert home_b != home_a
+    assert (await router.get_next_server(later_a))[0] == home_a
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("relay",
+                         [None, "prompt_token_ids", "prompt_token_ids_b64"])
+async def test_responses_request_relayed_prompt_token_ids(relay):
+    """Routers use relayed prompt ids, plain or base64, and count the text without them."""
+    token_ids = list(range(40))
+    request = ResponsesRequest(
+        model="m",
+        input="hello " * 10,
+        disaggregated_params=DisaggregatedParams(
+            request_type="generation_only" if relay else "context_only"))
+    if relay == "prompt_token_ids_b64":
+        request.prompt_token_ids_b64 = base64.b64encode(
+            np.asarray(token_ids, dtype=np.int32).tobytes()).decode()
+    elif relay:
+        request.prompt_token_ids = token_ids
+    relayed = [token_ids] if relay else None
+
+    router = LoadBalancingRouter(server_role=None,
+                                 servers=["server1"],
+                                 use_tokens=True)
+    await router.get_next_server(request)
+    assert router._server_state["server1"]._num_active_tokens == (
+        len(token_ids) if relay else len(responses_request_text(request)))
+    await router.finish_request(request)
+    assert router._server_state["server1"]._num_active_tokens == 0
+    assert ConversationRouter._try_extract_token_ids(request) == relayed
+    if relay:
+        kv_router = KvCacheAwareRouter(server_role=None, servers=["server1"])
+        with mock.patch.object(kv_router,
+                               "_get_tokenizer",
+                               side_effect=AssertionError):
+            assert kv_router._tokenize(request) == relayed
+    # A base64 relay is decoded for routing, not expanded onto the request.
+    assert request.prompt_token_ids == (token_ids if relay == "prompt_token_ids"
+                                        else None)

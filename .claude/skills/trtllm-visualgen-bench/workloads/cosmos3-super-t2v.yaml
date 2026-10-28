@@ -1,0 +1,18 @@
+# nvidia/Cosmos3-Super  ·  Cosmos3OmniMoTPipeline  ·  t2v
+# guidance_scale · max_sequence_length: pipeline defaults.
+backend: openai-videos
+
+common_params:
+  width: 1280
+  height: 720
+  num_frames: 189
+  frame_rate: 24.0
+  num_inference_steps: 35
+  guidance_scale: 6.0
+  max_sequence_length: 4096
+  extra_params:
+    output_type: video
+  seed: 42
+
+requests:
+  - prompt_file: ../prompts/cosmos3-t2v.json

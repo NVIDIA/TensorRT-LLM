@@ -26,10 +26,10 @@ from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 
 try:
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.pertoken_adaln import (
+    from tensorrt_llm._torch.visual_gen.kernels.blackwell.pertoken_adaln import (
         fused_pertoken_adaln as _fused_pertoken_adaln,
     )
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.pertoken_adaln import (
+    from tensorrt_llm._torch.visual_gen.kernels.blackwell.pertoken_adaln import (
         fused_pertoken_adaln_residual as _fused_pertoken_adaln_residual,
     )
 

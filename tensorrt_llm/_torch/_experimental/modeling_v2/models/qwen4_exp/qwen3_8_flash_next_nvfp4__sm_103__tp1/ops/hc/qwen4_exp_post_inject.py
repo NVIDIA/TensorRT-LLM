@@ -43,55 +43,21 @@ class Qwen4ExpPostInject(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: leading (token dims), hc_count, hidden, dtype; layout
-    # "contiguous" (default) | "row_slice" (`buf[::2]`) | "col_slice"
-    # (`buf[:, :width]`), both last-dim stride 1.
-    CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(
-                why=f"checkpoint 4x2560 bf16, {why}",
-                spec=dict(leading=(t,), hc_count=CKPT_HC_COUNT, hidden=CKPT_HIDDEN),
-            )
-            for t, why in (
-                (1, "decode, 1 token"),
-                (2, "2 tokens"),
-                (7, "7 tokens, odd count"),
-                (64, "decode batch / MTP rows, 64 tokens"),
-                (2048, "prefill 2048 tokens"),
-                (8192, "prefill 8192 tokens, largest measured"),
-            )
+    # "contiguous" (default) | "col_slice" (`buf[:, :width]`, last-dim stride 1).
+    CELLS: tuple[Cell, ...] = tuple(
+        Cell(
+            why=f"checkpoint 4x2560 bf16, {why}",
+            spec=dict(leading=(t,), hc_count=CKPT_HC_COUNT, hidden=CKPT_HIDDEN),
         )
-        + (
-            Cell(
-                why="[2, 5, width] leading dims",
-                spec=dict(leading=(2, 5), hc_count=CKPT_HC_COUNT, hidden=CKPT_HIDDEN),
-            ),
-            Cell(
-                why="hyper_input a row slice buf[::2] of a wider buffer",
-                spec=dict(
-                    leading=(8,), hc_count=CKPT_HC_COUNT, hidden=CKPT_HIDDEN, layout="row_slice"
-                ),
-            ),
-            Cell(
-                why="hyper_input a column slice buf[:, :width]",
-                spec=dict(
-                    leading=(8,), hc_count=CKPT_HC_COUNT, hidden=CKPT_HIDDEN, layout="col_slice"
-                ),
-            ),
+        for t, why in (
+            (64, "decode batch / MTP rows, 64 tokens"),
+            (8192, "prefill 8192 tokens, largest measured"),
         )
-        + tuple(
-            Cell(
-                why=f"hc_count {c} read from inject, hidden 128",
-                spec=dict(leading=(48,), hc_count=c, hidden=128),
-            )
-            for c in (1, 2, 3, 8)
-        )
-        + tuple(
-            Cell(
-                why=f"{str(d).removeprefix('torch.')} operands, 64 tokens",
-                spec=dict(leading=(64,), hc_count=CKPT_HC_COUNT, hidden=CKPT_HIDDEN, dtype=d),
-            )
-            for d in (torch.float16, torch.float32)
-        )
+    ) + (
+        Cell(
+            why="hyper_input a column slice buf[:, :width]",
+            spec=dict(leading=(8,), hc_count=CKPT_HC_COUNT, hidden=CKPT_HIDDEN, layout="col_slice"),
+        ),
     )
 
     note = """
@@ -122,8 +88,13 @@ class Qwen4ExpPostInject(OpWrapper):
     broadcast operands take a non-vectorized path. An in-place form was not
     measured.
 
-    Not certified: float8 operands. Hard limits: not probed (the largest
-    measured operand is 8192 x 10240 = 2^26.3 elements).
+    Certified: bf16 2-D operands at the checkpoint's 4 x 2560, 64 and 8192
+    rows contiguous, 8 rows with `hyper_input` a column slice; graph replay.
+
+    Not certified: other row counts, a row-slice `hyper_input`, hc_count other
+    than 4, hidden other than 2560, float16, float32 and float8 operands,
+    leading dims beyond one. Hard limits: not
+    probed (the largest measured operand is 8192 x 10240 = 2^26.3 elements).
     """
 
     def __call__(

@@ -54,11 +54,18 @@ Deep dive into memory access patterns and cache behavior.
 
 **Key Metrics:**
 - L1/L2 cache hit rates
-- Memory load/store throughput
-- Coalescing efficiency
-- Shared memory bank conflicts
+- Memory throughput, Mem Busy, Max Bandwidth, Mem Pipes Busy
+- Local and shared memory spilling
 
 **When to Use:** When memory throughput >60% (memory-bound kernel).
+
+### MemoryWorkloadAnalysis_Chart / MemoryWorkloadAnalysis_Tables
+
+**Command**: `--section MemoryWorkloadAnalysis_Chart --section MemoryWorkloadAnalysis_Tables`
+
+The memory chart, and per-unit tables (shared memory, L1/TEX, L2, device memory)
+that include shared-memory bank conflicts. Uncoalesced accesses and bank
+conflicts per instruction are in `SourceCounters`.
 
 ### ComputeWorkloadAnalysis
 
@@ -80,9 +87,8 @@ Compute pipeline utilization breakdown.
 Warp scheduler statistics.
 
 **Key Metrics:**
-- Eligible warps per scheduler
-- Scheduler issue rate
-- Warp stall reasons (summary)
+- Theoretical, active, eligible and issued warps per scheduler
+- Issue slots with one or more eligible warps, and with none (skipped issue slots)
 
 **When to Use:** When occupancy is low or scheduler seems underutilized.
 
@@ -95,6 +101,7 @@ Detailed warp stall reason breakdown.
 **Key Metrics:**
 - Stall cycles by reason: memory dependency, execution dependency, sync, etc.
 - Active vs stalled warp ratio
+- From Nsight Compute 2026.2, sampled stall reasons per warp slot when no warp issued
 
 **When to Use:** After SchedulerStats shows stalls; identifies root cause.
 
@@ -142,13 +149,17 @@ How work is distributed across GPU resources.
 
 **Command**: `--section SourceCounters`
 
-Source-level metrics (requires `-lineinfo` compilation flag).
+Per-instruction (SASS) metrics, read on the source page
+(`--page source --print-source sass`). Mapping them to CUDA source lines needs
+the `-lineinfo` compilation flag; the SASS-level metrics do not.
 
 **Key Metrics:**
-- Per-line execution counts
-- Per-line stall reasons
+- Per-instruction execution counts and branch divergence
+- Per-instruction warp stall samples, by stall reason
+- Per-instruction excessive global sectors (`L2 Theoretical Sectors Global Excessive`)
+  and shared-memory bank conflicts (`L1 Conflicts Shared N-Way`)
 
-**When to Use:** Correlate metrics to source code lines.
+**When to Use:** Find which instructions stall or waste memory traffic.
 
 ## Roofline Sections
 
@@ -176,6 +187,12 @@ Hierarchical roofline for FP16 operations.
 
 Hierarchical roofline for tensor core operations.
 
+### SpeedOfLight_HierarchicalDoubleRooflineChart
+
+**Command**: `--section SpeedOfLight_HierarchicalDoubleRooflineChart`
+
+Hierarchical roofline for FP64 operations.
+
 ## Multi-GPU Sections
 
 ### Nvlink
@@ -198,23 +215,36 @@ NUMA affinity and CPU-GPU distance. **When to Use:** Investigating CPU-GPU affin
 
 ## Special Sections
 
-### PmSampling / PmSampling_WarpStates
+### PmSampling
 
 **Command**: `--section PmSampling`
 
-Performance monitoring sampling (lower overhead than full profiling).
+Timeline of metrics sampled at a fixed interval over the kernel's runtime, with sampled warp
+stall reasons, to show how its behavior changes over time. Collected over several replay
+passes. Nsight Compute 2026.3 removed `PmSampling_WarpStates`, a separate timeline of every
+warp stall state.
+
+### gr10x_UTCMMA_Inference / gr10x_UTCMMA_Training
+
+**Command**: `--section gr10x_UTCMMA_Inference` (or `_Training`)
+
+Single-pass PM sampling timelines of UTCMMA (tensor-core MMA) activity, for GR10x (Rubin)
+GPUs only. New in Nsight Compute 2026.3.
 
 ### Tile
 
 **Command**: `--section Tile`
 
-Tile statistics for tiled/blocked algorithms.
+Launch configuration, execution and resource usage of CUDA Tile kernels (cuTile
+Python, CUDA Tile C++), which compile to Tile IR. It shows nothing for other
+kernels, however they tile their work.
 
 ### C2CLink
 
 **Command**: `--section C2CLink`
 
-Chip-to-chip link analysis (Grace Hopper systems).
+NVLink-C2C link utilization between a Grace CPU and the GPU (Grace Hopper,
+Grace Blackwell).
 
 ## Section Sets
 
@@ -222,11 +252,16 @@ Pre-defined collections for convenience:
 
 | Set | Sections Included | ~Metrics | When to Use |
 |-----|-------------------|----------|-------------|
-| `basic` | LaunchStats, Occupancy, SpeedOfLight, WorkloadDistribution | 213 | Quick overview |
-| `detailed` | basic + ComputeWorkloadAnalysis, MemoryWorkloadAnalysis, SourceCounters | 996 | Standard analysis |
-| `full` | All sections | 8051 | Exhaustive (slow) |
-| `roofline` | SpeedOfLight + all roofline charts | 6679 | Roofline focus |
-| `nvlink` | Nvlink, Nvlink_Tables, Nvlink_Topology | 122 | Multi-GPU focus |
+| `basic` | LaunchStats, Occupancy, SpeedOfLight, WorkloadDistribution | 229 | Quick overview |
+| `detailed` | basic + ComputeWorkloadAnalysis, MemoryWorkloadAnalysis, MemoryWorkloadAnalysis_Chart, SourceCounters, SpeedOfLight_RooflineChart, Tile | 1150 | Standard analysis |
+| `full` | Nearly all sections (not C2CLink, Nvlink) | 9059 | Exhaustive (slow) |
+| `roofline` | SpeedOfLight, WorkloadDistribution + all roofline charts | 6783 | Roofline focus |
+| `nvlink` | Nvlink, Nvlink_Tables, Nvlink_Topology | 162 | Multi-GPU focus |
+| `pmsampling` | PmSampling, gr10x_UTCMMA_Inference, gr10x_UTCMMA_Training | 1248 | Behavior over time |
+
+Metric counts are the estimates `ncu --list-sets` prints for Nsight Compute 2026.3.1, the same
+with or without a GPU; they change between versions. In 2026.1 and 2026.2 the `pmsampling` set
+was PmSampling and PmSampling_WarpStates.
 
 **Recommendation**: Prefer individual `--section` flags for targeted, faster analysis. Use `--set` only for broad exploration.
 
@@ -239,7 +274,7 @@ Pre-defined collections for convenience:
 | Latency-bound (both <40%) | `LaunchStats`, `Occupancy` |
 | Warp stalls | `WarpStateStats`, `SchedulerStats` |
 | Instruction-bound | `InstructionStats` |
-| Source-level analysis | `SourceCounters` (needs `-lineinfo`) |
+| Source-level analysis | `SourceCounters` (`-lineinfo` to map to CUDA lines) |
 | Load imbalance | `WorkloadDistribution` |
 
 ## Combining Sections

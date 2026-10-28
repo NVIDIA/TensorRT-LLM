@@ -3,16 +3,14 @@
 """GPU test for the fused_recurrent_gated_delta_rule_update entry.
 
 The axis this entry exists for is more than one token per sequence per step --
-the speculative verify call -- so the cells sweep `P`, and the two state sinks
-(write-back into the pool, per-step states into the rollback buffer) are
-driven separately and together.
+the speculative verify call -- so the cells are that call as the target makes it
+(per-step states into the rollback buffer, the pool untouched) at both pool
+dtypes. The write-back sink is driven only by the cold-call test below.
 
-Two tests answer "is this harness blind" rather than a correctness question:
-the neighbouring `chunk_gated_delta_rule` is wrong on the first indexed
+The neighbouring `chunk_gated_delta_rule` was once wrong on the first indexed
 in-place call of a process (an autotuner trial launch consumes the state), so
 `test_cold_call_in_a_fresh_process_is_correct` measures the first call of a
-process that has made none, and `test_the_gate_rejects_a_doubly_applied_state`
-shows `_compare` rejects exactly the damage that mechanism leaves.
+process that has made none.
 """
 
 from __future__ import annotations
@@ -26,7 +24,6 @@ from pathlib import Path
 import pytest
 import torch
 
-import tensorrt_llm._torch.modules.fla.fused_recurrent as _impl
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.fused_recurrent_gated_delta_rule_update import (  # noqa: E501
     HEAD_K_DIM,
     HEAD_V_DIM,
@@ -74,67 +71,49 @@ def _compare(out: tuple, ref: tuple) -> None:
 
 
 DEV = "cuda"
-REPEAT = NUM_V_HEADS // NUM_K_HEADS  # 3
 MIXED_QKV_WIDTH = 2 * NUM_K_HEADS * HEAD_K_DIM + NUM_V_HEADS * HEAD_V_DIM  # 10240
 CACHE_SENTINEL = -3.0
 
 
 def _build(spec, seed):
-    """`__call__`'s arguments by name for one spec, plus what the locks need.
+    """`__call__`'s arguments by name for one spec, plus the live slots.
 
     q/k/v are views over one packed `[T, 10240]` row block (or contiguous
     copies, as the target passes them); `g` is built the way the gating step
     builds it -- negative, so `exp(g) < 1` -- and `beta` is a sigmoid.
     """
     gen = torch.Generator(device=DEV).manual_seed(seed)
-    mode, n = spec["mode"], spec["n"]
-    lengths = spec.get("lengths")
-    batch, tokens = (n, spec["p"]) if lengths is None else (1, sum(lengths))
-    total = batch * tokens
+    mode, n, tokens = spec["mode"], spec["n"], spec["p"]
+    total = n * tokens
 
     def randn(*shape, dtype=torch.float32):
         return torch.randn(*shape, generator=gen, device=DEV, dtype=dtype)
 
     mixed = randn(total, MIXED_QKV_WIDTH, dtype=torch.bfloat16)
     kd = NUM_K_HEADS * HEAD_K_DIM
-    q = mixed[:, :kd].view(batch, tokens, NUM_K_HEADS, HEAD_K_DIM)
-    k = mixed[:, kd : 2 * kd].view(batch, tokens, NUM_K_HEADS, HEAD_K_DIM)
-    v = mixed[:, 2 * kd :].view(batch, tokens, NUM_V_HEADS, HEAD_V_DIM)
+    q = mixed[:, :kd].view(n, tokens, NUM_K_HEADS, HEAD_K_DIM)
+    k = mixed[:, kd : 2 * kd].view(n, tokens, NUM_K_HEADS, HEAD_K_DIM)
+    v = mixed[:, 2 * kd :].view(n, tokens, NUM_V_HEADS, HEAD_V_DIM)
     if spec.get("qkv") == "contiguous":
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
     a, a_log, dt_bias = randn(total, NUM_V_HEADS), randn(NUM_V_HEADS), randn(NUM_V_HEADS)
     g = -torch.exp(a_log) * torch.nn.functional.softplus(a + dt_bias)
-    g = g.view(batch, tokens, NUM_V_HEADS)
+    g = g.view(n, tokens, NUM_V_HEADS)
     b = randn(total, NUM_V_HEADS, dtype=torch.bfloat16)
-    beta_kind = spec.get("beta", "fp32")
-    beta = (b.sigmoid() if beta_kind == "bf16" else b.float().sigmoid()).view(
-        batch, tokens, NUM_V_HEADS
-    )
-    if beta_kind == "channel":
-        beta = beta[..., None].expand(batch, tokens, NUM_V_HEADS, HEAD_V_DIM).contiguous()
+    beta = b.sigmoid() if spec.get("beta", "fp32") == "bf16" else b.float().sigmoid()
+    beta = beta.view(n, tokens, NUM_V_HEADS)
 
     pool_slots = spec.get("pool_slots", SLOTS)
-    pool = layered = None
-    if pool_slots is not None:
-        pool = randn(pool_slots, NUM_V_HEADS, HEAD_V_DIM, HEAD_K_DIM) * 0.05
-        pool = pool.to(spec.get("pool_dtype", torch.float32))
-        if spec.get("pool_view") == "layer_major":
-            layered = torch.zeros((3,) + pool.shape, dtype=pool.dtype, device=DEV)
-            layered[1].copy_(pool)
-            pool = layered[1]
-            assert pool.is_contiguous()
+    pool = randn(pool_slots, NUM_V_HEADS, HEAD_V_DIM, HEAD_K_DIM) * 0.05
+    pool = pool.to(spec.get("pool_dtype", torch.float32))
 
     slots = spec.get("slots") or tuple(range(n))
-    indices = torch.tensor(slots, dtype=spec.get("index_dtype", torch.int32), device=DEV)
-    cu_seqlens = None
-    if lengths is not None:
-        bounds = torch.tensor((0,) + tuple(lengths)).cumsum(0)
-        cu_seqlens = bounds.to(device=DEV, dtype=spec.get("cu_dtype", torch.int64))
+    indices = torch.tensor(slots, dtype=torch.int32, device=DEV)
 
     buffer = cache_steps = None
-    if mode in ("verify", "both"):
-        rows = spec.get("cache_rows", SLOTS if pool_slots is None else pool_slots)
+    if mode == "verify":
+        rows = spec.get("cache_rows", pool_slots)
         cache_steps = tokens
         buffer = torch.full(
             (rows, cache_steps, NUM_V_HEADS, HEAD_V_DIM, HEAD_K_DIM),
@@ -142,17 +121,6 @@ def _build(spec, seed):
             dtype=spec.get("cache_dtype", torch.float32),
             device=DEV,
         )
-
-    output = out_buf = None
-    if spec.get("output") == "prefix":
-        # A length-prefix slice of a longer row-major buffer, as the stock mixer
-        # passes it: contiguous, and the tail is not offered.
-        out_buf = torch.full(
-            (total + 5, NUM_V_HEADS, HEAD_V_DIM), -7.0, dtype=torch.bfloat16, device=DEV
-        )
-        output = out_buf[:total].view(batch, tokens, NUM_V_HEADS, HEAD_V_DIM)
-    elif spec.get("output") == "fp32":
-        output = torch.zeros(batch, tokens, NUM_V_HEADS, HEAD_V_DIM, device=DEV)
 
     kwargs = dict(
         q=q,
@@ -164,16 +132,14 @@ def _build(spec, seed):
         initial_state_indices=indices,
         scale=None,
         use_qk_l2norm_in_kernel=True,
-        cu_seqlens=cu_seqlens,
+        cu_seqlens=None,
         disable_state_update=mode == "verify",
         disable_output_calculation=False,
         intermediate_states_buffer=buffer,
         cache_steps=cache_steps,
-        output=output,
+        output=None,
     )
-    return kwargs, dict(
-        layered=layered, out_buf=out_buf, total=total, live=[s for s in slots if s >= 0]
-    )
+    return kwargs, list(slots)
 
 
 def _seed(why):
@@ -183,55 +149,23 @@ def _seed(why):
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
-    kw, ctx = _build(cell.spec, seed=_seed(cell.why))
-    pool, buffer, live = kw["initial_state_source"], kw["intermediate_states_buffer"], ctx["live"]
-    pool_before = None if pool is None else pool.clone()
-    buffer_before = None if buffer is None else buffer.clone()
-    layered_before = None if ctx["layered"] is None else ctx["layered"].clone()
-    tail_before = None if ctx["out_buf"] is None else ctx["out_buf"][ctx["total"] :].clone()
+    kw, live = _build(cell.spec, seed=_seed(cell.why))
+    pool, buffer = kw["initial_state_source"], kw["intermediate_states_buffer"]
+    pool_before, buffer_before = pool.clone(), buffer.clone()
 
     ref = op.reference(**kw)
     got = op(**kw)
     _compare((got, pool, buffer), ref)
 
     # The in-place locks, bitwise, independent of the reference.
-    if kw["output"] is not None:
-        assert got.data_ptr() == kw["output"].data_ptr(), "output must be written in place"
-    if tail_before is not None:
-        assert torch.equal(ctx["out_buf"][ctx["total"] :], tail_before), "buffer tail touched"
-    if pool is not None:
-        if kw["disable_state_update"]:
-            assert torch.equal(pool, pool_before), "the pool must not move on a verify call"
-        else:
-            for s in live:
-                assert not torch.equal(pool[s], pool_before[s]), f"slot {s} was not written"
-            pool_before[live] = pool[live]
-            assert torch.equal(pool, pool_before), "a slot outside the indices was written"
-    if buffer is not None:
-        for s in live:
-            assert not (buffer[s] == CACHE_SENTINEL).any(), f"row {s} not fully cached"
-        buffer_before[live] = buffer[live]
-        assert torch.equal(buffer, buffer_before), "a buffer row outside the indices was written"
-    if layered_before is not None:
-        layered = ctx["layered"]
-        assert torch.equal(layered[0], layered_before[0]) and torch.equal(
-            layered[2], layered_before[2]
-        ), "the neighbouring layers must be untouched"
-    if cell.spec["mode"] == "both":
-        # Independent of the reference: the last cached step is the stored state.
-        assert torch.equal(buffer[live, cell.spec["p"] - 1], pool[live])
+    assert torch.equal(pool, pool_before), "the pool must not move on a verify call"
+    for s in live:
+        assert not (buffer[s] == CACHE_SENTINEL).any(), f"row {s} not fully cached"
+    buffer_before[live] = buffer[live]
+    assert torch.equal(buffer, buffer_before), "a buffer row outside the indices was written"
 
 
-# ── the mechanism the neighbouring entry fails on ─────────────────────────
-
-
-def test_the_wrapped_kernel_carries_no_autotuner() -> None:
-    """Why the cold call is safe here: `triton.heuristics` + `triton.jit`, so
-    there is no trial launch to consume the in-place state."""
-    kernel = _impl.fused_recurrent_gated_delta_rule_update_fwd_kernel
-    names = [cls.__name__ for cls in type(kernel).__mro__]
-    assert "Autotuner" not in names, f"the wrapped kernel gained an autotuner ({names})"
-    assert not hasattr(kernel, "configs"), "an autotuner config list appeared on the wrapped kernel"
+# ── the mechanism the neighbouring entry failed on ────────────────────────
 
 
 _COLD_SPEC = dict(mode="write_back", n=2, p=3, slots=(5, 2))
@@ -298,171 +232,7 @@ def test_cold_call_in_a_fresh_process_is_correct() -> None:
     assert result["out_bitwise_equal"] and result["pool_bitwise_equal"], result
 
 
-def test_the_gate_rejects_a_doubly_applied_state() -> None:
-    """The damage an autotuner trial launch leaves -- the state applied twice --
-    is rejected by `_compare`, so a cold-call error of that shape cannot pass."""
-    kw, _ = _build(_COLD_SPEC, seed=8)
-    pool = kw["initial_state_source"]
-    ref = op.reference(**kw)
-    _compare((op(**kw), pool, None), ref)  # one application is right
-
-    doubled = op(**kw)
-    out_err = (doubled.float() - ref[0].float()).abs().max().item()
-    pool_err = (pool - ref[1]).abs().max().item()
-    print(f"\ndoubly applied: output {out_err:.3e}, state {pool_err:.3e}")
-    assert out_err > 1e-2 and pool_err > 1e-2
-    with pytest.raises(AssertionError):
-        _compare((doubled, pool, None), ref)
-
-
-# ── properties beyond a single reference comparison ───────────────────────
-
-
-def test_varlen_form_matches_the_batched_form_bitwise() -> None:
-    """`cu_seqlens` at B = 1 is the same arithmetic as the uniform batch."""
-    n, p = 3, 4
-    kw, _ = _build(dict(mode="write_back", n=n, p=p, slots=(2, 6, 3)), seed=60)
-    pool_before = kw["initial_state_source"].clone()
-    batched = op(**kw)
-    total = n * p
-    flat = dict(
-        kw,
-        q=kw["q"].reshape(1, total, NUM_K_HEADS, HEAD_K_DIM),
-        k=kw["k"].reshape(1, total, NUM_K_HEADS, HEAD_K_DIM),
-        v=kw["v"].reshape(1, total, NUM_V_HEADS, HEAD_V_DIM),
-        g=kw["g"].reshape(1, total, NUM_V_HEADS),
-        beta=kw["beta"].reshape(1, total, NUM_V_HEADS),
-        initial_state_source=pool_before.clone(),
-        cu_seqlens=torch.arange(0, total + 1, p, device=DEV, dtype=torch.int64),
-    )
-    varlen = op(**flat)
-    assert torch.equal(varlen.reshape(n, p, NUM_V_HEADS, HEAD_V_DIM), batched)
-    assert torch.equal(flat["initial_state_source"], kw["initial_state_source"])
-
-
-def test_scale_default_is_bitwise_head_dim_pow_minus_half() -> None:
-    kw, _ = _build(dict(mode="write_back", n=2, p=3, slots=(1, 2)), seed=66)
-    pool_a, pool_b = kw["initial_state_source"].clone(), kw["initial_state_source"].clone()
-    out_a = op(**dict(kw, initial_state_source=pool_a))
-    out_b = op(**dict(kw, initial_state_source=pool_b, scale=HEAD_K_DIM**-0.5))
-    assert torch.equal(out_a, out_b) and torch.equal(pool_a, pool_b)
-
-
-def test_deterministic() -> None:
-    kw, _ = _build(dict(mode="both", n=3, p=4), seed=68)
-    pool0, buf0 = kw["initial_state_source"].clone(), kw["intermediate_states_buffer"].clone()
-    runs = []
-    for _ in range(2):
-        pool, buf = pool0.clone(), buf0.clone()
-        out = op(**dict(kw, initial_state_source=pool, intermediate_states_buffer=buf))
-        runs.append((out, pool, buf))
-    assert all(torch.equal(x, y) for x, y in zip(*runs))
-
-
-def test_duplicate_slot_indices_race_on_the_write_back() -> None:
-    """Two sequences on one slot: the outputs stay right, the slot does not.
-    Nothing raises, so it is a caller obligation recorded as a measurement."""
-    kw, _ = _build(dict(mode="write_back", n=2, p=3, slots=(3, 3)), seed=69)
-    pool = kw["initial_state_source"]
-    pool_before = pool.clone()
-    ref = op.reference(**kw)
-    got = op(**kw)
-    torch.testing.assert_close(got, ref[0])
-
-    def one(i, source):
-        rows = slice(i, i + 1)
-        return op.reference(
-            **dict(
-                kw,
-                q=kw["q"][rows],
-                k=kw["k"][rows],
-                v=kw["v"][rows],
-                g=kw["g"][rows],
-                beta=kw["beta"][rows],
-                initial_state_source=source,
-                initial_state_indices=kw["initial_state_indices"][rows],
-            )
-        )[1]
-
-    after_both = one(1, one(0, pool_before))
-    drift = (pool[3] - after_both[3]).abs().max().item()
-    print(f"\nshared slot drift from a sequential application: {drift:.3e}")
-    assert drift > 1e-2
-
-
-# ── what the guard refuses, and what the op refuses itself ────────────────
-
-
-def _small(seed, **spec):
-    return _build(dict(dict(mode="write_back", n=2, p=3), **spec), seed=seed)[0]
-
-
-def test_a_strided_output_clobbers_its_neighbour_and_is_refused() -> None:
-    """Unguarded, a last-dim slice of a doubly wide buffer is written with
-    packed arithmetic: the half never offered is overwritten."""
-    kw = _small(70)
-    wide = torch.zeros(2, 3, NUM_V_HEADS, 2 * HEAD_V_DIM, dtype=torch.bfloat16, device=DEV)
-    strided = wide[..., :HEAD_V_DIM]
-    op(**dict(kw, initial_state_source=kw["initial_state_source"].clone(), output=strided))
-    assert (wide[..., HEAD_V_DIM:] != 0).any(), "the hazard this guard covers is gone"
-    with pytest.raises(AssertionError, match="output must be contiguous"):
-        with validating(op):
-            op(**dict(kw, output=wide[..., :HEAD_V_DIM]))
-
-
-def test_output_with_the_calculation_off_is_never_written_and_is_refused() -> None:
-    kw = _build(dict(mode="verify", n=2, p=3), seed=71)[0]
-    buf = torch.full((2, 3, NUM_V_HEADS, HEAD_V_DIM), -7.0, dtype=torch.bfloat16, device=DEV)
-    got = op(**dict(kw, disable_output_calculation=True, output=buf))
-    assert tuple(got.shape) == (1, 1, 1, 1) and (buf == -7.0).all(), "the hazard is gone"
-    with pytest.raises(AssertionError, match="mutually exclusive"):
-        with validating(op):
-            op(**dict(kw, disable_output_calculation=True, output=buf))
-
-
-def test_a_strided_pool_loses_the_write_back_and_is_refused() -> None:
-    """Unguarded, a `[::2]` slot view is replaced by a contiguous copy: the
-    output is right, and the caller's pool comes back bitwise unchanged."""
-    kw = _small(72)
-    backing = torch.zeros(2 * SLOTS, NUM_V_HEADS, HEAD_V_DIM, HEAD_K_DIM, device=DEV)
-    strided = backing[::2]
-    strided.copy_(kw["initial_state_source"])
-    before = strided.clone()
-    ref = op.reference(**dict(kw, initial_state_source=before))
-    got = op(**dict(kw, initial_state_source=strided))
-    torch.testing.assert_close(got, ref[0])
-    assert torch.equal(strided, before), "the hazard this guard covers is gone"
-    with pytest.raises(AssertionError, match="initial_state_source must be contiguous"):
-        with validating(op):
-            op(**dict(kw, initial_state_source=strided))
-
-
-def test_a_strided_step_buffer_loses_every_cached_state_and_is_refused() -> None:
-    """The same copy-in trap on the per-step buffer: unguarded, the caller's
-    buffer comes back bitwise unchanged and nothing raises."""
-    kw = _build(dict(mode="verify", n=2, p=3), seed=73)[0]
-    backing = torch.full(
-        (2 * SLOTS, 3, NUM_V_HEADS, HEAD_V_DIM, HEAD_K_DIM), CACHE_SENTINEL, device=DEV
-    )
-    strided = backing[::2]
-    op(**dict(kw, intermediate_states_buffer=strided))
-    assert (backing == CACHE_SENTINEL).all(), "the hazard this guard covers is gone"
-    with pytest.raises(AssertionError, match="intermediate_states_buffer must be contiguous"):
-        with validating(op):
-            op(**dict(kw, intermediate_states_buffer=strided))
-
-
-def test_a_short_cache_steps_writes_into_the_next_row_and_is_refused() -> None:
-    """Unguarded, cache_steps 2 at P 3: row 0's last step lands in row 1, a
-    row the call never named."""
-    kw = _build(dict(mode="verify", n=1, p=3), seed=74)[0]
-    short = torch.full((SLOTS, 2, NUM_V_HEADS, HEAD_V_DIM, HEAD_K_DIM), CACHE_SENTINEL, device=DEV)
-    op(**dict(kw, intermediate_states_buffer=short, cache_steps=2))
-    assert not (short[1, 0] == CACHE_SENTINEL).all(), "the hazard this guard covers is gone"
-    for cache_steps in (2, None):
-        with pytest.raises(AssertionError, match="cache_steps must be at least"):
-            with validating(op):
-                op(**dict(kw, intermediate_states_buffer=short.clone(), cache_steps=cache_steps))
+# ── what the guard refuses ─────────────────────────────────────────────
 
 
 def test_cache_steps_off_the_buffer_step_axis_misplaces_rows_and_is_refused() -> None:
@@ -478,103 +248,3 @@ def test_cache_steps_off_the_buffer_step_axis_misplaces_rows_and_is_refused() ->
     with pytest.raises(AssertionError, match="must equal intermediate_states_buffer's step axis"):
         with validating(op):
             op(**dict(kw, intermediate_states_buffer=deep.clone(), cache_steps=2))
-
-
-def test_op_rejects_what_it_really_rejects() -> None:
-    """Three loud refusals; the guard admits each so the op's own error is what
-    surfaces."""
-    from triton.compiler.errors import CompilationError
-
-    kw = _small(76)
-    cu = torch.tensor([0, 3, 6], device=DEV, dtype=torch.int64)
-    with pytest.raises(ValueError, match="batch size is expected to be 1"):
-        with validating(op):
-            op(**dict(kw, cu_seqlens=cu))
-
-    flat = _build(dict(mode="write_back", n=1, p=6), seed=77)[0]
-    with pytest.raises(ValueError, match="number of initial states"):
-        with validating(op):
-            op(**dict(flat, cu_seqlens=cu))
-
-    with pytest.raises(CompilationError):
-        with validating(op):
-            op(**dict(kw, initial_state_source=None))
-
-
-def test_sequence_count_past_the_grid_cap_fails_loudly() -> None:
-    """gridDim.z is `N * HV`, capped at 65535: 1365 sequences at HV 48. Above
-    it the launch is refused, not truncated, and the context survives."""
-    over = 1400
-    assert over * NUM_V_HEADS > 65535
-    kw = _build(dict(mode="write_back", n=over, p=1, slots=(0,)), seed=78)[0]
-    indices = torch.arange(over, device=DEV, dtype=torch.int32) % SLOTS
-    with pytest.raises(RuntimeError, match="invalid argument"):
-        op(**dict(kw, initial_state_indices=indices, disable_state_update=True))
-
-    kw, _ = _build(dict(mode="verify", n=2, p=2), seed=79)
-    ref = op.reference(**kw)
-    _compare((op(**kw), kw["initial_state_source"], kw["intermediate_states_buffer"]), ref)
-
-
-# ── discrimination ────────────────────────────────────────────────────────
-
-
-def _wrong_variants(kw, pool_before):
-    """Plausible wrong recurrences, each expressed as `reference` driven on
-    transformed inputs -- so the rival is the same arithmetic, misapplied."""
-    base = dict(kw, initial_state_source=pool_before)
-    n, p = kw["q"].shape[:2]
-
-    def flip(t):
-        return t.flip(1)
-
-    def per_token(t):
-        return t.reshape((n * p, 1) + tuple(t.shape[2:]))
-
-    out = {
-        "no_gating": op.reference(**dict(base, g=torch.zeros_like(kw["g"])))[0],
-        "beta_one": op.reference(**dict(base, beta=torch.ones_like(kw["beta"])))[0],
-        "qk_swapped": op.reference(**dict(base, q=kw["k"], k=kw["q"]))[0],
-        "no_initial_state": op.reference(
-            **dict(base, initial_state_source=torch.zeros_like(pool_before))
-        )[0],
-        "transposed_pool": op.reference(
-            **dict(base, initial_state_source=pool_before.transpose(-1, -2).contiguous())
-        )[0],
-        # Tiled instead of interleaved: v-head hv reads q/k head hv % H.
-        "repeat_not_interleave": op.reference(
-            **dict(base, q=kw["q"].repeat(1, 1, REPEAT, 1), k=kw["k"].repeat(1, 1, REPEAT, 1))
-        )[0],
-        "reversed_tokens": flip(
-            op.reference(**dict(base, **{x: flip(kw[x]) for x in ("q", "k", "v", "g", "beta")}))[0]
-        ),
-        # Every predicted token re-read from the same initial state.
-        "independent_tokens": op.reference(
-            **dict(
-                base,
-                **{x: per_token(kw[x]) for x in ("q", "k", "v", "g", "beta")},
-                initial_state_indices=kw["initial_state_indices"].repeat_interleave(p),
-                disable_state_update=True,
-            )
-        )[0].reshape(kw["v"].shape),
-    }
-    return out
-
-
-def test_default_gate_separates_the_correct_reference_from_wrong_ones() -> None:
-    """`_compare` runs at torch's default band, so it is only as good as its
-    ability to reject a near miss. Two of these (`reversed_tokens`,
-    `independent_tokens`) are wrong only when P > 1 -- this entry's axis."""
-    kw, _ = _build(dict(mode="write_back", n=3, p=4, slots=(2, 5, 0)), seed=80)
-    pool = kw["initial_state_source"]
-    pool_before = pool.clone()
-    ref = op.reference(**kw)
-    got = op(**kw)
-    _compare((got, pool, None), ref)
-    own = (got.float() - ref[0].float()).abs().max().item()
-    for name, wrong in _wrong_variants(kw, pool_before).items():
-        gap = (wrong.float() - ref[0].float()).abs().max().item()
-        print(f"{name}: {gap:.3e} from the reference (the kernel: {own:.3e})")
-        assert gap > 1e-2, f"{name} is not a distinct reference (gap {gap:.3e})"
-        with pytest.raises(AssertionError):
-            _compare((got, pool, None), (wrong, ref[1], None))

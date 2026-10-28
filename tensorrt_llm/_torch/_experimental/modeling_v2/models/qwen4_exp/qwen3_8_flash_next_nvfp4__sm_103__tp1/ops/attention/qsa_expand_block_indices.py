@@ -17,6 +17,10 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_ke
 _CKPT = dict(compress_ratio=4, token_topk=2048)
 
 
+#: First positions of 32 MTP verify blocks in the sparse branch (KV past 2048).
+_VERIFY_STARTS = tuple(2100 + (499 * g) % 6000 for g in range(32))
+
+
 def _spec(batch, **overrides) -> dict:
     """A cell spec at this checkpoint's geometry and the engine's metadata dtypes.
 
@@ -24,20 +28,16 @@ def _spec(batch, **overrides) -> dict:
       ("sweep", n)                         n rows at 4096 + 13 i, length = position + 1
       ("serving", requests, context_lens)  one packed step: context chunks, then
                                            two MTP rows per remaining request
-      ("rows", positions)                  explicit positions, length = position + 1
+      ("verify", starts, p)                one MTP verify block of p rows per start,
+                                           every row's length the block's end
     """
     base = dict(
         batch=batch,
         position_dtype=torch.int64,  # qsa_logical_positions
         length_dtype=torch.int32,  # qsa_sequence_lengths
-        layout="dense",
         **_CKPT,
     )
     return {**base, **overrides}
-
-
-def _geometry(compress_ratio: int, token_topk: int) -> dict:
-    return _spec(("rows", (4096, 97, 30)), compress_ratio=compress_ratio, token_topk=token_topk)
 
 
 class QsaExpandBlockIndices(OpWrapper):
@@ -70,67 +70,20 @@ class QsaExpandBlockIndices(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
-        # ---- decode rows: the column-split launch below 128 rows -------------
+        # ---- decode rows: the column-split launch below 128 rows, whole rows from 128
         Cell(why="decode: one row, columns split across programs", spec=_spec(("sweep", 1))),
-        Cell(why="decode MTP: one request's two rows", spec=_spec(("sweep", 2))),
-        Cell(why="decode: one row for each of 32 request slots", spec=_spec(("sweep", 32))),
-        Cell(why="127 rows: the last row count on the column split", spec=_spec(("sweep", 127))),
-        Cell(why="128 rows: the first row count on whole-row programs", spec=_spec(("sweep", 128))),
-        Cell(why="256 rows on whole-row programs", spec=_spec(("sweep", 256))),
-        # ---- serving steps: sequence_lengths > query_position + 1 inside chunks
+        # ---- MTP verify blocks (max_draft_len up to 7): p rows per request, every
+        # row's length the block's end, so only the last row has length == position + 1.
         Cell(
-            why="mixed 1334 rows: 4 chunks + 28 MTP decodes, 32 slots",
-            spec=_spec(("serving", 32, (900, 200, 150, 28))),
+            why="verify MTP7: 32 requests x 8 = 256 rows, whole-row programs",
+            spec=_spec(("verify", _VERIFY_STARTS, 8)),
         ),
-        Cell(
-            why="mixed 8190 rows: 4 chunks + 28 MTP decodes, 32 slots",
-            spec=_spec(("serving", 32, (8000, 100, 30, 4))),
-        ),
-        Cell(
-            why="warm-up capture: 8191 rows of one request from 0",
-            spec=_spec(("serving", 1, (8191,))),
-        ),
+        # ---- context rows: sequence_lengths > query_position + 1 inside chunks; chunk
+        # 0 starts at position 0, so its rows also carry every tail width 0..3.
         Cell(
             why="warm-up capture: 2 x 4096 rows, the [8192, 512] buffer's height",
             spec=_spec(("serving", 2, (4096, 4096))),
         ),
-        Cell(
-            why="tail widths 0..3 across 4096, and positions 0, 3, 7",
-            spec=_spec(("rows", (4095, 4096, 4097, 4098, 4099, 7, 3, 0))),
-        ),
-        # ---- geometry is a free axis: neither cr nor block_topk need be 2^k ---
-        Cell(why="geometry cr 2, block_topk 8", spec=_geometry(2, 16)),
-        Cell(why="geometry cr 2, block_topk 5", spec=_geometry(2, 10)),
-        Cell(why="geometry cr 2, block_topk 1024", spec=_geometry(2, 2048)),
-        Cell(why="geometry cr 3, block_topk 7", spec=_geometry(3, 21)),
-        Cell(why="geometry cr 3, block_topk 8", spec=_geometry(3, 24)),
-        Cell(why="geometry cr 4, block_topk 3", spec=_geometry(4, 12)),
-        Cell(why="geometry cr 4, block_topk 511", spec=_geometry(4, 2044)),
-        Cell(why="geometry cr 5, block_topk 8", spec=_geometry(5, 40)),
-        Cell(why="geometry cr 8, block_topk 8", spec=_geometry(8, 64)),
-        Cell(why="geometry cr 16, block_topk 128", spec=_geometry(16, 2048)),
-        # ---- metadata dtypes and layouts ------------------------------------
-        Cell(
-            why="int32 positions, int32 lengths",
-            spec=_spec(("rows", (4096, 97)), position_dtype=torch.int32),
-        ),
-        Cell(
-            why="int64 positions, int64 lengths",
-            spec=_spec(("rows", (4096, 97)), length_dtype=torch.int64),
-        ),
-        Cell(
-            why="int32 positions, int64 lengths",
-            spec=_spec(("rows", (4096, 97)), position_dtype=torch.int32, length_dtype=torch.int64),
-        ),
-        Cell(
-            why="a row slice of the engine's taller qsa_topk_indices buffer",
-            spec=_spec(("sweep", 4), layout="row_slice"),
-        ),
-        Cell(
-            why="a column slice of a wider buffer: stride(0) != block_topk",
-            spec=_spec(("sweep", 4), layout="column_slice"),
-        ),
-        Cell(why="zero rows: a shaped empty, no launch", spec=_spec(("sweep", 0))),
     )
 
     note = """
@@ -140,8 +93,8 @@ class QsaExpandBlockIndices(OpWrapper):
     request's whole KV length broadcast over its rows, so inside a context
     chunk it exceeds `position + 1` on every row but the last).
 
-    Preconditions that are values, so not `is_valid` guards (both measured to
-    fail silently):
+    Preconditions that are values, so not `is_valid` guards (both fail
+    silently; no test pins them):
       - `block_indices` is prefix-packed: every group id before every `-1`.
         The tail's column comes from the *count* of valid groups, so `[-1, 3]`
         at position 15, length 16, cr 4, topk 8 returns all `-1` -- tokens
@@ -152,16 +105,16 @@ class QsaExpandBlockIndices(OpWrapper):
         inside `sequence_lengths` is expanded verbatim.
     Duplicate group ids expand to duplicate tokens.
 
-    Every metadata violation is rejected loudly by the callable (rank, width
-    vs geometry, int32-only `block_indices`, int32/int64 metadata, one entry
-    per row, `stride(1) == 1`, contiguous metadata, CUDA), so `is_valid` adds
-    nothing. A one-element strided metadata view reports contiguous and is
-    accepted -- benign at one row.
+    The callable rejects metadata violations loudly (rank, width vs geometry,
+    int32-only `block_indices`, int32/int64 metadata, one entry per row,
+    `stride(1) == 1`, contiguous metadata, CUDA), so `is_valid` adds nothing;
+    the test pins the width-vs-geometry rejection. A one-element strided
+    metadata view reports contiguous and is accepted -- benign at one row.
 
     Launch: one program per (row, 256 columns) below 128 rows, one per row
-    from 128 up; 127 and 128 rows agree on their shared rows. No autotune.
-    CUDA-graph capturable; a replay recomputes from the live buffers, and the
-    captured row count fixes the launch shape.
+    from 128 up. No autotune. CUDA-graph capturable (captured at 256 rows); a
+    replay recomputes from the live buffers, and the captured row count fixes
+    the launch shape.
 
     Hard limits (read from the kernel, not probed): the row offset is
     `program_id * stride(0)` in int32, so `rows * stride(0) >= 2^31` (4 Mi

@@ -22,6 +22,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.nccl_window_graph import (
+    abandon_nccl_window_graph_owner,
+    nccl_window_graph_capture,
+    release_nccl_window_graph_owner,
+)
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+
 from ..utils import _sync
 from .cupti import _build_cuda_graph_kernel_stats_cupti
 from .eager import _l2_flush_buffer
@@ -62,13 +69,18 @@ def _time_moe_forward_cuda_graph(
         _cupti_available = False
 
     # ---- 1. Pre-capture eager pass for shape discovery and lazy init/codegen.
-    with torch.inference_mode():
+    # ``forward`` runs outside ``ModelCaller``, so this harness owns the NCCL-window
+    # lease scope. This pass also registers every window size the capture below
+    # reuses; NCCL registration itself is not capture-safe.
+    with torch.inference_mode(), discard_nccl_window_tensor_outputs((x, router_logits)):
         eager_out = moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
+    # Only the output type is inspected; its window lease ended with the scope.
     if not isinstance(eager_out, torch.Tensor):
         raise RuntimeError(
             "CUDA-Graph timing requires a tensor output from moe.forward; got "
             f"{type(eager_out).__name__}. Use --no_cuda_graph for this case."
         )
+    del eager_out
     torch.cuda.synchronize()
 
     # ---- 2. Pre-create events; ``cudaEventRecordWithFlags`` makes graph-internal
@@ -93,38 +105,54 @@ def _time_moe_forward_cuda_graph(
     torch.cuda.synchronize()
 
     big_graph = torch.cuda.CUDAGraph()
-    with torch.inference_mode(), torch.cuda.graph(big_graph):
-        for i in range(iters):
-            if l2_buffer is not None:
-                l2_buffer.zero_()
-            _record_external(starts[i])
-            moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
-            _record_external(ends[i])
+    # Bind NCCL-window buffers requested during capture to this graph's pool, and
+    # hand them back only after the graph is gone.
+    graph_pool = torch.cuda.graph_pool_handle()
+    completed = False
+    try:
+        with torch.inference_mode(), nccl_window_graph_capture(big_graph, graph_pool):
+            for i in range(iters):
+                if l2_buffer is not None:
+                    l2_buffer.zero_()
+                _record_external(starts[i])
+                # Close each unrolled iteration's lease scope inside the capture so
+                # the next iteration reuses the same pool-owned window.
+                with discard_nccl_window_tensor_outputs((x, router_logits)):
+                    moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
+                _record_external(ends[i])
 
-    _sync()
-    for _ in range(warmup):
-        big_graph.replay()
-    _sync()
+        _sync()
+        for _ in range(warmup):
+            big_graph.replay()
+        _sync()
 
-    if _cupti_available:
-        _cupti.activity_flush_all(0)
-        _cupti_kernels.clear()
-        _cupti_events.clear()
+        if _cupti_available:
+            _cupti.activity_flush_all(0)
+            _cupti_kernels.clear()
+            _cupti_events.clear()
 
-    # Start the nsys capture AFTER warmup replays so only the measured replay is
-    # captured (cudaProfilerStart/Stop are host-side, bracketing the replay). The
-    # NVTX range wraps the host-side replay() (host NVTX is not recorded into the
-    # graph, so it must sit here); it marks the whole unrolled replay window.
-    profiler.start()
-    with measured_range(nsys):
-        big_graph.replay()
-    _sync()
-    profiler.stop()
+        # Start the nsys capture AFTER warmup replays so only the measured replay is
+        # captured (cudaProfilerStart/Stop are host-side, bracketing the replay). The
+        # NVTX range wraps the host-side replay() (host NVTX is not recorded into the
+        # graph, so it must sit here); it marks the whole unrolled replay window.
+        profiler.start()
+        with measured_range(nsys):
+            big_graph.replay()
+        _sync()
+        profiler.stop()
 
-    if _cupti_available:
-        _cupti.activity_flush_all(0)
+        if _cupti_available:
+            _cupti.activity_flush_all(0)
 
-    forward_times_ms = [starts[i].elapsed_time(ends[i]) for i in range(iters)]
+        forward_times_ms = [starts[i].elapsed_time(ends[i]) for i in range(iters)]
+        completed = True
+    finally:
+        big_graph.reset()
+        if completed:
+            release_nccl_window_graph_owner(graph_pool)
+        else:
+            # Local failures need not occur on every rank.
+            abandon_nccl_window_graph_owner(graph_pool)
 
     if _cupti_available:
         _cupti_kernels.sort(key=lambda k: k[1])

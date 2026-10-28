@@ -38,13 +38,24 @@ from ..accuracy_core import GSM8K, LlmapiAccuracyTestHarness
 
 # The targets assert their own SM at construction: certification is per GPU
 # architecture, and a receipt from another one says nothing here.
-skip_not_sm103 = pytest.mark.skipif(
-    get_sm_version() != 103, reason="modeling_v2 targets in this batch are certified on sm_103 only"
+skip_not_sm10x = pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="modeling_v2 targets in this batch are certified on sm_100 and sm_103 only",
 )
 
 
-class TestModelingV2GptOss120bSm103Tp1(LlmapiAccuracyTestHarness):
-    """gpt-oss-120b / sm_103 / tp1."""
+class TestModelingV2GptOss120bSm10xDefault(LlmapiAccuracyTestHarness):
+    """gpt-oss-120b / sm_10x / default, one case per layout its routing admits.
+
+    Each layout cuts the weights differently (heads, expert windows, the two
+    intermediate padding rules) or crosses ranks differently (none at one GPU,
+    fused allreduce, or allgather + reduce-scatter under attention DP), and a
+    wrong cut still produces fluent text, so every layout was measured before
+    routing admitted it. CI runs a representative subset (the l0_b300 and
+    l0_gb300 test lists): one GPU, each residual-norm path, each expert split
+    and both padding rules. The cut of every layout is pinned on the CPU by
+    test_modeling_v2_gpt_oss_default_shards.py.
+    """
 
     # The registry key upstream uses for this checkpoint; it carries the
     # W4A8_MXFP4_MXFP8 entry the engine resolves from its quantization_config.
@@ -60,8 +71,31 @@ class TestModelingV2GptOss120bSm103Tp1(LlmapiAccuracyTestHarness):
         "fewshot_as_multiturn": True,
     }
 
-    @skip_not_sm103
-    def test_gsm8k(self, mocker):
+    @skip_not_sm10x
+    @pytest.mark.parametrize(
+        "world_size, moe_tp_size, moe_ep_size, attention_dp",
+        [
+            pytest.param(1, 1, 1, False, id="tp1"),
+            pytest.param(2, 2, 1, False, id="tp2", marks=pytest.mark.skip_less_device(2)),
+            pytest.param(2, 1, 2, False, id="tp2_ep2", marks=pytest.mark.skip_less_device(2)),
+            pytest.param(4, 4, 1, False, id="tp4", marks=pytest.mark.skip_less_device(4)),
+            pytest.param(4, 1, 4, False, id="tp4_ep4", marks=pytest.mark.skip_less_device(4)),
+            pytest.param(
+                4, 2, 2, False, id="tp4_moetp2_ep2", marks=pytest.mark.skip_less_device(4)
+            ),
+            pytest.param(2, 1, 2, True, id="dep2", marks=pytest.mark.skip_less_device(2)),
+            pytest.param(4, 1, 4, True, id="dep4", marks=pytest.mark.skip_less_device(4)),
+            pytest.param(
+                4, 2, 2, True, id="dep4_moetp2_ep2", marks=pytest.mark.skip_less_device(4)
+            ),
+            pytest.param(8, 8, 1, False, id="tp8", marks=pytest.mark.skip_less_mpi_world_size(8)),
+            pytest.param(
+                8, 1, 8, False, id="tp8_ep8", marks=pytest.mark.skip_less_mpi_world_size(8)
+            ),
+            pytest.param(8, 1, 8, True, id="dep8", marks=pytest.mark.skip_less_mpi_world_size(8)),
+        ],
+    )
+    def test_gsm8k(self, mocker, world_size, moe_tp_size, moe_ep_size, attention_dp):
         # Both patches are the protocol the anchor was measured under, and both
         # are what TestGPTOSS applies to this same checkpoint. The stock 256
         # tokens truncate it mid-chain-of-thought, before it ever reaches an
@@ -82,6 +116,10 @@ class TestModelingV2GptOss120bSm103Tp1(LlmapiAccuracyTestHarness):
         # does, which is the rank rather than this process.
         with LLM(
             self.MODEL_PATH,
+            tensor_parallel_size=world_size,
+            moe_tensor_parallel_size=moe_tp_size,
+            moe_expert_parallel_size=moe_ep_size,
+            enable_attention_dp=attention_dp,
             modeling_v2="require",
             env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
         ) as llm:

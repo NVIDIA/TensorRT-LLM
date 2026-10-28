@@ -8,8 +8,9 @@ from types import SimpleNamespace
 import pytest
 
 grpc = pytest.importorskip(  # noqa: E402
-    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
+    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.73.1,<2")'
 )
+pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 from conftest import AbortError, FakeServicerContext  # noqa: E402
 
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
@@ -19,6 +20,7 @@ from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     model_pb2,
     server_pb2,
 )
+from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities  # noqa: E402
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 from tensorrt_llm.llmapi import KVEventsConfig  # noqa: E402
@@ -166,6 +168,25 @@ async def test_model_info_reports_the_context_window_and_capabilities():
     assert model_pb2.GUIDED_DECODING_MODE_JSON_SCHEMA in info.generation.guided_decoding.modes
     assert info.generation.output_logprobs.supported is True
     assert info.supports_token_ids_input is True
+    assert info.supports_multimodal is False
+    assert list(info.extra["trtllm_supported_modalities"]) == []
+
+
+@pytest.mark.asyncio
+async def test_model_info_advertises_loaded_image_support(monkeypatch):
+    inference = _inference()
+    monkeypatch.setattr(
+        inference,
+        "_media_capabilities",
+        MediaCapabilities({"image": "<image_{}>"}),
+    )
+
+    info = await _servicer(inference=inference).GetModelInfo(
+        model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
+    )
+
+    assert info.supports_multimodal is True
+    assert list(info.extra["trtllm_supported_modalities"]) == ["image"]
 
 
 @pytest.mark.asyncio
@@ -498,10 +519,11 @@ async def test_health_reports_not_ready_for_a_crashed_engine_that_is_not_shut_do
 
 
 @pytest.mark.asyncio
-async def test_health_survives_a_raising_health_check():
+@pytest.mark.parametrize("error_type", [RuntimeError, TypeError, AttributeError])
+async def test_health_survives_a_raising_health_check(error_type):
     """A probe reports state; it must not turn an engine fault into an RPC error."""
     llm = _llm()
-    llm._check_health = lambda: (_ for _ in ()).throw(RuntimeError("engine gone"))
+    llm._check_health = lambda: (_ for _ in ()).throw(error_type("engine gone"))
     servicer = OpenEngineControlServicer(llm, MODEL, _inference(), kv_transfer_backend="")
 
     response = await servicer.Health(lifecycle_pb2.HealthRequest(), FakeServicerContext())

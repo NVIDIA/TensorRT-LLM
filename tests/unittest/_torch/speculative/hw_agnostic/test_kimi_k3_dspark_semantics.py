@@ -27,13 +27,11 @@ from typing import Optional
 import pytest
 import torch
 import torch.nn.functional as F
+from _torch.helpers import dspark_markov_chain_logits_reference
 
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM, dspark_layer_window_size
 from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
-from tensorrt_llm._torch.models.modeling_speculative import (
-    dspark_markov_chain_logits,
-    dspark_markov_step_bias,
-)
+from tensorrt_llm._torch.models.modeling_speculative import dspark_markov_step_bias
 from tensorrt_llm._torch.speculative.dflash import dflash_draft_slot_ids
 
 needs_cuda = pytest.mark.skipif(
@@ -118,7 +116,7 @@ def test_markov_chain_matches_deepspec_reference():
     w1, w2, base, anchor = _random_markov()
     ref_tokens, ref_logits = _RefVanillaMarkov(w1, w2).sample_block_tokens(base, anchor)
 
-    out = dspark_markov_chain_logits(base, anchor, w1, w2)
+    out = dspark_markov_chain_logits_reference(base, anchor, w1, w2)
     assert torch.equal(out, ref_logits)
     # Greedy per-position argmax of the corrected logits reproduces the
     # reference sequentially-sampled chain (what sample_draft_tokens does).
@@ -128,7 +126,7 @@ def test_markov_chain_matches_deepspec_reference():
 def test_markov_chain_empty_block_is_noop():
     w1, w2, base, anchor = _random_markov()
     empty = base[:, :0, :]
-    assert dspark_markov_chain_logits(empty, anchor, w1, w2) is empty
+    assert dspark_markov_chain_logits_reference(empty, anchor, w1, w2) is empty
 
 
 def test_markov_chain_sharded_matches_full_vocab():
@@ -136,7 +134,7 @@ def test_markov_chain_sharded_matches_full_vocab():
     contiguous markov_w2/logits vocab shard, chained through a global
     argmax over all shards — reassembles to the full-vocab chain."""
     w1, w2, base, anchor = _random_markov()
-    full = dspark_markov_chain_logits(base, anchor, w1, w2)
+    full = dspark_markov_chain_logits_reference(base, anchor, w1, w2)
 
     tp = 4
     shard_w = VOCAB // tp

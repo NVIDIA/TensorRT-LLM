@@ -61,6 +61,10 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     transform_local_topk_and_prepare_pool_view_grouped,
 )
+from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
+    use_cute_dsl_paged_mqa_logits as resolve_cute_dsl_paged_mqa_logits,
+)
+from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAParams
 from tensorrt_llm._torch.attention.backends.sparse.params import use_self_sampling_gvr
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -175,6 +179,97 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params(use_self_samp
     # The metadata mirror of the two-level dispatch drives prior allocation.
     assert metadata.use_self_sampling_topk == use_self_sampling
     assert metadata.needs_gvr_prior == (not use_self_sampling)
+
+
+@pytest.mark.parametrize(
+    "requested,cute_dsl_available,sm_100f,expected",
+    [
+        (True, True, True, True),
+        (True, True, False, False),  # Hopper / SM120: the custom op raises
+        (True, False, True, False),  # cutlass-dsl not installed
+        (False, True, True, False),
+    ],
+)
+def test_cute_dsl_paged_mqa_logits_gate(requested, cute_dsl_available, sm_100f, expected):
+    """Metadata and Indexer take the same decision: metadata builds the DSL
+    atom-split buffers and skips the sm90 MTP expansion off it."""
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        compress_ratios=[1, 4, 128],
+        index_head_dim=96,
+        index_topk=512,
+        indexer_k_dtype="fp8",
+        use_cute_dsl_paged_mqa_logits=requested,
+    )
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.sparse_metadata_params = sparse_config.to_sparse_metadata_params()
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=256,
+        compressed_block_sizes={},
+        get_cache_indices=Mock(),
+    )
+    metadata.is_cuda_graph = False
+    metadata.create_buffers_for_mla_rope_append = Mock()
+    metadata.create_buffers_for_indexer = Mock()
+
+    indexer_mod = "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer"
+    with (
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.TrtllmAttentionMetadata.__post_init__"
+        ),
+        patch(f"{indexer_mod}.IS_CUTLASS_DSL_AVAILABLE", cute_dsl_available),
+        patch(f"{indexer_mod}.is_sm_100f", return_value=sm_100f),
+    ):
+        DSAtrtllmAttentionMetadata.__post_init__(metadata)
+        indexer_decision = resolve_cute_dsl_paged_mqa_logits(
+            sparse_config.to_sparse_params().use_cute_dsl_paged_mqa_logits
+        )
+        assert metadata.use_cute_dsl_paged_mqa_logits is expected
+    assert indexer_decision is expected
+
+
+@pytest.mark.parametrize(
+    "next_n,kernel_atoms,batch_size,max_ctx,expected",
+    [
+        (4, (1, 2, 3, 4), 32, 65536, (1, 4, 1)),  # exact atom: caller-side, unchanged
+        (6, (1, 2, 3), 32, 65536, (2, 3, 1)),  # exact divisor 3: caller-side
+        (7, (1, 2, 3, 4), 128, 65536, (1, 4, 2)),  # in-kernel 4 + 3: fewer waves
+        (7, (1, 2, 3), 128, 65536, (1, 3, 3)),  # FP4: 3 + 2 + 2
+        (5, (1, 2, 3, 4), 128, 65536, (1, 3, 2)),  # tile = widest atom (3 + 2)
+        (7, (1, 2, 3, 4), 1, 4096, (7, 1, 1)),  # wave tie: keep atom 1
+        (7, (1, 2, 3), 1, 65536, (7, 1, 1)),  # B=1: too few waves for the split to pay
+        (7, (1, 2, 3), 32, 4096, (1, 3, 3)),  # 24 atom-1 waves: split
+        (7, (1, 2, 3, 4), 0, 0, (1, 4, 2)),  # workload unknown: fewer KV passes
+    ],
+)
+def test_pick_dsl_split(next_n, kernel_atoms, batch_size, max_ctx, expected):
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import _pick_dsl_split
+
+    got = _pick_dsl_split(
+        next_n, num_sms=148, batch_size=batch_size, max_ctx=max_ctx, kernel_atoms=kernel_atoms
+    )
+    assert got == expected
+
+
+@pytest.mark.parametrize("next_n,num_atoms", [(4, 2), (5, 2), (7, 2), (7, 3), (8, 3)])
+def test_atom_ctx_offsets_match_kernel(next_n, num_atoms):
+    """The indexer's stagger must equal the kernel's _atom_ctx_len stagger."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import _atom_ctx_offsets
+    from tensorrt_llm._torch.attention.kernels.blackwell.paged_mqa_logits.mqa_logits_util import (
+        atom_tokens_after,
+    )
+
+    base, rem = divmod(next_n, num_atoms)
+    assert _atom_ctx_offsets(next_n, num_atoms) == [
+        atom_tokens_after(i, num_atoms, base, rem, next_n) for i in range(num_atoms)
+    ]
+
+
+def test_cute_dsl_paged_mqa_logits_default_is_aligned():
+    """ModelConfig.from_pretrained's no-config fallback reads the config
+    default, so the config classes and DSAParams must agree on it."""
+    assert DeepSeekSparseAttentionConfig().use_cute_dsl_paged_mqa_logits is True
+    assert DeepSeekV4SparseAttentionConfig().use_cute_dsl_paged_mqa_logits is True
+    assert DSAParams().use_cute_dsl_paged_mqa_logits is True
 
 
 @pytest.mark.parametrize(
@@ -309,11 +404,10 @@ def test_metadata_warmup_selfsampling_prefill_leg(
         kv_cache_manager=SimpleNamespace(),
         get_indexer_max_seq_len=Mock(return_value=msl_c),
         sparse_metadata_params=SimpleNamespace(use_cute_dsl_paged_mqa_logits=True),
+        use_cute_dsl_paged_mqa_logits=True,
         num_sms=148,
     )
-    ss_host = (
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host"
-    )
+    ss_host = "tensorrt_llm._torch.kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host"
     with (
         patch(
             "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.IS_CUTLASS_DSL_AVAILABLE",
@@ -386,7 +480,6 @@ def test_gvr_prior_writeback_uses_aux_stream():
             request_ids,
             kv_lens.tolist(),
             is_gen=False,
-            prepare_resource=True,
         )
         metadata = _create_mock_metadata(
             request_ids,
@@ -1777,12 +1870,18 @@ def _create_mock_metadata(
     enable_context_mla_with_cached_kv=False,
     index_topk=2048,
     enable_indexer_skip=False,
-    use_cute_dsl_paged_mqa_logits=False,
+    use_cute_dsl_paged_mqa_logits=None,
     compress_ratio=1,
     indexer_head_dim=128,
     max_num_tokens=8192,
 ):
     """Helper to create mock metadata for testing."""
+    if use_cute_dsl_paged_mqa_logits is None:
+        # Match the indexer built from the config default: the buffer layout
+        # (separate full-next_n schedule) differs between the two kernels.
+        use_cute_dsl_paged_mqa_logits = resolve_cute_dsl_paged_mqa_logits(
+            DeepSeekSparseAttentionConfig.model_fields["use_cute_dsl_paged_mqa_logits"].default
+        )
 
     class MockKVCacheParams:
         """Mock KV cache parameters holding per-sequence cached token counts."""
@@ -1794,7 +1893,7 @@ def _create_mock_metadata(
     class MockMetadata(DSAtrtllmAttentionMetadata):
         """Mock DSA attention metadata for unit testing indexer operations."""
 
-        def __init__(self, cache_manager):
+        def __init__(self, cache_manager: DSACacheManager | DSACacheManagerV2) -> None:
             """Initialize mock metadata with buffers, block tables, and indexer state.
 
             `cache_manager` is a parameter rather than a capture of the enclosing
@@ -1833,7 +1932,7 @@ def _create_mock_metadata(
             self._tokens_per_block = tpb
             self.kv_lens_cuda_runtime = kv_lens.cuda()
             self.indexer_k_cache_block_offsets = torch.zeros(
-                [batch_size, cache_manager.max_blocks_per_seq],
+                [batch_size, self.kv_cache_manager.max_blocks_per_seq],
                 device="cuda",
                 dtype=torch.int32,
             )
@@ -1842,7 +1941,7 @@ def _create_mock_metadata(
                 device="cpu",
                 pin_memory=True,
             )
-            block_ids = cache_manager.get_batch_cache_indices(request_ids)
+            block_ids = self.kv_cache_manager.get_batch_cache_indices(request_ids)
             for i in range(len(block_ids)):
                 self.host_indexer_k_cache_block_offsets[i, : len(block_ids[i])] = torch.tensor(
                     block_ids[i], dtype=torch.int32
@@ -2110,9 +2209,7 @@ def test_recompute_slot_mappings_matches_prepare_with_cached_tokens(dsa_cache_ma
         max_seq_len=256,
         num_layers=1,
     )
-    cache_manager.add_dummy_requests(
-        request_ids, kv_lens.tolist(), is_gen=False, prepare_resource=True
-    )
+    cache_manager.add_dummy_requests(request_ids, kv_lens.tolist(), is_gen=False)
     metadata = _create_mock_metadata(
         request_ids,
         len(request_ids),
@@ -2175,9 +2272,7 @@ def test_indexer_k_cache_scatter_custom_op(dsa_cache_manager):
     # Allocate blocks
     request_ids = list(range(batch_size))
     tokens_per_req = [32, 32, 32]
-    cache_manager.add_dummy_requests(
-        request_ids, tokens_per_req, is_gen=False, prepare_resource=True
-    )
+    cache_manager.add_dummy_requests(request_ids, tokens_per_req, is_gen=False)
 
     # Create metadata
     metadata = _create_mock_metadata(
@@ -2355,9 +2450,7 @@ def test_fp8_k_cache_roundtrip(dsa_cache_manager):
 
     # Allocate blocks for both requests
     request_ids = [0, 1]
-    cache_manager.add_dummy_requests(
-        request_ids, num_tokens_per_req, is_gen=False, prepare_resource=True
-    )
+    cache_manager.add_dummy_requests(request_ids, num_tokens_per_req, is_gen=False)
 
     # Prepare and write data for each request
     total_tokens = sum(num_tokens_per_req)
@@ -2511,7 +2604,6 @@ def test_indexer_decode_with_paged_kv_cache(
         request_ids=request_ids,
         token_nums=final_kv_lens.tolist(),
         is_gen=False,
-        prepare_resource=True,
     )
 
     # Generate test data with variable lengths
@@ -2802,7 +2894,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend, dsa
 
     request_ids = list(range(batch_size))
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=final_lens.tolist(), is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=final_lens.tolist(), is_gen=False
     )
 
     total_context_tokens = context_lens_context.sum().item()
@@ -3713,7 +3805,7 @@ def test_indexer_chunked_prefill(
     # Allocate blocks for all sequences
     request_ids = list(range(batch_size))
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=seq_lens_list, is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=seq_lens_list, is_gen=False
     )
 
     # Generate test data
@@ -3980,7 +4072,7 @@ def test_indexer_decode_custom_vs_fallback(
     request_ids = list(range(batch_size))
     final_lens = kv_lens + next_n  # Historical + new decode tokens
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=final_lens.tolist(), is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=final_lens.tolist(), is_gen=False
     )
 
     # Populate KV cache with historical context
@@ -4175,7 +4267,6 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size, dsa_cache_manager
         request_ids=request_ids,
         token_nums=reserve,
         is_gen=False,
-        prepare_resource=True,
     )
 
     def make_inputs(n_tokens):
@@ -4345,7 +4436,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(
     # Allocate cache blocks
     request_ids = list(range(batch_size))
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=seq_lens.tolist(), is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=seq_lens.tolist(), is_gen=False
     )
 
     # Generate test data
@@ -4459,7 +4550,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(
 
     request_ids = list(range(batch_size))
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=seq_lens.tolist(), is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=seq_lens.tolist(), is_gen=False
     )
 
     # Generate test data
@@ -4631,9 +4722,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip, ds
 
     # Allocate blocks
     request_ids = [0, 1]
-    cache_manager.add_dummy_requests(
-        request_ids, total_kv_lens, is_gen=False, prepare_resource=True
-    )
+    cache_manager.add_dummy_requests(request_ids, total_kv_lens, is_gen=False)
 
     # Generate test data
     q = torch.randn((total_tokens, heads, head_dim), device="cuda", dtype=torch.bfloat16)
@@ -4799,9 +4888,7 @@ def _mla_prefill_reuse_case(monkeypatch, dsa_cache_manager):
     )
     indexer = create_indexer(sparse_attn_config, layer_idx=0)
     request_ids = list(range(batch_size))
-    cache_manager.add_dummy_requests(
-        request_ids, total_kv_lens, is_gen=False, prepare_resource=True
-    )
+    cache_manager.add_dummy_requests(request_ids, total_kv_lens, is_gen=False)
 
     # Write distinct K for every position first, so the cached prefixes hold
     # real values rather than ties that either chunking may break differently.
@@ -5113,7 +5200,7 @@ def test_cutedsl_mqa_logits_output_buffer_persistent(dsa_cache_manager):
     request_ids = list(range(batch_size))
     kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32)
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=kv_lens.tolist(), is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=kv_lens.tolist(), is_gen=False
     )
 
     metadata = _create_mock_metadata(
@@ -5190,7 +5277,6 @@ def test_topk_indices_buffer_cuda_graph(dsa_cache_manager):
         request_ids=request_ids,
         token_nums=kv_lens.tolist(),
         is_gen=False,
-        prepare_resource=True,
     )
 
     metadata = _create_mock_metadata(

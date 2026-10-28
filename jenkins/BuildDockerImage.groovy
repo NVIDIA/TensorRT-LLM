@@ -793,7 +793,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
-            dockerfileStage: "release",
+            dockerfileStage: "tritonrelease",
         ],
         (stageNames.internalReleaseSBSA): [
             target: "trtllm",
@@ -801,7 +801,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             customTag: LLM_BRANCH_TAG + "-sbsa",
             build_wheel: true,
             arch: "arm64",
-            dockerfileStage: "release",
+            dockerfileStage: "tritonrelease",
         ],
         (stageNames.ciImageX86): [:],
         (stageNames.ciImageSBSA): [
@@ -979,7 +979,7 @@ pipeline {
         booleanParam(
             name: "useWheelFromBuildStage",
             defaultValue: false,
-            description: "Install the wheel from the build-stage tarball instead of compiling one inside the image. Read since Aug 2025 but never DECLARED, so params.useWheelFromBuildStage was always null and prepareWheelFromBuildStage() returned early on every run -- see nvbug 5433581, whose temporary kill switch was never reverted. Declared here so the flag is at least capable of being set; it stays false by default, and nothing turns it on. boltOptimizeWheel does NOT depend on it: a BOLT request carries itself past this gate for the SBSA release image only."
+            description: "Install the build-stage wheel instead of compiling inside the image. The declared job default is false; the nightly release caller explicitly enables this option. SBSA release images with boltOptimizeWheel enabled require the build-stage wheel independently of this flag."
         )
         booleanParam(
             name: "boltOptimizeWheel",

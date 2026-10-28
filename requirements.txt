@@ -48,7 +48,7 @@ pydantic-settings[yaml]
 msgspec
 omegaconf
 pillow
-PyNvVideoCodec~=2.1.0
+PyNvVideoCodec>=2.2.0
 optimum
 datasets
 evaluate
@@ -69,7 +69,7 @@ patchelf
 einops
 fla-core==0.5.2 # the Kimi Linear / Kimi K3 KDA layers import fla.modules and fla.ops when they load
 flashinfer-python==0.6.18
-xgrammar==0.1.32
+xgrammar==0.2.8
 llguidance==0.7.29
 jsonschema
 backoff
@@ -88,10 +88,10 @@ triton==3.8.0 # NOTE: if you update this, you must also run scripts/vendor_trito
 tiktoken
 blobfile
 openai-harmony==0.0.4
-# 4.8.0.dev0 is the first release exposing Rubin/SM107.
-nvidia-cutlass-dsl[cu13]==4.8.0.dev0; python_version >= "3.10" # required by PrimTS task-scheduled kernels and Rubin CuTe DSL kernels
+# 4.8.0 is the first final release exposing Rubin/SM107 (replaces the 4.8.0.dev0 pre-release pin).
+nvidia-cutlass-dsl[cu13]==4.8.0; python_version >= "3.10" # required by PrimTS task-scheduled kernels and Rubin CuTe DSL kernels
 nvidia-matmul-heuristics==0.1.0.27; python_version >= "3.10" # analytic GEMM heuristics for CuTe DSL autotuner tactic pruning
-quack-kernels==0.5.0; python_version >= "3.10" # required for MiniMax-M3 MSA and FlashAttention 4; only published release compatible with CUTLASS DSL >= 4.7
+quack-kernels==0.5.0; python_version >= "3.10" # required for MiniMax-M3 MSA, FlashAttention 4 and the opt-in GatedMLP SwiGLU GEMM epilogue; only published release compatible with CUTLASS DSL >= 4.7
 jinja2 # required for MinimaxM3 MSA
 plotly
 numexpr
@@ -109,7 +109,9 @@ nvidia-cuda-tileiras>=13.1,<13.2
 nvidia-cudnn-frontend>=1.27.0,<1.28
 etcd-sdk-python==0.0.7
 # Required by the checked-in OpenEngine gRPC bindings.
-grpcio>=1.67.1,<2
+grpcio>=1.73.1,<2
+# Provides the standard async gRPC Health service used by OpenEngine.
+grpcio-health-checking>=1.73.1,<1.82
 # etcd-sdk-python imports google.protobuf but omits it from its package metadata.
 # The binding lower bound comes from the CUTLASS DSL libraries, which need protobuf 6.x.
 protobuf>=6.30.2,<7

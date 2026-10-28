@@ -42,7 +42,13 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    _DEVICE_PAGE_TABLE_ENV,
+    KVCacheManagerV2,
+    Role,
+    _BasePageTableMaterializer,
+)
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import (
@@ -51,19 +57,25 @@ from tensorrt_llm.llmapi.llm_args import (
     MiniMaxM3SparseAttentionConfig,
 )
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, PageIndexMode
 
 DRAFT_LOCAL_LAYER = 60
+_CACHE_MANAGER_MODULE = "tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager"
 SCALE = 179  # sub-pages per M3 mega-slot: 3 dense x 2 + 57 sparse x 3 + draft x 2
 DRAFT_K_ADDR = 0x7000_0000
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+@pytest.mark.parametrize("setting", ["0", "1"])
 def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
     monkeypatch: pytest.MonkeyPatch,
+    setting: str,
 ) -> None:
     """Exercise real pool allocation, the draft page table and the resolved cache views."""
     torch.cuda.init()
+    if setting == "0" and not prefer_pinned():
+        pytest.skip("native host-reading kernel requires GPU-addressable host memory")
+    monkeypatch.setenv(_DEVICE_PAGE_TABLE_ENV, setting)
     manager = MiniMaxM3KVCacheManagerV2(
         KvCacheConfig(
             max_gpu_total_bytes=16 << 20,
@@ -119,7 +131,7 @@ def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
         )
 
         # One device copy converts the draft layer's slot ids to P128 pages.
-        copy_idx = torch.tensor([0, 1], dtype=torch.int32, pin_memory=True)
+        copy_idx = torch.tensor([0, 1], dtype=torch.int32, pin_memory=prefer_pinned())
         monkeypatch.setattr(
             manager,
             "index_mapper",
@@ -127,12 +139,15 @@ def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
         )
         device_copy = Mock(wraps=m3_cache_manager.copy_batch_block_offsets_to_device)
         monkeypatch.setattr(m3_cache_manager, "copy_batch_block_offsets_to_device", device_copy)
+        monkeypatch.setattr(kv_cache_manager_v2, "copy_batch_block_offsets_to_device", device_copy)
         draft_output = torch.full(
             (1, 2, 2, draft.max_blocks_per_seq), -7, dtype=torch.int32, device="cuda"
         )
         draft.copy_batch_block_offsets(draft_output, [101, 102], 1, 0, 2)
         torch.cuda.synchronize()
         device_copy.assert_called_once()
+        source, _, indices, scales, offsets, _ = device_copy.call_args.args
+        assert all(t.is_cuda == (setting == "1") for t in (source, indices, scales, offsets))
         converter = manager.impl.get_page_index_converter(4, Role.KEY)
         for row, slot in enumerate((2, 5)):
             expected_k = converter([slot] * draft.max_blocks_per_seq, PageIndexMode.SHARED)
@@ -172,6 +187,7 @@ def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
 @pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
 def test_block_scale_role_uses_global_layer_ids(dtype: DataType) -> None:
     manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.layer_specs = None
     manager.dtype = dtype
     manager.pp_layers = [60, 7, 2]
     manager.sparse_layer_ids = {7}
@@ -180,6 +196,7 @@ def test_block_scale_role_uses_global_layer_ids(dtype: DataType) -> None:
         assert manager._get_block_scale_role(Role.KEY, local_layer) == expected
         assert manager._get_block_scale_role(Role.VALUE, local_layer) is None
     generic = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    generic.layer_specs = None
     generic.dtype = dtype
     expected = Role.KEY_BLOCK_SCALE if dtype == DataType.NVFP4 else None
     assert generic._get_block_scale_role(Role.KEY, 0) == expected
@@ -229,6 +246,7 @@ def test_block_offset_copy_fills_the_virtual_pool_from_the_source_pool(monkeypat
     manager.dtype = DataType.FP8
     manager.num_attention_op_pools = 2
     manager._draft_op_pools = ((1, 0),)
+    manager.num_pools = 1
     manager._draft_index_scales = torch.tensor([SCALE], dtype=torch.int32)
     manager._draft_kv_offsets = torch.tensor([1], dtype=torch.int32)
     manager.host_kv_cache_block_offsets = torch.zeros((1, 4, 2, 8), dtype=torch.int32)
@@ -262,6 +280,77 @@ def test_block_offset_copy_fills_the_virtual_pool_from_the_source_pool(monkeypat
     hybrid.num_attention_op_pools = 0
     hybrid.copy_batch_block_offsets(dst, [7], 1, 0, 1)
     assert calls == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.parametrize("setting", ["0", "1"], ids=["native", "forced_cc"])
+def test_shared_draft_page_tables_use_real_materialization(
+    monkeypatch: pytest.MonkeyPatch, setting: str
+) -> None:
+    """Exercise base and virtual pool launches without allocating a model's KV cache."""
+    if setting == "0" and not prefer_pinned():
+        pytest.skip("native expansion requires GPU-addressable host memory")
+    monkeypatch.setenv(_DEVICE_PAGE_TABLE_ENV, setting)
+    pin = setting == "0"
+    host = torch.arange(32, dtype=torch.int32).reshape(1, 4, 8)
+    table = torch.full((1, 4, 2, 8), 777, dtype=torch.int32, pin_memory=pin)
+    table[:, :, 0] = host
+    table[0, 2, 0, -1] = BAD_PAGE_INDEX
+    stream = torch.cuda.current_stream()
+
+    def prepare_base(self, index_mapper_capacity: int) -> None:
+        # Only storage setup is stubbed. Both initialization of the draft
+        # materializers and all row gathers, H2D copies and kernels are real.
+        self.num_pools = 1
+        self._use_per_layer_page_tables = False
+        self.host_kv_cache_block_offsets = table
+        self._stream = stream
+        self.index_scales = torch.tensor([3], dtype=torch.int32, pin_memory=pin)
+        self.kv_offset = torch.tensor([1], dtype=torch.int32, pin_memory=pin)
+        self._page_table_materializer = _BasePageTableMaterializer(
+            table, stream, self.index_scales, self.kv_offset
+        )
+        self.kv_cache_pool_pointers = torch.tensor([[0, 0]], dtype=torch.int64)
+        self.kv_cache_pool_mapping = torch.tensor([[0, 0], [0, 1], [0, 2]], dtype=torch.int32)
+
+    monkeypatch.setattr(KVCacheManagerV2, "_prepare_page_table_tensor", prepare_base)
+    monkeypatch.setattr(
+        MiniMaxM3KVCacheManagerV2,
+        "_kv_slot_geometry",
+        lambda self, layer: (0, None, 4, 5 + 2 * layer, None),
+    )
+    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager._shared_draft_layer_ids = [1, 2]
+    manager.dtype = DataType.FP8
+    manager.layer_offsets = {0: 0, 1: 1, 2: 2}
+    manager.is_draft = False
+    manager.enable_swa_scratch_reuse = False
+    manager.tokens_per_block = 128
+    manager.max_copy_beam_width = 1
+    manager.kv_cache_type = CacheType.SELF
+    manager._prepare_page_table_tensor(4)
+    assert manager._draft_op_pools == ((1, 0), (2, 0))
+    assert len(manager._draft_page_table_materializers) == (2 if setting == "1" else 0)
+
+    # Reorder and shrink the batch between launches; retained staging must
+    # reread the live source instead of reusing the preceding batch's rows.
+    for request_ids in ([2, 0], [1]):
+        copy_idx = torch.tensor(request_ids, dtype=torch.int32, pin_memory=pin)
+        manager.index_mapper = SimpleNamespace(
+            get_copy_index=lambda ids, nc, bw, replicate_beam_zero=False: copy_idx
+        )
+        output = torch.full((3, 4, 2, 8), -12345, dtype=torch.int32, device="cuda")
+        manager.copy_batch_block_offsets(output, request_ids, 1, 0, len(request_ids))
+        stream.synchronize()
+        actual = output.cpu()
+        pages = table[0, request_ids, 0]
+        for pool, scale in enumerate((3, 7, 9)):
+            keys = torch.where(pages == BAD_PAGE_INDEX, 0, pages * scale)
+            values = torch.where(pages == BAD_PAGE_INDEX, 0, pages * scale + 1)
+            torch.testing.assert_close(actual[pool, : len(request_ids), 0], keys)
+            torch.testing.assert_close(actual[pool, : len(request_ids), 1], values)
+        assert torch.all(actual[:, len(request_ids) :] == -12345)
+        table[:, :, 0, 0] += 10
 
 
 @pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
@@ -299,6 +388,45 @@ def test_per_layer_page_tables_get_no_virtual_pools(monkeypatch, dtype, swa_scra
     assert manager._draft_op_pools == ()
     expected_extra_pages = {128} if dtype == DataType.FP8 else set()
     assert manager.trtllm_gen_extra_tokens_per_block == frozenset(expected_extra_pages)
+
+
+@pytest.mark.parametrize(
+    "dtype,tokens_per_block,expected",
+    [
+        (DataType.FP8, 128, {128}),
+        (DataType.BF16, 128, {128}),
+        (DataType.FP8, 32, set()),
+        (DataType.NVFP4, 128, set()),
+    ],
+)
+def test_separate_draft_manager_opts_into_p128(monkeypatch, dtype, tokens_per_block, expected):
+    """A separate (is_draft) manager holds only native draft layers: at 128-token pages
+    it lists 128 as a trtllm-gen extra page size (the only P128 route on SM107) and
+    builds no virtual pools."""
+    pointers = torch.tensor([[0x6000_0000, 0]])
+    mapping = torch.tensor([[0, 0]], dtype=torch.int32)
+
+    def fake_base_prepare(self, index_mapper_capacity):
+        self._use_per_layer_page_tables = False
+        self.kv_cache_pool_pointers = pointers.clone()
+        self.kv_cache_pool_mapping = mapping.clone()
+        self.num_attention_op_pools = 1
+
+    monkeypatch.setattr(KVCacheManagerV2, "_prepare_page_table_tensor", fake_base_prepare)
+    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.dtype = dtype
+    manager._shared_draft_layer_ids = []
+    manager.layer_offsets = {0: 0}
+    manager.is_draft = True
+    manager.enable_swa_scratch_reuse = False
+    manager.tokens_per_block = tokens_per_block
+
+    manager._prepare_page_table_tensor(8)
+
+    assert manager.trtllm_gen_extra_tokens_per_block == frozenset(expected)
+    assert manager._draft_op_pools == ()
+    assert torch.equal(manager.kv_cache_pool_pointers, pointers)
+    assert manager.num_attention_op_pools == (0 if dtype == DataType.NVFP4 else 1)
 
 
 def test_update_resources_refuses_tree_relocation(monkeypatch):
@@ -375,6 +503,91 @@ def test_draft_kv_cache_view_accessor_respects_local_layers(
         assert manager.get_draft_kv_cache_view() is view
         create_view.assert_called_once_with(manager, local_draft_layers)
     assert manager._shared_draft_layer_ids == [60, 61]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm,fmha_libs,error",
+    [
+        (107, None, None),
+        (107, "-flashinfer_trtllm_gen", "TLLM_FMHA_LIBS excludes it"),
+        (107, "fallback", "TLLM_FMHA_LIBS excludes it"),
+        (107, "flashinfer_trtllm_gen,fallback", None),
+        # Elsewhere the fallback has P128 paged-context kernels, so nothing is required.
+        (103, "-flashinfer_trtllm_gen", None),
+    ],
+)
+@pytest.mark.parametrize("site", ["separate_draft_manager", "nvfp4_draft_view"])
+def test_p128_opt_in_fails_fast_without_the_flashinfer_route(
+    monkeypatch, sm, fmha_libs, error, site
+):
+    """On SM107 the P128 opt-in is checked when the KV manager is set up, not at the
+    first prefill: a missing FlashInfer route raises an error that names the fix."""
+    monkeypatch.setattr(f"{_CACHE_MANAGER_MODULE}.get_sm_version", lambda: sm)
+    if fmha_libs is None:
+        monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
+    else:
+        monkeypatch.setenv("TLLM_FMHA_LIBS", fmha_libs)
+
+    if site == "separate_draft_manager":
+        monkeypatch.setattr(
+            KVCacheManagerV2,
+            "_prepare_page_table_tensor",
+            lambda self, capacity: setattr(self, "_use_per_layer_page_tables", False),
+        )
+        manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+        manager.dtype = DataType.FP8
+        manager._shared_draft_layer_ids = []
+        manager.layer_offsets = {0: 0}
+        manager.is_draft = True
+        manager.enable_swa_scratch_reuse = False
+        manager.tokens_per_block = 128
+        setup = lambda: manager._prepare_page_table_tensor(8)  # noqa: E731
+    else:
+        # Stop right after the check: the rest of the view needs real pools.
+        manager = SimpleNamespace(tokens_per_block=128, layer_offsets={})
+        setup = lambda: MiniMaxM3DraftKVCacheView(manager, [DRAFT_LOCAL_LAYER])  # noqa: E731
+
+    if error is not None:
+        with pytest.raises(RuntimeError, match=error) as excinfo:
+            setup()
+        assert "128-token KV pages" in str(excinfo.value)
+    elif site == "separate_draft_manager":
+        setup()
+        assert manager.trtllm_gen_extra_tokens_per_block == frozenset({128})
+    else:
+        # The check passed; the view then fails on the stub's missing layer.
+        with pytest.raises(KeyError, match=str(DRAFT_LOCAL_LAYER)):
+            setup()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("shared_draft", [False, True])
+def test_p128_target_fails_fast_only_with_a_shared_draft_layer(monkeypatch, shared_draft):
+    """On SM107 a BF16 target's dense layers keep SDPA, so a missing FlashInfer route only
+    fails setup when a shared draft layer needs it."""
+    monkeypatch.setattr(f"{_CACHE_MANAGER_MODULE}.get_sm_version", lambda: 107)
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "-flashinfer_trtllm_gen")
+    monkeypatch.setattr(
+        KVCacheManagerV2,
+        "_prepare_page_table_tensor",
+        lambda self, capacity: setattr(self, "_use_per_layer_page_tables", True),
+    )
+    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.dtype = DataType.HALF
+    manager.is_draft = False
+    manager.enable_swa_scratch_reuse = False
+    manager.tokens_per_block = 128
+    manager._dense_native_layer_ids = (0, 1, 2)
+    manager._shared_draft_layer_ids = [60] if shared_draft else []
+    manager.layer_offsets = {0: 0, 1: 1, 2: 2, **({60: 3} if shared_draft else {})}
+
+    if shared_draft:
+        with pytest.raises(RuntimeError, match="TLLM_FMHA_LIBS excludes it"):
+            manager._prepare_page_table_tensor(8)
+    else:
+        manager._prepare_page_table_tensor(8)
+        assert manager.trtllm_gen_extra_tokens_per_block == frozenset({128})
 
 
 @pytest.mark.cpu_only
@@ -458,6 +671,7 @@ def test_dense_layers_get_virtual_pools_without_speculation(monkeypatch):
     """Dense target layers need the same stride correction as draft layers."""
 
     def fake_base_prepare(self, index_mapper_capacity):
+        self._page_table_materializer = SimpleNamespace(uses_device_expansion=False)
         self._use_per_layer_page_tables = False
         self.kv_cache_pool_pointers = torch.tensor([[0x6000_0000, 0]], dtype=torch.int64)
         self.kv_cache_pool_mapping = torch.tensor([[0, i] for i in range(4)], dtype=torch.int32)

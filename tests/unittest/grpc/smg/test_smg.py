@@ -17,6 +17,7 @@
 import asyncio
 import io
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -52,6 +53,52 @@ from utils.llm_data import llm_models_root
 skip_no_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU not available")
 
 pytestmark = pytest.mark.threadleak(enabled=False)
+
+
+@pytest.mark.cpu_only
+def test_streaming_deltas_preserve_sequences_logprobs_and_final_tokens() -> None:
+    servicer = TrtllmServiceServicer(None)
+    first = SimpleNamespace(index=0, token_ids=[10], logprobs=[-0.5], finish_reason=None)
+    second = SimpleNamespace(index=1, token_ids=[20, 21], logprobs=[-1.0, -1.5], finish_reason=None)
+    result = SimpleNamespace(outputs=[first, second], cached_tokens=2)
+    sent: dict[int, int] = {}
+    initial = servicer._chunk_responses("request", result, [1, 2, 3], sent)
+    initial_bytes = [response.SerializeToString() for response in initial]
+    assert [list(response.chunk.token_ids) for response in initial] == [[10], [20, 21]]
+    assert sent == {0: 1, 1: 2}
+
+    first.token_ids.append(11)
+    first.logprobs.append(-0.25)
+    delta = servicer._chunk_responses("request", result, [1, 2, 3], sent)
+    assert len(delta) == 1
+    assert delta[0].chunk.sequence_index == 0
+    assert list(delta[0].chunk.token_ids) == [11]
+    assert delta[0].chunk.completion_tokens == 2
+    assert delta[0].chunk.prompt_tokens == 3
+    assert delta[0].chunk.cached_tokens == 2
+    assert [(entry.token_id, entry.logprob) for entry in delta[0].chunk.logprobs] == [(11, -0.25)]
+    assert [response.SerializeToString() for response in initial] == initial_bytes
+    assert servicer._chunk_responses("request", result, [1, 2, 3], sent) == []
+
+    first.finish_reason = second.finish_reason = "length"
+    final = servicer._complete_responses("request", result, [1, 2, 3])
+    assert [list(response.complete.output_token_ids) for response in final] == [[10, 11], [20, 21]]
+    assert [response.complete.sequence_index for response in final] == [0, 1]
+    assert all(response.complete.finish_reason == "length" for response in final)
+    final_bytes = [response.SerializeToString() for response in final]
+    first.token_ids.append(12)
+    second.token_ids.clear()
+    assert [response.SerializeToString() for response in final] == final_bytes
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("token_ids", [None, []])
+def test_streaming_empty_token_history(token_ids: list[int] | None) -> None:
+    servicer = TrtllmServiceServicer(None)
+    result = SimpleNamespace(outputs=[SimpleNamespace(index=0, token_ids=token_ids)])
+    sent: dict[int, int] = {}
+    assert servicer._chunk_responses("request", result, [], sent) == []
+    assert sent == {}
 
 
 @pytest.mark.cpu_only
