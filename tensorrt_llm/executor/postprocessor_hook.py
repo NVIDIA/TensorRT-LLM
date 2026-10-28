@@ -27,6 +27,7 @@ __all__ = [
     "suppress",
     "terminate",
     "apply_post_processor_hook",
+    "end_post_processor_hook",
     "load_post_processor_hook",
 ]
 
@@ -142,9 +143,42 @@ class PostProcessorHook(Protocol):
     The instance is built once per owner (its ``__init__`` is the one-time
     setup) and called once per output, per chunk. It owns any per-request state
     and is responsible for releasing it on ``chunk.is_final``.
+
+    A post-processing worker can drop a request without a final chunk: when the
+    executor reports an error for it, or when its post-processing raises
+    (including an exception from the hook itself). A hook that keeps per-request
+    state can also define ``on_request_end(request_id, reason)``, which the
+    worker calls through :func:`end_post_processor_hook` when it drops such a
+    request. The method is optional, so it is not a member of this protocol, and
+    hooks without it are unaffected.
     """
 
     def __call__(self, chunk: PostProcessorHookChunk) -> PostProcessorHookVerdict: ...
+
+
+def end_post_processor_hook(
+    hook: Optional[PostProcessorHook], request_id: int, reason: str
+) -> None:
+    """Tell ``hook`` that a request ended without a final chunk.
+
+    Calls the hook's optional ``on_request_end(request_id, reason)``; a hook
+    without that method, or no hook at all, is left alone. Never raises: the
+    request has already failed, so an exception from the hook is logged instead
+    of becoming a second error for that request.
+
+    Args:
+        hook: The post-processor hook, or None when none is configured.
+        request_id: The request's id, as the hook saw it in ``chunk.request_id``.
+        reason: ``"error"`` when the executor reported an error for the request,
+            ``"postprocessing_error"`` when its post-processing raised.
+    """
+    on_request_end = getattr(hook, "on_request_end", None)
+    if not callable(on_request_end):
+        return
+    try:
+        on_request_end(request_id, reason)
+    except Exception:
+        logger.exception("Post-processor hook on_request_end failed for request %s.", request_id)
 
 
 def _withhold_token_channel(output, streaming: bool) -> None:
