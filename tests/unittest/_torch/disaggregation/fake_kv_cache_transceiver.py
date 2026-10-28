@@ -54,8 +54,8 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
     ) -> None:
         self.kv_transfer_timeout_ms = kv_transfer_timeout_ms
         self._supports_inflight_cancellation = supports_inflight_cancellation
-        # Only advertised: the group consensus that would then retire a
-        # cancelled receive is not modeled (see cancel_request).
+        # The fake models a one-rank group: the next gen status call is the
+        # consensus that retires a cancelled receive (see cancel_request).
         self._group_retires_gen_receives = group_retires_gen_receives
         # C++-style transceivers consume the CacheTransBuffer budget; the
         # asynchronous Python transceiver does not.
@@ -193,12 +193,18 @@ class FakeKvCacheTransceiver(KvCacheTransceiver):
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel any pending transfer for ``req``.
 
-        Always succeeds immediately: the mid-write refusal (returning False)
-        and the caller's retry path are not modeled.
+        Succeeds immediately, except that under ``group_retires_gen_receives``
+        a pending receive is only marked cancelled and False is returned: the
+        next ``check_gen_transfer_status`` reports it, as the group consensus
+        would, and a later call returns True. The mid-write refusal is not
+        modeled.
         """
         self._assert_alive("cancel_request")
         rid = req.py_request_id
         self.call_log.append(f"cancel_request:{rid}")
+        if self._group_retires_gen_receives and rid in self._pending_recvs:
+            self._recv_outcomes[rid] = "cancel"
+            return False
         self._pending_sends.pop(rid, None)
         self._pending_recvs.pop(rid, None)
         self._send_outcomes.pop(rid, None)

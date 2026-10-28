@@ -3,10 +3,9 @@
 """Retirement of generation-side KV receives across a gen sync group.
 
 When the gen sync group has more than one rank (any multi-rank worker without
-attention DP;
-the PP or helix CP ranks of one DP rank under attention DP), a receive is
-retired only inside ``check_gen_transfer_status``, on every rank in the same
-call. A local cancel or deadline only cancels that rank's session.
+attention DP; the PP or helix CP ranks of one DP rank under attention DP), a
+receive is retired only inside ``check_gen_transfer_status``, on every rank in
+the same call. A local cancel or deadline only cancels that rank's session.
 
 Each rank runs a real ``KvCacheTransceiverV2`` (and, where the executor side
 matters, a real ``DisaggTransferCoordinator``) on its own thread over a shared
@@ -41,8 +40,9 @@ _GEN_ERROR_MSG = "Error in kv cache transfer for generation requests"
 _VOTED_ERROR_MSG = "Disagg KV cache transfer error"
 
 # Two-rank gen sync groups: TP ranks without attention DP gather over the world;
-# under attention DP, the two helix CP ranks of one DP rank gather over CP.
-_TOPOLOGIES = ["tp2", "adp_helix_cp2"]
+# under attention DP, the two helix CP ranks or the two PP ranks of one DP rank
+# gather over CP or PP.
+_TOPOLOGIES = ["tp2", "adp_helix_cp2", "adp_pp2"]
 
 
 @pytest.fixture(autouse=True)
@@ -134,6 +134,15 @@ def _group_of_two(topology: str):
         dists = [
             SimpleNamespace(rank=rank, cp_allgather=group.rank(rank).allgather) for rank in range(2)
         ]
+    elif topology == "adp_pp2":
+        group = FakeDistGroup(world_size=2, tp_size=1)
+        mapping = SimpleNamespace(
+            tp_size=1, pp_size=2, cp_size=1, world_size=2, enable_attention_dp=True
+        )
+        # With tp_size 1 the world is the DP rank's PP group.
+        dists = [
+            SimpleNamespace(rank=rank, pp_allgather=group.rank(rank).allgather) for rank in range(2)
+        ]
     else:
         raise ValueError(f"unknown topology {topology}")
     return group, [_transceiver(mapping, dist) for dist in dists]
@@ -210,9 +219,9 @@ def test_a_deadline_on_one_rank_fails_the_request_on_every_rank_in_one_round(
     clock, topology
 ) -> None:
     """Rank 0's receive started earlier and passes its deadline; rank 1's does
-    not, and its write then lands. The deadline cancels rank 0's session without
-    a rank-local timeout flag, and the next poll fails the request as a transfer
-    error on both ranks together instead of on rank 0 alone."""
+    not, and its write then lands. The timeout check flags neither rank; the
+    poll cancels rank 0's session, and the next poll fails the request as a
+    transfer error on both ranks together instead of on rank 0 alone."""
     group, tcs = _group_of_two(topology)
     attention_dp = tcs[0]._mapping.enable_attention_dp
     ranks = [
@@ -227,13 +236,14 @@ def test_a_deadline_on_one_rank_fails_the_request_on_every_rank_in_one_round(
         h.active.append(req)
     sessions = [tc._recv_sessions[_RID] for tc in tcs]
 
+    group.run(lambda rank: ranks[rank].coordinator.poll_gen_transfers())
     group.run(lambda rank: ranks[rank].coordinator.check_transfer_timeouts())
 
-    assert [h.dist.calls for h in ranks] == [[], []]
     assert [session.status for session in sessions] == [
         SessionStatus.CANCELLED,
         SessionStatus.TRANSFERRING,
     ]
+    assert [h.effects.failed for h in ranks] == [[], []]
     assert not any(req.py_kv_transfer_timed_out for req in reqs)
 
     _writer_reports(sessions[0], AgentResult.FAILED)

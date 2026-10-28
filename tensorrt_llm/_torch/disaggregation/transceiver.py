@@ -1579,7 +1579,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Cancel the transfer for the given request.
 
         Returns False if any task is mid-write (TRANSFERRING), or while a
-        group-synced receive waits for check_gen_transfer_status to retire it;
+        receive under gen sync waits for check_gen_transfer_status to retire it;
         caller must retry next iteration. Returns True when safe to free KV memory.
         """
         rid = get_unique_rid(req)

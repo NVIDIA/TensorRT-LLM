@@ -243,10 +243,10 @@ class ADPRouter(ABC):
         ``DisaggTransferCoordinator.align_gen_admission_across_cp`` and never
         starts.
 
-        A request retired on one CP rank only (e.g. a rank-local error) leaves
-        the CP ranks' own loads different. With the
-        maximum, every CP rank gathers the same loads over TP, and no CP rank
-        goes over ``max_num_active_requests``.
+        A request retired on one CP rank only (see ``align_gen_admission_across_cp``)
+        leaves the CP ranks' own loads different. With the maximum, every CP
+        rank gathers the same loads over TP, and no CP rank goes over
+        ``max_num_active_requests``.
         """
         loads_per_cp_rank = self.dist.cp_allgather_int64(
             [local_state.num_active_requests, local_state.num_active_tokens]
