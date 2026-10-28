@@ -228,3 +228,16 @@ def test_mtp_eagle_target_logits_are_sharded_for_greedy_batches(
         assert out is hidden and head_calls == [False] and processor.calls == []
     else:
         assert out == "gathered" and head_calls == []
+
+
+@pytest.mark.parametrize("sharded", [True, False])
+def test_mtp_eagle_skipped_drafting_keeps_the_shard_marker(sharded):
+    """A dynamic draft length of 0 skips drafting; sharded target logits still carry the marker the engine
+    gathers on before a logits post-processor sees them."""
+    worker = object.__new__(Eagle3OneModelWorker)
+    worker.skip_drafting = lambda *args: {"logits": "shard"}
+    metadata = SimpleNamespace(runtime_draft_len=0, sharded_target_logits=sharded)
+
+    out = worker._forward_impl(None, None, None, "shard", None, metadata, None)
+
+    assert out.get("logits_vocab_shard", False) is sharded

@@ -587,9 +587,13 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         runtime_draft_len = spec_metadata.runtime_draft_len
         # skip the draft forward if the runtime draft length is 0
         if runtime_draft_len == 0:
-            return self.skip_drafting(input_ids, position_ids, hidden_states,
-                                      logits, attn_metadata, spec_metadata,
-                                      draft_model)
+            outputs = self.skip_drafting(input_ids, position_ids, hidden_states,
+                                         logits, attn_metadata, spec_metadata,
+                                         draft_model)
+            # The skip path samples from, and returns, the same shard.
+            if spec_metadata.sharded_target_logits:
+                outputs['logits_vocab_shard'] = True
+            return outputs
 
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
