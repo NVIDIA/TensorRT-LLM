@@ -152,6 +152,32 @@ def test_checkpoint_io_policy_rejects_unknown_value() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("kwargs", [
+    {
+        "load_format": "DUMMY"
+    },
+    {
+        "checkpoint_format": "MX"
+    },
+    {
+        "checkpoint_loader": object()
+    },
+    {
+        "model_kwargs": {
+            "num_hidden_layers": 1
+        }
+    },
+])
+def test_model_streamer_policy_rejects_incompatible_config(
+        kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValidationError,
+                       match="checkpoint_io_policy='model_streamer'"):
+        TorchLlmArgs(model=llama_model_path,
+                     checkpoint_io_policy="model_streamer",
+                     **kwargs)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("model_kwargs", "expected"),
     [

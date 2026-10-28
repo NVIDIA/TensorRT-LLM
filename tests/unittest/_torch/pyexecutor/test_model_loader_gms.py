@@ -30,7 +30,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformRuntimeConstraints,
     PostTransformTransferScope,
 )
-from tensorrt_llm.llmapi.llm_args import LoadFormat
+from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 
 pytestmark = pytest.mark.cpu_only
 
@@ -102,6 +102,7 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     llm_args = SimpleNamespace(
         load_format=LoadFormat.GMS,
         lm_head_output_dtype="auto",
+        checkpoint_io_policy=CheckpointIOPolicy.NATIVE,
         gms_config=SimpleNamespace(socket_path="/tmp/gms.sock", mode="auto", tag="weights"),
     )
     loader = ModelLoader(
