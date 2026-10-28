@@ -2,7 +2,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Common runtime pipeline for cold-page quantization."""
 
-from typing import Any, Sequence
+from dataclasses import replace
+from typing import Any, Optional, Sequence
 
 from ...pyexecutor.resource_manager import DataType, KVCacheCompressionManager
 
@@ -13,6 +14,11 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
     uses_iteration_lifecycle = False
     provides_cold_page_codec = True
 
+    @property
+    def retained_token_window(self) -> Optional[tuple[int, int]]:
+        """The first/last-N tokens the config keeps at the active precision."""
+        return getattr(self.config, "retained_token_window", None)
+
     def create_cold_page_codec(
         self,
         cache_config: object,
@@ -22,11 +28,25 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
         num_kv_heads_per_layer: Sequence[int],
         head_dim_per_layer: Sequence[int],
         is_draft: bool = False,
+        retained_layers: Sequence[int] = (),
     ) -> object:
-        """Create one native codec with state isolated to this KVCM."""
+        """Create one native codec with state isolated to this KVCM.
+
+        The retained-token layers stay out of the codec: the native codec migrates the
+        lifecycles it does not own unchanged, which keeps those tokens at the active
+        precision in the cold tiers.
+        """
 
         from tensorrt_llm.bindings.internal import kv_cache_compression as native
 
+        if retained_layers:
+            retained = {int(layer) for layer in retained_layers}
+            cache_config = replace(
+                cache_config,
+                layers=[
+                    layer for layer in cache_config.layers if int(layer.layer_id) not in retained
+                ],
+            )
         codec_state = self.build_codec_state(
             cache_config,
             runtime_dtype=runtime_dtype,

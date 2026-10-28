@@ -3021,17 +3021,32 @@ class KVCacheCompressionManager(BaseResourceManager):
     def has_independent_draft_kv_cache(self) -> bool:
         return self.draft_kv_cache_manager is not None
 
+    @property
+    def retained_token_window(self) -> Optional[tuple[int, int]]:
+        """``(first_n, last_n)`` tokens per sequence that KVCacheManagerV2 keeps in a
+        retained-token layer group at the active precision, else None.
+
+        A storage-bound method that stores those tokens unchanged in the cold tiers
+        reports the window here; KVCacheManagerV2 reads it before building its pools.
+        """
+        return None
+
     def create_cold_page_codec(
-        self,
-        cache_config: object,
-        *,
-        runtime_dtype: DataType,
-        pp_layers: Sequence[int],
-        num_kv_heads_per_layer: Sequence[int],
-        head_dim_per_layer: Sequence[int],
-        is_draft: bool = False,
+            self,
+            cache_config: object,
+            *,
+            runtime_dtype: DataType,
+            pp_layers: Sequence[int],
+            num_kv_heads_per_layer: Sequence[int],
+            head_dim_per_layer: Sequence[int],
+            is_draft: bool = False,
+            retained_layers: Sequence[int] = (),
     ) -> Optional[object]:
-        """Create a native cold-page codec when the algorithm provides one."""
+        """Create a native cold-page codec when the algorithm provides one.
+
+        ``retained_layers`` are the retained-token layers of ``cache_config``; a codec
+        that does not own them leaves their lifecycles to KVCM's lossless migration.
+        """
         return None
 
     def encode_cold_pages(
