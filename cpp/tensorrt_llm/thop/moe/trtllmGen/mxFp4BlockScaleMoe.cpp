@@ -30,6 +30,10 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
+// Tactics are [tileN, config]; fine-grained pairs share the config space of their runner and are tagged with this bit
+// so the autotuner can profile them alongside the plain kernels and the tuned choice is unambiguous at run time.
+static constexpr int64_t kFgTacticBit = int64_t{1} << 40;
+
 namespace btg = batchedGemm::trtllm::gen;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
 using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
@@ -546,8 +550,6 @@ public:
         return *runner;
     }
 
-    // Tuned over the non-fine-grained tile set only: the fine-grained kernels are never profiled,
-    // so they reuse the tuned tile with their own default config.
     [[nodiscard]] std::vector<std::vector<int64_t>> getValidConfigs(int64_t topK, int64_t hiddenSize,
         int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens, int64_t validHiddenSize,
         int64_t validIntermediateSize)
@@ -565,6 +567,14 @@ public:
             for (auto cfg : nlRunner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts,
                      numTokens, validHiddenSize, validIntermediateSize))
                 result.push_back({static_cast<int64_t>(tileN), cfg});
+            if (tensorrt_llm::common::getEnvUseFineGrainedSync())
+            {
+                auto* fgRunner = getRunnerOrNull(tileN, /* useFineGrained */ true);
+                if (fgRunner != nullptr)
+                    for (auto cfg : fgRunner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts,
+                             numTokens, validHiddenSize, validIntermediateSize))
+                        result.push_back({static_cast<int64_t>(tileN), cfg | kFgTacticBit});
+            }
         }
         return result;
     }
@@ -593,8 +603,9 @@ public:
         auto const validHidden = valid_hidden_size.value_or(hidden_size);
         auto const validInter = valid_intermediate_size.value_or(intermediate_size);
 
+        bool const tunedTactic = tileN != -1 && config != -1;
         // No autotuner: select the tile and its default config from the full set.
-        if (tileN == -1 || config == -1)
+        if (!tunedTactic)
         {
             float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / local_num_experts;
             tileN = std::clamp(nextPowerOfTwo(avg_tokens_per_expert), mSupportedTileN.front(), mSupportedTileN.back());
@@ -603,10 +614,17 @@ public:
                              num_tokens, validHidden, validInter);
         }
 
-        // Prefer the fine-grained runner for the tuned tile when it has a valid config for this shape.
+        // Tuned tactics are run as selected. Without the autotuner, prefer the fine-grained default for the tile.
         RunnerType* runner = nullptr;
         int64_t configToRun = config;
-        if (useFineGrained)
+        if (config & kFgTacticBit)
+        {
+            runner = getRunnerOrNull(tileN, /* useFineGrained */ true);
+            TLLM_CHECK_WITH_INFO(
+                runner != nullptr, "fine-grained tactic for tileN=%d without a runner", static_cast<int32_t>(tileN));
+            configToRun = config & ~kFgTacticBit;
+        }
+        else if (useFineGrained && !tunedTactic)
         {
             auto* fineGrainedRunner = getRunnerOrNull(tileN, /* useFineGrained */ true);
             if (fineGrainedRunner != nullptr)
@@ -693,8 +711,6 @@ public:
         return *runner;
     }
 
-    // Tuned over the non-fine-grained tile set only: the fine-grained kernels are never profiled,
-    // so they reuse the tuned tile with their own default config.
     [[nodiscard]] std::vector<std::vector<int64_t>> getValidConfigs(int64_t topK, int64_t hiddenSize,
         int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens, int64_t validHiddenSize,
         int64_t validIntermediateSize)
@@ -712,6 +728,14 @@ public:
             for (auto cfg : nlRunner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts,
                      numTokens, validHiddenSize, validIntermediateSize))
                 result.push_back({static_cast<int64_t>(tileN), cfg});
+            if (tensorrt_llm::common::getEnvUseFineGrainedSync())
+            {
+                auto* fgRunner = getRunnerOrNull(tileN, /* useFineGrained */ true);
+                if (fgRunner != nullptr)
+                    for (auto cfg : fgRunner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts,
+                             numTokens, validHiddenSize, validIntermediateSize))
+                        result.push_back({static_cast<int64_t>(tileN), cfg | kFgTacticBit});
+            }
         }
         return result;
     }
@@ -742,8 +766,9 @@ public:
         auto const validHidden = valid_hidden_size.value_or(hidden_size);
         auto const validInter = valid_intermediate_size.value_or(intermediate_size);
 
+        bool const tunedTactic = tileN != -1 && config != -1;
         // No autotuner: select the tile and its default config from the full set.
-        if (tileN == -1 || config == -1)
+        if (!tunedTactic)
         {
             float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / local_num_experts;
             tileN = std::clamp(nextPowerOfTwo(avg_tokens_per_expert), mSupportedTileN.front(), mSupportedTileN.back());
@@ -752,10 +777,17 @@ public:
                              num_tokens, validHidden, validInter);
         }
 
-        // Prefer the fine-grained runner for the tuned tile when it has a valid config for this shape.
+        // Tuned tactics are run as selected. Without the autotuner, prefer the fine-grained default for the tile.
         RunnerType* runner = nullptr;
         int64_t configToRun = config;
-        if (useFineGrained)
+        if (config & kFgTacticBit)
+        {
+            runner = getRunnerOrNull(tileN, /* useFineGrained */ true);
+            TLLM_CHECK_WITH_INFO(
+                runner != nullptr, "fine-grained tactic for tileN=%d without a runner", static_cast<int32_t>(tileN));
+            configToRun = config & ~kFgTacticBit;
+        }
+        else if (useFineGrained && !tunedTactic)
         {
             auto* fineGrainedRunner = getRunnerOrNull(tileN, /* useFineGrained */ true);
             if (fineGrainedRunner != nullptr)
