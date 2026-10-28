@@ -132,6 +132,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # Whether the model's recurrent layers implement the in-forward snapshot
     # split (GDN).
     _supports_inforward_snapshot = False
+    # Whether a decode step whose requests, SSM base blocks and dummy flags all
+    # match the last upload keeps the uploaded state indices and dummy mask
+    # without rebuilding them.
+    _skips_steady_state_index_upload = False
     # In-forward Mamba snapshots (staging rows: inforward_snapshot_rows): longest
     # tail, and the fewest chunk tokens before P (the convolution window at P
     # must lie inside the chunk). See _setup_inforward_snapshot.
@@ -734,6 +738,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         }
         self._request_id_to_state_index = {}
         self._request_id_to_is_dummy = {}
+        # (request ids, SSM base blocks, dummy flags) of the last upload while
+        # it is known to be current.
+        self._steady_state_index_key: (
+            Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[bool, ...]] | None
+        ) = None
 
         state_index_capacity = self.max_batch_size + self._num_reserved_dummy_slots
         self._state_indices_buffer = DeviceCopyBuffer(
@@ -1184,6 +1193,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         assert n <= self._host_state_indices.shape[0], (
             f"State-index batch size {n} exceeds max_batch_size {self._host_state_indices.shape[0]}"
         )
+        if self._skips_steady_state_index_upload:
+            if n > 0 and self._is_steady_state_index_batch(requests):
+                return
         self._host_state_indices.zero_()
         if n > 0:
             for i, req in enumerate(requests):
@@ -1214,6 +1226,38 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _on_state_slots_relocated(self, old_slots: list[int], new_slots: list[int]) -> None:
         """Allow model-owned scratch state to follow the updated slot mapping."""
+
+    def _is_steady_state_index_batch(self, requests: List[LlmRequest]) -> bool:
+        """Whether the last upload (same requests, SSM base blocks and dummy flags) still holds.
+
+        Records the batch as the new reference otherwise.
+        """
+        base_indices = []
+        for req in requests:
+            kv_cache = self.kv_cache_map.get(req.py_request_id)
+            if kv_cache is None:
+                self._steady_state_index_key = None
+                return False
+            base_indices.append(kv_cache.get_ssm_block_base_index(self.ssm_layer_group_id))
+        if min(base_indices) < 0:
+            self._steady_state_index_key = None
+            return False
+        key = (
+            tuple(req.py_request_id for req in requests),
+            tuple(base_indices),
+            tuple(req.is_dummy for req in requests),
+        )
+        # Request ids recur (warmup and CUDA-graph dummies are freed and re-added
+        # under the same id), so the per-request maps, which free_resources()
+        # prunes, are checked as well.
+        if key == self._steady_state_index_key and all(
+            self._request_id_to_state_index.get(req.py_request_id) == base
+            and self._request_id_to_is_dummy.get(req.py_request_id) == req.is_dummy
+            for req, base in zip(requests, base_indices)
+        ):
+            return True
+        self._steady_state_index_key = key
+        return False
 
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         if num_contexts and self._speculative_state is not None:
@@ -1267,6 +1311,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._request_id_to_state_index.pop(request.py_request_id, None)
         self._request_id_to_is_dummy.pop(request.py_request_id, None)
         self._branch_snapshot_points.pop(request.py_request_id, None)
+        # A freed request ends any steady decode run.
+        self._steady_state_index_key = None
         super().free_resources(request, pin_on_release)
 
     def update_mamba_states(
