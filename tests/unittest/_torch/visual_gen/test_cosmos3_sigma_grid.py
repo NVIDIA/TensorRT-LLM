@@ -678,6 +678,36 @@ class TestIsolation:
         assert torch.equal(native_run, fresh_native)
 
 
+class TestRepeatedLeadingTimesteps:
+    """Strongly shifted grids repeat their leading integer timesteps; the solver
+    must still run every step of the schedule, in order, from step 0."""
+
+    @pytest.mark.parametrize(
+        ("native_flow_schedule", "sigma_grid", "flow_shift", "steps"),
+        [
+            (False, "native", 100.0, 35),
+            (False, "native", 10.0, 113),
+            (False, "diffusers", 100.0, 35),
+            (True, None, 100.0, 35),
+        ],
+    )
+    def test_full_trajectory_runs_from_the_first_step(
+        self, native_flow_schedule, sigma_grid, flow_shift, steps
+    ):
+        policy, base = _policy(native_flow_schedule=native_flow_schedule)
+        schedule = _resolve(policy, sigma_grid=sigma_grid, mode_flow_shift=flow_shift)
+        scheduler = _programmed(policy, base, schedule, steps)
+        timesteps = scheduler.timesteps.tolist()
+        assert len(set(timesteps)) < len(timesteps)
+
+        first = _trajectory(scheduler)
+        assert scheduler.step_index == steps
+        assert torch.isfinite(first).all()
+
+        policy.set_timesteps(scheduler, steps, device="cpu", grid=schedule.grid)
+        assert torch.equal(_trajectory(scheduler), first)
+
+
 def _bare_pipeline(policy, base) -> Cosmos3OmniMoTPipeline:
     pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
     pipeline.sampling = policy

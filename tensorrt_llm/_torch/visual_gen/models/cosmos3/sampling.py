@@ -406,9 +406,15 @@ class Cosmos3SamplingPolicy:
             sigmas = np.linspace(1.0 - 1.0 / num_train, 0.0, num_inference_steps + 1)[:-1]
         else:
             # karras, diffusers and "config" grids come from the scheduler config.
+            sigmas = None
+        if sigmas is None:
             scheduler.set_timesteps(num_inference_steps, device=device)
-            return
-        scheduler.set_timesteps(num_inference_steps, device=device, sigmas=sigmas)
+        else:
+            scheduler.set_timesteps(num_inference_steps, device=device, sigmas=sigmas)
+        # A strongly shifted grid can repeat its leading integer timesteps (999, 999, ...).
+        # UniPC looks up its first step by timestep value and, on repeats, starts at the
+        # second match; every generation runs the whole schedule, so start at step 0.
+        scheduler.set_begin_index(0)
 
     def scheduler_step_kwargs(self, generator: Any) -> dict:
         """Extra kwargs each ``scheduler.step()`` call requires.
