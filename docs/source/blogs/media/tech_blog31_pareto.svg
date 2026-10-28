@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 396" width="1000" height="396">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker><marker id="ahg" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#76B900" stroke-width="1"/></marker><marker id="ahb" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#2F80ED" stroke-width="1"/></marker><marker id="ahi" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#2d3142" stroke-width="1"/></marker></defs>
+<rect width="1000" height="396" fill="#f5f5f5"/>
+<line x1="330" y1="26" x2="362" y2="26" stroke="#76B900" stroke-width="2"/>
+<circle cx="346" cy="26" r="3.5" fill="#76B900"/>
+<text x="370" y="30" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">NVFP4 MLA</text>
+<line x1="520" y1="26" x2="552" y2="26" stroke="#4f5d75" stroke-width="1.5" stroke-dasharray="5,4"/>
+<circle cx="536" cy="26" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="560" y="30" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">FP8 MLA</text>
+<text x="30" y="60" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">(a) Long-Sequence Reasoning · 8K in / 16K out</text>
+<line x1="80" y1="76" x2="80" y2="340" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="80" y="355" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">0</text>
+<line x1="155" y1="76" x2="155" y2="340" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="155" y="355" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">50</text>
+<line x1="230" y1="76" x2="230" y2="340" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="230" y="355" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">100</text>
+<line x1="305" y1="76" x2="305" y2="340" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="305" y="355" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">150</text>
+<line x1="380" y1="76" x2="380" y2="340" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="380" y="355" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">200</text>
+<line x1="455" y1="76" x2="455" y2="340" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="455" y="355" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">250</text>
+<text x="74" y="343.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">0</text>
+<line x1="80" y1="274" x2="470" y2="274" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="74" y="277.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">2k</text>
+<line x1="80" y1="208" x2="470" y2="208" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="74" y="211.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">4k</text>
+<line x1="80" y1="142" x2="470" y2="142" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="74" y="145.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">6k</text>
+<line x1="80" y1="76" x2="470" y2="76" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="74" y="79.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">8k</text>
+<line x1="80" y1="340" x2="470" y2="340" stroke="#bfc0c0" stroke-width="1"/>
+<text x="275" y="376" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#4f5d75" text-anchor="middle">Generation rate (tokens/s/user)</text>
+<text x="40" y="208" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#4f5d75" text-anchor="middle" transform="rotate(-90 40 208)">Throughput (tokens/s/GPU)</text>
+<path d="M152.6,173.4 L171.9,181.7 L205.6,195.4 L221.2,218.2 L244,244.8 L289.2,280 L361.8,299.4 L407.4,316.2 L430.9,327.5 L458,333.2" fill="none" stroke="#4f5d75" stroke-width="1.5" stroke-dasharray="5,4"/>
+<path d="M185.1,97.1 L208,118.2 L244.2,149.8 L263.8,180.8 L298.6,213.6 L330.1,267.8 L378.1,297.4 L412.1,316.1 L431.8,327.1 L447.2,333.3" fill="none" stroke="#76B900" stroke-width="2"/>
+<circle cx="152.6" cy="173.4" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="171.9" cy="181.7" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="205.6" cy="195.4" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="221.2" cy="218.2" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="244" cy="244.8" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="289.2" cy="280" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="361.8" cy="299.4" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="407.4" cy="316.2" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="430.9" cy="327.5" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="458" cy="333.2" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="185.1" cy="97.1" r="3.5" fill="#76B900"/>
+<circle cx="208" cy="118.2" r="3.5" fill="#76B900"/>
+<circle cx="244.2" cy="149.8" r="3.5" fill="#76B900"/>
+<circle cx="263.8" cy="180.8" r="3.5" fill="#76B900"/>
+<circle cx="298.6" cy="213.6" r="3.5" fill="#76B900"/>
+<circle cx="330.1" cy="267.8" r="3.5" fill="#76B900"/>
+<circle cx="378.1" cy="297.4" r="3.5" fill="#76B900"/>
+<circle cx="412.1" cy="316.1" r="3.5" fill="#76B900"/>
+<circle cx="431.8" cy="327.1" r="3.5" fill="#76B900"/>
+<circle cx="447.2" cy="333.3" r="3.5" fill="#76B900"/>
+<line x1="289.2" y1="275" x2="289.2" y2="209.7" stroke="#2d3142" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="338" y="145.3" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">2.25x</text>
+<text x="338" y="160.3" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#4f5d75" text-anchor="start">at 139 tokens/s/user</text>
+<line x1="334" y1="149.3" x2="292.2" y2="212.7" stroke="#2d3142" stroke-width="0.8"/>
+<text x="540" y="60" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">(b) MLPerf DeepSeek-R1</text>
+<line x1="590" y1="76" x2="590" y2="340" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="590" y="355" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">0</text>
+<line x1="665" y1="76" x2="665" y2="340" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="665" y="355" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">50</text>
+<line x1="740" y1="76" x2="740" y2="340" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="740" y="355" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">100</text>
+<line x1="815" y1="76" x2="815" y2="340" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="815" y="355" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">150</text>
+<line x1="890" y1="76" x2="890" y2="340" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="890" y="355" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">200</text>
+<line x1="965" y1="76" x2="965" y2="340" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="965" y="355" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">250</text>
+<text x="584" y="343.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">0</text>
+<line x1="590" y1="296" x2="980" y2="296" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="584" y="299.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">2k</text>
+<line x1="590" y1="252" x2="980" y2="252" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="584" y="255.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">4k</text>
+<line x1="590" y1="208" x2="980" y2="208" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="584" y="211.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">6k</text>
+<line x1="590" y1="164" x2="980" y2="164" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="584" y="167.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">8k</text>
+<line x1="590" y1="120" x2="980" y2="120" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="584" y="123.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">10k</text>
+<line x1="590" y1="76" x2="980" y2="76" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="584" y="79.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">12k</text>
+<line x1="590" y1="340" x2="980" y2="340" stroke="#bfc0c0" stroke-width="1"/>
+<text x="785" y="376" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#4f5d75" text-anchor="middle">Generation rate (tokens/s/user)</text>
+<text x="550" y="208" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#4f5d75" text-anchor="middle" transform="rotate(-90 550 208)">Throughput (tokens/s/GPU)</text>
+<path d="M719.5,122.3 L739.3,151.6 L769.1,189.3 L776.6,221.9 L804.1,249.6 L833.5,288.5 L895.7,307.9 L935.5,321.8 L957.2,330.4 L974.8,335" fill="none" stroke="#4f5d75" stroke-width="1.5" stroke-dasharray="5,4"/>
+<path d="M739.4,88.6 L767,116.5 L804.7,159.6 L811.6,200 L845.1,233.1 L867.4,281.8 L899.1,307.5 L929.7,322.1 L952,330.5 L969,335" fill="none" stroke="#76B900" stroke-width="2"/>
+<circle cx="719.5" cy="122.3" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="739.3" cy="151.6" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="769.1" cy="189.3" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="776.6" cy="221.9" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="804.1" cy="249.6" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="833.5" cy="288.5" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="895.7" cy="307.9" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="935.5" cy="321.8" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="957.2" cy="330.4" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="974.8" cy="335" r="3.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<circle cx="739.4" cy="88.6" r="3.5" fill="#76B900"/>
+<circle cx="767" cy="116.5" r="3.5" fill="#76B900"/>
+<circle cx="804.7" cy="159.6" r="3.5" fill="#76B900"/>
+<circle cx="811.6" cy="200" r="3.5" fill="#76B900"/>
+<circle cx="845.1" cy="233.1" r="3.5" fill="#76B900"/>
+<circle cx="867.4" cy="281.8" r="3.5" fill="#76B900"/>
+<circle cx="899.1" cy="307.5" r="3.5" fill="#76B900"/>
+<circle cx="929.7" cy="322.1" r="3.5" fill="#76B900"/>
+<circle cx="952" cy="330.5" r="3.5" fill="#76B900"/>
+<circle cx="969" cy="335" r="3.5" fill="#76B900"/>
+<line x1="833.5" y1="283.5" x2="833.5" y2="226.6" stroke="#2d3142" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="875" y="146.4" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">2.30x</text>
+<text x="875" y="161.4" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#4f5d75" text-anchor="start">at 162 tokens/s/user</text>
+<line x1="871" y1="150.4" x2="836.5" y2="229.6" stroke="#2d3142" stroke-width="0.8"/>
+</svg>
