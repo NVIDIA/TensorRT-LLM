@@ -22,6 +22,7 @@ Runs without a Mooncake installation: the store handle is replaced by an
 in-process fake that records what it was handed.
 """
 
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -201,6 +202,96 @@ def test_hash_chain_rejects_shrinking_token_list():
     chain.extend(list(range(2 * TOKENS_PER_BLOCK)))
     with pytest.raises(ValueError, match="shrank"):
         chain.extend(list(range(TOKENS_PER_BLOCK)))
+
+
+def _reference_chain(scope: ReuseScope, tokens, tokens_per_block: int):
+    """A frozen copy of the per-token encoding stored keys were first written with.
+
+    Each block is blake2b-128 over its parent and its tokens as signed 8-byte
+    little-endian ids, starting from the scope's seed. Kept here, rather than
+    read from the module, so that a change to how the chain encodes tokens
+    cannot also change what it is checked against.
+    """
+
+    def digest(*parts: bytes) -> bytes:
+        hasher = hashlib.blake2b(digest_size=16)
+        for part in parts:
+            hasher.update(part)
+        return hasher.digest()
+
+    parent = scope.seed()
+    hashes = []
+    for start in range(0, len(tokens) - tokens_per_block + 1, tokens_per_block):
+        block = tokens[start : start + tokens_per_block]
+        parent = digest(parent, b"".join(int(t).to_bytes(8, "little", signed=True) for t in block))
+        hashes.append(parent)
+    return hashes
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        ReuseScope(),
+        ReuseScope(cache_salt="tenant-a"),
+        ReuseScope(multimodal_digests=(b"\x01" * 32,)),
+    ],
+    ids=["unscoped", "cache_salt", "multimodal"],
+)
+def test_hash_chain_keeps_the_stored_key_encoding(scope):
+    """Pages already in a pool stay addressable however the chain encodes tokens.
+
+    The token list covers both ends of int64 and -1, and is fed in pieces that
+    end mid-block, so incremental extension is checked against the same
+    reference as a single pass.
+    """
+    tokens = [7, -1, 2**63 - 1, -(2**63), 0, 151_000] * 5 + list(range(23))
+    expected = _reference_chain(scope, tokens, TOKENS_PER_BLOCK)
+    assert len(expected) == len(tokens) // TOKENS_PER_BLOCK
+
+    chain = BlockHashChain(TOKENS_PER_BLOCK, scope=scope)
+    for end in (5, 6, 17, len(tokens)):
+        chain.extend(tokens[:end])
+    assert list(chain.hashes) == expected
+    # Extending again with no new block leaves the chain as it is.
+    assert list(chain.extend(tuple(tokens))) == expected
+    # A tuple encodes like a list; a fresh chain makes it encode every block.
+    from_tuple = BlockHashChain(TOKENS_PER_BLOCK, scope=scope)
+    assert list(from_tuple.extend(tuple(tokens))) == expected
+
+
+def test_hash_chain_golden_digest():
+    """Pinned keys, captured from the per-token encoding before it was replaced.
+
+    A change here changes every key a deployment has stored, so pages written
+    by an older build stop being found. Regenerating these from the code under
+    test would prove nothing.
+    """
+    assert [h.hex() for h in BlockHashChain(4).extend(list(range(8)))] == [
+        "2e8c598e5152642e1a12a2345cedf3e3",
+        "4c62122a866d675f3f436e12723d692a",
+    ]
+    salted = BlockHashChain(2, scope=ReuseScope(cache_salt="tenant-a"))
+    assert [h.hex() for h in salted.extend([-1, 2**63 - 1, -(2**63), 0])] == [
+        "4308a783baf926ba62be9f96df5db867",
+        "3205a431e8c69e7077da3e22ce5b56da",
+    ]
+    multimodal = BlockHashChain(3, scope=ReuseScope(multimodal_digests=(b"\x01" * 32,)))
+    assert [h.hex() for h in multimodal.extend([151_000, 7, -5, 2**40, 0, 1, 99])] == [
+        "9e3d925110ea5d2fc057a7874a546f11",
+        "29d8726fadccb94fc9beacdde9042f0a",
+    ]
+
+
+@pytest.mark.parametrize("token", [2**63, -(2**63) - 1], ids=["above", "below"])
+def test_hash_chain_rejects_tokens_outside_int64(token):
+    """A token id no 8-byte key can encode is refused, and leaves the chain as it was."""
+    chain = BlockHashChain(TOKENS_PER_BLOCK)
+    chain.extend(list(range(TOKENS_PER_BLOCK)))
+    before = list(chain.hashes)
+    tokens = list(range(TOKENS_PER_BLOCK)) + [0] * (TOKENS_PER_BLOCK - 1) + [token]
+    with pytest.raises(OverflowError):
+        chain.extend(tokens)
+    assert list(chain.hashes) == before
 
 
 def test_key_namespace_separates_every_dimension():
