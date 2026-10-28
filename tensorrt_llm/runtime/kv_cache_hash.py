@@ -45,14 +45,6 @@ def truncate_sha256_hash_to_int64(block_hash: bytes) -> int:
     return int.from_bytes(block_hash[:8], "big", signed=False)
 
 
-def get_cache_salt_id(cache_salt: str) -> int:
-    """Return the cache salt id used by request handling and cache-aware routing."""
-    from blake3 import blake3
-
-    h = blake3(cache_salt.encode("utf-8")).digest(length=8)
-    return int.from_bytes(h, "little", signed=False)
-
-
 def hash_v1_block_key(
     tokens: Sequence[int],
     parent_hash: int = 0,

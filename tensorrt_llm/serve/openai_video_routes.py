@@ -13,6 +13,7 @@ is strictly unchanged from the inlined version.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import time
@@ -234,16 +235,13 @@ class _VideoRoutesMixin:
                 format=resolved_fmt,
                 frame_rate=output.frame_rate or request.frame_rate or params.frame_rate,
             )
-            if os.environ.get("TRTLLM_VIDEO_ASYNC_ENCODE", "1") != "0":
-                # Offload the blocking ffmpeg encode to a thread-pool executor so
-                # the event loop can start the next request's diffusion while this
-                # video encodes. Only overlaps when >=2 requests are in flight per
-                # server (i.e. client num_workers > server count).
-                saved_paths = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: output.save(paths_in, **_save_kwargs)
-                )
-            else:
-                saved_paths = output.save(paths_in, **_save_kwargs)
+            # Offload the blocking ffmpeg encode to a thread-pool executor so
+            # the event loop can start the next request's diffusion while this
+            # video encodes. Only overlaps when >=2 requests are in flight per
+            # server (i.e. client num_workers > server count).
+            saved_paths = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: output.save(paths_in, **_save_kwargs)
+            )
             latency = time.perf_counter() - sync_video_start  # seconds
             metrics = output.metrics
             generation = metrics.generation if metrics is not None else 0.0
@@ -528,15 +526,23 @@ class _VideoRoutesMixin:
                     format=resolved_fmt,
                     frame_rate=output.frame_rate or request.frame_rate or params.frame_rate,
                 )
-                if os.environ.get("TRTLLM_VIDEO_ASYNC_ENCODE", "1") != "0":
-                    # Offload the blocking encode to a thread so the event loop
-                    # stays responsive during ``postprocessing`` — pollers can
-                    # observe the state and other requests progress meanwhile.
-                    saved_paths = await asyncio.get_running_loop().run_in_executor(
-                        None, lambda: output.save(paths_in, **_save_kwargs)
-                    )
-                else:
-                    saved_paths = output.save(paths_in, **_save_kwargs)
+                # Offload the blocking encode to a thread so the event loop
+                # stays responsive during ``postprocessing`` — pollers can
+                # observe the state and other requests progress meanwhile.
+                save_future = asyncio.get_running_loop().run_in_executor(
+                    None, lambda: output.save(paths_in, **_save_kwargs)
+                )
+                try:
+                    saved_paths = await asyncio.shield(save_future)
+                except asyncio.CancelledError:
+                    # A cancel cannot stop the encode once the thread picked it
+                    # up, and ``delete_video`` cleans up by path before this
+                    # coroutine records them. Outwait the thread and remove what
+                    # it wrote, so the cancellation leaves nothing behind.
+                    with contextlib.suppress(Exception):
+                        for path in await save_future:
+                            Path(path).unlink(missing_ok=True)
+                    raise
             latency = time.perf_counter() - background_start  # seconds
             metrics = output.metrics
             generation = metrics.generation if metrics is not None else 0.0

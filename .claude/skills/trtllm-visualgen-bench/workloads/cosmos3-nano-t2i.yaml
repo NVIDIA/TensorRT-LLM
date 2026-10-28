@@ -1,0 +1,19 @@
+# nvidia/Cosmos3-Nano  ·  t2i
+#
+# WARMUP GAP: the default warmup covers the video mode only, so serve this with
+#   compilation_config: {resolutions: [[1024, 1024]], num_frames: [1]}
+# guidance_scale: COSMOS3_T2I_PARAMS default; that bucket declares no
+# max_sequence_length.
+backend: openai-images
+
+common_params:
+  width: 1024
+  height: 1024
+  num_inference_steps: 50
+  guidance_scale: 7.0
+  extra_params:
+    output_type: image
+  seed: 42
+
+requests:
+  - prompt_file: ../prompts/cosmos3-t2i.json

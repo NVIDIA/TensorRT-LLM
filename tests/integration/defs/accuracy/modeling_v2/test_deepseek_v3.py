@@ -48,8 +48,9 @@ from ..accuracy_core import (
 
 # The targets assert their own SM at construction: certification is per GPU
 # architecture, and a receipt from another one says nothing here.
-skip_not_sm103 = pytest.mark.skipif(
-    get_sm_version() != 103, reason="modeling_v2 targets in this batch are certified on sm_103 only"
+skip_not_sm10x = pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="modeling_v2 targets in this batch are certified on sm_100 and sm_103 only",
 )
 
 # The filter the modeling_v2 anchors were measured on. Unset, the evaluator
@@ -59,16 +60,74 @@ skip_not_sm103 = pytest.mark.skipif(
 _SCORES_FILTER = {"scores_filter": "exact_match,flexible-extract"}
 
 
-class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
-    """deepseek-r1-0528-nvfp4 / sm_103 / dep4, identity and the mtp3 variant."""
+def _layout(layout_id, world_size, moe_tp_size, moe_ep_size, attention_dp):
+    """One parallel layout as a pytest param, with the device count it needs.
+
+    A GB200/GB300 tray holds four GPUs and a B200/B300 node eight; larger
+    layouts span nodes.
+    """
+    need = (
+        pytest.mark.skip_less_device(world_size)
+        if world_size <= 4
+        else pytest.mark.skip_less_mpi_world_size(world_size)
+    )
+    return pytest.param(
+        dict(
+            tensor_parallel_size=world_size,
+            moe_tensor_parallel_size=moe_tp_size,
+            moe_expert_parallel_size=moe_ep_size,
+            enable_attention_dp=attention_dp,
+        ),
+        id=layout_id,
+        marks=need,
+    )
+
+
+# Every layout the default target's routing admits.
+_LAYOUTS = [
+    _layout("tp2", 2, 2, 1, False),
+    _layout("tp2_ep2", 2, 1, 2, False),
+    _layout("dep2", 2, 1, 2, True),
+    _layout("tp4", 4, 4, 1, False),
+    _layout("tp4_ep4", 4, 1, 4, False),
+    _layout("tp4_moetp2_ep2", 4, 2, 2, False),
+    _layout("dep4", 4, 1, 4, True),
+    _layout("dep4_moetp2_ep2", 4, 2, 2, True),
+    _layout("dep4_moetp4", 4, 4, 1, True),
+    _layout("tp8", 8, 8, 1, False),
+    _layout("tp8_ep8", 8, 1, 8, False),
+    _layout("tp8_moetp4_ep2", 8, 4, 2, False),
+    _layout("tp8_moetp2_ep4", 8, 2, 4, False),
+    _layout("dep8", 8, 1, 8, True),
+    _layout("dep8_moetp8", 8, 8, 1, True),
+    _layout("dep8_moetp2_ep4", 8, 2, 4, True),
+    _layout("dep16", 16, 1, 16, True),
+]
+
+# The layouts routing admits MTP at: each residual-norm path (attention TP in
+# one tray and across trays, attention DP) and each expert split.
+_MTP_LAYOUT_IDS = ("dep4", "tp4", "tp4_ep4", "dep4_moetp4", "tp8_moetp2_ep4", "dep8")
+_MTP_LAYOUTS = [p for i in _MTP_LAYOUT_IDS for p in _LAYOUTS if p.id == i]
+
+
+class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
+    """deepseek-r1-0528-nvfp4 / sm_10x / default, identity and the mtp3 variant.
+
+    Identity runs at every layout its routing admits, the mtp3 variant at the
+    layouts MTP is admitted at.
+
+    Each layout cuts the weights differently (heads, MLP and expert
+    intermediates, expert windows) or crosses ranks differently (fused
+    allreduce in or across trays, or allgather + reduce-scatter under attention
+    DP), and a wrong cut still produces fluent text, so every layout was
+    measured before routing admitted it. CI runs a representative subset (the
+    l0_gb300 test lists): each residual-norm path and each expert split. The
+    cut of every layout is pinned on the CPU by
+    test_modeling_v2_deepseek_default_shards.py.
+    """
 
     MODEL_NAME = "deepseek-ai/DeepSeek-R1-0528"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4"
-
-    # The parallel topology the path's dep4 segment declares. Routing derives
-    # the target *from* these, and the target then asserts every one of them
-    # against the mapping the engine actually built.
-    DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=True)
 
     # The kv-cache fraction is a boot requirement of the variant rather than a
     # tuning choice: the drafting forward's post-pool transient does not fit
@@ -76,30 +135,43 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
     MTP3 = MTPDecodingConfig(max_draft_len=3)
     MTP3_KV = KvCacheConfig(free_gpu_memory_fraction=0.75)
 
-    # One anchor shared by both legs of the acceptance gate below. It names the
-    # target and variant, not a test function, because that is what the number
-    # is a property of.
-    ACCEPTANCE_KEY = "ModelingV2DeepseekR10528Nvfp4Sm103Dep4::mtp3"
+    # One anchor shared by both legs of the acceptance gate below, at every
+    # layout. It names the target and variant, not a test function or a
+    # layout, because that is what the number is a property of: the draft
+    # layer computes the same function at every layout.
+    ACCEPTANCE_KEY = "ModelingV2DeepseekR10528Nvfp4Sm10xDefault::mtp3"
 
-    # There is deliberately no standalone identity gsm8k case. The paired test
-    # below evaluates the identity config as its first leg, and
-    # ``task.evaluate`` asserts accuracy against the reference on the way past,
-    # so a separate one would gate nothing new and would cost a fifth engine
-    # boot of a 61-layer, 4-rank model.
+    @skip_not_sm10x
+    @pytest.mark.parametrize("parallel", _LAYOUTS)
+    def test_gsm8k(self, mocker, parallel):
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
 
-    @skip_not_sm103
-    @pytest.mark.skip_less_device(4)
-    def test_gsm8k_identity_vs_mtp3(self, mocker):
-        """The identity accuracy gate, and the gate on MTP not moving it.
+        # `require` so a layout the routing does not admit fails instead of
+        # quietly measuring the built-in model. It also asks the engine to
+        # check its step contract on its first forward -- the contract is
+        # about metadata that engine prepared, so the only place it can be
+        # checked honestly is a run that prepared it; a synthesized metadata
+        # object would be checking the synthesizer.
+        with LLM(
+            self.MODEL_PATH,
+            modeling_v2="require",
+            env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
+            **parallel,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
-        Turning MTP on must not move the answers.
+    @skip_not_sm10x
+    @pytest.mark.parametrize("parallel", _MTP_LAYOUTS)
+    def test_gsm8k_identity_vs_mtp3(self, mocker, parallel):
+        """The gate on MTP not moving the answers.
 
         Rejection sampling holds the emitted distribution to the target
         model's, so the two scores should differ only by sampling noise.
 
         Both legs assert accuracy against the registered reference as they
-        run -- this test is therefore the identity gate as well as the
-        comparison.
+        run -- this test is therefore an identity gate at its layout as well
+        as the comparison.
 
         Both measurements are taken **in this one test** on purpose. The same
         identity forward measured 94.7688 and 95.0720 on consecutive days --
@@ -111,14 +183,10 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
         task = GSM8K(self.MODEL_NAME)
 
         # One dict for both legs: the comparison only means anything if the two
-        # engines were built under the same mode. It also asks each engine to
-        # check its step contract on its first forward -- the contract is about
-        # metadata that engine prepared, so the only place it can be checked
-        # honestly is a run that prepared it; a synthesized metadata object
-        # would be checking the synthesizer.
+        # engines were built under the same mode.
         modeling_v2 = dict(modeling_v2="require", env_overrides={MODELING_V2_VALIDATE_ENV: "1"})
 
-        with LLM(self.MODEL_PATH, **modeling_v2, **self.DEP4) as llm:
+        with LLM(self.MODEL_PATH, **modeling_v2, **parallel) as llm:
             identity = task.evaluate(llm)
 
         with LLM(
@@ -126,7 +194,7 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
             speculative_config=self.MTP3,
             kv_cache_config=self.MTP3_KV,
             **modeling_v2,
-            **self.DEP4,
+            **parallel,
         ) as llm:
             mtp3 = task.evaluate(llm)
 
@@ -139,19 +207,19 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
             f"distribution, so this is not sampling noise"
         )
 
-    @skip_not_sm103
-    @pytest.mark.skip_less_device(4)
+    @skip_not_sm10x
+    @pytest.mark.parametrize("parallel", _MTP_LAYOUTS)
     @pytest.mark.parametrize("mode", ["require", "off"], ids=["modeling_v2", "stock"])
-    def test_mtp3_acceptance(self, mode, mocker):
+    def test_mtp3_acceptance(self, mode, parallel, mocker):
         """The only gate that can see a miscomputed draft layer.
 
         Rejection sampling makes a wrong draft path *slower*, not wrong: every
         draft is rejected, the text stays correct, and the boot and accuracy
         gates both pass. Acceptance length is the sole detector.
 
-        Two independent cases rather than one that compares them in-session.
-        They share ``ACCEPTANCE_KEY``, so both are read against the same
-        recorded minimum, which is what makes the pair informative:
+        Two independent cases per layout rather than one that compares them
+        in-session. They share ``ACCEPTANCE_KEY``, so both are read against the
+        same recorded minimum, which is what makes the pair informative:
 
           modeling_v2 fails, stock passes -> the draft path regressed
           both fail                     -> the anchor is stale; re-derive it
@@ -160,19 +228,14 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
         The anchor is populated from the **stock** leg. Populating it from the
         target's own number would make the gate self-referential.
         """
-        # Stock cannot boot this checkpoint at dep4 with MTP otherwise: under
-        # attention DP + EP the MoE communication factory lands on
-        # DeepEPLowLatency, whose dispatch takes only NVFP4 uint8 hidden states,
-        # and the MTP layer is bf16 because modelopt excludes model.layers.61*
-        # from quantization. Disabling DeepEP lands on AllGatherReduceScatter --
-        # which is the strategy the modeling_v2 target implements by hand, so it
-        # makes the two comparable rather than less so. Only this leg needs it:
-        # the target builds that path itself and never consults the factory.
-        # It travels as ``env_overrides`` because it is read on the ranks.
-        # Ask the engine to check its step contract on its first forward. The
-        # contract is about metadata that engine prepared, so the only place it
-        # can be checked honestly is a run that prepared it; a synthesized
-        # metadata object would be checking the synthesizer.
+        # Stock cannot boot this checkpoint under attention DP + EP with MTP
+        # otherwise: the MoE communication factory lands on DeepEPLowLatency,
+        # whose dispatch takes only NVFP4 uint8 hidden states, and the MTP layer
+        # is bf16 because modelopt excludes model.layers.61* from quantization.
+        # Disabling DeepEP moves stock off it; the modeling_v2 target builds its
+        # own allgather + reduce-scatter and never consults the factory. Set at
+        # every layout, where it is inert under attention TP. It travels as
+        # ``env_overrides`` because it is read on the ranks.
         rank_env = {MODELING_V2_VALIDATE_ENV: "1"}
         if mode == "off":
             rank_env["TRTLLM_CAN_USE_DEEP_EP"] = "0"
@@ -187,10 +250,39 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
             enable_iter_perf_stats=True,
             modeling_v2=mode,
             env_overrides=rank_env,
-            **self.DEP4,
+            **parallel,
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] {mode} acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(self.ACCEPTANCE_KEY, acceptance_length)
+
+    @skip_not_sm10x
+    @pytest.mark.parametrize(
+        "parallel", [p for i in ("tp4_ep4", "dep4") for p in _LAYOUTS if p.id == i]
+    )
+    def test_gsm8k_chunked_prefill(self, mocker, parallel):
+        """The prefill target's cached-context flavor, under attention TP and DP.
+
+        With chunked prefill every chunk after the first attends to KV it did
+        not compute this step, so the forward takes the MLA path that appends
+        to the paged cache and reads the whole context back
+        (`mla_rope_append_paged_kv_assign_q`, `load_paged_kv_cache_for_mla`)
+        instead of the fresh-context one the other cases run. The harness's
+        GSM8K prompts are lm-eval's 5-shot chain-of-thought prompts, several
+        hundred tokens each, so `max_num_tokens=256` splits every one of them
+        into several chunks.
+        """
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
+
+        with LLM(
+            self.MODEL_PATH,
+            enable_chunked_prefill=True,
+            max_num_tokens=256,
+            modeling_v2="require",
+            env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
+            **parallel,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)

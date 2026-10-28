@@ -15,7 +15,7 @@
 """CuTe DSL custom op for Kimi K3 KDA multi-token speculative verify.
 
 Wraps the source-integrated ``kda_decode_mtp_kernel`` (see
-``cute_dsl_kernels/blackwell/kimi_k3_kda/kda_mtp_decode.py``) as the
+``attention/kernels/blackwell/kimi_k3_kda/kda_mtp_decode.py``) as the
 ``trtllm::kda_mtp_decode`` operator. One launch fuses, per generation
 request: replay of previously-accepted draft tokens from the ``kg/v/beta``
 caches, causal conv + SiLU, Q/K L2 norm, beta sigmoid, lower-bound gate, and
@@ -70,7 +70,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
     from cutlass.cute.runtime import from_dlpack
 
-    from ..cute_dsl_kernels.blackwell.kimi_k3_kda.kda_mtp_decode import (
+    from ..attention.kernels.blackwell.kimi_k3_kda.kda_mtp_decode import (
         NUM_THREADS,
         SPLIT_MAX_TILES,
         T_PAD,

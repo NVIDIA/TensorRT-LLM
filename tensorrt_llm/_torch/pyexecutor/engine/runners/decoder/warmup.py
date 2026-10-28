@@ -16,9 +16,11 @@ import torch
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import warmup_sampling_module
@@ -28,13 +30,13 @@ from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer
 from tensorrt_llm._torch.speculative import get_draft_kv_cache_manager
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
 from tensorrt_llm._utils import global_mpi_rank
+from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 
 from .metadata import resolve_mamba_metadata_cls
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.compilation.backend import Backend
     from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -236,8 +238,6 @@ class DecoderWarmup:
         dist: Distributed | None,
         model: torch.nn.Module,
         sparse_attention_config: BaseSparseAttentionConfig | None,
-        torch_compile_backend: Backend | None,
-        kv_cache_manager_key: ResourceManagerType,
         warmup_timer: _WarmupTimer,
         metrics: dict[str, float],
         agreement: WarmupAgreement,
@@ -249,14 +249,13 @@ class DecoderWarmup:
         torch_compile_bypass: Callable[[], contextlib.AbstractContextManager[None]],
         context_warmups_supported: bool,
         eager_workspace_reclaimable: bool,
+        warmup_inputs: torch.Tensor | None = None,
     ) -> None:
         self._config = config
         self.mapping = mapping
         self.dist = dist
         self.model = model
         self.sparse_attention_config = sparse_attention_config
-        self._torch_compile_backend = torch_compile_backend
-        self.kv_cache_manager_key = kv_cache_manager_key
         self._warmup_timer = warmup_timer
         self._metrics = metrics
         self._agreement = agreement
@@ -265,6 +264,7 @@ class DecoderWarmup:
         self._graphs = graphs
         self._inputs = inputs
         self._forward_warmup = forward_warmup
+        self._warmup_inputs = warmup_inputs
         self._torch_compile_bypass = torch_compile_bypass
         # Warmups that synthesize context batches.
         self._context_warmups_supported = context_warmups_supported
@@ -278,7 +278,11 @@ class DecoderWarmup:
 
     def run(self, resource_manager: ResourceManager) -> EagerWorkspaceReclaimer | None:
         """Warm up and capture graphs; return the eager workspace reclaimer to serve with."""
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        # Warm here, not in AllReduce.__init__, to scope it to the LLM executor's graph capture.
+        warmup_named_allreduce_topologies(self.model)
         # Retain a partial summary when a phase raises.
         with self._warmup_timer:
             return self._warmup_scheduled(resource_manager, kv_cache_manager)
@@ -290,7 +294,9 @@ class DecoderWarmup:
         Returns warmup configs covering the maximum context and generation shapes.
         """
 
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         token_num_upper_bound = min(
             self._config.max_num_tokens,
             self._config.max_batch_size * (self._config.max_seq_len - 1),
@@ -349,6 +355,7 @@ class DecoderWarmup:
             warmup_sampling_module()
             self._prewarm_engram_kernels(kv_cache_manager)
             self._prewarm_csa2_sparse_indexer(kv_cache_manager)
+            self._prewarm_minimax_m3_msa_indexer(kv_cache_manager)
 
         if kv_cache_manager is None:
             logger.info("Skipping warm up as no KV Cache manager allocated.")
@@ -561,7 +568,7 @@ class DecoderWarmup:
             self._config.is_spec_decode
             or self.mapping.cp_size != 1
             or self.sparse_attention_config is not None
-            or self._torch_compile_backend is not None
+            or self._config.torch_compile_enabled
             or self._graphs.breakable_cuda_graph_runner is not None
         ):
             logger.info(
@@ -696,53 +703,66 @@ class DecoderWarmup:
         compile per tactic covers every shape. Uses the real module and weights,
         so it cannot drift from what the model runs.
 
-        No-op on non-DSA models. See nvbugs/6482566.
+        No-op unless this rank holds the weights of a DSv4 indexer; only an
+        indexer whose Q projection takes the fused CuTe DSL path is compiled.
+        See nvbugs/6482566.
         """
         try:
-            from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.deepseek_v4 import (
-                DeepseekV4Indexer,
-            )
+            from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4Indexer
         except ImportError:
             return
 
-        indexer = next(
-            (
-                m
-                for m in self.model.modules()
-                if isinstance(m, DeepseekV4Indexer) and getattr(m, "wq_b", None) is not None
-            ),
-            None,
-        )
-        if indexer is None:
+        # Under pipeline parallelism the layers of other stages keep their
+        # modules but not their parameters, so require the wq_b weight itself.
+        local_indexers = [
+            m
+            for m in self.model.modules()
+            if isinstance(m, DeepseekV4Indexer)
+            and getattr(getattr(m, "wq_b", None), "weight", None) is not None
+        ]
+        if not local_indexers:
             return
 
-        weight = indexer.wq_b.weight
-        # _fallback_tactic() branches on m at 4 and 8, so these three token
-        # counts cover every fallback tactic it can return.
-        with torch.inference_mode():
-            for num_tokens in (4, 8, 16):
-                try:
-                    qr = torch.zeros(
-                        (num_tokens, weight.shape[1]), dtype=torch.bfloat16, device=weight.device
-                    )
-                    position_ids = torch.zeros(
-                        (num_tokens,), dtype=torch.int32, device=weight.device
-                    )
-                    indexer._project_and_quantize_q(qr, position_ids)
-                except Exception as e:
-                    # Never fail startup for a prewarm miss; the kernel would
-                    # simply be compiled later, as it is today.
-                    logger.warning(
-                        f"indexer-Q CuTe DSL prewarm skipped for {num_tokens} "
-                        f"tokens. {type(e).__name__}: {e}"
-                    )
-        torch.cuda.synchronize()
+        indexer = next(
+            (m for m in local_indexers if m._is_fused_project_mxfp4_enabled(torch.bfloat16)),
+            None,
+        )
+        compiled = 0
+        if indexer is not None:
+            weight = indexer.wq_b.weight
+            # _fallback_tactic() branches on m at 4 and 8, so these three token
+            # counts cover every fallback tactic it can return.
+            with torch.inference_mode():
+                for num_tokens in (4, 8, 16):
+                    try:
+                        qr = torch.zeros(
+                            (num_tokens, weight.shape[1]),
+                            dtype=torch.bfloat16,
+                            device=weight.device,
+                        )
+                        position_ids = torch.zeros(
+                            (num_tokens,), dtype=torch.int32, device=weight.device
+                        )
+                        indexer._project_and_quantize_q(qr, position_ids)
+                        compiled += 1
+                    except Exception as e:
+                        # A prewarm miss only defers this compile to the first
+                        # forward that needs it, so it must not fail startup.
+                        logger.warning(
+                            f"indexer-Q CuTe DSL prewarm skipped for {num_tokens} "
+                            f"tokens. {type(e).__name__}: {e}"
+                        )
+            torch.cuda.synchronize()
 
-        # Hold every rank here until the slowest has finished compiling, so the
-        # first MoE all-to-all dispatch is entered without JIT skew.
+        # Hold the TP group here until its slowest rank has finished these
+        # compiles, so they add no skew between TP peers at the first MoE
+        # all-to-all dispatch. Whether a rank enters depends only on the model
+        # layout, not on the rank-local fused-path check above, so the whole TP
+        # group always enters together.
         if self.mapping.tp_size > 1 and self.dist is not None:
             self.dist.tp_allgather(1)
-        logger.info("indexer-Q CuTe DSL prewarm complete")
+        if compiled:
+            logger.info(f"indexer-Q CuTe DSL prewarm complete ({compiled}/3 token counts)")
 
     def _ensure_dsa_attn_metadata_for_warmup(self, resource_manager: ResourceManager) -> None:
         """Build the DSA attention metadata if no warmup forward created it, so
@@ -757,7 +777,9 @@ class DecoderWarmup:
         metadata_cls = getattr(self._config.attention_backend, "Metadata", None)
         if metadata_cls is None or not issubclass(metadata_cls, DSAtrtllmAttentionMetadata):
             return
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         if kv_cache_manager is None:
             return
         self._metadata.setup_attention(
@@ -830,12 +852,15 @@ class DecoderWarmup:
                         record=False,
                         log_start=False,
                     ):
-                        self._forward_warmup(
-                            batch,
-                            resource_manager,
-                            enable_spec_decode=self._config.is_spec_decode,
-                            runtime_draft_len=get_static_draft_len(self._config.spec_config),
-                        )
+                        with discard_nccl_window_tensor_outputs(
+                            (getattr(self, "_warmup_inputs", None), batch)
+                        ):
+                            self._forward_warmup(
+                                batch,
+                                resource_manager,
+                                enable_spec_decode=self._config.is_spec_decode,
+                                runtime_draft_len=get_static_draft_len(self._config.spec_config),
+                            )
                         torch.cuda.synchronize()
             except torch.OutOfMemoryError:
                 if self._agreement.is_distributed_forward():
@@ -938,13 +963,14 @@ class DecoderWarmup:
                     record=False,
                     log_start=True,
                 ):
-                    self._forward_warmup(
-                        batch,
-                        resource_manager,
-                        enable_spec_decode=self._config.is_spec_decode,
-                        runtime_draft_len=get_static_draft_len(self._config.spec_config),
-                        trtllm_gen_jit_warmup=True,
-                    )
+                    with discard_nccl_window_tensor_outputs(getattr(self, "_warmup_inputs", None)):
+                        self._forward_warmup(
+                            batch,
+                            resource_manager,
+                            enable_spec_decode=self._config.is_spec_decode,
+                            runtime_draft_len=get_static_draft_len(self._config.spec_config),
+                            trtllm_gen_jit_warmup=True,
+                        )
                     torch.cuda.synchronize()
 
     @staticmethod
@@ -1058,7 +1084,9 @@ class DecoderWarmup:
         enable_flashinfer_mxfp8_autotuner = bool(flashinfer_mxfp8_methods)
         enable_native_mxfp8_autotuner = bool(native_mxfp8_methods)
 
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         if generation_only:
             tokens_per_gen_request = 1 + self._config.max_total_draft_tokens
             num_gen_requests = min(
@@ -1136,12 +1164,17 @@ class DecoderWarmup:
                             record=False,
                             log_start=True,
                         ):
-                            self._forward_warmup(
-                                batch,
-                                resource_manager,
-                                enable_spec_decode=self._config.is_spec_decode,
-                                runtime_draft_len=get_static_draft_len(self._config.spec_config),
-                            )
+                            with discard_nccl_window_tensor_outputs(
+                                (getattr(self, "_warmup_inputs", None), batch)
+                            ):
+                                self._forward_warmup(
+                                    batch,
+                                    resource_manager,
+                                    enable_spec_decode=self._config.is_spec_decode,
+                                    runtime_draft_len=get_static_draft_len(
+                                        self._config.spec_config
+                                    ),
+                                )
                             ran_forward = True
                             torch.cuda.synchronize()
 
@@ -1250,7 +1283,9 @@ class DecoderWarmup:
         """
         if os.environ.get("TLLM_MAMBA_MULTISEQ_WARMUP", "1") != "1":
             return
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         if kv_cache_manager is None or not isinstance(kv_cache_manager, MambaHybridCacheManager):
             return
 
@@ -1369,12 +1404,17 @@ class DecoderWarmup:
                                 batch, num_tokens_i, shape
                             ):
                                 continue
-                            self._forward_warmup(
-                                batch,
-                                resource_manager,
-                                enable_spec_decode=self._config.is_spec_decode,
-                                runtime_draft_len=get_static_draft_len(self._config.spec_config),
-                            )
+                            with discard_nccl_window_tensor_outputs(
+                                (getattr(self, "_warmup_inputs", None), batch)
+                            ):
+                                self._forward_warmup(
+                                    batch,
+                                    resource_manager,
+                                    enable_spec_decode=self._config.is_spec_decode,
+                                    runtime_draft_len=get_static_draft_len(
+                                        self._config.spec_config
+                                    ),
+                                )
 
                             if autotuner_enabled:
                                 AutoTuner.get().cache_pp_recv()
@@ -1470,3 +1510,41 @@ class DecoderWarmup:
             self.dist.tp_allgather(1)
         if compiled:
             logger.info("CSA2 sparse indexer prewarm complete")
+
+    def _prewarm_minimax_m3_msa_indexer(
+        self, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None
+    ) -> None:
+        """Compile the MSA indexer's KV-split proxy variants, which no warmup forward plans."""
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
+            MiniMaxM3KVCacheManagerV2,
+        )
+
+        if not isinstance(kv_cache_manager, MiniMaxM3KVCacheManagerV2):
+            return
+        sparse_config = self.sparse_attention_config
+        if (
+            not isinstance(sparse_config, MiniMaxM3SparseAttentionConfig)
+            or sparse_config.implementation != "msa"
+        ):
+            return
+
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import (
+            prewarm_split_proxy_variants,
+        )
+
+        params = sparse_config.to_sparse_metadata_params(
+            pretrained_config=self.model.model_config.pretrained_config
+        )
+        index_dtype = (
+            torch.float8_e4m3fn if kv_cache_manager.indexer_kv_dtype == "fp8" else torch.bfloat16
+        )
+        with torch.inference_mode():
+            prewarm_split_proxy_variants(
+                index_dtype,
+                params.sharded_index_head_count(self.mapping),
+                kv_cache_manager.tokens_per_block,
+            )
+        torch.cuda.synchronize()
+        if self.mapping.tp_size > 1 and self.dist is not None:
+            self.dist.tp_allgather(1)
+        logger.info("MiniMax-M3 MSA indexer prewarm complete")

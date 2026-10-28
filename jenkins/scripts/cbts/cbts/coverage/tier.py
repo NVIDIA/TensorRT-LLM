@@ -206,7 +206,7 @@ def apply_coverage_tier(
         return None, note
 
     selector = CoverageSelector(db, repo_root, no_data_policy=no_data_policy)
-    cov = selector.decide(residual, pr.raw_diffs or pr.diffs)
+    cov = selector.decide(residual, pr.raw_diffs or pr.diffs, selection_diffs=pr.diffs)
     if not cov.ok:
         return None, f"coverage tier declined: {cov.reason}"
 
@@ -261,7 +261,8 @@ def apply_coverage_tier(
         )
     result = CoverageTierResult(
         # single-GPU only; multi-GPU re-added in Groovy under MULTI_GPU_FILE_CHANGED gate
-        affected_stages={s for s in stages if not _is_multi_gpu(s)} - dropped,
+        affected_stages=({s for s in stages if not _is_multi_gpu(s)} - dropped)
+        | {stage for _, rule in pairs for stage in rule.affected_stages},
         removed=removed,
         dropped=dropped,
         reason=reason,

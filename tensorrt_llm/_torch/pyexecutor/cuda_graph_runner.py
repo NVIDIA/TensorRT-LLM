@@ -23,6 +23,9 @@ from ..distributed import Distributed
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..moe.expert_statistic import ExpertStatistic
+from ..nccl_window_graph import (nccl_window_graph_capture,
+                                 release_nccl_window_graph_owner)
+from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
@@ -100,19 +103,19 @@ def _restore_spec_decode_capture_state(
 
 @dataclass
 class CUDAGraphRunnerConfig:
-    """Configuration for the CUDAGraphRunner, passed from the ModelEngine."""
+    """Configuration for the CUDAGraphRunner, passed from the decoder runner."""
     use_cuda_graph: bool
     """
     Master switch controlling the model's execution path.
 
     This flag determines one of three distinct execution paths for the
-    model engine:
+    decoder runner:
 
     1.  **`False` (Pure Eager Path):**
         * Forces all execution to be in eager mode.
         * The `CUDAGraphRunner` instance is mostly dormant
         * Methods like `maybe_get_cuda_graph` and `pad_batch`
-            will return immediately, signaling the model engine to
+            will return immediately, signaling the decoder runner to
             run in eager mode.
 
     2.  **`True` (Eager Fallback Path):**
@@ -125,10 +128,10 @@ class CUDAGraphRunnerConfig:
         * The runner finds an eligible batch and a matching graph.
         * The graph is then captured (if new) or replayed.
 
-    Note: As of this implementation, the model engine *always* calls
+    Note: As of this implementation, the decoder runner *always* calls
     `cuda_graph_runner.pad_batch` and `cuda_graph_runner.maybe_get_cuda_graph`
     even when this is `False`. This could be refactored in the future
-    so that the engine bypasses the `CUDAGraphRunner` entirely in Case 1.
+    so that the decoder runner bypasses the `CUDAGraphRunner` entirely in Case 1.
     """
     cuda_graph_padding_enabled: bool
     cuda_graph_batch_sizes: list[int]
@@ -136,25 +139,29 @@ class CUDAGraphRunnerConfig:
     max_beam_width: int
     max_num_tokens: int
     spec_config: Optional[DecodingBaseConfig]
-    cuda_graph_mem_pool: Any
     use_mrope: bool
-    original_max_draft_len: int
     original_max_total_draft_tokens: int
     enable_attention_dp: bool
     is_encoder_decoder: bool
     batch_size: int
-    mapping: Optional[Mapping]
+    mapping: Mapping
     dist: Optional[Distributed]
-    kv_cache_manager_key: Any
     dynamic_draft_len_mapping: Optional[Dict[int, int]] = None
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
     enable_encoder_decoder_mixed_cuda_graph: bool = False
     enable_in_graph_sampling: bool = False
+    static_input_ids: Optional[torch.Tensor] = None
+    """The decoder runner's own int32 input-id buffer. When given (with
+    ``static_position_ids``), the graphs' static inputs are views of the
+    decoder runner's buffers: every write the runner makes is already the graphs'
+    input, and replay copies nothing. For runners that rewrite every token's
+    input each step."""
+    static_position_ids: Optional[torch.Tensor] = None
 
 
 class CUDAGraphRunner:
     """
-    Manages the lifecycle and execution of CUDA graphs for the model engine.
+    Manages the lifecycle and execution of CUDA graphs for the decoder runner.
 
     This unified class handles high-level orchestration (padding, eligibility)
     and low-level execution (capturing, resource management, replaying) for
@@ -177,16 +184,16 @@ class CUDAGraphRunner:
         self.enable_encoder_decoder_mixed_cuda_graph = (
             config.enable_encoder_decoder_mixed_cuda_graph)
         self.enable_in_graph_sampling = config.enable_in_graph_sampling
-        # Set by the engine while capturing an in-graph sampling tier pass.
+        # Set by DecoderCudaGraphs while capturing an in-graph sampling tier pass.
         self._capture_sample_type: Optional[SampleType] = None
-        # Resolves a runtime batch to its tier; registered by the engine so the
+        # Resolves a runtime batch to its tier; registered through the decoder runner so the
         # graph runner does not need to know about the sampler.
         self._sample_type_resolver: Optional[Callable[
             [ScheduledRequests, Optional[SampleType]], SampleType]] = None
         # Called just before each replay, after the static input buffers are
         # filled. For state a model computes inside its own forward and a graph
         # therefore captures the address of: a replay runs no Python, so nothing
-        # else refreshes it. Registered by the engine on the model's behalf.
+        # else refreshes it. Registered by the model.
         self._pre_replay_hooks: List[Callable[
             [KeyType, int, Dict[str, Any], Dict[str, Any]], None]] = []
         self._pre_replay_position_ids: Optional[torch.Tensor] = None
@@ -195,7 +202,7 @@ class CUDAGraphRunner:
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
-        self.memory_pool = config.cuda_graph_mem_pool
+        self.memory_pool = None
         self.padding_dummy_requests: Dict[int, LlmRequest] = {}
         self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
 
@@ -225,6 +232,25 @@ class CUDAGraphRunner:
         max_total_tokens = min(max_total_tokens, self.config.max_num_tokens)
 
         self._pre_replay_position_ids = None
+        if self.config.static_input_ids is not None:
+            input_ids = self.config.static_input_ids
+            position_ids = self.config.static_position_ids
+            if (self.config.use_mrope or position_ids is None
+                    or input_ids.dtype != torch.int32
+                    or position_ids.dtype != torch.int32 or input_ids.dim() != 1
+                    or position_ids.dim() != 1 or not input_ids.is_contiguous()
+                    or not position_ids.is_contiguous()
+                    or min(input_ids.numel(),
+                           position_ids.numel()) < max_total_tokens):
+                raise ValueError(
+                    "CUDA graph static inputs from the engine's buffers need "
+                    "two contiguous 1-D int32 buffers of at least "
+                    f"{max_total_tokens} tokens and no MRoPE.")
+            self.shared_static_tensors = {
+                "input_ids": input_ids[:max_total_tokens],
+                "position_ids": position_ids[:max_total_tokens].unsqueeze(0),
+            }
+            return
         self.shared_static_tensors = {
             "input_ids":
             torch.ones((max_total_tokens, ), device="cuda", dtype=torch.int32),
@@ -309,7 +335,7 @@ class CUDAGraphRunner:
         """Select the sparse-attention graph family for the execution view.
 
         ``promoted_context_request_ids`` contains semantic final-context rows
-        that the model engine temporarily placed in the generation list. It is
+        that the decoder runner temporarily placed in the generation list. It is
         empty for the existing generation-only path.
         """
         if (isinstance(self.sparse_config, SeqLenAwareSparseAttentionConfig)
@@ -464,7 +490,7 @@ class CUDAGraphRunner:
         selects -- match the pre-tier engine.
 
         Only resolves; the buffers the in-graph step reads are staged later, by
-        the engine, once it has settled which batch the forward runs on. The
+        the decoder runner, once it has settled which batch the forward runs on. The
         tier has to be known here because it is part of the key that decides
         which graph is replayed.
         """
@@ -527,7 +553,9 @@ class CUDAGraphRunner:
         return CUDAGraphRunner._get_mrope_position_delta(request) is not None
 
     def __del__(self):
-        self.clear()
+        # GC timing is not rank-symmetric, so destructor cleanup must not make
+        # graph-owned NCCL windows eligible for reuse.
+        self.clear(release_nccl_window_owners=False)
 
     def maybe_get_cuda_graph(
         self,
@@ -683,9 +711,6 @@ class CUDAGraphRunner:
                 enable_spec_decode: bool = False,
                 postprocess_fn: Optional[Callable] = None) -> Any:
         """Warm up and/or capture the forward pass for a graph key."""
-        # Preserve compatibility with direct callers that still pass a plain
-        # (batch_size, draft_len) generation-only tuple.
-        key = KeyType(*key)
         batch_size = key.batch_size
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
@@ -749,12 +774,20 @@ class CUDAGraphRunner:
             # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
             # This also lets us initialize states in the attn_metadata and
             # resize the shared attention workspace before any graph is captured.
-            for _ in range(self.WARMUP_STEPS):
-                output = forward_fn(capture_inputs)
+            def run_warmup():
+                result = forward_fn(capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
                 _restore_spec_decode_capture_state(attn_metadata,
                                                    saved_kv_lens_cuda)
+                return result
+
+            for _ in range(self.WARMUP_STEPS):
+                if self.is_warmup_only:
+                    output = run_warmup()
+                else:
+                    with discard_nccl_window_tensor_outputs(capture_inputs):
+                        run_warmup()
 
             if self.is_warmup_only:
                 return output
@@ -763,13 +796,11 @@ class CUDAGraphRunner:
             # Do not keep the eager result live from this runner across graph
             # setup/capture; release its reference before entering.
             output = None
-            with torch.cuda.graph(graph, pool=self.memory_pool):
+            graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
+            with nccl_window_graph_capture(graph, graph_pool):
                 output = forward_fn(capture_inputs)
-            # Snapshot before postprocessing so the check compares against
-            # the addresses the graph actually baked in.
+            # The addresses the graph baked in, for the strict buffer check.
             self._record_strict_buffer_snapshot(key)
-            if postprocess_fn is not None:
-                postprocess_fn(capture_inputs)
             _restore_spec_decode_capture_state(attn_metadata,
                                                saved_kv_lens_cuda)
 
@@ -791,7 +822,6 @@ class CUDAGraphRunner:
         ``position_id_offsets`` is a one-dimensional device tensor containing the
         position corrections applied inside the captured speculative preprocessing.
         """
-        key = KeyType(*key)
         stored_meta = self.graph_metadata[key]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
         if stored_meta["spec_metadata"] is not None:
@@ -809,7 +839,11 @@ class CUDAGraphRunner:
                 f"replay() got {seqlen} tokens for key {key}, but the graph "
                 f"was captured for {expected_num_tokens} tokens. A shorter "
                 "input_ids leaves the tail of the static input buffer stale.")
-        static_tensors["input_ids"][:seqlen].copy_(input_ids)
+        # With the decoder runner's buffers as the static inputs (static_input_ids)
+        # the source is the static view itself, and there is nothing to copy.
+        static_input_ids = static_tensors["input_ids"][:seqlen]
+        if input_ids.data_ptr() != static_input_ids.data_ptr():
+            static_input_ids.copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
         if self.config.use_mrope:
@@ -838,7 +872,7 @@ class CUDAGraphRunner:
                                                       non_blocking=True)
             else:
                 # Omission means every slot reads the dummy seq slot's
-                # permanently-zero delta (model_engine.py's mrope_dummy_seq_slot
+                # permanently-zero delta (DecoderInputPreparer's mrope_dummy_seq_slot
                 # fast path). Fill explicitly instead of leaving stale values.
                 logger.debug(
                     "replay() got no mrope_delta_read_seq_slots for a "
@@ -856,7 +890,9 @@ class CUDAGraphRunner:
                     f"for key {key}, but expected {expected_position_ids_shape}. "
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
-            static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
+            static_position_ids = static_tensors["position_ids"][:, :seqlen]
+            if position_ids.data_ptr() != static_position_ids.data_ptr():
+                static_position_ids.copy_(position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
         if num_encoder_tokens:
@@ -906,7 +942,7 @@ class CUDAGraphRunner:
     def _max_padded_batch_size(self) -> int:
         """Largest padded batch size ``_get_padded_batch`` may choose.
 
-        ``max_supported_batch_size`` bounds the captured graphs; the engine's
+        ``max_supported_batch_size`` bounds the captured graphs; the decoder runner's
         own ``batch_size`` bounds concurrent requests, and the padded size is
         exactly ``padding_size + batch.batch_size``, so both apply to the
         padded size itself.
@@ -1075,7 +1111,7 @@ class CUDAGraphRunner:
             return self.padding_dummy_requests[runtime_draft_len]
 
         kv_cache_manager = resource_manager.get_resource_manager(
-            self.config.kv_cache_manager_key)
+            ResourceManagerType.KV_CACHE_MANAGER)
 
         runtime_tokens_per_gen_step = (
             self.spec_config.get_runtime_tokens_per_gen_step(runtime_draft_len)
@@ -1092,8 +1128,6 @@ class CUDAGraphRunner:
                 cross_kv_cache_manager)
 
         # Get draft KV cache manager only for one-model speculative decoding.
-        # In two-model mode, each model has its own KV cache manager, so
-        # draft_kv_cache_manager should be None.
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self.spec_config, resource_manager)
 
@@ -1139,7 +1173,7 @@ class CUDAGraphRunner:
         """
         candidates = [
             resource_manager.get_resource_manager(
-                self.config.kv_cache_manager_key),
+                ResourceManagerType.KV_CACHE_MANAGER),
             get_draft_kv_cache_manager(self.spec_config, resource_manager),
             resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER),
@@ -1196,7 +1230,7 @@ class CUDAGraphRunner:
     def preallocate_padding_dummies(self,
                                     resource_manager: ResourceManager) -> None:
         """Eagerly allocates the padding dummies while the KV cache still has
-        free blocks (called at the end of ModelEngine.warmup, after graph
+        free blocks (called during DecoderWarmup, after graph
         capture).
 
         _get_padded_batch otherwise allocates the dummies lazily at the first
@@ -1213,7 +1247,7 @@ class CUDAGraphRunner:
         if not (self.enabled and self.padding_enabled):
             return
         kv_cache_manager = resource_manager.get_resource_manager(
-            self.config.kv_cache_manager_key)
+            ResourceManagerType.KV_CACHE_MANAGER)
         if kv_cache_manager is None or getattr(kv_cache_manager,
                                                'is_estimating_kv_cache', False):
             # The estimation-phase KV cache is sized with no headroom for
@@ -1258,7 +1292,7 @@ class CUDAGraphRunner:
             return True
 
         kv_cache_manager = resource_manager.get_resource_manager(
-            self.config.kv_cache_manager_key)
+            ResourceManagerType.KV_CACHE_MANAGER)
         kv_cache_manager.free_resources(dummy_request)
         if draft_kv_cache_manager is not None:
             draft_kv_cache_manager.free_resources(dummy_request)
@@ -1323,8 +1357,9 @@ class CUDAGraphRunner:
                 scheduled_requests.generation_requests = scheduled_requests.generation_requests[:
                                                                                                 -padding_size]
 
-    def clear(self):
+    def clear(self, *, release_nccl_window_owners: bool = True):
         """Releases all captured graphs and the associated memory pool."""
+        graph_pool = self.memory_pool
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
@@ -1334,6 +1369,8 @@ class CUDAGraphRunner:
         self.padding_dummy_requests = {}
         del self.memory_pool
         self.memory_pool = None
+        if release_nccl_window_owners and graph_pool is not None:
+            release_nccl_window_graph_owner(graph_pool)
         torch.cuda.empty_cache()
 
 
@@ -1354,7 +1391,6 @@ class EncoderCUDAGraphRunnerConfig:
     max_cuda_graph_num_tokens: int
     max_num_tokens: int
     max_seq_len: int
-    cuda_graph_mem_pool: Any
     is_encoder_decoder: bool = False
     use_fixed_sequence_slots: bool = False
 
@@ -1407,7 +1443,7 @@ class EncoderCUDAGraphRunner:
             # Neither mode prepares inputs through the encode-only path that
             # validates them and synthesizes capture stand-ins: feature mode
             # stages via its own mirrors, and the encoder-decoder runner
-            # overrides prepare_inputs/_prepare_capture_inputs. The graph would
+            # overrides _prepare_inputs/_prepare_capture_inputs. The graph would
             # capture the caller's tensor and then read it stale (or freed).
             unsupported = ("feature-mode"
                            if self.feature_mode else "encoder-decoder")
@@ -1460,7 +1496,7 @@ class EncoderCUDAGraphRunner:
         self.graph_outputs: Dict[EncoderKeyType, Callable[[],
                                                           Optional[Any]]] = {}
         self.graph_metadata: Dict[EncoderKeyType, Dict[str, Any]] = {}
-        self.memory_pool = config.cuda_graph_mem_pool
+        self.memory_pool = None
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
         self.shared_static_tensors_cpu: Dict[str, torch.Tensor] = {}
@@ -2330,7 +2366,11 @@ class EncoderCUDAGraphRunner:
             # The warmup pass must not build a graph; its caller consumes the
             # eager output directly.
             for _ in range(self.WARMUP_STEPS):
-                output = forward_fn(capture_inputs)
+                if self.is_warmup_only:
+                    output = forward_fn(capture_inputs)
+                else:
+                    with discard_nccl_window_tensor_outputs(capture_inputs):
+                        forward_fn(capture_inputs)
 
             if self.is_warmup_only:
                 return output
@@ -2339,13 +2379,15 @@ class EncoderCUDAGraphRunner:
             # Do not keep the eager result live from this runner across graph
             # setup/capture; release its reference before entering.
             output = None
-            with torch.cuda.graph(graph,
-                                  pool=self.memory_pool,
-                                  stream=self._get_capture_stream(),
-                                  capture_error_mode="thread_local"):
-                if capture_h2d is not None:
-                    capture_h2d()
-                output = forward_fn(capture_inputs)
+            graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
+            with nccl_window_graph_capture(graph,
+                                           graph_pool,
+                                           stream=self._get_capture_stream(),
+                                           capture_error_mode="thread_local"):
+                with discard_nccl_window_tensor_outputs(capture_inputs):
+                    if capture_h2d is not None:
+                        capture_h2d()
+                    output = forward_fn(capture_inputs)
 
         if self._contains_nested_tensor(output):
             raise TypeError(
@@ -2538,7 +2580,8 @@ class EncoderCUDAGraphRunner:
     def get_graph_pool(self):
         return self.memory_pool
 
-    def clear(self):
+    def clear(self, *, release_nccl_window_owners: bool = True):
+        graph_pool = self.memory_pool
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
@@ -2546,4 +2589,6 @@ class EncoderCUDAGraphRunner:
         self.graph_metadata.clear()
         del self.memory_pool
         self.memory_pool = None
+        if release_nccl_window_owners and graph_pool is not None:
+            release_nccl_window_graph_owner(graph_pool)
         torch.cuda.empty_cache()

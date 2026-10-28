@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cfloat>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -1022,6 +1023,23 @@ public:
             options.mNumInstsQ = kernelMeta.mStepQ / kernelMeta.mTileSizeQ;
             options.mNumInstsKv = kernelMeta.mStepKv / kernelMeta.mTileSizeKv;
 
+            int32_t vTokenStrideElements = 0;
+            if (isSeparateQkv(options.mQkvLayout) && params.mVTokenStrideInBytes != 0)
+            {
+                TLLM_CHECK_WITH_INFO(params.mVTokenStrideInBytes > 0, "V token stride must be positive");
+                constexpr int32_t kTmaAlignmentBytes = 16;
+                TLLM_CHECK_WITH_INFO(params.mVTokenStrideInBytes % kTmaAlignmentBytes == 0,
+                    "V token stride must be 16-byte aligned for TMA");
+                TLLM_CHECK_WITH_INFO(
+                    reinterpret_cast<std::uintptr_t>(fmhaData.mInputBuffers.vBasePtr) % kTmaAlignmentBytes == 0,
+                    "V pointer must be 16-byte aligned for TMA");
+                int32_t const elementBits = tg::dtypeGetNumBits(options.mDtypeV);
+                TLLM_CHECK_WITH_INFO(params.mVTokenStrideInBytes
+                        <= std::numeric_limits<int32_t>::max() * static_cast<int64_t>(elementBits) / 8,
+                    "V token stride exceeds the supported range");
+                int64_t const strideElements = params.mVTokenStrideInBytes * 8 / elementBits;
+                vTokenStrideElements = static_cast<int32_t>(strideElements);
+            }
             KernelParams kernelParams = fmha::KernelParamsSetup::setKernelParams(options, grid[0], grid[1], grid[2],
                 fmhaData.mMetaData.cumSeqLensQPtrD, fmhaData.mMetaData.cumSeqLensKvPtrD, fmhaData.mMetaData.seqLensKvD,
                 fmhaData.mInputBuffers.qBasePtr, fmhaData.mInputBuffers.kBasePtr, fmhaData.mInputBuffers.vBasePtr,
@@ -1040,7 +1058,7 @@ public:
                 fmhaData.mOutputBuffers.softmaxStatsD, fmhaData.mOutputBuffers.oDebugPtrD,
                 fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax, fmhaData.mMetaData.skipCorrThreshold,
                 fmhaData.mScales.kvSfScale, fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO,
-                options.mUseBlockSparseAttention, options.mUsesSharedPagedKvIdx);
+                options.mUseBlockSparseAttention, options.mUsesSharedPagedKvIdx, vTokenStrideElements);
 
             launchFmhaKernel(kernelParams, kernelMeta, func, grid, options, params.stream);
             // Run the separate reduction kernel if needed.
@@ -1070,6 +1088,8 @@ private:
         // Kernel selection mutates and then queries the autotuner's shared dummy kernel; the
         // background JIT warmup thread runs this same path. See getFmhaSelectionMutex().
         std::lock_guard<std::mutex> selectionLock(getFmhaSelectionMutex());
+        configurePaddedMlaTile(options, optionsFromArgs);
+
         // CGA SMEM reduction cluster limits are Rubin SM107-specific; clamping on SM100/SM103
         // changed autotuner choices without fixing a known failure mode on those GPUs.
         if (mSM != kSM_107)
@@ -1094,6 +1114,57 @@ private:
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
         limitCgaSmemReductionCtasKv(options);
         return {options, optionsFromArgs, ctaDim};
+    }
+
+    static void configurePaddedMlaTile(FmhaOptions& options, FmhaOptionsFromArgs& optionsFromArgs)
+    {
+        if (!options.mIsMlaGen || options.mSelectsGroupedMla || tg::isArchHopper(options.mCudaArch)
+            || options.mHeadDimV != 512 || (options.mHeadDimQk != 576 && options.mHeadDimQk != 512))
+        {
+            return;
+        }
+        int const numHeads = options.mNumHeadsQPerKv;
+        TLLM_CHECK_WITH_INFO(numHeads > 0, "The MLA Q heads per KV head must be positive.");
+        // Power-of-two groups of at least eight heads already have legal Q tiles.
+        if (numHeads >= 64 || (numHeads >= 8 && (numHeads & (numHeads - 1)) == 0))
+        {
+            return;
+        }
+        bool const isSparse = isTokenSparse(options.mSparseType);
+        // These selections already contain the whole head group in a legal Q8/Q16/Q64 tile.
+        if ((!isSparse && numHeads <= 16) || (isSparse && numHeads > 32))
+        {
+            return;
+        }
+        // The tree-mask path has its own grouping constraints and keeps its existing selection.
+        if (options.mIsCustomSpecDecodingGen && numHeads > 32)
+        {
+            return;
+        }
+
+        int paddedTileSizeQ = 8;
+        while (paddedTileSizeQ < numHeads)
+        {
+            paddedTileSizeQ *= 2;
+        }
+        bool const useSwapsMmaAb = paddedTileSizeQ <= 32;
+        options.mFmhaKernelType
+            = useSwapsMmaAb ? FmhaKernelType::SwapsMmaAbForGeneration : FmhaKernelType::KeepsMmaAbForGeneration;
+        options.mTileSizeQ = paddedTileSizeQ;
+        options.mTileSizeKv = 128;
+        options.mClusterDimX = 1;
+        options.mHeadDimPerCtaV = options.mHeadDimV;
+        options.mGroupsHeadsQ = true;
+        options.mSingleTokenQPerCta = true;
+        if (!isDisabled(options.mMultiCtasKvMode))
+        {
+            options.mMultiCtasKvMode
+                = useSwapsMmaAb ? MultiCtasKvMode::GmemReduction : MultiCtasKvMode::GmemReductionWithSeparateKernel;
+        }
+        // Supply the complete tile selection before CTA geometry is computed. The manual path
+        // still derives staging, MMA, softmax and launch parameters from the real head counts.
+        options.mEnablesAutoTuner = false;
+        optionsFromArgs.mIsTileSizeQSet = true;
     }
 
     void limitCgaSmemReductionCtasKv(FmhaOptions& options) const

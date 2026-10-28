@@ -46,7 +46,16 @@ from tensorrt_llm.mapping import Mapping
 _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
     "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1")
 
-_MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
+# Bytes of the full all-reduce message (tokens * hidden * ranks * element size) up to which the
+# MNNVL path uses the one-shot kernel; mirrors kOneShotSizeThreshold in thop/allreduceOp.cpp and
+# the same TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES override, so the lamport workspace is sized for it.
+_MNNVL_ONE_SHOT_THRESHOLD_BYTES = int(
+    os.environ.get("TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES", 64 * 1024 * 8 * 2))
+if _MNNVL_ONE_SHOT_THRESHOLD_BYTES < 0:
+    # The native side rejects a negative value too; fail at import with the variable's name.
+    raise ValueError(
+        "TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES must be a non-negative integer, got "
+        f"{_MNNVL_ONE_SHOT_THRESHOLD_BYTES}")
 
 _thread_local = threading.local()
 
@@ -103,6 +112,47 @@ class _MnnvlWorkspace(TypedDict):
     # Set once the workspace is handed out during CUDA graph capture: the captured graphs launch on its buffers and
     # flags, so a larger workspace that replaces it must keep it alive.
     captured: bool
+
+
+_named_allreduce_topology_warmups = set()
+_named_allreduce_topology_warmups_lock = threading.Lock()
+
+
+def _warmup_named_allreduce_topology(mapping: Mapping, group_name: str) -> None:
+    """Complete native TP topology discovery before PCG capture.
+
+    ``allreduce_pg_by_name`` keeps its optimized C++ collective implementation.
+    Its one-time ProcessGroup setup and first NCCL launch must happen eagerly:
+    a CUDA graph capture is not a safe place to initialize host-side c10d
+    metadata or lazily create the communicator.  Cache per group so model
+    construction pays this cost once, not once per all-reduce module.
+    """
+    if (not group_name or not torch.cuda.is_available()
+            or torch.compiler.is_compiling()):
+        return
+    with _named_allreduce_topology_warmups_lock:
+        if group_name in _named_allreduce_topology_warmups:
+            return
+        token = torch.ones(1, device="cuda", dtype=torch.float32)
+        # ``tp_group`` lists global ranks and the native op looks the rank up
+        # in it, so pass the global rank (as the all-reduce itself does), not
+        # the group-local ``tp_rank``: a TP group that does not start at rank 0
+        # (PP or CP > 1) would not contain ``tp_rank``.
+        torch.ops.trtllm.allreduce_pg_warmup_by_name(
+            token, mapping.tp_group, torch.distributed.get_rank(), group_name)
+        _named_allreduce_topology_warmups.add(group_name)
+
+
+def warmup_named_allreduce_topologies(model: nn.Module) -> None:
+    """Warm each named TP group used by the model's ``AllReduce`` modules, once and in a fixed order."""
+    if not mpi_disabled():
+        return
+    mappings = {}
+    for module in model.modules():
+        if isinstance(module, AllReduce) and module._group_name:
+            mappings.setdefault(module._group_name, module.mapping)
+    for group_name in sorted(mappings):
+        _warmup_named_allreduce_topology(mappings[group_name], group_name)
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -257,7 +307,10 @@ def get_or_scale_allreduce_mnnvl_workspace(
     allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
     if mapping in allreduce_mnnvl_workspaces:
         workspace = allreduce_mnnvl_workspaces[mapping]
-        if not workspace["handle"].is_mapped():
+        # The handle probe is a nanobind call, which dynamo cannot trace; the
+        # compiled path relies on the pre-scaled workspace being attached.
+        if (not torch.compiler.is_compiling()
+                and not workspace["handle"].is_mapped()):
             raise RuntimeError("MNNVL workspace handles are not attached")
         if workspace["buffer_size_bytes"] >= (buffer_size_bytes or 0):
             return _mark_if_capturing(workspace)
@@ -270,8 +323,17 @@ def get_or_scale_allreduce_mnnvl_workspace(
 
 
 def _mark_if_capturing(workspace: _MnnvlWorkspace) -> _MnnvlWorkspace:
-    """Record that a CUDA graph being captured launches on this workspace."""
-    if not workspace["captured"] and torch.cuda.is_current_stream_capturing():
+    """Record that a CUDA graph being captured launches on this workspace.
+
+    A torch.compile'd region is marked while it is traced: its graph embeds the
+    workspace buffers, so replacing the workspace later would leave it launching
+    on freed memory whether or not a CUDA graph was captured. The capture probe
+    is a bool-returning call that dynamo cannot trace.
+    """
+    if workspace["captured"]:
+        return workspace
+    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing(
+    ):
         workspace["captured"] = True
     return workspace
 
@@ -287,7 +349,10 @@ def _get_or_scale_allreduce_mnnvl_workspace(
     allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
     pending_comms = MNNVLAllReduce.allreduce_mnnvl_pending_comms
 
-    if mapping in allreduce_mnnvl_workspaces:
+    # The handle probe is a nanobind call, which dynamo cannot trace; the
+    # compiled path relies on the pre-scaled workspace being attached.
+    if mapping in allreduce_mnnvl_workspaces and not torch.compiler.is_compiling(
+    ):
         workspace = allreduce_mnnvl_workspaces[mapping]
         if not workspace["handle"].is_mapped():
             raise RuntimeError("MNNVL workspace handles are not attached")
@@ -303,6 +368,17 @@ def _get_or_scale_allreduce_mnnvl_workspace(
             raise RuntimeError(
                 "MNNVL all-reduce workspace creation or growth during CUDA graph capture: run each shape once "
                 "outside capture first")
+        if torch.compiler.is_compiling():
+            # The scaling path allocates multicast memory over MPI/ProcessGroup
+            # and synchronizes the device - none of which can run inside a
+            # dynamo-traced region (and a post-capture rescale would leave
+            # captured graphs holding freed buffer pointers).
+            raise RuntimeError(
+                f"[MNNVL] AllReduce workspace must grow to {buffer_size_bytes} "
+                "bytes inside a torch.compile'd region, but allocation cannot "
+                "run under tracing. Pre-scale the workspace before compiling "
+                "via MNNVLAllReduce.prescale_workspace (ModelEngine "
+                "does this for max_num_tokens x hidden_size).")
         # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
         init_buffer_size_bytes = max(1024 * 8192 * elem_size, buffer_size_bytes
                                      or 0)
@@ -431,7 +507,7 @@ def _allgather(
     input: Union[torch.Tensor, List[torch.Tensor]],
     group: List[int],
     rank: int,
-    group_boxed: Optional[object] = None,
+    group_name: Optional[str] = None,
     dim: int = -1,
     sizes: Optional[List[int]] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
@@ -442,7 +518,7 @@ def _allgather(
         input (Union[Tensor, List[Tensor]]): The input tensor or tensor list.
         group (List[int]): The list of ranks to participate in the all-gather.
         rank (int): The rank of the current process.
-        group_boxed (object): The boxed ProcessGroup object for the list of ranks, if available.
+        group_name (str): The registered ProcessGroup name, if available.
         dim (int): Gather along given dimension. By default -1.
         sizes(Optional[List[int]]): An optional list indicating 'input.shape[dim]' in all ranks. By default None.
     Returns:
@@ -463,7 +539,7 @@ def _allgather(
     # Inputs are reshaped in this way to pass necessary shape information to the allgather op
     if isinstance(input, torch.Tensor):
         if mpi_disabled():
-            torch_op = torch.ops.trtllm.allgather_pg
+            torch_op = torch.ops.trtllm.allgather_pg_by_name
         else:
             torch_op = torch.ops.trtllm.allgather
 
@@ -472,7 +548,7 @@ def _allgather(
     else:
         input, valid = filter_valid_input(input)
         if mpi_disabled():
-            torch_op = torch.ops.trtllm.allgather_list_pg
+            torch_op = torch.ops.trtllm.allgather_list_pg_by_name
         else:
             torch_op = torch.ops.trtllm.allgather_list
 
@@ -483,7 +559,7 @@ def _allgather(
         ]
 
     if mpi_disabled():
-        output = torch_op(input, sizes, group, group_boxed)
+        output = torch_op(input, sizes, group, group_name)
     else:
         output = torch_op(input, sizes, group)
 
@@ -541,9 +617,9 @@ def allgather(
     Returns:
         The gathered tensor or tensor list.
     '''
-    group_boxed = mapping.tp_group_pg.boxed() if mpi_disabled() else None
-    return _allgather(input, mapping.tp_group, mapping.tp_rank, group_boxed,
-                      dim, sizes)
+    group_name = mapping.tp_group_name if mpi_disabled() else None
+    return _allgather(input, mapping.tp_group, mapping.tp_rank, group_name, dim,
+                      sizes)
 
 
 def cp_allgather(
@@ -565,9 +641,9 @@ def cp_allgather(
     Returns:
         The gathered tensor or tensor list.
     '''
-    group_boxed = mapping.cp_group_pg.boxed() if mpi_disabled() else None
-    return _allgather(input, mapping.cp_group, mapping.cp_rank, group_boxed,
-                      dim, sizes)
+    group_name = mapping.cp_group_name if mpi_disabled() else None
+    return _allgather(input, mapping.cp_group, mapping.cp_rank, group_name, dim,
+                      sizes)
 
 
 def alltoall_helix(
@@ -727,7 +803,7 @@ def reducescatter(
 
     if isinstance(input, torch.Tensor):
         if mpi_disabled():
-            torch_op = torch.ops.trtllm.reducescatter_pg
+            torch_op = torch.ops.trtllm.reducescatter_pg_by_name
         else:
             torch_op = torch.ops.trtllm.reducescatter
         output_info = get_output_info(input, dim)
@@ -735,7 +811,7 @@ def reducescatter(
     else:
         input, valid = filter_valid_input(input)
         if mpi_disabled():
-            torch_op = torch.ops.trtllm.reducescatter_list_pg
+            torch_op = torch.ops.trtllm.reducescatter_list_pg_by_name
         else:
             torch_op = torch.ops.trtllm.reducescatter_list
         output_info = [get_output_info(val, dim) for val in input]
@@ -745,8 +821,8 @@ def reducescatter(
         ]
 
     if mpi_disabled():
-        output = torch_op(input, sizes, mapping.tp_group,
-                          mapping.tp_group_pg.boxed())
+        output = torch_op(input, sizes, mapping.tp_group, mapping.tp_rank,
+                          mapping.tp_group_name)
     else:
         output = torch_op(input, sizes, mapping.tp_group)
 
@@ -939,6 +1015,28 @@ class MNNVLAllReduce(nn.Module):
         if protocol_error is not None:
             raise protocol_error
 
+    def prescale_workspace(self, max_num_tokens: int, hidden_dim: int) -> None:
+        """Grow the lamport workspace to cover the largest shard forward() can see.
+
+        forward() lazily rescales the workspace, which allocates multicast
+        memory and synchronizes the device - illegal inside a dynamo-traced
+        region. Engines that torch.compile the model must call this after the
+        model is built and before the first compiled forward so the traced
+        path is a pure lookup.
+        """
+        # One-shot calls never need more than the threshold bytes, so together
+        # with the two-shot size at max_num_tokens this covers every call.
+        workspace_size_bytes = max(
+            self.get_required_workspace_size(max_num_tokens, hidden_dim,
+                                             self.mapping.tp_size, self.dtype),
+            _MNNVL_ONE_SHOT_THRESHOLD_BYTES)
+        # forward() rejects >= uint32 sizes before touching the workspace, so
+        # larger calls fall back to other strategies and need no headroom here.
+        uint32_aligned_max = (2**32 - 1) // (8 << 20) * (8 << 20)
+        workspace_size_bytes = min(workspace_size_bytes, uint32_aligned_max)
+        get_or_scale_allreduce_mnnvl_workspace(
+            self.mapping, self.dtype, buffer_size_bytes=workspace_size_bytes)
+
     def forward(
         self,
         input: torch.Tensor,
@@ -1060,8 +1158,12 @@ class AllReduce(nn.Module):
         self.mnnvl_allreduce = None
         self.symm_mem_allreduce = None
         self._disable_mpi = mpi_disabled()
+        self._group_name = (mapping.tp_group_name
+                            if self._disable_mpi and mapping.tp_size > 1
+                            and torch.distributed.is_initialized() else None)
 
-        self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
+        self.all_reduce_op = (torch.ops.trtllm.allreduce_pg_by_name if
+                              self._disable_mpi else torch.ops.trtllm.allreduce)
 
         # Propagate model-level prealloc config to AllReduceRunner once per
         # process.  extra_attrs is only active during model __init__, so we
@@ -1240,12 +1342,10 @@ class AllReduce(nn.Module):
 
         additional_args = {}
         if self._disable_mpi:
-            # Get ProcessGroup from mapping
-            pg = self.mapping.tp_group_pg
-            assert pg is not None, "TP ProcessGroup not initialised"
+            assert self._group_name, "TP ProcessGroup name not initialised"
             additional_args = {
                 "rank": torch.distributed.get_rank(),
-                "pg": pg.boxed(),
+                "group_name": self._group_name,
             }
 
         # In case that AutoTuner brings potential perf regression

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Startup-time model-runner dispatch and transitional helper exports."""
+"""Startup-time model-runner dispatch and exports."""
 
 from __future__ import annotations
 
@@ -11,15 +11,6 @@ from torch import nn
 
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
-from .common import (
-    apply_position_id_offset,
-    get_all_rank_num_tokens,
-    get_padding_params,
-    get_position_id_offset,
-    get_top_level_model,
-    prepare_multimodal_indices,
-    ship_multimodal_indices,
-)
 from .decoder import DecoderRunner
 from .encoder import EncoderRunner
 from .encoder_decoder import EncoderDecoderRunner
@@ -30,17 +21,10 @@ if TYPE_CHECKING:
     from .interface import ModelRunner
 
 __all__ = [
-    "apply_position_id_offset",
-    "get_all_rank_num_tokens",
-    "get_padding_params",
-    "get_position_id_offset",
-    "get_top_level_model",
     "DecoderRunner",
     "EncoderDecoderRunner",
     "EncoderRunner",
-    "prepare_multimodal_indices",
     "resolve_runner_type",
-    "ship_multimodal_indices",
 ]
 
 

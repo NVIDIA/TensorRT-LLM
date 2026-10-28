@@ -91,6 +91,13 @@ def close_test_block(block: Any) -> None:
     block.close()
 
 
+def reattach_test_block(
+    manager: Any, block: Any, parent: Any = None, reuse_scope: Any = None
+) -> None:
+    """Reattach an orphan through the native deduplication and page-adoption path."""
+    _cpp().reattach_test_block(manager, block, parent, reuse_scope)
+
+
 def set_test_block_page_cache_level(block: Any, life_cycle_id: int, cache_level: int) -> None:
     """Set synthetic page residency for attribution tests."""
     _cpp().set_test_block_page_cache_level(block, life_cycle_id, cache_level)

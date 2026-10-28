@@ -1,0 +1,83 @@
+# Canonical → synonym map.
+#
+# Purpose: QUERY-TIME normalization. Before grepping case frontmatter,
+# translate the terms in your head (or the user's words / profiler output /
+# bug title) to the canonical term. Frontmatter itself must contain
+# canonical terms only (tags.yaml); a synonym in frontmatter is a
+# validation error.
+#
+# Namespaces mirror tags.yaml. Every key below must be a canonical term in
+# tags.yaml; no synonym may collide with a canonical term or another
+# synonym (a colliding synonym would make normalization ambiguous).
+#
+# Collision is checked WITHIN a namespace — the maps are independent, so one
+# word may be canonical in one namespace and a synonym in another:
+# `communication` is canonical in both `module:` and `subsystems:`, and
+# `kv-cache-manager` is a `module:` term as well as a `subsystems: kv-cache`
+# synonym. Normalize with the namespace you are querying in mind.
+
+instability_class:
+  warmup-gap: [missing-warmup, jit-at-runtime, uncompiled-shape, runtime-compile-stall, cold-kernel, warmup-not-covered]
+  warmup-path-mismatch: [i2v-vs-t2v-warmup, cached-kv-warmup-mismatch, warmup-path-drift, warmup-mode-mismatch]
+  warmup-sizing-tradeoff: [warmup-token-cap, warmup-oom, warmup-over-reservation, autotuner-warmup-cap]
+  warmup-cache-key-over-specific: [false-not-warmed, spurious-recompile-warning, cache-key-too-strict]
+  cold-start-imbalance: [cold-rank-imbalance, adp-router-cold-start, first-request-pinned-rank]
+  opportunistic-collective-fallback: [ncll-symmetric-fallback, nccl-symm-cache-miss, in-graph-registration-failure, symmetric-buffer-leak, symmetric-oom-hang]
+  platform-conditional-disable: [ncll-platform-disable, gb10-ncll-symmetric-off, spark-nccl-off]
+  gc-driven-collective-destruction: [deepep-gc-hang, moe-deepep-gc-barrier, del-runs-collective]
+  active-vs-max-batch-stride: [beam-search-nondeterminism, sliced-outputids-stride-bug, active-batch-size-dependent]
+  metric-with-hidden-rng: [spec-decode-acceptance-rng, force-num-accepted-tokens-missing, fractional-ar-support]
+  cross-node-log-flush-race: [nfs-log-race, gen-server-log-race, prev-device-step-time-missing]
+  process-lifetime-cache-binds-env: [functools-cache-env, lru-cache-env, single-process-env-cache]
+
+signals:
+  first-iter-spike: [iter-0-slow, first-iteration-spike, run1-throughput-deficit, first-serve-iter-stall]
+  midrun-stall: [sporadic-stall, jit-stall, mid-run-spike, long-iteration-outlier, hang-detector-tripped]
+  rep-to-rep-variance: [cross-run-variance, run-to-run-spread, unstable-perf-metric, high-cv]
+  cross-rank-hang: [rank-hang, barrier-hang, uneven-across-ranks, one-rank-stuck]
+  non-deterministic-log-probs: [log-probs-flaky, non-deterministic-logits, run-to-run-token-drift]
+  eager-fallback-in-log: [fallback-warning, plain-nccl-fallback, silent-fallback]
+  oom-in-warmup: [warmup-oom, warmup-ima, warmup-illegal-memory-access]
+  autotuner-cache-miss-during-capture: [cache-miss-in-capture, autotuner-in-graph]
+  perf-ci-bar-flake: [perf-sanity-flake, ci-bar-intermittent, flaky-perf-test, intermittent-hard-fail]
+  startup-time-increase: [warmup-time-up, autotune-time-up, densified-grid-cost]
+  acceptance-length-drift: [acceptance-rate-flake, ar-run-to-run-drift, spec-decode-noise]
+  segfault-on-load: [nccl-load-segfault, dlopen-crash, segfault-at-init]
+  test-parser-missing-line: [parser-returned-none, missing-summary-line, log-line-not-parsed, empty-metric-slice]
+
+# This block is identical in both cookbooks — the two `subsystems:`
+# vocabularies had drifted, and a query-time map that differs per cookbook
+# cannot answer a cross-cookbook question.
+#
+# `module:` deliberately has no alias block: the module a case lives in is
+# answered by the routing table in SKILL.md and by data/modules.yaml, which
+# also carries the many-to-one crosswalk to the coarser module ids used in
+# the NVBug/PR corpus summary (a synonym map cannot express many-to-one).
+subsystems:
+  attention-kernel: [attention, xqa, trtllm-gen-attention]
+  fmha-kernel: [fmha, trtllm-gen-fmha]
+  mla-attention: [mla, mla-kernel, deepseek-attention]
+  dsa-attention: [dsa, dsa-indexer, sparse-attention, paged-mqa-logits]
+  moe: [mixture-of-experts, fused-moe, expert, grouped-gemm, router-gemm]
+  gemm-kernel: [cutlass-gemm, deepgemm, linear-layer]
+  cuda-graph: [graph, cudagraph, piecewise-graph, graph-capture]
+  scheduler-executor: [py-executor, overlap-scheduler, batch-scheduler, executor]
+  model-engine: [pytorch-model-engine]
+  spec-decode: [mtp, eagle, eagle3, speculative-decoding, draft-model]
+  communication: [allreduce, alltoall, nccl, nccl-symmetric, deepep, userbuffers, mnnvl, nvls, symm-mem]
+  kv-cache: [kv-cache-manager, block-manager, cache-transceiver]
+  autotuner: [tuner, tactic-selection, tunable-runner]
+  tokenizer: [input-processor, detokenizer]
+  sampler: [decoder, beam-search]
+  serve-endpoint: [trtllm-serve, openai-endpoint, media-io]
+  runtime-python: [llm-api, llmapi]
+  visual-gen-pipeline: [visualgen, flux, wan, ltx2, video-pipeline]
+  adp-router: [kv-aware-adp-router, attention-dp-router]
+  perf-test-config: [perf-sanity-config, model-test-config, bench-config]
+  perf-test-harness: [perf-sanity-harness, benchmark-driver, perf-harness]
+  unit-test-infra: [test-infra, pytest-infra]
+  build-dependency: [dep, third-party, third-party-dep, dependency-loader, flashinfer, cutlass-dep, torch-dep]
+
+introduced_via:
+  incomplete-coverage: [platform-support-gap, test-infra-gap]
+  dep-bump: [dependency-upgrade]

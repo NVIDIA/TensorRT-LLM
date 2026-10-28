@@ -1,7 +1,10 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # rules/
 
 One rule per file; each inherits from `Rule` in `base.py`. Shared lookup
-helpers live in `_helpers.py`. See the top-level [README](../README.md)
+helpers live in `_helpers.py`. See the top-level [README](../../README.md)
 for the overall CBTS architecture.
 
 ## Current rules
@@ -13,16 +16,17 @@ for the overall CBTS architecture.
 | `test_list.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs) |
 | `spec_dec.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. docs) |
-| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**` (excl. docs) |
-| `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
+| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per model node for changes under `models/` |
+| `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
-| `docs.py` | `DocsRule` | `docsonly` | `docs/**` → `CPU-Build_Docs` plus complete `l0_cpu`; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
-| `out_of_scope.py` | `OutOfScopeRule` | `noop` | `.github/CODEOWNERS`, `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**` (image suffixes intentionally not claimed — fall back to baseline since fixtures and doc diagrams are indistinguishable by location) |
+| `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus complete `l0_cpu`; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
+| `out_of_scope.py` | `OutOfScopeRule` | `noop` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure |
 
 ## DocsRule
 
 Claims every file under `docs/` plus Markdown and reStructuredText files
-anywhere in the repository. Every claim contributes the literal
+anywhere in the repository, excluding paths recognized by `is_out_of_scope`.
+The same exclusion applies to Python docstring contributions. Every claim contributes the literal
 `CPU-Build_Docs` stage, which runs Doxygen and Sphinx `make html`. Changes under
 `docs/` additionally keep every block and entry in `l0_cpu.yml`, because CPU
 tests directly read documentation sources such as `model-express.md` and import
@@ -38,6 +42,24 @@ launched; the x86 CPU stage supplies the CPU validation. Mixed PRs continue to
 follow the normal architecture gates. Documentation files inside another rule's
 source prefix remain excluded from that source rule, and mixed documentation
 and targeted-test changes combine by unioning their stages.
+
+The rule also consumes verified docstring edits in existing Python modules,
+classes, and functions. The input analyzer checks the unmodified patch against
+the post-image, parses both images, and separates literal docstring lines from
+code lines. A Python file with only those edits is claimed by `DocsRule` and
+excluded from the other rules. For a mixed file, the rule contributes the docs
+build and complete CPU validation without claiming the file; other rules and
+coverage analyze the remaining executable edits. The original patch remains
+available to coverage to reconstruct the pre-image. Selections combine by
+union, including the independent docs stage when coverage narrows the residual.
+
+Missing or mismatched patches, unparsable source, ambiguous scope identities,
+new definitions, and docstrings sharing a line with executable statements keep
+their normal code impact. Assigned strings, f-strings, non-leading string
+expressions, and explicit `__doc__` assignments are executable changes. This
+policy treats recognized literal docstring edits as low-risk documentation;
+it does not infer a complete graph of runtime docstring consumers.
+
 
 ## WaivesRule
 
@@ -281,7 +303,20 @@ Outcomes:
 Path-only rule. Claims non-documentation source changes under
 `tensorrt_llm/_torch/_experimental/modeling_v2/`, the self-contained second modeling
 path (one flat forward per checkpoint/arch/parallel triple, assembled
-from a catalog of op wrappers).
+from a catalog of op wrappers), including each family's native code
+(`models/<family>/csrc/`, `models/<family>/<target>/csrc/`: one torch-op library
+per model family, loaded only when routing picks one of the family's targets),
+plus what every family library shares: `cpp/tensorrt_llm/modeling_v2/` and the
+native build module `cpp/cmake/modules/modeling_v2.cmake`.
+
+Scope — per model node, else all of modeling_v2: source changes under
+`models/` (native `csrc/` included) select the nearest model node's unit tests
+and the accuracy gates of its targets. Family-shared code selects the whole
+family. A covering directory entry is retained when no more specific entry
+exists, unless it ignores that node. Whole-tree unit checks are always retained.
+Shared Python or native infrastructure selects every modeling_v2 entry, as does
+an unreadable routing tree. If no modeling_v2 entry matches, the rule falls back
+to baseline.
 
 `.md` exclusion carries more weight here than elsewhere: every catalog
 entry ships a contract document, so roughly a fifth of the subtree is
@@ -296,9 +331,10 @@ in `backend: pytorch` blocks beside everything else. A block belongs to
 modeling_v2 iff one of its `tests:` entries matches
 `_MV2_ENTRY_PATTERNS`:
 
-- `unittest/_torch/modeling_v2/` — the op-level catalog matrix, carried
-  as whole-directory entries (one on `l0_gb300`, one on
-  `l0_gb300_multi_gpus` for the 4-rank collectives).
+- `unittest/_torch/modeling_v2/` — the unit tests: one directory entry
+  (`--ignore` of `comm/`) that collects the catalog matrix and every
+  family's tests under `models/<family>`, plus `comm/` on
+  `l0_gb300_multi_gpus` for the 4-rank collectives.
 - `test_modeling_v2_` — the accuracy gates, and any future unit file.
 
 Both markers are exact by construction rather than by luck: every test
@@ -309,9 +345,9 @@ carve-out is needed.
 
 Outward fallback: not needed, and by design rather than by accident.
 Nothing beyond the resolver module is imported unless `LLM(modeling_v2=...)`
-is on — the model loader calls `modeling_v2_resolve`, which returns
-immediately when the switch is off, and the routing modules are imported
-lazily behind it. The callers outside the subtree,
+is on — the model loader calls `modeling_v2_resolve_on_all_ranks`, which
+returns immediately when the switch is off, and the routing modules are
+imported lazily behind it. The callers outside the subtree,
 `tensorrt_llm/_torch/pyexecutor/model_loader.py` (decides) and
 `tensorrt_llm/_torch/models/modeling_auto.py` (reads the decision off
 `ModelConfig`), are deliberately left unclaimed: a change to the shared
@@ -345,15 +381,83 @@ source-plus-test changes combine through the `testsonly` scope family.
 
 ## OutOfScopeRule
 
-Pure pattern match. Claims a changed file as `scope=noop` when it lives
-in any subtree neither pre-merge nor post-merge L0 consumes:
+Claims changes outside product-test selection as `scope=noop`, contributing no
+test stages or block filters. The main entry point still retains the always-run
+CPU stages. With only noop contributions, the source `l0_cpu` list runs without
+case filtering. In a mixed PR, other rules or coverage select the remaining
+changes; noop adds no requirement to retain the entire CPU suite. Build and
+repository checks remain upstream.
+
+`OUT_OF_SCOPE_EXACT_PATHS` lists reviewed metadata files by complete repository
+path. A new YAML, JSON, TOML, or template file is not automatically exempt,
+including at the repository root or under `scripts/` and `jenkins/`.
+
+| Paths | Purpose |
+|---|---|
+| `.github/CODEOWNERS` | Repository ownership metadata |
+| `LICENSE` | License metadata packaged by the upstream build |
+| `.pre-commit-config.yaml`, `agent-flow/.pre-commit-config.yaml` | Pre-commit checks |
+| `.clang-format`, `.clang-tidy`, `.clangd`, `.cmake-format.json`, `.editorconfig`, `.cursorignore` | Formatting and editor settings |
+| `.coderabbit.yaml`, `.nspect-allowlist.toml` | Review and security checks |
+| `scripts/bandit.yaml`, `jenkins/license_cpp.json` | External checks |
+| `legacy-files.txt`, `ruff-legacy.toml`, `ruff-legacy-baseline.json` | Legacy lint configuration |
+| `scripts/templates/precommit-legacy-files.j2`, `scripts/templates/pyproject-format-exclude.j2`, `scripts/templates/ruff-legacy.toml.j2` | Lint configuration templates |
+
+`OUT_OF_SCOPE_PREFIXES` covers the complete root directories
+`.github/ISSUE_TEMPLATE/`, `.codex/`, and `.claude/`, including new files and all
+file types. The trailing slash preserves the directory boundary: sibling paths
+such as `.github/workflows/` and `.claude-extra/`, and nested paths such as
+`nested/.codex/`, are not exempt. Markdown, reStructuredText, and Python
+docstrings inside exempt subtrees do not contribute a docs stage. The input
+loader leaves those Python files available for `OutOfScopeRule` to claim.
+
+`OUT_OF_SCOPE_FILENAMES` recognizes the exact basename `.gitignore` at every
+repository depth, including future directories. Git uses that complete name;
+`fixture.gitignore`, `.gitignore.bak`, and `.gitignore-template` are not exempt.
+
+`OUT_OF_SCOPE_DIRECTORY_FILENAMES` additionally recognizes the complete
+basenames `.clang-format`, `.clang-tidy`, and `.clangd` under `cpp/`.
+Directory patterns match the complete parent path; `cpp/**` includes its
+descendants. A file such as `cpp/kernels/runtime.clangd` is not exempt. There
+are no general file-extension exemptions in this rule.
+
+Product configuration, fixtures, workflows, dependency lists, and unrecognized
+metadata continue through the other rules or fallback. Root `.txt` files are
+not generally exempt.
+
+A repository-wide tracked-file scan on 2026-10-15 examined 16,405 paths.
+`.gitignore` does not filter tracked source out of checkout or the explicit
+wheel staging process. `.gitattributes` remains
+outside this rule because it controls LFS, text conversion, and export behavior;
+`.dockerignore` controls the actual Docker build context and also stays outside.
+`.devcontainer/` has no subtree exemption: `devcontainer.json`
+invokes `make_env.py`, which can run `make -C docker devel_build`, and Compose
+settings change the local container environment. Current Jenkins pipelines do
+not directly consume these files, but local build inputs still require normal
+analysis or fallback. CI workflows, image tags, runtime example inputs,
+test fixtures, pytest settings, requirements, and build files retain their other
+rules or fallback. Outside exempt subtrees, Markdown and reStructuredText remain
+owned by `DocsRule`.
+
+Outside exempt subtrees, `pyproject.toml` mixes static checks with packaging and
+dependencies. The rule
+claims it only when a verified raw patch reconstructs the pre-image and every
+non-comment line outside `tool.ruff`, `tool.isort`, `tool.yapf`, `tool.codespell`,
+`tool.autoflake`, and `tool.mypy` tables remains unchanged. This applies at any
+depth. Missing patches, unreadable/new/deleted files, multiline strings, quoted
+headers, and ambiguous section syntax remain unclaimed. The conservative section
+walker does not require a new TOML dependency on Python 3.10.
+
+The existing subtree exemptions also remain:
 
 - `tests/integration/test_lists/qa/` — QA-only test lists, separate
   nightly workflows.
 - `tests/integration/test_lists/dev/` — developer-side artifacts, no L0
   consumer.
 - `tests/integration/defs/.test_durations` — pytest-split timing cache.
+- `tests/integration/defs/agg_unit_mem_df.csv` — worker parallelism metadata.
 - `tests/microbenchmarks/` — benchmarking scripts, no L0 stage.
+- `jenkins/scripts/cbts/` — selection infrastructure.
 
 Image extensions (`.png`, `.jpg`, `.jpeg`, `.gif`, `.svg`, `.webp`) are
 intentionally NOT claimed: image files anywhere in the repo can be test
@@ -363,9 +467,8 @@ distinguish a fixture from a doc diagram. Image edits therefore fall
 back to baseline unless a more specific rule (AD / VG / spec-dec)
 claims them inside its source subtree.
 
-Excludes `*.txt` (`requirements.txt` / `constraints.txt` are runtime-relevant).
-`OUT_OF_SCOPE_EXACT_PATHS` and `OUT_OF_SCOPE_PREFIXES` in
-`out_of_scope.py` list the patterns.
+`OUT_OF_SCOPE_EXACT_PATHS`, `OUT_OF_SCOPE_FILENAMES`, `OUT_OF_SCOPE_PREFIXES`,
+and `OUT_OF_SCOPE_DIRECTORY_FILENAMES` in `out_of_scope.py` list the policies.
 
 ## Helpers (`_helpers.py`)
 

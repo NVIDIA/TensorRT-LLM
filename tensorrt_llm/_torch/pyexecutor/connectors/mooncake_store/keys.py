@@ -74,12 +74,13 @@ class ReuseScope:
 
     def seed(self) -> bytes:
         """The digest a request in this scope starts its hash chain from."""
-        return _digest(
-            _framed(
-                b"" if self.cache_salt is None else str(self.cache_salt).encode(),
-                *self.multimodal_digests,
-            )
-        )
+        return _digest(_framed(self._salt_bytes(), *self.multimodal_digests))
+
+    def _salt_bytes(self) -> bytes:
+        """Presence-tagged, so an absent salt and an empty one name different scopes."""
+        if self.cache_salt is None:
+            return b"\x00"
+        return b"\x01" + self.cache_salt.encode("utf-8")
 
 
 class BlockHashChain:

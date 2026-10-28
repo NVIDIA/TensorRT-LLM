@@ -3,7 +3,7 @@ name: kernel-triton-writing
 tags: [triton]
 description: >
   ONLY for OpenAI Triton (@triton.jit) kernel development. NEVER use for
-  CUDA C++ kernels, TileIR, or profiling tools (ncu, nsys).
+  CUDA C++ kernels, CuTe DSL kernels, TileIR, or profiling tools (ncu, nsys).
   The user's request must involve Triton explicitly. Covers Triton-specific
   patterns: fused elementwise, reductions (softmax, LayerNorm, RMSNorm),
   tiled GEMM with triton.autotune, and flash attention. Workflow:

@@ -12,13 +12,20 @@ from typing import Any
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionMetadata,
+    AttentionRuntimeFeatures,
+)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.memory_buffer_utils import with_shared_pool
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
+from tensorrt_llm._torch.nccl_window_tensor_scope import (
+    discard_nccl_window_tensor_outputs,
+    nccl_window_tensor_scope,
+)
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
     CUDAGraphRunnerConfig,
@@ -46,12 +53,12 @@ from .decoder import DecoderRunner, DecoderRunnerConfig, ExtraInputsCollector
 from .decoder.dummy_requests import DummyRequestFactory
 from .decoder.graphs import DecoderCudaGraphs
 from .decoder.inputs import DecoderInputPreparer
-from .encoder import EncoderConfigMixin, EncoderMixin, EncoderPreparedInputs
-from .interface import PreparedInputs, RunnerConfig, ScheduledInputs
+from .encoder import EncoderConfig, EncoderMixin, EncoderPreparedInputs
+from .interface import PreparedInputs, ScheduledInputs
 
 
 @dataclass(frozen=True)
-class EncoderStageConfig(EncoderConfigMixin, RunnerConfig):
+class EncoderStageConfig(EncoderConfig):
     """Configuration for the encoder stage of an encoder-decoder model."""
 
 
@@ -66,11 +73,17 @@ class EncoderStage(EncoderMixin):
         mapping: Mapping,
         dist: Distributed | None,
         moe_load_balancer: MoeLoadBalancer | None,
+        attention_runtime_features: AttentionRuntimeFeatures,
     ) -> None:
         if not config.is_encoder_decoder:
             raise ValueError("EncoderStage requires an encoder-decoder model.")
         self._initialize_encoder(
-            model, config, mapping=mapping, dist=dist, moe_load_balancer=moe_load_balancer
+            model,
+            config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=moe_load_balancer,
+            attention_runtime_features=attention_runtime_features,
         )
         self._feature_staging: torch.Tensor | None = None
         self._feature_staging_event: torch.cuda.Event | None = None
@@ -85,7 +98,7 @@ class EncoderStage(EncoderMixin):
             raise ValueError("Encoder sequence lengths and request IDs must have the same length.")
         metadata = self._create_attention_metadata(
             enable_context_mla_with_cached_kv=False,
-            num_heads_per_kv=1,
+            max_num_heads_per_kv=1,
         )
         if not isinstance(metadata, (VanillaAttentionMetadata, TrtllmAttentionMetadata)):
             raise TypeError(
@@ -101,7 +114,7 @@ class EncoderStage(EncoderMixin):
         metadata.prepare_encoder_only()
         return metadata
 
-    def prepare_inputs(
+    def _prepare_inputs(
         self,
         scheduled_requests: ScheduledRequests,
         *,
@@ -337,10 +350,8 @@ class EncoderStage(EncoderMixin):
         inputs: ScheduledInputs,
         *,
         resource_manager: ResourceManager,
-        is_dummy: bool = False,
     ) -> dict[str, Any]:
-        del is_dummy
-        prepared = self.prepare_inputs(
+        prepared = self._prepare_inputs(
             inputs.batch,
             resource_manager=resource_manager,
         )
@@ -358,34 +369,40 @@ class EncoderStage(EncoderMixin):
         if encoder is None:
             raise AttributeError("Encoder-decoder models must expose `encoder` or `model.encoder`.")
 
-        input_features = inputs.get("input_features")
-        if input_features is not None:
-            return encoder(
-                input_features=input_features,
-                attn_metadata=inputs["encoder_attn_metadata"],
+        # The independent encoder bypasses model_forward, including its embedding prelude.
+        with nccl_window_tensor_scope(inputs) as scope:
+            input_features = inputs.get("input_features")
+            if input_features is not None:
+                return scope.escape(
+                    encoder(
+                        input_features=input_features,
+                        attn_metadata=inputs["encoder_attn_metadata"],
+                    )
+                )
+
+            top_level_model = get_top_level_model(self._model)
+            embedding = getattr(top_level_model, "shared_embedding", None) or getattr(
+                top_level_model, "embed_tokens", None
             )
+            input_ids = inputs["encoder_input_ids"]
+            if embedding is None:
+                hidden_states = input_ids
+            else:
+                hidden_states = embedding(input_ids)
+                embedding_scale = getattr(top_level_model, "embed_scale", None)
+                if embedding_scale is not None:
+                    hidden_states = hidden_states * embedding_scale
 
-        top_level_model = get_top_level_model(self._model)
-        embedding = getattr(top_level_model, "shared_embedding", None) or getattr(
-            top_level_model, "embed_tokens", None
-        )
-        input_ids = inputs["encoder_input_ids"]
-        if embedding is None:
-            hidden_states = input_ids
-        else:
-            hidden_states = embedding(input_ids)
-            embedding_scale = getattr(top_level_model, "embed_scale", None)
-            if embedding_scale is not None:
-                hidden_states = hidden_states * embedding_scale
-
-        position_ids = inputs.get("encoder_position_ids")
-        if position_ids is not None and position_ids.dim() == 2:
-            position_ids = position_ids.squeeze(0)
-        return encoder(
-            hidden_states=hidden_states,
-            attn_metadata=inputs["encoder_attn_metadata"],
-            position_ids=position_ids,
-        )
+            position_ids = inputs.get("encoder_position_ids")
+            if position_ids is not None and position_ids.dim() == 2:
+                position_ids = position_ids.squeeze(0)
+            return scope.escape(
+                encoder(
+                    hidden_states=hidden_states,
+                    attn_metadata=inputs["encoder_attn_metadata"],
+                    position_ids=position_ids,
+                )
+            )
 
     def _forward_graph_inputs(self, inputs: dict[str, Any]) -> torch.Tensor:
         return self._forward_encoder_stack(
@@ -509,10 +526,12 @@ class EncoderDecoderInputPreparer(DecoderInputPreparer):
         self,
         *,
         sparse_attention_config: BaseSparseAttentionConfig | None,
+        attention_runtime_features: AttentionRuntimeFeatures,
         **decoder_inputs: Any,
     ) -> None:
         super().__init__(**decoder_inputs)
         self.sparse_attention_config = sparse_attention_config
+        self._attention_runtime_features = attention_runtime_features
         self._host_buffer_pool: list[dict[str, Any]] = []
         self._fast_path_static_eligible: bool | None = None
         self._position_id_offset: int | None = None
@@ -707,9 +726,9 @@ class EncoderDecoderInputPreparer(DecoderInputPreparer):
                 and not self._config.enable_attention_dp
                 and not self.mapping.has_cp_helix()
                 and not self._config.is_multimodal
-                and not self._config.attention_runtime_features.chunked_prefill
-                and not self._config.attention_runtime_features.cache_reuse
-                and not self._config.attention_runtime_features.has_speculative_draft_tokens
+                and not self._attention_runtime_features.chunked_prefill
+                and not self._attention_runtime_features.cache_reuse
+                and not self._attention_runtime_features.has_speculative_draft_tokens
             )
             self._fast_path_static_eligible = static_eligible
         if (
@@ -829,6 +848,7 @@ class EncoderDecoderInputPreparer(DecoderInputPreparer):
                     non_blocking=True,
                 )
                 self._staged_request_ids = staged_request_ids
+                self._staged_previous_batch_indices = None
             generation_begin = num_context_tokens
             generation_end = generation_begin + num_previous_batch_requests
             torch.index_select(
@@ -990,7 +1010,9 @@ class EncoderDecoderCudaGraphs(DecoderCudaGraphs):
 
         projection_batch = ScheduledRequests()
         projection_batch.reset_context_requests(batch.generation_requests)
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
         )
@@ -1154,9 +1176,12 @@ class EncoderDecoderCudaGraphs(DecoderCudaGraphs):
                         f"context requests={num_contexts}, "
                         f"packed encoder tokens={total_encoder_tokens}"
                     )
-                    self._forward_warmup(
-                        batch, resource_manager, enable_spec_decode=False, runtime_draft_len=0
+                    forward = (
+                        self.forward_discarded_warmup
+                        if runner.is_warmup_only
+                        else self._forward_warmup
                     )
+                    forward(batch, resource_manager, enable_spec_decode=False, runtime_draft_len=0)
                     torch.cuda.synchronize()
 
     def _populate_cross_kv_cache(self, inputs: dict[str, Any]) -> None:
@@ -1185,13 +1210,14 @@ class EncoderDecoderCudaGraphs(DecoderCudaGraphs):
                     "Encoder-decoder CUDA graph warmup requires every decoder "
                     "layer to expose a cross_attn module."
                 )
-            cross_attn(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                attn_metadata=attn_metadata,
-                cross_attn_metadata=cross_attn_metadata,
-                skip_cross_kv_projection=False,
-            )
+            with discard_nccl_window_tensor_outputs((hidden_states, encoder_hidden_states)):
+                cross_attn(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attn_metadata=attn_metadata,
+                    cross_attn_metadata=cross_attn_metadata,
+                    skip_cross_kv_projection=False,
+                )
 
     def _get_enc_dec_hidden_size(self) -> int:
         config = self.model.model_config.pretrained_config
@@ -1305,17 +1331,21 @@ class EncoderDecoderRunner(DecoderRunner):
         config: EncoderDecoderRunnerConfig,
         *,
         encoder_config: EncoderStageConfig,
+        input_processor: InputProcessor | BaseMultimodalInputProcessor,
+        attention_runtime_features: AttentionRuntimeFeatures,
         mapping: Mapping,
         dist: Distributed | None,
         moe_load_balancer: MoeLoadBalancer | None,
         **decoder_services: Any,
     ) -> None:
+        self._input_processor = input_processor
         self._encoder_stage = EncoderStage(
             model,
             encoder_config,
             mapping=mapping,
             dist=dist,
             moe_load_balancer=moe_load_balancer,
+            attention_runtime_features=attention_runtime_features,
         )
         # Mixed decoder graphs are planned from the encoder graph shapes; the
         # encoder graph resources stay in the stage.
@@ -1326,6 +1356,7 @@ class EncoderDecoderRunner(DecoderRunner):
             mapping=mapping,
             dist=dist,
             moe_load_balancer=moe_load_balancer,
+            attention_runtime_features=attention_runtime_features,
             **decoder_services,
         )
 
@@ -1334,12 +1365,9 @@ class EncoderDecoderRunner(DecoderRunner):
         inputs: ScheduledInputs,
         *,
         resource_manager: ResourceManager,
-        is_dummy: bool = False,
     ) -> dict[str, Any]:
         """Run the encoder phase for ``inputs.batch.encoder_requests``."""
-        return self._encoder_stage.forward(
-            inputs, resource_manager=resource_manager, is_dummy=is_dummy
-        )
+        return self._encoder_stage.forward(inputs, resource_manager=resource_manager)
 
     def warmup_encoder(self, resource_manager: ResourceManager) -> None:
         """Warm up and capture the encoder graph shapes."""
@@ -1353,9 +1381,9 @@ class EncoderDecoderRunner(DecoderRunner):
             pad_to_limit=self._encoder_stage._encoder_graph_pad_to_limit,
         )
 
-    def release_graphs(self) -> None:
-        self._encoder_stage.release_graphs()
-        super().release_graphs()
+    def release_graphs(self, *, release_nccl_window_owners: bool = True) -> None:
+        self._encoder_stage.release_graphs(release_nccl_window_owners=release_nccl_window_owners)
+        super().release_graphs(release_nccl_window_owners=release_nccl_window_owners)
 
     def _cuda_graph_runner_config(self) -> CUDAGraphRunnerConfig:
         return replace(
@@ -1376,13 +1404,14 @@ class EncoderDecoderRunner(DecoderRunner):
     ) -> EncoderDecoderInputPreparer:
         return EncoderDecoderInputPreparer(
             **self._input_preparer_kwargs(mm_item_scheduler),
-            sparse_attention_config=self.sparse_attention_config,
+            sparse_attention_config=self._sparse_attention_config,
+            attention_runtime_features=self._attention_runtime_features,
         )
 
     def _make_cuda_graphs(self) -> EncoderDecoderCudaGraphs:
         return EncoderDecoderCudaGraphs(
             **self._cuda_graphs_kwargs(),
-            input_processor=self.input_processor,
+            input_processor=self._input_processor,
             encoder_graph_shapes=self._encoder_graph_shapes,
             inputs=self._inputs,
         )

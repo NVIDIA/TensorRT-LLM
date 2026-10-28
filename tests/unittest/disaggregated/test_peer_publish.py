@@ -14,14 +14,8 @@ import numpy as np
 import pytest
 
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base import (
-    CacheExtent,
-    CacheKind,
-    Chunk,
-    Delivered,
-    Publishes,
-    TokenRange,
-)
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
+from tensorrt_llm._torch.disaggregation.native.extent import Attempt, CacheExtent, Chunk, Delivered
 from tensorrt_llm._torch.disaggregation.native.publish import PeerPublish
 from tensorrt_llm._torch.disaggregation.native.transfer import TaskStatus, TxSession
 
@@ -65,8 +59,9 @@ def _sending(rid: int = 42) -> TxSession:
     )
 
 
-def test_the_adapter_satisfies_the_contract():
-    assert isinstance(PeerPublish(_sending(), _request()), Publishes)
+def test_the_adapter_answers_with_an_attempt():
+    handle = PeerPublish(_sending(), _request()).publish(_extent())
+    assert isinstance(handle, Attempt)
 
 
 def test_each_piece_gets_its_own_handle():

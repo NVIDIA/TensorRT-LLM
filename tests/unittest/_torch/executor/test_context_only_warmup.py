@@ -14,6 +14,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -24,16 +25,24 @@ def _warmup_fixture(context_only: bool, available: int = 64):
         tokens_per_block=128,
         num_extra_kv_tokens=0,
         _has_cp_helix=False,
+        _stream=SimpleNamespace(cuda_stream=0),
+        _create_kv_cache=Mock(
+            side_effect=lambda *_args, **_kwargs: Mock(
+                num_committed_tokens=0,
+                capacity=0,
+                resume=Mock(return_value=True),
+                resize=Mock(return_value=True),
+            )
+        ),
+        _ensure_generation_beam_width=Mock(return_value=True),
         get_num_available_tokens=lambda **kwargs: min(available, kwargs["token_num_upper_bound"]),
         get_num_free_blocks=lambda: 64,
     )
 
     def add_dummy_requests(request_ids, **kwargs):
-        # Use production request construction/state initialization. Only the
-        # GPU cache allocation is excluded from these CPU phase-contract tests.
-        return KVCacheManagerV2.add_dummy_requests(
-            manager, request_ids, prepare_resource=False, **kwargs
-        )
+        # Exercise production request initialization and allocation control flow
+        # with CPU stand-ins for the GPU cache objects.
+        return KVCacheManagerV2.add_dummy_requests(manager, request_ids, **kwargs)
 
     manager.add_dummy_requests = Mock(side_effect=add_dummy_requests)
     resource_manager = SimpleNamespace(
@@ -54,7 +63,6 @@ def _warmup_fixture(context_only: bool, available: int = 64):
             use_mrope=False,
             enable_autotuner=False,
         ),
-        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
         model=SimpleNamespace(model_config=SimpleNamespace(pretrained_config=SimpleNamespace())),
         get_runtime_tokens_per_gen_step=lambda draft_len: draft_len + 1,
         release_request_state=None,
@@ -67,11 +75,10 @@ def _cuda_graphs(requests: DummyRequestFactory, warmup_only: bool) -> DecoderCud
         cuda_graph_runner=SimpleNamespace(enabled=True, is_warmup_only=warmup_only),
         breakable_cuda_graph_runner=None,
         config=requests._config,
-        mapping=None,
+        mapping=Mapping(),
         model=None,
         sparse_attention_config=None,
         metrics={},
-        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
         dummy_requests=requests,
         agreement=None,
         metadata=None,

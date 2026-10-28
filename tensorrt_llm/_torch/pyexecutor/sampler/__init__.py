@@ -36,7 +36,6 @@ Layout -- imports only ever point downward; there are no cycles::
                                                        finish_reasons
                                                        seed_manager
                                                        sampler_features
-                                                       two_model_spec_dec
           │           │           │           │           │
           └───────────┴───────────┴───────────┴───────────┘
                                   │
@@ -68,11 +67,26 @@ import importlib
 _SUBMODULES = frozenset({"sampler", "sampler_common", "sampling_resolution", "ops"})
 
 
+def _import_submodule(name: str, submodule: str):
+    try:
+        return importlib.import_module(f"{__name__}.{submodule}")
+    except AttributeError as e:
+        # An AttributeError escaping the submodule is a bug inside it, not a
+        # missing name here. Raised as is, hasattr() and getattr() with a
+        # default would hide it, and ``from ... import`` would run the
+        # submodule twice (losing the cause unless the name is a submodule).
+        raise ImportError(
+            f"cannot import {name!r} from {__name__!r}: importing "
+            f"{__name__}.{submodule} raised {e!r}",
+            name=__name__,
+        ) from e
+
+
 def __getattr__(name: str):
     if name in _SUBMODULES:
-        return importlib.import_module(f"{__name__}.{name}")
+        return _import_submodule(name, name)
     # Lazily forward everything else to the sampler orchestration module.
-    _sampler = importlib.import_module(f"{__name__}.sampler")
+    _sampler = _import_submodule(name, "sampler")
     try:
         return getattr(_sampler, name)
     except AttributeError:

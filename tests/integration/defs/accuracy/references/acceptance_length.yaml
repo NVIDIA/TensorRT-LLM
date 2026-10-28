@@ -12,9 +12,20 @@ TestNemotronV3Super::test_nvfp4_4gpus_block_reuse:
 TestGPTOSS::test_dflash:
   ref_al: 2.925596923467016
   min_al: 2.779317077293665
-TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm:
+TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp8]:
   ref_al: 4.448784989234082
   min_al: 4.226345739772378
+TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp4]:
+  ref_al: 4.448784989234082
+  min_al: 4.226345739772378
+# Not a copy of the DeepGEMM row above: that one is measured on the FP8 export,
+# this backend is the only one that serves the NVFP4 export, and the two differ
+# in both the MoE numerics and the checkpoint. The baseline was measured on the
+# same NVFP4 export (2x4 GB300, DEP8, GSM8K 96.21) before the aggregate test
+# moved to one-node DEP4.
+TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl:
+  ref_al: 4.433448078026391
+  min_al: 4.211775674125072
 TestDeepSeekV4FlashDSpark::test_gsm8k_1p1d_dep4:
   ref_al: 4.0738
   min_al: 3.8701
@@ -49,6 +60,9 @@ TestQwen3_30B_A3B::test_eagle3_accuracy[dynamic]:
   ref_al: 1.665238
   min_al: 1.5819761
 TestQwen3_5_35B_A3B::test_bf16_mtp:
+  ref_al: 3.504435
+  min_al: 3.32921325
+TestQwen3_5_35B_A3B::test_bf16_mtp_flashinfer_ring_replay:
   ref_al: 3.504435
   min_al: 3.32921325
 TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_trtllm_ple_offload:
@@ -96,16 +110,17 @@ disagg::TestNemotron3Super120B::test_auto_dtype:
 TestQwen3_8_27B::test_dflash2:
   ref_al: 5.899181450085933
   min_al: 5.604222377581636
-# Shared by both legs of TestModelingV2DeepseekR10528Nvfp4Sm103Dep4::
-# test_mtp3_acceptance. Keyed by target and variant rather than by test
-# function, because that is what the number is a property of, and because the
-# modeling_v2 and stock legs are read against the same minimum on purpose:
-# modeling_v2 failing while stock passes means the draft path regressed; both
-# failing means this anchor is stale. Populated from the STOCK leg -- taking it
-# from the target's own number would make the gate self-referential.
-ModelingV2DeepseekR10528Nvfp4Sm103Dep4::mtp3:
+# Shared by both legs of TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::
+# test_mtp3_acceptance, at every layout it runs. Keyed by target and variant
+# rather than by test function or layout, because that is what the number is a
+# property of, and because the modeling_v2 and stock legs are read against the
+# same minimum on purpose: modeling_v2 failing while stock passes means the
+# draft path regressed; both failing means this anchor is stale. Populated
+# from the STOCK leg -- taking it from the target's own number would make the
+# gate self-referential.
+ModelingV2DeepseekR10528Nvfp4Sm10xDefault::mtp3:
   ref_al: 3.020
-  # Hand-set, not the automatic 95%. Measured on GB300 over three runs each:
+  # Hand-set, not the automatic 95%. Measured at dep4 on GB300 over three runs each:
   # stock 3.020 / 2.998 / 3.009 / 3.014, modeling_v2 2.921 / 2.938 / 2.933. Each
   # side is stable to ~0.7%, and the two ranges do not overlap -- modeling_v2
   # runs about 2.6% under stock on this workload, consistently rather than as
@@ -122,21 +137,25 @@ ModelingV2DeepseekR10528Nvfp4Sm103Dep4::mtp3:
 TestGLM53FlashFP8::test_mtp:
   ref_al: 3.384
   min_al: 3.215
-# Read by TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::
-# test_mtp1_gsm8k_and_acceptance. Keyed by target and variant for the same
-# reason as the ModelingV2DeepseekR10528Nvfp4Sm103Dep4::mtp3 entry above.
+# Read by the acceptance-length cases of TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1
+# (test_qwen4_exp.py). Keyed by target and variant for the same reason as the
+# ModelingV2DeepseekR10528Nvfp4Sm10xDefault::mtp3 entry above, and one key per variant:
+# TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1 on one case must not overwrite another's floor.
 #
-# max_draft_len is 1 on this checkpoint (`mtp_num_hidden_layers: 1`, one module
-# replayed once per step), so acceptance length lives in [1.0, 2.0]: 1.0 is a
-# draft path that is rejected every time -- the exact failure a miscomputed MTP
-# layer produces, with the text still correct and every accuracy gate green --
-# and 2.0 is every draft accepted.
+# The checkpoint ships one MTP module (`mtp_num_hidden_layers: 1`), replayed max_draft_len
+# times per step, so acceptance length lives in [1.0, 1 + max_draft_len]: 1.0 is a draft
+# path that is rejected every time -- the exact failure a miscomputed MTP layer produces,
+# with the text still correct and every accuracy gate green -- and 1 + max_draft_len is
+# every draft accepted. Each min_al below is a hand-set collapse tripwire unless its
+# comment says it is 95% of ref_al.
+
+# test_mtp1_gsm8k_mmmu_and_video, over gsm8k
 ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1:
   # Smoke-scale, and labelled as such: measured on GB300 over the boot prompt
   # pair, STOCK 1.7403 against modeling_v2's 1.8063 on the same prompts. The
   # number below is the STOCK reading, so the gate is not self-referential.
-  # There is no full-gsm8k reading yet: the accuracy runs were made without
-  # enable_iter_perf_stats, so they recorded no specDecodingStats.
+  # There is no full-gsm8k STOCK reading yet; modeling_v2's own over full gsm8k
+  # (1319 samples) is 1.971.
   ref_al: 1.7403
   # Hand-set as a collapse tripwire, NOT the automatic 95% of ref_al -- 1.65
   # would be a floor derived from a two-prompt smoke applied to a 1319-sample
@@ -144,12 +163,48 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp1:
   # the variant's whole range: a collapsed or miscomputed draft path scores 1.0,
   # and anything at or above 1.5 is accepting at least half its drafts.
   #
-  # This unit has a disclosed deviation the gate is deliberately sized around:
-  # the draft layer runs dense attention rather than QSA, because
-  # `QSAAttentionMetadata` has no `prepare_for_draft_forward`. That costs
-  # acceptance on long prompts and costs nothing on short ones, so a floor set
-  # tight against a short-prompt reading would fail on the benchmark for a
-  # reason already written down. Replace both numbers with a full-gsm8k STOCK
-  # reading (TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1 on the stock leg) when one is
+  # Replace both numbers with a full-gsm8k STOCK reading
+  # (TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1 on the stock leg) when one is
   # measured, and tighten min_al then.
   min_al: 1.5
+
+# test_mtp3_cutedsl_fp8_kv_bf16_state, over gsm8k: three drafts with the trunk's experts on
+# CuteDSL over an fp8 KV cache and a bf16 recurrent state.
+ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_cutedsl_fp8_kv_bf16_state:
+  # modeling_v2's own full-gsm8k reading on GB300 (1319 samples); there is no built-in reading
+  # for this combination (the built-in model has no CuteDSL trunk). 3.705 over bf16 KV.
+  ref_al: 3.509
+  # 95% of ref_al, above the two-draft reading (~2.8): a third draft position that is never
+  # accepted fails it.
+  min_al: 3.334
+
+# test_mtp3_long_context_passkey: three drafts with IndexShare on, bf16 KV, over
+# 13 prompts of 3k-6k tokens (the sparse attention path). Most of the output is a copy of the
+# document's section headings, which the draft predicts almost always, so the readings sit
+# at the range's ceiling of 4.0.
+ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_long_context:
+  # The same prompts with the draft layer selecting on every step (IndexShare off): 4.000,
+  # equal to the IndexShare reading.
+  ref_al: 4.000
+  # Hand-set, 2.5% below ref_al rather than the automatic 95% (3.8): a draft loop whose
+  # reused selection is deliberately wrong (the oldest 512 groups of every row) scores
+  # 3.760, a 6% drop the automatic floor would pass.
+  min_al: 3.9
+
+# test_mtp3_cutedsl_fp8_kv_bf16_state, over the pass keys of mtp3_long_context with IndexShare
+# off.
+ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp3_cutedsl_fp8_kv_bf16_state_long_context:
+  # 3.962 here, against 4.000 over bf16 KV.
+  ref_al: 3.962
+  # 2.5% below ref_al, as for mtp3_long_context.
+  min_al: 3.86
+
+# test_mtp7_long_context_passkey: seven drafts with IndexShare on, over an NVFP4 KV cache and a
+# bf16 recurrent state, over 12 prompts of 3k-12k tokens (the sparse attention path), whose
+# output mostly copies the document's section headings. The KV dtype sets the reading, and seven
+# chained drafts amplify it: 7.857 over bf16 KV, 7.500 over fp8, 6.867 over NVFP4 (6.961 with
+# IndexShare off, 7.003 over an fp32 state).
+ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7_nvfp4_kv_bf16_state_long_context:
+  ref_al: 6.867
+  # 2.5% below ref_al, as for mtp3_long_context.
+  min_al: 6.69
