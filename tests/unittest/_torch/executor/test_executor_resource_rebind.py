@@ -246,6 +246,7 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
     ex.model_engine.get_max_num_sequences = Mock(return_value=2)
     ex.model_engine.warmup = Mock()
     ex.model_engine.llm_args = SimpleNamespace(
+        kv_connector_config=None,
         max_stats_len=0,
         max_num_tokens=128,
         print_iter_log=False,
