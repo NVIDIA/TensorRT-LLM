@@ -510,16 +510,20 @@ def get_qwen3_hybrid_num_attention_layers(config):
 def mamba_effective_tp_size(mapping) -> int:
     """TP degree for sizing per-rank mamba/KDA state (budgeting AND allocation).
 
-    Attention-DP replicates the state and takes precedence; helix repurposes
-    CP ranks as plain TP for recurrent-state layers. Must match the runtime
-    pool construction (mamba_cache_manager) or the budget split withholds
-    unsharded-state bytes the allocator never uses (observed: 27.2 GiB/rank
-    mis-withheld on a helix16 gen worker whose real pool is 1/16-sharded).
+    Attention-DP replicates the state; helix repurposes CP ranks as plain TP
+    for recurrent-state layers, and under helix + attention-DP at tp_size 1
+    (Kimi K3 helix_a2a) the CP group still shares every request, so the state
+    stays head-sharded across it. Must match the runtime pool construction
+    (mamba_cache_manager) or the budget split withholds unsharded-state bytes
+    the allocator never uses (observed: 27.2 GiB/rank mis-withheld on a
+    helix16 gen worker whose real pool is 1/16-sharded).
     """
+    if mapping.has_cp_helix():
+        if mapping.enable_attention_dp:
+            return mapping.cp_size if mapping.tp_size == 1 else 1
+        return mapping.tp_size * mapping.cp_size
     if mapping.enable_attention_dp:
         return 1
-    if mapping.has_cp_helix():
-        return mapping.tp_size * mapping.cp_size
     return mapping.tp_size
 
 
