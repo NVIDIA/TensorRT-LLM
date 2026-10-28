@@ -52,7 +52,8 @@ from .interface import _reject
 # run sequentially on the same CUDA stream, and the wrapper consumes its
 # previous output before the next layer is dispatched. Within one layer, the
 # scheduler runs the chunks of a multi-chunk forward on one stream and copies
-# each chunk out, because the leaves declare ``run_moe_reuses_buffers``.
+# every chunk but the last out of it -- the trailing ``torch.cat`` copies that
+# one -- because the leaves declare ``run_moe_reuses_buffers``.
 _SHARED_MOE_OUTPUT_BUF: dict = {}
 
 # ActivationType -> b12x activation string. b12x currently exposes "relu2"
