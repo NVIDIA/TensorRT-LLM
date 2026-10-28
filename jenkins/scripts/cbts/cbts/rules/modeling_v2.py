@@ -133,6 +133,9 @@ def _is_mv2_claim(path: str) -> bool:
     fixture, so the rule keeps claiming it and re-runs the stages (safe
     over-run).
     """
+    # K3 native code and fakes reach stock imports, so baseline selection applies.
+    if path.startswith(_MV2_SRC_PREFIXES[0] + "models/kimi_k3_vl/"):
+        return False
     if not (path.startswith(_MV2_SRC_PREFIXES) or path in _CPP_BUILD_FILES):
         return False
     if is_docs_path(path):

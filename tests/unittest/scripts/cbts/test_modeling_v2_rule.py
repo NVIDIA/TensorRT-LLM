@@ -30,7 +30,7 @@ _PY = "tensorrt_llm/_torch/_experimental/modeling_v2"
 _CPP = "cpp/tensorrt_llm/modeling_v2"
 _UNIT = "unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm TIMEOUT (30)"
 _COMM = "unittest/_torch/modeling_v2/comm"
-_KIMI_UNIT = "unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_native.py"
+_NATIVE_UNIT = "unittest/_torch/modeling_v2/models/glm_moe_dsa/test_modeling_v2_glm_native.py"
 _DEEPSEEK_ACCURACY = "accuracy/modeling_v2/test_deepseek_v3.py::TestDeepseek::test_gsm8k[tp4]"
 _GPT_OSS_ACCURACY = "accuracy/modeling_v2/test_gpt_oss.py::TestGptOss::test_gsm8k[tp1]"
 _CLAIMS = "unittest/_torch/modeling_v2/test_modeling_v2_claims.py"
@@ -56,7 +56,7 @@ def rule(tmp_path) -> ModelingV2Rule:
             condition={},
             tests=[_COMM, _DEEPSEEK_ACCURACY],
         ),
-        Block(yaml_stem="l0_b200", block_index=0, condition={}, tests=[_KIMI_UNIT]),
+        Block(yaml_stem="l0_b200", block_index=0, condition={}, tests=[_NATIVE_UNIT]),
         Block(yaml_stem="l0_cpu", block_index=0, condition={}, tests=["unittest/tools", _CLAIMS]),
     ]
     stages = {
@@ -70,7 +70,7 @@ def rule(tmp_path) -> ModelingV2Rule:
     for family, target, cls in (
         ("gpt_oss", "gpt_oss_120b__sm_10x__default", "GptOss"),
         ("deepseek_v3", "target", "Deepseek"),
-        ("kimi_k3_vl", "target", "Kimi"),
+        ("glm_moe_dsa", "target", "Glm"),
     ):
         root = tmp_path / _PY / "models" / family
         (root / target).mkdir(parents=True)
@@ -139,14 +139,14 @@ def test_scope(rule):
     assert result.scope == "modelingv2only" and result.sanity_relevant is False
     assert _selected(result) == {_UNIT, _GPT_OSS_ACCURACY, _CLAIMS}
     result = _apply(
-        rule, f"{_PY}/models/deepseek_v3/routing.py", f"{_PY}/models/kimi_k3_vl/csrc/k.cu"
+        rule, f"{_PY}/models/deepseek_v3/routing.py", f"{_PY}/models/glm_moe_dsa/csrc/k.cu"
     )
-    assert _selected(result) == {_UNIT, _DEEPSEEK_ACCURACY, _KIMI_UNIT, _CLAIMS}
+    assert _selected(result) == {_UNIT, _DEEPSEEK_ACCURACY, _NATIVE_UNIT, _CLAIMS}
     result = _apply(rule, f"{_CPP}/common/torchLibrary.h")
     assert _selected(result) == {
         _UNIT,
         _COMM,
-        _KIMI_UNIT,
+        _NATIVE_UNIT,
         _DEEPSEEK_ACCURACY,
         _GPT_OSS_ACCURACY,
         _CLAIMS,
@@ -156,3 +156,10 @@ def test_scope(rule):
     result = _apply(rule, f"{_PY}/models/minimax_m3/csrc/attnMega.cu")
     assert result.scope == "modelingv2only"
     assert _COMM in _selected(result)  # unreadable family falls back to all modeling_v2
+
+
+@pytest.mark.parametrize("relative", ["csrc/kernel.cu", "ops/_native.py", "routing.py"])
+def test_stock_linked_k3_uses_baseline_selection(rule, relative):
+    path = f"{_PY}/models/kimi_k3_vl/{relative}"
+    assert not _is_mv2_claim(path)
+    assert _apply(rule, path) is None
