@@ -463,6 +463,10 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 ignored_roles=ignored_roles,
                 view_partition=view_partition,
             )
+            if not pool_views:
+                # Ignored-only groups keep their lifecycle index but have no
+                # transferable layers or regions to match against a peer.
+                local_layers = []
             for pool_view in pool_views:
                 if pool_view.mapper_kind not in _MAPPER_KINDS_BY_CACHE_KIND[cache_kind]:
                     raise ValueError(

@@ -151,6 +151,7 @@ def test_ssm_layer_reuse_policies(length, select_optional, split_layer):
             else [manager.get_layer_group_id(i) for i in (1, 2, 3)]
         )
         assert len({required, optional, private}) == 3
+        manager.get_and_reset_ssm_snapshot_iteration_stats()
         reader = manager.create_kv_cache(input_tokens=tokens)
         caches.append(reader)
         assert reader.num_committed_tokens == length
@@ -161,6 +162,14 @@ def test_ssm_layer_reuse_policies(length, select_optional, split_layer):
         assert reader.resume(
             stream.cuda_stream, optional_reuse_groups=[optional] if select_optional else []
         )
+        reader.commit_pending_stats()
+        stats = manager.get_and_reset_ssm_snapshot_iteration_stats()
+        assert stats[required].iter_snapshot_hits == 1
+        if select_optional:
+            assert stats[optional].iter_snapshot_lookups == stats[optional].iter_snapshot_hits == 1
+        elif optional in stats:
+            assert stats[optional].iter_snapshot_lookups == 0
+            assert stats[optional].iter_snapshot_hits == stats[optional].iter_snapshot_misses == 0
         indices = [
             reader.get_ssm_block_base_index(group) for group in (required, optional, private)
         ]
@@ -296,4 +305,69 @@ def test_attention_buffer_reuse_policies(length, select_optional):
     finally:
         for cache in reversed(caches):
             cache.close()
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_scratch_addresses_with_unequal_buffer_membership(split):
+    layers = []
+    for layer in range(3):
+        buffers = [kv.BufferConfig(role="key", size=2048, tokens_per_block_override=2)]
+        if layer < 2:
+            buffers.extend(
+                [
+                    kv.BufferConfig(role="value", size=4096),
+                    kv.BufferConfig(role="side", size=512, coalescing_group=7),
+                ]
+            )
+        buffers.append(
+            kv.BufferConfig(
+                role="private", size=1024, reuse_policy=kv.ReusePolicy.PRIVATE if split else None
+            )
+        )
+        layers.append(
+            kv.AttentionLayerConfig(layer_id=layer, buffers=buffers, sliding_window_size=8)
+        )
+    manager = kv.KVCacheManager(
+        kv.KVCacheManagerConfig(
+            tokens_per_block=4,
+            layers=layers,
+            cache_tiers=[kv.GpuCacheTierConfig(quota=4 << 20)],
+            swa_scratch_reuse=kv.SwaScratchReuseConfig(),
+        )
+    )
+    stream = torch.cuda.Stream()
+    cache = manager.create_kv_cache(input_tokens=list(range(64)))
+    try:
+        assert cache.resume(stream.cuda_stream)
+        assert cache.resize(64)
+        required = manager.get_buffer_group_id(0, "key")
+        scratch = cache.get_scratch_desc(required)
+        assert scratch is not None
+        blocks = scratch.range.end - scratch.range.beg
+        # The side pool has one buffer for each of two layers and needs half
+        # a slot per logical block, more than K/V's two-fifths share.
+        assert len(scratch.slot_ids) == (blocks + 1) // 2
+        for layer in layers:
+            spans = []
+            for buffer in layer.buffers:
+                group = manager.get_buffer_group_id(layer.layer_id, buffer.role)
+                converter = manager.get_page_index_converter(layer.layer_id, buffer.role)
+                indices = converter(
+                    cache.get_base_page_indices(group),
+                    kv.PageIndexMode.PER_LAYER,
+                    cache.get_scratch_desc(group),
+                )
+                base = manager.get_mem_pool_base_address(
+                    layer.layer_id, buffer.role, kv.PageIndexMode.PER_LAYER
+                )
+                stride = manager.get_page_stride(layer.layer_id, buffer.role)
+                assert len(indices) == 16 * converter.expansion
+                for index in indices:
+                    assert index >= 0
+                    spans.append((base + index * stride, base + (index + 1) * stride))
+            spans.sort()
+            assert all(end <= following for (_, end), (following, _) in zip(spans, spans[1:]))
+    finally:
+        cache.close()
         manager.shutdown()

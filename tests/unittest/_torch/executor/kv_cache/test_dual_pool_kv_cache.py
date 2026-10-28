@@ -449,7 +449,9 @@ class TestCrossKvCacheConstruction:
         distributed = Mock()
         distributed.allreduce.side_effect = lambda value, op: value
         impl = Mock(
-            layer_grouping=[list(range(num_decoder_layers))],
+            buffer_grouping=[
+                [SimpleNamespace(layer_id=layer, role="key") for layer in range(num_decoder_layers)]
+            ],
             pool_group_descs=[],
             all_buffer_ids=[],
         )

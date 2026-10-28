@@ -1253,7 +1253,7 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
         side_effect=AssertionError("state-index lookup must not refresh the dummy mask")
     )
     # Provide a mamba layer group so _create_chunk places the slot ID
-    mamba_lg = SimpleNamespace(kind=CacheKind.STATE)
+    mamba_lg = SimpleNamespace(kind=CacheKind.STATE, pool_views=[object()])
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
