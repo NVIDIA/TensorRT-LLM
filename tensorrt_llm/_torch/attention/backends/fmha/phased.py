@@ -309,8 +309,13 @@ class PhasedFmha(Fmha):
         phase_input = _leading_rows(q, num_ctx_tokens)
         params.qkv_input = phase_input if forward_args.is_fused_qkv else None
         params.query_input = None if forward_args.is_fused_qkv else phase_input
-        params.key_input = _leading_rows(k, num_ctx_tokens) if k is not None else None
-        params.value_input = _leading_rows(v, num_ctx_tokens) if v is not None else None
+        if self.attn.is_mla_enable:
+            # An expanded MLA prefix or KV chunk can be longer than its Q span.
+            params.key_input = k
+            params.value_input = v
+        else:
+            params.key_input = _leading_rows(k, num_ctx_tokens) if k is not None else None
+            params.value_input = _leading_rows(v, num_ctx_tokens) if v is not None else None
         params.output = out_tensor if fused_epilogue else _leading_rows(out_tensor, num_ctx_tokens)
         params.sequence_lengths = metadata.kv_lens_cuda_runtime
         params.context_lengths = metadata.prompt_lens_cuda_runtime
