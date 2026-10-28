@@ -85,6 +85,9 @@ on the leader process; with attention DP, they run on each owning rank.
 * **`supports_speculative_prefill: bool`** (class attribute)
   * **Description**: Optional, `False` by default; only an explicit `True` counts, read from the class before the scheduler is constructed. Declares a scheduler whose content identity (its store keys) covers the `draft_prompt_lookahead` prompt tokens past each block's end, which never offers or saves a block whose lookahead tokens fall outside the prompt, and which never saves a block the current pass has not computed. Together with the worker's declaration it lets the connector run next to one-model speculative decoding on a disaggregated context server; see [Speculative decoding on a disaggregated context server](#speculative-decoding-on-a-disaggregated-context-server).
 
+* **`supports_admission_query: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts, read from the class so every rank agrees. Declares that `get_num_new_matched_tokens` may be asked while the scheduler is still admitting the request; see [Admission-time queries](#admission-time-queries).
+
 ##### Running under VSWA
 
 KVCacheManagerV2 supports multiple layer groups with a connector implementing the grouped APIs below. KVCacheManagerV1 registers a single primary pool and cannot describe VSWA to a connector. Single-window SWA remains allowed with either manager.
@@ -356,10 +359,12 @@ worker's transfer stream. Inference does not wait for the retirement control ite
 
 ##### Legacy final-batch queries
 
-`get_num_new_matched_tokens` is called at most once per KV allocation after batch selection.
-Its offer can reduce computation for that request, but does not free token budget for another
-request in the same iteration. With chunked prefill, allocation growth can limit the served prefix;
-`RequestData.computed_position` reflects the load interval that the runtime honors.
+`get_num_new_matched_tokens` is called at most once per KV allocation, after batch selection
+unless [admission-time queries](#admission-time-queries) are enabled. Its offer can reduce
+computation for that request, but does not free token budget for another request in the same
+iteration unless admission-time queries are enabled. With chunked prefill, allocation growth can
+limit the served prefix; `RequestData.computed_position` reflects the load interval that the runtime
+honors.
 
 Destroying an allocation clears its connector state, so replay queries again. Specify
 `enable_block_reuse=True` alongside the connector; see
@@ -368,6 +373,62 @@ Restarting a request whose prefix load failed (`reports_failed_loads`) is availa
 this path.
 
 **Deployment note.** Under a connector, a workload that was token-bound becomes KV-bound: the connector removes forward-pass tokens but its prefix still occupies GPU pages. Lowering `max_num_tokens` to hand memory back to the KV pool is usually the right adjustment, the opposite of the guidance for a connector-free deployment.
+
+##### Admission-time queries
+
+A connector without source reservations can be asked while the KV cache manager V2 scheduler
+admits a first context chunk, instead of after the batch is final. Its scheduler declares
+`supports_admission_query = True`, which promises:
+
+- `get_num_new_matched_tokens` has no effect beyond its answer until `update_state_after_alloc`;
+- asking again for the same allocation replaces the earlier answer;
+- a query may be followed by `request_reset` and another query, with no `update_state_after_alloc`
+  in between.
+
+A connector that starts a transfer inside `get_num_new_matched_tokens` must not declare it. A
+request asked at admission can still be dropped before `prepare_resources`: by the disaggregated
+benchmark gate, by batch waiting for generation requests, by the total-KV cap, by the multimodal
+scheduler wrapper, or when the batch cannot be queued. It is asked again on a later iteration.
+
+Enable it per server with `kv_connector_config.admission_query`:
+
+```yaml
+kv_connector_config:
+  connector: <name>
+  admission_query:
+    max_uncharged_parks: 2     # default 0
+    max_offer_deferrals: 16    # default 16
+disable_overlap_scheduler: true
+```
+
+The scheduler asks each scheduled first chunk once its chunk is sized and its pages are allocated,
+and `prepare_resources` uses that answer instead of asking again. An offer that reaches past the
+chunk moves the chunk window, so the pages it needs are booked right away. When the KV cache cannot
+cover them, the request gives its chunk and pages back and waits for a later iteration, up to
+`max_offer_deferrals` iterations; after that, or right after it preempted a started request for
+pages, it is admitted and the offer is capped to the whole blocks the chunk's pages hold. With
+`max_uncharged_parks > 0`, up to that many first chunks of at least two blocks per iteration, which
+the connector loads asynchronously, are admitted without charging their tokens to `max_num_tokens`:
+the executor parks them before the forward pass. They still take a batch slot and keep their pages.
+A request admitted without a charge that does not park stops the executor with a connector failure,
+which requires a process restart.
+
+| Setting | Effect |
+|---|---|
+| unset | Final-batch queries only. |
+| `admission_query: {}` | Admission-time queries and page booking. |
+| `admission_query: {max_uncharged_parks: N}` | Also admits up to `N` parking chunks per iteration without a token charge. |
+
+Comparing the first two isolates page booking, and the last two isolate the token charge.
+
+Admission-time queries require KV cache manager V2 and `disable_overlap_scheduler=True`, which the
+executor checks at startup, and chunked prefill, without which they have no effect. They are ignored, with a
+warning, under attention data parallelism, for a capacity-only connector role, for connectors that
+reserve their prefix during admission, and for connector schedulers that do not declare
+`supports_admission_query`. Under `enable_swa_scratch_reuse` the pages a shifting offer needs are
+not booked at admission; `prepare_resources` grows them as on the final-batch path. The settings are
+configuration rather than environment variables because they change admission behavior and can
+differ between the context and generation servers of one disaggregated deployment.
 
 ##### Completion headroom on disaggregated servers
 

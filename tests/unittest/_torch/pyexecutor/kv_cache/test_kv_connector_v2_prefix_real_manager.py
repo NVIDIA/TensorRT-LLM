@@ -60,6 +60,8 @@ class FakeConnectorManager:
     def __init__(self, num_matched=OFFER_TOKENS, load_async=False):
         self.prefix_reservations_enabled = False
         self.capacity_only = False
+        # Each admission-time query test turns it on.
+        self.admission_query_capable = False
         self.reservations = {}
         self.reservation_requests = {}
         self.next_reservation_id = 1
@@ -1112,3 +1114,134 @@ def test_refuted_connector_chunk_releases_unused_completion_reservation() -> Non
         assert not manager._disagg_completion_limits
     finally:
         manager.shutdown()
+
+
+# -- admission-time connector queries ----------------------------------------------
+
+
+def _admission_scheduler(manager: KVCacheManagerV2, **kwargs):
+    """A real KVCacheV2Scheduler that admits one-block context chunks."""
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+    from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
+
+    return KVCacheV2Scheduler(
+        max_batch_size=4,
+        max_num_tokens=TOKENS_PER_BLOCK,
+        kv_cache_manager=manager,
+        scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, TOKENS_PER_BLOCK),
+        **kwargs,
+    )
+
+
+def test_admission_books_a_shifting_offer_on_real_pages(
+    manager: KVCacheManagerV2, connector: FakeConnectorManager
+) -> None:
+    """The window an offer moves the chunk to is allocated while the request is admitted."""
+    connector.num_matched = 64
+    connector.admission_query_capable = True
+    request = make_request()
+    scheduler = _admission_scheduler(manager, connector_admission_query=True)
+
+    output = scheduler.schedule_request([request], set())
+
+    assert [req.py_request_id for req in output.context_requests] == [request.py_request_id]
+    kv_cache = manager.kv_cache_map[request.py_request_id]
+    assert kv_cache.capacity >= 64 + TOKENS_PER_BLOCK
+    # Only the capacity moved: the served prefix is placed in prepare_resources.
+    assert kv_cache.history_length == 0
+    assert connector.queries == [(request.py_request_id, 0)]
+    assert scheduler.uncharged_park_ids == frozenset()
+
+    run(manager, request)
+
+    # The admission-time answer was used, not asked again.
+    assert connector.queries == [(request.py_request_id, 0)]
+    assert request.context_current_position == 64
+    assert request.context_chunk_size == TOKENS_PER_BLOCK
+    assert kv_cache.history_length == 64
+    assert connector.commits == [(request.py_request_id, 64, False)]
+
+
+def test_admission_deferral_releases_real_pages() -> None:
+    """A first chunk whose offer cannot be covered gives its real pages back and is asked afresh."""
+    connector = FakeConnectorManager(num_matched=64)
+    connector.admission_query_capable = True
+    torch.cuda.init()
+    gc.collect()
+    torch.cuda.empty_cache()
+    manager = make_manager(
+        connector,
+        # The request resumes into a nearly full pool.
+        kv_cache_config=KvCacheConfig(
+            max_tokens=2048, enable_block_reuse=True, max_util_for_resume=1.0
+        ),
+    )
+    blocker = None
+    try:
+        # Leave exactly one free block: the one-block chunk fits, the window
+        # its offer moves it to does not.
+        available_blocks = manager.get_num_free_blocks()
+        blocker = manager.impl.create_kv_cache()
+        assert blocker.resume(manager._stream.cuda_stream)
+        for num_blocks in range(1, available_blocks + 2):
+            if not blocker.resize(num_blocks * TOKENS_PER_BLOCK):
+                break
+        else:
+            pytest.fail("The blocker did not exhaust the resolved KV pool")
+        held_blocks = num_blocks - 1
+        assert held_blocks > 1
+        assert blocker.resize((held_blocks - 1) * TOKENS_PER_BLOCK)
+
+        request = make_request()
+        scheduler = _admission_scheduler(
+            manager, connector_admission_query=True, max_connector_offer_deferrals=1
+        )
+
+        output = scheduler.schedule_request([request], set())
+
+        assert output.context_requests == []
+        assert request.py_request_id not in manager.kv_cache_map
+        assert connector.forgotten == [request.py_request_id]
+        assert request.py_connector_offer_deferrals == 1
+        assert request.context_current_position == 0
+        assert connector.queries == [(request.py_request_id, 0)]
+
+        # At the bound the request is admitted with the pages its chunk holds.
+        output = scheduler.schedule_request([request], set())
+
+        assert [req.py_request_id for req in output.context_requests] == [request.py_request_id]
+        assert request.py_request_id in manager.kv_cache_map
+        run(manager, request)
+        assert connector.queries == [(request.py_request_id, 0)] * 2
+        # The shifted window cannot grow and the capped fallback cannot advance.
+        assert connector.commits == [(request.py_request_id, 0, False)]
+        assert request.context_current_position == 0
+        manager.free_resources(request)
+    finally:
+        if blocker is not None:
+            blocker.close()
+        manager.shutdown()
+        del manager
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def test_admission_off_keeps_the_final_batch_query(
+    manager: KVCacheManagerV2, connector: FakeConnectorManager
+) -> None:
+    """Without kv_connector_config.admission_query a capable connector is asked in prepare_resources only."""
+    connector.num_matched = 64
+    connector.admission_query_capable = True
+    request = make_request()
+    scheduler = _admission_scheduler(manager)
+
+    output = scheduler.schedule_request([request], set())
+
+    assert [req.py_request_id for req in output.context_requests] == [request.py_request_id]
+    assert connector.queries == []
+
+    run(manager, request)
+
+    assert connector.queries == [(request.py_request_id, 0)]
+    assert connector.commits == [(request.py_request_id, 64, False)]
