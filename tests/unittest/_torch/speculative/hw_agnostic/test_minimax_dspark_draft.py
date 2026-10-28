@@ -24,6 +24,7 @@ import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_dspark
+from tensorrt_llm._torch.models.modeling_dflash import dspark_layer_window_size
 from tensorrt_llm._torch.models.modeling_dspark import (
     _MINIMAX_DSPARK_GEMMA_NORM_SUFFIXES,
     GQADSparkForCausalLM,
@@ -37,6 +38,7 @@ from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     MINIMAX_DSPARK_DRAFT_ARCH,
     build_minimax_dspark_draft_config,
+    get_layer_attention_window,
     load_pretrained_config,
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -186,6 +188,28 @@ def test_flattened_config_keeps_existing_dflash_window_spelling() -> None:
     cfg = build_minimax_dspark_draft_config(config)
     assert cfg.dflash_config["use_swa"] is False
     assert "swa_window_size" not in cfg.dflash_config
+    # The checkpoint's use_swa switch is mirrored into the context-window one.
+    assert cfg.use_sliding_window is False
+
+
+def test_checkpoint_use_swa_false_disables_the_context_window_too() -> None:
+    """A nested-only ``sliding_window`` is lifted to the top level; a checkpoint
+    that also says ``use_swa: false`` must not end up with a windowed context
+    path and an unwindowed block decode."""
+    config = json.loads(json.dumps(_CONFIG))
+    for key in ("layer_types", "sliding_window"):
+        config["text_config"].pop(key, None)
+        config.pop(key, None)
+    config["text_config"]["dflash_config"]["use_swa"] = False
+    cfg = build_minimax_dspark_draft_config(config)
+    assert cfg.use_sliding_window is False
+    assert cfg.dflash_config["use_swa"] is False
+    assert "swa_window_size" not in cfg.dflash_config
+    for layer_idx in range(cfg.num_hidden_layers):
+        assert get_layer_attention_window(cfg, layer_idx) is None
+        assert dspark_layer_window_size(
+            cfg.dflash_config["use_swa"], 0, cfg.layer_types, layer_idx
+        ) == (-1, -1)
 
 
 def test_load_pretrained_config_routes_by_architecture(tmp_path: pathlib.Path) -> None:

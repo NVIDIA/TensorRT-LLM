@@ -886,8 +886,10 @@ def build_minimax_dspark_draft_config(
     on exactly those layers. An explicit ``use_sliding_window: false`` (the
     DFlash operator switch read by ``get_layer_attention_window``) forces
     ``use_swa`` off, whether it would come from that translation or from the
-    checkpoint's own ``dflash_config``, so the switch disables the block
-    windows too.
+    checkpoint's own ``dflash_config``, and an explicit ``use_swa: false`` in
+    ``dflash_config`` turns ``use_sliding_window`` off when that key is not set
+    explicitly, so the context window and the block windows are disabled
+    together rather than one at a time.
     """
     flat = {
         k: v
@@ -909,6 +911,13 @@ def build_minimax_dspark_draft_config(
         flat.setdefault("layer_types", list(layer_types))
     if sliding_window:
         flat.setdefault("sliding_window", int(sliding_window))
+    # Two switches gate the windows: the top-level use_sliding_window (context
+    # window) and the DFlash use_swa (block windows). A checkpoint use_swa:
+    # false also turns the context window off unless use_sliding_window is set
+    # explicitly, and use_sliding_window: false always turns use_swa off, so
+    # neither path stays windowed on its own by accident.
+    if dflash.get("use_swa") is False:
+        flat.setdefault("use_sliding_window", False)
     if flat.get("use_sliding_window") is False:
         dflash["use_swa"] = False
         dflash.pop("swa_window_size", None)
