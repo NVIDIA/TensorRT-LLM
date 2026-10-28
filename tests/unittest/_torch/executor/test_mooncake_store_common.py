@@ -32,9 +32,11 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import config as c
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import master as master_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
+    DEFAULT_STAGING_BUFFER_BYTES,
     MooncakeStoreConnectorConfig,
     StoreRole,
     local_address,
+    parse_size,
     split_address,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import (
@@ -49,6 +51,10 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.staging import (
     plan_slot_geometry,
     stage_batch_for_put,
     unstage_batch_after_get,
+)
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.validation import (
+    NODE_BUDGET_RESERVE_BYTES,
+    validate_node_budget,
 )
 from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig
 
@@ -691,6 +697,113 @@ def test_config_has_no_environment_override_for_eviction_settings(store_config, 
     assert config.stats_interval is None
 
 
+def test_config_async_load_defaults_off_and_reads_the_json(store_config):
+    assert resolve_config().async_load is False
+    set_pool_setting(store_config, async_load=True)
+    assert resolve_config().async_load is True
+    # `bool("false")` is True, so only a JSON boolean is read.
+    set_pool_setting(store_config, async_load="false")
+    with pytest.raises(ValueError, match="async_load"):
+        resolve_config()
+
+
+def test_config_async_load_workers_defaults_to_one_and_rejects_zero(store_config):
+    assert resolve_config().async_load_workers == 1
+    set_pool_setting(store_config, async_load_workers=3)
+    assert resolve_config().async_load_workers == 3
+    set_pool_setting(store_config, async_load_workers=0)
+    with pytest.raises(ValueError, match="async_load_workers"):
+        resolve_config()
+
+
+def test_config_staging_buffer_bytes_defaults_and_parses_binary_units(store_config):
+    """A config without the key, such as vLLM's, stages what an unset field asks."""
+    default = MooncakeStoreConfig.model_fields["staging_buffer_bytes"].default
+    assert resolve_config().staging_buffer_bytes == DEFAULT_STAGING_BUFFER_BYTES
+    assert DEFAULT_STAGING_BUFFER_BYTES == parse_size(default, strict_units=True)
+
+    set_pool_setting(store_config, staging_buffer_bytes="512MiB")
+    assert resolve_config().staging_buffer_bytes == 512 * 1024**2
+
+    set_pool_setting(store_config, staging_buffer_bytes="512MB")
+    with pytest.raises(ValueError, match="ambiguous unit"):
+        resolve_config()
+    set_pool_setting(store_config, staging_buffer_bytes=0)
+    with pytest.raises(ValueError, match="staging_buffer_bytes"):
+        resolve_config()
+
+
+_GIB = 1 << 30
+
+
+def _budget_config(**overrides) -> MooncakeStoreConnectorConfig:
+    settings = dict(
+        master_server_address="10.0.0.7:50051",
+        global_segment_size=4 * _GIB,
+        stage_through_host=True,
+        staging_buffer_bytes=_GIB,
+    )
+    settings.update(overrides)
+    return MooncakeStoreConnectorConfig(**settings)
+
+
+def _assert_node_claim(config, *, ranks, claimed):
+    """`claimed` bytes fit exactly, and one byte less fails with the remedy text."""
+    validate_node_budget(
+        config, ranks_on_node=ranks, available_bytes=claimed + NODE_BUDGET_RESERVE_BYTES
+    )
+    with pytest.raises(ValueError, match="cannot afford") as excinfo:
+        validate_node_budget(
+            config, ranks_on_node=ranks, available_bytes=claimed + NODE_BUDGET_RESERVE_BYTES - 1
+        )
+    return str(excinfo.value)
+
+
+def test_validate_node_budget_counts_staging_once_per_direction():
+    """Each direction a role drives pins `staging_buffer_bytes` per rank, and no more."""
+    # Two ranks, each lending 4 GiB and staging 1 GiB for loads and 1 GiB for saves.
+    message = _assert_node_claim(_budget_config(), ranks=2, claimed=2 * 4 * _GIB + 2 * 2 * _GIB)
+    assert "lower staging_buffer_bytes" in message
+    # The load threads split the load direction's budget rather than adding to it.
+    _assert_node_claim(
+        _budget_config(async_load=True, async_load_workers=4),
+        ranks=2,
+        claimed=2 * 4 * _GIB + 2 * 2 * _GIB,
+    )
+    _assert_node_claim(
+        _budget_config(role=StoreRole.CONSUMER), ranks=2, claimed=2 * 4 * _GIB + 2 * _GIB
+    )
+    _assert_node_claim(
+        _budget_config(staging_buffer_bytes=512 * 1024**2), ranks=1, claimed=4 * _GIB + _GIB
+    )
+    # A capacity role transfers nothing, so it stages nothing either.
+    _assert_node_claim(_budget_config(role=StoreRole.CAPACITY), ranks=2, claimed=2 * 4 * _GIB)
+    message = _assert_node_claim(
+        _budget_config(stage_through_host=False), ranks=2, claimed=2 * 4 * _GIB
+    )
+    assert "staging_buffer_bytes" not in message
+
+
+def test_client_config_renders_the_async_and_staging_settings(tmp_path):
+    rendered, config = _rendered_client_config(
+        tmp_path, async_load=True, async_load_workers=3, staging_buffer_bytes="256MiB"
+    )
+    assert rendered["async_load"] is True
+    assert rendered["async_load_workers"] == 3
+    # Resolved to a byte count, as the segment size is.
+    assert rendered["staging_buffer_bytes"] == 256 * 1024**2
+    assert config.async_load is True
+    assert config.async_load_workers == 3
+    assert config.staging_buffer_bytes == 256 * 1024**2
+
+    rendered, config = _rendered_client_config(tmp_path)
+    assert rendered["async_load"] is False
+    assert rendered["async_load_workers"] == 1
+    assert rendered["staging_buffer_bytes"] == DEFAULT_STAGING_BUFFER_BYTES
+    assert config.async_load is False
+    assert config.staging_buffer_bytes == DEFAULT_STAGING_BUFFER_BYTES
+
+
 def _rendered_client_config(tmp_path, **settings):
     """What `provision_pool` writes for a block with `settings`, and that file read back."""
     pool = MooncakeStoreConfig(pool="h:1", model_key="m", **settings)
@@ -845,6 +958,12 @@ def test_plan_slot_geometry(page_bytes, batch, budget, expected_slots):
 def test_plan_slot_geometry_rejects_degenerate_inputs(bad):
     with pytest.raises(ValueError):
         plan_slot_geometry(*bad)
+
+
+def test_plan_slot_geometry_needs_the_configured_budget():
+    """The budget is `staging_buffer_bytes` or a load thread's share, never a default."""
+    with pytest.raises(TypeError):
+        plan_slot_geometry(1024, 8)
 
 
 def test_staging_pool_registers_its_whole_buffer_once():

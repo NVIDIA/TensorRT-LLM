@@ -4165,6 +4165,27 @@
       "additionalProperties": false,
       "description": "How this server joins a Mooncake store pool.\n\nThe settings every participant shares come from the master named by\n`pool`; what is left here is per-server. Setting this makes\n`trtllm-serve` render the Mooncake client config and export\n`MOONCAKE_CONFIG_PATH`; an inherited `MOONCAKE_CONFIG_PATH` wins.",
       "properties": {
+        "async_load": {
+          "default": false,
+          "description": "Load a prefix the pool serves on background threads while the request waits outside the batch, instead of inside the executor iteration, so other requests keep computing during the transfer. A page that is gone by load time restarts only that request on a single rank or an attention-DP owner, and fails the server under tensor parallelism. Validated with disable_overlap_scheduler. Ignored unless role reads the pool ('both' or 'consumer').",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Async Load",
+          "type": "boolean"
+        },
+        "async_load_workers": {
+          "default": 1,
+          "description": "Background load threads per rank when async_load is set. Each has its own CUDA stream and, under stage_through_host, an equal share of staging_buffer_bytes.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Async Load Workers",
+          "type": "integer"
+        },
         "group_blocks": {
           "default": false,
           "description": "Put every page of a block (all layer groups and tensor-parallel shards) into one Mooncake eviction group, so the master evicts a block whole rather than leaving pages that hold space but can never hit. Mostly matters under tensor parallelism. Ignored unless the role writes; needs Mooncake 0.3.13 or newer.",
@@ -4298,12 +4319,28 @@
         },
         "stage_through_host": {
           "default": false,
-          "description": "Copy pages through a pinned host buffer instead of registering the KV pools with Mooncake. For a host whose HCA cannot pin GPU pages; costs a copy each way. Ignored when role is 'capacity'.",
+          "description": "Copy pages through a pinned host buffer instead of registering the KV pools with Mooncake. For a host whose HCA cannot pin GPU pages; costs a copy each way. Ignored when role is 'capacity'. Pinned memory per direction is staging_buffer_bytes.",
           "telemetry": {
             "exclude": true
           },
           "title": "Stage Through Host",
           "type": "boolean"
+        },
+        "staging_buffer_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": "1GiB",
+          "description": "Pinned host memory per transfer direction when stage_through_host is set, as a binary size ('512MiB') or a byte count; ambiguous units such as 'GB' are refused. It bounds how many pages one store call stages, not how large a page may be. With async_load the load direction's share is split evenly across async_load_workers. Counted per rank in the node memory check. Ignored without stage_through_host.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Staging Buffer Bytes"
         },
         "stats_interval": {
           "anyOf": [

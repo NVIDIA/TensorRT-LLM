@@ -198,11 +198,14 @@ def validate_node_budget(
     # DRAM, so it belongs in the sum even when no segment is mounted.
     staging_claim = 0
     if config.stage_through_host:
-        from .staging import MAX_STAGING_BUFFER_BYTES
-
-        # One pool per direction, and a capacity-only rank opens neither.
+        # One budget per direction, and a capacity-only rank opens neither.
+        # `async_load` adds nothing: the load direction is either the
+        # synchronous load pool or the load workers' pools splitting the same
+        # budget, never both (see `MooncakeStoreConnectorWorker._open_staging`).
+        # A pool raised to one page because its share is below one page is
+        # warned about when it is allocated, not counted here.
         directions = int(config.role.loads) + int(config.role.saves)
-        staging_claim = ranks_on_node * directions * MAX_STAGING_BUFFER_BYTES
+        staging_claim = ranks_on_node * directions * config.staging_buffer_bytes
 
     claimed = segment_claim + staging_claim
     if claimed <= 0:
@@ -232,13 +235,20 @@ def validate_node_budget(
     if affordable > 0:
         remedy = (
             f"Lower segment_size to at most {affordable / _GIB:.1f} GiB, or run "
-            f"fewer ranks per node."
+            "fewer ranks per node"
+        )
+        # Naming the staging knobs only where staging is pinned at all.
+        remedy += (
+            ", lower staging_buffer_bytes, or turn off stage_through_host."
+            if staging_claim
+            else "."
         )
     else:
         remedy = (
             f"Lending nothing would not be enough: the {staging_claim / _GIB:.1f} "
             f"GiB of pinned staging buffers alone overruns the budget. Run fewer "
-            f"ranks per node, or turn off stage_through_host."
+            f"ranks per node, lower staging_buffer_bytes, or turn off "
+            f"stage_through_host."
         )
     raise ValueError(
         f"mooncake-store: this node cannot afford what the pool is configured "

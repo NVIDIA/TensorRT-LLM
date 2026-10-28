@@ -1900,16 +1900,15 @@ def test_worker_accepts_shared_one_model_draft_and_capacity_role(
 def make_staged_worker(fake_store, store_config, *, layout, budget=None):
     """A worker configured to pass pages through pinned host slots.
 
-    `budget` patches the pinned-memory ceiling rather than setting a field:
-    the allocation follows from the layout and the transfer batch now, so the
-    ceiling is the only thing left that can bind.
+    `budget` sets `staging_buffer_bytes`, the pinned memory per direction: the
+    slot width follows from the layout, so the budget only bounds how many
+    slots a pool holds.
     """
-    set_pool_setting(store_config, stage_through_host=True)
-    with contextlib.ExitStack() as stack:
-        if budget is not None:
-            patch = stack.enter_context(pytest.MonkeyPatch.context())
-            patch.setattr(worker_module, "MAX_STAGING_BUFFER_BYTES", budget)
-        worker = stack.enter_context(make_worker(fake_store, layout=layout))
+    settings = {"stage_through_host": True}
+    if budget is not None:
+        settings["staging_buffer_bytes"] = budget
+    set_pool_setting(store_config, **settings)
+    with make_worker(fake_store, layout=layout) as worker:
         yield worker
 
 
@@ -2188,6 +2187,763 @@ def test_staging_narrows_the_batch_to_the_budget(store_config, fake_store, stage
         )
         # Five pages through two slots, and no call wider than the slot count.
         assert [len(keys) for keys, _a, _s in fake_store.put_calls] == [2, 2, 1]
+
+
+# ---- asynchronous loads ----
+
+
+def enable_async_load(store_config, workers=None):
+    """Turn on `async_load` in the rendered client config."""
+    settings = {"async_load": True}
+    if workers is not None:
+        settings["async_load_workers"] = workers
+    set_pool_setting(store_config, **settings)
+
+
+def queue_async(worker, *transfers, fence=None):
+    """Bind metadata carrying asynchronous loads, as `handle_metadata` does.
+
+    The allocation fence is bound first, as the manager binds it just before
+    the metadata of the batch that allocated the pages.
+
+    Returns:
+        The fence the loads were queued with.
+    """
+    fence = fence if fence is not None else AllocationFence(worker._store)
+    worker.bind_allocation_fence(fence)
+    worker.bind_connector_meta(MooncakeStoreMetadata(async_loads=list(transfers)))
+    return fence
+
+
+def wait_async_idle(worker, timeout=5.0):
+    """Block until the load threads have finished every queued load."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with worker._load_lock:
+            if not worker._async_pending:
+                return
+        time.sleep(0.005)
+    raise AssertionError("the asynchronous load did not finish in time")
+
+
+def test_worker_has_no_load_thread_by_default(store_config, fake_store):
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        assert worker._async_load is False
+        assert worker._load_threads == []
+        assert worker._async_stagings == []
+        # Without asynchronous offers a parked id is echoed straight back.
+        assert worker.get_finished([], [5]) == ([], [5])
+
+
+def test_worker_starts_async_loads_from_metadata(store_config, fake_store):
+    """A rank queues its parked loads when it binds the metadata, behind the fence."""
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        assert worker._recover_failed_loads
+        block_hash = b"\x0a" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        fence = queue_async(
+            worker,
+            RequestTransfers(9, [PageTransfer(block_hash, 0, 2)]),
+            # Parked for an offer honoured with no tokens: nothing to wait for.
+            RequestTransfers(10, []),
+        )
+        wait_async_idle(worker)
+
+        # Only the request with pages to write waits for its allocation.
+        assert fence.waited_for == [{9}]
+        _saving, finished = worker.get_finished([], [9, 10])
+        assert sorted(finished) == [9, 10]
+        assert worker.take_failed_async_load_requests() == set()
+
+
+def test_worker_starts_async_loads_from_metadata_under_tensor_parallelism(store_config, fake_store):
+    """Every tensor-parallel rank queues its own shard's load from the broadcast metadata.
+
+    Tensor parallelism is set on the built worker, as a rank that cannot restart a
+    request alone, rather than through the world size, which would also change
+    every key namespace.
+    """
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        worker._recover_failed_loads = False
+        block_hash = b"\x07" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+
+        queue_async(worker, RequestTransfers(9, [PageTransfer(block_hash, 0, 2)]))
+        wait_async_idle(worker)
+
+        assert worker.get_finished([], [9]) == ([], [9])
+        assert [keys for keys, _addresses, _sizes in fake_store.get_calls] == [
+            [worker._namespaces[0].key(block_hash)]
+        ]
+
+
+def test_worker_async_load_failure_is_fatal_under_tensor_parallelism(store_config, fake_store):
+    """Tensor-parallel ranks cannot restart a request alone, so a lost page fails the rank."""
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        worker._recover_failed_loads = False
+        queue_async(worker, RequestTransfers(4, [PageTransfer(b"\x08" * 16, 0, 1)]))
+        wait_async_idle(worker)
+        with pytest.raises(RuntimeError, match="cannot restart the request alone"):
+            worker.get_finished([], [4])
+
+
+def test_worker_rejects_async_loads_in_metadata_when_async_load_is_off(store_config, fake_store):
+    """Binding never raises; the next executor calls do."""
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        worker.bind_allocation_fence(AllocationFence(fake_store))
+        worker.bind_connector_meta(MooncakeStoreMetadata(async_loads=[RequestTransfers(1, [])]))
+        with pytest.raises(RuntimeError, match="async_load is off"):
+            worker.start_load_kv(None)
+        with pytest.raises(RuntimeError, match="async_load is off"):
+            worker.get_finished([], [1])
+
+
+def test_worker_async_load_waits_on_the_fence_off_the_executor_thread(store_config, fake_store):
+    """Binding never blocks on the fence; the load thread waits on it before fetching."""
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        block_hash = b"\x0c" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        calls = []
+        store_get = fake_store.batch_get_into_multi_buffers
+
+        def recording_get(*args, **kwargs):
+            calls.append("get")
+            return store_get(*args, **kwargs)
+
+        fake_store.batch_get_into_multi_buffers = recording_get
+        released = threading.Event()
+        fence_threads = []
+
+        def blocking_fence(request_ids):
+            fence_threads.append(threading.current_thread().name)
+            assert released.wait(5.0), "the test never released the fence"
+            calls.append(("fence", set(request_ids)))
+
+        try:
+            queue_async(
+                worker, RequestTransfers(12, [PageTransfer(block_hash, 0, 2)]), fence=blocking_fence
+            )
+            # The fence of the parking iteration travels with the request, so a
+            # later iteration binding another changes nothing it waits on.
+            worker.bind_allocation_fence(None)
+            assert worker.get_finished([], [12]) == ([], [])
+        finally:
+            released.set()
+        wait_async_idle(worker)
+
+        assert calls == [("fence", {12}), "get"]
+        assert len(fence_threads) == 1
+        assert fence_threads[0].startswith("mooncake-store-load-")
+        assert worker.get_finished([], []) == ([], [12])
+
+
+def test_worker_async_load_is_reported_once_the_runtime_announces_it(store_config, fake_store):
+    """A landed load waits for the runtime to say it parked the request."""
+    enable_async_load(store_config)
+    layout = make_layout()
+    with make_worker(fake_store, layout=layout) as worker:
+        assert len(worker._load_threads) == 1
+        block_hash = b"\x05" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+
+        queue_async(worker, RequestTransfers(7, [PageTransfer(block_hash, 0, 2)]))
+        wait_async_idle(worker)
+
+        # Landed, but not announced: nothing to report yet.
+        assert worker.get_finished([], []) == ([], [])
+        assert worker.get_finished([], [7]) == ([], [7])
+        assert worker.take_failed_async_load_requests() == set()
+        # Reported once only.
+        assert worker.get_finished([], []) == ([], [])
+
+        (keys, addresses, sizes) = fake_store.get_calls[0]
+        expected_addresses, expected_sizes = PageAddressing(layout).buffers(0, 2)
+        assert keys == [worker._namespaces[0].key(block_hash)]
+        assert addresses == [expected_addresses]
+        assert sizes == [expected_sizes]
+
+
+def test_worker_async_load_announced_first_waits_for_the_pages(store_config, fake_store):
+    """The runtime is never told a load finished while its bytes are in flight."""
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        block_hash = b"\x06" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        gate = threading.Event()
+        store_get = fake_store.batch_get_into_multi_buffers
+
+        def gated(*args, **kwargs):
+            assert gate.wait(5.0), "the test never opened the gate"
+            return store_get(*args, **kwargs)
+
+        fake_store.batch_get_into_multi_buffers = gated
+        try:
+            queue_async(worker, RequestTransfers(7, [PageTransfer(block_hash, 0, 1)]))
+            assert worker.get_finished([], [7]) == ([], [])
+        finally:
+            gate.set()
+        wait_async_idle(worker)
+        assert worker.get_finished([], []) == ([], [7])
+        assert worker.take_failed_async_load_requests() == set()
+
+
+def test_worker_async_load_failure_is_handed_to_the_executor(store_config, fake_store):
+    """A missing page still releases the parked request, marked for a restart."""
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        present, missing, later = (bytes([1]) * 16, bytes([2]) * 16, bytes([3]) * 16)
+        for block_hash in (present, later):
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        # One page per store call, so the page after the missing one is a
+        # separate call the load thread can skip.
+        worker._async_batch_size = 1
+        queue_async(
+            worker,
+            RequestTransfers(
+                8,
+                [
+                    PageTransfer(present, 0, 1),
+                    PageTransfer(missing, 0, 2),
+                    PageTransfer(later, 0, 3),
+                ],
+            ),
+        )
+        wait_async_idle(worker)
+
+        assert worker.get_finished([], [8]) == ([], [8])
+        assert worker.take_failed_async_load_requests() == {8}
+        # Cleared on return.
+        assert worker.take_failed_async_load_requests() == set()
+        # The page after the missing one was not fetched: the request restarts.
+        fetched = [key for keys, _addresses, _sizes in fake_store.get_calls for key in keys]
+        assert worker._namespaces[0].key(later) not in fetched
+
+
+def test_worker_async_load_with_nothing_to_load_completes_at_once(store_config, fake_store):
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        fence = queue_async(worker, RequestTransfers(9, []))
+        assert worker.get_finished([], [9]) == ([], [9])
+        assert worker.take_failed_async_load_requests() == set()
+        assert fence.waited_for == []
+        assert fake_store.get_calls == []
+
+
+def test_worker_restarts_a_parked_request_it_was_never_handed(store_config, fake_store):
+    """An announced request with no load behind it must not stay parked."""
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        assert worker.get_finished([], [11]) == ([], [11])
+        assert worker.take_failed_async_load_requests() == {11}
+
+
+def test_worker_async_load_refuses_to_queue_without_a_fence(store_config, fake_store):
+    """Without the allocation fence nothing orders a load thread behind the allocation."""
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        block_hash = b"\x0b" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        worker.bind_allocation_fence(None)
+        worker.bind_connector_meta(
+            MooncakeStoreMetadata(
+                async_loads=[RequestTransfers(3, [PageTransfer(block_hash, 0, 1)])]
+            )
+        )
+        with pytest.raises(RuntimeError, match="no allocation fence"):
+            worker.start_load_kv(None)
+    assert fake_store.get_calls == []
+
+
+def test_worker_async_load_exception_is_fatal_at_the_next_executor_call(store_config, fake_store):
+    """A store call that raises fails the rank, even where a missing page would restart.
+
+    The error is sticky, so no later call, such as a second recovery poll,
+    sees a healthy worker.
+    """
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        assert worker._recover_failed_loads
+
+        def broken(*_args, **_kwargs):
+            raise RuntimeError("transport lost")
+
+        fake_store.batch_get_into_multi_buffers = broken
+        queue_async(worker, RequestTransfers(5, [PageTransfer(b"\x0d" * 16, 0, 1)]))
+        wait_async_idle(worker)
+
+        with pytest.raises(RuntimeError, match="background load failed") as excinfo:
+            worker.start_load_kv(None)
+        assert "transport lost" in str(excinfo.value)
+        with pytest.raises(RuntimeError, match="background load failed"):
+            worker.get_finished([], [5])
+        with pytest.raises(RuntimeError, match="background load failed"):
+            worker.start_load_kv(None)
+
+
+def test_bind_connector_meta_never_raises(store_config, fake_store):
+    """Binding runs outside the attention-DP failure vote, so the next calls raise instead."""
+    block_hash = b"\x1a" * 16
+
+    def async_metadata():
+        return MooncakeStoreMetadata(
+            async_loads=[RequestTransfers(1, [PageTransfer(block_hash, 0, 1)])]
+        )
+
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        worker.bind_allocation_fence(AllocationFence(fake_store))
+        worker.bind_connector_meta(async_metadata())
+        with pytest.raises(RuntimeError, match="async_load is off"):
+            worker.get_finished([], [])
+
+    enable_async_load(store_config)
+    # No layout registered yet, so no load thread exists to run the load.
+    with make_worker(fake_store) as worker:
+        worker.bind_allocation_fence(AllocationFence(fake_store))
+        worker.bind_connector_meta(async_metadata())
+        with pytest.raises(RuntimeError, match="layout was registered"):
+            worker.get_finished([], [])
+
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        worker.bind_allocation_fence(None)
+        worker.bind_connector_meta(async_metadata())
+        with pytest.raises(RuntimeError, match="no allocation fence"):
+            worker.get_finished([], [1])
+    assert fake_store.get_calls == []
+
+
+def test_worker_start_load_kv_starts_only_newly_bound_loads(store_config, fake_store):
+    """Recovery may call `start_load_kv` twice per pass and rebind the same metadata."""
+    block_hash = b"\x0e" * 16
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        worker.bind_allocation_fence(AllocationFence(fake_store))
+        bind_one_load(worker, fake_store, block_hash)
+        worker.start_load_kv(None)
+        worker.start_load_kv(None)
+        assert len(fake_store.get_calls) == 1
+
+    fake_store.get_calls.clear()
+    enable_async_load(store_config)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        metadata = MooncakeStoreMetadata(
+            async_loads=[RequestTransfers(4, [PageTransfer(block_hash, 0, 1)])]
+        )
+        worker.bind_allocation_fence(AllocationFence(fake_store))
+        worker.bind_connector_meta(metadata)
+        assert metadata.async_loads == []
+        worker.bind_connector_meta(metadata)
+        wait_async_idle(worker)
+        assert len(fake_store.get_calls) == 1
+        assert worker.get_finished([], [4]) == ([], [4])
+
+
+def test_staged_async_worker_refuses_a_synchronous_load(store_config, fake_store, staged_copies):
+    """Its loads all go through the load threads, so no synchronous load pool is pinned."""
+    enable_async_load(store_config)
+    with make_staged_worker(fake_store, store_config, layout=make_layout()) as worker:
+        assert worker._load_staging is None
+        bind_one_load(worker, fake_store, b"\x0f" * 16)
+        with pytest.raises(RuntimeError, match="synchronous staging pool"):
+            worker.start_load_kv(None)
+    assert fake_store.get_calls == []
+    assert staged_copies == []
+
+
+@pytest.mark.parametrize("role", ["producer", "capacity"])
+def test_async_load_is_off_for_roles_that_do_not_read(
+    store_config, fake_store, staged_copies, role
+):
+    """A role that never loads starts no load thread and pins no load staging."""
+    enable_async_load(store_config, workers=2)
+    set_pool_setting(store_config, role=role, stage_through_host=True)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        assert worker._async_load is False
+        assert worker._load_threads == []
+        assert worker._async_stagings == []
+        assert worker._load_staging is None
+
+
+def test_async_staging_registers_one_pool_per_worker_and_no_sync_load_pool(
+    store_config, fake_store, staged_copies
+):
+    enable_async_load(store_config, workers=3)
+    with make_staged_worker(fake_store, store_config, layout=make_pool_layout()) as worker:
+        assert worker._load_staging is None
+        assert len(worker._async_stagings) == 3
+        pools = [worker._save_staging, *worker._async_stagings]
+        # The save pool and one pool per load thread, and never the KV pools.
+        assert sorted(address for address, _ in fake_store.registered) == sorted(
+            pool.slot_address(0) for pool in pools
+        )
+        assert POOL_BASE not in [address for address, _ in fake_store.registered]
+
+
+def test_async_staged_load_scatters_only_landed_pages_on_the_loader_thread(
+    store_config, fake_store, staged_copies, monkeypatch
+):
+    """The load thread scatters through its own slots, and never a failed one."""
+    copy_threads = []
+
+    def record_copy(dst, src, size, kind, stream):
+        staged_copies.append((int(dst), int(src), int(size)))
+        copy_threads.append(threading.current_thread().name)
+
+    monkeypatch.setattr(staging_module, "_memcpy_async", record_copy)
+    enable_async_load(store_config)
+    layout = make_layout(regions_per_group=2)
+    with make_staged_worker(fake_store, store_config, layout=layout) as worker:
+        good, bad = bytes([0x1A]) * 16, bytes([0x1B]) * 16
+        for block_hash in (good, bad):
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        fake_store.fail_gets_for.add(worker._namespaces[0].key(bad))
+        queue_async(
+            worker, RequestTransfers(7, [PageTransfer(good, 0, 1), PageTransfer(bad, 0, 2)])
+        )
+        wait_async_idle(worker)
+
+        assert worker.get_finished([], [7]) == ([], [7])
+        assert worker.take_failed_async_load_requests() == {7}
+        # Both pages shared one store call, so slot 0 holds the landed page.
+        assert len(fake_store.get_calls) == 1
+        slot = worker._async_stagings[0].slot_address(0)
+        good_addresses, good_sizes = PageAddressing(layout).buffers(0, 1)
+        expected = []
+        offset = 0
+        for address, size in zip(good_addresses, good_sizes):
+            expected.append((address, slot + offset, size))
+            offset += size
+        assert staged_copies == expected
+        assert copy_threads and all(
+            name.startswith("mooncake-store-load-") for name in copy_threads
+        )
+
+
+def test_a_pool_below_one_page_warns_that_it_exceeds_the_budget(
+    store_config, fake_store, staged_copies, monkeypatch
+):
+    """A budget below one page still pins a page, which the node check did not count."""
+    layout = make_layout(regions_per_group=2)
+    page_bytes = PageAddressing(layout).bytes_per_page(0)
+    warnings = []
+    monkeypatch.setattr(worker_module.logger, "warning", warnings.append)
+
+    with make_staged_worker(
+        fake_store, store_config, layout=layout, budget=page_bytes - 1
+    ) as worker:
+        assert worker._load_staging.num_slots == 1
+        assert worker._save_staging.num_slots == 1
+    raised = [message for message in warnings if "raised to one page" in message]
+    assert len(raised) == 1
+    assert "the load, save staging pool(s)" in raised[0]
+
+    warnings.clear()
+    enable_async_load(store_config, workers=2)
+    # A whole page for the save pool, half of one for each load thread.
+    with make_staged_worker(fake_store, store_config, layout=layout, budget=page_bytes) as worker:
+        assert [pool.num_slots for pool in worker._async_stagings] == [1, 1]
+        assert worker._save_staging.num_slots == 1
+    raised = [message for message in warnings if "raised to one page" in message]
+    assert len(raised) == 1
+    assert "async-load-0, async-load-1" in raised[0]
+    assert "async_load_workers" in raised[0]
+
+    warnings.clear()
+    # Below one page for the save pool too, whose budget no load thread shares,
+    # so only the load threads' warning suggests fewer of them.
+    with make_staged_worker(
+        fake_store, store_config, layout=layout, budget=page_bytes - 1
+    ) as worker:
+        assert worker._save_staging.num_slots == 1
+    raised = [message for message in warnings if "raised to one page" in message]
+    assert len(raised) == 2
+    (save_warning,) = [message for message in raised if "the save staging pool(s)" in message]
+    assert "async_load_workers" not in save_warning
+
+
+def test_worker_pool_default_is_one_worker_with_the_full_staging(
+    store_config, fake_store, staged_copies
+):
+    """One load thread gets the load direction's whole budget, and no other load pool is pinned."""
+    enable_async_load(store_config)
+    layout = make_layout(regions_per_group=2)
+    page_bytes = PageAddressing(layout).bytes_per_page(0)
+    with make_staged_worker(
+        fake_store, store_config, layout=layout, budget=8 * page_bytes
+    ) as worker:
+        assert len(worker._load_threads) == 1
+        assert worker._load_staging is None
+        assert [pool.num_slots for pool in worker._async_stagings] == [8]
+        # The save pool is the budget's too.
+        assert worker._save_staging.num_slots == 8
+        assert worker._async_batch_size == worker._batch_size == 8
+
+
+def test_worker_pool_splits_the_staging_budget(
+    store_config, fake_store, staged_copies, monkeypatch
+):
+    layout = make_layout(regions_per_group=2)
+    page_bytes = PageAddressing(layout).bytes_per_page(0)
+    # 512 pages of budget across 4 load threads: 128 slots each.
+    enable_async_load(store_config, workers=4)
+    set_pool_setting(store_config, transfer_batch_size=256)
+    with make_staged_worker(
+        fake_store, store_config, layout=layout, budget=512 * page_bytes
+    ) as worker:
+        assert [pool.num_slots for pool in worker._async_stagings] == [128] * 4
+        assert worker._async_batch_size == 128
+        # Saves keep the whole direction's budget.
+        assert worker._batch_size == 256
+
+    # 8 pages across 2 threads: 4 each, with no floor, and a warning saying so.
+    warnings = []
+    monkeypatch.setattr(worker_module.logger, "warning", warnings.append)
+    enable_async_load(store_config, workers=2)
+    set_pool_setting(store_config, transfer_batch_size=16)
+    with make_staged_worker(
+        fake_store, store_config, layout=layout, budget=8 * page_bytes
+    ) as worker:
+        assert [pool.num_slots for pool in worker._async_stagings] == [4, 4]
+        assert worker._async_batch_size == 4
+        assert worker._batch_size == 8
+    assert any("stages only 4 page(s)" in message for message in warnings)
+    # The save pool narrows the batch it uses, and says so.
+    assert any("reduced its transfer batch" in message for message in warnings)
+
+    # A consumer pins no pool the narrowed batch applies to, so only the load
+    # threads' narrowing is reported.
+    warnings.clear()
+    set_pool_setting(store_config, role="consumer")
+    with make_staged_worker(
+        fake_store, store_config, layout=layout, budget=8 * page_bytes
+    ) as worker:
+        assert worker._save_staging is None and worker._load_staging is None
+        assert worker._async_batch_size == 4
+    assert any("stages only 4 page(s)" in message for message in warnings)
+    assert not any("reduced its transfer batch" in message for message in warnings)
+
+
+def test_worker_pool_loads_two_requests_concurrently(store_config, fake_store):
+    """Two load threads transfer at the same time; each request is handled once."""
+    enable_async_load(store_config, workers=2)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        assert len(worker._load_threads) == 2
+        hashes = [bytes([0x21]) * 16, bytes([0x22]) * 16]
+        for block_hash in hashes:
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        # Both threads must be inside the store call at once, or this times out.
+        rendezvous = threading.Barrier(2, timeout=5.0)
+        store_get = fake_store.batch_get_into_multi_buffers
+
+        def meet_then_get(*args, **kwargs):
+            rendezvous.wait()
+            return store_get(*args, **kwargs)
+
+        fake_store.batch_get_into_multi_buffers = meet_then_get
+        queue_async(
+            worker,
+            RequestTransfers(7, [PageTransfer(hashes[0], 0, 1)]),
+            RequestTransfers(8, [PageTransfer(hashes[1], 0, 2)]),
+        )
+        wait_async_idle(worker)
+
+        _saving, finished = worker.get_finished([], [7, 8])
+        assert sorted(finished) == [7, 8]
+        assert worker.take_failed_async_load_requests() == set()
+        fetched = [key for keys, _addresses, _sizes in fake_store.get_calls for key in keys]
+        assert sorted(fetched) == sorted(worker._namespaces[0].key(h) for h in hashes)
+
+
+def test_worker_pool_keeps_failure_and_success_apart(store_config, fake_store):
+    enable_async_load(store_config, workers=2)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        good, bad = bytes([0x31]) * 16, bytes([0x32]) * 16
+        fake_store.objects.add(worker._namespaces[0].key(good))
+        queue_async(
+            worker,
+            *(
+                RequestTransfers(request_id, [PageTransfer(block_hash, 0, page)])
+                for request_id, block_hash, page in ((7, good, 1), (8, bad, 2), (9, good, 3))
+            ),
+        )
+        wait_async_idle(worker)
+        _saving, finished = worker.get_finished([], [7, 8, 9])
+        assert sorted(finished) == [7, 8, 9]
+        assert worker.take_failed_async_load_requests() == {8}
+
+
+def test_worker_pool_stats_line_summarises_the_interval(store_config, fake_store, monkeypatch):
+    """Asynchronous loads fold into the `stats_interval` load line, with their queue."""
+    enable_async_load(store_config, workers=2)
+    set_pool_setting(store_config, stats_interval=60)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        # Idle and nothing loaded: no line, even when forced.
+        assert worker._maybe_log_load_stats(force=True) is None
+
+        good, bad = bytes([0x41]) * 16, bytes([0x42]) * 16
+        fake_store.objects.add(worker._namespaces[0].key(good))
+        queue_async(
+            worker,
+            RequestTransfers(7, [PageTransfer(good, 0, 1)]),
+            RequestTransfers(8, [PageTransfer(bad, 0, 2)]),
+        )
+        wait_async_idle(worker)
+
+        lines = []
+        monkeypatch.setattr(worker_module.logger, "info", lines.append)
+        # Not due yet: the interval gates the line.
+        assert worker._maybe_log_load_stats() is None
+        line = worker._maybe_log_load_stats(force=True)
+        assert line is not None and lines == [line]
+        assert line.startswith("mooncake-store load stats: rank 0 ")
+        assert "loads=2 pages=2 batches=2 " in line
+        assert "failed_pages=1 " in line
+        assert "wait_ms mean=" in line
+        assert "workers=2 queue=0 active=0 " in line
+        # The load thread waits on the fence, so that phase is timed too.
+        assert "phase_ms(wall/cpu per load) fence=" in line
+        # The counters start over, so a quiet interval logs nothing.
+        assert worker._maybe_log_load_stats(force=True) is None
+
+
+def test_the_ranks_device_is_adopted_by_the_load_threads(store_config, fake_store, fake_cuda):
+    """Like the save thread, a load thread must not run on torch's default device."""
+    enable_async_load(store_config, workers=2)
+    # No save thread, so every device switch below is a load thread's.
+    set_pool_setting(store_config, role="consumer")
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        assert worker._device_index == 3
+        assert len(worker._load_threads) == 2
+        # Each thread sets the device before registration stops waiting for it.
+        assert fake_cuda == [3, 3]
+
+
+def test_a_load_thread_that_cannot_start_fails_registration(
+    store_config, fake_store, fake_cuda, monkeypatch
+):
+    """A parked request must not wait on a load thread that died at startup."""
+
+    def refuse(_index):
+        raise RuntimeError("cudaSetDevice failed")
+
+    monkeypatch.setattr(torch.cuda, "set_device", refuse)
+    enable_async_load(store_config)
+    set_pool_setting(store_config, role="consumer")
+
+    with pytest.raises(RuntimeError, match="load thread"):
+        with make_worker(fake_store, layout=make_layout()):
+            pytest.fail("registration should not have completed")
+
+
+def _blocking_store_get(fake_store):
+    """Make the store's get block until released, and say when it is reading."""
+    reading = threading.Event()
+    release = threading.Event()
+    store_get = fake_store.batch_get_into_multi_buffers
+
+    def blocking_get(*args, **kwargs):
+        reading.set()
+        assert release.wait(30.0), "the test never released the load thread"
+        return store_get(*args, **kwargs)
+
+    fake_store.batch_get_into_multi_buffers = blocking_get
+    return reading, release
+
+
+def test_shutdown_leaves_the_store_open_under_a_load_still_reading(
+    store_config, fake_store, monkeypatch
+):
+    """A load thread inside a zero-copy get still writes the registered KV pools."""
+    monkeypatch.setattr(worker_module, "SAVE_DRAIN_TIMEOUT", 0.1)
+    enable_async_load(store_config)
+    reading, release = _blocking_store_get(fake_store)
+
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        try:
+            queue_async(worker, RequestTransfers(1, [PageTransfer(b"\x05" * 16, 0, 0)]))
+            assert reading.wait(30.0), "the load thread never reached the store"
+
+            worker.shutdown()
+
+            assert not fake_store.closed
+            assert worker._store is fake_store
+            assert fake_store.unregistered == []
+            # Kept rather than dropped, so a later call retries the join.
+            assert worker._load_threads
+        finally:
+            release.set()
+        worker.shutdown()
+
+        assert fake_store.closed
+        assert worker._store is None
+        assert worker._load_threads == []
+
+
+def test_shutdown_skips_loads_still_queued(store_config, fake_store, monkeypatch):
+    """A load queued behind the one in flight never reaches the store once shutting down."""
+    monkeypatch.setattr(worker_module, "SAVE_DRAIN_TIMEOUT", 0.1)
+    enable_async_load(store_config)
+    reading, release = _blocking_store_get(fake_store)
+
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        first, second = bytes([0x51]) * 16, bytes([0x52]) * 16
+        first_key, second_key = (worker._namespaces[0].key(h) for h in (first, second))
+        fake_store.objects.update((first_key, second_key))
+        try:
+            queue_async(
+                worker,
+                RequestTransfers(1, [PageTransfer(first, 0, 1)]),
+                RequestTransfers(2, [PageTransfer(second, 0, 2)]),
+            )
+            assert reading.wait(30.0), "the load thread never reached the store"
+            worker.shutdown()
+        finally:
+            release.set()
+        worker.shutdown()
+
+        assert [key for keys, _addresses, _sizes in fake_store.get_calls for key in keys] == [
+            first_key
+        ]
+        assert worker._async_pending == set()
+
+
+@pytest.mark.parametrize("async_load", [False, True], ids=["sync", "async"])
+def test_shutdown_closes_every_staging_pool_before_closing_the_store(
+    store_config, fake_store, staged_copies, async_load
+):
+    if async_load:
+        enable_async_load(store_config, workers=2)
+    with make_staged_worker(fake_store, store_config, layout=make_layout()) as worker:
+        pools = [worker._load_staging, worker._save_staging, *worker._async_stagings]
+        bases = [pool.slot_address(0) for pool in pools if pool is not None]
+        assert len(bases) == (3 if async_load else 2)
+    close_at = fake_store.events.index(("close",))
+    unregistered = [event[1] for event in fake_store.events[:close_at] if event[0] == "unregister"]
+    assert sorted(unregistered) == sorted(bases)
+    assert worker._unreleased_staging == []
+
+
+def test_shutdown_keeps_a_staging_pool_whose_unregistration_failed(
+    store_config, fake_store, staged_copies, monkeypatch
+):
+    """The fabric may still reach a pool whose registration did not come back."""
+    with make_staged_worker(fake_store, store_config, layout=make_layout()) as worker:
+        save_pool = worker._save_staging
+        save_base = save_pool.slot_address(0)
+        unregister = fake_store.unregister_buffer
+        monkeypatch.setattr(
+            fake_store,
+            "unregister_buffer",
+            lambda address: -1 if address == save_base else unregister(address),
+        )
+        worker.shutdown()
+
+        assert worker._unreleased_staging == [save_pool]
+        assert worker._save_staging is None
+        assert fake_store.closed
 
 
 # ---- scheduler ----
@@ -2723,12 +3479,16 @@ def test_scheduler_sync_load_stops_at_the_honoured_prefix(
     assert saved_pages(metadata) == saved
 
 
-def test_scheduler_rejects_an_honour_beyond_the_offer(store_config):
+@pytest.mark.parametrize("async_load", [False, True], ids=["sync", "async"])
+def test_scheduler_rejects_an_honour_beyond_the_offer(store_config, async_load):
+    if async_load:
+        enable_async_load(store_config)
     scheduler = make_scheduler(store_config, hit_blocks=1)
     request = make_request(1, list(range(4 * TOKENS_PER_BLOCK)))
-    assert scheduler.get_num_new_matched_tokens(request, 0) == (TOKENS_PER_BLOCK, False)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (TOKENS_PER_BLOCK, async_load)
     with pytest.raises(RuntimeError, match="whole-block part of"):
         settle_offer(scheduler, request, 2 * TOKENS_PER_BLOCK, [10, 11, 12])
+    assert scheduler.build_connector_meta(SchedulerOutput()).async_loads == []
 
 
 def test_scheduler_rejects_an_honour_off_a_block_boundary(store_config):
@@ -2897,3 +3657,266 @@ def test_scheduler_bypasses_multimodal_requests_it_cannot_identify(store_config)
     assert metadata.saves == []
     # Nothing was handed to a save thread, so nothing pins its pages either.
     assert scheduler.request_finished(request, [7, 8, 9]) is False
+
+
+# ---- admission-time queries and asynchronous offers ----
+
+
+def make_async_scheduler(store_config, hit_blocks):
+    enable_async_load(store_config)
+    return make_scheduler(store_config, hit_blocks=hit_blocks)
+
+
+def take_async_loads(scheduler):
+    """The parked loads the next metadata hands to the workers."""
+    return scheduler.build_connector_meta(SchedulerOutput()).async_loads
+
+
+def test_scheduler_declares_admission_queries():
+    """A query has no effect beyond its answer until the pages are reported.
+
+    So the KV cache manager may ask while the scheduler is still admitting the
+    request (`kv_connector_config.admission_query`).
+    """
+    assert MooncakeStoreConnectorScheduler.supports_admission_query is True
+
+
+def test_scheduler_repeated_query_replaces_the_answer(store_config):
+    """A request asked at admission and asked again is served by the last answer only."""
+    scheduler = make_scheduler(store_config, hit_blocks=2)
+    tokens = list(range(5 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, False)
+    scheduler._worker.hit_blocks = 3
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (3 * TOKENS_PER_BLOCK, False)
+    assert len(scheduler._worker.queries) == 2
+    # The chain is kept and extended idempotently, not rebuilt.
+    assert len(scheduler._requests[1].chain.hashes) == 5
+
+    pages = [10, 11, 12, 13, 14]
+    settle_offer(scheduler, request, 3 * TOKENS_PER_BLOCK, pages)
+    data = request_data(
+        1, tokens, pages, computed_position=0, num_scheduled_tokens=2 * TOKENS_PER_BLOCK
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    assert [page.page_index for transfers in metadata.loads for page in transfers.pages] == [
+        10,
+        11,
+        12,
+    ]
+    assert saved_pages(metadata) == [13, 14]
+
+    # The offer is consumed once. The follow-up carries no new tokens, since the
+    # adapter accumulates the per-step token deltas.
+    again = scheduler.build_connector_meta(
+        SchedulerOutput(
+            cached_requests=[
+                request_data(
+                    1, [], [], computed_position=5 * TOKENS_PER_BLOCK, num_scheduled_tokens=0
+                )
+            ]
+        )
+    )
+    assert again.loads == []
+
+
+def test_scheduler_query_reset_query_is_clean(store_config):
+    """A deferred first chunk gives its pages back between two queries."""
+    scheduler = make_scheduler(store_config, hit_blocks=2)
+    tokens = list(range(5 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    first_state = scheduler._requests[1]
+
+    scheduler.request_reset(request)
+    scheduler._worker.hit_blocks = 1
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (TOKENS_PER_BLOCK, False)
+    assert scheduler._requests[1] is not first_state
+
+    pages = [20, 21, 22, 23, 24]
+    settle_offer(scheduler, request, TOKENS_PER_BLOCK, pages)
+    data = request_data(
+        1, tokens, pages, computed_position=0, num_scheduled_tokens=4 * TOKENS_PER_BLOCK
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    assert [page.page_index for transfers in metadata.loads for page in transfers.pages] == [20]
+    assert saved_pages(metadata) == [21, 22, 23, 24]
+
+
+def test_scheduler_offers_asynchronously_when_enabled(store_config):
+    scheduler = make_async_scheduler(store_config, hit_blocks=2)
+    request = make_request(1, list(range(5 * TOKENS_PER_BLOCK)))
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, True)
+    # A miss is never asynchronous: there would be nothing to wait for.
+    scheduler._worker.hit_blocks = 0
+    request = make_request(2, list(range(5 * TOKENS_PER_BLOCK)))
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+
+
+def test_scheduler_sends_async_loads_through_metadata(store_config):
+    """The offer reaches every rank in the metadata, not only the adapter's own worker."""
+    scheduler = make_async_scheduler(store_config, hit_blocks=2)
+    request = make_request(1, list(range(5 * TOKENS_PER_BLOCK)))
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, True)
+
+    settle_offer(scheduler, request, 2 * TOKENS_PER_BLOCK, [10, 11, 12, 13, 14])
+
+    metadata = scheduler.build_connector_meta(SchedulerOutput())
+    (transfers,) = metadata.async_loads
+    assert transfers.request_id == 1
+    assert [page.page_index for page in transfers.pages] == [10, 11]
+    assert metadata.loads == [] and metadata.saves == []
+    assert metadata
+    # Sent once only.
+    assert take_async_loads(scheduler) == []
+
+
+def test_scheduler_repeated_query_replaces_the_answer_and_queues_one_load(store_config):
+    """Only the last answer counts, and exactly one asynchronous load is queued."""
+    scheduler = make_async_scheduler(store_config, hit_blocks=2)
+    request = make_request(1, list(range(5 * TOKENS_PER_BLOCK)))
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, True)
+    assert take_async_loads(scheduler) == []
+    scheduler._worker.hit_blocks = 3
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (3 * TOKENS_PER_BLOCK, True)
+
+    settle_offer(scheduler, request, 3 * TOKENS_PER_BLOCK, [10, 11, 12, 13, 14])
+
+    (transfers,) = take_async_loads(scheduler)
+    assert [page.page_index for page in transfers.pages] == [10, 11, 12]
+    assert take_async_loads(scheduler) == []
+
+
+def test_scheduler_queues_the_async_load_when_the_pages_are_reported(store_config):
+    """The offer reaches the workers, with the pages the runtime reserved, in the next metadata."""
+    scheduler = make_async_scheduler(store_config, hit_blocks=2)
+    tokens = list(range(5 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, True)
+    pages = [10, 11, 12, 13, 14]
+    settle_offer(scheduler, request, 2 * TOKENS_PER_BLOCK, pages)
+
+    (transfers,) = take_async_loads(scheduler)
+    state = scheduler._requests[1]
+    assert transfers.request_id == 1
+    assert [(page.layer_group_id, page.page_index) for page in transfers.pages] == [
+        (0, 10),
+        (0, 11),
+    ]
+    assert [page.block_hash for page in transfers.pages] == list(state.chain.hashes[:2])
+
+    # Once its load landed, the parked request comes back as a new request with
+    # all of its pages. It loads nothing more and does not write the stored
+    # blocks back.
+    data = request_data(
+        1,
+        tokens,
+        pages,
+        computed_position=2 * TOKENS_PER_BLOCK,
+        num_scheduled_tokens=3 * TOKENS_PER_BLOCK,
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    assert metadata.loads == []
+    assert metadata.async_loads == []
+    assert saved_pages(metadata) == [12, 13, 14]
+
+
+def test_scheduler_async_load_stops_at_the_honoured_prefix(store_config):
+    scheduler = make_async_scheduler(store_config, hit_blocks=3)
+    request = make_request(1, list(range(6 * TOKENS_PER_BLOCK)))
+    scheduler.get_num_new_matched_tokens(request, 0)
+    # Three pages exist, but only two offered blocks were honoured. The third
+    # page holds the locally computed tail and must not be overwritten.
+    settle_offer(scheduler, request, 2 * TOKENS_PER_BLOCK, [20, 21, 22])
+    (transfers,) = take_async_loads(scheduler)
+    assert [page.page_index for page in transfers.pages] == [20, 21]
+    assert scheduler._requests[1].async_loaded_upto == 2
+
+
+@pytest.mark.parametrize("pages", [[], [[20]], [[20, BAD_PAGE_INDEX]]])
+def test_scheduler_async_load_rejects_incomplete_honoured_prefix(store_config, pages):
+    scheduler = make_async_scheduler(store_config, hit_blocks=2)
+    request = make_request(1, list(range(6 * TOKENS_PER_BLOCK)))
+    scheduler.get_num_new_matched_tokens(request, 0)
+    request.py_num_connector_matched_tokens = 2 * TOKENS_PER_BLOCK
+    with pytest.raises(RuntimeError, match="honoured prefix"):
+        scheduler.update_state_after_alloc_by_layer_group(request, pages)
+    assert take_async_loads(scheduler) == []
+
+
+def test_scheduler_async_load_with_no_honoured_tokens_loads_nothing(store_config):
+    """The runtime parks the request anyway, so an empty load releases it."""
+    scheduler = make_async_scheduler(store_config, hit_blocks=2)
+    request = make_request(1, list(range(6 * TOKENS_PER_BLOCK)))
+    scheduler.get_num_new_matched_tokens(request, 0)
+    settle_offer(scheduler, request, 0, [20, 21])
+    (transfers,) = take_async_loads(scheduler)
+    assert transfers.request_id == 1
+    assert transfers.pages == []
+    assert scheduler._requests[1].async_loaded_upto == 0
+
+
+def test_scheduler_async_flat_alloc_is_a_single_group(store_config):
+    scheduler = make_async_scheduler(store_config, hit_blocks=1)
+    request = make_request(1, list(range(4 * TOKENS_PER_BLOCK)))
+    scheduler.get_num_new_matched_tokens(request, 0)
+    request.py_num_connector_matched_tokens = TOKENS_PER_BLOCK
+    scheduler.update_state_after_alloc(request, [30, 31, 32, 33])
+    (transfers,) = take_async_loads(scheduler)
+    assert [(page.layer_group_id, page.page_index) for page in transfers.pages] == [(0, 30)]
+
+
+def test_scheduler_alloc_hooks_queue_nothing_for_synchronous_loads(store_config):
+    scheduler = make_scheduler(store_config, hit_blocks=2)
+    tokens = list(range(5 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    pages = [10, 11, 12, 13, 14]
+    request.py_num_connector_matched_tokens = 2 * TOKENS_PER_BLOCK
+    scheduler.update_state_after_alloc_by_layer_group(request, [list(pages)])
+    scheduler.update_state_after_alloc(request, list(pages))
+    data = request_data(
+        1, tokens, pages, computed_position=0, num_scheduled_tokens=3 * TOKENS_PER_BLOCK
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    assert metadata.async_loads == []
+    assert [page.page_index for page in metadata.loads[0].pages] == [10, 11]
+
+
+def test_scheduler_request_reset_drops_a_pending_async_load(store_config):
+    """A load for an allocation that was released must never reach the workers."""
+    scheduler = make_async_scheduler(store_config, hit_blocks=2)
+    kept, reset = (make_request(i, list(range(5 * TOKENS_PER_BLOCK))) for i in (1, 2))
+    for request, pages in ((kept, [10, 11, 12]), (reset, [20, 21, 22])):
+        scheduler.get_num_new_matched_tokens(request, 0)
+        settle_offer(scheduler, request, 2 * TOKENS_PER_BLOCK, pages)
+
+    scheduler.request_reset(reset)
+
+    assert [transfers.request_id for transfers in take_async_loads(scheduler)] == [1]
+
+
+def test_scheduler_never_offers_async_to_a_bypassed_request(store_config):
+    """A request the store cannot key gets neither a lookup nor a load."""
+    scheduler = make_async_scheduler(store_config, hit_blocks=2)
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    for request in (
+        make_request(1, tokens, lora_task_id=0),
+        make_request(2, tokens, multimodal_positions=[4], multimodal_lengths=[4]),
+    ):
+        assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+        settle_offer(scheduler, request, 0, [7, 8, 9])
+    assert scheduler._worker.queries == []
+    assert take_async_loads(scheduler) == []
+
+
+@pytest.mark.parametrize("role", ["producer", "capacity"])
+def test_scheduler_capacity_and_producer_roles_never_offer_async(store_config, role):
+    enable_async_load(store_config)
+    set_pool_setting(store_config, role=role)
+    scheduler = make_scheduler(store_config, hit_blocks=2)
+    assert scheduler._async_load is False
+    request = make_request(1, list(range(3 * TOKENS_PER_BLOCK)))
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    settle_offer(scheduler, request, 0, [7, 8, 9])
+    assert take_async_loads(scheduler) == []

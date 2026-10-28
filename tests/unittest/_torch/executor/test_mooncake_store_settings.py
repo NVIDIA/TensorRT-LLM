@@ -92,6 +92,9 @@ def test_an_inherited_config_supersedes_the_block_it_ignores(monkeypatch, tmp_pa
         model_key="their-checkpoint",
         transfer_batch_size=128,
         stage_through_host=True,
+        staging_buffer_bytes="256MiB",
+        async_load=True,
+        async_load_workers=2,
     )
     monkeypatch.setenv(CONFIG_PATH_ENV, str(inherited))
     pool = mooncake_store_config(role="both", segment_size="16GiB")
@@ -104,6 +107,9 @@ def test_an_inherited_config_supersedes_the_block_it_ignores(monkeypatch, tmp_pa
     assert pool.model_key == "their-checkpoint"
     assert pool.transfer_batch_size == 128
     assert pool.stage_through_host is True
+    assert pool.staging_buffer_bytes == 256 * (1 << 20)
+    assert pool.async_load is True
+    assert pool.async_load_workers == 2
 
     # How to reach the pool and where this run's files go are the server's own,
     # so an inherited config has nothing to say about them.
@@ -203,6 +209,29 @@ def test_a_soft_pin_ttl_must_be_positive(ttl):
 def test_a_stats_interval_must_be_a_positive_number(interval):
     with pytest.raises(ValidationError, match="stats_interval"):
         mooncake_store_config(stats_interval=interval)
+
+
+def test_the_staging_and_async_load_settings_are_checked_up_front():
+    """A bad value names the field it came from rather than failing every rank later."""
+    pool = mooncake_store_config(
+        staging_buffer_bytes="512MiB", async_load=True, async_load_workers=4
+    )
+    assert pool.staging_buffer_bytes == "512MiB"
+    assert mooncake_store_config().staging_buffer_bytes == "1GiB"
+    assert mooncake_store_config().async_load is False
+    assert mooncake_store_config().async_load_workers == 1
+
+    with pytest.raises(ValidationError, match="async_load_workers"):
+        mooncake_store_config(async_load_workers=0)
+    with pytest.raises(ValidationError, match="mooncake_store.staging_buffer_bytes"):
+        mooncake_store_config(staging_buffer_bytes="1GB")
+    with pytest.raises(ValidationError, match="mooncake_store.staging_buffer_bytes"):
+        mooncake_store_config(staging_buffer_bytes=0)
+    # The size check is shared, and still names the segment size for its own.
+    with pytest.raises(ValidationError, match="mooncake_store.segment_size"):
+        mooncake_store_config(segment_size="1GB")
+    with pytest.raises(ValidationError, match="mooncake_store.segment_size"):
+        mooncake_store_config(segment_size=-1)
 
 
 def test_the_pool_replaces_this_engines_own_offload_tiers(monkeypatch, tmp_path):

@@ -280,6 +280,7 @@ def open_worker(
     enable_attention_dp: bool = False,
     soft_pin_ttl_ms: int | None = None,
     group_blocks: bool = False,
+    async_load: bool = False,
 ) -> Iterator[MooncakeStoreConnectorWorker]:
     """A worker holding a real store handle, over `buffer` or `layout` as its KV cache.
 
@@ -295,6 +296,7 @@ def open_worker(
         run_dir=pool.run_dir,
         soft_pin_ttl_ms=soft_pin_ttl_ms,
         group_blocks=group_blocks,
+        async_load=async_load,
     )
     with provision_pool(store_config, run_dir=pool.run_dir):
         worker = MooncakeStoreConnectorWorker(
@@ -387,6 +389,52 @@ def test_a_saved_page_comes_back_byte_identical(mooncake_pool, stage_through_hos
 
     # A transfer that overran its page would restore the asked-for bytes and
     # corrupt a neighbour, which the comparison above cannot see.
+    for group_id, region_id in _every_region():
+        neighbour = _page_slice(buffer, group_id, region_id, page_index + 1)
+        assert not neighbour.any(), (
+            f"The load wrote into page {page_index + 1} of layer group {group_id} "
+            f"({REGION_ROLES[region_id]}), which it was not asked for."
+        )
+
+
+@pytest.mark.parametrize("stage_through_host", [False, True], ids=["zero_copy", "host_staged"])
+def test_an_async_load_comes_back_byte_identical(mooncake_pool, stage_through_host):
+    """A load thread restores a page exactly as the synchronous path does.
+
+    It runs on its own thread and, when staged, through its own pinned slots
+    and CUDA stream, and the page counts as loaded only once it is reported.
+    """
+    buffer = _device_buffer(filled=True)
+    page_index = 3
+    expected = _snapshot(buffer, page_index)
+
+    with open_worker(
+        mooncake_pool, buffer=buffer, stage_through_host=stage_through_host, async_load=True
+    ) as worker:
+        save_page(worker, request_id=1, page_index=page_index)
+        buffer.zero_()
+        # The zeroing has to retire before the load thread writes the page,
+        # which is what the KV cache manager's allocation fence promises.
+        worker.bind_allocation_fence(lambda _request_ids: torch.cuda.synchronize())
+        worker.bind_connector_meta(
+            MooncakeStoreMetadata(
+                async_loads=_page_transfers(2, page_index, tuple(range(NUM_GROUPS)))
+            )
+        )
+
+        deadline = time.monotonic() + SAVE_TIMEOUT_SECONDS
+        while True:
+            _, finished_loading = worker.get_finished([], [2])
+            if 2 in finished_loading:
+                break
+            assert time.monotonic() < deadline, (
+                f"The asynchronous load of request 2 was not reported within "
+                f"{SAVE_TIMEOUT_SECONDS}s."
+            )
+            time.sleep(0.05)
+        assert worker.take_failed_async_load_requests() == set()
+
+    assert_page_matches(buffer, page_index, expected, context="Asynchronous load from the pool")
     for group_id, region_id in _every_region():
         neighbour = _page_slice(buffer, group_id, region_id, page_index + 1)
         assert not neighbour.any(), (

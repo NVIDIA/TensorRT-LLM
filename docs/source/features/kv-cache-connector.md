@@ -392,6 +392,7 @@ A connector that starts a transfer inside `get_num_new_matched_tokens` must not 
 request asked at admission can still be dropped before `prepare_resources`: by the disaggregated
 benchmark gate, by batch waiting for generation requests, by the total-KV cap, by the multimodal
 scheduler wrapper, or when the batch cannot be queued. It is asked again on a later iteration.
+The [`mooncake-store`](#asynchronous-loads) connector declares it.
 
 Enable it per server with `kv_connector_config.admission_query`:
 
@@ -933,10 +934,14 @@ its last line and skipped when there is nothing to report:
   lookup's own existence probe, so they cost no extra store call. Only a rank that looks prefixes
   up reports them: rank 0 under tensor parallelism, every owner under attention DP. Frequent holes
   are what [`soft_pin_ttl_ms` and `group_blocks`](#pool-eviction) address.
-* `mooncake-store load stats` counts loads (`start_load_kv` passes that moved pages), their
-  `pages`, store calls (`batches`) and `loaded_gib`, the transfer time from the destinations being
-  ready to the last page landing (`transfer_ms`), and each pass's mean wall and CPU milliseconds
-  for `fence`, `resolve`, `describe`, `get`, `unstage` and `sync`.
+* `mooncake-store load stats` counts loads (`start_load_kv` passes that moved pages, or with
+  [`async_load`](#asynchronous-loads) each parked request's load), their `pages`, store calls
+  (`batches`), `loaded_gib` and `failed_pages`, the transfer time from the destinations being ready
+  to the last page landing (`transfer_ms`), and each load's mean wall and CPU milliseconds for
+  `fence`, `resolve`, `describe`, `get`, `unstage` and `sync`. With `async_load` it also reports
+  the time a load waited for a load thread and the allocation fence (`wait_ms`), and, at the time
+  of the line, the load threads (`workers`) and the loads waiting for one (`queue`) or running
+  (`active`); a line is then logged while loads are waiting even if none finished.
 
 Both are flushed at shutdown. Unset, the default, counts nothing and costs nothing. The lines are
 logged at info level, so a log level above info hides them. Like the eviction settings, the
@@ -957,7 +962,8 @@ one-model MTP or EAGLE3 sharing the target KV cache; it bypasses individual requ
 LoRA adapter or multimodal content without hashes, leaving the rest of the deployment served.
 
 A page offered at lookup can still be gone at load time, evicted from a full pool or left behind by
-a put that never completed. The worker declares
+a put that never completed, whether the load runs synchronously or on a
+[load thread](#asynchronous-loads). The worker declares
 [`reports_failed_loads`](#2-worker-interface-kvcacheconnectorworker), so on a single-rank server or
 an attention-DP owner only the affected request restarts, without the offered prefix, and the rest
 of its batch runs. Under tensor parallelism every rank holds a shard of the same page and cannot
@@ -1015,3 +1021,50 @@ A host without `nvidia_peermem` usually needs only `WITH_NVIDIA_PEERMEM=0`, whic
 selects on its own where it can. When neither path is available, set `stage_through_host: true` to
 copy pages through a pinned host buffer instead, at the cost of a copy each way. A `capacity` server
 needs neither, since it registers no pages.
+
+Each direction a role drives (loads, saves) pins `staging_buffer_bytes` of host memory per rank,
+1 GiB by default, given as a binary size (`512MiB`) or a byte count. It bounds how many pages one
+store call stages, not how large a page may be: a budget below one page still pins one page, with
+a warning. The startup node memory check counts it per rank and direction, next to
+`segment_size`.
+
+### Asynchronous loads
+
+By default a prefix the pool serves is loaded inside the executor iteration that schedules the
+request, before its forward pass. With `async_load: true`, a server that reads the pool
+(`role: both` or `consumer`) parks such a request outside the batch instead, and
+`async_load_workers` background threads per rank (default 1) load its pages while other requests
+keep computing. The request rejoins the batch once every rank holds its pages. Every hit is
+offered this way, including a one-block offer under `local_reuse_backoff: align`, and parking a
+request costs it at least one iteration.
+
+```yaml
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    pool: file:///shared/pool.json
+    model_key: qwen2-1.5b-instruct
+    async_load: true
+    async_load_workers: 2
+disable_overlap_scheduler: true
+```
+
+| Path | How a load thread fills the pages |
+|---|---|
+| Zero copy (default) | The NIC writes into the registered KV pools, from the load thread. |
+| `stage_through_host` | Each load thread has its own CUDA stream and `staging_buffer_bytes / async_load_workers` of pinned slots, and scatters each batch on that stream. No separate synchronous load buffer is pinned. |
+
+A load thread first waits for the KV cache manager's allocation fence for the request's pages,
+so the executor never blocks on it. A page that is gone by load time restarts only that request,
+without the offered prefix, on a single-rank server or an attention-DP owner, and fails the
+server under tensor parallelism, as for synchronous loads. An exception raised by Mooncake on a
+load thread always fails the server, at the next executor call. Under attention DP a parked load
+counts toward `kv_connector_config.transfer_timeout_sec` (see
+[Attention data parallelism](#attention-data-parallelism)). Asynchronous loads are validated with
+`disable_overlap_scheduler: true`.
+
+The scheduler adapter declares
+[admission-time queries](#admission-time-queries): `kv_connector_config.admission_query: {}` books
+the pages a hit reaching past the first chunk needs while the request is admitted, with or without
+`async_load`. Admitting a chunk without charging its tokens (`max_uncharged_parks`) needs
+`async_load`, since only an asynchronous offer parks the request.
