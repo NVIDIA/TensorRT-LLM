@@ -54,10 +54,6 @@
 <circle cx="412.1" cy="316.1" r="3.5" fill="#76B900"/>
 <circle cx="431.8" cy="327.1" r="3.5" fill="#76B900"/>
 <circle cx="447.2" cy="333.3" r="3.5" fill="#76B900"/>
-<line x1="289.2" y1="275" x2="289.2" y2="209.7" stroke="#2d3142" stroke-width="1" stroke-dasharray="3,3"/>
-<text x="338" y="145.3" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">2.25x</text>
-<text x="338" y="160.3" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#4f5d75" text-anchor="start">at 139 tokens/s/user</text>
-<line x1="334" y1="149.3" x2="292.2" y2="212.7" stroke="#2d3142" stroke-width="0.8"/>
 <text x="540" y="60" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">(b) MLPerf DeepSeek-R1</text>
 <line x1="590" y1="76" x2="590" y2="340" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
 <text x="590" y="355" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">0</text>
@@ -109,8 +105,4 @@
 <circle cx="929.7" cy="322.1" r="3.5" fill="#76B900"/>
 <circle cx="952" cy="330.5" r="3.5" fill="#76B900"/>
 <circle cx="969" cy="335" r="3.5" fill="#76B900"/>
-<line x1="833.5" y1="283.5" x2="833.5" y2="226.6" stroke="#2d3142" stroke-width="1" stroke-dasharray="3,3"/>
-<text x="875" y="146.4" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">2.30x</text>
-<text x="875" y="161.4" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10" font-weight="500" fill="#4f5d75" text-anchor="start">at 162 tokens/s/user</text>
-<line x1="871" y1="150.4" x2="836.5" y2="229.6" stroke="#2d3142" stroke-width="0.8"/>
 </svg>
