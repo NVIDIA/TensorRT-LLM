@@ -763,7 +763,7 @@ def test_unsupported_matrix_falls_through(case: dict, expected_reason: str) -> N
         (100, "13.2", False, False),
         (107, "13.3", False, True),
         (107, "13.2", False, False),
-        (107, "13.3", True, False),
+        (107, "13.3", True, True),
         (100, "13.3", True, True),
         (120, "13.3", False, False),
     ],
@@ -791,7 +791,7 @@ def test_static_availability_gate(
     monkeypatch.setattr(PrimsTSFmha, "_missing_fused_nanobind_ops", staticmethod(lambda: []))
 
     assert PrimsTSFmha.is_available(_Attention(is_mla=is_mla)) is expected
-    if sm in (100, 103) or (sm == 107 and not is_mla):
+    if sm in (100, 103, 107):
         target_version.assert_called_once_with(min_version="13.3")
     else:
         target_version.assert_not_called()
