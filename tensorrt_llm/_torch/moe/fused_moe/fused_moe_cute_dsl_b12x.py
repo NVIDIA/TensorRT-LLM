@@ -364,7 +364,9 @@ class CuteDslB12xFusedMoEBase:
         if ctx.token_selected_experts is None or ctx.token_final_scales is None:
             raise ValueError(
                 f"{name} needs precomputed token_selected_experts and "
-                "token_final_scales; it cannot route from router_logits."
+                "token_final_scales; it cannot route from router_logits, and it "
+                "does not accept the None scales apply_router_weight_on_input "
+                "leaves behind once the scheduler has folded them into x."
             )
         if require_comm_plan(self, ctx).enable_alltoall:
             raise NotImplementedError(
@@ -389,8 +391,11 @@ class CuteDslB12xFusedMoEBase:
                 f"{type(self).__name__} expects unquantized input (x_sf=None) "
                 "on the b12x path; got a precomputed scale factor."
             )
-        # ``B12xMoEWrapper`` writes bfloat16 and refuses any other
-        # ``output_dtype`` at construction.
+        # The b12x kernel writes bfloat16, which is why ``supported_dtypes``
+        # admits bf16 activations alone: ``ConfigurableMoE`` derives
+        # ``output_dtype`` from the activation, so a layer built through the
+        # factory cannot get here. This is the backstop for a caller driving
+        # ``run_moe`` directly.
         if ctx.output_dtype not in (None, torch.bfloat16):
             raise ValueError(
                 f"{type(self).__name__} writes bfloat16 on the b12x path; "
@@ -536,8 +541,10 @@ class CuteDslB12xW4a16Nvfp4FusedMoE(CuteDslB12xFusedMoEBase, CutlassFusedMoEBase
 
         The wrapper runs in ``quant_mode="w4a16"``: it dequantizes the NVFP4
         weights and leaves the bf16 / fp16 activation alone, so there is no
-        activation quantization here at all. The pre-quant scale is a separate
-        concern. An AWQ-style checkpoint stores ``W / s``, and
+        activation quantization here at all. That is the kernel's own range;
+        the leaf admits bf16 activations only (``supported_dtypes``), because
+        the wrapper hands the kernel a bfloat16 output buffer. The pre-quant
+        scale is a separate concern. An AWQ-style checkpoint stores ``W / s``, and
         ``load_quant_scales`` fills ``fc31_act_scale`` from its
         ``*.pre_quant_scale`` keys regardless of ``quant_algo``, so the weights
         the kernel dequantizes expect the scaled activation ``x * s``. Same as
