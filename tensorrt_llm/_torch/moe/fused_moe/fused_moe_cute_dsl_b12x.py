@@ -353,7 +353,7 @@ class CuteDslB12xFusedMoEBase:
         ``ep_size > 1``), so a context asking otherwise fails here instead of
         having the request dropped. ``lora_params`` describes every adapter of
         the forward, so only MoE LoRA on this layer is such a request -- with
-        no layer index to read it by, any adapter is.
+        no layer index to read it by, any ``lora_params`` is.
         ``all_rank_num_tokens`` has no reader on either route: ``run_moe`` uses
         it only for the all-to-all tuner shapes, and all-to-all is refused.
         """
@@ -365,15 +365,16 @@ class CuteDslB12xFusedMoEBase:
                 "triple that do_finalize=False asks for."
             )
         if ctx.lora_params:
-            # Reading the layer's adapters out of ``lora_params`` needs a layer
-            # index. With none the leaf cannot tell MoE LoRA from an adapter it
-            # may ignore, so it refuses rather than return output a caller
-            # reads as carrying a LoRA delta.
+            # Reading the layer's adapters out of ``lora_params`` needs a
+            # layer index. With none the leaf cannot tell MoE LoRA from the
+            # adapters it may ignore, so it refuses every ``lora_params``
+            # rather than return output a caller reads as adapted.
             if self.layer_idx is None:
                 raise NotImplementedError(
                     f"{name} does not fuse routed-expert LoRA and has no "
-                    "layer_idx to tell whether lora_params carries any; build "
-                    "the leaf with layer_idx to narrow this to one layer."
+                    "layer_idx to tell whether lora_params carries any; pass "
+                    "layer_idx to create_moe_backend, or hand run_moe no "
+                    "lora_params."
                 )
             if moe_lora_active(ctx.lora_params, self.layer_idx):
                 raise NotImplementedError(
