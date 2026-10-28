@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
 import hashlib
 import math
 import os
@@ -24,6 +25,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     NamedTuple,
     Optional,
@@ -1235,6 +1237,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # instances built without running __init__.
     _defer_close_enabled: bool = False
     _defer_close_armed: bool = False
+    _defer_close_scope: bool = False
     _deferred_closes: Tuple[Tuple[int, _KVCache], ...] = ()
 
     def __init__(
@@ -5662,15 +5665,20 @@ class KVCacheManagerV2(BaseResourceManager):
     def arm_deferred_close(self, armed: bool) -> bool:
         """Arm or disarm deferred closing of finished requests' caches.
 
-        While armed, free_resources releases a finished (non-dummy) request's
-        IndexMapper slot at once (as release_index_slot does) and queues the
-        cache; its close(), which commits the last block and releases the
-        pages, runs in flush_deferred_closes(). The overlap executor arms this
-        only for its loop and flushes right after launching each forward step,
-        where the GPU still has queued work to cover the close, and before it
-        waits on an empty request queue with no request left. Takes effect
-        only with TRTLLM_KV_DEFER_CLOSE=1 on a target-model manager. Disarming
-        flushes. Returns whether deferred closing is armed.
+        While armed, free_resources called inside deferring_closes() releases
+        the (non-dummy) request's IndexMapper slot at once (as
+        release_index_slot does) and queues the cache; its close(), which
+        commits the last block and releases the pages, runs in
+        flush_deferred_closes(). Every other release (preemption, admission
+        rollbacks, reservation drops) closes at once, since its caller counts
+        on the pages being free when it returns. The overlap executor arms this
+        only for its loop, releases terminated requests inside
+        deferring_closes(), and flushes right after launching each forward
+        step, where the GPU still has queued work to cover the close, before it
+        waits on an empty request queue with no request left, and before it
+        fires a control request. Takes effect only with TRTLLM_KV_DEFER_CLOSE=1
+        on a target-model manager. Disarming flushes. Returns whether deferred
+        closing is armed.
         """
         was_armed = self._defer_close_armed
         self._defer_close_armed = bool(armed) and self._defer_close_enabled
@@ -5682,6 +5690,18 @@ class KVCacheManagerV2(BaseResourceManager):
         if not self._defer_close_armed:
             self.flush_deferred_closes()
         return self._defer_close_armed
+
+    @contextlib.contextmanager
+    def deferring_closes(self) -> Iterator[None]:
+        """Let free_resources defer the close of the requests it releases for
+        the duration, while deferred closing is armed (arm_deferred_close).
+        For the release of requests that have terminated only."""
+        outer = self._defer_close_scope
+        self._defer_close_scope = True
+        try:
+            yield
+        finally:
+            self._defer_close_scope = outer
 
     def flush_deferred_closes(self) -> int:
         """Close the caches whose close() free_resources deferred, in the order
@@ -5730,7 +5750,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache.discard_pending_stats()
         # Dummy requests reuse their ids, which the stats-exclusion bookkeeping
         # done after close() is keyed on, so they always close at once.
-        if self._defer_close_armed and not request.is_dummy:
+        if self._defer_close_armed and self._defer_close_scope and not request.is_dummy:
             if request.py_request_id in self._early_freed_index_requests:
                 self._early_freed_index_requests.discard(request.py_request_id)
             else:

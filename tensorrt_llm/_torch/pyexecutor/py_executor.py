@@ -4906,6 +4906,10 @@ class PyExecutor:
                      f"drain={pending.control_requires_drain} "
                      f"active_requests={len(self.active_requests)} "
                      f"waiting_queue={len(self.waiting_queue)}")
+        if self._kv_defer_close_armed:
+            # The action must not run while a finished request's cache is
+            # still open: its close() commits the last block and frees pages.
+            self.kv_cache_manager.flush_deferred_closes()
         # Quiesce the device before the action mutates GPU state. Under the
         # overlap scheduler a previous batch's forward/sample kernels may still
         # be in flight, so an in-place update_weights reload (or sleep/wakeup
@@ -8459,7 +8463,11 @@ class PyExecutor:
         self.disagg.forget_request(request.py_request_id)
 
     def _do_terminate_request(self, request: LlmRequest) -> None:
-        self._free_request_resources(request)
+        # Only a terminated request's cache may close late; preemption and
+        # recompute pauses release theirs through other paths, at once.
+        with (self.kv_cache_manager.deferring_closes()
+              if self._kv_defer_close_armed else nullcontext()):
+            self._free_request_resources(request)
         # Cancellation and request-scoped failures can terminate before the
         # normal post-prefill release point, including with a partial buffer.
         _strip_py_multimodal_data_post_prefill(request)
