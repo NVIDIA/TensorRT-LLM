@@ -32,6 +32,12 @@ counts as stored only once the worker's `wait_for_save` queued that pass.
 Next to a one-model draft on a disaggregated context server, a block's hash
 also covers the prompt tokens the draft reads past the block, so a block whose
 lookahead runs past the prompt is neither offered nor saved.
+
+With `async_load`, every hit is offered asynchronously: the runtime parks the
+request outside the batch, and the transfer is computed from the request's full
+page lists when its allocation is reported, then handed to the workers in the
+same iteration's metadata, which they bind after the KV cache manager's
+allocation fence.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -114,6 +120,8 @@ class _RequestState:
         "saved_upto",
         "load_first_block",
         "load_blocks",
+        "load_async",
+        "async_loaded_upto",
         "emitted_saves",
     )
 
@@ -130,6 +138,13 @@ class _RequestState:
         #: The offer made by `get_num_new_matched_tokens`, in block ordinals.
         self.load_first_block = 0
         self.load_blocks = 0
+        #: Whether that offer is asynchronous, which decides how
+        #: `update_state_after_alloc_by_layer_group` settles it.
+        self.load_async = False
+        #: End of the offer handed to the load workers, in block ordinals.
+        #: Those blocks are the store's already, so they are never written
+        #: back.
+        self.async_loaded_upto = 0
         self.emitted_saves = False
 
 
@@ -143,6 +158,14 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     #: last block whose lookahead the prompt holds, and saves publish only the
     #: blocks a pass computed.
     supports_speculative_prefill = True
+    #: A query only resets and refills this request's offer state
+    #: (`get_num_new_matched_tokens`), the pool lookup is a read-only
+    #: `count_prefix_hit`, and transfers are built only once the allocation is
+    #: reported (`update_state_after_alloc_by_layer_group`) or the batch is
+    #: final (`build_connector_meta`), so an admission-time answer has no other
+    #: effect and a repeated query replaces it. `request_reset` drops the state
+    #: of a request whose first chunk gave its pages back.
+    supports_admission_query = True
 
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
@@ -174,11 +197,18 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         # Saves bound in the last metadata, by request: the block ordinal they
         # end at. Settled by `_confirm_submitted_saves` at the next build.
         self._unconfirmed_saves: Dict[int, int] = {}
+        # Asynchronous offers park the request. Their transfers travel in the
+        # next metadata, which every worker binds after the KV cache manager has
+        # published the allocation fence for the batch. Under tensor parallelism
+        # this adapter exists on rank 0 only and every rank loads its own shard;
+        # under attention DP each owner loads its own pages.
+        self._async_load = self._config.async_load and self._config.role.loads
+        self._pending_async_loads: List[RequestTransfers] = []
 
         logger.warning(
             f"mooncake-store scheduler adapter ready (role={self._config.role.value}, "
             f"tokens_per_block={self._tokens_per_block}, "
-            f"prompt_lookahead={self._prompt_lookahead})"
+            f"prompt_lookahead={self._prompt_lookahead}, async_load={self._async_load})"
         )
 
     def wait_for_initialization(self):
@@ -202,7 +232,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             num_computed_tokens: Tokens already matched in the local KV cache.
 
         Returns:
-            Tokens the store can supply, and `False` for a synchronous load.
+            Tokens the store can supply, and whether they arrive asynchronously
+            (every hit when `async_load` is on). A miss is never asynchronous.
         """
         if self._config.capacity_only:
             # Neither a lookup nor a save will read the hash chain this would
@@ -218,8 +249,12 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
 
         tokens = request.get_tokens(0)
         state = self._state_for(request, tokens, scope)
+        # Every query replaces the outstanding offer, which is what makes a
+        # repeated admission-time query harmless.
         state.load_first_block = 0
         state.load_blocks = 0
+        state.load_async = False
+        state.async_loaded_upto = 0
 
         if not self._config.role.loads:
             return 0, False
@@ -245,38 +280,111 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
 
         state.load_first_block = first_block
         state.load_blocks = hit_blocks
+        state.load_async = self._async_load
         logger.debug(
             f"mooncake-store matched {hit_blocks} blocks "
             f"({hit_blocks * self._tokens_per_block} tokens) "
             f"for request {request.request_id}"
+            f"{' asynchronously' if state.load_async else ''}"
         )
-        return hit_blocks * self._tokens_per_block, False
+        return hit_blocks * self._tokens_per_block, state.load_async
 
     def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
-        """Trim the outstanding offer to what the runtime honoured.
+        """Settle an offer against a flat page list, as one layer group.
 
-        Page indices still come from the scheduler output: the flat `block_ids`
-        here are a single space, but a V2 page index is scoped to a layer
-        group, so this connector reads only
-        `RequestData.new_block_ids_by_layer_group`. `KVCacheManagerV2` reports
-        through `update_state_after_alloc_by_layer_group`, whose base form
-        folds the single layer group this connector accepts into this call.
+        The runtime uses the flat form only when it has no per-group view, so
+        `block_ids` is the single layer group's list, by block ordinal. The
+        work happens in `update_state_after_alloc_by_layer_group`; the base
+        class would otherwise fold that form back into this one.
+
+        Args:
+            request: The request that was allocated resources.
+            block_ids: Its page slot indices, by block ordinal.
+        """
+        self.update_state_after_alloc_by_layer_group(request, [list(block_ids)])
+
+    def update_state_after_alloc_by_layer_group(
+        self, request: LlmRequest, block_ids_by_layer_group: List[List[int]]
+    ) -> None:
+        """Trim the outstanding offer to what the runtime honoured, and queue an asynchronous one.
+
+        The runtime calls this once per allocation, after it committed the
+        honoured count. A synchronous offer is only trimmed: its pages are read
+        from the scheduler output in `build_connector_meta`, the same
+        iteration. An asynchronous offer parks the request, which
+        `build_scheduler_output` then skips until its load lands, so its
+        transfer is computed here from the lists, which hold every page of the
+        request by block ordinal. It is handed to the workers in the next
+        `build_connector_meta`, in the same iteration, and an offer honoured
+        with no tokens still queues an empty transfer, because the runtime
+        parks the request regardless and only the worker releases it.
 
         Args:
             request: The request that was allocated resources. Its
                 `py_num_connector_matched_tokens` is the honoured part of the
                 offer, which may be shorter than the offer when this
                 iteration's pages cannot hold all of it.
-            block_ids: Unused; see above.
+            block_ids_by_layer_group: Page slot indices per layer group,
+                indexed by layer group id, every page of the request by block
+                ordinal.
+
+        Raises:
+            RuntimeError: When the honoured count is not a whole-block part of
+                the offer, or an honoured block of an asynchronous offer has no
+                valid destination page in some layer group. The runtime counts
+                honoured tokens as computed, so an incomplete load must never
+                be reported as finished.
         """
+        state = self._requests.get(request.request_id)
+        if state is None or state.load_blocks == 0:
+            # A bypassed request, a miss, or a role that does not read.
+            return
         self._settle_offer(request)
+        if not state.load_async:
+            return
+
+        transfers = RequestTransfers(request.request_id)
+        limit = min(
+            len(state.chain.hashes),
+            min((len(indices) for indices in block_ids_by_layer_group), default=0),
+        )
+        load_end = state.load_first_block + state.load_blocks
+        for block in range(state.load_first_block, load_end):
+            if block >= limit:
+                raise RuntimeError(
+                    f"mooncake-store: honoured prefix block {block} of request "
+                    f"{request.request_id} has missing destination pages ({limit} "
+                    "addressable); cannot report an incomplete asynchronous load "
+                    "as finished"
+                )
+            block_hash = state.chain.hashes[block]
+            for layer_group_id, indices in enumerate(block_ids_by_layer_group):
+                page_index = int(indices[block])
+                if page_index == BAD_PAGE_INDEX:
+                    raise RuntimeError(
+                        f"mooncake-store: honoured prefix block {block} of request "
+                        f"{request.request_id} has an invalid destination page in "
+                        f"layer group {layer_group_id}; cannot report an incomplete "
+                        "asynchronous load as finished"
+                    )
+                transfers.pages.append(PageTransfer(block_hash, layer_group_id, page_index))
+        # Consumed here rather than in `build_connector_meta`: the request is not
+        # in the scheduler output while it is parked, and must not be loaded a
+        # second time when it comes back.
+        state.async_loaded_upto = load_end
+        state.load_blocks = 0
+        self._pending_async_loads.append(transfers)
 
     # ---- work lists ----
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> MooncakeStoreMetadata:
-        """Turn this iteration's scheduled requests into load and save lists."""
+        """Turn this iteration's scheduled requests into load and save lists.
+
+        The asynchronous loads queued since the last build travel too, once.
+        """
         self._confirm_submitted_saves()
         metadata = MooncakeStoreMetadata()
+        metadata.async_loads, self._pending_async_loads = self._pending_async_loads, []
         for request_data in (*scheduler_output.new_requests, *scheduler_output.cached_requests):
             state = self._requests.get(request_data.request_id)
             if state is None:
@@ -297,8 +405,15 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
 
             # Whatever the store just supplied, and whatever the local cache
             # matched, is not ours to write back: the store already has the
-            # former, and the latter was never allocated during this run.
-            state.saved_upto = max(state.saved_upto, state.load_first_block + state.load_blocks)
+            # former, and the latter was never allocated during this run. An
+            # asynchronous offer was consumed when its load was queued, and the
+            # parked request comes back with all of its pages, so its end is
+            # remembered separately.
+            state.saved_upto = max(
+                state.saved_upto,
+                state.load_first_block + state.load_blocks,
+                state.async_loaded_upto,
+            )
             # An offer is consumed once. The load is issued in exactly the
             # iteration the runtime allocated pages to hold it.
             state.load_blocks = 0
@@ -339,10 +454,17 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         `pages` and `saved_upto` describe the allocation that was just freed,
         and the lookup preceding the next attempt rebuilds the rest. Saves still
         awaiting confirmation belong to that allocation too, so a report about
-        them cannot advance the next attempt's save mark.
+        them cannot advance the next attempt's save mark. So does an
+        asynchronous load not yet handed to the workers; the runtime refuses a
+        reset while a load owns the allocation, so this is defensive.
         """
         self._requests.pop(request.request_id, None)
         self._unconfirmed_saves.pop(request.request_id, None)
+        self._pending_async_loads = [
+            transfers
+            for transfers in self._pending_async_loads
+            if transfers.request_id != request.request_id
+        ]
 
     # ---- internals ----
 
@@ -377,8 +499,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         """Count the last bound saves as stored once the worker queued them.
 
         Bound metadata may never reach `wait_for_save`: the iteration can fail
-        between `handle_metadata` and the forward pass, and once attention data
-        parallelism or asynchronous loads are supported, a fleet vote, a
+        between `handle_metadata` and the forward pass, and under attention
+        data parallelism or with asynchronous loads, a fleet vote, a
         same-iteration rebuild or a batch the connector emptied can supersede
         it. Such blocks were not computed by a pass that ran, so they are
         emitted again when the request is next scheduled instead of being lost.

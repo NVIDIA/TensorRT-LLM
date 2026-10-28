@@ -30,3 +30,7 @@ kv_connector_config:
     # soft_pin_ttl_ms: 86400000
     # Evict every page of a block (all layer groups and TP shards) together.
     # group_blocks: true
+    # Load a prefix the pool serves on background threads while the request
+    # waits outside the batch; validated with disable_overlap_scheduler: true.
+    # async_load: true
+    # async_load_workers: 1

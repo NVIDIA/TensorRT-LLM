@@ -153,15 +153,20 @@ def pool_capacity(config_path: str, segment_size):
         store.close()
 
 
-def _set_namespace(config_path: str, namespace: str) -> None:
-    """Point the rendered client config at `namespace`, renaming into place."""
+def _set_client_settings(config_path: str, **settings) -> None:
+    """Rewrite keys of the rendered client config, renaming into place."""
     with open(config_path) as handle:
         config = json.load(handle)
-    config["namespace"] = namespace
+    config.update(settings)
     staging = f"{config_path}.partial"
     with open(staging, "w") as handle:
         json.dump(config, handle, indent=2)
     os.replace(staging, config_path)
+
+
+def _set_namespace(config_path: str, namespace: str) -> None:
+    """Point the rendered client config at `namespace`."""
+    _set_client_settings(config_path, namespace=namespace)
 
 
 @pytest.fixture(scope="module")
@@ -261,6 +266,25 @@ def matched_token_counts(monkeypatch):
 
 
 @pytest.fixture
+def connector_answers(monkeypatch):
+    """Every answer the leader gave, as (matched tokens, whether asynchronous).
+
+    Only usable when the executor runs in this process, like
+    `matched_token_counts`.
+    """
+    answers = []
+    original = MooncakeStoreConnectorScheduler.get_num_new_matched_tokens
+
+    def recording(self, request, num_computed_tokens):
+        result = original(self, request, num_computed_tokens)
+        answers.append(tuple(result))
+        return result
+
+    monkeypatch.setattr(MooncakeStoreConnectorScheduler, "get_num_new_matched_tokens", recording)
+    return answers
+
+
+@pytest.fixture
 def single_process_worker(monkeypatch):
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     yield
@@ -306,6 +330,59 @@ def test_mooncake_e2e_cross_engine_prefix_reuse(
     )
 
     assert_tokens_agree(cold_token_ids, warm_token_ids, context="Cross-engine prefix reuse")
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_mooncake_e2e_async_load_matches_sync_tokens(
+    single_process_worker, mooncake_pool, connector_answers
+):
+    """A prefix loaded on background threads replays like one loaded in the iteration.
+
+    The cold engine computes and publishes the prompt synchronously. The warm
+    engine reads the same pool with `async_load` and two load threads, so the
+    request is parked while a load thread fills its pages through that thread's
+    own staging slots, and only rejoins the batch once they landed. Pages reported before they
+    landed, or scattered into the wrong slots, diverge early.
+    """
+    sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+
+    cold = LLM(**llm_kwargs(mooncake_pool))
+    try:
+        cold_output = cold.generate([PROMPT], sampling_params)
+    finally:
+        cold.shutdown()
+    assert connector_answers and not any(tokens for tokens, _ in connector_answers), (
+        f"The first run already found tokens in the pool (answers {connector_answers}), "
+        "so it was not a cold start and the comparison below is meaningless."
+    )
+    connector_answers.clear()
+
+    # The module's tests share this config, so it is restored whatever happens.
+    _set_client_settings(mooncake_pool.config_path, async_load=True, async_load_workers=2)
+    try:
+        warm = LLM(**llm_kwargs(mooncake_pool))
+        try:
+            warm_output = warm.generate([PROMPT], sampling_params)
+        finally:
+            warm.shutdown()
+    finally:
+        _set_client_settings(mooncake_pool.config_path, async_load=False, async_load_workers=1)
+
+    hits = [(tokens, asynchronous) for tokens, asynchronous in connector_answers if tokens]
+    assert hits, (
+        f"The second engine read nothing back from the pool (answers {connector_answers}), "
+        "so it recomputed the prefix and this test would pass with the connector disabled."
+    )
+    assert all(asynchronous for _, asynchronous in hits), (
+        f"The second engine offered a prefix synchronously (answers {connector_answers}), "
+        "so async_load did not reach its scheduler adapter."
+    )
+
+    assert_tokens_agree(
+        list(cold_output[0].outputs[0].token_ids),
+        list(warm_output[0].outputs[0].token_ids),
+        context="Prefix reuse through asynchronous loads",
+    )
 
 
 @pytest.mark.skip_less_device(2)

@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 __all__ = [
     "CLIENT_CONFIG_NAME",
     "CONFIG_PATH_ENV",
+    "DEFAULT_STAGING_BUFFER_BYTES",
     "MooncakeStoreConnectorConfig",
     "SEGMENTS_DIR_NAME",
     "StoreRole",
@@ -66,6 +67,10 @@ DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200
 #: Per-process Mooncake transfer buffer, not pool capacity. Written into the
 #: rendered config so a vLLM reader of the same file sees the same value.
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824
+#: Pinned host memory per transfer direction under `stage_through_host`. Must
+#: equal `parse_size` of the `MooncakeStoreConfig.staging_buffer_bytes` default,
+#: so a client config without the key stages exactly what an unset field asks.
+DEFAULT_STAGING_BUFFER_BYTES = 1 << 30
 DEFAULT_NAMESPACE = "trtllm"
 #: Mooncake's peer-to-peer handshake, which keeps a separate metadata process
 #: out of the deployment. An empty connstring is not a form `store.setup`
@@ -323,6 +328,19 @@ class MooncakeStoreConnectorConfig:
     #: pools with Mooncake. Costs a copy each way, but works without GPUDirect
     #: RDMA, which registering device memory requires.
     stage_through_host: bool = False
+    #: Pinned host memory per transfer direction under `stage_through_host`.
+    #: It bounds how many pages one store call stages, not how large a page may
+    #: be. With `async_load` the load direction's share is split evenly across
+    #: the load workers.
+    staging_buffer_bytes: int = DEFAULT_STAGING_BUFFER_BYTES
+    #: Load a prefix the pool serves on background threads while the request
+    #: waits outside the batch, instead of inside the executor iteration.
+    #: Ignored unless the role reads the pool.
+    async_load: bool = False
+    #: Background load threads per rank when `async_load` is set, each with its
+    #: own CUDA stream and, under `stage_through_host`, an equal share of
+    #: `staging_buffer_bytes`.
+    async_load_workers: int = 1
     #: Soft-pin every page this server writes for this many milliseconds, or
     #: `None` to leave pages unpinned. Mooncake's first eviction pass refills a
     #: shortfall in shard order rather than by age, which punches holes into
@@ -347,6 +365,10 @@ class MooncakeStoreConnectorConfig:
             raise ValueError("global_segment_size must be >= 0")
         if self.transfer_batch_size <= 0:
             raise ValueError("transfer_batch_size must be > 0")
+        if self.staging_buffer_bytes <= 0:
+            raise ValueError("staging_buffer_bytes must be > 0")
+        if self.async_load_workers < 1:
+            raise ValueError("async_load_workers must be >= 1")
         if self.soft_pin_ttl_ms is not None and self.soft_pin_ttl_ms <= 0:
             raise ValueError(
                 f"soft_pin_ttl_ms must be > 0, or absent to leave pages unpinned; "
@@ -392,6 +414,13 @@ class MooncakeStoreConnectorConfig:
             model_key=raw.get("model_key") or None,
             transfer_batch_size=int(raw.get("transfer_batch_size", 64)),
             stage_through_host=bool(raw.get("stage_through_host", False)),
+            # A config provisioned for vLLM carries none of these three, and
+            # gets today's synchronous loads through 1 GiB of staging.
+            staging_buffer_bytes=parse_size(
+                raw.get("staging_buffer_bytes", DEFAULT_STAGING_BUFFER_BYTES), strict_units=True
+            ),
+            async_load=_json_bool(raw, "async_load", False, path),
+            async_load_workers=int(raw.get("async_load_workers", 1)),
             soft_pin_ttl_ms=(
                 int(raw["soft_pin_ttl_ms"]) if raw.get("soft_pin_ttl_ms") is not None else None
             ),

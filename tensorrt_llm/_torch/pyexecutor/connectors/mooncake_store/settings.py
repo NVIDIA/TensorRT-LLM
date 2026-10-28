@@ -188,6 +188,13 @@ def _restate_pool_block(
         ("model_key", effective.model_key, pool.model_key),
         ("transfer_batch_size", effective.transfer_batch_size, pool.transfer_batch_size),
         ("stage_through_host", effective.stage_through_host, pool.stage_through_host),
+        (
+            "staging_buffer_bytes",
+            effective.staging_buffer_bytes,
+            parse_size(pool.staging_buffer_bytes, strict_units=True),
+        ),
+        ("async_load", effective.async_load, pool.async_load),
+        ("async_load_workers", effective.async_load_workers, pool.async_load_workers),
         ("group_blocks", effective.group_blocks, pool.group_blocks),
     )
     # Settings where `None` means off rather than "not stated", so a config

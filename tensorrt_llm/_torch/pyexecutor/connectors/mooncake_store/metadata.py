@@ -54,11 +54,19 @@ class RequestTransfers:
 
 @dataclass
 class MooncakeStoreMetadata:
-    """Loads to perform before the next forward pass, saves to start after it."""
+    """Loads to perform before the next forward pass, saves to start after it.
+
+    With `async_load` the scheduler hands parked requests' loads to the
+    workers' background load threads instead, in a third list.
+    """
 
     loads: List[RequestTransfers] = field(default_factory=list)
     saves: List[RequestTransfers] = field(default_factory=list)
+    #: Asynchronous loads to queue when the metadata is bound, after the KV
+    #: cache manager's allocation fence. Under TP the scheduler exists on rank 0
+    #: only and every rank loads its own shard of the parked request's pages.
+    async_loads: List[RequestTransfers] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         """Whether there is any work at all this iteration."""
-        return bool(self.loads or self.saves)
+        return bool(self.loads or self.saves or self.async_loads)
