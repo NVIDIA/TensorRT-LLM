@@ -2111,6 +2111,27 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     fi
                     export enrootImagePath="\$containerDir/container-\${imageDigest}.sqsh"
 
+                    # mksquashfs exits 0 even when it cannot read some files of the
+                    # unpacked image; it stores them as empty files or leaves them out.
+                    # Treat such an import as failed so it is never published.
+                    enrootImportChecked() {
+                        local docker_uri=\$1
+                        local tmp_path=\$2
+                        local log_path
+                        local rc
+
+                        log_path=\$(mktemp)
+                        { enroot import -o "\$tmp_path" -- "docker://\$docker_uri"; echo \$? > "\${log_path}.rc"; } 2>&1 | tee "\$log_path"
+                        rc=\$(cat "\${log_path}.rc" 2>/dev/null || echo 1)
+                        if [ "\$rc" -eq 0 ] && grep -q -E 'Failed to read file|Cannot stat dir/file' "\$log_path"
+                        then
+                            echo "enroot import could not read some image files; discarding \$tmp_path"
+                            rc=1
+                        fi
+                        rm -f "\$log_path" "\${log_path}.rc"
+                        return "\$rc"
+                    }
+
                     importContainerWithRetries() {
                         local docker_uri=\$1
                         local output_path=\$2
@@ -2139,7 +2160,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         tmp_path="\${output_path}.\${SLURM_JOB_ID}.tmp"
                         rm -f "\$tmp_path"
 
-                        until enroot import -o "\$tmp_path" -- "docker://\$docker_uri"
+                        until enrootImportChecked "\$docker_uri" "\$tmp_path"
                         do
                             if ((attempt >= max_attempts))
                             then
