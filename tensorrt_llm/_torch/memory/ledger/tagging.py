@@ -328,6 +328,16 @@ def _log_window_result(snapshot: TagSnapshot) -> None:
     )
     logger.info(f"memory ledger: startup tags captured -- {summary}")
 
+    # The executor's process is the one holding the memory, and this is the
+    # first moment every provider has something to report, so emit the full
+    # breakdown here rather than leaving the startup tags as the only output
+    # a run ever produces.
+    from .triggers import report_now
+
+    report = report_now(tag="startup_complete")
+    if report is not None:
+        logger.info(f"memory ledger: startup breakdown\n{report}")
+
 
 def _block_index() -> list[tuple[int, int]]:
     """Sorted ``(address, size)`` of every live block, for containment search."""
