@@ -205,6 +205,31 @@ def test_multigpu_forbidden_entry_fails_even_when_it_exists(mod, tmp_path):
     assert "must not be in the multi-GPU trigger table: it covers everything" in failures[0]
 
 
+def test_multigpu_forbidden_entry_matches_without_trailing_slash(mod, tmp_path):
+    # The Groovy table matches by substring, so `pkg/serve` over-triggers exactly like
+    # `pkg/serve/`; the entry must not slip past the forbidden list by dropping the slash.
+    _write(tmp_path, "pkg/serve/sub/mod.py")
+    _write(tmp_path, "table.groovy", _groovy(["pkg/serve"]))
+    data = _mg_data(forbidden=[("pkg/serve/", "it covers everything")])
+    failures = mod.check_multigpu(tmp_path, data)
+    assert len(failures) == 1, "\n\n".join(failures)
+    assert (
+        "`pkg/serve` must not be in the multi-GPU trigger table: it covers everything"
+        in failures[0]
+    )
+
+
+def test_multigpu_rejects_any_prefix_of_the_managed_directory(mod, tmp_path):
+    # Even without any forbidden row, an entry that is a string prefix of the managed
+    # directory substring-matches every path under it.
+    _write(tmp_path, "pkg/serve/sub/mod.py")
+    _write(tmp_path, "table.groovy", _groovy(["pkg/serve"]))
+    failures = mod.check_multigpu(tmp_path, _mg_data())
+    assert len(failures) == 1, "\n\n".join(failures)
+    assert "`pkg/serve` must not be in the multi-GPU trigger table" in failures[0]
+    assert "it is a prefix of `pkg/serve/`" in failures[0]
+
+
 # --------------------------- check_codeowners (synthetic) ---------------------------
 
 

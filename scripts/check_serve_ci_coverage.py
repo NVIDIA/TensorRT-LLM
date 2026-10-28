@@ -20,7 +20,8 @@ Three checks, driven by ``scripts/serve_ci_coverage.yml``:
 - ``multigpu``: the ``tensorrt_llm/serve/`` entries of the multi-GPU trigger table
   (``relatedFileList`` in ``getMultiGpuFileChanged``, ``jenkins/L0_MergeRequest.groovy``)
   must match files at the current head; every path on the required list that exists must
-  be covered by an entry; no entry may equal a forbidden (too-broad) prefix.
+  be covered by an entry; no entry may be a forbidden (too-broad) prefix, matched with
+  or without its trailing slash, or any other string prefix of the managed directory.
 - ``visual_gen``: every prefix in the CBTS VisualGen tuples
   (``jenkins/scripts/cbts/cbts/rules/visual_gen.py``) must match a file.
 - ``codeowners``: every ``.github/CODEOWNERS`` rule under the managed serve prefixes must
@@ -289,12 +290,23 @@ def check_multigpu(repo: Path, data: dict) -> list[str]:
 
     failures: list[str] = []
     managed_prefix = cfg["managed_prefix"]
-    forbidden = {row["path"]: row["why"] for row in cfg["forbidden"]}
+    # The Groovy table matches by substring, so a forbidden row is matched with and
+    # without its trailing slash: an entry `tensorrt_llm/serve` over-triggers exactly
+    # like `tensorrt_llm/serve/` does.
+    forbidden = {row["path"].rstrip("/"): row["why"] for row in cfg["forbidden"]}
     for line, entry in entries:
-        if entry in forbidden:
+        why = forbidden.get(entry.rstrip("/"))
+        if why is not None:
             failures.append(
                 f"{table_file}:{line}: `{entry}` must not be in the multi-GPU trigger "
-                f"table: {forbidden[entry]}. Add one entry per subpackage instead."
+                f"table: {why}. Add one entry per subpackage instead."
+            )
+        elif managed_prefix.startswith(entry):
+            failures.append(
+                f"{table_file}:{line}: `{entry}` must not be in the multi-GPU trigger "
+                f"table: it is a prefix of `{managed_prefix}`, and the table matches by "
+                "substring, so it would start the multi-GPU stages for every change "
+                "under that directory. Add one entry per subpackage instead."
             )
         if entry.startswith(managed_prefix) and not path_exists(repo, entry):
             failures.append(
