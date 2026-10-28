@@ -684,8 +684,8 @@ void BounceReceiver::scatterWorkerLoop()
             // Scatter into the final dst, then wait so the data is at dst before we ACK. A bad source, a
             // failed launch, OR a stream error must NOT produce an ACK — an ACK tells the sender its KV
             // data landed, so a false ACK here is silent corruption. On error the worker sends a NACK
-            // instead (the sender fails immediately with kPeerNack) and the done queue still releases
-            // the region.
+            // instead (the sender fails the request with kPeerNack without waiting out requestTimeoutMs)
+            // and the done queue still releases the region.
             cudaError_t launchErr = cudaErrorInvalidValue;
             {
                 // Prep leg: bounds-check + plan-array build + kernel launch (host-side cost).
@@ -697,7 +697,7 @@ void BounceReceiver::scatterWorkerLoop()
                 // flow's granted region), then fill the pinned plan buffers DIRECTLY (no intermediate
                 // vectors). Piece counts come from the peer's DATA message — a peer built with a larger
                 // maxChunkSizeBytes can carry more pieces than our pinned/scratch hold; reject rather than
-                // overflow (no launch -> NACK, the sender fails immediately; never a false ACK).
+                // overflow (no launch -> NACK, the sender fails the request; never a false ACK).
                 std::size_t const maxEntries = maxPlanEntries(ctx);
                 std::uint64_t rawPieces = 0;
                 for (std::uint32_t i = 0; i < n; ++i)
@@ -771,6 +771,15 @@ void BounceReceiver::scatterWorkerLoop()
             bool const ok = srcInBounds && launchErr == cudaSuccess && syncErr == cudaSuccess;
             if (!ok)
             {
+                if (launchErr != cudaSuccess)
+                {
+                    // A failed launch can still have enqueued the scatter: launchBatchedCopy reports
+                    // cudaGetLastError(), which may be a stale error from an earlier call on this thread
+                    // (e.g. the warn-only cudaSetDevice above). The NACK below tells the sender this
+                    // chunk will not write dst again, so drain the stream before sending it. (Also runs
+                    // when nothing was launched — launchErr keeps its initial value — on an idle stream.)
+                    (void) cudaStreamSynchronize(ctx->stream);
+                }
                 // Clear any non-sticky error so the next launch does not inherit it; a sticky
                 // (context-level) error cannot be cleared and will surface on the next CUDA call.
                 (void) cudaGetLastError();
@@ -789,8 +798,8 @@ void BounceReceiver::scatterWorkerLoop()
             // the sender's ackWait critical path. Region bookkeeping (scheduler free / re-grant) still
             // goes through drainScatterDone on the IO thread. A failed scatter sends NO ACK — a false
             // ACK would tell the sender corrupt/absent data landed. Instead the worker sends a NACK
-            // (also covering the plan-overflow rejection above) so the sender fails now rather than at
-            // requestTimeoutMs.
+            // (also covering the plan-overflow rejection above) so the sender fails the request without
+            // waiting out requestTimeoutMs.
             if (ok)
             {
                 BounceNvtxScope ackScope(
@@ -851,13 +860,14 @@ std::shared_future<BounceResult> BounceSender::submit(
         // silently absorbed as a slow success. Whether to retry is the caller's decision.
         TLLM_LOG_WARNING(
             "BounceTransport(%s): plan build for peer %s rejected: %s", mCtx.selfName.c_str(), peer.c_str(), e.what());
-        promise->set_value({TransferState::kFAILURE, BounceFailReason::kPlanRejected});
+        // Nothing was sent, so nothing can write the destination.
+        promise->set_value({TransferState::kFAILURE, BounceFailReason::kPlanRejected, /*quiesced=*/true});
         return fut;
     }
     auto const numChunks = static_cast<std::uint32_t>(plan.numChunks());
     if (numChunks == 0)
     {
-        promise->set_value({TransferState::kSUCCESS, BounceFailReason::kNone});
+        promise->set_value({TransferState::kSUCCESS, BounceFailReason::kNone, /*quiesced=*/true});
         return fut;
     }
 
@@ -930,6 +940,10 @@ void BounceSender::onGrant(std::string const& peer, BounceMsgHeader const& h, st
         TLLM_LOG_WARNING("BounceTransport(%s): dropping wrong-peer GRANT peer=%s expected=%s rid=%llu",
             mCtx.selfName.c_str(), peer.c_str(), req.peer.c_str(), static_cast<unsigned long long>(h.requestId));
         return;
+    }
+    if (req.failure)
+    {
+        return; // awaiting answers: nothing will be written; its cancel reclaims what this GRANT holds
     }
     bounceRangeEnd(req.nvtxGrantWait);     // first GRANT ends the credit-wait span (no-op on later GRANTs)
     bounceRangeEnd(req.nvtxCreditStarved); // a GRANT ends the current starvation period (pump may reopen one)
@@ -1021,6 +1035,10 @@ void BounceSender::attachCredits(std::uint64_t rid, Request& req)
 
 void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
 {
+    if (req.failure)
+    {
+        return; // awaiting answers: posted and pendingCredits stay empty
+    }
     if (req.abandonReason != BounceFailReason::kNone)
     {
         // Abandoned (GRANT mispair / plan overflow): stop attaching credits and launching gathers.
@@ -1361,8 +1379,8 @@ void BounceSender::onNack(std::string const& peer, BounceMsgHeader const& h)
     auto it = mRequests.find(h.requestId);
     if (it == mRequests.end())
     {
-        // Expected late arrival: the request already failed / was cancelled (e.g. a scatter NACK
-        // racing the timeout or a second chunk's NACK after the first one failed it).
+        // Expected late arrival: the request already resolved (e.g. an answer arriving after it
+        // resolved in-doubt on requestTimeoutMs, or a NACK racing kNoProgressTimeout).
         TLLM_LOG_DEBUG("BounceTransport(%s): dropping NACK for unknown rid=%llu peer=%s chunk=%u",
             mCtx.selfName.c_str(), static_cast<unsigned long long>(h.requestId), peer.c_str(), h.chunkIdx);
         return;
@@ -1375,8 +1393,18 @@ void BounceSender::onNack(std::string const& peer, BounceMsgHeader const& h)
             h.chunkIdx);
         return;
     }
-    // Same terminal path as a failed RDMA write (pollSenderHandles): failRequest resolves the future,
-    // recycles/defers the staging regions and sends the cancel that reclaims the receiver's regions.
+    if (req.failure)
+    {
+        onAnswerAfterFailure(req, h);
+        return;
+    }
+    // The NACK answers its own chunk (the receiver never scattered it, or synced before NACKing), so
+    // recycle that chunk now: failRequest must not wait for an answer that already arrived. A
+    // request-level NACK (rejected WANT) arrives before any chunk was sent and matches none.
+    releaseAnsweredChunk(req, h);
+    // Same terminal path as a failed RDMA write (pollSenderHandles): failRequest recycles/defers the
+    // staging regions, sends the cancel that reclaims the receiver's regions and resolves the future
+    // once the receiver has answered every other sent chunk.
     failRequest(h.requestId, req, BounceFailReason::kPeerNack);
 }
 
@@ -1401,22 +1429,14 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
             h.chunkIdx);
         return;
     }
-    bool found = false;
-    for (auto pit = req.posted.begin(); pit != req.posted.end(); ++pit)
+    if (req.failure)
     {
-        // Only a Sent chunk has finished reading its local staging region and may recycle it on ACK.
-        if (pit->chunkIdx == h.chunkIdx && pit->remoteHandle == h.regionHandle && pit->state == PostState::Sent)
-        {
-            bounceRangeEnd(pit->nvtxAckWait);
-            // Return the gather-staging region to the shared arena; re-schedule may hand the freed
-            // bytes to a waiting remote flow.
-            mCtx.sendGrants(mCtx.scheduler.releaseLocal(pit->localOffset));
-            req.posted.erase(pit);
-            found = true;
-            break;
-        }
+        // A failed request resolves FAILURE even if every chunk ends up ACKed (e.g. forgetPeer after
+        // all were Sent): never take the SUCCESS path below.
+        onAnswerAfterFailure(req, h);
+        return;
     }
-    if (!found)
+    if (!releaseAnsweredChunk(req, h))
     {
         TLLM_LOG_WARNING("BounceTransport(%s): dropping stale/invalid ACK peer=%s rid=%llu chunk=%u region=%llu",
             mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned long long>(h.requestId), h.chunkIdx,
@@ -1429,20 +1449,51 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
     req.lastProgress = std::chrono::steady_clock::now(); // forward progress: a chunk was ACKed
     if (req.acked >= req.numChunks)
     {
-        bounceRangeEnd(req.nvtxGrantWait);
-        bounceRangeEnd(req.nvtxCreditStarved);
-        bounceRangeEnd(req.nvtxArenaStarved);
-        bounceRangeEnd(req.nvtxReq);
-        try
-        {
-            req.promise->set_value({TransferState::kSUCCESS, BounceFailReason::kNone});
-        }
-        catch (...)
-        {
-            // set_value throws std::future_error ONLY if the promise is already satisfied — a benign
-            // double-resolve (a request resolves exactly once); intentionally ignored, not a failure.
-        }
+        resolve(req, {TransferState::kSUCCESS, BounceFailReason::kNone, /*quiesced=*/true});
         mRequests.erase(it);
+    }
+}
+
+bool BounceSender::releaseAnsweredChunk(Request& req, BounceMsgHeader const& h)
+{
+    // Only a Sent chunk can be answered: its DATA is out, and its write has finished reading the local
+    // staging region, so the answer may recycle that region.
+    auto const answered = std::find_if(req.posted.begin(), req.posted.end(),
+        [&h](Posted const& p)
+        { return p.chunkIdx == h.chunkIdx && p.remoteHandle == h.regionHandle && p.state == PostState::Sent; });
+    if (answered == req.posted.end())
+    {
+        return false;
+    }
+    bounceRangeEnd(answered->nvtxAckWait);
+    // Return the gather-staging region to the shared arena; re-schedule may hand the freed bytes to a
+    // waiting remote flow.
+    mCtx.sendGrants(mCtx.scheduler.releaseLocal(answered->localOffset));
+    req.posted.erase(answered);
+    return true;
+}
+
+void BounceSender::onAnswerAfterFailure(Request& req, BounceMsgHeader const& h)
+{
+    auto const answered = std::find_if(req.awaiting.begin(), req.awaiting.end(),
+        [&h](AnswerKey const& k) { return k.chunkIdx == h.chunkIdx && k.regionHandle == h.regionHandle; });
+    if (answered == req.awaiting.end())
+    {
+        TLLM_LOG_WARNING(
+            "BounceTransport(%s): dropping stale/invalid answer for failed request peer=%s rid=%llu chunk=%u "
+            "region=%llu",
+            mCtx.selfName.c_str(), req.peer.c_str(), static_cast<unsigned long long>(h.requestId), h.chunkIdx,
+            static_cast<unsigned long long>(h.regionHandle));
+        return;
+    }
+    // Its staging region was already released when the request failed; only the bookkeeping is left.
+    req.awaiting.erase(answered);
+    // A live receiver gets a fresh requestTimeoutMs for each remaining answer.
+    req.lastProgress = std::chrono::steady_clock::now();
+    if (req.awaiting.empty())
+    {
+        resolveFailure(h.requestId, req);
+        mRequests.erase(h.requestId);
     }
 }
 
@@ -1470,12 +1521,21 @@ void BounceSender::checkTimeouts()
         for (auto rid : stuck)
         {
             auto it = mRequests.find(rid);
-            if (it != mRequests.end())
+            if (it == mRequests.end())
             {
-                // Peer never granted or stopped making progress (unreachable / not bounce-ready /
-                // congested). Fail the request so wait() returns FAILURE instead of hanging.
-                failRequest(rid, it->second, BounceFailReason::kNoProgressTimeout);
+                continue;
             }
+            Request& req = it->second;
+            if (req.failure)
+            {
+                // No answer for requestTimeoutMs while chunks are still awaited: in-doubt (see failRequest).
+                resolveFailure(rid, req);
+                mRequests.erase(it);
+                continue;
+            }
+            // Peer never granted or stopped making progress (unreachable / not bounce-ready /
+            // congested). Fail the request so wait() returns FAILURE instead of hanging.
+            failRequest(rid, req, BounceFailReason::kNoProgressTimeout);
         }
     }
 }
@@ -1599,16 +1659,20 @@ bool BounceSender::drainOrphanGather()
 
 void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason reason)
 {
+    if (req.failure)
+    {
+        // Already awaiting answers (forget() reaches here again): keep the first reason and the answer
+        // deadline; staging and the cancel were handled at the first failure.
+        return;
+    }
     // An abandoned flow (GRANT mispair / plan overflow) reaches here through the timeout path;
     // report the specific abandon cause, not the generic timeout.
-    if (req.abandonReason != BounceFailReason::kNone)
-    {
-        reason = req.abandonReason;
-    }
+    BounceFailReason const reported = req.abandonReason != BounceFailReason::kNone ? req.abandonReason : reason;
+    req.failure = reported;
     // The one log line every sender-side failure passes through (timeout, peer drop, write/gather
     // failure) — keep it WARNING and keep the progress context.
     TLLM_LOG_WARNING("BounceTransport(%s): request FAILED rid=%llu peer=%s reason=\"%s\" chunks acked=%u posted=%u/%u",
-        mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), req.peer.c_str(), toString(reason), req.acked,
+        mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), req.peer.c_str(), toString(reported), req.acked,
         req.nextPost, req.numChunks);
     // Release in-flight transfer handles and return each gather-staging region to the shared arena —
     // but only once nothing is still touching the region's memory, else recycling races a live DMA.
@@ -1622,7 +1686,8 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
     //     cudaStreamQuery(ctx->stream) reports the stream idle.
     //   - Gathered: gather done (event observed), ctx already returned -> recycle now.
     //   - Sent: write landed (poll==kDone), xfer already released in pollSenderHandles, NIC done
-    //     reading -> recycle now.
+    //     reading -> recycle now. Its DATA is out, though: the receiver may still scatter it into the
+    //     destination, so remember it as awaiting the receiver's answer.
     bool deferredWrite = false;
     for (auto& p : req.posted)
     {
@@ -1644,12 +1709,21 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
             p.ctx = nullptr;
             continue; // do NOT release ctx or recycle the region yet
         }
+        if (p.state == PostState::Sent)
+        {
+            req.awaiting.push_back(AnswerKey{p.chunkIdx, p.remoteHandle});
+        }
         mCtx.sendGrants(mCtx.scheduler.releaseLocal(p.localOffset));
     }
+    // Every chunk is now recycled, parked as an orphan or awaiting its answer, so the drain loops have
+    // nothing left to gather, post or poll for this request; its parked credits die with the cancel.
+    req.posted.clear();
+    req.pendingCredits.clear();
     // Retract the credit request so the receiver stops holding/granting for it. If any RDMA write is
     // still in flight it is landing on the receiver's region; sending the cancel NOW would let the
     // receiver reclaim+re-grant that region under the write -> corruption. Defer the cancel until the
     // flow's writes drain (drainOrphanLocal sends it). With no in-flight write, send it immediately.
+    // The cancel does not stop the receiver's queued scatters: they still run and answer.
     if (deferredWrite)
     {
         mPendingCancel[rid] = req.peer;
@@ -1658,25 +1732,63 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
     {
         mCtx.channel->sendTo(req.peer, encodeCancel(rid, mCtx.channel->localEndpoint()));
     }
+    // Resolve at once when nothing is awaited; on kNoProgressTimeout (checkTimeouts, abandoned flows
+    // included), which already saw no progress for requestTimeoutMs, so an unanswered chunk is reported
+    // in-doubt rather than waited for again (its DATA may be recent); and when requestTimeoutMs <= 0
+    // (direct test configs only), which leaves no bound to wait under. This tests the caller's `reason`,
+    // not `reported`: an abandoned flow reports kProtocolError but arrives here from checkTimeouts.
+    bool const waitForAnswers
+        = !req.awaiting.empty() && reason != BounceFailReason::kNoProgressTimeout && mCtx.cfg.requestTimeoutMs > 0;
+    if (waitForAnswers)
+    {
+        // Resolving now would let the caller reuse the destination while the receiver may still
+        // scatter into it. lastProgress restarts here and at each answer; checkTimeouts resolves
+        // in-doubt after requestTimeoutMs without one. The pipeline is over: only nvtxReq stays open.
+        bounceRangeEnd(req.nvtxGrantWait);
+        bounceRangeEnd(req.nvtxCreditStarved);
+        bounceRangeEnd(req.nvtxArenaStarved);
+        req.lastProgress = std::chrono::steady_clock::now();
+        return;
+    }
+    resolveFailure(rid, req);
+    mRequests.erase(rid);
+}
+
+void BounceSender::resolveFailure(std::uint64_t rid, Request& req)
+{
+    // A sent chunk the receiver has not answered may still be scattered into the destination.
+    bool const quiesced = req.awaiting.empty();
+    if (!quiesced)
+    {
+        TLLM_LOG_WARNING(
+            "BounceTransport(%s): request rid=%llu peer=%s resolved FAILURE (\"%s\") with %zu sent chunk(s) "
+            "unanswered -> destination not proven quiescent (the receiver may still write it)",
+            mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), req.peer.c_str(), toString(*req.failure),
+            req.awaiting.size());
+    }
+    resolve(req, {TransferState::kFAILURE, *req.failure, quiesced});
+}
+
+void BounceSender::resolve(Request& req, BounceResult const& result)
+{
     bounceRangeEnd(req.nvtxGrantWait);
     bounceRangeEnd(req.nvtxCreditStarved);
     bounceRangeEnd(req.nvtxArenaStarved);
     bounceRangeEnd(req.nvtxReq);
     try
     {
-        req.promise->set_value({TransferState::kFAILURE, reason});
+        req.promise->set_value(result);
     }
     catch (...)
     {
         // set_value throws std::future_error ONLY if the promise is already satisfied — a benign
         // double-resolve (a request resolves exactly once); intentionally ignored, not a failure.
     }
-    mRequests.erase(rid);
 }
 
 void BounceSender::forget(std::string const& peer)
 {
-    // Fail any in-flight request targeting the gone peer so its wait() returns.
+    // Fail every request to the gone peer (failRequest leaves one already awaiting answers alone).
     std::lock_guard<std::mutex> lk(mReqMu);
     std::vector<std::uint64_t> toFail;
     for (auto const& [rid, req] : mRequests)
@@ -1775,20 +1887,18 @@ void BounceSender::failAll()
                 mCtx.exec->release(p.ctx); // still-gathering chunk: return its borrowed exec context
                 p.ctx = nullptr;
             }
+            if (p.state == PostState::Sent)
+            {
+                req.awaiting.push_back(AnswerKey{p.chunkIdx, p.remoteHandle});
+            }
         }
-        bounceRangeEnd(req.nvtxGrantWait);
-        bounceRangeEnd(req.nvtxCreditStarved);
-        bounceRangeEnd(req.nvtxArenaStarved);
-        bounceRangeEnd(req.nvtxReq);
-        try
+        if (!req.failure)
         {
-            req.promise->set_value({TransferState::kFAILURE, BounceFailReason::kShutdown});
+            req.failure = BounceFailReason::kShutdown; // a request already awaiting answers keeps its reason
         }
-        catch (...)
-        {
-            // set_value throws std::future_error ONLY if the promise is already satisfied — a benign
-            // double-resolve (a request resolves exactly once); intentionally ignored, not a failure.
-        }
+        // Any sent chunk still unanswered makes the result in-doubt: the caller's device sync drained our
+        // kernels, not the receiver's scatter.
+        resolveFailure(rid, req);
     }
     mRequests.clear();
     // Release the handles of deferred writes (waited on above) without recycling their regions or
