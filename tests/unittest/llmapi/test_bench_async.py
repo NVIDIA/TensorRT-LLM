@@ -558,14 +558,20 @@ async def test_iteration_worker_closes_socket_when_sentinel_send_fails():
 def test_iteration_writer_exits_when_no_message_arrives(tmp_path):
     # The sender never connected, so no end sentinel will come. Once
     # stop_event is set the writer must return instead of blocking forever.
+    stop = Event()
     socket = MagicMock()
-    socket.poll.return_value = 0
+
+    def poll(timeout):
+        # No message arrives; shutdown is signalled while the writer polls.
+        stop.set()
+        return 0
+
+    socket.poll.side_effect = poll
     context = MagicMock()
     context.socket.return_value = socket
-    stop = Event()
-    stop.set()
     with mock.patch.object(processes, "Context", return_value=context):
         IterationWriter.run("ipc://unused", tmp_path / "iter.log", stop)
+    socket.poll.assert_called_once()
     socket.recv_json.assert_not_called()
     socket.close.assert_called_once()
     context.term.assert_called_once()
