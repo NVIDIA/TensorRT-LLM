@@ -16,6 +16,9 @@ import pytest
 
 from tensorrt_llm.bench.dataset.utils import get_list_of_delays
 
+# The CPU CI stage runs pytest with -m cpu_only and skips files without this marker.
+pytestmark = pytest.mark.cpu_only
+
 
 def test_constant_delays() -> None:
     assert get_list_of_delays("constant", 2.0, 3, 0) == [2.0, 2.0, 2.0]
