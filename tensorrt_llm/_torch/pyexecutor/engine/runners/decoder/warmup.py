@@ -1326,7 +1326,8 @@ class DecoderWarmup:
         # target-verify kernel variants are not covered here anyway. None of
         # these needs the chunk-aligned variant (the two base shapes cover
         # both alignments).
-        if capped_num_tokens >= 32:
+        # Rank-local capacity, so the gate is agreed like the phase entry above.
+        if self._agreement.agree_flag(capped_num_tokens >= 32):
             mamba_warmup_shapes += [
                 # Prefill %16!=0 family, HAS_DECODE=False.
                 (capped_num_tokens - 4, 0, False, False, False),
@@ -1348,7 +1349,7 @@ class DecoderWarmup:
             # shift or become unreachable -- acceptable, as above.
             t = 1 + self._config.max_total_draft_tokens
             gen_odd = 2 if (2 * t) % 16 else 3
-            mamba_warmup_shapes += [
+            cross_term_shapes = [
                 # ctx %16==0, single gen token (==1 specialization).
                 (capped_num_tokens - 16 + t, 1, False, False, False),
                 # ctx %16!=0, single gen token.
@@ -1361,6 +1362,13 @@ class DecoderWarmup:
                 (1 + t, 1, False, False, False),
                 (1 + gen_odd * t, gen_odd, False, False, False),
                 (1 + 16 * t, 16, False, False, False),
+            ]
+            # With speculative decoding a cross-term can exceed the token
+            # budget; skip it on every rank or on none.
+            mamba_warmup_shapes += [
+                shape
+                for shape in cross_term_shapes
+                if self._agreement.agree_flag(shape[0] <= capped_num_tokens)
             ]
 
         autotuner_enabled = self._config.enable_autotuner

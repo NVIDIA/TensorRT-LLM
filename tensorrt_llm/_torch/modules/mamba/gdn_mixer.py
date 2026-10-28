@@ -745,7 +745,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         if not all(isinstance(lin, Linear) for lin in projections):
             return False
         for lin in projections:
-            if not isinstance(lin.quant_method, UnquantizedLinearMethod):
+            # Exact type: FP8QDQLinearMethod subclasses UnquantizedLinearMethod.
+            if type(lin.quant_method) is not UnquantizedLinearMethod:
                 return False
             if lin.bias is not None or lin.lora is not None:
                 return False

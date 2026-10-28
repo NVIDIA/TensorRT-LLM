@@ -40,6 +40,7 @@ import pickle
 from contextlib import nullcontext
 from unittest import mock
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -210,8 +211,8 @@ def test_allgather_ints_rejects_width_mismatch_in_result(td, world):
     rank, world_size, _ = world
     # Simulate a transport returning rows of unequal width (a rank sending a
     # different count); the helper must not hand back a ragged result.
-    ragged = [torch.zeros(13, dtype=torch.int64), torch.zeros(12, dtype=torch.int64)]
-    with mock.patch.object(td, "tp_allgather", return_value=ragged):
+    ragged = np.zeros((world_size, 12), dtype=np.int64)
+    with mock.patch.object(td, "tp_allgather_int64", return_value=ragged):
         with pytest.raises(RuntimeError, match="fixed-width"):
             td.allgather_ints([0] * 13)
 

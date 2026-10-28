@@ -42,8 +42,6 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
-import torch
-
 from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.logger import logger
 
@@ -381,13 +379,10 @@ class ADPRouter(ABC):
             num_connector_transfers,
             connector_poll_failed,
         )
-        # The serialized RankState is a fixed-size flat int list, so ship it
-        # as a CPU int64 tensor: a tensor allgather is a single host
-        # collective, while an object allgather adds a size-exchange round
-        # plus pickling. This exchange runs on the executor's per-iteration
-        # hot host path, where one extra collective round is measurable.
-        payload = torch.tensor(local_state.serialize(include_kv_cache_load), dtype=torch.int64)
-        responses = self.dist.tp_allgather(payload)
+        # The serialized RankState is a fixed-size flat int list, so use the
+        # fixed-size int64 gather: one collective instead of an object
+        # allgather's size exchange plus pickling, on the per-iteration hot path.
+        responses = self.dist.tp_allgather_int64(local_state.serialize(include_kv_cache_load))
         return [RankState.deserialize(data=resp.tolist()) for resp in responses]
 
     def gather_all_rank_states_with_extras(

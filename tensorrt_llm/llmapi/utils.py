@@ -669,7 +669,13 @@ def exclude_cpus_from_affinity(cpus: List[int],
     Returns ``(kept, dropped)``; ``dropped`` is empty when nothing was removed
     (empty spec, no overlap, or fewer than ``min_cpus`` would be left).
     """
-    excluded = parse_cpu_list(spec)
+    try:
+        excluded = parse_cpu_list(spec)
+    except ValueError:
+        logger.warning(
+            f"Ignoring malformed {WORKER_AFFINITY_EXCLUDE_ENV}={spec!r}; "
+            "CPU affinity is left unfiltered.")
+        return list(cpus), []
     if not excluded:
         return list(cpus), []
     kept = [c for c in cpus if c not in excluded]

@@ -30,7 +30,6 @@ from unittest.mock import MagicMock, Mock
 
 import numpy as np
 import pytest
-import torch
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -89,14 +88,14 @@ def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False, has_pp=False):
 
 
 def _as_state_payload(values):
-    """Mirror the int64 tensor transport used by gather_all_rank_states."""
-    return torch.tensor(values, dtype=torch.int64)
+    """Mirror one row of the int64 array returned by tp_allgather_int64."""
+    return np.asarray(values, dtype=np.int64)
 
 
 def _assert_allgathered_state(dist, expected_values):
-    dist.tp_allgather.assert_called_once()
-    (payload,) = dist.tp_allgather.call_args.args
-    assert torch.equal(payload, _as_state_payload(expected_values))
+    dist.tp_allgather_int64.assert_called_once()
+    (payload,) = dist.tp_allgather_int64.call_args.args
+    assert list(payload) == list(expected_values)
 
 
 def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attention_dp_relax=False):
@@ -580,7 +579,7 @@ class TestDefaultADPRouter:
             _retiring_request(prompt_len=200),
             _retiring_request(prompt_len=300),
         ]
-        dist.tp_allgather.side_effect = lambda payload: [payload]
+        dist.tp_allgather_int64.side_effect = lambda payload: np.asarray([payload])
 
         states = router.gather_all_rank_states(active_requests=active)
 
@@ -594,7 +593,7 @@ class TestDefaultADPRouter:
         dist = _mock_dist(tp_rank=0, has_cp_helix=False)
         router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=True)
         active = [_retiring_request(), _retiring_request()]
-        dist.tp_allgather.side_effect = lambda payload: [payload]
+        dist.tp_allgather_int64.side_effect = lambda payload: np.asarray([payload])
 
         states = router.gather_all_rank_states(active_requests=active)
 
@@ -611,7 +610,7 @@ class TestDefaultADPRouter:
             _retiring_request(prompt_len=200),
             _retiring_request(prompt_len=300),
         ]
-        dist.tp_allgather.side_effect = lambda payload: [payload]
+        dist.tp_allgather_int64.side_effect = lambda payload: np.asarray([payload])
 
         states = router.gather_all_rank_states(active_requests=active)
 
@@ -707,7 +706,7 @@ class TestDefaultADPRouter:
     def test_gather_all_rank_states(self):
         dist = _mock_dist(tp_rank=0, tp_size=2, has_cp_helix=False)
         # Short (older-format) payloads exercise deserialize's trailing-default fill.
-        dist.tp_allgather.return_value = [
+        dist.tp_allgather_int64.return_value = [
             _as_state_payload([0, 1, 10]),
             _as_state_payload([1, 2, 20]),
         ]
@@ -751,7 +750,7 @@ class TestDefaultADPRouter:
             connector_poll_failed=True,
         )
         rank1 = RankState(rank=1, num_active_requests=2, num_active_tokens=20)
-        dist.tp_allgather.return_value = [
+        dist.tp_allgather_int64.return_value = [
             _as_state_payload(expected_local.serialize(include_kv_cache_load)),
             _as_state_payload(rank1.serialize(include_kv_cache_load)),
         ]
@@ -780,7 +779,7 @@ class TestDefaultADPRouter:
             num_pending_new_requests=5,
         )
         rank1 = RankState(rank=1, num_active_requests=2, num_active_tokens=20)
-        dist.tp_allgather.return_value = [
+        dist.tp_allgather_int64.return_value = [
             _as_state_payload(expected_local.serialize()),
             _as_state_payload(rank1.serialize()),
         ]
@@ -806,7 +805,7 @@ class TestDefaultADPRouter:
         # DP rank. The peer CP rank still holds a 20-token request that this CP
         # rank already retired.
         dist.cp_allgather_int64.return_value = np.array([[1, 10], [2, 30]])
-        dist.tp_allgather.side_effect = lambda payload: [payload]
+        dist.tp_allgather_int64.side_effect = lambda payload: np.asarray([payload])
         router = DefaultADPRouter(dist=dist)
 
         [state] = router.gather_all_rank_states(
@@ -826,7 +825,7 @@ class TestDefaultADPRouter:
 
     def test_gather_all_rank_states_skips_cp_gather_without_helix(self):
         dist = _mock_dist(tp_rank=0, tp_size=2, has_cp_helix=False)
-        dist.tp_allgather.return_value = [
+        dist.tp_allgather_int64.return_value = [
             _as_state_payload([0, 1, 10]),
             _as_state_payload([1, 2, 20]),
         ]
@@ -871,7 +870,7 @@ class TestDefaultADPRouter:
                     for cp in cp_ranks
                 ]
             )
-            dist.tp_allgather.side_effect = lambda payload: [payload]
+            dist.tp_allgather_int64.side_effect = lambda payload: np.asarray([payload])
             requests = [Mock(total_input_len_cp=t) for t in active_tokens[(cp_rank, dp_rank)]]
             [state] = DefaultADPRouter(dist=dist).gather_all_rank_states(requests)
             return state
@@ -1564,11 +1563,10 @@ class TestKVCacheAwareADPRouterRouting:
         prefix_matches=None,
     ):
         dist = _mock_dist(tp_rank=tp_rank, tp_size=tp_size)
-        # Echo the payload back for every rank: rank-state gathers ship int64
-        # tensors, prefix-match gathers ship lists.
-        dist.tp_allgather = lambda data: [
-            data.clone() if isinstance(data, torch.Tensor) else list(data) for _ in range(tp_size)
-        ]
+        # Echo the payload back for every rank: rank-state gathers use the
+        # int64 gather, prefix-match gathers the object gather.
+        dist.tp_allgather_int64 = lambda data: np.asarray([list(data) for _ in range(tp_size)])
+        dist.tp_allgather = lambda data: [list(data) for _ in range(tp_size)]
         kv_cache_manager = MagicMock()
         kv_cache_manager.enable_block_reuse = True
         router = KVCacheAwareADPRouter(
@@ -1949,7 +1947,7 @@ class TestConversationAwareADPRouter:
             Mock(py_orig_prompt_len=100, state=LlmRequestState.GENERATION_IN_PROGRESS),
             _retiring_request(prompt_len=50),
         ]
-        dist.tp_allgather.side_effect = lambda payload: [payload]
+        dist.tp_allgather_int64.side_effect = lambda payload: np.asarray([payload])
 
         states = router.gather_all_rank_states(active_requests=active)
 

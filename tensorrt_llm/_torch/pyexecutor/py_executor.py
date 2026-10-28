@@ -1239,9 +1239,11 @@ class PyExecutor:
         # the whole fetch when nothing is pending. Valid only when the TP
         # group spans the whole world: the probe otherwise also relays the
         # count to other PP stages / CP ranks that the allgather never
-        # reaches.
+        # reaches. With a synchronized admission clock the probe also carries
+        # rank 0's clock, so it must not be skipped.
         self._fetch_hint_enabled = (self.enable_attention_dp and
-                                    self.dist.tp_size == self.dist.world_size)
+                                    self.dist.tp_size == self.dist.world_size
+                                    and not self._gen_admission.needs_clock)
 
         # Waiting queue for requests that have been fetched but not yet scheduled
         self.waiting_queue: WaitingQueue = create_waiting_queue(
@@ -5614,6 +5616,10 @@ class PyExecutor:
             # gather and votes forward work on the rank-state gather; the
             # packed exchanges carry neither.
             inactive_reasons.append("conditional attention DP")
+        if self._mm_encoder_item_scheduling_enabled:
+            # An encoder error can empty a rank's batch after the packed
+            # can_queue vote was taken.
+            inactive_reasons.append("multimodal encoder item scheduling")
         if self._kv_load_tracker.enabled:
             # The packed exchanges do not carry the KV-cache load telemetry
             # that routing reads from the rank-state gather.
@@ -5682,7 +5688,7 @@ class PyExecutor:
         Rank-uniform: every branch is taken on the gathered result. On an
         error vote the legacy handler runs verbatim on every rank (its dict
         all-gather carries the variable-size id lists, only needed now) and
-        the RankStates are considered stale, so _fetch_new_requests gathers
+        the RankStates (likewise after a timeout vote) are considered stale, so _fetch_new_requests gathers
         again after the failed requests left active_requests -- exactly
         today's routing inputs. Otherwise the states are stashed for it. On a
         timeout vote the coordinator fails this rank's drained buffer (an
@@ -5694,7 +5700,7 @@ class PyExecutor:
             flush_transfer_errors = self.disagg.handle_errors_synced()
         if result.any_timeout:
             self.disagg.fail_timed_out_synced(result.timed_out_requests)
-        if result.any_error:
+        if result.any_error or result.any_timeout:
             self._prefetched_rank_states = None
         else:
             self._prefetched_rank_states = result.rank_states
@@ -5716,7 +5722,10 @@ class PyExecutor:
         """
         batch_size = scheduled_batch.batch_size
         graph_batch, _ = self.model_engine.make_graph_batch(
-            scheduled_batch, self.resource_manager)
+            scheduled_batch,
+            self.resource_manager,
+            enable_spec_decode=self.enable_spec_decode,
+            runtime_draft_len=self.runtime_draft_len)
         cuda_graph_runner = getattr(self.model_engine, "cuda_graph_runner",
                                     None)
         can_run_cuda_graph = bool(
@@ -6289,17 +6298,20 @@ class PyExecutor:
                 and not (self.active_requests or self.waiting_queue)):
             deadline = getattr(self, "_control_drain_transfer_deadline", None)
             if deadline is None:
-                deadline = time.time() + _CONTROL_DRAIN_TRANSFER_TIMEOUT_S
+                deadline = time.monotonic() + _CONTROL_DRAIN_TRANSFER_TIMEOUT_S
                 self._control_drain_transfer_deadline = deadline
-            if time.time() < deadline:
+                self._control_drain_deadline_warned = False
+            if time.monotonic() < deadline:
                 return False
-            logger.warning(
-                "[control_action] %d KV transfer(s) still in flight after "
-                "%.0fs; firing the control request anyway. A generation "
-                "engine may decode this KV under the updated weights.",
-                transfers_in_flight,
-                _CONTROL_DRAIN_TRANSFER_TIMEOUT_S,
-            )
+            if not getattr(self, "_control_drain_deadline_warned", False):
+                self._control_drain_deadline_warned = True
+                logger.warning(
+                    "[control_action] %d KV transfer(s) still in flight after "
+                    "%.0fs; firing the control request anyway. A generation "
+                    "engine may decode this KV under the updated weights.",
+                    transfers_in_flight,
+                    _CONTROL_DRAIN_TRANSFER_TIMEOUT_S,
+                )
             return True
         # Queues (or a connector) are still draining; restart the transfer
         # deadline so it only measures time spent waiting on transfers alone.

@@ -208,8 +208,10 @@ def _make_executor(group, rank, *, active_requests, coordinator=None, runner=Non
     coordinator.bind(ex)
     ex._disagg_coordinator = coordinator
     ex.resource_manager = None
+    ex.enable_spec_decode = False
+    ex.runtime_draft_len = 0
     ex.model_engine = SimpleNamespace(
-        make_graph_batch=lambda batch, resource_manager: (batch, frozenset()),
+        make_graph_batch=lambda batch, resource_manager, **_: (batch, frozenset()),
         cuda_graph_runner=runner,
     )
     return ex
@@ -333,7 +335,8 @@ def test_loop_head_timeout_vote_fails_drained_buffer_on_every_rank():
     assert coord0._timed_out == []
     for ex in executors:
         ex._disagg_coordinator.handle_errors_synced.assert_not_called()
-        assert ex._prefetched_rank_states is not None
+        # Failing the timed-out requests makes the gathered states stale.
+        assert ex._prefetched_rank_states is None
 
 
 # ---------------------------------------------------------------------------
@@ -407,10 +410,11 @@ def _gate_executor(monkeypatch, **overrides):
     ex.drafter = None
     ex.enable_early_first_token_response = False
     ex.model_engine = SimpleNamespace(
-        is_spec_decode=False, make_graph_batch=lambda b, rm: (b, frozenset())
+        is_spec_decode=False, make_graph_batch=lambda b, rm, **_: (b, frozenset())
     )
     ex.adp_router = DefaultADPRouter(ex.dist)
     ex._kv_load_tracker = SimpleNamespace(enabled=False)
+    ex._mm_encoder_item_scheduling_enabled = False
     for key, value in overrides.items():
         setattr(ex, key, value)
     return ex
@@ -429,7 +433,9 @@ def test_gate_is_config_derived(monkeypatch):
         dict(is_benchmark_disagg=True),
         dict(drafter=object()),
         dict(enable_early_first_token_response=True),
-        dict(model_engine=SimpleNamespace(is_spec_decode=True, make_graph_batch=lambda b, rm: b)),
+        dict(
+            model_engine=SimpleNamespace(is_spec_decode=True, make_graph_batch=lambda b, rm, **_: b)
+        ),
         # conditional attention DP (remote-tail replay) gathers its own votes
         dict(_enable_remote_tail_adp=True),
         # KV-load routing telemetry rides the plain rank-state gather only
