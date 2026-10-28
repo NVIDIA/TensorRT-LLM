@@ -17,6 +17,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
+from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
@@ -246,43 +247,19 @@ class QwenModel(DecoderModel):
 
 
 @register_auto_model("Qwen2ForCausalLM")
-class Qwen2ForCausalLM(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
+class Qwen2ForCausalLM(SpecDecOneEngineForCausalLM[QwenModel, Qwen2Config]):
+    """Qwen2 with one-model speculative decoding (EAGLE3 hidden-state capture is
+    done by QwenDecoderLayer via spec_metadata.maybe_capture_hidden_states).
+
+    ``mrope_config`` (Qwen2-VL) reaches QwenModel through ``**kwargs`` of
+    SpecDecOneEngineForCausalLM.forward.
+    """
 
     def __init__(
         self,
         model_config: ModelConfig[Qwen2Config],
     ):
-        super().__init__(QwenModel(model_config),
-                         config=model_config,
-                         hidden_size=model_config.pretrained_config.hidden_size,
-                         vocab_size=model_config.pretrained_config.vocab_size)
-
-    # NOTE: Qwen2-VL needs special mrope_config so adding separate forward() function to accept 'mrope_config'.
-    def forward(
-        self,
-        attn_metadata: AttentionMetadata,
-        input_ids: torch.IntTensor = None,
-        position_ids: Optional[torch.IntTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        return_context_logits: bool = False,
-        mrope_config: Optional[dict] = None,
-        spec_metadata: Optional[SpecMetadata] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        output = self.model(input_ids=input_ids,
-                            attn_metadata=attn_metadata,
-                            position_ids=position_ids,
-                            inputs_embeds=inputs_embeds,
-                            mrope_config=mrope_config,
-                            spec_metadata=spec_metadata,
-                            **kwargs)
-
-        return self.logits_processor.forward(
-            output,
-            self.lm_head,
-            attn_metadata,
-            return_context_logits,
-        )
+        super().__init__(QwenModel(model_config), model_config)
 
 
 @register_auto_model("Qwen2ForProcessRewardModel")

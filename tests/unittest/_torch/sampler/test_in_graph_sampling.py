@@ -71,6 +71,7 @@ class _Request:
     py_logits_post_processors: Any = None
     py_guided_decoding_params: Any = None
     py_embedding_bias: Any = None
+    py_draft_tokens: Any = None
 
     def get_beam_width_by_iter(self, for_next_iteration: bool = False) -> int:
         return self.sampling_config.beam_width
@@ -104,6 +105,7 @@ class _Sampler(TorchSampler):
         self._in_graph_request_ids = []
         self._current_sample_type = SampleType.FULL
         self._fast_params = None
+        self._staged_batch = None
 
     def admit(self, *requests: LlmRequest) -> None:
         """Resolve the live requests' params into their slots, as admission does."""
@@ -158,6 +160,35 @@ class TestTierSelection:
         # the least capable request's.
         batch = [make_request(), make_request(py_min_length=50), make_request()]
         assert sample_type(sampler, batch) is SampleType.FULL
+
+    def test_per_request_verdict_is_computed_once(self, sampler):
+        # Whether a request fits the fast tier depends on parameters fixed at
+        # admission, so the batch loop must not redo the checks every step.
+        request = make_request()
+        assert sample_type(sampler, [request]) is SampleType.FAST
+        assert request.py_fast_path_ok is True
+
+        def fail(req):
+            raise AssertionError("verdict recomputed")
+
+        sampler._request_fast_path_ok = fail
+        assert sampler.get_sample_type([request]) is SampleType.FAST
+
+    def test_disqualified_request_keeps_its_verdict(self, sampler):
+        request = make_request(py_min_length=50)
+        assert sample_type(sampler, [request]) is SampleType.FULL
+        assert request.py_fast_path_ok is False
+
+    def test_live_request_after_padding_dummy_is_full(self, sampler):
+        # Dummies must be a trailing run: the live rows are read back as the
+        # leading prefix of the batch.
+        live = make_request(py_request_id=1, py_seq_slot=1)
+        dummy = make_request(py_request_id=2, py_seq_slot=None, is_dummy=True)
+        sampler.admit(live)
+        scheduled = SimpleNamespace(generation_requests=[dummy, live], num_context_requests=0)
+        assert sampler.resolve_in_graph_sample_type(scheduled) is SampleType.FULL
+        scheduled = SimpleNamespace(generation_requests=[live, dummy], num_context_requests=0)
+        assert sampler.resolve_in_graph_sample_type(scheduled) is SampleType.FAST
 
     def test_stop_words_stay_fast(self, sampler):
         # Stop words only decide when a request finishes, which still runs after
@@ -250,6 +281,85 @@ class TestStaging:
         assert sampler._in_graph_dest_indices is buffer
         assert sampler._in_graph_dest_indices[:2].tolist() == [6, 1]
         assert sampler._in_graph_request_ids == [7, 8]
+
+    def test_repeated_batch_is_not_restaged_but_seeds_advance(self, sampler):
+        # A steady decode batch restages the same requests every step; only the
+        # Philox offsets move.
+        batch = self._batch(
+            make_request(py_request_id=1, py_seq_slot=3),
+            make_request(py_request_id=2, py_seq_slot=5),
+        )
+        self._stage(sampler, batch, SampleType.FAST)
+        first_offsets = sampler._fast_params.offset[:2].tolist()
+        calls = []
+        original = sampler.stage_fast_sampling_params
+        sampler.stage_fast_sampling_params = lambda *a, **k: (calls.append(1), original(*a, **k))
+
+        self._stage(sampler, batch, SampleType.FAST)
+
+        assert calls == []
+        assert sampler._in_graph_staged
+        assert sampler._in_graph_request_ids == [1, 2]
+        assert sampler._in_graph_dest_indices[:2].tolist() == [3, 5]
+        assert sampler._fast_params.offset[:2].tolist() == [o + 2 for o in first_offsets]
+
+    def test_staged_batch_records_what_the_readback_needs(self, sampler):
+        live = [
+            make_request(py_request_id=1, py_seq_slot=3),
+            make_request(py_request_id=2, py_seq_slot=5),
+        ]
+        dummy = make_request(py_request_id=99, py_seq_slot=None, is_dummy=True)
+        self._stage(sampler, self._batch(*live, dummy), SampleType.FAST)
+
+        staged = sampler._staged_batch
+        assert staged.requests == [*live, dummy]
+        assert staged.live_requests == live
+        assert staged.live_request_ids == [1, 2]
+        assert staged.live_seq_slots_host.tolist() == [3, 5]
+        assert staged.live_seq_slots_host.dtype == torch.int32
+        assert staged.single_step_greedy
+
+    def test_multi_token_stop_words_need_the_finish_reason_kernel(self, sampler):
+        batch = self._batch(
+            make_request(py_request_id=1, py_seq_slot=3),
+            make_request(py_request_id=2, py_seq_slot=5, py_stop_words_list=[[13, 14]]),
+        )
+        self._stage(sampler, batch, SampleType.FAST)
+        assert not sampler._staged_batch.single_step_greedy
+
+    @pytest.mark.parametrize(
+        "second",
+        [
+            pytest.param([(1, 3), (9, 5)], id="new_request_same_slot"),
+            pytest.param([(1, 3), (2, 6)], id="request_moved_slot"),
+            pytest.param([(1, 3)], id="request_left"),
+        ],
+    )
+    def test_changed_batch_is_restaged(self, sampler, second):
+        first = self._batch(
+            make_request(py_request_id=1, py_seq_slot=3),
+            make_request(py_request_id=2, py_seq_slot=5),
+        )
+        self._stage(sampler, first, SampleType.FAST)
+        batch = self._batch(*[make_request(py_request_id=i, py_seq_slot=s) for i, s in second])
+        self._stage(sampler, batch, SampleType.FAST)
+
+        assert sampler._in_graph_rows == len(second)
+        assert sampler._in_graph_request_ids == [i for i, _ in second]
+        assert sampler._in_graph_dest_indices[: len(second)].tolist() == [s for _, s in second]
+
+    def test_direct_param_staging_invalidates_the_repeat_shortcut(self, sampler):
+        # stage_fast_sampling_params overwrites the buffers, so a later identical
+        # batch has to write them again.
+        batch = self._batch(make_request(py_request_id=1, py_seq_slot=3))
+        self._stage(sampler, batch, SampleType.FAST)
+        other = make_request(dict(temperature=0.5, top_p=0.7), py_request_id=4, py_seq_slot=6)
+        sampler.admit(other)
+        sampler.stage_fast_sampling_params([other], slots_per_row=[6], live_rows=1)
+        assert sampler._fast_params.temperature[:1].tolist() == pytest.approx([0.5])
+
+        self._stage(sampler, batch, SampleType.FAST)
+        assert sampler._fast_params.temperature[:1].tolist() == pytest.approx([0.8])
 
     def test_staging_a_full_batch_clears_previous_state(self, sampler):
         # Otherwise a FULL step would be sampled against the previous batch's

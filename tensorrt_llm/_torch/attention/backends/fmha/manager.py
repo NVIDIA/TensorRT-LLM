@@ -39,6 +39,7 @@ from .combined import CombinedFmha
 from .interface import Fmha, FmhaPhase
 from .phased import PhasedFmha
 from .registry import get_enabled_fmha_lib_classes
+from .sampling_shared_prefix import has_active_plan
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -139,6 +140,9 @@ class _FmhaCacheKey(NamedTuple):
     # without changing the request shape. Keep those selection regimes apart.
     output_dtype: torch.dtype | None
     output_sf_dtype: torch.dtype | None
+    # Whether the batch was planned for the shared-prefix library, which
+    # supports a batch only when it was.
+    shared_prefix_plan: bool
 
 
 _FmhaCacheInputs = dict[str, str]
@@ -391,6 +395,7 @@ class FmhaManager:
             has_block_sparse_inputs=block_sparse_inputs is not None,
             output_dtype=output_dtype,
             output_sf_dtype=output_sf_dtype,
+            shared_prefix_plan=has_active_plan(metadata),
         )
 
     def select(

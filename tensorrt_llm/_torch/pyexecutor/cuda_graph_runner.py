@@ -18,6 +18,11 @@ from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..attention.backends.fmha.registry import is_fmha_lib_enabled
+from ..attention.backends.fmha.sampling_shared_prefix import \
+    LIB_NAME as SAMPLING_SHARED_PREFIX_LIB
+from ..attention.backends.fmha.sampling_shared_prefix import \
+    resolve_graph_variant
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
 from ..memory_buffer_utils import Buffers, get_memory_buffers
@@ -78,6 +83,11 @@ class KeyType(NamedTuple):
     num_encoder_tokens: int = 0
     peft_cache_data_type: Optional[torch.dtype] = None
     use_lora_graph: bool = False
+    # 1 when the batch is captured with the n-sample shared-prefix attention
+    # library, 0 for the regular kernel. A graph records one kernel sequence, so
+    # the library's size gate must be part of the key. Always 0 unless the
+    # library is enabled (see CUDAGraphRunner.attn_variants).
+    attn_variant: int = 0
 
 
 def _save_spec_decode_capture_state(
@@ -190,6 +200,11 @@ class CUDAGraphRunner:
         # graph runner does not need to know about the sampler.
         self._sample_type_resolver: Optional[Callable[
             [ScheduledRequests, Optional[SampleType]], SampleType]] = None
+        # Shared-prefix library graph variants (see KeyType.attn_variant).
+        self.attn_variants_enabled = (
+            self.max_beam_width == 1
+            and is_fmha_lib_enabled(SAMPLING_SHARED_PREFIX_LIB))
+        self._capture_attn_variant: Optional[int] = None
         # Called just before each replay, after the static input buffers are
         # filled. For state a model computes inside its own forward and a graph
         # therefore captures the address of: a replay runs no Python, so nothing
@@ -449,7 +464,23 @@ class CUDAGraphRunner:
                        context_query_len=context_query_len,
                        num_encoder_tokens=num_encoder_tokens,
                        peft_cache_data_type=peft_cache_data_type,
-                       use_lora_graph=use_lora_graph)
+                       use_lora_graph=use_lora_graph,
+                       attn_variant=self._resolve_attn_variant(batch))
+
+    def attn_variants(self) -> Tuple[int, ...]:
+        """Graph variants to capture per batch shape."""
+        return (1, 0) if self.attn_variants_enabled else (0, )
+
+    def set_capture_attn_variant(self, variant: Optional[int]) -> None:
+        """Pin the variant captured by the current pass; None restores runtime resolution."""
+        self._capture_attn_variant = variant
+
+    def _resolve_attn_variant(self, batch: ScheduledRequests) -> int:
+        if not self.attn_variants_enabled:
+            return 0
+        if self._capture_attn_variant is not None:
+            return self._capture_attn_variant
+        return resolve_graph_variant(batch)
 
     def set_capture_sample_type(self,
                                 sample_type: Optional[SampleType]) -> None:
@@ -662,6 +693,8 @@ class CUDAGraphRunner:
             )
             graph_attn_metadata.num_contexts = key.num_contexts
         assert graph_attn_metadata.is_cuda_graph
+        if self.attn_variants_enabled:
+            graph_attn_metadata.shared_prefix_graph = bool(key.attn_variant)
 
         if enable_spec_decode:
             graph_spec_metadata = spec_metadata.create_cuda_graph_metadata(

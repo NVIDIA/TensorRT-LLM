@@ -445,14 +445,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
         # eviction can shrink the range from the tail.
         requests_list = self._filter_remote_tail_phase_requests(list(active_requests))
+        # Only context requests can carry an exclusive mode, so test the state
+        # first: during decode every request fails it, one cheap compare each.
         exclusive_remote_mode = next(
             (
                 getattr(req, "py_csa2_remote_tail_mode", None)
                 for req in requests_list
-                if not defer_remote_tail_context
+                if req.state_value == self._context_init_state_value
+                and not defer_remote_tail_context
                 and self.remote_tail_phase is not RemoteTailPhase.DECODE
                 and req.request_id not in inflight_request_ids
-                and req.state_value == self._context_init_state_value
                 and getattr(req, "py_csa2_remote_tail_mode", None) is not None
             ),
             None,
@@ -489,9 +491,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         # empty and context requests with a different adapter could be
         # admitted, causing ensure_batch to crash when it can't evict the
         # still-active adapter.
-        for req in requests_list:
-            if req.state_value == self._gen_to_complete_state_value:
-                budget.pre_claim_peft(req)
+        if self.peft_cache_manager is not None:
+            for req in requests_list:
+                if req.state_value == self._gen_to_complete_state_value:
+                    budget.pre_claim_peft(req)
 
         # --- Phase 1: generation / disagg only ---
         while req_it < req_it_end:
