@@ -39,7 +39,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     Role,
     _get_static_cache_size_layer_components,
 )
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.bindings import DataType
@@ -50,7 +50,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MultimodalConfig,
     TorchLlmArgs,
 )
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
 
 pytestmark = pytest.mark.cpu_only
@@ -240,7 +240,7 @@ class _ModelEngine:
     _mm_item_scheduler: object | None = None
     mm_encoder_item_scheduling_enabled: bool = False
     bytes_per_mm_encoder_embedding: int = 8
-    mm_encoder_cache = PyTorchModelEngine.mm_encoder_cache
+    mm_encoder_cache = ModelEngine.mm_encoder_cache
 
 
 def _make_reserve_creator(
@@ -1722,10 +1722,9 @@ def test_manager_estimation_clamps_only_temporary_avg_seq_len(
     assert kv_cache_config.avg_seq_len == 2055
 
 
-def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
+def _one_model_draft_creator(target_pool_ratio, mapping, draft_config) -> KvCacheCreator:
     creator = object.__new__(KvCacheCreator)
     creator._model_engine = Mock(max_cuda_graph_batch_size=4)
-    target_pool_ratio = [0.32, 0.68]
     creator._kv_cache_config = KvCacheConfig(
         pool_ratio=target_pool_ratio,
         max_attention_window=None,
@@ -1740,10 +1739,15 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
     creator._execution_stream = None
     creator._is_disagg = False
     creator._cache_transceiver_config = None
-    creator._mapping = Mock()
+    creator._mapping = mapping
+    creator._draft_config = draft_config
     creator._speculative_config = Mock()
     creator._disable_overlap_scheduler = False
+    return creator
 
+
+def _create_one_model_draft_manager(creator: KvCacheCreator, **kwargs) -> Mock:
+    """Run the draft-manager factory with the heavy pieces patched out."""
     effective_draft_config = Mock()
     effective_draft_config.pretrained_config.torch_dtype = "bfloat16"
     effective_draft_config.sparse_attention_config = None
@@ -1775,18 +1779,43 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
             return_value=Mock(),
         ) as create_manager,
     ):
-        codec_provider = object()
-        creator._create_one_model_draft_kv_cache_manager(
-            creator._max_seq_len,
-            estimating_kv_cache=True,
-            cold_page_codec_provider=codec_provider,
-        )
+        creator._create_one_model_draft_kv_cache_manager(creator._max_seq_len, **kwargs)
+    return create_manager
+
+
+def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
+    target_pool_ratio = [0.32, 0.68]
+    creator = _one_model_draft_creator(target_pool_ratio, Mock(), None)
+    codec_provider = object()
+    create_manager = _create_one_model_draft_manager(
+        creator, estimating_kv_cache=True, cold_page_codec_provider=codec_provider
+    )
 
     draft_config = create_manager.call_args.kwargs["kv_cache_config"]
     assert draft_config.pool_ratio == [1.0]
     assert create_manager.call_args.kwargs["max_cuda_graph_batch_size"] == 4
     assert create_manager.call_args.kwargs["cold_page_codec_provider"] is codec_provider
     assert creator._kv_cache_config.pool_ratio == target_pool_ratio
+
+
+def test_one_model_draft_kv_uses_the_drafter_mapping_under_helix() -> None:
+    # Helix + attention DP (Kimi K3 helix_a2a): the drafter is built head-TP on a
+    # mapping without attention DP, so its KV heads must be sharded the same way,
+    # not by the executor's attention-DP repurposed mapping.
+    helix_adp = Mapping(
+        world_size=4,
+        rank=1,
+        tp_size=1,
+        cp_size=4,
+        cp_config={"cp_type": CpType.HELIX},
+        enable_attention_dp=True,
+    )
+    drafter_mapping = helix_adp.repurpose_helix_cp_to_tp()
+    drafter_mapping.enable_attention_dp = False
+    creator = _one_model_draft_creator([1.0], helix_adp, SimpleNamespace(mapping=drafter_mapping))
+    create_manager = _create_one_model_draft_manager(creator)
+
+    assert create_manager.call_args.kwargs["mapping"] is drafter_mapping
 
 
 # ---------------------------------------------------------------------------

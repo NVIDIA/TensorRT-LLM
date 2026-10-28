@@ -211,7 +211,7 @@ MemAddress HostMemBacking::reserve(size_t size)
     return mAddr;
 }
 
-void HostMemBacking::commit(size_t offset, size_t size)
+void HostMemBacking::commit(size_t offset, size_t size, bool populated)
 {
     TLLM_CHECK_DEBUG(mAddr != 0 && offset + size <= mSize);
     TLLM_CHECK_DEBUG(offset % mUnit == 0 && size % mUnit == 0);
@@ -220,16 +220,11 @@ void HostMemBacking::commit(size_t offset, size_t size)
     // the device, which does not give it one.
     cuCheck(cuCtxSetCurrent(static_cast<CUcontext>(mContext)));
 
-    auto const [openAddr, openSize] = pagesCovering(mAddr + offset, size);
-    if (::mprotect(reinterpret_cast<void*>(openAddr), openSize, PROT_READ | PROT_WRITE) != 0)
+    if (!populated)
     {
-        throw HostOOMError(std::string("mprotect(PROT_READ|PROT_WRITE) failed: ") + std::strerror(errno));
+        open(offset, size);
+        populate(offset, size);
     }
-    // Allocating and zeroing through the kernel's fault path is the point of
-    // this backing: it scales across processes, where the driver serializes the
-    // same work on a per-process lock. One call for the whole range -- the unit
-    // only divides the registrations below.
-    hostPrefaultChunk(openAddr, openSize);
 
     size_t committed = 0;
     try
@@ -257,6 +252,35 @@ void HostMemBacking::commit(size_t offset, size_t size)
             TLLM_LOG_WARNING("KVCM2 host tier: mprotect(PROT_NONE) failed while unwinding a commit, errno %d", errno);
         }
         throw;
+    }
+}
+
+void HostMemBacking::open(size_t offset, size_t size)
+{
+    TLLM_CHECK_DEBUG(mAddr != 0 && offset + size <= mSize);
+    auto const [openAddr, openSize] = pagesCovering(mAddr + offset, size);
+    if (::mprotect(reinterpret_cast<void*>(openAddr), openSize, PROT_READ | PROT_WRITE) != 0)
+    {
+        throw HostOOMError(std::string("mprotect(PROT_READ|PROT_WRITE) failed: ") + std::strerror(errno));
+    }
+}
+
+void HostMemBacking::populate(size_t offset, size_t size) const
+{
+    TLLM_CHECK_DEBUG(mAddr != 0 && offset + size <= mSize);
+    // Allocating and zeroing through the kernel's fault path is the point of
+    // this backing: it scales across processes, where the driver serializes the
+    // same work on a per-process lock.
+    //
+    // Each call holds the process's mmap_lock for reading throughout, and
+    // whatever needs it for writing -- mprotect and registration by other
+    // fills, allocations on the executor -- waits for the call to finish.
+    // Short calls bound that wait.
+    constexpr size_t kPopulateCall = 4ULL << 20;
+    auto const [fillAddr, fillSize] = pagesCovering(mAddr + offset, size);
+    for (size_t done = 0; done < fillSize; done += kPopulateCall)
+    {
+        hostPrefaultChunk(fillAddr + done, std::min(kPopulateCall, fillSize - done));
     }
 }
 

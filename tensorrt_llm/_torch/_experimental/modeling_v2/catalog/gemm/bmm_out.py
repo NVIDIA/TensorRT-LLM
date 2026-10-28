@@ -48,18 +48,6 @@ class BmmOut(OpWrapper):
             "transposed-view path the targets happen to use",
             spec=dict(batch=128, m=64, k=128, n=512, dtype=torch.bfloat16, transposed_out=False),
         ),
-        Cell(
-            why="deepseek default at attention TP8, decode absorb: 16 heads per rank",
-            spec=dict(batch=16, m=1, k=128, n=512, dtype=torch.bfloat16, transposed_out=True),
-        ),
-        Cell(
-            why="deepseek default at attention TP4, decode expand: 32 heads per rank",
-            spec=dict(batch=32, m=1, k=512, n=128, dtype=torch.bfloat16, transposed_out=True),
-        ),
-        Cell(
-            why="deepseek default at attention TP2, prefill-height absorb: 64 heads per rank",
-            spec=dict(batch=64, m=2048, k=128, n=512, dtype=torch.bfloat16, transposed_out=True),
-        ),
     )
 
     note = """

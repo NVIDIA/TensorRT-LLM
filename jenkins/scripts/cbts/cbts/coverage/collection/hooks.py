@@ -34,9 +34,8 @@ _TaintTuple: TypeAlias = tuple[Optional[str], str, str, str]
 class Hooks:
     """The points in a test's lifecycle the guest bootstrap needs to react to.
 
-    A test starting (``switch_test_context``) or finishing (``record_test_outcome``), the
-    session ending (``flush_coverage``, ``record_channel_taints``), and a pool executor
-    spawning workers for the current test (``note_expected_workers``). No-op by default;
+    A test starting (``switch_test_context``) or finishing (``record_test_outcome``), and the
+    session ending (``flush_coverage``, ``record_channel_taints``). No-op by default;
     ``sitecustomize.py`` installs the real implementations as ``active`` once CBTS coverage
     is active in this process.
     """
@@ -60,9 +59,6 @@ class Hooks:
         learned of some other way -- see ``ContextServer.diagnostics`` for the current
         source.
         """
-
-    def note_expected_workers(self, nodeid: Optional[str], n: int) -> None:
-        """Record that the coordinator spawned n subprocess pool workers for a test."""
 
 
 active: Hooks = Hooks()

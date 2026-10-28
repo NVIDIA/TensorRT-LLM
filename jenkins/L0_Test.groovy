@@ -4046,8 +4046,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.michaeln_blossom
     """
 
-    // RTXPro6000D, RTX5080 and GH200 use the Austin model scratch.
-    if (type.contains("6000d") || type.contains("rtx-5080") || type == "gh200") {
+    // RTXPro6000D and RTX5080 use the Austin model scratch.
+    if (type.contains("6000d") || type.contains("rtx-5080")) {
         llmModelVolume = """
                 - name: scratch-trt-llm-data
                   nfs:
@@ -6479,7 +6479,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // may break the mapping functionality.
 
     x86TestConfigs = [
-        "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 1],
+        "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 2],
+        "CPU-Generic-x86-2": ["cpu", "l0_cpu", 2, 2],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 3],
         "A10-PyTorch-2": ["a10", "l0_a10", 2, 3],
@@ -6648,7 +6649,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     // SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
-        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 1],
+        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 2],
+        "CPU-Generic-arm-2": ["cpu", "l0_cpu", 2, 2],
         "GH200-PyTorch-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
@@ -7111,8 +7113,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             // Must match what requirements.txt resolves to from the public index: the
                             // wheel under test is linked against that libtorch, and a mismatch fails
                             // the import with an undefined c10 symbol instead of a version error.
-                            // Use internal mirror instead of https://download.pytorch.org/whl/cu132 for better network stability.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.14.0+cu132 torchvision==0.29.0+cu132 --extra-index-url https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu132")
+                            // The internal mirror proxies https://download.pytorch.org/whl/cu132.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.14.0+cu132 torchvision==0.29.0+cu132 --extra-index-url https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pytorch-cuda-thirteen-two-remote/simple")
                         }
 
                         // A stock image, so nothing here went through Dockerfile.multi or
