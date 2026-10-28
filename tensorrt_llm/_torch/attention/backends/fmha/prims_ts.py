@@ -165,7 +165,7 @@ class PrimsTSFmha(PhasedFmha):
     supports_vc_attention = True
 
     SUPPORTED_SMS = frozenset({100, 103, 107})
-    SUPPORTED_MLA_SMS = frozenset({100, 103})
+    SUPPORTED_MLA_SMS = frozenset({100, 103, 107})
     SUPPORTED_PAGE_SIZES = {16, 32, 64, 128}
     SUPPORTED_CONTEXT_HEAD_DIMS = {128, 256}
     SUPPORTED_DECODE_HEAD_DIMS = {64, 128, 256}
