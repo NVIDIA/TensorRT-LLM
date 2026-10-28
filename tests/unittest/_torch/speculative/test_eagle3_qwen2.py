@@ -20,6 +20,7 @@ needs a Qwen2-architecture checkpoint and a matching EAGLE-3 draft head, given b
 and an EAGLE-3 head trained for it); it skips otherwise.
 """
 
+import contextlib
 import os
 
 import pytest
@@ -41,6 +42,34 @@ def test_qwen2_is_a_one_model_speculative_target():
     assert issubclass(Qwen2ForCausalLM, SpecDecOneEngineForCausalLM)
 
 
+@contextlib.contextmanager
+def _accepted_drafts():
+    """Counts the draft tokens the speculative worker accepts.
+
+    ``LLM.get_stats`` returns nothing for this configuration, so the executor's per-iteration
+    stats are read as they are produced; the executor must run in this process
+    (``TLLM_WORKER_USE_SINGLE_PROCESS=1``).
+    """
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    counts = {"accepted": 0, "requests": 0}
+    original = PyExecutor._update_iter_stats
+
+    def update(self, stats, *args, **kwargs):
+        result = original(self, stats, *args, **kwargs)
+        spec = getattr(stats, "specdec_stats", None)
+        if spec is not None and spec.num_requests_with_draft_tokens > 0:
+            counts["accepted"] += spec.num_accepted_tokens
+            counts["requests"] += spec.num_requests_with_draft_tokens
+        return result
+
+    PyExecutor._update_iter_stats = update
+    try:
+        yield counts
+    finally:
+        PyExecutor._update_iter_stats = original
+
+
 def _paths():
     target = os.environ.get("TLLM_QWEN2_EAGLE3_TARGET")
     draft = os.environ.get("TLLM_QWEN2_EAGLE3_DRAFT")
@@ -52,7 +81,8 @@ def _paths():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.skipif(_paths() is None, reason="Qwen2 target and EAGLE-3 draft not provided")
 @pytest.mark.threadleak(enabled=False)
-def test_qwen2_eagle3_one_model_generates_and_accepts_draft_tokens():
+def test_qwen2_eagle3_one_model_generates_and_accepts_draft_tokens(monkeypatch):
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     from transformers import AutoTokenizer
 
     from tensorrt_llm import LLM, SamplingParams
@@ -76,12 +106,15 @@ def test_qwen2_eagle3_one_model_generates_and_accepts_draft_tokens():
             kv_cache_config=KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.3),
             cuda_graph_config=CudaGraphConfig(max_batch_size=len(PROMPTS)),
             skip_tokenizer_init=True,
+            enable_iter_perf_stats=True,
         )
-        with llm:
-            return [o.outputs[0].token_ids for o in llm.generate(prompt_ids, sampling)]
+        with _accepted_drafts() as counts, llm:
+            tokens = [o.outputs[0].token_ids for o in llm.generate(prompt_ids, sampling)]
+        return tokens, counts["accepted"]
 
-    reference = generate(None)
-    speculative = generate(Eagle3DecodingConfig(max_draft_len=3, speculative_model=draft))
+    reference, _ = generate(None)
+    speculative, accepted = generate(Eagle3DecodingConfig(max_draft_len=3, speculative_model=draft))
+    assert accepted > 0, "the speculative worker accepted no draft token"
 
     assert [len(t) for t in speculative] == [max_tokens] * len(PROMPTS)
     # Speculative decoding verifies a different token count per step, so bf16 rounding
