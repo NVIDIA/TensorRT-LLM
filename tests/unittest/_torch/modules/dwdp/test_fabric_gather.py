@@ -121,6 +121,16 @@ def test_sm_reserve_is_set_explicitly():
         cute_dsl_utils.set_sm_reserve(-1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_sm_reserve_must_leave_an_sm():
+    from tensorrt_llm._torch import cute_dsl_utils
+
+    sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    with pytest.raises(ValueError, match="must leave at least one"):
+        cute_dsl_utils.set_sm_reserve(sm_count)
+    assert cute_dsl_utils.sm_reserve() == 0
+
+
 @pytest.mark.parametrize(
     "full, cluster_size, reserve, expected",
     [(148, 1, 30, 118), (74, 2, 30, 59), (2, 2, 30, 1), (0, 2, 30, 0), (148, 1, 0, 148)],

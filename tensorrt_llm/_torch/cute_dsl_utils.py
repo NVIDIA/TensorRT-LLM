@@ -91,10 +91,23 @@ _sm_reserve = 0
 
 
 def set_sm_reserve(reserve: int) -> None:
-    """Keep ``reserve`` SMs out of persistent grids from now on (0 = none)."""
+    """Keep ``reserve`` SMs out of persistent grids from now on (0 = none).
+
+    A nonzero ``reserve`` must leave at least one SM of the current device.
+    """
     global _sm_reserve
     if reserve < 0:
         raise ValueError(f"SM reserve must be non-negative, got {reserve}")
+    if reserve:
+        import torch
+
+        if torch.cuda.is_available():
+            sm_count = torch.cuda.get_device_properties(
+                torch.cuda.current_device()).multi_processor_count
+            if reserve >= sm_count:
+                raise ValueError(
+                    f"SM reserve {reserve} must leave at least one of "
+                    f"{sm_count} SMs")
     if reserve and reserve != _sm_reserve:
         logger.info(
             f"[cute_dsl_utils] persistent grids launch with {reserve} SMs reserved"
