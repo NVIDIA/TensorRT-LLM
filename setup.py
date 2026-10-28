@@ -721,6 +721,7 @@ setup(
     scripts=[
         'tensorrt_llm/llmapi/trtllm-llmapi-launch',
         'tensorrt_llm/llmapi/_llmapi_process_guard.py',
+        'tensorrt_llm/llmapi/_llmapi_mpi_stop.py',
         'tensorrt_llm/serve/render/trtllm-render',
     ],
     extras_require={

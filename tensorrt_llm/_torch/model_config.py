@@ -105,6 +105,11 @@ _KIMI_K3_ARCHITECTURES = {
     "KimiLinearForCausalLM",
 }
 
+_GLM5_NEXT_ARCHITECTURES = {
+    "Glm5NextForCausalLM",
+    "Glm5NextForConditionalGeneration",
+}
+
 _MINIMAX_M3_ARCHITECTURES = {
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
@@ -575,6 +580,9 @@ class ModelConfig(Generic[TConfig]):
             sm_version = get_sm_version()
             if 100 <= sm_version < 120:
                 return "TRTLLM"
+
+        if architecture in _GLM5_NEXT_ARCHITECTURES and is_sm_100f():
+            return "TRTLLM"
 
         is_w4a16_nvfp4 = (quant_config is not None and quant_config.quant_algo
                           in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4"))

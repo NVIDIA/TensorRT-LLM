@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
+import ctypes
+import importlib.util
 import json
 import os
 import shlex
@@ -15,6 +17,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from pathlib import Path
 from subprocess import PIPE, Popen
+from types import ModuleType
 from typing import Literal
 
 import pytest
@@ -29,6 +32,65 @@ from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
                                              RemoteMpiCommSessionServer,
                                              _identity_barrier_timeout,
                                              split_mpi_env)
+
+_STOP_HELPER = (Path(__file__).parents[3] / "tensorrt_llm" / "llmapi" /
+                "_llmapi_mpi_stop.py")
+_STOP_HELPER_RUNNER = """
+import importlib.util
+import sys
+
+forbidden = {"tensorrt_llm", "torch", "mpi4py"}
+assert not forbidden.intersection(sys.modules)
+
+def forbid_heavy_imports(event: str, args: tuple[object, ...]) -> None:
+    if event == "import" and str(args[0]).split(".")[0] in forbidden:
+        raise AssertionError(f"stop helper imported {args[0]}")
+
+sys.addaudithook(forbid_heavy_imports)
+spec = importlib.util.spec_from_file_location("stop_helper", sys.argv[1])
+helper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helper)
+sys.exit(helper.main(ack_timeout=float(sys.argv[2]),
+                     max_attempts=int(sys.argv[3])))
+"""
+
+
+def _stop_helper_command(ack_timeout: float, max_attempts: int) -> list[str]:
+    """Return a helper subprocess command with import guards and bounded retries."""
+    return [
+        sys.executable, "-c", _STOP_HELPER_RUNNER,
+        str(_STOP_HELPER),
+        str(ack_timeout),
+        str(max_attempts)
+    ]
+
+
+def _stop_helper_environment(address: str, hmac_key: bytes) -> dict[str, str]:
+    """Return the inherited runtime environment with this server's credentials."""
+    env = os.environ.copy()
+    env["TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"] = address
+    env["TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"] = hmac_key.hex()
+    return env
+
+
+def _request_stop(stop_client: Literal["module", "standalone"], address: str,
+                  hmac_key: bytes, ack_timeout: float,
+                  max_attempts: int) -> bool:
+    """Run either stop client and return whether the server acknowledged it."""
+    if stop_client == "module":
+        from tensorrt_llm.llmapi.mgmn_leader_node import stop_server_main
+        return stop_server_main(ack_timeout=ack_timeout,
+                                max_attempts=max_attempts)
+    result = subprocess.run(
+        _stop_helper_command(ack_timeout, max_attempts),
+        env=_stop_helper_environment(address, hmac_key),
+        capture_output=True,
+        text=True,
+        timeout=ack_timeout * max_attempts + 10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return True
 
 
 def task0() -> int:
@@ -355,6 +417,146 @@ def test_remote_mpi_submit_sync_response_after_empty_poll(
 
 
 @pytest.mark.cpu_only
+def test_lightweight_stop_helper_queue_compatibility() -> None:
+    """The standalone sender must receive an ACK through the production queue."""
+    server = ZeroMqQueue(is_server=True, socket_type=zmq.PAIR)
+    server.socket.setsockopt(zmq.LINGER, 0)
+    server.socket.setsockopt(zmq.SNDTIMEO, 5000)
+    try:
+        endpoint, key = server.address
+        with subprocess.Popen(
+                _stop_helper_command(5.0, 1),
+                env=_stop_helper_environment(endpoint, key),
+                stdout=PIPE,
+                stderr=PIPE,
+                text=True,
+        ) as process:
+            try:
+                assert server.poll(5), "The helper did not send a stop request"
+                assert server.get(timeout=5) is None
+                server.put(RemoteMpiCommSessionServer.SHUTDOWN_ACK)
+                stdout, stderr = process.communicate(timeout=10)
+                assert process.returncode == 0, stdout + stderr
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=5)
+    finally:
+        server.close()
+
+
+@pytest.fixture
+def _stop_credential_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    """Load the standalone helper with isolated canonical key and cache state."""
+    from tensorrt_llm.executor import utils as executor_utils
+
+    monkeypatch.setattr(executor_utils, "_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY",
+                        None)
+    monkeypatch.delenv(executor_utils.LlmLauncherEnvs.
+                       TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.value,
+                       raising=False)
+    spec = importlib.util.spec_from_file_location("stop_credential_test",
+                                                  _STOP_HELPER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("key", "expected"), [
+    pytest.param("ab" * 32, b"\xab" * 32, id="lowercase"),
+    pytest.param("AB" * 32, b"\xab" * 32, id="uppercase"),
+    pytest.param("", None, id="empty"),
+    pytest.param("ab" * 31, None, id="short"),
+    pytest.param("ab" * 33, None, id="long"),
+    pytest.param("ab" * 31 + " \t", None, id="whitespace"),
+    pytest.param("ab" * 32 + "\n", None, id="newline"),
+    pytest.param("gg" * 32, None, id="nonhex"),
+])
+def test_lightweight_stop_key_matches_canonical_validation(
+        _stop_credential_module: ModuleType, monkeypatch: pytest.MonkeyPatch,
+        key: str, expected: bytes | None) -> None:
+    """Match real key validation and consume the canonical enum's environment."""
+    from tensorrt_llm.executor import utils as executor_utils
+
+    env_name = executor_utils.LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.value
+    if expected is None:
+        with pytest.raises(ValueError):
+            executor_utils._normalize_spawn_proxy_process_ipc_hmac_key(key)
+    else:
+        assert executor_utils._normalize_spawn_proxy_process_ipc_hmac_key(
+            key) == expected
+    for consume in (executor_utils.get_spawn_proxy_process_ipc_hmac_key_env,
+                    _stop_credential_module._consume_hmac_key):
+        monkeypatch.setenv(env_name, key)
+        if expected is None:
+            with pytest.raises(ValueError):
+                consume()
+        else:
+            assert consume() == expected
+        assert env_name not in os.environ
+    assert executor_utils._SPAWN_PROXY_PROCESS_IPC_HMAC_KEY == expected
+
+
+@pytest.mark.cpu_only
+def test_lightweight_stop_key_is_one_shot_unlike_canonical_cache(
+        _stop_credential_module: ModuleType,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the helper's one-shot key and missing-key exception intentional."""
+    from tensorrt_llm.executor import utils as executor_utils
+
+    env_name = executor_utils.LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.value
+    with pytest.raises(RuntimeError, match="HMAC encryption is required"):
+        executor_utils.get_spawn_proxy_process_ipc_hmac_key_env()
+    with pytest.raises(KeyError):
+        _stop_credential_module._consume_hmac_key()
+    monkeypatch.setenv(env_name, "ab" * 32)
+    assert executor_utils.get_spawn_proxy_process_ipc_hmac_key_env(
+    ) == b"\xab" * 32
+    assert env_name not in os.environ
+    assert executor_utils.get_spawn_proxy_process_ipc_hmac_key_env(
+    ) == b"\xab" * 32
+    monkeypatch.setenv(env_name, "ab" * 32)
+    assert _stop_credential_module._consume_hmac_key() == b"\xab" * 32
+    assert env_name not in os.environ
+    with pytest.raises(KeyError):
+        _stop_credential_module._consume_hmac_key()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(sys.platform != "linux",
+                    reason="requires Linux libc getenv")
+@pytest.mark.parametrize("key", ["ab" * 32, "bad-\u00e9-value"],
+                         ids=["valid", "invalid-nonascii"])
+def test_lightweight_stop_key_matches_canonical_libc_scrub(
+        _stop_credential_module: ModuleType, monkeypatch: pytest.MonkeyPatch,
+        key: str) -> None:
+    """Both consumers erase real libc bytes, including rejected multibyte keys."""
+    from tensorrt_llm.executor import utils as executor_utils
+
+    env_name = executor_utils.LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.value
+    key_bytes = os.fsencode(key)
+    libc = ctypes.CDLL(None)
+    libc.getenv.argtypes = [ctypes.c_char_p]
+    libc.getenv.restype = ctypes.c_void_p
+    for consume in (executor_utils.get_spawn_proxy_process_ipc_hmac_key_env,
+                    _stop_credential_module._consume_hmac_key):
+        monkeypatch.setenv(env_name, key)
+        value_ptr = libc.getenv(os.fsencode(env_name))
+        assert value_ptr
+        assert ctypes.string_at(value_ptr, len(key_bytes)) == key_bytes
+        if key == "ab" * 32:
+            assert consume() == b"\xab" * 32
+        else:
+            with pytest.raises(ValueError):
+                consume()
+        assert env_name not in os.environ
+        assert ctypes.string_at(value_ptr,
+                                len(key_bytes)) == b"\0" * len(key_bytes)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("task_type", [
     "submit", "submit_sync", "flashinfer_workspace",
     "flashinfer_temporary_cleanup", "task_kwargs", "client_sys_path"
@@ -488,6 +690,8 @@ def _launcher_env(tmp_path: Path, home: str) -> dict:
         f"    exec {shlex.quote(sys.executable)} \"$@\"\n"
         "elif [ \"$1\" = \"-c\" ]; then\n"
         "    echo ipc:///tmp/trtllm-pmi-workspace-test\n"
+        "elif [ \"${1##*/}\" = \"_llmapi_mpi_stop.py\" ]; then\n"
+        "    echo stop > \"$LAUNCHER_TEST_STOP_FIFO\"\n"
         "elif [ \"$1\" = \"-m\" ]; then\n"
         "    if [ \"$4\" = \"stop\" ]; then\n"
         "        echo stop > \"$LAUNCHER_TEST_STOP_FIFO\"\n"
@@ -954,8 +1158,10 @@ def _spawn_proxy_ipc(monkeypatch, tmp_path: Path):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("stop_client", ["module", "standalone"])
 def test_stop_request_reaches_server_still_waiting_for_workers(
-        _spawn_proxy_ipc, monkeypatch) -> None:
+        _spawn_proxy_ipc, monkeypatch,
+        stop_client: Literal["module", "standalone"]) -> None:
     """The stop client must stop a server whose workers are still running.
 
     This is ``trtllm-llmapi-launch``'s teardown: the engine (the PAIR client
@@ -971,7 +1177,6 @@ def test_stop_request_reaches_server_still_waiting_for_workers(
     from concurrent.futures import Future
 
     from tensorrt_llm.llmapi import mpi_session
-    from tensorrt_llm.llmapi.mgmn_leader_node import stop_server_main
     from tensorrt_llm.llmapi.mpi_session import RemoteTask
 
     addr, hmac_key = _spawn_proxy_ipc
@@ -1004,7 +1209,11 @@ def test_stop_request_reaches_server_still_waiting_for_workers(
         engine.put(RemoteTask(print, (), {}))
         engine.close()
         # The worker keeps running until the stop client has its answer.
-        assert stop_server_main(ack_timeout=0.5, max_attempts=20)
+        assert _request_stop(stop_client,
+                             addr,
+                             hmac_key,
+                             ack_timeout=0.5,
+                             max_attempts=20)
         assert not stopped.is_set()
         worker_future.set_result(None)
         assert stopped.wait(10)
@@ -1018,10 +1227,10 @@ def test_stop_request_reaches_server_still_waiting_for_workers(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("stop_client", ["module", "standalone"])
 def test_stop_request_reads_past_other_messages_to_the_ack(
-        _spawn_proxy_ipc) -> None:
+        _spawn_proxy_ipc, stop_client: Literal["module", "standalone"]) -> None:
     """A worker message sent to the stop client must not hide the ack."""
-    from tensorrt_llm.llmapi.mgmn_leader_node import stop_server_main
     from tensorrt_llm.llmapi.mpi_session import RemoteWorkerDeath
 
     addr, hmac_key = _spawn_proxy_ipc
@@ -1042,7 +1251,11 @@ def test_stop_request_reads_past_other_messages_to_the_ack(
     try:
         # One attempt only: a client that read just the first message would
         # miss the ack and give up.
-        assert stop_server_main(ack_timeout=5.0, max_attempts=1)
+        assert _request_stop(stop_client,
+                             addr,
+                             hmac_key,
+                             ack_timeout=5.0,
+                             max_attempts=1)
         assert stopped.wait(10)
     finally:
         server_thread.join(15)

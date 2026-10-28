@@ -292,7 +292,8 @@ def _helix_post_process(
 
     This is shared by both MHA (Attention) and MLA modules.  The only
     dimension that differs between the two callers is *value_dim*
-    (``head_dim`` for MHA, ``kv_lora_rank`` for MLA).
+    (``head_dim`` for MHA; for MLA ``kv_lora_rank``, or ``v_head_dim`` when
+    the V up-projection runs before the exchange).
 
     zero_kv_mask marks tokens this CP rank owns no KV for; those rows are forced
     to a no-op contribution before the exchange, exactly once per backend:
