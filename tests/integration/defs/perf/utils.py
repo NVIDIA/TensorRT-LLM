@@ -389,6 +389,7 @@ class PerfServeScriptTestCmds:
         self._server_log_file = None
 
     def start_server(self) -> None:
+        """Start the server, capture stdout/stderr, and wait for readiness."""
         if self._server_proc is not None:
             return
         from tensorrt_llm._utils import get_free_port
@@ -690,10 +691,6 @@ class AbstractPerfScriptTestClass(abc.ABC):
             self._result_state = "failed"
             self._error = e
             print_error(f"Test command failed. Error: {e}")
-            # run_cmd may fail before its redirected output is returned. The
-            # server's file is independent of CalledProcessError stdout/stderr.
-            if isinstance(commands, PerfServeScriptTestCmds):
-                commands.print_server_log_tail()
             partial_output = None
             if isinstance(e, subprocess.CalledProcessError):
                 if e.stdout:
@@ -716,6 +713,11 @@ class AbstractPerfScriptTestClass(abc.ABC):
                 print(f"{'=' * 60}")
                 print(partial_output)
                 print(f"{'=' * 60}\n")
+
+        # Include both command exceptions and failed requests reported by clients.
+        if self._result_state == "failed" and isinstance(
+                commands, PerfServeScriptTestCmds):
+            commands.print_server_log_tail()
 
         if self._result_state == "valid":
             if is_setup_cmd:

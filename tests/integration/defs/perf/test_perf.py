@@ -1417,6 +1417,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         return client_cmd
 
     def get_commands(self):
+        """Build performance commands with per-case server log storage."""
         num_gpus = self._config.num_gpus
 
         if is_windows() and num_gpus > 1:
@@ -1486,15 +1487,17 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 server_timeout = 1800
             else:
                 server_timeout = 600
-            return PerfServeScriptTestCmds(
-                server_cmd=server_cmd,
-                client_cmds=client_cmds,
-                data_cmds=data_cmds,
-                server_env=server_env,
-                server_timeout=server_timeout,
-                server_log_dir=os.path.abspath(
+            server_log_dir = None
+            if self._output_dir is not None:
+                server_log_dir = os.path.abspath(
                     os.path.join(self._output_dir, "detailed_results",
-                                 os.path.basename(engine_dir))))
+                                 os.path.basename(engine_dir)))
+            return PerfServeScriptTestCmds(server_cmd=server_cmd,
+                                           client_cmds=client_cmds,
+                                           data_cmds=data_cmds,
+                                           server_env=server_env,
+                                           server_timeout=server_timeout,
+                                           server_log_dir=server_log_dir)
 
         # PyTorch loads model checkpoints directly.
         build_cmd = []
