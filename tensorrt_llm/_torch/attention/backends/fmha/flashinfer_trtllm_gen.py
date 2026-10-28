@@ -233,8 +233,8 @@ _MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
 
 # Qwen3.5 decode paths of run_generation (generation-only, one KV head per rank, FP8 KV, uniform q_len), in order of
 # precedence: CP-lite (q35_cp.py, KV head replicated over attn.q35_cp_group), fused decode (q35_fused_decode.py),
-# segmented (q35_segmented.py). Thresholds tuned for Qwen3.5-397B on SM 10.3; a layout above batch 64 raises the
-# CP-lite bound in its run file (TRTLLM_Q35_ATTN_CP_MAX_BATCH, TEP8 b128: 128).
+# segmented (q35_segmented.py). Thresholds tuned for Qwen3.5-397B on SM 10.3; deployments above batch 64 raise the
+# CP-lite bound with TRTLLM_Q35_ATTN_CP_MAX_BATCH (e.g. 128 for TEP8 at batch 128).
 _Q35_ATTN_CP_MIN_BATCH = 2
 _Q35_ATTN_CP_MAX_BATCH = int(os.environ.get("TRTLLM_Q35_ATTN_CP_MAX_BATCH", "64"))
 _Q35_ATTN_FUSED_MAX_BATCH = 4
@@ -243,7 +243,7 @@ _Q35_ATTN_SEGMENTS = 16
 _Q35_ATTN_SEG_MAX_BATCH = 2
 # Counter slots for segmented / CP-lite calls: >= max(b * segments * folded heads, #SMs). segments * folded heads
 # is <= 128 here (MTP-6 verify: 1 x 7 x 16 = 112), so 128 slots per request up to the CP-lite batch cap (>= 64):
-# TEP8 b80 / b128 need 8960 / 14336 slots, more than the 64 * 128 that capped CP-lite at b73.
+# TEP8 at batch 80 / 128 needs 8960 / 14336 slots, so the slot count scales with the CP-lite batch cap.
 _Q35_COUNTER_SLOTS = max(64, _Q35_ATTN_CP_MAX_BATCH) * 128
 
 
@@ -1882,16 +1882,22 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 def _q35_trtllm_gen_lib(attn: "TrtllmAttention") -> Optional[FlashInferTrtllmGenFmha]:
     """The FlashInferTrtllmGenFmha instance that serves this layer's non-MLA generation calls, or None.
 
-    Only context-only libraries (PhasedFmha without its own run_generation) may precede it in selection order.
+    Only libraries that never take such a call may precede it in selection order: context-only libraries (PhasedFmha
+    without its own run_generation) and, on a layer without sparse_params, the block-sparse library, which requires
+    block-sparse inputs that only sparse-attention layers pass.
     """
+    # Imported here, as the registry does, rather than at module scope.
+    from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
+
     manager = getattr(attn, "_fmha_manager", None)
     for lib in getattr(manager, "fmha_libs", ()):
         if isinstance(lib, FlashInferTrtllmGenFmha):
             return lib
-        if not (
-            isinstance(lib, PhasedFmha) and type(lib).run_generation is PhasedFmha.run_generation
-        ):
-            return None
+        if isinstance(lib, PhasedFmha) and type(lib).run_generation is PhasedFmha.run_generation:
+            continue
+        if isinstance(lib, PrimsTSBlockSparseFmha) and attn.sparse_params is None:
+            continue
+        return None
     return None
 
 
@@ -1907,8 +1913,10 @@ def q35_kv_append_plan(
 
     Mirrors the conditions under which the C++ generation preprocess (applyBiasRopeUpdateKVCacheV2) writes FP8 K / V
     and an FP8 query with a uniform q_len; run_generation re-checks the call before skipping its preprocess.
+    None while Dynamo traces the forward: the plan reads the KV cache manager through nanobind, which Dynamo cannot
+    trace (an attention-DP CTX warms its generation shapes up under torch.compile).
     """
-    if num_tokens <= 0:
+    if num_tokens <= 0 or torch.compiler.is_compiling():
         return None
     lib = _q35_trtllm_gen_lib(attn)
     if lib is None or FlashInferTrtllmGenFmha._missing_fused_nanobind_ops():
