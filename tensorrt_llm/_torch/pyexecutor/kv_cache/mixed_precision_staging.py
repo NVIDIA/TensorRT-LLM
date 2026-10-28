@@ -10,7 +10,6 @@ import torch
 from tensorrt_llm._utils import prefer_pinned
 
 from ...memory_buffer_utils import Buffers
-from .kv_cache_manager_v2 import Role
 
 
 class MixedPrecisionKVStaging:
@@ -72,7 +71,7 @@ class MixedPrecisionKVStaging:
         for layer_idx in self.pools:
             local = manager.layer_offsets[layer_idx]
             key = tuple(
-                int(manager.impl.get_buffer_group_id(layer, Role.KEY))
+                int(manager.impl.get_layer_group_id(layer))
                 for layer in (local, manager.high_layers[local])
             )
             self.table_owner[layer_idx] = owners.setdefault(key, layer_idx)

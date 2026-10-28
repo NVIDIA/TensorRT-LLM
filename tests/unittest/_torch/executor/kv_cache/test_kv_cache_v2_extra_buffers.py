@@ -168,10 +168,9 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
                     layers = real_impl.layer_grouping[pool_id]
                     other_layer = next(layer for layer in layers if layer != physical_layer)
                     impl_proxy = Mock(wraps=real_impl)
-                    impl_proxy.buffer_grouping = [
-                        sorted(group, key=lambda buffer: buffer.layer_id != other_layer)
-                        for group in real_impl.buffer_grouping
-                    ]
+                    impl_proxy.layer_grouping = (
+                        (other_layer, *(layer for layer in layers if layer != other_layer)),
+                    )
                     mgr.impl = impl_proxy
 
                     mgr._prepare_page_table_tensor(index_mapper_capacity=1)

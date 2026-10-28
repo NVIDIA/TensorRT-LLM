@@ -266,7 +266,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             self._encoder_optional_groups = tuple(
                 sorted(
                     {
-                        self.impl.get_buffer_group_id(self._layer_roles[key], key[2].role)
+                        self.impl.get_layer_group_id(self._layer_roles[key])
                         for key in self._encoder_roles
                         if self._encoder_replay_enabled
                     }
@@ -277,11 +277,8 @@ class CSA2CacheManager(KVCacheManagerV2):
     def _log_checkpoint_pools(self):
         """Report physical quota once per group, without counting role views twice."""
         policies = {
-            self.impl.get_buffer_group_id(layer.layer_id, buffer.role): layer.reuse_policy
-            if buffer.reuse_policy is None
-            else buffer.reuse_policy
+            self.impl.get_layer_group_id(layer.layer_id): layer.reuse_policy
             for layer in self.impl.init_config.layers
-            for buffer in layer.buffers
         }
         for level, tier in enumerate(self.impl.cache_tier_list):
             grouping = self.impl.get_life_cycle_pool_group_indices(level)

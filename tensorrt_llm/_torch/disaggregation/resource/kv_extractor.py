@@ -187,9 +187,7 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     (model_layer, attn_type) into synthetic IDs via the
     _layer_attn_to_layer_id inverse mapping.
     """
-    local_layer_ids = list(
-        dict.fromkeys(int(buffer.layer_id) for buffer in manager.impl.buffer_grouping[lg_idx])
-    )
+    local_layer_ids = manager.impl.layer_grouping[lg_idx]
 
     get_global_layer_ids = getattr(manager, "get_disagg_global_layer_ids", None)
     if get_global_layer_ids is not None:
@@ -398,7 +396,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
 
     pool_groups: List[PhysicalPoolGroup] = []
     storage_pg_to_list_idx: Dict[int, int] = {}
-    layer_groups_by_id: List[LayerGroup | None] = [None] * len(manager.impl.buffer_grouping)
+    layer_groups_by_id: List[LayerGroup | None] = [None] * len(manager.impl.layer_grouping)
 
     for pg_desc in pool_group_descs:
         storage_pg_idx = int(pg_desc.pool_group_index)
@@ -423,11 +421,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         # memory is reused, not concatenated.
         for variant in pg_desc.slot_desc.variants:
             layer_group_id = int(variant.layer_group_id)
-            all_internal_layer_ids = list(
-                dict.fromkeys(
-                    int(buffer.layer_id) for buffer in manager.impl.buffer_grouping[layer_group_id]
-                )
-            )
+            all_internal_layer_ids = list(manager.impl.layer_grouping[layer_group_id])
             all_global_layer_ids = _compute_global_layer_ids(manager, layer_group_id)
             local_layers = [
                 LocalLayer(local_layer_id=int(iid), global_layer_id=int(gid))
@@ -465,10 +459,6 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 ignored_roles=ignored_roles,
                 view_partition=view_partition,
             )
-            if not pool_views:
-                # Ignored-only groups keep their lifecycle index but have no
-                # transferable layers or regions to match against a peer.
-                local_layers = []
             for pool_view in pool_views:
                 if pool_view.mapper_kind not in _MAPPER_KINDS_BY_CACHE_KIND[cache_kind]:
                     raise ValueError(
