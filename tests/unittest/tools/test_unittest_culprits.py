@@ -312,15 +312,22 @@ def _run_retry_wrapper(
 
     request = Mock()
     request.config.getoption.return_value = None
+    finalizers = []
+    request.addfinalizer.side_effect = finalizers.append
     output = tmp_path / "output"
     output.mkdir()
-    _TEST_UNITTESTS.test_unittests_v2(
-        str(tmp_path),
-        types.SimpleNamespace(run_cmd=run_cmd),
-        "unittest/test_retry.py",
-        str(output),
-        request,
-    )
+    try:
+        _TEST_UNITTESTS.test_unittests_v2(
+            str(tmp_path),
+            types.SimpleNamespace(run_cmd=run_cmd),
+            "unittest/test_retry.py",
+            str(output),
+            request,
+        )
+    finally:
+        for finalize in reversed(finalizers):
+            finalize()
+        assert not list(output.glob("unittest-cache-*"))
     return results
 
 

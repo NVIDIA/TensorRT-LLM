@@ -399,48 +399,49 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         command += ["-p", "no:xdist", f"--periodic-junit-xmlpath={output_xml}"]
         passed = run_command(command)
     else:
-        with TemporaryDirectory(prefix="unittest-cache-",
-                                dir=os.path.abspath(output_dir)) as cache_dir:
-            # Retry state belongs to this attempt, not earlier cases or stages.
-            cache_option = ["-o", f"cache_dir={cache_dir}"]
+        # Retry state belongs to this attempt, not earlier cases or stages.
+        retry_cache = TemporaryDirectory(prefix="unittest-cache-",
+                                         dir=os.path.abspath(output_dir))
+        request.addfinalizer(retry_cache.cleanup)
+        cache_option = ["-o", f"cache_dir={retry_cache.name}"]
+        # Avoid .xml extension to prevent CI from reading failures from it
+        parallel_output_xml = os.path.join(
+            output_dir,
+            f'parallel-sub-results-unittests-{case_fn}.xml.intermediate')
+        parallel_command = command + cache_option + [
+            "-n", f"{num_workers}",
+            f"--periodic-junit-xmlpath={parallel_output_xml}"
+        ]
+        passed = run_command(parallel_command, num_workers)
+
+        if not os.path.exists(parallel_output_xml):
+            _fail_unittests(
+                "no report generated, fatal failure in unittests (parallel phase)",
+                parallel_output_xml, output_dir, case)
+
+        if dry_run or passed:
+            os.rename(parallel_output_xml, output_xml)
+        else:
             # Avoid .xml extension to prevent CI from reading failures from it
-            parallel_output_xml = os.path.join(
+            retry_output_xml = os.path.join(
                 output_dir,
-                f'parallel-sub-results-unittests-{case_fn}.xml.intermediate')
-            parallel_command = command + cache_option + [
-                "-n", f"{num_workers}",
-                f"--periodic-junit-xmlpath={parallel_output_xml}"
+                f'retry-sub-results-unittests-{case_fn}.xml.intermediate')
+            # An empty failure cache must not rerun the full case and mask
+            # a process failure after otherwise passing tests.
+            retry_command = command + cache_option + [
+                "-p", "no:xdist", '--lf', '--lfnf=none',
+                f"--periodic-junit-xmlpath={retry_output_xml}"
             ]
-            passed = run_command(parallel_command, num_workers)
+            passed = run_command(retry_command)
 
-            if not os.path.exists(parallel_output_xml):
-                _fail_unittests(
-                    "no report generated, fatal failure in unittests (parallel phase)",
-                    parallel_output_xml, output_dir, case)
-
-            if dry_run or passed:
-                os.rename(parallel_output_xml, output_xml)
+            if os.path.exists(retry_output_xml):
+                merge_report(parallel_output_xml, retry_output_xml, output_xml,
+                             True)
             else:
-                # Avoid .xml extension to prevent CI from reading failures from it
-                retry_output_xml = os.path.join(
-                    output_dir,
-                    f'retry-sub-results-unittests-{case_fn}.xml.intermediate')
-                # An empty failure cache must not rerun the full case and mask
-                # a process failure after otherwise passing tests.
-                retry_command = command + cache_option + [
-                    "-p", "no:xdist", '--lf', '--lfnf=none',
-                    f"--periodic-junit-xmlpath={retry_output_xml}"
-                ]
-                passed = run_command(retry_command)
-
-                if os.path.exists(retry_output_xml):
-                    merge_report(parallel_output_xml, retry_output_xml,
-                                 output_xml, True)
-                else:
-                    os.rename(parallel_output_xml, output_xml)
-                    _fail_unittests(
-                        "no report generated, fatal failure in unittests (retry phase)",
-                        output_xml, output_dir, case)
+                os.rename(parallel_output_xml, output_xml)
+                _fail_unittests(
+                    "no report generated, fatal failure in unittests (retry phase)",
+                    output_xml, output_dir, case)
 
     if not passed:
         _fail_unittests("failure reported in unittests", output_xml, output_dir,
