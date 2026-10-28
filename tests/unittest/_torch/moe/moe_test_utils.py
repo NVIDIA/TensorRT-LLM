@@ -751,33 +751,10 @@ def should_skip_cutedsl(
     backend_name = backend_type.value  # "CUTEDSL" or "CUTEDSL_FC12"
     intermediate_size = model_config.intermediate_size
 
-    # NVFP4 with large intermediate_size has known accuracy issues (8.5% mismatch
-    # at i=14336, threshold 3%). Both CuteDSL and reference have FP4 intermediate
-    # storage, but produce DIFFERENT FP4 values due to:
-    # 1) SwiGLU precision: CuteDSL kernel uses approximate math ops for sigmoid
-    #    (rcp_approx + exp2 fastmath, see utils.py:sigmoid_f32), while reference
-    #    Triton kernel uses standard tl.sigmoid (see swiglu.py:42).
-    # 2) Precision chain: CuteDSL computes SwiGLU in FP32 (GEMM accumulator →
-    #    FP32 SwiGLU → FP4), reference goes FP32 accumulator → BF16 → SwiGLU →
-    #    BF16 → fp4_quantize. Two BF16 truncation points create different values.
-    # 3) FP4 quantization: CuteDSL uses rcp_approx for block scale reciprocal
-    #    (blockscaled_...fusion.py:2588), fp4_quantize uses exact division.
-    # These per-element FP4 value differences accumulate through FC2 GEMM dot
-    # product (K=intermediate_size). CUTLASS avoids this entirely with a single
-    # fused kernel keeping BF16 intermediate precision.
-    if quant_algo == QuantAlgo.NVFP4 and intermediate_size >= 14336:
-        return (
-            f"[Design Limitation] {backend_name} NVFP4 with large "
-            f"intermediate_size has accuracy issues due to FP4 intermediate "
-            f"storage between FC1+SwiGLU and FC2 kernels "
-            f"(intermediate_size={intermediate_size} >= 14336, "
-            f"FC2 accumulates over K={intermediate_size} with 896+ blocks)."
-        )
-
     # NVFP4 with Llama4Renormalize routing has significant accuracy issues.
-    # Same root cause as the large intermediate_size skip above: CuteDSL and
-    # reference produce different FP4 intermediate values due to approximate
-    # math ops (rcp_approx, exp2 fastmath) and BF16 truncation differences.
+    # CuteDSL quantizes the FC1 output to NVFP4 from the fp32 accumulator, while
+    # the reference GatedMLP rounds the GEMM output and the SwiGLU result to bf16
+    # first, so the two produce different FP4 intermediate values.
     # Llama4's sigmoid routing amplifies these differences: standard Renormalize
     # uses softmax (weights sum to 1, per-expert errors averaged), while Llama4
     # uses sigmoid (weights independent in (0,1), per-expert errors summed
