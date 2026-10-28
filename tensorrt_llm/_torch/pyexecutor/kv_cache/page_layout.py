@@ -51,6 +51,7 @@ __all__ = [
     "held",
     "layout_from_dict",
     "layout_to_dict",
+    "owned",
     "replica_ranks",
     "replicated",
     "sectioned",
@@ -301,6 +302,14 @@ def _footprint(tensor: Tensor) -> int | None:
 def replicated(size: int) -> tuple[Tensor, ...]:
     """A buffer of ``size`` bytes that every rank holds alike."""
     return (Tensor((Axis("byte", size, 1),)),)
+
+
+def owned(size: int, ranks: int, split: Sequence[str] = ("tp",)) -> tuple[Tensor, ...]:
+    """A buffer of ``size`` bytes that is this rank's own share of ``ranks`` ranks along ``split``,
+    in a split the manager does not describe further: it corresponds only to the same rank's."""
+    return (
+        Tensor((Axis("shard", ranks, size, tuple(split), 1), Axis("byte", size, 1)), name="own"),
+    )
 
 
 def head_major(

@@ -20,13 +20,18 @@ threads plus a Barrier-based ``Distributed`` mock, then drives a full
 ctx-send / gen-receive transfer and hands verification back to the caller.
 Model specifics (cache-manager construction, pool initialization, post-transfer
 verification) are injected as hooks; see ``test_deepseek_v4_kv_transfer.py``
-and ``test_minimax_m3_kv_transfer.py`` for the two current users.
+and ``test_minimax_m3_kv_transfer.py``. Before transferring, the page layouts
+the managers declare are checked byte for byte against each other
+(``utils.page_layout_oracle``), so a new cache's declarations are checked
+across the topology matrix its test runs, besides the bytes it reads back.
 """
 
 import os
 import threading
 import uuid
 from typing import Dict, List, Optional, Protocol, Sequence, TypeVar
+
+from utils.page_layout_oracle import assert_layouts_reshard
 
 import tensorrt_llm
 import tensorrt_llm.bindings
@@ -312,6 +317,19 @@ def get_layers_per_pp(num_layers: int, pp_size: int) -> List[int]:
     return [base + (1 if r < extra else 0) for r in range(pp_size)]
 
 
+def assert_declared_layouts_reshard(
+    ctx_managers: Sequence[KVCacheManagerV2], gen_managers: Sequence[KVCacheManagerV2]
+) -> None:
+    """Check the declared page layouts byte for byte (``utils.page_layout_oracle``).
+
+    Every context data-parallel group's layouts must fill every generation rank's pages.
+    """
+    ctx = [m.get_page_table().page_layout for m in ctx_managers]
+    gen = [m.get_page_table().page_layout for m in gen_managers]
+    for dp_rank in sorted({page.topology.dp_rank for page in ctx}):
+        assert_layouts_reshard([page for page in ctx if page.topology.dp_rank == dp_rank], gen)
+
+
 def run_kv_transfer_test(
     ctx_tp: int,
     ctx_pp: int,
@@ -336,6 +354,7 @@ def run_kv_transfer_test(
     # ===== 1. Create cache managers =====
     ctx_managers = list(manager_factory(ctx_tp, ctx_pp, ctx_enable_dp))
     gen_managers = list(manager_factory(gen_tp, gen_pp, gen_enable_dp))
+    assert_declared_layouts_reshard(ctx_managers, gen_managers)
 
     # ===== 2. Initialize data =====
     # ctx: random data, seed=pp_rank (same across TP, different across PP)

@@ -135,7 +135,6 @@ from ..resource_manager import (
 from ..scheduler import ScheduledRequests
 from . import _lender_hooks
 from .page_layout import (
-    Axis,
     BufferDesc,
     LayerGroupDesc,
     PageLayout,
@@ -143,6 +142,7 @@ from .page_layout import (
     Tensor,
     grid_place,
     head_major,
+    owned,
     replicated,
     token_major,
 )
@@ -300,6 +300,12 @@ class Role:
     MLA_V_PACKED = DataRole("mla_v_packed")
     MLA_HP_TAIL = DataRole("mla_hp_tail")
     ALL = DataRole("all")
+
+
+# The roles the base manager splits by KV head (_page_buffer_tensors).
+_HEAD_SPLIT_ROLES = frozenset(
+    str(role) for role in (Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
+)
 
 
 class BlockReusePolicy(StrEnum):
@@ -3711,16 +3717,32 @@ class KVCacheManagerV2(BaseResourceManager):
         tensors whose local pieces its ``size`` bytes hold, for ``tokens`` tokens of a page, in a
         layer of recurrent ``state`` or of attention.
 
-        The base manager's buffers are plain attention: ``Role.INDEX_KEY`` alike on every rank,
-        since every index-key side cache so far (DSA indexer-K, MiniMax M3) projects replicated
-        across TP ranks, and every other role head-major (HND) by the layer's KV heads, as the
-        TRTLLM attention kernels write K/V and their block scales. A subclass whose buffers
-        spread otherwise overrides this method, building tensors with ``page_layout``'s
-        ``head_major``, ``token_major``, ``sectioned`` and ``replicated`` or declaring its own.
+        The base manager declares the roles it registers itself: K/V and their block scales
+        head-major (HND) by the layer's KV heads, as the TRTLLM attention kernels write them, and
+        ``Role.INDEX_KEY`` alike on every rank, since every index-key side cache so far (DSA
+        indexer-K, MiniMax M3) projects replicated across TP ranks. A buffer that never moves
+        (``_page_untransferred_roles``) is this rank's own. A manager registering any other role,
+        or laying these out otherwise, overrides this method, building tensors with
+        ``page_layout``'s ``head_major``, ``token_major``, ``sectioned`` and ``replicated`` or
+        declaring its own.
+
+        Raises:
+            ValueError: For a role that moves and that the manager does not declare: guessing how
+                its bytes spread would transfer them wrongly between ranks of different parallel
+                sizes.
         """
         if role == Role.INDEX_KEY:
             return replicated(size)
-        return self._page_head_split(layer_id, size, tokens, state)
+        if role in _HEAD_SPLIT_ROLES:
+            return self._page_head_split(layer_id, size, tokens, state)
+        if role in self._page_untransferred_roles():
+            split = ("tp", "cp") if state else ("tp",)
+            return owned(size, grid_place(rank_topology(self.mapping), split)[0], split)
+        raise ValueError(
+            f"{type(self).__name__} registers role {role!r} but does not declare how its bytes "
+            "spread over ranks; override _page_buffer_tensors (or list the role in "
+            "_page_untransferred_roles if it never moves)"
+        )
 
     def _page_head_split(
         self,
@@ -3742,9 +3764,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if head_bytes is None and not state and heads > 0 and size % heads == 0:
             head_bytes = size // heads
         if head_bytes is None or size % head_bytes:
-            return (
-                Tensor((Axis("shard", ranks, size, split, 1), Axis("byte", size, 1)), name="own"),
-            )
+            return owned(size, ranks, split)
         heads = size // head_bytes
         total = total if total and not state else heads * ranks
         if token_major_:

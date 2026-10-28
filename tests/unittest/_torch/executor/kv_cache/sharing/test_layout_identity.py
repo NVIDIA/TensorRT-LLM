@@ -31,6 +31,7 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 import pytest
 import torch
+from utils.page_layout_oracle import assert_layouts_reshard
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm._torch.pyexecutor.kv_cache import page_layout, page_table, sharing
@@ -2185,6 +2186,68 @@ def test_attach_requires_a_window_for_every_non_required_group(monkeypatch, poli
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("src_tp,dst_tp", [(1, 2), (2, 1), (2, 4), (4, 2), (1, 4)])
+def test_declared_layouts_reshard_byte_for_byte(src_tp, dst_tp):
+    """The page layouts a manager declares at different TP sizes carry every byte to where it
+    belongs (utils.page_layout_oracle), for attention heads and sectioned and head-split state."""
+
+    def kv_ranks(tp):
+        return [derive_layout(attention(tp, rank, 4)).page_layout for rank in range(tp)]
+
+    def state_ranks(tp):
+        return [
+            derive_layout(
+                Manager(
+                    [
+                        (
+                            SsmLayerConfig,
+                            [0, 1],
+                            [("conv_state", 96 // tp, None), ("ssm_state", 128 // tp, None)],
+                        )
+                    ],
+                    tp_size=tp,
+                    tp_rank=rank,
+                    mappers={"conv_state": MapperKind.SECTIONED},
+                    layouts={
+                        "conv_state": RoleLayout(section_bytes=(32 // tp,) * 3),
+                        "ssm_state": RoleLayout(bytes_per_head=32),
+                    },
+                )
+            ).page_layout
+            for rank in range(tp)
+        ]
+
+    assert_layouts_reshard(kv_ranks(src_tp), kv_ranks(dst_tp))
+    assert_layouts_reshard(state_ranks(src_tp), state_ranks(dst_tp))
+
+
+class BaseDeclarations(Manager):
+    """The stand-in declaring its buffers as the base manager does."""
+
+    _page_buffer_tensors = KVCacheManagerV2._page_buffer_tensors
+
+
+@pytest.mark.cpu_only
+def test_a_role_the_manager_does_not_declare_is_refused():
+    """The base manager declares only the roles it registers; a role a manager adds without
+    declaring how its bytes spread over ranks is refused rather than guessed."""
+    manager = BaseDeclarations([kv_group(extra=[("side", 64, None)])])
+    with pytest.raises(ValueError, match="registers role 'side' but does not declare"):
+        derive_layout(manager)
+
+
+@pytest.mark.cpu_only
+def test_a_role_that_never_moves_is_the_rank_s_own():
+    manager = BaseDeclarations([kv_group(extra=[("side", 64, None)])], ignored={"side"})
+    layout = derive_layout(manager).page_layout
+    sides = [b for b in layout.buffers if b.role == "side"]
+    assert sides and all(not b.transferred for b in sides)
+    assert all(b.tensors == page_layout.owned(64, 1) for b in sides)
+    keys = [b for b in layout.buffers if b.role == "key"]
+    assert all(described(b)[0] == "INDEXED" for b in keys)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("attention_dp", [False, True], ids=["tp", "attention_dp"])
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 def test_a_state_group_splits_over_the_grid_its_kind_sets(tp_size, attention_dp):
@@ -2274,6 +2337,7 @@ def test_the_layout_types_keep_their_module_fields_and_members():
             "held",
             "layout_from_dict",
             "layout_to_dict",
+            "owned",
             "replica_ranks",
             "replicated",
             "sectioned",

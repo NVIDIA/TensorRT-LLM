@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
 import pytest
+from utils.page_layout_oracle import assert_layouts_reshard
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
     check_compatible,
@@ -148,85 +149,16 @@ def layout(topology: RankTopology, layers: tuple[int, ...], specs: list[Spec]) -
     return PageLayout(TOKENS, widths, groups, tuple(buffers), topology)
 
 
-@dataclass
-class Oracle:
-    """Global element ids, allotted per (layer, role, tensor)."""
-
-    bases: dict = field(default_factory=dict)
-    next_id: int = 0
-
-    def base(self, key: tuple, tensor: Tensor) -> int:
-        if key not in self.bases:
-            self.bases[key] = self.next_id
-            self.next_id += int(np.prod([a.extent for a in tensor.axes]))
-        return self.bases[key]
-
-    def elements(self, page: PageLayout, buffer: BufferDesc, tensor: Tensor):
-        """(byte offset in the pool slot, global element id) of each byte of the tensor's piece."""
-        base = self.base((buffer.layer, buffer.role, tensor.name), tensor)
-        holds = [list(held(a, page.topology)) for a in tensor.axes]
-        extents = [a.extent for a in tensor.axes]
-        for local in itertools.product(*(range(len(h)) for h in holds)):
-            offset = buffer.slot_offset + tensor.offset
-            linear = 0
-            for a, h, k, extent in zip(tensor.axes, holds, local, extents):
-                offset += k * a.stride
-                linear = linear * extent + h[k]
-            yield offset, base + linear
-
-    def memory(self, page: PageLayout) -> dict[int, np.ndarray]:
-        mem = {g: np.full(w[0], -1, dtype=np.int64) for g, w in page.pool_slot_bytes.items()}
-        for b in page.buffers:
-            for t in b.tensors:
-                for offset, element in self.elements(page, b, t):
-                    mem[b.pool_group][offset] = element
-        return mem
-
-
 def check(src: Instance, dst: Instance, specs: list[Spec], *, src_dp: int = 0) -> None:
     """Every destination rank of every data-parallel group gets each byte it holds exactly once,
     holding the right element, and only from source ranks of its fan."""
-    oracle = Oracle()
-    sources = [(t, layout(t, src.stages[t.pp_rank], specs)) for t in src.ranks(src_dp)]
-    src_memory = {id(page): oracle.memory(page) for _, page in sources}
-    for dst_dp in range(dst.tp if dst.attention_dp else 1):
-        for dst_topology in dst.ranks(dst_dp):
-            page = layout(dst_topology, dst.stages[dst_topology.pp_rank], specs)
-            got = {g: np.full(w[0], -1, dtype=np.int64) for g, w in page.pool_slot_bytes.items()}
-            writes = {g: np.zeros(w[0], dtype=np.int64) for g, w in page.pool_slot_bytes.items()}
-            for src_topology, src_page in sources:
-                maps = map_buffers(src_page, page)
-                if maps:
-                    tp_fan = fan(
-                        _tp(src_topology),
-                        _tp(dst_topology),
-                        0 if dst_topology.attention_dp else dst_topology.tp_rank,
-                    )
-                    cp_fan = fan(src_topology.cp_size, dst_topology.cp_size, dst_topology.cp_rank)
-                    src_tp = 0 if src_topology.attention_dp else src_topology.tp_rank
-                    assert src_tp in tp_fan and src_topology.cp_rank in cp_fan, (
-                        src_topology,
-                        dst_topology,
-                    )
-                memory = src_memory[id(src_page)]
-                for m in maps:
-                    for s, d, n in zip(m.src_offsets, m.dst_offsets, m.sizes):
-                        got[m.dst.pool_group][d : d + n] = memory[m.src.pool_group][s : s + n]
-                        writes[m.dst.pool_group][d : d + n] += 1
-            src_layers = {layer for stage in src.stages for layer in stage}
-            for b in page.buffers:
-                if b.layer not in src_layers:
-                    continue
-                for t in b.tensors:
-                    for offset, element in oracle.elements(page, b, t):
-                        assert writes[b.pool_group][offset] == 1, (
-                            f"{dst_topology} buffer ({b.layer}, {b.role}) tensor {t.name!r} byte "
-                            f"{offset}: {writes[b.pool_group][offset]} writes"
-                        )
-                        assert got[b.pool_group][offset] == element, (
-                            f"{dst_topology} buffer ({b.layer}, {b.role}) byte {offset}: element "
-                            f"{got[b.pool_group][offset]}, not {element}"
-                        )
+    sources = [layout(t, src.stages[t.pp_rank], specs) for t in src.ranks(src_dp)]
+    destinations = [
+        layout(t, dst.stages[t.pp_rank], specs)
+        for dst_dp in range(dst.tp if dst.attention_dp else 1)
+        for t in dst.ranks(dst_dp)
+    ]
+    assert_layouts_reshard(sources, destinations)
 
 
 TPS = (1, 2, 4, 8)
