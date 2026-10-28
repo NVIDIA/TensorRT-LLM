@@ -25,7 +25,9 @@ from tensorrt_llm._torch.utils import (ActType_TrtllmGen, Fp4QuantizedTensor,
                                        get_last_power_of_2_num_tokens_buckets,
                                        last_positive_power_of_2,
                                        next_positive_power_of_2)
+from tensorrt_llm._utils import get_sm_version
 
+from ...logger import logger
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
@@ -444,10 +446,44 @@ class FP4BlockScaleMoEInputs:
     topk_ids: Optional[torch.Tensor] = None
 
 
+# FP4 MoE [tile, config] pinned on SM 10.3 per (hidden_size, top_k,
+# intermediate_size, local_num_experts) and token count: the hidden-4096
+# top-10 decode shards' CUDA-graph draft and MTP verify steps. Every rank runs
+# the same tactic, and these beat the AutoTuner's pick at those shapes.
+# yapf: disable
+_SM103_PINNED_MOE_TACTICS = {
+    (4096, 10, 512, 64): {
+        7: (8, 70), 14: (8, 70), 21: (8, 70), 28: (8, 70),
+    },
+    (4096, 10, 512, 128): {
+        3: (8, 59), 5: (8, 59), 6: (8, 70), 7: (8, 70), 8: (8, 48), 9: (8, 48),
+        10: (8, 70), 11: (8, 70), 12: (8, 70), 13: (8, 70), 14: (8, 48),
+        15: (8, 70), 16: (8, 4), 18: (8, 4), 20: (8, 4), 21: (8, 4),
+        22: (8, 4), 24: (8, 48), 26: (8, 4), 28: (8, 4), 30: (8, 4),
+        32: (8, 4), 35: (8, 4), 42: (8, 48), 49: (8, 4), 56: (8, 2),
+        63: (8, 70), 70: (16, 20), 72: (8, 4), 77: (16, 20), 80: (8, 2),
+        84: (8, 48), 88: (8, 4), 91: (16, 20), 96: (8, 4), 98: (16, 20),
+        104: (8, 4), 105: (16, 20), 112: (8, 70), 120: (8, 4), 126: (16, 20),
+        128: (8, 70), 140: (16, 20), 154: (16, 20), 168: (16, 20),
+        182: (16, 20), 196: (16, 20), 210: (16, 20), 224: (16, 20),
+        504: (32, 4), 560: (32, 4), 616: (32, 4), 672: (32, 4), 728: (32, 4),
+        784: (32, 4), 840: (64, 0), 896: (64, 0),
+    },
+    (4096, 10, 256, 256): {
+        7: (8, 55), 14: (8, 66), 28: (8, 66),
+    },
+    (4096, 10, 256, 128): {
+        7: (8, 59), 14: (8, 44), 28: (8, 66),
+    },
+}
+# yapf: enable
+
+
 class FP4BlockScaleMoERunner(TunableRunner):
 
     runner_dict = dict()
     tuning_config = None
+    pinned_tactic_valid = dict()
 
     def __init__(self,
                  num_experts: int,
@@ -671,13 +707,46 @@ class FP4BlockScaleMoERunner(TunableRunner):
 
         return tuning_config
 
+    def pinned_tactic(self, num_tokens: int,
+                      hidden_size: int) -> Optional[List[int]]:
+        """The [tile, config] pinned for this shape on SM 10.3
+        (``_SM103_PINNED_MOE_TACTICS``), or None (no row, or the row is not a
+        valid tactic for the shape)."""
+        if get_sm_version() != 103:
+            return None
+        tactic = _SM103_PINNED_MOE_TACTICS.get(
+            (hidden_size, self.top_k, self.intermediate_size,
+             self.local_num_experts), {}).get(num_tokens)
+        if tactic is None:
+            return None
+        key = (self.act_type, hidden_size, self.top_k, self.intermediate_size,
+               self.local_num_experts, num_tokens)
+        valid = FP4BlockScaleMoERunner.pinned_tactic_valid.get(key)
+        if valid is None:
+            configs = self.get_runner().get_valid_configs(
+                self.top_k, hidden_size, self.intermediate_size,
+                self.local_num_experts, num_tokens)
+            valid = any(
+                int(t) == tactic[0] and int(c) == tactic[1] for t, c in configs)
+            FP4BlockScaleMoERunner.pinned_tactic_valid[key] = valid
+            if not valid:
+                logger.warning(
+                    f"Pinned FP4 MoE tactic {tactic} is not valid for "
+                    f"{key[1:]}; using the AutoTuner's pick")
+        return list(tactic) if valid else None
+
     def lookup_tactic(
             self, inputs: List[Optional[torch.Tensor]]) -> Optional[List[int]]:
         """The [tile, config] the op runs for ``inputs`` (its tensor arguments
         in ``FP4BlockScaleMoEInputs`` order; activations may be meta tensors):
-        the tuned choice, or None (not tuned yet). A caller that routes the
-        tokens itself builds its tables for this tile and passes the tactic as
-        ``prerouted_tactic``."""
+        the pinned or tuned choice, or None (not tuned yet). A caller that
+        routes the tokens itself builds its tables for this tile and passes the
+        tactic as ``prerouted_tactic``."""
+        hidden_states = FP4BlockScaleMoEInputs(*inputs).hidden_states
+        pinned = self.pinned_tactic(hidden_states.shape[0],
+                                    hidden_states.shape[1] * 2)
+        if pinned is not None:
+            return pinned
         shapes = tuple(
             t.size() if isinstance(t, torch.Tensor) else torch.Size((0, ))
             for t in inputs)
@@ -818,6 +887,10 @@ def fp4_block_scale_moe_runner(
             tuning_config_with_hook,
             input_tensors_for_tuner,
         )
+        pinned = kernel_runner.pinned_tactic(hidden_states.shape[0],
+                                             hidden_states.shape[1] * 2)
+        if pinned is not None:
+            best_tactic = pinned
         result = kernel_runner(
             input_tensors,
             tactic=[-1, -1] if best_tactic == -1 else best_tactic,
