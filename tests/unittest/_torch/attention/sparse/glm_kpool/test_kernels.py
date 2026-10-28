@@ -570,8 +570,12 @@ def test_pool_expansion_graph_replay_tracks_request_tables_and_tails():
 @pytest.mark.skipif(not HAS_FLASH_MLA, reason="FlashMLA not available")
 @pytest.mark.skipif(get_sm_version() < 90, reason="FlashMLA requires SM90 (Hopper) or later")
 @pytest.mark.parametrize("heads", [16, 64])
-def test_fp8_sparse_core_matches_dequantized_cache_and_replays_graph(heads):
-    """Exercise the selected-row core used by production prefill, decode and verify."""
+@pytest.mark.parametrize("width", [67, 2051])
+def test_fp8_sparse_core_matches_dequantized_cache_and_replays_graph(heads, width):
+    """Exercise the selected-row core used by production prefill, decode and verify.
+
+    2051 is GLM-5.3-Flash's selection width (512 pools of 4 plus a 3-token tail).
+    """
     from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import (
         GlmKpoolSparseAttention,
         latent_pool_rows,
@@ -587,7 +591,7 @@ def test_fp8_sparse_core_matches_dequantized_cache_and_replays_graph(heads):
     pool = storage[1::3]  # Nonzero offset and coalesced page stride.
     rows, base, stride = latent_pool_rows(pool)
     q = torch.randn(5, heads, 512, device="cuda", generator=generator).to(torch.bfloat16)
-    positions = torch.randint(0, 16, (5, 67), device="cuda", generator=generator)
+    positions = torch.randint(0, 16, (5, width), device="cuda", generator=generator)
     indices = (base + positions // 4 * stride + positions % 4).int()
     indices[:, -2] = -1
     indices[:, -1] = rows.shape[0]  # Preserve FlashMLA's out-of-range sentinel semantics.

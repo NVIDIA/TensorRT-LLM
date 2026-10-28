@@ -127,10 +127,11 @@ class GlmKpoolSparseAttention(TrtllmAttention):
 
     Metadata = TrtllmAttentionMetadata
 
-    #: FlashMLA tiles the top-k axis in blocks of 64 (``B_TOPK``); index rows
-    #: are padded to that multiple with ``-1`` (invalid) entries, which is
+    #: ``flash_mla_sparse_fwd`` needs the top-k axis in multiples of 128 on SM90
+    #: and for the SM100 128-head kernel (64 for the SM100 64-head kernel). Index
+    #: rows are padded to 128 with ``-1`` (invalid) entries, which is
     #: semantics-free by the kernel's own contract.
-    _KERNEL_TOPK_ALIGN = 64
+    _KERNEL_TOPK_ALIGN = 128
 
     # FlashMLA instantiates 64/128 query heads. Pad TP-local heads to the next
     # size and discard the extra outputs; heads attend independently.
