@@ -1683,14 +1683,24 @@ class TestRequestBudget(unittest.TestCase):
                                      beam_width=2)
         executor._validate_request_budget(fitting)
 
+    @staticmethod
+    def _make_budget_executor(resource_manager,
+                              max_num_tokens=64,
+                              encoder_max_num_tokens=64):
+        executor = PyExecutor.__new__(PyExecutor)
+        executor.resource_manager = resource_manager
+        executor.model_engine = SimpleNamespace(
+            max_num_tokens=max_num_tokens,
+            encoder_max_num_tokens=encoder_max_num_tokens)
+        return executor
+
     def test_validate_request_budget_checks_cross_manager(self):
         mgr = self._make_kv_cache_manager()
         mgr.kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS
         mgr.blocks_in_primary_pool = 2
         resource_manager = ResourceManager(
             {ResourceManagerType.CROSS_KV_CACHE_MANAGER: mgr})
-        executor = PyExecutor.__new__(PyExecutor)
-        executor.resource_manager = resource_manager
+        executor = self._make_budget_executor(resource_manager)
 
         oversized = self._make_request(prompt_len=20,
                                        max_new_tokens=5,
@@ -1702,6 +1712,77 @@ class TestRequestBudget(unittest.TestCase):
             executor._validate_request_budget(oversized)
 
         fitting = self._make_request(prompt_len=20,
+                                     max_new_tokens=5,
+                                     beam_width=1,
+                                     encoder_output_len=16)
+        executor._validate_request_budget(fitting)
+
+    def test_validate_request_budget_rejects_encoder_input_above_max_num_tokens(
+            self):
+        """An encoder input runs whole in one iteration, so one longer than
+        max_num_tokens can never be scheduled. A decoder prompt can be chunked,
+        so its length is not held to max_num_tokens here."""
+        executor = self._make_budget_executor(ResourceManager({}),
+                                              max_num_tokens=16,
+                                              encoder_max_num_tokens=16)
+
+        oversized = self._make_request(prompt_len=1,
+                                       max_new_tokens=5,
+                                       beam_width=1,
+                                       encoder_output_len=17)
+        with self.assertRaisesRegex(
+                ValueError,
+                r"encoder tokens \(17\) exceeds the limit value \(16\)"):
+            executor._validate_request_budget(oversized)
+
+        fitting = self._make_request(prompt_len=1,
+                                     max_new_tokens=5,
+                                     beam_width=1,
+                                     encoder_output_len=16)
+        executor._validate_request_budget(fitting)
+
+        decoder_only = self._make_request(prompt_len=200,
+                                          max_new_tokens=5,
+                                          beam_width=1)
+        executor._validate_request_budget(decoder_only)
+
+    def test_validate_request_budget_uses_smaller_encoder_token_limit(self):
+        executor = self._make_budget_executor(ResourceManager({}),
+                                              max_num_tokens=64,
+                                              encoder_max_num_tokens=16)
+
+        oversized = self._make_request(prompt_len=1,
+                                       max_new_tokens=5,
+                                       beam_width=1,
+                                       encoder_output_len=17)
+        with self.assertRaisesRegex(
+                ValueError,
+                r"encoder tokens \(17\) exceeds the limit value \(16\)"):
+            executor._validate_request_budget(oversized)
+
+    def test_validate_request_budget_rejects_encoder_output_above_cross_seq_len(
+            self):
+        """The encoder output must fit one sequence of the cross KV cache."""
+        mgr = self._make_kv_cache_manager()
+        mgr.kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS
+        mgr.max_seq_len = 16
+        resource_manager = ResourceManager(
+            {ResourceManagerType.CROSS_KV_CACHE_MANAGER: mgr})
+        executor = self._make_budget_executor(resource_manager,
+                                              max_num_tokens=64,
+                                              encoder_max_num_tokens=64)
+
+        oversized = self._make_request(prompt_len=1,
+                                       max_new_tokens=5,
+                                       beam_width=1,
+                                       encoder_output_len=17)
+        with self.assertRaisesRegex(
+                ValueError,
+                r"encoder tokens \(17\) exceeds the limit value \(16\).*"
+                r"cross KV cache max_seq_len=16"):
+            executor._validate_request_budget(oversized)
+
+        fitting = self._make_request(prompt_len=1,
                                      max_new_tokens=5,
                                      beam_width=1,
                                      encoder_output_len=16)

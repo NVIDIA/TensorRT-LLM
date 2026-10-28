@@ -669,6 +669,30 @@ def test_model_validation_fails_only_the_request_it_rejects() -> None:
     assert executor._validate_request_budget.call_count == 2
 
 
+def test_encoder_input_above_max_num_tokens_fails_only_that_request() -> None:
+    requests = [_make_admission_request(i) for i in range(3)]
+    for request, encoder_output_len in zip(requests, (16, 17, None)):
+        request.try_get_encoder_output_len = lambda length=encoder_output_len: length
+    executor = _make_admission_executor(None, requests)
+    executor.model_engine.max_num_tokens = 16
+    executor.model_engine.encoder_max_num_tokens = 16
+    executor.resource_manager = Mock(
+        get_request_kv_block_budgets=Mock(return_value=[]),
+        get_resource_manager=Mock(return_value=None),
+    )
+    for name in ("_validate_request_budget", "_validate_encoder_output_len"):
+        setattr(executor, name, types.MethodType(getattr(PyExecutor, name), executor))
+
+    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
+
+    assert admitted == [requests[0], requests[2]]
+    assert executor.active_requests == [requests[0], requests[2]]
+    executor._handle_errors.assert_called_once()
+    (error_msg,), kwargs = executor._handle_errors.call_args
+    assert "The number of encoder tokens (17) exceeds the limit value (16)" in error_msg
+    assert kwargs == {"requests": [requests[1]], "charge_budget": False}
+
+
 def test_model_validation_runs_after_the_sampler_and_before_the_budget() -> None:
     order = []
     model = types.SimpleNamespace(validate_request=lambda request: order.append("model"))
