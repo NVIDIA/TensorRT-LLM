@@ -37,7 +37,7 @@ def get_num_child_requests(request: ExecutorRequest) -> int:
 
 
 def collect_py_objects_from_requests(
-    requests: List, attribute_name: str, include_none: bool = False
+    requests: List, attribute_name: str, include_none: bool = False, *, allow_missing: bool = False
 ) -> Optional[Tuple[str, Dict]]:
     """Collect Python-only objects from requests.
 
@@ -45,7 +45,9 @@ def collect_py_objects_from_requests(
         requests: List of RequestQueueItem objects.
         attribute_name: Name of the attribute to collect.
         include_none: Include requests whose attribute value is None. When
-            enabled, the source request must have the attribute.
+            enabled, the source request must have the attribute unless
+            allow_missing is True.
+        allow_missing: Skip absent attributes when include_none is enabled.
 
     Returns:
         Tuple of (attribute_name, dict mapping request_id to object) or None if empty.
@@ -56,6 +58,8 @@ def collect_py_objects_from_requests(
             continue
         if item.request:
             if include_none:
+                if allow_missing and not hasattr(item.request, attribute_name):
+                    continue
                 req_id_to_obj[item.id] = getattr(item.request, attribute_name)
             else:
                 obj = getattr(item.request, attribute_name, None)
@@ -521,38 +525,33 @@ class RequestBroadcaster:
 
     def _collect_py_objects(self, new_requests: List) -> Tuple:
         """Collect Python-only objects from requests."""
-        py_logits_post_processors = collect_py_objects_from_requests(
-            new_requests, "py_logits_post_processors"
-        )
-        py_multimodal_data = collect_py_objects_from_requests(new_requests, "py_multimodal_data")
-        py_scheduling_params = collect_py_objects_from_requests(
-            new_requests, "py_scheduling_params"
-        )
-        py_num_logprobs = collect_py_objects_from_requests(new_requests, "py_num_logprobs")
-        py_disaggregated_params = collect_py_objects_from_requests(
-            new_requests, "py_disaggregated_params"
-        )
-        py_conversation_params = collect_py_objects_from_requests(
-            new_requests, "py_conversation_params", include_none=True
-        )
-        py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
-        py_lora_ckpt_source = collect_py_objects_from_requests(new_requests, "py_lora_ckpt_source")
-
-        return tuple(
-            filter(
-                None,
-                [
-                    py_logits_post_processors,
-                    py_multimodal_data,
-                    py_scheduling_params,
-                    py_num_logprobs,
-                    py_disaggregated_params,
-                    py_conversation_params,
-                    py_lora_path,
-                    py_lora_ckpt_source,
-                ],
+        py_objects = [
+            collect_py_objects_from_requests(new_requests, attribute_name)
+            for attribute_name in (
+                "py_logits_post_processors",
+                "py_multimodal_data",
+                "py_scheduling_params",
+                "py_num_logprobs",
+                "py_disaggregated_params",
+                "py_lora_path",
+                "py_lora_ckpt_source",
+                "py_logprobs_mode",
+                "py_logprobs_simple_format",
+                "py_return_routed_experts",
+                "py_arrival_time",
             )
+        ]
+        py_objects.extend(
+            [
+                collect_py_objects_from_requests(
+                    new_requests, "py_conversation_params", include_none=True
+                ),
+                collect_py_objects_from_requests(
+                    new_requests, "py_original_end_id", include_none=True, allow_missing=True
+                ),
+            ]
         )
+        return tuple(filter(None, py_objects))
 
     @nvtx_range("broadcast_requests")
     def _broadcast_requests(
