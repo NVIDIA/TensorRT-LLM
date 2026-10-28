@@ -35,9 +35,11 @@ from tensorrt_llm.serve.serving_extensions import ServingExtension, register_ser
 #: The chat template rejects values outside its own set with a 400, so the
 #: table emits only accepted levels; values absent from it are dropped so the
 #: template's own default applies. The non-identity rows map protocol efforts
-#: the template lacks: `max` is Anthropic's top tier, while `none` and the
-#: legacy `minimal` ask for the least reasoning and pin the floor explicitly
-#: rather than falling through to a high template default.
+#: the template lacks: `max` is Anthropic's top tier. The template has no way
+#: to turn reasoning off: it only sets a reasoning strength, from `low` to
+#: `xhigh`, and defaults to `xhigh`. So `none` and the legacy `minimal` get the
+#: least reasoning it offers, `low`, rather than falling through to that
+#: default.
 _MUSESPARK_EFFORT_NORMALIZATION = {
     "low": "low",
     "medium": "medium",

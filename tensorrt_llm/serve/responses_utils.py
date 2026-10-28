@@ -1628,6 +1628,7 @@ async def _create_input_tokens(
         processor=processor,
         chat_template=chat_template,
         tools=flat_tool_dicts,
+        model_type=model_type,
     )
     tools_dict = _tools_for_chat_template(request.tools, flat_tool_dicts,
                                           template_source)

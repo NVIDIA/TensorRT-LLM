@@ -21,6 +21,12 @@ from tensorrt_llm.inputs.chat_template_guard import (
     unreferenced_chat_template_kwargs,
     validate_chat_template_kwargs,
 )
+from tensorrt_llm.inputs.content_format import ContentFormat
+from tensorrt_llm.inputs.registry import (
+    MULTIMODAL_PLACEHOLDER_REGISTRY,
+    MultimodalPlaceholderMetadata,
+    MultimodalPlaceholderPlacement,
+)
 from tensorrt_llm.inputs.utils import apply_chat_template, rendered_hf_chat_template_source
 from tensorrt_llm.serve.render import RenderResources, render_chat
 from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
@@ -316,6 +322,40 @@ class TestRenderedChatTemplateSource:
         # source for the referenced-kwargs analysis to read.
         tokenizer = tokenizer_cls.__new__(tokenizer_cls)
         assert rendered_hf_chat_template_source(tokenizer=tokenizer, processor=None) is None
+
+    def test_model_that_skips_chat_templates_has_no_source(self):
+        # apply_chat_template joins such a model's content and never renders the
+        # tokenizer's template; both functions take that from one dispatch.
+        model_type = "passthrough_model_for_source_test"
+        MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+            model_type,
+            MultimodalPlaceholderMetadata(
+                placeholder_map={"image": "<image>"},
+                placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+                content_format=ContentFormat.PASSTHROUGH,
+            ),
+        )
+        try:
+            tokenizer = _FakeJinjaTokenizer(TEMPLATE_WITH_TOGGLE)
+            assert (
+                rendered_hf_chat_template_source(
+                    tokenizer=tokenizer, processor=None, model_type=model_type
+                )
+                is None
+            )
+            assert (
+                apply_chat_template(
+                    model_type=model_type,
+                    tokenizer=tokenizer,
+                    processor=None,
+                    conversation=[{"role": "user", "content": "hi"}],
+                    add_generation_prompt=True,
+                    mm_placeholder_counts=[{}],
+                )
+                == "hi"
+            )
+        finally:
+            MULTIMODAL_PLACEHOLDER_REGISTRY.remove_placeholder_metadata(model_type)
 
     def test_jinja_tokenizer_source_returned(self):
         tokenizer = _FakeJinjaTokenizer(TEMPLATE_WITH_TOGGLE)

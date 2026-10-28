@@ -237,6 +237,12 @@ TEMPLATE_EFFORT_AND_THINKING = (
 # A template that implements no reasoning controls at all.
 TEMPLATE_PLAIN = "{%- for message in messages %}{{ message['content'] }}{%- endfor %}"
 
+# A template whose reads the analysis cannot see: they may sit in the include.
+TEMPLATE_WITH_INCLUDE = (
+    "{%- include 'reasoning.jinja' -%}"
+    "{%- for message in messages %}{{ message['content'] }}{%- endfor %}"
+)
+
 
 def make_responses_request(**kwargs) -> ResponsesRequest:
     kwargs.setdefault("model", "musespark_open")
@@ -272,6 +278,14 @@ class TestResponsesReasoningKwargsInjection:
         kwargs = reasoning_chat_template_kwargs(req, template_source=TEMPLATE_PLAIN)
         assert kwargs == {"thinking": True}
         validate_chat_template_kwargs(TEMPLATE_PLAIN, kwargs)
+
+    def test_template_the_analysis_cannot_see_into_gets_only_the_parser_consumed_key(self):
+        # The include may or may not read `reasoning_effort`, so it is left out
+        # and the template keeps its own default. `thinking` stays: the
+        # reasoning parsers consume it whatever the template reads.
+        req = make_responses_request(reasoning={"effort": "high"})
+        kwargs = reasoning_chat_template_kwargs(req, template_source=TEMPLATE_WITH_INCLUDE)
+        assert kwargs == {"thinking": True}
 
     def test_effort_only_template_injection_passes_the_guard(self):
         # End to end: what the routing constructs for a reasoning-bearing

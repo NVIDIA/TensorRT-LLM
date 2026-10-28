@@ -116,10 +116,7 @@ class MuseSparkReasoningParser(BaseReasoningParser):
         r"^(?:<\|start\|>assistant|assistant)?\s+to=" + _NAME_CHARS + r"+"
     )
 
-    # Stripped-token fallback markers (plain text survives detokenization).
-    _BARE_SELF = " to=self"
-    _BARE_USER = " to=user"
-    _BARE_COMMENTARY = " to=commentary"
+    # Stripped-token fallback: the plain header text that survives detokenization.
     _STRIPPED_HEADER_RE = re.compile(
         r"(?:^|(?<=assistant)) to=(self|user|commentary|"
         + _NAME_CHARS

@@ -161,6 +161,16 @@ def test_musespark_parameter_value_not_trimmed(musespark_parser):
     assert musespark_calls_as_dicts(r.calls) == [(0, "f", {"a": " x \n"})]
 
 
+def test_musespark_block_in_private_reasoning_is_not_a_call(
+    musespark_parser, musespark_sample_tools
+):
+    """A block written inside a ``to=self`` message is planning, not a call."""
+    text = f" to=self{MS_M}Plan: {MS_WEATHER}{MS_EOM}{MS_S}assistant to=user{MS_M}Done.{MS_EOT}"
+    r = musespark_parser.detect_and_parse(text, musespark_sample_tools)
+    assert r.calls == []
+    assert r.normal_text == "Done."
+
+
 def test_musespark_nested_json_parameter(musespark_parser, musespark_sample_tools):
     opts = '{"units": ["c", "f"], "flags": {"verbose": true, "n": null}}'
     text = musespark_block(musespark_invoke("get_weather", city="Paris", opts=opts))
@@ -466,6 +476,8 @@ EQUIV_TEXTS = [
     f" to=self{MS_M}think{MS_EOM}{MS_S}assistant to=user{MS_M}Hi{MS_EOT}",
     f"{MS_S}assistant to=user{MS_M}Hi{MS_EOM}{MS_S}assistant to=self{MS_M}secret{MS_EOT}",
     f" to=commentary{MS_M}Checking.{MS_EOM}{MS_S}assistant to=user{MS_M}Done.{MS_EOT}",
+    f" to=self{MS_M}Plan: {MS_WEATHER}{MS_EOM}{MS_S}assistant to=user{MS_M}Done.{MS_EOT}",
+    f" to=self{MS_M}{MS_TIME}{MS_EOM}{MS_S}assistant to=get_weather{MS_M}{MS_WEATHER}{MS_EOT}",
 ]
 
 

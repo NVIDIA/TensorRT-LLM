@@ -9,13 +9,15 @@ does. Runs against the checkpoint's own tokenizer and chat template under
 ``LLM_MODELS_ROOT``; skips when the checkpoint is absent.
 """
 
+import json
 import os
 
 import pytest
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ChatCompletionToolsParam
 from tensorrt_llm.serve.render import RenderResources, render_chat
+from tensorrt_llm.serve.tool_parser.musespark_parser import MuseSparkToolParser
 from tensorrt_llm.tokenizer import load_hf_tokenizer
 
 pytestmark = pytest.mark.cpu_only
@@ -102,3 +104,63 @@ def test_tool_calls_with_string_arguments_render(resources):
     text = _render(resources, messages=TOOL_CALL_MESSAGES, tools=TOOLS)
     assert "get_weather" in text
     assert "Paris" in text
+
+
+RUN_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "run",
+        "description": "Run a job.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "code": {"type": "string"},
+                "days": {"type": "integer"},
+                "metric": {"type": "boolean"},
+                "opts": {"type": "object"},
+            },
+        },
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"city": "Paris"},
+        # Strings whose text is also valid JSON stay strings, quotes included.
+        {"city": "123", "code": '"q"'},
+        {"days": 3, "metric": True, "opts": {"units": ["c", "f"]}},
+    ],
+)
+def test_tool_call_arguments_round_trip_through_the_template(resources, arguments):
+    """The tool parser reads back the arguments the template writes into history.
+
+    The template writes a string argument as its bare text and any other value
+    as JSON, which the parser's schema-aware decoding undoes.
+    """
+    messages = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "run", "arguments": json.dumps(arguments)},
+                }
+            ],
+        },
+        {"role": "tool", "content": "done", "tool_call_id": "call_1"},
+    ]
+    text = _render(resources, messages=messages, tools=[RUN_TOOL])
+    # The call in the history is the last block; the system prompt's format
+    # examples come before it.
+    start = text.rindex("<atem:function_calls>")
+    end = text.index("</atem:function_calls>", start) + len("</atem:function_calls>")
+    parsed = MuseSparkToolParser().detect_and_parse(
+        text[start:end], [ChatCompletionToolsParam(**RUN_TOOL)]
+    )
+    assert [(c.name, json.loads(c.parameters)) for c in parsed.calls] == [("run", arguments)]

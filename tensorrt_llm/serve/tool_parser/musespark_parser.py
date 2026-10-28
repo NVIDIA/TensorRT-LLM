@@ -228,8 +228,10 @@ class MuseSparkToolParser(BaseToolParser):
 
         ``normal_text`` is everything outside the tool blocks, with headers,
         ``to=self`` spans and structural tokens removed, so commentary prose
-        before a call is kept.
+        before a call is kept. A block inside a ``to=self`` span is private
+        reasoning, not a call.
         """
+        text = self._drop_self_spans(text)
         expect_tool_calls = any(
             m.group(2) not in self._NON_TOOL_RECIPIENTS for m in self._HEADER_RE.finditer(text)
         )
@@ -264,21 +266,38 @@ class MuseSparkToolParser(BaseToolParser):
         normal_text = self._strip_headers_and_reasoning("".join(segments))
         return StreamingParseResult(normal_text=normal_text.strip(), calls=calls)
 
-    def _strip_headers_and_reasoning(self, text: str) -> str:
-        """Non-streaming cleanup of text outside tool blocks."""
-        out: List[str] = []
+    def _self_spans(self, text: str) -> List[Tuple[re.Match, int, bool]]:
+        """Each `` to=self`` message in ``text``: ``(header, end, closed)``.
+
+        A message runs from its header through ``<|eom|>``/``<|eot|>``; one
+        that has not ended yet runs to the end of ``text`` and is not closed.
+        Both parse paths skip these spans before they look for a tool block.
+        """
+        spans: List[Tuple[re.Match, int, bool]] = []
         pos = 0
         while True:
             m = self._HEADER_RE.search(text, pos)
             if m is None:
-                out.append(text[pos:])
-                break
-            out.append(text[pos : m.start()])
+                return spans
             pos = m.end()
             if m.group(2) == "self":
                 end_pos, end_tok = self._find_first(text[pos:], (self.EOM, self.EOT))
-                pos = len(text) if end_pos < 0 else pos + end_pos + len(end_tok)
-        return self._clean("".join(out))
+                closed = end_pos >= 0
+                pos = pos + end_pos + len(end_tok) if closed else len(text)
+                spans.append((m, pos, closed))
+
+    def _drop_self_spans(self, text: str) -> str:
+        out: List[str] = []
+        pos = 0
+        for header, end, _ in self._self_spans(text):
+            out.append(text[pos : header.start()])
+            pos = end
+        out.append(text[pos:])
+        return "".join(out)
+
+    def _strip_headers_and_reasoning(self, text: str) -> str:
+        """Non-streaming cleanup of text outside tool blocks."""
+        return self._clean(self._HEADER_RE.sub("", self._drop_self_spans(text)))
 
     # ------------------------------------------------------------- streaming
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
@@ -304,6 +323,17 @@ class MuseSparkToolParser(BaseToolParser):
                     start_pos = self._buffer.find(self.bot_token)
                     if start_pos >= 0:
                         leading = self._buffer[:start_pos]
+                        spans = self._self_spans(leading)
+                        if spans and not spans[-1][2]:
+                            # The block opens inside a private message: skip it with
+                            # the message, as the header-first path below would.
+                            header = spans[-1][0]
+                            before = self._strip_headers_and_reasoning(leading[: header.start()])
+                            if before:
+                                content_parts.append(before)
+                            self._buffer = self._buffer[header.end() :]
+                            self._in_reasoning_block = True
+                            continue
                         tail = self._HEADER_TAIL_RE.search(leading)
                         if tail is not None:
                             leading = leading[: tail.start()]
