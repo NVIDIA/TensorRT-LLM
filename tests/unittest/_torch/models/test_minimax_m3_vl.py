@@ -21,7 +21,7 @@ import io
 import json
 import os
 from types import SimpleNamespace
-from typing import Dict, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pytest
@@ -1829,34 +1829,91 @@ def test_real_checkpoint_video_fast_path_matches_processor_input_ids(
     follows a newline, as in trtllm-serve's rendered prompts (see
     ``_video_timestamp_ids`` for text glued to the marker).
     """
-    from tensorrt_llm.inputs.multimodal_data import VideoData
-
     proc, tokenizer = _real_checkpoint_input_processor()
     rng = np.random.default_rng(num_frames)
     frames = [rng.integers(0, 256, size=(side, side, 3), dtype=np.uint8) for _ in range(num_frames)]
-    video = frames
-    if timed:
-        # Every 7th frame of a 3 fps source: 0.0, 4.7, 9.3, 14.0, ... seconds.
-        video = VideoData(
-            frames=frames,
-            metadata={
-                "total_num_frames": 7 * num_frames,
-                "fps": 3.0,
-                "duration": 7 * num_frames / 3.0,
-                "frames_indices": list(range(0, 7 * num_frames, 7)),
-            },
-        )
-    prompt = "Watch:\n]<]video[>[ then summarize."
-    sampling = SimpleNamespace(add_special_tokens=False, truncate_prompt_tokens=None)
+    video = _timed_video(frames) if timed else frames
 
+    fast_ids, grid = _expand_video_prompt_both_ways(
+        proc, tokenizer, "Watch:\n]<]video[>[ then summarize.", [video]
+    )
+
+    temporal = int(proc.processor.video_processor.temporal_patch_size)
+    brackets = -(-num_frames // temporal)
+    assert int(grid[0, 0]) == brackets
+    vs_id = tokenizer.convert_tokens_to_ids("]<]start of image[>[")
+    assert fast_ids.count(vs_id) == brackets
+    assert tokenizer.decode(fast_ids).count(" seconds[>[") == (brackets if timed else 0)
+
+
+@pytest.mark.parametrize(
+    "timing",
+    [(True, False), (False, True), (True, True)],
+    ids=["timed_untimed", "untimed_timed", "timed_timed"],
+)
+def test_real_checkpoint_two_video_fast_path_matches_processor_input_ids(timing):
+    """Two videos in one prompt expand on the token-ID path as the checkpoint's processor does.
+
+    The processor gets one ``video_metadata`` entry per video, with
+    ``fps=None`` for a frame list, and timestamps only the timed videos. The
+    markers are adjacent, so the second video's first timestamp follows the
+    first video's ``VISION_END`` rather than prompt text.
+    """
+    proc, tokenizer = _real_checkpoint_input_processor()
+    rng = np.random.default_rng(len(timing))
+    num_frames = (3, 4)
+    videos = []
+    for n, timed in zip(num_frames, timing):
+        frames = [rng.integers(0, 256, size=(230, 230, 3), dtype=np.uint8) for _ in range(n)]
+        videos.append(_timed_video(frames) if timed else frames)
+
+    fast_ids, grid = _expand_video_prompt_both_ways(
+        proc, tokenizer, "Watch:\n]<]video[>[]<]video[>[ then compare.", videos
+    )
+
+    temporal = int(proc.processor.video_processor.temporal_patch_size)
+    brackets = [-(-n // temporal) for n in num_frames]
+    assert grid[:, 0].tolist() == brackets
+    vs_id = tokenizer.convert_tokens_to_ids("]<]start of image[>[")
+    assert fast_ids.count(vs_id) == sum(brackets)
+    assert tokenizer.decode(fast_ids).count(" seconds[>[") == sum(
+        b for b, timed in zip(brackets, timing) if timed
+    )
+
+
+def _timed_video(frames: List[np.ndarray]) -> Any:
+    """``VideoData`` of every 7th frame of a 3 fps source: 0.0, 4.7, 9.3, 14.0, ... seconds."""
+    from tensorrt_llm.inputs.multimodal_data import VideoData
+
+    n = len(frames)
+    return VideoData(
+        frames=frames,
+        metadata={
+            "total_num_frames": 7 * n,
+            "fps": 3.0,
+            "duration": 7 * n / 3.0,
+            "frames_indices": list(range(0, 7 * n, 7)),
+        },
+    )
+
+
+def _expand_video_prompt_both_ways(
+    proc: Any, tokenizer: Any, prompt: str, videos: List[Any]
+) -> Tuple[List[int], torch.Tensor]:
+    """Run ``prompt`` through the text-prompt and the token-ID paths and check that they agree.
+
+    Returns the token-ID path's ids and the ``video_grid_thw`` rows, which
+    both paths must report identically.
+    """
+    sampling = SimpleNamespace(add_special_tokens=False, truncate_prompt_tokens=None)
     slow_ids, slow_extra = proc.call_with_text_prompt(
-        {"prompt": prompt, "multi_modal_data": {"video": [video]}, "chat_template_applied": True},
+        {"prompt": prompt, "multi_modal_data": {"video": videos}, "chat_template_applied": True},
         sampling,
     )
     fast_ids, fast_extra = proc.call_with_token_ids(
         {
             "prompt_token_ids": tokenizer.encode(prompt, add_special_tokens=False),
-            "multi_modal_data": {"video": [video]},
+            "multi_modal_data": {"video": videos},
         },
         sampling,
     )
@@ -1867,16 +1924,11 @@ def test_real_checkpoint_video_fast_path_matches_processor_input_ids(
     assert slow_ids[len(prefix) :] == fast_ids
 
     grid = torch.as_tensor(slow_extra["multimodal_data"]["video"]["video_grid_thw"]).reshape(-1, 3)
-    temporal = int(proc.processor.video_processor.temporal_patch_size)
-    brackets = -(-num_frames // temporal)
-    assert int(grid[0, 0]) == brackets
-    vs_id = tokenizer.convert_tokens_to_ids("]<]start of image[>[")
-    assert fast_ids.count(vs_id) == brackets
-    assert tokenizer.decode(fast_ids).count(" seconds[>[") == (brackets if timed else 0)
     assert torch.equal(
         grid,
         torch.as_tensor(fast_extra["multimodal_data"]["video"]["video_grid_thw"]).reshape(-1, 3),
     )
+    return fast_ids, grid
 
 
 def _smooth_uint8_image(side: int) -> np.ndarray:
@@ -3047,6 +3099,33 @@ def test_video_timing_is_forwarded_to_the_processor(monkeypatch):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
+    "frames_indices",
+    [
+        torch.tensor([0, 13, 26, 39]),
+        np.array([0, 13, 26, 39]),
+        list(torch.tensor([0, 13, 26, 39])),
+    ],
+    ids=["tensor", "array", "list_of_tensors"],
+)
+def test_video_timing_accepts_index_tensors(monkeypatch, frames_indices):
+    """Frame indices given as a tensor, an array or a list of 0-d tensors keep the video's timing, as plain ints."""
+    recorder = _MediaRecordingProcessor()
+    proc, _ = _tokenizer_only_processor(monkeypatch, recorder)
+    frames = [np.zeros((28, 42, 3), dtype=np.uint8)] * 4
+    video = SimpleNamespace(frames=frames, metadata={"fps": 10, "frames_indices": frames_indices})
+
+    proc.call_with_text_prompt(
+        {"prompt": "watch", "multi_modal_data": {"video": [video]}}, SimpleNamespace()
+    )
+    metadata = recorder.call_kwargs[0]["videos_kwargs"]["video_metadata"]
+    assert metadata == [
+        {"total_num_frames": 4, "fps": 10.0, "duration": None, "frames_indices": [0, 13, 26, 39]}
+    ]
+    assert all(type(i) is int for i in metadata[0]["frames_indices"])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
     "metadata",
     [
         "frame_list",
@@ -3061,6 +3140,8 @@ def test_video_timing_is_forwarded_to_the_processor(monkeypatch):
         {"fps": 10.0, "frames_indices": [0, 5, 9]},
         {"fps": 10.0, "frames_indices": [0, None]},
         {"fps": 10.0, "frames_indices": [-10, 1]},
+        {"fps": 10.0, "frames_indices": 2},
+        {"fps": 10.0, "frames_indices": torch.tensor([0.0, 1.0])},
     ],
     ids=[
         "frame_list",
@@ -3075,6 +3156,8 @@ def test_video_timing_is_forwarded_to_the_processor(monkeypatch):
         "more_frame_indices_than_frames",
         "none_frame_index",
         "negative_frame_index",
+        "scalar_frame_indices",
+        "float_tensor_frame_indices",
     ],
 )
 def test_video_without_timing_passes_no_metadata(monkeypatch, metadata):

@@ -2061,7 +2061,9 @@ class MiniMaxM3VLInputProcessor:
         ``]<]{t} seconds[>[`` timestamp before each temporal group. A video
         without usable timing (no metadata, ``fps`` missing or not a finite
         positive number, or not one non-negative integer frame index per
-        delivered frame) gets ``fps=None`` and no timestamps. Only the keys
+        delivered frame) gets ``fps=None`` and no timestamps, with a debug log
+        when metadata was given. Frame indices may be a list, a tensor, an
+        array, or a list of 0-d tensors or numpy scalars. Only the keys
         transformers' ``VideoMetadata`` accepts are passed, and
         ``total_num_frames`` is the number of frames delivered, because the
         media loader has already sampled them.
@@ -2069,19 +2071,31 @@ class MiniMaxM3VLInputProcessor:
         metadata = getattr(video, "metadata", None)
         metadata = metadata if isinstance(metadata, Mapping) else {}
         fps = metadata.get("fps")
-        frames_indices = metadata.get("frames_indices")
+        indices = metadata.get("frames_indices")
+        # Check the values of a tensor or array, and of 0-d tensors or numpy scalars in a list.
+        frames_indices = indices.tolist() if hasattr(indices, "tolist") else indices
+        if isinstance(frames_indices, Sequence):
+            frames_indices = [i.tolist() if hasattr(i, "tolist") else i for i in frames_indices]
         if (
             not isinstance(fps, numbers.Real)
             or isinstance(fps, bool)
             or not math.isfinite(fps)
             or fps <= 0
-            or frames_indices is None
+            or not isinstance(frames_indices, Sequence)
             or len(frames_indices) != num_frames
             or not all(
                 isinstance(i, numbers.Integral) and not isinstance(i, bool) and i >= 0
                 for i in frames_indices
             )
         ):
+            if metadata:
+                from tensorrt_llm.logger import logger
+
+                logger.debug(
+                    f"MiniMax-M3 video metadata has no usable timing (fps={fps!r}, "
+                    f"frames_indices of type {type(indices).__name__} for "
+                    f"{num_frames} frames); the video gets no timestamps."
+                )
             fps, frames_indices = None, range(num_frames)
         return {
             "total_num_frames": num_frames,
