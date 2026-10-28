@@ -7625,7 +7625,6 @@ class PyExecutor:
                     lora_config = getattr(request, "lora_config", None)
                     req_item.locality_domain_id = (
                         self.kv_cache_manager.pick_locality_domain(
-                            req_item.id,
                             getattr(request, "input_token_ids", None),
                             lora_config.task_id
                             if lora_config is not None else None,

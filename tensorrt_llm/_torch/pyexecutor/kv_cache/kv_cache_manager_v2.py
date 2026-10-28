@@ -4637,7 +4637,6 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def pick_locality_domain(
         self,
-        request_id: int,
         input_tokens: Sequence[int] | None = None,
         lora_task_id: int | None = None,
         cache_salt: str | None = None,
@@ -4648,9 +4647,9 @@ class KVCacheManagerV2(BaseResourceManager):
         holding the longest cached prefix of its prompt when that match covers at
         least one block and the domain is not already carrying clearly more live
         requests than the others. Otherwise placement is round-robin over arrival
-        order. Request ids are not used: ids that advance in even steps (a parent
-        and its child per request, or round-robin disagg ids) would otherwise pin
-        every request to one domain.
+        order rather than by request id: ids that advance in even steps (a parent
+        and its child per request, or round-robin disagg ids) would pin every
+        request to one domain.
         """
         if self.num_locality_domains <= 1:
             return None
@@ -7080,7 +7079,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if locality_domain_ids is not None:
                 request_locality_domain_id = locality_domain_ids[i]
             if request_locality_domain_id is None and self.num_locality_domains > 1:
-                request_locality_domain_id = self.pick_locality_domain(req_id)
+                request_locality_domain_id = self.pick_locality_domain()
             req = LlmRequest(
                 request_id=req_id,
                 max_new_tokens=1,

@@ -532,7 +532,7 @@ def _add_sequence(
     skips the page-less tail). Used to exercise the SWA + MTP transfer path.
     """
     kv_cache = mgr._create_kv_cache(
-        request_id, None, None, locality_domain_id=mgr.pick_locality_domain(request_id)
+        request_id, None, None, locality_domain_id=mgr.pick_locality_domain()
     )
     if not mgr.enable_block_reuse:
         kv_cache.stop_committing()
