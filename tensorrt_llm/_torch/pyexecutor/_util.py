@@ -2371,8 +2371,16 @@ class KvCacheCreator:
         max_attention_window = (None if estimating_kv_cache else
                                 self._get_draft_max_attention_window(
                                     max_seq_len, kv_cache_config))
-        return kv_cache_config.model_copy(
-            update={"max_attention_window": max_attention_window})
+        updates = {"max_attention_window": max_attention_window}
+        if kv_cache_config.mamba_state_config.kda_2fp4_replay:
+            # The separate drafter has its own architecture and cache format.
+            updates[
+                "mamba_state_config"] = kv_cache_config.mamba_state_config.model_copy(
+                    update={
+                        "kda_2fp4_replay": False,
+                        "kda_2fp4_prefill_only": False
+                    })
+        return kv_cache_config.model_copy(update=updates)
 
     def _create_one_model_draft_kv_cache_manager(
         self,
@@ -3605,10 +3613,8 @@ def _create_kv_cache_manager(
             if not issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
                 raise ValueError(
                     "KDA 2FP4 replay requires KV cache manager V2.")
-            if spec_config is not None:
-                raise ValueError(
-                    "KDA 2FP4 replay is a one-token decode path, not an MTP path."
-                )
+            from ..modules.kimi_kda.kda_2fp4 import validate_speculative_config
+            validate_speculative_config(spec_config)
             if get_sm_version() not in (100, 103):
                 raise ValueError(
                     "Native KDA 2FP4 replay requires Blackwell SM100/SM103.")
@@ -3624,7 +3630,7 @@ def _create_kv_cache_manager(
                 )
             kda_extra_kwargs[
                 "supports_generation"] = not state_config.kda_2fp4_prefill_only
-        if (spec_config is not None
+        if (spec_config is not None and not state_config.kda_2fp4_replay
                 and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
                 and getattr(backbone, "kda_draft_records", False)):
             kda_extra_kwargs["kda_draft_records"] = True

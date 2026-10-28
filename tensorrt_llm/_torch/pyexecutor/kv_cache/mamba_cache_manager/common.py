@@ -675,7 +675,10 @@ def _estimate_mamba_hybrid_cache_cost(
     if state_config.kda_2fp4_replay and not state_config.kda_2fp4_prefill_only:
         live_rows = max_resident_sequences + num_reserved_dummy_slots
         heads = params.num_heads // _mamba_effective_tp_size(mapping)
-        intercept += local_mamba_layers * live_rows * (heads * 16 * 128 * 8 + 4)
+        tokens = spec_config.tokens_per_gen_step if spec_config is not None else 0
+        intercept += local_mamba_layers * live_rows * (heads * (16 + tokens) * 128 * 8 + 4)
+        if tokens:
+            intercept += local_mamba_layers * max_batch_size * (tokens * 3 * heads * 128 * 2 + 4)
 
     if interval is None:
         regular_slope = 0

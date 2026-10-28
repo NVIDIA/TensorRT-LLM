@@ -4,9 +4,9 @@
 # KDA 2FP4 checkpoint replay
 
 This opt-in path reduces persistent Kimi KDA recurrent-state storage on
-Blackwell SM100/SM103. It is a **one-token decode** path, not speculative
-or MTP replay. Activations are BF16 and K=V=128. The existing recurrent
-decode remains the default.
+Blackwell SM100/SM103. It supports one-token decode and DSpark verification
+with up to seven draft tokens. Activations are BF16 and K=V=128. The
+existing recurrent decode remains the default.
 
 Enable it in a serving YAML:
 
@@ -48,6 +48,39 @@ history lengths. Replay supplies an immutable length snapshot directly to
 commit, without a separate metadata launch. Batch size, slot-pool capacity,
 and cache/projection row strides are runtime parameters for both kernels.
 
+## DSpark decoding
+
+The same enablement works with DSpark:
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  mamba_state_config:
+    kda_2fp4_replay: true
+speculative_config:
+  decoding_type: DSpark
+  max_draft_len: 6
+  block_size: 6
+  speculative_model: /path/to/dspark-checkpoint
+```
+
+Verification uses the primary NVFP4 checkpoint and native NVFP4 projections,
+as ordinary decode does. It writes candidate K/U/G and compact raw Conv
+inputs without changing either live checkpoint or accepted history length.
+One post-sampling Triton launch commits the accepted Conv prefix across all
+local KDA layers and advances their history lengths. Rejected candidates
+are ignored and overwritten by subsequent rounds.
+
+The single history allocation has capacity `16 + max_draft_len + 1`; there
+is no double buffer or per-token dense recurrent-state allocation. When an
+accepted prefix reaches or exceeds 16 tokens, the complete accepted prefix
+is committed and repacked once, reading both primary and residual. For
+example, 15 pending tokens plus eight accepted tokens commit 23 updates.
+This commit schedule need not produce bitwise-identical results to ordinary
+one-token quantized decoding; validate model accuracy for the intended
+DSpark workload. The separate drafter retains its own cache format and does
+not inherit the target's packed KDA-state settings.
+
 ## Dedicated prefill workers
 
 Use this configuration only on the dedicated context worker:
@@ -77,7 +110,7 @@ history rows, and new or resumed requests begin with empty histories.
 Context and generation workers must both use the packed checkpoint format;
 they may use different head-sharded TP sizes as supported by V2 transfer.
 
-Speculative decoding, beam search, non-BF16 activations, non-128 head
+Speculative backends other than DSpark, beam search, non-BF16 activations, non-128 head
 dimensions, legacy cache managers, and KV-pool rebalancing are not supported
 by this initial path. The native checkpoint projection is quantized and is
 not numerically equivalent to the default recurrent BF16/FP32 path; validate

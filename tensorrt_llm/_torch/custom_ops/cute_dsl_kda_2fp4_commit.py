@@ -703,6 +703,7 @@ def _commit_kernel(
     slot_stride: Int64,
     total: Int32,
     H: cutlass.Constexpr,
+    CAP: cutlass.Constexpr,
     FULL: cutlass.Constexpr,
 ):
     atom_a = tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.MN_INTER, cutlass.BFloat16)
@@ -790,7 +791,7 @@ def _commit_kernel(
                 ep = _expand4(pscw, outer0)
                 er = _expand4(rscw, outer0)
 
-                hist_base = (Int64(live) * H + Int64(h)) * 2048
+                hist_base = (Int64(live) * H + Int64(h)) * CAP * 128
 
                 cute.arch.barrier()
                 if tidx < Int32(128):
@@ -982,6 +983,7 @@ def _commit_launch(
     num_ctas: Int32,
     stream,
     H: cutlass.Constexpr,
+    CAP: cutlass.Constexpr,
     FULL: cutlass.Constexpr,
     SMEM: cutlass.Constexpr,
 ):
@@ -1008,6 +1010,7 @@ def _commit_launch(
         slot_stride,
         total,
         H,
+        CAP,
         FULL,
     ).launch(grid=[num_ctas, 1, 1], block=[NTHREADS, 1, 1], smem=SMEM, stream=stream)
 
@@ -1042,7 +1045,7 @@ def commit(
         return
     if _SM is None:
         _SM = torch.cuda.get_device_properties(pool.device).multi_processor_count
-    key = (int(H), bool(full_only))
+    key = (int(H), int(hk.shape[2]), bool(full_only))
     fn = _CACHE.get(key)
     if fn is None:
         smem_bytes = 4096 + 4096 + 512 + 512 + 64 + 64 + 1024
@@ -1062,6 +1065,7 @@ def commit(
             Int32(1),
             cutlass_torch.current_stream(),
             int(H),
+            int(hk.shape[2]),
             bool(full_only),
             int(smem_bytes),
         )

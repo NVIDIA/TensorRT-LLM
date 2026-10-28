@@ -496,7 +496,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             max_seq_len=max_seq_len,
             num_reserved_dummy_slots=num_reserved_dummy_slots,
             extra_state_bytes_per_rank=cls._extra_state_bytes_per_rank(
-                model_config, mapping, **kwargs
+                model_config, mapping, kv_cache_config=kv_cache_config, **kwargs
             ),
             include_explicit_snapshots=True,
             cap_partial_attention_snapshots=True,

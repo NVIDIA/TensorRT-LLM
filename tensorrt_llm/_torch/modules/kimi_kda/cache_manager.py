@@ -968,6 +968,13 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         self._kda_2fp4_requests: dict[int, int] = {}
         self._kda_2fp4_free_rows: list[int] = []
         self._kda_2fp4_slot_map = None
+        self._kda_2fp4_mtp = False
+        self._kda_2fp4_step_width = 1
+        self._kda_2fp4_history_capacity = 16
+        self._kda_2fp4_old_lengths = None
+        self._kda_2fp4_candidates = None
+        self._kda_2fp4_intermediate_indices = None
+        self._kda_2fp4_commit_descriptors = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
 
@@ -976,8 +983,9 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         state_config = self.kv_cache_config.mamba_state_config
         self.use_kda_2fp4_replay = state_config.kda_2fp4_replay
         if self.use_kda_2fp4_replay:
-            if self.spec_config is not None:
-                raise ValueError("KDA 2FP4 replay does not support speculative decoding.")
+            from .kda_2fp4 import validate_speculative_config
+
+            validate_speculative_config(self.spec_config)
             if self._requested_num_spec is not None:
                 raise ValueError("KDA 2FP4 replay cannot share MTP replay buffers.")
             context = self._state_layout
@@ -1001,6 +1009,13 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
                 )
             self.supports_generation = not state_config.kda_2fp4_prefill_only
             self.kda_context_only = not self.supports_generation
+            self._kda_2fp4_mtp = self.spec_config is not None
+            self._kda_2fp4_step_width = (
+                self.spec_config.tokens_per_gen_step if self._kda_2fp4_mtp else 1
+            )
+            self._kda_2fp4_history_capacity = (
+                16 + self._kda_2fp4_step_width if self._kda_2fp4_mtp else 16
+            )
             history_bytes = 0
             if self.supports_generation and context.mamba_pp_layers:
                 capacity = (
@@ -1009,7 +1024,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
                 )
                 self._kda_2fp4_free_rows = list(range(capacity - 1, -1, -1))
                 for _ in context.mamba_pp_layers:
-                    shape = (capacity, heads, 16, 128)
+                    shape = (capacity, heads, self._kda_2fp4_history_capacity, 128)
                     buffers = (
                         torch.empty(shape, dtype=torch.bfloat16, device="cuda"),
                         torch.empty(shape, dtype=torch.bfloat16, device="cuda"),
@@ -1018,6 +1033,29 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
                     )
                     self._kda_2fp4_buffers.append(buffers)
                     history_bytes += sum(t.numel() * t.element_size() for t in buffers)
+                if self._kda_2fp4_mtp:
+                    self._kda_2fp4_old_lengths = torch.empty(
+                        (len(context.mamba_pp_layers), context.max_batch_size),
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                    self._kda_2fp4_candidates = torch.empty(
+                        (
+                            len(context.mamba_pp_layers),
+                            context.max_batch_size,
+                            self._kda_2fp4_step_width,
+                            context.conv_state_shape[0],
+                        ),
+                        dtype=context.conv_state_dtype,
+                        device="cuda",
+                    )
+                    self._kda_2fp4_intermediate_indices = torch.arange(
+                        context.max_batch_size, dtype=torch.int32, device="cuda"
+                    )
+                    history_bytes += self._kda_2fp4_old_lengths.numel() * 4
+                    history_bytes += (
+                        self._kda_2fp4_candidates.numel() * self._kda_2fp4_candidates.element_size()
+                    )
             if history_bytes and self.kv_cache_config.max_gpu_total_bytes:
                 remaining = self.kv_cache_config.max_gpu_total_bytes - history_bytes
                 if remaining <= 0:
@@ -1043,6 +1081,20 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     @property
     def use_kda_replay_update(self) -> bool:
         return self._kda_replay is not None
+
+    @property
+    @override
+    def intermediate_conv_states(self) -> torch.Tensor | None:
+        if getattr(self, "_kda_2fp4_mtp", False):
+            return self._kda_2fp4_candidates
+        return super().intermediate_conv_states
+
+    @property
+    @override
+    def intermediate_state_indices(self) -> torch.Tensor | None:
+        if getattr(self, "_kda_2fp4_mtp", False):
+            return self._kda_2fp4_intermediate_indices
+        return super().intermediate_state_indices
 
     @property
     def keeps_kda_draft_records(self) -> bool:
@@ -1087,6 +1139,27 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
             self._kda_2fp4_slot_map = torch.full(
                 (self._state_layout.slot_capacity,), -1, dtype=torch.int32, device="cuda"
             )
+            if self._kda_2fp4_mtp:
+                descriptors = []
+                for i, (hk, hu, hg, lengths) in enumerate(self._kda_2fp4_buffers):
+                    state, conv = self.all_ssm_states[i], self.all_conv_states[i]
+                    descriptors.append(
+                        (
+                            state.data_ptr(),
+                            state.stride(0),
+                            conv.data_ptr(),
+                            conv.stride(0),
+                            hk.data_ptr(),
+                            hu.data_ptr(),
+                            hg.data_ptr(),
+                            lengths.data_ptr(),
+                            self._kda_2fp4_old_lengths[i].data_ptr(),
+                            self._kda_2fp4_candidates[i].data_ptr(),
+                        )
+                    )
+                self._kda_2fp4_commit_descriptors = torch.tensor(
+                    descriptors, dtype=torch.int64, device="cuda"
+                )
             from .kda_2fp4 import commit_history
 
             # Compile the partial flush on an unmapped slot during initialization.
@@ -1249,6 +1322,16 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
                 history = ReplayHistory(
                     *self._kda_2fp4_buffers[self.mamba_layer_offsets[layer_idx]],
                     self._kda_2fp4_slot_map,
+                    candidate_x=(
+                        self._kda_2fp4_candidates[self.mamba_layer_offsets[layer_idx]]
+                        if self._kda_2fp4_mtp
+                        else None
+                    ),
+                    old_lengths=(
+                        self._kda_2fp4_old_lengths[self.mamba_layer_offsets[layer_idx]]
+                        if self._kda_2fp4_mtp
+                        else None
+                    ),
                 )
             return Kda2Fp4State(
                 conv=self.get_conv_states(layer_idx),
@@ -1263,6 +1346,10 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         self._kda_2fp4_slot_map = None
         self._kda_2fp4_requests = {}
         self._kda_2fp4_free_rows = []
+        self._kda_2fp4_old_lengths = None
+        self._kda_2fp4_candidates = None
+        self._kda_2fp4_intermediate_indices = None
+        self._kda_2fp4_commit_descriptors = None
         super().shutdown()
 
     @override
@@ -1274,6 +1361,9 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     @classmethod
     @override
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
+        kv_cache_config = kwargs.get("kv_cache_config")
+        if kv_cache_config is not None and kv_cache_config.mamba_state_config.kda_2fp4_replay:
+            return 0
         return KDAReplayState.estimate_bytes_per_slot(model_config, mapping, **kwargs)
 
     @override
@@ -1290,7 +1380,29 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     def update_mamba_states(
         self, attn_metadata, num_accepted_tokens, state_indices=None, accepted_leaf_positions=None
     ) -> None:
-        if self.kda_context_only:
+        if self.kda_context_only or not self.supports_generation:
+            return
+        if getattr(self, "_kda_2fp4_mtp", False):
+            if self.local_num_mamba_layers == 0:
+                return
+            num_contexts = attn_metadata.num_contexts
+            num_generations = attn_metadata.num_seqs - num_contexts
+            if num_generations:
+                from .kda_2fp4 import commit_verified
+
+                if state_indices is None:
+                    state_indices = self.get_state_indices()
+                generation = slice(num_contexts, num_contexts + num_generations)
+                commit_verified(
+                    self._kda_2fp4_commit_descriptors,
+                    state_indices[generation].to(torch.int32),
+                    self._kda_2fp4_slot_map,
+                    num_accepted_tokens[generation],
+                    self._dummy_request_mask[generation],
+                    self.ssm_state_shape[0],
+                    self._kda_2fp4_history_capacity,
+                    self._kda_2fp4_step_width,
+                )
             return
         super().update_mamba_states(
             attn_metadata, num_accepted_tokens, state_indices, accepted_leaf_positions

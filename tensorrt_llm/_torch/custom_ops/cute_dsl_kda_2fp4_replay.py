@@ -80,10 +80,14 @@ def _kda_scalar_active(
     dt_bias,
     out,
     old_lengths,
+    candidate_x,
     lower_bound: cutlass.Float32,
     norm_eps: cutlass.Float32,
     heads: cutlass.Constexpr,
     bounded: cutlass.Constexpr,
+    tokens: cutlass.Constexpr,
+    mtp: cutlass.Constexpr,
+    token: cutlass.Int32,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     block, _, _ = cute.arch.block_idx()
@@ -91,10 +95,12 @@ def _kda_scalar_active(
     warp = cute.arch.warp_idx()
     batch = block // heads
     head = block - batch * heads
+    row = batch * tokens + token
 
     slot = slots[batch].to(cutlass.Int32)
     live = slot_map[slot].to(cutlass.Int32)
-    length = lengths[live].to(cutlass.Int32)
+    accepted_length = lengths[live].to(cutlass.Int32)
+    length = accepted_length + token
 
     smem = utils.SmemAllocator()
     s_q = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((K,)), byte_alignment=16)
@@ -186,45 +192,48 @@ def _kda_scalar_active(
                 ),
                 state_mbar,
             )
-            if length > 0:
-                history_bytes = (
-                    tma_hk.global_tx_bytes() + tma_hu.global_tx_bytes() + tma_hg.global_tx_bytes()
-                )
-                prims.mbarrier_arrive_expect_tx(history_load_mbar, history_bytes)
-                prims.cp_async_bulk_tensor_shared_cta_global(
-                    cache_hk,
-                    tma_hk.get_ptr(),
-                    (
-                        cutlass.Int32(0),
-                        cutlass.Int32(0),
-                        head,
-                        live,
-                    ),
-                    history_load_mbar,
-                )
-                prims.cp_async_bulk_tensor_shared_cta_global(
-                    cache_hg,
-                    tma_hg.get_ptr(),
-                    (
-                        cutlass.Int32(0),
-                        cutlass.Int32(0),
-                        cutlass.Int32(0),
-                        head,
-                        live,
-                    ),
-                    history_load_mbar,
-                )
-                prims.cp_async_bulk_tensor_shared_cta_global(
-                    cache_hu,
-                    tma_hu.get_ptr(),
-                    (
-                        cutlass.Int32(0),
-                        cutlass.Int32(0),
-                        head,
-                        live,
-                    ),
-                    history_load_mbar,
-                )
+            if cutlass.const_expr(not mtp):
+                if length > 0:
+                    history_bytes = (
+                        tma_hk.global_tx_bytes()
+                        + tma_hu.global_tx_bytes()
+                        + tma_hg.global_tx_bytes()
+                    )
+                    prims.mbarrier_arrive_expect_tx(history_load_mbar, history_bytes)
+                    prims.cp_async_bulk_tensor_shared_cta_global(
+                        cache_hk,
+                        tma_hk.get_ptr(),
+                        (
+                            cutlass.Int32(0),
+                            cutlass.Int32(0),
+                            head,
+                            live,
+                        ),
+                        history_load_mbar,
+                    )
+                    prims.cp_async_bulk_tensor_shared_cta_global(
+                        cache_hg,
+                        tma_hg.get_ptr(),
+                        (
+                            cutlass.Int32(0),
+                            cutlass.Int32(0),
+                            cutlass.Int32(0),
+                            head,
+                            live,
+                        ),
+                        history_load_mbar,
+                    )
+                    prims.cp_async_bulk_tensor_shared_cta_global(
+                        cache_hu,
+                        tma_hu.get_ptr(),
+                        (
+                            cutlass.Int32(0),
+                            cutlass.Int32(0),
+                            head,
+                            live,
+                        ),
+                        history_load_mbar,
+                    )
 
     width = heads * K
     q_channel = head * K + tidx
@@ -232,13 +241,13 @@ def _kda_scalar_active(
     v_channel = 2 * width + head * K + tidx
 
     # Conv4 uses the old window, then publishes [old1, old2, raw].
-    raw_q = x[(batch, q_channel)]
-    raw_k = x[(batch, k_channel)]
-    raw_v = x[(batch, v_channel)]
-    z_bf16 = z[(batch, head, tidx)]
+    raw_q = x[(row, q_channel)]
+    raw_k = x[(row, k_channel)]
+    raw_v = x[(row, v_channel)]
+    z_bf16 = z[(row, head, tidx)]
     norm_bf16 = norm_weight[tidx]
-    beta_bf16 = beta[(batch, head)]
-    gate_bf16 = gate[(batch, head * K + tidx)]
+    beta_bf16 = beta[(row, head)]
+    gate_bf16 = gate[(row, head * K + tidx)]
     dt_value = dt_bias[head * K + tidx]
     a_log_value = a_log[head]
     pool_off = cute.crd2idx((slot, head, 0), pool.layout)
@@ -260,6 +269,42 @@ def _kda_scalar_active(
     q0, q1, q2 = q_state[0], q_state[1], q_state[2]
     k0, k1, k2 = k_state[0], k_state[1], k_state[2]
     v0, v1, v2 = v_state[0], v_state[1], v_state[2]
+
+    if cutlass.const_expr(mtp):
+        if token > 0:
+            if token >= 3:
+                q0 = x[(row - 3, q_channel)]
+            elif token == 2:
+                q0 = q_state[2]
+            else:
+                q0 = q_state[1]
+            if token >= 2:
+                q1 = x[(row - 2, q_channel)]
+            else:
+                q1 = q_state[2]
+            q2 = x[(row - 1, q_channel)]
+            if token >= 3:
+                k0 = x[(row - 3, k_channel)]
+            elif token == 2:
+                k0 = k_state[2]
+            else:
+                k0 = k_state[1]
+            if token >= 2:
+                k1 = x[(row - 2, k_channel)]
+            else:
+                k1 = k_state[2]
+            k2 = x[(row - 1, k_channel)]
+            if token >= 3:
+                v0 = x[(row - 3, v_channel)]
+            elif token == 2:
+                v0 = v_state[2]
+            else:
+                v0 = v_state[1]
+            if token >= 2:
+                v1 = x[(row - 2, v_channel)]
+            else:
+                v1 = v_state[2]
+            v2 = x[(row - 1, v_channel)]
 
     weight_raw = conv_weight.iterator.raw_ptr()
     wq = (weight_raw + q_channel * 4).load(count=4, alignment=8)
@@ -285,18 +330,23 @@ def _kda_scalar_active(
     s_k[tidx] = ak.to(cutlass.BFloat16)
     v_bf16 = av.to(cutlass.BFloat16)
 
-    q_state_ptr.store(
-        cutlass.Vector.from_elements((q1, q2, raw_q), dtype=cutlass.BFloat16),
-        alignment=2,
-    )
-    k_state_ptr.store(
-        cutlass.Vector.from_elements((k1, k2, raw_k), dtype=cutlass.BFloat16),
-        alignment=2,
-    )
-    v_state_ptr.store(
-        cutlass.Vector.from_elements((v1, v2, raw_v), dtype=cutlass.BFloat16),
-        alignment=2,
-    )
+    if cutlass.const_expr(mtp):
+        candidate_x[(batch, token, q_channel)] = raw_q
+        candidate_x[(batch, token, k_channel)] = raw_k
+        candidate_x[(batch, token, v_channel)] = raw_v
+    else:
+        q_state_ptr.store(
+            cutlass.Vector.from_elements((q1, q2, raw_q), dtype=cutlass.BFloat16),
+            alignment=2,
+        )
+        k_state_ptr.store(
+            cutlass.Vector.from_elements((k1, k2, raw_k), dtype=cutlass.BFloat16),
+            alignment=2,
+        )
+        v_state_ptr.store(
+            cutlass.Vector.from_elements((v1, v2, raw_v), dtype=cutlass.BFloat16),
+            alignment=2,
+        )
     cute.arch.barrier()
 
     # Simultaneous Q/K norm reductions.
@@ -431,8 +481,8 @@ def _kda_scalar_active(
         )
     if tidx < 64:
         # Private N padding rows must be true zero regardless of their scales.
-        for row in cutlass.range_constexpr(2, 8):
-            (mma_b.subview(row * 64 + tidx)).data_ptr().apply_swizzle(swizzle_s64).store(
+        for padding_row in cutlass.range_constexpr(2, 8):
+            (mma_b.subview(padding_row * 64 + tidx)).data_ptr().apply_swizzle(swizzle_s64).store(
                 cutlass.Int8(0)
             )
     # Repack plain row-major E4M3 scales into two 128x4 scale atoms.
@@ -514,9 +564,10 @@ def _kda_scalar_active(
                 )
             prims.tcgen05_commit(acc_mbar, group=prims.CTAGroup.CTA_1)
 
-    if length > 0:
-        while not prims.mbarrier_try_wait_parity(history_load_mbar, cutlass.Int32(0)):
-            pass
+    if cutlass.const_expr(not mtp):
+        if length > 0:
+            while not prims.mbarrier_try_wait_parity(history_load_mbar, cutlass.Int32(0)):
+                pass
 
     # First BF16 MMA: adjusted K [16,128] @ [kn,qn]^T. Two s128b
     # K64 panels avoid any padding in the instruction's K dimension.
@@ -525,9 +576,13 @@ def _kda_scalar_active(
         dense_col = tidx - 64
     for hist in cutlass.range_constexpr(N):
         adjusted_bf16 = cutlass.BFloat16(0.0)
-        if hist < length:
-            cached_k = cache_hk[hist * K + tidx].to(cutlass.Float32)
-            cached_g = cache_hg[hist * K + tidx]
+        if hist < accepted_length:
+            if cutlass.const_expr(mtp):
+                cached_k = hk[(live, head, hist, tidx)].to(cutlass.Float32)
+                cached_g = hg[(live, head, hist, tidx)]
+            else:
+                cached_k = cache_hk[hist * K + tidx].to(cutlass.Float32)
+                cached_g = cache_hg[hist * K + tidx]
             adjusted_bf16 = (cached_k * cute.exp(cumulative - cached_g, fastmath=True)).to(
                 cutlass.BFloat16
             )
@@ -628,8 +683,11 @@ def _kda_scalar_active(
     # first dense panels and the coefficient accumulator columns.
     for hist in cutlass.range_constexpr(N):
         uval = cutlass.BFloat16(0.0)
-        if hist < length:
-            uval = cache_hu[hist * K + tidx]
+        if hist < accepted_length:
+            if cutlass.const_expr(mtp):
+                uval = hu[(live, head, hist, tidx)]
+            else:
+                uval = cache_hu[hist * K + tidx]
         dst = (dense_a0.subview(tidx * 64 + hist)).data_ptr().apply_swizzle(swizzle_s128)
         _store_bf16(dst, uval)
     if tidx < N:
@@ -694,6 +752,32 @@ def _kda_scalar_active(
     if warp == 0:
         prims.tcgen05_dealloc(cutlass.inttoptr(tmem_raw, 6, cutlass.Float32), 32, group="cta_1")
 
+    # Candidates after the accepted prefix are private to this CTA until sampling.
+    if cutlass.const_expr(mtp):
+        for prior in cutlass.range(token):
+            hist = accepted_length + prior
+            adjusted = (
+                (
+                    hk[(live, head, hist, tidx)].to(cutlass.Float32)
+                    * cute.exp(cumulative - hg[(live, head, hist, tidx)], fastmath=True)
+                )
+                .to(cutlass.BFloat16)
+                .to(cutlass.Float32)
+            )
+            ck = _warp_sum_products(adjusted, kn.to(cutlass.Float32))
+            cq = _warp_sum_products(adjusted, qn.to(cutlass.Float32))
+            if lane == 0:
+                s_red[warp] = ck
+                s_red[4 + warp] = cq
+            cute.arch.barrier()
+            if tidx == 0:
+                s_scalar[6] = (s_red[0] + s_red[1]) + (s_red[2] + s_red[3])
+                s_scalar[7] = (s_red[4] + s_red[5]) + (s_red[6] + s_red[7])
+            cute.arch.barrier()
+            uk = hu[(live, head, hist, tidx)].to(cutlass.Float32)
+            hist_k = cute.fma(uk, s_scalar[6].to(cutlass.BFloat16).to(cutlass.Float32), hist_k)
+            hist_q = cute.fma(uk, s_scalar[7].to(cutlass.BFloat16).to(cutlass.Float32), hist_q)
+
     beta_v = beta_bf16.to(cutlass.Float32)
     beta_sigmoid = cute.div(
         cutlass.Float32(1.0),
@@ -737,9 +821,10 @@ def _kda_scalar_active(
         full=True,
     )
     result = core_f * rstd * norm_bf16.to(cutlass.Float32) * zg
-    out[(batch, head, tidx)] = result.to(cutlass.BFloat16)
+    out[(row, head, tidx)] = result.to(cutlass.BFloat16)
     if head == 0 and tidx == 0:
-        old_lengths[batch] = length
+        old_lengths[batch] = accepted_length
+    cute.arch.barrier()
 
 
 @cute.kernel
@@ -767,49 +852,98 @@ def _kda_scalar_kernel(
     dt_bias,
     out,
     old_lengths,
+    candidate_x,
     lower_bound: cutlass.Float32,
     norm_eps: cutlass.Float32,
     heads: cutlass.Constexpr,
     bounded: cutlass.Constexpr,
+    tokens: cutlass.Constexpr,
+    mtp: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     block, _, _ = cute.arch.block_idx()
     batch = block // heads
+    head = block - batch * heads
     if dummy[batch]:
-        head = block - batch * heads
-        out[(batch, head, tidx)] = cutlass.BFloat16(0.0)
+        for token in cutlass.range_constexpr(tokens):
+            out[(batch * tokens + token, head, tidx)] = cutlass.BFloat16(0.0)
+            if cutlass.const_expr(mtp):
+                for section in cutlass.range_constexpr(3):
+                    candidate_x[(batch, token, (section * heads + head) * K + tidx)] = (
+                        cutlass.BFloat16(0.0)
+                    )
         if head == 0 and tidx == 0:
             old_lengths[batch] = cutlass.Int32(0)
     else:
-        _kda_scalar_active(
-            tma_state,
-            tma_hk,
-            tma_hu,
-            tma_hg,
-            x,
-            conv_state,
-            conv_weight,
-            gate,
-            beta,
-            z,
-            norm_weight,
-            pool,
-            slots,
-            dummy,
-            slot_map,
-            hk,
-            hu,
-            hg,
-            lengths,
-            a_log,
-            dt_bias,
-            out,
-            old_lengths,
-            lower_bound,
-            norm_eps,
-            heads,
-            bounded,
-        )
+        if cutlass.const_expr(mtp):
+            for token in cutlass.range(tokens):
+                _kda_scalar_active(
+                    tma_state,
+                    tma_hk,
+                    tma_hu,
+                    tma_hg,
+                    x,
+                    conv_state,
+                    conv_weight,
+                    gate,
+                    beta,
+                    z,
+                    norm_weight,
+                    pool,
+                    slots,
+                    dummy,
+                    slot_map,
+                    hk,
+                    hu,
+                    hg,
+                    lengths,
+                    a_log,
+                    dt_bias,
+                    out,
+                    old_lengths,
+                    candidate_x,
+                    lower_bound,
+                    norm_eps,
+                    heads,
+                    bounded,
+                    tokens,
+                    mtp,
+                    token,
+                )
+        else:
+            _kda_scalar_active(
+                tma_state,
+                tma_hk,
+                tma_hu,
+                tma_hg,
+                x,
+                conv_state,
+                conv_weight,
+                gate,
+                beta,
+                z,
+                norm_weight,
+                pool,
+                slots,
+                dummy,
+                slot_map,
+                hk,
+                hu,
+                hg,
+                lengths,
+                a_log,
+                dt_bias,
+                out,
+                old_lengths,
+                candidate_x,
+                lower_bound,
+                norm_eps,
+                heads,
+                bounded,
+                tokens,
+                mtp,
+                cutlass.Int32(0),
+            )
 
 
 @cute.jit
@@ -833,10 +967,13 @@ def _launch_scalar(
     dt_bias,
     out,
     old_lengths,
+    candidate_x,
     lower_bound: cutlass.Float32,
     norm_eps: cutlass.Float32,
     heads: cutlass.Constexpr,
     bounded: cutlass.Constexpr,
+    tokens: cutlass.Constexpr,
+    mtp: cutlass.Constexpr,
     stream: cuda.CUstream,
 ):
     primary_layout = cute.make_layout(
@@ -852,7 +989,7 @@ def _launch_scalar(
     )
     hk_layout = cute.make_layout(
         (K, N, heads, hk.shape[0]),
-        stride=(1, K, N * K, hk.layout.stride[0]),
+        stride=(1, K, hk.layout.stride[1], hk.layout.stride[0]),
     )
     hk_tensor = cute.make_tensor(hk.iterator, hk_layout)
     tma_hk = cuda_exp.create_tensor_map_tiled_from_view(
@@ -863,7 +1000,7 @@ def _launch_scalar(
     )
     hu_layout = cute.make_layout(
         (K, N, heads, hu.shape[0]),
-        stride=(1, K, N * K, hu.layout.stride[0]),
+        stride=(1, K, hu.layout.stride[1], hu.layout.stride[0]),
     )
     hu_tensor = cute.make_tensor(hu.iterator, hu_layout)
     tma_hu = cuda_exp.create_tensor_map_tiled_from_view(
@@ -874,7 +1011,7 @@ def _launch_scalar(
     )
     hg_layout = cute.make_layout(
         (64, 2, N, heads, hg.shape[0]),
-        stride=(1, 64, K, N * K, hg.layout.stride[0]),
+        stride=(1, 64, K, hg.layout.stride[1], hg.layout.stride[0]),
     )
     hg_tensor = cute.make_tensor(hg.iterator, hg_layout)
     tma_hg = cuda_exp.create_tensor_map_tiled_from_view(
@@ -907,27 +1044,30 @@ def _launch_scalar(
         dt_bias,
         out,
         old_lengths,
+        candidate_x,
         lower_bound,
         norm_eps,
         heads,
         bounded,
+        tokens,
+        mtp,
     )
-    if cutlass.const_expr(heads == 96):
+    if cutlass.const_expr(heads == 96 and not mtp):
         kernel.launch(
-            grid=[x.shape[0] * heads, 1, 1],
+            grid=[slots.shape[0] * heads, 1, 1],
             block=[THREADS, 1, 1],
             min_blocks_per_mp=6,
             stream=stream,
         )
     else:
         kernel.launch(
-            grid=[x.shape[0] * heads, 1, 1],
+            grid=[slots.shape[0] * heads, 1, 1],
             block=[THREADS, 1, 1],
             stream=stream,
         )
 
 
-def _fake_tensor_args(heads: int) -> tuple:
+def _fake_tensor_args(heads: int, tokens: int = 1, capacity: int = N) -> tuple:
     """Compile once per stable H while B/S/R and all padded strides stay runtime."""
     b = cute.sym_int32(divisibility=1)
     s = cute.sym_int32(divisibility=1)
@@ -936,29 +1076,37 @@ def _fake_tensor_args(heads: int) -> tuple:
     def row(divisibility: int = 1) -> cute.SymInt:
         return cute.sym_int64(divisibility=divisibility)
 
+    rows = cute.sym_int32(divisibility=1)
     width = heads * K
     channels = 3 * width
-    hist_row = heads * N * K
+    hist_row = heads * capacity * K
     return (
-        make_fake_tensor(cutlass.BFloat16, (b, channels), stride=(row(16), 1)),
+        make_fake_tensor(cutlass.BFloat16, (rows, channels), stride=(row(16), 1)),
         make_fake_tensor(cutlass.BFloat16, (s, channels, 3), stride=(row(16), 3, 1)),
         make_fake_tensor(cutlass.BFloat16, (channels, 4), stride=(4, 1)),
-        make_fake_tensor(cutlass.BFloat16, (b, width), stride=(row(8), 1)),
-        make_fake_tensor(cutlass.BFloat16, (b, heads), stride=(row(1), 1)),
-        make_fake_tensor(cutlass.BFloat16, (b, heads, K), stride=(row(8), K, 1)),
+        make_fake_tensor(cutlass.BFloat16, (rows, width), stride=(row(8), 1)),
+        make_fake_tensor(cutlass.BFloat16, (rows, heads), stride=(row(1), 1)),
+        make_fake_tensor(cutlass.BFloat16, (rows, heads, K), stride=(row(8), K, 1)),
         make_fake_tensor(cutlass.BFloat16, (K,), stride=(1,)),
         make_fake_tensor(cutlass.Uint8, (s, heads, STATE_BYTES), stride=(row(16), STATE_BYTES, 1)),
         make_fake_tensor(cutlass.Int32, (b,), stride=(1,)),
         make_fake_tensor(cutlass.Boolean, (b,), stride=(1,)),
         make_fake_tensor(cutlass.Int32, (s,), stride=(1,)),
-        make_fake_tensor(cutlass.BFloat16, (r, heads, N, K), stride=(hist_row, N * K, K, 1)),
-        make_fake_tensor(cutlass.BFloat16, (r, heads, N, K), stride=(hist_row, N * K, K, 1)),
-        make_fake_tensor(cutlass.Float32, (r, heads, N, K), stride=(hist_row, N * K, K, 1)),
+        make_fake_tensor(
+            cutlass.BFloat16, (r, heads, capacity, K), stride=(hist_row, capacity * K, K, 1)
+        ),
+        make_fake_tensor(
+            cutlass.BFloat16, (r, heads, capacity, K), stride=(hist_row, capacity * K, K, 1)
+        ),
+        make_fake_tensor(
+            cutlass.Float32, (r, heads, capacity, K), stride=(hist_row, capacity * K, K, 1)
+        ),
         make_fake_tensor(cutlass.Int32, (r,), stride=(1,)),
         make_fake_tensor(cutlass.Float32, (heads,), stride=(1,)),
         make_fake_tensor(cutlass.Float32, (width,), stride=(1,)),
-        make_fake_tensor(cutlass.BFloat16, (b, heads, K), stride=(width, K, 1)),
+        make_fake_tensor(cutlass.BFloat16, (rows, heads, K), stride=(width, K, 1)),
         make_fake_tensor(cutlass.Int32, (b,), stride=(1,)),
+        make_fake_tensor(cutlass.BFloat16, (b, tokens, channels), stride=(row(1), channels, 1)),
     )
 
 
@@ -985,12 +1133,18 @@ def fused_replay(
     norm_eps: float,
     out: torch.Tensor,
     old_lengths: torch.Tensor,
+    *,
+    candidate_x: torch.Tensor | None = None,
+    tokens_per_step: int = 1,
 ) -> None:
-    """Write BF16 [B,H,128] output and int32 [B] old lengths without advancing counters."""
+    """Write BF16 [B*T,H,128] output and immutable [B] history-length snapshots."""
     heads = a_log.numel()
     bounded = lower_bound is not None
     lower_bound = 0.0 if lower_bound is None else lower_bound
-    key = (heads, bounded)
+    mtp = candidate_x is not None
+    if candidate_x is None:
+        candidate_x = x.unsqueeze(1)
+    key = (heads, bounded, mtp, tokens_per_step, hk.shape[2])
     tensor_args = (
         x,
         conv_state,
@@ -1011,9 +1165,10 @@ def fused_replay(
         dt_bias,
         out,
         old_lengths,
+        candidate_x,
     )
     if key not in _compiled:
-        compile_args = _fake_tensor_args(heads)
+        compile_args = _fake_tensor_args(heads, tokens_per_step, hk.shape[2])
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         _compiled[key] = cute.compile(
             _launch_scalar,
@@ -1022,6 +1177,8 @@ def fused_replay(
             float(norm_eps),
             heads,
             bounded,
+            tokens_per_step,
+            mtp,
             stream,
             options="--enable-tvm-ffi",
         )
