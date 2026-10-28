@@ -56,6 +56,9 @@ _SPLIT_PLAN_MIN_TILES = 4
 # 14K-256K KV, B1-B16): with it the wave-quantized makespan picks the measured
 # optimum within 5%.
 _SPLIT_PLAN_PIECE_COST_TILES = 60
+# Largest requests x candidates tile of _mla_split_kv_plan_2d_kernel; larger
+# batches use the candidate loop of _mla_split_kv_plan_kernel.
+_SPLIT_PLAN_2D_MAX_ELEMENTS = 16384
 
 
 @triton.jit(
@@ -97,9 +100,58 @@ def _mla_split_kv_plan_kernel(
         clusters = tl.sum(tl.where(mask, splits, 0), axis=0) * rows_per_request
         waves = (clusters + wave_clusters - 1) // wave_clusters
         cost = waves * (piece + PIECE_COST)
-        better = cost < best_cost
+        better = (cost < best_cost) & (pieces <= max_split)
         best_cost = tl.where(better, cost, best_cost)
         best_piece = tl.where(better, piece, best_piece)
+    plan = tl.minimum(tl.maximum((tiles + best_piece - 1) // best_piece, 1), max_split)
+    tl.store(plan_ptr + offsets, plan, mask=mask)
+
+
+@triton.jit(
+    do_not_specialize=["num_requests", "rows_per_request", "wave_clusters", "max_split"],
+    do_not_specialize_on_alignment=[
+        "num_requests",
+        "rows_per_request",
+        "wave_clusters",
+        "max_split",
+    ],
+)
+def _mla_split_kv_plan_2d_kernel(
+    cache_seqs_ptr,
+    plan_ptr,
+    num_requests,
+    rows_per_request,
+    wave_clusters,
+    max_split,
+    KV_TILE: tl.constexpr,
+    MIN_TILES: tl.constexpr,
+    PIECE_COST: tl.constexpr,
+    MAX_PIECES: tl.constexpr,
+    PIECES_BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """``_mla_split_kv_plan_kernel`` with the candidate piece counts as a
+    tensor axis (``PIECES_BLOCK >= MAX_PIECES``) instead of a loop."""
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < num_requests
+    kv_len = tl.load(cache_seqs_ptr + offsets, mask=mask, other=0)
+    tiles = tl.maximum((kv_len + KV_TILE - 1) // KV_TILE, 1)
+    tiles = tl.where(mask, tiles, 0)
+    longest = tl.max(tiles, axis=0)
+    pieces = tl.arange(0, PIECES_BLOCK) + 1
+    piece = tl.maximum((longest + pieces - 1) // pieces, MIN_TILES)
+    splits = tl.minimum(
+        tl.maximum((tiles[None, :] + piece[:, None] - 1) // piece[:, None], 1), max_split
+    )
+    clusters = tl.sum(tl.where(mask[None, :], splits, 0), axis=1) * rows_per_request
+    waves = (clusters + wave_clusters - 1) // wave_clusters
+    cost = waves * (piece + PIECE_COST)
+    candidate = (pieces <= MAX_PIECES) & (pieces <= max_split)
+    cost = tl.where(candidate, cost, 2**31 - 1)
+    best_cost = tl.min(cost, axis=0)
+    # Ties go to fewer pieces, as in the loop kernel.
+    best_pieces = tl.min(tl.where(cost == best_cost, pieces, PIECES_BLOCK + 1), axis=0)
+    best_piece = tl.maximum((longest + best_pieces - 1) // best_pieces, MIN_TILES)
     plan = tl.minimum(tl.maximum((tiles + best_piece - 1) // best_piece, 1), max_split)
     tl.store(plan_ptr + offsets, plan, mask=mask)
 
@@ -160,6 +212,25 @@ def launch_mla_split_kv_plan(
             or not tensor.is_cuda
         ):
             raise ValueError(f"{name} must be a contiguous CUDA int32 vector of >= {num_requests}")
+    block = max(16, triton.next_power_of_2(num_requests))
+    pieces_block = triton.next_power_of_2(_SPLIT_PLAN_MAX_SPLIT)
+    if block * pieces_block <= _SPLIT_PLAN_2D_MAX_ELEMENTS:
+        _mla_split_kv_plan_2d_kernel[(1,)](
+            cache_seqs,
+            plan,
+            num_requests,
+            max(rows_per_request, 1),
+            max(wave_clusters, 1),
+            max(max_split, 1),
+            KV_TILE=_SPLIT_PLAN_KV_TILE,
+            MIN_TILES=_SPLIT_PLAN_MIN_TILES,
+            PIECE_COST=_SPLIT_PLAN_PIECE_COST_TILES,
+            MAX_PIECES=_SPLIT_PLAN_MAX_SPLIT,
+            PIECES_BLOCK=pieces_block,
+            BLOCK=block,
+            num_warps=4,
+        )
+        return
     _mla_split_kv_plan_kernel[(1,)](
         cache_seqs,
         plan,

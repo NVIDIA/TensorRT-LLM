@@ -54,15 +54,19 @@ def test_plan_mla_split_kv_policy(kv_lens: list[int], rows: int, expected: list[
     assert plan == expected
 
 
-def test_plan_kernel_matches_host_mirror() -> None:
+@pytest.mark.parametrize("max_split", [32, 8, 1])
+def test_plan_kernel_matches_host_mirror(max_split: int) -> None:
+    """Both plan kernels: the 2D one up to 512 requests, the candidate loop above."""
     mod = _plan_mod()
     generator = torch.Generator().manual_seed(3)
     for rows in (1, 4, 8):
-        for batch in (1, 3, 8, 16, 37, 128):
+        for batch in (1, 3, 8, 16, 37, 128, 512, 513, 1024):
             kv = torch.randint(1, 300_000, (batch,), generator=generator)
             kv[0] = 262144  # a long one
             kv_lens = kv.tolist()
-            expected = mod.plan_mla_split_kv(kv_lens, rows_per_request=rows, wave_clusters=WAVE)
+            expected = mod.plan_mla_split_kv(
+                kv_lens, rows_per_request=rows, wave_clusters=WAVE, max_split=max_split
+            )
             cache_seqs = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
             plan = torch.full((batch + 3,), -5, dtype=torch.int32, device="cuda")
             mod.launch_mla_split_kv_plan(
@@ -71,10 +75,45 @@ def test_plan_kernel_matches_host_mirror() -> None:
                 num_requests=batch,
                 rows_per_request=rows,
                 wave_clusters=WAVE,
+                max_split=max_split,
             )
             torch.cuda.synchronize()
             assert plan[:batch].tolist() == expected, (rows, batch, kv_lens[:4])
             assert (plan[batch:] == -5).all()
+
+
+@pytest.mark.parametrize("batch", [1, 16, 512])
+def test_plan_2d_kernel_matches_loop_kernel(batch: int) -> None:
+    mod = _plan_mod()
+    generator = torch.Generator().manual_seed(4)
+    for rows in (1, 6, 8):
+        kv = torch.randint(0, 400_000, (batch,), generator=generator)
+        kv[-1] = 393216
+        cache_seqs = kv.to(device="cuda", dtype=torch.int32)
+        plans = []
+        for kernel, extra in (
+            (mod._mla_split_kv_plan_kernel, dict(BLOCK=mod._SPLIT_PLAN_MAX_REQUESTS)),
+            (
+                mod._mla_split_kv_plan_2d_kernel,
+                dict(PIECES_BLOCK=mod._SPLIT_PLAN_MAX_SPLIT, BLOCK=max(16, batch)),
+            ),
+        ):
+            plan = torch.full((batch,), -5, dtype=torch.int32, device="cuda")
+            kernel[(1,)](
+                cache_seqs,
+                plan,
+                batch,
+                rows,
+                WAVE,
+                mod._SPLIT_PLAN_MAX_SPLIT,
+                KV_TILE=mod._SPLIT_PLAN_KV_TILE,
+                MIN_TILES=mod._SPLIT_PLAN_MIN_TILES,
+                PIECE_COST=mod._SPLIT_PLAN_PIECE_COST_TILES,
+                MAX_PIECES=mod._SPLIT_PLAN_MAX_SPLIT,
+                **extra,
+            )
+            plans.append(plan.tolist())
+        assert plans[0] == plans[1], (rows, batch)
 
 
 def test_split_kv_plan_is_launched_once_per_step(monkeypatch) -> None:
