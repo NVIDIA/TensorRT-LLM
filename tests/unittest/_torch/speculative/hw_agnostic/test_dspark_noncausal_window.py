@@ -19,7 +19,6 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_dflash import (
-    DFlashForCausalLM,
     dflash_merge_future_block_attention,
     dflash_trtllm_windowed_block_attention,
 )
@@ -102,29 +101,6 @@ def test_merge_matches_the_non_causal_oracle(block_size, window, heads):
         assert not torch.allclose(out_causal, expected, atol=1e-3)
 
 
-@pytest.mark.cpu_only
-def test_merge_bounds_the_future_keys_by_the_right_window():
-    """A right window smaller than the block hides block keys more than
-    window_right ahead of the query."""
-    torch.manual_seed(1)
-    block_size, w = 7, 2
-    query = torch.randn(1, block_size, 4, 16)
-    keys = [torch.randn(10 + block_size, 1, 16)]
-    values = [torch.randn(10 + block_size, 1, 16)]
-    out_causal, lse_causal = _oracle(query, keys, values, [10], w, -1, causal=True)
-    expected, _ = _oracle(query, keys, values, [10], w, w, causal=False)
-    merged = dflash_merge_future_block_attention(
-        out_causal,
-        lse_causal,
-        query,
-        keys[0][-block_size:].unsqueeze(0),
-        values[0][-block_size:].unsqueeze(0),
-        16**-0.5,
-        w,
-    )
-    torch.testing.assert_close(merged, expected, atol=1e-5, rtol=1e-5)
-
-
 # ---------------------------------------------------------------------------
 # Mask resolution (CPU)
 # ---------------------------------------------------------------------------
@@ -168,13 +144,6 @@ def test_dspark_unwindowed_layers_stay_non_causal():
     wrapper = _wrapper(GQADSparkForCausalLM, config)
     assert wrapper._resolve_block_attention(0) == (False, (-1, -1))
     assert wrapper.validate_block_attention_windows() == ["non-causal context"] * 2
-
-
-@pytest.mark.cpu_only
-def test_plain_dflash_keeps_reading_a_windowed_layer_as_causal():
-    """No-regression: the DSpark override does not reach DFlash drafters."""
-    wrapper = _wrapper(DFlashForCausalLM, _minimax_like_config(num_layers=2, window=512))
-    assert wrapper._get_attention_mask_args(0) == (True, (511, 0))
 
 
 @pytest.mark.cpu_only

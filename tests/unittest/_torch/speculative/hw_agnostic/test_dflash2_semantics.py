@@ -636,16 +636,22 @@ def test_explicit_is_causal_overrides_the_layer_type_default():
 
 
 @pytest.mark.cpu_only
-def test_is_causal_is_ignored_for_a_plain_dflash_drafter():
-    """No-regression: an older drafter that happens to carry is_causal must
-    keep resolving its windows the old way."""
+@pytest.mark.parametrize("is_causal", [None, False, True])
+@pytest.mark.parametrize("explicit_window", [False, True])
+def test_is_causal_is_ignored_for_a_plain_dflash_drafter(is_causal, explicit_window):
+    """No-regression: a plain DFlash drafter keeps the causal windowed decode
+    whatever causality metadata it carries, and whether the window is inferred
+    from the layer types or switched on explicitly; the DSpark override does
+    not reach it."""
     config = SimpleNamespace(
-        is_causal=False,
         num_hidden_layers=2,
         layer_types=["sliding_attention", "full_attention"],
         sliding_window=512,
-        use_sliding_window=True,
     )
+    if is_causal is not None:
+        config.is_causal = is_causal
+    if explicit_window:
+        config.use_sliding_window = True
     wrapper = _mask_wrapper(config, is_dflash2=False)
     assert wrapper._get_attention_mask_args(0) == (True, (511, 0))
     assert wrapper._get_attention_mask_args(1) == (False, (-1, -1))

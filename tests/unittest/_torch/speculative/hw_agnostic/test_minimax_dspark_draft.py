@@ -17,6 +17,8 @@ translation (CPU only; no drafter module is built here)."""
 
 import json
 import pathlib
+import re
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -144,94 +146,325 @@ def test_flattened_config_exposes_backbone_and_drafter_fields() -> None:
     assert cfg.torch_dtype == torch.bfloat16
 
 
-@pytest.mark.parametrize("checkpoint_use_swa", [None, True])
-def test_flattened_config_honors_an_explicit_sliding_window_disable(
-    checkpoint_use_swa: bool | None,
+_WINDOW_KEYS = (
+    "layer_types",
+    "sliding_window",
+    "use_sliding_window",
+    "use_swa",
+    "swa_window_size",
+)
+_MIXED = ["sliding_attention", "full_attention"] * 2 + ["sliding_attention"]
+_HF = {"layer_types": _MIXED, "sliding_window": 8}
+_MIXED_WINDOWS = [8, None, 8, None, 8]
+_UNBOUNDED = [None] * 5
+_SOURCES = ("config", "text_config", "dflash_config", "text_config.dflash_config")
+
+
+def _window_config(fields: dict[str, dict]) -> dict:
+    """The published layout with every window field removed, then the given
+    fields placed per source (``config``, ``text_config``, ``dflash_config``,
+    ``text_config.dflash_config``)."""
+    config = deepcopy(_CONFIG)
+    sources = {
+        "config": config,
+        "text_config": config["text_config"],
+        "dflash_config": config["dflash_config"],
+        "text_config.dflash_config": config["text_config"]["dflash_config"],
+    }
+    for name, source in sources.items():
+        for key in _WINDOW_KEYS:
+            source.pop(key, None)
+        source.update(deepcopy(fields.get(name, {})))
+    if "dflash_config" in fields and "text_config.dflash_config" not in fields:
+        config["text_config"].pop("dflash_config")
+    return config
+
+
+@pytest.mark.parametrize(
+    "fields, context_windows, block_windows",
+    [pytest.param({source: _HF}, _MIXED_WINDOWS, _MIXED_WINDOWS, id=source) for source in _SOURCES]
+    + [
+        pytest.param(
+            {source: {"layer_types": schedule, "sliding_window": window} for source in _SOURCES},
+            [window if kind == "sliding_attention" else None for kind in schedule],
+            [window if kind == "sliding_attention" else None for kind in schedule],
+            id=f"matching-{window}-{schedule[0]}",
+        )
+        for window in (1, 3, 4096, 8192)
+        for schedule in (["sliding_attention"] * 5, ["full_attention"] * 5)
+    ]
+    + [
+        pytest.param(
+            {
+                "config": {
+                    **_HF,
+                    **({"use_sliding_window": enabled} if location in ("top", "both") else {}),
+                },
+                "text_config": (
+                    {"use_sliding_window": enabled} if location in ("text", "both") else {}
+                ),
+                "text_config.dflash_config": (
+                    {"use_swa": True, "swa_window_size": 8} if native else {}
+                ),
+            },
+            _MIXED_WINDOWS if enabled else _UNBOUNDED,
+            _MIXED_WINDOWS if enabled else _UNBOUNDED,
+            id=f"switch-{location}-{enabled}-{native}",
+        )
+        for location in ("top", "text", "both")
+        for enabled in (False, True)
+        for native in (False, True)
+    ]
+    + [
+        pytest.param(
+            {"config": _HF, "text_config": {key: None}},
+            _MIXED_WINDOWS,
+            _MIXED_WINDOWS,
+            id=f"outer-survives-{key}",
+        )
+        for key in ("layer_types", "sliding_window")
+    ]
+    + [
+        pytest.param(
+            {
+                "config": {**_HF, "use_sliding_window": False},
+                "text_config": {"use_sliding_window": None},
+            },
+            _UNBOUNDED,
+            _UNBOUNDED,
+            id="outer-disable-survives-null",
+        ),
+        pytest.param(
+            {
+                "text_config": {"layer_types": None, "sliding_window": None},
+                "text_config.dflash_config": _HF,
+            },
+            _MIXED_WINDOWS,
+            _MIXED_WINDOWS,
+            id="lift-through-null",
+        ),
+        pytest.param(
+            {
+                "text_config": _HF,
+                "text_config.dflash_config": {
+                    "layer_types": None,
+                    "sliding_window": None,
+                    "use_swa": None,
+                    "swa_window_size": None,
+                },
+            },
+            _MIXED_WINDOWS,
+            _MIXED_WINDOWS,
+            id="null-native-fields",
+        ),
+        pytest.param(
+            {source: dict.fromkeys(_WINDOW_KEYS) for source in _SOURCES},
+            _UNBOUNDED,
+            _UNBOUNDED,
+            id="all-window-fields-null",
+        ),
+        pytest.param(
+            {"text_config": {"sliding_window": 8}},
+            [8] * 5,
+            _UNBOUNDED,
+            id="hf-window-without-schedule",
+        ),
+        pytest.param(
+            {"text_config.dflash_config": {"use_swa": True, "swa_window_size": 8}},
+            _UNBOUNDED,
+            [8] * 5,
+            id="native-only",
+        ),
+        # Window fields declared only in the outer dflash_config survive the
+        # text_config copy replacing that dict as a whole.
+        pytest.param(
+            {"dflash_config": _HF, "text_config.dflash_config": {}},
+            _MIXED_WINDOWS,
+            _MIXED_WINDOWS,
+            id="outer-dflash-survives-text-dict",
+        ),
+        pytest.param(
+            {"dflash_config": {**_HF, "use_swa": False}, "text_config.dflash_config": {}},
+            _UNBOUNDED,
+            _UNBOUNDED,
+            id="outer-dflash-disable-survives-text-dict",
+        ),
+        # The operator switch written inside either dflash_config copy.
+        pytest.param(
+            {"text_config.dflash_config": {**_HF, "use_sliding_window": False}},
+            _UNBOUNDED,
+            _UNBOUNDED,
+            id="nested-disable-text-dflash",
+        ),
+        pytest.param(
+            {
+                "dflash_config": {**_HF, "use_sliding_window": False},
+                "text_config.dflash_config": {},
+            },
+            _UNBOUNDED,
+            _UNBOUNDED,
+            id="nested-disable-outer-dflash",
+        ),
+        # use_swa outside dflash_config is not a window declaration: nothing
+        # reads it there, so it neither disables nor conflicts.
+        pytest.param(
+            {"config": {"use_swa": False}, "text_config": _HF},
+            _MIXED_WINDOWS,
+            _MIXED_WINDOWS,
+            id="outer-use-swa-is-not-a-declaration",
+        ),
+        # An explicit use_swa without swa_window_size takes the HF window.
+        pytest.param(
+            {"text_config": _HF, "text_config.dflash_config": {"use_swa": True}},
+            _MIXED_WINDOWS,
+            _MIXED_WINDOWS,
+            id="explicit-use-swa-takes-hf-window",
+        ),
+    ]
+    + [
+        pytest.param(
+            {
+                "text_config": {} if flag == "absent" else {"use_sliding_window": flag},
+                "text_config.dflash_config": {**_HF, "use_swa": False},
+            },
+            _UNBOUNDED,
+            _UNBOUNDED,
+            id=f"native-disable-{flag}",
+        )
+        for flag in ("absent", None, False)
+    ],
+)
+def test_flattened_config_accepts_window_layouts(
+    fields: dict[str, dict],
+    context_windows: list[int | None],
+    block_windows: list[int | None],
 ) -> None:
-    """``use_sliding_window: false`` is the DFlash switch that disables the
-    pooled-context window; the block-decode window must follow it, whether it
-    would come from the HF ``sliding_attention`` spelling or from a
-    ``dflash_config.use_swa`` the checkpoint already carries."""
-    config = json.loads(json.dumps(_CONFIG))
-    config["text_config"]["use_sliding_window"] = False
-    if checkpoint_use_swa is not None:
-        config["text_config"]["dflash_config"]["use_swa"] = checkpoint_use_swa
-        config["text_config"]["dflash_config"]["swa_window_size"] = 4096
+    """Every layout the framework runs is accepted, and both window resolvers
+    (context path and block decode) see the declared windows. The two
+    helper-level results differ on purpose for the native-only and
+    schedule-free HF cases: ``_resolve_block_attention`` applies the final
+    precedence between them."""
+    config = _window_config(fields)
+    before = deepcopy(config)
     cfg = build_minimax_dspark_draft_config(config)
-    assert cfg.use_sliding_window is False
-    assert cfg.dflash_config["use_swa"] is False
-    assert "swa_window_size" not in cfg.dflash_config
+    dflash = cfg.dflash_config
+    assert [
+        get_layer_attention_window(cfg, i) for i in range(cfg.num_hidden_layers)
+    ] == context_windows
+    assert [
+        dspark_layer_window_size(
+            bool(dflash.get("use_swa", False)),
+            int(dflash.get("swa_window_size", 0) or 0),
+            getattr(cfg, "layer_types", None),
+            i,
+        )
+        for i in range(cfg.num_hidden_layers)
+    ] == [(-1, -1) if window is None else (window - 1, window - 1) for window in block_windows]
+    assert config == before
 
 
-@pytest.mark.parametrize("top_level", ["absent", None])
-def test_flattened_config_lifts_nested_window_fields_to_the_top_level(
-    top_level: str | None,
+@pytest.mark.parametrize(
+    "fields, error",
+    [
+        pytest.param(
+            {"text_config": {"layer_types": ["sliding_attention"] * count}},
+            f"text_config.layer_types length={count} vs num_hidden_layers=5",
+            id=f"schedule-length-{count}",
+        )
+        for count in (0, 1, 6)
+    ]
+    + [
+        pytest.param(
+            {"config": {"sliding_window": 8}, "text_config": {"sliding_window": 16}},
+            "config.sliding_window=8 vs text_config.sliding_window=16",
+            id="top-text-window",
+        ),
+        pytest.param(
+            {
+                "text_config": _HF,
+                "dflash_config": {"sliding_window": 16},
+                "text_config.dflash_config": {},
+            },
+            "text_config.sliding_window=8 vs dflash_config.sliding_window=16",
+            id="shadowed-outer-dflash",
+        ),
+        pytest.param(
+            {
+                "dflash_config": {"sliding_window": 8},
+                "text_config.dflash_config": {"sliding_window": 16},
+            },
+            "dflash_config.sliding_window=8 vs text_config.dflash_config.sliding_window=16",
+            id="two-dflash-copies",
+        ),
+        pytest.param(
+            {
+                "config": {"layer_types": _MIXED},
+                "text_config.dflash_config": {"layer_types": ["full_attention"] * 5},
+            },
+            "Conflicting MiniMax DSpark layer_types:",
+            id="schedule-copies",
+        ),
+        pytest.param(
+            {
+                "config": {"use_sliding_window": False},
+                "text_config": {"use_sliding_window": True},
+            },
+            "config.use_sliding_window=False vs text_config.use_sliding_window=True",
+            id="switch-copies",
+        ),
+        pytest.param(
+            {
+                "dflash_config": {"use_swa": False},
+                "text_config.dflash_config": {"use_swa": True},
+            },
+            "dflash_config.use_swa=False vs text_config.dflash_config.use_swa=True",
+            id="native-switch-copies",
+        ),
+        pytest.param(
+            {
+                "dflash_config": {"swa_window_size": 8},
+                "text_config.dflash_config": {"swa_window_size": 16},
+            },
+            "dflash_config.swa_window_size=8 vs text_config.dflash_config.swa_window_size=16",
+            id="native-window-copies",
+        ),
+        pytest.param(
+            {
+                "text_config": _HF,
+                "text_config.dflash_config": {"use_swa": True, "swa_window_size": 16},
+            },
+            "text_config.sliding_window=8 vs text_config.dflash_config.swa_window_size=16",
+            id="hf-native-window",
+        ),
+        pytest.param(
+            {"text_config.dflash_config": {"sliding_window": 8, "swa_window_size": 16}},
+            "text_config.dflash_config.sliding_window=8 vs "
+            "text_config.dflash_config.swa_window_size=16",
+            id="hf-native-same-source",
+        ),
+    ]
+    + [
+        pytest.param(
+            {
+                source: {"use_sliding_window": True},
+                "text_config.dflash_config": {"use_swa": False},
+            },
+            f"text_config.dflash_config.use_swa=False vs {source}.use_sliding_window=True",
+            id=f"opposed-switches-{source}",
+        )
+        for source in ("config", "text_config")
+    ],
+)
+def test_flattened_config_rejects_window_contradictions(
+    fields: dict[str, dict], error: str
 ) -> None:
-    """DFlash and ``get_layer_attention_window`` resolve the per-layer windows
-    from the top-level ``layer_types`` and ``sliding_window``; values the
-    checkpoint keeps only in ``dflash_config`` must surface there, whether the
-    top-level keys are missing or spelled ``null``."""
-    config = json.loads(json.dumps(_CONFIG))
-    for key in ("layer_types", "sliding_window"):
-        config["text_config"].pop(key, None)
-        config.pop(key, None)
-        if top_level is None:
-            config["text_config"][key] = None
-    mixed = ["sliding_attention", "full_attention"] * 2 + ["sliding_attention"]
-    config["text_config"]["dflash_config"]["layer_types"] = list(mixed)
-    config["text_config"]["dflash_config"]["sliding_window"] = 2048
-    cfg = build_minimax_dspark_draft_config(config)
-    assert cfg.layer_types == mixed
-    assert cfg.sliding_window == 2048
-    assert cfg.dflash_config["use_swa"] is True
-    assert cfg.dflash_config["swa_window_size"] == 2048
-    assert cfg.dflash_config["layer_types"] == mixed
-
-
-def test_flattened_config_treats_a_null_use_swa_as_unset() -> None:
-    """``use_swa: null`` must not block the HF-spelling translation the way an
-    explicit ``false`` does; DFlash reads a null as unset."""
-    config = json.loads(json.dumps(_CONFIG))
-    config["text_config"]["dflash_config"]["use_swa"] = None
-    cfg = build_minimax_dspark_draft_config(config)
-    assert cfg.dflash_config["use_swa"] is True
-    assert cfg.dflash_config["swa_window_size"] == 4096
-
-
-def test_flattened_config_keeps_existing_dflash_window_spelling() -> None:
-    config = json.loads(json.dumps(_CONFIG))
-    config["text_config"]["dflash_config"]["use_swa"] = False
-    cfg = build_minimax_dspark_draft_config(config)
-    assert cfg.dflash_config["use_swa"] is False
-    assert "swa_window_size" not in cfg.dflash_config
-    # The checkpoint's use_swa switch is mirrored into the context-window one.
-    assert cfg.use_sliding_window is False
-
-
-@pytest.mark.parametrize("use_sliding_window", ["absent", None])
-def test_checkpoint_use_swa_false_disables_the_context_window_too(
-    use_sliding_window: str | None,
-) -> None:
-    """A nested-only ``sliding_window`` is lifted to the top level; a checkpoint
-    that also says ``use_swa: false`` must not end up with a windowed context
-    path and an unwindowed block decode, whether ``use_sliding_window`` is
-    missing or spelled ``null``."""
-    config = json.loads(json.dumps(_CONFIG))
-    for key in ("layer_types", "sliding_window"):
-        config["text_config"].pop(key, None)
-        config.pop(key, None)
-    config["text_config"]["dflash_config"]["use_swa"] = False
-    if use_sliding_window is None:
-        config["text_config"]["use_sliding_window"] = None
-    cfg = build_minimax_dspark_draft_config(config)
-    assert cfg.use_sliding_window is False
-    assert cfg.dflash_config["use_swa"] is False
-    assert "swa_window_size" not in cfg.dflash_config
-    for layer_idx in range(cfg.num_hidden_layers):
-        assert get_layer_attention_window(cfg, layer_idx) is None
-        assert dspark_layer_window_size(
-            cfg.dflash_config["use_swa"], 0, cfg.layer_types, layer_idx
-        ) == (-1, -1)
+    """Only self-contradictory declarations are rejected, and the error names
+    both sources."""
+    config = _window_config(fields)
+    before = deepcopy(config)
+    with pytest.raises(ValueError, match=re.escape(error)):
+        build_minimax_dspark_draft_config(config)
+    assert config == before
 
 
 def test_load_pretrained_config_routes_by_architecture(tmp_path: pathlib.Path) -> None:
@@ -375,6 +608,12 @@ def test_backbone_norms_are_gemma_modules_and_only_raw_weight_norms_are_folded(
 
     tiny = json.loads(json.dumps(_CONFIG))
     tiny["text_config"].update(hidden_size=64, num_hidden_layers=1)
+    for source in (
+        tiny["text_config"],
+        tiny["dflash_config"],
+        tiny["text_config"]["dflash_config"],
+    ):
+        source["layer_types"] = ["sliding_attention"]
     cfg = build_minimax_dspark_draft_config(tiny)
     cfg.torch_dtype = torch.bfloat16
     model = modeling_dspark.MiniMaxDSparkModel(ModelConfig(pretrained_config=cfg))

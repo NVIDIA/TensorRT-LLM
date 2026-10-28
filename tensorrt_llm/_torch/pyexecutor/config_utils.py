@@ -874,8 +874,9 @@ def build_minimax_dspark_draft_config(
     no ``auto_map`` and no modeling code, so ``AutoConfig.from_pretrained``
     cannot resolve it. The drafter's own fields (``dspark_*``,
     ``dflash_config``, ``hidden_size``, ``vocab_size``, ...) are duplicated
-    at the top level and inside ``text_config``; the text side wins where both
-    are present. The result is a plain ``PretrainedConfig`` with every field as
+    at the top level and inside ``text_config``. The text side wins for other
+    fields; window declarations must agree, and null window fields are unset.
+    The result is a plain ``PretrainedConfig`` with every field as
     an attribute, which is what ``DFlashForCausalLM`` and the registered
     ``DSparkMiniMaxDraftModel`` backbone read.
 
@@ -896,11 +897,76 @@ def build_minimax_dspark_draft_config(
         for k, v in config_dict.items() if k not in _MINIMAX_DSPARK_DROPPED_KEYS
     }
     text = config_dict.get("text_config") or {}
+    # Window declarations may be repeated at the top level, under text_config
+    # and inside either dflash_config copy (HF or DFlash spelling). Every
+    # non-null copy must agree: the context path and the block decode read
+    # them from different places, so conflicting declarations are rejected
+    # before merging, where precedence would otherwise hide them silently.
+    # The error names both sources.
+    window_keys = ("layer_types", "sliding_window", "use_sliding_window")
+    sources = (
+        ("config", config_dict),
+        ("text_config", text),
+        ("dflash_config", config_dict.get("dflash_config") or {}),
+        ("text_config.dflash_config", text.get("dflash_config") or {}),
+    )
+    declared = {}
+    for source_name, source in sources:
+        # use_swa / swa_window_size are DFlash keys: only the dflash_config
+        # copies declare them, nothing reads them at the outer levels.
+        keys = window_keys if source_name in ("config", "text_config") else (
+            *window_keys, "use_swa", "swa_window_size")
+        for key in keys:
+            value = source.get(key)
+            if value is None:
+                continue
+            name = f"{source_name}.{key}"
+            canonical = "sliding_window" if key == "swa_window_size" else key
+            if canonical in declared:
+                other_name, other_value = declared[canonical]
+                if value != other_value:
+                    raise ValueError(
+                        f"Conflicting MiniMax DSpark {canonical}: "
+                        f"{other_name}={other_value!r} vs {name}={value!r}.")
+            else:
+                declared[canonical] = (name, value)
+
+    if "use_swa" in declared and "use_sliding_window" in declared:
+        swa_name, use_swa = declared["use_swa"]
+        sliding_name, use_sliding_window = declared["use_sliding_window"]
+        if use_swa is False and use_sliding_window is True:
+            raise ValueError(f"Conflicting MiniMax DSpark switches: "
+                             f"{swa_name}={use_swa!r} vs "
+                             f"{sliding_name}={use_sliding_window!r}.")
+
+    # A null window field under text_config counts as unset and must not
+    # shadow a value given at the top level.
     flat.update({
         k: v
         for k, v in text.items() if k not in _MINIMAX_DSPARK_DROPPED_KEYS
+        and not (k in window_keys and v is None)
     })
+    if "layer_types" in declared and flat.get("num_hidden_layers") is not None:
+        name, types = declared["layer_types"]
+        if len(types) != flat["num_hidden_layers"]:
+            raise ValueError(
+                f"Conflicting MiniMax DSpark layer_types: "
+                f"{name} length={len(types)} vs "
+                f"num_hidden_layers={flat['num_hidden_layers']!r}.")
+
     dflash = dict(flat.get("dflash_config") or {})
+    # text_config replaces the outer dflash_config as a whole; a window field
+    # declared only in the outer copy must survive that replacement (the scan
+    # above already made sure the two copies agree wherever both speak).
+    outer_dflash = config_dict.get("dflash_config") or {}
+    for key in ("layer_types", "sliding_window", "use_swa", "swa_window_size"):
+        if outer_dflash.get(key) is not None and dflash.get(key) is None:
+            dflash[key] = outer_dflash[key]
+    # The operator switch may also be written inside dflash_config; it is read
+    # from the top level, so a nested declaration is surfaced there.
+    if "use_sliding_window" in declared and flat.get(
+            "use_sliding_window") is None:
+        flat["use_sliding_window"] = declared["use_sliding_window"][1]
     # A null window field in config.json counts as unset, which is how DFlash
     # and get_layer_attention_window read it; dropping the key here lets the
     # lifts and switches below treat null and missing alike.
@@ -935,6 +1001,11 @@ def build_minimax_dspark_draft_config(
         dflash["use_swa"] = True
         dflash["swa_window_size"] = int(sliding_window)
         dflash.setdefault("layer_types", list(layer_types))
+    elif (dflash.get("use_swa") is True and sliding_window
+          and dflash.get("swa_window_size") is None):
+        # An explicit use_swa without the DFlash window size takes the HF one;
+        # DFlash rejects use_swa with no size.
+        dflash["swa_window_size"] = int(sliding_window)
     flat["dflash_config"] = dflash
     flat["architectures"] = [MINIMAX_DSPARK_DRAFT_ARCH]
     # Not ``minimax_m3_vl``: that model_type selects the VL target's
