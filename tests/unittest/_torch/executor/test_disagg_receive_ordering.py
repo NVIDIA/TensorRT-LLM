@@ -65,6 +65,7 @@ def _manager() -> Mock:
     manager.kv_cache_map = {}
     manager.prepare_context_cache.return_value = 0
     manager.prepare_disagg_gen_init = MethodType(KVCacheManagerV2.prepare_disagg_gen_init, manager)
+    manager.disagg_transfer_length = MethodType(KVCacheManagerV2.disagg_transfer_length, manager)
     manager.prepare_resources = MethodType(KVCacheManagerV2.prepare_resources, manager)
     return manager
 
@@ -299,3 +300,27 @@ def test_receive_does_not_drain_work_after_admission(transfer_mode: str) -> None
         assert completed_at_publication == [False]
     finally:
         tail.synchronize()
+
+
+@pytest.mark.cpu_only
+def test_admission_history_is_the_prompt_the_transfer_brings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole prompt, counted globally under Helix, or the part the manager says moves."""
+    monkeypatch.setattr(torch.cuda, "Event", Mock())
+    manager = _manager()
+    request = _request(manager)
+    request.total_input_len_cp = 512
+    resize = manager.kv_cache_map[request.py_request_id].resize
+
+    assert manager.prepare_disagg_gen_init(request)
+    assert resize.call_args.args[1] == 128
+
+    manager._has_cp_helix = True
+    assert manager.prepare_disagg_gen_init(request)
+    assert resize.call_args.args[1] == 512
+
+    manager._has_cp_helix = False
+    manager.disagg_transfer_length = lambda req: 96
+    assert manager.prepare_disagg_gen_init(request)
+    assert resize.call_args.args == (128, 96)

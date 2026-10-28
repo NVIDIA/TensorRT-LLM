@@ -4764,9 +4764,10 @@ class KVCacheManagerV2(BaseResourceManager):
         """Prepare KV cache for a disagg generation init request.
 
         Allocates capacity for the full prompt (+ draft) and sets
-        ``kv_cache.history_length`` to ``prompt_len``. Returns True on
-        success, False if preparation or resize failed (an unlocked cache
-        is suspended on first-chunk resize failure).
+        ``kv_cache.history_length`` to the prompt tokens the transfer brings
+        (``disagg_transfer_length``). Returns True on success, False if
+        preparation or resize failed (an unlocked cache is suspended on
+        first-chunk resize failure).
         """
         reused = self.prepare_context_cache(req)
         if reused is None:
@@ -4786,14 +4787,11 @@ class KVCacheManagerV2(BaseResourceManager):
         # prompt_len is the full incoming prompt length, robust to block
         # reuse (which may leave a non-zero context_current_position).
         # Helix requests carry the rank-local strided slice in prompt_len;
-        # the global ledger sizes off the full prompt instead.
-        remote_tail_start = getattr(req, "py_csa2_remote_tail_start", None)
-        history_len = (
-            remote_tail_start
-            if remote_tail_start is not None
-            else (req.total_input_len_cp if self._has_cp_helix else req.prompt_len)
-        )
+        # the global ledger sizes off the full prompt instead, so a transfer
+        # of the whole local slice stands for the whole prompt.
         prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+        transfer_len = self.disagg_transfer_length(req)
+        history_len = prompt_len if transfer_len == req.prompt_len else transfer_len
         target = prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
