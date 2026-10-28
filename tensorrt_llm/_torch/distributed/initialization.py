@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import os
 import socket
+from collections.abc import Iterator
 
 import torch
 import torch.distributed as dist
@@ -17,6 +19,7 @@ from tensorrt_llm.logger import logger
 
 __all__ = [
     "init_torch_distributed",
+    "model_streamer_torch_distributed",
     "ensure_cutedsl_torch_distributed",
     "ensure_deepgemm_torch_distributed",
 ]
@@ -278,3 +281,112 @@ def ensure_deepgemm_torch_distributed() -> None:
         f"(rank={rank}, local_rank={local_rank}, "
         f"world_size={world_size}, master={host}:{port}, backend=nccl)"
     )
+
+
+def _select_model_streamer_endpoint(ranks_span_nodes: bool) -> tuple[str, str] | str:
+    """Select rank 0's address and a free port on rank 0's host.
+
+    Returns:
+        ``(address, port)``, or a message that says why rank 0 cannot select them.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("", 0))
+            port = str(sock.getsockname()[1])
+        address = socket.gethostbyname(socket.gethostname())
+    except OSError as error:
+        return f"rank 0 cannot select a rendezvous endpoint: {error}"
+    # Some /etc/hosts files map the hostname to a loopback address such as
+    # 127.0.1.1. Ranks on the same node can use it; ranks on other nodes cannot.
+    if ranks_span_nodes and ipaddress.ip_address(address).is_loopback:
+        return (
+            f"the hostname of rank 0 resolves to the loopback address {address}, which "
+            "ranks on other nodes cannot reach. Map the hostname to a routable address."
+        )
+    return address, port
+
+
+@contextlib.contextmanager
+def model_streamer_torch_distributed(rank: int, world_size: int) -> Iterator[None]:
+    """Provide a NCCL group for ModelStreamer to stream weights.
+
+    Return immediately if world size is 1.
+
+    If there is an existing torch.distributed group, the group must match the
+    requested mapping and send CUDA tensors through NCCL, and it stays after this
+    context exits.
+
+    If there is no existing group, this context will create a default group
+    and destroy it when the context exits. It uses MPI to coordinate group creation
+    and avoids using env var MASTER_ADDR/MASTER_PORT so it won't affect other
+    distributed functions.
+
+    The context may set up an env var ``RUNAI_STREAMER_DIST=1`` to force
+    ModelStreamer to enable distributed streaming.
+
+    Args:
+        rank: Rank in the TRT-LLM model's MPI world.
+        world_size: Number of ranks in that world.
+
+    Raises:
+        RuntimeError: If the group or the MPI world does not match ``rank`` and
+            ``world_size``, if an existing group does not send CUDA tensors
+            through NCCL, or if rank 0 cannot select an endpoint that all ranks
+            can reach.
+    """
+    if world_size == 1:
+        yield
+        return
+    import torch.distributed as dist
+
+    created_group = False
+    force_distributed_streaming = False
+    if dist.is_initialized():
+        if dist.get_rank() != rank or dist.get_world_size() != world_size:
+            raise RuntimeError("Torch distributed group does not match the TRT-LLM mapping")
+        backends = dict(entry.split(":", 1) for entry in dist.get_backend_config().split(","))
+        if backends.get("cuda") != "nccl":
+            raise RuntimeError(
+                f"Model Streamer distributed streaming only works with nccl, but got {backends}"
+            )
+        # ModelStreamer currently only supports distributed streaming when the backend is literally "nccl".
+        # It would reject backend "cuda:nccl,cpu:gloo" even though it is also nccl.
+        # To fix this, we set up env var flag RUNAI_STREAMER_DIST=1 to force Model Streamer to enter distributed
+        # streaming mode.
+        force_distributed_streaming = "RUNAI_STREAMER_DIST" not in os.environ
+        if force_distributed_streaming:
+            os.environ["RUNAI_STREAMER_DIST"] = "1"
+    else:
+        from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
+
+        if mpi_rank() != rank or mpi_world_size() != world_size:
+            raise RuntimeError("MPI world does not match the TRT-LLM mapping")
+
+        ranks_span_nodes = len(set(mpi_comm().allgather(socket.gethostname()))) > 1
+        # Every rank joins the broadcast; only rank 0 chooses the endpoint.
+        # When rank 0 cannot choose one, it broadcasts the reason, so that every
+        # rank raises instead of waiting.
+        # Launcher MASTER_ADDR/MASTER_PORT can describe an outer job: the
+        # context and generation servers of a disaggregated launch may inherit
+        # the same values, and their groups would then meet at one endpoint.
+        endpoint = mpi_comm().bcast(
+            _select_model_streamer_endpoint(ranks_span_nodes) if rank == 0 else None, root=0
+        )
+        if isinstance(endpoint, str):
+            raise RuntimeError(f"Cannot create the Model Streamer process group: {endpoint}")
+        address, port = endpoint
+        # Model Streamer sends only CUDA tensors between ranks.
+        init_torch_distributed(
+            backend="nccl",
+            rank=rank,
+            world_size=world_size,
+            init_method=f"tcp://{address}:{port}",
+        )
+        created_group = True
+    try:
+        yield
+    finally:
+        if force_distributed_streaming:
+            os.environ.pop("RUNAI_STREAMER_DIST", None)
+        if created_group:
+            dist.destroy_process_group()

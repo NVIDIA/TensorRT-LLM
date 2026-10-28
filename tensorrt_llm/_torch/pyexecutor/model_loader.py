@@ -41,6 +41,8 @@ from ..models.checkpoints import memory_init, model_hooks
 from ..models.checkpoints.base_weight_mapper import BaseWeightMapper
 from ..models.checkpoints.checkpoint_catalog import CheckpointCatalog
 from ..models.checkpoints.gms import model_loading as gms_loading
+from ..models.checkpoints.model_streamer import \
+    model_loading as model_streamer_loading
 from ..models.checkpoints.mx import model_loading as mx_loading
 from ..models.checkpoints.weight_load_plan import WeightLoadPlan
 from ..models.modeling_utils import (DecoderModelForCausalLM,
@@ -470,17 +472,29 @@ def _resolve_checkpoint_io_policy(
     requested_policy: CheckpointIOPolicy,
     partial_model_loading: bool,
 ) -> tuple[CheckpointIOPolicy, Optional[str]]:
-    """Return the policy to use and the reason for a fallback, if any."""
+    """Return the policy to use and the reason for a fallback, if any.
+
+    Raises:
+        - ValueError: ``model_streamer`` was requested for a load it cannot
+          handle. Model Streamer has no fallback.
+    """
 
     if requested_policy == CheckpointIOPolicy.NATIVE:
         return CheckpointIOPolicy.NATIVE, None
 
-    # requested_policy can be AUTO or RANK_STRIPED_READ_AHEAD:
+    # requested_policy can be AUTO, RANK_STRIPED_READ_AHEAD or MODEL_STREAMER:
     reason = _checkpoint_io_incompatibility_reason(checkpoint_loader,
                                                    checkpoint_format,
                                                    load_format,
                                                    requested_policy,
                                                    partial_model_loading)
+
+    if requested_policy == CheckpointIOPolicy.MODEL_STREAMER:
+        if reason is not None:
+            raise ValueError(
+                f"checkpoint_io_policy='model_streamer' is unsupported: {reason}"
+            )
+        return CheckpointIOPolicy.MODEL_STREAMER, None
 
     if reason is None:
         # Compatible: AUTO and RANK_STRIPED_READ_AHEAD both use read-ahead.
@@ -530,6 +544,14 @@ def construct_checkpoint_loader(
                 selection_fallback_reason=selection_fallback_reason,
             )
         return checkpoint_loader
+
+    if checkpoint_io_policy == CheckpointIOPolicy.MODEL_STREAMER:
+        # Model Streamer streams the target weights into the model itself
+        # (see `load_model_from_auto_load_format`). The HF loader still loads
+        # the config, the weight mapper and a separate draft checkpoint, with
+        # native I/O.
+        checkpoint_io_policy = CheckpointIOPolicy.NATIVE
+        requested_checkpoint_io_policy = CheckpointIOPolicy.NATIVE
 
     checkpoint_weight_loader_cls = get_checkpoint_weight_loader(
         checkpoint_format)
@@ -697,7 +719,8 @@ def _checkpoint_startup_metadata(
 
 def _check_post_init_model_compat(
         model: DecoderModelForCausalLM, load_format: LoadFormat,
-        checkpoint_loader: BaseCheckpointLoader) -> None:
+        checkpoint_loader: BaseCheckpointLoader,
+        checkpoint_io_policy: CheckpointIOPolicy) -> None:
     """Raise error if the initialized LLM model cannot load the checkpoint.
     """
     requires_regular_checkpoint_loading = any(
@@ -709,11 +732,14 @@ def _check_post_init_model_compat(
     # check the resolved format too.
     if requires_regular_checkpoint_loading and (
             load_format != LoadFormat.AUTO
-            or checkpoint_loader.checkpoint_format == CheckpointFormat.MX):
+            or checkpoint_loader.checkpoint_format == CheckpointFormat.MX
+            or checkpoint_io_policy == CheckpointIOPolicy.MODEL_STREAMER):
         raise ValueError(
             "Host-resident model weights currently require the regular "
             "checkpoint loading of load_format=AUTO; DUMMY, VISION_ONLY, GMS, "
-            "and MX loaders cannot materialize them")
+            "MX and Model Streamer loading cannot materialize them")
+    if checkpoint_io_policy == CheckpointIOPolicy.MODEL_STREAMER:
+        model_streamer_loading.check_model_streamer_support(model)
 
 
 def _load_checkpoint_into_model(
@@ -842,6 +868,10 @@ def load_model_from_auto_load_format(
     Built-in and custom checkpoint loaders, including custom weight loaders,
     read the checkpoint here.
 
+    With ``checkpoint_io_policy="model_streamer"``, Model Streamer streams the
+    target weights into the model, and a separate draft checkpoint is read with
+    the checkpoint loader as usual.
+
     Args:
         checkpoint_loader: checkpoint loader of this load
         checkpoint_dir: checkpoint directory of the target model
@@ -855,35 +885,50 @@ def load_model_from_auto_load_format(
         metrics: model loader timing metrics, updated in place
 
     Returns:
-        The target weight mapper, and whether the checkpoint loader wrote
-        the target weights into the model directly (MX P2P).
+        The target weight mapper, and whether the target weights were written
+        into the model directly (MX P2P or Model Streamer).
     """
     # load target weights
     weights_checkpoint_dir = (model.llm_checkpoint_dir if hasattr(
         model, 'llm_checkpoint_dir') else checkpoint_dir)
-    # Generic loaders ignore source_identity; MXCheckpointLoader pops it.
-    target_load_weights_kwargs: dict[str, Any] = {
-        "source_identity": source_identity
-    }
-    if checkpoint_loader.checkpoint_format == CheckpointFormat.MX:
-        target_load_weights_kwargs.update(
-            mx_loading.get_mx_load_weights_kwargs(model_config=model_config,
-                                                  llm_args=llm_args,
-                                                  qualification=qualification))
+    # Model Streamer does not use the weight mapper, but reload() and weight
+    # updates need it.
     weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
         model, model_config)
-    _load_checkpoint_into_model(
-        checkpoint_loader,
-        weights_checkpoint_dir,
-        model=model,
-        is_draft_model=False,
-        mapping=mapping,
-        weight_mapper=weight_mapper,
-        extra_load_weights_kwargs=target_load_weights_kwargs,
-        metrics=metrics)
-    # Read before the draft load: an MX draft read without MX state resets
-    # this flag.
-    weights_preloaded = mx_loading.is_mx_weights_preloaded(checkpoint_loader)
+    if llm_args.checkpoint_io_policy == CheckpointIOPolicy.MODEL_STREAMER:
+        with timing_metric(
+                ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
+                metrics):
+            model_streamer_loading.load_weights_with_model_streamer(
+                model,
+                weights_checkpoint_dir,
+                rank=mapping.rank,
+                world_size=mapping.world_size)
+        weights_preloaded = True
+    else:
+        # Generic loaders ignore source_identity; MXCheckpointLoader pops it.
+        target_load_weights_kwargs: dict[str, Any] = {
+            "source_identity": source_identity
+        }
+        if checkpoint_loader.checkpoint_format == CheckpointFormat.MX:
+            target_load_weights_kwargs.update(
+                mx_loading.get_mx_load_weights_kwargs(
+                    model_config=model_config,
+                    llm_args=llm_args,
+                    qualification=qualification))
+        _load_checkpoint_into_model(
+            checkpoint_loader,
+            weights_checkpoint_dir,
+            model=model,
+            is_draft_model=False,
+            mapping=mapping,
+            weight_mapper=weight_mapper,
+            extra_load_weights_kwargs=target_load_weights_kwargs,
+            metrics=metrics)
+        # Read before the draft load: an MX draft read without MX state
+        # resets this flag.
+        weights_preloaded = mx_loading.is_mx_weights_preloaded(
+            checkpoint_loader)
 
     # load separate draft weights
     if spec_config is not None and spec_config.needs_separate_draft_weights:
@@ -1159,7 +1204,8 @@ class ModelLoader:
         validate_lm_head_output_dtype(model, self.llm_args.lm_head_output_dtype)
 
         # raise error when the built model cannot load the checkpoint as is
-        _check_post_init_model_compat(model, load_format, checkpoint_loader)
+        _check_post_init_model_compat(model, load_format, checkpoint_loader,
+                                      self.llm_args.checkpoint_io_policy)
 
         loads_draft_weights = (self.spec_config is not None and
                                self.spec_config.needs_separate_draft_weights)
