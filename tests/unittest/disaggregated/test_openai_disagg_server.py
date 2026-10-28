@@ -11,21 +11,36 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
+import contextlib
+import json
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import aiohttp
 import pytest
-from fastapi import Request
+from fastapi import FastAPI, Request
 from starlette.datastructures import Headers
 
-from tensorrt_llm.llmapi.disagg_utils import ServerRole, extract_disagg_cfg
-from tensorrt_llm.serve import openai_disagg_server
+from tensorrt_llm.executor.utils import context_length_exceeded_message
+from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig, ServerRole, extract_disagg_cfg
+from tensorrt_llm.serve import anthropic_adapter, openai_disagg_server
+from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
+from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatCompletionStreamResponse,
+    ChatMessage,
     CompletionRequest,
     ConversationParams,
     DisaggregatedParams,
+    UsageInfo,
 )
+from tensorrt_llm.serve.responses_utils import ServerArrivalTimeMiddleware
+from tensorrt_llm.serve.router import Router
 
 pytestmark = pytest.mark.cpu_only
 
@@ -324,3 +339,363 @@ def test_disagg_config_rejects_non_bool_request_chat_template_opt_in(value):
             generation_servers={"num_instances": 0},
             allow_request_chat_template=value,
         )
+
+
+# ---------------------------------------------------------------------------
+# Streamed /v1/messages: a slow context phase must not leave the client silent
+# ---------------------------------------------------------------------------
+
+_MODEL = "test-model"
+_SCHEDULE_STYLES = ["context_first", "generation_first"]
+# The events of the message the generation worker streams (_generation_frames).
+_MESSAGE_EVENTS = [
+    "message_start",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+    "message_delta",
+    "message_stop",
+]
+_OVER_LENGTH = context_length_exceeded_message(8, 9)
+
+
+def _generation_frames() -> list[bytes]:
+    """A generation worker's chat stream answering "hello"."""
+    chunks = [
+        ChatCompletionStreamResponse(
+            model=_MODEL, choices=[{"index": 0, "delta": {"role": "assistant"}}]
+        ),
+        ChatCompletionStreamResponse(
+            model=_MODEL, choices=[{"index": 0, "delta": {"content": "hello"}}]
+        ),
+        ChatCompletionStreamResponse(
+            model=_MODEL,
+            choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            usage=UsageInfo(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+        ),
+    ]
+    frames = [f"data: {chunk.model_dump_json()}\n\n".encode() for chunk in chunks]
+    return frames + [b"data: [DONE]\n\n"]
+
+
+def _worker_rejection(status: int, message: str) -> aiohttp.ClientResponseError:
+    """A worker's error response, as the HTTP client raises it."""
+    body = json.dumps({"object": "error", "message": message, "code": status})
+    return aiohttp.ClientResponseError(
+        Mock(real_url="http://ctx:8001/v1/chat/completions"),
+        (),
+        status=status,
+        message=f"Error: {body}",
+    )
+
+
+class _Workers:
+    """A context and a generation worker behind the disaggregated service, without a network.
+
+    The context phase runs ``context_phase`` and then answers with the KV-cache
+    handoff. The generation worker streams ``_generation_frames`` once the
+    context phase has succeeded, as it does once it has the KV cache.
+    """
+
+    def __init__(self, context_phase):
+        self.context_phase = context_phase
+        self.context_done = asyncio.Event()
+        self.context_cancelled = asyncio.Event()
+
+    async def send_context_request(self, request, server=None, hooks=None, req_id=None):
+        try:
+            await self.context_phase()
+        except asyncio.CancelledError:
+            self.context_cancelled.set()
+            raise
+        self.context_done.set()
+        disagg_request_id = request.disaggregated_params.disagg_request_id
+        return ChatCompletionResponse(
+            model=_MODEL,
+            usage=UsageInfo(prompt_tokens=3, completion_tokens=1),
+            prompt_token_ids=[1, 2, 3],
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content=""),
+                    finish_reason="length",
+                    disaggregated_params=DisaggregatedParams(
+                        request_type="context_only",
+                        disagg_request_id=disagg_request_id,
+                        ctx_request_id=disagg_request_id,
+                    ),
+                )
+            ],
+        )
+
+    async def send_generation_request(self, request, server=None, hooks=None, req_id=None):
+        async def stream():
+            await self.context_done.wait()
+            for frame in _generation_frames():
+                yield frame
+
+        return stream()
+
+
+def _messages_app(schedule_style: str, workers: _Workers) -> FastAPI:
+    """The /v1/messages route of a disaggregated server in front of ``workers``."""
+    config = DisaggServerConfig(server_configs=[], schedule_style=schedule_style)
+    service = OpenAIDisaggregatedService(
+        config, DisaggCoordinatorService(config, client_factory=Mock()), client_factory=Mock()
+    )
+    service.is_ready = AsyncMock(return_value=True)
+    service._ctx_router = AsyncMock(spec=Router)
+    service._ctx_router.get_next_server.return_value = ("ctx:8001", {})
+    service._gen_router = AsyncMock(spec=Router)
+    service._gen_router.get_next_server.return_value = ("gen:8002", {})
+    service._ctx_client = SimpleNamespace(send_request=workers.send_context_request)
+    service._gen_client = SimpleNamespace(send_request=workers.send_generation_request)
+
+    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    server._config = config
+    server._service = service
+    server._perf_metrics_collector = Mock()
+    server._allow_request_chat_template = False
+    server._collect_perf_metrics = False
+    app = FastAPI()
+    app.add_middleware(ServerArrivalTimeMiddleware)
+    app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
+    return app
+
+
+async def _post_messages(app: FastAPI, *, stream=True, on_send=None, leave=None) -> list[dict]:
+    """Send one /v1/messages request to ``app`` as a client and return the messages sent back.
+
+    ``on_send`` sees each message as it is sent. The client disconnects once
+    ``leave`` is set.
+    """
+    body = {
+        "model": _MODEL,
+        "max_tokens": 16,
+        "stream": stream,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    requested = False
+
+    async def receive():
+        nonlocal requested
+        if not requested:
+            requested = True
+            return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+        await (leave or asyncio.Event()).wait()
+        return {"type": "http.disconnect"}
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+        if on_send is not None:
+            on_send(message)
+
+    scope = {
+        "type": "http",
+        # As uvicorn declares it: a disconnect cancels a streaming response.
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/messages",
+        "raw_path": b"/v1/messages",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 40000),
+        "server": ("127.0.0.1", 8000),
+    }
+    await asyncio.wait_for(app(scope, receive, send), timeout=10)
+    return sent
+
+
+def _status(sent: list[dict]) -> int:
+    return next(message["status"] for message in sent if message["type"] == "http.response.start")
+
+
+def _body(sent: list[dict]) -> str:
+    return b"".join(
+        message.get("body", b"") for message in sent if message["type"] == "http.response.body"
+    ).decode()
+
+
+def _sse_events(sent: list[dict]) -> list[tuple[str, dict]]:
+    """The (event, data) pairs of a streamed response."""
+    events = []
+    for frame in _body(sent).split("\n\n"):
+        if frame:
+            fields = dict(line.split(": ", 1) for line in frame.splitlines())
+            events.append((fields["event"], json.loads(fields["data"])))
+    return events
+
+
+def _short_waits(monkeypatch):
+    monkeypatch.setattr(openai_disagg_server, "_MESSAGES_STREAM_START_WAIT_S", 0.05)
+    monkeypatch.setattr(anthropic_adapter, "STREAM_PING_INTERVAL_S", 0.05)
+
+
+def _waits_for(event: asyncio.Event):
+    """A context phase that lasts until ``event`` is set, or five seconds without it."""
+
+    async def context_phase():
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(event.wait(), 5)
+
+    return context_phase
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+async def test_messages_stream_starts_and_pings_while_the_context_phase_runs(
+    monkeypatch, schedule_style
+):
+    _short_waits(monkeypatch)
+    pinged = asyncio.Event()
+    workers = _Workers(_waits_for(pinged))
+    started_during_context_phase = []
+
+    def on_send(message):
+        if message["type"] == "http.response.start":
+            started_during_context_phase.append(not workers.context_done.is_set())
+        elif message.get("body", b"").startswith(b"event: ping\n"):
+            pinged.set()
+
+    sent = await _post_messages(_messages_app(schedule_style, workers), on_send=on_send)
+
+    assert _status(sent) == 200
+    assert started_during_context_phase == [True]
+    events = [event for event, _ in _sse_events(sent)]
+    message_start = events.index("message_start")
+    assert message_start > 0
+    assert set(events[:message_start]) == {"ping"}
+    assert [event for event in events[message_start:] if event != "ping"] == _MESSAGE_EVENTS
+    delta = {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": "hello"},
+    }
+    assert ("content_block_delta", delta) in _sse_events(sent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+async def test_messages_stream_after_a_fast_context_phase_is_the_reframed_generation(
+    schedule_style,
+):
+    async def context_phase():
+        pass
+
+    sent = await _post_messages(_messages_app(schedule_style, _Workers(context_phase)))
+
+    async def generation():
+        for frame in _generation_frames():
+            yield frame
+
+    reframed = anthropic_adapter.reframe_openai_stream(generation(), model=_MODEL)
+    expected = "".join([frame async for frame in reframed])
+
+    def without_message_id(text):
+        return re.sub(r'"id":"msg_[0-9a-f]+"', '"id":"msg"', text)
+
+    assert _status(sent) == 200
+    assert "event: ping" not in _body(sent)
+    assert without_message_id(_body(sent)) == without_message_id(expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+@pytest.mark.parametrize(
+    "status, worker_message, error_type",
+    [
+        pytest.param(400, _OVER_LENGTH, "invalid_request_error", id="over_length_400"),
+        pytest.param(503, "no capacity left", "api_error", id="503"),
+    ],
+)
+async def test_messages_stream_with_a_fast_context_failure_is_an_http_error(
+    schedule_style, status, worker_message, error_type
+):
+    async def context_phase():
+        raise _worker_rejection(status, worker_message)
+
+    streamed = await _post_messages(_messages_app(schedule_style, _Workers(context_phase)))
+    not_streamed = await _post_messages(
+        _messages_app(schedule_style, _Workers(context_phase)), stream=False
+    )
+
+    assert _status(streamed) == status
+    error = json.loads(_body(streamed))
+    assert error["type"] == "error"
+    assert error["error"]["type"] == error_type
+    # The error response of the same failure without a stream.
+    assert _status(not_streamed) == status
+    assert error == json.loads(_body(not_streamed))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+@pytest.mark.parametrize(
+    "status, worker_message",
+    [
+        pytest.param(400, _OVER_LENGTH, id="over_length_400"),
+        pytest.param(503, "no capacity left", id="503"),
+    ],
+)
+async def test_messages_stream_with_a_late_context_failure_ends_with_an_error_event(
+    monkeypatch, schedule_style, status, worker_message
+):
+    _short_waits(monkeypatch)
+    pinged = asyncio.Event()
+    wait = _waits_for(pinged)
+
+    async def context_phase():
+        await wait()
+        raise _worker_rejection(status, worker_message)
+
+    def on_send(message):
+        if message.get("body", b"").startswith(b"event: ping\n"):
+            pinged.set()
+
+    streamed = await _post_messages(
+        _messages_app(schedule_style, _Workers(context_phase)), on_send=on_send
+    )
+    pinged.set()
+    not_streamed = await _post_messages(
+        _messages_app(schedule_style, _Workers(context_phase)), stream=False
+    )
+
+    assert _status(streamed) == 200
+    events = _sse_events(streamed)
+    assert {event for event, _ in events[:-1]} == {"ping"}
+    assert events[-1][0] == "error"
+    # An error event as the stream reports any failure, with the message of
+    # the error response of the same failure without a stream.
+    assert events[-1][1] == {
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "message": json.loads(_body(not_streamed))["error"]["message"],
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+@pytest.mark.parametrize("leave", ["before_the_response_starts", "once_the_response_starts"])
+async def test_client_leaving_during_the_context_phase_cancels_it(
+    monkeypatch, schedule_style, leave
+):
+    _short_waits(monkeypatch)
+    workers = _Workers(_waits_for(asyncio.Event()))
+    left = asyncio.Event()
+    if leave == "before_the_response_starts":
+        left.set()
+
+    def on_send(message):
+        if message["type"] == "http.response.start":
+            left.set()
+
+    await _post_messages(_messages_app(schedule_style, workers), on_send=on_send, leave=left)
+
+    await asyncio.wait_for(workers.context_cancelled.wait(), 2)

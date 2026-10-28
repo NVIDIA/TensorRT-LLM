@@ -21,7 +21,7 @@ import socket
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from typing import Callable, Optional
+from typing import AsyncIterator, Awaitable, Callable, Optional, Union
 
 import aiohttp
 import uvicorn
@@ -107,6 +107,15 @@ _CLOCK_SYNC_TOTAL_BUDGET_SECONDS = 15.0
 # aligned to well under a millisecond, so discarding a noisier estimate is
 # strictly better than applying it.
 _CLOCK_SYNC_MAX_DELAY_SECONDS = 0.010
+
+# Seconds a streamed /v1/messages request waits for its chat pipeline before
+# the response starts. The pipeline has a stream to return only once its
+# context phase is done, and until the response starts the client receives
+# nothing, not even the status line, which clients and proxies take for a dead
+# connection after a while. A pipeline that answers within the wait is relayed
+# or, if it failed, answered with its error status; one still running has its
+# stream started and kept alive with pings until it answers.
+_MESSAGES_STREAM_START_WAIT_S = 1.0
 
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, queue_latency_metric,
@@ -469,9 +478,43 @@ class OpenAIDisaggServer:
             return anthropic_error_response(str(e), "invalid_request_error",
                                             400)
 
+        chat = self._wrap_entry_point(self._service.openai_chat_completion)(
+            chat_request, raw_request)
+        if request.stream:
+            chat = asyncio.ensure_future(chat)
+            try:
+                await asyncio.wait((chat, ),
+                                   timeout=_MESSAGES_STREAM_START_WAIT_S)
+            except asyncio.CancelledError:
+                # Cancelling the request cancels its pipeline.
+                chat.cancel()
+                raise
+            if not chat.done():
+                # The reframer pings while it waits for the pipeline.
+                return StreamingResponse(
+                    content=reframe_openai_stream(
+                        self._openai_stream_when_done(chat),
+                        model=request.model),
+                    media_type="text/event-stream",
+                )
+
+        answer = await self._messages_answer(chat)
+        if isinstance(answer, StreamingResponse):
+            return StreamingResponse(
+                content=reframe_openai_stream(answer.body_iterator,
+                                              model=request.model),
+                media_type="text/event-stream",
+            )
+        return answer
+
+    async def _messages_answer(self, chat: Awaitable[Response]) -> Response:
+        """Await a /v1/messages request's chat pipeline and answer from it.
+
+        A stream is returned as the pipeline's OpenAI stream, anything else as
+        the Anthropic response.
+        """
         try:
-            openai_response = await self._wrap_entry_point(
-                self._service.openai_chat_completion)(chat_request, raw_request)
+            openai_response = await chat
         except HTTPException as e:
             error_type = ("invalid_request_error"
                           if 400 <= e.status_code < 500 else "api_error")
@@ -479,11 +522,7 @@ class OpenAIDisaggServer:
                                             e.status_code)
 
         if isinstance(openai_response, StreamingResponse):
-            return StreamingResponse(
-                content=reframe_openai_stream(openai_response.body_iterator,
-                                              model=request.model),
-                media_type="text/event-stream",
-            )
+            return openai_response
 
         status = getattr(openai_response, "status_code", 500)
         if status != 200:
@@ -509,6 +548,32 @@ class OpenAIDisaggServer:
                                             "api_error", 500)
         return JSONResponse(content=anthropic_response.model_dump(
             exclude_none=True))
+
+    async def _openai_stream_when_done(
+            self, chat: asyncio.Future) -> AsyncIterator[Union[str, bytes]]:
+        """The OpenAI stream of a chat pipeline that outlasted the start wait.
+
+        The status line is already out, so a pipeline that fails raises
+        AnthropicResponseError with the message of its error response, and
+        the reframer ends the stream with an ``error`` event. A stream
+        abandoned before the pipeline answers, as when the client disconnects,
+        cancels the pipeline.
+        """
+        try:
+            answer = await self._messages_answer(chat)
+        finally:
+            chat.cancel()
+        if not isinstance(answer, StreamingResponse):
+            raise AnthropicResponseError(
+                json.loads(answer.body)["error"]["message"])
+        payloads = answer.body_iterator
+        try:
+            async for payload in payloads:
+                yield payload
+        finally:
+            aclose = getattr(payloads, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     async def get_model(self) -> Response:
         """List the served model, as a context worker reports it."""
