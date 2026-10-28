@@ -64,7 +64,10 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
 from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
 from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_params
 from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import check_compatible, received_bytes
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    MambaHybridCacheManagerV2,
+    MambaRole,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
@@ -187,14 +190,17 @@ def _get_mamba_layer_group(page_table) -> MambaLayerGroup:
     return mlgs[0]
 
 
+def _state_buffer(page_table, role):
+    """The page layout's ``role`` buffer of the first recurrent layer."""
+    return next(b for b in page_table.layout.buffers if b.role == str(role))
+
+
 # ---------------------------------------------------------------------------
 # Descriptor-level tests (no NIXL transfer)
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("enable_attention_dp", [True, False], ids=["adp_on", "adp_off_tp1"])
 def test_kda_layer_group_descriptors(enable_attention_dp):
     """V2 page table must describe BOTH KDA slots with exact byte extents."""
-    from tensorrt_llm._torch.disaggregation.resource.page import MAMBA_CONV_ROLE, MAMBA_SSM_ROLE
-
     mgr = _create_kda_managers(1, enable_attention_dp=enable_attention_dp)[0]
     try:
         pt = build_page_table_from_manager(mgr)
@@ -213,18 +219,19 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
         )
         assert tuple(ssm.shape[1:]) == (KDA_NUM_HEADS, KDA_HEAD_DIM, KDA_HEAD_DIM)
 
-        # Both pool_views present with correct roles and byte sizes.
-        conv_pv = next((pv for pv in mlg.pool_views if pv.pool_role == MAMBA_CONV_ROLE), None)
-        ssm_pv = next((pv for pv in mlg.pool_views if pv.pool_role == MAMBA_SSM_ROLE), None)
-        assert conv_pv is not None and ssm_pv is not None
-        assert conv_pv.bytes_per_layer == CONV_SLOT_BYTES
-        assert ssm_pv.bytes_per_layer == SSM_SLOT_BYTES
+        # Both state buffers present with their byte sizes.
+        conv_buffer = _state_buffer(pt, MambaRole.CONV_STATE)
+        ssm_buffer = _state_buffer(pt, MambaRole.SSM_STATE)
+        assert conv_buffer.size == CONV_SLOT_BYTES
+        assert ssm_buffer.size == SSM_SLOT_BYTES
 
         # qwen3_next 3-sectioning: equal sections summing to the conv slot.
-        assert conv_pv.section_bytes == [CONV_SLOT_BYTES // 3] * 3
-        assert sum(conv_pv.section_bytes) == conv_pv.bytes_per_layer
-        assert ssm_pv.bytes_per_head == KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
-        assert ssm_pv.bytes_per_layer // ssm_pv.bytes_per_head == KDA_NUM_HEADS
+        sections = [t.axes[0].held for t in conv_buffer.tensors]
+        assert sections == [CONV_SLOT_BYTES // 3] * 3
+        assert sum(sections) == conv_buffer.size
+        (head,) = (a for a in ssm_buffer.tensors[0].axes if a.name == "head")
+        assert ssm_buffer.size // head.held == KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
+        assert head.held == KDA_NUM_HEADS
 
         # local_layers cover exactly the KDA layers (by global_layer_id).
         assert sorted(ll.global_layer_id for ll in mlg.local_layers) == [
@@ -256,22 +263,10 @@ def test_kda_hetero_tp_sharded_accepted():
         gen_pt = build_page_table_from_manager(gen_mgr)
 
         # Production per-rank slots are the global sizes divided by tp.
-        from tensorrt_llm._torch.disaggregation.resource.page import MAMBA_CONV_ROLE, MAMBA_SSM_ROLE
-
-        ctx_mlg = _get_mamba_layer_group(ctx_pt)
-        gen_mlg = _get_mamba_layer_group(gen_pt)
-        ctx_conv_bpl = next(
-            pv.bytes_per_layer for pv in ctx_mlg.pool_views if pv.pool_role == MAMBA_CONV_ROLE
-        )
-        ctx_ssm_bpl = next(
-            pv.bytes_per_layer for pv in ctx_mlg.pool_views if pv.pool_role == MAMBA_SSM_ROLE
-        )
-        gen_conv_bpl = next(
-            pv.bytes_per_layer for pv in gen_mlg.pool_views if pv.pool_role == MAMBA_CONV_ROLE
-        )
-        gen_ssm_bpl = next(
-            pv.bytes_per_layer for pv in gen_mlg.pool_views if pv.pool_role == MAMBA_SSM_ROLE
-        )
+        ctx_conv_bpl = _state_buffer(ctx_pt, MambaRole.CONV_STATE).size
+        ctx_ssm_bpl = _state_buffer(ctx_pt, MambaRole.SSM_STATE).size
+        gen_conv_bpl = _state_buffer(gen_pt, MambaRole.CONV_STATE).size
+        gen_ssm_bpl = _state_buffer(gen_pt, MambaRole.SSM_STATE).size
         assert ctx_conv_bpl == CONV_SLOT_BYTES // 2
         assert ctx_ssm_bpl == SSM_SLOT_BYTES // 2
         assert gen_conv_bpl == CONV_SLOT_BYTES // 4

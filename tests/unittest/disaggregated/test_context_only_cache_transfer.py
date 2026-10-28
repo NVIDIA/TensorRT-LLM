@@ -18,9 +18,8 @@ from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.transfer import RecvReqInfo, Sender
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import create_cache_reuse_adapter
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
-from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_global_layer_ids
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import map_buffers
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType, SamplingConfig
@@ -174,21 +173,14 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
         assert receiver_registrar.get_peer_overlap(source_info, source_info.dp_rank).ranks == [
             source_info.instance_rank
         ]
-        pool_mapping = registrar.get_pool_mapping(target_info)
-        matched_global_ids = set()
-        for (src_group, src_view), (dst_group, dst_view) in pool_mapping.items():
-            source_group = source_info.page_table.layer_groups[src_group]
-            target_group = target_info.page_table.layer_groups[dst_group]
-            assert source_group.pool_views[src_view].mapper_kind == MapperKind.REPLICATED
-            assert target_group.pool_views[dst_view].mapper_kind == MapperKind.REPLICATED
-            source_ids = set(
-                get_pool_view_global_layer_ids(source_group.pool_views[src_view], source_group)
-            )
-            target_ids = set(
-                get_pool_view_global_layer_ids(target_group.pool_views[dst_view], target_group)
-            )
-            assert source_ids == target_ids
-            matched_global_ids.update(source_ids)
+        assert registrar.get_kv_maps(target_info)
+        runs = map_buffers(
+            source_info.page_table.layout, target_info.page_table.layout, key=target_info.dp_rank
+        )
+        # Every buffer that moves is alike on every rank, so each moves whole to its counterpart.
+        assert all(not r.src.split and not r.dst.split for r in runs)
+        assert all(r.src.layer == r.dst.layer and r.src.role == r.dst.role for r in runs)
+        matched_global_ids = {r.src.layer for r in runs}
         expected_global_ids = {
             layer * 3 + kind.value for layer, kind in source._layer_attn_to_layer_id
         }

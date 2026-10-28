@@ -42,7 +42,11 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DeepseekV4AttentionType,
 )
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool, get_pool_bytes
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_physical_pool,
+    get_pool_bytes,
+    get_transferred_pool_indices,
+)
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -147,9 +151,9 @@ def _init_pool_data(
 
         # Collect unique pools (deduplicate by base_address)
         unique_pools: Dict[int, int] = {}
-        for lg_idx, lg in enumerate(page_table.layer_groups):
-            for pv in lg.pool_views:
-                pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
+        for lg_idx in range(len(page_table.layer_groups)):
+            for pool_idx in get_transferred_pool_indices(page_table, lg_idx):
+                pool = get_physical_pool(page_table, lg_idx, pool_idx)
                 key = pool.base_address
                 if key not in unique_pools or get_pool_bytes(pool) > unique_pools[key]:
                     unique_pools[key] = get_pool_bytes(pool)

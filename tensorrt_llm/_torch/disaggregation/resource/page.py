@@ -16,26 +16,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import FrozenSet, List, Optional
-
-import numpy as np
+from typing import List, Optional
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
-    MapperKind,
     PageLayout,
     layout_from_dict,
     layout_to_dict,
-)
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import RoleLayout as RoleLayout
-
-BUFFER_ENTRY_DTYPE = np.dtype(
-    [
-        ("local_layer_id", np.uint32),
-        # Byte offsets within coalesced pools use 64 bits.
-        ("offset", np.uint64),
-        ("size", np.uint32),
-    ]
 )
 
 
@@ -45,7 +32,8 @@ class PhysicalPool:
 
     ``slot_bytes`` spans all layers and roles coalesced into one slot.
     The slot address is ``base_address + slot * slot_stride_bytes``;
-    per-layer and per-role offsets are carried by each PoolView.
+    where each buffer lies within the slot is the page layout's
+    (``KVCachePageTable.layout``).
     """
 
     base_address: int  # uint64
@@ -115,91 +103,6 @@ class LocalLayer:
 
 
 @dataclass
-class PoolView:
-    """
-    Per-layer-group view of a physical pool (slot layout for this life cycle).
-
-    Fields:
-        pool_idx: Index of the physical pool within its pool group.
-        buffer_entries: Structured array using ``BUFFER_ENTRY_DTYPE``. Each
-            entry records a buffer's ``local_layer_id`` and its byte ``offset``
-            and ``size`` within the pool slot.
-        pool_role: Set of native role-name strings (whatever the cache manager
-            uses, e.g. ``"key"`` / ``"value"`` / ``"deepseek_v4_swa"``) that
-            live in this pool. Used as the *equivalence label* for peer-to-peer
-            pool matching: two pools match iff their ``pool_role`` frozensets
-            are equal. Disagg never enumerates the role-name vocabulary —
-            adding a new role on the manager side requires no disagg change.
-        mapper_kind: Closed-set discriminator for picking the Mapper family.
-        bytes_per_layer: Uniform byte size of one layer's region within the
-            slot. The per-layer *offsets* live in ``buffer_entries``; only
-            the size is uniform, because a slot may interleave other role
-            classes between layers, making the layer stride non-uniform.
-            Set for every kind; ``None`` only in tables serialized by older
-            builders, where consumers re-derive it from the entries.
-        section_bytes: SECTIONED views only. Byte size of each section of one
-            layer's region, in slot order (``sum == bytes_per_layer``). Each
-            section is TP-sharded independently, so a TP mismatch is resolved
-            per section.
-        bytes_per_head: INDEXED views whose head count is not derivable from
-            ``RankInfo.attention`` (recurrent SSM state). ``bytes_per_layer //
-            bytes_per_head`` is the per-rank head count. Attention K/V leaves
-            it ``None`` and uses ``kv_heads_per_rank`` instead.
-    """
-
-    pool_idx: int
-    buffer_entries: np.ndarray  # dtype=BUFFER_ENTRY_DTYPE
-    pool_role: FrozenSet[str] = field(default_factory=frozenset)
-    mapper_kind: MapperKind = MapperKind.INDEXED
-    bytes_per_layer: Optional[int] = None
-    section_bytes: Optional[List[int]] = None
-    bytes_per_head: Optional[int] = None
-
-    def to_dict(self) -> dict:
-        return {
-            "pool_idx": int(self.pool_idx),
-            "buffer_entries": self.buffer_entries.tolist(),
-            "pool_role": sorted(self.pool_role),
-            "mapper_kind": int(self.mapper_kind),
-            "bytes_per_layer": (
-                int(self.bytes_per_layer) if self.bytes_per_layer is not None else None
-            ),
-            "section_bytes": (
-                [int(x) for x in self.section_bytes] if self.section_bytes is not None else None
-            ),
-            "bytes_per_head": (
-                int(self.bytes_per_head) if self.bytes_per_head is not None else None
-            ),
-        }
-
-    @staticmethod
-    def from_dict(data: dict) -> "PoolView":
-        raw = data.get("buffer_entries", [])
-        # msgpack deserializes tuples as lists; np.array requires tuples for
-        # structured dtypes (enforced in numpy >=2.0), so convert explicitly.
-        return PoolView(
-            pool_idx=int(data["pool_idx"]),
-            buffer_entries=np.array(
-                [tuple(row) for row in raw],
-                dtype=BUFFER_ENTRY_DTYPE,
-            ),
-            pool_role=frozenset(data["pool_role"]),
-            mapper_kind=MapperKind(int(data["mapper_kind"])),
-            bytes_per_layer=(
-                int(data["bytes_per_layer"]) if data.get("bytes_per_layer") is not None else None
-            ),
-            section_bytes=(
-                [int(x) for x in data["section_bytes"]]
-                if data.get("section_bytes") is not None
-                else None
-            ),
-            bytes_per_head=(
-                int(data["bytes_per_head"]) if data.get("bytes_per_head") is not None else None
-            ),
-        )
-
-
-@dataclass
 class LayerGroup:
     """Base class for one life cycle / layer-group.
 
@@ -209,13 +112,11 @@ class LayerGroup:
         block alignment.
       - pool_group_idx: index into KVCachePageTable.pool_groups
       - local_layers: local ↔ global layer ID mapping
-      - pool_views: logical views into pool_groups[pool_group_idx].pools
     """
 
     pool_group_idx: int
     kind: CacheKind = CacheKind.PAGED
     local_layers: List[LocalLayer] = field(default_factory=list)
-    pool_views: List[PoolView] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         raise NotImplementedError
@@ -244,7 +145,6 @@ class AttentionLayerGroup(LayerGroup):
             "kv_head_num_per_rank": int(self.kv_head_num_per_rank),
             "sliding_window_size": self.sliding_window_size,
             "local_layers": [ll.to_dict() for ll in self.local_layers],
-            "pool_views": [pv.to_dict() for pv in self.pool_views],
         }
 
     @classmethod
@@ -252,34 +152,18 @@ class AttentionLayerGroup(LayerGroup):
         return cls(
             pool_group_idx=int(data["pool_group_idx"]),
             local_layers=[LocalLayer.from_dict(x) for x in data.get("local_layers", [])],
-            pool_views=[PoolView.from_dict(pv) for pv in data.get("pool_views", [])],
             kv_head_num_per_rank=int(data["kv_head_num_per_rank"]),
             sliding_window_size=data.get("sliding_window_size"),
         )
-
-
-# Native role names of the hybrid Mamba managers (``MambaRole.CONV_STATE`` /
-# ``MambaRole.SSM_STATE``), spelled out here because page.py must not import
-# the manager.
-MAMBA_CONV_ROLE = frozenset({"conv_state"})
-MAMBA_SSM_ROLE = frozenset({"ssm_state"})
 
 
 @dataclass
 class MambaLayerGroup(LayerGroup):
     """Layer group for recurrent (STATE life cycle) states.
 
-    One slot per request; every view of the group is addressed by the same
-    slot id. Pools are accessed the same way as attention:
-        pool_groups[pool_group_idx].pools[pool_view.pool_idx]
-
-    Views are matched to a peer by ``pool_role``; how each view reshards
-    under a TP mismatch is described on the view itself (``mapper_kind``
-    plus ``section_bytes`` / ``bytes_per_head``), so a group may carry any
-    mix of recurrent roles (Mamba2 / GDN conv and SSM state, KDA state, PLE
-    side state) without the group knowing which is which.
-
-    Each physical slot packs its coalesced layers and roles together.
+    One slot per request, addressed by the same slot id in every pool of
+    the group's pool group; each slot packs its coalesced layers and roles
+    together, as the page layout describes.
     """
 
     def __post_init__(self) -> None:
@@ -290,7 +174,6 @@ class MambaLayerGroup(LayerGroup):
             "kind": int(self.kind),
             "pool_group_idx": int(self.pool_group_idx),
             "local_layers": [ll.to_dict() for ll in self.local_layers],
-            "pool_views": [pv.to_dict() for pv in self.pool_views],
             "slot_major_layout": True,
         }
 
@@ -304,14 +187,14 @@ class MambaLayerGroup(LayerGroup):
         return cls(
             pool_group_idx=int(data["pool_group_idx"]),
             local_layers=[LocalLayer.from_dict(x) for x in data["local_layers"]],
-            pool_views=[PoolView.from_dict(pv) for pv in data["pool_views"]],
         )
 
 
 @dataclass
 class KVCachePageTable:
-    """A rank's pools and views, indexed for transfer, and the page layout (``layout``) the manager
-    described them by, from which ``layout_mapping`` relates two ranks' pages."""
+    """A rank's pools and layer groups, indexed for transfer, and the page layout (``layout``) the
+    manager described them by: where each buffer lies in its pool's slot, from which
+    ``layout_mapping`` relates two ranks' pages."""
 
     tokens_per_block: int
     layer_groups: List[LayerGroup]

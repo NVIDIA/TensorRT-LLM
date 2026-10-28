@@ -13,12 +13,7 @@ import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.page import (
-    MAMBA_CONV_ROLE,
-    MAMBA_SSM_ROLE,
-    AttentionLayerGroup,
-    MambaLayerGroup,
-)
+from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, MambaLayerGroup
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -3692,8 +3687,8 @@ def test_v2_hybrid_disagg_page_table_uses_qwen3_next_conv_sections():
         assert isinstance(mamba_group, MambaLayerGroup)
         d_conv_m1 = mgr.conv_state_shape[1]
         conv_elem_size = mgr.all_conv_states[0].element_size()
-        conv_view = next(pv for pv in mamba_group.pool_views if pv.pool_role == MAMBA_CONV_ROLE)
-        assert conv_view.section_bytes == [
+        conv = next(b for b in page_table.layout.buffers if b.role == str(MambaRole.CONV_STATE))
+        assert [t.axes[0].held for t in conv.tensors] == [
             dim * d_conv_m1 * conv_elem_size for dim in mgr.conv_section_dims
         ]
         assert mgr.conv_section_dims == [8, 8, 32]
@@ -4854,8 +4849,11 @@ def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
         check_compatible(src_table.layout, dst_table.layout)
         src_group = next(g for g in src_table.layer_groups if isinstance(g, MambaLayerGroup))
         dst_group = next(g for g in dst_table.layer_groups if isinstance(g, MambaLayerGroup))
-        for group in (src_group, dst_group):
-            assert {pv.pool_role for pv in group.pool_views} == {MAMBA_CONV_ROLE, MAMBA_SSM_ROLE}
+        for table, group in ((src_table, src_group), (dst_table, dst_group)):
+            layers = {ll.global_layer_id for ll in group.local_layers}
+            assert {
+                b.role for b in table.layout.buffers if b.transferred and b.layer in layers
+            } == {str(MambaRole.CONV_STATE), str(MambaRole.SSM_STATE)}
         assert received_bytes(src_table.layout, dst_table.layout, "state") == sum(
             gen.mamba_layer_cache(i).conv[dst_slot].numel() * 2
             + gen.mamba_layer_cache(i).temporal[dst_slot].numel() * 4

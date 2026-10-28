@@ -23,15 +23,14 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVRegionExtractorV1,
     build_page_table_from_manager,
 )
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_global_layer_ids,
-    get_layer_byte_ranges,
     get_layer_to_layer_group,
     get_num_layer_groups,
     get_num_layers,
     get_physical_pool,
-    get_unique_layers,
+    get_transferred_pool_indices,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaRole
@@ -161,25 +160,21 @@ def test_build_page_table():
     assert get_num_layer_groups(page_table) > 0
 
     lg = page_table.layer_groups[0]
-    pv = lg.pool_views[0]
-    pool = get_physical_pool(page_table, 0, pv.pool_idx)
+    (pool_idx,) = get_transferred_pool_indices(page_table, 0)
+    pool = get_physical_pool(page_table, 0, pool_idx)
     assert pool.base_address > 0
     # V2 reserves additional slots beyond the requested token capacity.
     assert pool.num_slots >= max_tokens // tokens_per_block
-    assert len(pv.buffer_entries) > 0
-    assert pv.pool_role == frozenset({"key", "value"})
-    assert pv.mapper_kind == MapperKind.INDEXED
     assert len(get_global_layer_ids(lg)) > 0
 
-    local_layer_id = list(get_unique_layers(pv))[0]
-    layer_entries = sorted(
-        (e for e in pv.buffer_entries if int(e["local_layer_id"]) == local_layer_id),
-        key=lambda e: int(e["offset"]),
+    layer = get_global_layer_ids(lg)[0]
+    key, value = sorted(
+        (b for b in page_table.layout.buffers if b.layer == layer), key=lambda b: b.slot_offset
     )
-    assert len(layer_entries) >= 2  # KV layout: K + V buffer per layer
-    pool = get_physical_pool(page_table, 0, pv.pool_idx)
-    ptr_key = int(pool.base_address) + int(layer_entries[0]["offset"])
-    ptr_value = int(pool.base_address) + int(layer_entries[1]["offset"])
+    assert (key.role, value.role) == ("key", "value")
+    assert key.pool_index == value.pool_index == pool_idx
+    ptr_key = int(pool.base_address) + key.slot_offset
+    ptr_value = int(pool.base_address) + value.slot_offset
     assert ptr_key > 0
     assert ptr_value > ptr_key
 
@@ -204,24 +199,15 @@ def test_build_page_table():
 
 @pytest.mark.cpu_only
 def test_layer_group_meta_serialization():
-    import numpy as np
-
     from tensorrt_llm._torch.disaggregation.resource.page import (
-        BUFFER_ENTRY_DTYPE,
         AttentionLayerGroup,
         KVCachePageTable,
         LocalLayer,
         PhysicalPool,
         PhysicalPoolGroup,
-        PoolView,
     )
 
-    entries = np.array(
-        [(0, 0, 256), (0, 256, 256)],
-        dtype=BUFFER_ENTRY_DTYPE,
-    )
     kv_pool = PhysicalPool(base_address=1000, slot_bytes=512, num_slots=10)
-    pv = PoolView(pool_idx=0, buffer_entries=entries)
     local_layers = [
         LocalLayer(local_layer_id=0, global_layer_id=0),
         LocalLayer(local_layer_id=1, global_layer_id=1),
@@ -231,7 +217,6 @@ def test_layer_group_meta_serialization():
         kv_head_num_per_rank=4,
         sliding_window_size=512,
         local_layers=local_layers,
-        pool_views=[pv],
     )
     page_table = KVCachePageTable(
         tokens_per_block=16,
@@ -244,8 +229,7 @@ def test_layer_group_meta_serialization():
     assert isinstance(restored.layer_groups[0], AttentionLayerGroup)
     assert restored_lg.sliding_window_size == 512
     assert restored_lg.kv_head_num_per_rank == 4
-    assert len(restored_lg.local_layers) == 2
-    assert len(restored_lg.pool_views[0].buffer_entries) == 2
+    assert restored_lg.local_layers == local_layers
 
 
 def _page_table(groups, pool_slot_bytes, buffers, bases):
@@ -297,184 +281,55 @@ def _index_key(layer, pool, offset, size=128):
     return BufferDesc(layer, "index_key", 0, pool, offset, size, replicated(size))
 
 
-def test_page_table_stamps_homogeneous_pool_kinds():
-    """Split token-major K/V and replicated INDEX_KEY pools get NHD and REPLICATED views."""
-    views = (
-        _attention_page_table(
-            (
-                _kv(0, "key", 0, 0),
-                _kv(0, "value", 0, 128),
-                _kv(1, "key", 0, 256),
-                _kv(1, "value", 0, 384),
-                _index_key(1, 1, 0),
-            ),
-            (512, 128),
-        )
-        .layer_groups[0]
-        .pool_views
-    )
-    assert len(views) == 2
-    assert views[0].pool_role == frozenset({"key", "value"})
-    assert views[0].mapper_kind == MapperKind.NHD
-    assert get_unique_layers(views[0]) == {0, 1}
-    assert views[1].pool_role == frozenset({"index_key"})
-    assert views[1].mapper_kind == MapperKind.REPLICATED
-    assert get_unique_layers(views[1]) == {1}
+def test_a_layer_group_transfers_the_pools_holding_its_transferred_buffers():
+    """A layer group's pools that transfer are those holding its transferred buffers.
 
-
-def test_page_table_splits_mixed_kind_pool_into_per_class_views():
-    """A pool holding several kinds of buffers yields one view per kind.
-
-    Miniature of the MiniMax M3 layout at TP degrees where K == V == INDEX_KEY bytes per block:
-    one pool whose slot interleaves the sparse layer's INDEX_KEY between the layers' K/V. Native
-    sees a NHD K/V view (non-uniform layer offsets, uniform per-layer size) and a REPLICATED
-    INDEX_KEY view covering only the sparse layer.
+    Pools are listed by index within the group's pool group, once however many buffers share
+    them; a pool holding only buffers peers do not transfer is left out.
     """
-    views = (
-        _attention_page_table(
-            (
-                _kv(0, "key", 0, 0),
-                _kv(0, "value", 0, 128),
-                _index_key(0, 0, 256),
-                _kv(1, "key", 0, 384),
-                _kv(1, "value", 0, 512),
-            ),
-            (640,),
-        )
-        .layer_groups[0]
-        .pool_views
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import BufferDesc
+
+    kv = (
+        _kv(0, "key", 0, 0),
+        _kv(0, "value", 0, 128),
+        _index_key(0, 0, 256),
+        _kv(1, "key", 0, 384),
+        _kv(1, "value", 0, 512),
     )
-    assert len(views) == 2
-    kv_view, idx_view = views
-    # Both views address the same physical pool.
-    assert kv_view.pool_idx == idx_view.pool_idx == 0
+    assert get_transferred_pool_indices(_attention_page_table(kv, (640,)), 0) == [0]
 
-    assert kv_view.pool_role == frozenset({"key", "value"})
-    assert kv_view.mapper_kind == MapperKind.NHD
-    assert get_unique_layers(kv_view) == {0, 1}
-    assert kv_view.bytes_per_layer == 256
-    kv_starts, kv_bytes_per_layer = get_layer_byte_ranges(kv_view)
-    # Layer stride is non-uniform: INDEX_KEY interleaves after layer 0.
-    assert kv_starts == {0: 0, 1: 384}
-    assert kv_bytes_per_layer == 256
-
-    assert idx_view.pool_role == frozenset({"index_key"})
-    assert idx_view.mapper_kind == MapperKind.REPLICATED
-    assert get_unique_layers(idx_view) == {0}
-    assert idx_view.bytes_per_layer == 128
-    idx_starts, _ = get_layer_byte_ranges(idx_view)
-    assert idx_starts == {0: 256}
-
-
-def test_page_table_reads_view_kinds_off_tensors():
-    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
-        Axis,
-        BufferDesc,
-        Tensor,
-        head_major,
+    scales = tuple(
+        BufferDesc(layer, "scale", 0, 1, 64 * layer, 64, transferred=False) for layer in (0, 1)
     )
-
-    def kv(tensors):
-        return tuple(
-            _kv(layer, role, 0, 256 * layer + 128 * j, tensors=tensors)
-            for layer in (0, 1)
-            for j, role in enumerate(("key", "value"))
-        )
-
-    # Head-major heads, and a rank's own share whose heads go undeclared, are both INDEXED.
-    own = (Tensor((Axis("shard", 2, 128, ("tp",), 1), Axis("byte", 128, 1)), name="own"),)
-    for tensors in (head_major(128, 1, 2), own):
-        (view,) = _attention_page_table(kv(tensors), (512,)).layer_groups[0].pool_views
-        assert view.mapper_kind == MapperKind.INDEXED
-        assert view.bytes_per_layer == 256
-
-    # Buffers peers do not transfer are in no view.
-    buffers = kv(None) + tuple(
-        BufferDesc(layer, "scale", 0, 0, 512 + 64 * layer, 64, transferred=False)
-        for layer in (0, 1)
-    )
-    (view,) = _attention_page_table(buffers, (640,)).layer_groups[0].pool_views
-    assert view.pool_role == frozenset({"key", "value"})
-    assert [tuple(int(x) for x in e) for e in view.buffer_entries] == [
-        (0, 0, 128),
-        (0, 128, 128),
-        (1, 256, 128),
-        (1, 384, 128),
-    ]
+    page_table = _attention_page_table(kv + (_index_key(1, 2, 0),) + scales, (640, 128, 128))
+    assert get_transferred_pool_indices(page_table, 0) == [0, 2]
 
 
 @pytest.mark.cpu_only
 def test_mamba_layer_group_serialization():
-    import numpy as np
-
     from tensorrt_llm._torch.disaggregation.resource.page import (
-        BUFFER_ENTRY_DTYPE,
-        MAMBA_CONV_ROLE,
-        MAMBA_SSM_ROLE,
         LayerGroup,
         LocalLayer,
         MambaLayerGroup,
         PhysicalPool,
-        PoolView,
     )
 
-    sorted_lids = [0, 1, 2]
-    conv_slot_bytes = 128
-    ssm_slot_bytes = 256
     local_layers = [
         LocalLayer(local_layer_id=0, global_layer_id=10),
         LocalLayer(local_layer_id=1, global_layer_id=11),
         LocalLayer(local_layer_id=2, global_layer_id=12),
     ]
-    pool_views = [
-        PoolView(
-            pool_idx=0,
-            buffer_entries=np.array(
-                [(lid, 0, conv_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
-            ),
-            pool_role=MAMBA_CONV_ROLE,
-            mapper_kind=MapperKind.SECTIONED,
-            bytes_per_layer=conv_slot_bytes,
-        ),
-        PoolView(
-            pool_idx=1,
-            buffer_entries=np.array(
-                [(lid, 0, ssm_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
-            ),
-            pool_role=MAMBA_SSM_ROLE,
-            mapper_kind=MapperKind.INDEXED,
-            bytes_per_layer=ssm_slot_bytes,
-            bytes_per_head=128,
-        ),
-    ]
-    pool_views[0].section_bytes = [512, 256, 256]
-    mlg = MambaLayerGroup(
-        pool_group_idx=1,
-        local_layers=local_layers,
-        pool_views=pool_views,
-    )
+    mlg = MambaLayerGroup(pool_group_idx=1, local_layers=local_layers)
 
     d = mlg.to_dict()
     assert d["slot_major_layout"] is True
-    assert d["pool_views"][0]["section_bytes"] == [512, 256, 256]
-    assert d["pool_views"][1]["bytes_per_head"] == 128
     assert d["kind"] == int(CacheKind.STATE)
     assert "mamba_layer_offsets" not in d
     assert "conv_section_bytes" not in d
 
     restored = LayerGroup.from_dict(d)
     assert isinstance(restored, MambaLayerGroup)
-    assert len(restored.pool_views) == 2
-    assert restored.pool_views[0].pool_role == MAMBA_CONV_ROLE
-    assert restored.pool_views[0].bytes_per_layer == conv_slot_bytes
-    assert restored.pool_views[0].mapper_kind == MapperKind.SECTIONED
-    assert restored.pool_views[1].pool_role == MAMBA_SSM_ROLE
-    assert restored.pool_views[1].bytes_per_layer == ssm_slot_bytes
-    assert restored.pool_views[1].mapper_kind == MapperKind.INDEXED
-    assert restored.pool_views[0].section_bytes == [512, 256, 256]
-    assert restored.pool_views[0].bytes_per_head is None
-    assert restored.pool_views[1].bytes_per_head == 128
-    assert restored.pool_views[1].section_bytes is None
+    assert restored.pool_group_idx == 1
     assert [(ll.local_layer_id, ll.global_layer_id) for ll in restored.local_layers] == [
         (0, 10),
         (1, 11),
@@ -524,10 +379,8 @@ def _recurrent_page_table(conv_sections=(16, 16, 32), ple_on_layer=1):
 
 
 def test_page_table_describes_a_recurrent_group():
-    """Conv, SSM and PLE views come from the page layout, geometry included."""
+    """The recurrent group's layers and pools come from the page layout; its buffers stay there."""
     from tensorrt_llm._torch.disaggregation.resource.page import (
-        MAMBA_CONV_ROLE,
-        MAMBA_SSM_ROLE,
         AttentionLayerGroup,
         MambaLayerGroup,
     )
@@ -546,45 +399,20 @@ def test_page_table_describes_a_recurrent_group():
     pools = page_table.pool_groups[recurrent.pool_group_idx].pools
     assert (pools[0].base_address, pools[0].slot_bytes, pools[0].num_slots) == (0x10000, 256, 4)
 
-    by_role = {pv.pool_role: pv for pv in recurrent.pool_views}
-    assert set(by_role) == {
-        MAMBA_SSM_ROLE,
-        MAMBA_CONV_ROLE,
-        frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)}),
-    }
-
-    ssm = by_role[MAMBA_SSM_ROLE]
-    assert ssm.pool_idx == 0
-    assert ssm.mapper_kind == MapperKind.INDEXED
-    assert ssm.bytes_per_layer == 64
-    assert ssm.bytes_per_head == 32
-    assert ssm.section_bytes is None
-    assert [tuple(int(x) for x in e) for e in ssm.buffer_entries] == [(0, 0, 64), (1, 128, 64)]
-
-    conv = by_role[MAMBA_CONV_ROLE]
-    assert conv.pool_idx == 0
-    assert conv.mapper_kind == MapperKind.SECTIONED
-    assert conv.bytes_per_layer == 64
-    assert conv.section_bytes == [16, 16, 32]
-    assert conv.bytes_per_head is None
-    assert [tuple(int(x) for x in e) for e in conv.buffer_entries] == [(0, 64, 64), (1, 192, 64)]
-
-    ple = by_role[frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)})]
-    assert ple.pool_idx == 1
-    assert ple.mapper_kind == MapperKind.REPLICATED
-    assert ple.bytes_per_layer == 32
-    assert [tuple(int(x) for x in e) for e in ple.buffer_entries] == [(1, 0, 32)]
+    # SSM and conv state share pool 0, PLE context lies in pool 1.
+    assert get_transferred_pool_indices(page_table, 0) == [0, 1]
+    by_role = {b.role: b for b in page_table.layout.buffers if b.layer == 1}
+    assert (by_role["ssm_state"].pool_index, by_role["ssm_state"].slot_offset) == (0, 128)
+    assert (by_role["conv_state"].pool_index, by_role["conv_state"].slot_offset) == (0, 192)
+    assert by_role[str(MambaRole.PLE_NGRAM_CONTEXT)].pool_index == 1
 
     # A recurrent request's slot is addressed by its base pointer; the runs of the mapper place
-    # each layer's bytes within it. (Look views up by role: PoolView.__eq__ compares numpy entries.)
+    # each layer's bytes within it.
     extractor = KVRegionExtractorV1(page_table)
-    view_index = {pv.pool_role: idx for idx, pv in enumerate(recurrent.pool_views)}
-    conv_idx = view_index[MAMBA_CONV_ROLE]
-    ple_idx = view_index[frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)})]
-    conv_region = extractor.extract(np.array([2]), 0, conv_idx).memory
+    conv_region = extractor.extract(np.array([2]), 0, 0).memory
     assert conv_region.ptrs.tolist() == [0x10000 + 2 * 256]
     assert conv_region.bytes_per_region == 256
-    assert extractor.extract(np.array([3]), 0, ple_idx).memory.ptrs.tolist() == [0x20000 + 3 * 32]
+    assert extractor.extract(np.array([3]), 0, 1).memory.ptrs.tolist() == [0x20000 + 3 * 32]
 
     # The attention group is untouched by the recurrent one.
     assert attention.pool_group_idx == 1
@@ -597,68 +425,42 @@ def test_page_table_rejects_sections_that_do_not_cover_the_buffer():
 
 
 def test_v2_mamba_registration_uses_coalesced_physical_pool():
-    import numpy as np
-
-    from tensorrt_llm._torch.disaggregation.resource.page import (
-        BUFFER_ENTRY_DTYPE,
-        MAMBA_CONV_ROLE,
-        MAMBA_SSM_ROLE,
-        KVCachePageTable,
-        LocalLayer,
-        MambaLayerGroup,
-        PhysicalPool,
-        PhysicalPoolGroup,
-        PoolView,
-    )
     from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+        BufferDesc,
+        LayerGroupDesc,
+        head_major,
+        sectioned,
+    )
 
     state_bytes = 64
     num_layers = 2
     num_slots = 8
     # Equal-sized SSM and convolution states share one interleaved V2 pool.
     physical_slot_bytes = state_bytes * num_layers * 2
-    physical_pool = PhysicalPool(
-        base_address=1000,
-        slot_bytes=physical_slot_bytes,
-        num_slots=num_slots,
+    buffers = []
+    for i, layer in enumerate((1, 2)):
+        buffers.append(
+            BufferDesc(layer, "conv_state", 0, 0, i * state_bytes, state_bytes, sectioned((64,), 1))
+        )
+        buffers.append(
+            BufferDesc(
+                layer,
+                "ssm_state",
+                0,
+                0,
+                (num_layers + i) * state_bytes,
+                state_bytes,
+                head_major(state_bytes, 2, 2),
+            )
+        )
+    page_table = _page_table(
+        (LayerGroupDesc("state", None, 0, 0, (1, 2)),),
+        {0: (physical_slot_bytes,)},
+        tuple(buffers),
+        {0: [1000]},
     )
-    sorted_lids = [0, 1]
-    local_layers = [
-        LocalLayer(local_layer_id=0, global_layer_id=1),
-        LocalLayer(local_layer_id=1, global_layer_id=2),
-    ]
-    pool_views = [
-        PoolView(
-            pool_idx=0,
-            buffer_entries=np.array(
-                [(lid, lid * state_bytes, state_bytes) for lid in sorted_lids],
-                dtype=BUFFER_ENTRY_DTYPE,
-            ),
-            pool_role=MAMBA_CONV_ROLE,
-            mapper_kind=MapperKind.SECTIONED,
-            bytes_per_layer=state_bytes,
-        ),
-        PoolView(
-            pool_idx=0,
-            buffer_entries=np.array(
-                [(lid, (num_layers + lid) * state_bytes, state_bytes) for lid in sorted_lids],
-                dtype=BUFFER_ENTRY_DTYPE,
-            ),
-            pool_role=MAMBA_SSM_ROLE,
-            mapper_kind=MapperKind.INDEXED,
-            bytes_per_layer=state_bytes,
-        ),
-    ]
-    mamba_group = MambaLayerGroup(
-        pool_group_idx=0,
-        local_layers=local_layers,
-        pool_views=pool_views,
-    )
-    page_table = KVCachePageTable(
-        tokens_per_block=16,
-        layer_groups=[mamba_group],
-        pool_groups=[PhysicalPoolGroup(pools=[physical_pool])],
-    )
+    page_table.pool_groups[0].pools[0].num_slots = num_slots
 
     # V2 interleaved: one shared pool registered once
     assert get_unique_pool_memory_descs(page_table, device_id=3) == [
@@ -668,66 +470,25 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
 
 @pytest.mark.cpu_only
 def test_mixed_page_table_serialization():
-    import numpy as np
-
     from tensorrt_llm._torch.disaggregation.resource.page import (
-        BUFFER_ENTRY_DTYPE,
         AttentionLayerGroup,
         KVCachePageTable,
         LocalLayer,
         MambaLayerGroup,
         PhysicalPool,
         PhysicalPoolGroup,
-        PoolView,
     )
 
-    # Attention layer group
-    entries = np.array(
-        [(0, 0, 256), (0, 256, 256)],
-        dtype=BUFFER_ENTRY_DTYPE,
-    )
     attn_lg = AttentionLayerGroup(
         pool_group_idx=0,
         kv_head_num_per_rank=4,
         local_layers=[LocalLayer(0, 0)],
-        pool_views=[PoolView(pool_idx=0, buffer_entries=entries)],
     )
-
-    # Mamba layer group
-    from tensorrt_llm._torch.disaggregation.resource.page import MAMBA_CONV_ROLE, MAMBA_SSM_ROLE
-
-    mamba_sorted_lids = [0, 1]
     mamba_local_layers = [
         LocalLayer(local_layer_id=0, global_layer_id=1),
         LocalLayer(local_layer_id=1, global_layer_id=2),
     ]
-    mamba_pool_views = [
-        PoolView(
-            pool_idx=0,
-            buffer_entries=np.array(
-                [(lid, 0, 1024) for lid in mamba_sorted_lids], dtype=BUFFER_ENTRY_DTYPE
-            ),
-            pool_role=MAMBA_CONV_ROLE,
-            mapper_kind=MapperKind.SECTIONED,
-            bytes_per_layer=1024,
-            section_bytes=[256, 128, 128],
-        ),
-        PoolView(
-            pool_idx=1,
-            buffer_entries=np.array(
-                [(lid, 0, 2048) for lid in mamba_sorted_lids], dtype=BUFFER_ENTRY_DTYPE
-            ),
-            pool_role=MAMBA_SSM_ROLE,
-            mapper_kind=MapperKind.INDEXED,
-            bytes_per_layer=2048,
-            bytes_per_head=64,
-        ),
-    ]
-    mamba_lg = MambaLayerGroup(
-        pool_group_idx=1,
-        local_layers=mamba_local_layers,
-        pool_views=mamba_pool_views,
-    )
+    mamba_lg = MambaLayerGroup(pool_group_idx=1, local_layers=mamba_local_layers)
 
     page_table = KVCachePageTable(
         tokens_per_block=16,

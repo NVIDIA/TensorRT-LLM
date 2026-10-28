@@ -40,10 +40,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     Axis,
     BufferDesc,
     LayerGroupDesc,
-    MapperKind,
     PageLayout,
     RankTopology,
-    RoleLayout,
     ShardDesc,
     Tensor,
     head_major,
@@ -342,28 +340,6 @@ def test_a_shard_is_a_share_of_its_count(shard):
         ShardDesc(*shard)
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "sections",
-    [(np.int64(4), np.int64(4)), np.array([4, 4]), [4, 4], (4, 4)],
-    ids=["numpy-ints", "numpy-array", "list", "tuple"],
-)
-def test_a_validated_geometry_holds_its_sections_as_a_tuple_of_ints(sections):
-    checked = RoleLayout(section_bytes=sections, bytes_per_head=2)
-    assert checked == RoleLayout(section_bytes=(4, 4), bytes_per_head=2)
-    assert type(checked.section_bytes) is tuple
-    assert all(type(s) is int for s in checked.section_bytes)
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "fields", [{"section_bytes": (4, 0)}, {"bytes_per_head": 0}, {"section_bytes": (8, -4)}]
-)
-def test_validation_refuses_sizes_that_are_not_positive(fields):
-    with pytest.raises(ValueError, match="positive"):
-        RoleLayout(**fields)
-
-
 def described(b):
     """(kind, heads on this rank, bytes per head) a buffer's tensors amount to: "REPLICATED" alike
     on every rank, "SECTIONED" split by byte, else "NHD" or "INDEXED" by where its head axis lies;
@@ -427,8 +403,8 @@ class Manager:
         attention_dp=False,
         num_kv_heads=4,
         pp_layers: Optional[Sequence[int]] = None,
-        mappers: Optional[Dict[str, MapperKind]] = None,
-        layouts: Optional[Dict[str, RoleLayout]] = None,
+        mappers: Optional[Dict[str, str]] = None,
+        layouts: Optional[Dict[str, Dict[str, object]]] = None,
         ignored=(),
         pool_group_of: Optional[Sequence[int]] = None,
         windows: Optional[Sequence[Optional[int]]] = None,
@@ -447,7 +423,7 @@ class Manager:
         self.num_kv_heads = num_kv_heads
         self.num_kv_heads_per_layer = [heads_per_rank] * len(internal)
         self.pp_layers = list(pp_layers if pp_layers is not None else internal)
-        self.mappers = {"all": MapperKind.INDEXED, **(mappers or {})}
+        self.mappers = {"all": "head_major", **(mappers or {})}
         self.layouts = layouts or {}
         self.ignored = frozenset(ignored)
         layers: List[object] = []
@@ -503,23 +479,24 @@ class Manager:
 
     def _page_buffer_tensors(self, layer_id, role, size, tokens, state):
         """Each role spread as ``mappers`` names it ("all" for the roles it does not list):
-        replicated, sectioned by ``layouts``' section bytes, or split by head, head-major (INDEXED)
-        or token-major (NHD), ``layouts``' bytes per head or the layer's KV heads apart."""
+        "replicated", "sectioned" by ``layouts``' ``section_bytes``, or split by head,
+        "head_major" or "token_major", ``layouts``' ``bytes_per_head`` or the layer's KV heads
+        apart."""
         kind = self.mappers.get(role, self.mappers["all"])
-        layout = self.layouts.get(role, RoleLayout())
-        if kind == MapperKind.REPLICATED:
+        layout = self.layouts.get(role, {})
+        if kind == "replicated":
             return replicated(size)
-        if kind == MapperKind.SECTIONED:
+        if kind == "sectioned":
             split = ("tp", "cp") if state else ("tp",)
             ranks, _ = page_layout.grid_place(page_table.rank_topology(self.mapping), split)
-            return sectioned(layout.section_bytes, ranks, split)
+            return sectioned(layout["section_bytes"], ranks, split)
         return self._page_head_split(
             layer_id,
             size,
             tokens,
             state,
-            head_bytes=layout.bytes_per_head,
-            token_major_=kind == MapperKind.NHD,
+            head_bytes=layout.get("bytes_per_head"),
+            token_major_=kind == "token_major",
         )
 
     def _page_untransferred_roles(self):
@@ -547,10 +524,10 @@ def recurrent_state():
         [(SsmLayerConfig, [0, 1], [("conv_state", 96, None), ("ssm_state", 128, None)])],
         tp_size=2,
         tp_rank=1,
-        mappers={"conv_state": MapperKind.SECTIONED},
+        mappers={"conv_state": "sectioned"},
         layouts={
-            "conv_state": RoleLayout(section_bytes=(32, 32, 32)),
-            "ssm_state": RoleLayout(bytes_per_head=32),
+            "conv_state": dict(section_bytes=(32, 32, 32)),
+            "ssm_state": dict(bytes_per_head=32),
         },
     )
 
@@ -562,11 +539,11 @@ def check_token_major_kv_has_its_own_layout_id():
     """A manager declaring token-major K/V (NHD) and one declaring the default head-major K/V (HND)
     lay a block's bytes out differently, so they never share a ``layout_id``."""
     head_major = derive_layout(attention(1, 0, 4)).page_layout
-    token_major = derive_layout(attention(1, 0, 4, mappers={"all": MapperKind.NHD})).page_layout
+    token_major = derive_layout(attention(1, 0, 4, mappers={"all": "token_major"})).page_layout
     assert layout_id(head_major) != layout_id(token_major), TOKEN_MAJOR_SHARES
     assert {described(b)[0] for b in token_major.buffers} == {"NHD"}
     assert {described(b)[0] for b in head_major.buffers} == {"INDEXED"}
-    hnd = derive_layout(attention(1, 0, 4, mappers={"all": MapperKind.HND})).page_layout
+    hnd = derive_layout(attention(1, 0, 4, mappers={"all": "head_major"})).page_layout
     assert layout_id(hnd) == layout_id(head_major), "HND is the default head-major layout"
 
 
@@ -639,7 +616,7 @@ def test_a_group_of_replicated_buffers_is_whole_and_one_head_sharded_buffer_make
         tp_size=2,
         tp_rank=1,
         num_kv_heads=8,
-        mappers={"index_key": MapperKind.REPLICATED},
+        mappers={"index_key": "replicated"},
     )
     assert derive_layout(replicated_only).page_layout.layer_groups[0].shard == ShardDesc()
     mixed = Manager(
@@ -647,7 +624,7 @@ def test_a_group_of_replicated_buffers_is_whole_and_one_head_sharded_buffer_make
         tp_size=2,
         tp_rank=1,
         num_kv_heads=8,
-        mappers={"index_key": MapperKind.REPLICATED},
+        mappers={"index_key": "replicated"},
     )
     assert derive_layout(mixed).page_layout.layer_groups[0].shard == ShardDesc(2, 1)
 
@@ -659,7 +636,7 @@ def test_local_only_buffers_do_not_decide_the_identity():
         [(AttentionLayerConfig, [0], [("index_key", 64, None), scratch])],
         tp_size=2,
         tp_rank=1,
-        mappers={"index_key": MapperKind.REPLICATED},
+        mappers={"index_key": "replicated"},
         ignored=("scratch",),
     )
     layout = derive_layout(manager).page_layout
@@ -677,7 +654,7 @@ def test_groups_of_one_manager_are_judged_one_by_one():
         tp_size=2,
         tp_rank=0,
         num_kv_heads=8,
-        mappers={"index_key": MapperKind.REPLICATED},
+        mappers={"index_key": "replicated"},
     )
     groups = derive_layout(manager).page_layout.layer_groups
     assert [g.shard for g in groups] == [ShardDesc(2, 0), ShardDesc()]
@@ -768,10 +745,10 @@ def attention_and_state(tp_size, tp_rank, attention_dp, num_kv_heads, cp_size=1,
         tp_rank=tp_rank,
         attention_dp=attention_dp,
         num_kv_heads=num_kv_heads,
-        mappers={"conv_state": MapperKind.SECTIONED},
+        mappers={"conv_state": "sectioned"},
         layouts={
-            "conv_state": RoleLayout(section_bytes=(32, 32, 32)),
-            "ssm_state": RoleLayout(bytes_per_head=32),
+            "conv_state": dict(section_bytes=(32, 32, 32)),
+            "ssm_state": dict(bytes_per_head=32),
         },
     )
     if cp_size > 1:
@@ -1086,7 +1063,7 @@ def test_a_manager_naming_its_own_layers_names_extra_internal_layers():
     manager = Manager(
         [kv_group(lids=(1, 0)), (AttentionLayerConfig, [2, 3], [("tail", 64, None)])],
         pp_layers=[0, 1],
-        mappers={"tail": MapperKind.REPLICATED},
+        mappers={"tail": "replicated"},
     )
     named = {1: (2, 1), 0: (0, 0), 2: (1, 0), 3: (3, 1)}
     manager._page_layer_ids = lambda: named
@@ -1111,8 +1088,8 @@ def test_layer_groups_publish_each_layer_s_model_layer():
             (SsmLayerConfig, [2, 3], [("conv_state", 96, None), ("ssm_state", 128, None)]),
         ],
         pp_layers=[7, 6, 8, 9],
-        mappers={"conv_state": MapperKind.SECTIONED},
-        layouts={"conv_state": RoleLayout(section_bytes=(32, 32, 32))},
+        mappers={"conv_state": "sectioned"},
+        layouts={"conv_state": dict(section_bytes=(32, 32, 32))},
     )
     layout = derive_layout(manager).page_layout
     assert [(g.kind, g.layers, g.model_layers) for g in layout.layer_groups] == [
@@ -1159,7 +1136,7 @@ def test_layers_a_manager_names_publish_the_model_layers_named_beside_them():
     manager = Manager(
         [kv_group(lids=(1, 0)), (AttentionLayerConfig, [2, 3], [("tail", 64, None)])],
         pp_layers=[0, 1],
-        mappers={"tail": MapperKind.REPLICATED},
+        mappers={"tail": "replicated"},
     )
     manager._page_layer_ids = lambda: {1: (2, 1), 0: (0, 0), 2: (1, 0), 3: (3, 1)}
     layout = derive_layout(manager).page_layout
@@ -1184,15 +1161,13 @@ def test_a_layer_group_names_one_model_layer_per_layer():
 
 @pytest.mark.cpu_only
 def test_a_buffer_with_its_own_tokens_per_block_is_expanded():
-    manager = Manager(
-        [kv_group(extra=[("index_key", 64, 2)])], mappers={"index_key": MapperKind.REPLICATED}
-    )
+    manager = Manager([kv_group(extra=[("index_key", 64, 2)])], mappers={"index_key": "replicated"})
     layout = derive_layout(manager).page_layout
     assert {b.role: b.expansion for b in layout.buffers} == {"key": 1, "value": 1, "index_key": 2}
     plain = derive_layout(
         Manager(
             [kv_group(extra=[("index_key", 64, None)])],
-            mappers={"index_key": MapperKind.REPLICATED},
+            mappers={"index_key": "replicated"},
         )
     ).page_layout
     assert layout_id(layout) != layout_id(plain)
@@ -1292,7 +1267,7 @@ def test_a_manager_whose_parts_disagree_is_refused():
                 tp_size=2,
                 tp_rank=1,
                 num_kv_heads=8,
-                mappers={"index_key": MapperKind.REPLICATED},
+                mappers={"index_key": "replicated"},
             ),
             "fd26ca16e4400324b2590f51fdff89ce93369776249ffdeb08e10ecaf07c3652",
         ),
@@ -2207,10 +2182,10 @@ def test_declared_layouts_reshard_byte_for_byte(src_tp, dst_tp):
                     ],
                     tp_size=tp,
                     tp_rank=rank,
-                    mappers={"conv_state": MapperKind.SECTIONED},
+                    mappers={"conv_state": "sectioned"},
                     layouts={
-                        "conv_state": RoleLayout(section_bytes=(32 // tp,) * 3),
-                        "ssm_state": RoleLayout(bytes_per_head=32),
+                        "conv_state": dict(section_bytes=(32 // tp,) * 3),
+                        "ssm_state": dict(bytes_per_head=32),
                     },
                 )
             ).page_layout
@@ -2259,7 +2234,7 @@ def test_a_state_group_splits_over_the_grid_its_kind_sets(tp_size, attention_dp)
             tp_size=tp_size,
             tp_rank=rank,
             attention_dp=attention_dp,
-            layouts={"ssm_state": RoleLayout(bytes_per_head=32)},
+            layouts={"ssm_state": dict(bytes_per_head=32)},
         )
         (group,) = derive_layout(manager).page_layout.layer_groups
         assert group.shard == (ShardDesc(grid, rank) if grid > 1 else ShardDesc()), (rank, group)
@@ -2305,7 +2280,6 @@ LAYOUT_TYPES = (
     BufferDesc,
     RankTopology,
     ShardDesc,
-    RoleLayout,
     Tensor,
     Axis,
 )
@@ -2324,12 +2298,9 @@ def pinned_fields(cls):
 
 @pytest.mark.cpu_only
 def test_the_layout_types_keep_their_module_fields_and_members():
-    from tensorrt_llm._torch.disaggregation.resource import page as native
-
-    assert native.MapperKind is MapperKind and native.RoleLayout is RoleLayout
     assert sorted(page_layout.__all__) == sorted(
         [
-            *(t.__name__ for t in (*LAYOUT_TYPES, MapperKind)),
+            *(t.__name__ for t in LAYOUT_TYPES),
             "GRID_DIMENSIONS",
             "Progression",
             "grid_place",
@@ -2367,13 +2338,6 @@ def test_the_layout_types_keep_their_module_fields_and_members():
         "attention_dp=False"
     )
     assert pinned_fields(ShardDesc) == "count=1 index=0"
-    assert pinned_fields(RoleLayout) == "section_bytes=None bytes_per_head=None"
-    assert [m.name for m in MapperKind] == ["INDEXED", "REPLICATED", "NHD", "SECTIONED"]
-    assert set(MapperKind.__members__) == {"INDEXED", "HND", "REPLICATED", "NHD", "SECTIONED"}
-    assert MapperKind.HND is MapperKind.INDEXED
-    assert {name for name in vars(MapperKind) if not name.startswith("_")} == set(
-        MapperKind.__members__
-    )
     layout = every_field_set()
     group, buffer = layout.layer_groups[0], layout.buffers[0]
     tensor, axis = buffer.tensors[0], buffer.tensors[0].axes[0]
@@ -2557,14 +2521,27 @@ def test_layout_values_are_refused_rather_than_truncated(bad):
         lambda: make_layout(tokens_per_page=bad),
         lambda: make_layout(pool_slot_bytes={0: (bad,)}),
         lambda: make_layout(total_kv_heads_by_layer={0: bad}),
-        lambda: RoleLayout(bytes_per_head=bad),
-        lambda: RoleLayout(section_bytes=(bad,)),
         lambda: ShardDesc(count=bad),
         lambda: RankTopology(tp_size=bad),
         lambda: LayerGroupDesc("attention", bad, 0, 0, (0,)),
     ):
         with pytest.raises(ValueError):
             construct()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sections", [(16, 16), (32, 16, 32), (16, 8, 32)], ids=["short", "overlapping", "gap"]
+)
+def test_a_buffer_of_several_tensors_must_be_covered_by_them_back_to_back(sections):
+    """Sections that leave bytes out, or overlap, would move part of a buffer or a byte twice."""
+    assert BufferDesc(0, "conv", 0, 0, 0, 64, sectioned((16, 16, 32), 1)).size == 64
+    tensors = tuple(
+        dataclasses.replace(t, offset=offset)
+        for t, offset in zip(sectioned(sections, 1), (0, 16, 32))
+    )
+    with pytest.raises(ValueError, match="do not cover its 64 bytes"):
+        BufferDesc(0, "conv", 0, 0, 0, 64, tensors)
 
 
 def every_field_set():
@@ -2651,7 +2628,6 @@ def test_an_unchecked_rebuild_equals_the_checked_layout(build):
         *layout.layer_groups,
         *layout.buffers,
         layout.topology,
-        RoleLayout((16, 32), 16),
         *tensors,
         *(a for t in tensors for a in t.axes),
     )
@@ -2674,7 +2650,6 @@ def test_unchecked_constructors_keep_values_the_constructor_refuses_or_converts(
         (LayerGroupDesc, dict(group, model_layers=(0, 1))),
         (RankTopology, dict(tp_size=2, tp_rank=2)),
         (ShardDesc, dict(count=1, index=1)),
-        (RoleLayout, dict(bytes_per_head=0)),
         (PageLayout, dict(tokens_per_page=32, pool_slot_bytes={}, layer_groups=(), buffers=(odd,))),
     ]
     for cls, values in refused:

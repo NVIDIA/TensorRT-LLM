@@ -625,13 +625,16 @@ def decode_result_tail(message):
 def block_bytes_per_group(page_table: KVCachePageTable) -> list[int | None]:
     """Return transferred bytes per cache block for each layer group.
 
-    All distinct physical pools exposed by an attention group contribute to its
-    transfer size. Multiple logical views of the same physical pool contribute
-    only once. Non-attention groups retain a ``None`` placeholder so the result
-    remains aligned with receive-request layer-group indices.
+    Every physical pool holding a transferred buffer of an attention group
+    contributes its slot to the group's transfer size. Non-attention groups
+    retain a ``None`` placeholder so the result remains aligned with
+    receive-request layer-group indices.
     """
     from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
+    from tensorrt_llm._torch.disaggregation.resource.utils import (
+        get_physical_pool,
+        get_transferred_pool_indices,
+    )
 
     assert page_table is not None
     out: list[int | None] = []
@@ -639,11 +642,10 @@ def block_bytes_per_group(page_table: KVCachePageTable) -> list[int | None]:
         if lg.kind != CacheKind.PAGED:
             out.append(None)
             continue
-        pool_indices = {pool_view.pool_idx for pool_view in lg.pool_views}
         out.append(
             sum(
                 int(get_physical_pool(page_table, lg_idx, pool_idx).slot_bytes)
-                for pool_idx in pool_indices
+                for pool_idx in get_transferred_pool_indices(page_table, lg_idx)
             )
         )
     return out

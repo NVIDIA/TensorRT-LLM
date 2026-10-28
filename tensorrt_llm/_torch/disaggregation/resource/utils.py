@@ -15,17 +15,9 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Set
+from typing import Dict, List
 
-from .page import (
-    AttentionLayerGroup,
-    CacheKind,
-    KVCachePageTable,
-    LayerGroup,
-    MambaLayerGroup,
-    PhysicalPool,
-    PoolView,
-)
+from .page import AttentionLayerGroup, CacheKind, KVCachePageTable, PhysicalPool
 
 # -------------------------------------------------------------------------
 # PhysicalPool helpers
@@ -35,113 +27,6 @@ from .page import (
 def get_pool_bytes(pool: PhysicalPool) -> int:
     """Total transferable payload bytes across all slots in this pool."""
     return pool.slot_bytes * pool.num_slots
-
-
-# -------------------------------------------------------------------------
-# PoolView helpers
-# -------------------------------------------------------------------------
-
-
-def compute_layer_byte_ranges(
-    buffer_entries,
-    *,
-    declared_bytes_per_layer: "int | None" = None,
-    context: str = "PoolView",
-) -> tuple[Dict[int, int], int]:
-    """Per-layer slot-relative byte offsets from raw buffer entries.
-
-    Returns ``({local_layer_id: start_offset}, bytes_per_layer)``. A layer's
-    region is the concatenation of its buffer entries, which must be
-    contiguous within the slot; the region size must be uniform across
-    layers (the slot may interleave other role classes between layers, so
-    only the *size* is uniform — offsets are per layer). ``context`` labels
-    error messages; ``declared_bytes_per_layer`` cross-checks a size that
-    was recorded elsewhere.
-    """
-    starts: Dict[int, int] = {}
-    totals: Dict[int, int] = {}
-    entries_by_layer: Dict[int, list] = {}
-    for entry in buffer_entries:
-        entries_by_layer.setdefault(int(entry["local_layer_id"]), []).append(
-            (int(entry["offset"]), int(entry["size"]))
-        )
-    if not entries_by_layer:
-        raise ValueError(f"{context} has no buffer entries; per-layer byte ranges are undefined")
-    for layer_id, spans in entries_by_layer.items():
-        spans.sort()
-        for (off, size), (next_off, _) in zip(spans, spans[1:]):
-            if off + size != next_off:
-                raise ValueError(
-                    f"{context} layer {layer_id} buffers are "
-                    f"not contiguous: [{off}, {off + size}) is followed by offset {next_off}"
-                )
-        starts[layer_id] = spans[0][0]
-        totals[layer_id] = sum(size for _, size in spans)
-    distinct_totals = set(totals.values())
-    if len(distinct_totals) != 1:
-        raise ValueError(
-            f"{context} per-layer region sizes are not uniform: {sorted(totals.items())}"
-        )
-    bytes_per_layer = distinct_totals.pop()
-    if declared_bytes_per_layer is not None and declared_bytes_per_layer != bytes_per_layer:
-        raise ValueError(
-            f"{context} declares bytes_per_layer={declared_bytes_per_layer} but buffer "
-            f"entries sum to {bytes_per_layer} per layer"
-        )
-    return starts, bytes_per_layer
-
-
-def get_layer_byte_ranges(pool_view: PoolView) -> tuple[Dict[int, int], int]:
-    """Per-layer byte ranges of a view; see :func:`compute_layer_byte_ranges`."""
-    return compute_layer_byte_ranges(
-        pool_view.buffer_entries,
-        declared_bytes_per_layer=pool_view.bytes_per_layer,
-        context=f"PoolView(pool_idx={pool_view.pool_idx}, role={sorted(pool_view.pool_role)})",
-    )
-
-
-def get_unique_layers(pool_view: PoolView) -> Set[int]:
-    """Unique local layer IDs in *pool_view*."""
-    return {int(e["local_layer_id"]) for e in pool_view.buffer_entries}
-
-
-def get_num_buffer_entries(pool_view: PoolView) -> int:
-    """Number of buffer entries."""
-    return len(pool_view.buffer_entries)
-
-
-def get_pool_view_num_layers(pool_view: PoolView) -> int:
-    """
-    Number of unique layers represented in *pool_view*
-    """
-    return len(get_unique_layers(pool_view))
-
-
-def get_pool_view_global_layer_ids(pool_view: PoolView, layer_group: "LayerGroup") -> List[int]:
-    """
-    Global layer IDs for the layers that appear in *pool_view*, ordered by their
-    physical offset within the coalesced buffer (ascending).
-
-    The order is derived from the buffer entries' physical offsets rather than
-    from ``layer_group.local_layers`` order on purpose: the KV transfer maps
-    layers positionally (a layer's position in this list times the per-layer
-    slot size gives its byte offset), so the position must reflect the physical
-    slot layout. Deriving it from offsets keeps the transceiver decoupled from
-    the KV-cache manager's layer-grouping order (which is an implementation
-    detail, not an API contract). This mirrors ``get_aggregated_pages``, which
-    likewise sorts buffers by their offset inside the coalesced buffer.
-    """
-    local_to_global = {ll.local_layer_id: ll.global_layer_id for ll in layer_group.local_layers}
-    # A layer may contribute several buffer entries (e.g. KEY and VALUE); use the
-    # smallest offset as that layer's position within the slot.
-    min_offset: dict[int, int] = {}
-    for entry in pool_view.buffer_entries:
-        local_layer_id = int(entry["local_layer_id"])
-        offset = int(entry["offset"])
-        if local_layer_id not in min_offset or offset < min_offset[local_layer_id]:
-            min_offset[local_layer_id] = offset
-    ordered_local_ids = sorted(min_offset, key=lambda lid: min_offset[lid])
-    return [local_to_global[lid] for lid in ordered_local_ids]
 
 
 # -------------------------------------------------------------------------
@@ -176,6 +61,20 @@ def get_physical_pool(page_table: KVCachePageTable, lg_idx: int, pool_idx: int) 
     return page_table.pool_groups[int(lg.pool_group_idx)].pools[int(pool_idx)]
 
 
+def get_transferred_pool_indices(page_table: KVCachePageTable, lg_idx: int) -> List[int]:
+    """Indices, within layer group *lg_idx*'s pool group, of the pools holding a buffer of the
+    group's layers that transfers (``page_table.layout``)."""
+    group = page_table.layout.layer_groups[int(lg_idx)]
+    layers = set(group.layers)
+    return sorted(
+        {
+            b.pool_index
+            for b in page_table.layout.buffers
+            if b.transferred and b.pool_group == group.pool_group and b.layer in layers
+        }
+    )
+
+
 # -------------------------------------------------------------------------
 # NIXL memory registration helpers
 # -------------------------------------------------------------------------
@@ -188,14 +87,14 @@ def get_unique_pool_memory_descs(
     unique_pools: dict[tuple[int, int], int] = {}  # (ptr, size) -> index
     pool_counter = 0
     for lg_idx, lg in enumerate(page_table.layer_groups):
+        pool_indices = get_transferred_pool_indices(page_table, lg_idx)
         if lg.kind == CacheKind.STATE:
-            assert isinstance(lg, MambaLayerGroup)
             # MambaHybridCacheManagerV2: roles may share one allocation
             # (interleaved, equal sizes) or be separate (unequal sizes).
             # Process lowest-base first so the covering region registers
             # before higher-offset roles that fall inside it.
             pools = sorted(
-                (get_physical_pool(page_table, lg_idx, pv.pool_idx) for pv in lg.pool_views),
+                (get_physical_pool(page_table, lg_idx, pool_idx) for pool_idx in pool_indices),
                 key=lambda p: p.base_address,
             )
             for pool in pools:
@@ -207,9 +106,9 @@ def get_unique_pool_memory_descs(
                     unique_pools[pool_key] = pool_counter
                     pool_counter += 1
         else:
-            # PAGED (attention): each pool view is an independent allocation
-            for pv in lg.pool_views:
-                pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
+            # PAGED (attention): each pool is an independent allocation
+            for pool_idx in pool_indices:
+                pool = get_physical_pool(page_table, lg_idx, pool_idx)
                 pool_key = (pool.base_address, pool.num_slots * pool.slot_stride_bytes)
                 if pool_key not in unique_pools:
                     unique_pools[pool_key] = pool_counter
@@ -267,49 +166,3 @@ def get_num_layers(page_table: KVCachePageTable) -> int:
 def get_num_layer_groups(page_table: KVCachePageTable) -> int:
     """Layer group count."""
     return len(page_table.layer_groups)
-
-
-def get_pool_views(page_table: KVCachePageTable) -> List[List[PoolView]]:
-    """
-    Pool views per attention layer group
-    """
-    return [lg.pool_views for lg in page_table.layer_groups if lg.kind == CacheKind.PAGED]
-
-
-def get_total_pools(page_table: KVCachePageTable) -> int:
-    """Total pool-view count."""
-    return sum(len(lg.pool_views) for lg in page_table.layer_groups if lg.kind == CacheKind.PAGED)
-
-
-def get_total_buffer_entries(page_table: KVCachePageTable) -> int:
-    """Total buffer entries across all pools."""
-    return sum(
-        get_num_buffer_entries(pv)
-        for lg in page_table.layer_groups
-        if lg.kind == CacheKind.PAGED
-        for pv in lg.pool_views
-    )
-
-
-def get_total_pool_bytes(page_table: KVCachePageTable) -> int:
-    """
-    Total allocated bytes across all physical pools
-    """
-    return sum(
-        get_pool_bytes(get_physical_pool(page_table, lg_idx, pv.pool_idx))
-        for lg_idx, lg in enumerate(page_table.layer_groups)
-        if lg.kind == CacheKind.PAGED
-        for pv in lg.pool_views
-    )
-
-
-def get_total_slots(page_table: KVCachePageTable) -> int:
-    """
-    Total slot count across all physical pools
-    """
-    return sum(
-        get_physical_pool(page_table, lg_idx, pv.pool_idx).num_slots
-        for lg_idx, lg in enumerate(page_table.layer_groups)
-        if lg.kind == CacheKind.PAGED
-        for pv in lg.pool_views
-    )

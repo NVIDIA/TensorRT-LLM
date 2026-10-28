@@ -36,7 +36,6 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVRegionExtractorV1,
     build_page_table_from_manager,
 )
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import (
     Nvfp4ColdPageQuantizationCompression,
 )
@@ -1927,25 +1926,17 @@ class TestDeepseekV4CacheManager:
 
         try:
             page_table = build_page_table_from_manager(cache_manager)
-            saw_pool_view = False
-            for layer_group in page_table.layer_groups:
-                for pool_view in layer_group.pool_views:
-                    saw_pool_view = True
-                    # All DSv4 pools publish per-layer buffer_entries (INDEXED);
-                    # the FLAT layout is reserved for the DSA (DeepSeek v3.2)
-                    # indexer K cache pool.
-                    assert pool_view.mapper_kind == MapperKind.INDEXED
-                    # pool_role carries the manager-native role-name strings,
-                    # which are all DSv4 attention-type names like
-                    # "deepseek_v4_swa", "deepseek_v4_compress", etc.
-                    assert pool_view.pool_role
-                    for role_name in pool_view.pool_role:
-                        assert role_name.startswith("deepseek_v4_"), role_name
-            assert saw_pool_view
+            transferred = [b for b in page_table.layout.buffers if b.transferred]
+            assert transferred
+            for buffer in transferred:
+                # Roles carry the manager-native names, all DSv4 attention-type names like
+                # "deepseek_v4_swa", "deepseek_v4_compress", etc., each split by head.
+                assert buffer.role.startswith("deepseek_v4_"), buffer.role
+                assert buffer.split, buffer.role
         finally:
             cache_manager.shutdown()
 
-    def test_disagg_pool_mapping_prefers_exact_pool_view_layer_set(self):
+    def test_disagg_kv_maps_pair_every_pool_with_the_peer_s(self):
         ctx_cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
             max_batch_size=1,
@@ -1972,10 +1963,7 @@ class TestDeepseekV4CacheManager:
             registrar = PeerRegistrar(gen_rank_info, KVRegionExtractorV1(gen_cache_manager))
             registrar.register("ctx", 0, ctx_rank_info)
 
-            pool_mapping = registrar.get_pool_mapping(ctx_rank_info)
-            assert pool_mapping
-            for self_pool_key, peer_pool_key in pool_mapping.items():
-                registrar.get_kv_map(ctx_rank_info, self_pool_key, peer_pool_key)
+            assert registrar.get_kv_maps(ctx_rank_info)
         finally:
             ctx_cache_manager.shutdown()
             gen_cache_manager.shutdown()

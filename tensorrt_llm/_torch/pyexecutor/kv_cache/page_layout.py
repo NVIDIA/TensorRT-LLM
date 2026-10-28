@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import collections.abc
 import dataclasses
-import enum
 import math
 import numbers
 import types
@@ -39,11 +38,9 @@ __all__ = [
     "Axis",
     "BufferDesc",
     "LayerGroupDesc",
-    "MapperKind",
     "PageLayout",
     "Progression",
     "RankTopology",
-    "RoleLayout",
     "ShardDesc",
     "Tensor",
     "grid_place",
@@ -361,70 +358,6 @@ def sectioned(
     return tuple(out)
 
 
-class MapperKind(enum.IntEnum):
-    """How a role's bytes split across its layer group's grid of ranks (``LayerGroupDesc``).
-
-    Attributes:
-        INDEXED: Head-major layout; a head range is one contiguous byte range.
-        HND: Alias of INDEXED for the [head, token, dimension] layout.
-        REPLICATED: Identical bytes on every tensor-parallel rank.
-        NHD: Token-major [token, head, dimension] layout; a head range is a slice within every
-            token.
-        SECTIONED: Consecutive byte sections, each sharded independently, such as recurrent
-            convolution state.
-
-    Raises:
-        ValueError: If constructed from a value that names no mapper kind."""
-
-    INDEXED = 0
-    HND = INDEXED
-    REPLICATED = 1
-    NHD = 2
-    SECTIONED = 3
-
-
-@dataclass(frozen=True)
-class RoleLayout:
-    """Resharding geometry of one role; both fields None means no declared head axis.
-
-    Attributes:
-        section_bytes: Byte sizes of consecutive sections for a SECTIONED role, normalized to a
-            tuple. When given, their sum must equal the buffer's size.
-        bytes_per_head: Total bytes for one rank-local head, derived as size/head count for
-            attention INDEXED/NHD roles. NHD offsets remain token-major, not one contiguous head
-            slice. For other INDEXED roles, size must be divisible by this value; the quotient is
-            the per-rank head count.
-
-    Raises:
-        ValueError: If a section size or bytes_per_head is not a positive integer, including a
-            boolean. BufferDesc checks that the geometry fits its size."""
-
-    section_bytes: tuple[int, ...] | None = None
-    bytes_per_head: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.section_bytes is not None:
-            object.__setattr__(
-                self,
-                "section_bytes",
-                tuple(_integer(n, "section size", 1) for n in self.section_bytes),
-            )
-        if self.bytes_per_head is not None:
-            object.__setattr__(
-                self, "bytes_per_head", _integer(self.bytes_per_head, "bytes_per_head", 1)
-            )
-
-    @classmethod
-    def unchecked(
-        cls, section_bytes: tuple[int, ...] | None = None, bytes_per_head: int | None = None
-    ) -> RoleLayout:
-        """The constructor's role layout of these values, without its checks and conversions;
-        see ``PageLayout.unchecked``."""
-        layout = object.__new__(cls)
-        layout.__dict__.update(section_bytes=section_bytes, bytes_per_head=bytes_per_head)
-        return layout
-
-
 @dataclass(frozen=True)
 class ShardDesc:
     """Which share of a layer group's content this rank holds.
@@ -580,8 +513,9 @@ class BufferDesc:
 
     Raises:
         ValueError: If an index is not a non-negative integer, size or expansion is not a positive
-            integer, any such value is a boolean, two tensors share a name, or a tensor's piece
-            reaches past size."""
+            integer, any such value is a boolean, two tensors share a name, a tensor's piece
+            reaches past size, or the pieces of several tensors do not lie back to back over the
+            whole buffer."""
 
     layer: int
     role: str
@@ -605,12 +539,20 @@ class BufferDesc:
         names = [t.name for t in tensors]
         if len(set(names)) != len(names):
             raise ValueError(f"buffer ({self.layer}, {self.role}): tensor names repeat: {names}")
-        for t in tensors:
-            end = _footprint(t)
+        ends = [_footprint(t) for t in tensors]
+        for t, end in zip(tensors, ends):
             if end is not None and end > self.size:
                 raise ValueError(
                     f"buffer ({self.layer}, {self.role}): tensor {t.name!r} reaches byte {end} of "
                     f"a {self.size}-byte buffer"
+                )
+        if len(tensors) > 1 and None not in ends:
+            pieces = sorted((t.offset, end) for t, end in zip(tensors, ends))
+            bounds = [0, *(b for piece in pieces for b in piece), self.size]
+            if any(a != b for a, b in zip(bounds[::2], bounds[1::2])):
+                raise ValueError(
+                    f"buffer ({self.layer}, {self.role}): sections {pieces} do not cover its "
+                    f"{self.size} bytes"
                 )
         object.__setattr__(self, "tensors", tensors)
 

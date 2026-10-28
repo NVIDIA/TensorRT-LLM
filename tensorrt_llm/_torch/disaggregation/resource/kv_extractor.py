@@ -13,9 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
-from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import List
 
 import numpy as np
 
@@ -26,24 +24,16 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegion,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import (
-    BUFFER_ENTRY_DTYPE,
     AttentionLayerGroup,
     KVCachePageTable,
     LayerGroup,
     LocalLayer,
     MambaLayerGroup,
-    MapperKind,
     PhysicalPool,
     PhysicalPoolGroup,
-    PoolView,
-    RoleLayout,
 )
-from tensorrt_llm._torch.disaggregation.resource.utils import (
-    compute_layer_byte_ranges,
-    get_physical_pool,
-)
+from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import BufferDesc
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ManagerLayout
 from tensorrt_llm._utils import nvtx_range
 
@@ -80,17 +70,14 @@ class KVRegionExtractorV1(RegionExtractorBase):
         described by region_ids.
 
         For KV cache: each ptr = base_address + slot_id * slot_bytes, pointing
-        to the start of a full slot. Sub-slot selection (layers, role classes,
-        heads) is the mappers' responsibility; logical views carry that
-        geometry in their buffer entries.
+        to the start of a full slot. Sub-slot selection (layers, roles, heads)
+        is the mappers' responsibility, from the page layout.
 
         Args:
             layer_group_id: The layer group index (= life cycle index).
-            pool_idx: The pool index within the layer group.
+            pool_idx: The pool's index within the layer group's pool group.
         """
-        lg = self._page_table.layer_groups[layer_group_id]
-        pv = lg.pool_views[pool_idx]
-        pool = get_physical_pool(self._page_table, layer_group_id, pv.pool_idx)
+        pool = get_physical_pool(self._page_table, layer_group_id, pool_idx)
 
         base_ptr = pool.base_address
         block_size = pool.slot_bytes
@@ -109,88 +96,9 @@ class KVRegionExtractorV1(RegionExtractorBase):
 # ---------------------------------------------------------------------------
 
 
-def native_kind(buffer: BufferDesc) -> MapperKind:
-    """The mapper kind native's views label a buffer with, read off its tensors. Views bucket
-    their buffers by it and peers match views on it; how bytes move comes from the tensors
-    (``layout_mapping``), not from the label."""
-    if not buffer.split:
-        return MapperKind.REPLICATED
-    (tensor, *rest) = buffer.tensors
-    names = [axis.name for axis in tensor.axes]
-    if "shard" in names:
-        return MapperKind.INDEXED  # this rank's own bytes, its heads undeclared
-    if rest or "head" not in names:
-        return MapperKind.SECTIONED
-    return MapperKind.NHD if names[0] == "token" else MapperKind.INDEXED
-
-
-def _state_geometry(buffer: BufferDesc) -> RoleLayout:
-    """The section sizes or bytes per head a recurrent-state view reports to peers' checks."""
-    kind = native_kind(buffer)
-    if kind is MapperKind.SECTIONED:
-        sections = tuple(
-            math.prod(a.held if a.split else a.extent for a in t.axes) for t in buffer.tensors
-        )
-        if sum(sections) != buffer.size:
-            raise ValueError(
-                f"buffer ({buffer.layer}, {buffer.role}): sections {list(sections)} do not cover "
-                f"its {buffer.size} bytes"
-            )
-        return RoleLayout(section_bytes=sections)
-    head = next((a for a in buffer.tensors[0].axes if a.name == "head"), None)
-    if kind is MapperKind.REPLICATED or head is None:
-        return RoleLayout()
-    return RoleLayout(bytes_per_head=buffer.size // head.held)
-
-
-def _pool_views(
-    lg: int,
-    state: bool,
-    buffers: List[Tuple[int, BufferDesc]],
-) -> List[PoolView]:
-    """One layer group's views: its transferred buffers, by (pool, kind)."""
-    bucket_entries: Dict[tuple, list] = defaultdict(list)
-    bucket_roles: Dict[tuple, set] = defaultdict(set)
-    bucket_layouts: Dict[tuple, set] = defaultdict(set)
-    for internal, buffer in buffers:
-        key = (buffer.pool_index, native_kind(buffer))
-        bucket_entries[key].append((internal, buffer.slot_offset, buffer.size))
-        bucket_roles[key].add(buffer.role)
-        bucket_layouts[key].add(_state_geometry(buffer) if state else RoleLayout())
-
-    # Views are matched against a peer's and serialized, so their order (pool, then lowest slot
-    # offset), their entries' order (slot offset) and role text must not follow iteration order.
-    views = []
-    for key in sorted(bucket_entries, key=lambda k: (k[0], min(e[1] for e in bucket_entries[k]))):
-        pool_idx, kind = key
-        roles = frozenset(bucket_roles[key])
-        context = f"View(layer_group={lg}, pool={pool_idx}, kind={kind.name}, role={sorted(roles)})"
-        entries = np.array(
-            sorted(bucket_entries[key], key=lambda entry: entry[1]), dtype=BUFFER_ENTRY_DTYPE
-        )
-        _, bytes_per_layer = compute_layer_byte_ranges(entries, context=context)
-        if len(bucket_layouts[key]) > 1:
-            raise ValueError(f"{context} mixes roles with different layouts")
-        layout = next(iter(bucket_layouts[key]))
-        views.append(
-            PoolView(
-                pool_idx=pool_idx,
-                buffer_entries=entries,
-                pool_role=roles,
-                mapper_kind=kind,
-                bytes_per_layer=bytes_per_layer,
-                section_bytes=(
-                    list(layout.section_bytes) if layout.section_bytes is not None else None
-                ),
-                bytes_per_head=layout.bytes_per_head,
-            )
-        )
-    return views
-
-
 def page_table_from_layout(table: ManagerLayout) -> KVCachePageTable:
-    """Native's page table of a manager's page table: its device pools, and per layer group the
-    views of each pool that bucket its transferred buffers, carrying the page layout itself.
+    """Native's page table of a manager's page table: its device pools and layer groups, carrying
+    the page layout itself.
 
     Args:
         table: The manager's page table (``KVCacheManagerV2.get_page_table``).
@@ -208,22 +116,14 @@ def page_table_from_layout(table: ManagerLayout) -> KVCachePageTable:
     ]
     layer_groups: List[LayerGroup] = []
     for lg, desc in enumerate(layout.layer_groups):
-        local = table.local_layers[lg]
-        internal_of = {global_layer: internal for internal, global_layer in local}
-        local_layers = [LocalLayer(local_layer_id=i, global_layer_id=g) for i, g in local]
-        buffers = [
-            (internal_of[b.layer], b)
-            for b in layout.buffers
-            if b.transferred and b.pool_group == desc.pool_group and b.layer in internal_of
+        local_layers = [
+            LocalLayer(local_layer_id=i, global_layer_id=g) for i, g in table.local_layers[lg]
         ]
-        state = desc.kind == "state"
-        views = _pool_views(lg, state, buffers)
-        if state:
+        if desc.kind == "state":
             layer_groups.append(
                 MambaLayerGroup(
                     pool_group_idx=pool_index_of[desc.pool_group],
                     local_layers=local_layers,
-                    pool_views=views,
                 )
             )
         else:
@@ -233,7 +133,6 @@ def page_table_from_layout(table: ManagerLayout) -> KVCachePageTable:
                     kv_head_num_per_rank=table.kv_heads[lg],
                     sliding_window_size=desc.kept_window,
                     local_layers=local_layers,
-                    pool_views=views,
                 )
             )
     return KVCachePageTable(

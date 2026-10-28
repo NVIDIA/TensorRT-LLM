@@ -1348,7 +1348,7 @@ class Sender(SenderBase):
         # handle has to answer how many writes are still out after one of them has already failed.
         task.expected_transfers = expected_transfers
 
-        # Aggregate fragment pointers from all matching pool pairs.
+        # Aggregate fragment pointers from every pool pair this rank sends the peer of.
         # Each pool pair produces one or more region pairs (rp), each containing
         # a numpy array of src/dst pointers and a uniform bytes_per_region.
         src_frag_parts: list[np.ndarray] = []
@@ -1363,23 +1363,14 @@ class Sender(SenderBase):
         peer_extractor = self._registrar.peer_extractor(
             peer_ri.instance_name, peer_ri.instance_rank
         )
-        pool_mapping = self._registrar.get_pool_mapping(peer_ri)
         dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
         src_block_ids_per_groups = task._chunk.block_ids_per_layer_groups
 
-        # Aggregate fragments from all matching pools using numpy concatenation.
+        # Aggregate fragments from all pool pairs using numpy concatenation.
         # The mapper of a pool pair holds the runs this rank is elected to send
-        # (layout_mapping); an empty one means another rank sends that pair.
-        for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
-            mapper = self._registrar.get_kv_map(
-                peer_ri,
-                (self_lg, self_pi),
-                (peer_lg, peer_pi),
-                excluded=task._chunk.excluded_buffers,
-            )
-            if mapper.empty:
-                continue
-
+        # (layout_mapping); pairs another rank sends are absent.
+        kv_maps = self._registrar.get_kv_maps(peer_ri, excluded=task._chunk.excluded_buffers)
+        for ((self_lg, self_pi), (peer_lg, peer_pi)), mapper in kv_maps.items():
             lg_info = extractor.page_table.layer_groups[self_lg]
             src_block_ids = src_block_ids_per_groups[self_lg]
             dst_block_ids = dst_block_ids_per_groups[peer_lg]

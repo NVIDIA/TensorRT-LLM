@@ -13,436 +13,161 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Golden tests for ``PeerRegistrar.get_pool_mapping``.
+"""Which pools ``PeerRegistrar.get_kv_maps`` pairs.
 
-Locks the current (pre-refactor) behavior of disagg pool matching across the
-representative scenarios that the refactor must keep working:
-
-  * single KV pool, full layer overlap (basic MHA)
-  * MLA (kv_factor=1, KEY-only pool)
-  * KV + block-scale pools coexisting in one LG
-  * KV + REPLICATED indexer pools coexisting in one LG
-  * PP partial layer overlap (Step-1 LG match by global_layer_id)
-  * Two pools with same role but different layer sets within a peer LG
-    (DSv4 virtual-layer scenario, exercises ``best_overlap``)
-
-The refactor (PoolRole -> PoolMatchKey + TransferLayout) must keep these
-results stable. If a test needs updating, the change should be deliberate and
-called out in the refactor commit message.
+A rank's pools pair with a peer rank's by where each buffer's runs go: the pool (and layer group)
+a buffer lies in on this rank and the pool its counterpart lies in on the peer. Nothing matches
+pools by role or by kind.
 """
 
-import numpy as np
+from collections import defaultdict
+
 import pytest
+from layout_test_utils import native_page_table
 
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import (
-    BUFFER_ENTRY_DTYPE,
-    AttentionLayerGroup,
-    KVCachePageTable,
-    LocalLayer,
-    MapperKind,
-    PhysicalPool,
-    PhysicalPoolGroup,
-    PoolView,
-)
-from tensorrt_llm._torch.disaggregation.resource.utils import (
-    compute_layer_byte_ranges,
-    get_layer_to_layer_group,
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+    BufferDesc,
+    LayerGroupDesc,
+    PageLayout,
+    RankTopology,
+    head_major,
+    replicated,
 )
 
-# ---------------------------------------------------------------------------
-# Builders
-# ---------------------------------------------------------------------------
+pytestmark = pytest.mark.cpu_only
+
+HEAD_BYTES = 64
 
 
-def _entries(layer_role_pairs, per_buf_size=128):
-    """Build a structured numpy array of buffer entries.
+def kv(heads=2, total=2, pool=0):
+    """K and V of ``heads`` heads of ``total``, in pool ``pool`` of their layer group."""
+    size = heads * HEAD_BYTES
+    return [(role, pool, size, head_major(size, heads, total)) for role in ("key", "value")]
 
-    ``layer_role_pairs`` is a list of (local_layer_id, role_label_str). The
-    role label only feeds ``pool_role`` — buffer_entries itself only carries
-    (lid, offset, size).
+
+def page_table(groups, topology=RankTopology()):
+    """A native page table of ``groups``.
+
+    Per layer group (kind, pool group, layers, roles), each role (name, pool, size, tensors) lies
+    layer after layer within its pool's slot.
     """
-    rows = [
-        (lid, i * per_buf_size, per_buf_size) for i, (lid, _role) in enumerate(layer_role_pairs)
-    ]
-    if not rows:
-        return np.array([], dtype=BUFFER_ENTRY_DTYPE)
-    return np.array(rows, dtype=BUFFER_ENTRY_DTYPE)
-
-
-def _pool_view(pool_idx, layer_role_pairs, *, pool_role=None, mapper_kind=MapperKind.INDEXED):
-    """A PoolView with buffer entries.
-
-    ``pool_role`` defaults to the set of distinct role labels appearing in
-    ``layer_role_pairs`` (matching the V1 builder convention).
-    """
-    if pool_role is None:
-        pool_role = frozenset(role for _, role in layer_role_pairs)
-    return PoolView(
-        pool_idx=pool_idx,
-        buffer_entries=_entries(layer_role_pairs),
-        pool_role=pool_role,
-        mapper_kind=mapper_kind,
+    ends = defaultdict(int)
+    descs, buffers = [], []
+    for kind, g, layers, roles in groups:
+        descs.append(LayerGroupDesc(kind, None, 0, g, tuple(layers)))
+        for layer in layers:
+            for role, pool, size, tensors in roles:
+                buffers.append(BufferDesc(layer, role, g, pool, ends[g, pool], size, tensors))
+                ends[g, pool] += size
+    widths = defaultdict(dict)
+    for (g, pool), width in ends.items():
+        widths[g][pool] = width
+    layout = PageLayout(
+        tokens_per_page=16,
+        pool_slot_bytes={g: tuple(w[p] for p in range(len(w))) for g, w in widths.items()},
+        layer_groups=tuple(descs),
+        buffers=tuple(buffers),
+        topology=topology,
     )
+    bases = {
+        g: [0x100000 * (g + 1) + 0x10000 * p for p in range(len(w))]
+        for g, w in layout.pool_slot_bytes.items()
+    }
+    return native_page_table(layout, bases)
 
 
-def _indexer_pool_view(pool_idx, local_layer_ids, *, pool_role=frozenset({"indexer_k"})):
-    """Replicated indexer pool view: one synthesized entry per local layer."""
-    return _pool_view(
-        pool_idx,
-        [(lid, "indexer_k") for lid in local_layer_ids],
-        pool_role=pool_role,
-        mapper_kind=MapperKind.REPLICATED,
-    )
-
-
-def _attn_lg(pool_group_idx, local_global_pairs, pool_views, sliding_window=None):
-    return AttentionLayerGroup(
-        pool_group_idx=pool_group_idx,
-        kv_head_num_per_rank=2,
-        sliding_window_size=sliding_window,
-        local_layers=[
-            LocalLayer(local_layer_id=lid, global_layer_id=gid) for lid, gid in local_global_pairs
-        ],
-        pool_views=pool_views,
-    )
-
-
-def _page_table(layer_groups, pool_specs=None):
-    """Build a KVCachePageTable.
-
-    pool_specs: ``{pool_group_idx: [(slot_bytes, num_slots, base_addr), ...]}``.
-    Defaults to one 1024-byte/64-slot pool per group.
-    """
-    num_pgs = max((lg.pool_group_idx for lg in layer_groups), default=-1) + 1
-    if pool_specs is None:
-        pool_specs = {pg: [(1024, 64, 0x1000 * (pg + 1))] for pg in range(num_pgs)}
-
-    pool_groups = [
-        PhysicalPoolGroup(
-            pools=[
-                PhysicalPool(base_address=base, slot_bytes=sb, num_slots=ns)
-                for sb, ns, base in pool_specs.get(pg, [(1024, 64, 0x1000 * (pg + 1))])
-            ]
-        )
-        for pg in range(num_pgs)
-    ]
-
-    return KVCachePageTable(
-        tokens_per_block=16,
-        layer_groups=layer_groups,
-        pool_groups=pool_groups,
-    )
-
-
-def _rank_info(
-    name="self",
-    rank=0,
-    layer_num_per_pp=None,
-    page_table=None,
-):
-    if layer_num_per_pp is None:
-        layer_num_per_pp = [2]
+def rank(name, table, *, tp_size=1, tp_rank=0, layers=(2,)):
     return RankInfo(
         instance_name=name,
-        instance_rank=rank,
-        tp_size=1,
-        tp_rank=0,
-        pp_size=len(layer_num_per_pp),
+        instance_rank=tp_rank,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        pp_size=len(layers),
         pp_rank=0,
         dp_size=1,
         dp_rank=0,
         cp_size=1,
         cp_rank=0,
         device_id=0,
-        layer_num_per_pp=layer_num_per_pp,
+        layer_num_per_pp=list(layers),
         self_endpoint="",
         transfer_engine_info=b"",
         enable_attention_dp=False,
         aux_meta=None,
-        page_table=page_table,
+        page_table=table,
         sender_endpoints=[],
     )
 
 
-def _registrar(self_pt, **kwargs):
-    self_ri = _rank_info(name="self", page_table=self_pt, **kwargs)
-    return PeerRegistrar(self_ri, KVRegionExtractorV1(self_pt))
+def kv_maps(own, peer, excluded=frozenset()):
+    """{pool pair: bytes per slot} of what ``own``'s rank sends ``peer``'s."""
+    maps = PeerRegistrar(own, KVRegionExtractorV1(own.page_table)).get_kv_maps(peer, excluded)
+    return {pair: mapper.bytes_per_slot for pair, mapper in maps.items()}
 
 
-def _kv_pool_view(pool_idx, local_layer_ids):
-    """Convenience: KV pool view (key+value for each given local layer)."""
-    return _pool_view(
-        pool_idx,
-        [(lid, role) for lid in local_layer_ids for role in ("key", "value")],
-    )
+def test_a_pool_pairs_with_the_peer_pool_its_buffers_land_in():
+    """K/V and their block scales in two pools pair across.
 
-
-def _key_only_pool_view(pool_idx, local_layer_ids):
-    """Convenience: KEY-only pool view (MLA)."""
-    return _pool_view(pool_idx, [(lid, "key") for lid in local_layer_ids])
-
-
-# ---------------------------------------------------------------------------
-# Test cases
-# ---------------------------------------------------------------------------
-
-
-def test_kv_only_full_overlap():
-    """Single LG, single KV pool on each side. Identity mapping."""
-    self_lg = _attn_lg(0, [(0, 10), (1, 11)], [_kv_pool_view(0, [0, 1])])
-    peer_lg = _attn_lg(0, [(0, 10), (1, 11)], [_kv_pool_view(0, [0, 1])])
-
-    reg = _registrar(_page_table([self_lg]))
-    peer_ri = _rank_info(name="peer", rank=1, page_table=_page_table([peer_lg]))
-
-    mapping = reg.get_pool_mapping(peer_ri)
-    assert mapping == {(0, 0): (0, 0)}
-
-
-def test_mla_kv_only_full_overlap():
-    """MLA: KEY-only pool, kv_factor=1."""
-    self_lg = _attn_lg(0, [(0, 0), (1, 1)], [_key_only_pool_view(0, [0, 1])])
-    peer_lg = _attn_lg(0, [(0, 0), (1, 1)], [_key_only_pool_view(0, [0, 1])])
-
-    reg = _registrar(_page_table([self_lg]))
-    peer_ri = _rank_info(name="peer", rank=1, page_table=_page_table([peer_lg]))
-
-    mapping = reg.get_pool_mapping(peer_ri)
-    assert mapping == {(0, 0): (0, 0)}
-
-
-def test_kv_and_block_scale_in_same_lg():
-    """KV pool (idx=0) + block-scale pool (idx=1) match by role within the LG."""
-
-    def _bq_pool(pool_idx, lids):
-        return _pool_view(
-            pool_idx,
-            [(lid, role) for lid in lids for role in ("key_block_scale", "value_block_scale")],
-        )
-
-    self_lg = _attn_lg(0, [(0, 100), (1, 101)], [_kv_pool_view(0, [0, 1]), _bq_pool(1, [0, 1])])
-    peer_lg = _attn_lg(0, [(0, 100), (1, 101)], [_kv_pool_view(0, [0, 1]), _bq_pool(1, [0, 1])])
-
-    self_pt = _page_table([self_lg], pool_specs={0: [(1024, 64, 0x1000), (256, 64, 0x2000)]})
-    peer_pt = _page_table([peer_lg], pool_specs={0: [(1024, 64, 0x3000), (256, 64, 0x4000)]})
-
-    reg = _registrar(self_pt)
-    peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt)
-
-    mapping = reg.get_pool_mapping(peer_ri)
-    assert mapping == {(0, 0): (0, 0), (0, 1): (0, 1)}
-
-
-def test_kv_and_indexer_in_same_lg():
-    """KV pool + replicated indexer pool match independently by role."""
-    self_lg = _attn_lg(
-        0,
-        [(0, 0), (1, 1)],
-        [_kv_pool_view(0, [0, 1]), _indexer_pool_view(1, [0, 1])],
-    )
-    peer_lg = _attn_lg(
-        0,
-        [(0, 0), (1, 1)],
-        [_kv_pool_view(0, [0, 1]), _indexer_pool_view(1, [0, 1])],
-    )
-
-    self_pt = _page_table([self_lg], pool_specs={0: [(1024, 64, 0x1000), (512, 64, 0x2000)]})
-    peer_pt = _page_table([peer_lg], pool_specs={0: [(1024, 64, 0x3000), (512, 64, 0x4000)]})
-
-    reg = _registrar(self_pt)
-    peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt)
-
-    mapping = reg.get_pool_mapping(peer_ri)
-    assert mapping == {(0, 0): (0, 0), (0, 1): (0, 1)}
-
-
-def test_minimax_split_kv_and_replicated_index_pools_match():
-    """MiniMax M3 Triton shape: NHD KV pool + REPLICATED index-key pool.
-
-    coalescing_group derivation keeps INDEX_KEY in its own pool on every
-    topology, so both sides always present the same two role sets and
-    role-set matching pairs them 1:1 with kinds intact.
+    They do even where the peer orders the two pools the other way round.
     """
+    scales = [(f"{role}_block_scale", 1, 16, head_major(16, 2, 2)) for role in ("key", "value")]
+    peer_scales = [(role, 0, size, t) for role, _, size, t in scales]
+    own = rank("ctx", page_table([("attention", 0, (0, 1), kv() + scales)]))
+    peer = rank("gen", page_table([("attention", 0, (0, 1), kv(pool=1) + peer_scales)]))
+    assert kv_maps(own, peer) == {((0, 0), (0, 1)): 512, ((0, 1), (0, 0)): 64}
 
-    def _lg():
-        return _attn_lg(
-            0,
-            [(0, 0), (1, 1)],
-            [
-                _pool_view(
-                    0,
-                    [(lid, role) for lid in (0, 1) for role in ("key", "value")],
-                    mapper_kind=MapperKind.NHD,
+
+def test_a_replicated_index_cache_is_sent_by_one_of_the_ranks_fanning_in():
+    """TP2 into TP1: both ranks send their K/V heads, one the index-K every rank holds alike."""
+    index = [("index_key", 1, 32, replicated(32))]
+    peer = rank("gen", page_table([("attention", 0, (0, 1), kv(4, 4) + index)]))
+    sent = [
+        kv_maps(
+            rank(
+                "ctx",
+                page_table(
+                    [("attention", 0, (0, 1), kv(2, 4) + index)],
+                    RankTopology(tp_size=2, tp_rank=r),
                 ),
-                _pool_view(
-                    1, [(0, "index_key"), (1, "index_key")], mapper_kind=MapperKind.REPLICATED
-                ),
-            ],
+                tp_size=2,
+                tp_rank=r,
+            ),
+            peer,
         )
-
-    self_pt = _page_table([_lg()], pool_specs={0: [(512, 64, 0x1000), (256, 64, 0x2000)]})
-    peer_pt = _page_table([_lg()], pool_specs={0: [(512, 64, 0x3000), (256, 64, 0x4000)]})
-
-    reg = _registrar(self_pt)
-    peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt)
-
-    mapping = reg.get_pool_mapping(peer_ri)
-    assert mapping == {(0, 0): (0, 0), (0, 1): (0, 1)}
+        for r in range(2)
+    ]
+    assert sent == [{((0, 0), (0, 0)): 512, ((0, 1), (0, 1)): 64}, {((0, 0), (0, 0)): 512}]
 
 
-def test_mismatched_view_kinds_raise():
-    """Kind disagreement on one role set must fail loudly.
+def test_only_the_layers_both_ranks_hold_move():
+    own = rank("ctx", page_table([("attention", 0, (10, 11), kv())]))
+    peer = rank("gen", page_table([("attention", 0, (11, 12), kv())]), layers=(1, 2))
+    assert kv_maps(own, peer) == {((0, 0), (0, 0)): 256}
 
-    Same role set but different kinds on the two sides is a version or
-    configuration inconsistency.
+
+def test_a_layer_group_pairs_with_every_peer_group_holding_its_layers():
+    """Each layer's bytes go to the pool of the peer's layer group holding it.
+
+    Here the peer keeps layers 0 and 1 in layer groups of their own.
     """
-    self_lg = _attn_lg(
-        0, [(0, 0)], [_pool_view(0, [(0, "index_key")], mapper_kind=MapperKind.REPLICATED)]
-    )
-    peer_lg = _attn_lg(0, [(0, 0)], [_pool_view(0, [(0, "index_key")], mapper_kind=MapperKind.NHD)])
-
-    reg = _registrar(_page_table([self_lg]))
-    peer_ri = _rank_info(name="peer", rank=1, page_table=_page_table([peer_lg]))
-
-    with pytest.raises(ValueError, match="incompatible mapper"):
-        reg.get_pool_mapping(peer_ri)
+    own = rank("ctx", page_table([("attention", 0, (0, 1), kv())]))
+    peer = rank("gen", page_table([("attention", 0, (0,), kv()), ("attention", 1, (1,), kv())]))
+    assert kv_maps(own, peer) == {((0, 0), (0, 0)): 256, ((0, 0), (1, 0)): 256}
 
 
-def test_pp_partial_layer_overlap():
-    """Self covers global layers {10,11}, peer covers {11,12}. Match via overlap on layer 11."""
-    self_lg = _attn_lg(0, [(0, 10), (1, 11)], [_kv_pool_view(0, [0, 1])])
-    peer_lg = _attn_lg(0, [(0, 11), (1, 12)], [_kv_pool_view(0, [0, 1])])
-
-    reg = _registrar(_page_table([self_lg]), layer_num_per_pp=[1, 1])
-    peer_ri = _rank_info(
-        name="peer", rank=1, page_table=_page_table([peer_lg]), layer_num_per_pp=[1, 1]
-    )
-
-    mapping = reg.get_pool_mapping(peer_ri)
-    assert mapping == {(0, 0): (0, 0)}
+def test_buffers_a_transfer_leaves_out_move_nothing():
+    index = [("index_key", 1, 32, replicated(32))]
+    own = rank("ctx", page_table([("attention", 0, (0, 1), kv() + index)]))
+    peer = rank("gen", page_table([("attention", 0, (0, 1), kv() + index)]))
+    excluded = frozenset({(1, "key"), (1, "value"), (0, "index_key"), (1, "index_key")})
+    assert kv_maps(own, peer, excluded) == {((0, 0), (0, 0)): 256}
 
 
-def test_pool_view_spanning_multiple_peer_lgs_raises():
-    """A self pool view spanning two peer LGs must fail loudly.
-
-    Mismatched layer grouping between peers is an unsupported topology;
-    silently transferring only the first LG's overlap would drop layers.
-    """
-    self_lg = _attn_lg(0, [(0, 10), (1, 11)], [_kv_pool_view(0, [0, 1])])
-    # Peer holds the same global layers but split across two layer groups.
-    peer_lg0 = _attn_lg(0, [(0, 10)], [_kv_pool_view(0, [0])])
-    peer_lg1 = _attn_lg(1, [(0, 11)], [_kv_pool_view(0, [0])])
-
-    reg = _registrar(_page_table([self_lg]))
-    peer_ri = _rank_info(name="peer", rank=1, page_table=_page_table([peer_lg0, peer_lg1]))
-
-    with pytest.raises(ValueError, match="multiple peer layer groups"):
-        reg.get_pool_mapping(peer_ri)
-
-
-def test_skewed_buffer_entries_per_layer_raises():
-    """A skewed per-layer entry distribution must raise.
-
-    1 + 3 entries over two layers passes ``total % layers == 0`` (4 % 2)
-    but is not a uniform per-layer layout — must raise, not return 2.
-    """
-    view = _pool_view(0, [(0, "key"), (1, "key"), (1, "key"), (1, "key")])
-    with pytest.raises(ValueError, match="not uniform"):
-        compute_layer_byte_ranges(view.buffer_entries)
-
-
-def test_duplicate_global_layer_id_across_lgs_raises():
-    """Layer groups must partition a rank's attention layers.
-
-    The same global_layer_id in two LGs would silently corrupt peer matching.
-    """
-    lg0 = _attn_lg(0, [(0, 10)], [_kv_pool_view(0, [0])])
-    lg1 = _attn_lg(1, [(0, 10)], [_kv_pool_view(0, [0])])
-
-    with pytest.raises(ValueError, match="layer groups must partition"):
-        get_layer_to_layer_group(_page_table([lg0, lg1]))
-
-
-def test_two_pools_distinct_roles_in_same_lg():
-    """Two pools with distinct pool_role in one LG match by role, not by layer overlap.
-
-    Within one LG, pool_role normally identifies a pool uniquely (builder
-    invariant). Even when the pools' layer sets are different sizes / not
-    equal, the matching is purely role-based: each self pool finds the peer
-    pool with the same pool_role.
-    """
-    self_kv = _kv_pool_view(0, [0, 1])
-    self_indexer = _indexer_pool_view(1, [0, 1])
-    self_lg = _attn_lg(0, [(0, 10), (1, 11)], [self_kv, self_indexer])
-
-    peer_kv = _kv_pool_view(0, [0, 1])
-    peer_indexer = _indexer_pool_view(1, [0, 1])
-    peer_lg = _attn_lg(0, [(0, 10), (1, 11)], [peer_kv, peer_indexer])
-
-    self_pt = _page_table([self_lg], pool_specs={0: [(1024, 64, 0x1000), (512, 64, 0x2000)]})
-    peer_pt = _page_table([peer_lg], pool_specs={0: [(1024, 64, 0x3000), (512, 64, 0x4000)]})
-
-    reg = _registrar(self_pt)
-    peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt)
-
-    mapping = reg.get_pool_mapping(peer_ri)
-    assert mapping == {(0, 0): (0, 0), (0, 1): (0, 1)}
-
-
-def test_same_role_pools_disambiguated_by_layer_overlap():
-    """Defensive: same pool_role + different layer sets is resolved by overlap.
-
-    If a peer LG holds two pools with the same pool_role but different layer
-    sets, matching picks the one whose layer set actually overlaps self. A
-    peer pool with zero overlap is never matched even if the role matches.
-    """
-    self_lg = _attn_lg(0, [(0, 10), (1, 11)], [_kv_pool_view(0, [0, 1])])
-    peer_lg = _attn_lg(
-        0,
-        [(0, 10), (1, 11), (2, 12)],
-        [
-            # First peer pool covers layers {12} only — same role, zero overlap with self.
-            _kv_pool_view(0, [2]),
-            # Second peer pool covers layers {10, 11} — same role, full overlap.
-            _kv_pool_view(1, [0, 1]),
-        ],
-    )
-
-    self_pt = _page_table([self_lg])
-    peer_pt = _page_table([peer_lg], pool_specs={0: [(1024, 64, 0x3000), (1024, 64, 0x4000)]})
-
-    reg = _registrar(self_pt)
-    peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt, layer_num_per_pp=[3])
-
-    mapping = reg.get_pool_mapping(peer_ri)
-    assert mapping == {(0, 0): (0, 1)}
-
-
-@pytest.mark.parametrize(
-    ("self_mapper_kind", "peer_mapper_kind"),
-    [
-        (MapperKind.REPLICATED, MapperKind.INDEXED),
-        (MapperKind.INDEXED, MapperKind.REPLICATED),
-    ],
-)
-def test_mixed_mapper_kinds_are_rejected(self_mapper_kind, peer_mapper_kind):
-    """Pool layouts must use the same mapper kind on both peers."""
-
-    def _indexer_view(mapper_kind):
-        return _pool_view(
-            0,
-            [(0, "indexer_k"), (1, "indexer_k")],
-            pool_role=frozenset({"indexer_k"}),
-            mapper_kind=mapper_kind,
-        )
-
-    self_lg = _attn_lg(0, [(0, 10), (1, 11)], [_indexer_view(self_mapper_kind)])
-    peer_lg = _attn_lg(0, [(0, 10), (1, 11)], [_indexer_view(peer_mapper_kind)])
-    reg = _registrar(_page_table([self_lg]))
-    peer_ri = _rank_info(name="peer", rank=1, page_table=_page_table([peer_lg]))
-
-    with pytest.raises(ValueError, match="incompatible mapper kinds"):
-        reg.get_pool_mapping(peer_ri)
+def test_a_layer_in_two_layer_groups_of_one_pool_group_is_refused():
+    own = rank("ctx", page_table([("attention", 0, (0,), kv()), ("attention", 0, (0, 1), [])]))
+    peer = rank("gen", page_table([("attention", 0, (0, 1), kv())]))
+    with pytest.raises(ValueError, match="layer 0 lies in layer groups 0 and 1"):
+        kv_maps(own, peer)

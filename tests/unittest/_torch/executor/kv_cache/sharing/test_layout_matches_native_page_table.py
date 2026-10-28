@@ -27,12 +27,7 @@ from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
-    MapperKind,
-    ShardDesc,
-    head_major,
-    replicated,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import ShardDesc, head_major, replicated
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     MemoryKind,
     StagingOptions,
@@ -145,7 +140,8 @@ def kinds(layout):
 
 
 def mapper_of(b):
-    """The native mapper kind a buffer's tensors amount to."""
+    """How a buffer's tensors spread over ranks: "REPLICATED" alike on every rank, "SECTIONED" split
+    by byte, else "NHD" or "INDEXED" by where its head axis lies."""
     if not b.split:
         return "REPLICATED"
     (tensor, *rest) = b.tensors
@@ -158,16 +154,14 @@ def mapper_of(b):
 
 
 def sections_of(b):
-    """A sectioned buffer's section sizes on this rank, as native's ``section_bytes``; None
-    otherwise."""
+    """A sectioned buffer's section sizes on this rank; None otherwise."""
     if mapper_of(b) != "SECTIONED":
         return None
     return tuple(t.axes[0].held for t in b.tensors)
 
 
 def head_bytes_of(b):
-    """Bytes of one head on this rank of a buffer split by head, as native's ``bytes_per_head``;
-    None otherwise."""
+    """Bytes of one head on this rank of a buffer split by head; None otherwise."""
     head = next((a for a in b.tensors[0].axes if a.name == "head"), None)
     if mapper_of(b) not in ("INDEXED", "NHD") or head is None:
         return None
@@ -375,35 +369,62 @@ def _as_list(values):
     return None if values is None else [int(v) for v in values]
 
 
+def project(layout, desc, pools):
+    """A layer group's transferred buffers over its pools (named by base address): rows of (layer,
+    pool, offset, size, spread), the roles per (pool, spread), the state geometry per (pool,
+    spread), the heads attention buffers split by head and those replicated buffers count, and the
+    indices of the buffers it holds."""
+    state = desc.kind == "state"
+    rows, roles, geometries, heads, whole, claimed = (
+        [],
+        defaultdict(list),
+        defaultdict(set),
+        set(),
+        set(),
+        set(),
+    )
+    for i, b in enumerate(layout.buffers):
+        if b.layer not in desc.layers or b.pool_group != desc.pool_group or not b.transferred:
+            continue
+        claimed.add(i)
+        key = (pools[b.pool_index][0], mapper_of(b))
+        rows.append((b.layer, key[0], b.slot_offset, b.size, key[1]))
+        roles[key].append(b.role)
+        if state:
+            geometries[key].add((sections_of(b), head_bytes_of(b)))
+        elif key[1] in ("INDEXED", "NHD"):
+            heads.add(b.size // head_bytes_of(b))
+        elif key[1] == "REPLICATED":
+            whole.add(layout.total_kv_heads_by_layer.get(b.layer))
+    assert all(len(v) == 1 for v in geometries.values()), f"roles disagree: {dict(geometries)}"
+    return (
+        sorted(rows),
+        {k: sorted(set(v)) for k, v in roles.items()},
+        {k: (_as_list(s), h) for k, ((s, h),) in geometries.items()},
+        heads or whole,
+        claimed,
+    )
+
+
 def native_groups(page_table):
-    """What native's page table says per layer group. Pools are named by base address, layers by
-    the global ids of ``local_layers``; order-free parts are sorted."""
+    """What native's page table says per layer group: its own pools, named by base address, layer
+    groups and heads, and the transferred buffers its page layout places in them."""
     out = []
-    for lg in page_table.layer_groups:
+    for lg, desc in zip(page_table.layer_groups, page_table.layout.layer_groups):
         pools = [
             (int(p.base_address), int(p.slot_bytes), int(p.num_slots))
             for p in page_table.pool_groups[lg.pool_group_idx].pools
         ]
-        global_of = {int(ll.local_layer_id): int(ll.global_layer_id) for ll in lg.local_layers}
         state = lg.kind == CacheKind.STATE
-        rows, roles, geometry = [], {}, {}
-        for pv in lg.pool_views:
-            key = (pools[pv.pool_idx][0], MapperKind(int(pv.mapper_kind)).name)
-            assert key not in roles, f"two views of pool and mapper {key}"
-            roles[key] = sorted(pv.pool_role)
-            if state:
-                geometry[key] = (_as_list(pv.section_bytes), pv.bytes_per_head)
-            for e in pv.buffer_entries:
-                layer = global_of[int(e["local_layer_id"])]
-                rows.append((layer, key[0], int(e["offset"]), int(e["size"]), key[1]))
+        rows, roles, geometry, _, _ = project(page_table.layout, desc, pools)
         out.append(
             {
                 "kind": "state" if state else "attention",
                 "window": None if state else lg.sliding_window_size,
                 "heads": None if state else int(lg.kv_head_num_per_rank),
-                "layers": sorted(global_of.values()),
+                "layers": sorted(int(ll.global_layer_id) for ll in lg.local_layers),
                 "pools": pools,
-                "rows": sorted(rows),
+                "rows": rows,
                 "roles": roles,
                 "state_geometry": geometry,
             }
@@ -412,7 +433,7 @@ def native_groups(page_table):
 
 
 def public_groups(layout, regions):
-    """Project public transferred buffers into native's group, pool and role representation."""
+    """Project the public layout's transferred buffers into native's group, pool and role terms."""
     out, claimed = [], set()
     for desc in layout.layer_groups:
         g = desc.pool_group
@@ -421,23 +442,8 @@ def public_groups(layout, regions):
             region = regions[layout.device_region_index[(g, p)]]
             pools.append((region.address, region.slot_bytes, region.slot_count))
         state = desc.kind == "state"
-        rows, roles, geometries, heads = [], defaultdict(list), defaultdict(set), set()
-        whole = set()
-        for i, b in enumerate(layout.buffers):
-            if b.layer not in desc.layers or b.pool_group != g or not b.transferred:
-                continue
-            claimed.add(i)
-            key = (pools[b.pool_index][0], mapper_of(b))
-            rows.append((b.layer, key[0], b.slot_offset, b.size, key[1]))
-            roles[key].append(b.role)
-            if state:
-                geometries[key].add((sections_of(b), head_bytes_of(b)))
-            elif key[1] in ("INDEXED", "NHD"):
-                heads.add(b.size // head_bytes_of(b))
-            elif key[1] == "REPLICATED":
-                whole.add(layout.total_kv_heads_by_layer.get(b.layer))
-        heads = heads or whole
-        assert all(len(v) == 1 for v in geometries.values()), f"roles disagree: {dict(geometries)}"
+        rows, roles, geometry, heads, held = project(layout, desc, pools)
+        claimed |= held
         out.append(
             {
                 "kind": desc.kind,
@@ -445,9 +451,9 @@ def public_groups(layout, regions):
                 "heads": None if state else (heads.pop() if len(heads) == 1 else sorted(heads)),
                 "layers": sorted(desc.layers),
                 "pools": pools,
-                "rows": sorted(rows),
-                "roles": {k: sorted(set(v)) for k, v in roles.items()},
-                "state_geometry": {k: (_as_list(s), h) for k, ((s, h),) in geometries.items()},
+                "rows": rows,
+                "roles": roles,
+                "state_geometry": geometry,
             }
         )
     stray = [
@@ -566,8 +572,8 @@ def test_the_public_layout_matches_what_native_builds(
         for name, lie in lies(layout).items():
             assert public_groups(lie, regions) != native, f"the {name} lie went unnoticed"
 
-        # Every buffer sits where the runtime keeps its layer and role. Native's views list roles
-        # per pool and mapper, so a layer's K and V trading places shows only here.
+        # Every buffer sits where the runtime keeps its layer and role. The rows above list roles
+        # per pool and spread, so a layer's K and V trading places shows only here.
         internal = {
             int(ll.global_layer_id): int(ll.local_layer_id)
             for lg in page_table.layer_groups

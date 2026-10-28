@@ -13,33 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.resource.page import (
-    BUFFER_ENTRY_DTYPE,
     AttentionLayerGroup,
     KVCachePageTable,
     LayerGroup,
     LocalLayer,
     MambaLayerGroup,
-    MapperKind,
     PhysicalPool,
     PhysicalPoolGroup,
-    PoolView,
 )
 
 pytestmark = pytest.mark.cpu_only
-
-
-def _make_buffer_entries():
-    return np.array(
-        [
-            (0, 0, 128),  # local_layer_id=0, offset=0, size=128
-            (0, 128, 128),  # local_layer_id=0, offset=128, size=128
-        ],
-        dtype=BUFFER_ENTRY_DTYPE,
-    )
 
 
 def test_physical_pool_construction():
@@ -65,35 +51,6 @@ def test_physical_pool_roundtrip():
     assert restored.slot_stride_bytes == pool.slot_stride_bytes
 
 
-def test_pool_view_roundtrip():
-    entries = _make_buffer_entries()
-    pv = PoolView(pool_idx=0, buffer_entries=entries)
-    d = pv.to_dict()
-    restored = PoolView.from_dict(d)
-    assert restored.pool_idx == 0
-    assert len(restored.buffer_entries) == 2
-    assert restored.buffer_entries[0]["offset"] == 0
-    assert restored.buffer_entries[1]["offset"] == 128
-
-
-def test_pool_view_kind_roundtrip():
-    """REPLICATED / NHD kinds survive serialization; default stays INDEXED."""
-    entries = _make_buffer_entries()
-    for kind in (MapperKind.REPLICATED, MapperKind.NHD):
-        view = PoolView(
-            pool_idx=2,
-            buffer_entries=entries,
-            pool_role=frozenset({"index_key"}),
-            mapper_kind=kind,
-        )
-        restored = PoolView.from_dict(view.to_dict())
-        assert restored.mapper_kind == kind
-        assert restored.pool_role == frozenset({"index_key"})
-
-    legacy = PoolView(pool_idx=0, buffer_entries=entries).to_dict()
-    assert PoolView.from_dict(legacy).mapper_kind == MapperKind.INDEXED
-
-
 def test_local_layer_roundtrip():
     ll = LocalLayer(local_layer_id=0, global_layer_id=5)
     d = ll.to_dict()
@@ -103,43 +60,35 @@ def test_local_layer_roundtrip():
 
 
 def test_layer_group_roundtrip():
-    entries = _make_buffer_entries()
     lg = AttentionLayerGroup(
         pool_group_idx=0,
         kv_head_num_per_rank=8,
         sliding_window_size=None,
         local_layers=[LocalLayer(0, 5), LocalLayer(1, 6)],
-        pool_views=[PoolView(pool_idx=0, buffer_entries=entries)],
     )
     d = lg.to_dict()
     restored = LayerGroup.from_dict(d)
     assert restored.pool_group_idx == 0
     assert restored.kv_head_num_per_rank == 8
     assert restored.sliding_window_size is None
-    assert len(restored.local_layers) == 2
-    assert len(restored.pool_views) == 1
+    assert restored.local_layers == lg.local_layers
 
 
 @pytest.mark.parametrize("include_layout", [False, True])
 def test_mamba_v2_peer_layout_roundtrip(include_layout: bool) -> None:
     """V2 peers with an absent or true layout marker remain readable."""
-    group = MambaLayerGroup(
-        pool_group_idx=0,
-        local_layers=[LocalLayer(0, 5)],
-        pool_views=[PoolView(pool_idx=0, buffer_entries=_make_buffer_entries())],
-    )
+    group = MambaLayerGroup(pool_group_idx=0, local_layers=[LocalLayer(0, 5)])
     data = group.to_dict()
     if not include_layout:
         data.pop("slot_major_layout")
     restored = LayerGroup.from_dict(data)
     assert isinstance(restored, MambaLayerGroup)
     assert restored.local_layers == group.local_layers
-    np.testing.assert_array_equal(restored.pool_views[0].buffer_entries, _make_buffer_entries())
 
 
 def test_page_table_rejects_legacy_mamba_peer_layout() -> None:
     """Reject a peer's explicit V1 layout through the page-table intake path."""
-    group = MambaLayerGroup(pool_group_idx=0, local_layers=[], pool_views=[]).to_dict()
+    group = MambaLayerGroup(pool_group_idx=0, local_layers=[]).to_dict()
     group["slot_major_layout"] = False
     with pytest.raises(ValueError, match="layer-major recurrent-state layout"):
         KVCachePageTable.from_dict(
@@ -148,7 +97,6 @@ def test_page_table_rejects_legacy_mamba_peer_layout() -> None:
 
 
 def test_kv_cache_page_table_roundtrip():
-    entries = _make_buffer_entries()
     page_table = KVCachePageTable(
         tokens_per_block=64,
         layer_groups=[
@@ -157,7 +105,6 @@ def test_kv_cache_page_table_roundtrip():
                 kv_head_num_per_rank=8,
                 sliding_window_size=None,
                 local_layers=[LocalLayer(0, 5)],
-                pool_views=[PoolView(pool_idx=0, buffer_entries=entries)],
             )
         ],
         pool_groups=[
@@ -172,94 +119,3 @@ def test_kv_cache_page_table_roundtrip():
     assert len(restored.layer_groups) == 1
     assert len(restored.pool_groups) == 1
     assert restored.pool_groups[0].pools[0].base_address == 0x10000
-
-
-# ---------------------------------------------------------------------------
-# bytes_per_layer serialization and get_layer_byte_ranges geometry
-# ---------------------------------------------------------------------------
-
-
-def test_pool_view_bytes_per_layer_roundtrip():
-    entries = _make_buffer_entries()
-    view = PoolView(
-        pool_idx=1,
-        buffer_entries=entries,
-        pool_role=frozenset({"key", "value"}),
-        mapper_kind=MapperKind.NHD,
-        bytes_per_layer=256,
-    )
-    restored = PoolView.from_dict(view.to_dict())
-    assert restored.bytes_per_layer == 256
-
-    # None (INDEXED views) survives the roundtrip too.
-    legacyless = PoolView(pool_idx=0, buffer_entries=entries)
-    assert PoolView.from_dict(legacyless.to_dict()).bytes_per_layer is None
-
-
-def _view(entries, bytes_per_layer=None):
-    return PoolView(
-        pool_idx=0,
-        buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE),
-        pool_role=frozenset({"key", "value"}),
-        mapper_kind=MapperKind.NHD,
-        bytes_per_layer=bytes_per_layer,
-    )
-
-
-def test_layer_byte_ranges_uniform_stride():
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
-
-    # Dedicated K/V pool: dense layers, uniform stride.
-    starts, bytes_per_layer = get_layer_byte_ranges(
-        _view([(0, 0, 128), (0, 128, 128), (1, 256, 128), (1, 384, 128)])
-    )
-    assert starts == {0: 0, 1: 256}
-    assert bytes_per_layer == 256
-
-
-def test_layer_byte_ranges_non_uniform_stride():
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
-
-    # Coalesced slot: another role class interleaves 64B after layer 0,
-    # so the layer stride is non-uniform while sizes stay uniform.
-    starts, bytes_per_layer = get_layer_byte_ranges(
-        _view([(0, 0, 128), (0, 128, 128), (1, 320, 128), (1, 448, 128)])
-    )
-    assert starts == {0: 0, 1: 320}
-    assert bytes_per_layer == 256
-
-
-def test_layer_byte_ranges_noncontiguous_layer_raises():
-    import pytest
-
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
-
-    with pytest.raises(ValueError, match="not contiguous"):
-        get_layer_byte_ranges(_view([(0, 0, 128), (0, 192, 128)]))
-
-
-def test_layer_byte_ranges_nonuniform_size_raises():
-    import pytest
-
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
-
-    with pytest.raises(ValueError, match="not uniform"):
-        get_layer_byte_ranges(_view([(0, 0, 128), (1, 128, 64)]))
-
-
-def test_layer_byte_ranges_declared_size_mismatch_raises():
-    import pytest
-
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
-
-    with pytest.raises(ValueError, match="declares bytes_per_layer"):
-        get_layer_byte_ranges(_view([(0, 0, 128)], bytes_per_layer=256))
-
-
-def test_layer_byte_ranges_empty_view_raises():
-    import pytest
-
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
-
-    with pytest.raises(ValueError, match="no buffer entries"):
-        get_layer_byte_ranges(_view([]))

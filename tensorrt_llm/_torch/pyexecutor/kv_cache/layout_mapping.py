@@ -17,8 +17,8 @@
 Every buffer is the local pieces of tensors whose axes say which global indices a rank holds
 (``page_layout.held``). For a source rank and a destination rank this module gives, per buffer
 both hold, the byte runs the source sends: the indices both hold, of which the source is the
-elected sender, as runs that are contiguous on both sides. Nothing here knows a cache kind, a
-mapper kind or a model.
+elected sender, as runs that are contiguous on both sides. Nothing here knows a cache kind or a
+model.
 
 Pairing and election: ranks split each parallel dimension into equal shares in rank order, and a
 destination rank pairs with the source ranks whose share overlaps its own (``fan``); a

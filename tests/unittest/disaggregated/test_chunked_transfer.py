@@ -169,7 +169,6 @@ def _make_projection_sender() -> Sender:
     )
 
     mapper = MagicMock()
-    mapper.empty = False
     mapper.map.side_effect = lambda src_region, dst_region: SimpleNamespace(
         src=src_region,
         dst=dst_region,
@@ -181,12 +180,11 @@ def _make_projection_sender() -> Sender:
     registrar.get_peer_rank_info.return_value = peer_ri
     registrar.get_peer_overlap.return_value = SimpleNamespace(ranks=[0])
     registrar.should_send_kv.return_value = True
-    registrar.get_pool_mapping.return_value = {
-        (0, 0): (0, 0),
-        (1, 0): (1, 0),
-    }
     registrar.peer_extractor.return_value = extractor
-    registrar.get_kv_map.return_value = mapper
+    registrar.get_kv_maps.return_value = {
+        ((0, 0), (0, 0)): mapper,
+        ((1, 0), (1, 0)): mapper,
+    }
 
     sender = Sender.__new__(Sender)
     sender._registrar = registrar

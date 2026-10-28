@@ -429,9 +429,8 @@ def _coalesced_page_table() -> KVCachePageTable:
 
     K == V == index-K bytes per block, so V2 coalesces all three roles into
     one physical pool. The slot interleaves the sparse layer's index-K
-    between K/V regions (L0K L0V L1K L1V L1IDX L2K L2V L3K L3V), yielding
-    two views over the same pool: a token-major K/V view with a non-uniform
-    layer stride and a replicated index-K view.
+    between K/V regions (L0K L0V L1K L1V L1IDX L2K L2V L3K L3V): token-major
+    K/V with a non-uniform layer stride and a replicated index-K in one pool.
     """
     u = _UNIT
     kv = token_major(u, 16, 1, 1)
@@ -454,11 +453,11 @@ _INDEX_BUFFERS = frozenset({(1, "index_key")})
 
 
 def _ignored_role_page_table() -> KVCachePageTable:
-    """Page table whose slot holds regions no view transfers.
+    """Page table whose slot holds regions no transfer moves.
 
     The slot interleaves a local-only buffer after each layer's K region
-    (L0K L0LOCAL L1K L1LOCAL). Buffers that never move occupy slot offsets
-    but appear in no view, so no writer ever covers them.
+    (L0K L0LOCAL L1K L1LOCAL). Buffers that never move occupy slot offsets,
+    but no writer ever covers them.
     """
     u = _UNIT
     buffers = [
@@ -478,8 +477,8 @@ def _expected_write_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:
 def _summed_sender_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:
     """Destination bytes a matched-layout sender submits for *chunk*.
 
-    The extract -> get_kv_map -> WriteMeta.sizes path of
-    Sender._build_kv_write_meta, run per pool view against itself as the
+    The extract -> get_kv_maps -> WriteMeta.sizes path of
+    Sender._build_kv_write_meta, run per pool pair against itself as the
     peer. This is the quantity each writer attests on completion and the
     receiver sums into verified_write_bytes.
     """
@@ -487,17 +486,12 @@ def _summed_sender_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:
     registrar = PeerRegistrar(SimpleNamespace(), extractor)
     peer = SimpleNamespace(page_table=page_table, instance_name="peer", instance_rank=0, dp_rank=0)
     total = 0
-    for lg_idx, block_ids in enumerate(chunk.block_ids_per_layer_groups):
-        layer_group = page_table.layer_groups[lg_idx]
-        for view_idx in range(len(layer_group.pool_views)):
-            key = (lg_idx, view_idx)
-            mapper = registrar.get_kv_map(peer, key, key, excluded=chunk.excluded_buffers)
-            if mapper.empty:
-                continue
-            region = extractor.extract(block_ids, lg_idx, view_idx)
-            pairs = mapper.map(region, region)
-            for pair in pairs if isinstance(pairs, list) else [pairs]:
-                total += int(pair.src.memory.ptrs.size) * int(pair.src.memory.bytes_per_region)
+    maps = registrar.get_kv_maps(peer, excluded=chunk.excluded_buffers)
+    for ((lg_idx, pool_idx), _), mapper in maps.items():
+        region = extractor.extract(chunk.block_ids_per_layer_groups[lg_idx], lg_idx, pool_idx)
+        pairs = mapper.map(region, region)
+        for pair in pairs if isinstance(pairs, list) else [pairs]:
+            total += int(pair.src.memory.ptrs.size) * int(pair.src.memory.bytes_per_region)
     return total
 
 
@@ -505,10 +499,9 @@ class TestExpectedWriteBytesMatchSenderBytes:
     """The receiver expectation must equal the summed sender bytes.
 
     Otherwise verified-reuse admission marks every successful receive
-    unverified and its blocks never enter the reuse tree. Regression:
-    computing the expectation as physical slot_bytes per pool view double
-    counts a coalesced slot (one slot, one view per role class) and counts
-    ignored-role regions no view transfers.
+    unverified and its blocks never enter the reuse tree. Counting physical
+    slot_bytes instead would double count a coalesced slot holding several
+    kinds of buffers and count local-only regions no transfer moves.
     """
 
     @pytest.mark.parametrize(
@@ -526,7 +519,7 @@ class TestExpectedWriteBytesMatchSenderBytes:
         chunk.excluded_buffers = excluded_buffers
         expected = _expected_write_bytes(page_table, chunk)
         assert expected == _summed_sender_bytes(page_table, chunk)
-        # Both views share physical pool 0; each buffer the transfer moves contributes exactly
+        # All buffers share physical pool 0; each buffer the transfer moves contributes exactly
         # once, and the ones it leaves to the receiver (excluded_buffers) not at all.
         assert expected == 2 * units_per_block * _UNIT
 

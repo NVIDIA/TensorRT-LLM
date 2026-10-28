@@ -42,16 +42,7 @@ try:
 except ImportError:  # pragma: no cover - CPU-only env without CUDA bindings
     _HAVE_TRANSPORT = False
 
-# page.py is pure numpy dataclasses, always importable on CPU.
-from tensorrt_llm._torch.disaggregation.resource.page import (
-    BUFFER_ENTRY_DTYPE,
-    AttentionLayerGroup,
-    KVCachePageTable,
-    LocalLayer,
-    PhysicalPool,
-    PhysicalPoolGroup,
-    PoolView,
-)
+from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import map_buffers, received_bytes
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
@@ -374,29 +365,18 @@ def _recv_req(block_counts, rid=1, slice_id=0):
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
 class TestFanInReserve:
     def test_block_bytes_include_distinct_physical_pools_once(self) -> None:
-        entries = np.array([], dtype=BUFFER_ENTRY_DTYPE)
-        page_table = KVCachePageTable(
-            tokens_per_block=32,
-            layer_groups=[
-                AttentionLayerGroup(
-                    pool_group_idx=0,
-                    local_layers=[LocalLayer(local_layer_id=0, global_layer_id=0)],
-                    pool_views=[
-                        PoolView(pool_idx=0, buffer_entries=entries),
-                        PoolView(pool_idx=1, buffer_entries=entries),
-                        PoolView(pool_idx=1, buffer_entries=entries),
-                    ],
-                )
-            ],
-            pool_groups=[
-                PhysicalPoolGroup(
-                    pools=[
-                        PhysicalPool(base_address=0x200000, slot_bytes=100, num_slots=8),
-                        PhysicalPool(base_address=0x300000, slot_bytes=25, num_slots=8),
-                    ]
-                )
-            ],
+        layout = PageLayout(
+            tokens_per_page=32,
+            pool_slot_bytes={0: (100, 25)},
+            layer_groups=(LayerGroupDesc("attention", None, 0, 0, (0,)),),
+            buffers=(
+                BufferDesc(0, "key", 0, 0, 0, 50),
+                BufferDesc(0, "value", 0, 0, 50, 50),
+                BufferDesc(0, "index_key", 0, 1, 0, 12),
+                BufferDesc(0, "index_scale", 0, 1, 12, 13),
+            ),
         )
+        page_table = native_page_table(layout, {0: [0x200000, 0x300000]}, num_slots=8)
 
         assert btr.block_bytes_per_group(page_table) == [125]
 

@@ -259,16 +259,18 @@ def test_disagg_exports_both_pools_and_pairs_sink_tail(make_manager):
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
     from tensorrt_llm._torch.disaggregation.native.transfer import Sender
     from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_transferred_pool_indices
 
     manager = make_manager()
     rank = RankInfo.from_kv_cache_manager("mixed", manager, device_id=0)
     table = rank.page_table
     assert [group.local_layers[0].global_layer_id for group in table.layer_groups] == [0, 1]
-    assert [len(group.pool_views) for group in table.layer_groups] == [1, 1]
+    pools = [get_transferred_pool_indices(table, g) for g in range(2)]
+    assert [len(p) for p in pools] == [1, 1]
     registrar = PeerRegistrar(rank, KVRegionExtractorV1(table))
     peer = RankInfo.from_bytes(rank.to_bytes())
     peer.instance_name = "decode"
-    assert registrar.get_pool_mapping(peer) == {(0, 0): (0, 0), (1, 0): (1, 0)}
+    assert set(registrar.get_kv_maps(peer)) == {((g, p), (g, p)) for g, (p,) in enumerate(pools)}
     source, destination = Sender._pair_ordinals(
         np.array([4, -1, -1, -1, 7]), np.array([2, -1, -1, -1, 6])
     )

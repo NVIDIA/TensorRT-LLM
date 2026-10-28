@@ -54,11 +54,6 @@ class RunsMapper(RegionMapperBase):
         ]
 
     @property
-    def empty(self) -> bool:
-        """Whether the source sends nothing of the view pair."""
-        return not self._groups
-
-    @property
     def bytes_per_slot(self) -> int:
         """Bytes moved per slot or block."""
         return sum(size * src.size for size, src, _ in self._groups)
