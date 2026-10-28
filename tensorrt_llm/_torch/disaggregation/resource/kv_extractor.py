@@ -187,8 +187,8 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     (model_layer, attn_type) into synthetic IDs via the
     _layer_attn_to_layer_id inverse mapping.
     """
-    local_layer_ids = sorted(
-        {int(buffer.layer_id) for buffer in manager.impl.buffer_grouping[lg_idx]}
+    local_layer_ids = list(
+        dict.fromkeys(int(buffer.layer_id) for buffer in manager.impl.buffer_grouping[lg_idx])
     )
 
     get_global_layer_ids = getattr(manager, "get_disagg_global_layer_ids", None)
@@ -433,8 +433,10 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         # memory is reused, not concatenated.
         for variant in pg_desc.slot_desc.variants:
             layer_group_id = int(variant.layer_group_id)
-            all_internal_layer_ids = sorted(
-                {int(buffer.layer_id) for buffer in manager.impl.buffer_grouping[layer_group_id]}
+            all_internal_layer_ids = list(
+                dict.fromkeys(
+                    int(buffer.layer_id) for buffer in manager.impl.buffer_grouping[layer_group_id]
+                )
             )
             all_global_layer_ids = _compute_global_layer_ids(manager, layer_group_id)
             local_layers = [

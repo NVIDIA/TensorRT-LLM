@@ -77,12 +77,20 @@ std::vector<int> PageIndexConverter::operator()(std::vector<int> const& baseIndi
             // base_indices.
             int blockPos = ordinal - scratchRange.beg;
             int totalOffset = blockPos * scratchPages;
+            bool const crossesSlots = scale % scratchPages != 0;
+            if (crossesSlots)
+            {
+                // Unequal layer shares can put a block across two slots. Pack
+                // the layer's consecutive roles before resolving the slot ID,
+                // so a trailing role cannot wrap over an earlier block's data.
+                totalOffset += appliedLayerOffset % scratchPages;
+            }
             int slotIdx = totalOffset / scale;
             TLLM_CHECK_DEBUG_WITH_INFO(slotIdx < scratchSlots.size(), "Scratch slot %d past the %d the range describes",
                 slotIdx, scratchSlots.size());
             int slotId = scratchSlots[slotIdx];
             int offset = totalOffset % scale;
-            index = slotId * scale + (offset + appliedLayerOffset) % scale;
+            index = slotId * scale + (crossesSlots ? offset : (offset + appliedLayerOffset) % scale);
         }
         else if (baseIndices[toSizeT(ordinal)] == kBadPageIndex.value())
         {
@@ -829,9 +837,19 @@ TypedVec<LayerGroupId, std::vector<LayerId>> KvCacheManager::layerGrouping() con
 TypedVec<LayerGroupId, std::vector<BufferId>> KvCacheManager::bufferGrouping() const
 {
     TypedVec<LayerGroupId, std::vector<BufferId>> result(mLifeCycles.size());
+    std::unordered_map<LayerId, std::vector<BufferId>> buffersByLayer;
     for (auto const& buffer : allBufferIds())
     {
-        result.at(getBufferGroupId(buffer.layerId, buffer.role)).push_back(buffer);
+        buffersByLayer[buffer.layerId].push_back(buffer);
+    }
+    // Keep layer order consistent with layerGrouping() for consumers that pair
+    // group membership with a declared list of global model layer IDs.
+    for (auto const& [layer, lifeCycles] : mStorage->layerToLifeCycleIds())
+    {
+        for (auto const& buffer : buffersByLayer.at(layer))
+        {
+            result.at(getBufferGroupId(buffer.layerId, buffer.role)).push_back(buffer);
+        }
     }
     return result;
 }

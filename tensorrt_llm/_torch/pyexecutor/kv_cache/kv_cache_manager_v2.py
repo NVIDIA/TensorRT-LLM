@@ -2584,6 +2584,20 @@ class KVCacheManagerV2(BaseResourceManager):
         # release half of `preempt_request` has to wait.
         self._pending_preemption: Dict[int, LlmRequest] = {}
         self._use_per_layer_page_tables = False
+        if self.enable_swa_scratch_reuse:
+            for layer in config.layers:
+                if not isinstance(layer, AttentionLayerConfig) or layer.sliding_window_size is None:
+                    continue
+                for buffer in layer.buffers:
+                    if buffer.is_sparse:
+                        continue
+                    converter = self.impl.get_page_index_converter(layer.layer_id, buffer.role)
+                    if converter.scale % converter.scratch_pages_per_block:
+                        raise ValueError(
+                            "The attention scratch-table kernels require whole layer blocks per slot; "
+                            f"layer {layer.layer_id}, role {buffer.role} has an unequal coalesced share. "
+                            "Use separate coalescing groups or disable SWA scratch reuse."
+                        )
         self._prepare_page_table_tensor(index_mapper_capacity)
         self._sparse_layer_group_ids = tuple(
             sorted(
@@ -2910,7 +2924,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # A split layer can occur in several groups. This is membership metadata,
         # not the partition promised by the deprecated layer_grouping API.
         return [
-            sorted({int(buffer.layer_id) for buffer in buffers})
+            list(dict.fromkeys(int(buffer.layer_id) for buffer in buffers))
             for buffers in self.impl.buffer_grouping
         ]
 

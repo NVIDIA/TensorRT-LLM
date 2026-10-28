@@ -269,6 +269,7 @@ def test_attention_buffer_reuse_policies(length, select_optional):
             kv.AttentionLayerConfig(
                 layer_id=0,
                 reuse_policy=kv.ReusePolicy.PRIVATE,
+                sliding_window_size=4,
                 buffers=[
                     kv.BufferConfig(role="key", size=4096, reuse_policy=kv.ReusePolicy.REQUIRED),
                     kv.BufferConfig(role="index", size=2048, reuse_policy=kv.ReusePolicy.OPTIONAL),
@@ -295,8 +296,13 @@ def test_attention_buffer_reuse_policies(length, select_optional):
         caches.append(reader)
         assert reader.num_committed_tokens == length
         assert reader.reuse_status[required].complete
-        assert reader.reuse_status[optional].complete
+        optional_complete = length % config.tokens_per_block == 0
+        assert reader.reuse_status[optional].complete == optional_complete
         assert not reader.reuse_status[private].complete
+        if select_optional and not optional_complete:
+            with pytest.raises(ValueError):
+                reader.resume(stream.cuda_stream, optional_reuse_groups=[optional])
+            select_optional = False
         assert reader.resume(
             stream.cuda_stream, optional_reuse_groups=[optional] if select_optional else []
         )
