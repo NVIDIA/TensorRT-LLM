@@ -252,6 +252,11 @@ def test_library_accepts_supported_rope_and_declines_the_rest():
         PositionEmbeddingType.long_rope,
         PositionEmbeddingType.mrope,
         PositionEmbeddingType.yarn,
+        PositionEmbeddingType.alibi,
+        PositionEmbeddingType.alibi_with_scale,
+        PositionEmbeddingType.relative,
+        PositionEmbeddingType.chatglm,
+        PositionEmbeddingType.deferred,
     ):
         assert not SamplingSharedPrefixFmha._is_available(_fake_attn(position_type=position_type))
     # No table, rotary dim past the head or not a power of two.

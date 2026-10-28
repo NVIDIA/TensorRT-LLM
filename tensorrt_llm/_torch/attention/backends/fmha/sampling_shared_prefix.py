@@ -1063,7 +1063,9 @@ class _GraphBuffers:
             empty=torch.zeros((rows + 128,), dtype=torch.bool, device=device),
             copied=torch.cuda.Event(),
             meta_offset=meta_offset,
-            fused_prefix_indices=torch.zeros((prefix_capacity + 64,), dtype=torch.int32, device=device),
+            fused_prefix_indices=torch.zeros(
+                (prefix_capacity + 64,), dtype=torch.int32, device=device
+            ),
             fused_tail_indices=torch.zeros((tail_capacity + 64,), dtype=torch.int32, device=device),
         )
 
@@ -2274,9 +2276,14 @@ class SamplingSharedPrefixFmha(PhasedFmha):
             return False
         if QuantMode(getattr(attn, "quant_mode", 0)).has_kv_cache_quant():
             return False
-        if PositionEmbeddingType(getattr(attn, "position_embedding_type", 0)).is_rope():
+        position_type = PositionEmbeddingType(getattr(attn, "position_embedding_type", 0))
+        if position_type.is_rope():
             if not _fused_rope_supported(attn):
                 return False
+        elif position_type != PositionEmbeddingType.learned_absolute:
+            # ALiBi, relative, GLM and deferred embeddings are applied inside the attention op,
+            # which this library bypasses.
+            return False
         global _model_shape
         if _model_shape is None:  # the target layers come first; draft layers share the shape
             _model_shape = (num_heads, num_kv_heads, head_dim)
