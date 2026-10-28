@@ -124,7 +124,7 @@ class QsaPagedIndexScores(OpWrapper):
 
     note = """
     Metadata consumed: none -- every input is an argument. What the target
-    passes: `block_table` is `QSAAttentionMetadata.qsa_block_table` (raw
+    passes: `block_table` is `QSAMetadata.block_table` (raw
     pool-page ids, int32, -1 past each sequence); `query_positions` /
     `request_indices` are `qsa_logical_positions` / `qsa_req_idx_per_token`;
     `index_cache` is the layer's bf16 index-K plane (`get_index_k_buffer`).

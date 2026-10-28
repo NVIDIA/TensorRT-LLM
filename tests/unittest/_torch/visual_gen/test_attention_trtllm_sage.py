@@ -94,7 +94,7 @@ def _test_attention_trtllm_sage(
         sparse_params=sparse_params,
     )
 
-    metadata = attention_cls.Metadata(
+    metadata = attention_cls.create_metadata(
         max_num_requests=batch_size,
         max_num_tokens=seq_len,
         kv_cache_manager=None,

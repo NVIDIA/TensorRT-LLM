@@ -617,7 +617,10 @@ def test_gdn_custom_op_forwards_split_inputs(monkeypatch):
 
     class FakeMetadata:
         num_tokens = 2
-        mamba_metadata = object()
+        recurrent = SimpleNamespace(mamba_metadata=object())
+
+        def ext(self, cls):
+            return self.recurrent
 
     class FakeLayer:
         def forward_core(
@@ -634,7 +637,7 @@ def test_gdn_custom_op_forwards_split_inputs(monkeypatch):
             assert a.shape[0] == 2
             assert b.shape[0] == 2
             assert attn_metadata is metadata
-            assert mamba_metadata is metadata.mamba_metadata
+            assert mamba_metadata is metadata.recurrent.mamba_metadata
             assert spec_metadata is None
             output.fill_(5)
 

@@ -19,7 +19,7 @@ from tensorrt_llm._torch.attention.backends.sparse import dsa_flashinfer, inline
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.kernels import (
     deepseek_v4_local_to_global_indices,
 )
-from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManager
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManager, DSAMetadata
 from tensorrt_llm._torch.attention.backends.sparse.flashinfer_utils import (
     allocate_sparse_mla_split_workspace,
 )
@@ -202,8 +202,11 @@ def test_dsa_sparse_mla_cuda_graph_capture_replay() -> None:
     )
     metadata._num_tokens = num_tokens
     metadata._num_ctx_tokens = 0
-    metadata.max_draft_tokens = 0
-    metadata.token_positions_cuda = torch.arange(num_tokens, dtype=torch.int32, device="cuda")
+    dsa = object.__new__(DSAMetadata)
+    dsa.metadata = metadata
+    metadata.replace_ext(dsa)
+    dsa.max_draft_tokens = 0
+    dsa.token_positions_cuda = torch.arange(num_tokens, dtype=torch.int32, device="cuda")
     metadata.kv_cache_manager = SimpleNamespace(
         tokens_per_block=inline_scale_kv.PAGE_SIZE,
         get_unique_primary_pool=lambda: pool.view(pool.shape[0], 1, -1),

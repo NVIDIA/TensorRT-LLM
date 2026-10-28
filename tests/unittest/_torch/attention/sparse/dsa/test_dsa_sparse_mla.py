@@ -28,6 +28,7 @@ import torch
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention.backends.features import FlashMlaMetadata
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     MLAParams,
@@ -815,7 +816,7 @@ def _run_test_for_backend(
 
         ctx_seq_lens = torch.tensor(context_sequence_lengths, dtype=torch.int)
         total_ctx_tokens = sum(context_sequence_lengths)
-        attn_metadata = AttentionCls.Metadata(
+        attn_metadata = AttentionCls.create_metadata(
             seq_lens=ctx_seq_lens,
             request_ids=request_ids,
             max_num_requests=max_num_contexts,
@@ -828,7 +829,7 @@ def _run_test_for_backend(
                 num_cached_tokens_per_seq=[0 for _ in context_sequence_lengths],
             ),
             mapping=mapping,
-            sparse_attention_config=sparse_config,
+            sparse_metadata_params=sparse_config.to_sparse_metadata_params(),
         )
         attn_metadata.prepare()
 
@@ -843,7 +844,7 @@ def _run_test_for_backend(
                     [generation_seq_len_q] * max_num_contexts, dtype=torch.int
                 )
                 total_gen_tokens = max_num_contexts * generation_seq_len_q
-                attn_metadata = AttentionCls.Metadata(
+                attn_metadata = AttentionCls.create_metadata(
                     seq_lens=gen_seq_lens,
                     request_ids=request_ids,
                     max_num_requests=max_num_contexts,
@@ -859,8 +860,10 @@ def _run_test_for_backend(
                         ],
                     ),
                     mapping=mapping,
-                    enable_flash_mla=torch.cuda.get_device_capability() == (9, 0),
-                    sparse_attention_config=sparse_config,
+                    extension_types=(FlashMlaMetadata,)
+                    if torch.cuda.get_device_capability() == (9, 0)
+                    else (),
+                    sparse_metadata_params=sparse_config.to_sparse_metadata_params(),
                 )
                 attn_metadata.prepare()
             for layer_idx in range(num_layers):

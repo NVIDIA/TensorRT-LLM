@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import set_use_spec_decoding
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
@@ -241,7 +242,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                     hidden_states = hidden_states[0]
 
                 # Disable spec-dec mode for chained draft steps
-                attn_metadata.use_spec_decoding = False
+                set_use_spec_decoding(attn_metadata, False)
 
                 logits = draft_model.logits_processor(
                     hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
@@ -298,7 +299,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             num_accepted_tokens,
         )
 
-        attn_metadata.use_spec_decoding = True
+        set_use_spec_decoding(attn_metadata, True)
 
         return {
             "logits": raw_logits,

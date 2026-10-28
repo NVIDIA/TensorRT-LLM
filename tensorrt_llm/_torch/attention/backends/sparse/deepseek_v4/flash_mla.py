@@ -8,13 +8,13 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._utils import nvtx_range, nvtx_range_debug
 from tensorrt_llm.logger import logger
 
 from . import footer_scale_kv
 from .kernels import deepseek_v4_local_to_global_indices
-from .metadata import DeepseekV4TrtllmAttentionMetadata
+from .metadata import DeepseekV4Metadata
 from .params import DEEPSEEK_V4_SPARSE_RATIO, DeepseekV4AttentionType
 
 _BF16_CONTEXT_CHUNK_SIZE = 512
@@ -47,7 +47,7 @@ class DeepSeekV4FlashMLA:
         self,
         q: torch.Tensor,
         latent_cache: torch.Tensor,
-        metadata: DeepseekV4TrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         *,
         is_generation: bool,
         rotary_cos_sin: Optional[torch.Tensor] = None,
@@ -79,37 +79,38 @@ class DeepSeekV4FlashMLA:
 
     def _prepare_pool_indices(
         self,
-        metadata: DeepseekV4TrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         topk_indices: Optional[torch.Tensor],
         *,
         is_generation: bool,
     ) -> tuple[torch.Tensor, int, int]:
         """Convert local dual-pool indices to layer-pool-relative indices."""
+        dsv4 = metadata.ext(DeepseekV4Metadata)
         kv_cache_manager = metadata.kv_cache_manager
-        window_size = metadata.window_size
+        window_size = dsv4.window_size
         start_idx = metadata.num_ctx_tokens if is_generation else 0
         end_idx = metadata.num_tokens if is_generation else metadata.num_ctx_tokens
 
-        req_id = metadata.req_idx_per_token[start_idx:end_idx]
-        swa_local_indices = metadata.swa_local_indices_cuda[start_idx:end_idx]
+        req_id = dsv4.req_idx_per_token[start_idx:end_idx]
+        swa_local_indices = dsv4.swa_local_indices_cuda[start_idx:end_idx]
         local_layer_idx = kv_cache_manager.layer_offsets[self._layer_idx]
-        block_table_swa = metadata.sliding_block_tables[
+        block_table_swa = dsv4.sliding_block_tables[
             local_layer_idx, DeepseekV4AttentionType.SWA.value
         ]
-        swa_buffer_ptr = metadata.swa_buffer_ptrs[self._layer_idx]
+        swa_buffer_ptr = dsv4.swa_buffer_ptrs[self._layer_idx]
 
         block_table_compressed = None
         compressed_local_indices = None
         compressed_buffer_ptr = 0
         if self._compress_ratio > 1:
-            compressed_buffer_ptr = metadata.compressed_buffer_ptrs[self._layer_idx]
-            block_table_compressed = metadata.compress_block_tables[self._compress_ratio]
+            compressed_buffer_ptr = dsv4.compressed_buffer_ptrs[self._layer_idx]
+            block_table_compressed = dsv4.compress_block_tables[self._compress_ratio]
             if self._compress_ratio == DEEPSEEK_V4_SPARSE_RATIO:
                 if topk_indices is None:
                     raise ValueError("DeepSeek-V4 ratio-4 attention requires top-k indices")
                 compressed_local_indices = topk_indices
             else:
-                compressed_local_indices = metadata.compressed_local_indices_cuda[start_idx:end_idx]
+                compressed_local_indices = dsv4.compressed_local_indices_cuda[start_idx:end_idx]
 
         # Equal base/layer pointers make both output slices relative to the
         # tensors passed to FlashMLA instead of the shared sparse arena.
@@ -126,7 +127,7 @@ class DeepSeekV4FlashMLA:
             compress_pool_base_ptr=compressed_buffer_ptr,
             compressed_buffer_ptr=compressed_buffer_ptr,
             compress_ratio=self._compress_ratio,
-            num_compressed_indices=metadata.max_compressed_indices[self._compress_ratio],
+            num_compressed_indices=dsv4.max_compressed_indices[self._compress_ratio],
         )
         return global_indices, self._compress_ratio, window_size
 
@@ -238,7 +239,7 @@ class DeepSeekV4FlashMLA:
         self,
         q: torch.Tensor,
         latent_cache: torch.Tensor,
-        metadata: DeepseekV4TrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         output: torch.Tensor,
         topk_indices: Optional[torch.Tensor],
         softmax_scale: float,
@@ -263,7 +264,7 @@ class DeepSeekV4FlashMLA:
         self,
         q: torch.Tensor,
         latent_cache: torch.Tensor,
-        metadata: DeepseekV4TrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         output: torch.Tensor,
         topk_indices: Optional[torch.Tensor],
         softmax_scale: float,
@@ -363,7 +364,7 @@ class DeepSeekV4FlashMLA:
         self,
         q: torch.Tensor,
         latent_cache: torch.Tensor,
-        metadata: DeepseekV4TrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         output: torch.Tensor,
         topk_indices: torch.Tensor,
         softmax_scale: float,
@@ -464,7 +465,7 @@ class DeepSeekV4FlashMLA:
         self,
         q: torch.Tensor,
         latent_cache: torch.Tensor,
-        metadata: DeepseekV4TrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         output: torch.Tensor,
         topk_indices: Optional[torch.Tensor],
         softmax_scale: float,

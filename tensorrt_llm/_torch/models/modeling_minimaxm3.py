@@ -56,6 +56,8 @@ from ..attention.backends.sparse.minimax_m3 import (
     _write_main_kv_slots_to_pool,
 )
 from ..attention.backends.sparse.minimax_m3.common import index_head_range
+from ..attention.backends.sparse.minimax_m3.msa_backend import MiniMaxM3MsaMetadata
+from ..attention.backends.sparse.minimax_m3.triton_metadata import MiniMaxM3TritonMetadata
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..attention.backends.trtllm import TrtllmAttention
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
@@ -395,7 +397,7 @@ def _validate_sparse_attention_runtime_config(
     if sparse_config is None or sparse_config.algorithm != "minimax_m3":
         raise ValueError(
             "MiniMax-M3 requires sparse_attention_config.algorithm='minimax_m3' "
-            "to create its KV-cache manager and prepare attn_metadata.minimax_m3. "
+            "to create its KV-cache manager and prepare its attention metadata. "
             "Set the following in the LLM API configuration:\n"
             "sparse_attention_config:\n  algorithm: minimax_m3"
         )
@@ -1537,7 +1539,8 @@ class MiniMaxM3Attention(Attention):
             )
 
         rotary_dim = int(self.pos_embd_params.rope.dim)
-        index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
+        msa = attn_metadata.ext(MiniMaxM3MsaMetadata)
+        index_k_cache = msa.msa_idx_k_cache(self.layer_idx)
         if index_k_cache.dtype != torch.float8_e4m3fn:
             raise ValueError(
                 "MiniMax-M3 fused FP8 indexer requires an E4M3 index-K cache, "
@@ -1547,7 +1550,7 @@ class MiniMaxM3Attention(Attention):
         return torch.ops.trtllm.minimax_m3_fp8_indexer_qk_norm_rope(
             idx_qk.contiguous(),
             index_k_cache,
-            attn_metadata.msa_out_cache_loc[:num_tokens],
+            msa.msa_out_cache_loc[:num_tokens],
             self.sparse_num_index_heads,
             self.sparse_index_dim,
             rotary_dim,
@@ -1618,14 +1621,15 @@ class MiniMaxM3Attention(Attention):
         if cache_tensors is None:
             if kv_cache_manager is None:
                 return None
+            msa = attn_metadata.ext(MiniMaxM3MsaMetadata)
             buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
-            index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
+            index_k_cache = msa.msa_idx_k_cache(self.layer_idx)
             scale_buffers = (
                 kv_cache_manager.get_block_scale_buffers(self.layer_idx, kv_layout="HND")
                 if kv_cache_manager.is_nvfp4_layer(self.layer_idx)
                 else None
             )
-            out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
+            out_cache_loc = msa.msa_out_cache_loc
         else:
             buffers, index_k_cache, scale_buffers, out_cache_loc = cache_tensors
         num_tokens = int(packed.shape[0])
@@ -1897,19 +1901,19 @@ class MiniMaxM3Attention(Attention):
         v_cache_view = kv_pool[:, 1]
 
         # 5. Read the pre-built M3 metadata. Building is the
-        # responsibility of ``MiniMaxM3AttentionMetadata.prepare`` (or
+        # responsibility of ``MiniMaxM3TritonMetadata.prepare`` (or
         # the test path), so the forward stays CUDA-graph-capture safe.
-        m3_attachment = getattr(attn_metadata, "minimax_m3", None)
-        if m3_attachment is None:
+        m3 = attn_metadata.find_ext(MiniMaxM3TritonMetadata)
+        if m3 is None or m3.sparse_metadata is None:
             raise RuntimeError(
                 f"MiniMax-M3 dense forward (layer {self.layer_idx}) requires "
-                "attn_metadata.minimax_m3 to be pre-built by "
-                "MiniMaxM3AttentionMetadata.prepare(); the model_engine "
-                "configures the M3 backend's Metadata class so this happens "
-                "automatically. Test callers must attach minimax_m3 manually."
+                "the MiniMaxM3TritonMetadata extension to be prepared; the "
+                "model_engine attaches it through the M3 backend's "
+                "metadata_extensions so this happens automatically. Test "
+                "callers must attach and fill it manually."
             )
-        m3_meta = m3_attachment["metadata"]
-        out_cache_loc = m3_attachment["out_cache_loc"]
+        m3_meta = m3.sparse_metadata
+        out_cache_loc = m3.out_cache_loc
 
         # 6. Write the new tokens' K/V to the pool. All inputs come
         # from prepare() which lands them on the cache device, so the
@@ -1955,7 +1959,7 @@ class MiniMaxM3Attention(Attention):
         # prefill) preserves causality. ``q_positions`` from the prefill
         # metadata names each Q token's K-side position.
         # The metadata tensors are produced by
-        # :meth:`MiniMaxM3AttentionMetadata.prepare` on the cache
+        # :meth:`MiniMaxM3TritonMetadata.prepare` on the cache
         # device, so ``.to(dtype=torch.long)`` is a same-device dtype
         # conversion (capture-safe).
         seq_lens_dev = m3_meta.seq_lens.to(dtype=torch.long)
@@ -2213,11 +2217,11 @@ class MiniMaxM3Attention(Attention):
           8. Apply ``o_proj`` and return.
 
         Production callers (the LLM API path) drive
-        :meth:`MiniMaxM3AttentionMetadata.prepare` outside any
-        CUDA-graph capture window; that method attaches a pre-built
+        :meth:`MiniMaxM3TritonMetadata.prepare` outside any
+        CUDA-graph capture window; that method stores a pre-built
         :class:`MiniMaxM3TritonSparseAttentionMetadata` and an
-        ``out_cache_loc`` tensor as ``attn_metadata.minimax_m3``. Test
-        callers attach the same dict manually.  This forward path
+        ``out_cache_loc`` tensor on the extension. Test callers fill
+        the same extension manually.  This forward path
         always reads the pre-built attachment and never builds metadata
         itself — both would trigger
         ``cudaErrorStreamCaptureUnsupported`` for the
@@ -2246,7 +2250,8 @@ class MiniMaxM3Attention(Attention):
             ):
                 # Metadata stages these zero-copy views before compilation;
                 # tracing the cache manager's native pointer access is unsafe.
-                kv_cache, index_k_cache, kv_scale_cache = attn_metadata.msa_layer_cache_tensors[
+                msa = attn_metadata.ext(MiniMaxM3MsaMetadata)
+                kv_cache, index_k_cache, kv_scale_cache = msa.msa_layer_cache_tensors[
                     self.layer_idx
                 ]
                 q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
@@ -2255,7 +2260,7 @@ class MiniMaxM3Attention(Attention):
                     kv_cache,
                     index_k_cache,
                     kv_scale_cache,
-                    attn_metadata.msa_out_cache_loc,
+                    msa.msa_out_cache_loc,
                     self.layer_idx_str,
                 )
                 o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
@@ -2438,19 +2443,19 @@ class MiniMaxM3Attention(Attention):
         )
 
         # 5. Read the pre-built M3 metadata. Building is the
-        # responsibility of ``MiniMaxM3AttentionMetadata.prepare`` (or
+        # responsibility of ``MiniMaxM3TritonMetadata.prepare`` (or
         # the test path), so the forward stays CUDA-graph-capture safe.
-        m3_attachment = getattr(attn_metadata, "minimax_m3", None)
-        if m3_attachment is None:
+        m3 = attn_metadata.find_ext(MiniMaxM3TritonMetadata)
+        if m3 is None or m3.sparse_metadata is None:
             raise RuntimeError(
                 f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
-                "attn_metadata.minimax_m3 to be pre-built by "
-                "MiniMaxM3AttentionMetadata.prepare(); the model_engine "
-                "configures the M3 backend's Metadata class so this happens "
-                "automatically. Test callers must attach minimax_m3 manually."
+                "the MiniMaxM3TritonMetadata extension to be prepared; the "
+                "model_engine attaches it through the M3 backend's "
+                "metadata_extensions so this happens automatically. Test "
+                "callers must attach and fill it manually."
             )
-        m3_meta = m3_attachment["metadata"]
-        out_cache_loc = m3_attachment["out_cache_loc"]
+        m3_meta = m3.sparse_metadata
+        out_cache_loc = m3.out_cache_loc
 
         if not self.disable_index_value and idx_v_cache is not None:
             # The shared idx_v_proj is not part of the M3 checkpoint

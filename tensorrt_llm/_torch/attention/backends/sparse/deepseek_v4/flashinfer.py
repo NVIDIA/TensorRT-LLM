@@ -10,30 +10,32 @@ import torch
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 
 from ...interface import AttentionForwardArgs, AttentionInputType
+from ...trtllm import TrtllmAttentionMetadata
 from ..flashinfer_utils import (
     SPARSE_MLA_SPLIT_KV_TILE,
     allocate_sparse_mla_split_workspace,
     get_sparse_mla_op,
 )
 from . import footer_scale_kv
-from .metadata import DeepseekV4TrtllmAttentionMetadata
+from .metadata import DeepseekV4Metadata
 from .params import DeepseekV4AttentionType
 
 
 def run_flashinfer_sparse_mla(
     attn,
     q: torch.Tensor,
-    metadata: DeepseekV4TrtllmAttentionMetadata,
+    metadata: TrtllmAttentionMetadata,
     forward_args: AttentionForwardArgs,
     rotary_emb: RotaryEmbedding,
 ) -> None:
     """Run DeepSeek-V4 attention for ``FlashInferSparseMlaFmha``."""
+    dsv4 = metadata.ext(DeepseekV4Metadata)
     if forward_args.enable_dsv4_epilogue_fusion:
         raise NotImplementedError(
             "DSv4 epilogue fusion is fused into the C++ attention op; the "
             "FlashInfer SM120 FMHA does not provide it."
         )
-    if metadata.max_draft_tokens > 0:
+    if dsv4.max_draft_tokens > 0:
         raise NotImplementedError(
             "MTP / speculative decoding is not supported by the FlashInfer DSv4 FMHA yet."
         )
@@ -83,7 +85,7 @@ def run_flashinfer_sparse_mla(
         rotary_emb.is_neox,
         apply_rope=not forward_args.skip_mla_rope_generation,
     )
-    positions = metadata.token_positions_cuda[start_idx:end_idx]
+    positions = dsv4.token_positions_cuda[start_idx:end_idx]
 
     sparse_runtime_params = forward_args.sparse_runtime_params
     swa_indices = sparse_runtime_params.sparse_attn_indices
@@ -98,7 +100,7 @@ def run_flashinfer_sparse_mla(
         if extra_indices is None:
             raise RuntimeError("Compressed DeepSeek-V4 layers require extra sparse indices.")
         extra_lens = (
-            metadata.sparse_mla_topk_lens[attn.compress_ratio][start_idx:end_idx] - window
+            dsv4.sparse_mla_topk_lens[attn.compress_ratio][start_idx:end_idx] - window
         ).clamp(min=0)
         extra_pool = footer_scale_kv.get_pool_2d(
             metadata, DeepseekV4AttentionType.COMPRESS, attn.compress_ratio

@@ -11,7 +11,9 @@ import torch.nn.functional as F
 from pydantic import TypeAdapter
 from torch import nn
 
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
     CSA2Layout,
     CSA2Mode,
@@ -106,30 +108,34 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
         select_global_source=lambda layer, local, global_hidden: local,
         enter_layer=lambda layer: entered.append(layer.layer_idx),
     )
+    # The stubs serve as both the core metadata and its CSA2 extension.
+    source.ext = source.find_ext = lambda cls: source
 
     def phase_metadata(query, extra_width, query_start, *, staging_dtype, layer_idx=None):
         stop = query_start + query.shape[0]
         assert stop <= (contexts if query_start < contexts else count)
         torch.testing.assert_close(query.flatten(1), hidden[query_start:stop], atol=0, rtol=0)
-        return SimpleNamespace(
+        tile = SimpleNamespace(
             num_contexts=int(query_start < contexts),
             num_tokens=query.shape[0],
             num_query_heads=1,
             swa_pool=torch.empty(0, dtype=staging_dtype),
         )
+        tile.ext = lambda cls: tile
+        return tile
 
     def map_indices(layer, start, end, logical, *, visible_lengths):
         torch.testing.assert_close(logical[:, 0], row_ids[start:end], atol=0, rtol=0)
         torch.testing.assert_close(visible_lengths, row_ids[start:end] + 1, atol=0, rtol=0)
         return logical
 
-    source.get_query_tile_metadata = phase_metadata
-    source.global_slot_tile = map_indices
+    source.ext(CSA2Metadata).get_query_tile_metadata = phase_metadata
+    source.ext(CSA2Metadata).global_slot_tile = map_indices
 
     def indexer(state, start, end):
         index_calls.append((start, end))
         torch.testing.assert_close(state.index_q.flatten(), positions.float(), atol=0, rtol=0)
-        source.csa2_indices[0] = row_ids[:, None]
+        source.ext(CSA2Metadata).csa2_indices[0] = row_ids[:, None]
 
     backend = SimpleNamespace(
         sparse_params=CSA2Params(layout=layout, compute_backend=implementation),
@@ -270,20 +276,21 @@ def test_ced_owner_is_written_once_before_narrowed_query(monkeypatch, module_cac
         PositionalEmbeddingParams,
         RopeParams,
     )
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
     from tensorrt_llm._torch.metadata import KVCacheParams
     from tensorrt_llm.functional import PositionEmbeddingType
 
     manager, request = module_cache
-    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager
+    )
     metadata.request_ids = [request.py_request_id]
     metadata.num_contexts = 1
     metadata.prompt_lens = [4]
     metadata.seq_lens = torch.tensor([4], dtype=torch.int32)
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0])
     metadata.prepare()
-    metadata.begin_model_forward()
+    metadata.begin_forward()
     torch.manual_seed(4126)
     with torch.device("cuda"):
         model = DeepseekV41Attention(
@@ -330,7 +337,7 @@ def test_ced_owner_is_written_once_before_narrowed_query(monkeypatch, module_cac
     metadata.prompt_lens = [1]
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[3])
     metadata.prepare()
-    actual = model(hidden[-1:], metadata.csa2_positions, metadata)
+    actual = model(hidden[-1:], metadata.ext(CSA2Metadata).csa2_positions, metadata)
     torch.cuda.synchronize()
     assert actual.shape == (1, 32) and torch.isfinite(actual).all()
     assert writes == [0]
@@ -344,7 +351,6 @@ def _check_ratio2_module_partial_groups(monkeypatch, module_cache, overlap, impl
         PositionalEmbeddingParams,
         RopeParams,
     )
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
     from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
         pack_rows,
@@ -360,7 +366,9 @@ def _check_ratio2_module_partial_groups(monkeypatch, module_cache, overlap, impl
     torch.manual_seed(818)
     manager, request = module_cache
     layout = manager.layout
-    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager
+    )
     metadata.request_ids = [request.py_request_id]
     metadata.num_contexts = 1
     metadata.prompt_lens = [4]
@@ -430,12 +438,14 @@ def _check_ratio2_module_partial_groups(monkeypatch, module_cache, overlap, impl
         metadata.seq_lens = torch.tensor([1], dtype=torch.int32, device="cpu")
         metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[token])
         metadata.prepare()
-        positions = metadata.csa2_positions
-        assert metadata.get_compression_batch(0).cu_compressed_lengths.tolist() == [
+        positions = metadata.ext(CSA2Metadata).csa2_positions
+        assert metadata.ext(CSA2Metadata).get_compression_batch(
+            0
+        ).cu_compressed_lengths.tolist() == [
             0,
             int(new_rows),
         ]
-        assert metadata.get_compression_batch(0).output_rows == 1
+        assert metadata.ext(CSA2Metadata).get_compression_batch(0).output_rows == 1
         old_main = manager.get_main_buffer(0).clone()
         old_index = manager.get_index_pages(0).clone()
         # Fixed-capacity runtime padding does not generate an empty latent,
@@ -780,7 +790,6 @@ def test_fused_native_index_q_and_graph(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.metadata import KVCacheParams
 
     torch.manual_seed(946)
@@ -792,7 +801,9 @@ def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
         "tensorrt_llm._torch.attention.backends.sparse.csa2.module.do_multi_stream",
         lambda: enabled[0],
     )
-    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager
+    )
     metadata.request_ids = [request.py_request_id]
     metadata.num_contexts = 1
     metadata.prompt_lens = [4]
@@ -802,16 +813,16 @@ def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
     # its second half while comparing identical cache/history state.
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0])
     metadata.prepare()
-    model(hidden, metadata.csa2_positions, metadata)
+    model(hidden, metadata.ext(CSA2Metadata).csa2_positions, metadata)
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[1])
     metadata.num_contexts = 0
     metadata.is_cuda_graph = True
     metadata.prepare()
-    positions = metadata.csa2_positions
+    positions = metadata.ext(CSA2Metadata).csa2_positions
     hidden.normal_()
 
     def run():
-        metadata.reset_routing()
+        metadata.ext(CSA2Metadata).reset_routing()
         return model(hidden, positions, metadata)
 
     serial = run()
@@ -838,7 +849,6 @@ def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
 @pytest.mark.parametrize("overlap", [False, True])
 @torch.inference_mode()
 def test_native_module_fixed_context_graph(monkeypatch, module_cache, overlap):
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.metadata import KVCacheParams
 
     torch.manual_seed(947)
@@ -849,14 +859,16 @@ def test_native_module_fixed_context_graph(monkeypatch, module_cache, overlap):
     monkeypatch.setattr(
         "tensorrt_llm._torch.attention.backends.sparse.csa2.module.do_multi_stream", lambda: overlap
     )
-    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager
+    )
     metadata.request_ids = [request.py_request_id]
     metadata.num_contexts = 1
     metadata.prompt_lens = [4]
     metadata.seq_lens = torch.tensor([4], dtype=torch.int32, device="cpu")
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0])
     metadata.prepare()
-    positions = metadata.csa2_positions
+    positions = metadata.ext(CSA2Metadata).csa2_positions
     hidden = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
     phases = []
     original = model.backend.forward
@@ -868,7 +880,7 @@ def test_native_module_fixed_context_graph(monkeypatch, module_cache, overlap):
     monkeypatch.setattr(model.backend, "forward", observe)
 
     def run():
-        metadata.reset_routing()
+        metadata.ext(CSA2Metadata).reset_routing()
         return model(hidden, positions, metadata)
 
     baseline = run()
@@ -957,7 +969,6 @@ def test_packed_output_inverse_rope_module_and_graph(
 
     from dataclasses import replace
 
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.metadata import KVCacheParams
 
     torch.manual_seed(950)
@@ -969,7 +980,9 @@ def test_packed_output_inverse_rope_module_and_graph(
         grouped_block=block,
         sparse_options={"use_packed_sparse_attention": True, "fuse_packed_output_rope": True},
     )
-    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager
+    )
     metadata.request_ids = [request.py_request_id]
     metadata.num_contexts = 1
     metadata.prompt_lens = [4]
@@ -978,7 +991,7 @@ def test_packed_output_inverse_rope_module_and_graph(
     metadata.is_cuda_graph = True
     metadata.prepare()
     hidden = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
-    positions = metadata.csa2_positions
+    positions = metadata.ext(CSA2Metadata).csa2_positions
     inverse_calls = []
     native_rope = torch.ops.trtllm.mla_rope_inplace
 
@@ -998,7 +1011,7 @@ def test_packed_output_inverse_rope_module_and_graph(
     monkeypatch.setattr(model, "_project_output", observe_projection)
 
     def run():
-        metadata.reset_routing()
+        metadata.ext(CSA2Metadata).reset_routing()
         return model(hidden, positions, metadata)
 
     enabled = model.backend.sparse_params
@@ -1031,7 +1044,6 @@ def test_packed_output_inverse_rope_module_and_graph(
 @torch.inference_mode()
 def test_two_rank_module_projection_parity(monkeypatch, quantization):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
     from tensorrt_llm._torch.metadata import KVCacheParams
     from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
@@ -1108,7 +1120,7 @@ def test_two_rank_module_projection_parity(monkeypatch, quantization):
         assert manager.prepare_context(request)
         assert manager.resize_context(request, request.context_chunk_size)
         manager._stream.synchronize()
-        metadata = CSA2TrtllmMetadata(
+        metadata = CSA2TrtllmAttention.create_metadata(
             max_num_requests=1, max_num_tokens=3, kv_cache_manager=manager
         )
         metadata.request_ids = [request.py_request_id]
@@ -1127,8 +1139,10 @@ def test_two_rank_module_projection_parity(monkeypatch, quantization):
         with nccl_window_tensor_scope(hidden):
             # Both ranks execute both calls, including any shared startup/tuning
             # collectives. The reference has replicated heads and no TP reduction.
-            actual = model(hidden, tp_metadata.csa2_positions, tp_metadata)
-            expected = reference(hidden, reference_metadata.csa2_positions, reference_metadata)
+            actual = model(hidden, tp_metadata.ext(CSA2Metadata).csa2_positions, tp_metadata)
+            expected = reference(
+                hidden, reference_metadata.ext(CSA2Metadata).csa2_positions, reference_metadata
+            )
             torch.cuda.synchronize()
             assert reductions == [torch.Size([3, 128])]
             # Each TP shard rounds its O-B accumulation to BF16 before summation;
@@ -1147,7 +1161,6 @@ def replay_module_factory():
         RopeParams,
     )
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -1191,7 +1204,7 @@ def replay_module_factory():
         assert manager.prepare_context(request)
         assert manager.resize_context(request, request.context_chunk_size)
         manager._stream.synchronize()
-        metadata = CSA2TrtllmMetadata(
+        metadata = CSA2TrtllmAttention.create_metadata(
             max_num_requests=1, max_num_tokens=16, kv_cache_manager=manager
         )
         metadata.request_ids = [request.py_request_id]
@@ -1234,7 +1247,7 @@ def _prepare_replay_step(metadata, start, end, cached=None, decoder=False):
     metadata.seq_lens = torch.tensor([end - start], dtype=torch.int32, device="cpu")
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[start])
     if cached is not None:
-        metadata.set_swa_bounded_replay([cached], decoder=decoder)
+        metadata.ext(CSA2Metadata).set_swa_bounded_replay([cached], decoder=decoder)
     metadata.prepare()
 
 
@@ -1301,8 +1314,8 @@ def test_encoder_bounded_replay_preserves_global_and_truncates_swa(
     torch.manual_seed(955)
     model, manager, metadata, hidden = replay_module_factory(2)
     _prepare_replay_step(metadata, 0, 5)
-    model(hidden[:5], metadata.csa2_positions, metadata)
-    old_slots = metadata.csa2_main_write_slots[0]
+    model(hidden[:5], metadata.ext(CSA2Metadata).csa2_positions, metadata)
+    old_slots = metadata.ext(CSA2Metadata).csa2_main_write_slots[0]
     old_slots = old_slots[old_slots >= 0].clone()
     old_main = manager.get_main_buffer(0)[old_slots].clone()
     old_index = read_index_rows(manager.get_index_pages(0), old_slots).clone()
@@ -1320,18 +1333,20 @@ def test_encoder_bounded_replay_preserves_global_and_truncates_swa(
 
     monkeypatch.setattr(model.compressor, "forward", observe)
     _prepare_replay_step(metadata, 1, 8, cached=5)
-    actual = model(replay, metadata.csa2_positions, metadata)
+    actual = model(replay, metadata.ext(CSA2Metadata).csa2_positions, metadata)
     assert len(seen) == 1 and seen[0].shape[0] == 4
     torch.testing.assert_close(seen[0], replay[3:], atol=0, rtol=0)
     torch.testing.assert_close(manager.get_main_buffer(0)[old_slots], old_main, atol=0, rtol=0)
     torch.testing.assert_close(
         read_index_rows(manager.get_index_pages(0), old_slots), old_index, atol=0, rtol=0
     )
-    assert int((metadata.csa2_swa_indices[0][0] >= 0).sum()) == 1
+    assert int((metadata.ext(CSA2Metadata).csa2_swa_indices[0][0] >= 0).sum()) == 1
     expected_global = torch.cat(
         (unpack_rows(old_main, 512, "main"), _reference_global_rows(model, replay[3:], 4))
     )
-    expected = _reference_bounded_output(model, replay, metadata.csa2_positions, expected_global)
+    expected = _reference_bounded_output(
+        model, replay, metadata.ext(CSA2Metadata).csa2_positions, expected_global
+    )
     torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
 
 
@@ -1355,8 +1370,8 @@ def test_pure_replay_skips_global_projection_and_restores_odd_state(
     torch.manual_seed(956)
     model, manager, metadata, hidden = replay_module_factory(ratio)
     _prepare_replay_step(metadata, 0, cached)
-    model(hidden[:cached], metadata.csa2_positions, metadata)
-    slots = metadata.csa2_main_write_slots[0]
+    model(hidden[:cached], metadata.ext(CSA2Metadata).csa2_positions, metadata)
+    slots = metadata.ext(CSA2Metadata).csa2_main_write_slots[0]
     slots = slots[slots >= 0].clone()
     old_main = manager.get_main_buffer(0)[slots].clone()
     old_index = read_index_rows(manager.get_index_pages(0), slots).clone()
@@ -1376,20 +1391,20 @@ def test_pure_replay_skips_global_projection_and_restores_odd_state(
 
     monkeypatch.setattr(projection, "forward", observe)
     _prepare_replay_step(metadata, start, cached, cached=cached, decoder=decoder)
-    actual = model(replay, metadata.csa2_positions, metadata)
+    actual = model(replay, metadata.ext(CSA2Metadata).csa2_positions, metadata)
     assert counts == ([1] if ratio == 2 and cached % 2 and not decoder else [])
     torch.testing.assert_close(manager.get_main_buffer(0)[slots], old_main, atol=0, rtol=0)
     torch.testing.assert_close(
         read_index_rows(manager.get_index_pages(0), slots), old_index, atol=0, rtol=0
     )
-    assert bool((metadata.csa2_main_write_slots[0] < 0).all())
+    assert bool((metadata.ext(CSA2Metadata).csa2_main_write_slots[0] < 0).all())
     expected = _reference_bounded_output(
-        model, replay, metadata.csa2_positions, unpack_rows(old_main, 512, "main")
+        model, replay, metadata.ext(CSA2Metadata).csa2_positions, unpack_rows(old_main, 512, "main")
     )
     torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
     if ratio == 2 and cached % 2:
         _prepare_replay_step(metadata, cached, cached + 1)
-        batch = metadata.get_compression_batch(0)
+        batch = metadata.ext(CSA2Metadata).get_compression_batch(0)
         page, offset = divmod(cached - 1, batch.page_size)
         tail = replay[-1:]
         expected_kv, expected_score = (
@@ -1424,8 +1439,8 @@ def test_pure_replay_skips_global_projection_and_restores_odd_state(
         expected_row = pack_rows(
             model._rope(reference_latent.unsqueeze(1), reference_position, 1).squeeze(1), "main"
         )
-        model(next_hidden, metadata.csa2_positions, metadata)
-        new_slots = metadata.csa2_main_write_slots[0]
+        model(next_hidden, metadata.ext(CSA2Metadata).csa2_positions, metadata)
+        new_slots = metadata.ext(CSA2Metadata).csa2_main_write_slots[0]
         new_slots = new_slots[new_slots >= 0]
         torch.testing.assert_close(
             manager.get_main_buffer(0)[new_slots], expected_row, atol=0, rtol=0
@@ -1437,13 +1452,14 @@ def test_pure_replay_skips_global_projection_and_restores_odd_state(
 @torch.inference_mode()
 def test_bounded_replay_full_module_graph_changes_hit_position(replay_module_factory):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheRole
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
     torch.manual_seed(957)
     model, manager, seed_metadata, hidden = replay_module_factory(2, input_length=12)
 
     def new_metadata(graph=False):
-        result = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=16, kv_cache_manager=manager)
+        result = CSA2TrtllmAttention.create_metadata(
+            max_num_requests=1, max_num_tokens=16, kv_cache_manager=manager
+        )
         result.request_ids = list(seed_metadata.request_ids)
         result.num_contexts = 1
         result.prompt_lens = [12]
@@ -1456,8 +1472,8 @@ def test_bounded_replay_full_module_graph_changes_hit_position(replay_module_fac
 
     def seed(cached):
         _prepare_replay_step(seed_metadata, 0, cached)
-        model(hidden[:cached], seed_metadata.csa2_positions, seed_metadata)
-        slots = seed_metadata.csa2_main_write_slots[0]
+        model(hidden[:cached], seed_metadata.ext(CSA2Metadata).csa2_positions, seed_metadata)
+        slots = seed_metadata.ext(CSA2Metadata).csa2_main_write_slots[0]
         return slots[slots >= 0].clone()
 
     def drop_local_state():
@@ -1466,8 +1482,8 @@ def test_bounded_replay_full_module_graph_changes_hit_position(replay_module_fac
             manager.get_buffers(0, role).fill_(float("nan"))
 
     def run_graph_body():
-        graph_metadata.reset_routing()
-        return model(replay_input, graph_metadata.csa2_positions, graph_metadata)
+        graph_metadata.ext(CSA2Metadata).reset_routing()
+        return model(replay_input, graph_metadata.ext(CSA2Metadata).csa2_positions, graph_metadata)
 
     graph = None
     pointers = None
@@ -1478,7 +1494,9 @@ def test_bounded_replay_full_module_graph_changes_hit_position(replay_module_fac
         seed(cached)
         drop_local_state()
         _prepare_replay_step(eager_metadata, start, end, cached=cached)
-        expected = model(replay_input, eager_metadata.csa2_positions, eager_metadata).clone()
+        expected = model(
+            replay_input, eager_metadata.ext(CSA2Metadata).csa2_positions, eager_metadata
+        ).clone()
         # Reset real GLOBAL contents to this hit position's seeded prefix,
         # then remove local state again before executing the captured path.
         slots = seed(cached)
@@ -1486,9 +1504,9 @@ def test_bounded_replay_full_module_graph_changes_hit_position(replay_module_fac
         old_index = read_index_rows(manager.get_index_pages(0), slots).clone()
         _prepare_replay_step(graph_metadata, start, end, cached=cached)
         current_pointers = (
-            graph_metadata.csa2_positions.data_ptr(),
-            graph_metadata.get_compressed_positions(0).data_ptr(),
-            graph_metadata.get_compression_batch(0).start_positions.data_ptr(),
+            graph_metadata.ext(CSA2Metadata).csa2_positions.data_ptr(),
+            graph_metadata.ext(CSA2Metadata).get_compressed_positions(0).data_ptr(),
+            graph_metadata.ext(CSA2Metadata).get_compression_batch(0).start_positions.data_ptr(),
         )
         if graph is None:
             for _ in range(3):

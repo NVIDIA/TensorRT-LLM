@@ -16,7 +16,7 @@
 Differential tests for the fused DSA decode-metadata Triton kernel.
 
 The kernel in kernels.py collapses the eager metadata chain in
-DSAtrtllmAttentionMetadata.on_update_kv_lens() into one launch. Its whole
+DSAMetadata.on_kv_lens_changed() into one launch. Its whole
 contract is that the integer metadata it produces is BIT-IDENTICAL to that eager
 chain -- a wrong index silently corrupts sparse attention. These tests assert
 bit-exactness against the real eager helpers (build_req_idx_per_token +

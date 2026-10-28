@@ -27,7 +27,6 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     DeepseekV4CacheManager,
     DeepseekV4Indexer,
     DeepseekV4TrtllmAttention,
-    DeepseekV4TrtllmAttentionMetadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.compressor import Compressor
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
@@ -1119,8 +1118,8 @@ def test_deepseek_v4_sparse_ratios_prefer_checkpoint_defaults(tmp_path, monkeypa
 
     assert model_config.sparse_attention_config.compress_ratios == [128, 128, 4, 128, 4, 128, 1, 4]
     # V4 sparse MLA hardcodes window_size==128 (FMHA kernel TileSizeKV; see
-    # the runtime assertion in deepseek_v4.py:DeepseekV4TrtllmAttentionMetadata
-    # __post_init__), so this is the only legal value here.
+    # the runtime assertion in DeepseekV4Metadata.allocate), so this is the
+    # only legal value here.
     assert model_config.sparse_attention_config.window_size == 128
 
 
@@ -1393,7 +1392,7 @@ def test_deepseek_v4_sanity(
         assert success, f"Failed to resize context for request {req_id}"
         reqs.append(req)
 
-    attn_metadata = DeepseekV4TrtllmAttentionMetadata(
+    attn_metadata = DeepseekV4TrtllmAttention.create_metadata(
         seq_lens=torch.tensor(sequence_length, dtype=torch.int32),
         num_contexts=num_contexts,
         max_num_requests=len(sequence_length),
@@ -1406,7 +1405,7 @@ def test_deepseek_v4_sanity(
         prompt_lens=prompt_lens,
         max_num_tokens=8192,
         mapping=mapping,
-        sparse_attention_config=sparse_attn_config,
+        sparse_metadata_params=sparse_attn_config.to_sparse_metadata_params(),
     )
 
     position_ids = []

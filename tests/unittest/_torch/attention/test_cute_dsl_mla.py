@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from fmha_test_utils import metadata_stub
 
 from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import CuteDslMlaFmha
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -160,7 +161,7 @@ def _select_mla_generation_fmha(
         qk_rope_head_dim=64,
         layer_idx=0,
     )
-    meta = SimpleNamespace(
+    meta = metadata_stub(
         num_contexts=0,
         num_generations=batch_size,
         beam_width=1,

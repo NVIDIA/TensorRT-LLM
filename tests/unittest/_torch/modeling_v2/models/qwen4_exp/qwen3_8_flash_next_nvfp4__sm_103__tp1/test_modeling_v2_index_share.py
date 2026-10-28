@@ -22,12 +22,27 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_mtp_reuse_topk import (  # noqa: E501
     qsa_mtp_reuse_topk as reuse,
 )
+from tensorrt_llm._torch.attention.backends.sparse.qsa.metadata import QSAMetadata
 
 assert torch.cuda.is_available(), "the IndexShare plumbing runs on a CUDA device"
 
 DEV = "cuda"
 K = 512
 SLOT = 1
+
+
+def _qsa_stub(**fields) -> SimpleNamespace:
+    """A metadata stub whose QSA extension holds the ``qsa_``-prefixed fields."""
+    qsa = SimpleNamespace(
+        **{
+            name[len("qsa_") :]: fields.pop(name)
+            for name in list(fields)
+            if name.startswith("qsa_")
+        }
+    )
+    metadata = SimpleNamespace(**fields)
+    metadata.find_ext = metadata.ext = lambda cls: qsa if cls is QSAMetadata else None
+    return metadata
 
 
 def _target(cls):
@@ -37,7 +52,7 @@ def _target(cls):
 
 
 def _metadata(batch: int, accepted, seq_lens=None, num_contexts: int = 0):
-    return SimpleNamespace(
+    return _qsa_stub(
         num_seqs=batch,
         num_contexts=num_contexts,
         seq_lens_cuda=None
@@ -92,17 +107,18 @@ def test_decode_capture_at_draft_seven_takes_row_s_times_8_plus_a_minus_1():
     topk = torch.arange(batch * p * K, dtype=torch.int32, device=DEV).reshape(batch * p, K)
     visible = torch.arange(300, 300 + batch * p, dtype=torch.int32, device=DEV)
     md = _metadata(batch, accepted)
+    qsa = md.find_ext(QSAMetadata)
 
     _target(m.DecodeTarget)._capture_selection(md, topk, visible, batch, p)
 
     rows = [s * p + a - 1 for s, a in enumerate(accepted)]
     assert rows == [0, 15, 20, 26]
-    torch.testing.assert_close(md.qsa_shared_topk_indices[SLOT, :batch], topk[rows])
-    torch.testing.assert_close(md.qsa_shared_topk_visible_blocks[SLOT, :batch], visible[rows])
+    torch.testing.assert_close(qsa.shared_topk_indices[SLOT, :batch], topk[rows])
+    torch.testing.assert_close(qsa.shared_topk_visible_blocks[SLOT, :batch], visible[rows])
     # Other slots and rows past the batch are untouched.
-    assert torch.all(md.qsa_shared_topk_indices[SLOT, batch:] == -7)
-    assert torch.all(md.qsa_shared_topk_indices[0] == -7)
-    assert md.qsa_shared_topk_captured_slots == {SLOT}
+    assert torch.all(qsa.shared_topk_indices[SLOT, batch:] == -7)
+    assert torch.all(qsa.shared_topk_indices[0] == -7)
+    assert qsa.shared_topk_captured_slots == {SLOT}
 
 
 def test_prefill_capture_at_draft_seven():
@@ -115,13 +131,14 @@ def test_prefill_capture_at_draft_seven():
     topk = torch.arange(rows_total * K, dtype=torch.int32, device=DEV).reshape(rows_total, K)
     visible = torch.arange(400, 400 + rows_total, dtype=torch.int32, device=DEV)
     md = _metadata(5, accepted, seq_lens=seq_lens, num_contexts=2)
+    qsa = md.find_ext(QSAMetadata)
 
     _target(m.PrefillTarget)._capture_selection(md, topk, visible)
 
     rows = [4, 7, 8 + 7, 16 + 0, 24 + 5]
-    torch.testing.assert_close(md.qsa_shared_topk_indices[SLOT, :5], topk[rows])
-    torch.testing.assert_close(md.qsa_shared_topk_visible_blocks[SLOT, :5], visible[rows])
-    assert md.qsa_shared_topk_captured_slots == {SLOT}
+    torch.testing.assert_close(qsa.shared_topk_indices[SLOT, :5], topk[rows])
+    torch.testing.assert_close(qsa.shared_topk_visible_blocks[SLOT, :5], visible[rows])
+    assert qsa.shared_topk_captured_slots == {SLOT}
 
 
 def _reuse_case(fresh: int):

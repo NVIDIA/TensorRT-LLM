@@ -7,8 +7,8 @@ Layered as:
   * :mod:`.triton_metadata` -- ``MiniMaxM3TritonSparseAttentionMetadata``
                                 dataclass, CUDA-graph-stable buffer
                                 allocator + builder, and the
-                                :class:`AttentionMetadata` subclass
-                                factory for the Triton reference path.
+                                :class:`AttentionMetadata` extension
+                                for the Triton reference path.
   * :mod:`.cache_manager`   -- standalone side index cache used by tests
                                 and the :class:`KVCacheManagerV2`
                                 subclass factory. Shared by both backends.

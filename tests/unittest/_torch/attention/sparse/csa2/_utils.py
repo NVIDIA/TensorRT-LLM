@@ -7,8 +7,9 @@ from types import SimpleNamespace
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import CSA2Indexer
-from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
     CSA2ForwardState,
     CSA2Layout,
@@ -24,6 +25,15 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
     store_index_rows,
     store_rows,
 )
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+
+def _bare_csa2_metadata() -> TrtllmAttentionMetadata:
+    """Metadata built without ``__init__``, carrying a bare CSA2 extension."""
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    metadata.replace_ext(CSA2Metadata(metadata))
+    metadata.replace_ext(SpecDecodingMetadata(metadata))
+    return metadata
 
 
 def _index_pages(rows: int, device="cpu") -> torch.Tensor:
@@ -80,13 +90,13 @@ def _attention_reference(q, kv, valid, sink):
 def _page_metadata(table, requests, page_size, max_positions):
     # Exercise device-independent metadata transforms without allocating native
     # compute buffers. Constructor/lifecycle coverage uses real V2 managers.
-    meta = object.__new__(CSA2TrtllmMetadata)
-    meta.csa2_global_page_tables = {0: table}
-    meta.csa2_token_requests = requests
-    meta.csa2_global_page_sizes = {0: page_size}
-    meta.csa2_global_max_positions = {0: max_positions}
-    meta.csa2_kv_sources = {0: 0}
-    meta.reset_routing()
+    meta = _bare_csa2_metadata()
+    meta.ext(CSA2Metadata).csa2_global_page_tables = {0: table}
+    meta.ext(CSA2Metadata).csa2_token_requests = requests
+    meta.ext(CSA2Metadata).csa2_global_page_sizes = {0: page_size}
+    meta.ext(CSA2Metadata).csa2_global_max_positions = {0: max_positions}
+    meta.ext(CSA2Metadata).csa2_kv_sources = {0: 0}
+    meta.ext(CSA2Metadata).reset_routing()
     return meta
 
 
@@ -104,21 +114,29 @@ def _model_metadata(
 ):
     meta = _page_metadata(table, requests, page_size, max_positions)
     meta.kv_cache_manager = manager
-    meta.csa2_swa_indices = {i: swa_reads for i in range(len(layout.compress_ratios))}
-    meta.csa2_swa_write_slots = {i: swa_writes for i in range(len(layout.compress_ratios))}
-    meta.csa2_visible_lengths = {i: visible for i in range(len(layout.compress_ratios))}
-    meta.csa2_kv_sources = {
+    meta.ext(CSA2Metadata).csa2_swa_indices = {
+        i: swa_reads for i in range(len(layout.compress_ratios))
+    }
+    meta.ext(CSA2Metadata).csa2_swa_write_slots = {
+        i: swa_writes for i in range(len(layout.compress_ratios))
+    }
+    meta.ext(CSA2Metadata).csa2_visible_lengths = {
+        i: visible for i in range(len(layout.compress_ratios))
+    }
+    meta.ext(CSA2Metadata).csa2_kv_sources = {
         i: layout.layer(i).kv_source for i in range(len(layout.compress_ratios))
     }
-    meta.csa2_main_write_slots = {0: main_writes}
+    meta.ext(CSA2Metadata).csa2_main_write_slots = {0: main_writes}
     # These prediction fixtures allow arbitrary visibility per query. Treat
     # each row as a context chunk; real packed request phases are tested with
     # the manager-backed runtime metadata.
-    meta.csa2_request_query_ranges = tuple((i, i + 1) for i in range(len(requests)))
-    meta.csa2_request_start_positions = tuple(
+    meta.ext(CSA2Metadata).csa2_request_query_ranges = tuple(
+        (i, i + 1) for i in range(len(requests))
+    )
+    meta.ext(CSA2Metadata).csa2_request_start_positions = tuple(
         max_positions * layout.compress_ratios[0] - 1 for _ in requests
     )
-    meta.csa2_num_context_requests = len(requests)
+    meta.ext(CSA2Metadata).csa2_num_context_requests = len(requests)
     meta.mapping = None
     meta.is_cuda_graph = False
     return meta
@@ -128,23 +146,26 @@ def _run_indexer(layout, layer_idx, state):
     meta = state.metadata
     manager = meta.kv_cache_manager
     layer = layout.layer(layer_idx)
-    meta.enter_layer(layer)
+    meta.ext(CSA2Metadata).enter_layer(layer)
     manager.write_swa(
-        layer_idx, meta.csa2_swa_write_slots[layer_idx], state.swa_kv, state.swa_transform
+        layer_idx,
+        meta.ext(CSA2Metadata).csa2_swa_write_slots[layer_idx],
+        state.swa_kv,
+        state.swa_transform,
     )
     if layer.mode == CSA2Mode.FULL:
         manager.write_global(
             layer.kv_source,
-            meta.csa2_main_write_slots[layer.kv_source],
+            meta.ext(CSA2Metadata).csa2_main_write_slots[layer.kv_source],
             state.main_kv,
             state.index_k,
             state.main_transform,
             state.index_transform,
         )
     if layer.mode == CSA2Mode.REUSE:
-        if layer.index_source not in meta.csa2_indices:
+        if layer.index_source not in meta.ext(CSA2Metadata).csa2_indices:
             raise ValueError("CSA2 index source did not run")
-        return meta.csa2_indices[layer.index_source]
+        return meta.ext(CSA2Metadata).csa2_indices[layer.index_source]
     if layer_idx not in manager.indexers:
         manager.indexers[layer_idx] = CSA2Indexer(
             layout, layer_idx, state.index_q.shape[1], state.index_q.shape[-1]
@@ -161,10 +182,10 @@ def _prediction_reference(layout, layer, q, swa, sink, meta, **kwargs):
     state = CSA2ForwardState(metadata=meta, swa_kv=swa, **kwargs)
     logical = _run_indexer(layout, layer, state)
     manager = meta.kv_cache_manager
-    swa_slots = meta.csa2_swa_indices[layer]
+    swa_slots = meta.ext(CSA2Metadata).csa2_swa_indices[layer]
     kv = gather_rows(manager.get_swa_buffer(layer), swa_slots, q.shape[-1], "swa")
     valid = swa_slots >= 0
-    slots = meta.global_slot_tile(layer, 0, q.shape[0], logical)
+    slots = meta.ext(CSA2Metadata).global_slot_tile(layer, 0, q.shape[0], logical)
     kv = torch.cat(
         (
             kv,
@@ -265,7 +286,8 @@ def _run_modes(device, graph_replay=False):
 
     def run():
         meta = copy(base)
-        meta.reset_routing()
+        meta.replace_ext(base.ext(CSA2Metadata).clone_for(meta))
+        meta.ext(CSA2Metadata).reset_routing()
         outputs = []
         for i in range(3):
             kwargs = dict(index_q=iq if i == 0 else -iq, index_weights=weights) if i != 1 else {}
@@ -288,20 +310,22 @@ def _run_modes(device, graph_replay=False):
         (1.0, 1, False),
     ):
         iq.fill_(sign)
-        base.csa2_visible_lengths[0].fill_(visible)
-        page_slots = base.csa2_global_page_tables[0]
+        base.ext(CSA2Metadata).csa2_visible_lengths[0].fill_(visible)
+        page_slots = base.ext(CSA2Metadata).csa2_global_page_tables[0]
         page_slots.copy_(torch.tensor([[1, 0] if reverse else [0, 1]], device=device))
         graph.replay()
         actual = [o.clone() for o in outputs]
-        actual_indices = routing.csa2_indices[0].clone()
+        actual_indices = routing.ext(CSA2Metadata).csa2_indices[0].clone()
         expected, expected_routing = run()
         for a, e in zip(actual, expected):
             torch.testing.assert_close(a, e, atol=0, rtol=0)
-        torch.testing.assert_close(actual_indices, expected_routing.csa2_indices[0], atol=0, rtol=0)
+        torch.testing.assert_close(
+            actual_indices, expected_routing.ext(CSA2Metadata).csa2_indices[0], atol=0, rtol=0
+        )
     if graph_replay:
         for request_id in (-1, 1, 0):
-            base.csa2_token_requests.fill_(request_id)
-            base.csa2_global_page_tables[0][0, 1] = -1
+            base.ext(CSA2Metadata).csa2_token_requests.fill_(request_id)
+            base.ext(CSA2Metadata).csa2_global_page_tables[0][0, 1] = -1
             graph.replay()
             actual = [o.clone() for o in outputs]
             expected, _ = run()
@@ -332,7 +356,7 @@ class _FakeKvParams:
 class _FakeMetadata:
     """The attributes ``plan_decoder_replay`` reads, plus the SWA floors and slot resolution.
 
-    A real ``CSA2TrtllmMetadata`` needs a KV cache manager, pools
+    A real CSA2 metadata needs a KV cache manager, pools
     and a device; the planner is pure host arithmetic over these fields, so
     standing them up here keeps this a CPU test and keeps the refusals -- which
     are the part worth pinning -- independent of cache-manager plumbing.
@@ -341,7 +365,18 @@ class _FakeMetadata:
     what it clears; see the method.
     """
 
-    reset_routing = CSA2TrtllmMetadata.reset_routing
+    reset_routing = CSA2Metadata.reset_routing
+    decoder_context_ends = CSA2Metadata.decoder_context_ends
+
+    @property
+    def metadata(self) -> "_FakeMetadata":
+        # The fake serves as both the core metadata and its CSA2 extension.
+        return self
+
+    def ext(self, cls: type) -> "_FakeMetadata":
+        return self
+
+    find_ext = ext
 
     def __init__(
         self,

@@ -22,14 +22,16 @@ from typing import Any, List, Literal, Optional, Tuple
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
     AttentionMetadata,
 )
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAMetadata
 from tensorrt_llm._torch.attention.backends.sparse.dsa.module import forward_generation_sparse_attn
 from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSABackendForwardArgs
-from tensorrt_llm._torch.attention.backends.sparse.params import MTPIndexShareMetadata
+from tensorrt_llm._torch.attention.backends.sparse.params import MTPIndexShareExtension
 from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -43,7 +45,6 @@ from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.kernel_inputs import (
     to_trtllm_gen_act_type,
 )
 from tensorrt_llm._torch.speculative import MTPEagleWorker, SpecMetadata
-from tensorrt_llm._torch.speculative.eagle3 import _reset_mtp_index_share
 from tensorrt_llm._torch.speculative.interface import (
     _FORCE_ACCEPT_RNG_COUNTER_STRIDE,
     _FORCE_ACCEPT_RNG_POOL_SIZE,
@@ -627,6 +628,7 @@ class DecodeTarget:
         among the verify rows; and the selection the later steps attend to, as KV pool rows,
         or None where they attend to every position (a short context) or no step follows.
         """
+        dsa = attn_metadata.ext(DSAMetadata)
         draft = self._draft
         layer = draft.layer
         rows = hidden_states.shape[0]
@@ -651,7 +653,7 @@ class DecodeTarget:
         )
         attn_out = self._attention(layer, position_ids, hidden_states, attn_metadata, True)
         pool_rows = None
-        if draft_len > 1 and not attn_metadata.skip_indexer_for_gen_reqs:
+        if draft_len > 1 and not dsa.skip_indexer_for_gen_reqs:
             pool_rows = self._stash_selection(attn_metadata, num_accepted, draft_len + 1)
         hidden_states, residual = self._post_attention_hop(layer, attn_out, residual)
         gather_ids, hidden_states, residual = glm_gather_last_accepted_rows(
@@ -675,11 +677,12 @@ class DecodeTarget:
         indexer, to every position up to their own, the dense selection that metadata lists
         (refreshed for this step by the loop). Returns the MTP layer's output rows.
         """
+        dsa = attn_metadata.ext(DSAMetadata)
         draft = self._draft
         layer = draft.layer
         hidden_states, residual = eh_proj_output
-        if attn_metadata.skip_indexer_for_gen_reqs:
-            positions = attn_metadata.topk_indices_buffer[: hidden_states.shape[0]]
+        if dsa.skip_indexer_for_gen_reqs:
+            positions = dsa.topk_indices_buffer[: hidden_states.shape[0]]
             attn_out = self._attention(
                 layer, None, hidden_states, attn_metadata, True, positions=positions
             )
@@ -854,6 +857,7 @@ class DecodeTarget:
         stream after draft step 0's attention: each request's top-k of its last accepted row
         (the MTP index share), as KV pool rows of the MTP layer. The first later step joins
         it (``selection_ready``)."""
+        dsa = attn_metadata.ext(DSAMetadata)
         draft = self._draft
         manager = attn_metadata.kv_cache_manager
         requests = num_accepted.shape[0]
@@ -872,7 +876,7 @@ class DecodeTarget:
             )
             pool_rows = convert_req_index_to_global(
                 draft.request_rows[:requests],
-                attn_metadata.block_table[:requests],
+                dsa.block_table[:requests],
                 stashed,
                 tokens_per_block,
                 self.index_topk,
@@ -938,6 +942,7 @@ class DecodeTarget:
         Applies to one generation request whose shard fits the top-k kernel; returns whether it
         did, and otherwise every indexer layer scores the whole context with the built-in
         indexer."""
+        dsa = attn_metadata.ext(DSAMetadata)
         manager = attn_metadata.kv_cache_manager
         if self._hist_workspace is None or attn_metadata.num_seqs != 1:
             return False
@@ -975,8 +980,8 @@ class DecodeTarget:
             )
         buffers = self._hist_buffers
         hist_shard_meta(
-            attn_metadata.gen_indexer_kv_lens_cuda_runtime,
-            attn_metadata.indexer_k_cache_block_offsets[0],
+            dsa.gen_indexer_kv_lens_cuda_runtime,
+            dsa.indexer_k_cache_block_offsets[0],
             buffers["shard_ctx"],
             buffers["shard_block_table"],
             self.mapping.tp_size,
@@ -1004,6 +1009,7 @@ class DecodeTarget:
         On an MTP draft step after the first (``sharded``) the rows attend to a given
         selection and the indexer does not run: ``pool_rows``, KV pool rows, or
         ``positions``, sequence positions the flash decode maps to pool rows itself."""
+        dsa = attn_metadata.ext(DSAMetadata)
         mla = layer.self_attn
         mqa = mla.mqa
         indexer = mqa.indexer
@@ -1138,7 +1144,7 @@ class DecodeTarget:
                 output,
                 seq_len_q,
                 self.index_topk,
-                attn_metadata.block_table[: attn_metadata.num_seqs],
+                dsa.block_table[: attn_metadata.num_seqs],
                 manager.tokens_per_block,
                 page_index_scale,
                 layer_offset,
@@ -1190,6 +1196,7 @@ class DecodeTarget:
     def _select_rows(self, indexer, kv_a, latent_end, q_a, position_ids, attn_metadata, rows, mla):
         """The indexer of a layer that runs one, on this rank's key shard: writes the exact
         top-2048 cache positions of every row into the shared selection buffer."""
+        dsa = attn_metadata.ext(DSAMetadata)
         buffers = self._hist_buffers
         manager = attn_metadata.kv_cache_manager
         rope = indexer.rotary_emb
@@ -1217,8 +1224,8 @@ class DecodeTarget:
                 buffers["k_fp8"][:rows],
                 buffers["k_scale"][:rows],
                 k_cache,
-                attn_metadata.slot_mapping_fp8[:rows],
-                attn_metadata.slot_mapping_scale[:rows],
+                dsa.slot_mapping_fp8[:rows],
+                dsa.slot_mapping_scale[:rows],
                 rows,
                 True,
                 True,
@@ -1260,7 +1267,7 @@ class DecodeTarget:
         )
         hist_topk(
             logits,
-            attn_metadata.gen_indexer_kv_lens_cuda_runtime,
+            dsa.gen_indexer_kv_lens_cuda_runtime,
             buffers["topk"][:rows],
             self._hist_workspace.comm_buffer,
             self._hist_workspace.state,
@@ -1773,6 +1780,7 @@ class MTPDraftWorker(MTPEagleWorker):
         dense selection is refreshed from the new lengths. The host side of draft step 0's
         switch to one row per request comes before that.
         """
+        dsa = attn_metadata.ext(DSAMetadata)
         draft_len = spec_metadata.runtime_draft_len
         # The accepted tokens' rows: draft step 0's input ids (prepare_1st_drafter_inputs).
         accepted_tokens = inputs["input_ids"].view(batch_size, draft_len + 1)
@@ -1781,12 +1789,12 @@ class MTPDraftWorker(MTPEagleWorker):
         draft_tokens = accepted_tokens.new_empty((batch_size, draft_len))
         positions = inputs["position_ids"]
         eh_proj_output = gather_ids = pool_rows = next_new_tokens = None
-        uses_mtp_index_share = isinstance(attn_metadata, MTPIndexShareMetadata)
+        index_share = attn_metadata.find_ext(MTPIndexShareExtension)
         with contextlib.ExitStack() as draft_scope:
-            if uses_mtp_index_share:
-                attn_metadata.set_in_mtp_draft_loop(True)
-                attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
-                draft_scope.callback(_reset_mtp_index_share, attn_metadata)
+            if index_share is not None:
+                index_share.set_in_mtp_draft_loop(True)
+                index_share.set_mtp_num_accepted(num_accepted_tokens)
+                draft_scope.callback(index_share.reset_mtp_index_share)
             attn_metadata = draft_scope.enter_context(
                 self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager)
             )
@@ -1795,8 +1803,8 @@ class MTPDraftWorker(MTPEagleWorker):
             seq_lens = attn_metadata.seq_lens_cuda[:batch_size]
             kv_lens = attn_metadata.kv_lens_cuda[:batch_size]
             for i in range(draft_len):
-                if uses_mtp_index_share:
-                    attn_metadata.set_skip_topk(i > 0)
+                if index_share is not None:
+                    index_share.set_skip_topk(i > 0)
                 if i == 0:
                     hidden_states, gather_ids, pool_rows = decode.draft_first_step(
                         attn_metadata,
@@ -1843,12 +1851,10 @@ class MTPDraftWorker(MTPEagleWorker):
                         kv_lens,
                         rewind_accepted,
                     )
-                if not last and attn_metadata.skip_indexer_for_gen_reqs:
-                    attn_metadata.prepare_dense_topk_indices(
-                        attn_metadata.kv_lens_cuda, device=True
-                    )
+                if not last and dsa.skip_indexer_for_gen_reqs:
+                    dsa.prepare_dense_topk_indices(attn_metadata.kv_lens_cuda, device=True)
                 if i == 0:
-                    attn_metadata.use_spec_decoding = False
+                    attn_metadata.ext(SpecDecodingMetadata).use_spec_decoding = False
         self._drafted_rows = (draft_tokens, next_new_tokens)
         return draft_tokens
 

@@ -10,8 +10,9 @@ import torch
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 
 from ..interface import AttentionForwardArgs, AttentionInputType
+from ..trtllm import TrtllmAttentionMetadata
 from . import inline_scale_kv
-from .dsa import DSAtrtllmAttentionMetadata
+from .dsa import DSAMetadata
 from .flashinfer_utils import (
     SPARSE_MLA_SPLIT_KV_TILE,
     allocate_sparse_mla_split_workspace,
@@ -19,7 +20,7 @@ from .flashinfer_utils import (
 )
 
 
-def _inline_scale_pool_paged(metadata: DSAtrtllmAttentionMetadata) -> torch.Tensor:
+def _inline_scale_pool_paged(metadata: TrtllmAttentionMetadata) -> torch.Tensor:
     """Return the layer-interleaved primary pool as inline-scale pages."""
     manager = metadata.kv_cache_manager
     cached = getattr(metadata, "_inline_scale_pool", None)
@@ -37,31 +38,32 @@ def _inline_scale_pool_paged(metadata: DSAtrtllmAttentionMetadata) -> torch.Tens
 
 def _latent_append(
     attn,
-    metadata: DSAtrtllmAttentionMetadata,
+    metadata: TrtllmAttentionMetadata,
     latent_rows: torch.Tensor,
     start_idx: int,
     end_idx: int,
     is_generation: bool,
 ) -> None:
     """Quantize the new latent rows and scatter them into the main pool."""
-    metadata._ensure_pool_view_cached()
+    dsa = metadata.ext(DSAMetadata)
+    dsa._ensure_pool_view_cached()
     page_index_scale, layer_offset = metadata.kv_cache_manager.get_primary_pool_page_index_params(
         attn.get_local_layer_idx(metadata)
     )
-    positions = metadata.token_positions_cuda[start_idx:end_idx]
+    positions = dsa.token_positions_cuda[start_idx:end_idx]
     if is_generation:
-        block_table = metadata._cached_block_table_gen
-        req_idx = metadata._cached_req_idx_gen
+        block_table = dsa._cached_block_table_gen
+        req_idx = dsa._cached_req_idx_gen
     else:
-        block_table = metadata._cached_block_table_ctx
-        req_idx = metadata._cached_req_idx_ctx
+        block_table = dsa._cached_block_table_ctx
+        req_idx = dsa._cached_req_idx_ctx
     loc = torch.ops.trtllm.convert_req_index_to_global(
         req_idx,
         block_table,
         positions.unsqueeze(1).contiguous(),
-        metadata._cached_tokens_per_block,
+        dsa._cached_tokens_per_block,
         1,
-        page_index_scale * metadata._cached_tokens_per_block,
+        page_index_scale * dsa._cached_tokens_per_block,
         layer_offset,
     ).view(-1)
     pool = _inline_scale_pool_paged(metadata)
@@ -69,19 +71,20 @@ def _latent_append(
         pool.view(pool.shape[0], -1),
         loc,
         latent_rows,
-        page_size=metadata._cached_tokens_per_block,
+        page_size=dsa._cached_tokens_per_block,
     )
 
 
 def run_flashinfer_sparse_mla(
     attn,
     q: torch.Tensor,
-    metadata: DSAtrtllmAttentionMetadata,
+    metadata: TrtllmAttentionMetadata,
     forward_args: AttentionForwardArgs,
     rotary_emb: RotaryEmbedding,
 ) -> None:
     """Run DSA attention for ``FlashInferSparseMlaFmha``."""
-    if metadata.max_draft_tokens > 0:
+    dsa = metadata.ext(DSAMetadata)
+    if dsa.max_draft_tokens > 0:
         raise NotImplementedError(
             "MTP / speculative decoding is not supported by the FlashInfer DSA FMHA yet."
         )
@@ -114,7 +117,7 @@ def run_flashinfer_sparse_mla(
             "paths must stay disabled for this FMHA."
         )
 
-    positions = metadata.token_positions_cuda[start_idx:end_idx]
+    positions = dsa.token_positions_cuda[start_idx:end_idx]
     latent_cache = forward_args.latent_cache
     latent_rows = (
         latent_cache.view(num_tokens, attn.head_dim)

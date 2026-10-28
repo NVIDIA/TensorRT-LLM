@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import run_msa_nvfp4_sparse_gqa
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
@@ -36,8 +37,9 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_spa
     resolve_num_topk_chunks,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
-    MiniMaxM3MsaSparseAttentionMetadata,
+    MiniMaxM3MsaMetadata,
 )
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._utils import get_sm_version
 
 PAGE_SIZE = SPARSE_BLOCK_SIZE
@@ -49,6 +51,14 @@ skip_not_sm100 = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
     reason="MiniMax-M3 NVFP4 and fmha_sm100 require SM100/SM103.",
 )
+
+
+def _msa_metadata() -> TrtllmAttentionMetadata:
+    """An uninitialized TRTLLM metadata carrying a bare MSA extension."""
+    metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
+    metadata.replace_ext(MiniMaxM3MsaMetadata(metadata))
+    metadata.replace_ext(SpecDecodingMetadata(metadata))
+    return metadata
 
 
 def _flat_page_table(block_table: torch.Tensor, kv_lens_cpu: torch.Tensor) -> torch.Tensor:
@@ -972,8 +982,9 @@ def test_nvfp4_sparse_decode_matches_msa_csr_kernel(num_kv_heads, group):
     kv_lens = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
     cu_kv = torch.zeros(batch + 1, device="cuda", dtype=torch.int32)
     torch.cumsum(kv_lens, 0, out=cu_kv[1:])
-    metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
-    metadata.__dict__.update(
+    metadata = _msa_metadata()
+    metadata.__dict__.update(_num_contexts=2, _num_generations=batch - 2)
+    metadata.ext(MiniMaxM3MsaMetadata).__dict__.update(
         _msa_live_batch=batch,
         msa_cu_q_lens=torch.arange(batch + 1, device="cuda", dtype=torch.int32),
         msa_cu_kv_lens=cu_kv,
@@ -983,14 +994,12 @@ def test_nvfp4_sparse_decode_matches_msa_csr_kernel(num_kv_heads, group):
         _msa_total_k_rows=sum((s + PAGE_SIZE - 1) // PAGE_SIZE for s in seq_lens),
         msa_block_table=case.block_table,
         msa_seq_lens_cuda=case.seq_lens,
-        _num_contexts=2,
         _msa_context_prefix_bounds=(
             1,
             max(seq_lens[:2]),
             sum(seq_lens[:2]),
             sum((s + PAGE_SIZE - 1) // PAGE_SIZE for s in seq_lens[:2]),
         ),
-        _num_generations=batch - 2,
     )
 
     triton_out = _run_nvfp4(case)
@@ -1074,16 +1083,17 @@ def test_msa_nvfp4_calibrated_staging_and_scale_replay(
     )
     k_global = torch.tensor([2.0 / 2688.0], device="cuda", dtype=torch.float32)
     v_global = torch.tensor([1.0 / 2688.0], device="cuda", dtype=torch.float32)
-    metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
-    metadata._msa_live_batch = 1
-    metadata.msa_cu_q_lens = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
-    metadata.msa_cu_kv_lens = torch.tensor([0, kv_len], device="cuda", dtype=torch.int32)
-    metadata._msa_max_q_len = 1
-    metadata._msa_max_kv_len_all = kv_len
-    metadata._msa_total_k = kv_len
-    metadata._msa_total_k_rows = 1
-    metadata.msa_block_table = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
-    metadata.msa_seq_lens_cuda = torch.tensor([kv_len], device="cuda", dtype=torch.int32)
+    metadata = _msa_metadata()
+    msa = metadata.ext(MiniMaxM3MsaMetadata)
+    msa._msa_live_batch = 1
+    msa.msa_cu_q_lens = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    msa.msa_cu_kv_lens = torch.tensor([0, kv_len], device="cuda", dtype=torch.int32)
+    msa._msa_max_q_len = 1
+    msa._msa_max_kv_len_all = kv_len
+    msa._msa_total_k = kv_len
+    msa._msa_total_k_rows = 1
+    msa.msa_block_table = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+    msa.msa_seq_lens_cuda = torch.tensor([kv_len], device="cuda", dtype=torch.int32)
     topk = torch.full((1, 1, MSA_REQUIRED_TOPK), -1, device="cuda", dtype=torch.int32)
     topk[..., 0] = 0
     out = torch.empty(q.shape, device="cuda", dtype=torch.bfloat16)

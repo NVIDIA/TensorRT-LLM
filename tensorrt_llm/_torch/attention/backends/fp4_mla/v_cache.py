@@ -26,6 +26,7 @@ from .config import (
 )
 from .fp4_mla_kernels import _fp4_mla_rebuild_v_scale_from_k_scale_kernel
 from .layout import _ensure_workspace_tensor, get_fp4_mla_v_scale_pool_size
+from .state import find_fp4_mla
 
 
 def _shared_v_pack_storage_enabled() -> bool:
@@ -255,7 +256,7 @@ def _set_triton_v_packed_cache_valid(
         if _shared_v_pack_storage_enabled()
         else _triton_v_packed_valid_attr(layer_idx)
     )
-    metadata.fp4_mla_state.v_packed_cache_tags[valid_attr] = _triton_v_packed_cache_tag(
+    find_fp4_mla(metadata).v_packed_cache_tags[valid_attr] = _triton_v_packed_cache_tag(
         layer_idx,
         kv_cache,
         v_head_dim=v_head_dim,
@@ -284,7 +285,7 @@ def _is_triton_v_packed_cache_valid(
         if _shared_v_pack_storage_enabled()
         else _triton_v_packed_valid_attr(layer_idx)
     )
-    return metadata.fp4_mla_state.v_packed_cache_tags.get(valid_attr) == _triton_v_packed_cache_tag(
+    return find_fp4_mla(metadata).v_packed_cache_tags.get(valid_attr) == _triton_v_packed_cache_tag(
         layer_idx,
         kv_cache,
         v_head_dim=v_head_dim,
@@ -322,7 +323,7 @@ def _get_triton_v_packed_cache(
         page_ids=page_ids,
     ):
         return None
-    v_packed = metadata.fp4_mla_state.workspaces.get(_triton_v_packed_attr(layer_idx))
+    v_packed = find_fp4_mla(metadata).workspaces.get(_triton_v_packed_attr(layer_idx))
     expected_shape = _v_packed_shape(kv_cache, v_head_dim, page_size, block_v)
     if (
         v_packed is None

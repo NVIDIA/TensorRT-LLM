@@ -256,7 +256,7 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
 
     # NOTE: set up metadata, refer to tensorrt_llm/_torch/pyexecutor/model_engine.py
     # all layers share the same metadata
-    attn_metadata = AttentionCls.Metadata(
+    attn_metadata = AttentionCls.create_metadata(
         max_num_requests=len(context_sequence_lengths),
         max_num_tokens=8192,
         kv_cache_manager=None,

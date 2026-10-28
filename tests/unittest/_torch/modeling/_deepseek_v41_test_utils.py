@@ -13,13 +13,14 @@ import torch
 from test_modeling_deepseekv41 import _tiny_v41_model_config
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheManager,
     CSA2CacheRole,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.ced import prepare_ced_global_kv
 from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import CSA2Indexer
-from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import read_index_rows
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41ForCausalLM
@@ -68,13 +69,18 @@ def _apply_swa_floor(metadata, floors: torch.Tensor) -> None:
     """Independent reference masking for explicit layer-loop comparisons."""
     # SWA slots are resolved when a forward enters its first layer; resolve
     # them now so the layers below read the masked slots.
-    metadata._ensure_swa_slots()
+    metadata.ext(CSA2Metadata)._ensure_swa_slots()
     width = metadata.kv_cache_manager.layout.window_size
     logical = (
-        metadata.csa2_positions[:, None] - width + 1 + torch.arange(width, device=floors.device)
+        metadata.ext(CSA2Metadata).csa2_positions[:, None]
+        - width
+        + 1
+        + torch.arange(width, device=floors.device)
     )
-    for layer, indices in metadata.csa2_swa_indices.items():
-        metadata.csa2_swa_indices[layer] = indices.masked_fill(logical < floors[:, None], -1)
+    for layer, indices in metadata.ext(CSA2Metadata).csa2_swa_indices.items():
+        metadata.ext(CSA2Metadata).csa2_swa_indices[layer] = indices.masked_fill(
+            logical < floors[:, None], -1
+        )
 
 
 @pytest.fixture(params=["auto", "fp8"])
@@ -172,7 +178,7 @@ def cache_case(
         scheduled.context_requests_last_chunk = requests[:num_contexts]
         scheduled.generation_requests = requests[num_contexts:]
         manager.prepare_resources(scheduled)
-        metadata = CSA2TrtllmMetadata(
+        metadata = CSA2TrtllmAttention.create_metadata(
             seq_lens=torch.tensor(lengths, dtype=torch.int32),
             num_contexts=num_contexts,
             max_num_requests=batch,
@@ -289,9 +295,9 @@ def capture_layers(model):
 
     def save_routing(module, args, kwargs, output):
         metadata = kwargs["attn_metadata"]
-        for layer, indices in metadata.csa2_indices.items():
+        for layer, indices in metadata.ext(CSA2Metadata).csa2_indices.items():
             values[f"topk{layer}"] = (indices.clone(),)
-        for layer, blocks in metadata.csa2_candidates.items():
+        for layer, blocks in metadata.ext(CSA2Metadata).csa2_candidates.items():
             values[f"candidates{layer}"] = (blocks.clone(),)
 
     owner = model.model.layers[5]
@@ -329,8 +335,8 @@ def global_precompute_scope(metadata):
     try:
         yield
     finally:
-        metadata.csa2_precomputed_kv_layers.clear()
-        metadata.reset_routing()
+        metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers.clear()
+        metadata.ext(CSA2Metadata).reset_routing()
 
 
 @contextmanager
@@ -406,7 +412,7 @@ def run(
         p + n for p, n in zip(starts[num_contexts:], lengths[num_contexts:])
     ]
     metadata.kv_cache_params.num_cached_tokens_per_seq = list(starts)
-    metadata.prepare_context_replay(reqs[:num_contexts])
+    metadata.ext(CSA2Metadata).prepare_context_replay(reqs[:num_contexts])
     metadata.prepare()
     positions = torch.cat(
         [torch.arange(p, p + n, device="cuda", dtype=torch.int32) for p, n in zip(starts, lengths)]

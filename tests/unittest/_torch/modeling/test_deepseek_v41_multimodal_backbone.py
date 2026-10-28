@@ -54,7 +54,7 @@ def backbone() -> tuple[v41.DeepseekV41Model, SimpleNamespace, torch.Tensor, tor
     model.embed_tokens = Mock(return_value=embeddings)
     seq_lens = torch.tensor([4], dtype=torch.int32)
     metadata = SimpleNamespace(
-        begin_model_forward=Mock(),
+        begin_forward=Mock(),
         num_tokens=4,
         num_contexts=1,
         all_rank_num_tokens=[4],

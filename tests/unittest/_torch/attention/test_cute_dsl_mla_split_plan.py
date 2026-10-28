@@ -3,10 +3,10 @@
 """Per-request split-KV plan of the CuTe DSL MLA decode: policy, kernel vs mirror, kernel output."""
 
 import math
-from types import SimpleNamespace
 
 import pytest
 import torch
+from fmha_test_utils import metadata_stub
 
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
@@ -88,7 +88,7 @@ def test_split_kv_plan_is_launched_once_per_step(monkeypatch) -> None:
     monkeypatch.setattr(
         mod, "launch_mla_split_kv_plan", lambda *args, **kwargs: launches.append(kwargs)
     )
-    meta = SimpleNamespace(max_num_requests=16, _cute_dsl_mla_split_plan_key=None)
+    meta = metadata_stub(max_num_requests=16, _cute_dsl_mla_split_plan_key=None)
     cache_seqs = torch.full((8,), 14208, dtype=torch.int32, device="cuda")
     first = mod.CuteDslMlaFmha._split_kv_plan(meta, cache_seqs, 8, 8, 96)
     assert first.numel() == 8 and meta._cute_dsl_mla_split_plan.numel() == 16

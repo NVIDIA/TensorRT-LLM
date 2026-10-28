@@ -957,13 +957,26 @@ class CUDAGraphRunner:
         in; any of them changing before a later replay means the graph would
         read stale (or freed) memory. obj.graph_temporary_attrs are skipped.
         """
-        graph_temporary_attrs = getattr(obj, "graph_temporary_attrs", ())
-        return {
-            name: value.data_ptr()
-            for name, value in vars(obj).items()
-            if isinstance(value, torch.Tensor) and value.is_cuda
-            and name not in graph_temporary_attrs
-        }
+        ptrs = {}
+        for prefix, owner in CUDAGraphRunner._graph_tensor_owners(obj):
+            graph_temporary_attrs = getattr(owner, "graph_temporary_attrs", ())
+            ptrs.update({
+                prefix + name: value.data_ptr()
+                for name, value in vars(owner).items()
+                if isinstance(value, torch.Tensor) and value.is_cuda
+                and name not in graph_temporary_attrs
+            })
+        return ptrs
+
+    @staticmethod
+    def _graph_tensor_owners(obj: Any) -> List[Tuple[str, Any]]:
+        """obj and, for attention metadata, its extensions, with key prefixes."""
+        owners = [("", obj)]
+        attached = obj.__dict__.get("_extensions") if hasattr(
+            obj, "__dict__") else None
+        for extension in attached or ():
+            owners.append((f"{type(extension).__name__}.", extension))
+        return owners
 
     @staticmethod
     def _assert_graph_tensor_ptrs_stable(obj: Any,
@@ -975,20 +988,23 @@ class CUDAGraphRunner:
         live value is not the captured one. The target value saved before the
         swap is checked in its place.
         """
-        swapped_attrs = getattr(obj, "draft_replay_swapped_attrs", {})
-        for name, expected_ptr in expected_ptrs.items():
+        owners = dict(CUDAGraphRunner._graph_tensor_owners(obj))
+        for key, expected_ptr in expected_ptrs.items():
+            prefix, _, name = key.rpartition(".")
+            owner = owners.get(f"{prefix}." if prefix else "")
+            swapped_attrs = getattr(owner, "draft_replay_swapped_attrs", {})
             value = (swapped_attrs[name] if name in swapped_attrs else getattr(
-                obj, name, None))
+                owner, name, None))
             if not isinstance(value, torch.Tensor):
                 raise RuntimeError(
                     f"CUDA graph metadata attribute `{type(obj).__name__}."
-                    f"{name}` was a tensor at capture time but is now "
+                    f"{key}` was a tensor at capture time but is now "
                     f"{type(value).__name__}. Graph-visible buffers must be "
                     "updated in place, not rebound.")
             if value.data_ptr() != expected_ptr:
                 raise RuntimeError(
                     f"CUDA graph metadata tensor `{type(obj).__name__}."
-                    f"{name}` was reallocated between capture and replay "
+                    f"{key}` was reallocated between capture and replay "
                     f"(data_ptr 0x{expected_ptr:x} -> 0x{value.data_ptr():x}). "
                     "Graph-visible buffers must be updated in place; "
                     "rebinding invalidates addresses baked into the captured "

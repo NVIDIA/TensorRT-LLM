@@ -15,8 +15,17 @@ from unittest import mock
 
 import pytest
 
+from tensorrt_llm._torch.attention.backends.features import RecurrentMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MixedMambaHybridCacheManager
 from tensorrt_llm._torch.speculative.sa_worker import SAWorker
+
+
+def _recurrent_stub(mamba_metadata, **fields) -> SimpleNamespace:
+    """A metadata stub serving ``mamba_metadata`` through its recurrent extension."""
+    recurrent = SimpleNamespace(mamba_metadata=mamba_metadata)
+    metadata = SimpleNamespace(**fields)
+    metadata.find_ext = metadata.ext = lambda cls: recurrent if cls is RecurrentMetadata else None
+    return metadata
 
 
 def _make_worker() -> SAWorker:
@@ -34,7 +43,7 @@ def _make_worker() -> SAWorker:
 
 
 def _make_metadata(kv_cache_manager, num_seqs: int, num_contexts: int):
-    attn_metadata = SimpleNamespace(
+    attn_metadata = _recurrent_stub(
         num_seqs=num_seqs,
         num_contexts=num_contexts,
         kv_cache_manager=kv_cache_manager,

@@ -20,7 +20,7 @@ from tensorrt_llm._utils import get_sm_version, nvtx_range, nvtx_range_debug
 from tensorrt_llm.logger import logger
 
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
-from .metadata import DSAtrtllmAttentionMetadata
+from .metadata import DSAMetadata
 from .params import DSABackendForwardArgs
 
 if TYPE_CHECKING:
@@ -447,7 +447,7 @@ def forward_sparse_mla_kvcache_bf16(
     self,
     q: torch.Tensor,
     latent_cache: torch.Tensor,
-    attn_metadata: DSAtrtllmAttentionMetadata,
+    attn_metadata: AttentionMetadata,
     output: torch.Tensor,
     indexer_intermediates: Optional[List[torch.Tensor]],
     is_generation: bool = False,
@@ -460,9 +460,7 @@ def forward_sparse_mla_kvcache_bf16(
     2. Load full kv cache from paged memory (with k rope applied)
     3. Call FlashMLA sparse attention kernel for sparse prefill/decode
     """
-    assert isinstance(attn_metadata, DSAtrtllmAttentionMetadata), (
-        "DSA requires DSAtrtllmAttentionMetadata"
-    )
+    dsa = attn_metadata.ext(DSAMetadata)
     attention_input_type = (
         AttentionInputType.generation_only if is_generation else AttentionInputType.context_only
     )
@@ -476,8 +474,8 @@ def forward_sparse_mla_kvcache_bf16(
         ),
     )
     assert topk_indices_pool is not None
-    attn_metadata._ensure_pool_view_cached()
-    kv_cache_pool = attn_metadata._cached_pool_view
+    dsa._ensure_pool_view_cached()
+    kv_cache_pool = dsa._cached_pool_view
     assert kv_cache_pool is not None
 
     # Append current tokens to paged cache and apply RoPE to q

@@ -63,6 +63,8 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_sm_version
 from tensorrt_llm.logger import logger
 
+from ..features import HelixMetadata
+from ..features.spec_decoding import SpecDecodingMetadata
 from .interface import Fmha
 
 if TYPE_CHECKING:
@@ -72,13 +74,17 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
         DeepseekV4CacheManager,
     )
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
-        DeepseekV4TrtllmAttentionMetadata,
-    )
     from tensorrt_llm._torch.attention.backends.trtllm import (
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
+
+
+def _deepseek_v4_metadata():
+    """The DeepSeek-V4 extension class, imported on first use to avoid an import cycle."""
+    from ..sparse.deepseek_v4.metadata import DeepseekV4Metadata
+
+    return DeepseekV4Metadata
 
 
 _MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
@@ -255,13 +261,17 @@ class PrimsTSSparseMlaFmha(Fmha):
             return "a DeepSeek-V4 KV cache manager is required."
         if metadata.beam_width != 1:
             return "beam search is not supported."
-        if getattr(metadata, "token_positions_cuda", None) is None:
+        dsv4 = metadata.find_ext(_deepseek_v4_metadata())
+        if dsv4 is None:
+            return "DeepSeek-V4 metadata is required."
+        if dsv4.token_positions_cuda is None:
             return "token positions are required for the output RoPE."
-        if getattr(metadata, "sparse_mla_swa_lens", None) is None:
+        if getattr(dsv4, "sparse_mla_swa_lens", None) is None:
             return "per-step live lengths are required (DeepSeek-V4 metadata)."
         if fwd.attention_mask_data is not None or fwd.relative_attention_bias is not None:
             return "custom masks and relative bias are not supported."
-        if metadata.helix_position_offsets is not None:
+        helix = metadata.find_ext(HelixMetadata)
+        if helix is not None and helix.position_offsets is not None:
             return "Helix parallelism is not supported."
         rows = int(q.shape[0])
         if rows == 0:
@@ -342,11 +352,11 @@ class PrimsTSSparseMlaFmha(Fmha):
 
         return metadata.kv_cache_manager.dtype == DataType.FP8
 
-    def _extra_capacity(self, metadata: "DeepseekV4TrtllmAttentionMetadata") -> int:
+    def _extra_capacity(self, metadata: "TrtllmAttentionMetadata") -> int:
         ratio = int(self.attn.compress_ratio)
         if ratio <= 1:
             return 0
-        return int(metadata.max_compressed_indices[ratio])
+        return int(metadata.ext(_deepseek_v4_metadata()).max_compressed_indices[ratio])
 
     def _pool_view(
         self,
@@ -605,7 +615,7 @@ class PrimsTSSparseMlaFmha(Fmha):
         # fails here instead of silently shrinking the warmed set and moving
         # the MTP row counts' compiles to the first serving step.
         requests = int(metadata.max_num_requests or 0)
-        draft = int(metadata.max_total_draft_tokens or 0)
+        draft = int(metadata.ext(SpecDecodingMetadata).max_total_draft_tokens or 0)
         tokens = int(metadata.max_num_tokens or 0)
         max_rows = requests * (1 + draft)
         if tokens:
@@ -830,15 +840,16 @@ class PrimsTSSparseMlaFmha(Fmha):
         # come from the metadata too, derived once per step: the token's
         # position within the window, and the compressed rows selected beyond
         # the window.
-        positions = metadata.token_positions_cuda[start:end]
-        lengths = metadata.sparse_mla_swa_lens[start:end]
+        dsv4 = metadata.ext(_deepseek_v4_metadata())
+        positions = dsv4.token_positions_cuda[start:end]
+        lengths = dsv4.sparse_mla_swa_lens[start:end]
         swa_pool = self._pool_view(manager, DeepseekV4AttentionType.SWA, 1)
         extra_pool = None
         run_kwargs = {}
         if extra:
             extra_pool = self._pool_view(manager, DeepseekV4AttentionType.COMPRESS, ratio)
             run_kwargs["extra_indices"] = indices[:, window:]
-            run_kwargs["extra_lengths"] = metadata.sparse_mla_extra_lens[ratio][start:end]
+            run_kwargs["extra_lengths"] = dsv4.sparse_mla_extra_lens[ratio][start:end]
 
         if fused:
             # TRT-LLM's fused epilogue buffers are group-major [G, T, C] with

@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from fmha_test_utils import FakeAttention
+from fmha_test_utils import FakeAttention, metadata_stub
 
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.triton_custom_mask import TritonCustomMaskFmha
@@ -56,7 +56,7 @@ def test_custom_mask_quantized_context_support(
     attn = FakeAttention()
     attn.quant_mode = int(quant_mode)
     fmha = TritonCustomMaskFmha(attn)
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         num_contexts=1,
         is_cross=False,
         kv_cache_block_offsets=object(),

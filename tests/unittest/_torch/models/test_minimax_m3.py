@@ -38,6 +38,7 @@ from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
@@ -54,9 +55,10 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
     index_head_range,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
-    MiniMaxM3MsaSparseAttentionMetadata,
+    MiniMaxM3MsaMetadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _group_max_reduce
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.compilation.remove_copy_pass import remove_copy_for_mutates_args
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
@@ -725,10 +727,9 @@ def test_piecewise_captures_horizontal_producer_before_attention(
     index_cache = torch.empty_like(kv_cache)
     scale_cache = torch.empty(8, dtype=torch.uint8) if kv_dtype == "nvfp4" else None
     slots = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
-    metadata = Mock(
-        spec_set=MiniMaxM3MsaSparseAttentionMetadata,
-        num_tokens=2,
-        kv_cache_manager=None,
+    metadata = Mock(spec_set=TrtllmAttentionMetadata, num_tokens=2, kv_cache_manager=None)
+    metadata.ext.return_value = Mock(
+        spec_set=MiniMaxM3MsaMetadata,
         msa_layer_cache_tensors={3: (kv_cache, index_cache, scale_cache)},
         msa_out_cache_loc=slots,
     )
@@ -979,10 +980,9 @@ def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
     if caches_prewritten:
         index_cache.copy_(expected_cache)
     selected_blocks = torch.zeros(2, 1, 16, dtype=torch.int32)
-    attn_metadata = Mock(
-        spec_set=MiniMaxM3MsaSparseAttentionMetadata,
-        num_tokens=2,
-        kv_cache_manager=None,
+    attn_metadata = Mock(spec_set=TrtllmAttentionMetadata, num_tokens=2, kv_cache_manager=None)
+    msa = Mock(
+        spec_set=MiniMaxM3MsaMetadata,
         msa_decode_span=None,
         msa_idx_k_cache=Mock(return_value=index_cache),
         msa_write_idx_k=Mock(),
@@ -993,6 +993,7 @@ def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
         msa_kv_lens_cpu=torch.tensor([2], dtype=torch.int32),
         msa_qo_offset_cpu=torch.tensor([0], dtype=torch.int32),
     )
+    attn_metadata.ext.return_value = msa
 
     def write_caches(
         live_k: torch.Tensor,
@@ -1049,8 +1050,8 @@ def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
     )
 
     assert backend.write_layer_caches.call_count == (0 if caches_prewritten else 1)
-    attn_metadata.msa_write_idx_k.assert_not_called()
-    attn_metadata.msa_idx_k_cache.assert_called_once_with(3)
+    msa.msa_write_idx_k.assert_not_called()
+    msa.msa_idx_k_cache.assert_called_once_with(3)
     backend.indexer.select_blocks.assert_called_once()
     backend.forward.assert_called_once()
     called_q, called_k, called_v, called_metadata = backend.forward.call_args.args
@@ -1996,12 +1997,10 @@ def test_horizontal_producer_explicit_caches_match_manager(
     manager.is_nvfp4_layer.return_value = nvfp4
     manager.get_buffers.return_value = main
     manager.get_block_scale_buffers.return_value = scales
-    metadata = Mock(
-        spec_set=MiniMaxM3MsaSparseAttentionMetadata,
-        kv_cache_manager=manager,
-        msa_out_cache_loc=slots,
-    )
-    metadata.msa_idx_k_cache.return_value = index
+    metadata = Mock(spec_set=TrtllmAttentionMetadata, kv_cache_manager=manager)
+    msa = Mock(spec_set=MiniMaxM3MsaMetadata, msa_out_cache_loc=slots)
+    msa.msa_idx_k_cache.return_value = index
+    metadata.ext.return_value = msa
 
     def snapshot(outputs: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, ...]:
         return tuple(t.view(torch.uint8).clone() for t in (*outputs, main, index, scales))
@@ -2020,7 +2019,7 @@ def test_horizontal_producer_explicit_caches_match_manager(
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
     manager.get_buffers.assert_called_once_with(3, kv_layout="HND")
     assert manager.get_block_scale_buffers.call_count == int(nvfp4)
-    metadata.msa_idx_k_cache.assert_called_once_with(3)
+    msa.msa_idx_k_cache.assert_called_once_with(3)
 
     monkeypatch.setattr(
         modeling_minimaxm3,
@@ -2969,9 +2968,7 @@ def test_minimax_m3_dense_backend_library_order(
     metadata.cu_q_seqlens = metadata.cu_kv_seqlens = torch.tensor([0, 2], dtype=torch.int32)
     metadata.num_contexts = 1
     metadata.num_generations = 0
-    metadata.enable_flash_mla = False
-    metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
-    metadata.spec_decoding_bl_tree_mask = None
+    metadata.replace_ext(SpecDecodingMetadata(metadata))
     metadata.max_context_q_len_override = None
     metadata.kv_cache_manager = SimpleNamespace(
         dtype=DataType.BF16, max_attention_window_vec=[128], max_seq_len=128

@@ -13,7 +13,7 @@ import torch
 from ..params import SparseBackendForwardArgs, SparseMetadataParams, SparseParams
 
 if TYPE_CHECKING:
-    from .metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 
 class CSA2Mode(Enum):
@@ -245,7 +245,7 @@ class CSA2ForwardState:
     named next to them; the cache writes apply those in the quantize launch.
     """
 
-    metadata: CSA2TrtllmMetadata
+    metadata: TrtllmAttentionMetadata
     swa_kv: torch.Tensor
     index_q: torch.Tensor | None = None
     index_q_scale: torch.Tensor | None = None

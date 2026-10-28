@@ -12,6 +12,7 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention import mla as mla_module
+from tensorrt_llm._torch.attention.backends.features import FlashMlaMetadata
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType, MLAParams, PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention.backends.trtllm import \
@@ -1065,7 +1066,7 @@ def _run_test_for_backend(backend_name,
             else:
                 kv_cache_manager.impl.add_sequence_batch(
                     [(req_id, ctx_len, beam_width)], [req])
-        attn_metadata = AttentionCls.Metadata(
+        attn_metadata = AttentionCls.create_metadata(
             seq_lens=torch.tensor(context_sequence_lengths, dtype=torch.int),
             request_ids=list(range(len(context_sequence_lengths))),
             max_num_requests=len(context_sequence_lengths),
@@ -1114,10 +1115,11 @@ def _run_test_for_backend(backend_name,
                     ),
                     mapping=mapping,
                 )
-                if backend_name == "TRTLLM":
-                    gen_metadata_kwargs["enable_flash_mla"] = (
-                        cuda_capability == (9, 0))
-                attn_metadata = AttentionCls.Metadata(**gen_metadata_kwargs)
+                if backend_name == "TRTLLM" and cuda_capability == (9, 0):
+                    gen_metadata_kwargs["extension_types"] = (
+                        FlashMlaMetadata, )
+                attn_metadata = AttentionCls.create_metadata(
+                    **gen_metadata_kwargs)
                 attn_metadata.prepare()
             for layer_idx in range(num_layers):
                 print(
@@ -1358,21 +1360,18 @@ def _run_test_for_backend(backend_name,
 NUM_HEADS = 128
 
 
-class _Prefixes:
-    """The state `mla_prepare_*` touches, with the real methods bound to it.
+class _Prefixes(TrtllmAttentionMetadata):
+    """The state `mla_prepare_*` touches, running the real metadata methods.
 
     Deliberately not a full `TrtllmAttentionMetadata`: that needs a KV cache
-    manager and a resource pool, none of which these methods read. Binding the
-    production functions keeps this a test of the shipped code rather than of a
-    reimplementation.
+    manager and a resource pool, none of which these methods read. Inheriting
+    the production methods keeps this a test of the shipped code rather than of
+    a reimplementation; the length properties become plain attributes.
     """
 
-    # Bind the unbound functions so any edit to them is exercised here.
-    mla_prepare_scheduler_buffers = TrtllmAttentionMetadata.mla_prepare_scheduler_buffers
-    mla_prepare_ctx_cu_seqlens = TrtllmAttentionMetadata.mla_prepare_ctx_cu_seqlens
-    _invalidate_mla_scheduler_buffers = TrtllmAttentionMetadata._invalidate_mla_scheduler_buffers
-    on_update_kv_lens = TrtllmAttentionMetadata.on_update_kv_lens
-    update_for_spec_dec = TrtllmAttentionMetadata.update_for_spec_dec
+    num_contexts = 0
+    num_seqs = 0
+    seq_lens_cuda = None
 
     def __init__(self, q_lens, kv_lens, num_contexts=0):
         device = torch.device("cuda")
@@ -1392,8 +1391,6 @@ class _Prefixes:
         self.mla_ctx_cu_q_seqlens = torch.zeros(size,
                                                 dtype=torch.int32,
                                                 device=device)
-        # `enable_flash_mla` is the only other attribute the two hooks read.
-        self.enable_flash_mla = False
         self._invalidate_mla_scheduler_buffers()
 
     def rebuild(self):

@@ -20,7 +20,17 @@ import torch
 
 pytest.importorskip("fla")
 
+from tensorrt_llm._torch.attention.backends.features import RecurrentMetadata
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention  # noqa: E402
+
+
+def _recurrent_stub(mamba_metadata, **fields) -> SimpleNamespace:
+    """A metadata stub serving ``mamba_metadata`` through its recurrent extension."""
+    recurrent = SimpleNamespace(mamba_metadata=mamba_metadata)
+    metadata = SimpleNamespace(**fields)
+    metadata.find_ext = metadata.ext = lambda cls: recurrent if cls is RecurrentMetadata else None
+    return metadata
+
 
 HIDDEN_SIZE = 512
 NUM_HEADS = 4
@@ -87,7 +97,7 @@ def _mixed_metadata(num_ctx_tokens: int, num_decodes: int) -> SimpleNamespace:
         kda_single_sequence_length=num_ctx_tokens,
         _arange_buffer=torch.arange(batch + 1, dtype=torch.int32, device=device),
     )
-    return SimpleNamespace(
+    return _recurrent_stub(
         mamba_metadata=mamba,
         num_contexts=num_prefills,
         num_ctx_tokens=num_ctx_tokens,

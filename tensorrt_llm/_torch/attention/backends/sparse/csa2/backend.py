@@ -18,13 +18,13 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PredefinedAttentionMask,
     merge_attention_forward_args,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .indexer import CSA2Indexer
-from .metadata import CSA2TrtllmMetadata
+from .metadata import CSA2Metadata
 from .params import CSA2BackendForwardArgs, CSA2Layout, CSA2Mode, CSA2Params, select_csa2_backend
 
 if TYPE_CHECKING:
@@ -76,12 +76,13 @@ def _csa2_parent_quant_config(quant_config, native_fp8: bool):
 class CSA2TrtllmAttention(TrtllmAttention):
     """CSA2 sparse prediction with the inherited native trtllm-gen forward."""
 
-    Metadata = CSA2TrtllmMetadata
+    Metadata = TrtllmAttentionMetadata
+    metadata_extensions = (CSA2Metadata,)
     compute_backend = "trtllm"
 
     @classmethod
     def runtime_workspace_bytes_per_token(cls, model_config, mapping) -> int:
-        return CSA2TrtllmMetadata.cache_gather_bytes_per_token(model_config)
+        return CSA2Metadata.cache_gather_bytes_per_token(model_config)
 
     @classmethod
     def runtime_workspace_is_chunked_prefill_bounded(cls, model_config) -> bool:
@@ -115,7 +116,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
         ).multi_processor_count
 
         def arena_bytes(queries: int, page_capacity: int) -> int:
-            return CSA2TrtllmMetadata.workspace_reservation_bytes(
+            return CSA2Metadata.workspace_reservation_bytes(
                 max_batch_size,
                 queries,
                 page_capacity * 64,
@@ -268,9 +269,10 @@ class CSA2TrtllmAttention(TrtllmAttention):
     def prepare_sparse_inputs(
         self,
         q: torch.Tensor,
-        metadata: CSA2TrtllmMetadata,
+        metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> CSA2BackendForwardArgs:
+        csa2 = metadata.ext(CSA2Metadata)
         if self.native_fp8 and (
             forward_args.out_scale is not None
             or forward_args.out_scale_sf is not None
@@ -279,7 +281,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
             or (forward_args.output is not None and forward_args.output.dtype != torch.bfloat16)
         ):
             raise ValueError("CSA2 native FP8 attention requires unquantized BF16 output")
-        if metadata.swa_pool.dtype != self.staging_dtype:
+        if csa2.swa_pool.dtype != self.staging_dtype:
             raise ValueError("CSA2 tile staging dtype must match its attention backend")
         inputs = forward_args.sparse_backend_args
         if not isinstance(inputs, CSA2BackendForwardArgs):
@@ -288,7 +290,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
         if (
             q.shape != (count, self.num_heads * _HEAD_DIM)
             or q.dtype != torch.bfloat16
-            or metadata.num_query_heads != self.num_heads
+            or csa2.num_query_heads != self.num_heads
         ):
             raise ValueError("CSA2 Q geometry/dtype must match its BF16 metadata")
         if forward_args.attention_input_type not in (
@@ -299,6 +301,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
         if inputs.state is not None:
             state = inputs.state
             source = state.metadata
+            source_csa2 = source.ext(CSA2Metadata)
             manager = source.kv_cache_manager
             layout = self.sparse_params.layout
             if layout is None:
@@ -306,11 +309,11 @@ class CSA2TrtllmAttention(TrtllmAttention):
             layer = layout.layer(self.layer_idx)
             start, end = inputs.query_start, inputs.query_start + count
             if start == 0:
-                source.enter_layer(layer)
+                source_csa2.enter_layer(layer)
                 global_rows = None
                 if (
                     layer.mode == CSA2Mode.FULL
-                    and self.layer_idx in source.csa2_precomputed_kv_layers
+                    and self.layer_idx in source_csa2.csa2_precomputed_kv_layers
                 ):
                     if state.main_kv is not None or state.index_k is not None:
                         raise ValueError("CED precomputed global KV must not be projected twice")
@@ -321,7 +324,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
                         )
                     global_rows = (
                         layer.kv_source,
-                        source.csa2_main_write_slots[layer.kv_source],
+                        source_csa2.csa2_main_write_slots[layer.kv_source],
                         state.main_kv,
                         state.index_k,
                         state.main_transform,
@@ -338,7 +341,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
                 )
                 packed = manager.write_layer_rows(
                     self.layer_idx,
-                    source.csa2_swa_write_slots[self.layer_idx],
+                    source_csa2.csa2_swa_write_slots[self.layer_idx],
                     state.swa_kv,
                     state.swa_transform,
                     global_rows=global_rows,
@@ -362,37 +365,37 @@ class CSA2TrtllmAttention(TrtllmAttention):
                 # batch. FMHA query tiles only consume the published selections.
                 if start == 0:
                     self.indexer(state, 0, state.swa_kv.shape[0])
-                logical = source.csa2_indices[self.layer_idx][start:end]
+                logical = source_csa2.csa2_indices[self.layer_idx][start:end]
             elif layer.mode == CSA2Mode.REUSE:
-                if layer.index_source not in source.csa2_indices:
+                if layer.index_source not in source_csa2.csa2_indices:
                     raise ValueError("CSA2 index source did not run in this forward")
-                indices = source.csa2_indices[layer.index_source]
+                indices = source_csa2.csa2_indices[layer.index_source]
                 if indices.shape[0] != state.swa_kv.shape[0]:
                     raise ValueError("CSA2 Reuse rows must match their source's packed query order")
                 logical = indices[start:end]
             slots = None
             mapping = None
             if logical is not None:
-                visible = source.csa2_visible_lengths[self.layer_idx][start:end]
+                visible = source_csa2.csa2_visible_lengths[self.layer_idx][start:end]
                 if self._native_slot_mapping(logical):
                     # The staging kernels resolve logical rows through the
                     # owner's live page table themselves (one launch fewer).
-                    owner = source.csa2_kv_sources[self.layer_idx]
+                    owner = source_csa2.csa2_kv_sources[self.layer_idx]
                     slots = logical
                     mapping = (
-                        source.csa2_global_page_tables[owner],
-                        source.csa2_global_page_sizes[owner],
-                        source.csa2_global_max_positions[owner],
-                        source.csa2_token_requests[start:end],
+                        source_csa2.csa2_global_page_tables[owner],
+                        source_csa2.csa2_global_page_sizes[owner],
+                        source_csa2.csa2_global_max_positions[owner],
+                        source_csa2.csa2_token_requests[start:end],
                         visible,
                     )
                 else:
-                    slots = source.global_slot_tile(
+                    slots = source_csa2.global_slot_tile(
                         self.layer_idx, start, end, logical, visible_lengths=visible
                     )
             inputs = CSA2BackendForwardArgs(
                 swa_pool=manager.get_swa_buffer(self.layer_idx),
-                swa_indices=source.csa2_swa_indices[self.layer_idx][start:end],
+                swa_indices=source_csa2.csa2_swa_indices[self.layer_idx][start:end],
                 main_pool=None if logical is None else manager.get_main_buffer(layer.kv_source),
                 topk_indices=slots,
                 main_logical_indices=logical,
@@ -410,7 +413,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
             inputs.output_position_ids is not None or inputs.output_rotary_cos_sin is not None
         ) and not self.sparse_params.use_packed_sparse_attention:
             raise ValueError("CSA2 fused output RoPE requires packed sparse attention")
-        if metadata.swa_pool.device != q.device:
+        if csa2.swa_pool.device != q.device:
             raise ValueError("CSA2 Q and metadata must be on the same CUDA device")
         return inputs
 
@@ -425,6 +428,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
         )
 
     def sparse_attn_predict(self, q, k, metadata, forward_args):
+        csa2 = metadata.ext(CSA2Metadata)
         if self.compute_backend != "trtllm" or self.sparse_params.use_packed_sparse_attention:
             raise ValueError("CSA2 Flash and packed attention require their explicit module helper")
         if (
@@ -443,7 +447,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
             # Repeating a forward on one carrier is fine: it hands back the very
             # buffers derived below. Any other scale describes a KV cache this path
             # never reads, so it could only contradict the staging pool.
-            owned = metadata.stage_kv_scales
+            owned = csa2.stage_kv_scales
             for scale in (forward_args.kv_scale_orig_quant, forward_args.kv_scale_quant_orig):
                 if scale is not None and not any(scale is buffer for buffer in owned):
                     raise ValueError("CSA2 FP8 staging derives its own Q/KV scales")
@@ -465,7 +469,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
             # context does take range, bounded by Q's own amax and by the exponent the
             # main pool can actually need. Split-KV never runs here either way: every
             # MLA multi-CTA-KV cubin is a generation kernel.
-            stage_orig_quant, stage_quant_orig = metadata.derive_stage_kv_scales(
+            stage_orig_quant, stage_quant_orig = csa2.derive_stage_kv_scales(
                 inputs,
                 q=q,
                 q_shared=context,
@@ -478,7 +482,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
                 # Q's pair is the staging pair read backwards: dequant_q = 1 / dequant_kv.
                 forward_args.kv_scale_orig_quant = stage_quant_orig
                 forward_args.kv_scale_quant_orig = stage_orig_quant
-            metadata.stage_selected(
+            csa2.stage_selected(
                 inputs,
                 kv_scale_orig_quant=stage_orig_quant,
                 kv_scale_quant_orig=stage_quant_orig,
@@ -497,32 +501,32 @@ class CSA2TrtllmAttention(TrtllmAttention):
                 forward_args.quant_q_buffer = quant_q.view(
                     metadata.num_tokens, self.num_heads, _HEAD_DIM
                 )
-                forward_args.mla_bmm1_scale = metadata.mla_bmm1_scale
-                forward_args.mla_bmm2_scale = metadata.mla_bmm2_scale
+                forward_args.mla_bmm1_scale = csa2.mla_bmm1_scale
+                forward_args.mla_bmm2_scale = csa2.mla_bmm2_scale
             elif forward_args.attention_input_type == AttentionInputType.context_only:
                 forward_args.quant_scale_qkv = forward_args.kv_scale_orig_quant
         else:
-            metadata.stage_selected(inputs, main_logical=inputs.main_logical_indices)
+            csa2.stage_selected(inputs, main_logical=inputs.main_logical_indices)
         sparse = forward_args.sparse_runtime_params
-        sparse.sparse_attn_kv_lens = metadata.prepared_lens
+        sparse.sparse_attn_kv_lens = csa2.prepared_lens
         sparse.aux_kv_cache_pool_ptr = (
-            metadata.extra_pool.data_ptr()
+            csa2.extra_pool.data_ptr()
             if inputs.topk_indices is not None and metadata.num_sparse_topk > 128
             else None
         )
-        forward_args.fmha_scheduler_counter = metadata.prepared_counter
+        forward_args.fmha_scheduler_counter = csa2.prepared_counter
         forward_args.attention_window_size = metadata.num_sparse_topk
         # Context Q already includes RoPE and cache publication happened above.
         # A null latent cache skips the native context append/RoPE preprocessing.
         forward_args.latent_cache = (
             None
             if forward_args.attention_input_type == AttentionInputType.context_only
-            else metadata.latent_placeholder
+            else csa2.latent_placeholder
             if self.native_fp8
-            else metadata.swa_pool[:, 0]
+            else csa2.swa_pool[:, 0]
         )
         forward_args.q_pe = q.view(metadata.num_tokens, self.num_heads, _HEAD_DIM)[..., 448:]
-        return metadata.prepared_indices, None
+        return csa2.prepared_indices, None
 
     def _supports_packed(self, q, inputs, forward_args) -> bool:
         """Validate the explicit packed attention input/output contract."""
@@ -585,26 +589,27 @@ class CSA2TrtllmAttention(TrtllmAttention):
             raise ValueError("CSA2 requires an attention sink")
 
     def prepare_selected(self, q, metadata, forward_args):
+        csa2 = metadata.ext(CSA2Metadata)
         self._validate_helper_output(q, forward_args)
         if self.sparse_params.use_packed_sparse_attention:
             raise ValueError("Packed CSA2 must use forward_packed without BF16 staging")
         inputs = self.prepare_sparse_inputs(q, metadata, forward_args)
-        metadata.stage_selected(inputs, main_logical=inputs.main_logical_indices)
+        csa2.stage_selected(inputs, main_logical=inputs.main_logical_indices)
         query = q.view(metadata.num_tokens, self.num_heads, _HEAD_DIM)
-        if metadata.shared_plan is not None:
+        if csa2.shared_plan is not None:
             return (
                 query,
-                metadata.shared_pool,
-                metadata.prepared_indices,
+                csa2.shared_pool,
+                csa2.prepared_indices,
                 forward_args.attention_sinks,
                 1.0 / (self.q_scaling * math.sqrt(_HEAD_DIM)),
             )
-        kv = metadata.swa_pool
+        kv = csa2.swa_pool
         if metadata.num_sparse_topk > _SWA_TILE:
-            kv = torch.cat((kv, metadata.extra_pool), dim=1)
+            kv = torch.cat((kv, csa2.extra_pool), dim=1)
         valid = (
             torch.arange(metadata.num_sparse_topk, device=q.device)[None, :]
-            < metadata.prepared_lens[:, None]
+            < csa2.prepared_lens[:, None]
         )
         return (
             query,
@@ -694,10 +699,11 @@ class CSA2FlashMLA:
         return self._forward_selected(q, metadata, forward_args)
 
     def _forward_selected(self, q, metadata, forward_args):
+        csa2 = metadata.ext(CSA2Metadata)
         if self.attention is None:
             raise ValueError("CSA2 helper requires its attention backend")
         inputs = self.attention.prepare_selected(q, metadata, forward_args)
-        run = self.run_shared if metadata.shared_plan is not None else self.run
+        run = self.run_shared if csa2.shared_plan is not None else self.run
         result = run(*inputs).flatten(1)
         if forward_args.output is not None:
             forward_args.output.copy_(result)
@@ -872,10 +878,11 @@ class CSA2FlashInfer:
         return self._forward_selected(q, metadata, forward_args)
 
     def _forward_selected(self, q, metadata, forward_args):
+        csa2 = metadata.ext(CSA2Metadata)
         if self.attention is None:
             raise ValueError("CSA2 helper requires its attention backend")
         inputs = self.attention.prepare_selected(q, metadata, forward_args)
-        shared = metadata.shared_plan is not None
+        shared = csa2.shared_plan is not None
         query, values, selection, _, scale = inputs
         width = selection.shape[1] if shared else values.shape[1]
         key = (query.shape[0], query.shape[1], width, q.device, scale)

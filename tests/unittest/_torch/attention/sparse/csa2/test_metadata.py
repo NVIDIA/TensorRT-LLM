@@ -9,6 +9,8 @@ import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
 from tensorrt_llm._torch.attention.backends.sparse.csa2.compressor import CSA2CompressionBatch
 from tensorrt_llm._torch.attention.backends.sparse.csa2.decoder_replay import (
@@ -17,17 +19,16 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.decoder_replay import (
     exit_decoder_replay,
     plan_decoder_replay,
 )
-from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
-from ._utils import _FakeMetadata, _page_metadata
+from ._utils import _bare_csa2_metadata, _FakeMetadata, _page_metadata
 
 skip_pre_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
@@ -41,7 +42,7 @@ def test_decoder_swa_slots_skip_reclaimed_encoder_pages(device):
 
     if device == "cuda" and not (torch.cuda.is_available() and kernel.dsl_available()):
         pytest.skip("CuTe DSL SWA refresh requires CUDA")
-    metadata = object.__new__(CSA2TrtllmMetadata)
+    metadata = _bare_csa2_metadata()
     metadata.is_cuda_graph = False
     metadata.kv_lens_cuda = torch.zeros(1, device=device)
     metadata.kv_cache_manager = SimpleNamespace(
@@ -50,20 +51,30 @@ def test_decoder_swa_slots_skip_reclaimed_encoder_pages(device):
     )
     # Encoder pages have already been released, so a decoder-only query pass
     # binds only the decoder layers' tables.
-    metadata.csa2_query_layer_start = 2
-    metadata._csa2_buffers = {}
-    metadata._csa2_swa_page_tables = {
+    metadata.ext(CSA2Metadata).csa2_query_layer_start = 2
+    metadata.ext(CSA2Metadata)._csa2_buffers = {}
+    metadata.ext(CSA2Metadata)._csa2_swa_page_tables = {
         2: torch.tensor([[2, 3]], dtype=torch.int32, device=device),
         3: torch.tensor([[4, 5]], dtype=torch.int32, device=device),
     }
-    metadata.csa2_positions = torch.tensor([128, 129], dtype=torch.int32, device=device)
-    metadata.csa2_token_requests = torch.zeros(2, dtype=torch.int64, device=device)
-    metadata.csa2_replay_start_positions = torch.zeros(1, dtype=torch.int64, device=device)
+    metadata.ext(CSA2Metadata).csa2_positions = torch.tensor(
+        [128, 129], dtype=torch.int32, device=device
+    )
+    metadata.ext(CSA2Metadata).csa2_token_requests = torch.zeros(
+        2, dtype=torch.int64, device=device
+    )
+    metadata.ext(CSA2Metadata).csa2_replay_start_positions = torch.zeros(
+        1, dtype=torch.int64, device=device
+    )
     if device == "cuda":
-        metadata._csa2_swa_descriptors = metadata._swa_table_descriptors(4)
-        metadata._csa2_swa_ratios = metadata._swa_ratio_tensor((0, 2, 1, 1))
-    metadata._csa2_swa_resolved = False
-    metadata._ensure_swa_slots()
+        metadata.ext(CSA2Metadata)._csa2_swa_descriptors = metadata.ext(
+            CSA2Metadata
+        )._swa_table_descriptors(4)
+        metadata.ext(CSA2Metadata)._csa2_swa_ratios = metadata.ext(CSA2Metadata)._swa_ratio_tensor(
+            (0, 2, 1, 1)
+        )
+    metadata.ext(CSA2Metadata)._csa2_swa_resolved = False
+    metadata.ext(CSA2Metadata)._ensure_swa_slots()
     for layer, pages in ((2, (2, 3)), (3, (4, 5))):
         expected = torch.tensor(
             [
@@ -71,15 +82,19 @@ def test_decoder_swa_slots_skip_reclaimed_encoder_pages(device):
                 for end in (128, 129)
             ]
         )
-        torch.testing.assert_close(metadata.csa2_swa_indices[layer].cpu(), expected)
-        torch.testing.assert_close(metadata.csa2_swa_write_slots[layer].cpu(), expected[:, -1])
         torch.testing.assert_close(
-            metadata.csa2_visible_lengths[layer].cpu(), torch.tensor([129, 130])
+            metadata.ext(CSA2Metadata).csa2_swa_indices[layer].cpu(), expected
+        )
+        torch.testing.assert_close(
+            metadata.ext(CSA2Metadata).csa2_swa_write_slots[layer].cpu(), expected[:, -1]
+        )
+        torch.testing.assert_close(
+            metadata.ext(CSA2Metadata).csa2_visible_lengths[layer].cpu(), torch.tensor([129, 130])
         )
     # Layers before the boundary bind no pages and read or write nothing.
     for layer in (0, 1):
-        assert (metadata.csa2_swa_indices[layer] == -1).all()
-        assert (metadata.csa2_swa_write_slots[layer] == -1).all()
+        assert (metadata.ext(CSA2Metadata).csa2_swa_indices[layer] == -1).all()
+        assert (metadata.ext(CSA2Metadata).csa2_swa_write_slots[layer] == -1).all()
 
 
 @pytest.fixture
@@ -157,12 +172,12 @@ def _prepare(metadata, requests, starts, lengths):
 
 def _swa(metadata, layer):
     """Resolve the SWA slots from the current inputs, as a forward does, and return one layer's."""
-    metadata._csa2_swa_resolved = False
-    metadata._ensure_swa_slots()
+    metadata.ext(CSA2Metadata)._csa2_swa_resolved = False
+    metadata.ext(CSA2Metadata)._ensure_swa_slots()
     return (
-        metadata.csa2_swa_indices[layer],
-        metadata.csa2_swa_write_slots[layer],
-        metadata.csa2_visible_lengths[layer],
+        metadata.ext(CSA2Metadata).csa2_swa_indices[layer],
+        metadata.ext(CSA2Metadata).csa2_swa_write_slots[layer],
+        metadata.ext(CSA2Metadata).csa2_visible_lengths[layer],
     )
 
 
@@ -171,10 +186,12 @@ def _swa(metadata, layer):
 @torch.inference_mode()
 def test_manager_metadata_scratch_and_source_capacity(manager_requests):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheRole
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 
     manager, requests = manager_requests
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
+    )
     _prepare(metadata, requests, [0, 0], [257, 257])
     _assert_swa_cpu_reference(metadata, manager, requests, [0, 0], [257, 257], [0, 0])
     reads, writes, _ = _swa(metadata, 1)
@@ -183,30 +200,43 @@ def test_manager_metadata_scratch_and_source_capacity(manager_requests):
     # longer than the 128-token window.
     torch.testing.assert_close(reads[128], writes[1:129])
     assert _swa(metadata, 0)[2].count_nonzero() == 0
-    assert metadata.get_compression_batch(3) is None
+    assert metadata.ext(CSA2Metadata).get_compression_batch(3) is None
     assert manager.get_main_buffer(1).stride(0) == 288
     assert manager.get_index_pages(1).shape[1:] == (64, 1, 68)
-    metadata.set_source_batch([5, 3], [0, 1])
+    metadata.ext(CSA2Metadata).set_source_batch([5, 3], [0, 1])
     _prepare(metadata, requests, [4, 3], [1, 1])
-    compression = metadata.get_compression_batch(1)
+    compression = metadata.ext(CSA2Metadata).get_compression_batch(1)
     assert compression.output_rows == 8
     assert compression.cu_seq_lengths.tolist() == [0, 5, 8]
     assert compression.cu_compressed_lengths.tolist() == [0, 2, 4]
-    assert metadata.get_compressed_positions(1).tolist() == [0, 2, 0, 2, 0, 0, 0, 0]
-    assert metadata.csa2_main_write_slots[1][4:].tolist() == [-1] * 4
+    assert metadata.ext(CSA2Metadata).get_compressed_positions(1).tolist() == [
+        0,
+        2,
+        0,
+        2,
+        0,
+        0,
+        0,
+        0,
+    ]
+    assert metadata.ext(CSA2Metadata).csa2_main_write_slots[1][4:].tolist() == [-1] * 4
     _prepare(metadata, requests, [0, 1], [1, 1])
-    assert metadata.get_compression_batch(1).cu_compressed_lengths.tolist() == [0, 0, 1]
-    completed = metadata.csa2_main_write_slots[1].tolist()
+    assert metadata.ext(CSA2Metadata).get_compression_batch(1).cu_compressed_lengths.tolist() == [
+        0,
+        0,
+        1,
+    ]
+    completed = metadata.ext(CSA2Metadata).csa2_main_write_slots[1].tolist()
     expected_page = manager.get_cache_indices(97, 1, CSA2CacheRole.GLOBAL)[0]
     assert completed == [expected_page * 64, -1]
     # Zero completed ratio-2 groups still prepare partial state and padded slots.
     _prepare(metadata, requests, [0, 0], [1, 1])
-    compression = metadata.get_compression_batch(1)
+    compression = metadata.ext(CSA2Metadata).get_compression_batch(1)
     assert compression.output_rows == 2
     assert compression.cu_seq_lengths.tolist() == [0, 1, 2]
     assert compression.cu_compressed_lengths.tolist() == [0, 0, 0]
-    assert metadata.csa2_main_write_slots[1].tolist() == [-1, -1]
-    assert metadata.get_compressed_positions(1).tolist() == [0, 0]
+    assert metadata.ext(CSA2Metadata).csa2_main_write_slots[1].tolist() == [-1, -1]
+    assert metadata.ext(CSA2Metadata).get_compressed_positions(1).tolist() == [0, 0]
     # Consumer and source resolve the same owner pages, without owning extra KV.
     assert manager.get_cache_indices(41, 1, CSA2CacheRole.GLOBAL) == manager.get_cache_indices(
         41, 2, CSA2CacheRole.GLOBAL
@@ -222,22 +252,24 @@ def test_swa_slots_resolve_once_per_forward(manager_requests, monkeypatch):
     if not kernel.dsl_available():
         pytest.skip("Counting native resolutions requires the CuTe DSL")
     manager, requests = manager_requests
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
+    )
     launches = []
     refresh = kernel.refresh_swa_slots
     monkeypatch.setattr(kernel, "refresh_swa_slots", lambda *a: launches.append(refresh(*a)))
     layers = [manager.layout.layer(i) for i in range(len(manager.layout.compress_ratios))]
 
     def forward():
-        metadata.begin_model_forward()
+        metadata.begin_forward()
         for layer in layers:
-            metadata.enter_layer(layer)
+            metadata.ext(CSA2Metadata).enter_layer(layer)
 
     _prepare(metadata, requests, [0, 0], [257, 257])
     forward()
     forward()
     metadata.on_update_kv_lens()
-    metadata.prepare_indexer(1)
+    metadata.ext(CSA2Metadata).prepare_indexer(1)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         forward()
@@ -250,14 +282,16 @@ def test_swa_slots_resolve_once_per_forward(manager_requests, monkeypatch):
 @torch.inference_mode()
 def test_manager_partial_compression_graph_and_strided_publication(manager_requests):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.compressor import CSA2Compressor
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
         pack_rows,
         store_rows,
     )
 
     manager, requests = manager_requests
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
+    )
     metadata = metadata.create_cuda_graph_metadata(2)
     compressor = CSA2Compressor(32, 512, 2, 1e-6).cuda()
     compressor.wkv_gate.weight.normal_(std=0.1)
@@ -266,10 +300,10 @@ def test_manager_partial_compression_graph_and_strided_publication(manager_reque
     _prepare(metadata, requests, [0, 0], [1, 1])
     manager.get_main_buffer(1).fill_(73)
     manager.get_index_pages(1).fill_(59)
-    compression = metadata.get_compression_batch(1)
-    write_slots = metadata.csa2_main_write_slots[1]
-    global_page_table = metadata.csa2_global_page_tables[1]
-    write_slot_mapping = metadata.csa2_main_write_slots
+    compression = metadata.ext(CSA2Metadata).get_compression_batch(1)
+    write_slots = metadata.ext(CSA2Metadata).csa2_main_write_slots[1]
+    global_page_table = metadata.ext(CSA2Metadata).csa2_global_page_tables[1]
+    write_slot_mapping = metadata.ext(CSA2Metadata).csa2_main_write_slots
 
     def forward():
         output = compressor(inputs, compression)
@@ -291,13 +325,13 @@ def test_manager_partial_compression_graph_and_strided_publication(manager_reque
         inputs.copy_(torch.randn_like(inputs))
         ordered = requests if step < 2 else requests[::-1]
         _prepare(metadata, ordered, [step, step], [1, 1])
-        refreshed = metadata.get_compression_batch(1)
-        assert metadata.csa2_main_write_slots is not write_slot_mapping
-        write_slot_mapping = metadata.csa2_main_write_slots
+        refreshed = metadata.ext(CSA2Metadata).get_compression_batch(1)
+        assert metadata.ext(CSA2Metadata).csa2_main_write_slots is not write_slot_mapping
+        write_slot_mapping = metadata.ext(CSA2Metadata).csa2_main_write_slots
         assert ptrs == (
-            metadata.csa2_main_write_slots[1].data_ptr(),
+            metadata.ext(CSA2Metadata).csa2_main_write_slots[1].data_ptr(),
             refreshed.start_positions.data_ptr(),
-            metadata.csa2_global_page_tables[1].data_ptr(),
+            metadata.ext(CSA2Metadata).csa2_global_page_tables[1].data_ptr(),
         )
         manager.get_main_buffer(1).fill_(73)
         values, gates = compressor.wkv_gate(inputs).float().split(512, dim=-1)
@@ -320,7 +354,7 @@ def test_manager_partial_compression_graph_and_strided_publication(manager_reque
             expected *= torch.rsqrt(expected.square().mean(-1, keepdim=True) + 1e-6)
             expected = (expected * compressor.norm.weight.float()).to(torch.bfloat16)
             torch.testing.assert_close(output, expected, atol=0.02, rtol=0.02)
-            slots = metadata.csa2_main_write_slots[1].long()
+            slots = metadata.ext(CSA2Metadata).csa2_main_write_slots[1].long()
             torch.testing.assert_close(manager.get_main_buffer(1)[slots], pack_rows(output, "main"))
         # Main stores must never overwrite the adjacent index bytes.
         assert torch.all(manager.get_index_pages(1) == 59)
@@ -337,7 +371,7 @@ def test_odd_prefix_reuse_compression_matches_fresh():
         CSA2CacheRole,
     )
     from tensorrt_llm._torch.attention.backends.sparse.csa2.compressor import CSA2Compressor
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
     from tensorrt_llm.bindings import DataType
     from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -366,7 +400,9 @@ def test_odd_prefix_reuse_compression_matches_fresh():
         dtype=DataType.BF16,
         vocab_size=8192,
     )
-    metadata = CSA2TrtllmMetadata(max_num_requests=3, max_num_tokens=1024, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=3, max_num_tokens=1024, kv_cache_manager=manager
+    )
     compressor = CSA2Compressor(32, 512, 2, 1e-6).cuda()
     compressor.wkv_gate.weight.normal_(std=0.1)
     torch.manual_seed(671)
@@ -383,9 +419,11 @@ def test_odd_prefix_reuse_compression_matches_fresh():
 
     def compress(request_id, start, values):
         _prepare(metadata, [SimpleNamespace(py_request_id=request_id)], [start], [len(values)])
-        output = compressor(values, metadata.get_compression_batch(0))
+        output = compressor(values, metadata.ext(CSA2Metadata).get_compression_batch(0))
         manager.write_swa(0, _swa(metadata, 0)[1], _values(compressor, values).bfloat16())
-        manager.write_global(0, metadata.csa2_main_write_slots[0], output, output[:, :128])
+        manager.write_global(
+            0, metadata.ext(CSA2Metadata).csa2_main_write_slots[0], output, output[:, :128]
+        )
         return output
 
     try:
@@ -437,7 +475,7 @@ def test_odd_prefix_reuse_compression_matches_fresh():
 def test_chain_rewind_preserves_compressor_and_swa(start, accepted_drafts):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
     from tensorrt_llm._torch.attention.backends.sparse.csa2.compressor import CSA2Compressor
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
     from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
         gather_rows,
@@ -474,8 +512,10 @@ def test_chain_rewind_preserves_compressor_and_swa(start, accepted_drafts):
         sampling_config=SamplingConfig(),
         is_streaming=False,
     )
-    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=512, kv_cache_manager=manager)
-    metadata.is_spec_decoding_enabled = True
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=1, max_num_tokens=512, kv_cache_manager=manager
+    )
+    metadata.ext(SpecDecodingMetadata).is_spec_decoding_enabled = True
     compressor = CSA2Compressor(32, 512, 2, 1e-6).cuda()
     compressor.wkv_gate.weight.normal_(std=0.1)
     torch.manual_seed(719 + start + accepted_drafts)
@@ -491,11 +531,13 @@ def test_chain_rewind_preserves_compressor_and_swa(start, accepted_drafts):
             use_cache=True, num_cached_tokens_per_seq=[position]
         )
         metadata.prepare()
-        output = compressor(values, metadata.get_compression_batch(0))
+        output = compressor(values, metadata.ext(CSA2Metadata).get_compression_batch(0))
         swa = _values(compressor, values).bfloat16()
         projected_swa.append(swa.clone())
         manager.write_swa(0, _swa(metadata, 0)[1], swa)
-        manager.write_global(0, metadata.csa2_main_write_slots[0], output, output[:, :128])
+        manager.write_global(
+            0, metadata.ext(CSA2Metadata).csa2_main_write_slots[0], output, output[:, :128]
+        )
         return output
 
     try:
@@ -556,14 +598,16 @@ def test_chain_rewind_preserves_compressor_and_swa(start, accepted_drafts):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_temporal_prior_identity_rewind_and_replay(manager_requests):
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
     from tensorrt_llm._torch.metadata import KVCacheParams
 
     manager, requests = manager_requests
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=8, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=8, kv_cache_manager=manager
+    )
     metadata.is_cuda_graph = True
     resets = []
-    metadata.register_indexer_reset(1, lambda: resets.append(True))
+    metadata.ext(CSA2Metadata).register_indexer_reset(1, lambda: resets.append(True))
 
     def prepare(ordered, positions):
         metadata.request_ids = [request.py_request_id for request in ordered]
@@ -574,15 +618,15 @@ def test_temporal_prior_identity_rewind_and_replay(manager_requests):
             use_cache=True, num_cached_tokens_per_seq=positions
         )
         metadata.prepare()
-        return metadata.prepare_indexer_prior(1, 4)
+        return metadata.ext(CSA2Metadata).prepare_indexer_prior(1, 4)
 
     prior = prepare(requests, [0, 0])
     assert torch.all(prior == -1)
-    assert metadata.csa2_indexer_prior_capacity[1].shape == (8, 4)
+    assert metadata.ext(CSA2Metadata).csa2_indexer_prior_capacity[1].shape == (8, 4)
     selected = torch.arange(8, device="cuda", dtype=torch.int32).view(2, 4)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        metadata.publish_indexer_prior(1, selected)
+        metadata.ext(CSA2Metadata).publish_indexer_prior(1, selected)
     graph.replay()
     prior = prepare(requests, [1, 1])
     torch.testing.assert_close(prior, selected)
@@ -607,28 +651,35 @@ def test_temporal_prior_identity_rewind_and_replay(manager_requests):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_retained_metadata_buffers_and_workspace_accounting(manager_requests):
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 
     manager, requests = manager_requests
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
+    )
     for length in (1, 2, 3, 4):
         _prepare(metadata, requests, [0, 0], [length, length])
-    eager_keys = [key for key in metadata._csa2_buffers if not key[-1]]
+    eager_keys = [key for key in metadata.ext(CSA2Metadata)._csa2_buffers if not key[-1]]
     assert len({key[0] for key in eager_keys}) == len(eager_keys)
-    frame = metadata.get_query_tile_metadata(
+    frame = metadata.ext(CSA2Metadata).get_query_tile_metadata(
         torch.zeros(2, 8, 512, device="cuda", dtype=torch.bfloat16), 17
     )
-    before = metadata.get_workspace_bytes()
-    metadata._csa2_buffers["alias", (), torch.bfloat16, False] = frame.swa_pool.view(-1)
-    assert metadata.get_workspace_bytes() == before
+    before = metadata.ext(CSA2Metadata).get_workspace_bytes()
+    metadata.ext(CSA2Metadata)._csa2_buffers["alias", (), torch.bfloat16, False] = frame.ext(
+        CSA2Metadata
+    ).swa_pool.view(-1)
+    assert metadata.ext(CSA2Metadata).get_workspace_bytes() == before
     extra = torch.empty(129, device="cuda", dtype=torch.uint8)
-    metadata._csa2_buffers["extra", (129,), torch.uint8, False] = extra
-    assert metadata.get_workspace_bytes() == before + extra.untyped_storage().nbytes()
+    metadata.ext(CSA2Metadata)._csa2_buffers["extra", (129,), torch.uint8, False] = extra
+    assert (
+        metadata.ext(CSA2Metadata).get_workspace_bytes()
+        == before + extra.untyped_storage().nbytes()
+    )
     # Exact sum of the graph descriptor allocations: block table, contexts,
     # visible lengths, position validity, radix scratch and one schedule. Index
     # rows are read from the owner's cache pages in place, so no page copies are retained.
     expected = 4 * (1 * (4 + 64) + 8 + 80 * 32) + (148 + 1) * 8
-    assert metadata.workspace_reservation_bytes(2, 4, 64, 32, 148) == expected
+    assert metadata.ext(CSA2Metadata).workspace_reservation_bytes(2, 4, 64, 32, 148) == expected
 
 
 @skip_pre_blackwell
@@ -637,13 +688,15 @@ def test_retained_metadata_buffers_and_workspace_accounting(manager_requests):
 def test_pageable_metadata_uploads_feed_captured_consumer(manager_requests):
     dtype = torch.int64
     manager, _ = manager_requests
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=8, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=8, kv_cache_manager=manager
+    )
     metadata.is_cuda_graph = True
     width, steps = 257, 64
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        buffer = metadata._copy_csa2_tensor(
+        buffer = metadata.ext(CSA2Metadata)._copy_csa2_tensor(
             "pageable_lifetime", torch.zeros(width, dtype=dtype, device="cpu")
         )
         address = buffer.data_ptr()
@@ -668,7 +721,7 @@ def test_pageable_metadata_uploads_feed_captured_consumer(manager_requests):
             else:
                 value = backing
             assert not value.is_pinned()
-            updated = metadata._copy_csa2_tensor("pageable_lifetime", value)
+            updated = metadata.ext(CSA2Metadata)._copy_csa2_tensor("pageable_lifetime", value)
             assert updated.data_ptr() == address
             del value, backing
             # Encourage immediate pageable allocation reuse before the consumer.
@@ -688,7 +741,7 @@ def test_pageable_metadata_uploads_feed_captured_consumer(manager_requests):
 @torch.inference_mode()
 def test_representable_draft_switch_restores_target_fields(manager_requests):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
     from tensorrt_llm._torch.speculative.interface import (
         prepare_attn_metadata_for_draft_replay,
         restore_attn_metadata_after_draft_replay,
@@ -718,7 +771,7 @@ def test_representable_draft_switch_restores_target_fields(manager_requests):
             assert draft.prepare_context(request)
             assert draft.resize_context(request, request.context_chunk_size)
         draft._stream.synchronize()
-        metadata = CSA2TrtllmMetadata(
+        metadata = CSA2TrtllmAttention.create_metadata(
             max_num_requests=2,
             max_num_tokens=1024,
             kv_cache_manager=target,
@@ -730,18 +783,18 @@ def test_representable_draft_switch_restores_target_fields(manager_requests):
             layer: _swa(metadata, layer)[0].clone()
             for layer in range(len(target.layout.compress_ratios))
         }
-        target_pages = dict(metadata._csa2_swa_page_tables)
+        target_pages = dict(metadata.ext(CSA2Metadata)._csa2_swa_page_tables)
         target_page_values = {layer: pages.clone() for layer, pages in target_pages.items()}
-        target_positions = metadata.csa2_positions
-        target_state = metadata.get_compression_batch(1).kv_state
+        target_positions = metadata.ext(CSA2Metadata).csa2_positions
+        target_state = metadata.ext(CSA2Metadata).get_compression_batch(1).kv_state
         resets = []
-        metadata.register_indexer_reset(1, lambda: resets.append("target"))
+        metadata.ext(CSA2Metadata).register_indexer_reset(1, lambda: resets.append("target"))
         saved = prepare_attn_metadata_for_draft_replay(metadata, draft)
         assert resets == ["target"]
-        metadata.register_indexer_reset(1, lambda: resets.append("draft"))
+        metadata.ext(CSA2Metadata).register_indexer_reset(1, lambda: resets.append("draft"))
         try:
             assert metadata.kv_cache_manager is draft
-            for layer, pages in metadata._csa2_swa_page_tables.items():
+            for layer, pages in metadata.ext(CSA2Metadata)._csa2_swa_page_tables.items():
                 torch.testing.assert_close(
                     target_pages[layer], target_page_values[layer], atol=0, rtol=0
                 )
@@ -752,8 +805,8 @@ def test_representable_draft_switch_restores_target_fields(manager_requests):
         _assert_swa_cpu_reference(metadata, target, requests, [0, 0], [1, 1], [0, 0])
         for layer, expected in target_reads.items():
             torch.testing.assert_close(_swa(metadata, layer)[0], expected, atol=0, rtol=0)
-        assert metadata.csa2_positions is target_positions
-        assert metadata.get_compression_batch(1).kv_state is target_state
+        assert metadata.ext(CSA2Metadata).csa2_positions is target_positions
+        assert metadata.ext(CSA2Metadata).get_compression_batch(1).kv_state is target_state
         assert resets == ["target", "target"]
         # A later draft switch restores its own cached callback/prior state;
         # contiguous identity must not suppress reset of shared emission state.
@@ -845,30 +898,37 @@ def test_batch_page_tables_match_per_request_converters(manager_requests):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_temporal_prefill_seeds_first_decode(manager_requests, monkeypatch):
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
     from tensorrt_llm._torch.metadata import KVCacheParams
 
     manager, requests = manager_requests
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=8, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=8, kv_cache_manager=manager
+    )
     _prepare(metadata, requests, [0, 0], [2, 2])
-    assert metadata.prepare_indexer_prior(1, 4).shape == (0, 4)
+    assert metadata.ext(CSA2Metadata).prepare_indexer_prior(1, 4).shape == (0, 4)
     selected = torch.arange(16, dtype=torch.int32, device="cuda").view(4, 4)
-    metadata.publish_indexer_prior(1, selected)
+    metadata.ext(CSA2Metadata).publish_indexer_prior(1, selected)
     metadata.seq_lens = torch.ones(2, dtype=torch.int32)
     metadata.num_contexts = 0
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[2, 2])
     metadata.prepare()
-    torch.testing.assert_close(metadata.prepare_indexer_prior(1, 4), selected[[1, 3]])
+    torch.testing.assert_close(
+        metadata.ext(CSA2Metadata).prepare_indexer_prior(1, 4), selected[[1, 3]]
+    )
     if torch.cuda.get_device_capability()[0] != 10:
         return  # Native FP4 paged descriptor coverage is validated on SM100.
     manager.get_index_pages(1).zero_()
-    assert metadata.prepare_indexer(1) is metadata
+    assert metadata.ext(CSA2Metadata).prepare_indexer(1) is metadata.ext(CSA2Metadata)
     # Index pages are read in place through the owner's block table.
-    assert metadata.csa2_indexer_k_cache.data_ptr() == manager.get_index_pages(1).data_ptr()
-    valid = metadata.csa2_indexer_valid_positions
+    assert (
+        metadata.ext(CSA2Metadata).csa2_indexer_k_cache.data_ptr()
+        == manager.get_index_pages(1).data_ptr()
+    )
+    valid = metadata.ext(CSA2Metadata).csa2_indexer_valid_positions
     offsets = torch.arange(valid.shape[1], device=valid.device)
     torch.testing.assert_close(
-        valid, offsets[None, :] < metadata.csa2_indexer_visible_lengths[:, None]
+        valid, offsets[None, :] < metadata.ext(CSA2Metadata).csa2_indexer_visible_lengths[:, None]
     )
 
 
@@ -876,13 +936,15 @@ def test_temporal_prefill_seeds_first_decode(manager_requests, monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_graph_workspace_is_independent_of_context_gather_cap(manager_requests):
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
     from tensorrt_llm._torch.metadata import KVCacheParams
 
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("Native FP4 paged descriptors require SM100-family GPUs")
     manager, requests = manager_requests
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=8, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=8, kv_cache_manager=manager
+    )
     metadata.is_cuda_graph = True
     metadata.request_ids = [request.py_request_id for request in requests]
     metadata.seq_lens = torch.ones(2, dtype=torch.int32)
@@ -891,12 +953,12 @@ def test_graph_workspace_is_independent_of_context_gather_cap(manager_requests):
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0, 0])
     metadata.prepare()
     manager.fp8_ctx_mla_kv_len_cap = 1
-    metadata.prepare_indexer(1)
-    metadata.prepare_indexer(3)
-    arenas = list(metadata._csa2_indexer_workspaces.values())
+    metadata.ext(CSA2Metadata).prepare_indexer(1)
+    metadata.ext(CSA2Metadata).prepare_indexer(3)
+    arenas = list(metadata.ext(CSA2Metadata)._csa2_indexer_workspaces.values())
     assert len(arenas) == 1
     assert arenas[0]["block_table"].shape[0] == metadata.max_num_requests
-    expected = metadata._workspace_storage_bytes(arenas)
+    expected = metadata.ext(CSA2Metadata)._workspace_storage_bytes(arenas)
     assert expected > 0
     from tensorrt_llm._torch.pyexecutor._util import (
         get_attention_workspace_fixed_bytes,
@@ -936,7 +998,9 @@ def replay_metadata():
         assert manager._resume_and_restore(request_id, cache)
         assert cache.resize(32)
     manager._stream.synchronize()
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=64, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=64, kv_cache_manager=manager
+    )
     yield manager, metadata
     for request_id in list(manager.kv_cache_map):
         manager.free_resources(SimpleNamespace(py_request_id=request_id))
@@ -969,7 +1033,7 @@ def _prepare_replay(metadata, prefixes, suffixes=None, *, decoder=False, ids=Non
     metadata.kv_cache_params = KVCacheParams(
         use_cache=True, num_cached_tokens_per_seq=[start for start, _ in ranges]
     )
-    metadata.set_swa_bounded_replay(prefixes, decoder=decoder)
+    metadata.ext(CSA2Metadata).set_swa_bounded_replay(prefixes, decoder=decoder)
     metadata.prepare()
     return ranges
 
@@ -981,34 +1045,40 @@ def test_owner_source_selection_and_one_shot_reset(replay_metadata):
     manager, metadata = replay_metadata
     assert _prepare_replay(metadata, [5, 6], [3, 2]) == ((1, 8), (2, 8))
     # Ratio2 replays one raw odd tail plus suffix; ratio1 only projects suffix.
-    assert metadata.csa2_global_source_indices[1].tolist() == [3, 4, 5, 6, 11, 12]
-    assert metadata.csa2_global_source_indices[4].tolist() == [4, 5, 6, 11, 12]
-    compression = metadata.get_compression_batch(1)
+    assert metadata.ext(CSA2Metadata).csa2_global_source_indices[1].tolist() == [3, 4, 5, 6, 11, 12]
+    assert metadata.ext(CSA2Metadata).csa2_global_source_indices[4].tolist() == [4, 5, 6, 11, 12]
+    compression = metadata.ext(CSA2Metadata).get_compression_batch(1)
     assert compression.start_positions.tolist() == [4, 6]
     assert compression.cu_seq_lengths.tolist() == [0, 4, 6]
     assert compression.cu_compressed_lengths.tolist() == [0, 2, 3]
-    assert set(metadata.csa2_global_source_indices) == {1, 4}
-    assert [metadata.csa2_kv_sources[layer] for layer in (0, 1, 2, 3, 4)] == [None, 1, 1, 1, 4]
+    assert set(metadata.ext(CSA2Metadata).csa2_global_source_indices) == {1, 4}
+    assert [metadata.ext(CSA2Metadata).csa2_kv_sources[layer] for layer in (0, 1, 2, 3, 4)] == [
+        None,
+        1,
+        1,
+        1,
+        4,
+    ]
     for layer in range(5):
         reads = _swa(metadata, layer)[0]
         assert reads[0, :-1].tolist() == [-1, -1, -1]
         assert reads[7, :-1].tolist() == [-1, -1, -1]
     hidden = torch.randn(13, 32, device="cuda", dtype=torch.bfloat16)
     torch.testing.assert_close(
-        metadata.select_global_source(1, hidden), hidden[[3, 4, 5, 6, 11, 12]]
+        metadata.ext(CSA2Metadata).select_global_source(1, hidden), hidden[[3, 4, 5, 6, 11, 12]]
     )
     with pytest.raises(ValueError, match="external source batch"):
-        metadata.select_global_source(1, hidden, hidden)
+        metadata.ext(CSA2Metadata).select_global_source(1, hidden, hidden)
     # A normal subsequent prepare consumes no stale replay floor or selector.
     metadata.seq_lens = torch.ones(2, dtype=torch.int32)
     metadata.num_contexts = 0
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[8, 8])
     metadata.prepare()
-    assert metadata.csa2_replay_mode is None
-    assert metadata.csa2_global_source_indices == {}
-    assert metadata.csa2_replay_start_positions.tolist() == [0, 0]
+    assert metadata.ext(CSA2Metadata).csa2_replay_mode is None
+    assert metadata.ext(CSA2Metadata).csa2_global_source_indices == {}
+    assert metadata.ext(CSA2Metadata).csa2_replay_start_positions.tolist() == [0, 0]
     next_hidden = hidden[:2]
-    assert metadata.select_global_source(1, next_hidden) is next_hidden
+    assert metadata.ext(CSA2Metadata).select_global_source(1, next_hidden) is next_hidden
 
 
 @skip_pre_blackwell
@@ -1020,20 +1090,20 @@ def test_replay_graph_updates_values_but_rejects_shape_or_mode_change(replay_met
     _prepare_replay(metadata, [5], [3])
     hidden = torch.randn(7, 32, device="cuda", dtype=torch.bfloat16)
     q = torch.zeros(7, 8, 512, device="cuda", dtype=torch.bfloat16)
-    metadata.get_query_tile_metadata(q, 4, query_start=0)
+    metadata.ext(CSA2Metadata).get_query_tile_metadata(q, 4, query_start=0)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        metadata.get_query_tile_metadata(q, 4, query_start=0)
-        selected = metadata.select_global_source(1, hidden)
-        positions = metadata.csa2_positions.clone()
-        write_slots = metadata.csa2_main_write_slots[1].clone()
+        metadata.ext(CSA2Metadata).get_query_tile_metadata(q, 4, query_start=0)
+        selected = metadata.ext(CSA2Metadata).select_global_source(1, hidden)
+        positions = metadata.ext(CSA2Metadata).csa2_positions.clone()
+        write_slots = metadata.ext(CSA2Metadata).csa2_main_write_slots[1].clone()
     # Same source/query shape at a different absolute hit position is valid.
     _prepare_replay(metadata, [7], [3], ids=[97])
     hidden.neg_()
     graph.replay()
     torch.testing.assert_close(selected, hidden[3:])
     torch.testing.assert_close(positions, torch.arange(3, 10, dtype=torch.int32, device="cuda"))
-    torch.testing.assert_close(write_slots, metadata.csa2_main_write_slots[1])
+    torch.testing.assert_close(write_slots, metadata.ext(CSA2Metadata).csa2_main_write_slots[1])
     with pytest.raises(ValueError, match="fresh graph metadata"):
         metadata.prepare()
     with pytest.raises(ValueError, match="fresh graph metadata"):
@@ -1056,7 +1126,7 @@ def test_replay_requires_first_window_row_to_be_physically_writable():
         # requires127..254. Page0 is genuinely absent in the real allocator.
         assert cache.resize(255, 255)
         manager._stream.synchronize()
-        metadata = CSA2TrtllmMetadata(
+        metadata = CSA2TrtllmAttention.create_metadata(
             max_num_requests=1, max_num_tokens=128, kv_cache_manager=manager
         )
         assert manager.get_swa_replay_ranges([255]) == ((127, 255),)
@@ -1072,32 +1142,41 @@ def test_replay_requires_first_window_row_to_be_physically_writable():
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("accepted_end", [128, 129, 130])
 def test_live_endpoint_refreshes_query_slots_and_compressed_groups(
-    monkeypatch, ratio, accepted_end, query_width
+    ratio, accepted_end, query_width
 ):
     # Base scheduler invalidation is orthogonal; exercise the actual CSA2 tensor
     # refresh without native allocations, including an odd ratio-two boundary.
-    monkeypatch.setattr(TrtllmAttentionMetadata, "on_update_kv_lens", lambda self: None)
-    metadata = CSA2TrtllmMetadata.__new__(CSA2TrtllmMetadata)
-    metadata._csa2_ready_for_kv_update = True
+    metadata = _bare_csa2_metadata()
+    metadata.ext(CSA2Metadata)._csa2_ready_for_kv_update = True
     metadata.kv_cache_manager = SimpleNamespace(
         tokens_per_block=128, layout=SimpleNamespace(window_size=128, compress_ratios=(ratio,))
     )
-    metadata._csa2_query_lengths = torch.tensor([query_width], dtype=torch.int32)
-    metadata._csa2_query_base = torch.tensor([129], dtype=torch.int32)
-    metadata._csa2_query_offsets = torch.arange(query_width, dtype=torch.int32)
+    metadata.ext(CSA2Metadata)._csa2_query_lengths = torch.tensor([query_width], dtype=torch.int32)
+    metadata.ext(CSA2Metadata)._csa2_query_base = torch.tensor([129], dtype=torch.int32)
+    metadata.ext(CSA2Metadata)._csa2_query_offsets = torch.arange(query_width, dtype=torch.int32)
     metadata.kv_lens_cuda = torch.tensor([accepted_end], dtype=torch.int32)
-    metadata.csa2_token_requests = torch.zeros(query_width, dtype=torch.int64)
-    metadata.csa2_positions = torch.empty(query_width, dtype=torch.int32)
-    metadata.csa2_replay_start_positions = torch.zeros(1, dtype=torch.int64)
-    metadata._csa2_swa_page_tables = {0: torch.tensor([[4, 7]], dtype=torch.int32)}
+    metadata.ext(CSA2Metadata).csa2_token_requests = torch.zeros(query_width, dtype=torch.int64)
+    metadata.ext(CSA2Metadata).csa2_positions = torch.empty(query_width, dtype=torch.int32)
+    metadata.ext(CSA2Metadata).csa2_replay_start_positions = torch.zeros(1, dtype=torch.int64)
+    metadata.ext(CSA2Metadata)._csa2_swa_page_tables = {
+        0: torch.tensor([[4, 7]], dtype=torch.int32)
+    }
     metadata.is_cuda_graph = False
-    metadata._csa2_source_geometry = {0: (torch.tensor([129]), torch.tensor([query_width]))}
-    metadata.csa2_main_write_slots = {0: torch.empty(query_width, dtype=torch.int64)}
-    metadata._csa2_compressed_positions = {0: torch.empty(query_width, dtype=torch.int32)}
-    metadata.csa2_global_page_sizes = {0: 128 // ratio}
-    metadata.csa2_global_page_tables = {0: torch.tensor([[9, 12]], dtype=torch.int32)}
+    metadata.ext(CSA2Metadata)._csa2_source_geometry = {
+        0: (torch.tensor([129]), torch.tensor([query_width]))
+    }
+    metadata.ext(CSA2Metadata).csa2_main_write_slots = {
+        0: torch.empty(query_width, dtype=torch.int64)
+    }
+    metadata.ext(CSA2Metadata)._csa2_compressed_positions = {
+        0: torch.empty(query_width, dtype=torch.int32)
+    }
+    metadata.ext(CSA2Metadata).csa2_global_page_sizes = {0: 128 // ratio}
+    metadata.ext(CSA2Metadata).csa2_global_page_tables = {
+        0: torch.tensor([[9, 12]], dtype=torch.int32)
+    }
     if ratio == 2:
-        metadata._csa2_compression = {
+        metadata.ext(CSA2Metadata)._csa2_compression = {
             0: CSA2CompressionBatch(
                 torch.empty(0),
                 torch.empty(0),
@@ -1112,30 +1191,33 @@ def test_live_endpoint_refreshes_query_slots_and_compressed_groups(
                 query_width,
             )
         }
-    identities = (metadata.csa2_positions.data_ptr(), metadata.csa2_main_write_slots[0].data_ptr())
-    metadata.on_update_kv_lens()
+    identities = (
+        metadata.ext(CSA2Metadata).csa2_positions.data_ptr(),
+        metadata.ext(CSA2Metadata).csa2_main_write_slots[0].data_ptr(),
+    )
+    metadata.ext(CSA2Metadata).on_kv_lens_changed(spec_dec_step=False)
     positions = list(range(accepted_end - query_width, accepted_end))
-    assert metadata.csa2_positions.tolist() == positions
+    assert metadata.ext(CSA2Metadata).csa2_positions.tolist() == positions
     # The layer resolves its SWA slots from the refreshed positions when entered.
     _, writes, visible = _swa(metadata, 0)
     assert writes.tolist() == [[4, 7][p // 128] * 128 + p % 128 for p in positions]
     assert visible.tolist() == [(p + 1) // ratio for p in positions]
     groups = list(range((accepted_end - query_width) // ratio, accepted_end // ratio))
     page_size = 128 // ratio
-    assert metadata.csa2_main_write_slots[0].tolist() == [
+    assert metadata.ext(CSA2Metadata).csa2_main_write_slots[0].tolist() == [
         [9, 12][g // page_size] * page_size + g % page_size for g in groups
     ] + [-1] * (query_width - len(groups))
-    assert metadata._csa2_compressed_positions[0].tolist() == [g * ratio for g in groups] + [0] * (
-        query_width - len(groups)
-    )
+    assert metadata.ext(CSA2Metadata)._csa2_compressed_positions[0].tolist() == [
+        g * ratio for g in groups
+    ] + [0] * (query_width - len(groups))
     if ratio == 2:
-        batch = metadata._csa2_compression[0]
+        batch = metadata.ext(CSA2Metadata)._csa2_compression[0]
         assert batch.start_positions.tolist() == [accepted_end - query_width]
         assert batch.kv_lengths.tolist() == [accepted_end]
         assert batch.cu_compressed_lengths.tolist() == [0, len(groups)]
     assert identities == (
-        metadata.csa2_positions.data_ptr(),
-        metadata.csa2_main_write_slots[0].data_ptr(),
+        metadata.ext(CSA2Metadata).csa2_positions.data_ptr(),
+        metadata.ext(CSA2Metadata).csa2_main_write_slots[0].data_ptr(),
     )
 
 
@@ -1143,43 +1225,56 @@ def test_paged_owner_mapping_and_request_reordering():
     pages = _page_metadata(
         torch.tensor([[2, 0], [1, -1]], dtype=torch.int32), torch.tensor([1, 0]), 2, 4
     )
-    assert pages.global_slot_tile(0, 0, 2).tolist() == [[2, 3, -1, -1], [4, 5, 0, 1]]
+    assert pages.ext(CSA2Metadata).global_slot_tile(0, 0, 2).tolist() == [
+        [2, 3, -1, -1],
+        [4, 5, 0, 1],
+    ]
     logical = torch.tensor([[1, 3, -1], [2, 0, 4]], dtype=torch.int32)
-    assert pages.global_slot_tile(0, 0, 2, logical).tolist() == [[3, -1, -1], [0, 4, -1]]
+    assert pages.ext(CSA2Metadata).global_slot_tile(0, 0, 2, logical).tolist() == [
+        [3, -1, -1],
+        [0, 4, -1],
+    ]
 
 
 def test_invalid_paged_request_does_not_alias_real_request():
     pages = _page_metadata(torch.tensor([[3], [7]]), torch.tensor([-1, 2, 1]), 2, 2)
-    assert pages.global_slot_tile(0, 0, 3).tolist() == [[-1, -1], [-1, -1], [14, 15]]
+    assert pages.ext(CSA2Metadata).global_slot_tile(0, 0, 3).tolist() == [
+        [-1, -1],
+        [-1, -1],
+        [14, 15],
+    ]
 
 
 def test_routing_reset_detaches_shallow_clone():
     metadata = _page_metadata(torch.tensor([[0]]), torch.tensor([0]), 1, 1)
     layout = CSA2Layout((1, 1), (0,), (0,))
-    metadata.enter_layer(layout.layer(0))
+    metadata.ext(CSA2Metadata).enter_layer(layout.layer(0))
     indices = torch.tensor([[0]])
-    metadata.csa2_indices[0] = indices
+    metadata.ext(CSA2Metadata).csa2_indices[0] = indices
     clone = copy(metadata)
-    clone.reset_routing()
-    assert clone.csa2_indices == {} and clone.csa2_candidates == {}
-    assert metadata.csa2_indices[0] is indices
-    clone.enter_layer(layout.layer(0))
+    clone.replace_ext(metadata.ext(CSA2Metadata).clone_for(clone))
+    clone.ext(CSA2Metadata).reset_routing()
+    assert (
+        clone.ext(CSA2Metadata).csa2_indices == {} and clone.ext(CSA2Metadata).csa2_candidates == {}
+    )
+    assert metadata.ext(CSA2Metadata).csa2_indices[0] is indices
+    clone.ext(CSA2Metadata).enter_layer(layout.layer(0))
     with pytest.raises(ValueError, match="across forwards"):
-        metadata.enter_layer(layout.layer(0))
-    metadata.reset_routing()
-    assert metadata.csa2_indices == {}
+        metadata.ext(CSA2Metadata).enter_layer(layout.layer(0))
+    metadata.ext(CSA2Metadata).reset_routing()
+    assert metadata.ext(CSA2Metadata).csa2_indices == {}
 
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_staging_excludes_out_of_capacity_rows() -> None:
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
 
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("Fused CSA2 gather requires SM100-family validation")
     q = torch.empty((2, 32, 512), dtype=torch.bfloat16, device="cuda")
-    metadata = CSA2TrtllmMetadata.for_query_tile(q, 17)
+    metadata = CSA2Metadata.for_query_tile(q, 17)
     swa = pack_rows(torch.randn(3, 512, dtype=torch.bfloat16, device="cuda"), "swa")
     main = pack_rows(torch.randn(3, 512, dtype=torch.bfloat16, device="cuda"), "main")
     swa_slots = torch.tensor([[0, 3, 2**40, -1], [3, -1, -1, -1]], device="cuda")
@@ -1187,8 +1282,8 @@ def test_staging_excludes_out_of_capacity_rows() -> None:
     inputs = CSA2BackendForwardArgs(
         swa_pool=swa, swa_indices=swa_slots, main_pool=main, topk_indices=main_slots
     )
-    metadata.stage_selected(inputs)
-    assert metadata.prepared_lens.tolist() == [2, 1]
+    metadata.ext(CSA2Metadata).stage_selected(inputs)
+    assert metadata.ext(CSA2Metadata).prepared_lens.tolist() == [2, 1]
     expected = torch.cat(
         (
             _staging_gather_reference(swa, swa_slots[:, :1], 512, "swa"),
@@ -1196,8 +1291,8 @@ def test_staging_excludes_out_of_capacity_rows() -> None:
         ),
         dim=1,
     )
-    _assert_staging_bf16_decode(metadata.swa_pool[0, :2], expected[0])
-    assert torch.count_nonzero(metadata.swa_pool[1, 0]) == 0
+    _assert_staging_bf16_decode(metadata.ext(CSA2Metadata).swa_pool[0, :2], expected[0])
+    assert torch.count_nonzero(metadata.ext(CSA2Metadata).swa_pool[1, 0]) == 0
 
 
 def _staging_gather_reference(pool, slots, dim, cache_format):
@@ -1223,9 +1318,9 @@ WINDOW = 128
 
 
 class _LifecycleMetadata(_FakeMetadata):
-    _get_csa2_buffer = CSA2TrtllmMetadata._get_csa2_buffer
-    _copy_host = CSA2TrtllmMetadata._copy_host
-    _copy_csa2_tensor = CSA2TrtllmMetadata._copy_csa2_tensor
+    _get_csa2_buffer = CSA2Metadata._get_csa2_buffer
+    _copy_host = CSA2Metadata._copy_host
+    _copy_csa2_tensor = CSA2Metadata._copy_csa2_tensor
 
     @property
     def num_generations(self) -> int:
@@ -1264,7 +1359,7 @@ def test_replay_preserves_live_speculative_kv_lifecycle(
     metadata.kv_lens_cuda[2] -= 3
     metadata.on_update_kv_lens()
     expected_kv = metadata.kv_lens_cuda.clone()
-    positions = metadata.csa2_positions.clone()
+    positions = metadata.ext(CSA2Metadata).csa2_positions.clone()
     untrimmed_swa = _swa(metadata, 0)[0][400:].clone()
     requests = [SimpleNamespace(py_ced_replay=None) for _ in range(2)] if pass_requests else None
     plan = plan_decoder_replay(metadata, WINDOW, requests, private_decoder=private_decoder)
@@ -1281,22 +1376,28 @@ def test_replay_preserves_live_speculative_kv_lifecycle(
     # Encoder handoffs are published after planning and cleared by prepare().
     topk = torch.arange(413 * 3, dtype=torch.int32).reshape(413, 3)
     candidates = torch.arange(413 * 2, dtype=torch.int32).reshape(413, 2)
-    metadata.csa2_indices[20] = topk
-    metadata.csa2_candidates[20] = candidates
-    metadata.csa2_precomputed_kv_layers = {20}
-    metadata._csa2_last_layer = 20
+    metadata.ext(CSA2Metadata).csa2_indices[20] = topk
+    metadata.ext(CSA2Metadata).csa2_candidates[20] = candidates
+    metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers = {20}
+    metadata.ext(CSA2Metadata)._csa2_last_layer = 20
     saved_prompt = metadata.prompt_lens
     original_buffer = metadata.kv_lens_cuda
     enter_decoder_replay(metadata, plan)
     assert metadata.prepare_calls == 1
     assert metadata.kv_lens_cuda is original_buffer
     torch.testing.assert_close(metadata.kv_lens_cuda, expected_kv, atol=0, rtol=0)
-    torch.testing.assert_close(metadata.csa2_positions, positions[plan.rows], atol=0, rtol=0)
-    torch.testing.assert_close(metadata.csa2_indices[20], topk[plan.rows], atol=0, rtol=0)
-    torch.testing.assert_close(metadata.csa2_candidates[20], candidates[plan.rows], atol=0, rtol=0)
-    assert metadata.csa2_precomputed_kv_layers == {20}
-    assert metadata._csa2_last_layer == 20
-    assert metadata.csa2_replay_query_rows is plan.rows
+    torch.testing.assert_close(
+        metadata.ext(CSA2Metadata).csa2_positions, positions[plan.rows], atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        metadata.ext(CSA2Metadata).csa2_indices[20], topk[plan.rows], atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        metadata.ext(CSA2Metadata).csa2_candidates[20], candidates[plan.rows], atol=0, rtol=0
+    )
+    assert metadata.ext(CSA2Metadata).csa2_precomputed_kv_layers == {20}
+    assert metadata.ext(CSA2Metadata)._csa2_last_layer == 20
+    assert metadata.ext(CSA2Metadata).csa2_replay_query_rows is plan.rows
     indices = _swa(metadata, 0)[0]
     torch.testing.assert_close((indices[:WINDOW] >= 0).sum(-1), torch.arange(1, WINDOW + 1))
     torch.testing.assert_close(indices[WINDOW - 1], torch.arange(400, 528))
@@ -1309,26 +1410,30 @@ def test_replay_preserves_live_speculative_kv_lifecycle(
     assert metadata.seq_lens is plan.saved_seq_lens
     assert metadata.seq_lens.tolist() == [400, 7, 6]
     assert metadata.kv_cache_params.num_cached_tokens_per_seq == [128, 700, 900]
-    assert metadata.csa2_replay_query_rows is None
+    assert metadata.ext(CSA2Metadata).csa2_replay_query_rows is None
     torch.testing.assert_close(metadata.kv_lens_cuda, expected_kv, atol=0, rtol=0)
 
 
 def test_remote_tail_decoder_masks_only_pre_handoff_context_swa() -> None:
     metadata = _LifecycleMetadata([4, 3], 1, [100, 200])
     metadata.prepare()
-    metadata._ensure_swa_slots()
-    generation_indices = metadata.csa2_swa_indices[0][4:].clone()
-    write_slots = metadata.csa2_swa_write_slots[0].clone()
+    metadata.ext(CSA2Metadata)._ensure_swa_slots()
+    generation_indices = metadata.ext(CSA2Metadata).csa2_swa_indices[0][4:].clone()
+    write_slots = metadata.ext(CSA2Metadata).csa2_swa_write_slots[0].clone()
 
     enter_remote_tail_decoder(metadata, [102])
     # The next decoder layer resolves the slots against the raised floors.
-    metadata._ensure_swa_slots()
+    metadata.ext(CSA2Metadata)._ensure_swa_slots()
 
-    context_indices = metadata.csa2_swa_indices[0][:4]
+    context_indices = metadata.ext(CSA2Metadata).csa2_swa_indices[0][:4]
     assert torch.all(context_indices[context_indices >= 0] >= 102)
-    torch.testing.assert_close(metadata.csa2_swa_indices[0][4:], generation_indices, atol=0, rtol=0)
+    torch.testing.assert_close(
+        metadata.ext(CSA2Metadata).csa2_swa_indices[0][4:], generation_indices, atol=0, rtol=0
+    )
     # The floor hides reads only: rows below it still store their SWA.
-    torch.testing.assert_close(metadata.csa2_swa_write_slots[0], write_slots, atol=0, rtol=0)
+    torch.testing.assert_close(
+        metadata.ext(CSA2Metadata).csa2_swa_write_slots[0], write_slots, atol=0, rtol=0
+    )
 
 
 def _assert_swa_cpu_reference(metadata, manager, requests, starts, lengths, floors, observed=None):
@@ -1375,7 +1480,7 @@ def _assert_swa_cpu_reference(metadata, manager, requests, starts, lengths, floo
 def test_coalesced_uploads_mixed_dtypes_empty_values_and_slab_growth():
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import _CoalescedUploads
 
-    metadata = CSA2TrtllmMetadata.__new__(CSA2TrtllmMetadata)
+    metadata = _bare_csa2_metadata()
     vars(metadata).update(
         is_cuda_graph=False, kv_lens_cuda=torch.empty(0, dtype=torch.int32, device="cuda")
     )
@@ -1386,7 +1491,7 @@ def test_coalesced_uploads_mixed_dtypes_empty_values_and_slab_growth():
             "empty": np.empty(0, dtype=np.int64),
             "scalar": torch.tensor(size, dtype=torch.int32),
         }
-        uploads = _CoalescedUploads(metadata)
+        uploads = _CoalescedUploads(metadata.ext(CSA2Metadata))
         outputs = {key: uploads.copy(key, value) for key, value in values.items()}
         uploads.flush()
         for key, value in values.items():
@@ -1397,10 +1502,10 @@ def test_coalesced_uploads_mixed_dtypes_empty_values_and_slab_growth():
 @pytest.mark.cpu_only
 def test_swa_write_interval_validation_preserves_errors():
     def check(pages, starts, lengths, floors, allocated, block):
-        rows, columns = CSA2TrtllmMetadata._swa_write_pages(
+        rows, columns = CSA2Metadata._swa_write_pages(
             starts, lengths, floors, allocated, block, pages.shape
         )
-        CSA2TrtllmMetadata._check_written_pages(pages.numpy()[rows, columns] >= 0)
+        CSA2Metadata._check_written_pages(pages.numpy()[rows, columns] >= 0)
 
     full = [1 << 30]
     check(torch.tensor([[-1, 7]]), [128], [2], [0], full, 128)  # Historical-only hole.
@@ -1455,7 +1560,7 @@ def test_forward_swa_resolution_matches_cpu_reference(queries):
         assert manager.prepare_context(request)
         assert manager.resize_context(request, request.context_chunk_size)
         manager._stream.synchronize()
-        metadata = CSA2TrtllmMetadata(
+        metadata = CSA2TrtllmAttention.create_metadata(
             max_num_requests=1, max_num_tokens=8192, kv_cache_manager=manager
         )
         metadata.request_ids = [request.py_request_id]
@@ -1465,7 +1570,7 @@ def test_forward_swa_resolution_matches_cpu_reference(queries):
         metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0])
         metadata.prepare()
         _assert_swa_cpu_reference(metadata, manager, [request], [0], [queries], [0])
-        assert metadata._csa2_ready_for_kv_update
+        assert metadata.ext(CSA2Metadata)._csa2_ready_for_kv_update
     finally:
         manager.free_resources(request)
         manager.shutdown()
@@ -1495,15 +1600,17 @@ def test_swa_resolution_integer_outputs_and_graph(monkeypatch, native):
         pages_host = [row[:table_width] for row in pages_host]
         positions = torch.tensor(positions_host, dtype=torch.int32, device="cuda")
         requests = torch.tensor(requests_host, dtype=torch.int64, device="cuda")
-        metadata = CSA2TrtllmMetadata.__new__(CSA2TrtllmMetadata)
+        metadata = _bare_csa2_metadata()
         vars(metadata).update(
             is_cuda_graph=False,
-            _csa2_buffers={},
             kv_lens_cuda=positions,
             kv_cache_manager=SimpleNamespace(
                 tokens_per_block=block,
                 layout=SimpleNamespace(window_size=window, compress_ratios=ratios),
             ),
+        )
+        vars(metadata.ext(CSA2Metadata)).update(
+            _csa2_buffers={},
             csa2_positions=positions,
             csa2_token_requests=requests,
             csa2_replay_start_positions=torch.tensor(floors_host, dtype=torch.int64, device="cuda"),
@@ -1518,8 +1625,12 @@ def test_swa_resolution_integer_outputs_and_graph(monkeypatch, native):
 
         def bind():
             if native:
-                metadata._csa2_swa_descriptors = metadata._swa_table_descriptors(3)
-                metadata._csa2_swa_ratios = metadata._swa_ratio_tensor(ratios)
+                metadata.ext(CSA2Metadata)._csa2_swa_descriptors = metadata.ext(
+                    CSA2Metadata
+                )._swa_table_descriptors(3)
+                metadata.ext(CSA2Metadata)._csa2_swa_ratios = metadata.ext(
+                    CSA2Metadata
+                )._swa_ratio_tensor(ratios)
 
         outputs = [
             tuple(
@@ -1531,13 +1642,13 @@ def test_swa_resolution_integer_outputs_and_graph(monkeypatch, native):
 
         def resolve_all(force=True):
             if force:
-                metadata._csa2_swa_resolved = False
-            metadata._ensure_swa_slots()
+                metadata.ext(CSA2Metadata)._csa2_swa_resolved = False
+            metadata.ext(CSA2Metadata)._ensure_swa_slots()
             for layer, kept in enumerate(outputs):
                 for name, out in zip(
                     ("csa2_swa_indices", "csa2_swa_write_slots", "csa2_visible_lengths"), kept
                 ):
-                    out.copy_(getattr(metadata, name)[layer])
+                    out.copy_(getattr(metadata.ext(CSA2Metadata), name)[layer])
 
         def check():
             # Independent scalar CPU oracle, including invalid request domains.
@@ -1579,7 +1690,7 @@ def test_swa_resolution_integer_outputs_and_graph(monkeypatch, native):
         with torch.cuda.graph(graph):
             # Eager warmup resolved these inputs; the captured forward clears
             # the flag at its start and records the launch.
-            metadata.reset_routing()
+            metadata.ext(CSA2Metadata).reset_routing()
             resolve_all(force=False)
         for page in (-1, 13):
             pages_host[0][0] = page
@@ -1588,11 +1699,11 @@ def test_swa_resolution_integer_outputs_and_graph(monkeypatch, native):
             positions_host[1] += 1
             positions.copy_(torch.tensor(positions_host, dtype=torch.int32, device="cuda"))
             requests.copy_(torch.tensor(requests_host, dtype=torch.int64, device="cuda"))
-            metadata.csa2_replay_start_positions.copy_(
+            metadata.ext(CSA2Metadata).csa2_replay_start_positions.copy_(
                 torch.tensor(floors_host, dtype=torch.int64, device="cuda")
             )
             for layer in range(3):
-                metadata._csa2_swa_page_tables[layer][0, 0] = page
+                metadata.ext(CSA2Metadata)._csa2_swa_page_tables[layer][0, 0] = page
             for kept in outputs:
                 for out in kept:
                     out.fill_(94)
@@ -1651,13 +1762,13 @@ def test_indexer_descriptors_expand_pages_and_mask_missing_pages():
                 expected_valid,
             )
             with torch.inference_mode():
-                CSA2TrtllmMetadata._fill_indexer_descriptors(
+                CSA2Metadata._fill_indexer_descriptors(
                     table, requests, decode_visible, 1, factor, 64, *outputs
                 )
                 if device == "cuda" and page_size == 128 and columns:
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
-                        CSA2TrtllmMetadata._fill_indexer_descriptors(
+                        CSA2Metadata._fill_indexer_descriptors(
                             table, requests, decode_visible, 1, factor, 64, *outputs
                         )
                     for value in outputs:
@@ -1675,23 +1786,25 @@ def test_indexer_descriptors_expand_pages_and_mask_missing_pages():
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("published_first", [False, True])
 def test_swa_table_backing_stays_fixed_across_publication_and_fallback(published_first):
-    metadata = CSA2TrtllmMetadata.__new__(CSA2TrtllmMetadata)
-    metadata._csa2_buffers = {}
+    metadata = _bare_csa2_metadata()
+    metadata.ext(CSA2Metadata)._csa2_buffers = {}
     metadata.kv_lens_cuda = torch.empty(0, dtype=torch.int32)
     metadata.is_cuda_graph = True
     outer = torch.arange(16, dtype=torch.int32).reshape(2, 2, 4)
     published = outer[:, 0, :3]
     host = torch.full((2, 3), 17, dtype=torch.int32)
-    first = metadata._bind_swa_pages(0, host, published if published_first else None)
+    first = metadata.ext(CSA2Metadata)._bind_swa_pages(
+        0, host, published if published_first else None
+    )
     pointer, stride = first.data_ptr(), first.stride()
     assert (pointer == published.data_ptr()) == published_first
     # Direct fallback refreshes captured backing, even when that backing is an
     # outer-table view rather than the old private contiguous allocation.
-    fallback = metadata._bind_swa_pages(0, host, None)
+    fallback = metadata.ext(CSA2Metadata)._bind_swa_pages(0, host, None)
     assert (fallback.data_ptr(), fallback.stride()) == (pointer, stride)
     torch.testing.assert_close(fallback, host, atol=0, rtol=0)
     other = torch.full((2, 2, 4), 29, dtype=torch.int32)[:, 0, :3]
-    normal = metadata._bind_swa_pages(0, host, other)
+    normal = metadata.ext(CSA2Metadata)._bind_swa_pages(0, host, other)
     assert (normal.data_ptr(), normal.stride()) == (pointer, stride)
     torch.testing.assert_close(normal, other, atol=0, rtol=0)
 
@@ -1702,18 +1815,18 @@ def test_swa_table_backing_stays_fixed_across_publication_and_fallback(published
 
     small = [torch.zeros((1, 4), dtype=torch.int32) for _ in range(2)]
     large = [torch.zeros((8, 4), dtype=torch.int32) for _ in range(2)]
-    metadata._csa2_swa_page_tables = dict(enumerate(small))
-    first = metadata._swa_table_descriptors(2)
-    metadata._csa2_swa_page_tables = dict(enumerate(large))
-    second = metadata._swa_table_descriptors(2)
+    metadata.ext(CSA2Metadata)._csa2_swa_page_tables = dict(enumerate(small))
+    first = metadata.ext(CSA2Metadata)._swa_table_descriptors(2)
+    metadata.ext(CSA2Metadata)._csa2_swa_page_tables = dict(enumerate(large))
+    second = metadata.ext(CSA2Metadata)._swa_table_descriptors(2)
     assert first.data_ptr() != second.data_ptr() and second.tolist() == rows(large)
-    metadata._csa2_swa_page_tables = dict(enumerate(small))
-    assert metadata._swa_table_descriptors(2).data_ptr() == first.data_ptr()
+    metadata.ext(CSA2Metadata)._csa2_swa_page_tables = dict(enumerate(small))
+    assert metadata.ext(CSA2Metadata)._swa_table_descriptors(2).data_ptr() == first.data_ptr()
     # Eager metadata refreshes a single buffer in place before every launch.
     metadata.is_cuda_graph = False
-    eager = metadata._swa_table_descriptors(2)
-    metadata._csa2_swa_page_tables = dict(enumerate(large))
-    assert metadata._swa_table_descriptors(2).data_ptr() == eager.data_ptr()
+    eager = metadata.ext(CSA2Metadata)._swa_table_descriptors(2)
+    metadata.ext(CSA2Metadata)._csa2_swa_page_tables = dict(enumerate(large))
+    assert metadata.ext(CSA2Metadata)._swa_table_descriptors(2).data_ptr() == eager.data_ptr()
     assert eager.tolist() == rows(large) and first.tolist() == rows(small)
 
 
@@ -1726,7 +1839,9 @@ def test_swa_fresh_publication_reuses_tables_and_keeps_captured_backing(
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheRole
 
     manager, requests = manager_requests
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
+    )
     metadata.is_cuda_graph = True
     # Physical publication order need not equal logical model-layer order.
     order = [2, 0, 3, 1]
@@ -1758,9 +1873,9 @@ def test_swa_fresh_publication_reuses_tables_and_keeps_captured_backing(
     assert len(conversions) == 1
     pointers = {
         layer: (value.data_ptr(), value.stride())
-        for layer, value in metadata._csa2_swa_page_tables.items()
+        for layer, value in metadata.ext(CSA2Metadata)._csa2_swa_page_tables.items()
     }
-    for layer, value in metadata._csa2_swa_page_tables.items():
+    for layer, value in metadata.ext(CSA2Metadata)._csa2_swa_page_tables.items():
         assert (
             value.data_ptr()
             == metadata.kv_cache_block_offsets[manager.layer_offsets[layer], :2, 0, :4].data_ptr()
@@ -1787,14 +1902,14 @@ def test_swa_fresh_publication_reuses_tables_and_keeps_captured_backing(
         remap(shift)
         conversions.clear()
         if direct:
-            metadata.prepare_csa2()
+            metadata.ext(CSA2Metadata).prepare_csa2()
         else:
             _prepare(metadata, order, [130, 131], [2, 1])
         assert len(conversions) == 1
         assert manager._swa_publication is manager._swa_publication_token is None
         assert pointers == {
             layer: (value.data_ptr(), value.stride())
-            for layer, value in metadata._csa2_swa_page_tables.items()
+            for layer, value in metadata.ext(CSA2Metadata)._csa2_swa_page_tables.items()
         }
         assert output_pointers == tuple(value.data_ptr() for value in _swa(metadata, 0))
         graph.replay()
@@ -1809,7 +1924,7 @@ def test_swa_fresh_publication_reuses_tables_and_keeps_captured_backing(
         assert len(conversions) == 2
         assert pointers == {
             layer: (value.data_ptr(), value.stride())
-            for layer, value in metadata._csa2_swa_page_tables.items()
+            for layer, value in metadata.ext(CSA2Metadata)._csa2_swa_page_tables.items()
         }
         _assert_swa_cpu_reference(metadata, manager, requests, [130, 131], [2, 1], [0, 0])
     finally:
@@ -1834,15 +1949,17 @@ def test_swa_layer_reference_matches_scalar_oracle(rows, window):
     if rows > 256:
         # Request 1 starts at floor 127: page 0 is history below the floor, never a write target.
         tables[1][1, 0] = -1
-    metadata = CSA2TrtllmMetadata.__new__(CSA2TrtllmMetadata)
+    metadata = _bare_csa2_metadata()
     vars(metadata).update(
         is_cuda_graph=False,
-        _csa2_buffers={},
         kv_lens_cuda=torch.empty(0, dtype=torch.int32),
         kv_cache_manager=SimpleNamespace(
             tokens_per_block=block,
             layout=SimpleNamespace(window_size=window, compress_ratios=ratios),
         ),
+    )
+    vars(metadata.ext(CSA2Metadata)).update(
+        _csa2_buffers={},
         csa2_positions=torch.tensor(positions, dtype=torch.int32),
         csa2_token_requests=requests_host,
         csa2_replay_start_positions=torch.tensor(floors, dtype=torch.int64),
@@ -1905,7 +2022,7 @@ def test_swa_refresh_preserves_per_layer_page_domains(device: str) -> None:
         )
         for pages, shape, ratio in zip(pages_host, shapes, ratios)
     )
-    CSA2TrtllmMetadata._refresh_swa_tensor_outputs(
+    CSA2Metadata._refresh_swa_tensor_outputs(
         positions, requests, floors, block, window, layer_inputs
     )
     for (_, reads, writes, visible, ratio), pages, (table_rows, width) in zip(
@@ -1938,51 +2055,52 @@ def test_native_staging_pools_cover_tma_fetch_window(
     dtype: torch.dtype, shared_rows: int | None
 ) -> None:
     q = torch.empty(1, 8, 512, device="cuda", dtype=torch.bfloat16)
-    metadata = CSA2TrtllmMetadata.for_query_tile(
+    metadata = CSA2Metadata.for_query_tile(
         q,
         0,
         staging_dtype=dtype,
         context_lengths=[1] if shared_rows is not None else None,
         shared_rows=shared_rows,
     )
+    csa2 = metadata.ext(CSA2Metadata)
     if shared_rows is None:
-        assert metadata.swa_pool.shape == (1, 128, 512)
-        assert metadata.extra_pool.shape == (1, 1, 512)
+        assert csa2.swa_pool.shape == (1, 128, 512)
+        assert csa2.extra_pool.shape == (1, 1, 512)
     else:
-        assert metadata.shared_pool.shape == (shared_rows, 512)
-        assert metadata.swa_pool is metadata.extra_pool is metadata.shared_pool
-    for pool in (metadata.swa_pool, metadata.extra_pool):
+        assert csa2.shared_pool.shape == (shared_rows, 512)
+        assert csa2.swa_pool is csa2.extra_pool is csa2.shared_pool
+    for pool in (csa2.swa_pool, csa2.extra_pool):
         assert pool.dtype == dtype and pool.is_contiguous()
         # TMA's encoded row domain is larger than these small logical pools.
         # Padding must be mapped memory retained by the view itself.
         backing = pool.untyped_storage()
         available = backing.nbytes() - (pool.data_ptr() - backing.data_ptr())
         assert available >= 128 * 1024
-    assert metadata.host_kv_cache_pool_pointers[0, 0].item() == metadata.swa_pool.data_ptr()
+    assert metadata.host_kv_cache_pool_pointers[0, 0].item() == csa2.swa_pool.data_ptr()
 
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_context_tile_cache_retains_latest_and_preserves_graph_and_dtype():
-    source = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=64)
+    source = CSA2TrtllmAttention.create_metadata(max_num_requests=2, max_num_tokens=64)
     q = torch.zeros(64, 8, 512, dtype=torch.bfloat16, device="cuda")
-    generation = source.get_query_tile_metadata(q[:2], 0)
-    generation.swa_pool.zero_()
+    generation = source.ext(CSA2Metadata).get_query_tile_metadata(q[:2], 0)
+    generation.ext(CSA2Metadata).swa_pool.zero_()
     generation.workspace.resize_(32).fill_(47)
     generation_workspace = generation.workspace
     generation_workspace_pointer = generation.workspace.data_ptr()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        assert source.get_query_tile_metadata(q[:2], 0) is generation
-        captured = generation.swa_pool.view(torch.uint8).clone()
+        assert source.ext(CSA2Metadata).get_query_tile_metadata(q[:2], 0) is generation
+        captured = generation.ext(CSA2Metadata).swa_pool.view(torch.uint8).clone()
         captured_workspace = generation.workspace.clone()
-    generation_pointer = generation.swa_pool.data_ptr()
+    generation_pointer = generation.ext(CSA2Metadata).swa_pool.data_ptr()
     source._num_ctx_tokens = source._num_tokens = 64
     source._num_contexts = 2
-    source.csa2_request_query_ranges = ((0, 32), (32, 64))
-    source.csa2_request_start_positions = (0, 512)
-    source.csa2_request_lengths = (32, 32)
+    source.ext(CSA2Metadata).csa2_request_query_ranges = ((0, 32), (32, 64))
+    source.ext(CSA2Metadata).csa2_request_start_positions = (0, 512)
+    source.ext(CSA2Metadata).csa2_request_lengths = (32, 32)
     protected = {}
     for heads, extra, dtype in (
         (8, 0, torch.bfloat16),
@@ -1994,10 +2112,10 @@ def test_context_tile_cache_retains_latest_and_preserves_graph_and_dtype():
         workspace = None
         high_water = 0
         for count in (16, 7, 12, 16, 5, 48, 9, 48):
-            frame = source.get_query_tile_metadata(
+            frame = source.ext(CSA2Metadata).get_query_tile_metadata(
                 queries[:count], extra, query_start=0, staging_dtype=dtype
             )
-            assert frame.swa_pool.dtype == dtype
+            assert frame.ext(CSA2Metadata).swa_pool.dtype == dtype
             assert frame.num_tokens == count and frame.num_ctx_tokens == count
             assert frame.num_contexts == (2 if count > 32 else 1)
             if workspace is None:
@@ -2007,27 +2125,29 @@ def test_context_tile_cache_retains_latest_and_preserves_graph_and_dtype():
             high_water = max(high_water, 32 + count)
             frame.workspace.resize_(high_water).fill_(count)
             for previous in protected.values():
-                assert any(tile is previous for tile in source._csa2_query_tiles.values())
+                assert any(
+                    tile is previous for tile in source.ext(CSA2Metadata)._csa2_query_tiles.values()
+                )
                 assert previous.workspace is not frame.workspace
             # Only the latest shape of an eager context family stays resident.
             assert (
                 sum(
                     1
-                    for key, tile in source._csa2_query_tiles.items()
+                    for key, tile in source.ext(CSA2Metadata)._csa2_query_tiles.items()
                     if tile.num_contexts
-                    and tile.swa_pool.dtype == dtype
+                    and tile.ext(CSA2Metadata).swa_pool.dtype == dtype
                     and key[1] == heads
                     and key[3] == (extra + 127) // 128 * 128
                 )
                 == 1
             )
-            assert generation.swa_pool.data_ptr() == generation_pointer
+            assert generation.ext(CSA2Metadata).swa_pool.data_ptr() == generation_pointer
             assert generation.workspace is generation_workspace
             assert generation.workspace.data_ptr() == generation_workspace_pointer
             assert frame.workspace is not generation_workspace
-            assert source.get_query_tile_metadata(q[:2], 0) is generation
-            generation.swa_pool.fill_(count)
-            expected = generation.swa_pool.view(torch.uint8).clone()
+            assert source.ext(CSA2Metadata).get_query_tile_metadata(q[:2], 0) is generation
+            generation.ext(CSA2Metadata).swa_pool.fill_(count)
+            expected = generation.ext(CSA2Metadata).swa_pool.view(torch.uint8).clone()
             graph.replay()
             torch.testing.assert_close(captured, expected, atol=0, rtol=0)
             torch.testing.assert_close(
@@ -2042,39 +2162,52 @@ def test_context_tile_cache_retains_latest_and_preserves_graph_and_dtype():
 @torch.inference_mode()
 def test_shared_context_domains_follow_owner_source_batch_and_replay(manager_requests):
     manager, requests = manager_requests
-    source = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
-    source.set_source_batch([200, 200], [0, 0])
+    source = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
+    )
+    source.ext(CSA2Metadata).set_source_batch([200, 200], [0, 0])
     _prepare(source, requests, [130, 131], [2, 1])
     q = torch.zeros(3, 8, 512, device="cuda", dtype=torch.bfloat16)
-    child = source.get_query_tile_metadata(q, 512, query_start=0, layer_idx=1)
+    child = source.ext(CSA2Metadata).get_query_tile_metadata(q, 512, query_start=0, layer_idx=1)
     workspace = child.workspace
     workspace.resize_(64).fill_(11)
-    other_owner = source.get_query_tile_metadata(q, 512, query_start=0, layer_idx=3)
+    other_owner = source.ext(CSA2Metadata).get_query_tile_metadata(
+        q, 512, query_start=0, layer_idx=3
+    )
     other_workspace = other_owner.workspace
     other_workspace.resize_(96).fill_(17)
     assert other_workspace is not workspace
-    first = child.shared_plan
+    first = child.ext(CSA2Metadata).shared_plan
     assert first is not None
-    assert first.main_rows == sum(source._csa2_main_domain_counts[1])
+    assert first.main_rows == sum(source.ext(CSA2Metadata)._csa2_main_domain_counts[1])
     assert first.main_rows >= 200  # source visibility, plus admitted page capacity
     assert first.swa_rows == 257
     assert first.swa_starts.tolist() == [3, 4]
     assert child.max_num_requests == 2 and child.num_tokens == 3
-    assert child.swa_pool.data_ptr() == child.extra_pool.data_ptr() == child.shared_pool.data_ptr()
-    assert child.shared_pool.shape == (1 + first.swa_rows + first.main_rows, 512)
-    reuse = source.get_query_tile_metadata(q, 512, query_start=0, layer_idx=2)
+    assert (
+        child.ext(CSA2Metadata).swa_pool.data_ptr()
+        == child.ext(CSA2Metadata).extra_pool.data_ptr()
+        == child.ext(CSA2Metadata).shared_pool.data_ptr()
+    )
+    assert child.ext(CSA2Metadata).shared_pool.shape == (1 + first.swa_rows + first.main_rows, 512)
+    reuse = source.ext(CSA2Metadata).get_query_tile_metadata(q, 512, query_start=0, layer_idx=2)
     assert reuse is child
-    assert reuse.shared_plan.main_pages.data_ptr() == first.main_pages.data_ptr()
-    assert reuse.shared_plan.swa_pages.data_ptr() != first.swa_pages.data_ptr()
+    assert reuse.ext(CSA2Metadata).shared_plan.main_pages.data_ptr() == first.main_pages.data_ptr()
+    assert reuse.ext(CSA2Metadata).shared_plan.swa_pages.data_ptr() != first.swa_pages.data_ptr()
     # Pure decoder replay has no newly projected GLOBAL rows, but reads cached C.
-    source.set_swa_bounded_replay([130, 130], decoder=True)
+    source.ext(CSA2Metadata).set_swa_bounded_replay([130, 130], decoder=True)
     _prepare(source, requests, [2, 2], [128, 128])
     q = torch.zeros(256, 8, 512, device="cuda", dtype=torch.bfloat16)
-    child = source.get_query_tile_metadata(q, 512, query_start=0, layer_idx=1)
-    assert child.shared_plan is not None and child.shared_plan.main_rows >= 130
+    child = source.ext(CSA2Metadata).get_query_tile_metadata(q, 512, query_start=0, layer_idx=1)
+    assert (
+        child.ext(CSA2Metadata).shared_plan is not None
+        and child.ext(CSA2Metadata).shared_plan.main_rows >= 130
+    )
     assert child.workspace is child.cuda_graph_workspace is workspace
     assert child.workspace.numel() == 64
-    other_owner = source.get_query_tile_metadata(q, 512, query_start=0, layer_idx=3)
+    other_owner = source.ext(CSA2Metadata).get_query_tile_metadata(
+        q, 512, query_start=0, layer_idx=3
+    )
     assert other_owner.workspace is other_owner.cuda_graph_workspace is other_workspace
     assert other_workspace.numel() == 96
     torch.testing.assert_close(workspace, torch.full_like(workspace, 11), atol=0, rtol=0)
@@ -2082,12 +2215,14 @@ def test_shared_context_domains_follow_owner_source_batch_and_replay(manager_req
         other_workspace, torch.full_like(other_workspace, 17), atol=0, rtol=0
     )
     assert child.max_num_requests == 2 and child.num_tokens == 256
-    assert child.shared_plan.swa_starts.tolist() == [2, 2]
-    assert child.shared_pool.shape[0] < q.shape[0] * 640
+    assert child.ext(CSA2Metadata).shared_plan.swa_starts.tolist() == [2, 2]
+    assert child.ext(CSA2Metadata).shared_pool.shape[0] < q.shape[0] * 640
     # Captured context keeps its existing independent-generation frame.
     source.is_cuda_graph = True
-    selected = source.get_query_tile_metadata(q, 512, query_start=0, layer_idx=1)
-    assert selected.shared_plan is None and selected.swa_pool.shape == (256, 128, 512)
+    selected = source.ext(CSA2Metadata).get_query_tile_metadata(q, 512, query_start=0, layer_idx=1)
+    assert selected.ext(CSA2Metadata).shared_plan is None and selected.ext(
+        CSA2Metadata
+    ).swa_pool.shape == (256, 128, 512)
     assert selected.num_contexts == 0
     assert selected.workspace is not workspace and selected.workspace is not other_workspace
 
@@ -2105,13 +2240,15 @@ def test_shared_context_covers_upward_live_endpoint_inside_published_pages(manag
     from .test_backend import _backend
 
     manager, requests = manager_requests
-    source = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
-    source.set_source_batch([200, 200], [0, 0])
+    source = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
+    )
+    source.ext(CSA2Metadata).set_source_batch([200, 200], [0, 0])
     _prepare(source, requests, [130, 131], [2, 1])
     source.kv_lens_cuda.fill_(260)
     source.on_update_kv_lens()
     logical = torch.tensor([[110], [111], [112]], dtype=torch.int64, device="cuda")
-    slots = source.global_slot_tile(1, 0, 3, logical)
+    slots = source.ext(CSA2Metadata).global_slot_tile(1, 0, 3, logical)
     assert torch.all(slots >= 0)
     manager.get_swa_buffer(1).zero_()
     manager.get_main_buffer(1).zero_()
@@ -2122,10 +2259,10 @@ def test_shared_context_covers_upward_live_endpoint_inside_published_pages(manag
         torch.zeros(3, 128, device="cuda", dtype=torch.bfloat16),
     )
     q = torch.zeros(3, 8, 512, device="cuda", dtype=torch.bfloat16)
-    shared = source.get_query_tile_metadata(q, 512, query_start=0, layer_idx=1)
-    assert shared.shared_plan is not None
-    assert shared.shared_plan.main_rows > 2 * (200 // 2)
-    selected = CSA2TrtllmMetadata.for_query_tile(q, 512, context_lengths=[2, 1])
+    shared = source.ext(CSA2Metadata).get_query_tile_metadata(q, 512, query_start=0, layer_idx=1)
+    assert shared.ext(CSA2Metadata).shared_plan is not None
+    assert shared.ext(CSA2Metadata).shared_plan.main_rows > 2 * (200 // 2)
+    selected = CSA2Metadata.for_query_tile(q, 512, context_lengths=[2, 1])
     backend = _backend(8)
 
     def arguments():
@@ -2156,12 +2293,14 @@ def test_compressor_readiness_uses_current_rows(manager_requests):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheRole
 
     manager, requests = manager_requests
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
+    )
     base = manager.host_kv_cache_block_offsets
     row = int(manager.index_mapper.get_copy_index([requests[0].py_request_id], 1, 1)[0])
 
     def prepare_source(length):
-        metadata.set_source_batch([length, 0], [127, 0])
+        metadata.ext(CSA2Metadata).set_source_batch([length, 0], [127, 0])
         _prepare(metadata, requests, [4, 4], [1, 1])
 
     prepare_source(2)  # Source spans logical pages 0 and 1.
@@ -2185,19 +2324,22 @@ def test_compressor_readiness_uses_current_rows(manager_requests):
 @torch.inference_mode()
 def test_first_decode_after_context_takes_full_prepare(manager_requests):
     manager, requests = manager_requests
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
+    )
     # A one-token context chunk (a full prefix hit) and then its first decode
     # step: the context geometry must not be reused for the generation rows.
     _prepare(metadata, requests, [126, 129], [1, 1])
     _prepare_decode_metadata(metadata, requests, [127, 130])
-    assert metadata.csa2_num_context_requests == 0
-    assert metadata.csa2_decode_row_requests is not None
+    assert metadata.ext(CSA2Metadata).csa2_num_context_requests == 0
+    assert metadata.ext(CSA2Metadata).csa2_decode_row_requests is not None
 
 
 def _decode_derived_outputs(metadata):
     # SWA outputs are resolved when a forward enters its first layer.
-    metadata._ensure_swa_slots()
-    outputs = {"positions": metadata.csa2_positions}
+    csa2 = metadata.ext(CSA2Metadata)
+    csa2._ensure_swa_slots()
+    outputs = {"positions": csa2.csa2_positions}
     for name in (
         "csa2_swa_indices",
         "csa2_swa_write_slots",
@@ -2205,8 +2347,8 @@ def _decode_derived_outputs(metadata):
         "csa2_main_write_slots",
         "_csa2_compressed_positions",
     ):
-        outputs.update({(name, layer): tensor for layer, tensor in getattr(metadata, name).items()})
-    for owner, batch in metadata._csa2_compression.items():
+        outputs.update({(name, layer): tensor for layer, tensor in getattr(csa2, name).items()})
+    for owner, batch in csa2._csa2_compression.items():
         for name in ("start_positions", "kv_lengths", "cu_compressed_lengths"):
             outputs[owner, name] = getattr(batch, name)
     return outputs
@@ -2220,9 +2362,9 @@ def _prepare_decode_metadata(metadata, requests, starts, *, deferred=False):
     metadata.num_contexts = 0
     metadata.prompt_lens = [request.prompt_len for request in requests]
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=starts)
-    with metadata.defer_cuda_graph_decode_outputs() if deferred else nullcontext():
+    with metadata.ext(CSA2Metadata).defer_decode_outputs() if deferred else nullcontext():
         metadata.prepare()
-    assert not metadata._csa2_defer_decode_outputs
+    assert not metadata.ext(CSA2Metadata)._csa2_defer_decode_outputs
 
 
 @skip_pre_blackwell
@@ -2230,11 +2372,13 @@ def _prepare_decode_metadata(metadata, requests, starts, *, deferred=False):
 @torch.inference_mode()
 def test_steady_decode_refreshes_page_tables_across_pages(manager_requests, monkeypatch):
     manager, requests = manager_requests
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
+    )
     refreshed = []
-    refresh = metadata._refresh_steady_page_tables
+    refresh = metadata.ext(CSA2Metadata)._refresh_steady_page_tables
     monkeypatch.setattr(
-        metadata,
+        metadata.ext(CSA2Metadata),
         "_refresh_steady_page_tables",
         lambda *args: refreshed.append(args[2][0]) or refresh(*args),
     )
@@ -2243,15 +2387,17 @@ def test_steady_decode_refreshes_page_tables_across_pages(manager_requests, monk
     for start in range(125, 131):
         starts = [start, start + 3]
         _prepare_decode_metadata(metadata, requests, starts)
-        reference = CSA2TrtllmMetadata(
+        reference = CSA2TrtllmAttention.create_metadata(
             max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
         )
         _prepare_decode_metadata(reference, requests, starts)
         observed = _decode_derived_outputs(metadata)
         for name, tensor in _decode_derived_outputs(reference).items():
             torch.testing.assert_close(observed[name], tensor)
-        for owner, table in reference.csa2_global_page_tables.items():
-            torch.testing.assert_close(metadata.csa2_global_page_tables[owner], table)
+        for owner, table in reference.ext(CSA2Metadata).csa2_global_page_tables.items():
+            torch.testing.assert_close(
+                metadata.ext(CSA2Metadata).csa2_global_page_tables[owner], table
+            )
     assert refreshed == [128]
 
 
@@ -2268,23 +2414,25 @@ def test_decode_graph_defers_derived_uploads_and_refreshes_all_outputs(
     from tensorrt_llm.bindings import SamplingConfig
 
     manager, requests = manager_requests
-    reference = CSA2TrtllmMetadata(
+    reference = CSA2TrtllmAttention.create_metadata(
         max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
     )
-    base = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
+    base = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
+    )
     metadata = base.create_cuda_graph_metadata(batch_size)
     copied = []
-    copy_host = metadata._copy_host
+    copy_host = metadata.ext(CSA2Metadata)._copy_host
 
     def record_copy(key, destination, value):
         copied.append(key)
         return copy_host(key, destination, value)
 
-    monkeypatch.setattr(metadata, "_copy_host", record_copy)
+    monkeypatch.setattr(metadata.ext(CSA2Metadata), "_copy_host", record_copy)
     selected = requests[:batch_size]
     starts = [127] * batch_size
     _prepare_decode_metadata(metadata, selected, starts, deferred=True)
-    assert metadata._csa2_deferred_decode_outputs
+    assert metadata.ext(CSA2Metadata)._csa2_deferred_decode_outputs
     inputs = object.__new__(DecoderInputPreparer)
     inputs.guided_decoder = None
     pointers = {
@@ -2319,7 +2467,7 @@ def test_decode_graph_defers_derived_uploads_and_refreshes_all_outputs(
         }
         copied.clear()
         _prepare_decode_metadata(metadata, selected, starts, deferred=True)
-        assert metadata._csa2_deferred_decode_outputs
+        assert metadata.ext(CSA2Metadata)._csa2_deferred_decode_outputs
         if steady_start > 130:
             assert not copied
         for tensor in _decode_derived_outputs(metadata).values():
@@ -2383,7 +2531,7 @@ def test_decode_graph_defers_derived_uploads_and_refreshes_all_outputs(
 
     # Graph metadata used by a direct caller must still be fully initialized.
     _prepare_decode_metadata(metadata, selected, starts)
-    assert not metadata._csa2_deferred_decode_outputs
+    assert not metadata.ext(CSA2Metadata)._csa2_deferred_decode_outputs
     for name, tensor in _decode_derived_outputs(metadata).items():
         torch.testing.assert_close(tensor, expected[name], atol=0, rtol=0)
 
@@ -2404,7 +2552,9 @@ def test_decode_graph_defers_derived_uploads_and_refreshes_all_outputs(
 @torch.inference_mode()
 def test_decode_graph_deferral_keeps_unsupported_prepare_paths_complete(manager_requests, fallback):
     manager, requests = manager_requests
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
+    metadata = CSA2TrtllmAttention.create_metadata(
+        max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
+    )
     metadata.is_cuda_graph = fallback != "eager"
     metadata.request_ids = [request.py_request_id for request in requests]
     metadata.seq_lens = torch.ones(2, dtype=torch.int32)
@@ -2412,23 +2562,23 @@ def test_decode_graph_deferral_keeps_unsupported_prepare_paths_complete(manager_
     metadata.prompt_lens = [257, 257]
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[127, 128])
     if fallback == "source":
-        metadata.set_source_batch([1, 1], [127, 128])
+        metadata.ext(CSA2Metadata).set_source_batch([1, 1], [127, 128])
     if fallback == "remote_tail":
         metadata.csa2_remote_tail_mode = "decode"
     if fallback == "speculative":
-        metadata.is_spec_decoding_enabled = True
-    with metadata.defer_cuda_graph_decode_outputs():
+        metadata.ext(SpecDecodingMetadata).is_spec_decoding_enabled = True
+    with metadata.ext(CSA2Metadata).defer_decode_outputs():
         metadata.prepare()
-    assert not metadata._csa2_deferred_decode_outputs
-    assert metadata.csa2_positions.tolist() == [127, 128]
+    assert not metadata.ext(CSA2Metadata)._csa2_deferred_decode_outputs
+    assert metadata.ext(CSA2Metadata).csa2_positions.tolist() == [127, 128]
     _assert_swa_cpu_reference(metadata, manager, requests, [127, 128], [1, 1], [0, 0])
 
 
 @pytest.mark.cpu_only
 def test_decode_graph_prepare_scope_restores_proof_after_exception():
-    metadata = object.__new__(CSA2TrtllmMetadata)
+    metadata = _bare_csa2_metadata()
     with pytest.raises(RuntimeError, match="prepare failed"):
-        with metadata.defer_cuda_graph_decode_outputs():
-            assert metadata._csa2_defer_decode_outputs
+        with metadata.ext(CSA2Metadata).defer_decode_outputs():
+            assert metadata.ext(CSA2Metadata)._csa2_defer_decode_outputs
             raise RuntimeError("prepare failed")
-    assert not metadata._csa2_defer_decode_outputs
+    assert not metadata.ext(CSA2Metadata)._csa2_defer_decode_outputs

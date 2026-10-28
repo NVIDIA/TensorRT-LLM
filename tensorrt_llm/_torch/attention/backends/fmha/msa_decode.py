@@ -136,7 +136,10 @@ class MsaDecodeFmha(PhasedFmha):
         from ..sparse.minimax_m3.kernels.msa_utils import write_msa_phase_kv
 
         metadata = params.meta
-        span = metadata.msa_decode_span
+        from ..sparse.minimax_m3.msa_backend import MiniMaxM3MsaMetadata
+
+        msa = metadata.ext(MiniMaxM3MsaMetadata)
+        span = msa.msa_decode_span
         # Both kernels below map a query token to its request through the span,
         # while the phase params carry PhasedFmha's own derivation of the same
         # boundary. Checking them against each other rejects a step whose
@@ -159,8 +162,8 @@ class MsaDecodeFmha(PhasedFmha):
         )
         row_first = params.seq_offset
         row_last = row_first + metadata.num_generations
-        block_table = metadata.msa_block_table[row_first:row_last]
-        seq_lens = metadata.msa_seq_lens_cuda[row_first:row_last]
+        block_table = msa.msa_block_table[row_first:row_last]
+        seq_lens = msa.msa_seq_lens_cuda[row_first:row_last]
 
         kv_block_indexes = params.fwd.sparse_runtime_params.sparse_attn_indices
         if kv_block_indexes is not None:
@@ -238,12 +241,15 @@ class MsaDecodeFmha(PhasedFmha):
 
         attn = params.attn
         metadata = params.meta
+        from ..sparse.minimax_m3.msa_backend import MiniMaxM3MsaMetadata
+
+        msa = metadata.ext(MiniMaxM3MsaMetadata)
         head_dim = attn.head_dim
         num_tokens = params.num_tokens
         row_first = params.seq_offset
         # The sub-page block table prepare() staged, if it could; the kernel
         # expands its own when the factor does not match this layer's.
-        staged_table, staged_factor = metadata.msa_subpage_rows(
+        staged_table, staged_factor = msa.msa_subpage_rows(
             row_first, row_first + metadata.num_generations
         )
         if self._dense_layout is None:
@@ -261,7 +267,7 @@ class MsaDecodeFmha(PhasedFmha):
             sm_scale=(head_dim**-0.5) / float(attn.q_scaling),
             output=params.output.view(num_tokens, attn.num_heads, head_dim),
             decode_query_len=params.input_seq_length,
-            max_seq_len=int(metadata.msa_max_kv_len),
+            max_seq_len=int(msa.msa_max_kv_len),
             max_num_requests=int(metadata.max_num_requests),
             staged_subpage_table=staged_table,
             staged_subpages_per_slot=staged_factor,

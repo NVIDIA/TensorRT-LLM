@@ -170,6 +170,8 @@ def write_msa_phase_kv(
     MiniMaxM3MsaSparseAttention.write_layer_caches ahead of its indexer,
     tells both libraries the cache is already resident.
     """
+    from ..msa_backend import MiniMaxM3MsaMetadata
+
     if attention_input_type != AttentionInputType.mixed:
         raise NotImplementedError(
             "MiniMax-M3 MSA attention requires the mixed attention input type, "
@@ -178,13 +180,14 @@ def write_msa_phase_kv(
         )
     if k is None or v is None:
         return
+    msa = metadata.ext(MiniMaxM3MsaMetadata)
     num_tokens = int(k.shape[0])
     if num_tokens == 0:
         return
     write_msa_main_kv(
         metadata.kv_cache_manager,
         attn.layer_idx,
-        metadata.msa_out_cache_loc[token_offset : token_offset + num_tokens],
+        msa.msa_out_cache_loc[token_offset : token_offset + num_tokens],
         k,
         v,
         # k and v are this phase's own token slice, so every row owns a slot.

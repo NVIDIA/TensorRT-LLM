@@ -11,14 +11,15 @@ import torch
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCState, mHC
 
 from .....pyexecutor.ced_replay import EncoderReplay
-from .metadata import CSA2TrtllmMetadata
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
     from .....pyexecutor.llm_request import LlmRequest
 
 
 def prepare_ced_global_kv(
-    layer, hc_state: HCState, metadata: CSA2TrtllmMetadata
+    layer, hc_state: HCState, metadata: TrtllmAttentionMetadata
 ) -> torch.Tensor | None:
     """Write GLOBAL; a context-only source also returns its output before normalization."""
     attention = layer.self_attn

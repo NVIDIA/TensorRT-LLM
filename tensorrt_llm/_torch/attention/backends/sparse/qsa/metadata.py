@@ -1,164 +1,99 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Attention metadata for QSA sparse attention."""
+"""Attention metadata state for QSA sparse attention."""
 
-from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.features import DraftKVMetadata
+from tensorrt_llm._torch.attention.backends.sparse.params import (
+    MTPIndexShareExtension,
+    SparseAlgorithmExtension,
+)
 
 from .constants import QSA_KEY_ROLE_INDEX
 from .kernels import triton_qsa_unscale_block_table
 from .params import QSASparseMetadataParams
 
 
-# Keep inherited dataclass fields while intercepting one QSA-only constructor arg.
-@dataclass(init=False)
-class QSAAttentionMetadata(TrtllmAttentionMetadata):
-    """Extend TRTLLM metadata with graph-stable QSA page and row mappings."""
+class QSAMetadata(SparseAlgorithmExtension, MTPIndexShareExtension):
+    """Graph-stable QSA page and row mappings of a TRTLLM metadata."""
 
-    sparse_metadata_params: Optional[QSASparseMetadataParams] = None
-    qsa_needs_speculative_snapshot: bool = field(
-        init=False,
-        default=False,
-        repr=False,
-    )
-    qsa_has_local_layers: bool = field(
-        init=False,
-        default=False,
-        repr=False,
-    )
-
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        # Forwards the parent dataclass's full field set, so the signature
-        # stays open rather than restating it.
+    def allocate(self, buffers) -> None:
         """Allocate the fixed-shape QSA buffers updated before each graph replay."""
-        sparse_attention_config = kwargs.pop("sparse_attention_config", None)
-        if kwargs.get("sparse_metadata_params") is None and sparse_attention_config is not None:
-            kwargs["sparse_metadata_params"] = sparse_attention_config.to_sparse_metadata_params()
-        # The generated parent initializer dispatches to this class's
-        # ``__post_init__``; keep QSA validation there so both constructor forms
-        # (lowered params or the legacy user config) enforce the same contract.
-        super().__init__(*args, **kwargs)
-
-    def __post_init__(self) -> None:
         from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
 
-        super().__post_init__()
+        md = self.metadata
+        self.needs_speculative_snapshot = False
         # Draft-loop state; set by the speculative driver, read by the indexer.
-        self.qsa_in_mtp_draft_loop = False
-        self.qsa_indexer_skip_topk = False
-        self.qsa_mtp_num_accepted: Optional[torch.Tensor] = None
-        self.qsa_shared_topk_indices: Optional[torch.Tensor] = None
-        self.qsa_shared_topk_visible_blocks: Optional[torch.Tensor] = None
-        self.qsa_shared_topk_captured_slots: set[int] = set()
-        self.qsa_draft_block_table: Optional[torch.Tensor] = None
-        if not isinstance(self.kv_cache_manager, Qwen4ExpHybridCacheManager):
+        self.in_mtp_draft_loop = False
+        self.indexer_skip_topk = False
+        self.mtp_num_accepted: Optional[torch.Tensor] = None
+        self.shared_topk_indices: Optional[torch.Tensor] = None
+        self.shared_topk_visible_blocks: Optional[torch.Tensor] = None
+        self.shared_topk_captured_slots: set[int] = set()
+        self.draft_block_table: Optional[torch.Tensor] = None
+        if not isinstance(md.kv_cache_manager, Qwen4ExpHybridCacheManager):
             raise TypeError("QSA sparse attention requires Qwen4ExpHybridCacheManager")
-        if not isinstance(self.sparse_metadata_params, QSASparseMetadataParams):
+        params = md.sparse_metadata_params
+        if not isinstance(params, QSASparseMetadataParams):
             raise TypeError("QSA sparse attention requires QSASparseMetadataParams")
-        self.qsa_has_local_layers = self.kv_cache_manager.qsa_position_layer_id is not None
-        if not self.qsa_has_local_layers:
+        self.params = params
+        self.has_local_layers = md.kv_cache_manager.qsa_position_layer_id is not None
+        if not self.has_local_layers:
             # A PP rank may own only recurrent layers. It still uses the hybrid
-            # manager and parent metadata, but needs no QSA page views.
+            # manager and core metadata, but needs no QSA page views.
             return
-        capture_graph = self.is_cuda_graph
-        buffers = self.cuda_graph_buffers
 
-        # The sparse kernels index raw V2 pool pages, while the parent metadata
+        # The sparse kernels index raw V2 pool pages, while the core metadata
         # stores attention-operator encoded offsets. Keep an unscaled table.
-        self.qsa_block_table = self.get_empty(
-            buffers,
-            (
-                self.max_num_sequences,
-                self.kv_cache_manager.max_blocks_per_seq,
-            ),
-            cache_name="qsa_block_table",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
+        self.block_table = md.get_buffer(
+            (md.max_num_sequences, md.kv_cache_manager.max_blocks_per_seq),
+            torch.int32,
+            "qsa_block_table",
         )
-        self._qsa_attention_pool_id, self._qsa_page_index_scale = (
-            self.kv_cache_manager.get_qsa_attention_pool_layout()
+        self._attention_pool_id, self._page_index_scale = (
+            md.kv_cache_manager.get_qsa_attention_pool_layout()
         )
-        self._init_qsa_draft_block_table()
+        self._init_draft_block_table()
 
         # Packed-row mapping shared by compression, selection, and sparse GQA.
-        self.qsa_req_idx_per_token = self.get_empty(
-            buffers,
-            (self.max_num_tokens,),
-            cache_name="qsa_req_idx_per_token",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
+        self.req_idx_per_token = md.get_buffer(
+            (md.max_num_tokens,), torch.int32, "qsa_req_idx_per_token"
         )
-        self.qsa_logical_positions = self.get_empty(
-            buffers,
-            (self.max_num_tokens,),
-            cache_name="qsa_logical_positions",
-            dtype=torch.int64,
-            capture_graph=capture_graph,
+        self.logical_positions = md.get_buffer(
+            (md.max_num_tokens,), torch.int64, "qsa_logical_positions"
         )
-        self.qsa_sequence_lengths = self.get_empty(
-            buffers,
-            (self.max_num_tokens,),
-            cache_name="qsa_sequence_lengths",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
+        self.sequence_lengths = md.get_buffer(
+            (md.max_num_tokens,), torch.int32, "qsa_sequence_lengths"
         )
-        self.qsa_visible_blocks = self.get_empty(
-            buffers,
-            (self.max_num_tokens,),
-            cache_name="qsa_visible_blocks",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
+        self.visible_blocks = md.get_buffer((md.max_num_tokens,), torch.int32, "qsa_visible_blocks")
 
         # Reuse graph-stable row IDs instead of allocating arange each step.
-        self._qsa_token_arange = self.get_empty(
-            buffers,
-            (self.max_num_tokens,),
-            cache_name="qsa_token_arange",
-            dtype=torch.int64,
-            capture_graph=capture_graph,
-        )
-        self._qsa_token_arange.copy_(
+        self._token_arange = md.get_buffer((md.max_num_tokens,), torch.int64, "qsa_token_arange")
+        self._token_arange.copy_(
             torch.arange(
-                self.max_num_tokens,
-                device=self._qsa_token_arange.device,
+                md.max_num_tokens,
+                device=self._token_arange.device,
                 dtype=torch.int64,
             )
         )
         # The leading zero turns request lengths into packed-row boundaries.
-        self._qsa_cu_seq_lens = self.get_empty(
-            buffers,
-            (self.max_num_sequences + 1,),
-            cache_name="qsa_cu_seq_lens",
-            dtype=torch.int64,
-            capture_graph=capture_graph,
+        self._cu_seq_lens = md.get_buffer(
+            (md.max_num_sequences + 1,), torch.int64, "qsa_cu_seq_lens"
         )
-        self._qsa_cu_seq_lens.zero_()
+        self._cu_seq_lens.zero_()
 
         # TopK writes in place; caller ownership keeps the address graph-stable.
-        self.qsa_topk_indices = self.get_empty(
-            buffers,
-            (
-                self.max_num_tokens,
-                self.sparse_metadata_params.block_topk,
-            ),
-            cache_name="qsa_topk_indices",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
+        self.topk_indices = md.get_buffer(
+            (md.max_num_tokens, params.block_topk), torch.int32, "qsa_topk_indices"
         )
         # Per-row Top-K lower bounds; QSA searches every row from zero.
-        self.qsa_topk_row_starts = self.get_empty(
-            buffers,
-            (self.max_num_tokens,),
-            cache_name="qsa_topk_row_starts",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
+        self.topk_row_starts = md.get_buffer(
+            (md.max_num_tokens,), torch.int32, "qsa_topk_row_starts"
         )
-        self.qsa_topk_row_starts.zero_()
+        self.topk_row_starts.zero_()
 
         # One captured selection per sparse layer and request, reused by the
         # MTP draft loop. The layer axis is required because each layer runs
@@ -166,32 +101,24 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         # selections differ. ``shared_topk_visible_blocks`` records how many
         # compressed groups were complete when the row was captured, so the
         # reuse can tell which groups formed afterwards.
-        if self.sparse_metadata_params.mtp_index_share:
+        if params.mtp_index_share:
             # Slots are numbered by the bound manager; the draft loop binds the
             # separate draft manager.
-            num_slots = len(self.kv_cache_manager.qsa_shared_topk_slots)
-            if self.qsa_draft_block_table is not None:
-                num_slots = max(num_slots, len(self.draft_kv_cache_manager.qsa_shared_topk_slots))
-            self.qsa_shared_topk_indices = self.get_empty(
-                buffers,
-                (
-                    num_slots,
-                    self.max_num_sequences,
-                    self.sparse_metadata_params.block_topk,
-                ),
-                cache_name="qsa_shared_topk_indices",
-                dtype=torch.int32,
-                capture_graph=capture_graph,
+            num_slots = len(md.kv_cache_manager.qsa_shared_topk_slots)
+            if self.draft_block_table is not None:
+                num_slots = max(num_slots, len(md.draft_kv_cache_manager.qsa_shared_topk_slots))
+            self.shared_topk_indices = md.get_buffer(
+                (num_slots, md.max_num_sequences, params.block_topk),
+                torch.int32,
+                "qsa_shared_topk_indices",
             )
-            self.qsa_shared_topk_visible_blocks = self.get_empty(
-                buffers,
-                (num_slots, self.max_num_sequences),
-                cache_name="qsa_shared_topk_visible_blocks",
-                dtype=torch.int32,
-                capture_graph=capture_graph,
+            self.shared_topk_visible_blocks = md.get_buffer(
+                (num_slots, md.max_num_sequences),
+                torch.int32,
+                "qsa_shared_topk_visible_blocks",
             )
 
-    def _init_qsa_draft_block_table(self) -> None:
+    def _init_draft_block_table(self) -> None:
         """Allocate the page table of a separate one-model draft KV cache.
 
         The draft layers' pages live in the draft manager's pools, which the
@@ -202,85 +129,83 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         """
         from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
 
-        draft_manager = self.draft_kv_cache_manager
+        md = self.metadata
+        draft_manager = md.draft_kv_cache_manager
         if (
             not isinstance(draft_manager, Qwen4ExpHybridCacheManager)
             or draft_manager.qsa_position_layer_id is None
         ):
             return
-        self.qsa_draft_block_table = self.get_empty(
-            self.cuda_graph_buffers,
-            (self.max_num_sequences, draft_manager.max_blocks_per_seq),
-            cache_name="qsa_draft_block_table",
-            dtype=torch.int32,
-            capture_graph=self.is_cuda_graph,
+        self.draft_block_table = md.get_buffer(
+            (md.max_num_sequences, draft_manager.max_blocks_per_seq),
+            torch.int32,
+            "qsa_draft_block_table",
         )
-        self._qsa_draft_attention_pool_id, self._qsa_draft_page_index_scale = (
+        self._draft_attention_pool_id, self._draft_page_index_scale = (
             draft_manager.get_qsa_attention_pool_layout()
         )
 
     def set_skip_topk(self, skip: bool) -> None:
         """Mark a draft step that reuses the captured selection."""
-        self.qsa_indexer_skip_topk = skip
+        self.indexer_skip_topk = skip
 
     def set_in_mtp_draft_loop(self, active: bool) -> None:
         """Bracket the MTP draft loop so the indexer captures once and reuses."""
-        self.qsa_in_mtp_draft_loop = active
+        self.in_mtp_draft_loop = active
         # Readiness is per layer slot, not global: a layer may reuse only the
         # row it captured itself, and the layers do not all capture in the same
         # pass. A loop whose first step is a context pass captures nothing, so
         # the next step captures layer by layer.
-        self.qsa_shared_topk_captured_slots.clear()
+        self.shared_topk_captured_slots.clear()
 
     def set_mtp_num_accepted(self, num_accepted: Optional[torch.Tensor]) -> None:
         """Supply the per-request accepted counts used to pick the capture row."""
-        self.qsa_mtp_num_accepted = num_accepted
+        self.mtp_num_accepted = num_accepted
 
-    def _refresh_qsa_token_mapping(self) -> None:
+    def _refresh_token_mapping(self) -> None:
         """Map packed rows to requests, logical positions, and causal limits."""
-        num_seqs = self.num_seqs
-        num_tokens = self.num_tokens
+        md = self.metadata
+        num_seqs = md.num_seqs
+        num_tokens = md.num_tokens
         if num_seqs <= 0 or num_tokens <= 0:
             return
-        seq_lens = self.seq_lens_cuda[:num_seqs]
-        if self.num_contexts == 0 and num_tokens == num_seqs:
+        seq_lens = md.seq_lens_cuda[:num_seqs]
+        if md.num_contexts == 0 and num_tokens == num_seqs:
             from .kernels import triton_qsa_decode_token_mapping
 
             triton_qsa_decode_token_mapping(
-                kv_lens=self.kv_lens_cuda_runtime[:num_seqs],
+                kv_lens=md.kv_lens_cuda_runtime[:num_seqs],
                 seq_lens=seq_lens,
-                request_indices=self.qsa_req_idx_per_token[:num_tokens],
-                logical_positions=self.qsa_logical_positions[:num_tokens],
-                sequence_lengths=self.qsa_sequence_lengths[:num_tokens],
-                visible_blocks=self.qsa_visible_blocks[:num_tokens],
-                compress_ratio=self.sparse_metadata_params.compress_ratio,
+                request_indices=self.req_idx_per_token[:num_tokens],
+                logical_positions=self.logical_positions[:num_tokens],
+                sequence_lengths=self.sequence_lengths[:num_tokens],
+                visible_blocks=self.visible_blocks[:num_tokens],
+                compress_ratio=self.params.compress_ratio,
             )
             return
         torch.cumsum(
             seq_lens,
             dim=0,
             dtype=torch.int64,
-            out=self._qsa_cu_seq_lens[1 : num_seqs + 1],
+            out=self._cu_seq_lens[1 : num_seqs + 1],
         )
-        token_ids = self._qsa_token_arange[:num_tokens]
+        token_ids = self._token_arange[:num_tokens]
         req_idx = torch.searchsorted(
-            self._qsa_cu_seq_lens[1 : num_seqs + 1],
+            self._cu_seq_lens[1 : num_seqs + 1],
             token_ids,
             right=True,
         )
-        self.qsa_req_idx_per_token[:num_tokens].copy_(req_idx.to(torch.int32))
-        seq_starts = self._qsa_cu_seq_lens[:num_seqs]
-        cached_lens = self.kv_lens_cuda_runtime[:num_seqs].to(torch.int64) - seq_lens.to(
-            torch.int64
-        )
+        self.req_idx_per_token[:num_tokens].copy_(req_idx.to(torch.int32))
+        seq_starts = self._cu_seq_lens[:num_seqs]
+        cached_lens = md.kv_lens_cuda_runtime[:num_seqs].to(torch.int64) - seq_lens.to(torch.int64)
         logical = cached_lens[req_idx] + token_ids - seq_starts[req_idx]
-        self.qsa_logical_positions[:num_tokens].copy_(logical)
-        self.qsa_sequence_lengths[:num_tokens].copy_(self.kv_lens_cuda_runtime[:num_seqs][req_idx])
-        self.qsa_visible_blocks[:num_tokens].copy_(
-            ((logical + 1) // self.sparse_metadata_params.compress_ratio).to(torch.int32)
+        self.logical_positions[:num_tokens].copy_(logical)
+        self.sequence_lengths[:num_tokens].copy_(md.kv_lens_cuda_runtime[:num_seqs][req_idx])
+        self.visible_blocks[:num_tokens].copy_(
+            ((logical + 1) // self.params.compress_ratio).to(torch.int32)
         )
 
-    def _unscale_qsa_block_table(
+    def _unscale_block_table(
         self,
         block_offsets: torch.Tensor,
         pool_id: int,
@@ -288,7 +213,7 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         block_table: torch.Tensor,
     ) -> None:
         """Decode one manager's V2 attention offsets into raw page IDs."""
-        num_seqs = self.num_seqs
+        num_seqs = self.metadata.num_seqs
         if num_seqs <= 0:
             return
         triton_qsa_unscale_block_table(
@@ -297,94 +222,92 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
             page_index_scale=page_index_scale,
         )
 
-    def _refresh_qsa_block_table(self) -> None:
+    def _refresh_block_table(self) -> None:
         """Decode the bound manager's offsets into the table QSA kernels read.
 
-        While ``prepare_for_draft_forward()`` is in effect every operand here is
-        the draft manager's, so this rebuilds the draft table.
+        While a draft forward is in effect every operand here is the draft
+        manager's, so this rebuilds the draft table.
         """
-        self._unscale_qsa_block_table(
-            self.kv_cache_block_offsets,
-            self._qsa_attention_pool_id,
-            self._qsa_page_index_scale,
-            self.qsa_block_table,
+        self._unscale_block_table(
+            self.metadata.kv_cache_block_offsets,
+            self._attention_pool_id,
+            self._page_index_scale,
+            self.block_table,
         )
 
-    def _refresh_qsa_draft_block_table(self) -> None:
+    def _refresh_draft_block_table(self) -> None:
         """Decode the separate draft manager's offsets into the draft table."""
-        if self.qsa_draft_block_table is None:
+        if self.draft_block_table is None:
             return
-        self._unscale_qsa_block_table(
-            self.draft_kv_cache_block_offsets,
-            self._qsa_draft_attention_pool_id,
-            self._qsa_draft_page_index_scale,
-            self.qsa_draft_block_table,
+        self._unscale_block_table(
+            self.metadata.ext(DraftKVMetadata).kv_cache_block_offsets,
+            self._draft_attention_pool_id,
+            self._draft_page_index_scale,
+            self.draft_block_table,
         )
 
-    def _refresh_qsa_speculative_snapshot_state(self) -> None:
+    def _refresh_speculative_snapshot_state(self) -> None:
         """Cache whether eager generation contains multi-token verification rows.
 
         Host lengths are already available during prepare; using them avoids a
         device reduction and synchronization in every QSA layer.
         """
-        generation_lens = self.seq_lens[self.num_contexts : self.num_seqs]
-        self.qsa_needs_speculative_snapshot = any(length > 1 for length in generation_lens.tolist())
+        md = self.metadata
+        generation_lens = md.seq_lens[md.num_contexts : md.num_seqs]
+        self.needs_speculative_snapshot = any(length > 1 for length in generation_lens.tolist())
 
-    def _refresh_qsa_device_state(self) -> None:
+    def _refresh_device_state(self) -> None:
         """Rebuild the device-side block table and token mapping for this step."""
-        if not self.qsa_has_local_layers:
+        if not self.has_local_layers:
             return
-        self._refresh_qsa_block_table()
-        self._refresh_qsa_draft_block_table()
-        self._refresh_qsa_token_mapping()
+        self._refresh_block_table()
+        self._refresh_draft_block_table()
+        self._refresh_token_mapping()
 
-    def prepare_for_draft_forward(self) -> None:
+    def draft_swap(self) -> Any:
         """Point the QSA page table at the separate draft manager's pages.
 
         The caller has already swapped ``kv_cache_manager`` and
         ``kv_cache_block_offsets`` to the draft manager's. The draft table was
         decoded in ``prepare()``, so this only rebinds fields and launches
-        nothing; ``restore_draft_swaps()`` restores the target bindings. The
-        row mapping is manager-independent and stays as it is.
+        nothing. The row mapping is manager-independent and stays as it is.
         """
-        if self.qsa_draft_block_table is None:
-            return
-        if self.kv_cache_manager is not self.draft_kv_cache_manager:
+        if self.draft_block_table is None:
+            return None
+        md = self.metadata
+        if md.kv_cache_manager is not md.draft_kv_cache_manager:
             raise RuntimeError(
                 "QSA draft forward expects the metadata's draft KV cache manager "
-                f"to be bound; got {type(self.kv_cache_manager).__name__}"
+                f"to be bound; got {type(md.kv_cache_manager).__name__}"
             )
-        self.swap_for_draft("qsa_block_table", self.qsa_draft_block_table)
-        self.swap_for_draft("_qsa_attention_pool_id", self._qsa_draft_attention_pool_id)
-        self.swap_for_draft("_qsa_page_index_scale", self._qsa_draft_page_index_scale)
+        return self.swap_attrs_for_draft(
+            {
+                "block_table": self.draft_block_table,
+                "_attention_pool_id": self._draft_attention_pool_id,
+                "_page_index_scale": self._draft_page_index_scale,
+            }
+        )
+
+    def draft_restore(self, saved: Any) -> None:
+        if saved is not None:
+            self.restore_swapped_attrs(saved)
 
     def prepare(self) -> None:
         """Refresh host decisions, then rebuild graph-stable device mappings."""
-        super().prepare()
-        if not self.qsa_has_local_layers:
+        if not self.has_local_layers:
             return
-        self._refresh_qsa_speculative_snapshot_state()
-        self._refresh_qsa_device_state()
+        self._refresh_speculative_snapshot_state()
+        self._refresh_device_state()
 
-    def on_update_kv_lens(self) -> None:
-        """Refresh row limits after speculative decoding advances KV lengths."""
-        super().on_update_kv_lens()
-        if not self.qsa_has_local_layers:
-            return
-        # Page allocation is unchanged within the step, so only the row mapping
-        # depends on the updated lengths.
-        self._refresh_qsa_token_mapping()
+    def on_kv_lens_changed(self, spec_dec_step: bool) -> None:
+        """Refresh row limits after speculative decoding advances KV lengths.
 
-    def update_for_spec_dec(self) -> None:
-        """Refresh the row mapping after a draft step repacks the batch.
-
-        The first draft step rewrites seq_lens from one row per accepted token
-        to a single row per request and advances kv_lens_cuda in place, so the
-        packed-row mapping built during prepare() no longer describes the rows
-        the next draft step attends over.
+        Page allocation is unchanged within the step, so only the row mapping
+        depends on the updated lengths. A draft step also repacks the batch
+        from one row per accepted token to a single row per request.
         """
-        super().update_for_spec_dec()
-        self.on_update_kv_lens()
+        if self.has_local_layers:
+            self._refresh_token_mapping()
 
 
-__all__ = ["QSAAttentionMetadata"]
+__all__ = ["QSAMetadata"]

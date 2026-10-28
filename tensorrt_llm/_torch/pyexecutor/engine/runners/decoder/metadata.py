@@ -9,10 +9,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.features import RecurrentMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager,
     KVCacheManager,
@@ -97,11 +97,10 @@ class DecoderMetadata:
             kv_cache_manager=kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
         )
-        if isinstance(kv_cache_manager, BaseMambaCacheManager):
-            self.attn_metadata.mamba_chunk_size = getattr(
-                config, "chunk_size", self.attn_metadata.mamba_chunk_size
-            )
-        self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(self.model)
+        recurrent = self.attn_metadata.find_ext(RecurrentMetadata)
+        if recurrent is not None:
+            recurrent.chunk_size = getattr(config, "chunk_size", recurrent.chunk_size)
+            recurrent.mamba_metadata_cls = resolve_mamba_metadata_cls(self.model)
 
         return self.attn_metadata
 

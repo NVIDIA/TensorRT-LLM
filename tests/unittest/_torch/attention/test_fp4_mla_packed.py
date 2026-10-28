@@ -12,11 +12,28 @@ import torch
 import tensorrt_llm._torch.attention.backends.fp4_mla.config as fp4_mla_config
 import tensorrt_llm._torch.attention.backends.fp4_mla.metadata as fp4_mla_metadata
 import tensorrt_llm._torch.attention.backends.fp4_mla.packed_plan as fp4_mla_packed_plan
+from tensorrt_llm._torch.attention.backends.fp4_mla.state import Fp4MlaState, find_fp4_mla
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="requires an SM100-or-newer CUDA device",
 )
+
+
+def _attach_ext(metadata: SimpleNamespace, cls: type, extension: object) -> object:
+    """Serve ``extension`` as the stub's ``cls`` extension through ``find_ext``."""
+    if not hasattr(metadata, "stub_extensions"):
+        metadata.stub_extensions = {}
+        metadata.find_ext = metadata.stub_extensions.get
+    metadata.stub_extensions[cls] = extension
+    return extension
+
+
+def _fp4_mla_metadata(fp4_mla_state: object, **fields) -> SimpleNamespace:
+    """A metadata stub carrying ``fp4_mla_state`` as its FP4 MLA extension."""
+    metadata = SimpleNamespace(**fields)
+    _attach_ext(metadata, Fp4MlaState, fp4_mla_state)
+    return metadata
 
 
 @pytest.mark.parametrize(
@@ -268,7 +285,7 @@ def test_uniform_generation_lengths_fuse_the_packed_plan(monkeypatch) -> None:
     corrected = torch.zeros(2, dtype=torch.int32, device="cuda")
     generation_lens = torch.zeros(2, dtype=torch.int32, device="cuda")
     plan = torch.zeros(16, dtype=torch.int32, device="cuda")
-    metadata = SimpleNamespace(
+    metadata = _fp4_mla_metadata(
         num_contexts=0,
         num_seqs=2,
         kv_lens_cuda_runtime=torch.tensor([17, 25], dtype=torch.int32, device="cuda"),
@@ -302,7 +319,7 @@ def test_uniform_generation_lengths_fuse_the_packed_plan(monkeypatch) -> None:
     uniform(metadata, 8, 2, plan_geometry=geometry)
     assert [name for name, _ in calls] == ["plan"]
     assert calls[0][1]["generation_lengths"][3] == 4
-    assert metadata.fp4_mla_state.packed_plan_key == ("key",)
+    assert find_fp4_mla(metadata).packed_plan_key == ("key",)
     # The other layers of the step launch nothing.
     uniform(metadata, 8, 2, plan_geometry=geometry)
     uniform(metadata, 8, 2)
@@ -312,8 +329,8 @@ def test_uniform_generation_lengths_fuse_the_packed_plan(monkeypatch) -> None:
     assert len(calls) == 2 and calls[1][0] == "plan" and calls[1][1]["generation_lengths"] is None
     # A new step whose first caller cannot plan keeps the Triton lengths kernel,
     # and the decode then plans alone.
-    metadata.fp4_mla_state.generation_lengths_num_tokens = -1
-    metadata.fp4_mla_state.packed_plan_key = None
+    find_fp4_mla(metadata).generation_lengths_num_tokens = -1
+    find_fp4_mla(metadata).packed_plan_key = None
     uniform(metadata, 8, 2)
     uniform(metadata, 8, 2, plan_geometry=geometry)
     assert [name for name, _ in calls[2:]] == ["lengths", "plan"]
@@ -331,7 +348,7 @@ def test_packed_plan_geometry_is_shared_by_cache_update_and_decode(monkeypatch) 
     # An indexed device, as the kernels' tensors carry: the workspace helper
     # compares devices exactly before reusing a buffer.
     device = torch.device("cuda", torch.cuda.current_device())
-    metadata = SimpleNamespace(
+    metadata = _fp4_mla_metadata(
         num_contexts=0,
         num_seqs=4,
         page_size=256,
@@ -351,7 +368,7 @@ def test_packed_plan_geometry_is_shared_by_cache_update_and_decode(monkeypatch) 
     # The plan lives in the metadata workspace (a view of the stored buffer).
     assert (
         geometry.plan.data_ptr()
-        == metadata.fp4_mla_state.workspaces["_fp4_mla_packed_plan"].data_ptr()
+        == find_fp4_mla(metadata).workspaces["_fp4_mla_packed_plan"].data_ptr()
     )
     assert geometry.plan.numel() == _plan_mod().packed_plan_length(4, 40)
     again = fp4_mla_packed_plan._fp4_mla_packed_plan_geometry(

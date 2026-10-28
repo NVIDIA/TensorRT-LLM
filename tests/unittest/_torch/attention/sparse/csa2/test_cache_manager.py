@@ -7,11 +7,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheManager,
     CSA2CacheRole,
 )
-from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
     read_index_rows,
@@ -401,7 +402,7 @@ def _request(request_id, tokens):
 
 
 def _metadata(manager, request, metadata=None):
-    metadata = metadata or CSA2TrtllmMetadata(
+    metadata = metadata or CSA2TrtllmAttention.create_metadata(
         max_num_requests=1, max_num_tokens=512, kv_cache_manager=manager
     )
     metadata.request_ids = [request.py_request_id]
@@ -494,7 +495,7 @@ def _spec_manager(block):
 
 
 def _spec_metadata(manager):
-    return CSA2TrtllmMetadata(
+    return CSA2TrtllmAttention.create_metadata(
         max_num_requests=manager.max_batch_size,
         max_num_tokens=manager.max_num_tokens,
         kv_cache_manager=manager,
@@ -559,16 +560,16 @@ def test_first_verification_step_tolerates_the_overlap_tail(block):
         metadata = _spec_prepare(manager, requests, cached)
         owner = manager.layout.kv_source_layer_ids[-1]
         assert manager.layout.compress_ratios[owner] == 1
-        metadata._ensure_swa_slots()
+        metadata.ext(CSA2Metadata)._ensure_swa_slots()
         for row, request in enumerate(requests):
             cache = manager.kv_cache_map[request.py_request_id]
             assert cache.capacity == request.prompt_len + 2 * DRAFT_LEN
-            tail = metadata.csa2_request_query_ranges[row][1] - 1
+            tail = metadata.ext(CSA2Metadata).csa2_request_query_ranges[row][1] - 1
             for layer in range(len(manager.layout.compress_ratios)):
-                writes = metadata.csa2_swa_write_slots[layer]
+                writes = metadata.ext(CSA2Metadata).csa2_swa_write_slots[layer]
                 assert int(writes[tail]) == -1
                 assert all(int(v) >= 0 for v in writes[tail - DRAFT_LEN : tail])
-            assert int(metadata.csa2_main_write_slots[owner][tail]) == -1
+            assert int(metadata.ext(CSA2Metadata).csa2_main_write_slots[owner][tail]) == -1
     finally:
         _spec_cleanup(manager)
 

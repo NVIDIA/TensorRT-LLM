@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch.attention.backends.features import RecurrentMetadata
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
     Glm5NextCacheManager,
 )
@@ -122,6 +123,15 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as RuntimeKVCacheManager
 from tensorrt_llm.sampling_params import SamplingParams
+
+
+def _recurrent_stub(mamba_metadata, **fields) -> SimpleNamespace:
+    """A metadata stub serving ``mamba_metadata`` through its recurrent extension."""
+    recurrent = SimpleNamespace(mamba_metadata=mamba_metadata)
+    metadata = SimpleNamespace(**fields)
+    metadata.find_ext = metadata.ext = lambda cls: recurrent if cls is RecurrentMetadata else None
+    return metadata
+
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -5354,7 +5364,7 @@ def test_v2_gdn_replay_all_layer_commit_matches_contiguous_layout():
         )
 
         policy.commit_all_layers(
-            SimpleNamespace(
+            _recurrent_stub(
                 mamba_metadata=SimpleNamespace(
                     replay_num_decodes=batch_size,
                     replay_work_items=replay_work_items,
@@ -5407,14 +5417,14 @@ def test_v2_gdn_replay_commits_before_advancing_bookkeeping(monkeypatch):
     if not hasattr(mgr, "_dummy_request_mask"):
         mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(64, dtype=torch.bool))
     mgr.update_mamba_states(
-        SimpleNamespace(
-            num_seqs=batch_size,
-            num_contexts=0,
+        _recurrent_stub(
             mamba_metadata=SimpleNamespace(
                 replay_num_decodes=batch_size,
                 replay_work_items=torch.empty((batch_size, 4), dtype=torch.int32),
                 replay_n_writes=torch.empty(1, dtype=torch.int32),
             ),
+            num_seqs=batch_size,
+            num_contexts=0,
         ),
         torch.full((batch_size,), 3, dtype=torch.int32),
         state_indices=torch.arange(batch_size, dtype=torch.int32),

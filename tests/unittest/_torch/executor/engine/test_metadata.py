@@ -7,7 +7,12 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.attention.backends.features import FlashMlaMetadata
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionBackend,
+    AttentionRuntimeFeatures,
+)
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec, ModelConfig
 from tensorrt_llm._torch.pyexecutor.engine.metadata import (
     _get_max_num_heads_per_kv,
@@ -17,12 +22,12 @@ from tensorrt_llm._torch.pyexecutor.engine.metadata import (
 pytestmark = pytest.mark.cpu_only
 
 
-class _AttentionMetadata:
+class _AttentionMetadata(TrtllmAttentionMetadata):
     def __init__(self, **kwargs: Any) -> None:
         self.__dict__.update(kwargs)
 
 
-class _AttentionBackend:
+class _AttentionBackend(AttentionBackend):
     Metadata = _AttentionMetadata
 
 
@@ -56,7 +61,7 @@ def test_build_attention_metadata_resolves_model_derived_values() -> None:
     )
 
     assert metadata.max_num_heads_per_kv == 4
-    assert metadata.enable_flash_mla
+    assert metadata.extension_types == (FlashMlaMetadata,)
     assert metadata.enable_context_mla_with_cached_kv
     assert metadata.sparse_metadata_params is sparse_metadata_params
     sparse_attention_config.to_sparse_metadata_params.assert_called_once_with(

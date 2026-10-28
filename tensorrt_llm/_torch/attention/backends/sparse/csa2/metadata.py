@@ -12,9 +12,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.params import SparseAlgorithmExtension
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 
+from ...features.spec_decoding import SpecDecodingMetadata
 from .params import CSA2BackendForwardArgs, CSA2Layer
 
 if TYPE_CHECKING:
@@ -66,7 +68,7 @@ class _CoalescedUploads:
 
     _ALIGN = 16
 
-    def __init__(self, metadata: CSA2TrtllmMetadata):
+    def __init__(self, metadata: CSA2Metadata):
         self._metadata = metadata
         self._pending = []
         self._bytes = 0
@@ -115,11 +117,12 @@ class _CoalescedUploads:
         self._bytes = 0
 
 
-class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
+class CSA2Metadata(SparseAlgorithmExtension):
     """Manager-backed request metadata with bounded native query staging.
 
     Normal prepare resolves manager pages for the packed model forward.
-    for_query_tile creates a separate compute-only metadata object.
+    for_query_tile creates a separate compute-only metadata object that
+    carries its own CSA2 extension.
     Eager context retains real query groups with virtual staged KV lengths.
     Generation and captured context use independent one-query generation rows.
     Source causality, request isolation and windows are encoded in selections;
@@ -134,8 +137,10 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
     _csa2_defer_decode_outputs: bool = False
     _csa2_deferred_decode_outputs: bool = False
     _csa2_graph_reserved: bool = False
+    # The manager's SWA publication token while ``prepare()`` runs.
+    _swa_publication: object | None = None
 
-    # Request metadata is held directly on this object. Main/index physical
+    # Request metadata is held directly on this extension. Main/index physical
     # tables and write slots are owner-keyed; SWA and visibility are layer-keyed.
     csa2_indices: dict[int, torch.Tensor]
     csa2_candidates: dict[int, torch.Tensor]
@@ -159,53 +164,37 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
     decoder_context_ends: tuple[int, ...] | None = None
     csa2_decoder_capture_lens: tuple[int, ...] | None = None
 
-    def get_adp_token_counts(self) -> list[int]:
+    def adp_token_counts(self) -> list[int]:
         plan = self.decoder_replay_plan
-        input_tokens = self.padded_num_tokens or self.num_tokens
         decoder_tokens = (
-            plan.num_replay_tokens if plan and plan.replays_local_tokens else input_tokens
+            plan.num_replay_tokens
+            if plan and plan.replays_local_tokens
+            else self.metadata.num_tokens
         )
-        return [input_tokens, decoder_tokens]
+        return [decoder_tokens]
 
-    def set_adp_token_counts(self, counts: list[list[int]]) -> list[int]:
+    def set_adp_token_counts(self, counts: list[list[int]], input_counts: list[int]) -> None:
         plan = self.decoder_replay_plan
         if plan is not None:
-            plan.saved_all_rank_num_tokens, plan.replay_all_rank_num_tokens = counts
-            if not plan.updates_local_metadata and counts[0] == counts[1]:
+            plan.saved_all_rank_num_tokens, plan.replay_all_rank_num_tokens = (
+                input_counts,
+                counts[0],
+            )
+            if not plan.updates_local_metadata and input_counts == counts[0]:
                 self.decoder_replay_plan = None
-        return counts[0]
 
-    def __post_init__(self) -> None:
-        # Graph clones rerun post-init: eligibility belongs to their own next
+    def allocate(self, buffers) -> None:
+        # Graph clones re-allocate: eligibility belongs to their own next
         # successful preparation, not the metadata object they were copied from.
         self._csa2_deferred_decode_outputs = False
         self.decoder_replay_plan = None
         self.decoder_context_ends = None
-        super().__post_init__()
 
-    @property
-    def tokens_per_block(self) -> int:
-        return (
-            self.kv_cache_manager.tokens_per_block
-            if self.kv_cache_manager is not None
-            else _SWA_TILE
-        )
-
-    @property
-    def host_kv_cache_pool_pointers(self) -> torch.Tensor:
-        return (
-            self.pool_pointers
-            if hasattr(self, "pool_pointers")
-            else super().host_kv_cache_pool_pointers
-        )
-
-    @property
-    def host_kv_cache_pool_mapping(self) -> torch.Tensor:
-        return (
-            self.pool_mapping
-            if hasattr(self, "pool_mapping")
-            else super().host_kv_cache_pool_mapping
-        )
+    def kv_cache_pools(self) -> tuple[torch.Tensor, torch.Tensor, int] | None:
+        # A compute tile attends over its bounded staging pools, not the manager's.
+        if not hasattr(self, "pool_pointers"):
+            return None
+        return self.pool_pointers, self.pool_mapping, _SWA_TILE
 
     @property
     def stage_kv_scales(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -226,6 +215,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         staging_dtype: torch.dtype = torch.bfloat16,
         shared_rows: int | None = None,
     ) -> None:
+        md = self.metadata
         if staging_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
             raise ValueError("CSA2 native staging requires BF16 or E4M3")
         self.staging_dtype = staging_dtype
@@ -263,51 +253,51 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             [[self.swa_pool.data_ptr(), 0]], dtype=torch.int64, device="cpu"
         )
         self.pool_mapping = torch.zeros((1, 2), dtype=torch.int32, device="cpu")
-        self.num_sparse_topk = _SWA_TILE + extra_capacity
-        self.max_seq_len = self.num_sparse_topk
-        self.kv_cache_params = KVCacheParams(use_cache=True)
-        self.kv_cache_block_offsets = torch.zeros(
-            (1, capacity, 2, (self.num_sparse_topk + _SWA_TILE - 1) // _SWA_TILE),
+        md.num_sparse_topk = _SWA_TILE + extra_capacity
+        md.max_seq_len = md.num_sparse_topk
+        md.kv_cache_params = KVCacheParams(use_cache=True)
+        md.kv_cache_block_offsets = torch.zeros(
+            (1, capacity, 2, (md.num_sparse_topk + _SWA_TILE - 1) // _SWA_TILE),
             dtype=torch.int32,
             device=device,
         )
         self.prepared_indices = torch.full(
-            (capacity, self.num_sparse_topk), -1, dtype=torch.int32, device=device
+            (capacity, md.num_sparse_topk), -1, dtype=torch.int32, device=device
         )
         self.prepared_lens = torch.empty(capacity, dtype=torch.int32, device=device)
         self.prepared_counter = torch.zeros(1, dtype=torch.uint32, device=device)
         self.prepared_cu_q = torch.arange(capacity + 1, dtype=torch.int32, device=device) * heads
         self.prepared_cu_kv = (
-            torch.arange(capacity + 1, dtype=torch.int32, device=device) * self.num_sparse_topk
+            torch.arange(capacity + 1, dtype=torch.int32, device=device) * md.num_sparse_topk
         )
         self.query_lens_host = torch.ones(capacity, dtype=torch.int32, device="cpu")
         self.query_lens_device = torch.ones(capacity, dtype=torch.int32, device=device)
-        self.kv_lens.fill_(self.num_sparse_topk)
-        self.kv_lens_cuda.fill_(self.num_sparse_topk)
-        self.prompt_lens_cpu.fill_(1)
-        self.prompt_lens_cuda.fill_(1)
-        self.host_request_types.fill_(1)
-        self.host_total_kv_lens.zero_()
+        md.kv_lens.fill_(md.num_sparse_topk)
+        md.kv_lens_cuda.fill_(md.num_sparse_topk)
+        md.prompt_lens_cpu.fill_(1)
+        md.prompt_lens_cuda.fill_(1)
+        md.host_request_types.fill_(1)
+        md.host_total_kv_lens.zero_()
         # Each query count has independent native workspace storage.
         # Eager initialization and capture must use that same tensor.
-        self.cuda_graph_workspace = self.workspace
+        md.cuda_graph_workspace = md.workspace
 
-    @classmethod
+    @staticmethod
     def for_query_tile(
-        cls,
         q: torch.Tensor,
         extra_width: int,
         *,
         staging_dtype=torch.bfloat16,
         context_lengths: list[int] | None = None,
         shared_rows: int | None = None,
-    ) -> CSA2TrtllmMetadata:
+    ) -> TrtllmAttentionMetadata:
         """Prepare fixed geometry before TrtllmAttention.forward allocates output.
 
         q is BF16 [queries, heads, 512]. Extra capacity is a selected-main-row
         bound, not the persistent cache size. Callers retain one metadata object
         per geometry and warm it with the normal forward before graph capture.
         As with TrtllmAttentionMetadata, set is_cuda_graph for captured calls.
+        The returned metadata carries the tile's staging in its CSA2Metadata.
         """
         count, heads, dim = q.shape
         if context_lengths and (
@@ -323,16 +313,18 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         with torch.cuda.device(q.device):
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Prepare and warm CSA2 metadata before CUDA Graph capture")
-            metadata = cls(
+            metadata = TrtllmAttentionMetadata(
                 max_num_requests=len(context_lengths) if context_lengths else count,
                 max_num_tokens=count,
+                extension_types=(CSA2Metadata,),
             )
-            metadata._allocate(
+            tile = metadata.ext(CSA2Metadata)
+            tile._allocate(
                 count, heads, (extra_width + 127) // 128 * 128, q.device, staging_dtype, shared_rows
             )
-        metadata.num_query_heads = heads
-        metadata._seq_lens = metadata.query_lens_host
-        metadata._seq_lens_cuda = metadata.query_lens_device
+        tile.num_query_heads = heads
+        metadata._seq_lens = tile.query_lens_host
+        metadata._seq_lens_cuda = tile.query_lens_device
         metadata._num_contexts = metadata._num_ctx_tokens = 0
         metadata._num_generations = metadata._num_tokens = count
         metadata._bind_runtime_views(
@@ -343,23 +335,24 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             host_request_types=metadata.host_request_types,
         )
         metadata.host_total_kv_lens[1] = count * metadata.num_sparse_topk
-        metadata.cu_q_seqlens = metadata.prepared_cu_q
-        metadata.cu_kv_seqlens = metadata.prepared_cu_kv
+        metadata.cu_q_seqlens = tile.prepared_cu_q
+        metadata.cu_kv_seqlens = tile.prepared_cu_kv
         if context_lengths:
-            metadata._bind_context_tile(context_lengths)
+            tile._bind_context_tile(context_lengths)
         return metadata
 
     def _shared_context_plan(self, q, extra_width, layer_idx):
         # Graph frames are filtered by the caller. Without logical provenance,
         # keep the existing selected-row path.
+        md = self.metadata
         if (
             layer_idx is None
             or _SWA_TILE + (extra_width + 127) // 128 * 128 > 4096
             or not hasattr(self, "_csa2_main_domain_counts")
-            or q.shape[0] != self.num_ctx_tokens
+            or q.shape[0] != md.num_ctx_tokens
         ):
             return None
-        manager = self.kv_cache_manager
+        manager = md.kv_cache_manager
         requests = self.csa2_num_context_requests
         lengths = self.csa2_request_lengths[:requests]
         if not lengths or sum(lengths) != q.shape[0]:
@@ -437,12 +430,13 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         *,
         staging_dtype=torch.bfloat16,
         layer_idx: int | None = None,
-    ) -> CSA2TrtllmMetadata:
+    ) -> TrtllmAttentionMetadata:
         """Share bounded staging, retaining real request groups for context."""
+        md = self.metadata
         context_lengths = []
-        if query_start is not None and query_start < self.num_ctx_tokens:
+        if query_start is not None and query_start < md.num_ctx_tokens:
             end = query_start + q.shape[0]
-            if end > self.num_ctx_tokens:
+            if end > md.num_ctx_tokens:
                 raise ValueError("CSA2 query tiles must not cross the context/generation boundary")
             for begin, stop in self.csa2_request_query_ranges:
                 lo, hi = max(begin, query_start), min(stop, end)
@@ -455,7 +449,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         # path; choose it during graph warmup too, so its workspace is ready.
         with torch.cuda.device(q.device):
             capturing = torch.cuda.is_current_stream_capturing()
-        if context_lengths and (self.is_cuda_graph or capturing):
+        if context_lengths and (md.is_cuda_graph or capturing):
             context_lengths = []
         shared_plan = (
             self._shared_context_plan(q, extra_width, layer_idx)
@@ -486,7 +480,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         for previous, tile in tuple(self._csa2_query_tiles.items()):
             if (
                 previous != key
-                and not tile._csa2_graph_reserved
+                and not tile.ext(CSA2Metadata)._csa2_graph_reserved
                 and previous[:2] == key[:2]
                 and previous[3:6] == key[3:6]
                 and previous[8] == key[8]
@@ -509,22 +503,23 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 if workspace is not None:
                     metadata.workspace = metadata.cuda_graph_workspace = workspace
                 self._csa2_query_tiles[key] = metadata
-            metadata.shared_plan = shared_plan
-            metadata._csa2_graph_reserved |= self.is_cuda_graph or capturing
+            tile = metadata.ext(CSA2Metadata)
+            tile.shared_plan = shared_plan
+            tile._csa2_graph_reserved |= md.is_cuda_graph or capturing
             metadata.is_cuda_graph = capturing
             if capturing:
                 self._csa2_replay_capture_signature = getattr(self, "csa2_replay_signature", None)
             if context_lengths:
-                metadata._bind_context_tile(context_lengths)
+                tile._bind_context_tile(context_lengths)
         return metadata
 
-    def _bind_runtime_views(self, **kwargs) -> None:
+    def on_runtime_views_bound(self) -> None:
         # Generic prepare/rebinding can replace the geometry-only child views.
         self._csa2_context_geometry = None
-        super()._bind_runtime_views(**kwargs)
 
     def _bind_context_tile(self, query_lengths: list[int]) -> None:
-        geometry = (self.num_sparse_topk, tuple(query_lengths))
+        md = self.metadata
+        geometry = (md.num_sparse_topk, tuple(query_lengths))
         if getattr(self, "_csa2_context_geometry", None) == geometry:
             return
         # A failed partial update must not retain the previous successful key.
@@ -533,27 +528,27 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         # context kernel still applies a causal upper bound in staged-column
         # coordinates: give even the first query the full sparse capacity,
         # otherwise short source prefixes would clip valid compressed keys.
-        kv_lengths = [self.num_sparse_topk + length - 1 for length in query_lengths]
+        kv_lengths = [md.num_sparse_topk + length - 1 for length in query_lengths]
         requests = len(query_lengths)
         query = torch.tensor(query_lengths, dtype=torch.int32, device="cpu")
         kv = torch.tensor(kv_lengths, dtype=torch.int32, device="cpu")
         self.query_lens_host[:requests].copy_(query)
         self._copy_host("context_query_lens", self.query_lens_device[:requests], query)
-        self._seq_lens = self.query_lens_host[:requests]
-        self._seq_lens_cuda = self.query_lens_device[:requests]
-        self._num_contexts = requests
-        self._num_ctx_tokens = self._num_tokens = sum(query_lengths)
-        self._num_generations = 0
-        self.kv_lens[:requests].copy_(kv)
-        self._copy_host("context_kv_lens", self.kv_lens_cuda[:requests], kv)
+        md._seq_lens = self.query_lens_host[:requests]
+        md._seq_lens_cuda = self.query_lens_device[:requests]
+        md._num_contexts = requests
+        md._num_ctx_tokens = md._num_tokens = sum(query_lengths)
+        md._num_generations = 0
+        md.kv_lens[:requests].copy_(kv)
+        self._copy_host("context_kv_lens", md.kv_lens_cuda[:requests], kv)
         # THOP interprets context_lengths as Q lengths, independently of
         # past/current KV lengths. Keep them consistent with unfolded cuQ.
-        self.prompt_lens_cpu[:requests].copy_(query)
-        self._copy_host("context_prompt_lens", self.prompt_lens_cuda[:requests], query)
-        self.host_request_types[:requests].zero_()
-        self.host_total_kv_lens.zero_()
-        self.host_total_kv_lens[0] = sum(kv_lengths)
-        self.max_seq_len = max(self.num_sparse_topk, max(kv_lengths))
+        md.prompt_lens_cpu[:requests].copy_(query)
+        self._copy_host("context_prompt_lens", md.prompt_lens_cuda[:requests], query)
+        md.host_request_types[:requests].zero_()
+        md.host_total_kv_lens.zero_()
+        md.host_total_kv_lens[0] = sum(kv_lengths)
+        md.max_seq_len = max(md.num_sparse_topk, max(kv_lengths))
         self._copy_host(
             "context_cu_q",
             self.prepared_cu_q[: requests + 1],
@@ -564,14 +559,14 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             self.prepared_cu_kv[: requests + 1],
             torch.cat((kv.new_zeros(1), kv.cumsum(0).int())),
         )
-        self.cu_q_seqlens = self.prepared_cu_q[: requests + 1]
-        self.cu_kv_seqlens = self.prepared_cu_kv[: requests + 1]
-        self._bind_runtime_views(
-            kv_lens_cuda=self.kv_lens_cuda[:requests],
-            kv_lens=self.kv_lens[:requests],
-            prompt_lens_cuda=self.prompt_lens_cuda[:requests],
-            prompt_lens_cpu=self.prompt_lens_cpu[:requests],
-            host_request_types=self.host_request_types[:requests],
+        md.cu_q_seqlens = self.prepared_cu_q[: requests + 1]
+        md.cu_kv_seqlens = self.prepared_cu_kv[: requests + 1]
+        md._bind_runtime_views(
+            kv_lens_cuda=md.kv_lens_cuda[:requests],
+            kv_lens=md.kv_lens[:requests],
+            prompt_lens_cuda=md.prompt_lens_cuda[:requests],
+            prompt_lens_cpu=md.prompt_lens_cpu[:requests],
+            host_request_types=md.host_request_types[:requests],
         )
         self._csa2_context_geometry = geometry
 
@@ -585,10 +580,15 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         compact. A capture records its own compaction so replays follow the
         live selections.
         """
+        md, source_md = self.metadata, source.metadata
         groups = source.__dict__.setdefault("_csa2_stage_groups", {})
-        key = (group, self.prepared_lens.shape[0], self.num_sparse_topk)
+        key = (group, self.prepared_lens.shape[0], md.num_sparse_topk)
         capturing = torch.cuda.is_current_stream_capturing()
-        frame = (id(source), id(source.kv_cache_manager), getattr(source, "_csa2_stage_epoch", 0))
+        frame = (
+            id(source),
+            id(source_md.kv_cache_manager),
+            getattr(source, "_csa2_stage_epoch", 0),
+        )
         entry = groups.get(key)
         if entry is None:
             if capturing:
@@ -602,18 +602,18 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             capacity, device = self.prepared_lens.shape[0], self.prepared_lens.device
             entry = groups[key] = {
                 "tags": torch.empty(
-                    (capacity, self.num_sparse_topk), dtype=torch.int32, device=device
+                    (capacity, md.num_sparse_topk), dtype=torch.int32, device=device
                 ),
                 "counts": torch.empty(capacity, dtype=torch.int32, device=device),
                 "main_slots": torch.empty(
-                    (capacity, max(self.num_sparse_topk - _SWA_TILE, 1)),
+                    (capacity, max(md.num_sparse_topk - _SWA_TILE, 1)),
                     dtype=torch.int64,
                     device=device,
                 ),
                 "serial": None,
                 "graph_reserved": False,
             }
-        entry["graph_reserved"] |= self.is_cuda_graph or source.is_cuda_graph or capturing
+        entry["graph_reserved"] |= md.is_cuda_graph or source_md.is_cuda_graph or capturing
         serial = (*frame, count, capturing)
         compact = group is None or entry["serial"] != serial
         entry["serial"] = serial
@@ -719,7 +719,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         """
         from .quantization import _fused_gather_supported, gather_rows, row_bytes
 
-        count = self.num_tokens
+        md = self.metadata
+        count = md.num_tokens
         fp8 = self.swa_pool.dtype == torch.float8_e4m3fn
         if fp8:
             kv_scale_orig_quant = (
@@ -759,7 +760,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             if (
                 inputs.topk_indices.ndim != 2
                 or inputs.topk_indices.shape[0] != count
-                or inputs.topk_indices.shape[1] > self.num_sparse_topk - _SWA_TILE
+                or inputs.topk_indices.shape[1] > md.num_sparse_topk - _SWA_TILE
             ):
                 raise ValueError("CSA2 selected main indices exceed metadata geometry")
         # Preserve gather_rows validation even for zero-width selections; an
@@ -811,11 +812,11 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             and all(pool.is_cuda and pool.stride(1) == 1 for pool, _, _ in sources)
             and _fused_gather_supported(inputs.swa_pool.device.index)
         )
-        if native and self.num_sparse_topk <= 4096:
+        if native and md.num_sparse_topk <= 4096:
             from .kernel import stage_selected_rows
 
-            source = inputs.state.metadata if inputs.state is not None else None
-            scratch, compact = self._stage_scratch(source or self, inputs.stage_group, count)
+            source = inputs.state.metadata.ext(CSA2Metadata) if inputs.state is not None else self
+            scratch, compact = self._stage_scratch(source, inputs.stage_group, count)
             main_slots = inputs.topk_indices
             if mapping is not None and main_slots is not None:
                 main_slots = scratch["main_slots"][:count, : main_slots.shape[1]]
@@ -891,7 +892,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         indices[:, :_SWA_TILE].copy_(
             torch.where(swa_positions < lengths[:, None], offsets * _SWA_TILE + swa_positions, -1)
         )
-        extra_capacity = self.num_sparse_topk - _SWA_TILE
+        extra_capacity = md.num_sparse_topk - _SWA_TILE
         if extra_capacity:
             extra_positions = torch.arange(extra_capacity, device=swa.device)[None, :]
             indices[:, _SWA_TILE:].copy_(
@@ -935,25 +936,31 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             )
         self._csa2_pending_replay = (tuple(cached_prefix_lengths), decoder)
 
+    def bind_context_requests(
+        self, requests: list[LlmRequest], *, prefill_cuda_graphs: bool
+    ) -> None:
+        self.prepare_context_replay(requests, allow_final_window=not prefill_cuda_graphs)
+
     def prepare_context_replay(
         self, requests: list[LlmRequest], *, allow_final_window: bool = True
     ) -> None:
         """Resolve recovery sources and read floors before preparing model inputs."""
         from .....pyexecutor.ced_replay import EncoderCheckpoint, EncoderReplay
 
+        md = self.metadata
         # Graph selection may vary between chunks. Keep every chunk's Decoder
         # history when a later chunk can enter a graph that expects full inputs.
         self.decoder_context_ends = (
             tuple(request.prompt_len for request in requests) if allow_final_window else ()
         )
-        prefixes = [None] * self.num_seqs
-        floors = [0] * self.num_seqs
-        starts = self.kv_cache_params.num_cached_tokens_per_seq
-        lengths = self.seq_lens.tolist()
+        prefixes = [None] * md.num_seqs
+        floors = [0] * md.num_seqs
+        starts = md.kv_cache_params.num_cached_tokens_per_seq
+        lengths = md.seq_lens.tolist()
         for row, request in enumerate(requests):
             plan = request.py_ced_replay
             if isinstance(plan, (EncoderReplay, EncoderCheckpoint)):
-                cache = self.kv_cache_manager.kv_cache_map.get(request.py_request_id)
+                cache = md.kv_cache_manager.kv_cache_map.get(request.py_request_id)
                 if cache is None or plan.cache_identity != id(cache) or not cache.is_active:
                     raise ValueError("Encoder recovery has lost its active Global claim")
             if isinstance(plan, EncoderReplay):
@@ -978,7 +985,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         are not dependencies of this query-only pass and must not be reserved
         again merely to build metadata for the longer decoder interval.
         """
-        layout = self.kv_cache_manager.layout
+        md = self.metadata
+        layout = md.kv_cache_manager.layout
         if (
             first_layer not in self.csa2_precomputed_kv_layers
             or first_layer != max(layout.kv_source_layer_ids)
@@ -992,7 +1000,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         ends = [
             start + length
             for start, length in zip(
-                self.kv_cache_params.num_cached_tokens_per_seq, self.seq_lens.tolist()
+                md.kv_cache_params.num_cached_tokens_per_seq, md.seq_lens.tolist()
             )
         ]
         self.set_source_batch([0] * len(ends), ends)
@@ -1020,9 +1028,10 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         return hidden_states.index_select(0, indices)
 
     def _swa_replay_geometry(self, prefixes, decoder, starts, lengths) -> tuple:
+        md = self.metadata
         owner_shapes = []
-        for owner in self.kv_cache_manager.layout.kv_source_layer_ids:
-            ratio = self.kv_cache_manager.layout.compress_ratios[owner]
+        for owner in md.kv_cache_manager.layout.kv_source_layer_ids:
+            ratio = md.kv_cache_manager.layout.compress_ratios[owner]
             source_lengths = tuple(
                 length
                 if prefix is None
@@ -1035,7 +1044,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         return ("decoder" if decoder else "encoder", tuple(lengths), tuple(owner_shapes))
 
     @contextmanager
-    def defer_cuda_graph_decode_outputs(self):
+    def defer_decode_outputs(self):
         """Engine-only scope for a selected ordinary decode graph's preparation.
 
         The engine must run ``on_update_kv_lens`` before any model consumer,
@@ -1049,12 +1058,14 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         finally:
             self._csa2_defer_decode_outputs = previous
 
-    def prepare(self) -> None:
+    @contextmanager
+    def prepare_scope(self):
         from .cache_manager import CSA2CacheManager
 
+        md = self.metadata
         self._csa2_deferred_decode_outputs = False
         self._csa2_context_geometry = None
-        if self.is_cuda_graph and hasattr(self, "_csa2_replay_capture_signature"):
+        if md.is_cuda_graph and hasattr(self, "_csa2_replay_capture_signature"):
             pending = getattr(self, "_csa2_pending_replay", None)
             signature = (
                 None
@@ -1062,34 +1073,41 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 else self._swa_replay_geometry(
                     pending[0],
                     pending[1],
-                    self.kv_cache_params.num_cached_tokens_per_seq,
-                    self.seq_lens.tolist(),
+                    md.kv_cache_params.num_cached_tokens_per_seq,
+                    md.seq_lens.tolist(),
                 )
             )
             if signature != self._csa2_replay_capture_signature:
                 raise ValueError(
                     "CSA2 replay mode/source geometry changed; use fresh graph metadata and recapture"
                 )
-        with torch.cuda.device(self.kv_lens_cuda.device):
+        with torch.cuda.device(md.kv_lens_cuda.device):
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Prepare CSA2 request metadata before CUDA Graph capture")
         self._csa2_ready_for_kv_update = False
-        manager = self.kv_cache_manager
+        manager = md.kv_cache_manager
         scope = (
             manager._swa_publication_scope()
             if isinstance(manager, CSA2CacheManager)
             else nullcontext(None)
         )
         with scope as publication:
-            super().prepare()
-            self.prepare_csa2(swa_publication=publication)
+            self._swa_publication = publication
+            try:
+                yield
+            finally:
+                self._swa_publication = None
+
+    def prepare(self) -> None:
+        self.prepare_csa2(swa_publication=self._swa_publication)
 
     def _get_csa2_buffer(self, key, shape, dtype, *, like=None) -> torch.Tensor:
         # Preserve manager-local, shape-keyed addresses across graph replays.
+        md = self.metadata
         if not hasattr(self, "_csa2_buffers"):
             self._csa2_buffers = {}
-        cache_key = (key, tuple(shape), dtype, self.is_cuda_graph)
-        if not self.is_cuda_graph:
+        cache_key = (key, tuple(shape), dtype, md.is_cuda_graph)
+        if not md.is_cuda_graph:
             # Eager buffers retain only the latest shape per name. Track that
             # shape per name so a prepare with many keys does not rescan the
             # whole bank for every lookup.
@@ -1105,9 +1123,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         result = self._csa2_buffers.get(cache_key)
         if result is None:
             result = (
-                torch.empty_like(like, device=self.kv_lens_cuda.device)
+                torch.empty_like(like, device=md.kv_lens_cuda.device)
                 if like is not None
-                else torch.empty(shape, dtype=dtype, device=self.kv_lens_cuda.device)
+                else torch.empty(shape, dtype=dtype, device=md.kv_lens_cuda.device)
             )
             self._csa2_buffers[cache_key] = result
         return result
@@ -1161,11 +1179,12 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 "CSA2 query/replay interval requires writable SWA pages; "
                 "reserve the complete replay range before prepare"
             )
-        return CSA2TrtllmMetadata._flat_page_ranges(begin, np.where(active, end - begin, 0))
+        return CSA2Metadata._flat_page_ranges(begin, np.where(active, end - begin, 0))
 
     def _check_swa_write_pages(self, starts, lengths, floors, allocated_until, page_count):
         """Raise unless every SWA page the query intervals write is mapped."""
-        manager = self.kv_cache_manager
+        md = self.metadata
+        manager = md.kv_cache_manager
         write_rows, write_columns = self._swa_write_pages(
             starts,
             lengths,
@@ -1185,7 +1204,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         inside the allocated capacity are mapped."""
         from .cache_manager import CSA2CacheRole
 
-        manager = self.kv_cache_manager
+        md = self.metadata
+        manager = md.kv_cache_manager
         block = manager.tokens_per_block
         ratio = manager.layout.compress_ratios[owner]
         page_size = block // ratio
@@ -1259,6 +1279,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
 
     def _device_descriptors(self, kind: str, rows) -> torch.Tensor:
         """Device int64 table of the host descriptor ``rows``, uploaded only when they change."""
+        md = self.metadata
         key = (kind, tuple(rows))
         cache = getattr(self, "_csa2_swa_table_cache", None)
         if cache is None or cache[0] is not self._csa2_buffers:
@@ -1266,7 +1287,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             # descriptor index with it so every copy sees the same fills.
             cache = self._csa2_swa_table_cache = (self._csa2_buffers, {}, {})
         _, names, filled = cache
-        if self.is_cuda_graph:
+        if md.is_cuda_graph:
             # A captured launch reads its descriptor table at replay time, so
             # the content must never change after the fill: every distinct
             # binding (one per captured batch shape) owns its own buffer.
@@ -1296,11 +1317,12 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         re-arm it, so a graph capture always records the launch.
         """
         # None: not prepared by prepare_csa2.
+        md = self.metadata
         if getattr(self, "_csa2_swa_resolved", None) is not False:
             return
         from . import kernel
 
-        manager = self.kv_cache_manager
+        manager = md.kv_cache_manager
         positions, requests = self.csa2_positions, self.csa2_token_requests
         layers, count, window = (
             # SWA layers are a prefix; a decoder-only pass binds its suffix.
@@ -1410,13 +1432,14 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
     def _bind_swa_pages(self, layer, pages, published_pages):
         # Select backing once for each existing shape/graph key. A direct or
         # draft fallback must update it, never redirect a captured consumer.
+        md = self.metadata
         if published_pages is not None and (
             published_pages.dtype != pages.dtype
-            or published_pages.device != self.kv_lens_cuda.device
+            or published_pages.device != md.kv_lens_cuda.device
             or published_pages.shape != pages.shape
         ):
             published_pages = None
-        key = (f"swa_pages/{layer}", tuple(pages.shape), pages.dtype, self.is_cuda_graph)
+        key = (f"swa_pages/{layer}", tuple(pages.shape), pages.dtype, md.is_cuda_graph)
         if not hasattr(self, "_csa2_buffers"):
             self._csa2_buffers = {}
         if published_pages is not None and key not in self._csa2_buffers:
@@ -1443,27 +1466,30 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         from .cache_manager import CSA2CacheManager, CSA2CacheRole
         from .compressor import CSA2CompressionBatch
 
+        md = self.metadata
         self._csa2_deferred_decode_outputs = False
         self._csa2_ready_for_kv_update = False
         # Every prepared forward starts a new staging epoch: the first layer of
         # each staging group compacts again.
         self._csa2_stage_epoch = getattr(self, "_csa2_stage_epoch", 0) + 1
-        manager = self.kv_cache_manager
+        manager = md.kv_cache_manager
         if not isinstance(manager, CSA2CacheManager):
             raise TypeError("CSA2 runtime metadata requires CSA2CacheManager")
         self.csa2_query_layer_start = getattr(self, "_csa2_pending_query_layer_start", 0)
         if hasattr(self, "_csa2_pending_query_layer_start"):
             del self._csa2_pending_query_layer_start
-        if self.beam_width != 1 or self.is_spec_dec_dynamic_tree:
+        if md.beam_width != 1 or md.ext(SpecDecodingMetadata).is_spec_dec_dynamic_tree:
             raise NotImplementedError(
                 "CSA2 supports contiguous-prefix verification, not beams or dynamic trees"
             )
-        request_ids = list(self.request_ids)
-        lengths = self.seq_lens.tolist()
-        if manager.context_swa_layer_limit is not None and self.num_contexts != len(lengths):
+        request_ids = list(md.request_ids)
+        lengths = md.seq_lens.tolist()
+        if manager.context_swa_layer_limit is not None and md.num_contexts != len(lengths):
             raise ValueError("CSA2 context-only cache cannot prepare generation requests")
-        manager.validate_verification(lengths, self.num_contexts, self.is_spec_decoding_enabled)
-        starts = list(self.kv_cache_params.num_cached_tokens_per_seq)
+        manager.validate_verification(
+            lengths, md.num_contexts, md.ext(SpecDecodingMetadata).is_spec_decoding_enabled
+        )
+        starts = list(md.kv_cache_params.num_cached_tokens_per_seq)
         if len(request_ids) != len(lengths) or len(starts) != len(lengths):
             raise ValueError("CSA2 requires one query length and cached length per request")
         replay = getattr(self, "_csa2_pending_replay", None)
@@ -1489,7 +1515,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             for row, (prefix, start, length) in enumerate(zip(prefixes, starts, lengths)):
                 if prefix is None:
                     continue
-                if row >= self.num_contexts:
+                if row >= md.num_contexts:
                     raise ValueError("CSA2 bounded replay applies only to context requests")
                 if start != replay_starts[row]:
                     raise ValueError(
@@ -1521,14 +1547,14 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         # speculative/draft metadata keep the complete preparation contract.
         defer_outputs = (
             getattr(self, "_csa2_defer_decode_outputs", False)
-            and self.is_cuda_graph
-            and self.num_contexts == 0
+            and md.is_cuda_graph
+            and md.num_contexts == 0
             and bool(lengths)
             and all(length == 1 for length in lengths)
-            and not self.is_spec_decoding_enabled
+            and not md.ext(SpecDecodingMetadata).is_spec_decoding_enabled
             and replay is None
             and not external_source
-            and getattr(self, "csa2_remote_tail_mode", None) is None
+            and getattr(md, "csa2_remote_tail_mode", None) is None
         )
         source_lengths, source_starts = getattr(self, "_csa2_source_batch", (lengths, starts))
         if external_source:
@@ -1539,9 +1565,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         # step's full verification width; positions beyond the allocated
         # capacity stay unmapped and on_update_kv_lens narrows them later.
         allocated_until = np.full(len(lengths), manager.max_seq_len, dtype=np.int64)
-        allocated_until[self.num_contexts :] = [
+        allocated_until[md.num_contexts :] = [
             manager.kv_cache_map[request_id].capacity
-            for request_id in request_ids[self.num_contexts :]
+            for request_id in request_ids[md.num_contexts :]
         ]
         lengths_np = np.asarray(lengths, dtype=np.int64)
         starts_np = np.asarray(starts, dtype=np.int64)
@@ -1583,7 +1609,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             raise ValueError("CSA2 query positions exceed the manager context capacity")
         self.csa2_request_start_positions = tuple(starts)
         self.csa2_request_lengths = tuple(lengths)
-        self.csa2_num_context_requests = self.num_contexts
+        self.csa2_num_context_requests = md.num_contexts
         query_ends = np.cumsum(lengths_np)
         query_begins = query_ends - lengths_np
         packed_start = int(query_ends[-1]) if query_ends.size else 0
@@ -1622,10 +1648,10 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         self._csa2_compression = {}
         self._csa2_compressed_positions = {}
         published_swa = manager._get_swa_publication(
-            swa_publication, self.kv_cache_block_offsets, request_ids, self.num_contexts, page_count
+            swa_publication, md.kv_cache_block_offsets, request_ids, md.num_contexts, page_count
         )
         if published_swa is None:
-            manager.compute_batch_page_tables(request_ids, self.num_contexts)
+            manager.compute_batch_page_tables(request_ids, md.num_contexts)
         # Owner slots are resolved from these host KV ends: a draft prepare
         # runs without the generic prepare, so kv_lens_cuda may hold live
         # lengths that differ from the host positions.
@@ -1638,7 +1664,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             )
             shared_cu = copy("source_cu", np.cumsum([0, *source_lengths], dtype=np.int32))
         owners = manager.layout.kv_source_layer_ids
-        if self.num_contexts:
+        if md.num_contexts:
             # Reserve every currently addressable logical row, including
             # upward live-end corrections within already published pages.
             # This is capacity only; selected indices retain visibility.
@@ -1687,7 +1713,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             )
             capacity = sum(owner_lengths)
             global_spec = (owner, CSA2CacheRole.GLOBAL)
-            if self.num_contexts:
+            if md.num_contexts:
                 self._csa2_main_domain_counts[owner] = tuple(
                     min(page * (block // ratio), manager.max_seq_len // ratio)
                     for page in last_pages[index]
@@ -1752,11 +1778,11 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         self.csa2_token_requests = copy("token_requests", token_requests_np)
         # Generation-row -> generation-request map for the sparse paged indexer kernels
         decode_start = (
-            query_ranges[self.num_contexts][0]
-            if self.num_contexts < len(query_ranges)
+            query_ranges[md.num_contexts][0]
+            if md.num_contexts < len(query_ranges)
             else packed_start
         )
-        decode_rows_np = (token_requests_np[decode_start:] - self.num_contexts).astype(np.int32)
+        decode_rows_np = (token_requests_np[decode_start:] - md.num_contexts).astype(np.int32)
         self.csa2_decode_row_requests = (
             copy("decode_row_requests", decode_rows_np) if decode_rows_np.size else None
         )
@@ -1812,11 +1838,11 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         # Only a plain generation prepare seeds the steady path: context,
         # replay, source-override and decoder-boundary geometry must be rebuilt.
         steady_seed = (
-            not self.num_contexts
+            not md.num_contexts
             and replay is None
             and not external_source
             and not self.csa2_query_layer_start
-            and getattr(self, "csa2_remote_tail_mode", None) is None
+            and getattr(md, "csa2_remote_tail_mode", None) is None
         )
         self._finish_prepare_csa2(snapshot if steady_seed else None, defer_outputs=defer_outputs)
 
@@ -1826,8 +1852,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         The same generation requests, in the same order and with the same
         query lengths, each start where the previous query ended.
         """
+        md = self.metadata
         previous = getattr(self, "_csa2_steady_snapshot", None)
-        if previous is None or self.num_contexts:
+        if previous is None or md.num_contexts:
             return False
         ids, lengths, starts, _ = snapshot
         if (ids, lengths) != (previous[0], previous[1]):
@@ -1837,9 +1864,10 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
     def _steady_pages_moved(self, snapshot) -> bool:
         """Whether a steady step's last position, SWA window start or allocated
         capacity crossed a page boundary, so its page tables may have changed."""
+        md = self.metadata
         previous = self._csa2_steady_snapshot
-        block = self.kv_cache_manager.tokens_per_block
-        window = self.kv_cache_manager.layout.window_size
+        block = md.kv_cache_manager.tokens_per_block
+        window = md.kv_cache_manager.layout.window_size
         _, lengths, starts, allocated = snapshot
         last = starts + np.asarray(lengths, dtype=np.int64) - 1
         prev_last = last - (starts - previous[2])
@@ -1862,12 +1890,13 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         """
         from .cache_manager import CSA2CacheRole
 
-        manager = self.kv_cache_manager
+        md = self.metadata
+        manager = md.kv_cache_manager
         published_swa = manager._get_swa_publication(
-            swa_publication, self.kv_cache_block_offsets, request_ids, self.num_contexts, page_count
+            swa_publication, md.kv_cache_block_offsets, request_ids, md.num_contexts, page_count
         )
         if published_swa is None:
-            manager.compute_batch_page_tables(request_ids, self.num_contexts)
+            manager.compute_batch_page_tables(request_ids, md.num_contexts)
         self._check_swa_write_pages(starts, lengths, floors, allocated_until, page_count)
         ends = [start + length for start, length in zip(starts, lengths)]
         for owner in self.csa2_global_page_tables:
@@ -1895,7 +1924,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             torch._foreach_copy_(targets, sources)
 
     def _finish_prepare_csa2(self, snapshot, *, defer_outputs: bool) -> None:
-        manager = self.kv_cache_manager
+        md = self.metadata
+        manager = md.kv_cache_manager
         self._csa2_prepared_manager = manager
         self._csa2_forward_serial = getattr(self, "_csa2_forward_serial", 0) + 1
         for layer_idx in getattr(self, "_csa2_priors", {}):
@@ -1918,7 +1948,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         for name, value in fields.items():
             setattr(self, name, value)
 
-    def prepare_for_draft_forward(self) -> dict | None:
+    def draft_swap(self) -> dict | None:
         """Rebuild draft-owned fields after the existing interface swaps managers.
 
         Only identical explicit layer layouts are representable here. Virtual
@@ -1926,7 +1956,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         This hook runs before capture/replay, never inside a captured forward.
         """
         target = getattr(self, "_csa2_prepared_manager", None)
-        draft = self.kv_cache_manager
+        draft = self.metadata.kv_cache_manager
         if target is None or target is draft:
             return None
         if torch.cuda.is_current_stream_capturing():
@@ -1953,7 +1983,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             raise
         return saved
 
-    def restore_after_draft_forward(self, saved_state: dict | None) -> None:
+    def draft_restore(self, saved_state: dict | None) -> None:
         if saved_state is None:
             return
         draft = self._csa2_prepared_manager
@@ -1964,37 +1994,37 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         for callback in getattr(self, "_csa2_indexer_resets", {}).values():
             callback()
 
-    def begin_model_forward(self) -> None:
+    def begin_forward(self) -> None:
         """Reset only per-model-forward publications, retaining prepared buffers."""
         self.reset_routing()
         self.csa2_precomputed_kv_layers = set()
         self.csa2_replay_query_rows = None
         self.csa2_decoder_capture_lens = None
 
-    def on_update_kv_lens(self) -> None:
+    def on_kv_lens_changed(self, spec_dec_step: bool) -> None:
         """Refresh query/cache addresses after device-side acceptance correction.
 
         Host cached lengths reserve verification capacity; live device endpoints
         may be shorter. All address/ratio computations stay on device and retain
         the prepared tensor shapes for captured replay.
         """
-        super().on_update_kv_lens()
-        if getattr(self, "_csa2_ready_for_kv_update", False):
+        if not spec_dec_step and getattr(self, "_csa2_ready_for_kv_update", False):
             self._refresh_live_endpoints()
 
     def _refresh_live_endpoints(self) -> None:
         """Recompute positions and owner slots; SWA slots follow in the next forward."""
+        md = self.metadata
         self._csa2_shared_domains = {}
         self._csa2_swa_resolved = False
         _, _, positions = self._refresh_query_positions(
-            self.kv_lens_cuda,
+            md.kv_lens_cuda,
             self._csa2_query_lengths,
             self._csa2_query_base,
             self.csa2_token_requests.long(),
             self._csa2_query_offsets,
         )
         self.csa2_positions.copy_(positions)
-        self._resolve_owner_slots(self.kv_lens_cuda)
+        self._resolve_owner_slots(md.kv_lens_cuda)
 
     def _resolve_owner_slots(self, kv_lens: torch.Tensor) -> None:
         """Every KV owner's GLOBAL write slots and compressed groups for the KV ends
@@ -2034,7 +2064,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
     def _owner_slot_arguments(self):
         """``(owner, (source base, source lengths, pages, slots, compressed, ratio,
         page size, batch starts, batch lengths, batch cu))`` of every KV owner."""
-        manager = self.kv_cache_manager
+        md = self.metadata
+        manager = md.kv_cache_manager
         for owner, (source_base, source_lengths) in self._csa2_source_geometry.items():
             ratio = manager.layout.compress_ratios[owner]
             batch = self._csa2_compression.get(owner) if ratio == 2 else None
@@ -2190,7 +2221,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             slots = torch.where(logical < visible_lengths[:, None], slots, -1)
         return slots
 
-    def prepare_indexer(self, layer_idx: int) -> CSA2TrtllmMetadata | None:
+    def prepare_indexer(self, layer_idx: int) -> CSA2Metadata | None:
         """Bind native paged-indexer descriptors for the real generation queries.
 
         The owner's index rows are read in place: a GLOBAL page is a run of
@@ -2206,10 +2237,11 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
 
         from .quantization import INDEX_PAGE_ROWS
 
-        manager = self.kv_cache_manager
+        md = self.metadata
+        manager = md.kv_cache_manager
         if manager is None:
             raise ValueError("CSA2 paged indexer requires a cache manager")
-        if torch.cuda.is_current_stream_capturing() and not self.is_cuda_graph:
+        if torch.cuda.is_current_stream_capturing() and not md.is_cuda_graph:
             raise RuntimeError("Set is_cuda_graph before warming CSA2 paged indexer metadata")
         owner = self.csa2_kv_sources[layer_idx]
         if owner is None:
@@ -2226,7 +2258,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         count = decode_end - decode_start
         request_count = len(generation_ranges)
         ratio = manager.layout.compress_ratios[owner]
-        if self.is_cuda_graph:
+        if md.is_cuda_graph:
             max_positions = max(1, self.csa2_global_max_positions[owner])
         else:
             max_positions = max(
@@ -2240,7 +2272,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 ),
             )
         native_page_size = INDEX_PAGE_ROWS
-        if self.is_cuda_graph:
+        if md.is_cuda_graph:
             # Reserve the largest owner geometry during warmup so another
             # serialized owner cannot replace a buffer captured by this graph.
             required_pages = max(
@@ -2255,17 +2287,17 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         table = self.csa2_global_page_tables[owner][context_requests:]
         device = table.device
         draft_width = 1 + getattr(manager, "max_total_draft_tokens", 0)
-        query_capacity = self.max_num_requests * draft_width if self.is_cuda_graph else count
-        if self.is_cuda_graph and count > query_capacity:
+        query_capacity = md.max_num_requests * draft_width if md.is_cuda_graph else count
+        if md.is_cuda_graph and count > query_capacity:
             raise ValueError("CSA2 graph query count exceeds configured batch and draft width")
         key = (
             (device, manager.layout.index_topk, True)
-            if self.is_cuda_graph
+            if md.is_cuda_graph
             else (device, request_count, count, manager.layout.index_topk, False)
         )
         if not hasattr(self, "_csa2_indexer_workspaces"):
             self._csa2_indexer_workspaces = {}
-        if not self.is_cuda_graph:
+        if not md.is_cuda_graph:
             # Runtime metadata survives many batch geometries. Retain just
             # the latest eager arena per device; active descriptors still own
             # their tensors, and serialized stream work preserves their use.
@@ -2327,7 +2359,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             id(manager),
             getattr(self, "_csa2_forward_serial", 0),
             count,
-            self.is_cuda_graph,
+            md.is_cuda_graph,
             torch.cuda.is_current_stream_capturing(),
         )
         if scratch["owners"].get(owner) != serial:
@@ -2383,6 +2415,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         """
         from tensorrt_llm.deep_gemm import get_paged_sparse_mqa_logits_metadata
 
+        md = self.metadata
         row_requests = getattr(self, "csa2_decode_row_requests", None)
         table = self.csa2_indexer_block_table
         owner = self.csa2_kv_sources[layer_idx]
@@ -2402,10 +2435,10 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         counts = counts[counts.shape[0] - count :].reshape(-1)
         blocks = blocks[blocks.shape[0] - count :]
         serial = (
-            id(self.kv_cache_manager),
+            id(md.kv_cache_manager),
             getattr(self, "_csa2_forward_serial", 0),
             count,
-            self.is_cuda_graph,
+            md.is_cuda_graph,
             torch.cuda.is_current_stream_capturing(),
         )
         schedules = self.__dict__.setdefault("_csa2_sparse_schedules", {})
@@ -2570,14 +2603,14 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
 
     def get_workspace_bytes(self) -> int:
         """Report retained GPU workspace once per storage, excluding KV pools."""
+        md = self.metadata
         values = [
             value
-            for name, value in vars(self).items()
+            for name, value in (*vars(md).items(), *vars(self).items())
             if isinstance(value, torch.Tensor) and name != "position_ids"
         ]
+        values += [md.workspace, md.cuda_graph_workspace]
         for name in (
-            "workspace",
-            "cuda_graph_workspace",
             "_csa2_buffers",
             "_csa2_indexer_workspaces",
             "_csa2_priors",
@@ -2586,8 +2619,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         ):
             values.append(getattr(self, name, None))
         for metadata in getattr(self, "_csa2_query_tiles", {}).values():
-            for name, value in vars(metadata).items():
-                if name != "kv_cache_manager":
+            tile = metadata.ext(CSA2Metadata)
+            for name, value in (*vars(metadata).items(), *vars(tile).items()):
+                if name not in ("kv_cache_manager", "metadata"):
                     values.append(value)
         return self._workspace_storage_bytes(values)
 
@@ -2598,6 +2632,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         self._csa2_indexer_resets[layer_idx] = callback
 
     def prepare_indexer_prior(self, layer_idx: int, topk: int) -> torch.Tensor:
+        md = self.metadata
         if not hasattr(self, "_csa2_priors"):
             self._csa2_priors = {}
             self.csa2_indexer_prior_capacity = {}
@@ -2605,7 +2640,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         if record is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm up CSA2 temporal priors before graph capture")
-            capacity = self.max_num_tokens
+            capacity = md.max_num_tokens
             device = self.csa2_token_requests.device
             record = {
                 "prior": torch.full((capacity, topk), -1, dtype=torch.int32, device=device),
@@ -2625,17 +2660,18 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         return record["prior"][: record["count"]]
 
     def _refresh_indexer_prior(self, layer_idx: int) -> None:
+        md = self.metadata
         record = self._csa2_priors[layer_idx]
         previous = {key: row for row, key in enumerate(record["keys"]) if key is not None}
         rows, identities = [], []
         publish_keys = [None] * sum(self.csa2_request_lengths)
         reset = self.csa2_num_context_requests > 0
         for request_row, length in enumerate(self.csa2_request_lengths):
-            request_id = self.request_ids[request_row]
+            request_id = md.request_ids[request_row]
             start = self.csa2_request_start_positions[request_row]
             identity = (
-                id(self.kv_cache_manager),
-                self.kv_cache_manager.request_epoch(request_id),
+                id(md.kv_cache_manager),
+                md.kv_cache_manager.request_epoch(request_id),
                 request_id,
             )
             begin, end = self.csa2_request_query_ranges[request_row]

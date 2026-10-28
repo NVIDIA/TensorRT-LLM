@@ -29,6 +29,8 @@ try:
 except ImportError:  # The bundled DeepGEMM predates the sparse indexer kernels
     _HAS_SPARSE_MQA_LOGITS = False
 
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
 from ..dsa.indexer import _INDEXER_MQA_LOGITS_ELEM_BUDGET, Indexer, _split_prefill_queries
 from ..dsa.params import DSAParams
 from ..params import use_self_sampling_gvr
@@ -39,7 +41,7 @@ from .kernel import (
     mask_logits_,
     publish_candidates_,
 )
-from .metadata import CSA2TrtllmMetadata
+from .metadata import CSA2Metadata
 from .params import CSA2ForwardState, CSA2Layout, CSA2Mode, CSA2Params
 from .quantization import (
     INDEX_DATA_BYTES,
@@ -540,7 +542,7 @@ class CSA2Indexer(Indexer):
 
     def _select_paged_logits(
         self,
-        metadata: CSA2TrtllmMetadata,
+        metadata: TrtllmAttentionMetadata,
         logits: torch.Tensor,
         candidates: Optional[torch.Tensor],
         output_indices: torch.Tensor,
@@ -555,8 +557,9 @@ class CSA2Indexer(Indexer):
         candidate columns instead. TopK runs over the masked scores, then one
         CuTe launch validates, sorts and pads the selection with ``-1``.
         """
-        valid = metadata.csa2_indexer_valid_positions
-        visible = metadata.csa2_indexer_visible_lengths
+        csa2 = metadata.ext(CSA2Metadata)
+        valid = csa2.csa2_indexer_valid_positions
+        visible = csa2.csa2_indexer_visible_lengths
         width = logits.shape[1]
         if width == 0 or (candidates is not None and candidates.shape[1] == 0):
             return output_indices.fill_(-1)
@@ -587,8 +590,8 @@ class CSA2Indexer(Indexer):
             None,
             row_ends,
             is_prefill=False,
-            radix_aux_indices=metadata.csa2_indexer_radix_aux_indices,
-            radix_aux_logits=metadata.csa2_indexer_radix_aux_logits,
+            radix_aux_indices=csa2.csa2_indexer_radix_aux_indices,
+            radix_aux_logits=csa2.csa2_indexer_radix_aux_logits,
             gvr_prior_indices=gvr_prior_indices,
         )
         if positions is None:
@@ -924,7 +927,7 @@ class CSA2Indexer(Indexer):
 
     def _paged_mqa_logits(
         self,
-        metadata: CSA2TrtllmMetadata,
+        metadata: TrtllmAttentionMetadata,
         q_data: torch.Tensor,
         weights: torch.Tensor,
         q_scale: torch.Tensor,
@@ -932,6 +935,7 @@ class CSA2Indexer(Indexer):
     ) -> torch.Tensor:
         # Existing native paged specializations support 32/64 heads. Zero
         # weighted padding extends smaller CSA2 index geometries exactly.
+        csa2 = metadata.ext(CSA2Metadata)
         use_dsl = self.options.use_cute_dsl_paged_mqa_logits and IS_CUTLASS_DSL_AVAILABLE
         padded_heads = 64 if use_dsl or self.n_heads > 32 else 32
         if padded_heads != self.n_heads:
@@ -942,22 +946,22 @@ class CSA2Indexer(Indexer):
             return torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
                 q_data.view(torch.uint8),
                 q_scale,
-                metadata.csa2_indexer_k_cache,
+                csa2.csa2_indexer_k_cache,
                 weights,
-                metadata.csa2_indexer_context_lengths.flatten(),
-                metadata.csa2_indexer_block_table,
-                metadata.csa2_indexer_scheduler_metadata,
-                metadata.csa2_indexer_max_seq_len,
+                csa2.csa2_indexer_context_lengths.flatten(),
+                csa2.csa2_indexer_block_table,
+                csa2.csa2_indexer_scheduler_metadata,
+                csa2.csa2_indexer_max_seq_len,
                 **(emission_kwargs or {}),
             )
         return self._call_paged_mqa_logits(
             q_data,
-            metadata.csa2_indexer_k_cache,
+            csa2.csa2_indexer_k_cache,
             weights,
-            metadata.csa2_indexer_context_lengths,
-            metadata.csa2_indexer_block_table,
-            metadata.csa2_indexer_scheduler_metadata,
-            metadata.csa2_indexer_max_seq_len,
+            csa2.csa2_indexer_context_lengths,
+            csa2.csa2_indexer_block_table,
+            csa2.csa2_indexer_scheduler_metadata,
+            csa2.csa2_indexer_max_seq_len,
             q_scale,
         )
 
@@ -1081,7 +1085,7 @@ class CSA2Indexer(Indexer):
 
     def sparse_attn_indexer(
         self,
-        metadata: CSA2TrtllmMetadata,
+        metadata: TrtllmAttentionMetadata,
         hidden_states: torch.Tensor,
         q_fp8: torch.Tensor,
         k_fp8: torch.Tensor | None,
@@ -1095,34 +1099,35 @@ class CSA2Indexer(Indexer):
         Inputs span the complete model batch. K is read from the owner cache;
         the base signature is retained for the backend's indexer contract.
         """
+        csa2 = metadata.ext(CSA2Metadata)
         if is_generation is not None:
             raise ValueError("CSA2 prediction requires the complete model query batch")
         manager = metadata.kv_cache_manager
         count = hidden_states.shape[0]
         layer = self.layout.layer(self.layer_idx)
-        visible = metadata.csa2_visible_lengths[self.layer_idx]
-        max_positions = metadata.csa2_global_max_positions[layer.kv_source]
+        visible = csa2.csa2_visible_lengths[self.layer_idx]
+        max_positions = csa2.csa2_global_max_positions[layer.kv_source]
         logical = torch.empty((count, self.index_topk), dtype=torch.int32, device=q_fp8.device)
-        metadata.csa2_indices[self.layer_idx] = logical
+        csa2.csa2_indices[self.layer_idx] = logical
         prior = None
         if q_fp8.is_cuda and self.top_k.needs_gvr_prior:
-            metadata.register_indexer_reset(
+            csa2.register_indexer_reset(
                 self.layer_idx, lambda: self.top_k.reset_gvr_emission_rows(slice(None))
             )
-            prior = metadata.prepare_indexer_prior(self.layer_idx, self.index_topk)
+            prior = csa2.prepare_indexer_prior(self.layer_idx, self.index_topk)
         candidates = None
         sparse_blocks = sparse_counts = None
         auxiliary = sharded = ()
         score_hook = None
         sparse_logits = self.use_sparse_candidates and q_fp8.is_cuda
         if layer.candidate_source is not None and layer.candidate_source != self.layer_idx:
-            candidates = metadata.csa2_candidates.get(layer.candidate_source)
+            candidates = csa2.csa2_candidates.get(layer.candidate_source)
             if candidates is None or candidates.ndim != 2 or candidates.shape[0] != count:
                 raise ValueError(
                     "CSA2 candidate source must publish matching full-query rows first"
                 )
-            sparse_blocks = metadata.csa2_candidate_blocks.get(layer.candidate_source)
-            sparse_counts = metadata.csa2_candidate_counts.get(layer.candidate_source)
+            sparse_blocks = csa2.csa2_candidate_blocks.get(layer.candidate_source)
+            sparse_counts = csa2.csa2_candidate_counts.get(layer.candidate_source)
             sparse_logits = (
                 sparse_logits
                 and sparse_blocks is not None
@@ -1142,33 +1147,33 @@ class CSA2Indexer(Indexer):
             published = torch.full(
                 (count, candidate_width), -1, dtype=torch.int32, device=q_fp8.device
             )
-            metadata.csa2_candidates[self.layer_idx] = published
+            csa2.csa2_candidates[self.layer_idx] = published
             auxiliary = (published,)
             sparse_block = self.sparse_block
             if sparse_block:
                 # Rows no chunk scores keep block 0 and zero valid columns; gathered
                 # across TP ranks with the candidates.
-                metadata.csa2_candidate_blocks[self.layer_idx] = torch.zeros(
+                csa2.csa2_candidate_blocks[self.layer_idx] = torch.zeros(
                     (count, candidate_width // sparse_block), dtype=torch.int32, device=q_fp8.device
                 )
-                metadata.csa2_candidate_counts[self.layer_idx] = torch.zeros(
+                csa2.csa2_candidate_counts[self.layer_idx] = torch.zeros(
                     (count, 1), dtype=torch.int32, device=q_fp8.device
                 )
                 sharded = (
-                    metadata.csa2_candidate_blocks[self.layer_idx],
-                    metadata.csa2_candidate_counts[self.layer_idx],
+                    csa2.csa2_candidate_blocks[self.layer_idx],
+                    csa2.csa2_candidate_counts[self.layer_idx],
                 )
 
             def score_hook(scores: torch.Tensor, start: int, end: int) -> None:
                 self._publish_candidates(
                     scores,
                     visible[start:end],
-                    metadata.csa2_candidates,
+                    csa2.csa2_candidates,
                     start,
                     count,
                     candidate_width,
-                    metadata.csa2_candidate_blocks if sparse_block else None,
-                    metadata.csa2_candidate_counts if sparse_block else None,
+                    csa2.csa2_candidate_blocks if sparse_block else None,
+                    csa2.csa2_candidate_counts if sparse_block else None,
                 )
 
         # Host prefix bounds are valid for eager execution only. A graph must
@@ -1184,10 +1189,10 @@ class CSA2Indexer(Indexer):
                 max(
                     (prefix + end - begin) // layer.compress_ratio
                     for prefix, (begin, end) in zip(
-                        metadata.csa2_request_start_positions, metadata.csa2_request_query_ranges
+                        csa2.csa2_request_start_positions, csa2.csa2_request_query_ranges
                     )
                 )
-                if metadata.csa2_request_query_ranges
+                if csa2.csa2_request_query_ranges
                 else 0,
             )
         )
@@ -1201,7 +1206,7 @@ class CSA2Indexer(Indexer):
                 if candidates is not None
                 else torch.arange(short_bound, device=q_fp8.device).expand(count, -1)
             )
-            slots = metadata.global_slot_tile(self.layer_idx, 0, count, positions)
+            slots = csa2.global_slot_tile(self.layer_idx, 0, count, positions)
             positions = torch.where(slots >= 0, positions, -1)
             self._select_all_visible(
                 positions,
@@ -1210,12 +1215,12 @@ class CSA2Indexer(Indexer):
                 logical,
             )
             if prior is not None:
-                metadata.publish_indexer_prior(self.layer_idx, logical)
+                csa2.publish_indexer_prior(self.layer_idx, logical)
             return logical
 
         def candidate_tile(start: int, end: int) -> _ChunkInputs:
             positions = candidates[start:end]
-            slots = metadata.global_slot_tile(self.layer_idx, start, end, positions)
+            slots = csa2.global_slot_tile(self.layer_idx, start, end, positions)
             keys, scales = manager.gather_indexer_keys(layer.kv_source, slots.flatten())
             width = positions.shape[1]
             starts = torch.arange(end - start, dtype=torch.int32, device=q_fp8.device) * width
@@ -1232,9 +1237,7 @@ class CSA2Indexer(Indexer):
             # A request's compressed prefix is gathered once and shared by all
             # query tiles. Cached and newly published keys have the same owner.
             positions = torch.arange(width, device=q_fp8.device)
-            slots = metadata.global_slot_tile(self.layer_idx, start, start + 1, positions[None, :])[
-                0
-            ]
+            slots = csa2.global_slot_tile(self.layer_idx, start, start + 1, positions[None, :])[0]
             keys, scales = manager.gather_indexer_keys(layer.kv_source, slots)
             starts = torch.zeros(end - start, dtype=torch.int32, device=q_fp8.device)
             logical_positions = torch.where(slots >= 0, positions, -1).expand(end - start, -1)
@@ -1248,8 +1251,8 @@ class CSA2Indexer(Indexer):
                 shared_columns=True,
             )
 
-        ranges = metadata.csa2_request_query_ranges
-        num_contexts = metadata.csa2_num_context_requests
+        ranges = csa2.csa2_request_query_ranges
+        num_contexts = csa2.csa2_num_context_requests
         decode_start = ranges[num_contexts][0] if num_contexts < len(ranges) else count
         # Heuristic and GVR TopK address columns as key positions, so only
         # exact TopK may select over candidate-ordered columns.
@@ -1269,11 +1272,11 @@ class CSA2Indexer(Indexer):
             and 1 <= self.n_heads <= 64
             and self.head_dim == 128
         )
-        paged = metadata.prepare_indexer(self.layer_idx) if native_decode else None
+        paged = csa2.prepare_indexer(self.layer_idx) if native_decode else None
         sparse_descriptors = None
         if paged is not None and candidates is not None:
             # Sparse paged logits read the native index pages in place
-            sparse_descriptors = metadata.prepare_sparse_indexer(self.layer_idx, self.sparse_block)
+            sparse_descriptors = csa2.prepare_sparse_indexer(self.layer_idx, self.sparse_block)
             if sparse_descriptors is None:
                 paged = None
         chunks = []
@@ -1284,7 +1287,7 @@ class CSA2Indexer(Indexer):
                     # Gather the request's prefix once and score only each
                     # query's candidate blocks in it.
                     width = min(
-                        max_positions, metadata.csa2_request_start_positions[request] + end - begin
+                        max_positions, csa2.csa2_request_start_positions[request] + end - begin
                     )
 
                     def load_shared(begin=begin, end=end, width=width):
@@ -1324,7 +1327,7 @@ class CSA2Indexer(Indexer):
                 continue
             if not is_prefill and paged is not None:
                 continue
-            chunk_size = metadata.indexer_max_chunk_size
+            chunk_size = csa2.indexer_max_chunk_size
             for start in range(begin, end, chunk_size):
                 stop = min(start + chunk_size, end)
                 # Decode graphs must continue seeing newly published keys as
@@ -1334,7 +1337,7 @@ class CSA2Indexer(Indexer):
                     if not is_prefill or metadata.is_cuda_graph
                     else min(
                         max_positions,
-                        (metadata.csa2_request_start_positions[request] + stop - begin)
+                        (csa2.csa2_request_start_positions[request] + stop - begin)
                         // layer.compress_ratio,
                     )
                 )
@@ -1364,7 +1367,7 @@ class CSA2Indexer(Indexer):
             q_scale,
             logical,
             metadata.mapping,
-            metadata.indexer_q_split_threshold,
+            csa2.indexer_q_split_threshold,
             score_hook,
             auxiliary,
             radix_indices,
@@ -1381,7 +1384,7 @@ class CSA2Indexer(Indexer):
                 def hook(scores: torch.Tensor) -> None:
                     score_hook(scores, decode_start, count)
 
-            decode_visible = metadata.csa2_indexer_visible_lengths
+            decode_visible = csa2.csa2_indexer_visible_lengths
             if candidates is not None:
                 # Score only the published candidate blocks straight from the index pages
                 scores = self._sparse_candidate_logits(
@@ -1400,13 +1403,13 @@ class CSA2Indexer(Indexer):
                     logical[decode_start:],
                     None,
                     is_prefill=False,
-                    radix_aux_indices=metadata.csa2_indexer_radix_aux_indices,
-                    radix_aux_logits=metadata.csa2_indexer_radix_aux_logits,
+                    radix_aux_indices=csa2.csa2_indexer_radix_aux_indices,
+                    radix_aux_logits=csa2.csa2_indexer_radix_aux_logits,
                     gvr_prior_indices=prior,
                     valid_counts=sparse_counts[decode_start:],
                 )
                 if prior is not None:
-                    metadata.publish_indexer_prior(self.layer_idx, logical)
+                    csa2.publish_indexer_prior(self.layer_idx, logical)
                 return logical
             decode_scale = (
                 q_scale[decode_start:]
@@ -1418,13 +1421,13 @@ class CSA2Indexer(Indexer):
             if (
                 self.options.use_gvr_emission
                 and prior is not None
-                and metadata.csa2_indexer_max_seq_len % 8 == 0
+                and csa2.csa2_indexer_max_seq_len % 8 == 0
             ):
                 emission_kwargs = self.top_k.prepare_gvr_emission(
                     decode_count,
-                    metadata.csa2_indexer_max_seq_len,
+                    csa2.csa2_indexer_max_seq_len,
                     torch.cuda.get_device_properties(q_fp8.device).multi_processor_count,
-                    metadata.csa2_indexer_prior_capacity[self.layer_idx],
+                    csa2.csa2_indexer_prior_capacity[self.layer_idx],
                 )
             logits = self._paged_mqa_logits(
                 metadata,
@@ -1442,7 +1445,7 @@ class CSA2Indexer(Indexer):
                 prior,
             )
         if prior is not None:
-            metadata.publish_indexer_prior(self.layer_idx, logical)
+            csa2.publish_indexer_prior(self.layer_idx, logical)
         return logical
 
 

@@ -366,7 +366,7 @@ def _make_metadata(
         kwargs["enable_context_mla_with_cached_kv"] = True
     if runtime_features is not None:
         kwargs["runtime_features"] = runtime_features
-    metadata = attn_cls.Metadata(
+    metadata = attn_cls.create_metadata(
         seq_lens=torch.tensor(seq_lens, dtype=torch.int),
         request_ids=list(range(num_ctx)),
         max_num_requests=num_ctx,

@@ -25,8 +25,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from fmha_test_utils import metadata_stub
 
 from tensorrt_llm._torch.attention.backends import utils
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     PredefinedAttentionMask,
@@ -46,7 +48,7 @@ class _CapturingLogger:
 
 
 def _fake_metadata(**overrides):
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         num_contexts=2,
         num_generations=1,
         num_tokens=2050,
@@ -204,9 +206,7 @@ def test_trtllm_forward_logs_and_reraises_kernel_failure(monkeypatch) -> None:
     metadata.workspace = torch.zeros(1024, dtype=torch.int8)
     metadata.cu_q_seqlens = torch.zeros(batch + 1, dtype=torch.int32)
     metadata.cu_kv_seqlens = torch.zeros(batch + 1, dtype=torch.int32)
-    metadata.enable_flash_mla = False
-    metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
-    metadata.spec_decoding_bl_tree_mask = None
+    metadata.replace_ext(SpecDecodingMetadata(metadata))
     metadata.max_context_q_len_override = None
     metadata.kv_cache_manager = SimpleNamespace(
         max_attention_window_vec=[2048, None],

@@ -593,11 +593,12 @@ class DecoderWarmup:
         try:
             from tensorrt_llm._torch.attention.backends.sparse.dsa import (
                 _DG_SCHEDULE_BLOCK_KV,
-                DSAtrtllmAttentionMetadata,
+                DSAMetadata,
             )
         except ImportError:
             return
-        if not isinstance(attn_meta, DSAtrtllmAttentionMetadata):
+        dsa = attn_meta.find_ext(DSAMetadata)
+        if dsa is None:
             return
         try:
             from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
@@ -608,7 +609,7 @@ class DecoderWarmup:
             )
             return
 
-        num_sms = attn_meta.num_sms
+        num_sms = dsa.num_sms
         max_bs = max(1, int(self._config.max_batch_size))
         beam_width = max(1, self._config.max_beam_width)
         # Static upper bound on the row-count multiplier applied to
@@ -616,10 +617,8 @@ class DecoderWarmup:
         # are bounded above by `(1 + max_draft_tokens)`; see the
         # docstring for why we don't read the runtime `dsl_expand_factor`
         # here.
-        max_draft_tokens = int(getattr(attn_meta, "max_draft_tokens", 0) or 0)
-        expands_batch = getattr(attn_meta, "use_expanded_buffers_for_mtp", False) or getattr(
-            attn_meta, "expand_for_dsl", False
-        )
+        max_draft_tokens = int(dsa.max_draft_tokens or 0)
+        expands_batch = dsa.use_expanded_buffers_for_mtp or dsa.expand_for_dsl
         expand_factor = 1 + max_draft_tokens if expands_batch else 1
         max_aligned = ((max_bs * beam_width * expand_factor + 31) // 32) * 32
         buckets = list(range(32, max_aligned + 32, 32))
@@ -734,11 +733,11 @@ class DecoderWarmup:
         if self._metadata.attn_metadata is not None:
             return
         try:
-            from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAtrtllmAttentionMetadata
+            from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAMetadata
         except ImportError:
             return
-        metadata_cls = getattr(self._config.attention_backend, "Metadata", None)
-        if metadata_cls is None or not issubclass(metadata_cls, DSAtrtllmAttentionMetadata):
+        extension_types = getattr(self._config.attention_backend, "metadata_extensions", ())
+        if not any(issubclass(cls, DSAMetadata) for cls in extension_types):
             return
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
@@ -763,16 +762,14 @@ class DecoderWarmup:
         if attn_meta is None:
             return
         try:
-            from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAtrtllmAttentionMetadata
+            from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAMetadata
         except ImportError:
             return
-        if isinstance(attn_meta, DSAtrtllmAttentionMetadata):
+        dsa = attn_meta.find_ext(DSAMetadata)
+        if dsa is not None:
             next_n = 1 + self._config.original_max_draft_len
-            attn_meta.warmup_cute_dsl_radix_topk(next_n)
-            if hasattr(attn_meta, "warmup_selfsampling_topk"):
-                attn_meta.warmup_selfsampling_topk(
-                    next_n, batch_sizes=self._config.cuda_graph_batch_sizes
-                )
+            dsa.warmup_cute_dsl_radix_topk(next_n)
+            dsa.warmup_selfsampling_topk(next_n, batch_sizes=self._config.cuda_graph_batch_sizes)
 
     def _general_warmup(
         self, resource_manager: ResourceManager, warmup_requests_configs: list[tuple[int, int]]

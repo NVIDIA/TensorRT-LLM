@@ -8,6 +8,8 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import \
+    SpecDecodingMetadata
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -1162,13 +1164,11 @@ class Attention(nn.Module):
 
         # For dynamic tree spec decoding with Python RoPE, adjust position_ids
         # to use tree offsets (same as C++ kernel: past_seq_len + offset).
-        if (not self.rope_fusion
-                and getattr(attn_metadata, 'is_spec_dec_dynamic_tree', False)
-                and getattr(attn_metadata, 'use_spec_decoding', False)
-                and getattr(attn_metadata, 'spec_decoding_position_offsets',
-                            None) is not None
-                and attn_metadata.spec_decoding_position_offsets.dim() ==
-                1  # 1D layout ⇒ dynamic tree
+        spec = attn_metadata.find_ext(SpecDecodingMetadata)
+        if (not self.rope_fusion and spec is not None
+                and spec.is_spec_dec_dynamic_tree and spec.use_spec_decoding
+                and spec.position_offsets is not None
+                and spec.position_offsets.dim() == 1  # 1D layout ⇒ dynamic tree
                 and position_ids is not None):
             position_ids = self._adjust_position_ids_for_spec_dec(
                 position_ids, attn_metadata)
@@ -1256,8 +1256,9 @@ class Attention(nn.Module):
         base_pos = attn_metadata.kv_lens_cuda[num_contexts:num_contexts +
                                               num_gens] - gen_len
         total = num_gens * gen_len
-        offsets = attn_metadata.spec_decoding_position_offsets[:total].view(
-            num_gens, gen_len)
+        offsets = attn_metadata.ext(
+            SpecDecodingMetadata).position_offsets[:total].view(
+                num_gens, gen_len)
         start = attn_metadata.num_ctx_tokens
         end = start + total
         adjusted = (base_pos.unsqueeze(1) + offsets).reshape(-1)

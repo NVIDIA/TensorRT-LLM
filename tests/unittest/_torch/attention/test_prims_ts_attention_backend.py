@@ -16,7 +16,6 @@
 import functools
 import inspect
 import math
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -30,6 +29,7 @@ from backend_case import (
     run_backend,
     run_case,
 )
+from fmha_test_utils import metadata_stub
 from utils.util import getSMVersion
 
 pytestmark = pytest.mark.skipif(
@@ -492,7 +492,7 @@ def test_prims_ts_fp8_mla_scales_and_graph_replay(
         mla_bmm1_scale=torch.tensor([bmm1_scale, bmm1_scale * math.log2(math.e)], device=device),
         mla_bmm2_scale=torch.tensor([bmm2_scale], device=device),
     )
-    metadata = SimpleNamespace(
+    metadata = metadata_stub(
         host_kv_cache_pool_pointers=None,
         host_kv_cache_pool_mapping=None,
         kv_cache_block_offsets=block_tables,

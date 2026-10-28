@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import (
     packed_sparse_attention,
     quantize_scatter_rows,
 )
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Metadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
     INDEX_PAGE_BYTES,
     INDEX_PAGE_ROWS,
@@ -673,12 +674,11 @@ def test_quantization_cuda_graph_changed_values():
 
 
 def _stage_fixture(queries, swa_width, main_width, *, empty_pool=False, extra_width=None):
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
 
     torch.manual_seed(711)
     q = torch.empty(queries, 1, 512, dtype=torch.bfloat16, device="cuda")
-    metadata = CSA2TrtllmMetadata.for_query_tile(
+    metadata = CSA2Metadata.for_query_tile(
         q, (main_width or 0) if extra_width is None else extra_width
     )
     rows = 0 if empty_pool else 23
@@ -726,7 +726,10 @@ def _stage_oracle(metadata, inputs):
     packed = rows.gather(1, order[..., None].expand(-1, -1, 512))
     counts = valid.sum(1, dtype=torch.int32)
     packed = torch.where((positions < counts[:, None])[..., None], packed, 0)
-    primary, extra = torch.zeros_like(metadata.swa_pool), torch.zeros_like(metadata.extra_pool)
+    primary, extra = (
+        torch.zeros_like(metadata.ext(CSA2Metadata).swa_pool),
+        torch.zeros_like(metadata.ext(CSA2Metadata).extra_pool),
+    )
     primary[:, : min(rows.shape[1], 128)] = packed[:, :128]
     if rows.shape[1] > 128:
         extra[:, : rows.shape[1] - 128] = packed[:, 128:]
@@ -744,13 +747,18 @@ def _stage_oracle(metadata, inputs):
 
 def _check_stage(metadata, expected):
     for actual, reference in zip(
-        (metadata.swa_pool, metadata.extra_pool, metadata.prepared_lens, metadata.prepared_indices),
+        (
+            metadata.ext(CSA2Metadata).swa_pool,
+            metadata.ext(CSA2Metadata).extra_pool,
+            metadata.ext(CSA2Metadata).prepared_lens,
+            metadata.ext(CSA2Metadata).prepared_indices,
+        ),
         expected,
     ):
         if actual.dtype == torch.bfloat16:
             actual, reference = actual.view(torch.int16), reference.view(torch.int16)
         torch.testing.assert_close(actual, reference, atol=0, rtol=0)
-    assert metadata.prepared_counter.item() == 0
+    assert metadata.ext(CSA2Metadata).prepared_counter.item() == 0
 
 
 @skip_pre_blackwell
@@ -782,10 +790,10 @@ def test_native_staging_exact(queries, swa_width, main_width, empty_pool, extra_
         queries, swa_width, main_width, empty_pool=empty_pool, extra_width=extra_width
     )
     expected = _stage_oracle(metadata, inputs)
-    metadata.swa_pool.fill_(13)
-    metadata.extra_pool.fill_(17)
-    metadata.prepared_counter.fill_(19)
-    metadata.stage_selected(inputs)
+    metadata.ext(CSA2Metadata).swa_pool.fill_(13)
+    metadata.ext(CSA2Metadata).extra_pool.fill_(17)
+    metadata.ext(CSA2Metadata).prepared_counter.fill_(19)
+    metadata.ext(CSA2Metadata).stage_selected(inputs)
     _check_stage(metadata, expected)
     assert bool(calls) == (metadata.num_sparse_topk <= 4096)
 
@@ -817,27 +825,33 @@ def test_staging_group_reuse_validates_each_layers_own_slots():
     }
     # The first layer of the group resolves every column, so it tags all of them.
     stage_selected_rows(
-        inputs.swa_pool, resolved, inputs.swa_pool, None, metadata, scratch, compact=True
+        inputs.swa_pool,
+        resolved,
+        inputs.swa_pool,
+        None,
+        metadata.ext(CSA2Metadata),
+        scratch,
+        compact=True,
     )
     assert scratch["counts"].tolist() == [width] * queries
     # The later layer's private pool starts one row into a sentinel buffer, so the
     # row an unvalidated negative slot reaches decodes to +1.0 instead of zero.
     sentinel = torch.empty(rows + 1, row_bytes, dtype=torch.uint8, device="cuda")
     sentinel[:, :512], sentinel[:, 512:] = 56, 127  # E4M3 +1.0 with a 2**0 scale
-    metadata.swa_pool.fill_(13)
-    metadata.extra_pool.fill_(17)
+    metadata.ext(CSA2Metadata).swa_pool.fill_(13)
+    metadata.ext(CSA2Metadata).extra_pool.fill_(17)
     stage_selected_rows(
         sentinel[1:],
         torch.full((queries, width), -1, device="cuda", dtype=torch.int64),
         sentinel[1:],
         None,
-        metadata,
+        metadata.ext(CSA2Metadata),
         scratch,
         compact=False,
     )
     # Every tagged column is empty for this layer, so every staged row stays zero.
-    assert torch.count_nonzero(metadata.swa_pool) == 0
-    assert torch.count_nonzero(metadata.extra_pool) == 0
+    assert torch.count_nonzero(metadata.ext(CSA2Metadata).swa_pool) == 0
+    assert torch.count_nonzero(metadata.ext(CSA2Metadata).extra_pool) == 0
 
 
 @skip_pre_blackwell
@@ -845,26 +859,28 @@ def test_staging_group_reuse_validates_each_layers_own_slots():
 def test_native_staging_graph_refresh():
     _sm100()
     metadata, inputs = _stage_fixture(8, 128, 17)
-    metadata.stage_selected(inputs)
+    metadata.ext(CSA2Metadata).stage_selected(inputs)
     tensor_names = ("swa_pool", "extra_pool", "prepared_indices", "prepared_lens")
-    pointers = [getattr(metadata, name).data_ptr() for name in tensor_names]
-    retained = metadata.get_workspace_bytes()
+    pointers = [getattr(metadata.ext(CSA2Metadata), name).data_ptr() for name in tensor_names]
+    retained = metadata.ext(CSA2Metadata).get_workspace_bytes()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        metadata.stage_selected(inputs)
+        metadata.ext(CSA2Metadata).stage_selected(inputs)
     for selection, payload in ((0, 56), (-1, 128), (2, 32), (2, 184)):
         inputs.swa_indices.fill_(selection)
         inputs.topk_indices.fill_(selection)
         inputs.swa_pool[2, :512].fill_(payload)
         inputs.main_pool[2, :256].fill_(payload)
         expected = _stage_oracle(metadata, inputs)
-        metadata.swa_pool.fill_(13)
-        metadata.extra_pool.fill_(17)
-        metadata.prepared_counter.fill_(19)
+        metadata.ext(CSA2Metadata).swa_pool.fill_(13)
+        metadata.ext(CSA2Metadata).extra_pool.fill_(17)
+        metadata.ext(CSA2Metadata).prepared_counter.fill_(19)
         graph.replay()
         _check_stage(metadata, expected)
-    assert pointers == [getattr(metadata, name).data_ptr() for name in tensor_names]
-    assert retained == metadata.get_workspace_bytes()
+    assert pointers == [
+        getattr(metadata.ext(CSA2Metadata), name).data_ptr() for name in tensor_names
+    ]
+    assert retained == metadata.ext(CSA2Metadata).get_workspace_bytes()
 
 
 @skip_pre_blackwell
@@ -876,10 +892,10 @@ def test_native_staging_validation_and_fallback(monkeypatch):
     metadata, inputs = _stage_fixture(1, 17, None)
     # An unused malformed main pool is ignored; a supplied empty selection is validated.
     inputs.main_pool = torch.zeros(1, device="cuda")
-    metadata.stage_selected(inputs)
+    metadata.ext(CSA2Metadata).stage_selected(inputs)
     inputs.topk_indices = inputs.swa_indices[:, :0]
     with pytest.raises(ValueError, match="wrong row shape or dtype"):
-        metadata.stage_selected(inputs)
+        metadata.ext(CSA2Metadata).stage_selected(inputs)
     inputs.topk_indices = None
     original_slots = inputs.swa_indices
     backing = torch.empty(inputs.swa_pool.shape[0], 1056, dtype=torch.uint8, device="cuda")
@@ -889,14 +905,14 @@ def test_native_staging_validation_and_fallback(monkeypatch):
     monkeypatch.setattr(
         kernel, "stage_selected_rows", lambda *args: pytest.fail("Expected fallback")
     )
-    metadata.stage_selected(inputs)
+    metadata.ext(CSA2Metadata).stage_selected(inputs)
     _check_stage(metadata, expected)
     # The unsupported zero-query direct invocation still resets the counter.
     metadata._num_tokens = 0
     inputs.swa_indices = original_slots[:0]
-    metadata.prepared_counter.fill_(19)
-    metadata.stage_selected(inputs)
-    assert metadata.prepared_counter.item() == 0
+    metadata.ext(CSA2Metadata).prepared_counter.fill_(19)
+    metadata.ext(CSA2Metadata).stage_selected(inputs)
+    assert metadata.ext(CSA2Metadata).prepared_counter.item() == 0
 
 
 @skip_pre_blackwell
@@ -931,7 +947,6 @@ def test_fused_store_changed_row_counts(cache_format, dim):
 @torch.inference_mode()
 def test_native_fp8_staging_exact_bytes(dequant, q_dequant, monkeypatch):
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
     _sm100()
     control, inputs = _stage_fixture(3, 128, 17)
@@ -951,7 +966,7 @@ def test_native_fp8_staging_exact_bytes(dequant, q_dequant, monkeypatch):
     inputs.topk_indices[2, :2] = 2
     expected = _stage_oracle(control, inputs)
     q = torch.zeros(3, 64, 512, device="cuda", dtype=torch.bfloat16)
-    metadata = CSA2TrtllmMetadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
+    metadata = CSA2Metadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
     dq = torch.tensor([dequant], device="cuda", dtype=torch.float32)
     q_dq = torch.tensor([q_dequant], device="cuda", dtype=torch.float32)
     multiplier = dq.reciprocal()
@@ -963,10 +978,10 @@ def test_native_fp8_staging_exact_bytes(dequant, q_dequant, monkeypatch):
         return original(*args, **kwargs)
 
     monkeypatch.setattr(kernel, "stage_selected_rows", stage)
-    metadata.prepared_counter.fill_(19)
-    metadata.mla_bmm1_scale.fill_(float("nan"))
-    metadata.mla_bmm2_scale.fill_(float("nan"))
-    metadata.stage_selected(
+    metadata.ext(CSA2Metadata).prepared_counter.fill_(19)
+    metadata.ext(CSA2Metadata).mla_bmm1_scale.fill_(float("nan"))
+    metadata.ext(CSA2Metadata).mla_bmm2_scale.fill_(float("nan"))
+    metadata.ext(CSA2Metadata).stage_selected(
         inputs,
         kv_scale_orig_quant=multiplier,
         kv_scale_quant_orig=dq,
@@ -974,23 +989,29 @@ def test_native_fp8_staging_exact_bytes(dequant, q_dequant, monkeypatch):
         softmax_scale=512**-0.5,
     )
     assert calls == [True]
-    for actual, decoded in zip((metadata.swa_pool, metadata.extra_pool), expected[:2]):
+    for actual, decoded in zip(
+        (metadata.ext(CSA2Metadata).swa_pool, metadata.ext(CSA2Metadata).extra_pool), expected[:2]
+    ):
         quantized, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(decoded, dq)
         torch.testing.assert_close(
             actual.view(torch.uint8), quantized.view(torch.uint8), atol=0, rtol=0
         )
-    torch.testing.assert_close(metadata.prepared_lens, expected[2], atol=0, rtol=0)
-    torch.testing.assert_close(metadata.prepared_indices, expected[3], atol=0, rtol=0)
-    assert metadata.prepared_counter.item() == 0
+    torch.testing.assert_close(
+        metadata.ext(CSA2Metadata).prepared_lens, expected[2], atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        metadata.ext(CSA2Metadata).prepared_indices, expected[3], atol=0, rtol=0
+    )
+    assert metadata.ext(CSA2Metadata).prepared_counter.item() == 0
     # BMM1 folds the two independent dequant scales, not one shared scale.
     scale = q_dequant * dequant * 512**-0.5
     torch.testing.assert_close(
-        metadata.mla_bmm1_scale,
+        metadata.ext(CSA2Metadata).mla_bmm1_scale,
         torch.tensor([scale, scale * 1.4426950408889634], device="cuda"),
         atol=1e-7,
         rtol=1e-6,
     )
-    torch.testing.assert_close(metadata.mla_bmm2_scale, dq, atol=0, rtol=0)
+    torch.testing.assert_close(metadata.ext(CSA2Metadata).mla_bmm2_scale, dq, atol=0, rtol=0)
 
 
 def _stage_scale_reference(inputs):
@@ -1030,7 +1051,6 @@ def _stage_scale_reference(inputs):
 @torch.inference_mode()
 def test_stage_kv_scale_derivation(case, minimum):
     """The derived staging scale covers every selected row without saturating."""
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
     _sm100()
     _, inputs = _stage_fixture(3, 128, 17)
@@ -1052,9 +1072,11 @@ def test_stage_kv_scale_derivation(case, minimum):
         inputs.swa_pool[2, 512:].fill_(254)  # 2**127, past every clamp
         inputs.swa_indices[2, 0] = 2
     q = torch.zeros(3, 64, 512, device="cuda", dtype=torch.bfloat16)
-    metadata = CSA2TrtllmMetadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
-    quant, dequant = metadata.derive_stage_kv_scales(inputs, minimum=minimum, maximum=126)
-    assert (quant, dequant) == metadata.stage_kv_scales
+    metadata = CSA2Metadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
+    quant, dequant = metadata.ext(CSA2Metadata).derive_stage_kv_scales(
+        inputs, minimum=minimum, maximum=126
+    )
+    assert (quant, dequant) == metadata.ext(CSA2Metadata).stage_kv_scales
     scale = dequant.item()
     # A power of two costs no relative precision: it only moves the exponent.
     assert scale > 0.0 and math.log2(scale).is_integer()
@@ -1093,7 +1115,6 @@ def test_stage_kv_scale_respects_q_headroom(amax, expected):
     its codes land at ``scale * amax(|Q|)``: a scale wide enough to rescue the KV
     rows must still leave Q inside the E4M3 range.
     """
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
     _sm100()
     _, inputs = _stage_fixture(3, 128, 17)
@@ -1101,8 +1122,8 @@ def test_stage_kv_scale_respects_q_headroom(amax, expected):
     inputs.swa_pool[2, 512:].fill_(254)
     inputs.swa_indices[2, 0] = 2
     q = torch.full((3, 64, 512), amax, device="cuda", dtype=torch.bfloat16)
-    metadata = CSA2TrtllmMetadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
-    quant, dequant = metadata.derive_stage_kv_scales(inputs, q=q)
+    metadata = CSA2Metadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
+    quant, dequant = metadata.ext(CSA2Metadata).derive_stage_kv_scales(inputs, q=q)
     assert dequant.item() == expected
     assert quant.item() == 1.0 / expected
     if 0.0 < amax <= 448.0:  # A Q that saturates on its own bounds nothing useful.
@@ -1114,7 +1135,6 @@ def test_stage_kv_scale_respects_q_headroom(amax, expected):
 @torch.inference_mode()
 def test_stage_kv_scale_rescues_saturated_rows():
     """Rows decoding past 448 survive staging instead of clamping at the E4M3 max."""
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
     _sm100()
     control, inputs = _stage_fixture(4, 128, 17)
@@ -1130,15 +1150,26 @@ def test_stage_kv_scale_rescues_saturated_rows():
     )
     expected = _stage_oracle(control, inputs)
     q = torch.zeros(4, 64, 512, device="cuda", dtype=torch.bfloat16)
-    metadata = CSA2TrtllmMetadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
-    unit = metadata.native_unit_scale
-    metadata.stage_selected(inputs, kv_scale_orig_quant=unit, kv_scale_quant_orig=unit)
-    clamped = [pool.float().clone() for pool in (metadata.swa_pool, metadata.extra_pool)]
-    quant, dequant = metadata.derive_stage_kv_scales(inputs)
+    metadata = CSA2Metadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
+    unit = metadata.ext(CSA2Metadata).native_unit_scale
+    metadata.ext(CSA2Metadata).stage_selected(
+        inputs, kv_scale_orig_quant=unit, kv_scale_quant_orig=unit
+    )
+    clamped = [
+        pool.float().clone()
+        for pool in (metadata.ext(CSA2Metadata).swa_pool, metadata.ext(CSA2Metadata).extra_pool)
+    ]
+    quant, dequant = metadata.ext(CSA2Metadata).derive_stage_kv_scales(inputs)
     assert dequant.item() > 1.0
-    metadata.stage_selected(inputs, kv_scale_orig_quant=quant, kv_scale_quant_orig=dequant)
+    metadata.ext(CSA2Metadata).stage_selected(
+        inputs, kv_scale_orig_quant=quant, kv_scale_quant_orig=dequant
+    )
     saturated = 0
-    for pool, before, reference in zip((metadata.swa_pool, metadata.extra_pool), clamped, expected):
+    for pool, before, reference in zip(
+        (metadata.ext(CSA2Metadata).swa_pool, metadata.ext(CSA2Metadata).extra_pool),
+        clamped,
+        expected,
+    ):
         over = reference.float().abs() > 448.0
         saturated += int(over.sum())
         # A unit scale clamped these rows at 448, losing every bit of magnitude.
@@ -1171,7 +1202,6 @@ def test_stage_kv_scale_respects_q_resolution(amax, expected):
     bound therefore holds Q's own amax at unit magnitude or above, which leaves it
     the whole E4M3 normal range below one plus the subnormals under that.
     """
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
     _sm100()
     _, inputs = _stage_fixture(3, 128, 17)
@@ -1179,8 +1209,8 @@ def test_stage_kv_scale_respects_q_resolution(amax, expected):
     inputs.swa_pool[2, 512:].fill_(254)
     inputs.swa_indices[2, 0] = 2
     q = torch.full((3, 64, 512), amax, device="cuda", dtype=torch.bfloat16)
-    metadata = CSA2TrtllmMetadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
-    quant, dequant = metadata.derive_stage_kv_scales(inputs, q=q, q_shared=True)
+    metadata = CSA2Metadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
+    quant, dequant = metadata.ext(CSA2Metadata).derive_stage_kv_scales(inputs, q=q, q_shared=True)
     assert dequant.item() == expected
     assert quant.item() == 1.0 / expected
     # A zero Q has no magnitude to keep; otherwise Q stays at unit magnitude, or
@@ -1203,7 +1233,6 @@ def test_stage_kv_scale_rescues_context_rows():
     from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import (
         _CONTEXT_STAGE_SCALE_MAX_EXPONENT,
     )
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
     _sm100()
     control, inputs = _stage_fixture(4, 128, 17)
@@ -1222,20 +1251,31 @@ def test_stage_kv_scale_rescues_context_rows():
     inputs.main_pool[0, 256:].fill_(126)
     expected = _stage_oracle(control, inputs)
     q = torch.full((4, 64, 512), 64.0, device="cuda", dtype=torch.bfloat16)
-    metadata = CSA2TrtllmMetadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
-    unit = metadata.native_unit_scale
-    metadata.stage_selected(inputs, kv_scale_orig_quant=unit, kv_scale_quant_orig=unit)
-    clamped = [pool.float().clone() for pool in (metadata.swa_pool, metadata.extra_pool)]
-    quant, dequant = metadata.derive_stage_kv_scales(
+    metadata = CSA2Metadata.for_query_tile(q, 17, staging_dtype=torch.float8_e4m3fn)
+    unit = metadata.ext(CSA2Metadata).native_unit_scale
+    metadata.ext(CSA2Metadata).stage_selected(
+        inputs, kv_scale_orig_quant=unit, kv_scale_quant_orig=unit
+    )
+    clamped = [
+        pool.float().clone()
+        for pool in (metadata.ext(CSA2Metadata).swa_pool, metadata.ext(CSA2Metadata).extra_pool)
+    ]
+    quant, dequant = metadata.ext(CSA2Metadata).derive_stage_kv_scales(
         inputs, q=q, q_shared=True, maximum=_CONTEXT_STAGE_SCALE_MAX_EXPONENT
     )
     # 2688 mapped onto 448 is three binades, which is exactly the cap: context
     # never has to clip what the main pool asks for.
     assert dequant.item() == 8.0 == 2.0**_CONTEXT_STAGE_SCALE_MAX_EXPONENT
     assert 64.0 / dequant.item() >= 1.0  # Q gave up resolution, not magnitude.
-    metadata.stage_selected(inputs, kv_scale_orig_quant=quant, kv_scale_quant_orig=dequant)
+    metadata.ext(CSA2Metadata).stage_selected(
+        inputs, kv_scale_orig_quant=quant, kv_scale_quant_orig=dequant
+    )
     saturated = 0
-    for pool, before, reference in zip((metadata.swa_pool, metadata.extra_pool), clamped, expected):
+    for pool, before, reference in zip(
+        (metadata.ext(CSA2Metadata).swa_pool, metadata.ext(CSA2Metadata).extra_pool),
+        clamped,
+        expected,
+    ):
         over = reference.float().abs() > 448.0
         saturated += int(over.sum())
         # A unit scale clamped these rows at 448, losing every bit of magnitude.
@@ -1253,7 +1293,6 @@ def test_stage_kv_scale_rescues_context_rows():
 def test_unfused_fp8_staging_matches_fused_bytes(monkeypatch):
     """The eager staging fallback reproduces the fused route byte for byte."""
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
     _sm100()
     calls = []
@@ -1272,35 +1311,35 @@ def test_unfused_fp8_staging_matches_fused_bytes(monkeypatch):
         inputs.main_pool[1, 256:].fill_(126)
         calls.clear()
         q = torch.zeros(2, 64, 512, device="cuda", dtype=torch.bfloat16)
-        metadata = CSA2TrtllmMetadata.for_query_tile(
-            q, extra_width, staging_dtype=torch.float8_e4m3fn
-        )
-        quant, dequant = metadata.derive_stage_kv_scales(inputs)
+        metadata = CSA2Metadata.for_query_tile(q, extra_width, staging_dtype=torch.float8_e4m3fn)
+        quant, dequant = metadata.ext(CSA2Metadata).derive_stage_kv_scales(inputs)
         assert dequant.item() == 8.0  # 2688 mapped onto 448.
-        metadata.mla_bmm1_scale.fill_(float("nan"))
-        metadata.mla_bmm2_scale.fill_(float("nan"))
-        metadata.stage_selected(
+        metadata.ext(CSA2Metadata).mla_bmm1_scale.fill_(float("nan"))
+        metadata.ext(CSA2Metadata).mla_bmm2_scale.fill_(float("nan"))
+        metadata.ext(CSA2Metadata).stage_selected(
             inputs,
             kv_scale_orig_quant=quant,
             kv_scale_quant_orig=dequant,
-            q_scale_quant_orig=metadata.native_unit_scale,
+            q_scale_quant_orig=metadata.ext(CSA2Metadata).native_unit_scale,
             softmax_scale=512**-0.5,
         )
         assert bool(calls) == fused
         # The unfused route must publish the same folded BMM scales.
         scale = dequant * 512**-0.5
         torch.testing.assert_close(
-            metadata.mla_bmm1_scale,
+            metadata.ext(CSA2Metadata).mla_bmm1_scale,
             torch.cat((scale, scale * 1.4426950408889634)),
             atol=0,
             rtol=1e-6,
         )
-        torch.testing.assert_close(metadata.mla_bmm2_scale, dequant, atol=0, rtol=0)
+        torch.testing.assert_close(
+            metadata.ext(CSA2Metadata).mla_bmm2_scale, dequant, atol=0, rtol=0
+        )
         staged.append(
             (
-                metadata.swa_pool.view(torch.uint8).clone(),
-                metadata.extra_pool[:, :17].view(torch.uint8).clone(),
-                metadata.prepared_lens.clone(),
+                metadata.ext(CSA2Metadata).swa_pool.view(torch.uint8).clone(),
+                metadata.ext(CSA2Metadata).extra_pool[:, :17].view(torch.uint8).clone(),
+                metadata.ext(CSA2Metadata).prepared_lens.clone(),
             )
         )
     for fused_tensor, unfused in zip(*staged):
@@ -1347,8 +1386,7 @@ def test_shared_active_rows_preserve_compaction_and_decode_once(dtype):
     )
     bank = torch.full((25, 512), 7, device="cuda", dtype=dtype)
     metadata = SimpleNamespace(
-        num_tokens=5,
-        num_sparse_topk=128,
+        metadata=SimpleNamespace(num_tokens=5, num_sparse_topk=128),
         shared_pool=bank,
         _csa2_shared_selected=torch.empty(25, device="cuda", dtype=torch.int32),
         prepared_indices=torch.empty(5, 128, device="cuda", dtype=torch.int32),
@@ -1357,6 +1395,7 @@ def test_shared_active_rows_preserve_compaction_and_decode_once(dtype):
         mla_bmm1_scale=torch.empty(2, device="cuda"),
         mla_bmm2_scale=torch.empty(1, device="cuda"),
     )
+    metadata.ext = lambda cls: metadata
     unit = torch.ones(1, device="cuda")
     stage_shared_rows(
         swa,
@@ -1371,20 +1410,24 @@ def test_shared_active_rows_preserve_compaction_and_decode_once(dtype):
         q_scale_quant_orig=unit,
     )
     expected_ids = [[1, 3, 4, 17, 17, 19], [2, 3, 4, 5, 18, 20], [0], [10, 11, 12, 13, 22, 24], [0]]
-    expected_indices = torch.full_like(metadata.prepared_indices, -1)
+    expected_indices = torch.full_like(metadata.ext(CSA2Metadata).prepared_indices, -1)
     for row, ids in enumerate(expected_ids):
         expected_indices[row, : len(ids)] = torch.tensor(ids, device="cuda")
-    torch.testing.assert_close(metadata.prepared_indices, expected_indices, atol=0, rtol=0)
     torch.testing.assert_close(
-        metadata.prepared_lens,
+        metadata.ext(CSA2Metadata).prepared_indices, expected_indices, atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        metadata.ext(CSA2Metadata).prepared_lens,
         torch.tensor([len(ids) for ids in expected_ids], device="cuda", dtype=torch.int32),
         atol=0,
         rtol=0,
     )
     selected_rows = sorted({index for ids in expected_ids for index in ids if index})
-    expected_mask = torch.zeros_like(metadata._csa2_shared_selected)
+    expected_mask = torch.zeros_like(metadata.ext(CSA2Metadata)._csa2_shared_selected)
     expected_mask[selected_rows] = 1
-    torch.testing.assert_close(metadata._csa2_shared_selected, expected_mask, atol=0, rtol=0)
+    torch.testing.assert_close(
+        metadata.ext(CSA2Metadata)._csa2_shared_selected, expected_mask, atol=0, rtol=0
+    )
     expected_bank = torch.full((25, 512), 7, device="cuda", dtype=torch.bfloat16)
     expected_bank[0].zero_()
     decoded_swa, decoded_main = unpack_rows(swa, 512, "swa"), unpack_rows(main, 512, "main")
@@ -1422,17 +1465,19 @@ def test_shared_active_rows_preserve_compaction_and_decode_once(dtype):
         kv_scale_quant_orig=unit,
         q_scale_quant_orig=unit,
     )
-    assert not metadata._csa2_shared_selected.any()
-    assert (metadata.prepared_lens == 1).all()
-    assert (metadata.prepared_indices[:, 0] == 0).all()
-    assert (metadata.prepared_indices[:, 1:] == -1).all()
+    assert not metadata.ext(CSA2Metadata)._csa2_shared_selected.any()
+    assert (metadata.ext(CSA2Metadata).prepared_lens == 1).all()
+    assert (metadata.ext(CSA2Metadata).prepared_indices[:, 0] == 0).all()
+    assert (metadata.ext(CSA2Metadata).prepared_indices[:, 1:] == -1).all()
     torch.testing.assert_close(bank.view(torch.uint8), previous.view(torch.uint8), atol=0, rtol=0)
     # Empty request domains and no MAIN pool use the same offset upper bound.
     plan.swa_offsets = torch.tensor([1, 1, 9], device="cuda", dtype=torch.int64)
     plan.main_offsets = torch.tensor([9, 9, 9], device="cuda", dtype=torch.int64)
     plan.swa_rows, plan.main_rows, plan.main_pages = 8, 0, None
-    metadata.shared_pool = torch.full((9, 512), 7, device="cuda", dtype=dtype)
-    metadata._csa2_shared_selected = torch.empty(9, device="cuda", dtype=torch.int32)
+    metadata.ext(CSA2Metadata).shared_pool = torch.full((9, 512), 7, device="cuda", dtype=dtype)
+    metadata.ext(CSA2Metadata)._csa2_shared_selected = torch.empty(
+        9, device="cuda", dtype=torch.int32
+    )
     swa_slots.copy_(torch.tensor(swa_values, device="cuda"))
     stage_shared_rows(
         swa,
@@ -1449,9 +1494,11 @@ def test_shared_active_rows_preserve_compaction_and_decode_once(dtype):
     expected_indices.fill_(-1)
     expected_indices[:, 0] = 0
     expected_indices[3, :4] = torch.tensor([2, 3, 4, 5], device="cuda")
-    torch.testing.assert_close(metadata.prepared_indices, expected_indices, atol=0, rtol=0)
-    assert metadata._csa2_shared_selected.tolist() == [0, 0, 1, 1, 1, 1, 0, 0, 0]
-    assert metadata.prepared_lens.tolist() == [1, 1, 1, 4, 1]
+    torch.testing.assert_close(
+        metadata.ext(CSA2Metadata).prepared_indices, expected_indices, atol=0, rtol=0
+    )
+    assert metadata.ext(CSA2Metadata)._csa2_shared_selected.tolist() == [0, 0, 1, 1, 1, 1, 0, 0, 0]
+    assert metadata.ext(CSA2Metadata).prepared_lens.tolist() == [1, 1, 1, 4, 1]
     expected_bank = torch.full((9, 512), 7, device="cuda", dtype=torch.bfloat16)
     expected_bank[0].zero_()
     expected_bank[2:6].copy_(decoded_swa[37:41])
@@ -1460,7 +1507,10 @@ def test_shared_active_rows_preserve_compaction_and_decode_once(dtype):
             0
         ]
     torch.testing.assert_close(
-        metadata.shared_pool.view(torch.uint8), expected_bank.view(torch.uint8), atol=0, rtol=0
+        metadata.ext(CSA2Metadata).shared_pool.view(torch.uint8),
+        expected_bank.view(torch.uint8),
+        atol=0,
+        rtol=0,
     )
 
 
@@ -1481,8 +1531,6 @@ def _glue():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_owner_refresh_kernel_matches_reference():
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
-
     kernel = _glue()
     torch.manual_seed(1201)
     request_count = 3
@@ -1526,7 +1574,7 @@ def test_owner_refresh_kernel_matches_reference():
     for source_base, source_lengths, pages, slots, compressed, ratio, page_size, *batch in owners:
         outputs = [t for t in (slots, compressed, *batch) if t is not None]
         expected = [torch.empty_like(t) for t in outputs]
-        CSA2TrtllmMetadata._refresh_owner_slots(
+        CSA2Metadata._refresh_owner_slots(
             source_base,
             source_lengths,
             delta,
@@ -1715,8 +1763,7 @@ def test_shared_active_rows_heterogeneous_request_domains(dtype: torch.dtype) ->
     )
     bank = torch.full((main_offsets[-1], 512), 7, device="cuda", dtype=dtype)
     metadata = SimpleNamespace(
-        num_tokens=len(query_requests),
-        num_sparse_topk=128,
+        metadata=SimpleNamespace(num_tokens=len(query_requests), num_sparse_topk=128),
         shared_pool=bank,
         _csa2_shared_selected=torch.empty(bank.shape[0], device="cuda", dtype=torch.int32),
         prepared_indices=torch.empty(len(query_requests), 128, device="cuda", dtype=torch.int32),
@@ -1725,6 +1772,7 @@ def test_shared_active_rows_heterogeneous_request_domains(dtype: torch.dtype) ->
         mla_bmm1_scale=torch.empty(2, device="cuda"),
         mla_bmm2_scale=torch.empty(1, device="cuda"),
     )
+    metadata.ext = lambda cls: metadata
     dequant_scale = torch.tensor([0.3], device="cuda", dtype=torch.float32)
     stage_shared_rows(
         swa,
@@ -1738,15 +1786,19 @@ def test_shared_active_rows_heterogeneous_request_domains(dtype: torch.dtype) ->
         kv_scale_quant_orig=dequant_scale,
         q_scale_quant_orig=dequant_scale,
     )
-    expected_indices = torch.full_like(metadata.prepared_indices, -1)
+    expected_indices = torch.full_like(metadata.ext(CSA2Metadata).prepared_indices, -1)
     for query, ids in enumerate(expected_ids):
         expected_indices[query, : len(ids)] = torch.tensor(ids, device="cuda")
-    torch.testing.assert_close(metadata.prepared_indices, expected_indices, atol=0, rtol=0)
-    assert metadata.prepared_lens.tolist() == [len(ids) for ids in expected_ids]
+    torch.testing.assert_close(
+        metadata.ext(CSA2Metadata).prepared_indices, expected_indices, atol=0, rtol=0
+    )
+    assert metadata.ext(CSA2Metadata).prepared_lens.tolist() == [len(ids) for ids in expected_ids]
     selected_rows = {row for ids in expected_ids for row in ids if row}
-    expected_selected = torch.zeros_like(metadata._csa2_shared_selected)
+    expected_selected = torch.zeros_like(metadata.ext(CSA2Metadata)._csa2_shared_selected)
     expected_selected[list(selected_rows)] = 1
-    torch.testing.assert_close(metadata._csa2_shared_selected, expected_selected, atol=0, rtol=0)
+    torch.testing.assert_close(
+        metadata.ext(CSA2Metadata)._csa2_shared_selected, expected_selected, atol=0, rtol=0
+    )
     # Build the numerical oracle request by request, without a flat-row owner lookup.
     expected_bank = torch.full_like(bank, 7)
     expected_bank[0].zero_()
@@ -1821,8 +1873,7 @@ def test_shared_active_rows_reuse_request_count_specialization(
     )
     bank = torch.empty(1 + 2 * domain_rows, 512, device="cuda", dtype=dtype)
     metadata = SimpleNamespace(
-        num_tokens=queries,
-        num_sparse_topk=128,
+        metadata=SimpleNamespace(num_tokens=queries, num_sparse_topk=128),
         shared_pool=bank,
         _csa2_shared_selected=torch.empty(bank.shape[0], device="cuda", dtype=torch.int32),
         prepared_indices=torch.empty(queries, 128, device="cuda", dtype=torch.int32),
@@ -1831,6 +1882,7 @@ def test_shared_active_rows_reuse_request_count_specialization(
         mla_bmm1_scale=torch.empty(2, device="cuda"),
         mla_bmm2_scale=torch.empty(1, device="cuda"),
     )
+    metadata.ext = lambda cls: metadata
     swa_slots = torch.empty(queries, 1, device="cuda", dtype=torch.int64)
     main_slots = torch.empty(queries, 2, device="cuda", dtype=torch.int64)
     main_logical = torch.empty_like(main_slots)
@@ -1898,16 +1950,20 @@ def test_shared_active_rows_reuse_request_count_specialization(
         else:
             assert staging.keys() == compiled_staging.keys()
             assert all(value is compiled_staging[key] for key, value in staging.items())
-        expected_indices = torch.full_like(metadata.prepared_indices, -1)
+        expected_indices = torch.full_like(metadata.ext(CSA2Metadata).prepared_indices, -1)
         for query, ids in enumerate(expected_ids):
             expected_indices[query, : len(ids)] = torch.tensor(ids, device="cuda")
-        torch.testing.assert_close(metadata.prepared_indices, expected_indices, atol=0, rtol=0)
-        assert metadata.prepared_lens.tolist() == [len(ids) for ids in expected_ids]
+        torch.testing.assert_close(
+            metadata.ext(CSA2Metadata).prepared_indices, expected_indices, atol=0, rtol=0
+        )
+        assert metadata.ext(CSA2Metadata).prepared_lens.tolist() == [
+            len(ids) for ids in expected_ids
+        ]
         selected_rows = sorted(expected_rows)
-        expected_selected = torch.zeros_like(metadata._csa2_shared_selected)
+        expected_selected = torch.zeros_like(metadata.ext(CSA2Metadata)._csa2_shared_selected)
         expected_selected[selected_rows] = 1
         torch.testing.assert_close(
-            metadata._csa2_shared_selected, expected_selected, atol=0, rtol=0
+            metadata.ext(CSA2Metadata)._csa2_shared_selected, expected_selected, atol=0, rtol=0
         )
         expected_bank = torch.full_like(bank, 7)
         expected_bank[0].zero_()

@@ -16,6 +16,7 @@ import torch
 import tensorrt_llm._torch.model_config
 import tensorrt_llm._torch.pyexecutor.config_utils
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAMetadata
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -662,13 +663,12 @@ class Runner:
         AttentionCls = get_attention_backend(
             self.model_config.attn_backend, sparse_params=sparse_params
         )
-        metadata_cls = AttentionCls.Metadata
         sparse_metadata_params = (
             sparse_attention_config.to_sparse_metadata_params(pretrained_config=pretrained_config)
             if sparse_attention_config is not None
             else None
         )
-        attn_metadata = metadata_cls(
+        attn_metadata = AttentionCls.create_metadata(
             seq_lens=torch.tensor([seq_len_q] * batch_size, dtype=torch.int),
             request_ids=list(range(request_id_begin, request_id_begin + batch_size)),
             max_num_requests=kv_cache_manager.max_batch_size,
@@ -704,12 +704,12 @@ class Runner:
         # buffer stays one column wide and DeepGEMM aborts on the next_n mismatch.
         # Shapes only -- spec-dec masking stays off.
         #
-        # Gate on kv_lens_cuda_2d, not on the method: update_spec_dec_param() is on
+        # Gate on the DSA extension, not on the method: update_spec_dec_param() is on
         # the base metadata class, so hasattr() would let every backend in, and the
         # base sets max_total_draft_tokens unconditionally -- which reaches the
-        # attention op cache key and FMHA kernel selection. kv_lens_cuda_2d exists
-        # only on DSA metadata, which is the backend that needs this.
-        if run_type == "GEN" and seq_len_q > 1 and hasattr(attn_metadata, "kv_lens_cuda_2d"):
+        # attention op cache key and FMHA kernel selection. DSA is the backend that
+        # needs this.
+        if run_type == "GEN" and seq_len_q > 1 and attn_metadata.find_ext(DSAMetadata) is not None:
             attn_metadata.update_spec_dec_param(
                 batch_size=batch_size,
                 is_spec_decoding_enabled=False,

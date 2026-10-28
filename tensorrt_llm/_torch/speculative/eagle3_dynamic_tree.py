@@ -21,6 +21,7 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._utils import get_sm_version, nvtx_range
 
 from ..attention.backends import AttentionMetadata
@@ -340,8 +341,8 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
 
     def _apply_spec_metadata(self, attn_metadata, batch_size, query_len):
         """Set spec-dec gen lengths and refresh the C++ position-offset view."""
-        attn_metadata.spec_decoding_generation_lengths[:batch_size] = query_len
-        attn_metadata.update_position_offsets_for_cpp(query_len)
+        attn_metadata.ext(SpecDecodingMetadata).generation_lengths[:batch_size] = query_len
+        attn_metadata.ext(SpecDecodingMetadata).update_position_offsets_for_cpp(query_len)
 
     @nvtx_range("eagle3_dyn._ensure_spec_tree_manager")
     def _ensure_spec_tree_manager(self, resource_manager):
@@ -619,16 +620,18 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
 
         # Step-0 causal spec-dec (None in prefill-only warmup).
-        if attn_metadata.spec_decoding_generation_lengths is not None:
+        if attn_metadata.ext(SpecDecodingMetadata).generation_lengths is not None:
             total = num_gens * num_step0_tokens
-            dst = attn_metadata.spec_decoding_position_offsets[:total].view(
-                num_gens, num_step0_tokens
+            dst = (
+                attn_metadata.ext(SpecDecodingMetadata)
+                .position_offsets[:total]
+                .view(num_gens, num_step0_tokens)
             )
             dst.copy_(self._causal_offs[:num_step0_tokens].unsqueeze(0).expand(num_gens, -1))
             self._apply_spec_metadata(attn_metadata, num_gens, num_step0_tokens)
 
             # Hopper XQA needs packed 1D mask; Blackwell expects padded 3D.
-            packed_mask = attn_metadata.spec_decoding_packed_mask
+            packed_mask = attn_metadata.ext(SpecDecodingMetadata).packed_mask
             packed_mask[:num_gens].zero_()
             packed_mask[:num_gens, :num_step0_tokens, 0] = self._step0_causal_mask[
                 :num_step0_tokens
@@ -636,7 +639,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             if self._needs_mask_repack:
                 self._repack_mask_padded_to_packed(packed_mask, num_gens, num_step0_tokens)
 
-        attn_metadata.use_spec_decoding = num_gens > 0
+        attn_metadata.ext(SpecDecodingMetadata).use_spec_decoding = num_gens > 0
 
         # KV correction: target processed tokens_per_gen_step per request,
         # but step 0 should only attend to max_draft_len + 1 accepted-path tokens.
@@ -1122,13 +1125,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         selected_parents: torch.Tensor = None,
     ):
         """Prepare the mask and position offsets for the next layer."""
-        if attn_metadata.spec_decoding_packed_mask is None:
+        spec = attn_metadata.find_ext(SpecDecodingMetadata)
+        if spec.packed_mask is None:
             return
         spec_tree_manager = self.spec_tree_manager
         batch_size = attn_metadata.num_seqs
         num_tokens_current_layer = self.K * (cur_draft_idx + 1)
         num_tokens_previous_layer = self.K * cur_draft_idx
-        packed_mask = attn_metadata.spec_decoding_packed_mask
+        packed_mask = spec.packed_mask
         if cur_draft_idx == 0:
             spec_tree_manager.compute_spec_dec_packed_mask(
                 self.tree_mask_init_buffer[:batch_size],
@@ -1137,7 +1141,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             self.tree_mask_buffer[
                 : batch_size * num_tokens_current_layer * num_tokens_current_layer
             ].copy_(self.tree_mask_init_buffer[:batch_size].view(-1))
-            attn_metadata.spec_decoding_position_offsets.fill_(0)
+            spec.position_offsets.fill_(0)
             self._apply_spec_metadata(attn_metadata, batch_size, num_tokens_current_layer)
         else:
             num_parent_mask = batch_size * cur_draft_idx * self.K * cur_draft_idx * self.K
@@ -1146,9 +1150,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             )
 
             prev_total = batch_size * num_tokens_previous_layer
-            previous_position_offsets = attn_metadata.spec_decoding_position_offsets[
-                :prev_total
-            ].view(batch_size, num_tokens_previous_layer)
+            previous_position_offsets = spec.position_offsets[:prev_total].view(
+                batch_size, num_tokens_previous_layer
+            )
 
             # Fused: gather parent masks + build current mask + compute positions
             current_mask, new_positions = _build_mask_and_position(
@@ -1167,7 +1171,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             ].copy_(current_mask.reshape(-1))
 
             cur_total = batch_size * num_tokens_current_layer
-            attn_metadata.spec_decoding_position_offsets[:cur_total] = new_positions.reshape(-1)
+            spec.position_offsets[:cur_total] = new_positions.reshape(-1)
             self._apply_spec_metadata(attn_metadata, batch_size, num_tokens_current_layer)
 
         # Hopper XQA needs packed 1D mask; Blackwell expects padded 3D.
@@ -1211,7 +1215,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     ) - num_accepted_tokens[num_contexts:batch_size]
                 attn_metadata.kv_lens_cuda[:batch_size] += self.K
 
-            attn_metadata.use_spec_decoding = True
+            attn_metadata.ext(SpecDecodingMetadata).use_spec_decoding = True
 
         else:
             num_tokens_previous_layer = cur_draft_idx * self.K

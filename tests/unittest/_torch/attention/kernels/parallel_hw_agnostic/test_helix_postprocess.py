@@ -23,6 +23,7 @@ from parameterized import parameterized
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention.attention import _helix_sanitize_empty_kv, _helix_zero_kv_mask
+from tensorrt_llm._torch.attention.backends.features import HelixMetadata
 
 
 class _FakeAttnMetadata:
@@ -522,11 +523,11 @@ class TestHelixZeroKvMask(unittest.TestCase):
         num_heads = 2
         kv_lora_rank = 4
         helix_kv_bounds = torch.tensor([0, 5, 0], dtype=torch.int32)
+        helix = SimpleNamespace(kv_bounds=helix_kv_bounds, spec_tokens_valid=True)
         attn_metadata = SimpleNamespace(
-            helix_kv_bounds=helix_kv_bounds,
-            _helix_spec_tokens_valid=True,
             num_contexts=0,
             num_generations=1,
+            find_ext=lambda cls: helix if cls is HelixMetadata else None,
         )
         attn_backend = Mock()
         attn_backend.forward.return_value = torch.empty(num_tokens, num_heads * kv_lora_rank)

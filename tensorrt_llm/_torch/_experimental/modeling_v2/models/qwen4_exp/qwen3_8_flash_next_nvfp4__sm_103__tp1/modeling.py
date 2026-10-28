@@ -129,7 +129,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph import (
     eager_on_graph,
 )
+from tensorrt_llm._torch.attention.backends.features import FlashMlaMetadata, RecurrentMetadata
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.qsa.metadata import QSAMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
@@ -234,19 +237,19 @@ from .ops.vision.pos_embed_interpolate import pos_embed_interpolate
 # bypass routing.
 _SM = (10, 3)
 
-# QSA backend metadata buffers rebuilt by prepare(). Their absence means the engine
-# did not select the QSA metadata and the index plane would never be written.
+# QSA metadata buffers rebuilt by prepare(). Their absence means the engine did not
+# attach the QSA metadata and the index plane would never be written.
 _QSA_FIELDS = (
-    "qsa_block_table",
-    "qsa_req_idx_per_token",
-    "qsa_logical_positions",
-    "qsa_sequence_lengths",
-    "qsa_visible_blocks",
-    "qsa_topk_indices",
-    "qsa_topk_row_starts",
+    "block_table",
+    "req_idx_per_token",
+    "logical_positions",
+    "sequence_lengths",
+    "visible_blocks",
+    "topk_indices",
+    "topk_row_starts",
 )
 
-# Fields read off `attn_metadata.mamba_metadata`. Absence is silent: a smoke run
+# Fields read off `RecurrentMetadata.mamba_metadata`. Absence is silent: a smoke run
 # passes with no recurrent state at all.
 _MAMBA_FIELDS = (
     "state_indices",
@@ -266,6 +269,12 @@ _ROWTILE_MIN_ROWS = 2048  # capacity: fixed: a dispatch threshold, not a buffer 
 #: runner. From GB300 micro-benches, us a layer, CuTe DSL vs trtllm-gen: 2048
 #: rows 275 vs 273, 8192 rows 451 vs 555, 16384 rows 656 vs 882.
 _CUTE_DSL_MOE_MIN_ROWS = 4096  # capacity: fixed: a dispatch threshold, not a buffer size
+
+
+def _flash_mla_field(md: TrtllmAttentionMetadata, name: str):
+    """A FlashMLA metadata field, or None when FlashMLA is not attached."""
+    flash_mla = md.find_ext(FlashMlaMetadata)
+    return getattr(flash_mla, name) if flash_mla is not None else None
 
 
 def _decode_projection(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
@@ -1748,9 +1757,10 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         )
         self._binds += 1
 
-        missing = [name for name in _QSA_FIELDS if not hasattr(md, name)]
+        qsa = md.find_ext(QSAMetadata)
+        missing = [name for name in _QSA_FIELDS if not hasattr(qsa, name)]
         assert not missing, (
-            f"metadata fields missing: {missing}; the engine did not select QSA "
+            f"QSA metadata fields missing: {missing}; the engine did not attach QSA "
             "metadata for this model"
         )
 
@@ -1800,8 +1810,8 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         # `qsa_topk_select` checks only that the buffer is at least `index_topk` wide,
         # then addresses it as flat `index_topk`-wide rows ignoring the real stride, so
         # a width mismatch silently mis-writes every row but the first.
-        assert md.qsa_topk_indices.shape[1] == self.block_topk, (
-            f"the engine sized the QSA selection buffer {md.qsa_topk_indices.shape[1]} "
+        assert qsa.topk_indices.shape[1] == self.block_topk, (
+            f"the engine sized the QSA selection buffer {qsa.topk_indices.shape[1]} "
             f"wide and this target selects {self.block_topk} blocks per row"
         )
         position_cache = cm.get_qsa_position_buffer()
@@ -1813,9 +1823,10 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
 
         # A missed hybrid predicate would still build and pass a smoke run with 36
         # layers carrying no state.
-        mm = md.mamba_metadata
-        assert mm is not None and mm is not False, (
-            "attn_metadata.mamba_metadata is absent: the runtime allocated no "
+        recurrent = md.find_ext(RecurrentMetadata)
+        mm = recurrent.mamba_metadata if recurrent is not None else None
+        assert mm is not None, (
+            "the recurrent metadata is absent: the runtime allocated no "
             f"recurrent-state pool, so the {len(self.gdn_layers)} linear-attention "
             "layers would run with no state"
         )
@@ -1847,7 +1858,7 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         # With speculation on, the Blackwell trtllm-gen spec-dec mask machinery is off
         # for a linear tree at sm_103: every `spec_decoding_*` tensor stays None and
         # `predicted_tokens_per_seq` alone produces the within-block mask.
-        assert not md.is_spec_decoding_enabled, (
+        assert not md.ext(SpecDecodingMetadata).is_spec_decoding_enabled, (
             "the attention metadata reports is_spec_decoding_enabled; on sm_103 a "
             "linear-tree MTP forces that machinery off"
         )
@@ -1960,7 +1971,9 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
                 "this target resolved IndexShare on but the engine's QSA metadata did not"
             )
             slots = cm.qsa_shared_topk_slots
-            check_shared_selection(md.qsa_shared_topk_indices, slots, layer, self.block_topk)
+            check_shared_selection(
+                md.ext(QSAMetadata).shared_topk_indices, slots, layer, self.block_topk
+            )
             share_slot = slots[layer]
         self._draft_bound = _DraftBound(cm, index_cache, position_cache, kv, share_slot)
 
@@ -2680,6 +2693,7 @@ class PrefillTarget:
         """Project the prepared metadata onto thop_attention's batch state, once per
         forward. Tensors are engine-owned persistent buffers refreshed in place;
         Python ints are per-capture constants."""
+        spec = md.find_ext(SpecDecodingMetadata)
         return dict(
             sequence_length=md.kv_lens_cuda_runtime,
             host_past_key_value_lengths=md.kv_lens_runtime,
@@ -2706,21 +2720,21 @@ class PrefillTarget:
             block_ids_per_seq=md.block_ids_per_seq,
             max_context_q_len_override=md.max_context_q_len_override,
             is_cross=md.is_cross,
-            is_spec_decoding_enabled=md.is_spec_decoding_enabled,
-            use_spec_decoding=md.use_spec_decoding,
-            is_spec_dec_tree=md.is_spec_dec_tree,
-            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
-            spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
-            spec_decoding_packed_mask=md.spec_decoding_packed_mask,
-            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
-            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
-            spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
-            spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
+            is_spec_decoding_enabled=spec.is_spec_decoding_enabled,
+            use_spec_decoding=spec.use_spec_decoding,
+            is_spec_dec_tree=spec.is_spec_dec_tree,
+            spec_decoding_generation_lengths=spec.generation_lengths,
+            spec_decoding_position_offsets_for_cpp=spec.position_offsets_for_cpp,
+            spec_decoding_packed_mask=spec.packed_mask,
+            spec_decoding_bl_tree_mask_offset=spec.bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=spec.bl_tree_mask,
+            spec_decoding_target_max_draft_tokens=spec.max_total_draft_tokens,
+            spec_bl_tree_first_sparse_mask_offset_kv=spec.bl_tree_first_sparse_mask_offset_kv,
             num_sparse_topk=md.num_sparse_topk,
-            flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
-            flash_mla_num_splits=md.flash_mla_num_splits,
+            flash_mla_tile_scheduler_metadata=_flash_mla_field(md, "tile_scheduler_metadata"),
+            flash_mla_num_splits=_flash_mla_field(md, "num_splits"),
             max_num_sequences=md.max_num_sequences,
-            force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+            force_prepare_spec_dec_tree_mask=spec.force_prepare_tree_mask,
         )
 
     # --------------------------------------------------------------- blocks ---
@@ -3678,7 +3692,7 @@ class PrefillTarget:
         md = attn_metadata
         self._check_step_contract(md)
         attn_args = self.step_args(md)
-        mm = md.mamba_metadata
+        mm = md.ext(RecurrentMetadata).mamba_metadata
 
         # **The activation rows are the batch's rows, or a prefill CUDA graph bucket's.** A
         # breakable prefill graph pads the step's rows up to `padded_num_tokens` (zero ids,
@@ -3802,14 +3816,15 @@ class PrefillTarget:
         # The `[T, 3]` transpose of the `[3, 1, T]` position buffer, which the QSA position
         # plane stores.
         coords = torch.transpose(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]), 0, 1)
+        qsa_md = md.ext(QSAMetadata)
         qsa = (
-            md.qsa_req_idx_per_token[:num_tokens],
-            md.qsa_logical_positions[:num_tokens],
-            md.qsa_sequence_lengths[:num_tokens],
-            md.qsa_visible_blocks[:num_tokens],
-            md.qsa_topk_indices[:num_tokens],
-            md.qsa_topk_row_starts[:num_tokens],
-            md.qsa_block_table,
+            qsa_md.req_idx_per_token[:num_tokens],
+            qsa_md.logical_positions[:num_tokens],
+            qsa_md.sequence_lengths[:num_tokens],
+            qsa_md.visible_blocks[:num_tokens],
+            qsa_md.topk_indices[:num_tokens],
+            qsa_md.topk_row_starts[:num_tokens],
+            qsa_md.block_table,
             md.tokens_per_block,
             coords[:num_tokens],
             sparse,
@@ -3832,9 +3847,9 @@ class PrefillTarget:
                 num_gens=num_decodes,
                 rows_per_gen=gen_p,
                 slots=si_d,
-                request_indices=md.qsa_req_idx_per_token[num_prefill_tokens:num_tokens],
-                logical_positions=md.qsa_logical_positions[num_prefill_tokens:num_tokens],
-                block_table=md.qsa_block_table,
+                request_indices=qsa_md.req_idx_per_token[num_prefill_tokens:num_tokens],
+                logical_positions=qsa_md.logical_positions[num_prefill_tokens:num_tokens],
+                block_table=qsa_md.block_table,
                 tokens_per_block=md.tokens_per_block,
             )
 
@@ -4007,25 +4022,26 @@ class PrefillTarget:
         (`num_accepted - 1` past its first). Capturing here rather than at the first draft
         decode step keeps the indexer at one call per draft loop for a batch with context
         rows too."""
+        qsa = md.find_ext(QSAMetadata)
         batch = md.num_seqs
-        assert md.qsa_mtp_num_accepted is not None, (
+        assert qsa.mtp_num_accepted is not None, (
             "IndexShare needs the worker's accepted counts to pick each request's capture "
             "row; the draft loop did not supply them"
         )
         seq_lens = md.seq_lens_cuda[:batch].to(torch.int64)
         starts = torch.cumsum(seq_lens, 0) - seq_lens
-        accepted = md.qsa_mtp_num_accepted[:batch].to(torch.int64)
+        accepted = qsa.mtp_num_accepted[:batch].to(torch.int64)
         offsets = torch.minimum(torch.clamp(accepted - 1, min=0), seq_lens - 1)
         offsets[: md.num_contexts] = seq_lens[: md.num_contexts] - 1
         rows = starts + offsets
         slot = self.core._draft_bound.share_slot
-        md.qsa_shared_topk_indices[slot, :batch].copy_(torch.index_select(topk_indices, 0, rows))
-        md.qsa_shared_topk_visible_blocks[slot, :batch].copy_(
+        qsa.shared_topk_indices[slot, :batch].copy_(torch.index_select(topk_indices, 0, rows))
+        qsa.shared_topk_visible_blocks[slot, :batch].copy_(
             torch.index_select(visible_blocks, 0, rows)
         )
         # Host-side readiness, recorded in program order: under capture this runs while the
         # graph is recorded, so a graph holds the reuse only after the capture it reads.
-        md.qsa_shared_topk_captured_slots.add(slot)
+        qsa.shared_topk_captured_slots.add(slot)
 
     def mtp_forward(
         self,
@@ -4047,6 +4063,7 @@ class PrefillTarget:
             "core before the worker, so this cannot be reached first"
         )
         md = attn_metadata
+        qsa = md.find_ext(QSAMetadata)
         rows = hidden_states.shape[0]
         assert input_ids.shape[0] == rows, (
             f"the draft step's {input_ids.shape[0]} token ids and {rows} "
@@ -4098,19 +4115,17 @@ class PrefillTarget:
         )
 
         # The draft layer's QSA planes and the page table that addresses them. With a
-        # separate draft manager the engine's QSA metadata swaps `qsa_block_table` for the
-        # table it decodes from the draft manager's offsets (`prepare_for_draft_forward`);
+        # separate draft manager the engine's QSA metadata swaps `block_table` for the
+        # table it decodes from the draft manager's offsets (`QSAMetadata.draft_swap`);
         # a table still decoding the trunk's offsets would read and write another pool's
         # pages.
         draft = core._draft_bound
         if draft is None or cm is not draft.cm:
             core._bind_draft_cache_manager(md)
             draft = core._draft_bound
-        assert cm is core._bound.cm or md.qsa_block_table is getattr(
-            md, "qsa_draft_block_table", None
-        ), (
+        assert cm is core._bound.cm or qsa.block_table is qsa.draft_block_table, (
             "the draft step is bound to a separate draft KV cache manager but "
-            "qsa_block_table is not that manager's table: the engine's QSA metadata did "
+            "the QSA block_table is not that manager's table: the engine's QSA metadata did "
             "not swap its page table for the draft forward"
         )
         # The `qsa_*` row mapping is sized from the metadata's token count, which the
@@ -4128,8 +4143,8 @@ class PrefillTarget:
         # IndexShare: the only draft step with context rows is the loop's first, its
         # draft-extend step. It always runs the indexer and, with sharing on, captures the
         # selection the draft decode steps reuse.
-        share = core.mtp_index_share and md.qsa_in_mtp_draft_loop
-        assert not (share and md.qsa_indexer_skip_topk), (
+        share = core.mtp_index_share and qsa.in_mtp_draft_loop
+        assert not (share and qsa.indexer_skip_topk), (
             "the worker asked a draft step with context rows to reuse a selection; only "
             "the draft decode steps after it reuse"
         )
@@ -4213,9 +4228,9 @@ class PrefillTarget:
         # then the compression of every group this step completes. Maintained on every
         # draft step at both ends of the threshold, so the draft plane is complete when a
         # request crosses it.
-        req_idx = md.qsa_req_idx_per_token[:rows]
-        logical = md.qsa_logical_positions[:rows]
-        block_table = md.qsa_block_table
+        req_idx = qsa.req_idx_per_token[:rows]
+        logical = qsa.logical_positions[:rows]
+        block_table = qsa.block_table
         tokens_per_block = md.tokens_per_block
         index_cache = draft.index_cache
         qk_index = cublas_mm(mixed, M.idx)
@@ -4293,12 +4308,12 @@ class PrefillTarget:
                 only_visible_blocks=True,
                 context_rows=True,
             )
-            topk_indices = md.qsa_topk_indices[:rows]
-            visible_blocks = md.qsa_visible_blocks[:rows]
+            topk_indices = qsa.topk_indices[:rows]
+            visible_blocks = qsa.visible_blocks[:rows]
             _select(
                 core,
                 scores,
-                md.qsa_topk_row_starts[:rows],
+                qsa.topk_row_starts[:rows],
                 visible_blocks,
                 topk_indices,
                 _live_score_columns(core, md, batch),
@@ -4308,7 +4323,7 @@ class PrefillTarget:
             selected = qsa_expand_block_indices(
                 topk_indices,
                 logical,
-                md.qsa_sequence_lengths[:rows],
+                qsa.sequence_lengths[:rows],
                 compress_ratio=core.compress_ratio,
                 token_topk=core.token_topk,
             )
@@ -4380,6 +4395,7 @@ class DecodeTarget:
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """See PrefillTarget.step_args. Context counts are stated, not read: routing
         guarantees them, and a decode-only CUDA graph would freeze whatever it read."""
+        spec = md.find_ext(SpecDecodingMetadata)
         return dict(
             sequence_length=md.kv_lens_cuda_runtime,
             host_past_key_value_lengths=md.kv_lens_runtime,
@@ -4406,21 +4422,21 @@ class DecodeTarget:
             block_ids_per_seq=md.block_ids_per_seq,
             max_context_q_len_override=md.max_context_q_len_override,
             is_cross=md.is_cross,
-            is_spec_decoding_enabled=md.is_spec_decoding_enabled,
-            use_spec_decoding=md.use_spec_decoding,
-            is_spec_dec_tree=md.is_spec_dec_tree,
-            spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
-            spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
-            spec_decoding_packed_mask=md.spec_decoding_packed_mask,
-            spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
-            spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
-            spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
-            spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
+            is_spec_decoding_enabled=spec.is_spec_decoding_enabled,
+            use_spec_decoding=spec.use_spec_decoding,
+            is_spec_dec_tree=spec.is_spec_dec_tree,
+            spec_decoding_generation_lengths=spec.generation_lengths,
+            spec_decoding_position_offsets_for_cpp=spec.position_offsets_for_cpp,
+            spec_decoding_packed_mask=spec.packed_mask,
+            spec_decoding_bl_tree_mask_offset=spec.bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=spec.bl_tree_mask,
+            spec_decoding_target_max_draft_tokens=spec.max_total_draft_tokens,
+            spec_bl_tree_first_sparse_mask_offset_kv=spec.bl_tree_first_sparse_mask_offset_kv,
             num_sparse_topk=md.num_sparse_topk,
-            flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
-            flash_mla_num_splits=md.flash_mla_num_splits,
+            flash_mla_tile_scheduler_metadata=_flash_mla_field(md, "tile_scheduler_metadata"),
+            flash_mla_num_splits=_flash_mla_field(md, "num_splits"),
             max_num_sequences=md.max_num_sequences,
-            force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+            force_prepare_spec_dec_tree_mask=spec.force_prepare_tree_mask,
         )
 
     # --------------------------------------------------------------- blocks ---
@@ -5225,7 +5241,7 @@ class DecodeTarget:
         self._check_step_contract(md)
         step = self.step_args(md)
         spec_metadata = kwargs.get("spec_metadata")
-        mm = md.mamba_metadata
+        mm = md.ext(RecurrentMetadata).mamba_metadata
         # The bf16 block projections of a graph-captured step run as PDL launches
         # (`_decode_projection`); an eager step keeps cuBLAS.
         gemm = _decode_projection if md.is_cuda_graph else cublas_mm
@@ -5321,14 +5337,15 @@ class DecodeTarget:
         # per-capture constant matching the engine's short/long decode graph families.
         sparse = batch > 0 and int(md.kv_lens_runtime[:batch].max()) > core.dense_threshold
 
+        qsa_md = md.ext(QSAMetadata)
         qsa = (
-            md.qsa_req_idx_per_token[:num_tokens],
-            md.qsa_logical_positions[:num_tokens],
-            md.qsa_sequence_lengths[:num_tokens],
-            md.qsa_visible_blocks[:num_tokens],
-            md.qsa_topk_indices[:num_tokens],
-            md.qsa_topk_row_starts[:num_tokens],
-            md.qsa_block_table,
+            qsa_md.req_idx_per_token[:num_tokens],
+            qsa_md.logical_positions[:num_tokens],
+            qsa_md.sequence_lengths[:num_tokens],
+            qsa_md.visible_blocks[:num_tokens],
+            qsa_md.topk_indices[:num_tokens],
+            qsa_md.topk_row_starts[:num_tokens],
+            qsa_md.block_table,
             md.tokens_per_block,
             pos3,
             coords,
@@ -5348,9 +5365,9 @@ class DecodeTarget:
                 num_gens=batch,
                 rows_per_gen=gen_p,
                 slots=si_all,
-                request_indices=md.qsa_req_idx_per_token[:num_tokens],
-                logical_positions=md.qsa_logical_positions[:num_tokens],
-                block_table=md.qsa_block_table,
+                request_indices=qsa_md.req_idx_per_token[:num_tokens],
+                logical_positions=qsa_md.logical_positions[:num_tokens],
+                block_table=qsa_md.block_table,
                 tokens_per_block=md.tokens_per_block,
             )
 
@@ -5470,20 +5487,21 @@ class DecodeTarget:
         row with that row's complete-group count, in the draft layer's row of the shared
         buffers. Every request carries `p` rows here, and the worker continues the draft
         loop from row `num_accepted - 1` of each (the golden token counts as accepted)."""
-        assert md.qsa_mtp_num_accepted is not None, (
+        qsa = md.find_ext(QSAMetadata)
+        assert qsa.mtp_num_accepted is not None, (
             "IndexShare needs the worker's accepted counts to pick each request's capture "
             "row; the draft loop did not supply them"
         )
-        accepted = md.qsa_mtp_num_accepted[:batch].to(torch.int64)
+        accepted = qsa.mtp_num_accepted[:batch].to(torch.int64)
         rows = torch.arange(batch, dtype=torch.int64, device=topk_indices.device) * p
         rows = rows + torch.clamp(accepted - 1, min=0, max=p - 1)
         slot = self.core._draft_bound.share_slot
-        md.qsa_shared_topk_indices[slot, :batch].copy_(torch.index_select(topk_indices, 0, rows))
-        md.qsa_shared_topk_visible_blocks[slot, :batch].copy_(
+        qsa.shared_topk_indices[slot, :batch].copy_(torch.index_select(topk_indices, 0, rows))
+        qsa.shared_topk_visible_blocks[slot, :batch].copy_(
             torch.index_select(visible_blocks, 0, rows)
         )
         # Host-side readiness; see PrefillTarget._capture_selection.
-        md.qsa_shared_topk_captured_slots.add(slot)
+        qsa.shared_topk_captured_slots.add(slot)
 
     def mtp_forward(
         self,
@@ -5506,6 +5524,7 @@ class DecodeTarget:
             "core before the worker, so this cannot be reached first"
         )
         md = attn_metadata
+        qsa = md.find_ext(QSAMetadata)
         rows = hidden_states.shape[0]
         assert input_ids.shape[0] == rows, (
             f"the draft step's {input_ids.shape[0]} token ids and {rows} "
@@ -5552,19 +5571,17 @@ class DecodeTarget:
         )
 
         # The draft layer's QSA planes and the page table that addresses them. With a
-        # separate draft manager the engine's QSA metadata swaps `qsa_block_table` for the
-        # table it decodes from the draft manager's offsets (`prepare_for_draft_forward`);
+        # separate draft manager the engine's QSA metadata swaps `block_table` for the
+        # table it decodes from the draft manager's offsets (`QSAMetadata.draft_swap`);
         # a table still decoding the trunk's offsets would read and write another pool's
         # pages.
         draft = core._draft_bound
         if draft is None or cm is not draft.cm:
             core._bind_draft_cache_manager(md)
             draft = core._draft_bound
-        assert cm is core._bound.cm or md.qsa_block_table is getattr(
-            md, "qsa_draft_block_table", None
-        ), (
+        assert cm is core._bound.cm or qsa.block_table is qsa.draft_block_table, (
             "the draft step is bound to a separate draft KV cache manager but "
-            "qsa_block_table is not that manager's table: the engine's QSA metadata did "
+            "the QSA block_table is not that manager's table: the engine's QSA metadata did "
             "not swap its page table for the draft forward"
         )
         # The `qsa_*` row mapping is sized from the metadata's token count, which the
@@ -5581,10 +5598,10 @@ class DecodeTarget:
         # IndexShare: the loop's draft-extend step (`p` rows per request) runs the indexer
         # and, with sharing on, captures each request's selection; every draft decode step
         # after it (one row per request) reuses that capture instead of running the indexer.
-        share = core.mtp_index_share and md.qsa_in_mtp_draft_loop
-        reuse = share and md.qsa_indexer_skip_topk
+        share = core.mtp_index_share and qsa.in_mtp_draft_loop
+        reuse = share and qsa.indexer_skip_topk
         assert not share or reuse == (p == 1), (
-            f"the worker's reuse flag ({md.qsa_indexer_skip_topk}) disagrees with the "
+            f"the worker's reuse flag ({qsa.indexer_skip_topk}) disagrees with the "
             f"step's shape ({p} rows per request): only the draft decode steps after the "
             "draft-extend step reuse its selection"
         )
@@ -5663,9 +5680,9 @@ class DecodeTarget:
             mrope_section1=core.mrope_section1,
             mrope_section2=core.mrope_section2,
         )
-        req_idx = md.qsa_req_idx_per_token[:rows]
-        logical = md.qsa_logical_positions[:rows]
-        block_table = md.qsa_block_table
+        req_idx = qsa.req_idx_per_token[:rows]
+        logical = qsa.logical_positions[:rows]
+        block_table = qsa.block_table
         tokens_per_block = md.tokens_per_block
         index_cache = draft.index_cache
         # The QSA index branch, as in the trunk's `_attention_block` (see the prefill
@@ -5737,20 +5754,20 @@ class DecodeTarget:
         if sparse:
             kv = draft.kv
             _store_kv(core, kv, k_dst, v_dst, req_idx, logical, block_table, tokens_per_block)
-            topk_indices = md.qsa_topk_indices[:rows]
-            visible_blocks = md.qsa_visible_blocks[:rows]
+            topk_indices = qsa.topk_indices[:rows]
+            visible_blocks = qsa.visible_blocks[:rows]
             if reuse:
                 # The capture this loop's draft-extend step made, with the groups completed
                 # since appended; the expansion then adds the incomplete tail, so the
                 # positions drafted since the capture stay visible.
                 slot = draft.share_slot
-                assert slot in md.qsa_shared_topk_captured_slots, (
+                assert slot in qsa.shared_topk_captured_slots, (
                     "a draft decode step would reuse a selection that no draft-extend step "
                     "of this loop captured"
                 )
                 qsa_mtp_reuse_topk(
-                    shared_indices=md.qsa_shared_topk_indices[slot],
-                    shared_visible_blocks=md.qsa_shared_topk_visible_blocks[slot],
+                    shared_indices=qsa.shared_topk_indices[slot],
+                    shared_visible_blocks=qsa.shared_topk_visible_blocks[slot],
                     request_indices=req_idx,
                     visible_blocks=visible_blocks,
                     output=topk_indices,
@@ -5767,13 +5784,13 @@ class DecodeTarget:
                     only_visible_blocks=True,
                     context_rows=False,
                 )
-                _select(core, scores, md.qsa_topk_row_starts[:rows], visible_blocks, topk_indices)
+                _select(core, scores, qsa.topk_row_starts[:rows], visible_blocks, topk_indices)
                 if share:
                     self._capture_selection(md, topk_indices, visible_blocks, gen_seqs, p)
             selected = qsa_expand_block_indices(
                 topk_indices,
                 logical,
-                md.qsa_sequence_lengths[:rows],
+                qsa.sequence_lengths[:rows],
                 compress_ratio=core.compress_ratio,
                 token_topk=core.token_topk,
             )
@@ -6072,8 +6089,8 @@ class MTPLayer:
     lengths stay within `dense_seq_len_threshold`, and selection plus sparse GQA above it.
     With a separate draft KV manager the layer's K/V, index and position pages live in
     that manager's pools: the worker swaps `attn_metadata.kv_cache_manager` and the block
-    offsets for the draft loop, `QSAAttentionMetadata.prepare_for_draft_forward` swaps
-    `qsa_block_table` to the table it decodes from the draft manager's offsets, and the
+    offsets for the draft loop, `QSAMetadata.draft_swap` swaps
+    `block_table` to the table it decodes from the draft manager's offsets, and the
     core binds the draft manager's planes once per manager (`_DraftBound`). The planes need
     no rollback: each engine step's first draft call rewrites every position from the
     newly committed length on.

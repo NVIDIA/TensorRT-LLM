@@ -11,6 +11,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.distributed import AllReduceStrategy
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
@@ -23,7 +24,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..deepseek_v4.module import project_sparse_attn_output
 from .compressor import CSA2Compressor
-from .metadata import CSA2TrtllmMetadata
+from .metadata import CSA2Metadata
 from .params import (
     CSA2BackendForwardArgs,
     CSA2ForwardState,
@@ -378,29 +379,30 @@ class DeepseekV41Attention(nn.Module):
         )
 
     def prepare_global_cache(
-        self, hidden_states: torch.Tensor, metadata: CSA2TrtllmMetadata
+        self, hidden_states: torch.Tensor, metadata: TrtllmAttentionMetadata
     ) -> None:
         """Publish a CED owner's full encoder rows before narrowing decoder queries."""
+        csa2 = metadata.ext(CSA2Metadata)
         layer_idx = self.layer.layer_idx
         if self.layer.mode != CSA2Mode.FULL or self.compressor is None:
             raise ValueError("Only a Full CSA2 layer can precompute global KV")
-        if layer_idx in metadata.csa2_precomputed_kv_layers:
+        if layer_idx in csa2.csa2_precomputed_kv_layers:
             raise ValueError("CSA2 global KV was already precomputed for this forward")
-        source = metadata.select_global_source(layer_idx, hidden_states, None)
+        source = csa2.select_global_source(layer_idx, hidden_states, None)
         main_kv, index_k = self._prepare_global(
             hidden_states,
             source,
-            metadata.get_compression_batch(layer_idx),
-            metadata.get_compressed_positions(layer_idx),
+            csa2.get_compression_batch(layer_idx),
+            csa2.get_compressed_positions(layer_idx),
         )
         metadata.kv_cache_manager.write_global(
             self.layer.kv_source,
-            metadata.csa2_main_write_slots[self.layer.kv_source],
+            csa2.csa2_main_write_slots[self.layer.kv_source],
             main_kv,
             index_k,
-            *self.global_transforms(metadata.get_compressed_positions(layer_idx)),
+            *self.global_transforms(csa2.get_compressed_positions(layer_idx)),
         )
-        metadata.csa2_precomputed_kv_layers.add(layer_idx)
+        csa2.csa2_precomputed_kv_layers.add(layer_idx)
 
     def _prepare_auxiliary(
         self,
@@ -503,7 +505,7 @@ class DeepseekV41Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-        attn_metadata: CSA2TrtllmMetadata,
+        attn_metadata: TrtllmAttentionMetadata,
         *,
         global_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -514,17 +516,16 @@ class DeepseekV41Attention(nn.Module):
         completed group. ``global_hidden_states`` is the encoder output when
         decoder global KV is prepared from more rows than its SWA replay.
         """
-        precomputed = self.layer.layer_idx in attn_metadata.csa2_precomputed_kv_layers
-        compression = attn_metadata.get_compression_batch(self.layer.layer_idx)
+        csa2 = attn_metadata.ext(CSA2Metadata)
+        precomputed = self.layer.layer_idx in csa2.csa2_precomputed_kv_layers
+        compression = csa2.get_compression_batch(self.layer.layer_idx)
         compressed_positions = (
-            attn_metadata.get_compressed_positions(self.layer.layer_idx)
+            csa2.get_compressed_positions(self.layer.layer_idx)
             if self.layer.mode == CSA2Mode.FULL
             else None
         )
         global_source = (
-            attn_metadata.select_global_source(
-                self.layer.layer_idx, hidden_states, global_hidden_states
-            )
+            csa2.select_global_source(self.layer.layer_idx, hidden_states, global_hidden_states)
             if self.compressor is not None and not precomputed
             else None
         )
@@ -621,7 +622,7 @@ class DeepseekV41Attention(nn.Module):
             if start == end:
                 continue
             tile = q[start:end]
-            metadata = attn_metadata.get_query_tile_metadata(
+            metadata = csa2.get_query_tile_metadata(
                 tile,
                 0 if self.layer.mode == CSA2Mode.SWA else self.layout.index_topk,
                 query_start=start,

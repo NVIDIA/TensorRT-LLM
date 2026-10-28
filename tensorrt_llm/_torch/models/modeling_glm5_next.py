@@ -36,6 +36,7 @@ from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantConfig
 from ...quantization.mode import QuantAlgo
+from ..attention.backends.features import RecurrentMetadata
 from ..attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -415,7 +416,7 @@ def build_glm5_next_runtime_context(attn_metadata: AttentionMetadata) -> Glm5Nex
     """
     if attn_metadata.kv_cache_manager is None:
         raise ValueError("glm5_next requires a kv cache manager; got None")
-    mamba_metadata = attn_metadata.mamba_metadata
+    mamba_metadata = attn_metadata.ext(RecurrentMetadata).mamba_metadata
     assert isinstance(mamba_metadata, Glm5NextMamba2Metadata), (
         "glm5_next requires Glm5NextMamba2Metadata"
     )

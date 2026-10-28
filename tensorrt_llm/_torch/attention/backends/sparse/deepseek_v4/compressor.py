@@ -17,7 +17,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from .params import DeepseekV4AttentionType
 
 if TYPE_CHECKING:
-    from .metadata import DeepseekV4TrtllmAttentionMetadata
+    from ...trtllm import TrtllmAttentionMetadata
 
 
 class KVCacheDtype(IntEnum):
@@ -158,7 +158,7 @@ class Compressor(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        metadata: "DeepseekV4TrtllmAttentionMetadata",
+        metadata: "TrtllmAttentionMetadata",
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Forward pass for paged KV compression.
 
@@ -175,6 +175,10 @@ class Compressor(nn.Module):
             - no compressed tokens:                    (None, None)
         """
         # Extract metadata
+        # The metadata module imports this one through the indexer.
+        from .metadata import DeepseekV4Metadata
+
+        dsv4 = metadata.ext(DeepseekV4Metadata)
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
@@ -203,11 +207,11 @@ class Compressor(nn.Module):
         # Get block tables
         local_layer_idx = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
         if self.is_indexer:
-            block_table = metadata.indexer_k_cache_block_offsets
+            block_table = dsv4.indexer_k_cache_block_offsets
         else:
-            block_table = metadata.compress_block_tables[self.compress_ratio]
-        block_table_kv_state = metadata.sliding_block_tables[local_layer_idx, kv_type.value]
-        block_table_score_state = metadata.sliding_block_tables[local_layer_idx, score_type.value]
+            block_table = dsv4.compress_block_tables[self.compress_ratio]
+        block_table_kv_state = dsv4.sliding_block_tables[local_layer_idx, kv_type.value]
+        block_table_score_state = dsv4.sliding_block_tables[local_layer_idx, score_type.value]
 
         # Get tokens_per_block from cache manager
         # state_tokens_per_block: for compressor kv/score state caches (used in compress kernels)
@@ -216,11 +220,11 @@ class Compressor(nn.Module):
         compress_tokens_per_block = metadata.kv_cache_manager.compressed_block_sizes[self.layer_idx]
 
         # Get compression metadata
-        cu_new_comp_kv = metadata.cu_new_comp_kv_cuda[self.compress_ratio]
+        cu_new_comp_kv = dsv4.cu_new_comp_kv_cuda[self.compress_ratio]
         kv_lens = metadata.kv_lens_cuda_runtime
-        total_num_comp_tokens = metadata.num_total_compressed_tokens[self.compress_ratio]
-        num_comp_tokens = metadata.new_comp_kv_lens_cuda[self.compress_ratio][:bsz]
-        max_ctx_comp_kv_lens = metadata.max_ctx_compressed_tokens[self.compress_ratio]
+        total_num_comp_tokens = dsv4.num_total_compressed_tokens[self.compress_ratio]
+        num_comp_tokens = dsv4.new_comp_kv_lens_cuda[self.compress_ratio][:bsz]
+        max_ctx_comp_kv_lens = dsv4.max_ctx_compressed_tokens[self.compress_ratio]
 
         # Project input to KV and score in the checkpoint dtype. The compressor
         # kernels accept bf16 or fp32 kv_score and convert values to fp32
@@ -241,8 +245,8 @@ class Compressor(nn.Module):
                 block_table_score_state[:num_contexts],
                 kv_comp,
                 kv_lens[:num_contexts],
-                metadata.cached_token_lens_cuda[:num_contexts],
-                metadata.cu_seq_lens_cuda,
+                dsv4.cached_token_lens_cuda[:num_contexts],
+                dsv4.cu_seq_lens_cuda,
                 cu_new_comp_kv[: num_contexts + 1],
                 num_contexts,
                 state_tokens_per_block,
@@ -257,8 +261,8 @@ class Compressor(nn.Module):
             # batches: next_n is only the batch maximum (the kernel's loop
             # bound) and the real per-request counts come through
             # new_tokens_per_seq.
-            next_n = metadata.num_gen_tokens_per_seq
-            new_tokens_per_seq = metadata.gen_new_tokens_per_seq
+            next_n = dsv4.num_gen_tokens_per_seq
+            new_tokens_per_seq = dsv4.gen_new_tokens_per_seq
             # Pass full kv_score (not sliced) with the generation portion of
             # cu_seq_lens so the kernel reads at the correct absolute offsets.
             torch.ops.trtllm.compressor_paged_kv_compress(
@@ -270,7 +274,7 @@ class Compressor(nn.Module):
                 block_table_score_state[num_contexts:],
                 kv_comp,
                 gen_kv_lens,
-                metadata.cu_seq_lens_cuda[num_contexts:],
+                dsv4.cu_seq_lens_cuda[num_contexts:],
                 cu_new_comp_kv[num_contexts:],
                 num_generations,
                 state_tokens_per_block,
@@ -281,7 +285,7 @@ class Compressor(nn.Module):
             )
 
         # Scatter to cache with appropriate quantization (all modes fused)
-        start_pos = metadata.past_kv_lens_cuda[self.compress_ratio][:bsz]
+        start_pos = dsv4.past_kv_lens_cuda[self.compress_ratio][:bsz]
         total_tokens = kv_comp.shape[0]
 
         # Allocate optional returned postprocess buffers for indexer paths.
@@ -308,8 +312,8 @@ class Compressor(nn.Module):
                     total_tokens, num_scale_blocks, dtype=torch.uint8, device=kv_comp.device
                 )
 
-        position_ids = metadata.compressed_position_ids_cuda[self.compress_ratio][:total_tokens]
-        compressed_mask = metadata.compressed_mask_cuda[self.compress_ratio][:total_tokens]
+        position_ids = dsv4.compressed_position_ids_cuda[self.compress_ratio][:total_tokens]
+        compressed_mask = dsv4.compressed_mask_cuda[self.compress_ratio][:total_tokens]
 
         if self.footer_scale_cache and not self.is_indexer:
             self._footer_scale_postprocess_scatter(

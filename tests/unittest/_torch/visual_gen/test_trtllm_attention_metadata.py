@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.sparse.params import (
     BlockSparseForwardInputs,
     SparseBackendForwardArgs,
@@ -64,9 +65,7 @@ def _make_core_forward_metadata():
     metadata.use_paged_context_fmha = False
     metadata.cu_q_seqlens = None
     metadata.cu_kv_seqlens = None
-    metadata.enable_flash_mla = False
-    metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
-    metadata.spec_decoding_bl_tree_mask = None
+    metadata.replace_ext(SpecDecodingMetadata(metadata))
     metadata.kv_lens_cuda_runtime = torch.tensor([4], dtype=torch.int32)
     metadata.kv_lens_runtime = torch.tensor([4], dtype=torch.int32)
     metadata.prompt_lens_cuda_runtime = torch.tensor([4], dtype=torch.int32)

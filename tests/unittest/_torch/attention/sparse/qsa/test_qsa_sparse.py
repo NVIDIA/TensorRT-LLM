@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.features import DraftKVMetadata
 from tensorrt_llm._torch.attention.backends.sparse.qsa import (
     QSASparseMetadataParams,
     QSASparseParams,
@@ -26,7 +27,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     triton_qsa_prefill_compress,
     triton_qsa_unscale_block_table,
 )
-from tensorrt_llm._torch.attention.backends.sparse.qsa.metadata import QSAAttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.qsa.metadata import QSAMetadata
 from tensorrt_llm._torch.attention.backends.sparse.qsa.module import (
     _capture_mtp_shared_topk,
     _store_paged_kv_reference,
@@ -46,6 +47,20 @@ from tensorrt_llm._torch.speculative.interface import (
     restore_attn_metadata_after_draft_replay,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
+
+
+def _qsa_stub(**fields) -> SimpleNamespace:
+    """A metadata stub whose QSA extension holds the ``qsa_``-prefixed fields."""
+    qsa = SimpleNamespace(
+        **{
+            name[len("qsa_") :]: fields.pop(name)
+            for name in list(fields)
+            if name.startswith("qsa_")
+        }
+    )
+    metadata = SimpleNamespace(**fields)
+    metadata.find_ext = metadata.ext = lambda cls: qsa if cls is QSAMetadata else None
+    return metadata
 
 
 def _params(
@@ -278,7 +293,7 @@ def test_qsa_mtp_capture_uses_each_request_own_rows() -> None:
     seq_lens = torch.tensor([1, 1, 4], device="cuda", dtype=torch.int32)
     indices = torch.arange(6, device="cuda", dtype=torch.int32).unsqueeze(1).repeat(1, 2)
     visible_blocks = torch.arange(100, 106, device="cuda", dtype=torch.int32)
-    metadata = SimpleNamespace(
+    metadata = _qsa_stub(
         num_seqs=3,
         seq_lens_cuda=seq_lens,
         qsa_mtp_num_accepted=torch.tensor([1, 1, 3], device="cuda", dtype=torch.int32),
@@ -286,19 +301,20 @@ def test_qsa_mtp_capture_uses_each_request_own_rows() -> None:
         qsa_shared_topk_visible_blocks=torch.full((1, 3), -99, device="cuda", dtype=torch.int32),
         qsa_shared_topk_captured_slots=set(),
     )
+    qsa = metadata.find_ext(QSAMetadata)
 
     _capture_mtp_shared_topk(metadata, 0, indices, visible_blocks)
 
     # Request 2 starts at row 2 and accepted three tokens, so it keeps row 4.
-    assert metadata.qsa_shared_topk_indices[0, :, 0].tolist() == [0, 1, 4]
-    assert metadata.qsa_shared_topk_visible_blocks[0].tolist() == [100, 101, 104]
-    assert metadata.qsa_shared_topk_captured_slots == {0}
+    assert qsa.shared_topk_indices[0, :, 0].tolist() == [0, 1, 4]
+    assert qsa.shared_topk_visible_blocks[0].tolist() == [100, 101, 104]
+    assert qsa.shared_topk_captured_slots == {0}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_qsa_mtp_capture_keeps_each_layer_in_its_own_slot() -> None:
     """Two sparse layers that rank the same requests differently both survive."""
-    metadata = SimpleNamespace(
+    metadata = _qsa_stub(
         num_seqs=2,
         seq_lens_cuda=torch.ones(2, device="cuda", dtype=torch.int32),
         qsa_mtp_num_accepted=None,
@@ -306,6 +322,7 @@ def test_qsa_mtp_capture_keeps_each_layer_in_its_own_slot() -> None:
         qsa_shared_topk_visible_blocks=torch.full((2, 2), -99, device="cuda", dtype=torch.int32),
         qsa_shared_topk_captured_slots=set(),
     )
+    qsa = metadata.find_ext(QSAMetadata)
 
     for slot, base in enumerate((10, 20)):
         indices = torch.tensor(
@@ -314,12 +331,12 @@ def test_qsa_mtp_capture_keeps_each_layer_in_its_own_slot() -> None:
         visible_blocks = torch.tensor([base, base], device="cuda", dtype=torch.int32)
         _capture_mtp_shared_topk(metadata, slot, indices, visible_blocks)
 
-    assert metadata.qsa_shared_topk_indices.tolist() == [
+    assert qsa.shared_topk_indices.tolist() == [
         [[10, 11], [12, 13]],
         [[20, 21], [22, 23]],
     ]
-    assert metadata.qsa_shared_topk_visible_blocks.tolist() == [[10, 10], [20, 20]]
-    assert metadata.qsa_shared_topk_captured_slots == {0, 1}
+    assert qsa.shared_topk_visible_blocks.tolist() == [[10, 10], [20, 20]]
+    assert qsa.shared_topk_captured_slots == {0, 1}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -352,7 +369,7 @@ def test_qsa_mtp_reuse_waits_for_the_calling_layer_to_capture() -> None:
     # contents of a slot no layer has written yet.
     shared = torch.zeros((2, 1, params.block_topk), dtype=torch.int32, device="cuda")
     shared[1].fill_(999)
-    metadata = SimpleNamespace(
+    metadata = _qsa_stub(
         qsa_block_table=block_table,
         kv_cache_manager=SimpleNamespace(tokens_per_block=tokens_per_block),
         qsa_indexer_skip_topk=True,
@@ -363,6 +380,7 @@ def test_qsa_mtp_reuse_waits_for_the_calling_layer_to_capture() -> None:
         num_seqs=1,
         seq_lens_cuda=torch.tensor([1], dtype=torch.int32, device="cuda"),
     )
+    qsa = metadata.find_ext(QSAMetadata)
 
     selected = select_qsa_paged_tokens(
         q,
@@ -381,8 +399,8 @@ def test_qsa_mtp_reuse_waits_for_the_calling_layer_to_capture() -> None:
     assert max(chosen) <= int(query_positions[0]), "the selection must stay causal"
     # Scoring ran for this layer, so its slot now carries a real selection
     # rather than what a premature reuse would have read back.
-    assert metadata.qsa_shared_topk_captured_slots == {0, 1}
-    assert 999 not in metadata.qsa_shared_topk_indices[1].tolist()
+    assert qsa.shared_topk_captured_slots == {0, 1}
+    assert 999 not in qsa.shared_topk_indices[1].tolist()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -539,26 +557,27 @@ def test_qsa_spec_dec_remaps_rows_after_the_draft_loop_packs_one_row_per_request
     """The first draft step repacks the batch, so the row mapping must follow it."""
     num_seqs, rows_per_seq = 2, 2
     num_tokens = num_seqs * rows_per_seq
-    metadata = object.__new__(QSAAttentionMetadata)
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    qsa = QSAMetadata(metadata)
+    metadata.replace_ext(qsa)
     metadata._seq_lens = torch.full((num_seqs,), rows_per_seq, dtype=torch.int32)
     metadata._seq_lens_cuda = metadata._seq_lens.cuda()
     metadata._num_contexts = 0
     metadata._num_tokens = num_tokens
     metadata.kv_lens_cuda_runtime = torch.tensor([40, 56], dtype=torch.int32, device="cuda")
-    metadata.sparse_metadata_params = SimpleNamespace(compress_ratio=4)
-    metadata.qsa_has_local_layers = True
-    metadata.enable_flash_mla = False
+    qsa.params = SimpleNamespace(compress_ratio=4)
+    qsa.has_local_layers = True
     metadata._mla_scheduler_buffers_valid = True
     metadata._mla_ctx_cu_seqlens_valid = True
-    metadata.qsa_req_idx_per_token = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
-    metadata.qsa_logical_positions = torch.zeros(num_tokens, dtype=torch.int64, device="cuda")
-    metadata.qsa_sequence_lengths = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
-    metadata.qsa_visible_blocks = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
-    metadata._qsa_cu_seq_lens = torch.zeros(num_seqs + 1, dtype=torch.int64, device="cuda")
-    metadata._qsa_token_arange = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+    qsa.req_idx_per_token = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
+    qsa.logical_positions = torch.zeros(num_tokens, dtype=torch.int64, device="cuda")
+    qsa.sequence_lengths = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
+    qsa.visible_blocks = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
+    qsa._cu_seq_lens = torch.zeros(num_seqs + 1, dtype=torch.int64, device="cuda")
+    qsa._token_arange = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
 
-    metadata._refresh_qsa_token_mapping()
-    assert metadata.qsa_req_idx_per_token.tolist() == [0, 0, 1, 1]
+    qsa._refresh_token_mapping()
+    assert qsa.req_idx_per_token.tolist() == [0, 0, 1, 1]
 
     # What the draft loop does to the metadata between its first two steps.
     metadata._seq_lens.fill_(1)
@@ -566,10 +585,8 @@ def test_qsa_spec_dec_remaps_rows_after_the_draft_loop_packs_one_row_per_request
     metadata._num_tokens = num_seqs
     metadata.update_for_spec_dec()
 
-    assert metadata.qsa_req_idx_per_token[:num_seqs].tolist() == [0, 1]
-    torch.testing.assert_close(
-        metadata.qsa_sequence_lengths[:num_seqs], metadata.kv_lens_cuda_runtime
-    )
+    assert qsa.req_idx_per_token[:num_seqs].tolist() == [0, 1]
+    torch.testing.assert_close(qsa.sequence_lengths[:num_seqs], metadata.kv_lens_cuda_runtime)
 
 
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
@@ -934,7 +951,7 @@ def test_qsa_paged_selection_torch_fallback_stays_causal() -> None:
     query_positions = torch.tensor([5], device="cuda")
     sequence_lengths = torch.tensor([16], device="cuda")
     request_indices = torch.tensor([0], dtype=torch.int32, device="cuda")
-    metadata = SimpleNamespace(
+    metadata = _qsa_stub(
         qsa_block_table=block_table,
         kv_cache_manager=SimpleNamespace(tokens_per_block=tokens_per_block),
     )
@@ -991,7 +1008,7 @@ def test_qsa_paged_selection_supports_multiple_rows_per_request() -> None:
     # each row's causal boundary in the selector and incomplete tail.
     sequence_lengths = torch.tensor([10, 10, 14, 14], device="cuda")
     request_indices = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device="cuda")
-    metadata = SimpleNamespace(
+    metadata = _qsa_stub(
         qsa_block_table=block_table,
         kv_cache_manager=SimpleNamespace(tokens_per_block=tokens_per_block),
     )
@@ -1243,7 +1260,7 @@ def test_qsa_sparse_gqa_reads_hnd_paged_cache() -> None:
         v_cache[page, 0, within] = torch.tensor([position * 10.0, position * 10.0 + 1.0])
     selected = torch.tensor([[0, 3, 4, -1]], dtype=torch.int32)
     q = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
-    metadata = SimpleNamespace(
+    metadata = _qsa_stub(
         qsa_block_table=torch.tensor([[0, 1]], dtype=torch.int32),
         kv_cache_manager=SimpleNamespace(tokens_per_block=4),
     )
@@ -1268,7 +1285,7 @@ def test_qsa_sparse_gqa_all_invalid_row_returns_zero() -> None:
     q = torch.randn(1, 2, 4)
     k_cache = torch.randn(1, 1, 4, 4)
     v_cache = torch.randn_like(k_cache)
-    metadata = SimpleNamespace(
+    metadata = _qsa_stub(
         qsa_block_table=torch.tensor([[0]], dtype=torch.int32),
         kv_cache_manager=SimpleNamespace(tokens_per_block=4),
     )
@@ -1336,7 +1353,7 @@ def test_fused_qsa_sparse_gqa_matches_reference(head_dim: int, cache_dtype: torc
         dtype=torch.int32,
         device="cuda",
     )
-    metadata = SimpleNamespace(
+    metadata = _qsa_stub(
         qsa_block_table=block_table,
         kv_cache_manager=SimpleNamespace(tokens_per_block=tokens_per_block),
     )
@@ -1386,7 +1403,7 @@ def test_qsa_splitk_merge_output_gate_matches_separate_gate() -> None:
     request_indices = torch.zeros(rows, dtype=torch.int32, device="cuda")
     selected = torch.arange(selected_width, dtype=torch.int32, device="cuda").reshape(rows, -1)
     output_gate = torch.randn_like(q)
-    metadata = SimpleNamespace(
+    metadata = _qsa_stub(
         qsa_block_table=block_table,
         kv_cache_manager=SimpleNamespace(tokens_per_block=tokens_per_block),
     )
@@ -1456,7 +1473,7 @@ def test_fused_qsa_prefill_bounds_sparse_attention_to_visible_tokens() -> None:
     selected = torch.full((rows, final_topk), -1, dtype=torch.int32, device="cuda")
     columns = torch.arange(final_topk, device="cuda").unsqueeze(0)
     selected.copy_(torch.where(columns < visible_tokens.unsqueeze(1), columns, -1))
-    metadata = SimpleNamespace(
+    metadata = _qsa_stub(
         qsa_block_table=block_table,
         kv_cache_manager=SimpleNamespace(tokens_per_block=tokens_per_block),
     )
@@ -1604,20 +1621,22 @@ def test_qsa_speculative_snapshot_state_uses_host_lengths(
     num_contexts: int,
     expected: bool,
 ) -> None:
-    metadata = object.__new__(QSAAttentionMetadata)
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    qsa = QSAMetadata(metadata)
+    metadata.replace_ext(qsa)
     metadata._seq_lens = torch.tensor(sequence_lengths, dtype=torch.int32)
     metadata._num_contexts = num_contexts
 
-    metadata._refresh_qsa_speculative_snapshot_state()
+    qsa._refresh_speculative_snapshot_state()
 
-    assert metadata.qsa_needs_speculative_snapshot is expected
+    assert qsa.needs_speculative_snapshot is expected
 
 
 def test_qsa_ordinary_mixed_batch_skips_speculative_cache_snapshot() -> None:
     indexer = object.__new__(QSAIndexer)
     torch.nn.Module.__init__(indexer)
     indexer._pending_speculative_cache = object()
-    metadata = SimpleNamespace(
+    metadata = _qsa_stub(
         num_contexts=1,
         num_seqs=2,
         num_tokens=2,
@@ -1643,7 +1662,7 @@ def test_qsa_multi_token_generation_captures_speculative_cache_snapshot() -> Non
     indexer = object.__new__(QSAIndexer)
     torch.nn.Module.__init__(indexer)
     indexer._pending_speculative_cache = None
-    metadata = SimpleNamespace(
+    metadata = _qsa_stub(
         num_contexts=0,
         num_seqs=1,
         num_tokens=4,
@@ -1717,7 +1736,6 @@ _DRAFT_LAYOUT = dict(sparse_layer_ids=[48], pool_id=0, scale=4, num_pools=1, max
 
 
 def _qsa_metadata_with_draft(
-    monkeypatch,
     *,
     mtp_index_share: bool = False,
     draft_layout: dict | None = _DRAFT_LAYOUT,
@@ -1725,8 +1743,7 @@ def _qsa_metadata_with_draft(
 ):
     """QSA metadata over a target manager and, unless `draft_layout` is None, a separate
     draft manager (`draft_manager` replaces the one `draft_layout` describes)."""
-    monkeypatch.setattr(TrtllmAttentionMetadata, "__post_init__", lambda self: None)
-    metadata = object.__new__(QSAAttentionMetadata)
+    metadata = object.__new__(TrtllmAttentionMetadata)
     metadata.kv_cache_manager = _qsa_layout_manager(**_TARGET_LAYOUT)
     if draft_manager is None and draft_layout is not None:
         draft_manager = _qsa_layout_manager(**draft_layout)
@@ -1737,7 +1754,9 @@ def _qsa_metadata_with_draft(
     metadata.max_num_sequences = 4
     metadata.max_num_tokens = 16
     metadata.draft_replay_swapped_attrs = {}
-    metadata.__post_init__()
+    qsa = QSAMetadata(metadata)
+    qsa.allocate(None)
+    metadata.replace_ext(qsa)
     return metadata
 
 
@@ -1760,44 +1779,48 @@ def _set_qsa_offsets(metadata, num_seqs: int, generation: int):
         if layout is _TARGET_LAYOUT:
             metadata.kv_cache_block_offsets = offsets
         else:
-            metadata.draft_kv_cache_block_offsets = offsets
+            draft_kv = metadata.find_ext(DraftKVMetadata) or DraftKVMetadata(metadata)
+            draft_kv.kv_cache_block_offsets = offsets
+            metadata.replace_ext(draft_kv)
     return slots
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_qsa_draft_block_table_exists_only_for_a_separate_draft_manager(monkeypatch) -> None:
-    metadata = _qsa_metadata_with_draft(monkeypatch)
+def test_qsa_draft_block_table_exists_only_for_a_separate_draft_manager() -> None:
+    metadata = _qsa_metadata_with_draft()
+    qsa = metadata.find_ext(QSAMetadata)
 
     # Each table is sized, and its pool and page scale taken, from its own manager.
-    assert metadata.qsa_block_table.shape == (4, _TARGET_LAYOUT["max_blocks_per_seq"])
-    assert metadata.qsa_draft_block_table.shape == (4, _DRAFT_LAYOUT["max_blocks_per_seq"])
-    assert metadata.qsa_draft_block_table.data_ptr() != metadata.qsa_block_table.data_ptr()
-    assert (metadata._qsa_attention_pool_id, metadata._qsa_page_index_scale) == (1, 6)
-    assert (metadata._qsa_draft_attention_pool_id, metadata._qsa_draft_page_index_scale) == (0, 4)
+    assert qsa.block_table.shape == (4, _TARGET_LAYOUT["max_blocks_per_seq"])
+    assert qsa.draft_block_table.shape == (4, _DRAFT_LAYOUT["max_blocks_per_seq"])
+    assert qsa.draft_block_table.data_ptr() != qsa.block_table.data_ptr()
+    assert (qsa._attention_pool_id, qsa._page_index_scale) == (1, 6)
+    assert (qsa._draft_attention_pool_id, qsa._draft_page_index_scale) == (0, 4)
 
-    target_only = _qsa_metadata_with_draft(monkeypatch, draft_layout=None)
-    assert target_only.qsa_draft_block_table is None
+    target_only = _qsa_metadata_with_draft(draft_layout=None)
+    assert target_only.ext(QSAMetadata).draft_block_table is None
     assert target_only.prepare_for_draft_forward() is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("kind", ("not_qsa", "no_local_layer"))
-def test_qsa_draft_table_needs_a_qsa_draft_manager_with_local_layers(monkeypatch, kind) -> None:
+def test_qsa_draft_table_needs_a_qsa_draft_manager_with_local_layers(kind) -> None:
     if kind == "not_qsa":
         draft_manager = SimpleNamespace(qsa_position_layer_id=0)
     else:
         draft_manager = _qsa_layout_manager(**_DRAFT_LAYOUT)
         draft_manager.qsa_position_layer_id = None
-    metadata = _qsa_metadata_with_draft(monkeypatch, draft_manager=draft_manager)
+    metadata = _qsa_metadata_with_draft(draft_manager=draft_manager)
+    qsa = metadata.find_ext(QSAMetadata)
     metadata._seq_lens = torch.ones(2, dtype=torch.int32)
 
-    assert metadata.qsa_draft_block_table is None
+    assert qsa.draft_block_table is None
     # The target's own manager is bound, as outside a draft loop, and the hook and the
     # refresh both leave the target bindings alone.
     metadata.prepare_for_draft_forward()
-    metadata._refresh_qsa_draft_block_table()
+    qsa._refresh_draft_block_table()
     assert metadata.draft_replay_swapped_attrs == {}
-    assert (metadata._qsa_attention_pool_id, metadata._qsa_page_index_scale) == (1, 6)
+    assert (qsa._attention_pool_id, qsa._page_index_scale) == (1, 6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -1810,46 +1833,46 @@ def test_qsa_draft_table_needs_a_qsa_draft_manager_with_local_layers(monkeypatch
     ),
     ids=("draft_wider", "target_wider", "no_draft"),
 )
-def test_qsa_shared_topk_slots_cover_the_wider_manager(monkeypatch, draft_layout, slots) -> None:
+def test_qsa_shared_topk_slots_cover_the_wider_manager(draft_layout, slots) -> None:
     """The shared selection buffers are addressed by whichever manager is bound."""
-    metadata = _qsa_metadata_with_draft(
-        monkeypatch, mtp_index_share=True, draft_layout=draft_layout
-    )
+    metadata = _qsa_metadata_with_draft(mtp_index_share=True, draft_layout=draft_layout)
+    qsa = metadata.find_ext(QSAMetadata)
 
-    assert metadata.qsa_shared_topk_indices.shape[0] == slots
-    assert metadata.qsa_shared_topk_visible_blocks.shape[0] == slots
+    assert qsa.shared_topk_indices.shape[0] == slots
+    assert qsa.shared_topk_visible_blocks.shape[0] == slots
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_qsa_draft_forward_addresses_the_draft_manager_pages(monkeypatch) -> None:
-    """prepare() decodes both tables; the draft swap makes `qsa_block_table` the draft one
+def test_qsa_draft_forward_addresses_the_draft_manager_pages() -> None:
+    """prepare() decodes both tables; the draft swap makes `block_table` the draft one
     and the restore puts the target's table, pool and scale back."""
     num_seqs = 3
-    metadata = _qsa_metadata_with_draft(monkeypatch)
+    metadata = _qsa_metadata_with_draft()
+    qsa = metadata.find_ext(QSAMetadata)
     metadata._seq_lens = torch.ones(num_seqs, dtype=torch.int32)
     target_slots, draft_slots = _set_qsa_offsets(metadata, num_seqs, generation=0)
-    target_table = metadata.qsa_block_table
+    target_table = qsa.block_table
 
-    metadata._refresh_qsa_block_table()
-    metadata._refresh_qsa_draft_block_table()
+    qsa._refresh_block_table()
+    qsa._refresh_draft_block_table()
     torch.testing.assert_close(target_table[:num_seqs], target_slots)
-    torch.testing.assert_close(metadata.qsa_draft_block_table[:num_seqs], draft_slots)
+    torch.testing.assert_close(qsa.draft_block_table[:num_seqs], draft_slots)
 
     draft_manager = metadata.draft_kv_cache_manager
     saved = prepare_attn_metadata_for_draft_replay(metadata, draft_manager)
     assert saved is not None
     assert metadata.kv_cache_manager is draft_manager
-    assert metadata.qsa_block_table is metadata.qsa_draft_block_table
+    assert qsa.block_table is qsa.draft_block_table
     # Every operand of the table refresh is the draft manager's while swapped, so a
     # refresh rebuilds the draft table and leaves the target's alone.
-    metadata._refresh_qsa_block_table()
-    torch.testing.assert_close(metadata.qsa_block_table[:num_seqs], draft_slots)
+    qsa._refresh_block_table()
+    torch.testing.assert_close(qsa.block_table[:num_seqs], draft_slots)
     torch.testing.assert_close(target_table[:num_seqs], target_slots)
 
     restore_attn_metadata_after_draft_replay(metadata, saved)
     assert metadata.kv_cache_manager is not draft_manager
-    assert metadata.qsa_block_table is target_table
-    assert (metadata._qsa_attention_pool_id, metadata._qsa_page_index_scale) == (1, 6)
+    assert qsa.block_table is target_table
+    assert (qsa._attention_pool_id, qsa._page_index_scale) == (1, 6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -1857,55 +1880,54 @@ def test_qsa_prepare_decodes_the_target_and_the_draft_table(monkeypatch) -> None
     """`prepare()` is what refreshes both tables before every step and replay: a second
     generation of offsets reaches the target table and the draft table through it."""
     num_seqs = 3
-    metadata = _qsa_metadata_with_draft(monkeypatch)
+    metadata = _qsa_metadata_with_draft()
+    qsa = metadata.find_ext(QSAMetadata)
     metadata._seq_lens = torch.ones(num_seqs, dtype=torch.int32)
-    # The parent's prepare and the row mapping are not under test here.
-    monkeypatch.setattr(TrtllmAttentionMetadata, "prepare", lambda self: None)
-    monkeypatch.setattr(QSAAttentionMetadata, "_refresh_qsa_token_mapping", lambda self: None)
-    monkeypatch.setattr(
-        QSAAttentionMetadata, "_refresh_qsa_speculative_snapshot_state", lambda self: None
-    )
+    # The row mapping is not under test here.
+    monkeypatch.setattr(QSAMetadata, "_refresh_token_mapping", lambda self: None)
+    monkeypatch.setattr(QSAMetadata, "_refresh_speculative_snapshot_state", lambda self: None)
     for generation in (0, 1):
         target_slots, draft_slots = _set_qsa_offsets(metadata, num_seqs, generation)
-        metadata.prepare()
-        torch.testing.assert_close(metadata.qsa_block_table[:num_seqs], target_slots)
-        torch.testing.assert_close(metadata.qsa_draft_block_table[:num_seqs], draft_slots)
+        qsa.prepare()
+        torch.testing.assert_close(qsa.block_table[:num_seqs], target_slots)
+        torch.testing.assert_close(qsa.draft_block_table[:num_seqs], draft_slots)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_qsa_draft_forward_refuses_an_unswapped_manager(monkeypatch) -> None:
-    metadata = _qsa_metadata_with_draft(monkeypatch)
+def test_qsa_draft_forward_refuses_an_unswapped_manager() -> None:
+    metadata = _qsa_metadata_with_draft()
 
     with pytest.raises(RuntimeError, match="draft KV cache manager"):
         metadata.prepare_for_draft_forward()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_qsa_draft_table_replays_the_refreshed_draft_pages(monkeypatch) -> None:
+def test_qsa_draft_table_replays_the_refreshed_draft_pages() -> None:
     """A graph captured across the draft swap reads each table by address: the trunk
     segment the target table, the draft segment the draft one, and a refresh outside
     capture (as prepare() does before every replay) is what the replay sees."""
     num_seqs = 3
-    metadata = _qsa_metadata_with_draft(monkeypatch)
+    metadata = _qsa_metadata_with_draft()
+    qsa = metadata.find_ext(QSAMetadata)
     metadata._seq_lens = torch.ones(num_seqs, dtype=torch.int32)
     _set_qsa_offsets(metadata, num_seqs, generation=0)
-    metadata._refresh_qsa_block_table()
-    metadata._refresh_qsa_draft_block_table()
+    qsa._refresh_block_table()
+    qsa._refresh_draft_block_table()
     draft_manager = metadata.draft_kv_cache_manager
-    target_seen = torch.zeros_like(metadata.qsa_block_table[:num_seqs])
-    draft_seen = torch.zeros_like(metadata.qsa_draft_block_table[:num_seqs])
+    target_seen = torch.zeros_like(qsa.block_table[:num_seqs])
+    draft_seen = torch.zeros_like(qsa.draft_block_table[:num_seqs])
 
     graph = torch.cuda.CUDAGraph()
     torch.cuda.synchronize()
     with torch.cuda.graph(graph):
-        target_seen.copy_(metadata.qsa_block_table[:num_seqs])
+        target_seen.copy_(qsa.block_table[:num_seqs])
         saved = prepare_attn_metadata_for_draft_replay(metadata, draft_manager)
-        draft_seen.copy_(metadata.qsa_block_table[:num_seqs])
+        draft_seen.copy_(qsa.block_table[:num_seqs])
         restore_attn_metadata_after_draft_replay(metadata, saved)
 
     target_slots, draft_slots = _set_qsa_offsets(metadata, num_seqs, generation=1)
-    metadata._refresh_qsa_block_table()
-    metadata._refresh_qsa_draft_block_table()
+    qsa._refresh_block_table()
+    qsa._refresh_draft_block_table()
     graph.replay()
     torch.cuda.synchronize()
 

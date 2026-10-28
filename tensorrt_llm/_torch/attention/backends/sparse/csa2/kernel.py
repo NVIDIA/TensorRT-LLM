@@ -388,7 +388,7 @@ def _glue_kernels():
     class OwnerSlotsKernel:
         """GLOBAL write slots and compressed groups of every KV owner for live endpoints.
 
-        Mirrors ``CSA2TrtllmMetadata._refresh_owner_slots`` in one launch: grid
+        Mirrors ``CSA2Metadata._refresh_owner_slots`` in one launch: grid
         ``y`` selects the owner, whose buffers and geometry come from an int64
         ``[owners, OWNER_DESC_WIDTH]`` descriptor table (see
         ``owner_slot_descriptor``). Per-request group counts and their prefix
@@ -1385,7 +1385,7 @@ def refresh_owner_slots(
     requests: int,
     max_capacity: int,
 ) -> None:
-    """Device implementation of ``CSA2TrtllmMetadata._refresh_owner_slots`` for
+    """Device implementation of ``CSA2Metadata._refresh_owner_slots`` for
     every owner of the int64 ``[owners, OWNER_DESC_WIDTH]`` ``descriptors``."""
     ns = _glue_kernels()
     _check(requests <= ns.OwnerSlotsKernel.MAX_REQUESTS, "CSA2 owner refresh request capacity")
@@ -1426,7 +1426,7 @@ def fill_indexer_descriptors(
     visible: torch.Tensor,
     valid: torch.Tensor,
 ) -> None:
-    """Device implementation of ``CSA2TrtllmMetadata._fill_indexer_descriptors``."""
+    """Device implementation of ``CSA2Metadata._fill_indexer_descriptors``."""
     count = int(blocks.shape[0])
     if count == 0:
         return
@@ -1885,7 +1885,7 @@ def _cache_kernels():
         max_positions: Int64,
         visible: Int64,
     ) -> Int64:
-        """``CSA2TrtllmMetadata._map_global_slots`` for one entry (visibility applied)."""
+        """``CSA2Metadata._map_global_slots`` for one entry (visibility applied)."""
         slot = Int64(-1)
         if (table_rows > 0) & (table_cols > 0) & (logical >= 0):
             page = logical // page_size
@@ -4110,7 +4110,7 @@ def stage_selected_rows(
     swa_slots,
     main_pool,
     main_slots,
-    metadata,
+    tile,
     scratch,
     *,
     compact=True,
@@ -4126,14 +4126,14 @@ def stage_selected_rows(
     Main selections are either physical ``main_slots`` or ``main_logical``
     positions resolved in-kernel through ``main_mapping`` (``page_table``,
     ``page_size``, ``max_positions``, ``requests``, ``visible``), exactly as
-    ``CSA2TrtllmMetadata.global_slot_tile`` with visibility. ``scratch`` holds
+    ``CSA2Metadata.global_slot_tile`` with visibility. ``scratch`` holds
     the group's ``tags``/``counts`` (and, in the mapped form, ``main_slots``
     receives the physical rows); ``compact=False`` reuses them from an
     earlier layer of the same group in this forward.
     """
-    count = metadata.num_tokens
-    capacity = metadata.num_sparse_topk
-    fp8 = metadata.swa_pool.dtype == torch.float8_e4m3fn
+    count = tile.metadata.num_tokens
+    capacity = tile.metadata.num_sparse_topk
+    fp8 = tile.swa_pool.dtype == torch.float8_e4m3fn
     device = swa_pool.device
     has_main = main_slots is not None or main_logical is not None
     if not has_main:
@@ -4151,12 +4151,12 @@ def stage_selected_rows(
     tags, counts = scratch["tags"], scratch["counts"]
     _check(capacity <= tags.shape[1] and capacity <= 4096, "staging capacity")
     ns = _cache_kernels()
-    placeholder = metadata.prepared_counter
+    placeholder = tile.prepared_counter
     dequant = kv_scale_quant_orig if fp8 else placeholder
     quant = kv_scale_orig_quant if fp8 else placeholder
     q_dequant = q_scale_quant_orig if fp8 else placeholder
-    bmm1 = metadata.mla_bmm1_scale if fp8 else placeholder
-    bmm2 = metadata.mla_bmm2_scale if fp8 else placeholder
+    bmm1 = tile.mla_bmm1_scale if fp8 else placeholder
+    bmm2 = tile.mla_bmm2_scale if fp8 else placeholder
     logical_int64 = logical.dtype == torch.int64
     table_ptr, table_rows, table_cols, table_stride, page_size, max_positions = table_args
     if compact:
@@ -4190,7 +4190,7 @@ def stage_selected_rows(
             int(capacity),
             _stream(device),
         )
-    extra_rows = int(metadata.extra_pool.shape[1])
+    extra_rows = int(tile.extra_pool.shape[1])
     _launch(
         ("stage_dequant", fp8, device.index),
         lambda: ns.StageDequantKernel(fp8),
@@ -4200,12 +4200,12 @@ def stage_selected_rows(
         _ptr(slots, align=8),
         _ptr(tags),
         _ptr(counts),
-        _ptr(metadata.swa_pool, align=8),
-        _ptr(metadata.extra_pool, align=8),
+        _ptr(tile.swa_pool, align=8),
+        _ptr(tile.extra_pool, align=8),
         _ptr(quant),
-        _ptr(metadata.prepared_lens),
-        _ptr(metadata.prepared_indices),
-        _ptr(metadata.prepared_counter),
+        _ptr(tile.prepared_lens),
+        _ptr(tile.prepared_indices),
+        _ptr(tile.prepared_counter),
         _ptr(q_dequant),
         _ptr(dequant),
         _ptr(bmm1),
@@ -4235,7 +4235,7 @@ def stage_shared_rows(
     main_pool,
     main_slots,
     main_logical,
-    metadata,
+    tile,
     plan,
     *,
     main_mapping=None,
@@ -4251,10 +4251,10 @@ def stage_shared_rows(
     their ``main_logical`` positions, or logical positions resolved through
     ``main_mapping``. Outputs preserve selection order and duplicates.
     """
-    count = metadata.num_tokens
-    capacity = metadata.num_sparse_topk
-    bank = metadata.shared_pool
-    selected = metadata._csa2_shared_selected
+    count = tile.metadata.num_tokens
+    capacity = tile.metadata.num_sparse_topk
+    bank = tile.shared_pool
+    selected = tile._csa2_shared_selected
     device = swa_pool.device
     _check(
         bank.shape == (1 + plan.swa_rows + plan.main_rows, 512) and bank.is_contiguous(),
@@ -4297,7 +4297,7 @@ def stage_shared_rows(
     selected.zero_()
     bank[0].zero_()
     ns = _cache_kernels()
-    placeholder = metadata.prepared_counter
+    placeholder = tile.prepared_counter
     q_dequant = q_scale_quant_orig if fp8 else placeholder
     _launch(
         ("shared_compact", fp8, has_main, premapped, device.index),
@@ -4313,13 +4313,13 @@ def stage_shared_rows(
         _ptr(visible, align=8),
         table_ptr,
         _ptr(selected),
-        _ptr(metadata.prepared_indices),
-        _ptr(metadata.prepared_lens),
-        _ptr(metadata.prepared_counter),
+        _ptr(tile.prepared_indices),
+        _ptr(tile.prepared_lens),
+        _ptr(tile.prepared_counter),
         _ptr(q_dequant),
         _ptr(kv_scale_quant_orig if fp8 else placeholder),
-        _ptr(metadata.mla_bmm1_scale if fp8 else placeholder),
-        _ptr(metadata.mla_bmm2_scale if fp8 else placeholder),
+        _ptr(tile.mla_bmm1_scale if fp8 else placeholder),
+        _ptr(tile.mla_bmm2_scale if fp8 else placeholder),
         int(count),
         swa_width,
         main_width,

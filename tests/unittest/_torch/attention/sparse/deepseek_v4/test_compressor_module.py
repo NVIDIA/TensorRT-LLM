@@ -37,7 +37,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     DeepseekV4CacheManager,
     DeepseekV4Indexer,
-    DeepseekV4TrtllmAttentionMetadata,
+    DeepseekV4Metadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.compressor import (
     Compressor,
@@ -47,6 +47,7 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
 )
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import get_sm_version
@@ -135,6 +136,10 @@ class DummyAttentionMetadata:
         self.gen_new_tokens_per_seq = None
         self.kv_lens_cuda_runtime = None  # Set by caller
         self.cached_token_lens_cuda = None  # Set by caller
+
+    def ext(self, cls: type) -> "DummyAttentionMetadata":
+        """The dummy carries the DeepSeek-V4 extension state itself."""
+        return self
 
 
 # ============================================================================
@@ -368,6 +373,15 @@ ORI_SEQ_LEN = 65536
 ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW = 40000.0, 4, 32, 1
 
 
+def _dsv4_stub() -> DeepseekV4Metadata:
+    """An extension built through ``__new__`` on a core metadata built the same way."""
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    extension = object.__new__(DeepseekV4Metadata)
+    extension.metadata = metadata
+    metadata.replace_ext(extension)
+    return extension
+
+
 def _active_compressed_position_ids(
     compress_ratio, num_contexts, num_gen_tokens_per_seq, cached_tokens, kv_lens
 ):
@@ -377,9 +391,10 @@ def _active_compressed_position_ids(
     cached_tokens = torch.tensor(cached_tokens, dtype=torch.int32, device=DEVICE)
     kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device=DEVICE)
 
-    metadata = object.__new__(DeepseekV4TrtllmAttentionMetadata)
-    metadata.num_contexts = num_contexts
-    metadata.num_generations = num_generations
+    metadata = _dsv4_stub()
+    md = metadata.metadata
+    md.num_contexts = num_contexts
+    md.num_generations = num_generations
     metadata.num_gen_tokens_per_seq = num_gen_tokens_per_seq
     metadata._compress_ratios_sorted = [compress_ratio]
     metadata.compressed_kv_lens_cuda = {
@@ -492,7 +507,7 @@ def test_compressed_mask_static_shapes_no_recompile():
             new_comp_bufs[r][:batch_size] = counts
             cu_bufs[r][: batch_size + 1] = F.pad(torch.cumsum(counts, 0), (1, 0)).to(torch.int32)
         batch_size_cuda.fill_(batch_size)
-        DeepseekV4TrtllmAttentionMetadata._compute_compressed_mask(
+        DeepseekV4Metadata._compute_compressed_mask(
             new_comp_bufs, cu_bufs, mask_bufs, batch_size_cuda, ratios
         )
         for r, new_comp in new_comp_by_ratio.items():
@@ -543,7 +558,7 @@ def test_ctx_position_ids_host_sizes_match_device_scalar_fallback(
 
     def _run(ctx_output_sizes):
         out = torch.full((total + 8,), -1, dtype=torch.int32, device=DEVICE)
-        DeepseekV4TrtllmAttentionMetadata._compute_ctx_compressed_position_ids(
+        DeepseekV4Metadata._compute_ctx_compressed_position_ids(
             {compress_ratio: past},
             {compress_ratio: cu},
             {compress_ratio: out},

@@ -111,6 +111,8 @@ def test_indexer_forward_uses_prior_only_for_temporal_gvr(
             (num_generations or 1, _MAX_RADIX_BLOCKS_PER_ROW, topk), dtype=torch.float32
         ),
     )
+    # The stub carries the DSA extension state itself.
+    metadata.ext = lambda cls: metadata
     # Keep distinct storage so the caller test catches use of the host twin.
     metadata.seq_lens_cuda = metadata.seq_lens.clone()
     # Radix fallback and self-sampling deliberately have no prior attribute.

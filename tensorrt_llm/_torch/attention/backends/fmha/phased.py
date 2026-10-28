@@ -27,6 +27,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
+from ..features.spec_decoding import SpecDecodingMetadata
 from .interface import Fmha
 
 if TYPE_CHECKING:
@@ -172,6 +173,7 @@ class PhasedFmha(Fmha):
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
     ) -> None:
+        spec = metadata.find_ext(SpecDecodingMetadata)
         attn = self.attn
         output = forward_args.output
         if output is None:
@@ -288,9 +290,9 @@ class PhasedFmha(Fmha):
             predicted_tokens_per_seq = attn.predicted_tokens_per_seq
             spec_gen_lengths = None
             spec_pos_offsets = None
-            if metadata.is_spec_decoding_enabled and predicted_tokens_per_seq > 1:
-                spec_gen_lengths = metadata.spec_decoding_generation_lengths
-                position_offsets_for_cpp = metadata.spec_decoding_position_offsets_for_cpp
+            if spec.is_spec_decoding_enabled and predicted_tokens_per_seq > 1:
+                spec_gen_lengths = spec.generation_lengths
+                position_offsets_for_cpp = spec.position_offsets_for_cpp
                 if position_offsets_for_cpp is not None and position_offsets_for_cpp.dim() == 1:
                     position_offsets_for_cpp = position_offsets_for_cpp.view(
                         metadata.max_num_requests, -1

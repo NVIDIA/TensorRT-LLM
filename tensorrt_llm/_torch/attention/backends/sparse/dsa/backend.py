@@ -18,7 +18,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     MLAParams,
     PositionalEmbeddingParams,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .indexer import (
@@ -26,7 +26,7 @@ from .indexer import (
     transform_local_topk_and_prepare_pool_view,
     transform_local_topk_and_prepare_pool_view_grouped,
 )
-from .metadata import DSAtrtllmAttentionMetadata
+from .metadata import DSAMetadata
 from .params import DSAParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
@@ -68,7 +68,8 @@ def _get_nvfp4_mla_kv_cache_amax() -> float:
 class DSATrtllmAttention(TrtllmAttention):
     """TRT-LLM attention layer with DSA sparse indexer for MLA models."""
 
-    Metadata = DSAtrtllmAttentionMetadata
+    Metadata = TrtllmAttentionMetadata
+    metadata_extensions = (DSAMetadata,)
 
     def __init__(
         self,
@@ -156,15 +157,16 @@ class DSATrtllmAttention(TrtllmAttention):
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
-        metadata: DSAtrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run the DSA indexer and convert its local TopK to paged indices."""
+        dsa = metadata.ext(DSAMetadata)
         is_generation = forward_args.attention_input_type == AttentionInputType.generation_only
         sparse_backend_args = forward_args.sparse_backend_args
         phase_start = metadata.num_ctx_tokens if is_generation else 0
         phase_end = metadata.num_tokens if is_generation else metadata.num_ctx_tokens
-        shared_topk_indices = metadata.shared_topk_indices
+        shared_topk_indices = dsa.shared_topk_indices
         if self.indexer is None:
             topk_indices = shared_topk_indices[phase_start:phase_end]
         else:
@@ -175,7 +177,7 @@ class DSATrtllmAttention(TrtllmAttention):
                 indexer_intermediates,
                 is_generation=is_generation,
             )
-            preserve_mtp_topk = metadata.in_mtp_draft_loop and self.indexer.mtp_index_share
+            preserve_mtp_topk = dsa.in_mtp_draft_loop and self.indexer.mtp_index_share
             if shared_topk_indices is not None and not preserve_mtp_topk:
                 shared_topk_indices[
                     phase_start : phase_start + topk_indices.shape[0],
@@ -185,11 +187,11 @@ class DSATrtllmAttention(TrtllmAttention):
         local_layer_idx = self.get_local_layer_idx(metadata)
         kv_cache_dtype = getattr(metadata.kv_cache_manager, "dtype", None)
         if kv_cache_dtype == tensorrt_llm.bindings.DataType.NVFP4 and not is_generation:
-            metadata._ensure_pool_view_cached()
+            dsa._ensure_pool_view_cached()
             page_index_scale, layer_offset = (
                 metadata.kv_cache_manager.get_primary_pool_page_index_params(local_layer_idx)
             )
-            total_kv_tokens = metadata.num_ctx_mla_kv_tokens
+            total_kv_tokens = dsa.num_ctx_mla_kv_tokens
             if total_kv_tokens <= 0:
                 raise RuntimeError("NVFP4 DSA context has no active KV tokens")
             head_dim = metadata.kv_cache_manager.head_dim
@@ -204,7 +206,7 @@ class DSATrtllmAttention(TrtllmAttention):
             # stream. Drop its Python reference before allocating the next
             # layer's scratch so the caching allocator can reuse that storage
             # in stream order instead of transiently keeping two full buffers.
-            metadata.nvfp4_mla_context_fp8_scratch = None
+            dsa.nvfp4_mla_context_fp8_scratch = None
             scratch = torch.empty(
                 (scratch_capacity, 1, head_dim),
                 dtype=torch.float8_e4m3fn,
@@ -215,29 +217,29 @@ class DSATrtllmAttention(TrtllmAttention):
                 metadata.host_kv_cache_pool_pointers,
                 metadata.host_kv_cache_pool_mapping,
                 topk_indices,
-                metadata._cached_req_idx_ctx,
-                metadata._cached_block_table_ctx,
+                dsa._cached_req_idx_ctx,
+                dsa._cached_block_table_ctx,
                 metadata.ctx_kv_indptr[: metadata.num_contexts + 1],
                 scratch,
                 compact_indices,
                 self._nvfp4_mla_kv_scale_quant_orig,
                 local_layer_idx,
                 total_kv_tokens,
-                metadata._cached_tokens_per_block,
-                page_index_scale * metadata._cached_tokens_per_block,
+                dsa._cached_tokens_per_block,
+                page_index_scale * dsa._cached_tokens_per_block,
                 layer_offset,
                 metadata.kv_cache_manager.mla_kv_cache_residual_dim,
-                metadata._cached_num_pool_tokens,
+                dsa._cached_num_pool_tokens,
             )
-            metadata.nvfp4_mla_context_fp8_scratch = scratch
+            dsa.nvfp4_mla_context_fp8_scratch = scratch
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
             return compact_indices, None
 
         topk_indices_global = self._remap_topk_to_global(topk_indices, metadata, is_generation)
 
         if kv_cache_dtype == tensorrt_llm.bindings.DataType.NVFP4:
-            scratch = metadata.nvfp4_mla_fp8_scratch
-            compact_indices = metadata.nvfp4_mla_compact_indices
+            scratch = dsa.nvfp4_mla_fp8_scratch
+            compact_indices = dsa.nvfp4_mla_compact_indices
             if scratch is None or compact_indices is None:
                 raise RuntimeError("NVFP4 MLA scratch buffers were not allocated")
             num_rows = topk_indices_global.shape[0]
@@ -257,7 +259,7 @@ class DSATrtllmAttention(TrtllmAttention):
                 self._nvfp4_mla_kv_scale_quant_orig,
                 local_layer_idx,
                 metadata.kv_cache_manager.mla_kv_cache_residual_dim,
-                metadata._cached_num_pool_tokens,
+                dsa._cached_num_pool_tokens,
             )
             # Static sparse MLA treats indices as offsets from kvPtr. Feed it
             # compact offsets and the FP8 scratch base; TRTLLMGen is unchanged.
@@ -269,7 +271,7 @@ class DSATrtllmAttention(TrtllmAttention):
     def _remap_topk_to_global(
         self,
         topk_indices: torch.Tensor,
-        metadata: DSAtrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         is_generation: bool,
     ) -> torch.Tensor:
         """Convert this layer's local top-k to global pool indices.
@@ -277,6 +279,7 @@ class DSATrtllmAttention(TrtllmAttention):
         Uses the cross-layer fan-out (grouped) remap when enabled and applicable;
         otherwise the per-layer single-op path (unchanged).
         """
+        dsa = metadata.ext(DSAMetadata)
         local_layer_idx = self.get_local_layer_idx(metadata)
 
         # Grouping applies only to the MLA target-verify generation forward.
@@ -284,7 +287,7 @@ class DSATrtllmAttention(TrtllmAttention):
         # reuse a frozen top-k for shared layers that differs from the leader's,
         # so fan-out is unsafe there; context is excluded to avoid a group-sized
         # allocation over many tokens).
-        if _GROUP_REMAP and is_generation and not metadata.in_mtp_draft_loop:
+        if _GROUP_REMAP and is_generation and not dsa.in_mtp_draft_loop:
             grouped = self._grouped_remap_topk_to_global(
                 topk_indices, metadata, local_layer_idx, is_generation
             )
@@ -299,7 +302,7 @@ class DSATrtllmAttention(TrtllmAttention):
     def _grouped_remap_topk_to_global(
         self,
         topk_indices: torch.Tensor,
-        metadata: DSAtrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         local_layer_idx: int,
         is_generation: bool,
     ) -> Optional[torch.Tensor]:
@@ -314,7 +317,8 @@ class DSATrtllmAttention(TrtllmAttention):
         that equivalence is covered by unit tests (see
         ``tests/unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py``).
         """
-        struct = metadata._ensure_group_remap_struct()
+        dsa = metadata.ext(DSAMetadata)
+        struct = dsa._ensure_group_remap_struct()
         leader_of = struct.get("leader_of")
         if leader_of is None or local_layer_idx >= len(leader_of):
             return None
@@ -332,7 +336,7 @@ class DSATrtllmAttention(TrtllmAttention):
                 struct["group_scale"][leader],
                 is_generation,
             )
-            metadata._group_remap_batched[leader] = batched
+            dsa._group_remap_batched[leader] = batched
         else:
             # Shared layer: read the leader's precomputed batch. The batch is
             # cleared at every step boundary, so a present entry is from this
@@ -340,7 +344,7 @@ class DSATrtllmAttention(TrtllmAttention):
             # top-k shape, and otherwise fall back to the per-layer path. This
             # makes any leader/follower ordering or shape mismatch a safe
             # per-layer fallback rather than a stale/out-of-bounds read.
-            batched = metadata._group_remap_batched.get(leader, None)
+            batched = dsa._group_remap_batched.get(leader, None)
             if (
                 batched is None
                 or slot >= batched.shape[0]
@@ -354,7 +358,7 @@ class DSATrtllmAttention(TrtllmAttention):
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
-        metadata: DSAtrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """No-op KV prediction; DSA uses indexer-based selection instead."""
@@ -364,16 +368,17 @@ class DSATrtllmAttention(TrtllmAttention):
         self,
         q: torch.Tensor,
         latent_cache: torch.Tensor,
-        metadata: DSAtrtllmAttentionMetadata,
+        metadata: TrtllmAttentionMetadata,
         is_generation: bool = False,
         **kwargs,
     ) -> None:
         """Apply RoPE, append latent cache to paged KV, and assign query for MLA."""
+        dsa = metadata.ext(DSAMetadata)
         if is_generation:
-            cached_token_indptr = metadata.gen_cached_token_indptr
-            kv_indptr = metadata.gen_kv_indptr
+            cached_token_indptr = dsa.gen_cached_token_indptr
+            kv_indptr = dsa.gen_kv_indptr
             num_seqs = metadata.num_generations
-            max_seq_len = metadata.max_gen_seq_len
+            max_seq_len = dsa.max_gen_seq_len
             block_offsets = metadata.kv_cache_block_offsets[:, metadata.num_contexts :]
         else:
             cached_token_indptr = metadata.ctx_cached_token_indptr

@@ -16,9 +16,11 @@
 
 import os
 from dataclasses import dataclass
-from typing import Literal, Optional, Protocol, runtime_checkable
+from typing import Literal, Optional
 
 import torch
+
+from ..extensions import MetadataExtension
 
 _INDEXER_MQA_LOGITS_DEFAULT_ELEM_BUDGET = 1 << 31
 _INDEXER_MQA_LOGITS_BYTES_PER_ELEMENT = 4
@@ -43,22 +45,30 @@ def get_indexer_mqa_logits_workspace_bytes(
     return elem_budget * _INDEXER_MQA_LOGITS_BYTES_PER_ELEMENT
 
 
-@runtime_checkable
-class MTPIndexShareMetadata(Protocol):
-    """Draft-loop state a sparse backend exposes so MTP can share one selection.
+class MTPIndexShareExtension(MetadataExtension):
+    """Draft-loop state a sparse algorithm exposes so MTP can share one selection.
 
-    The three calls are used together for one draft loop, so a backend that
+    The three calls are used together for one draft loop, so an algorithm that
     implements only some of them cannot serve the reuse at all.
     """
 
     def set_in_mtp_draft_loop(self, active: bool) -> None:
         """Mark whether a draft loop is running."""
+        raise NotImplementedError
 
     def set_mtp_num_accepted(self, num_accepted: Optional[torch.Tensor]) -> None:
         """Supply the per-request accepted counts used to pick the capture row."""
+        raise NotImplementedError
 
     def set_skip_topk(self, skip: bool) -> None:
         """Ask the indexer to reuse its captured selection instead of scoring."""
+        raise NotImplementedError
+
+    def reset_mtp_index_share(self) -> None:
+        """Clear the draft-loop state the indexer reads."""
+        self.set_skip_topk(False)
+        self.set_in_mtp_draft_loop(False)
+        self.set_mtp_num_accepted(None)
 
 
 def use_self_sampling_gvr(
@@ -94,6 +104,10 @@ class SparseParams:
 
 class SparseMetadataParams:
     """Base parameters for sparse attention metadata."""
+
+
+class SparseAlgorithmExtension(MetadataExtension):
+    """Base of a sparse algorithm's metadata state; a metadata carries at most one."""
 
 
 @dataclass(kw_only=True, slots=True)

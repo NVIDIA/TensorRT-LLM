@@ -9,7 +9,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.attention.backends.sparse.hooks import get_sparse_attention_hooks
 from tensorrt_llm._torch.attention.backends.sparse.qsa import (
-    QSAAttentionMetadata,
+    QSAMetadata,
     QSASparseMetadataParams,
     QSASparseParams,
 )
@@ -201,7 +201,8 @@ def test_qsa_sparse_hook_is_registered() -> None:
 
 
 def test_qsa_empty_batch_keeps_the_regular_backend_path() -> None:
-    metadata = object.__new__(QSAAttentionMetadata)
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    metadata.replace_ext(QSAMetadata(metadata))
     metadata._num_tokens = 0
 
     output = QSASparseHooks().forward(
@@ -224,20 +225,20 @@ def test_qsa_empty_batch_keeps_the_regular_backend_path() -> None:
     assert output is None
 
 
-def test_qsa_metadata_allows_a_pp_rank_without_local_sparse_layers(monkeypatch) -> None:
-    monkeypatch.setattr(TrtllmAttentionMetadata, "__post_init__", lambda self: None)
+def test_qsa_metadata_allows_a_pp_rank_without_local_sparse_layers() -> None:
     manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.qsa_position_layer_id = None
-    metadata = object.__new__(QSAAttentionMetadata)
+    metadata = object.__new__(TrtllmAttentionMetadata)
     metadata.kv_cache_manager = manager
     metadata.sparse_metadata_params = QSASparseMetadataParams(
         token_topk=2048,
         compress_ratio=4,
     )
 
-    metadata.__post_init__()
+    qsa = QSAMetadata(metadata)
+    qsa.allocate(None)
 
-    assert not metadata.qsa_has_local_layers
+    assert not qsa.has_local_layers
 
 
 def test_qsa_hybrid_routes_to_sparse_v2_cache_manager(monkeypatch) -> None:
@@ -403,7 +404,8 @@ def test_qsa_cache_manager_delegates_regular_kv_layout(
 
 def test_qsa_uses_regular_attention_for_unsupported_head_dim() -> None:
     """Triton indexes head dims with tl.arange, so non-powers of two go dense."""
-    metadata = object.__new__(QSAAttentionMetadata)
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    metadata.replace_ext(QSAMetadata(metadata))
     metadata._num_tokens = 1
     metadata.kv_cache_manager = SimpleNamespace(dtype=DataType.BF16)
     # head_dim comes from the module, not from q: q is still the fused QKV here.
@@ -432,7 +434,8 @@ def test_qsa_uses_regular_attention_for_unsupported_head_dim() -> None:
 
 
 def test_qsa_uses_regular_attention_for_scale_paged_kv_cache() -> None:
-    metadata = object.__new__(QSAAttentionMetadata)
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    metadata.replace_ext(QSAMetadata(metadata))
     metadata._num_tokens = 1
     metadata.kv_cache_manager = SimpleNamespace(dtype=DataType.NVFP4)
     indexer = SimpleNamespace(project_and_update_cache=lambda *args: torch.empty((1, 4, 128)))

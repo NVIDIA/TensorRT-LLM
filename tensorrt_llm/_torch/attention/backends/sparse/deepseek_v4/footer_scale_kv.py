@@ -20,12 +20,14 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 
 from .kernels import deepseek_v4_local_to_global_indices
+from .metadata import DeepseekV4Metadata
 from .params import DeepseekV4AttentionType
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
-
-    from .metadata import DeepseekV4TrtllmAttentionMetadata
+    from tensorrt_llm._torch.attention.backends.trtllm import (
+        TrtllmAttention,
+        TrtllmAttentionMetadata,
+    )
 
 DIM_NOPE = 448
 DIM_ROPE = 64
@@ -152,7 +154,7 @@ def quant_scatter(
 
 
 def get_pool_2d(
-    metadata: DeepseekV4TrtllmAttentionMetadata,
+    metadata: TrtllmAttentionMetadata,
     attn_type: DeepseekV4AttentionType,
     compress_ratio: int,
     page_size: int | None = None,
@@ -210,25 +212,24 @@ def get_pool_2d(
 
 def append_swa(
     attn: TrtllmAttention,
-    metadata: DeepseekV4TrtllmAttentionMetadata,
+    metadata: TrtllmAttentionMetadata,
     latent_rows: torch.Tensor,
     start_idx: int,
     end_idx: int,
     page_size: int = PAGE_SIZE,
 ) -> None:
     """Quantize new latent rows and scatter them into the canonical SWA pool."""
-    positions = metadata.token_positions_cuda[start_idx:end_idx]
-    req_id = metadata.req_idx_per_token[start_idx:end_idx]
+    dsv4 = metadata.ext(DeepseekV4Metadata)
+    positions = dsv4.token_positions_cuda[start_idx:end_idx]
+    req_id = dsv4.req_idx_per_token[start_idx:end_idx]
     local_layer_idx = metadata.kv_cache_manager.layer_offsets[attn.layer_idx]
-    block_table_swa = metadata.sliding_block_tables[
-        local_layer_idx, DeepseekV4AttentionType.SWA.value
-    ]
+    block_table_swa = dsv4.sliding_block_tables[local_layer_idx, DeepseekV4AttentionType.SWA.value]
     loc = deepseek_v4_local_to_global_indices(
         req_id=req_id,
         block_table_swa=block_table_swa,
         swa_local_indices=positions.unsqueeze(1).contiguous(),
-        swa_pool_base_ptr=metadata.sparse_mla_base_ptrs[1],
-        swa_buffer_ptr=metadata.swa_buffer_ptrs[attn.layer_idx],
+        swa_pool_base_ptr=dsv4.sparse_mla_base_ptrs[1],
+        swa_buffer_ptr=dsv4.swa_buffer_ptrs[attn.layer_idx],
         tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
         token_stride=TOKEN_BYTES,
     ).view(-1)
@@ -238,7 +239,7 @@ def append_swa(
 
 def apply_rope_and_append_swa(
     attn: TrtllmAttention,
-    metadata: DeepseekV4TrtllmAttentionMetadata,
+    metadata: TrtllmAttentionMetadata,
     q: torch.Tensor,
     latent_rows: torch.Tensor | None,
     start_idx: int,
@@ -250,13 +251,14 @@ def apply_rope_and_append_swa(
     page_size: int = PAGE_SIZE,
 ) -> None:
     """Apply MLA RoPE and append latent rows to the canonical SWA cache."""
+    dsv4 = metadata.ext(DeepseekV4Metadata)
     num_tokens = end_idx - start_idx
     if num_tokens == 0:
         return
     if attn.mla_params is None:
         raise ValueError("Footer-scale MLA cache requires MLA parameters")
 
-    positions = metadata.token_positions_cuda[start_idx:end_idx]
+    positions = dsv4.token_positions_cuda[start_idx:end_idx]
     if positions.numel() != num_tokens:
         raise ValueError(
             "Expected one cached token position per footer-scale append, got "

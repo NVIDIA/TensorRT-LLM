@@ -6,10 +6,9 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
-    DeepseekV4TrtllmAttentionMetadata,
-)
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import DeepseekV4Metadata
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import _fused_q_rope_specs
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 
 class _Mqa:
@@ -18,6 +17,12 @@ class _Mqa:
 
     def _ensure_rope_table_size(self, size):
         pass
+
+
+def _serve_as_extension(metadata: SimpleNamespace) -> None:
+    """Let the stub act as both the core metadata and its DeepSeek-V4 extension."""
+    metadata.metadata = metadata
+    metadata.find_ext = lambda cls: metadata
 
 
 def _ragged_metadata(verify_lens, *, context_lens=(), kv_lens=None):
@@ -36,8 +41,9 @@ def _ragged_metadata(verify_lens, *, context_lens=(), kv_lens=None):
         fused_q_gen_cu_seqlens=torch.zeros(num_generations + 1, dtype=torch.int32),
         _fused_q_gen_cu_seqlens_valid=False,
     )
+    _serve_as_extension(metadata)
     metadata.mla_prepare_fused_q_gen_cu_seqlens = MethodType(
-        DeepseekV4TrtllmAttentionMetadata.mla_prepare_fused_q_gen_cu_seqlens, metadata
+        DeepseekV4Metadata.mla_prepare_fused_q_gen_cu_seqlens, metadata
     )
     return metadata
 
@@ -68,6 +74,7 @@ def test_uniform_k5_keeps_scalar_generation_spec():
         max_seq_len=1006,
         is_ragged_verify=False,
     )
+    _serve_as_extension(metadata)
     _, specs = _fused_q_rope_specs(SimpleNamespace(mqa=_Mqa()), metadata, 0, 128)
     assert len(specs) == 1
     rows, cache_lens, seq_len, cu_q_seqlens = specs[0]
@@ -121,6 +128,7 @@ def test_ragged_generation_fails_closed_without_stable_prefix_hook():
         max_seq_len=20,
         is_ragged_verify=True,
     )
+    _serve_as_extension(metadata)
     mla = SimpleNamespace(mqa=_Mqa())
     assert _fused_q_rope_specs(mla, metadata, 0, 2) == (None, [])
     metadata.mla_prepare_fused_q_gen_cu_seqlens = lambda: None
@@ -150,7 +158,10 @@ def test_prefix_builder_fails_closed_without_graph_storage(capacity):
 
 
 def test_sequence_update_invalidates_cached_prefix():
-    metadata = DeepseekV4TrtllmAttentionMetadata.__new__(DeepseekV4TrtllmAttentionMetadata)
-    metadata._fused_q_gen_cu_seqlens_valid = True
+    metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
+    dsv4 = DeepseekV4Metadata.__new__(DeepseekV4Metadata)
+    dsv4.metadata = metadata
+    metadata.replace_ext(dsv4)
+    dsv4._fused_q_gen_cu_seqlens_valid = True
     metadata._invalidate_mla_scheduler_buffers()
-    assert not metadata._fused_q_gen_cu_seqlens_valid
+    assert not dsv4._fused_q_gen_cu_seqlens_valid

@@ -1078,8 +1078,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._prepare_full_draft_page_table()
         self._update_draft_kv_lengths()
 
-    def __post_init__(self) -> None:
-        super().__post_init__()
+    def _post_init_core(self) -> None:
+        super()._post_init_core()
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
     def _post_init_with_buffers(self, buffers) -> None:
@@ -1629,7 +1629,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 wrappers.is_planned = False
                 self._plan_with_params(plan_params)
 
-    def prepare(self) -> None:
+    def _prepare_core(self) -> None:
 
         def _to_int32_tensor(arr: np.ndarray) -> torch.Tensor:
             """Host int32 staging tensor for async H2D copies; pinned when
@@ -1641,7 +1641,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             return maybe_pin_memory(
                 torch.from_numpy(arr.astype(np.int32, copy=False)))
 
-        super().prepare()
+        super()._prepare_core()
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)

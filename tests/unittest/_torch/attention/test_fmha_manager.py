@@ -20,8 +20,9 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from fmha_test_utils import FakeAttention, FakeFmha, FakePhasedFmha
+from fmha_test_utils import FakeAttention, FakeFmha, FakePhasedFmha, metadata_stub
 
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.fmha import manager as fmha_manager
 from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
@@ -56,7 +57,7 @@ def _make_metadata(
     use_spec_decoding: bool = False,
     num_sparse_topk: int = 0,
 ) -> SimpleNamespace:
-    return SimpleNamespace(
+    return metadata_stub(
         num_contexts=num_contexts,
         num_generations=num_generations,
         num_ctx_tokens=num_ctx_tokens,
@@ -625,7 +626,9 @@ def test_fmha_cache_separates_speculative_decoding(speculative_first: bool) -> N
         attn,
         "regular-only",
         events,
-        request_support_predicate=lambda _q, metadata: not metadata.use_spec_decoding,
+        request_support_predicate=lambda _q, metadata: not metadata.ext(
+            SpecDecodingMetadata
+        ).use_spec_decoding,
     )
     fallback = FakeFmha(attn, "fallback", events)
     manager.fmha_libs = [regular_only, fallback]

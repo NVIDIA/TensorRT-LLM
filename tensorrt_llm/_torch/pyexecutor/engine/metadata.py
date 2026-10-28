@@ -9,11 +9,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.features import FlashMlaMetadata
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionBackend,
     AttentionMetadata,
     AttentionRuntimeFeatures,
 )
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig, _get_kv_cache_layer_specs
 from tensorrt_llm.mapping import Mapping
 
@@ -75,7 +77,14 @@ def build_attention_metadata(
         if sparse_attention_config is not None
         else None
     )
-    return attention_backend.Metadata(
+    # FlashMLA kernels run on the TRTLLM backend only.
+    extension_types = (
+        (FlashMlaMetadata,)
+        if model_config.enable_flash_mla
+        and issubclass(attention_backend.Metadata, TrtllmAttentionMetadata)
+        else ()
+    )
+    return attention_backend.create_metadata(
         max_num_requests=max_batch_size,
         max_num_tokens=max_num_tokens,
         max_num_sequences=max_batch_size * max_beam_width,
@@ -83,9 +92,9 @@ def build_attention_metadata(
         draft_kv_cache_manager=draft_kv_cache_manager,
         mapping=mapping,
         runtime_features=attention_runtime_features,
-        enable_flash_mla=model_config.enable_flash_mla,
         enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
         cache_indirection=cache_indirection,
         max_num_heads_per_kv=max_num_heads_per_kv,
         sparse_metadata_params=sparse_metadata_params,
+        extension_types=extension_types,
     )

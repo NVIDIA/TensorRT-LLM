@@ -83,6 +83,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsno
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
+from tensorrt_llm._torch.attention.backends.features.spec_decoding import SpecDecodingMetadata
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -131,7 +132,7 @@ def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
         num_ctx_tokens=md.num_ctx_tokens,
         trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
         max_num_sequences=md.max_num_sequences,
-        force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+        force_prepare_spec_dec_tree_mask=md.ext(SpecDecodingMetadata).force_prepare_tree_mask,
     )
 
 
