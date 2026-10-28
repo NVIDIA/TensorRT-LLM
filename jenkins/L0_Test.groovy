@@ -480,6 +480,7 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
     def unrerunInfraFailure = null
     def hasUnrerunFailure = false
     def hasUnfinishedTests = false
+    def testFailure = null
 
     for (int i = 0; i < isolateTestLines.size(); i++) {
         def isolateTestName = isolateTestLines[i].trim()
@@ -507,6 +508,7 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
+            testFailure = testFailure ?: e
             def rerunResult = rerunFailedTests(
                 pipeline, stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}", postTag, retryContext)
             if (rerunResult.failed) {
@@ -559,6 +561,7 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
     }
 
     return [
+        testFailure: testFailure,
         rerunFailed: rerunFailed,
         rerunInfraFailure: rerunInfraFailure,
         unrerunInfraFailure: unrerunInfraFailure,
@@ -2485,7 +2488,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
             }
 
-            runPytestStage(stageName) {
+            runPytestStage(stageName) { pytestResult ->
                 // Submit the Slurm job. Submit/metadata/track all run on the one
                 // frontend the enclosing withSlurmFrontendFailover pinned, so they
                 // share the job workspace (slurm_job_id.txt, scripts) on that login
@@ -2842,6 +2845,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                                 expectedTestLists: [unsplitTestListLocal],
                             ])
                             if (refresh.allFailuresWaived) {
+                                pytestResult.failure = jobFailure
                                 return
                             }
                         }
@@ -5325,16 +5329,21 @@ def priorAttemptTags(String postTag) {
 }
 
 // Annotate a step before nested stages so Jenkins colors Run Pytest itself.
-// Rethrow the original exception to preserve failure classification and retries.
+// Preserve test execution failures visually even when reruns or waives succeed.
+// Rethrow final failures unchanged to preserve classification and retries.
 def runPytestStage(String stageName, Closure body) {
     stage("[${stageName}] Run Pytest") {
         def stageFailure = null
+        def pytestResult = [failure: null]
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
             try {
-                body()
+                body(pytestResult)
             } catch (Throwable e) {
                 stageFailure = e
                 throw e
+            }
+            if (pytestResult.failure != null) {
+                throw pytestResult.failure
             }
         }
         if (stageFailure != null) {
@@ -5500,7 +5509,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
     }
 
     runPytestStage(stageName)
-    {
+    { pytestResult ->
         def noRegularTests = false
         def noIsolateTests = false
         def rerunFailed = false
@@ -5696,6 +5705,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
+                        pytestResult.failure = e
                         def rerunResult = rerunFailedTests(
                             pipeline, stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag, retryContext)
                         // Unconditional: a test can crash again during the rerun itself
@@ -5731,6 +5741,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
                             def isolatedResult = runIsolatedTests(
                                 pipeline, preprocessedLists, pytestCommand, llmSrc, stageName, postTag, retryContext)
+                            pytestResult.failure = isolatedResult.testFailure ?: pytestResult.failure
                             rerunFailed = isolatedResult.rerunFailed || rerunFailed
                             rerunInfraFailure = isolatedResult.rerunInfraFailure ?: rerunInfraFailure
                             unrerunInfraFailure = isolatedResult.unrerunInfraFailure ?: unrerunInfraFailure
