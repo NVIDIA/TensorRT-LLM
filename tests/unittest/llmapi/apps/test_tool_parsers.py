@@ -6624,6 +6624,236 @@ class TestForcedToolChoicePostprocessing:
         assert finish_reasons[-1] == "stop"
 
 
+class TestChatStreamFinishChunk:
+    """A streamed choice ends with a chunk of its own carrying the finish.
+
+    Clients may stop reading a choice at its first ``finish_reason``, so
+    output sharing that chunk -- the last content, or the closing fragment of
+    a tool call's arguments -- would never reach them. Each case streams a few
+    inline deltas through the real ``chat_stream_post_processor``; the last
+    iteration finishes the choice.
+    """
+
+    SECTION = TestForcedToolChoicePostprocessing.WEATHER_CALL_SECTION
+    # Cut before the end tag, so the parser releases the call only when the
+    # stream finishes.
+    UNCLOSED_SECTION = SECTION[:-len(TestForcedToolChoicePostprocessing.EOT)]
+    WEATHER_CALL = ("get_weather", {"location": "NYC"})
+
+    @staticmethod
+    def _make_args(sample_tools,
+                   tool_parser=None,
+                   forced_tool_name=None,
+                   **overrides):
+        args = TestForcedToolChoicePostprocessing._make_args(
+            sample_tools,
+            tool_parser=tool_parser,
+            forced_tool_name=forced_tool_name,
+            stream=True)
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    @staticmethod
+    def _stream(args, steps, finish_reason="stop", **final_fields):
+        """Feed ``steps`` through ``chat_stream_post_processor``.
+
+        Each step is the text one iteration generated, or a dict mapping each
+        choice index to it. The last step finishes every choice, and its
+        outputs also get ``final_fields``. Returns the decoded SSE payloads.
+        """
+        from types import SimpleNamespace
+
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_stream_post_processor
+
+        payloads = []
+        for step_index, step in enumerate(steps):
+            last = step_index == len(steps) - 1
+            texts = step if isinstance(step, dict) else {0: step}
+            outputs = []
+            for index, text in texts.items():
+                fields = dict(index=index,
+                              text_diff=text,
+                              token_ids_diff=[step_index],
+                              logprobs_diff=[-0.5],
+                              finish_reason=None,
+                              stop_reason=None,
+                              length=step_index + 1,
+                              disaggregated_params=None)
+                if last:
+                    fields.update(finish_reason=finish_reason, **final_fields)
+                outputs.append(SimpleNamespace(**fields))
+            rsp = SimpleNamespace(outputs=outputs,
+                                  cached_tokens=0,
+                                  id="test-request",
+                                  _done=last)
+            for line in chat_stream_post_processor(rsp, args):
+                payloads.append(json.loads(line[len("data: "):]))
+        return payloads
+
+    @staticmethod
+    def _choices(payloads, index=0):
+        return [
+            choice for payload in payloads for choice in payload["choices"]
+            if choice["index"] == index
+        ]
+
+    @staticmethod
+    def _has_output(choice):
+        delta = choice["delta"]
+        return bool(
+            delta.get("content") or delta.get("reasoning_content")
+            or delta.get("tool_calls")
+            or (choice.get("logprobs") or {}).get("content"))
+
+    @staticmethod
+    def _read_until_finish(payloads, index=0):
+        """Return what a client has when it stops at the choice's finish.
+
+        Such a client acts on the first ``finish_reason`` without reading the
+        rest of that chunk. It keeps the content, the tool-call name and the
+        tool-call arguments (parsed when they are complete JSON) of the
+        chunks before it.
+        """
+        content = name = arguments = ""
+        for choice in TestChatStreamFinishChunk._choices(payloads, index):
+            if choice.get("finish_reason") is not None:
+                try:
+                    return content, name, json.loads(arguments)
+                except json.JSONDecodeError:
+                    return content, name, arguments
+            content += choice["delta"].get("content") or ""
+            for call in choice["delta"].get("tool_calls") or []:
+                function = call.get("function") or {}
+                name += function.get("name") or ""
+                arguments += function.get("arguments") or ""
+        raise AssertionError(f"choice {index} never received a finish_reason")
+
+    @pytest.mark.parametrize(
+        "tool_parser, forced_tool_name, steps, expected",
+        [
+            pytest.param("qwen3",
+                         "get_weather", ['{"location"', ': "NY', 'C"}'],
+                         ("", *WEATHER_CALL),
+                         id="forced_call_arguments_in_fragments"),
+            pytest.param(
+                "kimi_k3",
+                None, ["Sure. ", UNCLOSED_SECTION[:30], UNCLOSED_SECTION[30:]],
+                ("Sure. ", *WEATHER_CALL),
+                id="k3_call_flushed_at_finish"),
+            pytest.param("kimi_k3",
+                         "get_weather",
+                         ["Let me check. ", SECTION[:40], SECTION[40:]],
+                         ("Let me check. ", *WEATHER_CALL),
+                         id="forced_k3_call"),
+            pytest.param(None,
+                         None, ["Good ", "morning"], ("Good morning", "", ""),
+                         id="content"),
+        ],
+    )
+    def test_finish_reason_arrives_on_its_own_empty_chunk(
+            self, sample_tools, tool_parser, forced_tool_name, steps, expected):
+        args = self._make_args(sample_tools,
+                               tool_parser=tool_parser,
+                               forced_tool_name=forced_tool_name)
+        payloads = self._stream(args, steps)
+
+        assert self._read_until_finish(payloads) == expected, (
+            "a client that stops reading at finish_reason must already have "
+            "all of the content and every tool-call fragment")
+        choices = self._choices(payloads)
+        last_output = [c for c in choices if self._has_output(c)][-1]
+        assert last_output.get("finish_reason") is None, (
+            "the last chunk with output must not carry finish_reason")
+        *earlier, last = choices
+        early_finishes = [c for c in earlier if c.get("finish_reason")]
+        assert not early_finishes, "only the last chunk may carry finish_reason"
+        assert last.get("finish_reason") and last["delta"] == {}, (
+            "the last chunk must carry finish_reason with an empty delta")
+
+    def test_a_finish_without_new_output_stays_one_chunk(self, sample_tools):
+        choices = self._choices(
+            self._stream(self._make_args(sample_tools),
+                         ["Good ", "morning", ""]))
+
+        assert choices[-2]["delta"]["content"] == "morning"
+        assert choices[-2].get("finish_reason") is None
+        assert choices[-1]["finish_reason"] == "stop"
+        assert not self._has_output(choices[-1])
+
+    def test_continuous_usage_is_on_the_output_and_the_finish_chunk(
+            self, sample_tools):
+        from tensorrt_llm.serve.openai_protocol import StreamOptions
+
+        args = self._make_args(sample_tools,
+                               stream_options=StreamOptions(
+                                   include_usage=True,
+                                   continuous_usage_stats=True))
+        payloads = self._stream(args, ["Good ", "morning"],
+                                finish_reason="length")
+
+        *_, output_chunk, finish_chunk, usage_chunk = payloads
+        assert output_chunk["choices"][0]["delta"]["content"] == "morning"
+        assert "finish_reason" not in output_chunk["choices"][0]
+        assert finish_chunk["choices"] == [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "length"
+        }]
+        assert usage_chunk["choices"] == []
+        # Every chunk of such a stream reports the usage so far.
+        assert all(payload.get("usage") for payload in payloads)
+        assert output_chunk["usage"] == finish_chunk["usage"]
+        assert finish_chunk["usage"]["completion_tokens"] == 2
+
+    def test_logprobs_stay_with_the_output_and_the_stop_with_the_finish(
+            self, sample_tools):
+        from types import SimpleNamespace
+
+        args = self._make_args(
+            sample_tools,
+            return_logprobs=True,
+            tokenizer=SimpleNamespace(decode=lambda token_id: f"<{token_id}>"),
+            return_spec_decode_stats=True)
+        counters = SimpleNamespace(spec_dec_totals=(3, 4),
+                                   per_pos_accepted=[2, 1],
+                                   per_pos_drafted=[2, 2])
+        payloads = self._stream(args, ["Good ", "morning"],
+                                stop_reason="END",
+                                _spec_dec_counters=counters)
+
+        *_, output_chunk, finish_chunk = payloads
+        output_choice, = output_chunk["choices"]
+        finish_choice, = finish_chunk["choices"]
+        assert output_choice["delta"]["content"] == "morning"
+        tokens = [e["token"] for e in output_choice["logprobs"]["content"]]
+        assert tokens == ["<1>"]
+        for key in ("finish_reason", "stop_reason", "speculative_decoding"):
+            assert key not in output_choice
+        assert finish_choice["delta"] == {}
+        assert "logprobs" not in finish_choice
+        assert finish_choice["finish_reason"] == "stop"
+        assert finish_choice["stop_reason"] == "END"
+        assert finish_choice["speculative_decoding"][
+            "total_accepted_draft_tokens"] == 3
+
+    def test_each_choice_ends_with_its_own_finish_chunk(self, sample_tools):
+        args = self._make_args(sample_tools, num_choices=2)
+        steps = [{0: "Good ", 1: "Good "}, {0: "morning", 1: "evening"}]
+        payloads = self._stream(args, steps)
+
+        for index, text in ((0, "Good morning"), (1, "Good evening")):
+            *earlier, last = self._choices(payloads, index)
+            assert not [c for c in earlier if c.get("finish_reason")]
+            assert last == {
+                "index": index,
+                "delta": {},
+                "finish_reason": "stop"
+            }
+            assert self._read_until_finish(payloads, index) == (text, "", "")
+
+
 class TestConfigureParserSpecialTokenDecoding:
     """Test parser-specific detokenization settings in the OpenAI server."""
 
