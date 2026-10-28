@@ -13,17 +13,32 @@ the checkpoint.
 import json
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+import torch
+from _torch.attention.multi_gpu.helix_test_utils import CACHE_TYPE_SELFKONLY, setup_kv_and_metadata
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
+from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_kimi_k3_vl import (
+    KimiK3ForConditionalGeneration,
+    KimiK3VisionModel,
+)
 from tensorrt_llm._torch.models.modeling_kimi_k25 import _vision_requires_replication
+from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_kimi_k3_multimodal_config,
     load_pretrained_config,
 )
+from tensorrt_llm._torch.utils import model_extra_attrs
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 
 def _composite_config():
@@ -155,6 +170,130 @@ class TestKimiK3LoaderRouting(unittest.TestCase):
         self.assertEqual(config.architectures, ["KimiLinearForCausalLM"])
         self.assertEqual(config.model_type, "kimi_linear")
         self.assertEqual(config.hidden_size, 7168)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_kimi_k3_forward_with_attached_embeddings():
+    text_config = KimiLinearConfig(
+        vocab_size=128,
+        hidden_size=256,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=32,
+        num_key_value_heads=32,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        rms_norm_eps=1e-6,
+        attn_res_block_size=1,
+        mla_use_nope=True,
+        mla_use_output_gate=True,
+        max_position_embeddings=128,
+        torch_dtype=torch.bfloat16,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        linear_attn_config={
+            "kda_layers": [],
+            "full_attn_layers": [1],
+            "num_heads": 32,
+        },
+    )
+    config = KimiK3Config(
+        architectures=["KimiK3ForConditionalGeneration"],
+        text_config=text_config,
+        vision_config={
+            "vt_hidden_size": 128,
+            "vt_num_hidden_layers": 1,
+            "vt_num_attention_heads": 1,
+            "qkv_hidden_size": 128,
+            "vt_intermediate_size": 256,
+            "text_hidden_size": 256,
+            "patch_size": 2,
+            "init_pos_emb_height": 2,
+            "init_pos_emb_width": 2,
+            "init_pos_emb_time": 1,
+            "media_placeholder_token_id": 127,
+            "pad_token_id": 0,
+        },
+        media_placeholder_token_id=127,
+        pad_token_id=0,
+        torch_dtype=torch.bfloat16,
+    )
+    model_config = ModelConfig(
+        pretrained_config=config,
+        attn_backend="TRTLLM",
+        max_num_tokens=4,
+        max_seq_len=128,
+    )
+    model_cls = get_registered_model_class("KimiK3ForConditionalGeneration")
+    assert model_cls is KimiK3ForConditionalGeneration
+    with torch.device("cuda"):
+        model = model_cls(model_config).eval()
+    assert isinstance(model.mm_encoder, KimiK3VisionModel)
+    assert isinstance(model.llm, KimiLinearForCausalLM)
+    assert len(model.llm.model.layers) == 1
+
+    generator = torch.Generator(device="cpu").manual_seed(147)
+    for parameter in model.parameters():
+        if parameter.ndim == 1:
+            parameter.fill_(1.0)
+        else:
+            parameter.copy_(
+                torch.randn(parameter.shape, generator=generator, dtype=torch.float32) * 0.05
+            )
+
+    # Native MLA requires a cache pool even when recomputing the entire context.
+    scenario = SimpleNamespace(
+        ctx_len=4,
+        batch=1,
+        kv_cache_tokens_per_block=64,
+        num_layers=1,
+        kv_cache_dtype=torch.bfloat16,
+    )
+    manager, metadata = setup_kv_and_metadata(
+        scenario,
+        model_config.mapping,
+        cache_type=CACHE_TYPE_SELFKONLY,
+        num_kv_heads=1,
+        head_dim=text_config.kv_lora_rank + text_config.qk_rope_head_dim,
+    )
+    try:
+        extra_attrs = dict(model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(metadata)
+        input_ids = torch.tensor([3, 4, 5, 6], dtype=torch.int32, device="cuda")
+        media_ids = input_ids.clone()
+        media_ids[1] = 127
+        params = MultimodalParams(
+            multimodal_data={
+                "multimodal_embedding": model.llm.model.embed_tokens(input_ids[1:2]).clone()
+            }
+        )
+
+        with model_extra_attrs(extra_attrs):
+            metadata.prepare()
+            expected = model(metadata, input_ids=input_ids, return_context_logits=True)
+            changed = model(metadata, input_ids=media_ids, return_context_logits=True)
+            actual = model(
+                metadata,
+                input_ids=media_ids,
+                return_context_logits=True,
+                multimodal_params=[params],
+                mm_token_indices=torch.tensor([1], device="cuda"),
+                text_token_indices=torch.tensor([0, 2, 3], device="cuda"),
+            )
+
+        for logits in (expected, changed, actual):
+            assert logits.shape == (4, text_config.vocab_size)
+            assert logits.is_cuda and logits.dtype == torch.float32
+            assert torch.isfinite(logits).all()
+        assert not torch.allclose(changed[-1], expected[-1], atol=0.005, rtol=0.03)
+        torch.testing.assert_close(actual, expected, atol=0.005, rtol=0.03)
+    finally:
+        manager.shutdown()
 
 
 if __name__ == "__main__":
