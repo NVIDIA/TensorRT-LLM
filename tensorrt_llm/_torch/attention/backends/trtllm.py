@@ -148,11 +148,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     cuda_graph_workspace: Optional[torch.Tensor] = None
     workspace_reclaimable: bool = field(default=True, init=False)
     # batch_block_table_key of the target / draft KV cache manager at the last
-    # block-offset copy of prepare_steady_decode_step; prepare() clears them.
+    # block-offset copy of prepare_steady_decode_step or of a prepare() keyed
+    # by key_prepared_block_offsets; prepare() clears them.
     _steady_block_table_keys: tuple = field(default=(None, None),
                                             init=False,
                                             repr=False,
                                             compare=False)
+    # Whether the last prepare() copied the full block-offset table width.
+    _prepared_full_block_offsets: bool = field(default=False,
+                                               init=False,
+                                               repr=False,
+                                               compare=False)
 
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
@@ -1024,6 +1030,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self._invalidate_mla_scheduler_buffers()
         self._steady_block_table_keys = (None, None)
+        self._prepared_full_block_offsets = False
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
         if extra_attrs is None:
@@ -1160,6 +1167,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.num_contexts,
                     self.num_seqs,
                     max_blocks=max_blocks)
+            self._prepared_full_block_offsets = max_blocks is None
 
         # Don't pass self.kv_lens as kv_lens here because it includes extra
         # tokens. Use the actual KV length (without extra tokens) for
@@ -1291,6 +1299,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 and self.fp4_mla_state is None
                 and not self._has_mixed_precision_kv()
                 and not self.kv_cache_params.use_full_generation_page_table)
+
+    def key_prepared_block_offsets(self) -> None:
+        """Key the block offsets the last prepare() copied, so that the next prepare_steady_decode_step skips
+        its copy while they are unchanged. A no-op unless that prepare() copied the full table width."""
+        if not self._prepared_full_block_offsets:
+            return
+        keys = []
+        for manager in (self.kv_cache_manager, self.draft_kv_cache_manager):
+            keys.append(None if manager is None else manager.
+                        batch_block_table_key(self.request_ids))
+        self._steady_block_table_keys = tuple(keys)
 
     def prepare_steady_decode_step(self, kv_lens: List[int]) -> None:
         """prepare() of a generation-only step that runs the batch of the previous prepare() one step later.

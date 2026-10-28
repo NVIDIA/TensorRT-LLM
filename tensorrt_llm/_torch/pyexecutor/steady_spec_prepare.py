@@ -374,6 +374,9 @@ class SteadyMtpPrepare:
             and static["position_ids"].dtype == torch.int32
         ):
             static_ids, static_pos = static["input_ids"], static["position_ids"]
+        if attn_steady:
+            # The first steady step skips the block-offset copy this pass made when nothing changed.
+            attn_metadata.key_prepared_block_offsets()
         self.record = SteadyMtpRecord(
             request_ids=[request.py_request_id for request in requests],
             slots=[request.py_seq_slot for request in requests],
