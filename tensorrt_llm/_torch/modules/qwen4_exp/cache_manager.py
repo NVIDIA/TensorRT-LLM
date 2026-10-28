@@ -38,6 +38,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHyb
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     _get_local_mamba_cache_layout,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, replicated
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
@@ -190,6 +191,17 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
             QSA_INDEX_POSITION: MapperKind.REPLICATED,
             QSA_SIDE_PLANES: MapperKind.REPLICATED,
         }
+
+    @override
+    def _page_buffer_tensors(
+        self, layer_id: int, role: str, size: int, tokens: int, state: bool
+    ) -> tuple[Tensor, ...]:
+        """PLE state is computed from replicated inputs, and QSA index positions are request-wide
+        coordinates, packed with index-K into the side planes when they would share a pool: every
+        rank holds the same bytes of each, with no head axis to split."""
+        if role in (PLE_CONV_STATE, PLE_NGRAM_CONTEXT, QSA_INDEX_POSITION, QSA_SIDE_PLANES):
+            return replicated(size)
+        return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
 
     @override
     def __init__(

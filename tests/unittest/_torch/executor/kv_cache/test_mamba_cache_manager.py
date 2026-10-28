@@ -4074,6 +4074,10 @@ def test_v2_hybrid_disagg_page_table_preserves_lifecycle_indices():
         assert len(page_table.layer_groups) == len(mgr.impl.layer_grouping)
         assert isinstance(page_table.layer_groups[0], MambaLayerGroup)
         assert isinstance(page_table.layer_groups[1], AttentionLayerGroup)
+        # The manager's own page table keeps the same lifecycle order.
+        groups = mgr.get_page_table().page_layout.layer_groups
+        assert len(groups) == len(mgr.impl.layer_grouping)
+        assert [g.kind for g in groups[:2]] == ["state", "attention"]
 
         requests = mgr.add_dummy_requests([123], token_nums=[64], is_gen=False)
         assert len(requests) == 1
@@ -4100,6 +4104,13 @@ def test_v2_hybrid_disagg_page_table_uses_qwen3_next_conv_sections():
         conv_elem_size = mgr.all_conv_states[0].element_size()
         conv_view = next(pv for pv in mamba_group.pool_views if pv.pool_role == MAMBA_CONV_ROLE)
         assert conv_view.section_bytes == [
+            dim * d_conv_m1 * conv_elem_size for dim in mgr.conv_section_dims
+        ]
+        # The manager's own page table declares the same sections, one tensor each.
+        layout = mgr.get_page_table().page_layout
+        assert layout.layer_groups[0].kind == "state"
+        conv = next(b for b in layout.buffers if b.role == str(MambaRole.CONV_STATE))
+        assert [t.axes[0].held for t in conv.tensors] == [
             dim * d_conv_m1 * conv_elem_size for dim in mgr.conv_section_dims
         ]
         assert mgr.conv_section_dims == [8, 8, 32]
@@ -5998,6 +6009,7 @@ def test_v2_kda_draft_records_replace_the_replay_caches(kda_replay_num_spec):
         }
         # A KVCM state buffer of the SSM layers, kept out of disaggregated transfers like the other replay buffers.
         assert DataRole("kda_state_tok") in mgr.get_disagg_ignored_roles()
+        assert "kda_state_tok" in mgr._page_untransferred_roles()
         assert len(mgr.kda_state_tok) == 2
         for layer_idx in range(2):
             layer_cache = mgr.mamba_layer_cache(layer_idx)
@@ -6341,6 +6353,7 @@ def test_v2_kda_replay_buffers_are_kvcm_state_buffers(manager_cls):
         )
         ignored = {str(role) for role in mgr.get_disagg_ignored_roles()}
         assert replay_roles | {"prev_num_accepted_tokens"} <= ignored
+        assert mgr._page_untransferred_roles() == ignored
     finally:
         mgr.shutdown()
 
@@ -6409,6 +6422,7 @@ def test_v2_kda_worker_role_cache(monkeypatch, role, is_disagg, manager_cls):
             assert not mgr.get_disagg_ignored_roles() & {
                 DataRole(name) for name in _KDA_REPLAY_FIELDS
             }
+            assert not mgr._page_untransferred_roles() & set(_KDA_REPLAY_FIELDS)
             mgr.update_mamba_states(
                 SimpleNamespace(num_seqs=1, num_contexts=1),
                 torch.ones(1, device="cuda", dtype=torch.int32),

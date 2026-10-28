@@ -27,7 +27,12 @@ from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import MapperKind, ShardDesc
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+    MapperKind,
+    ShardDesc,
+    head_major,
+    replicated,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     MemoryKind,
     StagingOptions,
@@ -139,8 +144,38 @@ def kinds(layout):
     return [desc.kind for desc in layout.layer_groups]
 
 
+def mapper_of(b):
+    """The native mapper kind a buffer's tensors amount to."""
+    if not b.split:
+        return "REPLICATED"
+    (tensor, *rest) = b.tensors
+    names = [a.name for a in tensor.axes]
+    if "shard" in names:
+        return "INDEXED"  # a rank's own bytes, its heads undeclared
+    if rest or "head" not in names:
+        return "SECTIONED"
+    return "NHD" if names[0] == "token" else "INDEXED"
+
+
+def sections_of(b):
+    """A sectioned buffer's section sizes on this rank, as native's ``section_bytes``; None
+    otherwise."""
+    if mapper_of(b) != "SECTIONED":
+        return None
+    return tuple(t.axes[0].held for t in b.tensors)
+
+
+def head_bytes_of(b):
+    """Bytes of one head on this rank of a buffer split by head, as native's ``bytes_per_head``;
+    None otherwise."""
+    head = next((a for a in b.tensors[0].axes if a.name == "head"), None)
+    if mapper_of(b) not in ("INDEXED", "NHD") or head is None:
+        return None
+    return b.size // head.held
+
+
 def roles(layout):
-    return {(b.role, b.mapper.name) for b in layout.buffers}
+    return {(b.role, mapper_of(b)) for b in layout.buffers}
 
 
 def check_tp2(mgr, layout):
@@ -182,7 +217,7 @@ def check_mla(tp_size):
 def check_helix(mgr, layout):
     assert mgr._has_cp_helix and (mgr._helix_cp_rank, mgr._helix_cp_size) == (1, 2), mgr.mapping
     # A page holds tokens_per_block tokens of each head's K and V, two bytes each (fp16).
-    per_head = {b.geometry.bytes_per_head for b in layout.buffers}
+    per_head = {head_bytes_of(b) for b in layout.buffers}
     assert per_head == {layout.tokens_per_page * mgr.head_dim * 2}, (per_head, mgr.head_dim)
 
 
@@ -218,11 +253,7 @@ def check_gdn(tp_size, stage_kinds):
     def check(mgr, layout):
         assert mgr.mapping.tp_size == tp_size, mgr.mapping
         assert set(kinds(layout)) == stage_kinds, kinds(layout)
-        sections = {
-            tuple(b.geometry.section_bytes)
-            for b in layout.buffers
-            if b.mapper is MapperKind.SECTIONED
-        }
+        sections = {sections_of(b) for b in layout.buffers if mapper_of(b) == "SECTIONED"}
         assert sections and all(len(s) == 3 and s[0] == s[1] < s[2] for s in sections), sections
 
     return check
@@ -396,16 +427,14 @@ def public_groups(layout, regions):
             if b.layer not in desc.layers or b.pool_group != g or not b.transferred:
                 continue
             claimed.add(i)
-            key = (pools[b.pool_index][0], b.mapper.name)
+            key = (pools[b.pool_index][0], mapper_of(b))
             rows.append((b.layer, key[0], b.slot_offset, b.size, key[1]))
             roles[key].append(b.role)
             if state:
-                section = b.geometry.section_bytes
-                section = None if section is None else tuple(section)
-                geometries[key].add((section, b.geometry.bytes_per_head))
-            elif b.mapper in (MapperKind.INDEXED, MapperKind.NHD):
-                heads.add(b.size // b.geometry.bytes_per_head)
-            elif b.mapper is MapperKind.REPLICATED:
+                geometries[key].add((sections_of(b), head_bytes_of(b)))
+            elif key[1] in ("INDEXED", "NHD"):
+                heads.add(b.size // head_bytes_of(b))
+            elif key[1] == "REPLICATED":
                 whole.add(layout.total_kv_heads_by_layer.get(b.layer))
         heads = heads or whole
         assert all(len(v) == 1 for v in geometries.values()), f"roles disagree: {dict(geometries)}"
@@ -459,15 +488,14 @@ def lies(layout):
             for i, d in enumerate(layout.layer_groups)
         )
 
-    other = MapperKind.INDEXED if first.mapper is MapperKind.REPLICATED else MapperKind.REPLICATED
-    geometry = first.geometry
-    if other is MapperKind.INDEXED and geometry.bytes_per_head is None:
-        geometry = dataclasses.replace(geometry, bytes_per_head=first.size)
+    other = (
+        head_major(first.size, 1, 1) if mapper_of(first) == "REPLICATED" else replicated(first.size)
+    )
     window = 128 if layout.layer_groups[0].kept_window == 64 else 64
     out = {
         "offset": dict(buffers=buffers(slot_offset=first.slot_offset + first.size)),
         "layer": dict(buffers=buffers(layer=first.layer + 1000)),
-        "mapper": dict(buffers=buffers(mapper=other, geometry=geometry)),
+        "mapper": dict(buffers=buffers(tensors=other)),
         "extra buffer": dict(
             buffers=layout.buffers + (dataclasses.replace(first, layer=first.layer + 1000),)
         ),

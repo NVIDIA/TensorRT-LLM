@@ -12,14 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""One rank's page layout and transfer geometry as immutable values, and which ranks of an
-instance hold the same bytes; standard library only."""
+"""One rank's page layout as immutable values, and which ranks of an instance hold the same bytes;
+standard library only.
+
+A buffer holds the local pieces of one or more tensors. A tensor names its axes and their extents
+over all ranks together; each axis says how its indices spread over the parallel dimensions
+(``Axis.split``: whole on every rank, a contiguous run per rank, or every n-th index per rank) and
+the byte stride of its local index. Which global indices a rank holds is therefore a progression
+per axis (``held``), and how two ranks' pages correspond follows from intersecting them."""
 
 from __future__ import annotations
 
 import collections.abc
 import dataclasses
 import enum
+import math
 import numbers
 import types
 from collections.abc import Sequence
@@ -27,14 +34,25 @@ from dataclasses import dataclass, field
 from typing import Literal, Mapping
 
 __all__ = [
+    "GRID_DIMENSIONS",
+    "Axis",
     "BufferDesc",
     "LayerGroupDesc",
     "MapperKind",
     "PageLayout",
+    "Progression",
     "RankTopology",
     "RoleLayout",
     "ShardDesc",
+    "Tensor",
+    "grid_place",
+    "head_major",
+    "held",
+    "owned",
     "replica_ranks",
+    "replicated",
+    "sectioned",
+    "token_major",
 ]
 
 _QUANT_MODES = ("fp8", "nvfp4", "fp8_ds_mla")
@@ -56,7 +74,8 @@ _NO_ENTRIES: Mapping = _frozen({})
 
 
 class MapperKind(enum.IntEnum):
-    """How a role's bytes split across its layer group's grid of ranks (``LayerGroupDesc``).
+    """How a role's bytes split across ranks, as a manager declares it to the native transfer
+    (``get_disagg_role_mapper_kinds``).
 
     Attributes:
         INDEXED: Head-major layout; a head range is one contiguous byte range.
@@ -79,7 +98,8 @@ class MapperKind(enum.IntEnum):
 
 @dataclass(frozen=True)
 class RoleLayout:
-    """Resharding geometry of one role; both fields None means no declared head axis.
+    """Resharding geometry of one role, as a manager declares it to the native transfer
+    (``get_disagg_role_layouts``); both fields None means no declared head axis.
 
     Attributes:
         section_bytes: Byte sizes of consecutive sections for a SECTIONED role, normalized to a
@@ -91,7 +111,7 @@ class RoleLayout:
 
     Raises:
         ValueError: If a section size or bytes_per_head is not a positive integer, including a
-            boolean. BufferDesc checks that the geometry fits its size."""
+            boolean."""
 
     section_bytes: tuple[int, ...] | None = None
     bytes_per_head: int | None = None
@@ -119,13 +139,290 @@ class RoleLayout:
         return layout
 
 
-def _check_size(geometry: RoleLayout, size: int) -> None:
-    if geometry.section_bytes is not None and sum(geometry.section_bytes) != size:
-        raise ValueError(f"sections {geometry.section_bytes} do not sum to {size} bytes")
-    if geometry.bytes_per_head is not None and size % geometry.bytes_per_head:
-        raise ValueError(
-            f"{size} bytes is not a whole number of {geometry.bytes_per_head}-byte heads"
+GRID_DIMENSIONS = ("tp", "cp")
+"""Parallel dimensions an axis may split over (``Axis.split``): "tp" the tensor-parallel ranks of
+one attention data-parallel group, "cp" the context-parallel ranks. Pipeline ranks hold other
+layers and data-parallel ranks other requests, so neither splits a page."""
+
+
+@dataclass(frozen=True)
+class Progression:
+    """The indices ``start, start + step, ..., start + (count - 1) * step``.
+
+    Attributes:
+        start: First index.
+        step: Positive distance between consecutive indices.
+        count: Non-negative number of indices.
+    """
+
+    start: int
+    step: int
+    count: int
+
+    @property
+    def last(self) -> int:
+        """The last index; ``start - step`` when empty."""
+        return self.start + (self.count - 1) * self.step
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __iter__(self):
+        return iter(range(self.start, self.start + self.count * self.step, self.step))
+
+    def __contains__(self, index: object) -> bool:
+        if not isinstance(index, int) or self.count == 0:
+            return False
+        offset = index - self.start
+        return 0 <= offset <= (self.count - 1) * self.step and offset % self.step == 0
+
+    def intersect(self, other: Progression) -> Progression | None:
+        """The indices both hold, themselves a progression, or None when they share none."""
+        if self.count == 0 or other.count == 0:
+            return None
+        lo, hi = max(self.start, other.start), min(self.last, other.last)
+        if lo > hi:
+            return None
+        g = math.gcd(self.step, other.step)
+        if (other.start - self.start) % g:
+            return None
+        lcm = self.step // g * other.step
+        # x = self.start + self.step * t with x = other.start (mod other.step).
+        m = other.step // g
+        t = 0 if m == 1 else (other.start - self.start) // g * pow(self.step // g, -1, m) % m
+        first = lo + (self.start + self.step * t - lo) % lcm
+        if first > hi:
+            return None
+        return Progression(first, lcm, (hi - first) // lcm + 1)
+
+
+def grid_place(topology: RankTopology, dims: Sequence[str]) -> tuple[int, int]:
+    """``(size, rank)`` of this rank in the grid of the parallel dimensions ``dims``, outer to
+    inner, the last minor. Under attention data parallelism each tensor-parallel rank serves its own
+    requests and holds its buffers whole, so "tp" counts this rank alone."""
+    size, rank = 1, 0
+    for dim in dims:
+        if dim == "tp":
+            n, r = (1, 0) if topology.attention_dp else (topology.tp_size, topology.tp_rank)
+        elif dim == "cp":
+            n, r = topology.cp_size, topology.cp_rank
+        else:
+            raise ValueError(f"{dim!r} is no grid dimension; one of {GRID_DIMENSIONS}")
+        size, rank = size * n, rank * n + r
+    return size, rank
+
+
+@dataclass(frozen=True)
+class Axis:
+    """One dimension of a tensor: its extent over all ranks together, which of its indices a rank
+    holds, and the byte stride between consecutive indices a rank holds.
+
+    A rank at ``r`` of ``n`` in the grid of the ``split`` dimensions holds every index when
+    ``split`` is empty; ``held`` indices from ``r * extent // n`` when split contiguously (ranks
+    hold overlapping or equal runs when ``held * n`` exceeds ``extent``); or indices
+    ``r, r + n, ...`` below ``extent`` when ``cyclic``. Local index ``k`` (the k-th index held, in
+    order) lies at byte ``k * stride`` of its tensor.
+
+    Attributes:
+        name: The axis' name; peers match tensors' axes on it.
+        extent: Positive number of indices over all ranks together.
+        stride: Positive bytes between consecutive local indices.
+        split: Parallel dimensions from ``GRID_DIMENSIONS`` the axis spreads over, outer to inner;
+            empty when every rank holds every index. Normalized to a tuple.
+        held: Positive number of indices a rank holds of a contiguous split, at most extent;
+            required for a contiguous split, None otherwise.
+        cyclic: Whether a split rank holds every n-th index rather than a contiguous run.
+
+    Raises:
+        ValueError: If a number is not a positive integer or is a boolean, split names a dimension
+            twice or one outside ``GRID_DIMENSIONS``, held is missing from a contiguous split or
+            given for another, or held exceeds extent.
+    """
+
+    name: str
+    extent: int
+    stride: int
+    split: tuple[str, ...] = ()
+    held: int | None = None
+    cyclic: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError(f"an axis needs a name, got {self.name!r}")
+        object.__setattr__(self, "extent", _integer(self.extent, f"extent of {self.name}", 1))
+        object.__setattr__(self, "stride", _integer(self.stride, f"stride of {self.name}", 1))
+        split = tuple(str(dim) for dim in self.split)
+        if len(set(split)) != len(split) or not set(split) <= set(GRID_DIMENSIONS):
+            raise ValueError(f"axis {self.name} splits over {split}, not over {GRID_DIMENSIONS}")
+        object.__setattr__(self, "split", split)
+        object.__setattr__(self, "cyclic", bool(self.cyclic))
+        contiguous = bool(split) and not self.cyclic
+        if self.cyclic and not split:
+            raise ValueError(f"axis {self.name} is cyclic but not split")
+        if contiguous != (self.held is not None):
+            raise ValueError(
+                f"axis {self.name}: a contiguous split, and only one, says how many indices a "
+                f"rank holds (held={self.held!r}, split={split}, cyclic={self.cyclic})"
+            )
+        if self.held is not None:
+            held_ = _integer(self.held, f"indices held of {self.name}", 1)
+            if held_ > self.extent:
+                raise ValueError(f"axis {self.name}: {held_} held of {self.extent} indices")
+            object.__setattr__(self, "held", held_)
+
+    @classmethod
+    def unchecked(
+        cls,
+        name: str,
+        extent: int,
+        stride: int,
+        split: tuple[str, ...] = (),
+        held: int | None = None,
+        cyclic: bool = False,
+    ) -> Axis:
+        """The constructor's axis of these values, without its checks and conversions; see
+        ``PageLayout.unchecked``."""
+        axis = object.__new__(cls)
+        axis.__dict__.update(
+            name=name, extent=extent, stride=stride, split=split, held=held, cyclic=cyclic
         )
+        return axis
+
+
+@dataclass(frozen=True)
+class Tensor:
+    """A tensor whose local piece a buffer holds: its axes, and where the piece starts.
+
+    Attributes:
+        axes: The tensor's axes, normalized to a tuple; their order is the order peers list them
+            in, not the order of their bytes, which their strides give.
+        offset: Non-negative byte offset of the local piece within its buffer.
+        name: Tells the tensors of one buffer apart; peers match tensors on it.
+
+    Raises:
+        ValueError: If there is no axis, two axes share a name, a parallel dimension splits two
+            axes, or offset is not a non-negative integer.
+    """
+
+    axes: tuple[Axis, ...]
+    offset: int = 0
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        axes = tuple(self.axes)
+        if not axes or not all(isinstance(a, Axis) for a in axes):
+            raise ValueError(f"a tensor has one or more Axis values, got {axes!r}")
+        names = [a.name for a in axes]
+        if len(set(names)) != len(names):
+            raise ValueError(f"axis names repeat: {names}")
+        dims = [dim for a in axes for dim in a.split]
+        if len(set(dims)) != len(dims):
+            raise ValueError(f"a parallel dimension splits two axes: {dims}")
+        object.__setattr__(self, "axes", axes)
+        object.__setattr__(self, "offset", _integer(self.offset, "tensor offset"))
+        object.__setattr__(self, "name", str(self.name))
+
+    @property
+    def split(self) -> bool:
+        """Whether some axis spreads over parallel dimensions."""
+        return any(a.split for a in self.axes)
+
+    @classmethod
+    def unchecked(cls, axes: tuple[Axis, ...], offset: int = 0, name: str = "") -> Tensor:
+        """The constructor's tensor of these values, without its checks and conversions; see
+        ``PageLayout.unchecked``."""
+        tensor = object.__new__(cls)
+        tensor.__dict__.update(axes=tuple(axes), offset=offset, name=name)
+        return tensor
+
+
+def held(axis: Axis, topology: RankTopology) -> Progression:
+    """The global indices of ``axis`` that the rank at ``topology`` holds, in local order."""
+    if not axis.split:
+        return Progression(0, 1, axis.extent)
+    n, r = grid_place(topology, axis.split)
+    if axis.cyclic:
+        return Progression(r, n, len(range(r, axis.extent, n)))
+    start = r * axis.extent // n
+    if start + axis.held > axis.extent:
+        raise ValueError(
+            f"axis {axis.name}: rank {r} of {n} holds {axis.held} indices from {start}, past "
+            f"its extent of {axis.extent}"
+        )
+    return Progression(start, 1, axis.held)
+
+
+def _footprint(tensor: Tensor) -> int | None:
+    """Bytes from its buffer's start to the end of a tensor's local piece, or None when a cyclic
+    axis leaves the count of its indices to the rank."""
+    end = tensor.offset + 1
+    for a in tensor.axes:
+        if a.cyclic:
+            return None
+        end += ((a.held if a.split else a.extent) - 1) * a.stride
+    return end
+
+
+def replicated(size: int) -> tuple[Tensor, ...]:
+    """A buffer of ``size`` bytes that every rank holds alike."""
+    return (Tensor((Axis("byte", size, 1),)),)
+
+
+def owned(size: int, ranks: int, split: Sequence[str] = ("tp",)) -> tuple[Tensor, ...]:
+    """A buffer of ``size`` bytes that is this rank's own share of ``ranks`` ranks along ``split``,
+    in a split the manager does not describe further: it corresponds only to the same rank's."""
+    return (
+        Tensor((Axis("shard", ranks, size, tuple(split), 1), Axis("byte", size, 1)), name="own"),
+    )
+
+
+def head_major(
+    size: int, heads: int, total_heads: int, split: Sequence[str] = ("tp",)
+) -> tuple[Tensor, ...]:
+    """A buffer of ``heads`` heads of ``size // heads`` bytes each ([head, ...], HND), of
+    ``total_heads`` split contiguously over ``split``."""
+    if heads <= 0 or size % heads:
+        raise ValueError(f"{size} bytes is not a whole number of {heads} heads")
+    head = size // heads
+    return (
+        Tensor(
+            (Axis("head", total_heads, head, tuple(split), heads), Axis("byte", head, 1)),
+        ),
+    )
+
+
+def token_major(
+    size: int, tokens: int, heads: int, total_heads: int, split: Sequence[str] = ("tp",)
+) -> tuple[Tensor, ...]:
+    """A buffer of ``tokens`` tokens, each ``heads`` heads of equal bytes ([token, head, ...],
+    NHD), of ``total_heads`` split contiguously over ``split``."""
+    if tokens <= 0 or heads <= 0 or size % (tokens * heads):
+        raise ValueError(f"{size} bytes is not a whole number of {tokens} x {heads} token heads")
+    head = size // (tokens * heads)
+    return (
+        Tensor(
+            (
+                Axis("token", tokens, heads * head),
+                Axis("head", total_heads, head, tuple(split), heads),
+                Axis("byte", head, 1),
+            )
+        ),
+    )
+
+
+def sectioned(
+    section_bytes: Sequence[int], ranks: int, split: Sequence[str] = ("tp",)
+) -> tuple[Tensor, ...]:
+    """Consecutive sections of a buffer, each the local ``1 / ranks`` of its own tensor, split
+    contiguously by byte over the ``ranks`` ranks of ``split`` (Mamba2 conv state ``[x | B | C]``,
+    GDN ``[Q | K | V]``)."""
+    out, offset = [], 0
+    for i, n in enumerate(section_bytes):
+        out.append(
+            Tensor((Axis("byte", n * ranks, 1, tuple(split), n),), offset=offset, name=f"s{i}")
+        )
+        offset += n
+    return tuple(out)
 
 
 @dataclass(frozen=True)
@@ -171,8 +468,8 @@ class LayerGroupDesc:
     attention groups over the tensor-parallel ranks of one attention data-parallel
     group; state groups over the tensor-parallel ranks, over none under attention
     data parallelism, and over tensor times context ranks, context-minor, under
-    Helix. ``shard`` is this rank's share; each buffer's ``mapper`` and
-    ``geometry`` say how it splits.
+    Helix. ``shard`` is this rank's share; each buffer's ``tensors`` say how it
+    splits.
 
     Attributes:
         kind: "attention" for attention KV data, or "state" for recurrent state.
@@ -273,9 +570,8 @@ class BufferDesc:
         pool_index: Non-negative pool index within pool_group.
         slot_offset: Non-negative byte offset within that pool's slot.
         size: Positive byte size of the buffer.
-        mapper: How this role's bytes split across tensor-parallel ranks.
-        geometry: RoleLayout; declared section sizes must sum to size, and declared bytes per head
-            must divide size.
+        tensors: The tensors whose local pieces the buffer holds, and how they spread over ranks;
+            normalized to a tuple. Defaults to the whole buffer, alike on every rank.
         transferred: Whether peers transfer this role. False marks local-only buffers, which still
             accompany copies of whole slots.
         expansion: Positive number of sub-pages within one page, each of
@@ -284,8 +580,9 @@ class BufferDesc:
 
     Raises:
         ValueError: If an index is not a non-negative integer, size or expansion is not a positive
-            integer, any such value is a boolean, mapper names no mapper kind, geometry is not a
-            RoleLayout, or geometry does not fit size."""
+            integer, any such value is a boolean, two tensors share a name, a tensor's piece
+            reaches past size, or the pieces of several tensors do not lie back to back over the
+            whole buffer."""
 
     layer: int
     role: str
@@ -293,8 +590,7 @@ class BufferDesc:
     pool_index: int
     slot_offset: int
     size: int
-    mapper: MapperKind = MapperKind.INDEXED
-    geometry: RoleLayout = RoleLayout()
+    tensors: tuple[Tensor, ...] = ()
     transferred: bool = True
     expansion: int = 1
 
@@ -304,10 +600,33 @@ class BufferDesc:
         object.__setattr__(self, "size", _integer(self.size, "size", 1))
         object.__setattr__(self, "expansion", _integer(self.expansion, "expansion", 1))
         object.__setattr__(self, "role", str(self.role))
-        object.__setattr__(self, "mapper", MapperKind(_integer(self.mapper, "mapper")))
-        if not isinstance(self.geometry, RoleLayout):
-            raise ValueError(f"geometry must be a role layout, got {self.geometry!r}")
-        _check_size(self.geometry, self.size)
+        tensors = tuple(self.tensors) or replicated(self.size)
+        if not all(isinstance(t, Tensor) for t in tensors):
+            raise ValueError(f"tensors must be Tensor values, got {tensors!r}")
+        names = [t.name for t in tensors]
+        if len(set(names)) != len(names):
+            raise ValueError(f"buffer ({self.layer}, {self.role}): tensor names repeat: {names}")
+        ends = [_footprint(t) for t in tensors]
+        for t, end in zip(tensors, ends):
+            if end is not None and end > self.size:
+                raise ValueError(
+                    f"buffer ({self.layer}, {self.role}): tensor {t.name!r} reaches byte {end} of "
+                    f"a {self.size}-byte buffer"
+                )
+        if len(tensors) > 1 and None not in ends:
+            pieces = sorted((t.offset, end) for t, end in zip(tensors, ends))
+            bounds = [0, *(b for piece in pieces for b in piece), self.size]
+            if any(a != b for a, b in zip(bounds[::2], bounds[1::2])):
+                raise ValueError(
+                    f"buffer ({self.layer}, {self.role}): sections {pieces} do not cover its "
+                    f"{self.size} bytes"
+                )
+        object.__setattr__(self, "tensors", tensors)
+
+    @property
+    def split(self) -> bool:
+        """Whether some tensor spreads over parallel dimensions; else every rank holds it alike."""
+        return any(t.split for t in self.tensors)
 
     @classmethod
     def unchecked(
@@ -318,8 +637,7 @@ class BufferDesc:
         pool_index: int,
         slot_offset: int,
         size: int,
-        mapper: MapperKind = MapperKind.INDEXED,
-        geometry: RoleLayout = RoleLayout(),
+        tensors: tuple[Tensor, ...] = (),
         transferred: bool = True,
         expansion: int = 1,
     ) -> BufferDesc:
@@ -333,8 +651,7 @@ class BufferDesc:
             pool_index=pool_index,
             slot_offset=slot_offset,
             size=size,
-            mapper=mapper,
-            geometry=geometry,
+            tensors=tuple(tensors) or replicated(size),
             transferred=transferred,
             expansion=expansion,
         )
@@ -442,6 +759,9 @@ class PageLayout:
         device_region_index: (pool group, pool index) -> device region index in Lender.regions.
         staging_region_index: Pool group -> staging region index in Lender.regions; empty when the
             lender stages nothing.
+        rebuilds_untransferred: Whether the buffers peers do not transfer derive from the others,
+            which the manager rebuilds after the native transfer imports a request's pages; a
+            reader that invokes no rebuild, such as the lender, moves them too.
 
     Raises:
         ValueError: If tokens_per_page, a slot width or a KV head count is not a positive integer; a
@@ -459,6 +779,7 @@ class PageLayout:
     quant_mode: Literal["fp8", "nvfp4", "fp8_ds_mla"] | None = None
     device_region_index: Mapping[tuple[int, int], int] = field(default_factory=dict)
     staging_region_index: Mapping[int, int] = field(default_factory=dict)
+    rebuilds_untransferred: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -484,6 +805,7 @@ class PageLayout:
             for g, i in self.staging_region_index.items()
         }
         object.__setattr__(self, "staging_region_index", _frozen(staging))
+        object.__setattr__(self, "rebuilds_untransferred", bool(self.rebuilds_untransferred))
         object.__setattr__(self, "layer_groups", tuple(self.layer_groups))
         object.__setattr__(self, "buffers", tuple(self.buffers))
         if self.quant_mode is not None and self.quant_mode not in _QUANT_MODES:
@@ -510,6 +832,7 @@ class PageLayout:
         quant_mode: Literal["fp8", "nvfp4", "fp8_ds_mla"] | None = None,
         device_region_index: Mapping[tuple[int, int], int] = _NO_ENTRIES,
         staging_region_index: Mapping[int, int] = _NO_ENTRIES,
+        rebuilds_untransferred: bool = False,
     ) -> PageLayout:
         """The constructor's layout of these values, without its checks and conversions.
 
@@ -532,6 +855,7 @@ class PageLayout:
             quant_mode=quant_mode,
             device_region_index=_frozen(dict(device_region_index)),
             staging_region_index=_frozen(dict(staging_region_index)),
+            rebuilds_untransferred=rebuilds_untransferred,
         )
         return layout
 
@@ -556,32 +880,24 @@ def _same_group(layout: PageLayout, desc: LayerGroupDesc) -> LayerGroupDesc | No
     return None
 
 
-def _attention_head_ranges(
-    layout: PageLayout, desc: LayerGroupDesc
-) -> tuple[tuple[int, str, int, int], ...] | None:
-    """The transferred nonreplicated buffers' head ranges, or None without their geometry."""
-    if desc.kind != "attention":
-        return None
-    topology = layout.topology
-    tp_size = 1 if topology.attention_dp else topology.tp_size
-    tp_rank = 0 if topology.attention_dp else topology.tp_rank
-    ranges = []
+def _held_indices(layout: PageLayout, desc: LayerGroupDesc) -> tuple | None:
+    """The indices this rank holds of every split axis of the group's transferred buffers, by
+    (layer, role, tensor, axis); None when no transferred buffer splits."""
+    out = []
     for buffer in layout.buffers:
         if (
             buffer.pool_group != desc.pool_group
             or buffer.layer not in desc.layers
             or not buffer.transferred
-            or buffer.mapper is MapperKind.REPLICATED
+            or not buffer.split
         ):
             continue
-        total = layout.total_kv_heads_by_layer.get(buffer.layer)
-        head_bytes = buffer.geometry.bytes_per_head
-        if not total or head_bytes is None:
-            return None
-        ranges.append(
-            (buffer.layer, buffer.role, tp_rank * total // tp_size, buffer.size // head_bytes)
-        )
-    return tuple(sorted(ranges)) if ranges else None
+        for tensor in buffer.tensors:
+            for axis in tensor.axes:
+                if axis.split:
+                    key = (buffer.layer, buffer.role, tensor.name, axis.name)
+                    out.append((key, held(axis, layout.topology)))
+    return tuple(sorted(out, key=lambda item: item[0])) if out else None
 
 
 def replica_ranks(
@@ -597,11 +913,10 @@ def replica_ranks(
     Ranks hold the same bytes of a layer group when they serve the same requests (the same
     attention data-parallel rank); hold the same pages (under Helix an attention group's pages split
     by context-parallel rank, while a state group's rows do not); hold the same layers, in a layer
-    group of the same kind; and hold the same share of the group's content: a replicated buffer is
-    the same on every such rank. Other buffers match when their published content shards are equal,
-    or when every transferred buffer's head range is equal. Per-buffer head ranges also recognize
-    replicas when a group contains layers with different replication factors. Without head
-    geometry, the published content shard is the only basis for matching.
+    group of the same kind; and hold the same share of the group's content: a buffer every rank
+    holds alike is the same on every such rank, and split buffers match when the ranks hold the
+    same indices of every split axis. Without split buffers, the published content shard is the
+    only basis for matching.
 
     Args:
         ranks: Every rank's layout of one instance, by flat rank.
@@ -619,7 +934,7 @@ def replica_ranks(
     desc = layout.layer_groups[group]
     topology = layout.topology
     paged_by_context = desc.kind == "attention"
-    head_ranges = None if replicated else _attention_head_ranges(layout, desc)
+    held_indices = None if replicated else _held_indices(layout, desc)
     out = []
     for other_rank in range(len(ranks)):
         other = ranks[other_rank]
@@ -631,11 +946,12 @@ def replica_ranks(
         match = _same_group(other, desc)
         if match is None:
             continue
-        if (
-            not replicated
-            and match.shard != desc.shard
-            and (head_ranges is None or _attention_head_ranges(other, match) != head_ranges)
-        ):
-            continue
+        if not replicated:
+            other_held = _held_indices(other, match)
+            if held_indices is None and other_held is None:
+                if match.shard != desc.shard:
+                    continue
+            elif other_held != held_indices:
+                continue
         out.append(other_rank)
     return tuple(out)

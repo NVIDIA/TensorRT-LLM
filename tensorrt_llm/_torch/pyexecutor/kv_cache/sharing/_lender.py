@@ -163,13 +163,12 @@ def _checked_layout(manager: KVCacheManagerV2) -> ManagerLayout:
     if _manager.attached_lender(manager) is not None:
         raise ValueError("a lender is already attached to this KV cache manager")
     layout = derive_layout(manager)
-    configs = _manager.layer_configs(manager)
     unbounded = [
         lg
-        for lg, layers in enumerate(_manager.layer_group_layer_ids(manager))
+        for lg in range(layout.num_layer_groups)
         if not layout.recurrent[lg]
         and layout.windows[lg] is None
-        and any(_manager.is_non_required_layer(configs[layer]) for layer in layers)
+        and not (layout.prefix_required[lg] if layout.prefix_required else True)
     ]
     if unbounded:
         raise ValueError(f"non-REQUIRED layer groups {unbounded} must have a retained window")

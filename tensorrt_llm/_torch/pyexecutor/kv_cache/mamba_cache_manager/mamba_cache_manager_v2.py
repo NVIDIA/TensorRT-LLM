@@ -48,6 +48,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     Role,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, grid_place, sectioned
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import rank_topology
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -403,6 +405,35 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 bytes_per_head=int(head_dim) * int(d_state) * self.ssm_state_dtype.itemsize
             ),
         }
+
+    @override
+    def _page_buffer_tensors(
+        self, layer_id: int, role: str, size: int, tokens: int, state: bool
+    ) -> tuple[Tensor, ...]:
+        """Convolution state is a concatenation of sections (Mamba2 ``[x | B | C]``, GDN
+        ``[Q | K | V]``), each split by byte over the ranks recurrent state splits over; SSM state
+        is split by head."""
+        if role == MambaRole.CONV_STATE:
+            d_conv_m1 = int(self.conv_state_shape[1])
+            ranks, _ = grid_place(rank_topology(self.mapping), ("tp", "cp"))
+            return sectioned(
+                [
+                    int(dim) * d_conv_m1 * self.conv_state_dtype.itemsize
+                    for dim in self.conv_section_dims
+                ],
+                ranks,
+                ("tp", "cp"),
+            )
+        if role == MambaRole.SSM_STATE:
+            _, head_dim, d_state = self.ssm_state_shape
+            return self._page_head_split(
+                layer_id,
+                size,
+                tokens,
+                state,
+                head_bytes=int(head_dim) * int(d_state) * self.ssm_state_dtype.itemsize,
+            )
+        return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
 
     def _extra_scratch_bytes_per_slot(self) -> int:
         return 0

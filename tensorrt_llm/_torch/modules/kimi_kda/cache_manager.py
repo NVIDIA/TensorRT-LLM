@@ -978,6 +978,17 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         return roles
 
     @override
+    def _page_untransferred_roles(self) -> frozenset[str]:
+        """The KDA replay buffers, which a generation server seeds from the transferred conv
+        state instead of receiving."""
+        roles = super()._page_untransferred_roles()
+        if self._kda_replay is not None:
+            roles |= {
+                str(role) for role in self._kda_replay.disagg_ignored_roles(self._state_layout)
+            }
+        return roles
+
+    @override
     def _setup_model_state(self) -> None:
         if self._kda_replay is not None:
             bind_kda_replay_pool(self._kda_replay, self)

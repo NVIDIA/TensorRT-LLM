@@ -25,12 +25,7 @@ if TYPE_CHECKING:
     import torch
 
     from tensorrt_llm.mapping import Mapping
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import (
-        AttentionLayerConfig,
-        PoolGroupDesc,
-        SsmLayerConfig,
-        _KVCache,
-    )
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import _KVCache
 
     from ...llm_request import LlmRequest
     from .._lender_hooks import _ManagerHooks
@@ -98,21 +93,6 @@ def model_has_attention_window(manager: KVCacheManagerV2) -> bool:
 def model_has_sparse_buffers(manager: KVCacheManagerV2) -> bool:
     """Whether any pipeline stage holds sparse buffers."""
     return manager._model_has_sparse_buffers
-
-
-def kv_dtype(manager: KVCacheManagerV2) -> str | None:
-    """The element type of the manager's KV data by name, such as ``"BF16"`` or ``"NVFP4"``;
-    ``None`` for a manager declaring none."""
-    dtype = getattr(manager, "dtype", None)
-    return None if dtype is None else str(getattr(dtype, "name", dtype))
-
-
-def kv_quant_mode(manager: KVCacheManagerV2) -> str | None:
-    """How the manager quantizes its KV data: ``None`` unquantized, else ``"fp8"``, ``"nvfp4"``, or
-    ``"fp8_ds_mla"``, DeepSeek-V4's FP8 pages carrying their scales."""
-    if getattr(manager, "use_fp8_ds_mla", False):
-        return "fp8_ds_mla"
-    return {"FP8": "fp8", "NVFP4": "nvfp4"}.get(kv_dtype(manager))
 
 
 def commits_blocks(manager: KVCacheManagerV2) -> bool:
@@ -193,88 +173,6 @@ def install_lender(manager: KVCacheManagerV2, lender: _ManagerHooks) -> None:
     manager._sharing = lender
 
 
-def layer_configs(manager: KVCacheManagerV2) -> dict[int, object]:
-    """Internal layer id -> layer config, preferring the manager's config to the runtime's.
-    A layer without an explicit id uses its position in the config."""
-    config = getattr(manager, "kv_cache_manager_py_config", None)
-    if config is None:
-        config = manager.impl.init_config
-    out: dict[int, object] = {}
-    for position, layer in enumerate(config.layers):
-        out[int(getattr(layer, "layer_id", position))] = layer
-    return out
-
-
-def layer_group_layer_ids(manager: KVCacheManagerV2) -> list[list[int]]:
-    """Internal layer ids per runtime layer group, in layer-group order."""
-    return [[int(layer_id) for layer_id in group] for group in manager.impl.layer_grouping]
-
-
-def pool_group_descriptors(manager: KVCacheManagerV2) -> Sequence[PoolGroupDesc]:
-    """Runtime pool-group descriptors, in the runtime's order."""
-    return manager.impl.pool_group_descs
-
-
-def declared_global_layer_ids(manager: KVCacheManagerV2) -> dict[int, int] | None:
-    """Internal-to-global layer ids, or ``None`` without the manager's declaration."""
-    getter = getattr(manager, "get_disagg_global_layer_ids", None)
-    if getter is None:
-        return None
-    table: dict[int, int] = {}
-    for layer_group, layer_ids in enumerate(manager.impl.layer_grouping):
-        ids = [int(value) for value in getter(layer_group)]
-        if len(ids) != len(layer_ids):
-            raise ValueError(
-                f"layer group {layer_group}: {len(ids)} declared global ids for {len(layer_ids)} layers"
-            )
-        table.update(zip((int(layer_id) for layer_id in layer_ids), ids))
-    return table
-
-
-def declared_model_layer_ids(manager: KVCacheManagerV2) -> dict[int, int] | None:
-    """Internal layer id -> the model layer it belongs to, or ``None`` without the manager's
-    declaration."""
-    getter = getattr(manager, "get_model_layer_ids", None)
-    if getter is None:
-        return None
-    table: dict[int, int] = {}
-    for layer_group, layer_ids in enumerate(manager.impl.layer_grouping):
-        ids = [int(value) for value in getter(layer_group)]
-        if len(ids) != len(layer_ids):
-            raise ValueError(
-                f"layer group {layer_group}: {len(ids)} declared model layers for {len(layer_ids)} "
-                "layers"
-            )
-        table.update(zip((int(layer_id) for layer_id in layer_ids), ids))
-    return table
-
-
-def role_declaration(manager: KVCacheManagerV2, name: str) -> dict[str, object]:
-    """Role-keyed layout declarations from the named manager getter."""
-    getter = getattr(manager, name, None)
-    if getter is None:
-        return {}
-    return {str(role): value for role, value in dict(getter()).items()}
-
-
-def role_mapper_kinds(manager: KVCacheManagerV2) -> dict[str, object]:
-    """The manager's per-role mapper declarations."""
-    return role_declaration(manager, "get_disagg_role_mapper_kinds")
-
-
-def role_layouts(manager: KVCacheManagerV2) -> dict[str, object]:
-    """The manager's per-role layout declarations."""
-    return role_declaration(manager, "get_disagg_role_layouts")
-
-
-def ignored_roles(manager: KVCacheManagerV2) -> frozenset[str]:
-    """Roles omitted without a receive-time rebuild, which lending does not invoke."""
-    if callable(getattr(manager, "rebuild_disagg_imported_cache", None)):
-        return frozenset()
-    getter = getattr(manager, "get_disagg_ignored_roles", None)
-    return frozenset(str(role) for role in (getter() if getter else ()))
-
-
 def layer_group_pool_indices(manager: KVCacheManagerV2) -> list[int]:
     """The pool-group index of each runtime layer group, in layer-group order."""
     return [int(value) for value in manager.impl.get_life_cycle_pool_group_indices()]
@@ -293,52 +191,6 @@ def index_row(manager: KVCacheManagerV2, request_id: int) -> int | None:
     if request_id in manager._early_freed_index_requests:
         return None
     return int(manager.index_mapper.get_index(request_id)) * int(manager.max_beam_width)
-
-
-def virtual_layers(manager: KVCacheManagerV2) -> tuple[dict[int, tuple[int, int]], int] | None:
-    """(internal id -> (model layer, attention type), type count), or None without virtual layers;
-    a shared internal id takes its first declared type, as native's page table does."""
-    # TODO: Layer ids come from the manager's private _layer_attn_to_layer_id; KVCacheManagerV2
-    # does not publish each internal layer's model layer and kind.
-    virtual = getattr(manager, "_layer_attn_to_layer_id", None)
-    if not virtual:
-        return None
-    inverse: dict[int, tuple[int, int]] = {}
-    for (model_layer, attn_type), layer_id in virtual.items():
-        inverse.setdefault(int(layer_id), (int(model_layer), int(attn_type.value)))
-    # Every member of the enum counts, so stages holding different attention types agree.
-    attn_type_class = type(next(iter(virtual))[1])
-    return inverse, max(int(member.value) for member in attn_type_class) + 1
-
-
-def global_layer_ids(manager: KVCacheManagerV2, internal_ids: Sequence[int]) -> list[int]:
-    """Each internal layer's global id, the same under any pipeline split: the declared id, else for
-    virtual layers ``model_layer * num_types + attention_type``, else the model layer."""
-    # One declared id per internal layer of each layer group, in order (FP4 MLA's tail layers).
-    declared = declared_global_layer_ids(manager)
-    if declared is not None:
-        return [declared[int(lid)] for lid in internal_ids]
-    virtual = virtual_layers(manager)
-    if virtual is None:
-        return [int(manager.pp_layers[int(lid)]) for lid in internal_ids]
-    inverse, num_types = virtual
-    return [inverse[int(lid)][0] * num_types + inverse[int(lid)][1] for lid in internal_ids]
-
-
-def model_layer_ids(manager: KVCacheManagerV2, internal_ids: Sequence[int]) -> list[int]:
-    """The model layer each internal layer belongs to: the declared one, else for virtual layers
-    the model layer they number, else the model layer itself. ``ValueError`` for a manager that
-    declares global layer ids without declaring their model layers."""
-    declared = declared_model_layer_ids(manager)
-    if declared is not None:
-        return [declared[int(lid)] for lid in internal_ids]
-    if declared_global_layer_ids(manager) is not None:
-        raise ValueError("the manager declares global layer ids without their model layers")
-    virtual = virtual_layers(manager)
-    if virtual is None:
-        return [int(manager.pp_layers[int(lid)]) for lid in internal_ids]
-    inverse, _ = virtual
-    return [inverse[int(lid)][0] for lid in internal_ids]
 
 
 def runtime(manager: KVCacheManagerV2) -> object:
@@ -543,37 +395,6 @@ def is_closed(kv: _KVCache) -> bool:
 def num_blocks(kv: _KVCache) -> int:
     """Block ordinals of ``kv``: a shrink drops those past its capacity, with their pages."""
     return int(kv.num_blocks)
-
-
-def is_recurrent_layer(layer_config: AttentionLayerConfig | SsmLayerConfig) -> bool:
-    """Whether a layer config of the runtime describes a recurrent-state layer."""
-    from tensorrt_llm.runtime import kv_cache_manager_v2 as runtime
-
-    return isinstance(layer_config, runtime.SsmLayerConfig)
-
-
-def is_private_layer(layer_config: AttentionLayerConfig | SsmLayerConfig) -> bool:
-    """Whether the native lifecycle excludes this layer from prefix reuse."""
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
-
-    return getattr(layer_config, "reuse_policy", None) == AttentionReusePolicy.PRIVATE
-
-
-def is_non_required_layer(layer_config: AttentionLayerConfig | SsmLayerConfig) -> bool:
-    """Whether prefix coverage is optional or private for this layer."""
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
-
-    return (
-        getattr(layer_config, "reuse_policy", AttentionReusePolicy.REQUIRED)
-        != AttentionReusePolicy.REQUIRED
-    )
-
-
-def read_window(manager: KVCacheManagerV2, layer_group: int, kept: int | None) -> int | None:
-    """Tokens of the window ``layer_group``'s attention reads, as the manager declares it; the
-    window it keeps, ``kept``, for a manager declaring none."""
-    declared = getattr(manager, "_attention_read_window", None)
-    return kept if declared is None else declared(layer_group)
 
 
 def stale_range(manager: KVCacheManagerV2, layer_group: int, history: int) -> tuple[int, int]:
