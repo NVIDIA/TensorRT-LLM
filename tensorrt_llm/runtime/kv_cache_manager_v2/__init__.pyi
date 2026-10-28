@@ -943,7 +943,7 @@ class PageIndexConverter:
         self,
         base_indices: Sequence[int],
         index_mode: PageIndexMode | None = None,
-        scratch_range: HalfOpenRange | None = None,
+        scratch_range: HalfOpenRange | ScratchDesc | None = None,
         scratch_slots: Sequence[int] = (),
     ) -> list[int]: ...
 

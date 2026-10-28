@@ -3723,13 +3723,28 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("scratch_pages_per_block", &kv::PageIndexConverter::scratchPagesPerBlock)
         .def(
             "__call__",
+            // `scratch_range` also takes the ScratchDesc that get_scratch_desc() returns, which
+            // carries its slots with it; see ScratchDescCompat.
             [](kv::PageIndexConverter const& self, std::vector<int> const& baseIndices,
-                std::optional<kv::PageIndexMode> indexMode,
-                std::optional<kv::HalfOpenRange<kv::BlockOrdinal>> scratchRange,
+                std::optional<kv::PageIndexMode> indexMode, nb::object scratch,
                 std::vector<int> const& scratchSlots) -> std::vector<int>
             {
-                return self(baseIndices, indexMode, scratchRange.value_or(kv::HalfOpenRange<kv::BlockOrdinal>{}),
-                    kv::Span<int const>{scratchSlots.data(), static_cast<int>(scratchSlots.size())});
+                kv::HalfOpenRange<kv::BlockOrdinal> range{};
+                std::vector<int> const* slots = &scratchSlots;
+                if (nb::isinstance<ScratchDescCompat>(scratch))
+                {
+                    TLLM_CHECK_WITH_INFO(
+                        scratchSlots.empty(), "scratch_slots must be empty when scratch_range is a ScratchDesc");
+                    auto const& desc = nb::cast<ScratchDescCompat const&>(scratch);
+                    range = desc.range;
+                    slots = &desc.slotIds;
+                }
+                else if (!scratch.is_none())
+                {
+                    range = nb::cast<kv::HalfOpenRange<kv::BlockOrdinal>>(scratch);
+                }
+                return self(
+                    baseIndices, indexMode, range, kv::Span<int const>{slots->data(), static_cast<int>(slots->size())});
             },
             nb::arg("base_indices"), nb::arg("index_mode") = nb::none(), nb::arg("scratch_range") = nb::none(),
             nb::arg("scratch_slots") = std::vector<int>{});
