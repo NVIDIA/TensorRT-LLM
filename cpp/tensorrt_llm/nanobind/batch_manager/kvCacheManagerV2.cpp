@@ -1949,8 +1949,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::KvCache>(m, "_KVCache")
         .def(
             "resume",
-            [](kv::KvCache& self, nb::object stream, std::optional<std::vector<int>> groups)
+            // `is_decoding` is accepted and ignored: resuming no longer distinguishes a
+            // decoding request, since what that selected -- sparse history offload -- is the
+            // sparse fetch path's now. Drop the parameter once the full sparse attention
+            // support is merged and its callers stop passing it; it is here only so this
+            // change stands alone.
+            [](kv::KvCache& self, nb::object stream, std::optional<bool> isDecoding,
+                std::optional<std::vector<int>> groups)
             {
+                (void) isDecoding;
                 std::optional<CUstream> optStream;
                 if (!stream.is_none())
                     optStream = reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
@@ -1966,7 +1973,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 nb::gil_scoped_release rel;
                 return self.resume(optStream, std::move(selected));
             },
-            nb::arg("cuda_stream") = nb::none(), nb::arg("optional_reuse_groups") = nb::none())
+            nb::arg("cuda_stream") = nb::none(), nb::arg("is_decoding") = nb::none(),
+            nb::arg("optional_reuse_groups") = nb::none())
         .def(
             "get_page_priorities",
             [](kv::KvCache const& self, int layerGroupId, int beamIndex)
