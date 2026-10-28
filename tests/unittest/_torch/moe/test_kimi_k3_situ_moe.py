@@ -2236,7 +2236,8 @@ def test_cutedsl_fc12_survives_autotune_warmup():
     gate = _make_test_gate(num_experts=num_experts)
 
     torch.manual_seed(91)
-    x = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
+    # More tokens than the small-batch kernel serves, so the call reaches the FC12 kernel.
+    x = torch.randn(64, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
     act_scale = float(x.abs().max().float() / (448 * 6))
     w1 = [
         torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
@@ -2280,6 +2281,50 @@ def test_cutedsl_fc12_survives_autotune_warmup():
     profiled = autotuner.stats.tuned_op_profiled_configs.get(custom_op, 0)
     assert profiled > 0, f"{custom_op} was never profiled; the warmup branch did not run"
     assert not autotuner.stats.failed_profiling_count.get(custom_op, set())
+
+
+@nvfp4_moe_supported
+@pytest.mark.parametrize("num_tokens", [1, 8, 32])
+def test_cutedsl_fc12_small_batch_matches_fc12_kernel(num_tokens):
+    """Up to 32 tokens a SiTU FC12 layer runs the small-batch kernel: the same NVFP4 MoE on the
+    same weights as the FC12 kernel, which still serves the layer when the small-batch path is
+    turned off. The two sum the expert partials in different orders."""
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+    if get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("CUTEDSL_FC12 needs SM107 and CuTe DSL Rubin support")
+
+    num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
+    gate = _make_test_gate(num_experts=num_experts)
+    torch.manual_seed(93)
+    x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
+    act_scale = float(x.abs().max().float() / (448 * 6))
+    w1, w2, w3 = (
+        [
+            torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda") * 0.05
+            for _ in range(num_experts)
+        ]
+        for rows, cols in ((inter, hidden), (hidden, inter), (inter, hidden))
+    )
+    bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], act_scale) for e in range(num_experts)]
+    moe = _make_nvfp4_moe(gate, num_experts=num_experts, moe_backend="CUTEDSL_FC12")
+    _stream_nvfp4_bank(moe, bank)
+    moe.backend._weights_transformed = False
+    moe.post_load_weights()
+    backend = moe.backend
+    assert backend.small_batch_max_tokens == 32
+
+    router_logits = gate.compute_logits(x)
+    small_batch = moe.forward(x, router_logits, all_rank_num_tokens=None).float()
+    torch.cuda.synchronize()
+    assert backend._small_batch_counters is not None, "the small-batch kernel did not run"
+    assert int(backend._small_batch_counters.abs().sum().item()) == 0
+
+    backend.small_batch_max_tokens = 0
+    fc12 = moe.forward(x, router_logits, all_rank_num_tokens=None).float()
+    assert torch.isfinite(small_batch).all() and small_batch.abs().max() > 0
+    rel = (small_batch - fc12).norm() / fc12.norm().clamp_min(1e-30)
+    assert rel < 3e-2, f"relative difference to the FC12 kernel {rel:.3e}"
 
 
 def test_fp8_block_scaled_dequantization():

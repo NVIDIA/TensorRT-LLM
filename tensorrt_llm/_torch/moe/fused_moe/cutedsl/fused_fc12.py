@@ -24,6 +24,12 @@ Uses the grouped-GEMM NVFP4 weight layout (``NVFP4CuteDslFusedMoEMethod``),
 ``NvFp4WeightView``, ``quantize_input_nvfp4`` and ``CuteDslFusedMoENvfp4Runner``
 (narrowed to the fused kernel's tiles) without inheriting from that leaf. No
 locality-domain (uGPU) support.
+
+Calls of at most ``small_batch_max_tokens`` tokens (SiTU layers without
+all-to-all) run the small-batch kernel
+(``trtllm::cute_dsl_nvfp4_small_batch_moe_rubin``) instead: FC1, SiTU, NVFP4
+requantization, FC2 and the combine in one persistent grid on the same weights
+and ``moe_sort`` tables, with a token-indexed FC1 output on MoE-TP slices.
 """
 
 import torch
@@ -33,6 +39,11 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from ....autotuner import AutoTuner
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType, EventType
+from ...custom_ops.cute_dsl_small_batch_moe_custom_op import (
+    SMALL_BATCH_MOE_MAX_TOKENS,
+    new_small_batch_moe_counters,
+    small_batch_moe_supports,
+)
 from ..activation import (
     DEFAULT_MOE_ACTIVATION,
     ActivationParamShape,
@@ -224,6 +235,16 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         self.scaling_vector_size = 16
         # SMs the fused kernel leaves free (``reserve_sms_for_concurrent_kernels``).
         self._concurrent_sm_reserve = 0
+        # Largest call the small-batch kernel serves (0: none); it implements the SiTU epilogue.
+        self.small_batch_max_tokens = (
+            SMALL_BATCH_MOE_MAX_TOKENS
+            if self.activation_type == ActivationType.SiTu
+            and small_batch_moe_supports(self.intermediate_size_per_partition, self.hidden_size)
+            else 0
+        )
+        # Created by the first small-batch call (warmup runs before any graph capture); every
+        # launch leaves it zero.
+        self._small_batch_counters: torch.Tensor | None = None
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -354,6 +375,17 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             self._join_pending_x_ready()
             return moe_output
 
+        if token_selected_experts.size(0) <= self.small_batch_max_tokens and not enable_alltoall:
+            return self._run_small_batch(
+                x,
+                token_selected_experts,
+                token_final_scales,
+                x_sf,
+                moe_output,
+                weight_view,
+                sort_tables,
+            )
+
         effective_top_k = token_selected_experts.size(-1)
         tuner = AutoTuner.get()
         runner = CuteDslFc12FusedMoENvfp4Runner(
@@ -385,6 +417,79 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
                 sort_tables=sort_tables,
             )
         return runner(inputs, tactic=best_tactic)
+
+    def _sort_routing(
+        self,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor | None,
+        weight_view: NvFp4WeightView,
+        tile_size: int,
+    ) -> tuple[torch.Tensor, ...]:
+        """``moe_sort``'s tables of this rank's experts for tiles of ``tile_size`` rows."""
+        return torch.ops.trtllm.moe_sort(
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_slots,
+            top_k=token_selected_experts.size(1),
+            local_expert_offset=weight_view.slot_start,
+            local_num_experts=weight_view.expert_size_per_partition,
+            tile_tokens_dim=tile_size,
+        )
+
+    def _run_small_batch(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        x_sf: torch.Tensor,
+        moe_output: torch.Tensor,
+        weight_view: NvFp4WeightView,
+        sort_tables: MoESortTables | None = None,
+    ) -> torch.Tensor:
+        """The small-batch kernel; it writes every element of ``moe_output``."""
+        if sort_tables is not None and sort_tables.tile_size == 128:
+            sort_outputs = sort_tables.outputs
+        else:
+            sort_outputs = self._sort_routing(
+                token_selected_experts, token_final_scales, weight_view, 128
+            )
+        (
+            tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            _total_num_padded_tokens,
+            num_non_exiting_tiles,
+        ) = sort_outputs
+        self._join_pending_x_ready()
+        if self._small_batch_counters is None:
+            self._small_batch_counters = new_small_batch_moe_counters(x.device)
+        situ_beta, situ_linear_beta = self._situ_betas()
+        torch.ops.trtllm.cute_dsl_nvfp4_small_batch_moe_rubin(
+            input=x.view(torch.float4_e2m1fn_x2),
+            input_scale=x_sf.view(torch.uint8),
+            fc1_weight=weight_view.w3_w1_weight.view(torch.float4_e2m1fn_x2),
+            fc1_weight_scale=weight_view.fc1_weight_scale.view(torch.uint8),
+            fc1_alpha=weight_view.fc1_global_scale,
+            fc2_weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
+            fc2_weight_scale=weight_view.fc2_weight_scale.view(torch.uint8),
+            fc2_alpha=weight_view.fc2_global_scale,
+            output=moe_output,
+            tile_idx_to_group_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            global_sf=self.fc2_input_scale,
+            token_final_scales=token_final_scales,
+            counters=self._small_batch_counters,
+            top_k=token_selected_experts.size(1),
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            # MoE-TP ranks hold a slice of every expert's intermediate
+            token_indexed=self.tp_size > 1,
+        )
+        return moe_output
 
     def _situ_betas(self) -> tuple[float, float]:
         """``(situ_beta, situ_linear_beta)`` for the fused op; -1 disables them.
@@ -438,14 +543,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             assert sort_tables.tile_size == tile_size
             sort_outputs = sort_tables.outputs
         else:
-            sort_outputs = torch.ops.trtllm.moe_sort(
-                token_selected_experts=token_selected_experts,
-                token_final_scales=token_final_scales,
-                num_experts=self.num_slots,
-                top_k=effective_top_k,
-                local_expert_offset=slot_start,
-                local_num_experts=esp,
-                tile_tokens_dim=tile_size,
+            sort_outputs = self._sort_routing(
+                token_selected_experts, token_final_scales, weight_view, tile_size
             )
         (
             tile_idx_to_expert_idx,
