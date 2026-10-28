@@ -88,6 +88,7 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor.enable_attention_dp = True
     executor.enable_early_first_token_response = False
     executor.kv_connector_manager = None
+    executor.kv_cache_transceiver = None
     executor._is_kv_manager_v2 = False
     executor._kv_load_tracker = KvLoadTracker(None, rank=0, enabled=False)
     executor._kv_cache_capacity = {}
