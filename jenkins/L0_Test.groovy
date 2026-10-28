@@ -4511,6 +4511,12 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
 
 def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=null, String clusterName=null) {
     if (stageName.startsWith('CPU-Generic-WaiveRefresh-')) {
+        sh """
+            wget -nv --tries=3 -O '${llmSrc}/waive_validation_scripts.tar.gz' \
+                'https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive-validation/waive_validation_scripts.tar.gz'
+            tar -xzf '${llmSrc}/waive_validation_scripts.tar.gz' -C '${llmSrc}'
+            sha256sum '${llmSrc}/jenkins/scripts/refresh_test_waives.py' '${llmSrc}/tests/integration/defs/test_unittests.py'
+        """
         def testList = "${llmSrc}/waive_refresh_validation_${stageName}.txt"
         def isolated = stageName.contains('-Isolated-') ? ' ISOLATION' : ''
         sh """printf '%s\\n' \

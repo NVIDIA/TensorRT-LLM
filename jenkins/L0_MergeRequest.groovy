@@ -656,6 +656,8 @@ def mergeWaiveList(pipeline, globalVars)
                     '# snapshot-time: 2026-10-25T08:33:07.774Z\n' +
                     '# target-branch-commit: simulated-old-baseline\n' +
                     '# validation-fixture: TRTLLMINF-400 bot-run validation\n'
+                sh "tar -czf waive_validation_scripts.tar.gz -C ${LLM_ROOT} jenkins/scripts/refresh_test_waives.py tests/integration/defs/test_unittests.py"
+                trtllm_utils.uploadArtifacts("waive_validation_scripts.tar.gz", "${UPLOAD_PATH}/waive-validation/")
                 echo '[WAIVE-VALIDATION] Using an empty initial waive list and simulated old snapshot; final refresh still queries real OpenDB.'
             }
         }
