@@ -18,6 +18,7 @@ import math
 import threading
 import time
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import replace
 
 import numpy as np
@@ -45,6 +46,7 @@ from together_driver import TogetherDriver
 from tensorrt_llm._torch.disaggregation.base.backend import (
     Capabilities,
     InvalidSubmission,
+    LayerGroupRows,
     MemoryKind,
     SubmissionRejected,
 )
@@ -1055,8 +1057,8 @@ def _view_with(endpoint: Endpoint, **changes) -> CpuView:
     fields = {
         "layer_group_index": 0,
         "object_keys": rows.object_keys,
-        "addresses": rows.addresses,
-        "region_index": 0,
+        "slots": rows.slots,
+        "region_indices": (0,),
     }
     fields.update(changes)
     return CpuView([Rows(**fields)])
@@ -1064,18 +1066,27 @@ def _view_with(endpoint: Endpoint, **changes) -> CpuView:
 
 INVALID_SUBMISSIONS: dict[str, Callable[[Endpoint], tuple[CpuView, object]]] = {
     "hint": lambda e: (e.view("A"), "peer-0"),
-    "no_keys": lambda e: (_view_with(e, object_keys=None, addresses=None, region_index=None), None),
+    "no_keys": lambda e: (_view_with(e, object_keys=None, slots=None, region_indices=None), None),
+    "no_slots": lambda e: (_view_with(e, slots=None), None),
+    "no_regions": lambda e: (_view_with(e, region_indices=None), None),
     "key_dtype": lambda e: (_view_with(e, object_keys=np.zeros((1, 4), dtype=np.int32)), None),
     "key_width": lambda e: (_view_with(e, object_keys=np.zeros((1, 0), dtype=np.uint8)), None),
-    "address_dtype": lambda e: (_view_with(e, addresses=e.region.slots(0).astype(np.uint64)), None),
+    "slot_dtype": lambda e: (_view_with(e, slots=e.region.slots(0).astype(np.uint64)), None),
+    "slot_shape": lambda e: (_view_with(e, slots=e.region.slots(0)[:, None]), None),
     "len_disagrees_with_arrays": lambda e: (_view_with(e, rows=2), None),
-    "past_the_region": lambda e: (_view_with(e, addresses=e.region.slots(2)), None),
-    "before_the_region": lambda e: (_view_with(e, addresses=e.region.slots(-1)), None),
-    "misaligned": lambda e: (_view_with(e, addresses=e.region.slots(0) + 1), None),
-    "unknown_region_index": lambda e: (_view_with(e, region_index=1), None),
-    "negative_region_index": lambda e: (_view_with(e, region_index=-1), None),
+    "past_the_region": lambda e: (_view_with(e, slots=e.region.slots(2)), None),
+    "before_the_region": lambda e: (_view_with(e, slots=e.region.slots(-1)), None),
+    "unknown_region_index": lambda e: (_view_with(e, region_indices=(1,)), None),
+    "negative_region_index": lambda e: (_view_with(e, region_indices=(-1,)), None),
+    "empty_regions": lambda e: (_view_with(e, region_indices=()), None),
+    "repeated_region": lambda e: (_view_with(e, region_indices=(0, 0)), None),
+    "region_list": lambda e: (_view_with(e, region_indices=[0]), None),
+    "region_bool": lambda e: (_view_with(e, region_indices=(True,)), None),
+    "region_string": lambda e: (_view_with(e, region_indices=("0",)), None),
     "same_slot_in_a_group": lambda e: (
-        CpuView([Rows(0, np.stack([object_key("A"), object_key("B")]), e.region.slots(0, 0), 0)]),
+        CpuView(
+            [Rows(0, np.stack([object_key("A"), object_key("B")]), e.region.slots(0, 0), (0,))]
+        ),
         None,
     ),
     "same_slot_across_groups": lambda e: (CpuView([e.rows(["A"], 0), e.rows(["A"], 1)]), None),
@@ -1086,11 +1097,78 @@ def test_object_keys_in_any_memory_order_are_taken(store: MemoryStore) -> None:
     commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
     reader = Endpoint(MemoryDriver(store), ["A", "B"])
     rows = reader.rows(["A", "B"])
-    view = CpuView([Rows(0, np.asfortranarray(rows.object_keys), rows.addresses, 0)])
+    view = CpuView([Rows(0, np.asfortranarray(rows.object_keys), rows.slots, (0,))])
     attempt = reader.backend.fetch(view, None)
     assert masks(reader.wait_outcome(attempt)) == [[True, True]]
     reader.wait_quiesced(attempt)
     reader.close()
+
+
+@pytest.mark.parametrize("indices", [(0, 1), (1, 0)])
+@pytest.mark.parametrize("row_limit", [None, 1])
+def test_rows_transfer_the_same_slot_from_every_listed_region(
+    store: MemoryStore, indices: tuple[int, ...], row_limit: int | None
+) -> None:
+    other = CpuRegion(3, 3)
+    capabilities = replace(DEFAULT_CAPABILITIES, max_rows_per_op=row_limit)
+    with closing(
+        Endpoint(MemoryDriver(store, capabilities=capabilities), ["A", "B", "C"], others=[other])
+    ) as endpoint:
+        first = {name: name.encode() * SLOT_BYTES for name in endpoint.names}
+        second = {name: name.lower().encode() * 3 for name in endpoint.names}
+        for slot, name in enumerate(endpoint.names):
+            endpoint.write(name, first[name])
+            other.write(slot, second[name])
+        rows = Rows(
+            7,
+            np.stack([object_key("C"), object_key("A")]),
+            np.array([2, 0], dtype=np.int64),
+            indices,
+        )
+        assert isinstance(rows, LayerGroupRows)
+        view = CpuView([rows])
+        published = endpoint.backend.publish(view, None)
+        assert masks(endpoint.wait_outcome(published)) == [[True, True]]
+        endpoint.wait_quiesced(published)
+        for name in ("C", "A"):
+            parts = (first[name], second[name])
+            assert store.committed_payload(store_key(name)) == b"".join(
+                parts[index] for index in indices
+            )
+        for call in endpoint.driver.calls_to("put"):
+            for row in call.rows:
+                assert tuple(span.nbytes for span in row.spans) == tuple(
+                    (SLOT_BYTES, 3)[index] for index in indices
+                )
+
+        for slot, name in enumerate(endpoint.names):
+            endpoint.write(name, b"\0" * SLOT_BYTES)
+            other.write(slot, b"\0" * 3)
+        fetched = endpoint.backend.fetch(view, None)
+        assert masks(endpoint.wait_outcome(fetched)) == [[True, True]]
+        endpoint.wait_quiesced(fetched)
+        for slot, name in ((2, "C"), (0, "A")):
+            assert endpoint.read(name) == first[name]
+            assert other.read(slot) == second[name]
+        assert endpoint.read("B") == b"\0" * SLOT_BYTES and other.read(1) == b"\0" * 3
+
+
+@pytest.mark.parametrize("failure", ["driver", "slot_bound", "shared_destination"])
+def test_multi_region_rows_are_rejected_before_any_driver_access(
+    store: MemoryStore, failure: str
+) -> None:
+    other = CpuRegion(3, 1 if failure == "slot_bound" else 2)
+    capabilities = replace(DEFAULT_CAPABILITIES, multi_span=failure != "driver")
+    endpoint = Endpoint(MemoryDriver(store, capabilities=capabilities), ["A", "B"], others=[other])
+    rows = Rows(0, object_key("A")[None, :], np.array([1], dtype=np.int64), (0, 1))
+    groups = [rows]
+    if failure == "shared_destination":
+        groups.append(Rows(1, object_key("B")[None, :], rows.slots, (1,)))
+    with pytest.raises(InvalidSubmission):
+        endpoint.backend.fetch(CpuView(groups), None)
+    assert store_calls(endpoint) == []
+    assert endpoint.backend.stats()["attempts_active"] == 0
+    endpoint.close()
 
 
 @pytest.mark.parametrize("case", INVALID_SUBMISSIONS)
@@ -1128,7 +1206,7 @@ def test_a_publish_may_read_one_slot_twice(store: MemoryStore) -> None:
     writer = Endpoint(MemoryDriver(store), ["A", "B"])
     writer.write("A", b"aaaaaaaa")
     keys = np.stack([object_key("A"), object_key("B")])
-    view = CpuView([Rows(0, keys, writer.region.slots(0, 0), 0)])
+    view = CpuView([Rows(0, keys, writer.region.slots(0, 0), (0,))])
     attempt = writer.backend.publish(view, None)
     assert masks(writer.wait_outcome(attempt)) == [[True, True]]
     assert store.committed_payload(store_key("B")) == b"aaaaaaaa"
@@ -1577,7 +1655,7 @@ def test_rows_in_a_region_the_backend_did_not_register_are_rejected(store: Memor
     device = CpuRegion(SLOT_BYTES, 1, memory_kind=MemoryKind.DEVICE)
     reader = Endpoint(MemoryDriver(store, capabilities=HOST_ONLY), ["A"], others=[device])
     assert reader.binding.live_labels() == frozenset({"region:0"})
-    view = CpuView([Rows(0, object_key("A")[None, :], device.slots(0), 1)])
+    view = CpuView([Rows(0, object_key("A")[None, :], device.slots(0), (1,))])
     with pytest.raises(InvalidSubmission, match="region 1 is not registered"):
         reader.backend.fetch(view, None)
     with pytest.raises(ValueError, match="region 1 is not registered"):
@@ -1618,7 +1696,7 @@ def test_rows_naming_one_key_at_two_addresses_never_share_a_call(
                 0,
                 np.stack([object_key(key) for key in keys]),
                 endpoint.region.slots(*range(len(keys))),
-                0,
+                (0,),
             )
         ]
     )

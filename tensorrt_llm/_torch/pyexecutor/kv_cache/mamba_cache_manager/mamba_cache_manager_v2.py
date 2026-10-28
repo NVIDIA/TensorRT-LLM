@@ -41,12 +41,15 @@ else:
     from typing_extensions import override
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
+from tensorrt_llm._torch.pyexecutor.kv_cache import _lender_hooks
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     BlockReusePolicy,
     KVCacheManagerV2,
     Role,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, grid_place, sectioned
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import rank_topology
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -402,6 +405,35 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 bytes_per_head=int(head_dim) * int(d_state) * self.ssm_state_dtype.itemsize
             ),
         }
+
+    @override
+    def _page_buffer_tensors(
+        self, layer_id: int, role: str, size: int, tokens: int, state: bool
+    ) -> tuple[Tensor, ...]:
+        """Convolution state is a concatenation of sections (Mamba2 ``[x | B | C]``, GDN
+        ``[Q | K | V]``), each split by byte over the ranks recurrent state splits over; SSM state
+        is split by head."""
+        if role == MambaRole.CONV_STATE:
+            d_conv_m1 = int(self.conv_state_shape[1])
+            ranks, _ = grid_place(rank_topology(self.mapping), ("tp", "cp"))
+            return sectioned(
+                [
+                    int(dim) * d_conv_m1 * self.conv_state_dtype.itemsize
+                    for dim in self.conv_section_dims
+                ],
+                ranks,
+                ("tp", "cp"),
+            )
+        if role == MambaRole.SSM_STATE:
+            _, head_dim, d_state = self.ssm_state_shape
+            return self._page_head_split(
+                layer_id,
+                size,
+                tokens,
+                state,
+                head_bytes=int(head_dim) * int(d_state) * self.ssm_state_dtype.itemsize,
+            )
+        return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
 
     def _extra_scratch_bytes_per_slot(self) -> int:
         return 0
@@ -1105,27 +1137,48 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         )
 
     @override
-    def try_commit_blocks(self, request: LlmRequest, kv_cache=None) -> None:
+    def _retry_held_commit(
+        self, request: LlmRequest, kv_cache: _KVCache, end: int, fetch_touched_suffix: bool
+    ) -> bool:
+        """Retry the current recurrent state, since an earlier snapshot may be stale."""
+        return self.try_commit_blocks(request, kv_cache)
+
+    @override
+    def _held_commit_drop_end(self, held: tuple) -> int:
+        """A recurrent retry uses the request's current endpoint."""
+        return held[1].context_current_position
+
+    @override
+    def try_commit_blocks(self, request: LlmRequest, kv_cache=None) -> bool:
+        """Commit recurrent snapshots when page locks and the lender permit it."""
         should_block_reuse = (
             self.enable_block_reuse and not self.is_draft and not request.is_dummy_request
         )
         if not should_block_reuse:
-            return
+            return False
 
         if kv_cache is None:
             kv_cache = self.kv_cache_map.get(request.py_request_id)
         if kv_cache is None:
-            return
+            return False
 
         snapshot_points = request.expect_snapshot_points
         commit_limit = (
             min(max(snapshot_points), request.prompt_len) if snapshot_points else request.prompt_len
         )
         commit_end = min(request.context_current_position, commit_limit)
-        if (
+        commits = (
             request.context_current_position in request.expect_snapshot_points
             and commit_end > kv_cache.num_committed_tokens
-        ):
+        )
+        stops = request.context_remaining_length == 0
+        gate = (
+            self._commit_gate(kv_cache, request, commit_end)
+            if commits or stops
+            else _lender_hooks.COMMIT
+        )
+        held = gate == _lender_hooks.HOLD
+        if commits and gate == _lender_hooks.COMMIT:
             tokens = self._augment_tokens_for_block_reuse(
                 request.get_tokens(DEFAULT_BEAM_INDEX),
                 request,
@@ -1140,12 +1193,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 self._branch_snapshots_taken_total += 1
         if request.context_current_position >= commit_limit:
             self._mark_context_position_as_history(request, kv_cache)
-        if request.context_remaining_length == 0:
+        if stops and not held:
             kv_cache.stop_committing()
+        return stops and not held
 
     def _mark_context_position_as_history(self, request: LlmRequest, kv_cache) -> None:
         """Advance history without making later recurrent state reusable."""
-        history_length = request.context_current_position
+        history_length = self._lent_history(kv_cache, request.context_current_position)
         if history_length <= kv_cache.history_length:
             return
         capacity = max(kv_cache.capacity, history_length)
@@ -1157,7 +1211,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def update_context_resources(self, scheduled_batch: ScheduledRequests) -> None:
-        for request in scheduled_batch.context_requests:
+        requests = scheduled_batch.context_requests
+        # A lender can cap history only while a page lock holds a window.
+        lock_state = self._history_lock_state() if requests else None
+        for request in requests:
             kv_cache = self.kv_cache_map.get(request.py_request_id)
             if kv_cache is None or not kv_cache.is_active:
                 continue
@@ -1179,17 +1236,21 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 is_all_reusable or is_snapshot_boundary or request.context_remaining_length == 0
             )
 
-            if should_resize and not kv_cache.resize(None, request.context_current_position):
-                raise ValueError(
-                    "Failed to resize history length of V2 Mamba cache for "
-                    f"request {request.py_request_id} to "
-                    f"{request.context_current_position} tokens at context "
-                    "update"
-                )
-            if should_commit:
-                self.try_commit_blocks(request, kv_cache)
+            if should_resize:
+                position = request.context_current_position
+                if lock_state is not None:
+                    position = self._lent_history(kv_cache, position)
+                if not kv_cache.resize(None, position):
+                    raise ValueError(
+                        "Failed to resize history length of V2 Mamba cache for "
+                        f"request {request.py_request_id} to "
+                        f"{request.context_current_position} tokens at context "
+                        "update"
+                    )
+            stopped = should_commit and self.try_commit_blocks(request, kv_cache)
             if request.context_remaining_length == 0:
-                if self.conversation_manager is not None:
+                # A held commit saves the conversation's drop plan at its retry.
+                if self.conversation_manager is not None and (stopped or not should_block_reuse):
                     self.conversation_manager.save_drop_plan(request, kv_cache)
                 kv_cache.enable_swa_scratch_reuse = False
 

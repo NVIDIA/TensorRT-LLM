@@ -38,6 +38,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     Role,
     _BasePageTableMaterializer,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, replicated
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -717,6 +718,17 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             Role.ALL: self._main_kv_mapper_kind,
             Role.INDEX_KEY: MapperKind.REPLICATED,
         }
+
+    def _page_buffer_tensors(
+        self, layer_id: int, role: str, size: int, tokens: int, state: bool
+    ) -> tuple[Tensor, ...]:
+        """K/V and their block scales split by head as the backend writes them, head-major (MSA)
+        or token-major (Triton); index-K alike on every rank."""
+        if role == Role.INDEX_KEY:
+            return replicated(size)
+        return self._page_head_split(
+            layer_id, size, tokens, state, token_major_=self._main_kv_layout_name() == "NHD"
+        )
 
     def _main_kv_layout_name(self) -> str:
         """Return the tensor-view layout name for the selected mapper kind."""

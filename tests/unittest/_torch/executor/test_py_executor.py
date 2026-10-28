@@ -37,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_load import KvLoadTracker
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ExecutorRequest,
@@ -3799,6 +3800,58 @@ def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
 
     stub.kv_cache_manager.reset_reuse_state.assert_called_once_with()
     stub.draft_kv_cache_manager.reset_reuse_state.assert_called_once_with()
+
+
+@pytest.mark.parametrize("joint", [False, True])
+@pytest.mark.parametrize("refusing", [None, "target", "draft"])
+def test_reset_prefix_cache_checks_all_lenders_before_clearing_any_tree(joint, refusing):
+    """A draft lender's refusal leaves both reuse trees and captured routes intact."""
+    events = []
+
+    def manager(name):
+        cache_manager = object.__new__(KVCacheManagerV2)
+
+        def before_reset():
+            events.append((name, "check"))
+            if name == refusing:
+                raise RuntimeError("locked cache")
+
+        cache_manager._sharing = types.SimpleNamespace(
+            _before_reset=before_reset,
+            _on_reset=lambda: events.append((name, "reset")),
+        )
+
+        def clear():
+            assert ("target", "check") in events
+            assert not joint or ("draft", "check") in events
+            events.append((name, "clear"))
+
+        cache_manager.impl = Mock(clear_reusable_blocks=Mock(side_effect=clear))
+        cache_manager.conversation_manager = None
+        return cache_manager
+
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_manager = manager("target")
+    executor.draft_kv_cache_manager = manager("draft")
+    executor.enable_joint_kv_cache_reuse = joint
+    executor.model_engine = types.SimpleNamespace(route_capture=Mock())
+
+    if refusing == "target" or (joint and refusing == "draft"):
+        with pytest.raises(RuntimeError, match="locked cache"):
+            executor.reset_prefix_cache()
+        executor.kv_cache_manager.impl.clear_reusable_blocks.assert_not_called()
+        executor.draft_kv_cache_manager.impl.clear_reusable_blocks.assert_not_called()
+        executor.model_engine.route_capture.clear_shared.assert_not_called()
+        assert all(action == "check" for _, action in events)
+    else:
+        executor.reset_prefix_cache()
+        executor.kv_cache_manager.impl.clear_reusable_blocks.assert_called_once_with()
+        if joint:
+            executor.draft_kv_cache_manager.impl.clear_reusable_blocks.assert_called_once_with()
+        else:
+            executor.draft_kv_cache_manager.impl.clear_reusable_blocks.assert_not_called()
+            assert not any(name == "draft" for name, _ in events)
+        executor.model_engine.route_capture.clear_shared.assert_called_once_with()
 
 
 class TestPendingTransferResponseFlush:

@@ -97,6 +97,7 @@ from .hang_detector import (HangDetector, all_ranks_crashed,
                             hard_kill_on_rank_crash, propagate_hard_kill,
                             start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
+from .kv_cache import _lender_hooks
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
@@ -5689,9 +5690,9 @@ class PyExecutor:
     def _can_pause_for_rebalance(self) -> bool:
         """Gate KV pool rebalance to the cases the hook supports.
 
-        Scope: no in-flight disagg transfer, no KV connector, no drafter, not
-        during warmup or shutdown. Honors the ``enable_kv_pool_rebalance``
-        opt-in flag (default off).
+        Scope: no in-flight disagg transfer, no KV connector, no attached KV
+        cache lender, no drafter, not during warmup or shutdown. Honors the
+        ``enable_kv_pool_rebalance`` opt-in flag (default off).
 
         Beam search *is* supported.  It needs no special handling on this side:
         ``KvCache::suspend`` / ``resume`` walk every beam already
@@ -5725,6 +5726,12 @@ class PyExecutor:
         if not self.enable_kv_pool_rebalance:
             return False
         if self.kv_cache_transceiver is not None:
+            return False
+        if self.kv_cache_manager._sharing is not None:
+            # A lender exposes fixed-address device regions for its lifetime;
+            # adjust() may relocate those pools. The attach contract requires
+            # every cache-holding rank to attach or none, keeping this gate
+            # identical across ranks before the rebalance collectives.
             return False
         if self.kv_connector_manager is not None:
             # Rebalance suspends every active request and runs a defragmenting
@@ -10100,9 +10107,15 @@ class PyExecutor:
         scheduled_requests.added_inflight_req_ids = []
 
     def reset_prefix_cache(self):
-        self.kv_cache_manager.reset_reuse_state()
+        managers = [self.kv_cache_manager]
         if self.enable_joint_kv_cache_reuse:
-            self.draft_kv_cache_manager.reset_reuse_state()
+            managers.append(self.draft_kv_cache_manager)
+        # Every lender must allow the reset before either reuse tree changes.
+        for manager in managers:
+            if isinstance(manager, KVCacheManagerV2):
+                _lender_hooks.before_reset(manager)
+        for manager in managers:
+            manager.reset_reuse_state()
         # R3: invalidate cached routes together with the KV reuse state. Guard the
         # engine lookup too -- minimal executors (unit tests) may have no engine.
         route_capture = getattr(getattr(self, "model_engine", None),

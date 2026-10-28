@@ -21,6 +21,7 @@ from typing import Callable, Optional
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
 
+from ..kv_cache import _lender_hooks
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
@@ -1688,9 +1689,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         # GPU pages so other requests can resume().
         # Skip if already suspended — suspending again is a no-op
         # that frees no pages.
-        if self.kv_cache_manager.is_request_active(
-            req.py_request_id
-        ) and not self._has_pending_connector_load(req):
+        if (
+            self.kv_cache_manager.is_request_active(req.py_request_id)
+            and not self._has_pending_connector_load(req)
+            and not self._holds_page_locks(req)
+        ):
             logger.debug(
                 f"[V2Scheduler] Self-evicting request {req.py_request_id} "
                 f"(state={req.state.name}) to free GPU pages"
@@ -1746,6 +1749,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         remains "active" on device, which could cause ensure_batch to
         fail if it needs to load a different adapter into a full cache.
         """
+        if self._holds_page_locks(req):
+            return
         self._clear_request_runtime_state(req)
         self.kv_cache_manager.suspend_request(req)
         if self.draft_kv_cache_manager is not None:
@@ -1879,6 +1884,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         if (
             any(self._has_pending_connector_load(r) for r in active_requests)
             or self.kv_cache_manager.has_pending_preemption()
+            or self._holds_page_locks(None)
         ):
             self._stalled_schedules = 0
             return
@@ -2004,6 +2010,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         connector = self.kv_cache_manager.kv_connector_manager
         return connector is not None and connector.has_pending_load(req)
 
+    def _holds_page_locks(self, req: LlmRequest | None) -> bool:
+        return _lender_hooks.scheduler_holds_page_locks(self, req)
+
     def _is_evictable(self, req: LlmRequest, inflight_request_ids: set[int]) -> bool:
         """A started request whose KV cache is still active on GPU.
 
@@ -2014,7 +2023,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             return False
         if not self._is_started_request(req):
             return False
-        if self._has_pending_connector_load(req):
+        if self._has_pending_connector_load(req) or self._holds_page_locks(req):
             return False
         return self.kv_cache_manager.is_request_active(req.py_request_id)
 
@@ -2023,7 +2032,7 @@ class KVCacheV2Scheduler(RequestScheduler):
     ) -> bool:
         if req.request_id in inflight_request_ids:
             return False
-        if self._has_pending_connector_load(req):
+        if self._has_pending_connector_load(req) or self._holds_page_locks(req):
             return False
         # is_generation_in_progress_state also includes GENERATION_TO_COMPLETE,
         # which is outside the schedulable range and may still be finalizing.

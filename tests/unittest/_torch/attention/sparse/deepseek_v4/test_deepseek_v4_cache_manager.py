@@ -1942,6 +1942,14 @@ class TestDeepseekV4CacheManager:
                     for role_name in pool_view.pool_role:
                         assert role_name.startswith("deepseek_v4_"), role_name
             assert saw_pool_view
+            # The manager's own page table moves the same roles, each split by head.
+            transferred = [
+                b for b in cache_manager.get_page_table().page_layout.buffers if b.transferred
+            ]
+            assert transferred
+            for buffer in transferred:
+                assert buffer.role.startswith("deepseek_v4_"), buffer.role
+                assert buffer.split, buffer.role
         finally:
             cache_manager.shutdown()
 
