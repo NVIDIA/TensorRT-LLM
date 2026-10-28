@@ -46,6 +46,7 @@
 #ifdef TLLM_BOUNCE_V2
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceArena.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceConfig.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceTransferStatus.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceTransport.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ExecPool.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ZmqControlChannel.h"
@@ -87,60 +88,6 @@ struct NixlBounceState
     }
 };
 } // namespace bounce
-
-namespace
-{
-/// TransferStatus over the bounce transport's completion future (the value Python's wait() reads).
-class BounceTransferStatus final : public TransferStatus
-{
-public:
-    explicit BounceTransferStatus(std::shared_future<bounce::BounceResult> fut)
-        : mFut(std::move(fut))
-    {
-    }
-
-    [[nodiscard]] bool isCompleted() const override
-    {
-        // Success only (TransferStatus contract, mirrors NixlTransferStatus): a failed transfer never
-        // reports completed; callers poll wait()/getLastStatusStr for the outcome. get() cannot throw:
-        // the promise is only ever resolved with set_value, and every erase/shutdown path resolves it
-        // first, so broken_promise is unreachable.
-        return mFut.valid() && mFut.wait_for(std::chrono::seconds(0)) == std::future_status::ready
-            && mFut.get().state == TransferState::kSUCCESS;
-    }
-
-    [[nodiscard]] TransferState wait(int64_t timeoutMs) const override
-    {
-        if (!mFut.valid())
-        {
-            return TransferState::kFAILURE;
-        }
-        if (timeoutMs < 0)
-        {
-            return mFut.get().state;
-        }
-        if (mFut.wait_for(std::chrono::milliseconds(timeoutMs)) == std::future_status::ready)
-        {
-            return mFut.get().state;
-        }
-        return TransferState::kIN_PROGRESS;
-    }
-
-    /// Failure cause recorded by the bounce transport (empty while in flight / on success).
-    [[nodiscard]] std::string getLastStatusStr() const override
-    {
-        if (!mFut.valid() || mFut.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
-        {
-            return {};
-        }
-        auto const& result = mFut.get();
-        return result.reason == bounce::BounceFailReason::kNone ? std::string{} : bounce::toString(result.reason);
-    }
-
-private:
-    std::shared_future<bounce::BounceResult> mFut;
-};
-} // namespace
 
 void NixlTransferAgent::maybeInitBounce(
     std::size_t agentBufferSizeMb, std::unordered_map<std::string, std::string> const& bounceParams)
@@ -1049,7 +996,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         TLLM_LOG_DEBUG("NixlTransferAgent(%s): bounce path engaged for write to %s (%zu descs)", mName.c_str(),
             request.getRemoteName().c_str(), request.getSrcDescs().getDescs().size());
         auto fut = mBounce->transport->submit(request.getSrcDescs(), request.getDstDescs(), request.getRemoteName());
-        return std::make_unique<BounceTransferStatus>(std::move(fut));
+        return std::make_unique<bounce::BounceTransferStatus>(std::move(fut));
     }
 #endif
 

@@ -150,11 +150,20 @@ if(NIXL_ROOT)
                          ${NIXL_BUILD_LIBRARY} PkgConfig::TLLM_BOUNCE_ZMQ)
 
     # One reactor test target: the bounce sources compiled in, plus the shared
-    # include/link sets.
+    # include/link sets. Each test case gets a 300 s ctest timeout (each takes
+    # seconds), so a test that hangs (e.g. on a closed stream gate) fails under
+    # its own name within minutes instead of at the stage's time limit.
     function(add_bounce_reactor_test name src)
       cmake_parse_arguments(ARG "INSTRUMENTED" "" "" ${ARGN})
-      add_tllm_gtest(${name} SOURCES ${src} FULL_STACK LABELS
-                     "unit;full-stack;gpu")
+      add_tllm_gtest(
+        ${name}
+        SOURCES
+        ${src}
+        FULL_STACK
+        TIMEOUT
+        300
+        LABELS
+        "unit;full-stack;gpu")
       if(ARG_INSTRUMENTED)
         target_sources(${name} PRIVATE ${BOUNCE_TSAN_SRCS})
       else()
