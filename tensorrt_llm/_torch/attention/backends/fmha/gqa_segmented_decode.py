@@ -302,28 +302,51 @@ def segment_attention(
 ) -> None:
     """trtllm-gen decode of every segment as a one-token request of seg_q's folded heads, with its base-2 LSE.
 
-    Launched without PDL: the FMHA may read the segment tables / lengths, which the kernel right before it writes,
-    before its dependency wait.
+    Calls FlashInfer's trtllm-gen decode op directly (the op behind ``trtllm_batch_decode_with_kv_cache``), skipping
+    the public wrapper's per-call argument validation. Launched without PDL: the FMHA may read the segment tables /
+    lengths, which the kernel right before it writes, before its dependency wait.
     """
-    flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-        query=seg_q,
-        kv_cache=(kv_pool, kv_pool),
-        workspace_buffer=workspace,
-        block_tables=seg_table,
-        seq_lens=seg_lens,
-        max_seq_len=max_seg_len,
-        bmm1_scale=bmm1_scale,
-        bmm2_scale=bmm2_scale,
-        out=seg_out,
-        enable_pdl=False,
-        backend="trtllm-gen",
-        q_len_per_req=1,
-        uses_shared_paged_kv_idx=False,
-        lse=seg_lse,
-        bmm1_scale_log2=(
-            _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else None
-        ),
-        multi_ctas_kv_counter_buffer=counter,
+    num_requests, num_heads, _ = seg_q.shape
+    sm_count = flashinfer.decode.get_device_sm_count(seg_q.device)
+    assert counter.numel() * counter.element_size() >= 4 * max(
+        num_requests * num_heads, sm_count
+    ), "multi-CTA counter buffer too small for the segment attention call"
+    flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode(
+        seg_out,
+        None,  # out_scale_factor
+        seg_q,
+        kv_pool,
+        kv_pool,
+        workspace,
+        counter,
+        seg_table,
+        seg_lens,
+        1,  # max_q_len
+        max_seg_len,
+        _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale,
+        bmm2_scale,
+        -1.0,  # o_sf_scale
+        -1,  # o_sf_vec_size
+        0,  # o_sf_start_index
+        num_requests,
+        -1,  # window_left
+        0,  # sparse_mla_top_k
+        sm_count,
+        False,  # enable_pdl
+        workspace.numel() * workspace.element_size(),
+        None,  # sinks
+        None,  # cum_seq_lens_q
+        None,  # k_block_scales
+        None,  # v_block_scales
+        None,  # skip_softmax_threshold_scale_factor
+        False,  # uses_shared_paged_kv_idx
+        seg_lse,
+        seg_lse.stride(0),
+        seg_lse.stride(1),
+        False,  # enable_block_sparse_attention
+        None,  # sparse_mla_top_k_lens
+        0,  # bf16q_fp8kv_transform_mode (FP8 query)
+        None,  # use_fp16_softmax
     )
 
 
