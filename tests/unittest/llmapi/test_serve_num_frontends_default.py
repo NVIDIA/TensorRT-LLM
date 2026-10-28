@@ -39,8 +39,6 @@ pytestmark = pytest.mark.cpu_only
         pytest.param({"orchestrator_type": "rpc"}, {}, "orchestrator_type='rpc'", id="rpc"),
         pytest.param({"enable_resource_governor": True}, {}, "enable_resource_governor", id="rg"),
         pytest.param({}, {"enable_sleep_mode": True}, "--enable_sleep_mode", id="sleep_mode"),
-        pytest.param({}, {"metadata_server": True}, "--metadata_server_config_file", id="metadata"),
-        pytest.param({}, {"disagg_cluster": True}, "disagg_cluster", id="disagg_cluster"),
     ],
 )
 def test_default_falls_back_to_one_frontend(monkeypatch, llm_args, conflict, reason) -> None:
@@ -53,8 +51,6 @@ def test_default_falls_back_to_one_frontend(monkeypatch, llm_args, conflict, rea
         grpc=False,
         report_addr=None,
         enable_sleep_mode=False,
-        metadata_server=False,
-        disagg_cluster=False,
     )
 
     _resolve_default_num_serve_frontends(llm_args, **{**no_conflict, **conflict})
@@ -70,10 +66,11 @@ def test_default_falls_back_to_one_frontend(monkeypatch, llm_args, conflict, rea
         pytest.param([], "num_serve_frontends: 1", 1, id="yaml_opt_out"),
         pytest.param(["--port", "0"], None, 1, id="port0"),
         pytest.param(["--enable_sleep_mode"], None, 1, id="sleep_mode"),
+        # Only the launcher registers with a disagg cluster, so the default holds.
         pytest.param(
             ["--server_role", "context", "--disagg_cluster_uri", "etcd://localhost:2379"],
             None,
-            1,
+            DEFAULT_NUM_SERVE_FRONTENDS,
             id="disagg_cluster",
         ),
         # An explicit count is honored; launch_server's own guard rejects the conflict.
