@@ -285,12 +285,10 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **FLUX.1** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
 | **FLUX.2** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | Yes [^vg1] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| **LTX-2** | Yes | Yes | Yes [^vg1] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| **LTX-2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **MiniMax-H3** | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | No | No | Yes |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
 | **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
-
-[^vg1]: Wan 2.2 and LTX-2 have no built-in TeaCache coefficient tables, so TeaCache requires an explicit `coefficients` list in `cache_config` (Wan 2.2 A14B dual-transformer models also require `coefficients_2`); without them the pipeline raises at load time. See the TeaCache section of the [Visual Generation](./visual-generation.md) page.
