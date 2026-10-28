@@ -206,7 +206,8 @@ struct BufferConfig
     //! densely packed, so a padded page is not expressible.
     int sparseUnitChunks = 1;
 
-    //! Reuse policy of this buffer; nullopt uses the layer's policy.
+    //! Reuse policy of this buffer; nullopt inherits the layer's policy. Overrides can
+    //! place buffers of one attention or SSM layer in different lifecycle groups.
     std::optional<ReusePolicy> reusePolicy;
 
     [[nodiscard]] ReusePolicy effectiveReusePolicy(ReusePolicy layerPolicy) const noexcept

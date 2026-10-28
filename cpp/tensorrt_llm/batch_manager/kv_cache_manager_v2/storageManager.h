@@ -299,9 +299,6 @@ public:
     // Pool group base address without per-layer offset.
     MemAddress getMemPoolBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
 
-    // Storage attributes of a layer's buffers within one lifecycle.
-    LayerAttr const& getLayerAttr(LayerId layerId, LifeCycleId lifeCycle) const;
-
     // Address of a slot's buffer in a specific pool at a cache level.
     Address slotAddress(CacheLevel level, PoolGroupIndex pgIdx, SlotId slotId, PoolIndex poolIdx) const;
 
@@ -481,9 +478,6 @@ private:
 
     // slot-to-page-index scale factors: [lcId][poolIdx]
     TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> mSlotToPageIndices;
-
-    // Per-(layer, lifecycle) storage attributes for scratch slot management.
-    std::map<LayerLifeCycleKey, LayerAttr> mLayerAttributes;
 
     // Max slot utilization fraction per lifecycle (across all layers in that lifecycle).
     TypedVec<LifeCycleId, Rational> mSlotUtilFracMax;

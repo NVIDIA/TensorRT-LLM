@@ -196,14 +196,14 @@ struct BufferAttr
 {
     LifeCycleId lifeCycleId{0};
     PoolIndex poolIndex{0};
-    size_t offset = 0; // byte offset within the slot
-    size_t size = 0;   // expanded size of the buffer (after expansion)
-    int expansion = 1; // expansion factor (tokens_per_block / tokens_per_block_override)
+    size_t offset = 0;            // byte offset within the slot
+    size_t size = 0;              // expanded size of the buffer (after expansion)
+    int expansion = 1;            // expansion factor (tokens_per_block / tokens_per_block_override)
+    int scratchPagesPerBlock = 1; // buffers of this layer in the same coalesced slot
 };
 
 // ---------------------------------------------------------------------------
 // Rational — exact fraction for slot utilization computations.
-// Mirrors Python's fractions.Fraction used in _storage/_config.py::LayerAttr.
 // ---------------------------------------------------------------------------
 struct Rational
 {
@@ -229,26 +229,6 @@ struct Rational
 };
 
 // ---------------------------------------------------------------------------
-// LayerAttr — storage attributes of one layer's buffers within one lifecycle, for scratch slot
-// management. An SSM layer whose buffers use different reuse policies has one LayerAttr per lifecycle.
-// Mirrors _storage/_config.py::LayerAttr.
-// ---------------------------------------------------------------------------
-struct LayerAttr
-{
-    LifeCycleId lifeCycleId{0};
-
-    // Number of sub-pages within a single coalesced slot that belong to this layer,
-    // per pool within the pool group.
-    TypedVec<PoolIndex, int> slotUtil;
-
-    // Fraction of slot_util to total number of buffers in the slot, max over all pools.
-    Rational slotUtilFracMax;
-};
-
-// (layer, lifecycle) key of a LayerAttr.
-using LayerLifeCycleKey = std::pair<LayerId, LifeCycleId>;
-
-// ---------------------------------------------------------------------------
 // StorageConfig — complete storage layout for the KV cache.
 // Mirrors _storage/_config.py::StorageConfig.
 // ---------------------------------------------------------------------------
@@ -270,12 +250,8 @@ struct StorageConfig
     std::map<BufferId, BufferAttr> bufferAttributes() const;
 
     // Map LayerId → the lifecycles of its buffers, in ascending order. A layer spans several
-    // lifecycles only when its SSM buffers use different reuse policies.
+    // lifecycles when its buffers use different reuse policies.
     std::unordered_map<LayerId, std::vector<LifeCycleId>> layerToLifeCycleIds() const;
-
-    // Per-(layer, lifecycle) storage attributes (slot utilization within coalesced slots).
-    // Mirrors _storage/_config.py::StorageConfig.layer_attributes().
-    std::map<LayerLifeCycleKey, LayerAttr> layerAttributes() const;
 
     LifeCycleId numLifeCycles() const;
 };

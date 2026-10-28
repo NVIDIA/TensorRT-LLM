@@ -171,7 +171,7 @@ TEST(KvCacheManagerV2ConfigTest, SparseBuffersCoalesceBySize)
     EXPECT_EQ(second.expansion, 1);
 }
 
-TEST(KvCacheManagerV2ConfigTest, AttentionBuffersMustUseTheirLayerReusePolicy)
+TEST(KvCacheManagerV2ConfigTest, AttentionBufferPoliciesOverrideLayerDefault)
 {
     auto config = makeConfig();
     auto& buffer = std::get<AttentionLayerConfig>(config.layers.front()).buffers.front();
@@ -181,8 +181,11 @@ TEST(KvCacheManagerV2ConfigTest, AttentionBuffersMustUseTheirLayerReusePolicy)
     for (auto const policy : {ReusePolicy::PRIVATE, ReusePolicy::OPTIONAL})
     {
         buffer.reusePolicy = policy;
-        EXPECT_THROW(config.validate(), std::invalid_argument);
-        EXPECT_THROW(createStorageConfig(config), std::invalid_argument);
+        EXPECT_NO_THROW(config.validate());
+        auto const storage = createStorageConfig(config);
+        LifeCycleRegistry const registry(config);
+        auto const attr = storage.bufferAttributes().at(BufferId{0, buffer.role});
+        EXPECT_EQ(std::get<AttnLifeCycle>(registry[attr.lifeCycleId]).reusePolicy, policy);
     }
 }
 
@@ -238,28 +241,6 @@ TEST(KvCacheManagerV2ConfigTest, SsmBufferReusePoliciesSplitLayerLifecycles)
     EXPECT_NE(grouping[required], grouping[privateLc]);
     EXPECT_NE(grouping[required], grouping[optional]);
     EXPECT_NE(grouping[privateLc], grouping[optional]);
-
-    // Slot utilization is tracked per (layer, lifecycle): every SSM layer owns one buffer in each
-    // slot of the lifecycles it uses.
-    auto const layerAttributes = storage.layerAttributes();
-    EXPECT_EQ(layerAttributes.size(), 8U);
-    EXPECT_EQ(layerAttributes.count({3, required}), 0U);
-    for (LayerId layerId : {1, 2, 3})
-    {
-        for (auto const lc : {required, privateLc, optional})
-        {
-            if (layerId == 3 && lc != privateLc)
-            {
-                continue;
-            }
-            SCOPED_TRACE(std::to_string(layerId) + "/" + std::to_string(lc.value()));
-            auto const& attr = layerAttributes.at({layerId, lc});
-            EXPECT_EQ(attr.lifeCycleId, lc);
-            ASSERT_EQ(attr.slotUtil.size(), PoolIndex{1});
-            EXPECT_EQ(attr.slotUtil[PoolIndex{0}], 1);
-            EXPECT_EQ(attr.slotUtilFracMax, (Rational{1, lc == privateLc ? 3 : 2}));
-        }
-    }
 }
 
 } // namespace
