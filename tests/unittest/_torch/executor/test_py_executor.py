@@ -2811,6 +2811,19 @@ def test_pad_dummy_skipped_for_single_rank_attention_dp():
     assert stub.active_requests == []
 
 
+@pytest.mark.parametrize("capacity_only", [False, True])
+def test_pad_dummy_single_rank_attention_dp_with_kv_connector(capacity_only: bool) -> None:
+    # A connector that moves KV needs a forward pass to flush its finished
+    # loads, so a tp1 rank still pads; a capacity-only connector does not.
+    stub = _StubADPExecutor(tp_size=1)
+    stub.expected_num_active_requests = 1
+    stub.kv_connector_manager = Mock(capacity_only=capacity_only)
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == (0 if capacity_only else 1)
+
+
 def test_adp_dummy_role_set_to_ctx_on_context_only_request():
     stub = _StubADPExecutor()
     req = _make_adp_queue_item(RequestType.REQUEST_TYPE_CONTEXT_ONLY)
@@ -3739,6 +3752,20 @@ def test_pad_empty_batch_no_op_for_single_rank_attention_dp():
     assert stub.add_dummy_calls == []
     assert scheduled_batch.batch_size == 0
     assert stub._pending_adp_dummy_request is None
+
+
+@pytest.mark.parametrize("capacity_only", [False, True])
+def test_pad_empty_batch_single_rank_attention_dp_with_kv_connector(
+    capacity_only: bool,
+) -> None:
+    # A canceled connector load frees its slot only after a forward pass flushes
+    # its response, so a tp1 rank with a KV-moving connector still pads.
+    stub, scheduled_batch = _unfittable_rank(tp_size=1)
+    stub.kv_connector_manager = Mock(capacity_only=capacity_only)
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert scheduled_batch.batch_size == (0 if capacity_only else 1)
 
 
 def test_pad_empty_batch_no_op_when_attention_dp_disabled():

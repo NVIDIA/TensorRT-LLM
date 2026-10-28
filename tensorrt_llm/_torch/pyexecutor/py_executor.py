@@ -432,6 +432,24 @@ def _request_flag(request, name: str) -> bool:
     return bool(value)
 
 
+def _single_rank_adp_skips_padding(executor: "PyExecutor") -> bool:
+    """Whether a single-rank attention-DP group can skip ADP dummy padding.
+
+    With one rank there is no peer whose collectives an empty batch would
+    stall, so padding only buys a wasted forward pass. A KV connector that
+    moves KV is the exception: canceled or completed loads release their slots
+    only after a forward pass flushes their responses, so an empty rank must
+    still be padded to make progress.
+
+    A module-level function so the minimal executors that unit tests assemble
+    can use it without the ``PyExecutor`` properties.
+    """
+    if executor.dist.tp_size > 1:
+        return False
+    connector = getattr(executor, "kv_connector_manager", None)
+    return connector is None or connector.capacity_only
+
+
 class PyExecutor:
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -8203,8 +8221,7 @@ class PyExecutor:
         """Pad an idle attention-DP rank with a role-matched dummy request."""
         if getattr(self, "_enable_remote_tail_adp", False):
             return
-        # A single-rank attention-DP group has no peer to keep in step.
-        if not self.enable_attention_dp or self.dist.tp_size <= 1:
+        if not self.enable_attention_dp or _single_rank_adp_skips_padding(self):
             return
 
         expected_num_active_requests = self.expected_num_active_requests
@@ -8375,7 +8392,7 @@ class PyExecutor:
             return
         # With a single attention-DP rank `_can_queue` vetoes only this rank's
         # own empty batch, so there is no peer to unblock.
-        if self.dist.tp_size <= 1:
+        if _single_rank_adp_skips_padding(self):
             return
         # A canceled connector load can remove the last local request during
         # recovery while peers still need this owner to participate in forward.
