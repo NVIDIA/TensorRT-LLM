@@ -128,6 +128,22 @@ async def test_router_lists_only_signed_records():
     assert await router.fetch_live_servers() == {"trtllm/a": "http://127.0.0.1:8001"}
 
 
+@pytest.mark.parametrize(
+    "signature",
+    [None, 7, "", "x", "sha256=", "sha256=zz", "\ud800", "sha256=\ud800"],
+    ids=["none", "int", "empty", "no_prefix", "prefix_only", "non_hex", "surrogate", "prefix_surrogate"],
+)
+def test_malformed_signature_is_ignored(signature):
+    raw = InMemoryDictionary()
+    store = JsonDictionary(raw, record_auth_key=RECORD_KEY)
+    store.put("trtllm/good", _record())
+    bad = _record(url="http://127.0.0.1:8002")
+    bad[RECORD_SIGNATURE_FIELD] = signature
+    raw.put("trtllm/bad", json.dumps(bad))
+    assert store.get("trtllm/bad") is None
+    assert store.get("trtllm/good") == _record()
+
+
 def test_config_validation():
     with pytest.raises(ValueError):
         MetadataServerConfig(server_type="etcd", record_auth_key="")
