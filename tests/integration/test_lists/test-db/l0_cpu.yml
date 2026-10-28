@@ -334,6 +334,7 @@ l0_cpu:
   - unittest/quantization/test_mode.py
   - unittest/scaffolding
   - unittest/scripts
+  - unittest/serve/test_postproc_strategy.py
   - unittest/tools
   - unittest/usage
   - unittest/utils/test_logger.py
