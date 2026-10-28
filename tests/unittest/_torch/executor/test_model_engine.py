@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import gc
 import unittest
 import weakref
 from ast import literal_eval
@@ -651,6 +652,8 @@ class ModelEngineTestCase(unittest.TestCase):
         refit. So the fully decorated hook must never even look up the KV cache
         manager -- with torch.compile on or off.
         """
+        # Finalize earlier engines before observing this hook's GC calls.
+        gc.collect()
         for compile_enabled in (True, False):
             with self.subTest(compile_enabled=compile_enabled):
                 resource_manager = Mock()
@@ -742,7 +745,7 @@ class ModelEngineTestCase(unittest.TestCase):
             cuda_graph_runner=Mock(),
             breakable_cuda_graph_runner=Mock(),
             config=None,
-            mapping=None,
+            mapping=Mapping(),
             model=None,
             sparse_attention_config=None,
             metrics={},
@@ -1211,7 +1214,6 @@ def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> Non
     runner.forward_encoder.assert_called_once_with(
         inputs,
         resource_manager=resource_manager,
-        is_dummy=False,
     )
 
 

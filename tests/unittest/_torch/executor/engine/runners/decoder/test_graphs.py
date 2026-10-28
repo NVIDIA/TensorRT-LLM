@@ -21,6 +21,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+from tensorrt_llm.mapping import Mapping
 
 
 @pytest.mark.cpu_only
@@ -348,6 +349,7 @@ def test_dynamic_warmup_graphs_match_replay_schedule(schedule: dict[int, int]) -
     runner._dynamic_draft_len_mapping = compute_dynamic_draft_len_mapping(runner._config)
     graphs = runner._get_graphs_to_capture(batch_sizes)
     replay = object.__new__(CUDAGraphRunner)
+    replay.clear = Mock()
     replay.supported_batch_sizes = batch_sizes
     replay.dynamic_draft_len_mapping = runner._dynamic_draft_len_mapping
 
@@ -372,7 +374,7 @@ class TestWarmupCleanup(unittest.TestCase):
             config=SimpleNamespace(
                 enable_autotuner=True, prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE
             ),
-            mapping=None,
+            mapping=Mapping(),
             model=SimpleNamespace(modules=lambda: []),
             sparse_attention_config=None,
             metrics={},

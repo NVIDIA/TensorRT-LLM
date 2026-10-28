@@ -368,11 +368,10 @@ def test_encoder_runner_forwards_eager_model_inputs_and_gathers_logits() -> None
 
     outputs = runner._forward_step(
         inputs,
-        gather_ids=torch.tensor([2, 0]),
-        gather_context_logits=False,
+        gather_context_logits=True,
     )
 
-    torch.testing.assert_close(outputs["logits"], torch.tensor([[8, 9, 10, 11], [0, 1, 2, 3]]))
+    torch.testing.assert_close(outputs["logits"], torch.arange(12).reshape(3, 4))
     metadata.on_update_kv_lens.assert_called_once_with()
     model_forward.assert_called_once_with(**inputs, return_context_logits=True)
 

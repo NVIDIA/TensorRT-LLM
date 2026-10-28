@@ -43,7 +43,6 @@ def cuda_graph_runner_and_kv_cache(
             max_beam_width=1,
             max_num_tokens=258,
             spec_config=None,
-            cuda_graph_mem_pool=None,
             use_mrope=False,
             original_max_total_draft_tokens=0,
             enable_attention_dp=False,
@@ -51,7 +50,6 @@ def cuda_graph_runner_and_kv_cache(
             batch_size=13,
             mapping=Mapping(),
             dist=None,
-            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
         )
     )
     with managed_kv_cache(
@@ -284,21 +282,27 @@ class ExecutionStreamTestCase(unittest.TestCase):
             return observed
 
         torch.cuda.synchronize()
+        # Warm up lazy CUDA kernels and the event before delaying the real KV writes.
+        writes_done = torch.cuda.Event()
+        with torch.cuda.stream(writer_stream):
+            torch.cuda._sleep(1)
+            source.fill_(1)
+            writes_done.record()
+        writes_done.synchronize()
         with torch.cuda.stream(execution_stream):
             runner.capture(key, forward, inputs)
         torch.cuda.synchronize()
 
         for value in (7, 11):
             cache.cuda_stream = writer_stream.cuda_stream
-            writes_done = torch.cuda.Event()
             with torch.cuda.stream(writer_stream):
                 torch.cuda._sleep(1 << 29)
                 source.fill_(value)
                 writes_done.record()
 
+            self.assertFalse(writes_done.query(), "the KV write must still be in flight")
             kv_cache_manager.suspend_request(request)
             self.assertFalse(cache.is_active)
-            self.assertFalse(writes_done.query(), "the KV write must still be in flight")
             self.assertTrue(kv_cache_manager.resume_request(request))
             with torch.cuda.stream(execution_stream):
                 runner.replay(key, inputs)

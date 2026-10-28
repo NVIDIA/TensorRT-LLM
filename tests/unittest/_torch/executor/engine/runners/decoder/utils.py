@@ -49,7 +49,6 @@ def decoder_config(**changes: Any) -> DecoderRunnerConfig:
         dtype=torch.float16,
         enable_attention_dp=False,
         disable_overlap_scheduler=False,
-        is_encode_only=False,
         is_spec_decode=False,
         spec_config=None,
         max_draft_len=0,
@@ -142,7 +141,11 @@ def decoder_graphs(
 ) -> DecoderCudaGraphs:
     mapping = mapping or Mapping()
     return DecoderCudaGraphs(
-        cuda_graph_runner=cuda_graph_runner,
+        cuda_graph_runner=(
+            cuda_graph_runner
+            if cuda_graph_runner is not None
+            else Mock(enabled=False, is_warmup_only=False)
+        ),
         breakable_cuda_graph_runner=None,
         config=config,
         mapping=mapping,

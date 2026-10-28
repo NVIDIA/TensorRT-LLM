@@ -29,7 +29,6 @@ def test_pooling_runner_owns_forward_output_processing(
     attn_metadata = SimpleNamespace(on_update_kv_lens=Mock())
     prepared = PreparedInputs(
         {"attn_metadata": attn_metadata, "input_ids": torch.tensor([1])},
-        gather_ids=torch.tensor([2, 0]),
     )
     monkeypatch.setattr(runner, "_prepare_inputs", Mock(return_value=prepared))
 
@@ -38,12 +37,12 @@ def test_pooling_runner_owns_forward_output_processing(
         resource_manager=SimpleNamespace(get_resource_manager=Mock(return_value=None)),
     )
 
-    torch.testing.assert_close(outputs["logits"], logits[[2, 0]])
+    torch.testing.assert_close(outputs["logits"], logits)
     attn_metadata.on_update_kv_lens.assert_called_once_with()
     model_forward.assert_called_once_with(
         attn_metadata=attn_metadata,
         input_ids=prepared.kwargs["input_ids"],
-        return_context_logits=True,
+        return_context_logits=False,
     )
 
 

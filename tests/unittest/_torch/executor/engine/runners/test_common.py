@@ -12,7 +12,6 @@ from tensorrt_llm._torch.pyexecutor.engine.runners import (
     DecoderRunner,
     EncoderDecoderRunner,
     EncoderRunner,
-    NoKVCacheRunner,
     common,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
@@ -27,6 +26,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     token_model_inputs,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ModelRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
