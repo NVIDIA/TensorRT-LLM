@@ -61,14 +61,11 @@ from tensorrt_llm.commands._serve_stability import ALLOWED_TAGS, collect_command
 
 REFERENCE_PATH = pathlib.Path(__file__).parent / "references" / "trtllm_serve_cli.yaml"
 
-# Subcommands we gate. Names must match the keys in `main.commands` in
-# tensorrt_llm/commands/serve.py.
-GATED_SUBCOMMANDS = (
-    "serve",
-    "disaggregated",
-    "disaggregated_mpi_worker",
-    "mm_embedding_serve",
-)
+# Every subcommand registered on `trtllm-serve` is gated. The list is derived
+# from `main.commands` (in registration order) so that a newly registered
+# subcommand is gated automatically: its options must carry stability tags and
+# the reference YAML must gain a section for it, or this file's tests fail.
+GATED_SUBCOMMANDS = tuple(serve_cmd.main.commands)
 
 
 def _load_reference() -> dict[str, Any]:
@@ -101,6 +98,40 @@ class TestServeCLIStability:
     @pytest.fixture(scope="class")
     def live(self) -> dict[str, dict[str, dict[str, Any]]]:
         return _live_surface()
+
+    def test_reference_lists_exactly_the_registered_subcommands(self, reference):
+        """The YAML must have exactly one section per registered subcommand.
+
+        `GATED_SUBCOMMANDS` is derived from `main.commands`, so a new
+        subcommand is gated automatically. This check keeps the YAML in step
+        in both directions: a registered subcommand without a section would
+        otherwise ship ungated options, and a section for a subcommand that
+        is no longer registered would never be read again.
+        """
+        registered = set(serve_cmd.main.commands)
+        listed = set(reference.get("commands", {}) or {})
+        errors: list[str] = []
+        missing = sorted(registered - listed)
+        if missing:
+            errors.append(
+                f"trtllm-serve subcommand(s) {missing} have no section in "
+                "tests/unittest/api_stability/references/trtllm_serve_cli.yaml. "
+                "Add `commands: <name>: options:` with one entry per option "
+                "(status: prototype | beta | stable | deprecated) and declare "
+                "each option with stability_option(..., status=...). The API "
+                "review committee approves changes to this file."
+            )
+        extra = sorted(listed - registered)
+        if extra:
+            errors.append(
+                "tests/unittest/api_stability/references/trtllm_serve_cli.yaml "
+                f"lists subcommand(s) {extra} that trtllm-serve no longer "
+                "registers. If one was removed or renamed, was it deprecated "
+                "for at least one minor release first? Remove the section in "
+                "the same PR; the API review committee approves."
+            )
+        if errors:
+            pytest.fail("\n".join(errors))
 
     def test_every_option_has_a_stability_tag(self, live):
         """Every CLI option must carry an explicit stability tag.
