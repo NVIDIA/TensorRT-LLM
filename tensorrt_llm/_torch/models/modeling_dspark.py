@@ -98,7 +98,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from ..distributed import AllReduceParams
+from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -108,6 +108,8 @@ from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import is_mla
 from ..speculative.interface import SpeculativeDecodingMode
+from ..speculative.spec_tail_kernels import DraftBlockPlacement
+from ..speculative.vocab_parallel import markov_chain_logits
 from ..utils import AuxStreamType
 from .modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
@@ -123,7 +125,6 @@ from .modeling_speculative import (
     DSparkConfidenceHead,
     SpecDecOneEngineForCausalLM,
     build_markov_head,
-    dspark_markov_chain_logits,
 )
 from .modeling_utils import DecoderModel, register_auto_model, register_draft_model
 
@@ -2524,18 +2525,36 @@ def cute_dsl_mla_decode_unavailability_reason() -> Optional[str]:
     return None
 
 
+def _all_reduce_add_norm(
+    all_reduce: AllReduce, partial: torch.Tensor, residual: torch.Tensor, norm: RMSNorm
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``norm(all_reduce(partial) + residual)`` and the new residual, fused."""
+    return all_reduce(
+        partial,
+        all_reduce_params=AllReduceParams(
+            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            residual=residual,
+            norm_weight=norm.weight,
+            eps=norm.variance_epsilon,
+        ),
+    )
+
+
+def _block_upper_triangle(block_size: int, device) -> torch.Tensor:
+    """``[1, block, 1, block]``: query i sees block key j > i (the fixup's part)."""
+    idx = torch.arange(block_size, device=device)
+    return (idx.view(1, block_size) > idx.view(block_size, 1)).view(1, block_size, 1, block_size)
+
+
 def _build_mla_block_fixup(ctx_len, page_tables, block_size, page_size) -> _MLABlockFixup:
     """Where the block's latents go, and the upper-triangle mask, for all layers."""
     device = ctx_len.device
     pos = ctx_len.view(-1, 1) + torch.arange(block_size, device=device)
-    idx = torch.arange(block_size, device=device)
     seq_lens = (ctx_len + block_size).to(torch.int32)
     return _MLABlockFixup(
         pages=page_tables.gather(1, pos // page_size),
         offsets=pos % page_size,
-        valid=(idx.view(1, block_size) > idx.view(block_size, 1)).view(
-            1, block_size, 1, block_size
-        ),
+        valid=_block_upper_triangle(block_size, device),
         page_tables_i32=page_tables.to(torch.int32),
         seq_lens_i32=seq_lens,
         # repeat_interleave, not repeat: the kernel indexes kv_bounds at
@@ -2652,23 +2671,20 @@ class _DSparkHeadMixin:
         self,
         base_logits: torch.Tensor,
         first_prev_tokens: torch.Tensor,
-        argmax_fn=None,
-        vocab_slice: Optional[slice] = None,
+        tp_exchange=None,
     ) -> torch.Tensor:
-        """Apply the vanilla-Markov intra-block bias to block logits.
+        """Apply the vanilla-Markov intra-block bias to float32 block logits.
 
         No-op (returns ``base_logits`` unchanged) when the checkpoint ships no
-        Markov head. See :func:`dspark_markov_chain` for the semantics; when
-        ``base_logits`` is a TP vocab shard the caller must pass this rank's
-        ``vocab_slice`` (to shard the markov_w2 rows identically) and an
-        ``argmax_fn`` returning full-vocab token ids -- ``DFlashWorker`` handles
-        both.
+        Markov head. See :func:`dspark_markov_chain` for the semantics and
+        :func:`markov_chain_logits` for the arguments: ``base_logits`` is the
+        full vocab, or this rank's vocab shard with the TP group's
+        ``tp_exchange`` -- ``DSparkWorker`` handles both.
         """
         if not self.has_markov_head:
             return base_logits
-        markov_w2 = self.markov_w2 if vocab_slice is None else self.markov_w2[vocab_slice]
-        return dspark_markov_chain_logits(
-            base_logits, first_prev_tokens, self.markov_w1, markov_w2, argmax_fn=argmax_fn
+        return markov_chain_logits(
+            base_logits, first_prev_tokens, self.markov_w1, self.markov_w2, tp_exchange
         )
 
     def _take_dspark_head_weights(self, weights: Dict) -> tuple[Dict, Dict]:
@@ -2863,6 +2879,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # max_seq_len that free_gpu_memory_fraction never bounds. Independent of the
     # backend field, which is why either value of it works here.
     _paged_ctx_cache = True
+
+    # Acceptance length is measured with the TP fusions: the split fc, and each
+    # o_proj / down_proj all-reduce of the block decode below fused with the
+    # residual add and the RMSNorm after it.
+    _tp_fusions = True
 
     def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
         cfg = draft_config.pretrained_config
@@ -3299,12 +3320,14 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         ctx_cache_batch_idx,
         ctx_kv_cache=None,
         ctx_page_table=None,
+        block_placement: Optional[DraftBlockPlacement] = None,
     ):
         """Eager absorbed-MLA block decode over the drafter's latent cache.
 
         Args mirror the base: ``ctx_k_cache`` is
         ``[pool_slots, L, max_ctx+block_size, 1, kv_cache_head_dim]`` and
-        ``ctx_v_cache`` is unused (``None``).
+        ``ctx_v_cache`` is unused (``None``). ``block_placement`` is where the
+        worker already placed the block in the pages (paged context only).
         """
         if self._fused_kv_weight is None:
             self._build_fused_kv_buffers()
@@ -3319,43 +3342,54 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         blk_freqs = self._mla_freqs_cis(device)[query_positions.long()]
 
         slots = ctx_cache_batch_idx.long()
+        paged = ctx_page_table is not None
+        # attention_backend picks the implementation; both kernel backends need
+        # page tables, so the eager gather also covers the private arena.
+        variant = self._mla_block_decode_variant(paged)
+        use_kernel = variant != "eager"
         # Context pages for this batch, resolved once: rows are batch positions
         # when bound to the manager's per-request block table and slots on the
         # private arena, which is exactly what ctx_cache_batch_idx already is.
-        page_tables = (
-            None if ctx_page_table is None else ctx_page_table.index_select(0, slots).long()
-        )
+        page_tables = None if not paged else ctx_page_table.index_select(0, slots)
 
         # Valid-key mask, shared by every layer: context slots below this
         # request's length, then the whole block (DSpark is non-causal). Pages
         # past a request's allocation hold another request's data, so the mask
         # is what keeps them out -- not the block table.
-        page_size = None if page_tables is None else ctx_kv_cache[0].shape[-2]
-        capacity = ctx_k_cache.shape[2] if page_tables is None else page_tables.shape[1] * page_size
-        # attention_backend picks the implementation; both kernel backends need
-        # page tables, so the eager gather also covers the private arena.
-        variant = self._mla_block_decode_variant(page_tables is not None)
-        use_kernel = variant != "eager"
+        page_size = None if not paged else ctx_kv_cache[0].shape[-2]
+        capacity = ctx_k_cache.shape[2] if not paged else ctx_page_table.shape[1] * page_size
         # Kernel path: index and mask operands are layer-invariant, so build
         # them once here rather than five times inside the decode loop.
-        fixup = (
-            _build_mla_block_fixup(num_ctx_per_req[:batch], page_tables, block_size, page_size)
-            if use_kernel
-            else None
-        )
+        if not use_kernel:
+            fixup = None
+        elif block_placement is not None:
+            fixup = _MLABlockFixup(
+                pages=block_placement.pages,
+                offsets=block_placement.offsets,
+                valid=_block_upper_triangle(block_size, device),
+                page_tables_i32=page_tables,
+                seq_lens_i32=block_placement.seq_lens,
+                kv_bounds_i32=block_placement.kv_bounds,
+            )
+        else:
+            fixup = _build_mla_block_fixup(
+                num_ctx_per_req[:batch], page_tables.long(), block_size, page_size
+            )
         logger.info_once(
             "MLA DSpark block decode: "
             + {
                 "trtllm_gen": "trtllm-gen paged kernel, block in pool + upper-triangle fixup",
                 "cute_dsl": "one cute-dsl pass over context and block, no fixup",
                 "eager": f"eager (backend={self.dflash_attention_backend!r}, "
-                f"paged={page_tables is not None}, "
+                f"paged={paged}, "
                 f"flashinfer={self._mla_decode_op() is not None})",
             }[variant],
             key="mla_dspark_block_decode_variant",
         )
         # Eager path only: dense key mask over the gathered context.
         if not use_kernel:
+            if paged:
+                page_tables = page_tables.long()
             ctx_valid = torch.arange(capacity, device=device).unsqueeze(0) < num_ctx_per_req[
                 :batch
             ].view(-1, 1)
@@ -3364,12 +3398,23 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             )
         hidden_states = noise_embedding
         residual = None
+        # With the fused all-reduce, the previous layer's un-reduced MLP output
+        # and the all-reduce that sums it.
+        partial, partial_all_reduce = None, None
         for layer_idx, layer in enumerate(self.model.layers):
             attn = layer.self_attn
             hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
             if residual is None:
                 residual = hidden_states.clone()
                 hs_normed = layer.input_layernorm(hs_flat)
+            elif partial is not None:
+                hs_normed, res_flat = _all_reduce_add_norm(
+                    partial_all_reduce,
+                    partial,
+                    residual.reshape(-1, residual.shape[-1]),
+                    layer.input_layernorm,
+                )
+                residual = res_flat.reshape(batch, block_size, -1)
             else:
                 res_flat = residual.reshape(-1, residual.shape[-1])
                 hs_normed, res_flat = layer.input_layernorm(hs_flat, res_flat)
@@ -3442,7 +3487,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                     capacity,
                 )
             else:
-                if page_tables is None:
+                if not paged:
                     ctx = ctx_k_cache[slots, layer_idx, :, 0, :]
                 else:
                     # [pages, kv_factor=1, nkv=1, page, hd] -> gather this
@@ -3456,16 +3501,37 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 ctx_out = torch.einsum("bsht,btc->bshc", probs, kv_full[..., :latent_dim])
             attn_out = torch.einsum("bshc,hvc->bshv", ctx_out, attn._v_b_proj.to(ctx_out.dtype))
 
-            hidden_out = attn.o_proj(attn_out.reshape(batch * block_size, -1))
             res_flat = residual.reshape(-1, residual.shape[-1])
-            hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)
-            hidden_out = layer.mlp(hidden_out)
-            hidden_states = hidden_out.reshape(batch, block_size, -1)
+            # With the TP fusions, o_proj and down_proj reduce their outputs;
+            # fuse each all-reduce with the residual add and the RMSNorm after it.
+            if self._tp_split:
+                hidden_out = attn.o_proj(
+                    attn_out.reshape(batch * block_size, -1),
+                    all_reduce_params=AllReduceParams(enable_allreduce=False),
+                )
+                hidden_out, res_flat = _all_reduce_add_norm(
+                    attn.o_proj.all_reduce, hidden_out, res_flat, layer.post_attention_layernorm
+                )
+                partial = layer.mlp(
+                    hidden_out, final_all_reduce_params=AllReduceParams(enable_allreduce=False)
+                )
+                partial_all_reduce = layer.mlp.down_proj.all_reduce
+                hidden_states = partial
+            else:
+                hidden_out = attn.o_proj(attn_out.reshape(batch * block_size, -1))
+                hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)
+                hidden_out = layer.mlp(hidden_out)
+                hidden_states = hidden_out.reshape(batch, block_size, -1)
             residual = res_flat.reshape(batch, block_size, -1)
 
+        res_flat = residual.reshape(-1, residual.shape[-1])
+        if partial is not None:
+            hidden_states_out, _ = _all_reduce_add_norm(
+                partial_all_reduce, partial, res_flat, self.model.norm
+            )
+            return hidden_states_out
         hidden_states_out, _ = self.model.norm(
-            hidden_states.reshape(-1, hidden_states.shape[-1]),
-            residual.reshape(-1, residual.shape[-1]),
+            hidden_states.reshape(-1, hidden_states.shape[-1]), res_flat
         )
         return hidden_states_out
 

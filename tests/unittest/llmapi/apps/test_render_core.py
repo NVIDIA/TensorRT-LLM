@@ -653,6 +653,22 @@ class TestRenderConversation:
 
 
 class TestFingerprint:
+    @pytest.mark.parametrize("model_type", [None, ""])
+    def test_unknown_worker_model_type_matches_the_router(self, tokenizer, model_type) -> None:
+        worker = self._worker_resources(
+            tokenizer, model_config=SimpleNamespace(model_type=model_type)
+        )
+        router = RenderResources.from_tokenizer(tokenizer)
+        assert fingerprints_match(worker.fingerprint(), router.fingerprint())
+
+    @pytest.mark.parametrize("local,remote", [(None, "qwen3"), ("", "qwen3"), ("qwen2", "qwen3")])
+    def test_known_model_types_remain_distinct(self, tokenizer, local, remote) -> None:
+        base = resources(tokenizer)
+        assert not fingerprints_match(
+            dataclasses.replace(base, model_type=local).fingerprint(),
+            dataclasses.replace(base, model_type=remote).fingerprint(),
+        )
+
     def test_a_different_server_template_changes_the_digest(self, tokenizer) -> None:
         plain = compute_fingerprint(resources(tokenizer))
         with_template = compute_fingerprint(
