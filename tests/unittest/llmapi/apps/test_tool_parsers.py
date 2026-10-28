@@ -6807,8 +6807,30 @@ class TestChatStreamFinishChunk:
         assert output_chunk["usage"] == finish_chunk["usage"]
         assert finish_chunk["usage"]["completion_tokens"] == 2
 
+    def test_final_reasoning_precedes_the_finish_chunk(self, sample_tools):
+        # deepseek-r1 reads all output before "</think>" as reasoning, so the
+        # last delta carries reasoning_content and no content.
+        args = self._make_args(sample_tools, reasoning_parser="deepseek-r1")
+        *earlier, last = self._choices(self._stream(args,
+                                                    ["Let me ", "think."]))
+
+        assert earlier[-1]["delta"]["reasoning_content"] == "think."
+        assert not earlier[-1]["delta"].get("content")
+        assert not [c for c in earlier if c.get("finish_reason")]
+        assert last == {"index": 0, "delta": {}, "finish_reason": "stop"}
+
+    @pytest.mark.parametrize(
+        "steps, content, token",
+        [
+            pytest.param(
+                ["Good ", "morning"], "morning", "<1>", id="with_final_text"),
+            # The last token decodes to no text but still has logprobs.
+            pytest.param(
+                ["Good ", "morning", ""], "", "<2>", id="without_final_text"),
+        ],
+    )
     def test_logprobs_stay_with_the_output_and_the_stop_with_the_finish(
-            self, sample_tools):
+            self, sample_tools, steps, content, token):
         from types import SimpleNamespace
 
         args = self._make_args(
@@ -6819,16 +6841,17 @@ class TestChatStreamFinishChunk:
         counters = SimpleNamespace(spec_dec_totals=(3, 4),
                                    per_pos_accepted=[2, 1],
                                    per_pos_drafted=[2, 2])
-        payloads = self._stream(args, ["Good ", "morning"],
+        payloads = self._stream(args,
+                                steps,
                                 stop_reason="END",
                                 _spec_dec_counters=counters)
 
         *_, output_chunk, finish_chunk = payloads
         output_choice, = output_chunk["choices"]
         finish_choice, = finish_chunk["choices"]
-        assert output_choice["delta"]["content"] == "morning"
+        assert (output_choice["delta"].get("content") or "") == content
         tokens = [e["token"] for e in output_choice["logprobs"]["content"]]
-        assert tokens == ["<1>"]
+        assert tokens == [token]
         for key in ("finish_reason", "stop_reason", "speculative_decoding"):
             assert key not in output_choice
         assert finish_choice["delta"] == {}
