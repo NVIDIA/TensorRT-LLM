@@ -548,7 +548,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                     dtype=torch.int32,
                     pin_memory=prefer_pinned(),
                 )
-                manager.fill_retained_page_table(self.request_ids, layer_idx, table.numpy())
+                manager.fill_high_precision_page_table(self.request_ids, layer_idx, table.numpy())
                 high_table[: self.num_seqs].copy_(table, non_blocking=True)
 
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
