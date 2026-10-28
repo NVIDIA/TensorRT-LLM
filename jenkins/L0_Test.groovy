@@ -5073,6 +5073,11 @@ Map refreshFailedTestWaives(String llmSrc, String stageName, Map options = [:]) 
             echo "TOT waive result: ${verdict}. Full report: ${stageName}/waive_refresh/report.json in the test-results artifact."
             waived.each { entry -> echo "SKIPPED by new TOT waive: ${entry.test}; ${entry.reason}" }
             retained.each { entry -> echo "FAILURE RETAINED: ${entry.test}; ${entry.reason}" }
+            if (status == 1) {
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
+                    error "Some test failures remain after the TOT waive check; keeping the original failure."
+                }
+            }
         }
         return [allFailuresWaived: status == 0, report: report]
     } catch (InterruptedException e) {
