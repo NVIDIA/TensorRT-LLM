@@ -21,6 +21,8 @@
 from __future__ import annotations
 
 import json
+import math
+from collections.abc import Callable
 from dataclasses import dataclass, fields
 from functools import lru_cache
 from pathlib import Path
@@ -1092,6 +1094,7 @@ class WanRMSNorm(nn.Module):
         self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(shape))
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
+        self.register_buffer("_silu_zero_bias", None, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         norm_dim = 1 if self.channel_first else -1
@@ -1102,6 +1105,74 @@ class WanRMSNorm(nn.Module):
         )
         normalized = F.normalize(x.float() if needs_fp32_normalize else x, dim=norm_dim).to(x.dtype)
         return normalized * self.scale * self.gamma + self.bias
+
+
+def _can_fuse_wan_norm_silu(
+    norm: WanRMSNorm, x: torch.Tensor, nonlinearity: Callable[[torch.Tensor], torch.Tensor]
+) -> bool:
+    """Check the prepared, eager inference contract without importing Triton."""
+    if (
+        type(norm) is not WanRMSNorm
+        or norm._silu_zero_bias is None
+        or nonlinearity is not F.silu
+        or norm.training
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or x.requires_grad
+        or not x.is_cuda
+        or x.device.index != torch.cuda.current_device()
+        or torch.cuda.is_current_stream_capturing()
+        or torch.cuda.get_device_capability(x.device) != (10, 0)
+        or x.dtype != torch.bfloat16
+        or x.ndim != 5
+        or any(size <= 0 for size in x.shape)
+        or x.shape[1] not in (256, 512, 1024)
+        or not x.is_contiguous(memory_format=torch.channels_last_3d)
+        or norm.channel_first is not True
+        or type(norm.bias) is not float
+        or norm.bias != 0.0
+        or math.copysign(1.0, norm.bias) < 0
+        or norm.scale != x.shape[1] ** 0.5
+        or norm._forward_hooks
+        or norm._forward_pre_hooks
+        or torch.nn.modules.module._global_forward_hooks
+        or torch.nn.modules.module._global_forward_pre_hooks
+        or getattr(norm.forward, "__func__", None) is not WanRMSNorm.forward
+    ):
+        return False
+    gamma, zero = norm.gamma, norm._silu_zero_bias
+    if (
+        gamma.device != x.device
+        or zero.device != x.device
+        or gamma.dtype != x.dtype
+        or zero.dtype != x.dtype
+        or tuple(gamma.shape) != (x.shape[1], 1, 1, 1)
+        or tuple(zero.shape) != (x.shape[1],)
+        or not gamma.is_contiguous()
+        or not zero.is_contiguous()
+    ):
+        return False
+    # Singleton strides do not participate in addressing. Every physical row
+    # must still contain C consecutive channels with no inter-row padding.
+    strides = x.stride()
+    if strides[1] != 1:
+        return False
+    step = x.shape[1]
+    for dim in (4, 3, 2, 0):
+        if x.shape[dim] > 1 and strides[dim] != step:
+            return False
+        step *= x.shape[dim]
+    return True
+
+
+def _wan_norm_silu(
+    norm: WanRMSNorm, x: torch.Tensor, nonlinearity: Callable[[torch.Tensor], torch.Tensor]
+) -> torch.Tensor:
+    if _can_fuse_wan_norm_silu(norm, x, nonlinearity):
+        from .rmsnorm_silu import rmsnorm_silu
+
+        return rmsnorm_silu(x, norm.gamma, norm._silu_zero_bias, norm.scale)
+    return nonlinearity(norm(x))
 
 
 class WanUpsample(nn.Upsample):
@@ -1238,7 +1309,7 @@ class WanResidualBlock(nn.Module):
         elif getattr(self.conv1, "absorbs_silu", False):
             x = self.norm1(x)  # conv1 applies SiLU
         else:
-            x = self.nonlinearity(self.norm1(x))
+            x = _wan_norm_silu(self.norm1, x, self.nonlinearity)
 
         if feat_cache is not None and feat_idx is not None:
             x = _causal_conv_with_cache(self.conv1, x, feat_cache, feat_idx)
@@ -1250,7 +1321,7 @@ class WanResidualBlock(nn.Module):
         elif getattr(self.conv2, "absorbs_silu", False):
             h = self.norm2(x)  # conv2 applies SiLU
         else:
-            h = self.nonlinearity(self.norm2(x))
+            h = _wan_norm_silu(self.norm2, x, self.nonlinearity)
         x = self.dropout(h)
 
         # Only Conv2 feeds the block residual add. A parallel wrapper advertises
@@ -1617,7 +1688,7 @@ class WanDecoder3d(nn.Module):
         for up_block in self.up_blocks:
             x = up_block(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
 
-        x = self.nonlinearity(self.norm_out(x))
+        x = _wan_norm_silu(self.norm_out, x, self.nonlinearity)
         if feat_cache is not None and feat_idx is not None:
             x = _causal_conv_with_cache(self.conv_out, x, feat_cache, feat_idx)
         else:
@@ -1847,3 +1918,29 @@ class WanVAE(nn.Module):
         posterior = self.encode(sample).latent_dist
         z = posterior.sample(generator=generator) if sample_posterior else posterior.mode()
         return self.decode(z, return_dict=return_dict)
+
+
+def _prepare_wan_decoder_norm_silu(vae: WanVAE) -> None:
+    """Prepare decoder-only buffers after loading and final device/dtype placement.
+
+    This SM100 path leaves encoder/attention norms and checkpoint keys
+    unchanged. Buffers follow subsequent module device/dtype moves. Unsupported
+    dtypes/devices use native operations; no allocation occurs during forward.
+    """
+    if vae.training:
+        return
+    norms = [vae.decoder.norm_out]
+    for module in vae.decoder.modules():
+        if type(module) is WanResidualBlock:
+            norms.extend((module.norm1, module.norm2))
+    for norm in norms:
+        if (
+            type(norm) is WanRMSNorm
+            and not norm.training
+            and norm.gamma.is_cuda
+            and norm.gamma.dtype == torch.bfloat16
+            and torch.cuda.get_device_capability(norm.gamma.device) == (10, 0)
+            and norm.gamma.numel() in (256, 512, 1024)
+            and norm._silu_zero_bias is None
+        ):
+            norm._silu_zero_bias = norm.gamma.new_zeros((norm.gamma.numel(),))
