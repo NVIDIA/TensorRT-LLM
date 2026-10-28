@@ -163,3 +163,21 @@ def test_k3_uses_modeling_v2_selection(rule, relative):
     path = f"{_PY}/models/kimi_k3_vl/{relative}"
     assert _is_mv2_claim(path)
     assert _apply(rule, path).scope == "modelingv2only"
+
+
+def test_k3_native_change_keeps_existing_kernel_and_collective_tests(rule):
+    family = rule._src_root / "models/kimi_k3_vl"
+    (family / "target").mkdir(parents=True)
+    (family / "target/modeling.py").touch()
+    (family / "routing.py").write_text("from .target.modeling import KimiK3\n")
+    kernel_tests = {
+        "unittest/_torch/kernels/kimi_k3/test_k3_mnnvl_comm.py",
+        "unittest/_torch/kernels/kimi_k3/test_k3_sandwich.py",
+    }
+    matrix = "unittest/_torch/modeling_v2/comm/test_modeling_v2_mnnvl_allgather_split_op_matrix.py"
+    rule.yaml_index.blocks[1].tests.extend([*sorted(kernel_tests), matrix])
+    result = _apply(rule, f"{_PY}/models/kimi_k3_vl/csrc/k3MnnvlAllreduce.cu")
+    assert kernel_tests | {matrix, _COMM} <= _selected(result)
+    assert result.scope == "modelingv2only"
+    other = _selected(_apply(rule, f"{_PY}/models/gpt_oss/csrc/kernel.cu"))
+    assert not (kernel_tests | {matrix}) & other

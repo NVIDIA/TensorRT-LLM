@@ -7,9 +7,8 @@ from typing import Optional, Sequence, Tuple, Union
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
+from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops import native_ops
 from tensorrt_llm.functional import AllReduceFusionOp
 
 from .mnnvl_workspace import MnnvlWorkspace
@@ -200,7 +199,7 @@ class MnnvlFusionAllreduce(OpWrapper):
                 f"not {workspace.buffer_bytes}"
             )
         fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM if fused else AllReduceFusionOp.NONE
-        outputs = native_ops.k3_mnnvl_fusion_allreduce(
+        outputs = load_family_ops(__name__).k3_mnnvl_fusion_allreduce(
             input,
             norm_weight,
             residual,

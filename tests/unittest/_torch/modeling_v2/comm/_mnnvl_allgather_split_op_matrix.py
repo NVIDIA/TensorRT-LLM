@@ -35,7 +35,7 @@ from pathlib import Path
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops import native_ops
+from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _lockstep as ls  # noqa: E402
@@ -86,6 +86,9 @@ WS_B = None
 WS_C = None  # created by the failure-model check after the refused creates
 ROT = {}
 STATS = {"normed_err": 0.0, "attn_res_err": 0.0}
+
+
+_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
 
 
 def buffer_bytes(world: int) -> int:
@@ -438,7 +441,9 @@ def check_unsupported_calls_raise_on_every_rank() -> None:
     expect_refusal(lambda: allgather_split(rows.bfloat16(), 8, WS_A), RuntimeError, "bf16 rows")
     expect_refusal(lambda: allgather_split(rows[:0], 8, WS_A), RuntimeError, "no rows")
     expect_refusal(
-        lambda: native_ops.mnnvl_allgather_split(
+        lambda: load_family_ops(
+            "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+        ).mnnvl_allgather_split(
             rows, 8, R.world + 1, WS_A.comm_buffer(torch.bfloat16), WS_A.buffer_flags
         ),
         RuntimeError,

@@ -24,6 +24,14 @@ def test_k3_family_native_ops():
     ):
         importlib.import_module(f"{package}.{target}")
     ops = load_family_ops(package)
+    for name in (
+        "k3_mnnvl_fusion_allreduce",
+        "k3_attn_res_rmsnorm_fwd",
+        "k3_attn_res_add_rmsnorm_fwd",
+        "mnnvl_allgather_split",
+        "mnnvl_allreduce_attn_res",
+    ):
+        assert getattr(ops, name).default._schema is not None, name
     # A single candidate has softmax weight one; unit RMS weights leave ones unchanged.
     residual = torch.ones((2, 1, 7168), device="cuda", dtype=torch.bfloat16)
     blocks = residual.new_empty((0, 2, 1, 7168))

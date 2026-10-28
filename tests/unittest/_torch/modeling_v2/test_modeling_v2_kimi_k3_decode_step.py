@@ -11,23 +11,28 @@ import pytest
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
-    modeling as route_a,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling import (  # noqa: E501
-    DecodeStep,
-    _attn_res_max_tokens,
-    decode_step,
-    latent_push,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
-    modeling as route_b,
-)
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAIntermediateLayerCache,
     KDAReplayLayerCache,
 )
 from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import _KdaPrequantizedCore
+
+try:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+        modeling as route_a,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling import (  # noqa: E501
+        DecodeStep,
+        _attn_res_max_tokens,
+        decode_step,
+        latent_push,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
+        modeling as route_b,
+    )
+except NoTarget as no_target:
+    pytest.skip(str(no_target), allow_module_level=True)
 
 spec_worker_a = import_module(f"{route_a.__package__}.spec_worker")
 spec_worker_b = import_module(f"{route_b.__package__}.spec_worker")

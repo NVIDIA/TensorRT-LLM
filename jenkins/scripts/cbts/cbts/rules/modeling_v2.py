@@ -107,6 +107,11 @@ _IGNORE = re.compile(r"--ignore=(\S+)")
 _UNIT_ROOT = "unittest/_torch/modeling_v2"
 _ACCURACY_ROOT = "accuracy/modeling_v2"
 
+# Some family tests also exercise stock/CuTe wrappers and live outside models/<family>.
+_FAMILY_TEST_PREFIXES = {
+    "kimi_k3_vl": ("unittest/_torch/kernels/kimi_k3", f"{_UNIT_ROOT}/comm"),
+}
+
 # Substrings that mark a test entry as modeling_v2. All are unambiguous:
 #   - "unittest/_torch/modeling_v2/" → the op and target unit tests
 #   - "accuracy/modeling_v2/" → the per-model accuracy gates
@@ -141,8 +146,13 @@ def _is_mv2_claim(path: str) -> bool:
 
 
 def _entry_is_mv2(entry: str) -> bool:
-    return entry.split()[0].rstrip("/") == _UNIT_ROOT or any(
-        p in entry for p in _MV2_ENTRY_PATTERNS
+    if entry.split()[0].rstrip("/") == _UNIT_ROOT or any(p in entry for p in _MV2_ENTRY_PATTERNS):
+        return True
+    target = _entry_target(entry)
+    return any(
+        _target_in_filter_subtree(target, prefix)
+        for prefixes in _FAMILY_TEST_PREFIXES.values()
+        for prefix in prefixes
     )
 
 
@@ -254,7 +264,11 @@ class ModelingV2Rule(Rule):
         gates = self._gates_under(node)
         if gates is None:
             return None
-        return {f"{_UNIT_ROOT}/models/{node.as_posix()}"} | gates
+        return (
+            {f"{_UNIT_ROOT}/models/{node.as_posix()}"}
+            | gates
+            | set(_FAMILY_TEST_PREFIXES.get(node.parts[0], ()))
+        )
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
         claimed = {f for f in pr.changed_files if _is_mv2_claim(f)}

@@ -4,9 +4,8 @@
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
+from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops import native_ops
 
 
 class AttnResRmsnormFwd(OpWrapper):
@@ -94,7 +93,7 @@ class AttnResRmsnormFwd(OpWrapper):
         rms_eps: float,
         output_rms_eps: float,
     ) -> torch.Tensor:
-        return native_ops.k3_attn_res_rmsnorm_fwd(
+        return load_family_ops(__name__).k3_attn_res_rmsnorm_fwd(
             layer_residual,
             block_residual,
             res_weight,

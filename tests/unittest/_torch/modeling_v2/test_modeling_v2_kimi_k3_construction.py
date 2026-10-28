@@ -9,22 +9,23 @@ import types
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
-    modeling as route_a,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
-    spec_worker as spec_a,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
-    modeling as route_b,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
-    spec_worker as spec_b,
-)
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch.models import modeling_kimi_linear as shared
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+try:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+        modeling as route_a,
+        spec_worker as spec_a,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp16ep1 import (  # noqa: E501
+        modeling as route_b,
+        spec_worker as spec_b,
+    )
+except NoTarget as no_target:
+    pytest.skip(str(no_target), allow_module_level=True)
 
 
 def _config(moe_tp, moe_ep, split_set=True, spec_config=None, attention_dp=False):

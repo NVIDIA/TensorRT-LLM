@@ -303,6 +303,10 @@ def test_native_code_loads_only_when_routing_picks_its_target():
             assert _is_docstring_or_future(node), (
                 f"{init.relative_to(_REPO)}:{node.lineno} -- a family package holds a docstring only"
             )
+    for init in sorted(_MODELS.glob("*/ops/__init__.py")):
+        assert all(_is_docstring_or_future(node) for node in ast.parse(init.read_text()).body), (
+            f"{init.relative_to(_REPO)}: importing unrelated ops must not load a native library"
+        )
     for routing in sorted(_MODELS.glob("*/routing.py")):
         for node in ast.parse(routing.read_text()).body:
             assert not (isinstance(node, ast.ImportFrom) and node.level == 1), (

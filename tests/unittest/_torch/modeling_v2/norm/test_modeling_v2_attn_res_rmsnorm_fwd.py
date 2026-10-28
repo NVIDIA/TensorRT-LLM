@@ -17,7 +17,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops import native_ops
+from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_rmsnorm_fwd import (
     attn_res_rmsnorm_fwd,
 )
@@ -37,6 +37,9 @@ RMS_EPS = 1e-6
 MIN_COSINE = 0.9999
 MAX_RELATIVE_L2 = 5e-3
 INPUT_NAMES = ("layer_residual", "block_residual", "res_weight", "rms_weight", "output_rms_weight")
+
+
+_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
 
 
 def _make_inputs(num_tokens: int, num_candidates: int, seed: int = 0) -> tuple[torch.Tensor, ...]:
@@ -155,15 +158,17 @@ def test_k3_fused_add_preserves_rounding_and_graph_inputs(
     layer, block, res_weight, rms_weight, output_weight = inputs
     addend = layer.roll(1, dims=-1) * 0.25
     args = (layer, addend, block, res_weight, rms_weight, output_weight, RMS_EPS, RMS_EPS)
-    updated, normalized = native_ops.k3_attn_res_add_rmsnorm_fwd(*args, early_trigger=early_trigger)
+    updated, normalized = load_family_ops(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+    ).k3_attn_res_add_rmsnorm_fwd(*args, early_trigger=early_trigger)
     for replay in (False, True):
         if replay:
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                updated, normalized = native_ops.k3_attn_res_add_rmsnorm_fwd(
-                    *args, early_trigger=early_trigger
-                )
+                updated, normalized = load_family_ops(
+                    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+                ).k3_attn_res_add_rmsnorm_fwd(*args, early_trigger=early_trigger)
             layer.copy_(layer.roll(3, dims=-1))
             addend.neg_()
             graph.replay()

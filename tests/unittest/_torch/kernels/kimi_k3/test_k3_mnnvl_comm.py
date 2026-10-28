@@ -62,6 +62,13 @@ def _trtllm():
     return namespace()
 
 
+def _k3_native():
+    """Resolve the family namespace inside each MPI worker."""
+    from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
+
+    return load_family_ops("tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl")
+
+
 WORLD = 4
 H, LATENT, EXPERTS = 7168, 3584, 896
 EPS, OUT_EPS = 1e-6, 1e-5
@@ -136,7 +143,7 @@ def _stock_attn_res(mnnvl, input, prefix_sum, block_residual, res_weight, rms_we
     workspace = get_or_scale_allreduce_mnnvl_workspace(
         mnnvl.mapping, mnnvl.dtype, buffer_size_bytes=one_shot_bytes
     )
-    normed, updated = _trtllm().mnnvl_allreduce_attn_res(
+    normed, updated = _k3_native().mnnvl_allreduce_attn_res(
         input, prefix_sum, block_residual, res_weight, rms_weight, output_rms_weight, rms_eps, output_rms_eps,
         workspace["uc_buffer"].view(mnnvl.dtype).view(3, -1), workspace["buffer_flags"],
     )  # fmt: skip
@@ -153,7 +160,7 @@ def _stock_allgather_split(mnnvl, input, bf16_columns):
     workspace = get_or_scale_allreduce_mnnvl_workspace(
         mnnvl.mapping, mnnvl.dtype, buffer_size_bytes=footprint
     )
-    bf16_out, fp32_out = _trtllm().mnnvl_allgather_split(
+    bf16_out, fp32_out = _k3_native().mnnvl_allgather_split(
         input, bf16_columns, mnnvl.mapping.tp_size, workspace["uc_buffer"].view(mnnvl.dtype).view(3, -1),
         workspace["buffer_flags"],
     )  # fmt: skip

@@ -95,10 +95,10 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, NamedTuple, Opti
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla.decode_view import (
     k3_mla_decode_view,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops import native_ops
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_drafter_attn_qknorm import (
     k3_drafter_attn_qknorm,
 )
@@ -647,10 +647,7 @@ def _apply_attn_res_rmsnorm_fused(
     if M > max_fused_tokens or H != 7168 or N > 12:
         _note_attn_res_fusion("attn_res+norm", False, M, H, N)
         return None
-    try:
-        attn_res_rmsnorm_op = native_ops.k3_attn_res_rmsnorm_fwd
-    except (AttributeError, RuntimeError):
-        return None
+    attn_res_rmsnorm_op = load_family_ops(__name__).k3_attn_res_rmsnorm_fwd
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
     block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
     output = attn_res_rmsnorm_op(
@@ -721,10 +718,7 @@ def _apply_attn_res_add_rmsnorm_fused(
     if M > max_fused_tokens or H != 7168 or N > 12:
         _note_attn_res_fusion("add+attn_res+norm", False, M, H, N)
         return None
-    try:
-        attn_res_add_rmsnorm_op = native_ops.k3_attn_res_add_rmsnorm_fwd
-    except (AttributeError, RuntimeError):
-        return None
+    attn_res_add_rmsnorm_op = load_family_ops(__name__).k3_attn_res_add_rmsnorm_fwd
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
     addend_kernel = addend.reshape(M, 1, H).contiguous()
     block_kernel = block_residual.reshape(K, M, 1, H).contiguous()

@@ -64,6 +64,13 @@ def _trtllm():
     return namespace()
 
 
+def _k3_native():
+    """Resolve the family namespace inside each MPI worker."""
+    from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
+
+    return load_family_ops("tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl")
+
+
 WORLD = 4
 H, K_O, LATENT, WIDTH, PAD, ACT = 7168, 768, 3584, 224, 256, 384
 PLAIN_K, DOWN_K = 384, 896
@@ -171,7 +178,7 @@ def _attn_res_ar(ctx, partial, prefix, block, res_w, rms_w, out_w):
         mnnvl.dtype,
         buffer_size_bytes=num_tokens * hidden_dim * mnnvl.mapping.tp_size * partial.element_size(),
     )
-    return _trtllm().mnnvl_allreduce_attn_res(
+    return _k3_native().mnnvl_allreduce_attn_res(
         partial, prefix, block, res_w, rms_w, out_w, EPS, EPS,
         workspace["uc_buffer"].view(mnnvl.dtype).view(3, -1), workspace["buffer_flags"],
     )  # fmt: skip

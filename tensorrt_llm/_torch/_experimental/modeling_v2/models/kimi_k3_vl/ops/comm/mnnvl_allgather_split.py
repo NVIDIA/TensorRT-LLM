@@ -7,9 +7,8 @@ from typing import Sequence, Tuple
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
+from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops import native_ops
 
 from .mnnvl_workspace import MnnvlWorkspace
 
@@ -137,7 +136,7 @@ class MnnvlAllgatherSplit(OpWrapper):
                 f"mnnvl_allgather_split: the call needs {need} bytes per Lamport buffer, the workspace has "
                 f"{workspace.buffer_bytes}"
             )
-        bf16_out, fp32_out = native_ops.mnnvl_allgather_split(
+        bf16_out, fp32_out = load_family_ops(__name__).mnnvl_allgather_split(
             input,
             bf16_columns,
             workspace.world_size,
