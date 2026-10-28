@@ -188,10 +188,15 @@ class KvCacheLayout:
         raise KeyError(f"no layer group {layer_group_id} in layout")
 
     def group_of_layer(self, layer_id: int) -> KvCacheLayerGroupLayout:
-        """The layer group owning a global model layer index."""
-        for group in self.groups:
-            if layer_id in group.layer_ids:
-                return group
+        """Deprecated: resolve a buffer group in KVCM and call group().
+
+        Returns a uniform layer's group; raises ValueError for a split layer.
+        """
+        matches = [group for group in self.groups if layer_id in group.layer_ids]
+        if len(matches) > 1:
+            raise ValueError(f"layer {layer_id} spans several groups; resolve a buffer group first")
+        if matches:
+            return matches[0]
         raise KeyError(f"layer {layer_id} is not covered by this layout")
 
     def as_single_pool_tensor(self) -> Optional[torch.Tensor]:
