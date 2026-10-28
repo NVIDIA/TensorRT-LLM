@@ -744,17 +744,15 @@ struct FusedSchedulerArgs
  * consumers run in the default one, so the release is system-scope. Each CTA
  * also waits for route_target before it reads the plan, which CTA 0 finishes
  * last, with the scheduler's spin bound. */
-template <int FixedEp, int FixedExperts, int FixedHelpers>
 __global__ void __launch_bounds__(512, 1) halo_q_tma_fused_kernel(FusedSchedulerArgs const scheduler,
     GpuDirectStorage const direct, int warps, int total_slots, unsigned* completed_ctas, uint64_t flag_mc,
     uint64_t generation, unsigned long long* route_epoch, unsigned long long route_target)
 {
-    tensorrt_llm::kernels::halo_q_scheduler_body<FixedEp, FixedExperts, FixedHelpers>(scheduler.routes,
-        scheduler.out_slots, scheduler.out_ids, scheduler.out_levels, scheduler.out_owners, scheduler.peer_bases,
-        scheduler.status, scheduler.partial, scheduler.route_aux, scheduler.grid_sync, scheduler.plan,
-        scheduler.route_prefix, scheduler.ep, scheduler.experts, scheduler.helpers, scheduler.local_rank,
-        scheduler.route_capacity, static_cast<int>(gridDim.x), scheduler.spin_cycles, scheduler.capacity,
-        scheduler.route_count);
+    tensorrt_llm::kernels::halo_q_scheduler_body(scheduler.routes, scheduler.out_slots, scheduler.out_ids,
+        scheduler.out_levels, scheduler.out_owners, scheduler.peer_bases, scheduler.status, scheduler.partial,
+        scheduler.route_aux, scheduler.grid_sync, scheduler.plan, scheduler.route_prefix, scheduler.ep,
+        scheduler.experts, scheduler.helpers, scheduler.local_rank, scheduler.route_capacity,
+        static_cast<int>(gridDim.x), scheduler.spin_cycles, scheduler.capacity, scheduler.route_count);
     // Orders every thread's scheduler writes before thread 0's release.
     __syncthreads();
     if (threadIdx.x == 0)
@@ -778,16 +776,6 @@ __global__ void __launch_bounds__(512, 1) halo_q_tma_fused_kernel(FusedScheduler
     tma_copy_gpu_direct_body(direct, warps, total_slots, completed_ctas, flag_mc, generation);
 }
 
-// HALO-Q is specialized for 384 experts with 4 helpers at EP4 and EP8.
-void const* select_fused_kernel(MegamoeTmaGpuPlanConfig const& config)
-{
-    if (config.global_experts == 384 && config.helper_count == 4 && config.world == 8)
-        return reinterpret_cast<void const*>(&halo_q_tma_fused_kernel<8, 384, 4>);
-    if (config.global_experts == 384 && config.helper_count == 4 && config.world == 4)
-        return reinterpret_cast<void const*>(&halo_q_tma_fused_kernel<4, 384, 4>);
-    return reinterpret_cast<void const*>(&halo_q_tma_fused_kernel<0, 0, 0>);
-}
-
 } // namespace
 
 struct MegamoeTmaCopyState
@@ -801,7 +789,7 @@ struct MegamoeTmaCopyState
     uint64_t* direct_tables = nullptr;
     bool direct_configured = false;
     bool direct_bound = false;
-    // The fused kernel of the bound geometry, prepared by megamoe_tma_copy_bind_gpu_direct.
+    // The fused kernel, prepared by megamoe_tma_copy_bind_gpu_direct.
     void const* fused_kernel = nullptr;
     int fused_total_slots = 0;
     int fused_dynamic_bytes = 0;
@@ -825,7 +813,7 @@ cudaError_t prepare_fused_launch(MegamoeTmaCopyState& state)
 {
     auto const& c = state.config;
     auto const& plan = state.direct.config;
-    void const* kernel = select_fused_kernel(plan);
+    void const* kernel = reinterpret_cast<void const*>(&halo_q_tma_fused_kernel);
     cudaFuncAttributes attributes{};
     cudaError_t error = cudaFuncGetAttributes(&attributes, kernel);
     if (error != cudaSuccess)
@@ -985,9 +973,9 @@ extern "C" int megamoe_tma_copy_create(uint64_t max_segments, int sms, int warps
         &config.device_shared_bytes_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, config.device);
     if (error != cudaSuccess)
         return fail(error);
-    // The generic fused kernel bounds the geometry; binding prepares the
-    // specialization of the bound plan geometry.
-    void const* kernel = reinterpret_cast<void const*>(&halo_q_tma_fused_kernel<0, 0, 0>);
+    // The fused kernel's static shared memory bounds the copy slots; binding
+    // prepares its launch for the bound plan geometry.
+    void const* kernel = reinterpret_cast<void const*>(&halo_q_tma_fused_kernel);
     cudaFuncAttributes attributes{};
     error = cudaFuncGetAttributes(&attributes, kernel);
     if (error != cudaSuccess)

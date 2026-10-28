@@ -41,6 +41,9 @@ constexpr int kMaxExperts = 384;
 constexpr int kMaxBroadcasts = kMaxExperts;
 constexpr int kHelperMaskWords = (kMaxBroadcasts + 31) / 32;
 constexpr int kMinGroup = 4;
+/* Rank loops run in fully unrolled chunks of this many predicated ranks, so
+ * every load of a chunk is independent and in flight together. */
+constexpr int kRankChunk = 8;
 constexpr int kSymPayloadOffset = 64;
 using Epoch = std::uint32_t;
 
@@ -358,11 +361,9 @@ __device__ bool stable_worker_ordinal_pass(int const* routes, int* ordinal, int*
     return true;
 }
 
-template <int FixedEp>
 __device__ bool exchange_counts(unsigned long long const* peer_bases, int const* partial, int* shared, int ep,
     int expert_count, int local_rank, int ctas, Epoch epoch, unsigned long long spin_cycles, int* status)
 {
-    int const exchange_ep = FixedEp > 0 ? FixedEp : ep;
     int const tid = threadIdx.x;
     __shared__ int wait_failed;
     if (tid == 0)
@@ -384,10 +385,10 @@ __device__ bool exchange_counts(unsigned long long const* peer_bases, int const*
      * complete row to the peer acquire. */
     int const warp = tid >> 5;
     int const lane = tid & 31;
-    for (int destination = warp; destination < exchange_ep; destination += blockDim.x >> 5)
+    for (int destination = warp; destination < ep; destination += blockDim.x >> 5)
     {
         int* peer = reinterpret_cast<int*>(peer_bases[destination]);
-        int* row = peer + kSymPayloadOffset + (parity * exchange_ep + local_rank) * expert_count;
+        int* row = peer + kSymPayloadOffset + (parity * ep + local_rank) * expert_count;
         /* Keep scalar remote stores for the publication path; the local mirror
          * copy below uses vector transfers when alignment permits. */
         for (int expert = lane; expert < expert_count; expert += 32)
@@ -402,7 +403,7 @@ __device__ bool exchange_counts(unsigned long long const* peer_bases, int const*
     __syncthreads();
 
     int* local = reinterpret_cast<int*>(peer_bases[local_rank]);
-    if (tid < exchange_ep)
+    if (tid < ep)
     {
         unsigned long long start = clock64();
         Epoch observed = load_relaxed_system(local + tid);
@@ -422,8 +423,8 @@ __device__ bool exchange_counts(unsigned long long const* peer_bases, int const*
     __syncthreads();
     if (wait_failed)
         return false;
-    int const* payload = local + kSymPayloadOffset + parity * exchange_ep * expert_count;
-    int const total = exchange_ep * expert_count;
+    int const* payload = local + kSymPayloadOffset + parity * ep * expert_count;
+    int const total = ep * expert_count;
     /* Vectorize the local mirror copy when shape and alignment permit. */
     if ((total & 3) == 0 && (reinterpret_cast<uintptr_t>(payload) & 15) == 0)
     {
@@ -442,140 +443,145 @@ __device__ bool exchange_counts(unsigned long long const* peer_bases, int const*
     return true;
 }
 
-__device__ void prepare_halo_m_sparse8(int const* counts, int* histogram, int* load, int* candidates, int experts)
+/* Rank and home bounds of the register planner path.  Every hierarchy level
+ * of EP <= 8 fits one 8-lane warp segment, and a home of at most 64 experts
+ * fits two 32-lane rounds. */
+constexpr int kRegisterEp = 8;
+constexpr int kRegisterRounds = 2;
+
+__device__ __forceinline__ bool uses_register_prepare(int ep, int experts)
 {
-    int const tid = threadIdx.x;
-    int const warp = tid >> 5;
-    int const lane = tid & 31;
-    if (warp >= 8)
-        return;
-    int const home = experts / 8;
-    int local_index[2];
-    int local_mass[2];
-    int rank_load = 0;
-#pragma unroll
-    for (int round = 0; round < 2; ++round)
-    {
-        int local = lane + 32 * round;
-        int mass = -1;
-        if (local < home)
-        {
-            mass = 0;
-            int expert = warp * home + local;
-#pragma unroll
-            for (int source = 0; source < 8; ++source)
-                mass += counts[source * experts + expert];
-            rank_load += mass;
-        }
-        local_index[round] = local;
-        local_mass[round] = mass;
-    }
-    rank_load = __reduce_add_sync(0xffffffffu, rank_load);
-    if (lane == 0)
-        load[warp] = rank_load;
-    for (int slot = 0; slot < 4; ++slot)
+    return ep <= kRegisterEp && experts / ep <= 32 * kRegisterRounds;
+}
+
+/* Pick the owner's hot list from the lane-resident home masses: the heaviest
+ * remaining expert per slot, the lowest home index on a tie.  Each lane holds
+ * home experts lane + 32 * round; entries outside the home carry -1. */
+template <int Rounds>
+__device__ __forceinline__ void select_owner_candidates(int (&local_mass)[Rounds], int* histogram, int* candidates,
+    int owner, int home, int candidate_count, bool write_mass)
+{
+    int const lane = threadIdx.x & 31;
+    for (int slot = 0; slot < candidate_count; ++slot)
     {
         int best_mass = -1;
         int best_local = INT_MAX;
 #pragma unroll
-        for (int round = 0; round < 2; ++round)
+        for (int round = 0; round < Rounds; ++round)
         {
-            int mass = local_mass[round];
-            int local = local_index[round];
+            int const mass = local_mass[round];
+            int const local = lane + 32 * round;
             if (mass > best_mass || (mass == best_mass && local < best_local))
             {
                 best_mass = mass;
                 best_local = local;
             }
         }
-        int warp_mass = __reduce_max_sync(0xffffffffu, best_mass);
-        int winner = __reduce_min_sync(0xffffffffu, best_mass == warp_mass ? best_local : INT_MAX);
+        int const warp_mass = __reduce_max_sync(0xffffffffu, best_mass);
+        int const winner = __reduce_min_sync(0xffffffffu, best_mass == warp_mass ? best_local : INT_MAX);
         if (lane == 0)
         {
-            int expert = warp * home + winner;
-            candidates[warp * 4 + slot] = expert;
-            histogram[expert] = warp_mass;
+            int const expert = owner * home + winner;
+            candidates[owner * candidate_count + slot] = expert;
+            if (write_mass)
+                histogram[expert] = warp_mass;
         }
 #pragma unroll
-        for (int round = 0; round < 2; ++round)
-            if (local_index[round] == winner)
+        for (int round = 0; round < Rounds; ++round)
+            if (lane + 32 * round == winner)
                 local_mass[round] = -1;
     }
-    asm volatile("bar.sync 4, 256;" ::: "memory");
 }
 
-/* Build HALO-M's dense histogram, rank loads and per-owner hot lists with one
- * warp per rank.  The former thread-0 implementation dominated the kernel. */
-template <int FixedEp, int FixedHelpers>
+__device__ __forceinline__ void reset_owner_state(
+    int owner, int rank_load, int* load, int* recv_used, int* send_used, int* next_index, int* frozen)
+{
+    load[owner] = rank_load;
+    recv_used[owner] = 0;
+    send_used[owner] = 0;
+    next_index[owner] = 0;
+    frozen[owner] = 0;
+}
+
+/* Rank loads and per-owner hot lists for uses_register_prepare(): one warp
+ * per owner sums its home masses over the source ranks straight into
+ * registers.  Every load is unconditional (out-of-range sources and experts
+ * read a clamped valid address and contribute nothing), so all of them are in
+ * flight together.  Only the candidates' masses reach histogram[]; the
+ * planners read no other entry.  The owner warps, warp 0 among them, meet at
+ * a named barrier; the other warps leave at once. */
+__device__ void prepare_halo_m_register(int const* counts, int* histogram, int* load, int* candidates, int* recv_used,
+    int* send_used, int* next_index, int* frozen, int ep, int experts, int helpers)
+{
+    int const warp = threadIdx.x >> 5;
+    int const lane = threadIdx.x & 31;
+    if (warp >= ep)
+        return;
+    int const owner = warp;
+    int const home = experts / ep;
+    int local_mass[kRegisterRounds];
+    int rank_load = 0;
+#pragma unroll
+    for (int round = 0; round < kRegisterRounds; ++round)
+    {
+        int const local = lane + 32 * round;
+        bool const in_home = local < home;
+        int const expert = owner * home + imin(local, home - 1);
+        int mass = 0;
+#pragma unroll
+        for (int source = 0; source < kRegisterEp; ++source)
+        {
+            int const count = counts[imin(source, ep - 1) * experts + expert];
+            mass += source < ep ? count : 0;
+        }
+        rank_load += in_home ? mass : 0;
+        local_mass[round] = in_home ? mass : -1;
+    }
+    rank_load = __reduce_add_sync(0xffffffffu, rank_load);
+    if (lane == 0)
+        reset_owner_state(owner, rank_load, load, recv_used, send_used, next_index, frozen);
+    select_owner_candidates(local_mass, histogram, candidates, owner, home, imin(helpers, home), true);
+    asm volatile("bar.sync 4, %0;" ::"r"(ep * 32) : "memory");
+}
+
+/* Rounds of 32 home experts per lane; EP2 has the largest home, 192 experts. */
+constexpr int kMaxHomeRounds = (kMaxExperts / 2 + 31) / 32;
+
+/* Dense histogram, rank loads and per-owner hot lists for every other
+ * geometry, with one warp per owner. */
 __device__ void prepare_halo_m(int const* counts, int* histogram, int* load, int* candidates, int* recv_used,
     int* send_used, int* next_index, int* frozen, int ep, int experts, int helpers)
 {
-    int const prepare_ep = FixedEp > 0 ? FixedEp : ep;
-    int const prepare_helpers = imin(FixedHelpers > 0 ? FixedHelpers : helpers, experts / prepare_ep);
     int const tid = threadIdx.x;
     int const warp = tid >> 5;
     int const lane = tid & 31;
-    int const home = experts / prepare_ep;
+    int const home = experts / ep;
     for (int expert = tid; expert < experts; expert += blockDim.x)
     {
         int mass = 0;
 #pragma unroll
-        for (int rank = 0; rank < prepare_ep; ++rank)
+        for (int rank = 0; rank < ep; ++rank)
             mass += counts[rank * experts + expert];
         histogram[expert] = mass;
     }
     __syncthreads();
 
-    for (int owner = warp; owner < prepare_ep; owner += blockDim.x >> 5)
+    for (int owner = warp; owner < ep; owner += blockDim.x >> 5)
     {
         int rank_load = 0;
         for (int local = lane; local < home; local += 32)
             rank_load += histogram[owner * home + local];
         rank_load = __reduce_add_sync(0xffffffffu, rank_load);
         if (lane == 0)
-        {
-            load[owner] = rank_load;
-            recv_used[owner] = 0;
-            send_used[owner] = 0;
-            next_index[owner] = 0;
-            frozen[owner] = 0;
-        }
-
-        /* EP2 is the largest home: 192 experts, six entries per lane. */
-        constexpr int rounds = FixedEp == 8 ? 2 : 6;
-        int local_index[rounds];
-        int local_mass[rounds];
+            reset_owner_state(owner, rank_load, load, recv_used, send_used, next_index, frozen);
+        int local_mass[kMaxHomeRounds];
 #pragma unroll
-        for (int round = 0; round < rounds; ++round)
+        for (int round = 0; round < kMaxHomeRounds; ++round)
         {
-            int local = lane + 32 * round;
-            local_index[round] = local;
+            int const local = lane + 32 * round;
             local_mass[round] = local < home ? histogram[owner * home + local] : -1;
         }
-        for (int slot = 0; slot < prepare_helpers; ++slot)
-        {
-            int best_mass = -1;
-            int best_local = INT_MAX;
-#pragma unroll
-            for (int round = 0; round < rounds; ++round)
-            {
-                int mass = local_mass[round];
-                int local = local_index[round];
-                if (mass > best_mass || (mass == best_mass && local < best_local))
-                {
-                    best_mass = mass;
-                    best_local = local;
-                }
-            }
-            int warp_mass = __reduce_max_sync(0xffffffffu, best_mass);
-            int winner = __reduce_min_sync(0xffffffffu, best_mass == warp_mass ? best_local : INT_MAX);
-            if (lane == 0)
-                candidates[owner * prepare_helpers + slot] = owner * home + winner;
-#pragma unroll
-            for (int round = 0; round < rounds; ++round)
-                if (local_index[round] == winner)
-                    local_mass[round] = -1;
-        }
+        select_owner_candidates(local_mass, histogram, candidates, owner, home, imin(helpers, home), false);
     }
     __syncthreads();
 }
@@ -583,12 +589,10 @@ __device__ void prepare_halo_m(int const* counts, int* histogram, int* load, int
 /* EP<=8 fast path: every participating lane owns one rank's complete
  * mutable HALO-M state.  Group and destination decisions use only shuffles,
  * avoiding repeated shared-memory rank-state traffic and warp barriers. */
-template <int FixedEp, int FixedHelpers, bool NarrowKeys>
+template <bool NarrowKeys>
 __device__ __forceinline__ int plan_halo_m_register8_impl(
     int const* histogram, int lane_load, int total, int* quota, int const* candidates, int* plan, int ep, int helpers)
 {
-    int const plan_ep = FixedEp > 0 ? FixedEp : ep;
-    int const plan_helpers = FixedHelpers > 0 ? FixedHelpers : helpers;
     int const lane = threadIdx.x & 31;
     constexpr unsigned mask = 0xffu;
     int lane_recv = 0;
@@ -596,8 +600,8 @@ __device__ __forceinline__ int plan_halo_m_register8_impl(
     int lane_next = 0;
     int lane_frozen = 0;
 
-    int const target = total / plan_ep + (total % plan_ep != 0);
-    int const depth = hierarchy_depth(plan_ep);
+    int const target = total / ep + (total % ep != 0);
+    int const depth = hierarchy_depth(ep);
     int* p_expert = plan_field(plan, kPlanExpert);
     int* p_level = plan_field(plan, kPlanLevel);
     int* p_begin = plan_field(plan, kPlanGroupBegin);
@@ -607,10 +611,10 @@ __device__ __forceinline__ int plan_halo_m_register8_impl(
     int broadcasts = 0;
 
     int trips = 0;
-    for (int guard = 0; guard < plan_ep * (plan_helpers + 2); ++guard)
+    for (int guard = 0; guard < ep * (helpers + 2); ++guard)
     {
         ++trips;
-        bool const eligible = lane < plan_ep && !lane_frozen && lane_load > target;
+        bool const eligible = lane < ep && !lane_frozen && lane_load > target;
         int owner, owner_load;
         if constexpr (NarrowKeys)
         {
@@ -633,7 +637,7 @@ __device__ __forceinline__ int plan_halo_m_register8_impl(
             = __shfl_sync(mask, (static_cast<unsigned>(lane_send) << 4) | static_cast<unsigned>(lane_next), owner, 8);
         int const owner_send = static_cast<int>(packed >> 4);
         int const owner_next = static_cast<int>(packed & 15u);
-        if (owner_send >= plan_helpers || owner_next >= plan_helpers)
+        if (owner_send >= helpers || owner_next >= helpers)
         {
             if (lane == owner)
                 lane_frozen = 1;
@@ -642,11 +646,11 @@ __device__ __forceinline__ int plan_halo_m_register8_impl(
 
         /* owner and owner_next are warp-uniform here, so every lane can read
          * candidates[] and histogram[] directly.  Both are written by
-         * prepare_halo_m_sparse8 before its bar.sync and never inside this
+         * the prepare step before its barrier and never inside this
          * loop, so every lane loads the same values and no broadcast from the
          * owner is needed.  Only the owner advances lane_next, and it does so
          * before the mass test. */
-        int const expert = candidates[owner * plan_helpers + owner_next];
+        int const expert = candidates[owner * helpers + owner_next];
         if (lane == owner)
             ++lane_next;
         int const mass = histogram[expert];
@@ -665,95 +669,39 @@ __device__ __forceinline__ int plan_halo_m_register8_impl(
             continue;
         }
 
-        int positive_target = imax(target, 1);
-        int need = imax(1, mass / positive_target + (mass % positive_target != 0));
-        int wanted = depth - 1;
-        for (int level = depth - 1; level >= 0; --level)
-        {
-            if (plan_ep / (1 << level) >= need)
-            {
-                wanted = level;
-                break;
-            }
-        }
-
+        /* EP <= 8 has at most two hierarchy levels: level 0 is every rank
+         * and, at EP8, level 1 is the two halves of four ranks.  Two
+         * independent full-mask sums give the two half sums.  Integer addition
+         * is exact, so zeroing the other half's addends yields each half sum
+         * exactly; the two reduces do not depend on each other, and neither
+         * redux.sync uses a per-lane membermask.  The lower half wins a tie. */
+        int const half = ep >> 1;
+        unsigned const rank_mask = (1u << ep) - 1u;
+        unsigned const low_mask = (1u << half) - 1u;
+        unsigned const high_mask = rank_mask & ~low_mask;
+        int const slack = lane < ep && lane != owner ? imax(0, target - lane_load) : 0;
+        int const room_low = __reduce_add_sync(mask, lane < half ? slack : 0);
+        int const room_high = __reduce_add_sync(mask, lane >= half ? slack : 0);
+        unsigned const receive_mask = __ballot_sync(mask, lane < ep && lane_recv < helpers);
         int chosen_level = -1;
         int chosen_begin = -1;
         int chosen_size = 0;
-        if constexpr (FixedEp == 8 && FixedHelpers == 4)
+        if (depth > 1 && mass <= half * target)
         {
-            int slack = lane != owner ? imax(0, target - lane_load) : 0;
-            /* Two independent full-mask sums give the two half sums.  Integer
-             * addition is exact, so zeroing the other half's addends yields
-             * each half sum exactly; the two reduces do not depend on each
-             * other, and neither redux.sync uses a per-lane membermask. */
-            int room0 = __reduce_add_sync(mask, lane < 4 ? slack : 0);
-            int room4 = __reduce_add_sync(mask, lane >= 4 ? slack : 0);
-            unsigned receive_mask = __ballot_sync(mask, lane_recv < plan_helpers);
-            bool valid0 = (receive_mask & 0x0fu) == 0x0fu && room0 > 0;
-            bool valid4 = (receive_mask & 0xf0u) == 0xf0u && room4 > 0;
-            bool want_half = mass <= 4 * target;
-            if (want_half && (valid0 || valid4))
+            bool const valid_low = (receive_mask & low_mask) == low_mask && room_low > 0;
+            bool const valid_high = (receive_mask & high_mask) == high_mask && room_high > 0;
+            if (valid_low || valid_high)
             {
                 chosen_level = 1;
-                chosen_begin = valid0 && (!valid4 || room0 >= room4) ? 0 : 4;
-                chosen_size = 4;
-            }
-            else if (receive_mask == mask && room0 + room4 > 0)
-            {
-                chosen_level = 0;
-                chosen_begin = 0;
-                chosen_size = 8;
+                chosen_begin = valid_low && (!valid_high || room_low >= room_high) ? 0 : half;
+                chosen_size = half;
             }
         }
-        else
+        if (chosen_level < 0 && (receive_mask & rank_mask) == rank_mask && room_low + room_high > 0)
         {
-            for (int level = wanted; level >= 0 && chosen_level < 0; --level)
-            {
-                int size = plan_ep / (1 << level);
-                bool active = lane < plan_ep;
-                int begin = (lane / size) * size;
-                unsigned group_mask = rank_group_mask(begin, size);
-                int local_room = active && lane != owner ? imax(0, target - lane_load) : 0;
-                int room = 0;
-                if (active)
-                    room = __reduce_add_sync(group_mask, local_room);
-                unsigned receive_mask = __ballot_sync(mask, active && lane_recv < plan_helpers);
-                bool group_leader = active && lane == begin && (receive_mask & group_mask) == group_mask;
-                unsigned leader_mask = __ballot_sync(mask, group_leader);
-                int best_room = -1;
-                int best_begin = INT_MAX;
-                if (leader_mask)
-                {
-                    int const first_leader = __ffs(leader_mask) - 1;
-                    if constexpr (NarrowKeys)
-                    {
-                        unsigned key = 0;
-                        if (group_leader)
-                            key = __reduce_max_sync(
-                                leader_mask, (static_cast<unsigned>(room) << 4) | (15u - static_cast<unsigned>(begin)));
-                        key = __shfl_sync(mask, key, first_leader, 8);
-                        best_room = static_cast<int>(key >> 4);
-                        best_begin = 15 - static_cast<int>(key & 15u);
-                    }
-                    else
-                    {
-                        if (group_leader)
-                        {
-                            best_room = __reduce_max_sync(leader_mask, room);
-                            best_begin = __reduce_min_sync(leader_mask, room == best_room ? begin : INT_MAX);
-                        }
-                        best_room = __shfl_sync(mask, best_room, first_leader, 8);
-                        best_begin = __shfl_sync(mask, best_begin, first_leader, 8);
-                    }
-                }
-                if (best_begin != INT_MAX && best_room > 0)
-                {
-                    chosen_level = level;
-                    chosen_begin = best_begin;
-                    chosen_size = size;
-                }
-            }
+            chosen_level = 0;
+            chosen_begin = 0;
+            chosen_size = ep;
         }
         if (chosen_level < 0)
         {
@@ -819,8 +767,8 @@ __device__ __forceinline__ int plan_halo_m_register8_impl(
             p_owner[b] = owner;
             p_helper[b] = -1;
         }
-        if (lane < plan_ep)
-            quota[b * plan_ep + lane] = lane_quota;
+        if (lane < ep)
+            quota[b * ep + lane] = lane_quota;
 
         bool in_group = lane >= chosen_begin && lane < chosen_begin + chosen_size;
         if (in_group)
@@ -839,22 +787,18 @@ __device__ __forceinline__ int plan_halo_m_register8_impl(
 }
 
 /* Select the key representation once, from the actual complete rank load.
- * This guard keeps owner/destination loads and group-room keys representable.
+ * This guard keeps the owner and destination load keys representable.
  * Keep the wide path for large valid int32 inputs without putting a runtime
  * representation branch on each iteration of either planning loop. */
-template <int FixedEp, int FixedHelpers>
 __device__ __forceinline__ int plan_halo_m_register8(
     int const* histogram, int const* load, int* quota, int const* candidates, int* plan, int ep, int helpers)
 {
-    int const plan_ep = FixedEp > 0 ? FixedEp : ep;
     int const lane = threadIdx.x & 31;
-    int const lane_load = lane < plan_ep ? load[lane] : 0;
+    int const lane_load = lane < ep ? load[lane] : 0;
     int const total = __reduce_add_sync(0xffu, lane_load);
     if (total <= 0x0fffffff)
-        return plan_halo_m_register8_impl<FixedEp, FixedHelpers, true>(
-            histogram, lane_load, total, quota, candidates, plan, ep, helpers);
-    return plan_halo_m_register8_impl<FixedEp, FixedHelpers, false>(
-        histogram, lane_load, total, quota, candidates, plan, ep, helpers);
+        return plan_halo_m_register8_impl<true>(histogram, lane_load, total, quota, candidates, plan, ep, helpers);
+    return plan_halo_m_register8_impl<false>(histogram, lane_load, total, quota, candidates, plan, ep, helpers);
 }
 
 /* Exact HALO-M state machine executed by warp 0.  Each lane owns one rank;
@@ -1224,8 +1168,8 @@ __device__ __forceinline__ void halo_q_direction8(
  * `b`, `hosts` and `expert` are the lane's own broadcast identity and do not
  * change between phases or rounds, so the caller hoists them.  Reading them
  * here would put a four-deep dependent load chain (order[lane] -> b -> host_mask[b]
- * and the GLOBAL p_expert[b] -> expert -> counts[...]) at the head of all
- * fourteen phases. */
+ * and the GLOBAL p_expert[b] -> expert -> counts[...]) at the head of every
+ * phase. */
 __device__ __forceinline__ void halo_q_pair8(
     int left, int right, int b, int hosts, int expert, int const* counts, int* quota, int ep, int experts)
 {
@@ -1312,11 +1256,9 @@ __device__ __forceinline__ void halo_q_build_order_and_masks(int const* p_expert
     host_mask[lane] = static_cast<int>(rank_group_mask(p_begin[lane], p_size[lane]) | (1u << p_owner[lane]));
 }
 
-template <int FixedEp>
 __device__ void run_halo_q(int const* counts, int* quota, int* plan, int broadcasts, int ep, int experts, int* ring,
     int* order, int* host_mask)
 {
-    int const plan_ep = FixedEp > 0 ? FixedEp : ep;
     int const tid = threadIdx.x;
     int const warp = tid >> 5;
     int const lane = tid & 31;
@@ -1324,31 +1266,37 @@ __device__ void run_halo_q(int const* counts, int* quota, int* plan, int broadca
     int* p_begin = plan_field(plan, kPlanGroupBegin);
     int* p_size = plan_field(plan, kPlanGroupSize);
     int* p_owner = plan_field(plan, kPlanOwner);
-    if (plan_ep <= 8 && broadcasts <= 8)
+    if (ep <= kRegisterEp && broadcasts <= 8)
     {
-        if (warp < plan_ep / 2)
+        if (warp < ep / 2)
         {
             if (warp == 0)
                 halo_q_build_order_and_masks(p_expert, p_begin, p_size, p_owner, order, host_mask, broadcasts);
-            halo_q_active_barrier((plan_ep / 2) * 32);
+            halo_q_active_barrier((ep / 2) * 32);
             /* Loop-invariant broadcast identity, read once after the barrier
-             * that publishes order[] and host_mask[].  All four participating
+             * that publishes order[] and host_mask[].  All ep / 2 participating
              * warps read the same lane-indexed entries. */
             int const my_b = lane < broadcasts ? order[lane] : -1;
             int const my_hosts = my_b >= 0 ? host_mask[my_b] : 0;
             int const my_expert = my_b >= 0 ? p_expert[my_b] : -1;
             if (broadcasts >= 2)
             {
-                int const ring_size = plan_ep - 1;
+                int const ring_size = ep - 1;
                 /* Run two repair rounds unconditionally. A phase with no required
                  * repair is a no-op, so the plan equals running only the required
                  * repairs. */
                 int const repair_rounds = 2;
                 for (int round = 0; round < repair_rounds; ++round)
                 {
-                    for (int phase = 0; phase < plan_ep - 1; ++phase)
+                    /* At most kRegisterEp - 1 phases, unrolled; the guard is
+                     * uniform across the block, so every pair warp meets
+                     * every barrier it executes. */
+#pragma unroll
+                    for (int phase = 0; phase < kRegisterEp - 1; ++phase)
                     {
-                        int right_index = warp == 0 ? 0 : plan_ep - 1 - warp;
+                        if (phase >= ep - 1)
+                            break;
+                        int right_index = warp == 0 ? 0 : ep - 1 - warp;
                         int right_position = right_index - phase;
                         if (right_position < 0)
                             right_position += ring_size;
@@ -1361,22 +1309,16 @@ __device__ void run_halo_q(int const* counts, int* quota, int* plan, int broadca
                                 left_position += ring_size;
                             left = 1 + left_position;
                         }
-                        halo_q_pair8(left, right, my_b, my_hosts, my_expert, counts, quota, plan_ep, experts);
-                        if constexpr (FixedEp == 8)
-                        {
-                            /* Must stay unconditional.  Omitting it after a
-                             * round's last phase races twice: warp 0 enters the
-                             * next round's phase 0 while warp 3 still writes the
-                             * same quota[], and after the final phase warps 1-3
-                             * leave run_halo_q while warp 0 -- which only meets
-                             * warp 8 at scheduler_tail_barrier -- walks into
-                             * build_route_prefix and reads every quota[]. */
-                            halo_q_active_barrier(128);
-                        }
-                        else
-                        {
-                            halo_q_active_barrier((plan_ep / 2) * 32);
-                        }
+                        halo_q_pair8(left, right, my_b, my_hosts, my_expert, counts, quota, ep, experts);
+                        /* Must stay unconditional.  Omitting it after a
+                         * round's last phase races twice: warp 0 enters the
+                         * next round's phase 0 while the last pair warp still
+                         * writes the same quota[], and after the final phase
+                         * the other pair warps leave run_halo_q while warp 0
+                         * -- which only meets warp 8 at scheduler_tail_barrier
+                         * -- walks into build_route_prefix and reads every
+                         * quota[]. */
+                        halo_q_active_barrier((ep / 2) * 32);
                     }
                 }
             }
@@ -1385,7 +1327,7 @@ __device__ void run_halo_q(int const* counts, int* quota, int* plan, int broadca
     }
     if (warp == 0)
         halo_q_build_order_and_masks(p_expert, p_begin, p_size, p_owner, order, host_mask, broadcasts);
-    if (tid < plan_ep - 1)
+    if (tid < ep - 1)
         ring[tid] = tid + 1;
     __syncthreads();
     if (broadcasts < 2)
@@ -1393,9 +1335,9 @@ __device__ void run_halo_q(int const* counts, int* quota, int* plan, int broadca
 
     for (int round = 0; round < 2; ++round)
     {
-        for (int phase = 0; phase < plan_ep - 1; ++phase)
+        for (int phase = 0; phase < ep - 1; ++phase)
         {
-            if (warp < plan_ep / 2)
+            if (warp < ep / 2)
             {
                 int left, right;
                 if (warp == 0)
@@ -1406,16 +1348,16 @@ __device__ void run_halo_q(int const* counts, int* quota, int* plan, int broadca
                 else
                 {
                     left = ring[warp];
-                    right = ring[plan_ep - 1 - warp];
+                    right = ring[ep - 1 - warp];
                 }
-                halo_q_repair(left, right, broadcasts, order, host_mask, counts, p_expert, quota, plan_ep, experts);
-                halo_q_repair(right, left, broadcasts, order, host_mask, counts, p_expert, quota, plan_ep, experts);
+                halo_q_repair(left, right, broadcasts, order, host_mask, counts, p_expert, quota, ep, experts);
+                halo_q_repair(right, left, broadcasts, order, host_mask, counts, p_expert, quota, ep, experts);
             }
             __syncthreads();
             if (tid == 0)
             {
-                int last = ring[plan_ep - 2];
-                for (int index = plan_ep - 2; index > 0; --index)
+                int last = ring[ep - 2];
+                for (int index = ep - 2; index > 0; --index)
                     ring[index] = ring[index - 1];
                 ring[0] = last;
             }
@@ -1445,17 +1387,20 @@ __device__ void color_and_publish_local(int* plan, int broadcasts, int ep, int h
         {
             if (p_level[b] != level)
                 continue;
-            unsigned unavailable[kHelperMaskWords] = {0};
-            for (int rank = p_begin[b]; rank < p_begin[b] + p_size[b]; ++rank)
-                for (int word = 0; word < words; ++word)
-                    unavailable[word] |= static_cast<unsigned>(used[rank * kHelperMaskWords + word]);
+            /* The lowest slot free on every group rank, one mask word at a
+             * time, so the scan keeps no per-word array. */
             int helper = -1;
-            for (int slot = 0; slot < active_helpers; ++slot)
-                if (!(unavailable[slot / 32] & (1u << (slot % 32))))
-                {
-                    helper = slot;
-                    break;
-                }
+            for (int word = 0; word < words && helper < 0; ++word)
+            {
+                unsigned unavailable = 0;
+                for (int rank = p_begin[b]; rank < p_begin[b] + p_size[b]; ++rank)
+                    unavailable |= static_cast<unsigned>(used[rank * kHelperMaskWords + word]);
+                int const slots = imin(32, active_helpers - word * 32);
+                unsigned const valid = slots == 32 ? 0xffffffffu : (1u << slots) - 1u;
+                unsigned const open_slots = ~unavailable & valid;
+                if (open_slots)
+                    helper = word * 32 + __ffs(open_slots) - 1;
+            }
             if (helper < 0)
             {
                 record_status(status + 4, epoch);
@@ -1493,10 +1438,18 @@ __device__ void build_route_prefix(int const* counts, int const* quota, int* pre
     {
         int expert = p_expert[b];
         int source_before = 0;
-        for (int rank = 0; rank < local_rank; ++rank)
+        /* Ranks past the bound load a clamped valid entry and add nothing,
+         * so every load of a chunk is unconditional. */
+        for (int base = 0; base < local_rank; base += kRankChunk)
         {
-            int diagonal = imin(counts[rank * experts + expert], quota[b * ep + rank]);
-            source_before += counts[rank * experts + expert] - diagonal;
+#pragma unroll
+            for (int step = 0; step < kRankChunk; ++step)
+            {
+                int const rank = imin(base + step, local_rank - 1);
+                int const count = counts[rank * experts + expert];
+                int const diagonal = imin(count, quota[b * ep + rank]);
+                source_before += base + step < local_rank ? count - diagonal : 0;
+            }
         }
         int source_count = counts[local_rank * experts + expert];
         int source_diagonal = imin(source_count, quota[b * ep + local_rank]);
@@ -1508,16 +1461,28 @@ __device__ void build_route_prefix(int const* counts, int const* quota, int* pre
          * although route_destination never reads it: it costs one store and
          * leaves no stale entry below ep. */
         int destination_before = 0;
-        for (int destination = 0; destination < ep; ++destination)
+        for (int base = 0; base < ep; base += kRankChunk)
         {
-            int overlap = destination_before - source_before;
-            overlap = imax(0, imin(residual_supply, overlap));
-            int diagonal_prefix = local_rank < destination ? source_diagonal : 0;
-            prefix[b * (ep + 1) + destination] = diagonal_prefix + overlap;
-            if (destination + 1 < ep)
+            /* Load the whole chunk before the first prefix store, which the
+             * compiler cannot order after loads it might alias. */
+            int destination_supply[kRankChunk];
+#pragma unroll
+            for (int step = 0; step < kRankChunk; ++step)
             {
-                int diagonal = imin(counts[destination * experts + expert], quota[b * ep + destination]);
-                destination_before += quota[b * ep + destination] - diagonal;
+                int const destination = imin(base + step, ep - 1);
+                int const destination_quota = quota[b * ep + destination];
+                destination_supply[step]
+                    = destination_quota - imin(counts[destination * experts + expert], destination_quota);
+            }
+#pragma unroll
+            for (int step = 0; step < kRankChunk; ++step)
+            {
+                int const destination = base + step;
+                int const overlap = imax(0, imin(residual_supply, destination_before - source_before));
+                int const diagonal_prefix = local_rank < destination ? source_diagonal : 0;
+                if (destination < ep)
+                    prefix[b * (ep + 1) + destination] = diagonal_prefix + overlap;
+                destination_before += destination + 1 < ep ? destination_supply[step] : 0;
             }
         }
     }
@@ -1676,28 +1641,51 @@ __device__ void materialize_worker_hot_routes(int const* routes, int* output, in
     int const end = imin(worker_end, begin + warp_span);
     int hot_count = shared[warp * bins + experts];
     hot_count = imin(hot_count, imax(0, end - begin));
-    for (int offset = lane; offset < hot_count; offset += 32)
+    /* Each lane resolves kHotBatch routes at once: every dependent load of a
+     * stage is issued for the whole batch before the next stage consumes it.
+     * Batch members are distinct routes, so the order of their stores does
+     * not matter. */
+    constexpr int kHotBatch = 4;
+    for (int first = lane; first < hot_count; first += 32 * kHotBatch)
     {
-        int index = hot_indices[begin + offset];
-        int expert = routes[index];
-        int b = expert_lut[expert];
-        int ordinal = output[index] + shared[warp * bins + expert];
-        int const* prefix = route_prefix + b * (ep + 1);
-        int destination = route_destination(prefix, ordinal, ep);
-        int slot = -1;
-        if (group_contains(destination, p_begin[b], p_size[b]))
+        int index[kHotBatch];
+        int expert[kHotBatch];
+        int ordinal[kHotBatch];
+#pragma unroll
+        for (int step = 0; step < kHotBatch; ++step)
         {
-            slot = destination * local_slots + home + p_helper[b];
+            int const offset = first + 32 * step;
+            index[step] = offset < hot_count ? hot_indices[begin + offset] : -1;
         }
-        else if (destination == p_owner[b])
+#pragma unroll
+        for (int step = 0; step < kHotBatch; ++step)
         {
-            slot = destination * local_slots + expert - p_owner[b] * home;
+            expert[step] = index[step] >= 0 ? routes[index[step]] : 0;
+            ordinal[step] = index[step] >= 0 ? output[index[step]] : 0;
         }
-        else
+#pragma unroll
+        for (int step = 0; step < kHotBatch; ++step)
         {
-            record_status(status + 5, epoch);
+            if (index[step] < 0)
+                continue;
+            int b = expert_lut[expert[step]];
+            int const* prefix = route_prefix + b * (ep + 1);
+            int destination = route_destination(prefix, ordinal[step] + shared[warp * bins + expert[step]], ep);
+            int slot = -1;
+            if (group_contains(destination, p_begin[b], p_size[b]))
+            {
+                slot = destination * local_slots + home + p_helper[b];
+            }
+            else if (destination == p_owner[b])
+            {
+                slot = destination * local_slots + expert[step] - p_owner[b] * home;
+            }
+            else
+            {
+                record_status(status + 5, epoch);
+            }
+            output[index[step]] = slot;
         }
-        output[index] = slot;
     }
 }
 
@@ -1766,15 +1754,11 @@ __device__ void materialize_worker_routes(int const* routes, int* output, int co
 /* One scheduler generation on a grid of ctas resident CTAs of 512 threads:
  * CTA 0 plans and publishes the helper placement, the other CTAs write routes.
  * The fused scheduler + in-switch copy kernel runs it as its first phase. */
-template <int FixedEp, int FixedExperts, int FixedHelpers>
 __device__ __forceinline__ void halo_q_scheduler_body(int const* routes, int* out_slots, int* out_ids, int* out_levels,
     int* out_owners, unsigned long long const* peer_bases, int* status, int* partial, int* route_aux, int* grid_sync,
-    int* plan, int* route_prefix, int runtime_ep, int runtime_experts, int runtime_helpers, int local_rank,
-    int route_capacity, int ctas, unsigned long long spin_cycles, int capacity, int route_count)
+    int* plan, int* route_prefix, int ep, int experts, int helpers, int local_rank, int route_capacity, int ctas,
+    unsigned long long spin_cycles, int capacity, int route_count)
 {
-    int const ep = FixedEp > 0 ? FixedEp : runtime_ep;
-    int const experts = FixedExperts > 0 ? FixedExperts : runtime_experts;
-    int const helpers = FixedHelpers > 0 ? FixedHelpers : runtime_helpers;
     // Only the caller's valid prefix is readable. Keep the public output at
     // its configured capacity, clearing stale routes inside this same kernel.
     // Empty ranks still execute every collective; no route load occurs at N=0.
@@ -1814,26 +1798,14 @@ __device__ __forceinline__ void halo_q_scheduler_body(int const* routes, int* ou
         offset += capacity;
         int* host_mask = shared + offset;
 
-        bool exchange_ok;
-        if (ep == 8)
-            exchange_ok = exchange_counts<8>(
-                peer_bases, partial, shared, ep, experts, local_rank, ctas, epoch, spin_cycles, status);
-        else
-            exchange_ok = exchange_counts<0>(
-                peer_bases, partial, shared, ep, experts, local_rank, ctas, epoch, spin_cycles, status);
-        if (!exchange_ok)
+        if (!exchange_counts(peer_bases, partial, shared, ep, experts, local_rank, ctas, epoch, spin_cycles, status))
             return;
-        /* EP8 keeps only its candidate masses; other EPs retain the dense
-         * histogram required by the generic planner path. */
-        if (ep == 8 && helpers == 4 && experts >= 32)
-        {
-            prepare_halo_m_sparse8(counts, histogram, load, selected_flags, experts);
-        }
+        if (uses_register_prepare(ep, experts))
+            prepare_halo_m_register(counts, histogram, load, selected_flags, recv_used, send_used, next_index, frozen,
+                ep, experts, helpers);
         else
-        {
-            prepare_halo_m<0, 0>(counts, histogram, load, selected_flags, recv_used, send_used, next_index, frozen, ep,
+            prepare_halo_m(counts, histogram, load, selected_flags, recv_used, send_used, next_index, frozen, ep,
                 experts, helpers);
-        }
 
         int broadcasts = 0;
         if (threadIdx.x < (ep <= 8 ? 8 : 32))
@@ -1841,18 +1813,7 @@ __device__ __forceinline__ void halo_q_scheduler_body(int const* routes, int* ou
             // These short-circuit bounds keep helpers*ep <= 120.
             if (ep <= 8 && helpers <= 15 && helpers * ep <= experts)
             {
-                if (ep == 8 && helpers == 4)
-                {
-                    broadcasts = plan_halo_m_register8<8, 4>(histogram, load, quota, selected_flags, plan, ep, helpers);
-                }
-                else if (ep == 4 && helpers == 4)
-                {
-                    broadcasts = plan_halo_m_register8<4, 4>(histogram, load, quota, selected_flags, plan, ep, helpers);
-                }
-                else
-                {
-                    broadcasts = plan_halo_m_register8<0, 0>(histogram, load, quota, selected_flags, plan, ep, helpers);
-                }
+                broadcasts = plan_halo_m_register8(histogram, load, quota, selected_flags, plan, ep, helpers);
             }
             else
             {
@@ -1876,10 +1837,7 @@ __device__ __forceinline__ void halo_q_scheduler_body(int const* routes, int* ou
         if (threadIdx.x == 8 * 32)
             color_and_publish_local(
                 plan, broadcasts, ep, helpers, local_rank, recv_used, out_ids, out_levels, out_owners, status, epoch);
-        if (ep == 8)
-            run_halo_q<8>(counts, quota, plan, broadcasts, ep, experts, ring, order, host_mask);
-        else
-            run_halo_q<0>(counts, quota, plan, broadcasts, ep, experts, ring, order, host_mask);
+        run_halo_q(counts, quota, plan, broadcasts, ep, experts, ring, order, host_mask);
         if (ctas > 1)
         {
             int const warp = threadIdx.x >> 5;
