@@ -572,6 +572,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                     recompute_paused,
                     inflight_request_ids,
                     scheduled_beam_width,
+                    # Tearing down a started request only pays off when
+                    # nothing else can run. While other generation work
+                    # progresses this pass (scheduled here or in flight),
+                    # it releases pages as it finishes, so this request
+                    # waits instead of costing another one a re-prefill.
+                    allow_recompute_pause=not scheduled_gen and not inflight_request_ids,
                 )
                 if action is ScheduleAction.STOP:
                     break
@@ -1633,8 +1639,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         recompute_paused: RequestList,
         inflight_request_ids: set[int],
         scheduled_beam_width: int,
+        allow_recompute_pause: bool = True,
     ) -> tuple[ScheduleAction, int, int, int]:
         """Try to schedule a generation request.
+
+        *allow_recompute_pause* gates the destructive fallback: when False, a
+        request that suspension cannot make room for self-suspends and waits
+        rather than tearing down another started request.
 
         Returns ``(action, tokens, scheduled_beam_width, req_it_end)``.
         *tokens* is meaningful only when *action* is ``SCHEDULED``.
@@ -1669,7 +1680,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
             )
 
-        if not success:
+        if not success and allow_recompute_pause:
             req_it_end, success = self._try_recompute_pause_for_gen(
                 req,
                 requests_list,
