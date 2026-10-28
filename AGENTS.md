@@ -24,7 +24,9 @@ Python and C++ codebase with a PyTorch execution path.
   `pytest -m cpu_only tests/unittest/llmapi/test_trtllm_serve_config_schemas.py`.
   Commit the generated `tensorrt_llm/schemas/*.json` snapshots; never hand-edit them.
   Version bumps in `tensorrt_llm/version.py` also require regeneration: the snapshots
-  include the package version in their `$id` and `title`.
+  include the package version in their `$id` and `title`. For an automated version-only
+  bump, `python3 scripts/generate_trtllm_serve_schemas.py --sync-version` updates only
+  that metadata without importing TensorRT-LLM or requiring a matching build.
   `python3 scripts/generate_trtllm_serve_schemas.py --check` and the CPU schema tests
   reject missing or stale snapshots. Wheels and HTML docs publish these same files.
 - When adding or renaming a public model architecture identifier, update
@@ -92,6 +94,12 @@ HuggingFace Model → LLM API → PyTorch Executor
 - `trtllm-serve`: OpenAI-compatible REST + gRPC server, supports all backends
 - **Disaggregated serving**: separates prefill (context) and decode (generation) across GPUs
   - KV cache exchange via NIXL (default), UCX, or MPI
+
+### Multimodal request data
+
+Read the [multimodal developer guide](docs/source/developer-guide/multimodal.md) before changing multimodal paths.
+Reuse `MultimodalParams`; request Params own cache references.
+Encoder and LLM forward Params are execution views.
 
 ## Key Files
 
@@ -184,7 +192,8 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 
 New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 `LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
-for integration tests and `REQUIRES_GPU` for tests that need a GPU. `google-tests`
+for integration tests and include `gpu` in `LABELS` for tests that need a GPU.
+CI controls test concurrency through `parallel_run_ctest`. `google-tests`
 continues to build all C++ tests; component aggregate targets build migrated tests.
 
 ### Advisory semantic review

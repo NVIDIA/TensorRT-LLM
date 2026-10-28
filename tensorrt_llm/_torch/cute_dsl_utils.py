@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+import os
 import platform
 import sys
 import types
@@ -73,3 +75,68 @@ def install_cutlass_dsl_compatibility() -> None:
             setattr(cute.core, name, getattr(cute, name))
     if not hasattr(cute, "make_fragment") and hasattr(cute, "make_rmem_tensor"):
         cute.make_fragment = cute.make_rmem_tensor
+
+
+# ``TRTLLM_CUTEDSL_SM_RESERVE=<n>`` (default 0) keeps ``n`` SMs out of every
+# CuTeDSL persistent grid, so CTAs that would land on SMs another kernel holds
+# resident do not run their static tile share as a second wave. The hook wraps
+# ``HardwareInfo.get_max_active_clusters`` on the class, is installed when this
+# module is imported (before any kernel queries occupancy), and reads the
+# variable at each grid sizing; callers that memoize the occupancy must key on
+# ``sm_reserve()`` (the dense GEMM custom op does) or a reserve set after their
+# first query is lost.
+_SM_RESERVE_ENV = "TRTLLM_CUTEDSL_SM_RESERVE"
+_sm_reserve_announced = set()
+
+
+def sm_reserve() -> int:
+    """SMs to keep out of persistent grids, from ``TRTLLM_CUTEDSL_SM_RESERVE`` (0 = none)."""
+    try:
+        return max(0, int(os.environ.get(_SM_RESERVE_ENV, "0")))
+    except ValueError:
+        return 0
+
+
+def reserved_max_active_clusters(full: int, cluster_size: int,
+                                 reserve: int) -> int:
+    """``full`` clusters less enough to free ``reserve`` SMs, never below one.
+
+    A non-positive ``full`` means the device cannot host the cluster shape and
+    is returned unchanged, so callers' "unsupported" checks still fire.
+    """
+    if reserve <= 0 or full <= 0:
+        return full
+    # One cluster occupies cluster_size SMs.
+    return max(1, full - math.ceil(reserve / max(1, cluster_size)))
+
+
+def _install_sm_reserve() -> None:
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        return
+    try:
+        from cutlass.utils import HardwareInfo
+    except ImportError:
+        return
+    if getattr(HardwareInfo.get_max_active_clusters, "_trtllm_sm_reserve_hook",
+               False):
+        return
+    original = HardwareInfo.get_max_active_clusters
+
+    def get_max_active_clusters(self, cluster_size: int, *args,
+                                **kwargs) -> int:
+        full = original(self, cluster_size, *args, **kwargs)
+        reserve = sm_reserve()
+        if reserve <= 0:
+            return full
+        if reserve not in _sm_reserve_announced:
+            _sm_reserve_announced.add(reserve)
+            logger.info(
+                f"[cute_dsl_utils] {_SM_RESERVE_ENV}={reserve}: persistent grids "
+                f"launch with {reserve} SMs reserved")
+        return reserved_max_active_clusters(full, cluster_size, reserve)
+
+    get_max_active_clusters._trtllm_sm_reserve_hook = True
+    HardwareInfo.get_max_active_clusters = get_max_active_clusters
+
+
+_install_sm_reserve()

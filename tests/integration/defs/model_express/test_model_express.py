@@ -128,6 +128,26 @@ _MX_CASES = (
         id="mistral-bf16-tp2",
         marks=pytest.mark.skip_less_device(4),
     ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_PHI3_MODEL",
+            default_model_subdir="Phi-4",
+            repository_cache_prefix="models--trtllm-mx-e2e--phi3-tp1",
+            tp_size=1,
+        ),
+        id="phi3-bf16-tp1",
+        marks=pytest.mark.skip_less_device(2),
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_PHI3_MODEL",
+            default_model_subdir="Phi-4",
+            repository_cache_prefix="models--trtllm-mx-e2e--phi3-tp2",
+            tp_size=2,
+        ),
+        id="phi3-bf16-tp2",
+        marks=pytest.mark.skip_less_device(4),
+    ),
 )
 
 

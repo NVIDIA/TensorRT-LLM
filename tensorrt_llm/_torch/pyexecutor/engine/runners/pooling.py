@@ -8,6 +8,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -34,9 +35,15 @@ class PoolingRunner(NoKVCacheRunner):
         dist: Distributed | None,
         moe_load_balancer: MoeLoadBalancer | None,
         model_caller: ModelCaller,
+        attention_runtime_features: AttentionRuntimeFeatures,
     ) -> None:
         super().__init__(
-            model, config, mapping=mapping, dist=dist, moe_load_balancer=moe_load_balancer
+            model,
+            config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=moe_load_balancer,
+            attention_runtime_features=attention_runtime_features,
         )
         self._model_caller = model_caller
 

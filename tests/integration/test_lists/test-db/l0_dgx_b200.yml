@@ -25,6 +25,9 @@ l0_dgx_b200:
   - unittest/_torch/multi_gpu/test_minimax_m3_piecewise.py::test_minimax_m3_piecewise_empty_adp_rank_preserves_caches
   # One process: the MNNVL workspace's capture guard raises before any MNNVL call.
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_workspace_creation_refuses_graph_capture
+  # TP2 DSpark MLA drafter (split context projection, fused all-reduce + norm)
+  # vs the single-GPU drafter.
+  - unittest/_torch/multi_gpu/test_dspark_drafter_tp_fusion.py
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-TRTLLM]
   - disaggregated/test_disaggregated_beam_search.py::test_disaggregated_beam_search_v2[beam2-reuse]
   - disaggregated/test_disaggregated_beam_search.py::test_disaggregated_beam_search_v2[beam4-no-reuse]
@@ -34,7 +37,10 @@ l0_dgx_b200:
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_eviction
   # ------------- VisualGen multi-GPU tests ---------------
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_parallel_vae.py
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-2-1]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-2-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_ulysses_and_parallel_vae
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_tp2_example_lpips TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-VANILLA] TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FA4] TIMEOUT (30)
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxParallelism::test_ulysses_2gpu_correctness
@@ -55,10 +61,16 @@ l0_dgx_b200:
       orchestrator: mpi
   tests:
   - unittest/disaggregated/test_transfer_lifecycle_gpu.py
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-4-1]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-4-1]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-2-2]
+  - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-2-2]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_partial_vae_groups
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[4-3-VANILLA] TIMEOUT (30)
   # Synthetic weights cover Engram head/row shards and TP/EP shared-expert collectives.
   - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip -k "world:4"
+  # Vocab-parallel token selection over TP2/TP4 vocab shards (default all-reduce).
+  - unittest/_torch/multi_gpu/test_vocab_parallel_selection.py
   - unittest/_torch/moe/test_deepseek_v41_shared_moe.py
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpu_mtp_ar TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestLlama4SpeculativeDecoding::test_llama4_eagle3[linear] TIMEOUT (60)
@@ -235,12 +247,14 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/multi_gpu/test_flux_tp.py
   - unittest/_torch/visual_gen/multi_gpu/test_flux_ulysses.py
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_async_ulysses.py
+  - unittest/_torch/visual_gen/multi_gpu/test_ltx2_parallel_vae.py
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_ulysses.py
   - unittest/_torch/visual_gen/multi_gpu/test_parallel_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_parallel_conv.py
   - unittest/_torch/visual_gen/multi_gpu/test_parallel_group_norm.py
   - unittest/_torch/visual_gen/multi_gpu/test_parallel_vae.py
   - unittest/_torch/visual_gen/multi_gpu/test_qwen_image_attention_parallel.py
+  - unittest/_torch/visual_gen/multi_gpu/test_qwen_image_edit_ulysses.py
   - unittest/_torch/visual_gen/multi_gpu/test_ring_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_tp_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_token_sharded_tp_collectives.py -k "nccl"
@@ -253,7 +267,6 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py
   - unittest/_torch/visual_gen/multi_gpu/test_wan_token_sharded_tp.py
   - unittest/_torch/visual_gen/multi_gpu/test_wan_transformer_parallel.py
-  - unittest/_torch/visual_gen/multi_gpu/test_wan_vsa_ulysses.py
 - condition:
     ranges:
       system_gpu_count:

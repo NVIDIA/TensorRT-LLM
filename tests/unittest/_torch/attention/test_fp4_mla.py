@@ -46,7 +46,12 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    BAD_PAGE_INDEX,
+    KVCacheManagerV2,
+    Role,
+)
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, MTPDecodingConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -553,6 +558,60 @@ def test_fp4_mla_cuda_graph_generation_lengths_records_capture_once(monkeypatch)
     assert first[1].data_ptr() == second[1].data_ptr() == generation_lens.data_ptr()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA tensors")
+@pytest.mark.parametrize(
+    "tokens_per_block,cp_size,cp_rank,tokens_per_seq",
+    [(64, 16, 0, 8), (64, 16, 15, 8), (32, 4, 1, 1), (128, 2, 1, 6)],
+)
+def test_recompute_helix_spec_buffers_matches_elementwise_reference(
+    tokens_per_block: int, cp_size: int, cp_rank: int, tokens_per_seq: int
+) -> None:
+    generator = torch.Generator().manual_seed(7)
+    num_seqs = 5
+    num_tokens = num_seqs * tokens_per_seq
+    base = torch.randint(0, 300_000, (num_seqs, 1), generator=generator)
+    # One verify group straddles a ledger boundary, one a page boundary.
+    base[0, 0] = tokens_per_block * cp_size - max(1, tokens_per_seq // 2)
+    base[1, 0] = 7 * tokens_per_block - max(1, tokens_per_seq // 2)
+    positions = (base + torch.arange(tokens_per_seq)).reshape(-1).to(torch.int32).cuda()
+    metadata = object.__new__(trtllm_backend.TrtllmAttentionMetadata)
+    metadata.kv_cache_manager = SimpleNamespace(tokens_per_block=tokens_per_block)
+    metadata.mapping = SimpleNamespace(cp_size=cp_size, cp_rank=cp_rank)
+    metadata._num_contexts = 1
+    metadata._num_generations = num_seqs
+    untouched = 77
+    # The helix buffers are generation-relative; kv_lens_cuda is batch-indexed.
+    metadata.helix_position_offsets = torch.cat(
+        [positions, torch.full((2,), untouched, dtype=torch.int32, device="cuda")]
+    )
+    metadata.helix_local_slots = torch.full_like(metadata.helix_position_offsets, untouched)
+    metadata.helix_kv_bounds = torch.full_like(metadata.helix_position_offsets, untouched)
+    metadata.kv_lens_cuda = torch.full((num_seqs + 3,), untouched, dtype=torch.int32, device="cuda")
+
+    metadata.recompute_helix_spec_buffers(num_tokens, tokens_per_seq)
+    torch.cuda.synchronize()
+
+    # Reference: the per-op formulation (helix_local_len_vec mirrors the cache manager).
+    owner = torch.div(positions, tokens_per_block, rounding_mode="floor") % cp_size
+    expected_slots = torch.where(
+        owner == cp_rank, metadata.helix_local_len_vec(positions), torch.full_like(positions, -1)
+    )
+    expected_bounds = metadata.helix_local_len_vec(positions + 1)
+    gen = slice(0, num_tokens)
+    torch.testing.assert_close(metadata.helix_local_slots[gen], expected_slots)
+    torch.testing.assert_close(metadata.helix_kv_bounds[gen], expected_bounds)
+    torch.testing.assert_close(
+        metadata.kv_lens_cuda[1 : 1 + num_seqs],
+        expected_bounds.view(num_seqs, tokens_per_seq)[:, -1],
+    )
+    assert (metadata.helix_local_slots[num_tokens:] == untouched).all()
+    assert (metadata.helix_kv_bounds[num_tokens:] == untouched).all()
+    assert metadata.kv_lens_cuda[0].item() == untouched
+    assert (metadata.kv_lens_cuda[1 + num_seqs :] == untouched).all()
+    # Any group of the sequence that this rank does not own writes no slot.
+    assert ((metadata.helix_local_slots[gen] == -1) == (owner != cp_rank)).all()
+
+
 @pytest.mark.parametrize("layer_offset", [0, 1, 3])
 def test_fp4_mla_v2_encoded_page_capacity_is_layer_invariant(layer_offset: int) -> None:
     manager = object.__new__(Fp4MlaKVCacheManagerV2)
@@ -621,6 +680,7 @@ def test_fp4_mla_v2_cache_size_accounts_for_bf16_fallback(
 
 def test_fp4_mla_v2_runtime_sizing_accounts_for_pipeline_slots() -> None:
     manager = object.__new__(Fp4MlaKVCacheManagerV2)
+    manager.layer_specs = None
     manager.max_batch_size = 3
     manager.mapping = SimpleNamespace(pp_size=2)
     manager.max_num_tokens = 100
@@ -1012,13 +1072,28 @@ def test_fp4_mla_manager_v2_registers_native_cache_and_hp_roles(monkeypatch) -> 
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="FP4 MLA (NVFP4 KV cache) requires Blackwell or newer",
 )
-def test_fp4_mla_manager_v2_copies_per_pool_block_offsets(monkeypatch) -> None:
+@pytest.mark.parametrize("device_page_table", ["0", "1"])
+def test_fp4_mla_manager_v2_copies_per_pool_block_offsets(monkeypatch, device_page_table) -> None:
+    if device_page_table == "0" and not prefer_pinned():
+        pytest.skip("Native page-table expansion requires GPU-addressable host memory")
+    monkeypatch.setenv("TLLM_KVCM_V2_DEVICE_PAGE_TABLE", device_page_table)
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     seq_lens = [FP4_MLA_TOKENS_PER_BLOCK + 1, 3]
     manager = _create_fp4_mla_v2_manager(max_tokens=1024, max_seq_len=512, max_batch_size=2)
     try:
         manager.add_dummy_requests(list(range(len(seq_lens))), seq_lens)
         assert manager._use_per_layer_page_tables is False
+        assert manager.uses_device_page_table is (device_page_table == "1")
+        if device_page_table == "0":
+            assert all(
+                tensor.is_pinned()
+                for tensor in (
+                    manager.host_kv_cache_block_offsets,
+                    manager.index_scales,
+                    manager.kv_offset,
+                    manager.index_mapper.get_copy_index([0, 1], 0, 1),
+                )
+            )
         page_spec = manager.get_fp4_mla_page_table_spec(0)
         assert page_spec.cache_page_index_scale == 1
         dst = torch.full(
@@ -1038,6 +1113,28 @@ def test_fp4_mla_manager_v2_copies_per_pool_block_offsets(monkeypatch) -> None:
                 dst[page_spec.cache_pool_id, seq_idx, 0, :num_blocks].tolist()
                 == block_ids[seq_idx][:num_blocks]
             )
+
+        # Check every lifecycle pool and both planes, including padding, after
+        # reordering and shrinking the batch. Reuse a capacity-sized output so
+        # that rows beyond the active batch must remain untouched.
+        for request_ids in ([1, 0], [1]):
+            dst.fill_(-1)
+            copy_idx = manager.index_mapper.get_copy_index(request_ids, 0, 1).long()
+            base = manager.host_kv_cache_block_offsets[:, copy_idx, 0, :]
+            scaled = base * manager.index_scales[:, None, None]
+            expected = torch.stack(
+                (
+                    torch.where(base == BAD_PAGE_INDEX, 0, scaled),
+                    torch.where(
+                        base == BAD_PAGE_INDEX, 0, scaled + manager.kv_offset[:, None, None]
+                    ),
+                ),
+                dim=2,
+            )
+            manager.copy_batch_block_offsets(dst, request_ids, 1, 0, len(request_ids))
+            torch.cuda.synchronize()
+            torch.testing.assert_close(dst[:, : len(request_ids)].cpu(), expected)
+            assert torch.all(dst[:, len(request_ids) :] == -1)
     finally:
         manager.shutdown()
 
@@ -1595,6 +1692,11 @@ def _build_fp4_mla_attention_decode_case(
     num_pages = sum(num_blocks)
     max_seq_len = max(page_size, max(seq_lens))
     max_tokens = max(page_size, num_pages * page_size)
+    # The V2 manager splits its budget across pools, so an exactly sized budget
+    # cannot always admit long MTP requests (the dummy request is silently
+    # dropped); give the test manager headroom.
+    max_tokens += max(max_tokens // 2, len(seq_lens) * 64 * page_size)
+    max_seq_len += 32 * page_size
     context_seq_lens = [seq_len - query_len_per_seq for seq_len in seq_lens]
     if min(context_seq_lens) <= 0:
         raise ValueError("FP4 MLA decode cases require a non-empty context for every sequence.")
@@ -1893,6 +1995,8 @@ def _assert_fp4_mla_attention_decode_accuracy(
     query_len_per_seq: int = 1,
     enable_helix: bool = False,
     enable_block_reuse: bool = False,
+    packed_queries: bool = False,
+    split_kv: int | None = None,
 ) -> None:
     _reset_triton_allocator()
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, backend)
@@ -1900,6 +2004,10 @@ def _assert_fp4_mla_attention_decode_accuracy(
         FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV,
         str(int(fused_v_transpose)),
     )
+    # Packed decode rows are the default; the legacy padded path stays covered
+    # by the existing cases, which opt out explicitly.
+    monkeypatch.setenv(fp4_mla_backend.FP4_MLA_PACKED_Q_ENV, str(int(packed_queries)))
+    monkeypatch.setenv("TRTLLM_FP4_MLA_SPLIT_KV", "auto" if split_kv is None else str(split_kv))
     (
         kv_cache_manager,
         metadata,
@@ -2049,6 +2157,68 @@ def test_fp4_mla_attention_decode_cutedsl_helix_mtp5_matches_reference(
         seed=37,
         query_len_per_seq=6,
         enable_helix=True,
+    )
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
+)
+@pytest.mark.parametrize(
+    "num_heads,query_len_per_seq,enable_helix,split_kv,seq_lens",
+    [
+        (128, 1, False, 1, [131, 512]),
+        (128, 4, False, 2, [131, 512]),
+        (96, 8, False, 1, [131, 2100]),
+        (96, 8, True, 1, [131, 2100]),
+        (96, 8, True, 4, [131, 2100]),
+        (96, 1, True, 4, [131, 2100]),
+        (12, 8, False, 4, [131, 900]),
+        (12, 8, True, 2, [131, 900]),
+        (6, 6, False, 3, [131, 700]),
+        # Imbalanced batches: the balanced plan gives the long requests most of
+        # the task slots (DEP-style traffic, see plan_packed_tasks).
+        (96, 8, False, 4, [131, 20000, 600, 45000]),
+        (96, 8, True, 4, [131, 20000, 600, 45000]),
+        (128, 1, False, 16, [300, 70000, 2200]),
+        (12, 8, False, 2, [131, 9000, 131, 131, 131, 131, 131, 24000]),
+    ],
+    ids=[
+        "h128-q1-s1",
+        "h128-q4-s2",
+        "h96-q8-s1",
+        "h96-q8-helix-s1",
+        "h96-q8-helix-s4",
+        "h96-q1-helix-s4",
+        "h12-q8-s4",
+        "h12-q8-helix-s2",
+        "h6-q6-s3",
+        "h96-q8-skew-s4",
+        "h96-q8-helix-skew-s4",
+        "h128-q1-skew-s16",
+        "h12-q8-skew8-s2",
+    ],
+)
+def test_fp4_mla_attention_decode_cutedsl_packed_matches_reference(
+    monkeypatch,
+    num_heads: int,
+    query_len_per_seq: int,
+    enable_helix: bool,
+    split_kv: int,
+    seq_lens: list[int],
+) -> None:
+    """Packed [query, head] rows, in-kernel KV splits, per-row (Helix) bounds."""
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=num_heads,
+        seq_lens=seq_lens,
+        seed=41,
+        query_len_per_seq=query_len_per_seq,
+        enable_helix=enable_helix,
+        packed_queries=True,
+        split_kv=split_kv,
     )
 
 

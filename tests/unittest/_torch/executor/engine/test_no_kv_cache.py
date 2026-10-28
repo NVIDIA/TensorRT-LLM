@@ -13,6 +13,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners import common as common_modul
 from tensorrt_llm._torch.pyexecutor.engine.runners import no_kv_cache as no_kv_cache_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunnerConfig
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
 pytestmark = pytest.mark.cpu_only
@@ -43,12 +44,15 @@ def _request(
     position_ids: list[int] | None = None,
     multimodal_data: dict | None = None,
 ) -> SimpleNamespace:
+    params = (
+        MultimodalParams(multimodal_data=multimodal_data) if multimodal_data is not None else None
+    )
     return SimpleNamespace(
+        py_multimodal_params=params,
         get_tokens=Mock(return_value=tokens),
         py_request_id=request_id,
         py_position_ids=position_ids,
         py_multimodal_data=multimodal_data,
-        py_mm_item_order=None,
         py_seq_slot=request_id,
     )
 
@@ -97,7 +101,6 @@ def _prepare(
                 max_beam_width=1,
                 without_logits=False,
                 attention_backend=_AttentionBackend,
-                attention_runtime_features=AttentionRuntimeFeatures(),
                 enable_attention_dp=enable_attention_dp,
                 prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
                 prefill_cuda_graph_num_tokens=[],
@@ -107,13 +110,14 @@ def _prepare(
             dist=dist,
             moe_load_balancer=None,
             model_caller=Mock(),
+            attention_runtime_features=AttentionRuntimeFeatures(),
         )
     monkeypatch.setattr(
         runner,
-        "setup_attn_metadata",
+        "_setup_attn_metadata",
         Mock(return_value=attn_metadata),
     )
-    prepared = runner.prepare_inputs(
+    prepared = runner._prepare_inputs(
         scheduled_requests,
         resource_manager=SimpleNamespace(name="resources"),
     )
@@ -171,7 +175,6 @@ def test_no_kv_cache_runner_prepare_inputs_builds_and_ships_multimodal_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = _request(3, [1, 101], multimodal_data={"image": object()})
-    request.py_mm_item_order = ["image"]
     multimodal_params = Mock()
     multimodal_params_factory = Mock(return_value=multimodal_params)
     multimodal_input = object()
@@ -202,7 +205,6 @@ def test_no_kv_cache_runner_prepare_inputs_builds_and_ships_multimodal_inputs(
     multimodal_params_factory.assert_called_once_with(
         multimodal_input=multimodal_input,
         multimodal_data=request.py_multimodal_data,
-        mm_item_order=request.py_mm_item_order,
         input_ids_start_offset=0,
     )
     multimodal_params.to_device.assert_called_once_with(

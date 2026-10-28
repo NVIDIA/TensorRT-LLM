@@ -25,9 +25,22 @@ cannot serve a case (dtype/layout/feature) are skipped via the capability matrix
 import backend_case
 import pytest
 import torch
-from backend_case import BACKENDS_UNDER_TEST, BackendCase, generate_inputs, run_backend, run_case
+from backend_capability import unsupported_reason
+from backend_case import (
+    BACKENDS_UNDER_TEST,
+    BF16_ATOL,
+    BF16_RTOL,
+    FP8_ATOL,
+    BackendCase,
+    generate_inputs,
+    generate_mla_context_inputs,
+    run_backend,
+    run_case,
+)
 from model_attn_config import MODEL_CONFIGS, ModelAttnConfig
 from utils.util import getSMVersion
+
+from tensorrt_llm._utils import get_sm_version
 
 # Precision variants as (dtype, kv_dtype): bf16/fp16 are compute-only; fp8 is an
 # fp8 KV cache with bf16 compute.
@@ -232,6 +245,84 @@ MODEL_CASES = _model_cases()
 @pytest.mark.parametrize("name", list(MODEL_CASES), ids=lambda n: n)
 def test_attention_backend(name):
     run_case(MODEL_CASES[name])
+
+
+def _mla_context_v_stride_case() -> BackendCase:
+    case = next(
+        (
+            case
+            for name, case in MODEL_CASES.items()
+            if name.startswith("hunyuan_mla_ctx-ctx-")
+            and case.dtype == "bfloat16"
+            and case.kv_dtype is None
+        ),
+        None,
+    )
+    if case is None:
+        pytest.skip("no bf16 hunyuan_mla_ctx case")
+    if get_sm_version() < 90:
+        pytest.skip("requires SM90 or newer context FMHA")
+    if reason := unsupported_reason("TRTLLM", case):
+        pytest.skip(reason)
+    return case
+
+
+@pytest.mark.parametrize(
+    "kv_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8_compute"]
+)
+def test_mla_context_v_token_stride_matches_both_input_layouts(kv_dtype: torch.dtype) -> None:
+    """Check separate-V layouts through BF16 FMHA and the FP8 context input quantizer."""
+    case = _mla_context_v_stride_case()
+    fp8_context = kv_dtype == torch.float8_e4m3fn
+    if fp8_context and get_sm_version() not in (90, 100, 103, 107, 120):
+        pytest.skip("requires a GPU supporting FP8 context MLA")
+    inputs = generate_mla_context_inputs(case)
+    assert inputs["v"].stride(0) > inputs["v"].size(1)
+    expected = run_backend(case, "VANILLA", inputs, kv_dtype=case.compute_dtype, kv_layout="NHD")
+    outputs = []
+
+    for make_contiguous in (False, True):
+        current_inputs = dict(inputs)
+        if make_contiguous:
+            current_inputs["v"] = current_inputs["v"].contiguous()
+        actual = run_backend(
+            case, "TRTLLM", current_inputs, kv_dtype=kv_dtype, kv_layout=case.kv_layout
+        )
+        atol = BF16_ATOL + FP8_ATOL if fp8_context else BF16_ATOL
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=BF16_RTOL)
+        outputs.append(actual)
+
+    torch.testing.assert_close(outputs[0], outputs[1], atol=BF16_ATOL, rtol=BF16_RTOL)
+
+
+@pytest.mark.parametrize(
+    ("layout", "error"),
+    [
+        ("feature_stride", "contiguous V features within each token"),
+        ("token_stride", "16-byte aligned V token stride"),
+        ("pointer", "16-byte aligned V pointer"),
+    ],
+)
+def test_mla_context_v_layout_rejected(layout: str, error: str) -> None:
+    case = _mla_context_v_stride_case()
+    inputs = generate_mla_context_inputs(case)
+    v = inputs["v"]
+    if layout == "feature_stride":
+        invalid_v = torch.empty(v.size(0), v.size(1) * 2, dtype=v.dtype, device="cuda")[:, ::2]
+    elif layout == "token_stride":
+        invalid_v = torch.empty_strided(v.shape, (v.size(1) + 1, 1), dtype=v.dtype, device="cuda")
+    else:
+        storage = torch.empty(v.numel() + 1, dtype=v.dtype, device="cuda")
+        invalid_v = storage[1:].view(v.shape)
+    invalid_v.copy_(v)
+    with pytest.raises(RuntimeError, match=error):
+        run_backend(
+            case,
+            "TRTLLM",
+            dict(inputs, v=invalid_v),
+            kv_dtype=case.compute_dtype,
+            kv_layout=case.kv_layout,
+        )
 
 
 # ---------------------------------------------------------------------------

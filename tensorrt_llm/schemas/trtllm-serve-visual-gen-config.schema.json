@@ -510,6 +510,13 @@
           "title": "Smooth K",
           "type": "boolean"
         },
+        "smooth_v": {
+          "default": false,
+          "description": "Subtract the per-channel V mean before quantizing V and add it back to the output. SageAttention only; applied where the attention runs on the PrimTS kernels, while the trtllm-gen kernels quantize V without it.",
+          "status": "prototype",
+          "title": "Smooth V",
+          "type": "boolean"
+        },
         "v_block_size": {
           "default": 0,
           "description": "V quantization block size on the hidden dimension; 0 uses one tensor-wide V scale.",

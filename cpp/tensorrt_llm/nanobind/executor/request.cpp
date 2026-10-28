@@ -715,6 +715,7 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw("request_type", &tle::Request::getRequestType, &tle::Request::setRequestType)
         .def_prop_rw(
             "encoder_input_features", &tle::Request::getEncoderInputFeatures, &tle::Request::setEncoderInputFeatures)
+        .def_prop_ro("encoder_output_length", &tle::Request::getEncoderOutputLength)
         .def_prop_rw(
             "guided_decoding_params", &tle::Request::getGuidedDecodingParams, &tle::Request::setGuidedDecodingParams)
         .def_prop_rw("allotted_time_ms", &tle::Request::getAllottedTimeMs, &tle::Request::setAllottedTimeMs)
@@ -724,11 +725,6 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw("priority", &tle::Request::getPriority, &tle::Request::setPriority)
         .def("__getstate__", requestGetstate)
         .def("__setstate__", requestSetstate);
-
-    nb::class_<tle::SpeculativeDecodingFastLogitsInfo>(m, "SpeculativeDecodingFastLogitsInfo")
-        .def(nb::init<>())
-        .def_rw("draft_request_id", &tle::SpeculativeDecodingFastLogitsInfo::draftRequestId)
-        .def_rw("draft_participant_id", &tle::SpeculativeDecodingFastLogitsInfo::draftParticipantId);
 
     auto requestPerfMetrics = nb::class_<tle::RequestPerfMetrics>(m, "RequestPerfMetrics");
 
@@ -841,40 +837,32 @@ void initRequestBindings(nb::module_& m)
         .def("__getstate__", requestPerfMetricsGetstate)
         .def("__setstate__", requestPerfMetricsSetstate);
 
-    nb::class_<tle::AdditionalOutput>(m, "AdditionalOutput")
-        .def(nb::init<std::string, tle::Tensor>(), nb::arg("name"), nb::arg("output"))
-        .def_rw("name", &tle::AdditionalOutput::name)
-        .def_rw("output", &tle::AdditionalOutput::output);
-
     auto resultSetstate = [](tle::Result& self, nb::tuple const& state)
     {
-        if (state.size() != 14)
+        if (state.size() != 11)
         {
-            throw std::runtime_error("Invalid Request state!");
+            throw std::runtime_error("Invalid Result state!");
         }
         tle::Result result;
         result.isFinal = nb::cast<bool>(state[0]);
         result.outputTokenIds = nb::cast<std::vector<VecTokens>>(state[1]);
         result.cumLogProbs = nb::cast<std::optional<std::vector<float>>>(state[2]);
         result.logProbs = nb::cast<std::optional<std::vector<std::vector<float>>>>(state[3]);
-        result.contextLogits = nb::cast<std::optional<Tensor>>(state[4]);
-        result.generationLogits = nb::cast<std::optional<Tensor>>(state[5]);
-        result.encoderOutput = nb::cast<std::optional<Tensor>>(state[6]);
-        result.finishReasons = nb::cast<std::vector<tle::FinishReason>>(state[7]);
-        result.sequenceIndex = nb::cast<SizeType32>(state[8]);
-        result.isSequenceFinal = nb::cast<bool>(state[9]);
-        result.decodingIter = nb::cast<SizeType32>(state[10]);
-        result.avgDecodedTokensPerIter = nb::cast<float>(state[11]);
-        result.contextPhaseParams = nb::cast<std::optional<tle::ContextPhaseParams>>(state[12]);
-        result.requestPerfMetrics = nb::cast<std::optional<tle::RequestPerfMetrics>>(state[13]);
+        result.finishReasons = nb::cast<std::vector<tle::FinishReason>>(state[4]);
+        result.sequenceIndex = nb::cast<SizeType32>(state[5]);
+        result.isSequenceFinal = nb::cast<bool>(state[6]);
+        result.decodingIter = nb::cast<SizeType32>(state[7]);
+        result.avgDecodedTokensPerIter = nb::cast<float>(state[8]);
+        result.contextPhaseParams = nb::cast<std::optional<tle::ContextPhaseParams>>(state[9]);
+        result.requestPerfMetrics = nb::cast<std::optional<tle::RequestPerfMetrics>>(state[10]);
         new (&self) tle::Result(result);
     };
 
     auto resultGetstate = [](tle::Result const& self)
     {
-        return nb::make_tuple(self.isFinal, self.outputTokenIds, self.cumLogProbs, self.logProbs, self.contextLogits,
-            self.generationLogits, self.encoderOutput, self.finishReasons, self.sequenceIndex, self.isSequenceFinal,
-            self.decodingIter, self.avgDecodedTokensPerIter, self.contextPhaseParams, self.requestPerfMetrics);
+        return nb::make_tuple(self.isFinal, self.outputTokenIds, self.cumLogProbs, self.logProbs, self.finishReasons,
+            self.sequenceIndex, self.isSequenceFinal, self.decodingIter, self.avgDecodedTokensPerIter,
+            self.contextPhaseParams, self.requestPerfMetrics);
     };
 
     nb::class_<tle::Result>(m, "Result")
@@ -883,11 +871,6 @@ void initRequestBindings(nb::module_& m)
         .def_rw("output_token_ids", &tle::Result::outputTokenIds)
         .def_rw("cum_log_probs", &tle::Result::cumLogProbs, nb::arg("cum_log_probs").none())
         .def_rw("log_probs", &tle::Result::logProbs, nb::arg("log_probs").none())
-        .def_rw("context_logits", &tle::Result::contextLogits, nb::arg("context_logits").none())
-        .def_rw("generation_logits", &tle::Result::generationLogits, nb::arg("generation_logits").none())
-        .def_rw("spec_dec_fast_logits_info", &tle::Result::specDecFastLogitsInfo,
-            nb::arg("spec_dec_fast_logits_info").none())
-        .def_rw("encoder_output", &tle::Result::encoderOutput, nb::arg("encoder_output").none())
         .def_rw("finish_reasons", &tle::Result::finishReasons)
         .def_rw("sequence_index", &tle::Result::sequenceIndex)
         .def_rw("is_sequence_final", &tle::Result::isSequenceFinal)
@@ -895,7 +878,6 @@ void initRequestBindings(nb::module_& m)
         .def_rw("avg_decoded_tokens_per_iter", &tle::Result::avgDecodedTokensPerIter)
         .def_rw("context_phase_params", &tle::Result::contextPhaseParams, nb::arg("context_phase_params").none())
         .def_rw("request_perf_metrics", &tle::Result::requestPerfMetrics, nb::arg("request_perf_metrics").none())
-        .def_rw("additional_outputs", &tle::Result::additionalOutputs)
         .def("__getstate__", resultGetstate)
         .def("__setstate__", resultSetstate);
 
@@ -930,24 +912,6 @@ void initRequestBindings(nb::module_& m)
         .def("has_error", &tle::Response::hasError)
         .def_prop_ro("error_msg", &tle::Response::getErrorMsg)
         .def_prop_ro("result", &tle::Response::getResult)
-        .def("clear_context_logits",
-            [](tle::Response& self)
-            {
-                if (!self.hasError())
-                {
-                    auto& result = const_cast<tle::Result&>(self.getResult());
-                    result.contextLogits.reset();
-                }
-            })
-        .def("clear_generation_logits",
-            [](tle::Response& self)
-            {
-                if (!self.hasError())
-                {
-                    auto& result = const_cast<tle::Result&>(self.getResult());
-                    result.generationLogits.reset();
-                }
-            })
         .def("__getstate__", responseGetstate)
         .def("__setstate__", responseSetstate);
 }

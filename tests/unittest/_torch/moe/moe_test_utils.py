@@ -26,7 +26,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE, CuteDslFusedMoE, CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     ACTIVATION_PAYLOAD,
     SimpleActivation,
@@ -35,7 +35,19 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     SwigluBiasActivation,
     activation_constant_names,
 )
-from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
+    cutedsl_grouped_gemm_leaf,
+    find_cutedsl_grouped_gemm_leaf,
+)
+from tensorrt_llm._torch.moe.fused_moe.cutlass import (
+    cutlass_leaf,
+    cutlass_leaves_in_resolution_order,
+    find_cutlass_leaf,
+)
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
+    CuteDslB12xNvfp4FusedMoE,
+    CuteDslB12xW4a16Nvfp4FusedMoE,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import find_marlin_leaf, marlin_leaf
@@ -95,9 +107,15 @@ def get_backend_class(
         # Reuse the family's raising lookup for its message, which lists what
         # *is* registered rather than only naming what is missing.
         raising_lookup = {
+            MoeBackendType.CUTLASS: cutlass_leaf,
             MoeBackendType.TRTLLM: trtllm_gen_leaf,
             MoeBackendType.MARLIN: marlin_leaf,
-        }[backend_type]
+            MoeBackendType.CUTEDSL: cutedsl_grouped_gemm_leaf,
+        }.get(backend_type)
+        if raising_lookup is None:
+            raise ValueError(
+                f"{backend_type.value} has no implementation serving quant_algo={quant_algo} here"
+            )
         return raising_lookup(quant_algo)
     return backend_class
 
@@ -107,34 +125,50 @@ def find_backend_class(
 ) -> type[MoE] | None:
     """The MoE backend class, or ``None`` if the family has no leaf for the format.
 
-    ``TRTLLM`` and ``MARLIN`` are not one class each but sets of leaves keyed by
-    quant (and, for TRTLLM-Gen, provider), so both need ``quant_algo``.
+    ``CUTLASS``, ``TRTLLM``, ``MARLIN``, ``CUTEDSL`` and ``CUTE_DSL_B12X`` are
+    not one class each but sets of leaves keyed by quant (and, for TRTLLM-Gen,
+    provider), so each needs ``quant_algo``. CUTLASS publishes
+    ``fp8_block_scales`` twice, once per SM family, so for that format the leaf
+    is the one this device runs.
     TRTLLM-Gen prefers the native leaf for that format and falls back to the
     FlashInfer sibling, which is what "the TRTLLM backend" has to mean for the
     unquantized format: bf16 has no native leaf, only
     ``FlashinferTrtllmGenBf16Impl``. For every other format the native leaf
     exists and wins, so only bf16 tests are exercising a FlashInfer class.
-    Marlin has a single provider, so its lookup is keyed by quant alone.
 
     Absence is returned rather than raised so that a parameter generator can
     tell it apart from a real failure: catching the exception instead would let
     a leaf that got unregistered read as a combination nobody meant to run, and
     the sweep would go green by shrinking.
     """
+    if backend_type is MoeBackendType.CUTLASS:
+        return find_cutlass_leaf(quant_algo)
     if backend_type is MoeBackendType.TRTLLM:
         return find_trtllm_gen_leaf(quant_algo)
     if backend_type is MoeBackendType.MARLIN:
         return find_marlin_leaf(quant_algo)
+    if backend_type is MoeBackendType.CUTEDSL:
+        return find_cutedsl_grouped_gemm_leaf(quant_algo)
+    if backend_type is MoeBackendType.CUTE_DSL_B12X:
+        # Two leaves, one format each: NVFP4 keeps the CUTLASS prefill path,
+        # W4A16_NVFP4 never leaves the b12x kernel. Compared after
+        # canonical_quant, as the leaves' can_implement sees the format.
+        quant = canonical_quant(quant_algo)
+        return next(
+            (
+                leaf
+                for leaf in (CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE)
+                if canonical_quant(leaf.b12x_quant_algo) == quant
+            ),
+            None,
+        )
 
     backend_class_map = {
-        MoeBackendType.CUTLASS: CutlassFusedMoE,
-        MoeBackendType.CUTEDSL: CuteDslFusedMoE,
         MoeBackendType.CUTEDSL_FC12: CuteDslFc12FusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
         MoeBackendType.MEGAMOE_DEEPGEMM: MegaMoEDeepGemm,
         MoeBackendType.MEGAMOE_CUTEDSL: MegaMoECuteDsl,
-        MoeBackendType.CUTE_DSL_B12X: CuteDslB12xFusedMoE,
     }
     return backend_class_map[backend_type]
 
@@ -151,10 +185,14 @@ def find_backend_classes(
     absent. A caller asking whether a case is *supported* has to ask the same
     way, or it skips cases the layer under test goes on to serve.
 
+    For CUTLASS ``fp8_block_scales`` these are the SM90 and SM120 leaves.
+
     :func:`find_backend_class` stays for callers that want to name one class.
     """
     if backend_type is MoeBackendType.TRTLLM:
         return trtllm_gen_leaves_in_resolution_order(quant_algo)
+    if backend_type is MoeBackendType.CUTLASS:
+        return cutlass_leaves_in_resolution_order(quant_algo)
     cls = find_backend_class(backend_type, quant_algo)
     return () if cls is None else (cls,)
 
@@ -289,119 +327,6 @@ def should_skip_trtllm(
     """
     if backend_type != MoeBackendType.TRTLLM:
         return None
-
-    # [Bug] On B300 (SM103), TRTLLM-Gen block-scale MoE produces a CUDA
-    # illegal memory access (IMA) when the autotuner exposes tile=32
-    # with certain configIndex values that have not been blacklisted.
-    # Empirically the IMA originates inside the W4A16_MXFP4 path
-    # (Bf16MxE2m1BlockScaleMoERunner); once it fires, every subsequent
-    # test in the same pytest process ERRORs at setup with
-    # `cudaErrorIllegalAddress`.
-    #
-    # Background:
-    # * Jenkins L0_MergeRequest_PR/37541 (build 899, stage
-    #   B300-PyTorch-1) originally reported the failure on
-    #   FP8_BLOCK_SCALES `e8_k1_h512_i512-seq=8`, which is a cascade
-    #   victim of an upstream tile=32 IMA.
-    # * PR #13964 head commit 5629e0dff9 introduced two related fixes:
-    #     - Python: corrected the swapped
-    #       `(local_num_experts, num_tokens)` ordering in
-    #       `Bf16MxE2m1BlockScaleMoERunner.get_valid_tactics`.
-    #     - C++: blacklisted tactic `[tileN==32, configIndex==5]` on
-    #       SM103 via `isKnownInvalidBlockScaleMoeTactic` in
-    #       `cpp/.../blockScaleMoe/runner.h`.
-    # * Empirical reproduction of
-    #   `pytest test_moe_backend.py::test_moe_backend -k "TRTLLM"`
-    #   on B300 (NVIDIA B300 SXM6, SM103) at commit 5629e0dff9:
-    #
-    #       blacklist body                                  result
-    #       ---------------------------------------------   ----------------
-    #       SM103 && tileN==32 && configIndex==5            23 pass + 1 FAIL
-    #       (PR HEAD)                                        (W4A16_MXFP4) +
-    #                                                        10 cascade ERROR
-    #       return false (blacklist disabled)               identical to above
-    #       SM103 && tileN==32 (all configIndex)            34/34 pass
-    #
-    #   This shows the PR's `[tileN==32, configIndex==5]` blacklist is
-    #   necessary but *not sufficient*; tileN==32 on SM103 has at
-    #   least one additional broken configIndex that needs to be
-    #   blacklisted (or the kernel fixed) for the W4A16_MXFP4 path.
-    #
-    # Reproduce on a B300 node (Slurm `trt-llm_b300` account):
-    #   1. Build TRT-LLM from PR head 5629e0dff9 inside the project's
-    #      tritondevel container (single GPU is sufficient).
-    #   2. cd tests/unittest && \
-    #      python3 -m pytest -v -s \
-    #          _torch/moe/test_moe_backend.py::test_moe_backend \
-    #          -k "TRTLLM" -p no:randomly
-    #   3. Expect:
-    #        FAILED ...alpha=1.702_beta=1.0_limit=7.0-e128_k4_h2880_i2880
-    #               -seq=8-...-quant=W4A16_MXFP4...
-    #             torch.AcceleratorError: CUDA error: illegal memory access
-    #
-    # Skip the directly-observed FAIL until the C++ blacklist is
-    # extended (e.g. `SMVersion==103 && tileTokensDim==32`) or the
-    # underlying kernel is fixed for tileN==32 on SM103.
-    from tensorrt_llm._utils import get_sm_version
-
-    if (
-        get_sm_version() == 103
-        and quant_algo == QuantAlgo.W4A16_MXFP4
-        and swiglu_gptoss_style
-        and model_config is not None
-        and model_config.num_experts == 128
-        and model_config.top_k == 4
-        and model_config.hidden_size == 2880
-        and model_config.intermediate_size == 2880
-        and seq_len == 8
-    ):
-        return (
-            "[Bug] TRTLLMGen MoE W4A16_MXFP4 on B300 (SM103) with "
-            "MoeModelConfig(128, 4, 2880, 2880), "
-            "swiglu_gptoss_style=True and seq_len=8 hits CUDA "
-            "illegal memory access in a tileN=32 autotune tactic "
-            "not covered by the partial blacklist "
-            "[tileN=32, configIndex=5] in PR #13964 head 5629e0dff9; "
-            "see the comment above for reproduction."
-        )
-
-    # [nvbug 6165866] The same uninitialized-trtllm-gen-scratch IMA cascade
-    # described above also poisons the whole `-k "TRTLLM"` pytest process on
-    # Blackwell (both SM100/B200 and SM103/B300) through two broader case
-    # families. They are skipped here (in addition to the specific SM103 case
-    # above) so the single-process run stays clean until the kernel is fixed.
-    # See https://nvbugspro.nvidia.com/bug/6165866
-    #
-    # (1) quant=None (BF16): the flashinfer BF16 GEMM
-    #     (`bmm_Bfloat16_..._sm100f`, trtllm_batched_gemm_runner.cu:305) is the
-    #     cascade victim once a block-scale case has run earlier in the same
-    #     process. Minimal repro (reproduces on both SM100 and SM103):
-    #       e60_k4_h2048_i1408-seq=1-quant=None,
-    #       e60_k4_h2048_i1408-seq=1-quant=FP8_BLOCK_SCALES,
-    #       e60_k4_h2048_i1408-seq=1-quant=W4A8_MXFP4_FP8,
-    #       then e8_k1_h512_i512-seq=1-quant=None  -> IMA on the last case.
-    #
-    # (2) e128 W4A16_MXFP4 (all seq / plain+gptoss): the four e128 shape
-    #     (num_experts=128, top_k=4, hidden=intermediate=2880) W4A16_MXFP4
-    #     cases poison each other (the SM103 gptoss-seq8 case above is one of
-    #     them; on SM100 the first observed FAIL is e128-seq1-W4A16_MXFP4).
-    is_e128_w4a16_mxfp4 = (
-        quant_algo == QuantAlgo.W4A16_MXFP4
-        and model_config is not None
-        and model_config.num_experts == 128
-        and model_config.top_k == 4
-        and model_config.hidden_size == 2880
-        and model_config.intermediate_size == 2880
-    )
-    if get_sm_version() in (100, 103) and (quant_algo is None or is_e128_w4a16_mxfp4):
-        return (
-            "[nvbug 6165866] TRTLLM-Gen MoE on Blackwell (SM100/SM103) hits a "
-            "CUDA illegal memory access that cascades across the whole pytest "
-            "process; the quant=None (flashinfer BF16 GEMM victim) and e128 "
-            "W4A16_MXFP4 (self-cascading tileN=32 tactic) families are skipped "
-            "until the kernel is fixed. "
-            "See https://nvbugspro.nvidia.com/bug/6165866"
-        )
 
     # Routing method compatibility check (used by test_moe_module.py)
     # TRTLLMGen C++ routing kernel (runner.cu) implements:
@@ -713,33 +638,10 @@ def should_skip_cutedsl(
     backend_name = backend_type.value  # "CUTEDSL" or "CUTEDSL_FC12"
     intermediate_size = model_config.intermediate_size
 
-    # NVFP4 with large intermediate_size has known accuracy issues (8.5% mismatch
-    # at i=14336, threshold 3%). Both CuteDSL and reference have FP4 intermediate
-    # storage, but produce DIFFERENT FP4 values due to:
-    # 1) SwiGLU precision: CuteDSL kernel uses approximate math ops for sigmoid
-    #    (rcp_approx + exp2 fastmath, see utils.py:sigmoid_f32), while reference
-    #    Triton kernel uses standard tl.sigmoid (see swiglu.py:42).
-    # 2) Precision chain: CuteDSL computes SwiGLU in FP32 (GEMM accumulator →
-    #    FP32 SwiGLU → FP4), reference goes FP32 accumulator → BF16 → SwiGLU →
-    #    BF16 → fp4_quantize. Two BF16 truncation points create different values.
-    # 3) FP4 quantization: CuteDSL uses rcp_approx for block scale reciprocal
-    #    (blockscaled_...fusion.py:2588), fp4_quantize uses exact division.
-    # These per-element FP4 value differences accumulate through FC2 GEMM dot
-    # product (K=intermediate_size). CUTLASS avoids this entirely with a single
-    # fused kernel keeping BF16 intermediate precision.
-    if quant_algo == QuantAlgo.NVFP4 and intermediate_size >= 14336:
-        return (
-            f"[Design Limitation] {backend_name} NVFP4 with large "
-            f"intermediate_size has accuracy issues due to FP4 intermediate "
-            f"storage between FC1+SwiGLU and FC2 kernels "
-            f"(intermediate_size={intermediate_size} >= 14336, "
-            f"FC2 accumulates over K={intermediate_size} with 896+ blocks)."
-        )
-
     # NVFP4 with Llama4Renormalize routing has significant accuracy issues.
-    # Same root cause as the large intermediate_size skip above: CuteDSL and
-    # reference produce different FP4 intermediate values due to approximate
-    # math ops (rcp_approx, exp2 fastmath) and BF16 truncation differences.
+    # CuteDSL quantizes the FC1 output to NVFP4 from the fp32 accumulator, while
+    # the reference GatedMLP rounds the GEMM output and the SwiGLU result to bf16
+    # first, so the two produce different FP4 intermediate values.
     # Llama4's sigmoid routing amplifies these differences: standard Renormalize
     # uses softmax (weights sum to 1, per-expert errors averaged), while Llama4
     # uses sigmoid (weights independent in (0,1), per-expert errors summed
@@ -1302,12 +1204,11 @@ def get_quick_skip_reason(
         # under test goes on to serve.
         candidates = find_backend_classes(backend_type, quant_algo)
         if not candidates:
-            # No leaf publishes this (provider, quant) pair, which is the same
-            # verdict the single TRTLLM-Gen ``can_implement`` used to return as
-            # QUANT_UNSUPPORTED. Asked as a query, so any other failure in the
-            # lookup still raises instead of being reported as a skip.
+            # No leaf of this family publishes the format. Asked as a query,
+            # so any other failure in the lookup still raises instead of being
+            # reported as a skip.
             quant = normalize_quant(canonical_quant(quant_algo))
-            return f"no TRTLLM-Gen implementation for quant={quant}"
+            return f"no {backend_type.value} implementation for quant={quant}"
         is_minimax_megamoe = backend_type == MoeBackendType.MEGAMOE_CUTEDSL and swiglu_gptoss_style
         # Eligibility reads *which* constants an activation carries, not just
         # its kind: a backend declaring ``limit=UNSUPPORTED`` serves unclamped

@@ -519,11 +519,11 @@ def test_failed_item_fences_cached_pools(reuse_cache, monkeypatch):
     assert s2._real is not real  # fresh pool, no reuse across the failure
 
 
-class _FakeBarrierSession:
+class _FakeProbeSession:
     """Fakes MpiPoolSession.submit for master-side submit_sync_per_worker tests.
 
-    Worker-side behaviour (the barrier itself) needs real MPI and is covered
-    by the multi-GPU validation runs; here each entry stands for one worker's
+    Worker-side behaviour needs real MPI and is covered by the multi-GPU
+    validation runs; here each entry stands for one worker's
     future: a (rank, result) tuple, an Exception, or None (never completes,
     i.e. a wedged worker).
     """
@@ -548,14 +548,14 @@ class _FakeBarrierSession:
 def test_probe_returns_results_ordered_by_rank():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(2, "c"), (0, "a"), (1, "b")])
+    session = _FakeProbeSession([(2, "c"), (0, "a"), (1, "b")])
     assert submit_sync_per_worker(session, lambda: None) == ["a", "b", "c"]
 
 
 def test_probe_times_out_on_wedged_worker():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(0, "a"), None])  # rank 1 never returns
+    session = _FakeProbeSession([(0, "a"), None])  # rank 1 never returns
     with pytest.raises(RuntimeError, match="timed out"):
         submit_sync_per_worker(session, lambda: None, timeout=0.2)
 
@@ -563,7 +563,7 @@ def test_probe_times_out_on_wedged_worker():
 def test_probe_propagates_worker_exception():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(0, "a"), ValueError("worker died")])
+    session = _FakeProbeSession([(0, "a"), ValueError("worker died")])
     with pytest.raises(ValueError, match="worker died"):
         submit_sync_per_worker(session, lambda: None)
 
@@ -571,7 +571,7 @@ def test_probe_propagates_worker_exception():
 def test_probe_flags_missing_rank():
     from test_common.grouped_test_utils import submit_sync_per_worker
 
-    session = _FakeBarrierSession([(0, "a"), (0, "a")])  # rank 1 never covered
+    session = _FakeProbeSession([(0, "a"), (0, "a")])  # rank 1 never covered
     with pytest.raises(RuntimeError, match=r"ranks \[1\]"):
         submit_sync_per_worker(session, lambda: None)
 

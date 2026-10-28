@@ -19,7 +19,7 @@ DwdpManager is a thin lifecycle layer that:
 - owns the Single Source of Truth for registered MoE layer indices
 - forwards runtime calls to the DWDPWeightManager produced by setup_dwdp
 
-These tests mock out COMM_WORLD / global_mpi_rank / setup_dwdp so the full
+These tests mock out COMM_WORLD / dwdp_global_rank / setup_dwdp so the full
 lifecycle can be exercised on a single CPU without MPI / CUDA / MNNVL.
 """
 
@@ -74,7 +74,7 @@ def _configure_mock_comm_world(mock_comm_world, world_size: int = 1024):
 
 
 @patch("tensorrt_llm._torch.pyexecutor.dwdp.setup_dwdp")
-@patch("tensorrt_llm._torch.pyexecutor.dwdp.global_mpi_rank", return_value=0)
+@patch("tensorrt_llm._torch.pyexecutor.dwdp.dwdp_global_rank", return_value=0)
 @patch("tensorrt_llm._torch.pyexecutor.dwdp.COMM_WORLD")
 class TestDwdpManagerLifecycle(unittest.TestCase):
     def setUp(self):

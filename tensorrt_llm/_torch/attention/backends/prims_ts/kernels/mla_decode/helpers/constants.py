@@ -34,8 +34,10 @@ WARP_REDUCTION_BFLY_DISTANCES = (16, 8, 4, 2, 1)
 WARPGROUP_WARPS = 4
 WARPGROUP_THREADS = WARPGROUP_WARPS * WARP_LANES
 
-# Kernel-level TMEM lifecycle synchronization.  Barrier ID 15 is reserved for
-# alloc/dealloc phases in the 1CTA path; the 2CTA path uses config-owned IDs.
+# Kernel-level 1CTA TMEM synchronization: 14 publishes allocation to compute
+# warps; 15 handles full-CTA initialization/deallocation. The 2CTA path owns
+# its barrier IDs in its configuration.
+TMEM_READY_BARRIER_ID = 14
 TMEM_LIFECYCLE_BARRIER_ID = 15
 TMEM_DEALLOC_MBAR_THREADS = WARP_LANES
 
@@ -69,6 +71,10 @@ TCGEN05_16X32BX2_BF16_P_STRIDE = 32
 TCGEN05_16X32BX2_FP8_P_STRIDE = 16
 TCGEN05_SECOND_PANEL_ADDR_OFFSET = 16 << 16
 
+# Softmax uses base-two exponentials internally; public sparse LSE uses ln.
+LN_2 = 0.6931471805599453
+LOG2_E = 1.4426950408889634
+
 # Softmax scratch stores the max state first and the sum state in a second
 # fixed-size panel.  The offset is in Uint32 scratch words.
 SOFTMAX_SCRATCH_SUM_WORD_OFFSET = 384
@@ -86,6 +92,16 @@ SMEM_P_FP8_STORE_BARRIER_BASE_ID = 4
 # Page-offset entries are Int32 page IDs staged through cp.async.
 PAGE_OFFSET_BYTES = 4
 CP_ASYNC_CACHE_CA = "ca"
+
+# gather4 always copies four selected KV rows. This instruction width is
+# independent of the number of issuing warps or the KV tile size.
+TMA_GATHER_ROWS = 4
+
+# Sparse 2CTA offset caches derive their sizes from cfg token geometry:
+# K owns 128/2=64 rows per CTA; V needs all 128 rows. Lane-distributed
+# caches therefore hold 64/32=2 K and 128/32=4 V words per lane. A uniform
+# cache instead holds the issuing warp's share (64/W K and 128/W V words
+# per lane). Pending V stays lane-distributed until it becomes current.
 
 # Dense MLA kernels specialize paged-KV addressing for this explicit ABI set.
 # Each listed size exactly partitions a 128-token KV tile; other page sizes are
