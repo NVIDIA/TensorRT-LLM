@@ -266,10 +266,10 @@ class ReusePolicy(enum.IntEnum):
 class BufferConfig:
     """One buffer of a layer.
 
-    ``reuse_policy`` of ``None`` uses the layer's policy. Only SSM layers accept a
-    different policy; the buffer then belongs to the SSM layer group of that
-    policy while keeping its layer ID, so one SSM layer can span several layer
-    groups.
+    ``reuse_policy`` of ``None`` uses the layer's policy. Attention and SSM
+    buffers can override the layer's policy; the buffer then belongs to the
+    layer group for its effective policy and lifecycle properties while keeping
+    its layer ID, so one layer can span several layer groups.
     """
 
     role: DataRole
