@@ -40,7 +40,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.visual_gen.params import MediaRole
 
-from .cache import CacheDiTAccelerator, TeaCacheAccelerator
+from .cache import CacheDiTAccelerator, SeaCacheAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .mapping import _VisualGenAutotuneDist
@@ -142,7 +142,7 @@ class BasePipeline(nn.Module):
         self._warmed_up_shapes: Set[tuple] = set()
         self._runtime_lora_applications: List[Any] = []
 
-        # Unified cache acceleration (TeaCache, Cache-DiT); see _setup_cache_acceleration
+        # Unified cache acceleration (TeaCache, Cache-DiT, SeaCache); see _setup_cache_acceleration
         self.cache_accelerator: Optional["CacheAccelerator"] = None
 
         # Components
@@ -731,7 +731,7 @@ class BasePipeline(nn.Module):
             )
 
     def _setup_cache_acceleration(self) -> None:
-        """Enable TeaCache or Cache-DiT from model_config.cache_backend."""
+        """Enable TeaCache, Cache-DiT or SeaCache from model_config.cache_backend."""
 
         if getattr(self, "cache_accelerator", None) is not None:
             self.cache_accelerator.unwrap()
@@ -741,6 +741,12 @@ class BasePipeline(nn.Module):
 
         if cfg.cache_backend == "cache_dit":
             acc = CacheDiTAccelerator(self, cfg.cache_dit)
+            acc.wrap()
+            self.cache_accelerator = acc
+            return
+
+        if cfg.cache_backend == "seacache":
+            acc = SeaCacheAccelerator(self, cfg.seacache)
             acc.wrap()
             self.cache_accelerator = acc
             return
@@ -1353,7 +1359,7 @@ class BasePipeline(nn.Module):
         scheduler_step_kwargs: Optional[Dict[str, Any]] = None,
         extra_stream_timesteps: dict[str, torch.Tensor] | None = None,
     ):
-        """Execute denoising loop with optional CFG parallel and TeaCache support.
+        """Execute denoising loop with optional CFG parallel and step-caching support.
 
         Args:
             latents: Initial noise latents (primary stream, e.g., video)
@@ -1411,7 +1417,7 @@ class BasePipeline(nn.Module):
             if stream_timesteps.ndim != 1 or len(stream_timesteps) != total_steps:
                 raise ValueError(f"Timestep schedule for {name} must have {total_steps} entries.")
 
-        # Reset cache acceleration state for new generation (TeaCache / Cache-DiT)
+        # Reset cache acceleration state for new generation (TeaCache / Cache-DiT / SeaCache)
         if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
             self.cache_accelerator.refresh(total_steps)
 
@@ -1527,7 +1533,7 @@ class BasePipeline(nn.Module):
             logger.info("=" * 80)
             logger.info(f"Denoising done: {total_time:.2f}s ({total_time / total_steps:.2f}s/step)")
 
-            # Single logging site for TeaCache and Cache-DiT.
+            # Single logging site for TeaCache, Cache-DiT and SeaCache.
             if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
                 stats = self.cache_accelerator.get_stats()
                 if stats:
@@ -1547,6 +1553,12 @@ class BasePipeline(nn.Module):
                                 f"TeaCache: {stats['hit_rate']:.1%} hit rate "
                                 f"({stats['cached']}/{stats['total']} steps)"
                             )
+                    elif self.pipeline_config.cache_backend == "seacache":
+                        logger.info(
+                            f"SeaCache: {stats['hit_rate']:.1%} hit rate "
+                            f"({stats['cached']}/{stats['total']} steps, "
+                            f"cached steps {stats['cached_step_indices']})"
+                        )
                     else:
                         logger.info("Cache acceleration stats: %s", stats)
 

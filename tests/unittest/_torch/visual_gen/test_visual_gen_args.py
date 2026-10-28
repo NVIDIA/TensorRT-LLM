@@ -18,6 +18,7 @@ from tensorrt_llm.visual_gen.args import (
     ParallelConfig,
     QuantAttentionConfig,
     RuntimeLoRAConfig,
+    SeaCacheConfig,
     SkipSoftmaxAttentionConfig,
     TeaCacheConfig,
     TorchCompileConfig,
@@ -382,6 +383,47 @@ class TestVisualGenArgsCacheBackend:
         assert args.cache_backend == "teacache"
         assert isinstance(args.cache_config, TeaCacheConfig)
         assert args.teacache.teacache_thresh == 0.11
+
+    def test_cache_union_discriminated_seacache(self):
+        args = VisualGenArgs(
+            model="/tmp/model",
+            cache_config={"cache_backend": "seacache", "threshold": 0.15},
+        )
+        assert args.cache_backend == "seacache"
+        assert isinstance(args.cache_config, SeaCacheConfig)
+        assert args.seacache.threshold == 0.15
+        assert args.seacache.max_consecutive_cached_steps == 2
+        assert args.teacache is None and args.cache_dit is None
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"threshold": 0.0},
+            {"threshold": -0.1},
+            {"max_consecutive_cached_steps": -1},
+            {"thresh": 0.2},
+        ],
+    )
+    def test_seacache_rejects_invalid_values(self, kwargs):
+        with pytest.raises(ValidationError):
+            SeaCacheConfig(**kwargs)
+
+    def test_seacache_zero_cap_means_unlimited(self):
+        assert SeaCacheConfig(max_consecutive_cached_steps=0).max_consecutive_cached_steps == 0
+
+    def test_seacache_config_round_trips(self):
+        args = VisualGenArgs(
+            model="/tmp/model",
+            cache_config={"cache_backend": "seacache", "max_consecutive_cached_steps": 0},
+        )
+        dumped = args.model_dump()["cache_config"]
+        assert dumped == {
+            "cache_backend": "seacache",
+            "threshold": 0.25,
+            "max_consecutive_cached_steps": 0,
+        }
+        restored = VisualGenArgs(model="/tmp/model", cache_config=dumped)
+        assert restored.cache_config == args.cache_config
 
     def test_cache_default_is_none(self):
         args = VisualGenArgs(model="/tmp/model")
