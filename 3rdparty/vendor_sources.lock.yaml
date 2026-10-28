@@ -15,14 +15,14 @@ vendors:
   flashinfer-prims-ts:
     url: https://github.com/yuxianq/flashinfer.git
     branch: nvbug-6959297-cutlass-dsl-compat--flashinfer
-    commit: 6d7db1edba4951ec5ee7bcb30d6f034a8bb7b4d4
+    commit: 5e65ffd86015a17d824adf987a167f764d5e8a4e
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
     patch_digest: sha256:4f6de67614fcc57125506cc7561a5f28d33defc3198956312fde5d50cc770d99
-    digest: sha256-tree-v1:4dcbda360dbed72911a2495054ff64166882ad07751db811ff4cb17b7bbd643a
+    digest: sha256-tree-v1:935d7d18e8094a58ea3da4faca714997ee5afdeeac2f2f6c4c6bc265c4aba081
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0

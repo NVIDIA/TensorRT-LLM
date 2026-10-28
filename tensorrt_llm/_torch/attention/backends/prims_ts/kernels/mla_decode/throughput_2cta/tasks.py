@@ -39,6 +39,8 @@ The BF16 register roles are:
 """
 
 from collections.abc import Callable
+from contextlib import contextmanager
+from dataclasses import replace
 
 import cutlass
 import cutlass.cute as cute
@@ -53,7 +55,11 @@ from cutlass.experimental.task_scheduling.schedule_builder import (
 from cutlass.experimental.task_scheduling.resources import StageInfo
 from cutlass.experimental.task_scheduling.task import Task
 
-from ...task_compat import task_context_kwargs
+from ...task_compat import (
+    TS_TREE_WALKING_TASK,
+    TaskCacheStageInfoMixin,
+    task_context_kwargs,
+)
 from .resources import (
     MlaWorkQueue,
     WorkThrottleBarrierResource,
@@ -117,7 +123,9 @@ def _capture_clc_work_tile_body(
         else:
             body(prelude_state)
 
-    if work_queue is not None and use_clc_dynamic:
+    # Tree-walking tasks run every launch shape, static or CLC, through the
+    # queue-driven work-tile loop; older tasks looped static launches themselves.
+    if work_queue is not None and (use_clc_dynamic or TS_TREE_WALKING_TASK):
         with work_tile_loop(
             work_queue,
             skip_if=MlaWorkQueue.skip_work_tile_if,
@@ -137,19 +145,49 @@ def _capture_clc_work_tile_body(
     work_queue_tail(work_queue, advance_label="advance_tile")
 
 
-class MlaClcTask(Task):
+@contextmanager
+def _work_tile_region(work_queue):
+    """Run one task body per work tile, then the work queue's per-tile tail.
+
+    Tree-walking tasks drive every launch shape, static or CLC, through the
+    queue-driven work-tile loop, with zero-K tiles skippable. Older tasks looped
+    static launches themselves, so the body runs bare and only the tail follows.
+    """
+    if work_queue is not None and TS_TREE_WALKING_TASK:
+        with work_tile_loop(
+            work_queue, skip_if=MlaWorkQueue.skip_work_tile_if
+        ) as work_tiles:
+            with work_tiles.skippable():
+                yield
+            work_queue_tail(work_queue, advance_label="advance_tile")
+    else:
+        yield
+        work_queue_tail(work_queue, advance_label="advance_tile")
+
+
+class MlaClcTask(TaskCacheStageInfoMixin, Task):
     """Stock Task persistent loop with an MLA-specific dynamic K domain."""
+
+    # HEAD/TAIL work reads ``loop_offset`` / ``loop_end`` for the tile's K range.
+    restore_loop_state_outside_loop = True
 
     @cute.jit
     def get_domain(self, tile_coord):
         """Recompute the loop bound required by the stock Task public API."""
 
-        assert isinstance(self.work_queue, MlaWorkQueue)
-        return self.work_queue.k_tile_count_for_tile(tile_coord)
+        work_queue = (
+            self._find_work_tile_loop().work_queue
+            if TS_TREE_WALKING_TASK
+            else self.work_queue
+        )
+        assert isinstance(work_queue, MlaWorkQueue)
+        return work_queue.k_tile_count_for_tile(tile_coord)
 
 
-class MlaTask(Task):
+class MlaTask(TaskCacheStageInfoMixin, Task):
     """Task subclass that recomputes MLA k-domain per persistent work tile."""
+
+    restore_loop_state_outside_loop = True
 
     @cute.jit
     def _run_one_mla_work_tile(
@@ -256,81 +294,136 @@ class MlaTask(Task):
 class MlaInterleavedTask(MlaTask):
     """Persistent task that carries its interleave lane across work tiles."""
 
-    def __init__(self, *args, **kwargs) -> None:
-        """Create staged parity and index-remapping state for this task."""
+    if TS_TREE_WALKING_TASK:
 
-        super().__init__(*args, **kwargs)
-        self._cumulative_k_parity = cutlass.Int32(0)
-        self._mapped_domain_start = cutlass.Int32(self.domain_start)
-        self._actual_domain = cutlass.Int32(0)
-        self._fixed_loop_end = cutlass.Int32(self.domain_start)
+        def __init__(self, *args, **kwargs) -> None:
+            """Create staged parity and index-remapping state for this task."""
 
-    @cute.jit
-    def _run_one_mla_work_tile(
-        self,
-        work_tile,
-        context: ResourceContext | None = None,
-    ) -> None:
-        """Run one tile by mapping its local offsets onto this fixed lane."""
+            super().__init__(*args, **kwargs)
+            # The lane is the schedule's fixed ``domain_loop`` start.
+            self._lane = int(self._domain_loop_bounds[0])
+            self._cumulative_k_parity = cutlass.Int32(0)
+            self._mapped_domain_start = cutlass.Int32(self._lane)
+            self._actual_domain = cutlass.Int32(0)
+            self._fixed_loop_end = cutlass.Int32(self._lane)
 
-        fixed_lane = cutlass.Int32(self.domain_start)
-        self._actual_domain = work_tile.k_tile_count
-        self._mapped_domain_start = (
-            fixed_lane + self._cumulative_k_parity
-        ) % cutlass.Int32(2)
-        lane_iterations = (
-            self._actual_domain - self._mapped_domain_start + cutlass.Int32(1)
-        ) // cutlass.Int32(2)
-        self._fixed_loop_end = fixed_lane + lane_iterations * cutlass.Int32(2)
-        self.domain = self._fixed_loop_end
-        self._run_task_body_impl(work_tile, **task_context_kwargs(context))
-        self._cumulative_k_parity = (
-            self._cumulative_k_parity + self._actual_domain
-        ) % cutlass.Int32(2)
+        @cute.jit
+        def get_domain(self, tile_coord):
+            """Map this tile's K range onto the fixed lane and return its loop end.
 
-    @cute.jit
-    def _create_stage_info(
-        self,
-        resource,
-        idx,
-        work_tile=None,
-        is_producer=None,
-        resolved_domain=None,
-        label=None,
-        schedule_stage=None,
-        routing_slot=None,
-        context: ResourceContext | None = None,
-    ) -> StageInfo:
-        """Return base pipeline state with the work tile's actual K offset."""
+            The loop runs ``range(lane, fixed_loop_end, 2)``; the mapped start,
+            actual domain, and loop end are kept for ``_create_stage_info``.
+            """
 
-        base_info = Task._create_stage_info(
+            work_queue = self._find_work_tile_loop().work_queue
+            fixed_lane = cutlass.Int32(self._lane)
+            self._actual_domain = work_queue.k_tile_count_for_tile(tile_coord)
+            self._mapped_domain_start = (
+                fixed_lane + self._cumulative_k_parity
+            ) % cutlass.Int32(2)
+            lane_iterations = (
+                self._actual_domain - self._mapped_domain_start + cutlass.Int32(1)
+            ) // cutlass.Int32(2)
+            self._fixed_loop_end = fixed_lane + lane_iterations * cutlass.Int32(2)
+            return self._fixed_loop_end
+
+        @cute.jit
+        def _end_work_tile(self, skip, work_tile) -> None:
+            """Carry the lane's parity into the next tile (zero for skipped tiles)."""
+
+            self._cumulative_k_parity = (
+                self._cumulative_k_parity + work_tile.k_tile_count
+            ) % cutlass.Int32(2)
+
+        def _create_stage_info(self, step, ctx) -> StageInfo:
+            """Return base pipeline state with the work tile's actual K offset."""
+
+            base_info = super()._create_stage_info(step, ctx)
+            return replace(
+                base_info,
+                loop_offset=self._mapped_domain_start
+                + (cutlass.Int32(base_info.loop_offset) - cutlass.Int32(self._lane)),
+                loop_start=self._mapped_domain_start,
+                loop_end=self._actual_domain,
+            )
+
+    else:
+
+        def __init__(self, *args, **kwargs) -> None:
+            """Create staged parity and index-remapping state for this task."""
+
+            super().__init__(*args, **kwargs)
+            self._cumulative_k_parity = cutlass.Int32(0)
+            self._mapped_domain_start = cutlass.Int32(self.domain_start)
+            self._actual_domain = cutlass.Int32(0)
+            self._fixed_loop_end = cutlass.Int32(self.domain_start)
+
+        @cute.jit
+        def _run_one_mla_work_tile(
+            self,
+            work_tile,
+            context: ResourceContext | None = None,
+        ) -> None:
+            """Run one tile by mapping its local offsets onto this fixed lane."""
+
+            fixed_lane = cutlass.Int32(self.domain_start)
+            self._actual_domain = work_tile.k_tile_count
+            self._mapped_domain_start = (
+                fixed_lane + self._cumulative_k_parity
+            ) % cutlass.Int32(2)
+            lane_iterations = (
+                self._actual_domain - self._mapped_domain_start + cutlass.Int32(1)
+            ) // cutlass.Int32(2)
+            self._fixed_loop_end = fixed_lane + lane_iterations * cutlass.Int32(2)
+            self.domain = self._fixed_loop_end
+            self._run_task_body_impl(work_tile, **task_context_kwargs(context))
+            self._cumulative_k_parity = (
+                self._cumulative_k_parity + self._actual_domain
+            ) % cutlass.Int32(2)
+
+        @cute.jit
+        def _create_stage_info(
             self,
             resource,
             idx,
-            work_tile,
-            is_producer,
-            resolved_domain,
-            label,
-            schedule_stage,
-            routing_slot,
-            **task_context_kwargs(context),
-        )
-        actual_loop_offset = self._mapped_domain_start + (
-            cutlass.Int32(base_info.loop_offset) - cutlass.Int32(self.domain_start)
-        )
-        return StageInfo(
-            loop_offset=actual_loop_offset,
-            loop_start=self._mapped_domain_start,
-            loop_end=self._actual_domain,
-            loop_step=base_info.loop_step,
-            stage_idx=base_info.stage_idx,
-            label=base_info.label,
-            barrier=base_info.barrier,
-            work_tile=base_info.work_tile,
-            num_active_stages=base_info.num_active_stages,
-            context=base_info.context,
-            task_cache=base_info.task_cache,
-        )
+            work_tile=None,
+            is_producer=None,
+            resolved_domain=None,
+            label=None,
+            schedule_stage=None,
+            routing_slot=None,
+            context: ResourceContext | None = None,
+        ) -> StageInfo:
+            """Return base pipeline state with the work tile's actual K offset."""
+
+            base_info = Task._create_stage_info(
+                self,
+                resource,
+                idx,
+                work_tile,
+                is_producer,
+                resolved_domain,
+                label,
+                schedule_stage,
+                routing_slot,
+                **task_context_kwargs(context),
+            )
+            actual_loop_offset = self._mapped_domain_start + (
+                cutlass.Int32(base_info.loop_offset) - cutlass.Int32(self.domain_start)
+            )
+            return StageInfo(
+                loop_offset=actual_loop_offset,
+                loop_start=self._mapped_domain_start,
+                loop_end=self._actual_domain,
+                loop_step=base_info.loop_step,
+                stage_idx=base_info.stage_idx,
+                label=base_info.label,
+                barrier=base_info.barrier,
+                work_tile=base_info.work_tile,
+                num_active_stages=base_info.num_active_stages,
+                context=base_info.context,
+                task_cache=base_info.task_cache,
+            )
 
 
 def create_load_tma_task(
@@ -484,13 +577,13 @@ def create_sparse_offsets_task(
 
     @schedule
     def offsets_schedule(page_offsets, work_queue=None):
-        page_offsets.init_sparse_state()
-        page_offsets.bind_sparse_request()
-        with domain_loop(loop_start, loop_end, loop_step):
-            page_offsets.acquire()
-            page_offsets.load_sparse_offsets()
-            page_offsets.commit()
-        work_queue_tail(work_queue, advance_label="advance_tile")
+        with _work_tile_region(work_queue):
+            page_offsets.init_sparse_state()
+            page_offsets.bind_sparse_request()
+            with domain_loop(loop_start, loop_end, loop_step):
+                page_offsets.acquire()
+                page_offsets.load_sparse_offsets()
+                page_offsets.commit()
 
     result = (
         offsets_schedule(page_offsets)
@@ -526,27 +619,27 @@ def create_load_k_task(
 
     def load_k_body(smem_q, smem_k, page_offsets=None, work_queue=None):
         """Load Q once and then publish one K stage per loop tile."""
-        smem_q.init_load_state()
-        smem_k.init_load_state()
-        smem_q.acquire()
-        smem_q.tma_load()
-        smem_q.commit()
+        with _work_tile_region(work_queue):
+            smem_q.init_load_state()
+            smem_k.init_load_state()
+            smem_q.acquire()
+            smem_q.tma_load()
+            smem_q.commit()
 
-        with domain_loop(loop_start, loop_end, loop_step):
-            if page_offsets is not None:
-                page_offsets.wait()
-                page_stage = page_offsets.sparse_stage()
-                smem_k.acquire()
-                smem_k.tma_load_shared(page_offset_stage=page_stage)
-                smem_k.commit()
-                # The last quad has been copied into TMA operands. Only now
-                # may the metadata producer overwrite this shared ring slot.
-                page_offsets.release()
-            else:
-                smem_k.acquire()
-                smem_k.tma_load_paged()
-                smem_k.commit()
-        work_queue_tail(work_queue, advance_label="advance_tile")
+            with domain_loop(loop_start, loop_end, loop_step):
+                if page_offsets is not None:
+                    page_offsets.wait()
+                    page_stage = page_offsets.sparse_stage()
+                    smem_k.acquire()
+                    smem_k.tma_load_shared(page_offset_stage=page_stage)
+                    smem_k.commit()
+                    # The last quad has been copied into TMA operands. Only now
+                    # may the metadata producer overwrite this shared ring slot.
+                    page_offsets.release()
+                else:
+                    smem_k.acquire()
+                    smem_k.tma_load_paged()
+                    smem_k.commit()
 
     @schedule
     def load_k_schedule(smem_q, smem_k, page_offsets, work_queue=None):
@@ -595,21 +688,21 @@ def create_load_v_task(
 
     def load_v_body(smem_v, page_offsets=None, work_queue=None):
         """Publish one V stage per logical K tile."""
-        smem_v.init_load_state()
-        with domain_loop(loop_start, loop_end, loop_step):
-            if page_offsets is not None:
-                page_offsets.wait()
-                page_stage = page_offsets.sparse_stage()
-                smem_v.acquire()
-                smem_v.tma_load_shared(page_offset_stage=page_stage)
-                smem_v.commit()
-                # Keep the ring slot protected through every shared read.
-                page_offsets.release()
-            else:
-                smem_v.acquire()
-                smem_v.tma_load_paged()
-                smem_v.commit()
-        work_queue_tail(work_queue, advance_label="advance_tile")
+        with _work_tile_region(work_queue):
+            smem_v.init_load_state()
+            with domain_loop(loop_start, loop_end, loop_step):
+                if page_offsets is not None:
+                    page_offsets.wait()
+                    page_stage = page_offsets.sparse_stage()
+                    smem_v.acquire()
+                    smem_v.tma_load_shared(page_offset_stage=page_stage)
+                    smem_v.commit()
+                    # Keep the ring slot protected through every shared read.
+                    page_offsets.release()
+                else:
+                    smem_v.acquire()
+                    smem_v.tma_load_paged()
+                    smem_v.commit()
 
     @schedule
     def load_v_schedule(smem_v, page_offsets, work_queue=None):
@@ -799,15 +892,15 @@ def create_mma_qk_task(
     @schedule
     def mma_qk_schedule(smem_q, smem_kv, tmem_s, work_queue=None):
         """Consume Q/K stages and publish S for every k-tile."""
-        smem_q.wait()
-        smem_q.q_desc()
-        staged_qk_mma(smem_kv, tmem_s, iterations_qk)
-
-        with domain_loop(loop_start, loop_end, loop_step):
+        with _work_tile_region(work_queue):
+            smem_q.wait()
+            smem_q.q_desc()
             staged_qk_mma(smem_kv, tmem_s, iterations_qk)
 
-        smem_q.release()
-        work_queue_tail(work_queue, advance_label="advance_tile")
+            with domain_loop(loop_start, loop_end, loop_step):
+                staged_qk_mma(smem_kv, tmem_s, iterations_qk)
+
+            smem_q.release()
 
     schedule_result = (
         mma_qk_schedule(smem_q, smem_kv, tmem_s)
@@ -849,17 +942,17 @@ def create_mma_pv_task(
     @schedule
     def mma_pv_schedule(smem_kv, smem_p, tmem_o, work_queue=None):
         """Consume delayed V and P stages and accumulate O."""
-        with domain_loop(loop_start, loop_end, loop_step):
-            staged_pv_mma(smem_kv, smem_p, tmem_o, iterations_pv)
+        with _work_tile_region(work_queue):
+            with domain_loop(loop_start, loop_end, loop_step):
+                staged_pv_mma(smem_kv, smem_p, tmem_o, iterations_pv)
 
-        staged_pv_mma(
-            smem_kv,
-            smem_p,
-            tmem_o,
-            iterations_pv,
-            is_tail=True,
-        )
-        work_queue_tail(work_queue, advance_label="advance_tile")
+            staged_pv_mma(
+                smem_kv,
+                smem_p,
+                tmem_o,
+                iterations_pv,
+                is_tail=True,
+            )
 
     schedule_result = (
         mma_pv_schedule(smem_kv, smem_p, tmem_o)
@@ -897,12 +990,12 @@ def create_mma_qk_direct_task(
     @schedule
     def mma_qk_direct_schedule(smem_q, smem_k, tmem_s, work_queue=None):
         """Consume Q once and publish one S stage per K tile."""
-        smem_q.wait()
-        smem_q.q_desc()
-        with domain_loop(loop_start, loop_end, loop_step):
-            staged_qk_mma_k_tile(smem_k, tmem_s, iterations_qk)
-        smem_q.release()
-        work_queue_tail(work_queue, advance_label="advance_tile")
+        with _work_tile_region(work_queue):
+            smem_q.wait()
+            smem_q.q_desc()
+            with domain_loop(loop_start, loop_end, loop_step):
+                staged_qk_mma_k_tile(smem_k, tmem_s, iterations_qk)
+            smem_q.release()
 
     schedule_result = (
         mma_qk_direct_schedule(smem_q, smem_k, tmem_s)
@@ -943,7 +1036,10 @@ def create_mma_pv_direct_task(
     @schedule
     def mma_pv_direct_schedule(smem_v, smem_p, tmem_o, work_queue=None):
         """Consume one P/V pair and publish one O stage per K tile."""
-        with domain_loop(loop_start, loop_end, loop_step):
+        with (
+            _work_tile_region(work_queue),
+            domain_loop(loop_start, loop_end, loop_step),
+        ):
             if per_n_o_pipeline:
                 staged_pv_mma_v_tile_per_n(
                     smem_v,
@@ -954,7 +1050,6 @@ def create_mma_pv_direct_task(
                 )
             else:
                 staged_pv_mma_v_tile(smem_v, smem_p, tmem_o, iterations_pv)
-        work_queue_tail(work_queue, advance_label="advance_tile")
 
     schedule_result = (
         mma_pv_direct_schedule(smem_v, smem_p, tmem_o)
@@ -1426,6 +1521,13 @@ def create_scheduler_task(
 class MlaOutputTmaTask(MlaTask):
     """Drain global TMA writes once after the persistent work loop."""
 
+    if TS_TREE_WALKING_TASK:
+
+        @cute.jit
+        def _drain(self) -> None:
+            super()._drain()
+            prims.cp_async_bulk_wait_group(0)
+
     @cute.jit
     def _drain_mla_work_tile_tails(self):
         MlaTask._drain_mla_work_tile_tails(self)
@@ -1437,14 +1539,14 @@ def create_output_tma_task(output, work_queue=None, **task_kwargs):
 
     @schedule
     def output_schedule(output, work_queue=None):
-        # This task only has epilogue work; declare its empty K loop.
-        with domain_loop(0, 0, 1):
-            pass
-        for iter_n in range(2):
-            output.wait()
-            output.tma_store_output(iter_n=iter_n)
-            output.release()
-        work_queue_tail(work_queue, advance_label="advance_tile")
+        with _work_tile_region(work_queue):
+            # This task only has epilogue work; declare its empty K loop.
+            with domain_loop(0, 0, 1):
+                pass
+            for iter_n in range(2):
+                output.wait()
+                output.tma_store_output(iter_n=iter_n)
+                output.release()
 
     captured = (
         output_schedule(output)

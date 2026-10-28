@@ -44,6 +44,7 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 from cutlass.experimental.task_scheduling.enums import SignalingThreads
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
+from ...task_compat import TS_TREE_WALKING_TASK
 from ...tensor_map import (
     create_tensor_map_ragged_from_tensor,
     create_tensor_map_tiled_from_view,
@@ -203,10 +204,21 @@ def build_mla_decode_task_manager(
     Agent = pipeline.Agent
     use_clc_dynamic = bool(work_queue is not None and work_queue.use_clc_dynamic)
     use_work_throttle = use_clc_dynamic and not cfg.use_fp8_split_mma_schedule
-    non_interleaved_task_class = MlaClcTask if use_clc_dynamic else MlaTask
+    # Tree-walking tasks drive static launches through the work queue as well.
+    use_queue_loop = use_clc_dynamic or (
+        TS_TREE_WALKING_TASK and work_queue is not None
+    )
+    non_interleaved_task_class = MlaClcTask if use_queue_loop else MlaTask
     task_domain = (
         MlaClcTask.get_domain
-        if use_clc_dynamic and not isinstance(domain, int)
+        if use_queue_loop and not isinstance(domain, int)
+        else domain
+    )
+
+    # The dual-softmax lanes map each tile's K range onto their own parity.
+    interleaved_domain = (
+        MlaInterleavedTask.get_domain
+        if use_queue_loop and not isinstance(domain, int)
         else domain
     )
 
@@ -525,14 +537,16 @@ def build_mla_decode_task_manager(
             smem_k,
             page_offsets=page_offset_window if sparse_offsets_enabled else None,
             work_queue=work_queue,
-            domain=domain,
+            task_class=non_interleaved_task_class,
+            domain=task_domain,
             num_registers=wg2_reg_count,
         )
         load_v_task = create_load_v_task(
             smem_v,
             page_offsets=page_offset_window if sparse_offsets_enabled else None,
             work_queue=work_queue,
-            domain=domain,
+            task_class=non_interleaved_task_class,
+            domain=task_domain,
             num_registers=wg2_reg_count,
         )
         mma_task = None
@@ -542,7 +556,8 @@ def build_mla_decode_task_manager(
             tmem_s,
             iterations_qk=cfg.iterations_qk,
             work_queue=work_queue,
-            domain=domain,
+            task_class=non_interleaved_task_class,
+            domain=task_domain,
             num_registers=wg2_reg_count,
         )
         mma_pv_task = create_mma_pv_direct_task(
@@ -554,7 +569,8 @@ def build_mla_decode_task_manager(
             iterations_pv_n=cfg.iterations_pv_n,
             per_n_o_pipeline=cfg.use_fp8_split_mma_schedule,
             work_queue=work_queue,
-            domain=domain,
+            task_class=non_interleaved_task_class,
+            domain=task_domain,
             num_registers=wg2_reg_count,
         )
         load_tma_task = None
@@ -602,7 +618,9 @@ def build_mla_decode_task_manager(
             if cfg.use_fp8_dual_softmax_schedule
             else non_interleaved_task_class
         ),
-        domain=(domain if cfg.use_fp8_dual_softmax_schedule else task_domain),
+        domain=(
+            interleaved_domain if cfg.use_fp8_dual_softmax_schedule else task_domain
+        ),
         domain_start=0,
         step=2 if cfg.use_fp8_dual_softmax_schedule else 1,
         num_registers=cfg.softmax_reg_num,
@@ -615,7 +633,7 @@ def build_mla_decode_task_manager(
             smem_p,
             work_queue=work_queue,
             task_class=MlaInterleavedTask,
-            domain=domain,
+            domain=interleaved_domain,
             domain_start=1,
             step=2,
             num_registers=cfg.softmax_reg_num,
@@ -660,7 +678,8 @@ def build_mla_decode_task_manager(
             create_sparse_offsets_task(
                 page_offset_window,
                 work_queue=work_queue,
-                domain=domain,
+                task_class=non_interleaved_task_class,
+                domain=task_domain,
                 num_registers=wg2_reg_count,
             )
         )
@@ -676,7 +695,8 @@ def build_mla_decode_task_manager(
         task_list.append(
             create_padding_task(
                 work_queue=work_queue,
-                domain=domain,
+                task_class=non_interleaved_task_class,
+                domain=task_domain,
                 num_registers=wg2_reg_count,
                 warp_idx=10 if sparse_offsets_enabled else 9,
                 num_warps=1 if sparse_offsets_enabled else 2,
@@ -705,7 +725,8 @@ def build_mla_decode_task_manager(
         # four-warp group with the low-register producer budget.
         padding_task = create_padding_task(
             work_queue=work_queue,
-            domain=domain,
+            task_class=non_interleaved_task_class,
+            domain=task_domain,
             num_registers=wg2_reg_count,
             warp_idx=9 if cfg.load_num_warps > 1 else 10,
             num_warps=3 if cfg.load_num_warps > 1 else 2,
