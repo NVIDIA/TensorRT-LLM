@@ -18,6 +18,9 @@ import pytest
 
 from tensorrt_llm.evaluate.cnn_dailymail import CnnDailymail
 
+# The CPU CI stage runs pytest with -m cpu_only and skips files without this marker.
+pytestmark = pytest.mark.cpu_only
+
 
 def _evaluator(rouge1: float = 0.0) -> CnnDailymail:
     # Skip __init__ (it downloads the dataset and the rouge metric) and stub
