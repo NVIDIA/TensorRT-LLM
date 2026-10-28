@@ -117,9 +117,15 @@ def test_retryable_failure_reason_reaches_the_timeout_message(
 
 def test_error_body_naming_choices_is_not_a_completion(client: ModuleType, endpoint) -> None:
     url, responses, requests = endpoint
-    responses.extend([(500, '{"error":{"param":"choices"}}'), (200, '{"choices":[{}]}')])
+    responses.extend(
+        [
+            (500, '{"error":{"param":"choices"}}'),
+            (200, '{"error":{"param":"choices"}}'),
+            (200, '{"choices":[{}]}'),
+        ]
+    )
     client.verify_endpoint(url, "model")
-    assert len(requests) == 2
+    assert len(requests) == 3
 
 
 def test_heartbeat_request_remains_best_effort(client: ModuleType, endpoint) -> None:
