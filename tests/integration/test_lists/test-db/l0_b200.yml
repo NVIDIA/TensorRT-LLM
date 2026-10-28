@@ -273,6 +273,7 @@ l0_b200:
   - unittest/_torch/sampler --ignore=unittest/_torch/sampler/test_beam_search.py -k "not test_speculative_d2h_parity_real_predictor"
   - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/speculative/test_lilicorr_loading.py
+  - unittest/_torch/speculative/test_dspark_slot_reset_no_sync.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_rmsnorm_rope.py
   # Fused strict acceptance and DFlash paged-latent drafter bookkeeping vs

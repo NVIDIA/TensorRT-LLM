@@ -27,6 +27,7 @@ from ..llm_request import (
     get_draft_token_length,
     rewind_context_after_cache_drop,
 )
+from .prefix_wait_planner import PrefixWaitPlanner
 from .scheduler import (
     RemoteTailPhase,
     RequestList,
@@ -203,6 +204,13 @@ class KVCacheV2Scheduler(RequestScheduler):
             enable_prefix_aware_scheduling
             and kv_cache_manager.enable_block_reuse
             and self._skip_pays_off_under_reuse_policy()
+        )
+        # Keeps new context requests queued behind a prefill of a prefix they
+        # share, where the cache manager can make that prefix reusable.
+        self._prefix_wait_planner = (
+            PrefixWaitPlanner(kv_cache_manager)
+            if kv_cache_manager.can_share_inflight_prefix
+            else None
         )
         if scheduler_policy != CapacitySchedulerPolicy.MAX_UTILIZATION:
             logger.warning(
@@ -411,7 +419,12 @@ class KVCacheV2Scheduler(RequestScheduler):
     # ---- Main scheduling loop ----
 
     def _schedule_loop(
-        self, active_requests, inflight_request_ids, *, defer_remote_tail_context=False
+        self,
+        active_requests,
+        inflight_request_ids,
+        *,
+        defer_remote_tail_context=False,
+        prefix_waits=None,
     ):
         scheduled_ctx: RequestList = []
         scheduled_remote_mode = None
@@ -638,6 +651,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         # iteration as a stall even though the contributor is running. Deferring
         # is itself the progress in that case.
         deferred_behind_contributor = False
+        # New requests that wait for a prefix another request prefills. Planned
+        # once per schedule_request, so a retry below spends no wait budget.
+        if prefix_waits is None:
+            prefix_waits = (
+                self._prefix_wait_planner.plan(pending_ctx)
+                if self._prefix_wait_planner is not None and pending_ctx
+                else {}
+            )
 
         # After any reordering: pre-grown requests go first so no other request
         # takes the budget their replay needs (stable sort).
@@ -653,6 +674,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         for req in pending_ctx:
             if budget.requests_full:
                 break
+            if req.py_request_id in prefix_waits:
+                # A request new in this pass only prefills the prefix if it was
+                # admitted ahead of this one. A prefix wait is not progress; see
+                # the invariant below.
+                owner_id = prefix_waits[req.py_request_id]
+                if owner_id is None or any(r.py_request_id == owner_id for r in scheduled_ctx):
+                    continue
             # A radix probe cannot affect admission once the chunk token budget
             # is exhausted. Keep scanning: an encoder request may still fit.
             if (
@@ -718,6 +746,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                     continue
                 has_chunking = has_chunking or chunking_flag
                 scheduled_ctx.append(req)
+                if self._prefix_wait_planner is not None:
+                    self._prefix_wait_planner.add_owner(req)
                 if len(scheduled_ctx) == 1:
                     scheduled_remote_mode = remote_mode
                 budget.commit(req, tokens, peft_pages)
@@ -732,6 +762,16 @@ class KVCacheV2Scheduler(RequestScheduler):
                 # a request is only ever deferred behind a contributor that
                 # actually runs this iteration, so a deferral always leaves
                 # either inflight_request_ids or scheduled_ctx non-empty.
+                #
+                # A prefix wait (PrefixWaitPlanner) is deliberately not
+                # progress. Its owner is either scheduled in this pass or a
+                # prefilling request that is itself a context candidate, and
+                # each request waits at most MAX_WAIT_PASSES (128) passes in
+                # total, well below _DEADLOCK_STALL_ITERS. A
+                # pass that only waits therefore counts as a stall but cannot
+                # trip the detector by itself, while counting it as progress
+                # would let a stalled owner plus new sibling arrivals hide a
+                # real deadlock.
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
 
@@ -752,7 +792,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             # A non-ADP replay that cannot acquire KV must let decode release
             # pages. Retry admission without replay; keep its forward isolated.
             return self._schedule_loop(
-                requests_list, inflight_request_ids, defer_remote_tail_context=True
+                requests_list,
+                inflight_request_ids,
+                defer_remote_tail_context=True,
+                prefix_waits=prefix_waits,
             )
 
         if self._ctx_demote_uncached_tokens:
