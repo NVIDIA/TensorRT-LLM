@@ -293,4 +293,4 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 
-[^vg1]: Wan 2.2 and LTX-2 have no built-in TeaCache coefficient tables, so TeaCache requires an explicit `coefficients` list in `cache_config` (Wan 2.2 also needs `coefficients_2`); without them the pipeline raises at load time. See the TeaCache section of the [Visual Generation](./visual-generation.md) page.
+[^vg1]: Wan 2.2 and LTX-2 have no built-in TeaCache coefficient tables, so TeaCache requires an explicit `coefficients` list in `cache_config` (Wan 2.2 A14B dual-transformer models also require `coefficients_2`); without them the pipeline raises at load time. See the TeaCache section of the [Visual Generation](./visual-generation.md) page.

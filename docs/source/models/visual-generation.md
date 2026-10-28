@@ -332,9 +332,9 @@ cache_config:
 | `coefficients` | list[float] | per-model | Polynomial coefficients used by the TeaCache decision function. Set automatically at load time based on the checkpoint. |
 
 Wan 2.2 and LTX-2 have no built-in TeaCache coefficient tables. Set
-`cache_config.coefficients` explicitly for LTX-2. Wan 2.2 requires both
-`cache_config.coefficients` for its high-noise transformer and
-`cache_config.coefficients_2` for its low-noise transformer.
+`cache_config.coefficients` explicitly for LTX-2 and Wan 2.2 TI2V-5B. Wan 2.2
+A14B models require both `cache_config.coefficients` for the high-noise
+transformer and `cache_config.coefficients_2` for the low-noise transformer.
 
 #### Cache-DiT
 
