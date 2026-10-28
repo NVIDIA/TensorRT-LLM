@@ -47,7 +47,10 @@ __device__ __forceinline__ float2 mhcFmaF32x2(float2 const& a, float2 const& b, 
 // Kernel 1: big_fuse — one CTA per token
 //
 //  Template parameters:
-//    NUM_SPLITS:  split-K reduction (1 = direct, >1 = sum across splits)
+//    NUM_SPLITS:  split-K reduction (1 = direct, >1 = sum across splits,
+//                 0 = runtime split count `num_splits_runtime`). Splits are
+//                 always summed in split order, so the result is independent
+//                 of how the producer's split CTAs were scheduled.
 //    BLOCK_SIZE:  threads per CTA (multiple of 32, >= 64)
 //
 //  Phase 1a (warp 0, lanes 0-3): RMS norm + sigmoid → s_pre_mix, post_mix
@@ -71,7 +74,9 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
     // sublayer's gate pre_mix_ext [M, 4] instead of this token's own sigmoid gate, and Phase 1a
     // writes this token's own gate to pre_mix_out [M, 4] for the next sublayer. V4 (kLaggedPre =
     // false) ignores both pointers and behaves exactly as before.
-    float const* __restrict__ pre_mix_ext = nullptr, float* __restrict__ pre_mix_out = nullptr)
+    float const* __restrict__ pre_mix_ext = nullptr, float* __restrict__ pre_mix_out = nullptr,
+    // Split count when NUM_SPLITS == 0; ignored otherwise.
+    int num_splits_runtime = 0)
 {
     constexpr int HC_MULT = 4;
     constexpr int HC_MULT2 = HC_MULT * HC_MULT;       // 16 comb_mix entries
@@ -120,7 +125,65 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
 
     float cm[HC_MULT];
 
-    // ---- Phase 1a (warp 0, lanes 0..3): split-K reduce → RMS norm → sigmoid ----
+    // ---- Phase 1a prologue: split-K reduce ----
+    // Each of the token's HC_MULT3 + 1 values (24 mixes, then the sqr-sum) is owned by one lane, which sums it over
+    // the splits in a fixed order with coalesced loads; lanes 0..3 of warp 0 then gather the six mixes and the
+    // sqr-sum they need. The fixed order keeps the result independent of how the producer's split CTAs ran.
+    float r_split = 0.0f;
+    float y_pre_split = 0.0f;
+    float y_post_split = 0.0f;
+    float cm_split[HC_MULT] = {};
+    if constexpr (NUM_SPLITS != 1)
+    {
+        float split_sum = 0.0f;
+        if constexpr (NUM_SPLITS == 0)
+        {
+            // Runtime (large) split counts: every warp sums a strided subset of the splits, then warp 0 adds the
+            // per-warp partials in warp order, so the order stays fixed for a given split count and block size.
+            constexpr int kNumWarps = BLOCK_SIZE / WARP_SIZE;
+            __shared__ float s_split_part[kNumWarps][HC_MULT3 + 1];
+            if (lane <= HC_MULT3)
+            {
+                float part = 0.0f;
+#pragma unroll 4
+                for (int s = warp_id; s < num_splits_runtime; s += kNumWarps)
+                {
+                    long long const row = static_cast<long long>(s) * M + token;
+                    part += (lane < HC_MULT3) ? y_acc[row * HC_MULT3 + lane] : r_acc[row];
+                }
+                s_split_part[warp_id][lane] = part;
+            }
+            __syncthreads();
+            if (warp_id == 0 && lane <= HC_MULT3)
+            {
+#pragma unroll
+                for (int w = 0; w < kNumWarps; w++)
+                    split_sum += s_split_part[w][lane];
+            }
+        }
+        else if (warp_id == 0 && lane <= HC_MULT3)
+        {
+#pragma unroll
+            for (int s = 0; s < NUM_SPLITS; s++)
+            {
+                long long const row = static_cast<long long>(s) * M + token;
+                split_sum += (lane < HC_MULT3) ? y_acc[row * HC_MULT3 + lane] : r_acc[row];
+            }
+        }
+        if (warp_id == 0)
+        {
+            unsigned constexpr kFullMask = 0xffffffffu;
+            int const row_lane = lane & (HC_MULT - 1);
+            r_split = __shfl_sync(kFullMask, split_sum, HC_MULT3);
+            y_pre_split = __shfl_sync(kFullMask, split_sum, row_lane);
+            y_post_split = __shfl_sync(kFullMask, split_sum, HC_MULT + row_lane);
+#pragma unroll
+            for (int k = 0; k < HC_MULT; k++)
+                cm_split[k] = __shfl_sync(kFullMask, split_sum, 2 * HC_MULT + row_lane * HC_MULT + k);
+        }
+    }
+
+    // ---- Phase 1a (warp 0, lanes 0..3): RMS norm → sigmoid ----
     // Keep one full comb row per lane: its four independent values provide ILP
     // across Sinkhorn's reciprocal/shuffle dependency chains. Load only the
     // six y values this lane actually consumes instead of materializing all 24.
@@ -145,17 +208,12 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
         }
         else
         {
-            r_val = 0.0f;
-            for (int s = 0; s < NUM_SPLITS; s++)
-            {
-                r_val += r_acc[s * M + token];
-                float const* y_row = y_acc + (static_cast<long long>(s) * M + token) * HC_MULT3;
-                y_pre += y_row[lane];
-                y_post += y_row[HC_MULT + lane];
+            r_val = r_split;
+            y_pre = y_pre_split;
+            y_post = y_post_split;
 #pragma unroll
-                for (int k = 0; k < HC_MULT; k++)
-                    cm[k] += y_row[2 * HC_MULT + lane * HC_MULT + k];
-            }
+            for (int k = 0; k < HC_MULT; k++)
+                cm[k] = cm_split[k];
         }
 
         // RMS norm: rstd = 1/sqrt(mean(x²) + eps)
@@ -399,7 +457,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
         float const* __restrict__, __nv_bfloat16 const* __restrict__, float const* __restrict__,                       \
         float const* __restrict__, float* __restrict__, float* __restrict__, __nv_bfloat16* __restrict__, int, int,    \
         int, float, float, float, float, int, __nv_bfloat16 const* __restrict__, float, float const* __restrict__,     \
-        float* __restrict__);
+        float* __restrict__, int);
 
 #define INST_BIGFUSE(NS, BS)                                                                                           \
     INST_BIGFUSE_1(NS, BS, false, false, false)                                                                        \
@@ -426,6 +484,10 @@ INST_BIGFUSE(8, 512)
 INST_BIGFUSE(16, 128)
 INST_BIGFUSE(16, 256)
 INST_BIGFUSE(16, 512)
+// NS = 0: split count read at runtime (num_splits_runtime).
+INST_BIGFUSE(0, 128)
+INST_BIGFUSE(0, 256)
+INST_BIGFUSE(0, 512)
 INST_BIGFUSE_TMA(false)
 INST_BIGFUSE_TMA(true)
 #undef INST_BIGFUSE_TMA
@@ -867,7 +929,7 @@ static void mhcBigFuseDispatch(float const* y_acc, float const* r_acc, __nv_bflo
     float const* hc_scale, float const* hc_base, float* post_mix, float* comb_mix, __nv_bfloat16* layer_input, int M,
     int K, int hidden_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
     int sinkhorn_repeat, int block_size, __nv_bfloat16 const* norm_weight, float norm_eps, float const* pre_mix_ext,
-    float* pre_mix_out, cudaStream_t stream)
+    float* pre_mix_out, int num_splits_runtime, cudaStream_t stream)
 {
     dim3 grid(static_cast<unsigned int>(M));
 
@@ -875,7 +937,8 @@ static void mhcBigFuseDispatch(float const* y_acc, float const* r_acc, __nv_bflo
     tensorrt_llm::common::launchWithPdlWhenEnabled("mhcBigFuseKernel",                                                 \
         mhcBigFuseKernel<NUM_SPLITS, BS, kFuseNorm, USE_TMA, kLaggedPre>, grid, dim3(BS), SMEM_BYTES, stream, y_acc,   \
         r_acc, residual, hc_scale, hc_base, post_mix, comb_mix, layer_input, M, K, hidden_size, rms_eps, hc_pre_eps,   \
-        hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, pre_mix_ext, pre_mix_out)
+        hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, pre_mix_ext, pre_mix_out,         \
+        num_splits_runtime)
     if (block_size >= 512)
     {
         if constexpr (NUM_SPLITS == 1)
@@ -921,8 +984,7 @@ void mhcBigFuseLaunch(float const* y_acc, float const* r_acc, __nv_bfloat16 cons
     if (M <= 0)
         return;
 
-    TLLM_CHECK_WITH_INFO(num_splits == 1 || num_splits == 2 || num_splits == 4 || num_splits == 8 || num_splits == 16,
-        "mhcBigFuseLaunch: only num_splits ∈ {1,2,4,8,16} supported, got %d", num_splits);
+    TLLM_CHECK_WITH_INFO(num_splits >= 1, "mhcBigFuseLaunch: num_splits must be >= 1, got %d", num_splits);
 
     int const bs = (block_size > 0) ? block_size : selectBigFuseBlockSize(M);
     bool const fuse_norm = (norm_weight != nullptr);
@@ -934,7 +996,7 @@ void mhcBigFuseLaunch(float const* y_acc, float const* r_acc, __nv_bfloat16 cons
 #define DISPATCH_BF_INNER(NS, FN, LP)                                                                                  \
     mhcBigFuseDispatch<NS, FN, LP>(y_acc, r_acc, residual, hc_scale, hc_base, post_mix, comb_mix, layer_input, M, K,   \
         hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, bs, norm_weight,       \
-        norm_eps, pre_mix_ext, pre_mix_out, stream)
+        norm_eps, pre_mix_ext, pre_mix_out, num_splits, stream)
 #define DISPATCH_BF_NORM(NS, FN) (lagged ? DISPATCH_BF_INNER(NS, FN, true) : DISPATCH_BF_INNER(NS, FN, false))
 #define DISPATCH_BF(NS) (fuse_norm ? DISPATCH_BF_NORM(NS, true) : DISPATCH_BF_NORM(NS, false))
 
@@ -945,6 +1007,8 @@ void mhcBigFuseLaunch(float const* y_acc, float const* r_acc, __nv_bfloat16 cons
     case 4: DISPATCH_BF(4); break;
     case 8: DISPATCH_BF(8); break;
     case 16: DISPATCH_BF(16); break;
+    // Other split counts (e.g. the fused-HC MMA ladder's 7/14/28/56/112) read the count at runtime.
+    default: DISPATCH_BF(0); break;
     }
 #undef DISPATCH_BF
 #undef DISPATCH_BF_NORM
