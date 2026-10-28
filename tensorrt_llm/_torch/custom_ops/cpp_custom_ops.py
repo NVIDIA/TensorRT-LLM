@@ -1359,6 +1359,27 @@ def _register_fake():
             torch.empty_like(residual),
         ]
 
+    @torch.library.register_fake("trtllm::allreduce_residual_rmsnorm_mxfp8")
+    def _(input, residual, norm_weight, workspace, group, strategy, eps,
+          alignment, trigger_completion_at_end) -> List[torch.Tensor]:
+        m, k = input.shape[0], input.shape[-1]
+        padded_k = (k + alignment - 1) // alignment * alignment
+        return [
+            torch.empty_like(input),
+            input.new_empty((m, padded_k), dtype=torch.float8_e4m3fn),
+            input.new_empty((m * padded_k // 32, ), dtype=torch.uint8),
+            torch.empty_like(residual),
+        ]
+
+    @torch.library.register_fake("trtllm::moe_finalize_allreduce_match")
+    def _(input, residual, norm_weight, expanded_idx_to_permuted_idx,
+          expert_scale_factor, workspace, group, strategy, rank, nranks,
+          eps) -> List[torch.Tensor]:
+        return [
+            torch.empty_like(residual),
+            torch.empty_like(residual),
+        ]
+
     @torch.library.register_fake("trtllm::renorm_moe_routing_op")
     def _(router_logits, topk, output_dtype: torch.dtype = None):
         num_tokens = router_logits.shape[0]
@@ -1647,6 +1668,18 @@ def _register_fake():
                                                dtype=hidden_states.dtype)
             return [norm_out, quant_out, sf_out]
         return [quant_out, sf_out]
+
+    @torch.library.register_fake("trtllm::pad_nvfp4_activation")
+    def _(
+        fp4_input: torch.Tensor,
+        sf_input: torch.Tensor,
+        padded_hidden_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        fp4_output = fp4_input.new_empty(
+            (fp4_input.shape[0], padded_hidden_size // 2))
+        sf_output = sf_input.new_empty(
+            (sf_input.shape[0], padded_hidden_size // 16))
+        return fp4_output, sf_output
 
     @torch.library.register_fake("trtllm::fused_gated_rmsnorm_quant")
     def _(

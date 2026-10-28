@@ -1271,6 +1271,63 @@ class AllReduce(nn.Module):
 
         return output if len(output) > 1 else output[0]
 
+    def thop_strategy_for_fusion(self) -> Optional[int]:
+        """The strategy argument under which a fused thop op reduces exactly as ``forward`` would, or None.
+
+        None when ``forward`` would not reduce through the thop all-reduce kernels with a tactic the op can reproduce:
+        TP 1, MNNVL or symmetric memory, process-group mode, UB or LOWPRECISION, or AUTO outside the native autotuner
+        (disabled, or in a tuning pass). AUTO is resolved in C++ from the native tactic cache entry of
+        RESIDUAL_RMS_NORM, as torch.ops.trtllm.autotuned_allreduce does.
+        """
+        if (self.mapping.tp_size == 1 or self.mnnvl_allreduce is not None
+                or self.symm_mem_allreduce is not None or self._disable_mpi):
+            return None
+        strategy = self.strategy
+        if strategy in (AllReduceStrategy.MNNVL, AllReduceStrategy.SYMM_MEM):
+            strategy = AllReduceStrategy.AUTO
+        if strategy in (AllReduceStrategy.UB, AllReduceStrategy.LOWPRECISION):
+            return None
+        if strategy == AllReduceStrategy.AUTO and (
+                os.environ.get("TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
+                or _ALLREDUCE_AUTOTUNER_TUNING_MODE
+                or not _ALLREDUCE_NATIVE_AUTOTUNER_ENABLED):
+            return None
+        return int(strategy)
+
+    def residual_rms_norm_mxfp8(
+        self,
+        input: torch.Tensor,
+        *,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        alignment: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """AllReduce(RESIDUAL_RMS_NORM) with the MXFP8 quantization of its norm output fused in.
+
+        Returns (norm_out, mxfp8 [M, round_up(K, alignment)], row-major UE8M0 scales [M * round_up(K, alignment) / 32],
+        residual_out), byte-identical to ``forward`` with RESIDUAL_RMS_NORM followed by
+        ``mxfp8_quantize(norm_out, False, alignment)``, or None when this module would not reduce through the
+        thop all-reduce kernels (TP 1, MNNVL or symmetric memory, process-group mode, a non-native or tuning
+        autotuner pass), in which case the caller runs the unfused path.
+        """
+        strategy = self.thop_strategy_for_fusion()
+        if (strategy is None or input.dtype != torch.bfloat16 or not hasattr(
+                torch.ops.trtllm, "allreduce_residual_rmsnorm_mxfp8")):
+            return None
+        norm_out, quant_out, scale_out, residual_out = torch.ops.trtllm.allreduce_residual_rmsnorm_mxfp8(
+            input=input.contiguous(),
+            residual=residual,
+            norm_weight=norm_weight,
+            workspace=self.workspace,
+            group=self.mapping.tp_group,
+            strategy=strategy,
+            eps=eps,
+            alignment=alignment,
+            trigger_completion_at_end=False,
+        )
+        return norm_out, quant_out, scale_out, residual_out
+
 
 class MoEAllReduce(nn.Module):
 
@@ -1362,6 +1419,44 @@ class MoEAllReduce(nn.Module):
                 nranks=self.mapping.tp_size,
                 eps=all_reduce_params.eps,
             )
+
+
+    def finalize_allreduce_match_unfused(
+        self,
+        fc2_output: torch.Tensor,
+        *,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+        expert_scale_factor: torch.Tensor,
+        eps: float,
+        strategy: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """MoE finalize + all-reduce + residual add + RMSNorm in one one-shot kernel, bit-exact to the unfused path.
+
+        The unfused path is the MoE finalize kernel followed by the one-shot AR+RMSNorm kernel (AllReduce with
+        RESIDUAL_RMS_NORM). This uses that kernel's launch geometry and cross-rank accumulation, and reads FC2 rows
+        at ``fc2_output.size(1)`` (round_up(hidden, 128) for the MXFP4 TRTLLM MoE). One-shot only:
+        ``residual.shape[0] <= self.max_token``. ``strategy`` is the post-MoE AllReduce's
+        (``AllReduce.thop_strategy_for_fusion``): the fused kernel runs only when it resolves to ONESHOT, as the
+        unfused all-reduce would; otherwise the op runs the finalize kernel and that all-reduce. Returns
+        (norm_out, residual_out).
+        """
+        assert residual.shape[0] <= self.max_token, "Num tokens must be less than or equal to max_token"
+        norm_out, residual_out = torch.ops.trtllm.moe_finalize_allreduce_match(
+            input=fc2_output,
+            residual=residual,
+            norm_weight=norm_weight,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            expert_scale_factor=expert_scale_factor,
+            workspace=self.workspace,
+            group=self.mapping.tp_group,
+            strategy=strategy,
+            rank=self.mapping.tp_rank,
+            nranks=self.mapping.tp_size,
+            eps=eps,
+        )
+        return norm_out, residual_out
 
 
 def all_to_all_4d(

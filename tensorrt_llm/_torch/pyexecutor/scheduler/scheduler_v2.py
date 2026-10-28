@@ -15,6 +15,7 @@
 
 import enum
 import os
+import sys
 from typing import Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
@@ -35,6 +36,42 @@ from .scheduler import (
     _is_forced_context_chunk_boundary,
     drop_decoder_context_requests_waiting_for_encoder_output,
 )
+
+# The generation-order line is printed once per process.
+_LPT_SORT_REPORTED = False
+
+
+def _sort_generation_longest_kv_first(generation_requests: RequestList) -> None:
+    """TLLM_LPT_SORT=1: LoRA groups as before, longest KV first.
+
+    ``get_num_tokens(0)`` is the request's committed length; the KV the
+    attention reads this step differs from it by the in-flight step's accepted
+    tokens and the query tokens, both at most draft_len + 1. ``list.sort`` is
+    stable, so equal keys keep the FCFS order of the scheduling loop.
+    """
+    global _LPT_SORT_REPORTED
+    if _LPT_SORT_REPORTED or len(generation_requests) < 2:
+        generation_requests.sort(key=lambda r: (_get_lora_task_id(r), -r.get_num_tokens(0)))
+        return
+    before = [r.py_request_id for r in generation_requests]
+    generation_requests.sort(key=lambda r: (_get_lora_task_id(r), -r.get_num_tokens(0)))
+    _LPT_SORT_REPORTED = True
+    try:
+        from tensorrt_llm._utils import mpi_rank
+
+        rank = mpi_rank()
+    except Exception:
+        rank = "?"
+    # Printed rather than logged: worker processes keep the logger at "error".
+    print(
+        "generation order: longest-KV-first (TLLM_LPT_SORT=1)"
+        f" rank={rank} pid={os.getpid()} n_gen={len(generation_requests)}"
+        f" kv_tokens_first={generation_requests[0].get_num_tokens(0)}"
+        f" kv_tokens_last={generation_requests[-1].get_num_tokens(0)}"
+        f" reordered={before != [r.py_request_id for r in generation_requests]}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 class ScheduleAction(enum.Enum):
@@ -254,6 +291,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._prioritize_first_token_gen = (
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
+
+        # TLLM_LPT_SORT=1 (opt-in, default off): within each LoRA group, order the
+        # scheduled generation requests longest-KV-first instead of FCFS. The
+        # persistent decode FMHA takes requests in batch order, so FCFS can
+        # leave the longest-KV requests running alone at the end of each call.
+        # Only the order changes: the set of scheduled requests and every
+        # budget are decided before the sort, and per-request state across
+        # iterations is keyed by py_seq_slot, not by batch position.
+        self._lpt_generation_order = os.environ.get("TLLM_LPT_SORT", "0") == "1"
 
     @property
     def scheduling_state_range(
@@ -1558,7 +1604,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             context_requests.extend(last)
         else:
             context_requests.sort(key=self._lora_key)
-        generation_requests.sort(key=self._lora_key)
+        if self._lpt_generation_order:
+            _sort_generation_longest_kv_first(generation_requests)
+        else:
+            generation_requests.sort(key=self._lora_key)
 
     # ---- can_schedule (PP dry-run) ----
 

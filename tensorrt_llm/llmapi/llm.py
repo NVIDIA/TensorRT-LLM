@@ -1562,7 +1562,9 @@ class BaseLLM:
                        None)
         reason = spec_sampler_base.one_model_sampling_rejection_reason(
             sampling_params,
-            fused_sampling=bool(mode is not None and mode.is_fused))
+            fused_sampling=bool(mode is not None and mode.is_fused),
+            min_length_one_supported=spec_sampler_base.
+            _supports_eagle3_min_length_one(self.args.speculative_config))
         if reason is not None:
             raise RequestError(reason)
 

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import contextlib
 from typing import Callable, List, Optional, Union
 
@@ -192,6 +207,19 @@ def inplace_info():
         }
     }
     optional_inplace_infos = {
+        # Registered when eagle3 is imported. Preserve the persistent capture
+        # buffer instead of cloning it during auto-functionalization.
+        "fused_eagle3_capture": {
+            1: "dest"
+        },
+        # Void op: auto_functionalized returns None, then each mutated argument
+        # in schema order. The packed outputs and residual are independent.
+        "add_rmsnorm_fp4_quant_out": {
+            1: "residual",
+            2: "fp4",
+            3: "sf",
+            4: "y_out"
+        },
         "attn_custom_op_inplace": {
             1: "output",
             2: "output_sf"

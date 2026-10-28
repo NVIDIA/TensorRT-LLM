@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/common/attentionOp.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
@@ -26,6 +27,7 @@
 #include "tensorrt_llm/thop/attentionOp.h"
 #include "tensorrt_llm/thop/trtllmGenFusedOps.h"
 #include <ATen/cuda/CUDAContext.h>
+#include <mutex>
 #include <optional>
 #include <torch/extension.h>
 #include <tuple>
@@ -78,6 +80,57 @@ T const* optPtr(OptTensorT&& t, std::enable_if_t<std::is_const_v<OptTensorT>>* =
 cudaStream_t currentStreamFor(at::Tensor const& tensor)
 {
     return at::cuda::getCurrentCUDAStream(tensor.get_device()).stream();
+}
+
+// Decoder-info reuse (TLLM_REUSE_DECODER_INFO, default off). In a pure-generation step every attention layer of a
+// model builds the same decoder info (cu_seqlens, cu_kv_seqlens, tokens_info, rotary inv-freq) into the same
+// workspace offsets. The Python caller (fmha/flashinfer_trtllm_gen.py) knows the layer order of a step and arms a
+// one-shot hint for the next generation preprocess call when the previous call on this thread was the previous
+// target layer of the same pure-generation step with the same inputs. This file only honours the hint when the
+// arguments that determine the decoder-info bytes also match the last call that built them on this thread;
+// otherwise it builds them as before. The values are identical either way: the kernel is skipped, not changed.
+struct DecoderInfoKey
+{
+    void const* workspace{};
+    void const* seqKvLengths{};
+    void const* seqQLengths{};
+    void const* rotaryInvFreqCache{};
+    int64_t workspaceBytes{};
+    int64_t batchBeam{};
+    int64_t numTokens{};
+    int64_t inputSeqLength{};
+    int64_t rotaryDim{};
+    int64_t rotaryScaleType{};
+    double rotaryBase{};
+    double rotaryScale{};
+    int64_t rotaryMaxPositions{};
+    bool separateQkvScales{};
+    int device{-1};
+    cudaStream_t stream{};
+
+    bool operator==(DecoderInfoKey const& o) const
+    {
+        return workspace == o.workspace && seqKvLengths == o.seqKvLengths && seqQLengths == o.seqQLengths
+            && rotaryInvFreqCache == o.rotaryInvFreqCache && workspaceBytes == o.workspaceBytes
+            && batchBeam == o.batchBeam && numTokens == o.numTokens && inputSeqLength == o.inputSeqLength
+            && rotaryDim == o.rotaryDim && rotaryScaleType == o.rotaryScaleType && rotaryBase == o.rotaryBase
+            && rotaryScale == o.rotaryScale && rotaryMaxPositions == o.rotaryMaxPositions
+            && separateQkvScales == o.separateQkvScales && device == o.device && stream == o.stream;
+    }
+};
+
+struct DecoderInfoReuseState
+{
+    bool hintArmed{false};
+    int64_t hintLayer{-1};
+    bool built{false};
+    DecoderInfoKey builtKey{};
+};
+
+DecoderInfoReuseState& decoderInfoReuseState()
+{
+    thread_local DecoderInfoReuseState state;
+    return state;
 }
 
 bool isQOnlyInput(at::Tensor const& qkvInput, int64_t const numHeads, int64_t const headSize)
@@ -666,10 +719,38 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     decoderInfoParams.rotaryEmbeddingCoeffCache = nullptr;
     decoderInfoParams.rotaryEmbeddingMaxPositions = static_cast<int>(rotary_embedding_max_positions);
     bool const buildDecoderInfoNeeded = decoderInfoParams.isBuildDecoderInfoKernelNeeded();
-    if (buildDecoderInfoNeeded)
+    // Decoder-info reuse: consume the one-shot hint (see DecoderInfoReuseState) and skip the build only when the
+    // bytes it would write are already in place from the last build on this thread.
+    auto& reuseState = decoderInfoReuseState();
+    bool const hinted = reuseState.hintArmed && reuseState.hintLayer == layer_idx;
+    reuseState.hintArmed = false;
+    DecoderInfoKey const decoderInfoKey{workspace.data_ptr(), sequence_lengths.data_ptr(), decoderInfoParams.seqQLengths,
+        decoderInfoParams.rotaryEmbeddingInvFreqCache, static_cast<int64_t>(workspace.nbytes()), batch_beam, num_tokens,
+        input_seq_length, rotary_embedding_dim, rotary_embedding_scale_type, rotary_embedding_base,
+        rotary_embedding_scale, rotary_embedding_max_positions, decoderInfoParams.separateQkvScales,
+        qkv_input.get_device(), stream};
+    bool const reuseDecoderInfo
+        = buildDecoderInfoNeeded && hinted && reuseState.built && reuseState.builtKey == decoderInfoKey;
+    if (reuseDecoderInfo)
+    {
+        static std::once_flag reuseLogged;
+        std::call_once(reuseLogged,
+            []
+            {
+                TLLM_LOG_WARNING(
+                    "decoder info reused across the layers of a generation step (TLLM_REUSE_DECODER_INFO=1)");
+            });
+    }
+    else if (buildDecoderInfoNeeded)
     {
         tensorrt_llm::kernels::invokeBuildDecoderInfo(decoderInfoParams, stream);
         sync_check_cuda_error(stream);
+        reuseState.built = true;
+        reuseState.builtKey = decoderInfoKey;
+    }
+    else
+    {
+        reuseState.built = false;
     }
 
     auto* rotaryInvFreqBuf = buildDecoderInfoNeeded ? views.rotaryInvFreqBufPtr : optPtr<float>(rotary_inv_freq);
@@ -793,6 +874,19 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
         cuSeqlens, input_seq_length, max_past_kv_length, windowLeft, isMultiTokenGen};
 }
 
+void decoderInfoReuseHint(int64_t const layer_idx)
+{
+    auto& state = decoderInfoReuseState();
+    state.hintArmed = true;
+    state.hintLayer = layer_idx;
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    // Host-only: arms decoder-info reuse for the next trtllm_gen_generation_preprocess call on this thread.
+    m.def("decoder_info_reuse_hint", &tensorrt_llm::torch_ext::decoderInfoReuseHint);
+}

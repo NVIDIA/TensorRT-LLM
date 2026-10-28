@@ -438,6 +438,51 @@ void residualRmsNormFp4Quant(RmsNormFp4QuantParams const& params, tensorrt_llm::
     sync_check_cuda_error(stream);
 }
 
+namespace
+{
+
+__global__ void padNvfp4ActivationKernel(uint32_t const* fp4Input, uint8_t const* sfInput, uint32_t* fp4Output,
+    uint8_t* sfOutput, int inputFp4Words, int outputFp4Words, int inputSfCols, int outputSfCols)
+{
+    int64_t const row = blockIdx.x;
+
+    for (int word = static_cast<int>(threadIdx.x); word < outputFp4Words; word += static_cast<int>(blockDim.x))
+    {
+        fp4Output[row * outputFp4Words + word] = word < inputFp4Words ? fp4Input[row * inputFp4Words + word] : 0U;
+    }
+    for (int col = static_cast<int>(threadIdx.x); col < outputSfCols; col += static_cast<int>(blockDim.x))
+    {
+        sfOutput[row * outputSfCols + col] = col < inputSfCols ? sfInput[row * inputSfCols + col] : 0U;
+    }
+}
+
+} // namespace
+
+void padNvfp4Activation(void const* fp4Input, void const* sfInput, void* fp4Output, void* sfOutput, int64_t rows,
+    int inputHiddenSize, int outputHiddenSize, cudaStream_t stream)
+{
+    if (rows == 0)
+    {
+        return;
+    }
+
+    constexpr int kThreads = 256;
+    constexpr int kValuesPerFp4Byte = 2;
+    constexpr int kBytesPerFp4Word = 4;
+    constexpr int kSfVecSize = 16;
+    int const inputFp4Cols = inputHiddenSize / kValuesPerFp4Byte;
+    int const outputFp4Cols = outputHiddenSize / kValuesPerFp4Byte;
+    int const inputFp4Words = inputFp4Cols / kBytesPerFp4Word;
+    int const outputFp4Words = outputFp4Cols / kBytesPerFp4Word;
+    int const inputSfCols = inputHiddenSize / kSfVecSize;
+    int const outputSfCols = outputHiddenSize / kSfVecSize;
+
+    padNvfp4ActivationKernel<<<static_cast<unsigned int>(rows), kThreads, 0, stream>>>(
+        static_cast<uint32_t const*>(fp4Input), static_cast<uint8_t const*>(sfInput), static_cast<uint32_t*>(fp4Output),
+        static_cast<uint8_t*>(sfOutput), inputFp4Words, outputFp4Words, inputSfCols, outputSfCols);
+    sync_check_cuda_error(stream);
+}
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import copy
+import operator
 import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -474,6 +475,44 @@ DEFAULT_SAMPLING_SEED = 42
 # all unseeded requests. A string so it cannot collide with a slot id.
 _UNSEEDED_RNG_WINDOW_KEY = "unseeded"
 
+# Opt-in switch: default off, on only when the value is exactly "1".
+#   TLLM_FAST_PREP_INPUTS=1  the one-model sampling-parameter and RNG
+#   population (_scan_one_model_sampling, _populate_request_rng_state and
+#   populate_sampling_params_for_one_model, which _prepare_tp_inputs runs every
+#   step) does fewer Python operations per request: the per-row normalization
+#   is memoized per distinct raw parameter tuple, and per-token rows are
+#   expanded with list operations. Same values, same order, same RNG counters.
+_FAST_PREP_INPUTS = os.environ.get("TLLM_FAST_PREP_INPUTS") == "1"
+# Raw (temperature, top_k, top_p, min_p) -> the normalized row; why equal keys
+# give identical rows: SpecMetadata._fast_scan_one_model_sampling.
+_fast_sampling_norm_memo: dict = {}
+_fast_take4 = operator.itemgetter(0, 1, 2, 3)
+_fast_take_num_tokens = operator.itemgetter(4)
+_fast_printed: set = set()
+
+
+def _fast_print_once(key: str, message: str) -> None:
+    """One info line per process and key. Printed rather than logged:
+    worker processes keep the logger's default "error" level."""
+    if key not in _fast_printed:
+        _fast_printed.add(key)
+        print(message, flush=True)
+
+
+def _fast_expand_rows(values: list, counts: list) -> list:
+    """Each values[i] repeated counts[i] times, in row order: the per-token
+    layout the original loops build with one generator per request."""
+    n = len(values)
+    if n and counts[0] > 0 and counts.count(counts[0]) == n:
+        width = counts[0]
+        if width == 1:
+            return list(values)
+        out = [None] * (n * width)
+        for j in range(width):
+            out[j::width] = values
+        return out
+    return [value for value, count in zip(values, counts) for _ in range(count)]
+
 
 @dataclass
 class SpecMetadata:
@@ -801,21 +840,26 @@ class SpecMetadata:
         from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import \
             request_random_seed
 
-        user_seeds = [request_random_seed(request) for request in requests]
-        request_seeds = [
-            DEFAULT_SAMPLING_SEED if seed is None else seed
-            for seed in user_seeds
-        ]
-        request_offsets = self._take_rng_window_offsets(
-            requests, [seed is not None for seed in user_seeds])
-        num_tokens_per_request = [n for *_, n in per_request_normalized]
+        if _FAST_PREP_INPUTS:
+            request_seeds, request_offsets, flat_seeds, flat_offsets = (
+                self._fast_request_rng_rows(requests, per_request_normalized,
+                                            request_random_seed))
+        else:
+            user_seeds = [request_random_seed(request) for request in requests]
+            request_seeds = [
+                DEFAULT_SAMPLING_SEED if seed is None else seed
+                for seed in user_seeds
+            ]
+            request_offsets = self._take_rng_window_offsets(
+                requests, [seed is not None for seed in user_seeds])
+            num_tokens_per_request = [n for *_, n in per_request_normalized]
 
-        flat_seeds: list[int] = []
-        flat_offsets: list[int] = []
-        for seed, offset, num_tokens in zip(request_seeds, request_offsets,
-                                            num_tokens_per_request):
-            flat_seeds.extend(seed for _ in range(num_tokens))
-            flat_offsets.extend(offset for _ in range(num_tokens))
+            flat_seeds: list[int] = []
+            flat_offsets: list[int] = []
+            for seed, offset, num_tokens in zip(request_seeds, request_offsets,
+                                                num_tokens_per_request):
+                flat_seeds.extend(seed for _ in range(num_tokens))
+                flat_offsets.extend(offset for _ in range(num_tokens))
 
         # A batch wider than the buffers would silently truncate the copies
         # below, so assert rather than grow: CUDA graph batch sizes are already
@@ -846,6 +890,11 @@ class SpecMetadata:
                                        device='cuda')
 
         def _upload(dst: torch.Tensor, values: list[int]) -> None:
+            if _FAST_PREP_INPUTS and isinstance(values, torch.Tensor):
+                # Fast path: an int64 row _fast_request_rng_rows built as a
+                # tensor (pinned like torch.tensor(..., pin_memory=...) below).
+                dst[:len(values)].copy_(values, non_blocking=True)
+                return
             dst[:len(values)].copy_(torch.tensor(values,
                                                  dtype=torch.int64,
                                                  pin_memory=prefer_pinned()),
@@ -855,6 +904,86 @@ class SpecMetadata:
         _upload(self.request_offsets, request_offsets)
         _upload(self.seeds, flat_seeds)
         _upload(self.offsets, flat_offsets)
+
+    def _fast_request_rng_rows(self, requests, per_request_normalized,
+                               request_random_seed):
+        """Fast path: the four rows _populate_request_rng_state uploads.
+
+        With no seeded request every row takes the shared unseeded counter in
+        turn (_take_rng_window_offsets), so the counter advances by the row
+        count at once and the offsets are consecutive windows. Otherwise the
+        per-request counter walk runs unchanged. The per-token rows repeat each
+        request's value its row count, as the original generators do.
+
+        request_random_seed(request) is None exactly when the raw seed is None,
+        so the raw seeds the scan of this same ``requests`` list just read
+        decide "no row is seeded" without a second pass over the requests.
+        """
+        num_requests = len(requests)
+        scanned = getattr(self, "_fast_scan_seeds", None)
+        self._fast_scan_seeds = None  # used once; drop the request references
+        if (scanned is not None and scanned[0] is requests
+                and scanned[1].count(None) == num_requests):
+            unseeded = True
+        else:
+            user_seeds = [request_random_seed(request) for request in requests]
+            unseeded = user_seeds.count(None) == num_requests
+        num_tokens_per_request = list(
+            map(_fast_take_num_tokens, per_request_normalized))
+        if unseeded:
+            # The int64 rows are built as (pinned) tensors directly, holding
+            # exactly the values the lists would: seeds all DEFAULT_SAMPLING_SEED,
+            # offsets step*window, (step+1)*window, ... (see _upload).
+            pin = prefer_pinned()
+            window = self.max_draft_len + 1
+            step = self._rng_window_counter.get(_UNSEEDED_RNG_WINDOW_KEY, 0)
+            if num_requests:
+                self._rng_window_counter[_UNSEEDED_RNG_WINDOW_KEY] = (
+                    step + num_requests)
+            request_seeds = torch.full((num_requests, ),
+                                       DEFAULT_SAMPLING_SEED,
+                                       dtype=torch.int64,
+                                       pin_memory=pin)
+            request_offsets = torch.arange(step * window,
+                                           (step + num_requests) * window,
+                                           window,
+                                           dtype=torch.int64,
+                                           pin_memory=pin)
+            num_flat = sum(num_tokens_per_request)
+            flat_seeds = torch.full((num_flat, ),
+                                    DEFAULT_SAMPLING_SEED,
+                                    dtype=torch.int64,
+                                    pin_memory=pin)
+            width = num_tokens_per_request[0] if num_requests else 0
+            if (width > 0
+                    and num_tokens_per_request.count(width) == num_requests):
+                flat_offsets = torch.empty((num_flat, ),
+                                           dtype=torch.int64,
+                                           pin_memory=pin)
+                flat_offsets.view(num_requests, width).copy_(
+                    request_offsets.view(num_requests,
+                                         1).expand(num_requests, width))
+            else:
+                flat_offsets = _fast_expand_rows(request_offsets.tolist(),
+                                                 num_tokens_per_request)
+            _fast_print_once(
+                "rng-unseeded", "TLLM_FAST_PREP_INPUTS=1: "
+                "unseeded batch, RNG seed/offset rows built as tensors")
+            return request_seeds, request_offsets, flat_seeds, flat_offsets
+
+        _fast_print_once(
+            "rng-seeded", "TLLM_FAST_PREP_INPUTS=1: seeded "
+            "rows present, per-request RNG window walk kept")
+        request_seeds = [
+            DEFAULT_SAMPLING_SEED if seed is None else seed
+            for seed in user_seeds
+        ]
+        request_offsets = self._take_rng_window_offsets(
+            requests, [seed is not None for seed in user_seeds])
+        flat_seeds = _fast_expand_rows(request_seeds, num_tokens_per_request)
+        flat_offsets = _fast_expand_rows(request_offsets,
+                                         num_tokens_per_request)
+        return request_seeds, request_offsets, flat_seeds, flat_offsets
 
     def prepare_rejection_sampling_buffers(self):
         """
@@ -1216,6 +1345,11 @@ class SpecMetadata:
                 is_greedy,
             )
 
+        if _FAST_PREP_INPUTS:
+            return self._fast_scan_one_model_sampling(
+                requests, _normalize_request_sampling_params,
+                LlmRequestState.GENERATION_IN_PROGRESS)
+
         # Phase 1: collect per-request flags and normalized values.
         per_request_normalized: list[tuple[float, int, float, float, int]] = []
         has_non_greedy_requests = False
@@ -1269,6 +1403,69 @@ class SpecMetadata:
         # value rather than resurrect the local value.
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
+        return per_request_normalized, per_request_slot_ids
+
+    def _fast_scan_one_model_sampling(self, requests, normalize,
+                                      generation_in_progress):
+        """Fast path: Phase 1 of _scan_one_model_sampling with ``normalize``
+        (its _normalize_request_sampling_params) memoized per raw tuple and
+        row token count; equal keys share one (read-only) row tuple.
+
+        ``normalize`` is a pure function of (temperature, top_k, top_p,
+        min_p): its greedy test only compares the values (==, >, is None), and
+        it returns either a constant or the value itself. Keys that compare
+        equal therefore give the same row, bit for bit, except a min_p of +0.0
+        against -0.0, which a non-greedy row keeps as given; rows with
+        min_p == 0.0 skip the memo. NaN keys never match (NaN != NaN). The C++
+        reads, the row order and the flags stay per request, as in Phase 1.
+
+        The same pass reads each row's raw seed: _fast_request_rng_rows uses it
+        for this ``requests`` list (identity) to see that no row is seeded.
+        """
+        memo = _fast_sampling_norm_memo
+        if len(memo) > 4096:
+            memo.clear()
+        gen_num_tokens = 1 + self.runtime_draft_len
+        dummy_slot_row = self.dummy_slot_row
+        per_request_normalized: list[tuple[float, int, float, float, int]] = []
+        per_request_slot_ids: list[int] = []
+        raw_seeds: list = []
+        has_non_greedy_requests = False
+        for request in requests:
+            sampling_config = request.sampling_config
+            temp_val = sampling_config.temperature
+            tk_val = sampling_config.top_k
+            tp_val = sampling_config.top_p
+            mp_val = sampling_config.min_p
+            raw_seeds.append(sampling_config.seed)
+            # Context requests have no draft tokens yet.
+            num_tokens = (gen_num_tokens
+                          if request.state == generation_in_progress else 1)
+            key = (temp_val, tk_val, tp_val, mp_val, num_tokens)
+            entry = memo.get(key) if mp_val != 0.0 else None
+            if entry is None:
+                norm = normalize(temperature=temp_val,
+                                 top_k=tk_val,
+                                 top_p=tp_val,
+                                 min_p=mp_val)
+                entry = ((norm[0], norm[1], norm[2], norm[3], num_tokens),
+                         norm[4])
+                if mp_val != 0.0:
+                    memo[key] = entry
+            row, is_greedy = entry
+            if not is_greedy:
+                has_non_greedy_requests = True
+            per_request_normalized.append(row)
+            slot = request.py_seq_slot
+            per_request_slot_ids.append(
+                slot if slot is not None else dummy_slot_row)
+        self.is_all_greedy_sample = not has_non_greedy_requests
+        if self.group_all_greedy_sample is not None:
+            self.is_all_greedy_sample = self.group_all_greedy_sample
+        self._fast_scan_seeds = (requests, raw_seeds)
+        _fast_print_once(
+            "sampling", "TLLM_FAST_PREP_INPUTS=1: one-model "
+            f"sampling scan memoized ({len(memo)} distinct parameter rows)")
         return per_request_normalized, per_request_slot_ids
 
     @property
@@ -1330,8 +1527,12 @@ class SpecMetadata:
                               self.is_spec_dec_tree else self.max_draft_len + 1)
         # Warmup batches may exceed max_num_requests * tokens_per_request (e.g.
         # when CUDA-graph warmup passes use max_batch_size > max_num_requests).
-        actual_flat_size = sum(num_tokens
-                               for *_, num_tokens in per_request_normalized)
+        if _FAST_PREP_INPUTS:
+            actual_flat_size = sum(
+                map(_fast_take_num_tokens, per_request_normalized))
+        else:
+            actual_flat_size = sum(num_tokens
+                                   for *_, num_tokens in per_request_normalized)
         required_flat_size = max(tokens_per_request * self.max_num_requests,
                                  actual_flat_size)
 
@@ -1405,7 +1606,13 @@ class SpecMetadata:
                 or need_update_expanded_sampler_param):
             return
 
-        if need_update_sampler_param:
+        if need_update_sampler_param and _FAST_PREP_INPUTS:
+            request_temperatures = [row[0] for row in per_request_normalized]
+            request_top_ks = [row[1] for row in per_request_normalized]
+            request_top_ps = [row[2] for row in per_request_normalized]
+            request_min_ps = ([row[3] for row in per_request_normalized]
+                              if fill_min_p else [])
+        elif need_update_sampler_param:
             request_temperatures: list[float] = []
             request_top_ks: list[int] = []
             request_top_ps: list[float] = []
@@ -1417,6 +1624,7 @@ class SpecMetadata:
                 if fill_min_p:
                     request_min_ps.append(mp_val)
 
+        if need_update_sampler_param:
             self.request_temperatures[:len(request_temperatures)].copy_(
                 torch.tensor(request_temperatures,
                              dtype=torch.float32,
@@ -1452,7 +1660,18 @@ class SpecMetadata:
                 (tk for tk in request_top_ks if 0 < tk < _disable_topk),
                 default=0)
 
-        if need_update_expanded_sampler_param:
+        if need_update_expanded_sampler_param and _FAST_PREP_INPUTS:
+            counts = list(map(_fast_take_num_tokens, per_request_normalized))
+            temperatures = _fast_expand_rows(
+                [row[0] for row in per_request_normalized], counts)
+            top_ks = _fast_expand_rows(
+                [row[1] for row in per_request_normalized], counts)
+            top_ps = _fast_expand_rows(
+                [row[2] for row in per_request_normalized], counts)
+            min_ps = (_fast_expand_rows(
+                [row[3] for row in per_request_normalized], counts)
+                      if fill_min_p else [])
+        elif need_update_expanded_sampler_param:
             temperatures: list[float] = []
             top_ks: list[int] = []
             top_ps: list[float] = []
@@ -1464,6 +1683,7 @@ class SpecMetadata:
                 if fill_min_p:
                     min_ps.extend(mp_val for _ in range(num_tokens))
 
+        if need_update_expanded_sampler_param:
             self.temperatures[:len(temperatures)].copy_(torch.tensor(
                 temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
                                                         non_blocking=True)
@@ -1506,10 +1726,15 @@ class SpecMetadata:
         ``top_k_max`` derives from the same values as the per-request buffers,
         so it stays valid for as long as they do.
         """
-        values = tuple(
-            (temp, top_k, top_p, min_p)
-            for temp, top_k, top_p, min_p, _ in per_request_normalized)
-        num_tokens = tuple(n for *_, n in per_request_normalized)
+        if _FAST_PREP_INPUTS:
+            values = tuple(map(_fast_take4, per_request_normalized))
+            num_tokens = tuple(
+                map(_fast_take_num_tokens, per_request_normalized))
+        else:
+            values = tuple(
+                (temp, top_k, top_p, min_p)
+                for temp, top_k, top_p, min_p, _ in per_request_normalized)
+            num_tokens = tuple(n for *_, n in per_request_normalized)
 
         request_signature = values
         expanded_signature = (values, num_tokens)

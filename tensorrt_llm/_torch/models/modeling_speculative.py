@@ -25,6 +25,7 @@ from ..modules.embedding import Embedding, get_masked_input_and_mask
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
+from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -1704,12 +1705,26 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         if self.spec_worker is not None:
             # get logits
-            logits = self.logits_processor.forward(
-                hidden_states[spec_metadata.gather_ids],
-                self.lm_head,
-                attn_metadata,
-                True,
-            )
+            keeps_dtype = getattr(self.spec_worker, "keeps_target_logits_dtype",
+                                  None)
+            if (keeps_dtype is not None
+                    and type(self.logits_processor) is LogitsProcessor
+                    and keeps_dtype()):
+                # TLLM_BF16_TARGET_LOGITS=1: no vocab-wide fp32 copy.
+                logits = self.logits_processor.forward(
+                    hidden_states[spec_metadata.gather_ids],
+                    self.lm_head,
+                    attn_metadata,
+                    True,
+                    keep_dtype=True,
+                )
+            else:
+                logits = self.logits_processor.forward(
+                    hidden_states[spec_metadata.gather_ids],
+                    self.lm_head,
+                    attn_metadata,
+                    True,
+                )
 
             # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with
             # fused inputs_embeds; fall back to the pre-fusion token IDs

@@ -82,6 +82,11 @@ struct RmsNormFp4QuantParams
 // field docs above); dataType selects the fp16/bf16 instantiation.
 void residualRmsNormFp4Quant(RmsNormFp4QuantParams const& params, tensorrt_llm::DataType dataType, cudaStream_t stream);
 
+//! Copy compact row-major NVFP4 activations and E4M3 block scales into a
+//! wider row-major physical layout, zero-filling both tails in one launch.
+void padNvfp4Activation(void const* fp4Input, void const* sfInput, void* fp4Output, void* sfOutput, int64_t rows,
+    int inputHiddenSize, int outputHiddenSize, cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

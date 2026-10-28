@@ -6030,6 +6030,184 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                 self._shuffle_w2_weight(module.w2_bias.data[expert_idx])
 
 
+class MXFP4AsNVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEMethod):
+    """NVFP4 (W4A4) execution of a stored MXFP4 checkpoint, repacked at load.
+
+    Opt-in through ``TLLM_MXFP4_MOE_NVFP4_ACT`` on the TRTLLM-Gen W4A8 MXFP4
+    leaf. Takes the MXFP4 FUSED_GATE_UP_PROJ dict the model loader builds
+    (packed E2M1 codes, UE8M0 group-32 scales) and turns it into the NVFP4 dict
+    the parent loads:
+
+    - FP4 codes are kept byte for byte (E2M1 is the same element format).
+    - Each UE8M0 scale ``2^(s-127)`` becomes two E4M3 group-16 scales
+      ``2^(s-emax+8)`` under a per-(expert, projection) global
+      ``weight_scale_2 = 2^(emax-127-8)``, ``emax`` the expert's largest
+      exponent. E4M3 holds every power of two in ``[2^-9, 2^8]``, so a block
+      is exact iff ``s >= emax-17``. A block below that (35 of 3.6e9 in
+      gpt-oss-120b, all in down_proj, each ``<= 2^-17`` of its expert's
+      largest weight) takes scale ``2^-9`` with its codes requantized to the
+      nearest E2M1 value of ``code * 2^-deficit``; the count is logged.
+    - Activation global scales are static bounds, not calibration: FC1's
+      input is an RMSNorm output, so ``|y| <= sqrt(hidden) * max|norm_w|``
+      (supplied by the model loader as ``gate_up_proj_input_scale``); FC2's
+      input is the clamped SwiGLU, ``|y| <= clamp * (clamp + |linear_offset|)``.
+    """
+
+    _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+    _E4M3_POW2_MAX = 8  # 2^8 is the largest power of two E4M3 holds
+    _E4M3_POW2_SPAN = 17  # ... and 2^-9 the smallest (subnormal)
+    _FP4_AMAX_TO_INPUT_SCALE = 1.0 / (448.0 * 6.0)  # checkpoint input_scale = amax / (448 * 6)
+
+    @staticmethod
+    def rmsnorm_output_amax_bound(norm_weight: torch.Tensor) -> float:
+        """``max|x_i| / rms(x) <= sqrt(n)`` for any x, hence the RMSNorm output bound."""
+        return math.sqrt(norm_weight.numel()) * float(norm_weight.float().abs().max())
+
+    # Headroom over the exact-arithmetic bounds: bf16 rounding of the norm
+    # output (and the FC1 epilogue's own rounding) can exceed them by ~2^-8
+    # relative, which would put a block scale just past E4M3's 448.
+    _AMAX_HEADROOM = 1.02
+
+    @classmethod
+    def input_scale_for_amax(cls, amax: float) -> torch.Tensor:
+        """Checkpoint-convention input_scale for an amax bound, with headroom."""
+        return torch.tensor(amax * cls._AMAX_HEADROOM *
+                            cls._FP4_AMAX_TO_INPUT_SCALE,
+                            dtype=torch.float32)
+
+    @staticmethod
+    def _max_float(value) -> float:
+        if isinstance(value, torch.Tensor):
+            return float(value.float().abs().max())
+        return abs(float(value))
+
+    def _swiglu_output_amax_bound(self, module: torch.nn.Module) -> float:
+        activation = module.activation
+        clamp = self._max_float(activation.clamp)
+        return clamp * (clamp + self._max_float(activation.linear_offset))
+
+    @classmethod
+    def _requant_codes(cls, codes: torch.Tensor, deficit: torch.Tensor,
+                       group: int) -> torch.Tensor:
+        """Rescale the packed E2M1 codes of out-of-range groups by ``2^-deficit``.
+
+        ``codes`` [rows, K/2] uint8 (low nibble first), ``deficit`` [rows, K/group]
+        int. Returns a modified copy; nearest E2M1 value, ties toward zero.
+        """
+        codes = codes.clone()
+        lut = torch.tensor(cls._E2M1_VALUES, dtype=torch.float32)
+        bytes_per_group = group // 2
+        for row, g in deficit.nonzero().tolist():
+            d = int(deficit[row, g])
+            sl = slice(g * bytes_per_group, (g + 1) * bytes_per_group)
+            packed = codes[row, sl].to(torch.int64).cpu()
+            nibbles = torch.stack([packed & 0xF, packed >> 4], dim=-1).flatten()
+            sign = nibbles & 0x8
+            mag = lut[nibbles & 0x7] * (2.0**-d)
+            idx = (mag[:, None] - lut[None, :]).abs().argmin(dim=1)
+            new = (idx | sign).view(-1, 2)
+            codes[row, sl] = (new[:, 0] | (new[:, 1] << 4)).to(torch.uint8).to(
+                codes.device)
+        return codes
+
+    def _repack_projection(self, codes_t: List[torch.Tensor],
+                           scales_t: List[torch.Tensor]):
+        """Repack one projection of every expert (loader layout: transposed).
+
+        Returns (codes_t, nvfp4_scales_t as uint8 E4M3 bits, weight_scale_2 [E],
+        number of requantized groups).
+        """
+        group = 32
+        device = (torch.device("cuda", torch.cuda.current_device())
+                  if torch.cuda.is_available() else torch.device("cpu"))
+        s = torch.stack([t.transpose(0, 1) for t in scales_t]).to(
+            device=device, dtype=torch.int32)  # [E, rows, K/32]
+        emax = s.amax(dim=(1, 2))
+        low = emax - self._E4M3_POW2_SPAN
+        deficit = (low[:, None, None] - s).clamp(min=0)
+        exp = torch.maximum(s, low[:, None, None]) - emax[:, None, None] + \
+            self._E4M3_POW2_MAX
+        nv = torch.exp2(exp.float()).to(torch.float8_e4m3fn).view(torch.uint8)
+        nv = nv.repeat_interleave(group // 16, dim=-1)  # [E, rows, K/16]
+        weight_scale_2 = torch.exp2(
+            (emax - 127 - self._E4M3_POW2_MAX).float()).cpu()
+        new_scales_t = [nv[e].transpose(0, 1) for e in range(nv.shape[0])]
+        num_requant = int((deficit > 0).sum())
+        if num_requant:
+            codes_t = list(codes_t)
+            for e in (deficit.amax(dim=(1, 2)) > 0).nonzero().flatten().tolist():
+                codes_t[e] = self._requant_codes(
+                    codes_t[e].transpose(0, 1), deficit[e].cpu(),
+                    group).transpose(0, 1)
+        return codes_t, new_scales_t, weight_scale_2, num_requant
+
+    def load_weights(self,
+                     module: torch.nn.Module,
+                     weights: Dict,
+                     weight_loading_mode: MoEWeightLoadingMode,
+                     allow_partial_loading: bool = False):
+        assert weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
+        if "gate_up_proj_input_scale" not in weights:
+            raise ValueError(
+                f"{type(self).__name__} needs the model loader to supply "
+                "gate_up_proj_input_scale (the FC1 input amax bound)")
+        weights = dict(weights)
+        stats = []
+        for proj in ("gate_up_proj", "down_proj"):
+            scale_key = f"{proj}_weight_scale"
+            assert (proj in weights) == (scale_key in weights), (
+                f"{proj} codes and scales must load together")
+            if proj not in weights:
+                continue
+            (weights[proj], weights[scale_key], weights[f"{proj}_weight_scale_2"],
+             num_requant) = self._repack_projection(weights[proj],
+                                                    weights[scale_key])
+            stats.append(f"{proj} requantized groups {num_requant}")
+            if num_requant:
+                logger.warning(
+                    f"MXFP4->NVFP4 repack, layer {module.layer_idx} {proj}: "
+                    f"{num_requant} group-32 blocks below the E4M3 scale range "
+                    "of their expert were requantized")
+            bias_key = f"{proj}.bias"
+            if bias_key in weights:
+                weights[bias_key] = [b.float() for b in weights[bias_key]]
+        weights["down_proj_input_scale"] = self.input_scale_for_amax(
+            self._swiglu_output_amax_bound(module))
+        logger.info_once(
+            "MXFP4->NVFP4 repack (layer "
+            f"{module.layer_idx}): FC1 input scale "
+            f"{float(weights['gate_up_proj_input_scale']):.6g}, FC2 input scale "
+            f"{float(weights['down_proj_input_scale']):.6g}; " + "; ".join(stats),
+            key="mxfp4_as_nvfp4_repack")
+        super().load_weights(module, weights, weight_loading_mode,
+                             allow_partial_loading)
+
+    def load_fp4_weight_block_scales(self,
+                                     module: torch.nn.Module,
+                                     weights: Dict,
+                                     load_expert_ids: List[int],
+                                     dst_w3_w1_weight_scale: Optional[torch.Tensor],
+                                     dst_w2_weight_scale: Optional[torch.Tensor],
+                                     tmp_weight_scale_2: Dict,
+                                     ignore_weight_scale=False):
+        """As the parent, with one weight_scale_2 per expert, not per layer."""
+        super().load_fp4_weight_block_scales(module, weights, load_expert_ids,
+                                             dst_w3_w1_weight_scale,
+                                             dst_w2_weight_scale,
+                                             tmp_weight_scale_2,
+                                             ignore_weight_scale)
+        gate_up = weights.get("gate_up_proj_weight_scale_2")
+        down = weights.get("down_proj_weight_scale_2")
+        for local_slot_id, expert_id in enumerate(load_expert_ids):
+            entry = tmp_weight_scale_2.get(local_slot_id)
+            if entry is None:
+                continue
+            if gate_up is not None:
+                entry['w1'] = entry['w3'] = gate_up[expert_id]
+            if down is not None:
+                entry['w2'] = down[expert_id]
+
+
 class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
     eplb_support_status = EplbSupportStatus.NOT_VERIFIED
 

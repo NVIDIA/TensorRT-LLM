@@ -228,6 +228,39 @@ class Fp4QuantizedTensor:
     def shape(self):
         return self.fp4_tensor.shape
 
+    def numel(self) -> int:
+        return self.fp4_tensor.numel()
+
+    def split(
+        self,
+        split_size_or_sections: int | list[int],
+        dim: int = 0,
+    ) -> tuple["Fp4QuantizedTensor", ...]:
+        """Split row-major activations, scales, and BF16 views by token."""
+        if dim != 0:
+            raise ValueError(
+                "Fp4QuantizedTensor can only be split along the token dimension"
+            )
+        if self.is_sf_swizzled:
+            raise ValueError(
+                "Fp4QuantizedTensor with swizzled scales cannot be split")
+        fp4_chunks = self.fp4_tensor.split(split_size_or_sections, dim=dim)
+        sf_chunks = self.scaling_factor.split(split_size_or_sections, dim=dim)
+        if self.unquantized_hidden_states is None:
+            hp_chunks = (None, ) * len(fp4_chunks)
+        else:
+            hp_chunks = self.unquantized_hidden_states.split(
+                split_size_or_sections, dim=dim)
+        return tuple(
+            Fp4QuantizedTensor(
+                fp4_chunk,
+                sf_chunk,
+                is_sf_swizzled=False,
+                unquantized_hidden_states=hp_chunk,
+                reciprocal_scale=self.reciprocal_scale,
+            ) for fp4_chunk, sf_chunk, hp_chunk in zip(fp4_chunks, sf_chunks,
+                                                       hp_chunks))
+
 
 @dataclass
 class MxFp8QuantizedTensor:

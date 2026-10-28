@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import sys
 from typing import Any, Dict, Literal, Optional
 
 import torch
@@ -11,13 +13,14 @@ from transformers import GptOssConfig
 
 from tensorrt_llm._utils import get_hf_rope_theta, get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.logger import logger
 
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import (PositionalEmbeddingParams,
                                             PredefinedAttentionMask, RopeParams)
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           allgather)
+                           MoEAllReduce, allgather)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -27,7 +30,10 @@ from ..modules.embedding import Embedding
 from ..moe.fused_moe import (MoEWeightLoadingMode, RenormalizeMoeRoutingMethod,
                              SwigluBiasActivation, TritonFusedMoE, create_moe,
                              is_moe_weight_owner)
+from ..moe.fused_moe.quantization import MXFP4AsNVFP4TRTLLMGenFusedMoEMethod
 # isort: on
+from ..modules.fused_ops.rmsnorm_fp4_quant import (
+    add_rmsnorm_fp4_quant, add_rmsnorm_fp4_quant_available)
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
@@ -37,6 +43,76 @@ from .modeling_utils import DecoderModel, filter_weights, register_auto_model
 
 # Use TinyGEMM when the number of tokens is not larger than this threshold
 MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
+
+# A/B escape hatch: restore separate RMSNorm and NVFP4 input quantization.
+# Read once at import so the environment is never queried in the hot path.
+_GPT_OSS_DISABLE_FUSED_MLP_NVFP4_INPUT = os.environ.get(
+    "TLLM_GPT_OSS_DISABLE_FUSED_MLP_NVFP4_INPUT", "0") == "1"
+
+if _GPT_OSS_DISABLE_FUSED_MLP_NVFP4_INPUT:
+    logger.info_once(
+        "GPT-OSS fused RMSNorm and NVFP4 input quantization disabled by "
+        "TLLM_GPT_OSS_DISABLE_FUSED_MLP_NVFP4_INPUT=1",
+        key="gpt_oss_fused_mlp_nvfp4_input_disabled",
+    )
+
+# Opt-in MXFP8 W8A8 for the checkpoint's bf16 dense layers, read once at
+# import (GptOssForCausalLM._maybe_requantize_dense_to_mxfp8). Default off.
+_MXFP8_ATTN_PROJ = os.environ.get("TLLM_MXFP8_ATTN_PROJ", "0") == "1"
+_MXFP8_LM_HEAD = os.environ.get("TLLM_MXFP8_LM_HEAD", "0")
+_printed: set = set()
+
+
+def _print_once(key: str, message: str) -> None:
+    """One line per process and key; printed, since workers log at "error"."""
+    if key not in _printed:
+        _printed.add(key)
+        print(message, flush=True)
+
+
+# GPT-OSS all-reduce fusions for the attention-TP path, each default off and read once at import:
+# - TLLM_GPT_OSS_MOE_FINALIZE_AR=1: the MoE finalize (top-k weighted unpermute) runs inside the post-MoE all-reduce
+#   (MoEAllReduce.finalize_allreduce_match_unfused), bit-exact to finalize + AR + residual + RMSNorm.
+# - TLLM_GPT_OSS_AR_MXFP8_QUANT=1: the MoE's MXFP8 input quantization runs inside the pre-MoE all-reduce
+#   (AllReduce.residual_rms_norm_mxfp8), bit-exact to AR + residual + RMSNorm + mxfp8_quantize.
+# Both apply to one-shot sized steps (<= 128 tokens) on the MXFP4 TRTLLM-Gen MoE with MXFP8 activations; every other
+# step, layer and configuration keeps the unfused path.
+_GPT_OSS_MOE_FINALIZE_AR = os.environ.get("TLLM_GPT_OSS_MOE_FINALIZE_AR", "0") == "1"
+_GPT_OSS_AR_MXFP8_QUANT = os.environ.get("TLLM_GPT_OSS_AR_MXFP8_QUANT", "0") == "1"
+_GPT_OSS_FUSED_AR_MAX_TOKENS = 128
+_gpt_oss_fusion_reported = set()
+
+
+def _report_gpt_oss_fusion_once(name: str, detail: str) -> None:
+    if name in _gpt_oss_fusion_reported:
+        return
+    _gpt_oss_fusion_reported.add(name)
+    # Printed rather than logged: worker processes keep the logger at "error".
+    print(f"{name} engaged: {detail} pid={os.getpid()}",
+          file=sys.stderr,
+          flush=True)
+
+
+def _moe_input_hidden_alignment(impl) -> int:
+    """The column alignment the MoE pads its MXFP8 input to (its quant method's input_hidden_alignment).
+
+    The impl creates ``quant_method`` only in create_weights, after the decoder layers are built (and not at all
+    before weight loading when model_config.skip_create_weights_in_init is set), so fall back to the method the
+    impl will create; for the MXFP4 TRTLLM-Gen leaf that is a class constant (512).
+    """
+    method = getattr(impl, "quant_method", None)
+    if method is None:
+        method = impl._get_quant_method()
+    return int(method.input_hidden_alignment)
+
+
+def _fused_mlp_nvfp4_input_enabled(tp_size: int, enable_attn_dp: bool,
+                                   sm_version: int) -> bool:
+    # Attention-DP ranks normalize local tokens; only attention TP needs the
+    # existing fused all-reduce + RMSNorm path instead.
+    return (not _GPT_OSS_DISABLE_FUSED_MLP_NVFP4_INPUT
+            and (tp_size == 1 or enable_attn_dp) and 100 <= sm_version < 120
+            and add_rmsnorm_fp4_quant_available())
 
 
 class AttentionBlock(Attention):
@@ -91,6 +167,11 @@ class AttentionBlock(Attention):
                 f"GPT-OSS model uses attention sinks, which are only supported "
                 f"with attn_backend='TRTLLM'. Current backend: {self.attn_backend}."
             )
+
+        # Every target layer after the first may reuse the decoder info the layer before it built in the same
+        # pure-generation step (TLLM_REUSE_DECODER_INFO, see fmha/flashinfer_trtllm_gen.py); the EAGLE3 draft
+        # layers are not GPT-OSS AttentionBlocks and always build their own.
+        self.attn.reuse_decoder_info_from_previous_layer = layer_idx > 0
 
         # Only apply sliding window to every other layer
         self.sliding_window = pretrained_config.sliding_window if layer_idx % 2 == 0 else None
@@ -225,38 +306,63 @@ class MLPBlock(torch.nn.Module):
 
     def forward_normal(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor | Fp4QuantizedTensor,
         residual: Optional[torch.Tensor] = None,
-        lora_params: Optional[dict] = None
+        lora_params: Optional[dict] = None,
+        do_finalize: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        orig_shape = x.shape
-        hidden_dim = orig_shape[-1]
-        x = x.view(-1, hidden_dim)
-
-        # t = self.norm(x) was done in the parent block
-        t = x
+        if isinstance(x, Fp4QuantizedTensor):
+            t = x.unquantized_hidden_states
+            if t is None:
+                raise ValueError(
+                    "GPT-OSS MoE requires the BF16 view of a prequantized input"
+                )
+            orig_shape = t.shape
+            hidden_dim = orig_shape[-1]
+            t = t.view(-1, hidden_dim)
+            expert_input = x
+        else:
+            orig_shape = x.shape
+            hidden_dim = orig_shape[-1]
+            t = x.view(-1, hidden_dim)
+            expert_input = t
 
         g = self.compute_gate_output(t, lora_params=lora_params)
 
         # When attention_dp is not enabled, don't pass those parameters
-        expert_output = self.experts(x=t, router_logits=g)
+        if isinstance(expert_input, Fp4QuantizedTensor):
+            expert_output = self.experts(x=expert_input,
+                                         router_logits=g,
+                                         output_dtype=t.dtype,
+                                         do_finalize=do_finalize)
+        else:
+            expert_output = self.experts(x=expert_input,
+                                         router_logits=g,
+                                         do_finalize=do_finalize)
 
+        if not do_finalize:
+            # [fc2_output, expert_weights, expanded_idx_to_permuted_idx] for a fused finalize + all-reduce.
+            return expert_output, residual
         expert_output = expert_output.view(orig_shape)
         return expert_output, residual
 
     def forward_attn_dp(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor | Fp4QuantizedTensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
         lora_params: Optional[dict] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        orig_shape = x.shape
+        # The router and output shape use the logical BF16 view, not the
+        # packed/padded FP4 shape passed to the experts.
+        t = x.unquantized_hidden_states if isinstance(x,
+                                                      Fp4QuantizedTensor) else x
+        if t is None:
+            raise ValueError(
+                "GPT-OSS MoE requires the BF16 view of a prequantized input")
+        orig_shape = t.shape
         hidden_dim = orig_shape[-1]
-        x = x.view(-1, hidden_dim)
-
-        # t = self.norm(x) was done in the parent block
-        t = x
+        t = t.view(-1, hidden_dim)
 
         # Get attention_dp parameters
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
@@ -267,27 +373,38 @@ class MLPBlock(torch.nn.Module):
 
         g = self.compute_gate_output(t, lora_params=lora_params)
 
-        # Let CutlassFusedMoE and TRTLLMGenFusedMoE handle allgather internally
-        # Pass the normalized tensor (t) as input to experts, not x
-        expert_output = self.experts(x=t,
+        # Let the MoE handle dispatch internally. Prequantized inputs must
+        # retain their scales and explicitly request the BF16 output dtype.
+        expert_input = t
+        expert_kwargs = {}
+        if isinstance(x, Fp4QuantizedTensor):
+            expert_input = x
+            expert_kwargs["output_dtype"] = t.dtype
+        expert_output = self.experts(x=expert_input,
                                      router_logits=g,
                                      all_rank_num_tokens=all_rank_num_tokens,
-                                     use_dp_padding=False)
+                                     use_dp_padding=False,
+                                     **expert_kwargs)
 
         expert_output = expert_output.view(orig_shape)
         return expert_output, residual
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor | Fp4QuantizedTensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
-        lora_params: Optional[dict] = None
+        lora_params: Optional[dict] = None,
+        do_finalize: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.enable_attention_dp:
+            assert do_finalize, "attention DP keeps the finalized MoE output"
             return self.forward_attn_dp(x, attn_metadata, residual, lora_params)
         else:
-            return self.forward_normal(x, residual, lora_params)
+            return self.forward_normal(x,
+                                       residual,
+                                       lora_params,
+                                       do_finalize=do_finalize)
 
 
 class TransformerBlock(DecoderLayer):
@@ -304,6 +421,10 @@ class TransformerBlock(DecoderLayer):
         mapping = config.mapping
         self.enable_attn_dp = mapping.enable_attention_dp
         self.is_tp = mapping.has_tp() and not self.enable_attn_dp
+        sm_version = get_sm_version()
+        self.enable_fused_mlp_nvfp4_input = \
+            _fused_mlp_nvfp4_input_enabled(mapping.tp_size,
+                                           self.enable_attn_dp, sm_version)
 
         pretrained_config = config.pretrained_config
         self.input_layernorm = RMSNorm(
@@ -335,11 +456,128 @@ class TransformerBlock(DecoderLayer):
 
         # setup for tp
         self.allreduce = None
+        self.moe_allreduce = None
         if self.is_tp:
             self.allreduce = AllReduce(
                 mapping=config.mapping,
                 strategy=config.allreduce_strategy,
                 dtype=config.pretrained_config.torch_dtype)
+            if _GPT_OSS_MOE_FINALIZE_AR:
+                self.moe_allreduce = MoEAllReduce(mapping=config.mapping)
+        # Whether the all-reduce fusions can apply to this layer at all, decided here (not in the compiled
+        # forward). Steps above _GPT_OSS_FUSED_AR_MAX_TOKENS and EAGLE3 capture layers still take the unfused path.
+        self._fused_ar_eligible = self._fusions_eligible()
+        self._mxfp8_alignment = (_moe_input_hidden_alignment(
+            self._mxfp8_moe_impl()) if self._fused_ar_eligible else None)
+        if self._fused_ar_eligible:
+            if _GPT_OSS_AR_MXFP8_QUANT:
+                _report_gpt_oss_fusion_once(
+                    "TLLM_GPT_OSS_AR_MXFP8_QUANT",
+                    f"pre-MoE all-reduce writes the MXFP8 MoE input (<= {_GPT_OSS_FUSED_AR_MAX_TOKENS} tokens,"
+                    f" alignment {self._mxfp8_alignment})")
+            if _GPT_OSS_MOE_FINALIZE_AR:
+                _report_gpt_oss_fusion_once(
+                    "TLLM_GPT_OSS_MOE_FINALIZE_AR",
+                    f"MoE finalize runs in the post-MoE all-reduce (<= {_GPT_OSS_FUSED_AR_MAX_TOKENS} tokens,"
+                    " not on EAGLE3 capture layers)")
+        elif (_GPT_OSS_MOE_FINALIZE_AR or _GPT_OSS_AR_MXFP8_QUANT) and self.is_tp:
+            _report_gpt_oss_fusion_once(
+                "TLLM_GPT_OSS_FUSED_AR_INELIGIBLE",
+                "flags set but this layer keeps the unfused all-reduce (MoE leaf, MoE comm, MNNVL/symm-mem AR or"
+                " multi-node TP)")
+
+    def _mxfp8_moe_impl(self):
+        """The MoE implementation when it is the MXFP4 TRTLLM-Gen leaf with MXFP8 activations and no MoE comm."""
+        from ..moe.fused_moe.trtllm_gen.trtllm_w4a8_mxfp4_mxfp8 import \
+            TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl
+        experts = self.mlp.experts
+        impl = getattr(experts, "backend", experts)
+        if not isinstance(impl, TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl):
+            return None
+        if getattr(experts, "comm", None) is not None or getattr(
+                experts, "reduce_results", False):
+            return None
+        # TLLM_MXFP4_MOE_NVFP4_ACT swaps this leaf to NVFP4 activations; the fused all-reduces write MXFP8 input and
+        # assume the MXFP8 runner's un-finalized rows, so neither may run on that worker.
+        if getattr(impl, "mxfp4_as_nvfp4", False):
+            if "TLLM_GPT_OSS_FUSED_AR_REFUSED" not in _gpt_oss_fusion_reported:
+                _gpt_oss_fusion_reported.add("TLLM_GPT_OSS_FUSED_AR_REFUSED")
+                # Printed rather than logged: worker processes keep the logger at "error".
+                print(
+                    "TLLM_GPT_OSS_MOE_FINALIZE_AR / TLLM_GPT_OSS_AR_MXFP8_QUANT refused: TLLM_MXFP4_MOE_NVFP4_ACT=1 "
+                    f"runs this MoE on NVFP4 activations; the unfused all-reduce is kept pid={os.getpid()}",
+                    file=sys.stderr,
+                    flush=True)
+            return None
+        return impl
+
+    def _fusions_eligible(self) -> bool:
+        ar = self.allreduce
+        return bool((_GPT_OSS_MOE_FINALIZE_AR or _GPT_OSS_AR_MXFP8_QUANT)
+                    and ar is not None and self._mxfp8_moe_impl() is not None
+                    # The unfused all-reduce must be the custom one-shot/two-shot kernel path, not MNNVL or
+                    # symmetric-memory, for the fused kernels to reproduce it.
+                    and getattr(ar, "mnnvl_allreduce", None) is None
+                    and getattr(ar, "symm_mem_allreduce", None) is None
+                    and not self.mapping.is_multi_node())
+
+    def _try_fused_mlp_nvfp4_input(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        lora_params: Optional[dict],
+        all_rank_num_tokens: Optional[list[int]] = None,
+    ) -> Optional[tuple[Fp4QuantizedTensor, torch.Tensor]]:
+        """Fuse the local GPT-OSS MLP norm and NVFP4 input quantization."""
+        if (not self.enable_fused_mlp_nvfp4_input or bool(lora_params)
+                or x.dtype != torch.bfloat16 or x.dim() != 2
+                or not x.is_contiguous() or residual.shape != x.shape
+                or residual.dtype != x.dtype or not residual.is_contiguous()):
+            return None
+
+        # The MoE scheduler pads ordinary tensors when any DP rank is empty.
+        # Use the shared count list so all ranks take that fallback together.
+        if x.shape[0] == 0 or (all_rank_num_tokens is not None
+                               and 0 in all_rank_num_tokens):
+            return None
+
+        get_quant_params = getattr(self.mlp.experts,
+                                   "get_nvfp4_input_quant_params", None)
+        if get_quant_params is None:
+            return None
+        quant_params = get_quant_params()
+        if quant_params is None:
+            return None
+        input_scale, padded_hidden_size = quant_params
+        hidden_size = x.shape[-1]
+        norm_weight = self.post_attention_layernorm.weight
+        if (hidden_size % 16 != 0 or padded_hidden_size < hidden_size
+                or padded_hidden_size % 16 != 0
+                or input_scale.dtype != torch.float32
+                or input_scale.device != x.device or input_scale.numel() != 1
+                or norm_weight.shape != (hidden_size, )
+                or norm_weight.dtype != x.dtype
+                or norm_weight.device != x.device
+                or not norm_weight.is_contiguous()):
+            return None
+        if (padded_hidden_size != hidden_size
+                and not hasattr(torch.ops.trtllm, "pad_nvfp4_activation")):
+            return None
+
+        fp4, sf, norm_out = add_rmsnorm_fp4_quant(
+            x,
+            residual,
+            norm_weight,
+            self.post_attention_layernorm.variance_epsilon,
+            input_scale,
+            padded_hidden_size,
+        )
+        return Fp4QuantizedTensor(
+            fp4,
+            sf,
+            is_sf_swizzled=False,
+            unquantized_hidden_states=norm_out,
+        ), residual
 
     def forward_normal(
         self,
@@ -361,7 +599,13 @@ class TransformerBlock(DecoderLayer):
                                 residual=residual,
                                 lora_params=lora_params,
                                 **kwargs)
-        x, residual = self.post_attention_layernorm(x, residual)
+        fused_mlp_input = self._try_fused_mlp_nvfp4_input(
+            x, residual, lora_params,
+            attn_metadata.all_rank_num_tokens if self.enable_attn_dp else None)
+        if fused_mlp_input is None:
+            x, residual = self.post_attention_layernorm(x, residual)
+        else:
+            x, residual = fused_mlp_input
 
         x, residual = self.mlp(x,
                                attn_metadata,
@@ -398,23 +642,67 @@ class TransformerBlock(DecoderLayer):
             lora_params=lora_params,
             **kwargs)
 
-        x, residual = self.allreduce(
-            x,
-            all_reduce_params=AllReduceParams(
-                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+        fusions_apply = (self._fused_ar_eligible
+                         and x.shape[0] <= _GPT_OSS_FUSED_AR_MAX_TOKENS
+                         and not lora_params)
+
+        mxfp8_out = None
+        if _GPT_OSS_AR_MXFP8_QUANT and fusions_apply:
+            mxfp8_out = self.allreduce.residual_rms_norm_mxfp8(
+                x,
                 residual=residual,
                 norm_weight=self.post_attention_layernorm.weight,
                 eps=self.post_attention_layernorm.variance_epsilon,
-                trigger_completion_at_end=False,
-            ))
+                alignment=self._mxfp8_alignment,
+            )
+        if mxfp8_out is not None:
+            norm_out, fp8_out, sf_out, residual = mxfp8_out
+            # The prequantized-activation carrier the MoE path accepts (also through moe_custom_op); the
+            # MXFP8 leaf passes E4M3 data with row-major UE8M0 scales straight through (fp4_block_scale.py).
+            x = Fp4QuantizedTensor(fp8_out,
+                                   sf_out.view(fp8_out.shape[0], -1),
+                                   is_sf_swizzled=False,
+                                   unquantized_hidden_states=norm_out)
+        else:
+            x, residual = self.allreduce(
+                x,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.post_attention_layernorm.weight,
+                    eps=self.post_attention_layernorm.variance_epsilon,
+                    trigger_completion_at_end=False,
+                ))
+
+        is_capture_layer = (spec_metadata is not None
+                            and spec_metadata.is_layer_capture(self.layer_idx))
+        f2_strategy = (self.allreduce.thop_strategy_for_fusion()
+                       if self.moe_allreduce is not None and fusions_apply
+                       and not is_capture_layer else None)
+        if f2_strategy is not None:
+            (fc2_output, expert_weights,
+             expanded_idx_to_permuted_idx), residual = self.mlp(
+                 x,
+                 attn_metadata,
+                 residual,
+                 lora_params=lora_params,
+                 do_finalize=False)
+            return self.moe_allreduce.finalize_allreduce_match_unfused(
+                fc2_output,
+                residual=residual,
+                norm_weight=self.next_layer_layernorm.weight,
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                expert_scale_factor=expert_weights,
+                eps=self.next_layer_layernorm.variance_epsilon,
+                strategy=f2_strategy,
+            )
 
         x, residual = self.mlp(x,
                                attn_metadata,
                                residual,
                                lora_params=lora_params)
 
-        if spec_metadata is not None and spec_metadata.is_layer_capture(
-                self.layer_idx):
+        if is_capture_layer:
             # In eagle3 mode, we capture the value in the boundary of decoder layer.
             # If fusing rms in the next layer, the value is not correct. Thus, if
             # this layer will be captured, we should not fuse the rms in the next
@@ -647,10 +935,80 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                 quant_config.exclude_modules[i] = '.'.join(prefix + names)
 
         super().apply_quant_config_exclude_modules()
+        self._maybe_requantize_dense_to_mxfp8()
 
         for _, module in self.named_modules():
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
+
+    def _maybe_requantize_dense_to_mxfp8(self) -> None:
+        """Opt-in: run the checkpoint's bf16 dense layers as MXFP8 W8A8.
+
+        TLLM_MXFP8_ATTN_PROJ=1: every attention qkv_proj and o_proj.
+        TLLM_MXFP8_LM_HEAD=1: the target lm_head and the EAGLE3 one-model
+        drafter's lm_head (when it has its own; a drafter that shares the
+        target's gets the requantized one).
+        Both apply only on single-GPU ranks (mapping.world_size == 1: TP1
+        aggregated and TP1 prefill workers); TLLM_MXFP8_LM_HEAD=all also
+        allows any rank whose lm_head holds the whole vocabulary. The engine
+        quantizes the stored bf16 weights at load and derives every scale
+        itself; nothing else is read from disk.
+        """
+        from ..modules.embedding import LMHead
+        from ..modules.linear import requantize_linear_to_mxfp8
+
+        mapping = self.model_config.mapping
+        single_gpu = mapping.world_size == 1
+
+        if _MXFP8_ATTN_PROJ:
+            if not single_gpu:
+                _print_once(
+                    "mxfp8-attn-off", "[TLLM mxfp8-attn-proj] "
+                    "TLLM_MXFP8_ATTN_PROJ=1 but qkv_proj/o_proj stay bf16: "
+                    f"world_size {mapping.world_size} (single-GPU ranks only)")
+            else:
+                refused, done = [], 0
+                for block in self.model.block:
+                    for name in ("qkv_proj", "o_proj"):
+                        reason = requantize_linear_to_mxfp8(
+                            getattr(block.attn, name))
+                        if reason is None:
+                            done += 1
+                        else:
+                            refused.append(f"{name}: {reason}")
+                _print_once(
+                    "mxfp8-attn", f"[TLLM mxfp8-attn-proj] {done} of "
+                    f"{2 * len(self.model.block)} GPT-OSS qkv_proj/o_proj "
+                    "requantized from the checkpoint's bf16 to MXFP8 at load "
+                    "(TLLM_MXFP8_ATTN_PROJ=1)" +
+                    (f"; kept bf16: {sorted(set(refused))}" if refused else ""))
+
+        if _MXFP8_LM_HEAD in ("1", "all"):
+            heads = [("target", self.lm_head)]
+            draft = getattr(self, "draft_model", None)
+            spec_config = getattr(self.model_config, "spec_config", None)
+            if (draft is not None and spec_config is not None
+                    and spec_config.spec_dec_mode.is_eagle3_one_model()
+                    and isinstance(getattr(draft, "lm_head", None), LMHead)
+                    and draft.lm_head is not self.lm_head):
+                heads.append(("draft", draft.lm_head))
+            for role, head in heads:
+                reason = None
+                if not single_gpu and _MXFP8_LM_HEAD != "all":
+                    reason = (f"world_size {mapping.world_size} (single-GPU "
+                              "ranks only; TLLM_MXFP8_LM_HEAD=all widens it)")
+                elif not (head.tp_mode is None or head.tp_size == 1):
+                    reason = "the lm_head is vocabulary-sharded"
+                elif head.padding_size or head.enable_lm_head_tp_in_adp:
+                    reason = "padded vocabulary or lm_head TP in ADP"
+                else:
+                    reason = requantize_linear_to_mxfp8(head)
+                _print_once(
+                    f"mxfp8-lm-head-{role}", f"[TLLM mxfp8-lm-head] {role} "
+                    f"lm_head [{head.out_features}, {head.in_features}] " +
+                    ("requantized from the checkpoint's bf16 to MXFP8 at load "
+                     f"(TLLM_MXFP8_LM_HEAD={_MXFP8_LM_HEAD})"
+                     if reason is None else f"stays bf16: {reason}"))
 
     def load_weights(self, weights: Dict):
         is_nvfp4 = self.model_config.quant_config.quant_mode.has_nvfp4()
@@ -783,6 +1141,19 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                             moe_weights[
                                 f"{i}.w2.weight_scale_inv"] = module_weights[
                                     'down_proj_scales'][i, :, :]
+
+                    if getattr(module, "mxfp4_as_nvfp4", False):
+                        # TLLM_MXFP4_MOE_NVFP4_ACT: the backend repacks these
+                        # MXFP4 tensors to NVFP4; its static FC1 input scale is
+                        # the bound of this layer's RMSNorm output.
+                        norm_key = name.replace(
+                            "mlp.experts",
+                            "post_attention_layernorm") + ".weight"
+                        moe_weights["gate_up_proj_input_scale"] = (
+                            MXFP4AsNVFP4TRTLLMGenFusedMoEMethod.
+                            input_scale_for_amax(
+                                MXFP4AsNVFP4TRTLLMGenFusedMoEMethod.
+                                rmsnorm_output_amax_bound(weights[norm_key])))
 
                 module.load_weights(weights=[moe_weights])
             elif hasattr(module, "load_weights"):

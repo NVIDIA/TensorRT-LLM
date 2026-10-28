@@ -120,6 +120,23 @@ from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
 from .workspace import EagerWorkspaceReclaimer
 
+# Opt-in switch: default off, on only when the value is exactly "1".
+#   TLLM_FAST_PREP_INPUTS=1  _prepare_tp_inputs packs the speculative
+#   generation rows that carry a previous overlap tensor with list operations
+#   over the whole batch instead of one Python iteration per row. Same lists,
+#   same order, same request side effects (speculative/interface.py does the
+#   same for the one-model sampling-parameter and RNG population).
+_FAST_PREP_INPUTS = os.environ.get("TLLM_FAST_PREP_INPUTS") == "1"
+_fast_printed: set[str] = set()
+
+
+def _fast_print_once(key: str, message: str) -> None:
+    """One info line per process and key. Printed rather than logged:
+    worker processes keep the logger's default "error" level."""
+    if key not in _fast_printed:
+        _fast_printed.add(key)
+        print(message, flush=True)
+
 
 def _get_context_prompt_lookahead_token(request: LlmRequest,
                                         chunk_end: int) -> int:
@@ -155,6 +172,7 @@ def _make_single_token_context_graph_batch(
     scheduled_requests: ScheduledRequests,
     is_multimodal_decode_compatible: Optional[Callable[[LlmRequest],
                                                        bool]] = None,
+    preserve_eagle3_min_length_context: bool = False,
 ) -> tuple[ScheduledRequests, frozenset[int]]:
     """Build a decode-shaped graph candidate for final one-token contexts.
 
@@ -170,6 +188,11 @@ def _make_single_token_context_graph_batch(
         return scheduled_requests, frozenset()
 
     for request in context_requests:
+        # EAGLE3 masks EOS on context rows before sampling the first token.
+        # A decode-shaped graph would hide these rows from that mask.
+        if (preserve_eagle3_min_length_context and request.py_min_length == 1
+                and request.get_num_tokens(0) == request.orig_prompt_len):
+            return scheduled_requests, frozenset()
         if (request.context_chunk_size != 1
                 or request.context_remaining_length != 1
                 or request.context_current_position + 1 != request.py_prompt_len
@@ -5054,7 +5077,27 @@ class PyTorchModelEngine(ModelEngine):
         # Collect generation request IDs during categorization to avoid
         # a separate iteration over scheduled_requests.generation_requests later.
         all_gen_request_ids = []
-        for request in scheduled_requests.generation_requests:
+        # Fast path: with no promoted rows and a previous draft tensor, the test
+        # below sends every row to the extend lists (its second operand holds),
+        # so only the dummy split is per row; the loop runs over no rows then.
+        _fast_split = (_FAST_PREP_INPUTS
+                       and not promoted_context_request_ids
+                       and next_draft_tokens_device is not None)
+        if _fast_split:
+            _gen_rows = scheduled_requests.generation_requests
+            all_gen_request_ids.extend(
+                [request.py_request_id for request in _gen_rows])
+            _dummy_flags = [request.is_dummy for request in _gen_rows]
+            if any(_dummy_flags):
+                for request, _is_dummy in zip(_gen_rows, _dummy_flags):
+                    if _is_dummy:
+                        extend_dummy_requests.append(request)
+                    else:
+                        extend_requests.append(request)
+            else:
+                extend_requests.extend(_gen_rows)
+        for request in (() if _fast_split else
+                        scheduled_requests.generation_requests):
             is_promoted_context = (request.py_request_id
                                    in promoted_context_request_ids)
             if not is_promoted_context:
@@ -5130,7 +5173,71 @@ class PyTorchModelEngine(ModelEngine):
         runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
             self.runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
-        for request in extend_requests:
+        # Fast path: the real extend rows (all but the dummy tail; the dummy
+        # split above put them first) take the previous-tensor branch below
+        # when every one of them has a py_batch_idx. Pack those rows with
+        # whole-batch list operations: the same values in the same order as
+        # the per-row branch, and the same request side effects. The loop
+        # below then runs over the dummy tail only.
+        _fast_tail = extend_requests
+        if (_FAST_PREP_INPUTS and next_draft_tokens_device is not None
+                and not promoted_context_request_ids and not _has_cp_helix
+                and not is_enc_dec):
+            _fast_rows = extend_requests[:len(extend_requests) -
+                                         len(extend_dummy_requests)]
+            _fast_prev = [request.py_batch_idx for request in _fast_rows]
+            if _fast_rows and None not in _fast_prev:
+                _fast_tail = extend_requests[len(_fast_rows):]
+                _T = runtime_tokens_per_gen_step
+                _n = len(_fast_rows)
+                _past = [
+                    request.max_beam_num_tokens - 1 for request in _fast_rows
+                ]
+                for request, _p in zip(_fast_rows, _past):
+                    if getattr(request, "py_needs_onehot_draft_probs", False):
+                        if request.py_seq_slot is not None:
+                            padding_gen_slots.append(request.py_seq_slot)
+                        request.py_needs_onehot_draft_probs = False  # consume once
+                    request.py_batch_idx = request.py_seq_slot
+                    # The cached_tokens setter's own guard (llm_request.py:
+                    # 1131-1135): it latches once, so a latched row skips it.
+                    if not request._cached_tokens_set:
+                        request.cached_tokens = _p + _T
+                request_ids.extend(
+                    [request.py_request_id for request in _fast_rows])
+                sequence_lengths.extend([_T] * _n)
+                num_accepted_draft_tokens.extend([
+                    request.py_num_accepted_draft_tokens
+                    for request in _fast_rows
+                ])
+                draft_lens.extend([runtime_draft_token_buffer_width] * _n)
+                # Row i's gather ids and positions are T consecutive values;
+                # gather ids continue position_ids' current length.
+                _base = len(position_ids)
+                gather_ids.extend(range(_base, _base + _n * _T))
+                _positions = [0] * (_n * _T)
+                _prev_pos = [0] * (_n * _T)
+                for _j in range(_T):
+                    _positions[_j::_T] = [_p + _j for _p in _past]
+                    _prev_pos[_j::_T] = _fast_prev
+                position_ids.extend(_positions)
+                previous_batch_indices.extend(_fast_prev)
+                previous_pos_indices.extend(_prev_pos)
+                num_cached_tokens_per_seq.extend([
+                    _p + _T - request.py_num_compressed_tokens
+                    for request, _p in zip(_fast_rows, _past)
+                ])
+                if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
+                        self.attn_backend) and spec_config.is_linear_tree:
+                    prompt_lengths.extend([_T] * _n)
+                else:
+                    prompt_lengths.extend(
+                        [request.py_prompt_len for request in _fast_rows])
+                _fast_print_once(
+                    "extend", "TLLM_FAST_PREP_INPUTS=1: "
+                    f"_prepare_tp_inputs packed {_n} speculative rows "
+                    f"({_T} tokens each) without the per-row loop")
+        for request in _fast_tail:
             is_promoted_context = (request.py_request_id
                                    in promoted_context_request_ids)
             if getattr(request, "py_needs_onehot_draft_probs", False):
@@ -6329,7 +6436,10 @@ class PyTorchModelEngine(ModelEngine):
             graph_requests, promoted_context_request_ids = \
                 _make_single_token_context_graph_batch(
                     scheduled_requests,
-                    self._is_final_multimodal_context_decode_compatible)
+                    self._is_final_multimodal_context_decode_compatible,
+                    preserve_eagle3_min_length_context=(
+                        getattr(spec_metadata, "first_token_eos_ids", None)
+                        is not None))
 
         with self.cuda_graph_runner.pad_batch(
                 graph_requests, resource_manager,

@@ -121,6 +121,10 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         self.act_alpha.data.copy_(params.alpha)
         self.act_beta.data.copy_(params.beta)
 
+    def _get_direct_moe_output_hidden_size(self, ctx: MoERunContext) -> int | None:
+        """Return a logical output width only for supported finalizers."""
+        return None
+
     def run_moe(
         self,
         ctx: MoERunContext,
@@ -175,10 +179,12 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
                 self.quant_method, "intermediate_size_per_partition_lean", None
             ),
             gated_act_type=act_type,
-            output=k.moe_output,
+            # Un-finalized runs return per-expert rows, never into a caller's output buffer.
+            output=k.moe_output if k.do_finalize else None,
             # Pass that to the autotuner so the top bucket profiles per-expert load at runtime scale.
             tune_max_num_tokens=self.max_num_tokens,
             use_dp=self.use_dp,
+            output_hidden_size=self._get_direct_moe_output_hidden_size(ctx),
         )
 
         if not k.do_finalize:
@@ -222,6 +228,16 @@ class TRTLLMGenNvfp4Base(TRTLLMGenFp4BlockScaleBase):
             if needs_padded_method
             else NVFP4TRTLLMGenFusedMoEBaseMethod()
         )
+
+    def get_nvfp4_input_quant_params(self) -> tuple[torch.Tensor, int] | None:
+        """Return the direct-NVFP4 scale and padded GEMM input width."""
+        if getattr(self, "fc31_act_scale", None) is not None:
+            return None
+        input_scale = getattr(self, "fc31_input_scale", None)
+        weight = getattr(self, "w3_w1_weight", None)
+        if input_scale is None or weight is None:
+            return None
+        return input_scale, int(weight.shape[-1] * 2)
 
     def quantize_input(
         self,
@@ -295,9 +311,41 @@ class TRTLLMGenW4a8Mxfp4Mxfp8Base(TRTLLMGenFp4BlockScaleBase):
         return W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod()
 
     def quantize_input(
-        self, x: torch.Tensor, post_quant_comm: bool = True
+        self,
+        x: torch.Tensor | Fp4QuantizedTensor | MxFp8QuantizedTensor,
+        post_quant_comm: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # An activation already quantized to MXFP8 upstream (GPT-OSS fuses it into the pre-MoE all-reduce under
+        # TLLM_GPT_OSS_AR_MXFP8_QUANT) passes through. Fp4QuantizedTensor is the carrier that survives
+        # moe_custom_op under torch.compile; here it holds E4M3 data with row-major UE8M0 scales, padded to
+        # input_hidden_alignment exactly as mxfp8_quantize below would write them.
+        if isinstance(x, (Fp4QuantizedTensor, MxFp8QuantizedTensor)):
+            data = x.fp4_tensor if isinstance(x, Fp4QuantizedTensor) else x.fp8_tensor
+            if data.dtype == torch.float8_e4m3fn:
+                assert not x.is_sf_swizzled, "prequantized MXFP8 input must have row-major scales"
+                padded = (
+                    (self.hidden_size + self.quant_method.input_hidden_alignment - 1)
+                    // self.quant_method.input_hidden_alignment
+                    * self.quant_method.input_hidden_alignment
+                )
+                assert data.shape[-1] == padded, (
+                    f"prequantized MXFP8 input width {data.shape[-1]} != padded hidden size {padded}"
+                )
+                return data, x.scaling_factor.view(data.shape[0], -1)
         x, x_sf = self.op_backend.mxfp8_quantize(
             x, False, alignment=self.quant_method.input_hidden_alignment
         )
         return x, x_sf.view(x.shape[0], -1)
+
+    def forward_fake(self, x, router_logits, *, do_finalize: bool = True, **kwargs):
+        """The un-finalized FC2 rows are round_up(hidden, 128) wide here, not the input width."""
+        if do_finalize:
+            return super().forward_fake(x, router_logits, do_finalize=do_finalize, **kwargs)
+        from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import (
+            mxfp8_fake_output_without_finalize,
+        )
+
+        data = x.fp4_tensor if isinstance(x, Fp4QuantizedTensor) else x
+        return mxfp8_fake_output_without_finalize(
+            data, self.num_experts, self.routing_method.top_k, (self.hidden_size + 127) // 128 * 128
+        )

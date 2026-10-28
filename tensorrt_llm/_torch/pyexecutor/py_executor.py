@@ -60,7 +60,7 @@ from ..disaggregation.orchestration.admission import \
     DisaggTransferAdmissionController
 from ..disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator, NoopDisaggCoordinator, attach_ctx_usage,
-    transfer_window_bypass_eligible)
+    transfer_window_bypass_eligible, uses_async_gen_transfer)
 from ..disaggregation.orchestration.pp_termination import \
     DisaggPPTerminationHandler
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
@@ -3691,6 +3691,35 @@ class PyExecutor:
         transceiver = getattr(self, "kv_cache_transceiver", None)
         if transceiver is None:
             return NoopDisaggCoordinator()
+        is_kv_manager_v2 = getattr(self, "_is_kv_manager_v2", False)
+        # TLLM_KV_FENCE_POLL=1 (opt-in, default off) enables the polled
+        # receive fence (#19857 backport); unset, the blocking fence is kept.
+        fence_poll_opt_in = os.environ.get("TLLM_KV_FENCE_POLL", "0") == "1"
+        # Only the overlap loop admits while the previous forward is still
+        # queued on the execution stream that records the admission fence. A
+        # KV connector is reported after that fence, so it keeps the wait.
+        defer_unready_gen_receives = (
+            fence_poll_opt_in
+            and is_kv_manager_v2
+            and not getattr(self, "disable_overlap_scheduler", True)
+            and self._dist_size(getattr(self, "dist", None), "pp_size") == 1
+            and getattr(self, "kv_connector_manager", None) is None)
+        # With the opt-in set, the receive-fence mode is reported once per
+        # executor process. Printed rather than logged: worker processes keep
+        # the logger's default "error" level.
+        if fence_poll_opt_in:
+            print(
+                "disagg gen-init KV receive fence: "
+                f"{'polled (#19857)' if defer_unready_gen_receives and uses_async_gen_transfer() else 'blocking'}"
+                f" rank={getattr(getattr(self, 'dist', None), 'rank', '?')}"
+                f" kv_manager_v2={is_kv_manager_v2}"
+                f" overlap={not getattr(self, 'disable_overlap_scheduler', True)}"
+                f" pp_size={self._dist_size(getattr(self, 'dist', None), 'pp_size')}"
+                f" kv_connector={getattr(self, 'kv_connector_manager', None) is not None}"
+                f" async_gen_transfer={uses_async_gen_transfer()}"
+                " (TLLM_KV_FENCE_POLL=1)",
+                file=sys.stderr,
+                flush=True)
         return DisaggTransferCoordinator(
             transceiver=transceiver,
             transfer_manager=getattr(self, "async_transfer_manager", None),
@@ -3705,7 +3734,8 @@ class PyExecutor:
                 self, "force_terminate_ctx_for_partial_reuse", False),
             admission_controller=getattr(
                 self, "_disagg_transfer_admission_controller", None),
-            is_kv_manager_v2=getattr(self, "_is_kv_manager_v2", False))
+            is_kv_manager_v2=is_kv_manager_v2,
+            defer_unready_gen_receives=defer_unready_gen_receives)
 
     @staticmethod
     def _dist_size(dist, name: str) -> int:

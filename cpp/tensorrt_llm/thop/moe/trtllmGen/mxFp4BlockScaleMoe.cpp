@@ -35,7 +35,7 @@ using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodTy
 using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::computeSelectedTileN;
 
-torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor> const& routing_logits,
+std::vector<torch::Tensor> dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor> const& routing_logits,
     torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
     std::optional<torch::Tensor> const& hidden_states_scale, torch::Tensor const& gemm1_weights,
     torch::Tensor const& gemm1_weights_scale, std::optional<torch::Tensor> const& gemm1_bias,
@@ -51,9 +51,10 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
     btg::Dtype const dtype, MoeRunnerType& moe_runner, int64_t moeConfigIndex,
     torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
-    torch::optional<torch::Tensor> const& out_tensor)
+    torch::optional<torch::Tensor> const& out_tensor, bool const do_finalize = true)
 {
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by MXFP4 block scale MOE");
+    TORCH_CHECK(do_finalize || !out_tensor.has_value(), "out_tensor is only supported when do_finalize=true.");
     TORCH_CHECK(tile_tokens_dim == 8 || tile_tokens_dim == 16 || tile_tokens_dim == 32 || tile_tokens_dim == 64
             || tile_tokens_dim == 128 || tile_tokens_dim == 256,
         "tile_tokens_dim must be 8, 16, 32, 64, 128, 256");
@@ -446,7 +447,11 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
 
     // allocate or use provided output
     at::Tensor output;
-    if (out_tensor.has_value())
+    if (!do_finalize)
+    {
+        // No finalize: the caller combines FC2's per-expert rows itself.
+    }
+    else if (out_tensor.has_value())
     {
         TORCH_CHECK(out_tensor->scalar_type() == at::ScalarType::BFloat16, "out_tensor must be bfloat16.");
         TORCH_CHECK(out_tensor->dim() == 2, "out_tensor must be 2D.");
@@ -484,8 +489,9 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
     // gemm2 intermediate ws
     workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;
-    args.output = output.data_ptr();
+    args.output = do_finalize ? output.data_ptr() : nullptr;
     args.output_scale = nullptr;
+    args.do_finalize = do_finalize;
 
     auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
     at::Tensor workspace_fc1 = at::detail::empty_cuda(
@@ -496,7 +502,18 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
     workspace.bmm2_workspace = workspace_fc2.data_ptr();
     auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
     moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
-    return output;
+    if (!do_finalize)
+    {
+        // FC2 writes output_hidden_size columns per row (the stride the finalize kernel reads with,
+        // finalizeData.hiddenDimPadded), into a buffer allocated args.hidden_size wide.
+        int64_t const fc2Width = args.output_hidden_size.value_or(args.hidden_size);
+        TORCH_CHECK(fc2Width <= args.hidden_size, "FC2 output width exceeds its buffer.");
+        auto fc2Output = gemm2_output.view({-1}).narrow(0, 0, gemm2_output.size(0) * fc2Width).view(
+            {gemm2_output.size(0), fc2Width});
+        auto expertWeights = topk_weights.has_value() ? topk_weights.value() : expert_weights;
+        return {fc2Output, expertWeights, expanded_idx_to_permuted_idx.view({args.num_tokens, args.top_k})};
+    }
+    return {output};
 }
 
 // Wrapped the TRTLLM-Gen kernel runner in a Torch custom class to allow
@@ -633,7 +650,7 @@ public:
             gemm2_weights_scale, gemm2_bias, std::nullopt, std::nullopt, std::nullopt, num_experts, top_k, n_group,
             topk_group, intermediate_size, valid_hidden_size, valid_intermediate_size, local_expert_offset,
             local_num_experts, routed_scaling_factor, tileN, routing_method_type, mDtypeAct, *runner, configToRun,
-            topk_weights, topk_ids, output);
+            topk_weights, topk_ids, output)[0];
     }
 
 private:
@@ -716,7 +733,7 @@ public:
         return result;
     }
 
-    [[nodiscard]] torch::Tensor run(torch::optional<torch::Tensor> const& routing_logits,
+    [[nodiscard]] std::vector<torch::Tensor> runImpl(torch::optional<torch::Tensor> const& routing_logits,
         std::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
         std::optional<torch::Tensor> const& hidden_states_scale, torch::Tensor const& gemm1_weights,
         torch::Tensor const& gemm1_weights_scale, std::optional<torch::Tensor> const& gemm1_bias,
@@ -731,7 +748,7 @@ public:
         int64_t local_expert_offset, int64_t local_num_experts, std::optional<double> routed_scaling_factor,
         int64_t routing_method_type, std::vector<int64_t> tile_config_pair,
         torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
-        torch::optional<torch::Tensor> const& output)
+        torch::optional<torch::Tensor> const& output, bool const do_finalize)
     {
         int64_t tileN = tile_config_pair[0];
         int64_t config = tile_config_pair[1];
@@ -782,7 +799,59 @@ public:
             gemm2_weights_scale, gemm2_bias, output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, valid_hidden_size, valid_intermediate_size,
             local_expert_offset, local_num_experts, routed_scaling_factor, tileN, routing_method_type, mDtypeAct,
-            *runner, configToRun, topk_weights, topk_ids, output);
+            *runner, configToRun, topk_weights, topk_ids, output, do_finalize);
+    }
+
+    [[nodiscard]] torch::Tensor run(torch::optional<torch::Tensor> const& routing_logits,
+        std::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
+        std::optional<torch::Tensor> const& hidden_states_scale, torch::Tensor const& gemm1_weights,
+        torch::Tensor const& gemm1_weights_scale, std::optional<torch::Tensor> const& gemm1_bias,
+        std::optional<torch::Tensor> const& gemm1_alpha, std::optional<torch::Tensor> const& gemm1_beta,
+        std::optional<torch::Tensor> const& gemm1_clamp_limit, torch::Tensor const& gemm2_weights,
+        torch::Tensor const& gemm2_weights_scale, std::optional<torch::Tensor> const& gemm2_bias,
+        std::optional<torch::Tensor> const& output1_scale_scalar,
+        std::optional<torch::Tensor> const& output1_scale_gate_scalar,
+        std::optional<torch::Tensor> const& output2_scale_scalar, int64_t num_experts, int64_t top_k,
+        std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t intermediate_size,
+        std::optional<int64_t> const valid_hidden_size, std::optional<int64_t> const valid_intermediate_size,
+        int64_t local_expert_offset, int64_t local_num_experts, std::optional<double> routed_scaling_factor,
+        int64_t routing_method_type, std::vector<int64_t> tile_config_pair,
+        torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
+        torch::optional<torch::Tensor> const& output)
+    {
+        return runImpl(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
+            gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
+            gemm2_weights_scale, gemm2_bias, output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar,
+            num_experts, top_k, n_group, topk_group, intermediate_size, valid_hidden_size, valid_intermediate_size,
+            local_expert_offset, local_num_experts, routed_scaling_factor, routing_method_type, tile_config_pair,
+            topk_weights, topk_ids, output, /*do_finalize=*/true)[0];
+    }
+
+    // Same tactic choice and kernels as run(), without the finalize kernel: returns the FC2 output
+    // [rows, output_hidden_size], the routing weights [num_tokens, top_k] and expanded_idx_to_permuted_idx
+    // [num_tokens, top_k] for a caller that fuses the finalize into its all-reduce.
+    [[nodiscard]] std::vector<torch::Tensor> runUnfinalized(torch::optional<torch::Tensor> const& routing_logits,
+        std::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
+        std::optional<torch::Tensor> const& hidden_states_scale, torch::Tensor const& gemm1_weights,
+        torch::Tensor const& gemm1_weights_scale, std::optional<torch::Tensor> const& gemm1_bias,
+        std::optional<torch::Tensor> const& gemm1_alpha, std::optional<torch::Tensor> const& gemm1_beta,
+        std::optional<torch::Tensor> const& gemm1_clamp_limit, torch::Tensor const& gemm2_weights,
+        torch::Tensor const& gemm2_weights_scale, std::optional<torch::Tensor> const& gemm2_bias,
+        std::optional<torch::Tensor> const& output1_scale_scalar,
+        std::optional<torch::Tensor> const& output1_scale_gate_scalar,
+        std::optional<torch::Tensor> const& output2_scale_scalar, int64_t num_experts, int64_t top_k,
+        std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t intermediate_size,
+        std::optional<int64_t> const valid_hidden_size, std::optional<int64_t> const valid_intermediate_size,
+        int64_t local_expert_offset, int64_t local_num_experts, std::optional<double> routed_scaling_factor,
+        int64_t routing_method_type, std::vector<int64_t> tile_config_pair,
+        torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids)
+    {
+        return runImpl(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
+            gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
+            gemm2_weights_scale, gemm2_bias, output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar,
+            num_experts, top_k, n_group, topk_group, intermediate_size, valid_hidden_size, valid_intermediate_size,
+            local_expert_offset, local_num_experts, routed_scaling_factor, routing_method_type, tile_config_pair,
+            topk_weights, topk_ids, std::nullopt, /*do_finalize=*/false);
     }
 
 private:
@@ -810,5 +879,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.class_<tensorrt_llm::torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner>("MxE4m3MxE2m1BlockScaleMoERunner")
         .def(torch::init<int64_t, bool>())
         .def("get_valid_configs", &tensorrt_llm::torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::getValidConfigs)
-        .def("run_moe", &tensorrt_llm::torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::run);
+        .def("run_moe", &tensorrt_llm::torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::run)
+        .def("run_moe_unfinalized", &tensorrt_llm::torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::runUnfinalized);
 }

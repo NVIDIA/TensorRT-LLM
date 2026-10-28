@@ -14,7 +14,9 @@
 # limitations under the License.
 """``trtllm.trtllm_gen.fused_moe.nvfp4``."""
 
-from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem
+from tensorrt_llm._torch.utils import ActivationType
+
+from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem, MoERunContext
 from ..impl_identity import register_moe_impl
 from .eligibility import check_trtllm_gen_leaf
 from .fp4_block_scale import TRTLLMGenNvfp4Base
@@ -33,6 +35,28 @@ class TrtllmTrtllmGenNvfp4Impl(TRTLLMGenNvfp4Base):
     #: native op backend calls them, so eligibility is per leaf and not on
     #: ``TRTLLMGenNvfp4Base`` (which the FlashInfer leaf shares).
     supports_situ = True
+
+    def _get_direct_moe_output_hidden_size(self, ctx: MoERunContext) -> int | None:
+        plan = ctx.comm_plan
+        if (
+            self._enable_direct_moe_output
+            and ctx.do_finalize
+            and plan is not None
+            and plan.moe_output is None
+            and not plan.enable_alltoall
+            and not plan.payload_in_workspace
+            and not self.use_flashinfer
+            and self.bias
+            and self.activation_type == ActivationType.SwigluBias
+            and self.mapping.moe_tp_size == 1
+            and self.mapping.moe_ep_size == 1
+            and self.hidden_size % 32 == 0
+            and self.hidden_size < self.w3_w1_weight.shape[-1] * 2
+        ):
+            # The functional op owns this output; communication storage
+            # and the padded expert-GEMM dimensions stay unchanged.
+            return self.hidden_size
+        return None
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:

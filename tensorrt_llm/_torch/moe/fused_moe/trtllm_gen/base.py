@@ -25,6 +25,7 @@ implements none of ``MoEImplBase``'s four abstract methods and publishes no
 descriptor.
 """
 
+import os
 from typing import ClassVar
 
 import torch
@@ -223,6 +224,9 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         # Cached for autotune profile sizing (forward path passes
         # tune_max_num_tokens to the MoE op).
         self.max_num_tokens = model_config.max_num_tokens
+        self._enable_direct_moe_output = (
+            os.environ.get("TLLM_GPT_OSS_ENABLE_DIRECT_MOE_OUTPUT", "0") == "1"
+        )
 
         self.op_backend: MoEOpBackend = get_op_backend(self.provider)
 
@@ -459,6 +463,12 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         rather than on any one of them.
         """
         if do_finalize:
+            if isinstance(x, Fp4QuantizedTensor):
+                # Packed inputs may include expert-GEMM padding.
+                num_tokens = (
+                    all_rank_num_tokens[self.mapping.tp_rank] if all_rank_num_tokens else x.shape[0]
+                )
+                return x.fp4_tensor.new_empty((num_tokens, self.hidden_size), dtype=torch.bfloat16)
             return super().forward_fake(
                 x,
                 router_logits,

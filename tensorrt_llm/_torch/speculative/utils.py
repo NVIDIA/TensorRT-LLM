@@ -36,7 +36,7 @@ from .pard import PARDSpecMetadata, PARDWorker
 from .sa_worker import SASpecMetadata, SAWorker
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
-from .spec_sampler_base import SpecSampler
+from .spec_sampler_base import SpecSampler, _supports_eagle3_min_length_one
 from .suffix_automaton import SuffixAutomatonManager
 
 _GEMMA4_SHARED_KV_TARGET_ARCHITECTURES = (
@@ -667,10 +667,13 @@ def get_spec_decoder(
         # supported yet and are rejected at admission rather than mispenalized.
         penalty_supported = not _is_effective_dynamic_tree(spec_config)
         fused_sampling = (spec_config.advanced_sampling_mode.is_fused)
-        return SpecSampler(sampler_args,
-                           enable_penalty=spec_config.enable_penalty,
-                           penalty_supported=penalty_supported,
-                           fused_sampling=fused_sampling)
+        return SpecSampler(
+            sampler_args,
+            enable_penalty=spec_config.enable_penalty,
+            penalty_supported=penalty_supported,
+            fused_sampling=fused_sampling,
+            min_length_one_supported=_supports_eagle3_min_length_one(
+                spec_config))
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 

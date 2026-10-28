@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -81,6 +81,9 @@ enum class AllReduceFusionOp : int8_t
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7,
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
     RMS_NORM = 9,
+    // RESIDUAL_RMS_NORM plus the MXFP8 (E4M3 + row-major UE8M0 per 32) quantization of the norm output, padded to a
+    // caller-given column alignment; outputs [norm, quant, scale, residual].
+    RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8 = 10,
 };
 
 inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
@@ -99,6 +102,7 @@ inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
         os << "MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM";
         break;
     case AllReduceFusionOp::RMS_NORM: os << "RMS_NORM"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8: os << "RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8"; break;
     default: os << "UNKNOWN"; break;
     }
     return os;

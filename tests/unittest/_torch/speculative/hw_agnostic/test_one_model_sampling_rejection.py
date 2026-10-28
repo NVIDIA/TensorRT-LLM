@@ -23,6 +23,7 @@ import pytest
 import torch
 
 from tensorrt_llm import SamplingParams
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._torch.speculative.spec_sampler_base import (
     UNSUPPORTED_BAD_WORDS_MSG,
     UNSUPPORTED_EMBEDDING_BIAS_MSG,
@@ -31,11 +32,12 @@ from tensorrt_llm._torch.speculative.spec_sampler_base import (
     UNSUPPORTED_NO_REPEAT_NGRAM_MSG,
     UNSUPPORTED_TOP_P_DECAY_MSG,
     SpecSampler,
+    _supports_eagle3_min_length_one,
     one_model_sampling_rejection_reason,
 )
 from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi import LLM
-from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig, SADecodingConfig
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, NGramDecodingConfig, SADecodingConfig
 
 # (id, SamplingParams kwargs, expected message). Every entry is a value the
 # OpenAI frontend can send today.
@@ -237,7 +239,9 @@ def _executor_request(**sampling_config_overrides) -> types.SimpleNamespace:
     )
 
 
-def _validate_on_executor(request) -> None:
+def _validate_on_executor(
+    request, *, min_length_one_supported: bool = False, fused_sampling: bool = False
+) -> None:
     """Run the real ``validate_request`` against a minimal sampler stand-in."""
     sampler = types.SimpleNamespace(
         _validate_unsupported_logits_processors=(
@@ -245,7 +249,8 @@ def _validate_on_executor(request) -> None:
         ),
         _enable_penalty=False,
         _penalty_supported=True,
-        _fused_sampling=False,
+        _fused_sampling=fused_sampling,
+        _min_length_one_supported=min_length_one_supported,
     )
     SpecSampler.validate_request(sampler, request)
 
@@ -272,3 +277,76 @@ def test_executor_side_check_still_rejects_top_p_decay():
 def test_executor_side_check_admits_a_neutral_request():
     """The stub covers every field the path reads; a neutral request passes."""
     _validate_on_executor(_executor_request())
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "mode,use_dynamic_tree,top_k,supported",
+    [
+        (SpeculativeDecodingMode.EAGLE3_ONE_MODEL, False, None, True),
+        (SpeculativeDecodingMode.EAGLE3_ONE_MODEL, True, 1, True),
+        (SpeculativeDecodingMode.EAGLE3_ONE_MODEL, True, 2, False),
+        (SpeculativeDecodingMode.MTP, False, None, False),
+        (SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL, False, None, False),
+    ],
+)
+@pytest.mark.parametrize("min_tokens", [0, 1, 2])
+def test_minimum_length_frontend_and_executor_admission_agree(
+    mode, use_dynamic_tree, top_k, supported, min_tokens
+):
+    config = types.SimpleNamespace(
+        spec_dec_mode=mode,
+        use_dynamic_tree=use_dynamic_tree,
+        dynamic_tree_max_topK=top_k,
+        advanced_sampling_mode=AdvancedSamplingMode.FULL,
+    )
+    assert _supports_eagle3_min_length_one(config) is supported
+    request = _executor_request()
+    request.py_min_length = min_tokens
+    if min_tokens and not (min_tokens == 1 and supported):
+        with pytest.raises(RequestError) as frontend_error:
+            _check_arguments(config, SamplingParams(min_tokens=min_tokens))
+        with pytest.raises(ValueError) as executor_error:
+            _validate_on_executor(request, min_length_one_supported=supported)
+        assert str(frontend_error.value) == str(executor_error.value) == UNSUPPORTED_MIN_LENGTH_MSG
+    else:
+        _check_arguments(config, SamplingParams(min_tokens=min_tokens))
+        _validate_on_executor(request, min_length_one_supported=supported)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "name,kwargs,expected", UNSUPPORTED_CASES[1:], ids=[case[0] for case in UNSUPPORTED_CASES[1:]]
+)
+def test_linear_eagle3_minimum_does_not_admit_other_unsupported_features(name, kwargs, expected):
+    config = types.SimpleNamespace(
+        spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
+        use_dynamic_tree=False,
+        advanced_sampling_mode=AdvancedSamplingMode.FULL,
+    )
+    with pytest.raises(RequestError) as excinfo:
+        _check_arguments(config, SamplingParams(min_tokens=1, **kwargs))
+    assert str(excinfo.value) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fused_sampling", [False, True])
+def test_linear_eagle3_minimum_preserves_min_p_mode_gate(fused_sampling):
+    config = types.SimpleNamespace(
+        spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
+        use_dynamic_tree=False,
+        advanced_sampling_mode=(
+            AdvancedSamplingMode.FULL if fused_sampling else AdvancedSamplingMode.NO_TOPK
+        ),
+    )
+    request = _executor_request(min_p=0.1)
+    request.py_min_length = 1
+    if fused_sampling:
+        _check_arguments(config, SamplingParams(min_tokens=1, min_p=0.1))
+        _validate_on_executor(request, min_length_one_supported=True, fused_sampling=True)
+    else:
+        with pytest.raises(RequestError) as frontend_error:
+            _check_arguments(config, SamplingParams(min_tokens=1, min_p=0.1))
+        with pytest.raises(ValueError) as executor_error:
+            _validate_on_executor(request, min_length_one_supported=True)
+        assert str(frontend_error.value) == str(executor_error.value) == UNSUPPORTED_MIN_P_MSG

@@ -855,6 +855,12 @@ class ConfigurableMoE(MoE):
         """Delegate has_nvfp4 to backend"""
         return getattr(self.backend, "has_nvfp4", False)
 
+    def get_nvfp4_input_quant_params(self) -> Optional[tuple[torch.Tensor, int]]:
+        """Return fused NVFP4 parameters only if dispatch accepts quantized inputs."""
+        if self.comm is not None and not self.comm.supports_post_quant_dispatch():
+            return None
+        return self.backend.get_nvfp4_input_quant_params()
+
     def forward_fake(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],

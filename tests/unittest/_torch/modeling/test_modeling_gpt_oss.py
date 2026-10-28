@@ -4,6 +4,8 @@
 import json
 import os
 import shutil
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -17,8 +19,11 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_gpt_oss import GptOssForCausalLM
+from tensorrt_llm._torch.models.modeling_gpt_oss import (
+    GptOssForCausalLM, MLPBlock, TransformerBlock,
+    _fused_mlp_nvfp4_input_enabled)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm.bindings.executor import \
     KvCacheConfig as BindingsKvCacheConfig
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
@@ -51,6 +56,199 @@ configs = """
     "rope_ntk_beta": 32
 }
 """
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("prequantized", [False, True])
+def test_gpt_oss_mlp_uses_bf16_router_view_and_fp4_expert_input(
+        tp_size: int, prequantized: bool) -> None:
+    mlp = MLPBlock.__new__(MLPBlock)
+    torch.nn.Module.__init__(mlp)
+    mlp.enable_attention_dp = tp_size > 1
+    mlp.mapping = SimpleNamespace(tp_size=tp_size)
+    counts = [3] + [7] * (tp_size - 1)
+    metadata = SimpleNamespace(all_rank_num_tokens=counts)
+    norm_out = torch.randn((3, 16), dtype=torch.bfloat16)
+    carrier = Fp4QuantizedTensor(
+        torch.zeros((3, 24), dtype=torch.uint8),
+        torch.zeros((3, 3), dtype=torch.uint8),
+        is_sf_swizzled=False,
+        unquantized_hidden_states=norm_out,
+    )
+    router_logits = torch.randn((3, 4), dtype=torch.bfloat16)
+    mlp.compute_gate_output = Mock(return_value=router_logits)
+    mlp.experts = Mock(return_value=torch.zeros_like(norm_out))
+    residual = torch.randn_like(norm_out)
+
+    output, residual_out = mlp(carrier if prequantized else norm_out,
+                               metadata,
+                               residual=residual)
+
+    torch.testing.assert_close(output, torch.zeros_like(norm_out))
+    assert residual_out is residual
+    router_call = mlp.compute_gate_output.call_args
+    torch.testing.assert_close(router_call.args[0], norm_out)
+    assert router_call.kwargs == {"lora_params": None}
+    expert_call = mlp.experts.call_args
+    if prequantized:
+        assert expert_call.kwargs["x"] is carrier
+        assert expert_call.kwargs["output_dtype"] == torch.bfloat16
+    else:
+        torch.testing.assert_close(expert_call.kwargs["x"], norm_out)
+        assert "output_dtype" not in expert_call.kwargs
+    assert expert_call.kwargs["router_logits"] is router_logits
+    if mlp.enable_attention_dp:
+        assert expert_call.kwargs["all_rank_num_tokens"] is counts
+        assert expert_call.kwargs["use_dp_padding"] is False
+    else:
+        assert "all_rank_num_tokens" not in expert_call.kwargs
+
+    first, second = carrier.split([1, 2])
+    assert first.fp4_tensor.shape[0] == 1
+    assert second.fp4_tensor.shape[0] == 2
+    torch.testing.assert_close(first.unquantized_hidden_states, norm_out[:1])
+    torch.testing.assert_close(second.unquantized_hidden_states, norm_out[1:])
+
+
+@pytest.mark.parametrize("tp_size, enable_attn_dp", [(1, False), (2, True),
+                                                     (4, True), (8, True)])
+def test_gpt_oss_fused_nvfp4_mlp_input_kill_switch(
+        tp_size: int, enable_attn_dp: bool) -> None:
+    module = "tensorrt_llm._torch.models.modeling_gpt_oss"
+    with patch(f"{module}._GPT_OSS_DISABLE_FUSED_MLP_NVFP4_INPUT", True), \
+            patch(f"{module}.add_rmsnorm_fp4_quant_available") as available:
+        assert not _fused_mlp_nvfp4_input_enabled(tp_size, enable_attn_dp, 103)
+
+    available.assert_not_called()
+
+
+@pytest.mark.parametrize("tp_size, enable_attn_dp, expected", [
+    (1, False, True),
+    (1, True, True),
+    (2, True, True),
+    (4, True, True),
+    (8, True, True),
+    (16, True, True),
+    (2, False, False),
+    (4, False, False),
+    (8, False, False),
+    (16, False, False),
+])
+def test_gpt_oss_fused_nvfp4_mlp_input_enabled_by_default(
+        tp_size: int, enable_attn_dp: bool, expected: bool) -> None:
+    module = "tensorrt_llm._torch.models.modeling_gpt_oss"
+    with patch(f"{module}._GPT_OSS_DISABLE_FUSED_MLP_NVFP4_INPUT", False), \
+            patch(f"{module}.add_rmsnorm_fp4_quant_available",
+                  return_value=True) as available:
+        assert _fused_mlp_nvfp4_input_enabled(tp_size, enable_attn_dp,
+                                              103) is expected
+
+    if expected:
+        available.assert_called_once_with()
+    else:
+        available.assert_not_called()
+
+
+@pytest.mark.parametrize("counts", [None, [2, 7], [2] + [7] * 7])
+def test_gpt_oss_builds_unswizzled_fused_nvfp4_mlp_input(
+        counts: list[int] | None) -> None:
+    block = TransformerBlock.__new__(TransformerBlock)
+    torch.nn.Module.__init__(block)
+    block.enable_fused_mlp_nvfp4_input = True
+    input_scale = torch.ones((1, ), dtype=torch.float32)
+    block.mlp = SimpleNamespace(experts=SimpleNamespace(
+        get_nvfp4_input_quant_params=Mock(return_value=(input_scale, 32))))
+    weight = torch.ones((16, ), dtype=torch.bfloat16)
+    block.post_attention_layernorm = SimpleNamespace(weight=weight,
+                                                     variance_epsilon=1e-5)
+    x = torch.randn((2, 16), dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+    fp4 = torch.zeros((2, 16), dtype=torch.uint8)
+    sf = torch.zeros((2, 2), dtype=torch.uint8)
+    norm_out = torch.randn_like(x)
+
+    with patch(
+            "tensorrt_llm._torch.models.modeling_gpt_oss.add_rmsnorm_fp4_quant",
+            return_value=(fp4, sf, norm_out)) as fused:
+        result = block._try_fused_mlp_nvfp4_input(x, residual, None, counts)
+
+    assert result is not None
+    carrier, residual_out = result
+    assert carrier.fp4_tensor is fp4
+    assert carrier.scaling_factor is sf
+    assert carrier.unquantized_hidden_states is norm_out
+    assert not carrier.is_sf_swizzled
+    assert residual_out is residual
+    fused.assert_called_once_with(x, residual, weight, 1e-5, input_scale, 32)
+
+
+@pytest.mark.parametrize("counts", [[0, 7], [7, 0], [0, 0], [7] * 7 + [0]])
+def test_gpt_oss_fused_nvfp4_mlp_input_empty_rank_falls_back_on_all_ranks(
+        counts: list[int]) -> None:
+    block = TransformerBlock.__new__(TransformerBlock)
+    torch.nn.Module.__init__(block)
+    block.enable_fused_mlp_nvfp4_input = True
+    block.mlp = SimpleNamespace(experts=Mock())
+
+    with patch(
+            "tensorrt_llm._torch.models.modeling_gpt_oss.add_rmsnorm_fp4_quant"
+    ) as fused:
+        for num_tokens in counts:
+            x = torch.randn((num_tokens, 16), dtype=torch.bfloat16)
+            residual = torch.randn_like(x)
+            residual_before = residual.clone()
+            assert block._try_fused_mlp_nvfp4_input(x, residual, None,
+                                                    counts) is None
+            torch.testing.assert_close(residual, residual_before)
+
+    fused.assert_not_called()
+    block.mlp.experts.get_nvfp4_input_quant_params.assert_not_called()
+
+
+@pytest.mark.parametrize("counts", [[2, 7], [2, 0]])
+def test_gpt_oss_fused_nvfp4_forward_passes_dp_token_counts(
+        counts: list[int]) -> None:
+    block = TransformerBlock.__new__(TransformerBlock)
+    torch.nn.Module.__init__(block)
+    block.enable_attn_dp = True
+    block.is_tp = False
+    x = torch.randn((2, 16), dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+    metadata = SimpleNamespace(all_rank_num_tokens=counts)
+    block.attn = Mock(return_value=(x, residual))
+    block._try_fused_mlp_nvfp4_input = Mock(return_value=None)
+    block.post_attention_layernorm = Mock(return_value=(x, residual))
+    block.mlp = Mock(return_value=(x, residual))
+    block.next_layer_layernorm = Mock(return_value=(x, residual))
+
+    block(None, x, metadata, residual=residual)
+
+    block._try_fused_mlp_nvfp4_input.assert_called_once_with(
+        x, residual, None, counts)
+    block.post_attention_layernorm.assert_called_once_with(x, residual)
+
+
+def test_gpt_oss_fused_nvfp4_mlp_input_falls_back_for_lora() -> None:
+    block = TransformerBlock.__new__(TransformerBlock)
+    torch.nn.Module.__init__(block)
+    block.enable_fused_mlp_nvfp4_input = True
+    block.mlp = SimpleNamespace(experts=Mock())
+    x = torch.randn((2, 16), dtype=torch.bfloat16)
+
+    assert block._try_fused_mlp_nvfp4_input(x, torch.randn_like(x),
+                                            {"adapter": object()}) is None
+    block.mlp.experts.get_nvfp4_input_quant_params.assert_not_called()
+
+
+def test_gpt_oss_fused_nvfp4_mlp_input_falls_back_for_other_backend() -> None:
+    block = TransformerBlock.__new__(TransformerBlock)
+    torch.nn.Module.__init__(block)
+    block.enable_fused_mlp_nvfp4_input = True
+    block.mlp = SimpleNamespace(experts=SimpleNamespace())
+    x = torch.randn((2, 16), dtype=torch.bfloat16)
+
+    assert block._try_fused_mlp_nvfp4_input(x, torch.randn_like(x),
+                                            None) is None
 
 
 def test_gpt_oss_prefers_python_transceiver() -> None:

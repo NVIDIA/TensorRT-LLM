@@ -39,6 +39,8 @@ Example:
 """
 
 import math
+import os
+import sys
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -75,6 +77,58 @@ if TYPE_CHECKING:
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
+
+
+# Decoder-info reuse (default off). In a pure-generation step every layer's generation preprocess rebuilds the same
+# decoder info (cu_seqlens, tokens_info, ...) into the same workspace offsets. A model marks the attention layers that
+# may reuse the info of the layer before them (``attn.reuse_decoder_info_from_previous_layer``; GPT-OSS sets it on
+# its target layers after the first), and the preprocess op skips the rebuild when armed through
+# ``torch.ops.trtllm.decoder_info_reuse_hint``. The values the attention reads are unchanged.
+_REUSE_DECODER_INFO = os.environ.get("TLLM_REUSE_DECODER_INFO", "0") == "1"
+# (id(metadata), layer_idx, key) of the last generation preprocess call: reuse requires an unbroken chain of
+# consecutive layers over the same metadata and inputs.
+_decoder_info_last_call = None
+_decoder_info_reuse_reported = False
+
+
+def _decoder_info_reuse(attn, meta, params, batch_beam: int) -> bool:
+    """Return True and arm the C++ hint when this call may reuse the previous layer's decoder info."""
+    global _decoder_info_last_call, _decoder_info_reuse_reported
+    if not _REUSE_DECODER_INFO:
+        return False
+    spec_lengths = params.spec_decoding_generation_lengths
+    key = (
+        params.workspace.data_ptr(),
+        params.workspace.numel(),
+        params.sequence_lengths.data_ptr(),
+        None if spec_lengths is None else spec_lengths.data_ptr(),
+        params.num_tokens,
+        batch_beam,
+        params.input_seq_length,
+        params.seq_offset,
+    )
+    layer_idx = attn.layer_idx
+    previous = _decoder_info_last_call
+    _decoder_info_last_call = (id(meta), layer_idx, key)
+    if not (
+        getattr(attn, "reuse_decoder_info_from_previous_layer", False)
+        and meta.num_contexts == 0
+        and not params.is_cross
+        and previous == (id(meta), layer_idx - 1, key)
+        and hasattr(torch.ops.trtllm, "decoder_info_reuse_hint")
+    ):
+        return False
+    torch.ops.trtllm.decoder_info_reuse_hint(attn.local_layer_idx)
+    if not _decoder_info_reuse_reported:
+        _decoder_info_reuse_reported = True
+        # Printed rather than logged: worker processes keep the logger at "error".
+        print(
+            "decoder info reuse armed (TLLM_REUSE_DECODER_INFO=1)"
+            f" pid={os.getpid()} layer={layer_idx} tokens={params.num_tokens} batch={batch_beam}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return True
 
 
 def _install_flashinfer_mla_decode_tuning_config_cache() -> None:
@@ -1086,6 +1140,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         output = fwd.output
         fp8_context_fmha = self._use_fp8_context_fmha(output, fwd.attention_input_type)
         batch_beam = params.batch_size
+        _decoder_info_reuse(attn, meta, params, batch_beam)
         (
             q_processed,
             kv_pool,

@@ -20,6 +20,7 @@
 #include "tensorrt_llm/kernels/moe/communication/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
+#include <cstdlib>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -499,7 +500,8 @@ void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& p
 //                  * MoE Finalize Allreduce Fusion *                   //
 /////////////////////////////////////////////////////////////////
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, typename ScaleType = DType>
+template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, typename ScaleType = DType,
+    bool Fp32Acc = false>
 __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeAllReduceFusionParams params)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -546,6 +548,8 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
 
     int top_k = params.top_k;
     bool use_scale_factor = params.expert_scale_factor != nullptr;
+    // Row stride of the FC2 output; wider than hidden_dim when the MoE pads its output columns.
+    int const input_row_stride = params.input_row_stride > 0 ? params.input_row_stride : params.hidden_dim;
 
     // Persistent Kernel
     // Each cluster iterate through all token it need to handle
@@ -581,7 +585,8 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
             if (permuted_idx == -1)
                 continue;
 
-            int thread_offset_across_token = permuted_idx * params.hidden_dim + thread_offset_within_token;
+            int64_t thread_offset_across_token
+                = static_cast<int64_t>(permuted_idx) * input_row_stride + thread_offset_within_token;
             float block_scale = 1.0;
             if (use_scale_factor)
             {
@@ -671,11 +676,40 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
                 done &= !is_neg_zero(vals[r]);
             }
         }
-        float4 sum_val = vals[0];
-#pragma unroll
-        for (int r = 1; r < NRanks; ++r)
+        float4 sum_val;
+        if constexpr (Fp32Acc)
         {
-            sum_val = add128<DType>(sum_val, vals[r]);
+            // Same summation as the regular AR kernel's allreduce_sum<..., Fp32Acc=true>: fp32 over ranks 0..N-1,
+            // one rounding to DType.
+            float acc_f32[kElemsPerAccess];
+#pragma unroll
+            for (int i = 0; i < kElemsPerAccess; ++i)
+            {
+                acc_f32[i] = static_cast<float>(reinterpret_cast<DType*>(&vals[0])[i]);
+            }
+#pragma unroll
+            for (int r = 1; r < NRanks; ++r)
+            {
+#pragma unroll
+                for (int i = 0; i < kElemsPerAccess; ++i)
+                {
+                    acc_f32[i] += static_cast<float>(reinterpret_cast<DType*>(&vals[r])[i]);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < kElemsPerAccess; ++i)
+            {
+                reinterpret_cast<DType*>(&sum_val)[i] = static_cast<DType>(acc_f32[i]);
+            }
+        }
+        else
+        {
+            sum_val = vals[0];
+#pragma unroll
+            for (int r = 1; r < NRanks; ++r)
+            {
+                sum_val = add128<DType>(sum_val, vals[r]);
+            }
         }
 
         // * Fuse
@@ -686,12 +720,22 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
 #endif
 }
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, typename ScaleType = DType>
+template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, typename ScaleType = DType,
+    bool Fp32Acc = false>
 void launch_oneshot_moefinalize_lamport(MoeFinalizeAllReduceFusionParams const& params, cudaLaunchConfig_t& cfg)
 {
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg,
-        moefinalize_allreduce_fusion_kernel_oneshot_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut, ScaleType>,
+        moefinalize_allreduce_fusion_kernel_oneshot_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut, ScaleType,
+            Fp32Acc>,
         params));
+}
+
+// Mirrors use_fp32_acc() of the regular AR fusion kernel (allReduceFusionKernels.cu): fp32 cross-rank accumulation
+// unless ALL_REDUCE_FUSION_KERNEL_ACC_FP32=0, so match_unfused_allreduce sums the way the unfused AR does.
+bool match_unfused_fp32_acc()
+{
+    static char* fp32_acc = std::getenv("ALL_REDUCE_FUSION_KERNEL_ACC_FP32");
+    return fp32_acc == nullptr || fp32_acc[0] != '0';
 }
 
 template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, typename ScaleType = DType>
@@ -715,8 +759,33 @@ void moefinalize_allreduce_fusion_kernel_launcher(MoeFinalizeAllReduceFusionPara
         cluster_size /= 2;
     }
     int block_size = warps_per_token / cluster_size * 32;
-    TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
     int sm_count = get_sm_count();
+    if (params.match_unfused_allreduce)
+    {
+        // The regular one-shot AR+RMSNorm launcher's geometry (allReduceFusionKernels.cu,
+        // allreduce_fusion_kernel_launcher): exactly hidden_dim / 8 threads per token, so no thread of a cluster
+        // reaches into the next token (hidden 2880: 2 x 180 instead of 4 x 96 = 384 threads for 360 accesses), and
+        // the same block/cluster split, hence the same RMSNorm reduction order, as the unfused path.
+        TLLM_CHECK_WITH_INFO(tensorrt_llm::common::getSMVersion() >= 90 && tensorrt_llm::common::getSMVersion() < 120,
+            "moefinalize_allreduce_fusion_op: match_unfused_allreduce needs cluster launch (SM90..SM119)");
+        cluster_size = 8;
+        while (threads_per_token % cluster_size != 0 && cluster_size > 1)
+        {
+            cluster_size /= 2;
+        }
+        block_size = threads_per_token / cluster_size;
+        while (block_size < 128 && cluster_size >= 2)
+        {
+            block_size *= 2;
+            cluster_size /= 2;
+        }
+        while (cluster_num * cluster_size > sm_count && cluster_size > 1 && block_size <= 512)
+        {
+            block_size *= 2;
+            cluster_size /= 2;
+        }
+    }
+    TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
     int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
     cudaLaunchConfig_t cfg;
     cudaLaunchAttribute attribute[2];
@@ -734,7 +803,16 @@ void moefinalize_allreduce_fusion_kernel_launcher(MoeFinalizeAllReduceFusionPara
     cfg.numAttrs = 2;
     if (oneshot)
     {
-        launch_oneshot_moefinalize_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut, ScaleType>(params, cfg);
+        if (params.match_unfused_allreduce && match_unfused_fp32_acc())
+        {
+            launch_oneshot_moefinalize_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut, ScaleType, true>(
+                params, cfg);
+        }
+        else
+        {
+            launch_oneshot_moefinalize_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut, ScaleType, false>(
+                params, cfg);
+        }
     }
 }
 

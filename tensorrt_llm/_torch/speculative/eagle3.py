@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Set
 
@@ -18,9 +19,10 @@ from ..attention.backends.flashinfer import FlashInferAttentionMetadata
 from ..attention.backends.sparse.params import MTPIndexShareMetadata
 from ..model_config import ModelConfig
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
-from ..pyexecutor.llm_request import LlmRequest
+from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
+from ..utils import get_model_extra_attrs
 from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
                         SpecWorkerBase)
 from .mtp import _select_mtp_position_ids
@@ -30,12 +32,73 @@ from .spec_tree_manager import SpecTreeManager
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
 
+# Opt-in switches: default off, on only when the variable is exactly "1".
+#   TLLM_BF16_DRAFT_LOGITS=1  EAGLE3 draft logits stay in the lm_head
+#                             dtype into the draft argmax (no fp32 copy).
+#   TLLM_MINLEN1_INPLACE_MASK=1  mask the min_length == 1 first-token EOS in the
+#                             target logits in place (no full-logits clone).
+#   TLLM_BF16_TARGET_LOGITS=1  target logits stay in the lm_head dtype into
+#                             the fused sampler (no fp32 copy).
+_BF16_DRAFT_LOGITS_ENV = "TLLM_BF16_DRAFT_LOGITS"
+_MINLEN1_INPLACE_MASK_ENV = "TLLM_MINLEN1_INPLACE_MASK"
+_BF16_TARGET_LOGITS_ENV = "TLLM_BF16_TARGET_LOGITS"
+_switch_printed: Set[str] = set()
+
+
+def _switch_print_once(key: str, message: str) -> None:
+    """One engagement line per process and key. Printed rather than logged:
+    worker processes keep the logger's default "error" level."""
+    if key not in _switch_printed:
+        _switch_printed.add(key)
+        print(message, flush=True)
+
 
 def _reset_mtp_index_share(attn_metadata: MTPIndexShareMetadata) -> None:
     """Clear the draft-loop state a sparse indexer reads."""
     attn_metadata.set_skip_topk(False)
     attn_metadata.set_in_mtp_draft_loop(False)
     attn_metadata.set_mtp_num_accepted(None)
+
+
+@torch.library.custom_op("trtllm::fused_eagle3_capture",
+                         mutates_args=("dest", ))
+def _fused_eagle3_capture(dest: torch.Tensor, hidden_states: torch.Tensor,
+                          residual: torch.Tensor, num_tokens: int,
+                          dim1_start: int, dim1_end: int) -> None:
+    # Keep dispatch and storage checks inside the opaque mutation boundary:
+    # Dynamo must not specialize graphs on source/destination storage identity.
+    if (dest.is_cuda and hidden_states.is_cuda and residual.is_cuda
+            and dest.device == hidden_states.device == residual.device
+            and dest.dtype == hidden_states.dtype == residual.dtype ==
+            torch.bfloat16
+            and dest.ndim == hidden_states.ndim == residual.ndim == 2
+            and dest.is_contiguous() and hidden_states.is_contiguous()
+            and residual.is_contiguous() and 0 <= num_tokens <= min(
+                dest.shape[0], hidden_states.shape[0], residual.shape[0])
+            and 0 <= dim1_start < dim1_end <= dest.shape[1] and
+            hidden_states.shape[1] == residual.shape[1] == dim1_end - dim1_start
+            and not dest.requires_grad and not hidden_states.requires_grad
+            and not residual.requires_grad
+            and not torch._C._overlaps(dest, hidden_states)
+            and not torch._C._overlaps(dest, residual)):
+        # ATen writes with the full capture-buffer row stride and uses the same
+        # BF16 addition/rounding as the incumbent temporary. It launches on the
+        # current stream without early PDL completion: following RMSNorm may
+        # overwrite both inputs only after these reads finish.
+        torch.add(hidden_states[:num_tokens],
+                  residual[:num_tokens],
+                  out=dest[:num_tokens, dim1_start:dim1_end])
+    else:
+        inplace_slice_copy(dest,
+                           hidden_states[:num_tokens] + residual[:num_tokens],
+                           dim1_start, dim1_end)
+
+
+@_fused_eagle3_capture.register_fake
+def _fused_eagle3_capture_fake(dest: torch.Tensor, hidden_states: torch.Tensor,
+                               residual: torch.Tensor, num_tokens: int,
+                               dim1_start: int, dim1_end: int) -> None:
+    return None
 
 
 class Eagle3ResourceManager(BaseResourceManager):
@@ -249,8 +312,13 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
     retrieve_parent_token: Optional[torch.Tensor] = None
+    # Context-row EOS ids to suppress for min_tokens=1; -1 means no ban.
+    # Values are refreshed per batch, including dummy rows and recycled slots.
+    first_token_eos_ids: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        self._enable_fused_eagle_capture = os.environ.get(
+            "TLLM_GPT_OSS_ENABLE_FUSED_EAGLE_CAPTURE", "0") == "1"
         # Every worker on this metadata drafts off the shift-by-1 context input
         # ids (draft_prompt_lookahead == 1), so the chunk tail needs a prompt token.
         self.allocate_context_prompt_lookahead()
@@ -323,6 +391,41 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         # Set tree flags based on config
         self.is_spec_dec_tree = self.use_dynamic_tree
         self.is_spec_dec_dynamic_tree = self.use_dynamic_tree
+
+        if self.spec_dec_mode.is_eagle3_one_model(
+        ) and not self.is_spec_dec_tree:
+            self.first_token_eos_ids = torch.full((self.max_num_requests, ),
+                                                  -1,
+                                                  dtype=torch.long,
+                                                  device='cuda')
+
+    def populate_sampling_params_for_one_model(
+            self, requests: list[LlmRequest]) -> None:
+        super().populate_sampling_params_for_one_model(requests)
+        if self.first_token_eos_ids is None:
+            return
+        eos_ids = []
+        # Context requests precede generation requests. Every generation request
+        # already has a target token, including the token imported from disagg
+        # prefill. No H2D upload or masking kernel is needed for decode-only steps.
+        for request in requests:
+            if request.state == LlmRequestState.GENERATION_IN_PROGRESS:
+                break
+            eos_id = -1
+            if request.py_min_length == 1:
+                # orig_prompt_len survives pause/recompute; py_orig_prompt_len
+                # can include generated tokens after reset_for_recompute.
+                generated = request.get_num_tokens(0) - request.orig_prompt_len
+                if generated == 0:
+                    original_end_id = getattr(request, "py_original_end_id",
+                                              request.py_end_id)
+                    if original_end_id is not None:
+                        eos_id = original_end_id
+            eos_ids.append(eos_id)
+        if eos_ids:
+            self.first_token_eos_ids[:len(eos_ids)].copy_(torch.tensor(
+                eos_ids, dtype=torch.long, pin_memory=prefer_pinned()),
+                                                          non_blocking=True)
 
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
@@ -420,16 +523,34 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                         "EAGLE3 hidden-state capture token count exceeds "
                         f"available hidden states: num_tokens={num_tokens}, "
                         f"hidden_states={hidden_states.shape[0]}")
-                to_save = hidden_states[:num_tokens]
-                if residual is not None:
-                    # residual shares its leading (token) dim with hidden_states
-                    # (both come from the same decoder layer), so the bound
-                    # check above already guarantees num_tokens <=
-                    # residual.shape[0]; no separate check is needed.
-                    to_save = to_save + residual[:num_tokens]
-                inplace_slice_copy(self.hidden_states, to_save,
-                                   i * self.hidden_size,
-                                   (i + 1) * self.hidden_size)
+                enable_fusion = self._enable_fused_eagle_capture and residual is not None
+                if enable_fusion:
+                    # The compiler's multi-stream scheduler does not track
+                    # readers before later in-place writers (RMSNorm here).
+                    # Keep the original graph when compiler aux streams exist.
+                    attrs = get_model_extra_attrs()
+                    stream_ref = attrs.get(
+                        "aux_streams") if attrs is not None else None
+                    if stream_ref is not None:
+                        streams = stream_ref()
+                        enable_fusion = streams is not None and len(
+                            streams) == 0
+                if enable_fusion:
+                    _fused_eagle3_capture(self.hidden_states, hidden_states,
+                                          residual, num_tokens,
+                                          i * self.hidden_size,
+                                          (i + 1) * self.hidden_size)
+                else:
+                    to_save = hidden_states[:num_tokens]
+                    if residual is not None:
+                        # residual shares its leading (token) dim with hidden_states
+                        # (both come from the same decoder layer), so the bound
+                        # check above already guarantees num_tokens <=
+                        # residual.shape[0]; no separate check is needed.
+                        to_save = to_save + residual[:num_tokens]
+                    inplace_slice_copy(self.hidden_states, to_save,
+                                       i * self.hidden_size,
+                                       (i + 1) * self.hidden_size)
                 break
 
 
@@ -534,6 +655,181 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 self._saved_generation_lengths)
             self._saved_generation_lengths = None
 
+    @staticmethod
+    def _apply_min_length_one(
+            logits: torch.Tensor, num_contexts: int,
+            spec_metadata: Eagle3OneModelSpecMetadata) -> torch.Tensor:
+        """Mask first-token EOS before every linear EAGLE3 sampling branch.
+
+        Context rows lead the target logits. Decode rows already follow at least
+        one generated token, including disaggregated handoff, so decode-only
+        steps return without launching a kernel. The per-row ban is device data,
+        not a Python condition that would freeze during CUDA graph capture.
+        """
+        eos_ids = getattr(spec_metadata, "first_token_eos_ids", None)
+        if num_contexts == 0 or eos_ids is None:
+            return logits
+        eos_ids = eos_ids[:num_contexts]
+        vocab_size = logits.shape[-1]
+        active = (eos_ids >= 0) & (eos_ids < vocab_size)
+        safe_ids = eos_ids.clamp(0, vocab_size - 1)
+        rows = torch.arange(num_contexts, device=logits.device)
+        masked = logits.clone()
+        context_logits = masked.reshape(-1, vocab_size)[:num_contexts]
+        context_logits[rows,
+                       safe_ids] = torch.where(active, float("-inf"),
+                                               context_logits[rows, safe_ids])
+        return masked
+
+    @staticmethod
+    def _mask_min_length_one_in_place(
+            logits: torch.Tensor, num_contexts: int,
+            spec_metadata: Eagle3OneModelSpecMetadata):
+        """In-place twin of ``_apply_min_length_one`` (TLLM_MINLEN1_INPLACE_MASK=1).
+
+        Writes the same -inf at the same (context row, EOS id) positions, but
+        into ``logits`` itself instead of a clone of every row, and returns what
+        ``_restore_min_length_one`` needs to put the original values back once
+        the step's last reader of the masked logits is enqueued. Returns None,
+        writing nothing, exactly where ``_apply_min_length_one`` returns its
+        input unchanged. ``logits`` must be contiguous (the gate checks).
+        """
+        eos_ids = getattr(spec_metadata, "first_token_eos_ids", None)
+        if num_contexts == 0 or eos_ids is None:
+            return None
+        eos_ids = eos_ids[:num_contexts]
+        vocab_size = logits.shape[-1]
+        active = (eos_ids >= 0) & (eos_ids < vocab_size)
+        safe_ids = eos_ids.clamp(0, vocab_size - 1)
+        rows = torch.arange(num_contexts, device=logits.device)
+        flat = logits.view(-1, vocab_size)
+        saved = flat[rows, safe_ids]
+        flat[rows, safe_ids] = torch.where(active, float("-inf"), saved)
+        return flat, rows, safe_ids, saved
+
+    @staticmethod
+    def _restore_min_length_one(state) -> None:
+        """Undo ``_mask_min_length_one_in_place``: the original values, bit for
+        bit, at the positions it wrote (one per context row, so no aliasing)."""
+        flat, rows, safe_ids, saved = state
+        flat[rows, safe_ids] = saved
+
+    def _minlen1_in_place(self, logits: torch.Tensor, spec_metadata) -> bool:
+        """Whether this step masks the min-length-1 EOS in place.
+
+        Off unless TLLM_MINLEN1_INPLACE_MASK=1. The in-place mask equals the
+        clone's only while nothing but the step's samplers reads the masked
+        logits and nothing else writes them: not under a guided decoder (its
+        bitmask writes the logits in place), not when the draft length is 0
+        (skip_drafting returns the masked logits as the step's logits), and
+        only for contiguous logits (the mask writes through a view).
+        """
+        if os.environ.get(_MINLEN1_INPLACE_MASK_ENV) != "1":
+            return False
+        reason = None
+        if self.guided_decoder is not None:
+            reason = "a guided decoder writes the target logits in place"
+        elif spec_metadata.runtime_draft_len == 0:
+            reason = "draft length 0 (skip_drafting returns the masked logits)"
+        elif not logits.is_contiguous():
+            reason = "the target logits are not contiguous"
+        if reason is not None:
+            _switch_print_once(
+                "minlen1-off:" + reason,
+                "[TLLM minlen1-inplace] TLLM_MINLEN1_INPLACE_MASK=1 but this step clones "
+                f"the target logits as before: {reason}")
+            return False
+        _switch_print_once(
+            "minlen1-on",
+            "[TLLM minlen1-inplace] min_length==1 first-token EOS masked in place in "
+            "the target logits and restored after sampling (no full-logits "
+            "clone; TLLM_MINLEN1_INPLACE_MASK=1)")
+        return True
+
+    def _bf16_draft_logits(self, draft_model,
+                           advanced_draft_sampling: bool) -> bool:
+        """Whether this draft step keeps its logits in the lm_head dtype.
+
+        Off unless TLLM_BF16_DRAFT_LOGITS=1. Exact only where the draft logits'
+        one consumer is the greedy draft sampler: torch.argmax, or torch.max
+        per vocab shard (``greedy_sample_draft_with_tp_gather``), picks the same
+        (largest value, lowest index) on bf16 logits as on their exact fp32
+        copy. So not with advanced (rejection) draft sampling, which reads
+        probabilities, nor with a guided decoder (in-place bitmask), nor with a
+        draft logits processor other than the base one, whose only work after
+        the lm_head is that fp32 copy. The target logits stay fp32: the fused
+        sampler's bf16 build walks the vocabulary in another per-thread order
+        than its fp32 build, so the same random draw picks another token.
+        """
+        if os.environ.get(_BF16_DRAFT_LOGITS_ENV) != "1":
+            return False
+        from ..modules.logits_processor import LogitsProcessor
+        reason = None
+        if advanced_draft_sampling:
+            reason = "advanced (rejection) draft sampling reads probabilities"
+        elif self.guided_decoder is not None:
+            reason = "a guided decoder writes the draft logits in place"
+        elif type(getattr(draft_model, "logits_processor",
+                          None)) is not LogitsProcessor:
+            reason = "the draft model has its own logits processor"
+        if reason is not None:
+            _switch_print_once(
+                "bf16-draft-off:" + reason,
+                "[TLLM bf16-draft-logits] TLLM_BF16_DRAFT_LOGITS=1 but this draft step keeps "
+                f"fp32 logits: {reason}")
+            return False
+        _switch_print_once(
+            "bf16-draft-on",
+            "[TLLM bf16-draft-logits] EAGLE3 draft logits stay in the lm_head dtype into the "
+            "draft argmax (no fp32 copy; TLLM_BF16_DRAFT_LOGITS=1)")
+        return True
+
+    def keeps_target_logits_dtype(self) -> bool:
+        """Whether the target logits reach the sampler in the lm_head dtype.
+
+        Off unless TLLM_BF16_TARGET_LOGITS=1. Skips the vocab-wide fp32 copy
+        of the target logits (an exact upcast); the fused sampler reads bf16
+        logits natively (its bf16 build walks the vocabulary in a different
+        per-thread order than its fp32 build, so a given random draw can pick
+        a different token from the same distribution). Greedy rows take
+        torch.argmax, which picks the same token on bf16 as on the fp32 copy.
+        Only for the linear EAGLE3 one-model worker with strict acceptance and
+        the fused sampler: not with relaxed acceptance, rejection sampling,
+        occurrence penalties, another advanced-sampling mode or a guided
+        decoder, which read or write the logits on paths not checked in bf16.
+        """
+        if os.environ.get(_BF16_TARGET_LOGITS_ENV) != "1":
+            return False
+        from ...llmapi.llm_args import AdvancedSamplingMode
+        cfg = self.spec_config
+        reason = None
+        if type(self) is not Eagle3OneModelWorker or self.is_mtp_eagle \
+                or self.use_dynamic_tree:
+            reason = "not the linear EAGLE3 one-model worker"
+        elif getattr(cfg, "use_relaxed_acceptance_for_thinking", False):
+            reason = "relaxed acceptance"
+        elif getattr(cfg, "use_rejection_sampling", False):
+            reason = "rejection sampling"
+        elif getattr(cfg, "enable_penalty", False):
+            reason = "occurrence penalties"
+        elif getattr(cfg, "advanced_sampling_mode",
+                     AdvancedSamplingMode.FULL) != AdvancedSamplingMode.FULL:
+            reason = "advanced_sampling_mode is not FULL (fused sampler)"
+        elif self.guided_decoder is not None:
+            reason = "a guided decoder writes the target logits in place"
+        if reason is not None:
+            _switch_print_once(
+                "bf16-target-off:" + reason,
+                "[TLLM bf16-target-logits] TLLM_BF16_TARGET_LOGITS=1 but the "
+                f"target logits stay fp32: {reason}")
+            return False
+        _switch_print_once(
+            "bf16-target-on",
+            "[TLLM bf16-target-logits] target logits stay in the lm_head "
+            "dtype into the fused sampler / argmax (no fp32 copy; "
+            "TLLM_BF16_TARGET_LOGITS=1)")
+        return True
+
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
 
@@ -547,6 +843,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                       draft_model,
                       resource_manager=None):
 
+        raw_logits = logits
+        minlen1_saved = None
+        if self._minlen1_in_place(logits, spec_metadata):
+            minlen1_saved = self._mask_min_length_one_in_place(
+                logits, attn_metadata.num_contexts, spec_metadata)
+        else:
+            logits = self._apply_min_length_one(logits,
+                                                attn_metadata.num_contexts,
+                                                spec_metadata)
         runtime_draft_len = spec_metadata.runtime_draft_len
         # skip the draft forward if the runtime draft length is 0
         if runtime_draft_len == 0:
@@ -558,14 +863,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        raw_logits = logits
-
         self._execute_guided_decoder_if_present(logits)
 
         # Sample and accept tokens. ``input_ids`` is required by the relaxed-
         # acceptance path (scans for thinking-phase tokens); ignored otherwise.
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, attn_metadata, spec_metadata)
+        if minlen1_saved is not None:
+            # The masked logits' last reader is enqueued (same stream): restore
+            # them, so raw_logits, the step's logits, is the unmasked tensor.
+            self._restore_min_length_one(minlen1_saved)
 
         # Mamba hybrid models need state updates after token acceptance because
         # the accepted token count affects which Mamba states are valid. The
@@ -919,6 +1226,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         logits = draft_model.mtp_layers[0].shared_head(
                             hidden_states[gather_ids], draft_model.lm_head,
                             attn_metadata, True)
+                elif self._bf16_draft_logits(draft_model,
+                                             advanced_draft_sampling):
+                    # No fp32 copy; sample_draft_tokens below takes
+                    # its argmax branch on the lm_head-dtype logits.
+                    logits = draft_model.logits_processor(
+                        hidden_states[gather_ids],
+                        draft_model.lm_head,
+                        attn_metadata,
+                        True,
+                        keep_dtype=True)
                 else:
                     logits = draft_model.logits_processor(
                         hidden_states[gather_ids], draft_model.lm_head,

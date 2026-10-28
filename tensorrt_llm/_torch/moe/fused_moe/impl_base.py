@@ -235,6 +235,10 @@ class MoEImplBase(
         ...
 
     # ---- execution --------------------------------------------------------
+    def get_nvfp4_input_quant_params(self) -> Optional[tuple[torch.Tensor, int]]:
+        """Return static scale and physical width for fused input quantization."""
+        return None
+
     @abc.abstractmethod
     def quantize_input(
         self, x: "torch.Tensor | Fp4QuantizedTensor", **kwargs: object
@@ -257,7 +261,9 @@ class MoEImplBase(
     def run_moe(self, ctx: MoERunContext) -> torch.Tensor: ...
 
     def try_fused_route_quant(
-        self, x: "torch.Tensor", router_logits: "torch.Tensor"
+        self,
+        x: "torch.Tensor | Fp4QuantizedTensor",
+        router_logits: "torch.Tensor",
     ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None":
         """Offer to fuse routing and input quantization into one launch.
 

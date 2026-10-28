@@ -103,6 +103,8 @@ l0_dgx_b200:
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and MXFP8 and not W4A8"
   # --- TRTLLM ---
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and NVFP4 and not W4A8"
+  - unittest/_torch/moe/test_moe_module.py::test_fused_nvfp4_input_multi_gpu
+  - unittest/_torch/moe/test_moe_module.py::test_fused_nvfp4_input_compiled_multi_gpu
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and FP8_BLOCK_SCALES"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A16_MXFP4"

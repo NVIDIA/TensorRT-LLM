@@ -12,8 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-MoE Module Unit Tests
+"""MoE Module Unit Tests.
 
 This module provides a unified test framework for testing MoE modules through the
 high-level create_moe() + forward() interface, rather than the backend-level interfaces.
@@ -33,9 +32,11 @@ import pickle
 import sys
 import tempfile
 import traceback
+import weakref
 from contextlib import nullcontext
 from itertools import product
 from typing import List, Optional
+from unittest.mock import patch
 
 import cloudpickle
 import pytest
@@ -71,7 +72,13 @@ from transformers.configuration_utils import PretrainedConfig
 import tensorrt_llm.bindings.internal.runtime as _tbr
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.compilation.backend import Backend
+from tensorrt_llm._torch.compilation.utils import capture_piecewise_cuda_graph
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.fused_ops.rmsnorm_fp4_quant import (
+    add_rmsnorm_fp4_quant,
+    add_rmsnorm_fp4_quant_available,
+)
 from tensorrt_llm._torch.moe.fused_moe import (
     DEFAULT_MOE_ACTIVATION,
     DeepSeekV3MoeRoutingMethod,
@@ -91,6 +98,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
+from tensorrt_llm._torch.moe.fused_moe.moe_op_backend import TRTLLMOpBackend
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     DeepSeekFP8BlockScalesFusedMoEMethod,
     DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
@@ -110,7 +118,13 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     WFP4A16FusedMoEMethod,
     WInt4AFP8FusedMoEMethod,
 )
-from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm._torch.utils import (
+    ActivationType,
+    Fp4QuantizedTensor,
+    model_extra_attrs,
+    piecewise_cuda_graph,
+    torch_compiling,
+)
 from tensorrt_llm._utils import get_sm_version, mpi_comm, mpi_rank
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
@@ -417,8 +431,7 @@ def _run_eplb_test(
 
 
 def _create_routing_method(routing_method_cls, top_k, num_experts, dtype, model_config=None):
-    """
-    Create a routing method instance with appropriate parameters for each routing method type.
+    """Create a routing method instance with appropriate parameters for each routing method type.
 
     Args:
         routing_method_cls: The routing method class to instantiate
@@ -496,9 +509,10 @@ def _test_moe_worker(
     swiglu_beta: float = 0,
     swiglu_limit: float = float("inf"),
     bias_dtype: Optional[torch.dtype] = None,
+    fused_nvfp4_input: bool = False,
+    compiled_fused_nvfp4_input: bool = False,
 ):
-    """
-    Test MoE module worker function.
+    """Test MoE module worker function.
 
     This test verifies:
     1. MoE module forward pass produces correct results
@@ -534,6 +548,8 @@ def _test_moe_worker(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             bias_dtype=bias_dtype,
+            fused_nvfp4_input=fused_nvfp4_input,
+            compiled_fused_nvfp4_input=compiled_fused_nvfp4_input,
         )
     except Exception:
         traceback.print_exc()
@@ -557,6 +573,8 @@ def _test_moe_worker_impl(
     swiglu_beta: float = 0,
     swiglu_limit: float = float("inf"),
     bias_dtype: Optional[torch.dtype] = None,
+    fused_nvfp4_input: bool = False,
+    compiled_fused_nvfp4_input: bool = False,
 ):
     """Actual implementation of _test_moe_worker."""
     # Default routing logits dtype to model dtype if not specified
@@ -574,13 +592,14 @@ def _test_moe_worker_impl(
     # Setup mapping
     mapping = mapping or Mapping()
     mapping.rank = mpi_rank()
+    device_rank = mapping.local_rank
     # DP modes need per-rank token counts for cross-rank dispatch; non-DP modes
     # (TTP/TEP) have no dispatch and the scheduler derives [x.shape[0]] from None.
     all_rank_num_tokens = [seq_len] * mapping.world_size if mapping.enable_attention_dp else None
-    torch.cuda.set_device(mapping.rank)
+    torch.cuda.set_device(device_rank)
     _ensure_dist_for_megamoe(moe_backend, mapping.rank, mapping.world_size)
 
-    with torch.device(f"cuda:{mapping.rank}"):
+    with torch.device(f"cuda:{device_rank}"):
         torch.manual_seed(0)
         torch.cuda.manual_seed(0)
 
@@ -718,7 +737,7 @@ def _test_moe_worker_impl(
 
             fused_moe.load_weights([weights])
             fused_moe.post_load_weights()
-            fused_moe.cuda(f"cuda:{mapping.rank}")
+            fused_moe.cuda(f"cuda:{device_rank}")
 
             # Record initial expert_ids before any forward pass (for EPLB test)
             initial_expert_ids = None
@@ -742,7 +761,18 @@ def _test_moe_worker_impl(
                 ref_fused_moe = quantize_util.create_ref_module(routing_method, **ref_module_kwargs)
             ref_fused_moe.moe_tp_size = mapping.moe_tp_size
             ref_fused_moe.load_weights([ref_weights])
-            ref_fused_moe.cuda(f"cuda:{mapping.rank}")
+            ref_fused_moe.cuda(f"cuda:{device_rank}")
+
+            if fused_nvfp4_input:
+                _check_fused_nvfp4_moe_input(
+                    fused_moe,
+                    ref_fused_moe,
+                    x,
+                    router_logits,
+                    all_rank_num_tokens,
+                    compiled=compiled_fused_nvfp4_input,
+                )
+                return
 
             # Define forward function
             def run_forward():
@@ -785,6 +815,230 @@ def _test_moe_worker_impl(
                 _run_eplb_test(
                     run_forward, ref_fused_moe, ref_output, moe_load_balancer, initial_expert_ids
                 )
+
+
+def _check_fused_nvfp4_moe_input(
+    moe, ref_moe, x, router_logits, all_rank_num_tokens, *, compiled: bool = False
+):
+    """Exercise the real norm -> packed carrier -> native expert runner boundary."""
+    from tensorrt_llm._torch.custom_ops import flashinfer_fused_add_rmsnorm
+
+    assert isinstance(moe.backend.op_backend, TRTLLMOpBackend)
+    if moe.mapping.moe_ep_size == 8:
+        assert moe.backend._enable_direct_moe_output, "EP8 must test the enabled opt-in guard"
+    params = moe.get_nvfp4_input_quant_params()
+    assert params is not None, "The test must exercise prequantized dispatch, not its fallback"
+    input_scale, padded_hidden_size = params
+    assert x.shape[1] in (2880, 3072) and padded_hidden_size == 3072
+    weight = torch.rand((x.shape[1],), dtype=x.dtype, device=x.device) + 0.5
+    residual_source = torch.randn_like(x)
+    residual = residual_source.clone()
+    normalized_ref = x.clone()
+    flashinfer_fused_add_rmsnorm(normalized_ref, residual_source.clone(), weight, 1e-5)
+
+    with (
+        torch.inference_mode(),
+        patch.object(moe.backend, "_enable_direct_moe_output", False),
+    ):
+        reference = ref_moe(normalized_ref, router_logits)
+        baseline = moe(
+            normalized_ref,
+            router_logits,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=False,
+        ).clone()
+    assert torch.isfinite(baseline).all()
+    ref_moe.check_accuracy(baseline, reference)
+
+    def run():
+        residual.copy_(residual_source)
+        fp4, sf, norm_out = add_rmsnorm_fp4_quant(
+            x, residual, weight, 1e-5, input_scale, padded_hidden_size
+        )
+        assert fp4.dtype == torch.uint8 and sf.dtype == torch.uint8
+        carrier = Fp4QuantizedTensor(
+            fp4, sf, is_sf_swizzled=False, unquantized_hidden_states=norm_out
+        )
+        return moe(
+            carrier,
+            router_logits,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=False,
+            output_dtype=x.dtype,
+        )
+
+    with torch.inference_mode():
+        # Both arms retain fused norm/quant inputs and use the same loaded
+        # weights, scales, routing and autotuner. Only output ownership differs.
+        with patch.object(moe.backend, "_enable_direct_moe_output", False):
+            incumbent = run().clone()
+        # Spy on the real runner; do not replace the expert computation with a mock.
+        with patch.object(
+            moe.backend.op_backend,
+            "run_fp4_block_scale_moe",
+            wraps=moe.backend.op_backend.run_fp4_block_scale_moe,
+        ) as runner:
+            eager = run().clone()
+        assert runner.call_count > 0
+        for call in runner.call_args_list:
+            assert call.args[2].dtype == torch.uint8
+            direct_expected = (
+                moe.backend._enable_direct_moe_output
+                and all_rank_num_tokens is None
+                and x.shape[1] < padded_hidden_size
+            )
+            assert call.kwargs["output_hidden_size"] == (x.shape[1] if direct_expected else None)
+            if all_rank_num_tokens is not None:
+                # NVLink one-sided dispatch supplies the workspace that used to
+                # be returned without a GEMM writing it for float4 inputs.
+                assert call.kwargs["output"] is not None
+        assert torch.isfinite(eager).all()
+        assert eager.shape == x.shape and eager.dtype == torch.bfloat16
+        assert eager.is_contiguous()
+        torch.testing.assert_close(eager, incumbent, rtol=0, atol=0)
+        ref_moe.check_accuracy(eager, reference)
+
+        for _ in range(3):
+            run()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run()
+        for _ in range(3):
+            x.copy_(torch.randn_like(x))
+            router_logits.copy_(torch.randn_like(router_logits))
+            residual_source.copy_(torch.randn_like(residual_source))
+            with patch.object(moe.backend, "_enable_direct_moe_output", False):
+                replay_reference = run().clone()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.isfinite(captured).all()
+            torch.testing.assert_close(captured, replay_reference, rtol=0, atol=0)
+
+        if compiled:
+            _check_compiled_fused_nvfp4_moe_input(
+                moe,
+                ref_moe,
+                x,
+                router_logits,
+                all_rank_num_tokens,
+                weight,
+            )
+
+
+def _check_compiled_fused_nvfp4_moe_input(
+    moe, ref_moe, x, router_logits, all_rank_num_tokens, weight
+) -> None:
+    """Keep the native MoE in the fullgraph and piecewise-capture checks."""
+    from tensorrt_llm._torch.custom_ops import flashinfer_fused_add_rmsnorm
+    from tensorrt_llm._torch.models.modeling_gpt_oss import TransformerBlock
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+
+    # Trace the real eligibility/parameter lookup as well as the packed consumer.
+    block = TransformerBlock.__new__(TransformerBlock)
+    torch.nn.Module.__init__(block)
+    block.enable_fused_mlp_nvfp4_input = True
+    block.post_attention_layernorm = RMSNorm(hidden_size=x.shape[1], eps=1e-5, dtype=x.dtype)
+    block.post_attention_layernorm.weight = torch.nn.Parameter(weight, requires_grad=False)
+    block.mlp = torch.nn.Module()
+    block.mlp.experts = moe
+
+    def run(inputs_embeds, residual, logits):
+        fused = block._try_fused_mlp_nvfp4_input(inputs_embeds, residual, None, all_rank_num_tokens)
+        assert fused is not None, "The compiled model boundary must select fusion"
+        carrier, residual = fused
+        output = moe(
+            carrier,
+            logits,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=False,
+            output_dtype=inputs_embeds.dtype,
+        )
+        return (
+            output,
+            carrier.fp4_tensor,
+            carrier.scaling_factor,
+            carrier.unquantized_hidden_states,
+            residual,
+        )
+
+    attrs = {
+        "moe_layers": {"compiled_nvfp4": weakref.ref(moe)},
+        "global_stream": torch.cuda.current_stream(),
+    }
+    with (
+        patch.object(moe, "layer_idx_str", "compiled_nvfp4"),
+        patch.object(moe, "register_to_config", True),
+        model_extra_attrs(attrs),
+    ):
+        for piecewise in (False, True):
+            backend = Backend(
+                enable_inductor=False,
+                enable_piecewise_cuda_graph=piecewise,
+                capture_num_tokens=[x.shape[0]],
+                mapping=moe.mapping,
+            )
+            traced_targets = []
+
+            def record_backend(gm, examples):
+                traced_targets.extend(str(node.target) for node in gm.graph.nodes)
+                return backend(gm, examples)
+
+            compiled = torch.compile(run, backend=record_backend, fullgraph=True)
+            # Piecewise replay retains input addresses. Change their contents,
+            # not their allocations, after capture.
+            input_buffer = torch.empty_like(x)
+            residual_buffer = torch.empty_like(x)
+            logits_buffer = torch.empty_like(router_logits)
+            try:
+                for _ in range(7):
+                    source_x = torch.randn_like(x)
+                    source_residual = torch.randn_like(x)
+                    source_logits = torch.randn_like(router_logits)
+                    normalized_ref = source_x.clone()
+                    flashinfer_fused_add_rmsnorm(
+                        normalized_ref, source_residual.clone(), weight, 1e-5
+                    )
+                    reference = ref_moe(normalized_ref, source_logits)
+                    with (
+                        torch_compiling(False),
+                        patch.object(moe.backend, "_enable_direct_moe_output", False),
+                    ):
+                        # DP MoE can return a reusable communication workspace.
+                        expected = tuple(
+                            out.clone()
+                            for out in run(source_x.clone(), source_residual.clone(), source_logits)
+                        )
+                    ref_moe.check_accuracy(expected[0], reference)
+                    input_buffer.copy_(source_x)
+                    residual_buffer.copy_(source_residual)
+                    logits_buffer.copy_(source_logits)
+                    with (
+                        torch_compiling(True),
+                        piecewise_cuda_graph(piecewise),
+                        capture_piecewise_cuda_graph(piecewise),
+                    ):
+                        actual = compiled(input_buffer, residual_buffer, logits_buffer)
+                    torch.cuda.synchronize()
+                    assert torch.isfinite(actual[0]).all()
+                    ref_moe.check_accuracy(actual[0], reference)
+                    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+                    for out, ref in zip(actual[1:], expected[1:], strict=True):
+                        torch.testing.assert_close(out, ref, rtol=0, atol=0)
+                    assert actual[1].dtype == actual[2].dtype == torch.uint8
+                    assert actual[0].shape == actual[3].shape == x.shape
+                    assert actual[4].data_ptr() == residual_buffer.data_ptr()
+                    assert not actual[1][:, x.shape[1] // 2 :].count_nonzero().item()
+                    assert not actual[2][:, x.shape[1] // 16 :].count_nonzero().item()
+                assert any("add_rmsnorm_fp4_quant_out" in name for name in traced_targets)
+                assert any("moe_custom_op" in name for name in traced_targets)
+                if piecewise:
+                    runners = list(backend._piecewise_runners)
+                    assert runners, "The test must capture piecewise CUDA graphs"
+                    assert all(r.entries[x.shape[0]].cuda_graph is not None for r in runners)
+            finally:
+                backend.clear_piecewise_cuda_graphs()
+                torch._dynamo.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -893,9 +1147,10 @@ def _test_moe_multi_gpu(
     swiglu_alpha: float = 1,
     swiglu_beta: float = 0,
     swiglu_limit: float = float("inf"),
+    fused_nvfp4_input: bool = False,
+    compiled_fused_nvfp4_input: bool = False,
 ):
-    """
-    Test MoE module with multi-GPU support.
+    """Test MoE module with multi-GPU support.
 
     Args:
         executor: Shared module-scoped MPIPoolExecutor (see moe_multi_gpu_executor)
@@ -917,7 +1172,6 @@ def _test_moe_multi_gpu(
         swiglu_beta: SwiGLU beta parameter (default=0, non-gptoss)
         swiglu_limit: SwiGLU limit parameter (default=inf, non-gptoss)
     """
-
     mapping = _create_mapping_for_parallel_mode(world_size, parallel_mode)
 
     results = executor.map(
@@ -941,6 +1195,9 @@ def _test_moe_multi_gpu(
                     swiglu_alpha,
                     swiglu_beta,
                     swiglu_limit,
+                    None,  # bias_dtype
+                    fused_nvfp4_input,
+                    compiled_fused_nvfp4_input,
                 )
             ]
             * world_size
@@ -1094,8 +1351,7 @@ def _get_comm_method_skip_reason(
     model_config: "MoeModelConfig",
     dtype: Optional[torch.dtype] = None,
 ) -> Optional[str]:
-    """
-    Check if a communication method is compatible with the given model config.
+    """Check if a communication method is compatible with the given model config.
 
     Returns a skip reason string if incompatible, None otherwise.
     """
@@ -1253,8 +1509,7 @@ def generate_multi_gpu_test_params(
     quant_algos,
     routing_methods,
 ) -> List:
-    """
-    Generate test parameter combinations for multi-GPU tests.
+    """Generate test parameter combinations for multi-GPU tests.
 
     Args:
         parallel_modes: List of parallel modes
@@ -1489,8 +1744,7 @@ def _generate_focused_multi_gpu_test_params(
 def generate_base_test_params(
     swiglu_combos, model_configs, seq_lens, dtypes, backend_types, quant_algos, routing_methods
 ) -> List:
-    """
-    Generate test parameter combinations for base tests.
+    """Generate test parameter combinations for base tests.
 
     Args:
         swiglu_combos: List of (swiglu_alpha, swiglu_beta, swiglu_limit) tuples
@@ -1569,8 +1823,7 @@ def test_configurable_moe_single_gpu(
     swiglu_beta: float,
     swiglu_limit: float,
 ):
-    """
-    Single-GPU test for ConfigurableMoE module.
+    """Single-GPU test for ConfigurableMoE module.
 
     This test verifies:
     1. MoE create_moe -> load_weights -> forward produces correct results
@@ -1624,6 +1877,140 @@ def test_configurable_moe_single_gpu(
     )
 
 
+@pytest.mark.skipif(
+    not add_rmsnorm_fp4_quant_available(), reason="requires FlashInfer add RMSNorm + FP4 quant"
+)
+@pytest.mark.parametrize("num_tokens", [1, 7, 228])
+def test_fused_nvfp4_input_single_gpu(num_tokens, monkeypatch):
+    if not 100 <= get_sm_version() < 120:
+        pytest.skip("requires SM100/SM103")
+    monkeypatch.setenv("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER", "0")
+    _test_moe_worker(
+        moe_backend=MoeBackendType.TRTLLM.value,
+        dtype=torch.bfloat16,
+        quant_algo=QuantAlgo.NVFP4,
+        model_config=MoeModelConfig(8, 2, 2880, 2880),
+        seq_len=num_tokens,
+        swiglu_alpha=1.702,
+        swiglu_beta=1,
+        swiglu_limit=7,
+        fused_nvfp4_input=True,
+    )
+
+
+@pytest.mark.skipif(
+    not add_rmsnorm_fp4_quant_available(), reason="requires FlashInfer add RMSNorm + FP4 quant"
+)
+@pytest.mark.parametrize("num_tokens", [7, 128, 257])
+def test_fused_nvfp4_input_compiled_single_gpu(num_tokens, monkeypatch):
+    if not 100 <= get_sm_version() < 120:
+        pytest.skip("requires SM100/SM103")
+    monkeypatch.setenv("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER", "0")
+    _test_moe_worker(
+        moe_backend=MoeBackendType.TRTLLM.value,
+        dtype=torch.bfloat16,
+        quant_algo=QuantAlgo.NVFP4,
+        model_config=MoeModelConfig(8, 2, 2880, 2880),
+        seq_len=num_tokens,
+        swiglu_alpha=1.702,
+        swiglu_beta=1,
+        swiglu_limit=7,
+        fused_nvfp4_input=True,
+        compiled_fused_nvfp4_input=True,
+    )
+
+
+@pytest.mark.skipif(
+    not add_rmsnorm_fp4_quant_available(), reason="requires FlashInfer add RMSNorm + FP4 quant"
+)
+@pytest.mark.parametrize("hidden_size", [2880, 3072])
+@pytest.mark.parametrize("num_tokens", [1, 7, 127, 128, 129, 255, 256, 257, 1024, 8192])
+def test_direct_moe_output_single_gpu(hidden_size, num_tokens, monkeypatch):
+    if not 100 <= get_sm_version() < 120:
+        pytest.skip("requires SM100/SM103")
+    monkeypatch.setenv("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER", "0")
+    monkeypatch.setenv("TLLM_GPT_OSS_ENABLE_DIRECT_MOE_OUTPUT", "1")
+    _test_moe_worker(
+        moe_backend=MoeBackendType.TRTLLM.value,
+        dtype=torch.bfloat16,
+        quant_algo=QuantAlgo.NVFP4,
+        model_config=MoeModelConfig(8, 2, hidden_size, 2880),
+        seq_len=num_tokens,
+        swiglu_alpha=1.702,
+        swiglu_beta=1,
+        swiglu_limit=7,
+        fused_nvfp4_input=True,
+    )
+
+
+@pytest.mark.skipif(
+    not add_rmsnorm_fp4_quant_available(), reason="requires FlashInfer add RMSNorm + FP4 quant"
+)
+@pytest.mark.parametrize("hidden_size", [2880, 3072])
+@pytest.mark.parametrize("num_tokens", [7, 128, 257, 8192])
+def test_direct_moe_output_compiled_single_gpu(hidden_size, num_tokens, monkeypatch):
+    if not 100 <= get_sm_version() < 120:
+        pytest.skip("requires SM100/SM103")
+    monkeypatch.setenv("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER", "0")
+    monkeypatch.setenv("TLLM_GPT_OSS_ENABLE_DIRECT_MOE_OUTPUT", "1")
+    _test_moe_worker(
+        moe_backend=MoeBackendType.TRTLLM.value,
+        dtype=torch.bfloat16,
+        quant_algo=QuantAlgo.NVFP4,
+        model_config=MoeModelConfig(8, 2, hidden_size, 2880),
+        seq_len=num_tokens,
+        swiglu_alpha=1.702,
+        swiglu_beta=1,
+        swiglu_limit=7,
+        fused_nvfp4_input=True,
+        compiled_fused_nvfp4_input=True,
+    )
+
+
+@pytest.fixture(scope="module")
+def moe_ep8_executor():
+    """Eight-rank pool for the direct MoE output path's decode regressions."""
+    with MPIPoolExecutor(
+        initializer=_moe_init_ep8_worker,
+        initargs=(sys.path,),
+        max_workers=8,
+    ) as executor:
+        yield executor
+
+
+def _moe_init_ep8_worker(custom_paths):
+    _moe_init_worker(custom_paths)
+    os.environ["TLLM_GPT_OSS_ENABLE_DIRECT_MOE_OUTPUT"] = "1"
+    os.environ["TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER"] = "0"
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 NVLink-connected GPUs")
+@pytest.mark.skipif(
+    not add_rmsnorm_fp4_quant_available(), reason="requires FlashInfer add RMSNorm + FP4 quant"
+)
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("num_tokens,compiled", [(1, False), (128, False), (128, True)])
+def test_direct_moe_output_ep8(num_tokens, compiled, moe_ep8_executor):
+    if not 100 <= get_sm_version() < 120:
+        pytest.skip("requires SM100/SM103")
+    _test_moe_multi_gpu(
+        moe_ep8_executor,
+        "NVLINK_ONE_SIDED",
+        MoeBackendType.TRTLLM.value,
+        QuantAlgo.NVFP4,
+        dtype=torch.bfloat16,
+        world_size=8,
+        parallel_mode="DEP",
+        model_config=MoeModelConfig(8, 2, 2880, 2880),
+        seq_len=num_tokens,
+        swiglu_alpha=1.702,
+        swiglu_beta=1,
+        swiglu_limit=7,
+        fused_nvfp4_input=True,
+        compiled_fused_nvfp4_input=compiled,
+    )
+
+
 # ============================================================================
 # FP32 Routing Bias Tests
 # ============================================================================
@@ -1674,8 +2061,7 @@ def _create_routing_method_with_bias(routing_method_cls, top_k, num_experts, bia
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_trtllm_gen_fp32_routing_bias(routing_method_cls, moe_model_config, quant_algo, dtype):
-    """
-    Test that trtllmGen MoE backend correctly handles fp32 routing_bias.
+    """Test that trtllmGen MoE backend correctly handles fp32 routing_bias.
 
     MiniMax-M2/M3 and DeepSeek models emit fp32 routing_bias from
     trust_remote_code model definitions. This test verifies that the fp32 bias
@@ -1848,6 +2234,58 @@ def test_configurable_moe_multi_gpu(
     )
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires 4 NVLink-connected GPUs")
+@pytest.mark.skipif(
+    not add_rmsnorm_fp4_quant_available(), reason="requires FlashInfer add RMSNorm + FP4 quant"
+)
+@pytest.mark.parametrize("num_tokens", [1, 7, 228])
+@pytest.mark.threadleak(enabled=False)
+def test_fused_nvfp4_input_multi_gpu(num_tokens, moe_multi_gpu_executor):
+    if not 100 <= get_sm_version() < 120:
+        pytest.skip("requires SM100/SM103")
+    _test_moe_multi_gpu(
+        moe_multi_gpu_executor,
+        "NVLINK_ONE_SIDED",
+        MoeBackendType.TRTLLM.value,
+        QuantAlgo.NVFP4,
+        dtype=torch.bfloat16,
+        world_size=4,
+        parallel_mode="DEP",
+        model_config=MoeModelConfig(8, 2, 2880, 2880),
+        seq_len=num_tokens,
+        swiglu_alpha=1.702,
+        swiglu_beta=1,
+        swiglu_limit=7,
+        fused_nvfp4_input=True,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires 4 NVLink-connected GPUs")
+@pytest.mark.skipif(
+    not add_rmsnorm_fp4_quant_available(), reason="requires FlashInfer add RMSNorm + FP4 quant"
+)
+@pytest.mark.threadleak(enabled=False)
+def test_fused_nvfp4_input_compiled_multi_gpu(moe_multi_gpu_executor):
+    if not 100 <= get_sm_version() < 120:
+        pytest.skip("requires SM100/SM103")
+    _test_moe_multi_gpu(
+        moe_multi_gpu_executor,
+        "NVLINK_ONE_SIDED",
+        MoeBackendType.TRTLLM.value,
+        QuantAlgo.NVFP4,
+        dtype=torch.bfloat16,
+        world_size=4,
+        parallel_mode="DEP",
+        model_config=MoeModelConfig(8, 2, 2880, 2880),
+        seq_len=128,
+        swiglu_alpha=1.702,
+        swiglu_beta=1,
+        swiglu_limit=7,
+        fused_nvfp4_input=True,
+        compiled_fused_nvfp4_input=True,
+    )
+
+
 # ============================================================================
 # MoE Multi-GPU EPLB Tests
 # ============================================================================
@@ -1863,8 +2301,7 @@ EPLB_NUM_SLOTS_LIST = [16]  # Must be > num_experts (8) to be effective
 
 
 def _get_fused_moe_method_class(quant_algo, backend_type):
-    """
-    Get the FusedMoEMethod class based on quant_algo and backend_type.
+    """Get the FusedMoEMethod class based on quant_algo and backend_type.
 
     This mirrors the logic in each backend's _get_quant_method() method.
 
@@ -1943,8 +2380,7 @@ def _get_fused_moe_method_class(quant_algo, backend_type):
 
 
 def _should_skip_EPLB(quant_algo, backend_type, num_slots, num_experts):
-    """
-    Check if EPLB test should be skipped based on quant_algo, backend_type, and slot configuration.
+    """Check if EPLB test should be skipped based on quant_algo, backend_type, and slot configuration.
 
     Returns:
         str or None: Skip reason if should skip, None otherwise
@@ -1979,8 +2415,7 @@ def generate_eplb_test_params(
     quant_algos,
     routing_methods,
 ) -> List:
-    """
-    Generate test parameter combinations for EPLB tests.
+    """Generate test parameter combinations for EPLB tests.
 
     EPLB requires num_slots > num_experts to be effective.
 

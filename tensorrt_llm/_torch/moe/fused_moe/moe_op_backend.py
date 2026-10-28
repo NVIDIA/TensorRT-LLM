@@ -65,8 +65,7 @@ def get_op_backend(name: str) -> "MoEOpBackend":
 
 
 class MoEOpBackend:
-    """
-    Base class for MoE Op backend operations.
+    """Base class for MoE Op backend operations.
 
     All backend-specific operations are accessed through this unified interface.
     Subclasses register themselves using the @register_op_backend decorator.
@@ -170,6 +169,7 @@ class MoEOpBackend:
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         use_dp: bool = False,
+        output_hidden_size: Optional[int] = None,
     ) -> List[torch.Tensor]:
         """Run FP4 block scale MoE computation."""
         raise NotImplementedError
@@ -336,8 +336,15 @@ class TRTLLMOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        output_hidden_size=None,
     ):
         hidden_size = gemm1_weights.shape[-1] * 2
+        if output_hidden_size is not None and (
+            hidden_states.dtype not in (torch.uint8, torch.float8_e4m3fn)
+            or gemm1_weights_scale is None
+            or gemm1_weights_scale.shape[-1] != hidden_size // 16
+        ):
+            raise ValueError("output_hidden_size requires the TRTLLM NVFP4 op")
         if gated_act_type == int(ActType_TrtllmGen.SiTu):
             # Fused SiTu FC1 cubins exist for two input formats: NVFP4
             # (group-16 scales, packed-FP4 activations) and MXFP4 (group-32
@@ -440,6 +447,7 @@ class TRTLLMOpBackend(MoEOpBackend):
                     output=output,
                     tune_max_num_tokens=tune_max_num_tokens,
                     use_dp=use_dp,
+                    output_hidden_size=output_hidden_size,
                 )
                 if not do_finalize:
                     return outputs
@@ -451,6 +459,44 @@ class TRTLLMOpBackend(MoEOpBackend):
                 and gemm1_weights_scale.shape[-1] == hidden_size // 32
             ):
                 # mxfp4
+                if not do_finalize:
+                    # MXFP8 activations only (the un-finalized runner is the MxE4m3 one); the caller fuses the
+                    # finalize into its all-reduce (GPT-OSS, TLLM_GPT_OSS_MOE_FINALIZE_AR).
+                    if hidden_states.dtype != torch.float8_e4m3fn or output is not None:
+                        raise ValueError(
+                            "do_finalize=False on the MXFP4 TRTLLM op needs MXFP8 activations and no output buffer"
+                        )
+                    return torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner_unfinalized(
+                        router_logits,
+                        routing_bias,
+                        hidden_states,
+                        hidden_states_scale,
+                        gemm1_weights,
+                        gemm1_weights_scale,
+                        gemm1_bias,
+                        gemm1_alpha,
+                        gemm1_beta,
+                        gemm1_clamp_limit,
+                        gemm2_weights,
+                        gemm2_weights_scale,
+                        gemm2_bias,
+                        num_experts,
+                        top_k,
+                        n_group,
+                        topk_group,
+                        intermediate_size,
+                        valid_hidden_size,
+                        valid_intermediate_size,
+                        local_expert_offset,
+                        local_num_experts,
+                        routed_scaling_factor,
+                        routing_method_type,
+                        gated_act_type,
+                        topk_weights,
+                        topk_ids,
+                        tune_max_num_tokens=tune_max_num_tokens,
+                        use_dp=use_dp,
+                    )
                 return torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
                     router_logits,
                     routing_bias,
@@ -516,6 +562,14 @@ class TRTLLMOpBackend(MoEOpBackend):
                 tune_max_num_tokens=tune_max_num_tokens,
                 use_dp=use_dp,
             )
+
+        # Never silently leave a caller-provided output workspace unwritten.
+        raise ValueError(
+            "Unsupported FP4 MoE input: "
+            f"hidden_states.dtype={hidden_states.dtype}, "
+            f"gemm1_weights_scale.shape="
+            f"{None if gemm1_weights_scale is None else tuple(gemm1_weights_scale.shape)}"
+        )
 
     def run_bf16_moe(
         self,
@@ -776,7 +830,10 @@ class FlashinferOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        output_hidden_size=None,
     ):
+        if output_hidden_size is not None:
+            raise ValueError("output_hidden_size requires the TRTLLM NVFP4 op")
         if router_logits is not None:
             outputs = self._fused_moe.trtllm_fp4_block_scale_moe(
                 router_logits,

@@ -30,6 +30,7 @@
 #include "tensorrt_llm/kernels/communicationKernels/mnnvlAllreduceKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/moe/communication/moeAllReduceFusionKernels.h"
+#include "tensorrt_llm/kernels/moe/trtllmGen/DevKernel.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/mcastDeviceMemory.h"
@@ -82,6 +83,9 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
+
+// thop/mxFp8Quantize.cpp
+std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor const& self, bool isSfSwizzledLayout, int64_t alignment);
 
 #if ENABLE_MULTI_DEVICE
 
@@ -271,6 +275,12 @@ public:
     }
 
     ~AllreduceOp() = default;
+
+    void setQuantAlignment(int64_t alignment)
+    {
+        TORCH_CHECK(alignment > 0 && alignment % 32 == 0, "MXFP8 alignment must be a positive multiple of 32");
+        mQuantAlignment = alignment;
+    }
 
     int getRank() const
     {
@@ -796,6 +806,27 @@ private:
                     = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant;
             }
         }
+        else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8)
+        {
+            TORCH_CHECK(input.dim() == 2, "MXFP8 out-quant all-reduce expects a 2D input");
+            int64_t const k = hidden_size;
+            TORCH_CHECK(k % 32 == 0, "MXFP8 out-quant all-reduce: hidden size must be a multiple of 32");
+            int64_t const padded_k = (k + mQuantAlignment - 1) / mQuantAlignment * mQuantAlignment;
+            int64_t const m = input.size(0);
+            norm_out = torch::empty_like(input);
+            residual_out = torch::empty_like(residual.value());
+            quant_out = at::detail::empty_cuda({m, padded_k}, torch::kFloat8_e4m3fn, input.device(), std::nullopt);
+            scale_out = at::detail::empty_cuda({m * padded_k / 32}, SF_DTYPE, input.device(), std::nullopt);
+
+            allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
+            allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
+            allreduce_fusion_params.quant_out = quant_out.mutable_data_ptr();
+            allreduce_fusion_params.scale_out = scale_out.mutable_data_ptr();
+            allreduce_fusion_params.quant_padded_hidden_dim = static_cast<int>(padded_k);
+            allreduce_fusion_params.layout = tensorrt_llm::QuantizationSFLayout::LINEAR;
+            allreduce_fusion_params.pattern
+                = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant;
+        }
         else
         {
             TORCH_CHECK(false, "Unsupported fusion operation: " + tensorrt_llm::kernels::toString(mOp));
@@ -843,6 +874,8 @@ private:
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: return {quant_out, scale_out, residual_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
             return {norm_out, quant_out, scale_out, residual_out};
+        case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8:
+            return {norm_out, quant_out, scale_out, residual_out};
         default: TORCH_CHECK(false, "Unsupported fusion operation: " + tensorrt_llm::kernels::toString(mOp));
         }
         return {};
@@ -888,6 +921,14 @@ private:
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
         {
             return {norm_out, reduce_output};
+        }
+
+        // MXFP8 out-quant: the same quantizer the MXFP8 MoE runs on its input (no global scale).
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8)
+        {
+            auto [quant_out, scale_out]
+                = torch_ext::mxfp8_quantize(norm_out, /*isSfSwizzledLayout=*/false, mQuantAlignment);
+            return {norm_out, quant_out, scale_out, reduce_output};
         }
 
         int64_t const sf_vecsize = 16;
@@ -1474,6 +1515,8 @@ private:
     AllReduceStrategyType mStrategy;
     AllReduceFusionOp mOp;
     float mEps;
+    // RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8: the MXFP8 output's column alignment (its consumer's padded K).
+    int64_t mQuantAlignment{32};
     std::variant<std::shared_ptr<ncclComm_t>, c10::intrusive_ptr<c10d::ProcessGroup>> mNcclComm;
 };
 
@@ -1822,6 +1865,76 @@ std::vector<torch::Tensor> autotunedAllreduce(torch::Tensor const& input,
         input, residual, normWeight, scale, bias, workspace, group, tactic, fusionOp, eps, triggerCompletionAtEnd);
 }
 
+// The strategy the unfused AllReduce(RESIDUAL_RMS_NORM) on these inputs runs: a given strategy as is; AUTO as
+// autotunedAllreduce resolves it (the native autotuner cache entry for RESIDUAL_RMS_NORM with the same input shapes,
+// token bucket and NCCL-window rule; NCCL_SYMMETRIC when untuned). The GPT-OSS fused ops use it to reduce exactly as the
+// unfused path would.
+int64_t resolveResidualRmsNormTactic(torch::Tensor const& input, torch::Tensor const& residual,
+    torch::Tensor const& normWeight, torch::optional<torch::Tensor> const& workspace,
+    torch::List<int64_t> const& group, int64_t const strategy)
+{
+    if (static_cast<AllReduceStrategyType>(int8_t(strategy)) != AllReduceStrategyType::AUTO)
+    {
+        return strategy;
+    }
+    auto key = getAllReduceTacticCacheKey(input, residual, normWeight, std::nullopt, std::nullopt, workspace, group,
+        AllReduceFusionOp::RESIDUAL_RMS_NORM, false);
+    auto const bucketIndex = getAllReduceBucketIndexForTokens(input.size(0));
+    auto const defaultTactic = findAllReduceTactic(key, bucketIndex);
+    key.inputUsesNcclWindow = true;
+    auto const windowTactic = findAllReduceTactic(key, bucketIndex);
+    if (!defaultTactic.has_value() && !windowTactic.has_value())
+    {
+        return static_cast<int64_t>(AllReduceStrategyType::NCCL_SYMMETRIC);
+    }
+    if (!defaultTactic.has_value())
+    {
+        return *windowTactic;
+    }
+    if (!windowTactic.has_value())
+    {
+        return *defaultTactic;
+    }
+    return isNCCLWindowBuffer(input, group) ? *windowTactic : *defaultTactic;
+}
+
+// AR + residual + RMSNorm with the MXFP8 quantization of the norm output fused in (GPT-OSS pre-MoE all-reduce under
+// TLLM_GPT_OSS_AR_MXFP8_QUANT). Outputs [norm_out, quant_out [M, round_up(K, alignment)] e4m3, scale_out
+// [M * round_up(K, alignment) / 32] row-major UE8M0, residual_out]: the unfused path's AllReduce(RESIDUAL_RMS_NORM)
+// outputs plus mxfp8_quantize(norm_out, false, alignment). Strategy AUTO resolves the tactic exactly as
+// autotunedAllreduce does for RESIDUAL_RMS_NORM on the same inputs (same key, same bucket, NCCL_SYMMETRIC when
+// untuned), so the reduction runs on the kernel the unfused all-reduce would use; any other strategy is used as given.
+std::vector<torch::Tensor> allreduceResidualRmsNormMxfp8(torch::Tensor const& input, torch::Tensor const& residual,
+    torch::Tensor const& normWeight, torch::optional<torch::Tensor> workspace, torch::List<int64_t> const& group,
+    int64_t const strategy, double const eps, int64_t const alignment, bool const triggerCompletionAtEnd)
+{
+#if ENABLE_MULTI_DEVICE
+    int64_t const tactic = resolveResidualRmsNormTactic(input, residual, normWeight, workspace, group, strategy);
+    static std::once_flag engaged;
+    std::call_once(engaged,
+        [&]
+        {
+            TLLM_LOG_WARNING("pre-MoE all-reduce fused with MXFP8 quantization (TLLM_GPT_OSS_AR_MXFP8_QUANT=1), "
+                             "first call: %ld tokens, strategy %ld",
+                static_cast<long>(input.size(0)), static_cast<long>(tactic));
+        });
+    std::set<int> groupSet;
+    for (int64_t rank : group)
+    {
+        groupSet.insert(static_cast<int>(rank));
+    }
+    AllreduceOp op(groupSet, tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type()),
+        static_cast<AllReduceStrategyType>(int8_t(tactic)), AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8,
+        static_cast<float>(eps));
+    op.setQuantAlignment(alignment);
+    op.initialize();
+    return op.run(input, residual, normWeight, std::nullopt, std::nullopt, triggerCompletionAtEnd, workspace);
+#else
+    TORCH_CHECK(false, "allreduce_residual_rmsnorm_mxfp8 needs a multi-device build");
+    return {};
+#endif // ENABLE_MULTI_DEVICE
+}
+
 std::vector<torch::Tensor> allreduce_pg(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
     torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
     torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> const& workspace,
@@ -1929,13 +2042,16 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor const& residual, torch::T
 //     expanded_idx_to_permuted_idx [m, top_k]
 //     expert_scale_factor [m, top_k]
 //     shared_expert_output [m, hidden_dim]
-std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input,
+namespace
+{
+std::vector<torch::Tensor> moeFinalizeAllreduceImpl(torch::Tensor const& input,
     torch::optional<torch::Tensor> const& residual, torch::Tensor const& norm_weight,
     torch::Tensor const& expanded_idx_to_permuted_idx, torch::optional<torch::Tensor> const& shared_expert_output,
     torch::optional<torch::Tensor> const& expert_scale_factor, torch::Tensor workspace, int64_t const rank,
-    int64_t const nranks, double const eps)
+    int64_t const nranks, double const eps, bool const match_unfused_allreduce)
 {
     auto allreduce_fusion_params = tensorrt_llm::kernels::ar_fusion::moe::MoeFinalizeAllReduceFusionParams();
+    allreduce_fusion_params.match_unfused_allreduce = match_unfused_allreduce;
 
     int hidden_dim = norm_weight.size(0);
     int top_k = expanded_idx_to_permuted_idx.size(-1);
@@ -2005,6 +2121,18 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input,
         allreduce_fusion_params.residual_out = nullptr;
     }
 
+    if (match_unfused_allreduce)
+    {
+        // The FC2 output may be wider than the hidden size it reduces to (padded MoE output columns).
+        TORCH_CHECK(
+            input.dim() == 2 && input.is_contiguous(), "moe_finalize_allreduce_match: input must be 2D contiguous");
+        TORCH_CHECK(input.size(1) >= hidden_dim && input.size(1) % 8 == 0,
+            "moe_finalize_allreduce_match: input row width must be >= hidden_dim and a multiple of 8");
+        TORCH_CHECK(expanded_idx_to_permuted_idx.numel() == static_cast<int64_t>(num_tokens) * top_k,
+            "moe_finalize_allreduce_match: expanded_idx_to_permuted_idx must be [num_tokens, top_k]");
+        allreduce_fusion_params.input_row_stride = static_cast<int>(input.size(1));
+    }
+
     tensorrt_llm::kernels::ar_fusion::moe::moefinalize_allreduce_fusion_op(allreduce_fusion_params);
 
     if (residual.has_value())
@@ -2012,6 +2140,80 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input,
         return {norm_out, residual_out};
     }
     return {norm_out};
+}
+} // namespace
+
+std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input,
+    torch::optional<torch::Tensor> const& residual, torch::Tensor const& norm_weight,
+    torch::Tensor const& expanded_idx_to_permuted_idx, torch::optional<torch::Tensor> const& shared_expert_output,
+    torch::optional<torch::Tensor> const& expert_scale_factor, torch::Tensor workspace, int64_t const rank,
+    int64_t const nranks, double const eps)
+{
+    return moeFinalizeAllreduceImpl(input, residual, norm_weight, expanded_idx_to_permuted_idx, shared_expert_output,
+        expert_scale_factor, workspace, rank, nranks, eps, /*match_unfused_allreduce=*/false);
+}
+
+// MoE finalize fused into the post-MoE AR + residual + RMSNorm, matching the unfused path (finalize kernel, then the
+// one-shot AR+RMSNorm kernel) bit for bit: the regular kernel's launch geometry and cross-rank accumulation, and an FC2
+// output row stride taken from input.size(1). Used by GPT-OSS under TLLM_GPT_OSS_MOE_FINALIZE_AR=1.
+//
+// The fused kernel is one-shot only, so it runs only when the unfused post-MoE all-reduce would be one-shot too
+// (resolveResidualRmsNormTactic == ONESHOT). Otherwise this runs the unfused path itself: the MoE finalize kernel
+// (moe::dev::finalize::run with the runner's own parameters) and the all-reduce with that tactic.
+std::vector<torch::Tensor> moe_finalize_allreduce_match(torch::Tensor const& input, torch::Tensor const& residual,
+    torch::Tensor const& norm_weight, torch::Tensor const& expanded_idx_to_permuted_idx,
+    torch::Tensor const& expert_scale_factor, torch::Tensor workspace, torch::List<int64_t> const& group,
+    int64_t const strategy, int64_t const rank, int64_t const nranks, double const eps)
+{
+    int64_t const tactic = resolveResidualRmsNormTactic(residual, residual, norm_weight, workspace, group, strategy);
+    bool const fused = static_cast<AllReduceStrategyType>(int8_t(tactic)) == AllReduceStrategyType::ONESHOT;
+    // One line per (token count, tactic) pair: which post-MoE all-reduce each decode shape ran.
+    {
+        static std::mutex logMutex;
+        static std::set<std::pair<int64_t, int64_t>> logged;
+        std::lock_guard<std::mutex> lock(logMutex);
+        if (logged.insert({residual.size(0), tactic}).second)
+        {
+            TLLM_LOG_WARNING("MoE finalize %s the post-MoE all-reduce (TLLM_GPT_OSS_MOE_FINALIZE_AR=1): %ld tokens, "
+                             "strategy %ld, FC2 row width %ld, hidden %ld",
+                fused ? "fused into" : "kept before (tuned all-reduce is not one-shot)",
+                static_cast<long>(residual.size(0)), static_cast<long>(tactic), static_cast<long>(input.size(-1)),
+                static_cast<long>(norm_weight.size(0)));
+        }
+    }
+    if (fused)
+    {
+        return moeFinalizeAllreduceImpl(input, residual, norm_weight, expanded_idx_to_permuted_idx, std::nullopt,
+            expert_scale_factor, workspace, rank, nranks, eps, /*match_unfused_allreduce=*/true);
+    }
+    // Unfused: the finalize exactly as the MXFP4 runner launches it (runner.cu setOpsData), then the all-reduce.
+    TORCH_CHECK(input.dim() == 2 && input.scalar_type() == at::ScalarType::BFloat16
+            && expert_scale_factor.scalar_type() == at::ScalarType::BFloat16,
+        "moe_finalize_allreduce_match: bf16 FC2 rows and routing weights expected");
+    int64_t const num_tokens = residual.size(0);
+    int64_t const hidden = norm_weight.size(0);
+    int64_t const top_k = expanded_idx_to_permuted_idx.size(-1);
+    at::Tensor moe_out
+        = at::detail::empty_cuda({num_tokens, hidden}, at::ScalarType::BFloat16, input.device(), std::nullopt);
+    ::moe::dev::finalize::Data finalizeData;
+    finalizeData.mDtypeElt = ::batchedGemm::trtllm::gen::Dtype::Bfloat16;
+    finalizeData.mDtypeExpW = ::batchedGemm::trtllm::gen::Dtype::Bfloat16;
+    finalizeData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+    finalizeData.mUseDeepSeekFp8 = false;
+    finalizeData.inPtr = input.data_ptr();
+    finalizeData.outPtr = moe_out.data_ptr();
+    finalizeData.expertWeightsPtr = expert_scale_factor.data_ptr();
+    finalizeData.expandedIdxToPermutedIdx = static_cast<int32_t*>(expanded_idx_to_permuted_idx.data_ptr());
+    finalizeData.numTokens = static_cast<int32_t>(num_tokens);
+    finalizeData.numExperts = 0; // read by the DeepSeek finalize only
+    finalizeData.topK = static_cast<int32_t>(top_k);
+    finalizeData.hiddenDim = static_cast<int32_t>(hidden);
+    finalizeData.hiddenDimPadded = static_cast<int32_t>(input.size(1));
+    finalizeData.totalNumPaddedTokens = nullptr; // read by the DeepSeek finalize only
+    ::moe::dev::finalize::run(
+        finalizeData, at::cuda::getCurrentCUDAStream(input.get_device()).stream());
+    return allreduce_raw(moe_out, residual, norm_weight, std::nullopt, std::nullopt, workspace, group, tactic,
+        static_cast<int64_t>(AllReduceFusionOp::RESIDUAL_RMS_NORM), eps, /*trigger_completion_at_end=*/false);
 }
 
 namespace
@@ -2387,6 +2589,30 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int rank,"
         "int nranks,"
         "float eps) -> Tensor[]");
+    m.def(
+        "moe_finalize_allreduce_match("
+        "Tensor input,"
+        "Tensor residual,"
+        "Tensor norm_weight,"
+        "Tensor expanded_idx_to_permuted_idx,"
+        "Tensor expert_scale_factor,"
+        "Tensor workspace,"
+        "int[] group,"
+        "int strategy,"
+        "int rank,"
+        "int nranks,"
+        "float eps) -> Tensor[]");
+    m.def(
+        "allreduce_residual_rmsnorm_mxfp8("
+        "Tensor input,"
+        "Tensor residual,"
+        "Tensor norm_weight,"
+        "Tensor? workspace,"
+        "int[] group,"
+        "int strategy,"
+        "float eps,"
+        "int alignment,"
+        "bool trigger_completion_at_end) -> Tensor[]");
     m.def("preallocate_nccl_window_buffer(Tensor input, int[] group, int count) -> ()");
     m.def("is_nccl_window_buffer(Tensor input, int[] group) -> bool");
     m.def(
@@ -2420,6 +2646,8 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("allreduce_pg", &tensorrt_llm::torch_ext::allreduce_pg);
     m.impl("moe_allreduce", &tensorrt_llm::torch_ext::moe_allreduce);
     m.impl("moe_finalize_allreduce", &tensorrt_llm::torch_ext::moe_finalize_allreduce);
+    m.impl("moe_finalize_allreduce_match", &tensorrt_llm::torch_ext::moe_finalize_allreduce_match);
+    m.impl("allreduce_residual_rmsnorm_mxfp8", &tensorrt_llm::torch_ext::allreduceResidualRmsNormMxfp8);
     m.impl("preallocate_nccl_window_buffer", &tensorrt_llm::torch_ext::preallocateNCCLWindowBuffer);
     m.impl("is_nccl_window_buffer", &tensorrt_llm::torch_ext::isNCCLWindowBuffer);
     m.impl("minimax_allreduce_rms", &tensorrt_llm::torch_ext::minimax_allreduce_rms);

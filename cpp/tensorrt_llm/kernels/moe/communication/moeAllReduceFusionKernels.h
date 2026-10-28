@@ -100,7 +100,14 @@ struct MoeFinalizeAllReduceFusionParams : public AllReduceFusionParams
     void* shared_expert_output = nullptr;
     // [num_tokens, top_k]
     int32_t* expanded_idx_to_permuted_idx = nullptr;
-    // allreduce_in [maxPermutedPaddedCount, hidden_dim]
+    // allreduce_in [maxPermutedPaddedCount, input_row_stride]
+    // Row stride of allreduce_in in elements; 0 means hidden_dim. The FC2 output of a padded MoE is wider than the
+    // hidden size it is reduced to (e.g. 2944 columns for hidden 2880).
+    int input_row_stride = 0;
+    // Match the unfused path bit for bit: the regular one-shot AR+RMSNorm kernel's launch geometry (which fixes the
+    // RMSNorm reduction order and covers hidden sizes whose hidden_dim / 8 is not a multiple of 32 * cluster size)
+    // and its cross-rank accumulation (fp32 unless ALL_REDUCE_FUSION_KERNEL_ACC_FP32=0).
+    bool match_unfused_allreduce = false;
 };
 
 void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& params);

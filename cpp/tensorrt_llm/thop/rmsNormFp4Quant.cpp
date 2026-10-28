@@ -23,6 +23,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/EmptyTensor.h>
 
+#include <limits>
+#include <tuple>
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -234,6 +236,42 @@ std::vector<at::Tensor> fused_rmsnorm_fp4_quantize(at::Tensor const& hidden_stat
     return {quant_out, scale_out};
 }
 
+std::tuple<at::Tensor, at::Tensor> pad_nvfp4_activation(
+    at::Tensor const& fp4_input, at::Tensor const& sf_input, int64_t padded_hidden_size)
+{
+    CHECK_TH_CUDA(fp4_input);
+    CHECK_CONTIGUOUS(fp4_input);
+    CHECK_TH_CUDA(sf_input);
+    CHECK_CONTIGUOUS(sf_input);
+    TORCH_CHECK(fp4_input.get_device() == sf_input.get_device(), "fp4_input and sf_input must be on the same device");
+    TORCH_CHECK(fp4_input.dim() == 2, "fp4_input must have shape [num_tokens, hidden_size / 2]");
+    TORCH_CHECK(sf_input.dim() == 2, "sf_input must have shape [num_tokens, hidden_size / 16]");
+    TORCH_CHECK(fp4_input.size(0) == sf_input.size(0), "fp4_input and sf_input must have the same row count");
+    TORCH_CHECK(fp4_input.element_size() == 1, "fp4_input elements must occupy one byte");
+    TORCH_CHECK(sf_input.element_size() == 1, "sf_input elements must occupy one byte");
+
+    constexpr int64_t kValuesPerFp4Byte = 2;
+    constexpr int64_t kSfVecSize = 16;
+    int64_t const hidden_size = fp4_input.size(1) * kValuesPerFp4Byte;
+    TORCH_CHECK(sf_input.size(1) * kSfVecSize == hidden_size,
+        "fp4_input and sf_input must describe the same logical hidden size");
+    TORCH_CHECK(padded_hidden_size >= hidden_size, "padded_hidden_size must not be smaller than hidden_size");
+    TORCH_CHECK(padded_hidden_size % kSfVecSize == 0, "padded_hidden_size must be divisible by 16");
+    TORCH_CHECK(padded_hidden_size <= std::numeric_limits<int>::max(), "padded_hidden_size exceeds INT_MAX");
+    TORCH_CHECK(fp4_input.size(0) <= std::numeric_limits<int>::max(), "num_tokens exceeds CUDA grid limit");
+
+    at::Tensor fp4_output = at::detail::empty_cuda({fp4_input.size(0), padded_hidden_size / kValuesPerFp4Byte},
+        fp4_input.scalar_type(), fp4_input.device(), std::nullopt);
+    at::Tensor sf_output = at::detail::empty_cuda(
+        {sf_input.size(0), padded_hidden_size / kSfVecSize}, sf_input.scalar_type(), sf_input.device(), std::nullopt);
+
+    auto const stream = at::cuda::getCurrentCUDAStream(fp4_input.get_device());
+    tensorrt_llm::kernels::padNvfp4Activation(fp4_input.const_data_ptr(), sf_input.const_data_ptr(),
+        fp4_output.mutable_data_ptr(), sf_output.mutable_data_ptr(), fp4_input.size(0), static_cast<int>(hidden_size),
+        static_cast<int>(padded_hidden_size), stream);
+    return {fp4_output, sf_output};
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -255,10 +293,16 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor scale_factor,"
         "float eps,"
         "bool return_norm_out) -> Tensor[]");
+    m.def(
+        "pad_nvfp4_activation("
+        "Tensor fp4_input,"
+        "Tensor sf_input,"
+        "int padded_hidden_size) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fused_add_rmsnorm_fp4_quantize", &tensorrt_llm::torch_ext::fused_add_rmsnorm_fp4_quantize);
     m.impl("fused_rmsnorm_fp4_quantize", &tensorrt_llm::torch_ext::fused_rmsnorm_fp4_quantize);
+    m.impl("pad_nvfp4_activation", &tensorrt_llm::torch_ext::pad_nvfp4_activation);
 }

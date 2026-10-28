@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -266,6 +266,36 @@ public:
                 m_params.layout);
             reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id]
                 = cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(pack_val, m_scale_factor, sf_out);
+        }
+        else if constexpr (GetQuantType<Pattern> == QuantType::kMXFP8)
+        {
+            // The device quantizer of mxfp8_quantize (quantize_with_block_size<FP16_TO_MXFP8>): 8 elements per
+            // thread, the amax of a 32-group shared over 4 aligned lanes (one token's lanes 4j..4j+3 always share a
+            // warp: blocks hold whole groups since hidden_dim / 8 and the block size are multiples of 4).
+            constexpr int kMxSfVecSize = 32;
+            constexpr int kThreadsPerSf = kMxSfVecSize / kMathCount;
+            using PackedVec = PackedVec<DType>;
+            PackedVec pack_val = *reinterpret_cast<PackedVec const*>(&val);
+            int const padded_cols = m_params.quant_padded_hidden_dim;
+            int64_t const row_vecs = padded_cols / kMathCount;
+            int64_t const row_sfs = padded_cols / kMxSfVecSize;
+            uint8_t* sf_row = reinterpret_cast<uint8_t*>(m_params.scale_out) + token_id * row_sfs;
+            uint8_t* sf_out = (m_access_id_in_token % kThreadsPerSf == 0)
+                ? sf_row + m_access_id_in_token / kThreadsPerSf
+                : nullptr;
+            uint64_t* quant_row = reinterpret_cast<uint64_t*>(m_params.quant_out) + token_id * row_vecs;
+            quant_row[m_access_id_in_token] = cvt_warp_fp16_to_mxfp8<DType, kMxSfVecSize, 1>(pack_val, sf_out);
+            // Padded columns and their scale groups are zero, as mxfp8_quantize writes them.
+            int const data_vecs = m_params.hidden_dim / kMathCount;
+            if (m_access_id_in_token < row_vecs - data_vecs)
+            {
+                quant_row[data_vecs + m_access_id_in_token] = 0ull;
+            }
+            int const data_sfs = m_params.hidden_dim / kMxSfVecSize;
+            if (m_access_id_in_token < row_sfs - data_sfs)
+            {
+                sf_row[data_sfs + m_access_id_in_token] = 0;
+            }
         }
         else if constexpr (GetQuantType<Pattern> == QuantType::kFP8)
         {
@@ -791,6 +821,19 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
     else if (params.pattern == AllReduceFusionPattern::kARRMSNorm)                                                     \
     {                                                                                                                  \
         DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARRMSNorm, NRanks);                                          \
+    }                                                                                                                  \
+    else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant)                                \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<DType, float>)                                                                   \
+        {                                                                                                              \
+            DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant, NRanks);                 \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false,                                                                                \
+                "allreduce_fusion_kernel: AllReduceFusionPattern=kARResidualRMSNormOutMXFP8Quant can not work with "   \
+                "DType=float!");                                                                                       \
+        }                                                                                                              \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \

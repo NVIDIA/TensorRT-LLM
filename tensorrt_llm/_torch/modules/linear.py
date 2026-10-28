@@ -3638,6 +3638,132 @@ class MXFP8LinearMethod(LinearMethodBase):
         self._store_scale(module, torch.cat(scales, dim=0))
 
 
+_mxfp8_from_bf16_printed: set = set()
+
+
+class MXFP8FromBf16LinearMethod(MXFP8LinearMethod):
+    """MXFP8 W8A8 for a Linear whose checkpoint weight is bf16/fp16.
+
+    The engine quantizes the stored weight once at load: e4m3 elements and one
+    UE8M0 scale per 1x32 block along K, the power of two chosen so the block
+    max fits e4m3 (``mxfp8_utils.quant_bf16_to_mxfp8``). No scale is read
+    from the checkpoint. Forward is MXFP8LinearMethod's: dynamic MXFP8
+    activation quantization and the CUTLASS block-scaled e4m3 GEMM. Selected
+    only through ``requantize_linear_to_mxfp8``.
+    """
+
+    # Rows quantized per chunk: bounds the fp32 temporaries of a large weight
+    # (an lm_head) to a few hundred MB.
+    _QUANT_ROWS = 16384
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool, dtype: torch.dtype):
+        super().create_weights(module, in_features, out_features, bias, dtype)
+        if (module.quant_config is not None
+                and module.quant_config.layer_quant_mode.has_fp4_kv_cache()
+                and module.weights_loading_config.weight_mode
+                == WeightMode.FUSED_QKV_LINEAR):
+            # Same unit KV scales UnquantizedLinearMethod creates for an FP4
+            # KV cache over unquantized fused QKV weights.
+            module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                         requires_grad=False)
+            module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                             requires_grad=False)
+
+    def _quantize_and_store(self, module: Linear, weight: torch.Tensor) -> None:
+        from tensorrt_llm._torch.modules.mxfp8_utils import (
+            dequant_mxfp8_weight, quant_bf16_to_mxfp8)
+        assert tuple(
+            weight.shape) == (module.out_features, module.in_features), (
+                "MXFP8 requantization got weight "
+                f"{tuple(weight.shape)}, expected "
+                f"{(module.out_features, module.in_features)}")
+        q_rows, s_rows = [], []
+        for start in range(0, weight.shape[0], self._QUANT_ROWS):
+            q, s = quant_bf16_to_mxfp8(weight[start:start + self._QUANT_ROWS],
+                                       self.BLOCK_SIZE)
+            q_rows.append(q)
+            s_rows.append(s)
+        w_e4m3 = torch.cat(q_rows)
+        scale_2d = torch.cat(s_rows)
+        copy_weight(module.weight, w_e4m3)
+        self._store_scale(module, scale_2d)
+        key = str(tuple(weight.shape))
+        if key not in _mxfp8_from_bf16_printed:
+            # Engagement and numerics, once per weight shape and process
+            # (printed: worker processes log at "error").
+            _mxfp8_from_bf16_printed.add(key)
+            rows = weight[:self._QUANT_ROWS].float()
+            deq = dequant_mxfp8_weight(w_e4m3[:self._QUANT_ROWS],
+                                       scale_2d[:self._QUANT_ROWS],
+                                       self.BLOCK_SIZE)
+            rel = ((deq - rows).norm() / rows.norm().clamp_min(1e-30)).item()
+            gemm = ("CUTLASS MXFP8 GEMM" if self.use_cutlass else
+                    "dequant reference GEMM (no CUTLASS MXFP8 op)")
+            print(
+                f"[TLLM mxfp8-from-bf16] weight {tuple(weight.shape)} "
+                f"{weight.dtype} requantized at load to MXFP8 (e4m3, UE8M0 "
+                f"per 1x32): relative Frobenius error {rel:.3e} over the "
+                f"first {rows.shape[0]} rows; {gemm}",
+                flush=True)
+
+    def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
+        assert len(weights) == 1 and "weight" in weights[0]
+        device = torch.device("cuda")
+        weight = module.load_shard(weights[0], "weight", device=device)
+        self._quantize_and_store(module, weight)
+        if module.bias is not None:
+            copy_weight(module.bias,
+                        module.load_shard(weights[0], "bias", device=device))
+
+    def load_weights_fused_qkv_linear(self, module: Linear,
+                                      weights: List[Dict]) -> None:
+        if hasattr(module, "kv_scales") and any("k_scale" in w
+                                                for w in weights):
+            raise NotImplementedError(
+                "MXFP8 requantization of a fused QKV weight does not load "
+                "checkpoint KV scales")
+        # The helper copies the biases itself.
+        q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
+            module, weights)
+        self._quantize_and_store(module,
+                                 torch.cat((q_weight, k_weight, v_weight)))
+
+    def load_weights_fused_gate_up_linear(self, module: Linear,
+                                          weights: List[Dict]) -> None:
+        gate_weight, up_weight = load_weights_fused_gate_up_helper(
+            module, weights)
+        self._quantize_and_store(module, torch.cat((gate_weight, up_weight)))
+
+
+def requantize_linear_to_mxfp8(module: Linear) -> Optional[str]:
+    """Switch an unquantized, not yet loaded bf16/fp16 Linear to MXFP8.
+
+    The module's weights are re-created as MXFP8 (``MXFP8FromBf16LinearMethod``)
+    and its quant_config is left as it is, so every quant predicate of the
+    module and its owner (fused output quantization, NVFP4 folds) still reads
+    "unquantized" and its input stays bf16. Call before the weights are loaded
+    (in a model's ``__post_init__``). Returns None when switched, else the
+    reason the module keeps its bf16 weights.
+    """
+    qc = module.quant_config
+    if qc is not None and qc.layer_quant_mode.has_any_quant(
+            exclude_kv_cache=True):
+        return "the module is already quantized"
+    if module.dtype not in (torch.bfloat16, torch.float16):
+        return f"dtype {module.dtype} is not bf16/fp16"
+    if (module.in_features % MXFP8LinearMethod.BLOCK_SIZE
+            or module.out_features % 32):
+        return (f"shape [{module.out_features}, {module.in_features}] is not "
+                "a multiple of 32")
+    if not _mxfp8_cutlass_op_available():
+        return "the CUTLASS MXFP8 GEMM needs SM100+ and trtllm::mxfp8_mxfp8_gemm"
+    module._mxfp8_from_bf16 = True
+    module._weights_created = False
+    module.create_weights()
+    return None
+
+
 def get_quant_method(quant_config: Optional[QuantConfig] = None):
     if quant_config is None or not quant_config.layer_quant_mode.has_any_quant(
             exclude_kv_cache=True):
@@ -3857,6 +3983,9 @@ class Linear(nn.Module):
             self.create_weights()
 
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
+        if getattr(self, "_mxfp8_from_bf16", False):
+            # Set only by requantize_linear_to_mxfp8.
+            return MXFP8FromBf16LinearMethod()
         quant_method = get_quant_method(quant_config)
         method_type = type(quant_method)
         if method_type is W4A16NVFP4LinearMethod:
