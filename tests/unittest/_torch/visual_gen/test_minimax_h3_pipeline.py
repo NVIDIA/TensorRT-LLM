@@ -108,7 +108,12 @@ class _SyntheticMiniMaxH3Pipeline(MiniMaxH3Pipeline):
         # that BasePipeline.device reads.
         self.workflow = "fl2va"
         self._device = torch.device("cpu")
-        self.pipeline_config = SimpleNamespace(visual_gen_mapping=None)
+        self.pipeline_config = SimpleNamespace(
+            visual_gen_mapping=None,
+            primary_model_config=SimpleNamespace(
+                attention=SimpleNamespace(backend="VANILLA", sparse_attention_config=None)
+            ),
+        )
         self.transformer = _FakeMiniMaxH3Transformer()
         self.vae = SimpleNamespace(
             config=SimpleNamespace(latent_channels=2),
