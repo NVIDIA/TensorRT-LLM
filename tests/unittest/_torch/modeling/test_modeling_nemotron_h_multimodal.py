@@ -533,9 +533,11 @@ def _assert_batch_equivalence(
 ) -> None:
     """Batched and separate runs of two requests must produce matching logits.
 
-    Both runs are teacher-forced onto each request's own greedy continuation, so every step
-    is computed from the same prefix. Free-running tokens are not comparable: batching shifts
-    logits by about one bf16 ULP, which flips near-tied tokens.
+    This guards against cross-request leakage or ordering bugs when the vision encoder batches
+    multimodal inputs across requests. Both runs are teacher-forced onto each request's own
+    greedy continuation, so every step is computed from the same prefix. Free-running tokens
+    are not comparable: batching shifts logits by about one bf16 ULP, which flips near-tied
+    tokens.
     """
     max_tokens = 16
     # Batching noise is about one bf16 ULP (<= 0.25 at these logit magnitudes); cross-request
