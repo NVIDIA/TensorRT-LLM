@@ -229,6 +229,15 @@ class OpenAIHttpClient(OpenAIClient):
         self._router = router
         self._role = role
         self._metrics_collector = ClientMetricsCollector(role)
+        # A non-streamed response arrives whole, so timeout_secs bounds the whole
+        # request. A streamed response lasts as long as the worker keeps
+        # generating, so timeout_secs bounds its silence instead: connecting, and
+        # every wait for data once the request is sent. A total bound would cut
+        # a long generation that is still producing tokens.
+        self._non_stream_timeout = aiohttp.ClientTimeout(total=timeout_secs)
+        self._stream_timeout = aiohttp.ClientTimeout(
+            total=None, connect=timeout_secs, sock_read=timeout_secs
+        )
         self._session = session or aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(
                 limit=0,
@@ -464,6 +473,7 @@ class OpenAIHttpClient(OpenAIClient):
                     url,
                     data=body,
                     headers=headers,
+                    timeout=self._stream_timeout if is_stream else self._non_stream_timeout,
                 ) as http_response:
                     response_clock = AdjustedSteadyClock()
                     if self._request_perf_metrics:

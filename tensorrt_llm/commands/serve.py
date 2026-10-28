@@ -1980,7 +1980,9 @@ def serve_embedding(
                   "--request_timeout",
                   type=int,
                   default=180,
-                  help="Request timeout",
+                  help="Request timeout in seconds. A streamed response "
+                  "from a worker may run longer: it times out only after "
+                  "this many seconds without data.",
                   status="beta")
 @stability_option("-l",
                   '--log_level',
