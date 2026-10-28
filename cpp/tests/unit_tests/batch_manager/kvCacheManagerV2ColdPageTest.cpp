@@ -227,6 +227,13 @@ TEST_P(OptionalDiskCheckpointTest, PayloadRestoreRetryAndIndependentEviction)
 
     auto reader = manager->createKvCache({}, span, 2);
     ASSERT_TRUE(reader->reuseStatus()[encoder.value()].complete);
+    auto reservations
+        = storage.newSlotsForPoolGroup(kHotLevel, hotGroup, storage.getStatistics(kHotLevel, hotGroup).free);
+    for (auto const& slot : reservations)
+    {
+        // Offload can still be reading the recycled GPU slots on another stream.
+        slot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
+    }
     // Poison the entire hot Encoder group: a false restore cannot pass using
     // stale bytes from the original slot after it was offloaded to disk.
     for (int p = 0; p < sizes.size().value(); ++p)
