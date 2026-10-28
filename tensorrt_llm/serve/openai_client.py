@@ -122,6 +122,19 @@ def _metrics_phase(role: ServerRole) -> str:
     return "ctx" if role is ServerRole.CONTEXT else "gen"
 
 
+# Failures that leave a generation leg undelivered: the connection could not be
+# opened (ClientConnectorError), or the connection closed before the whole
+# request was written (aiohttp's ClientConnectionResetError, a
+# ConnectionResetError). Any other failure may happen after the generation
+# server accepted the request. Once the connection is open, a server-side close
+# or reset before the response surfaces as ServerDisconnectedError or as
+# ClientOSError (ECONNRESET) whether or not the server read the request first.
+_GENERATION_LEG_RETRYABLE_ERRORS = (
+    aiohttp.ClientConnectorError,
+    ConnectionResetError,
+)
+
+
 class OpenAIClient(ABC):
     async def send_request(
         self,
@@ -468,11 +481,20 @@ class OpenAIHttpClient(OpenAIClient):
         # attempt that reaches self._max_retries.
         _TRANSIENT_TCP_BUDGET = 0 if self._no_retry or is_remote_tail_handoff else 5
         loop_max = max(max_retries, _TRANSIENT_TCP_BUDGET) + 1
+        # A generation leg takes its prompt KV cache from the context server's
+        # send session named by disagg_request_id.
+        is_generation_leg = (
+            self._role == ServerRole.GENERATION
+            and disagg_params is not None
+            and disagg_params.request_type == "generation_only"
+        )
         for attempt in range(loop_max):
             if attempt > 0:
                 await self._router.renew_request(request, req_id=req_id)
-            # Regenerate disagg_request_id on retry to avoid ID collision on workers
-            if attempt > 0 and self._disagg_id_generator is not None:
+            # A retried request gets a new disagg_request_id so it cannot collide
+            # with the abandoned attempt on the worker. A generation leg keeps its
+            # id: a new one could never be paired with the context KV cache.
+            if attempt > 0 and self._disagg_id_generator is not None and not is_generation_leg:
                 dp = getattr(request, "disaggregated_params", None)
                 if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
                     dp.disagg_request_id = await self._disagg_id_generator()
@@ -486,6 +508,7 @@ class OpenAIHttpClient(OpenAIClient):
             if self._request_perf_metrics:
                 headers[RETURN_METRICS_HEADER] = "1"
             headers.update(self._get_request_headers(request))
+            response_started = False
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
@@ -494,6 +517,7 @@ class OpenAIHttpClient(OpenAIClient):
                     data=body,
                     headers=headers,
                 ) as http_response:
+                    response_started = True
                     response_clock = AdjustedSteadyClock()
                     if self._request_perf_metrics:
                         destination_time = get_steady_clock_now_in_seconds()
@@ -565,6 +589,20 @@ class OpenAIHttpClient(OpenAIClient):
                 if lines_yielded > 0:
                     logger.error(
                         f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",
+                        traceback.format_exc(),
+                    )
+                    raise
+                # Once the generation server may have accepted a generation leg,
+                # that attempt owns the context KV cache: the transfer either went
+                # to it or failed and was released on the context server. A re-post
+                # would reuse its disagg_request_id and collide with the original
+                # on the worker, or wait for KV cache that is never sent.
+                if is_generation_leg and (
+                    response_started or not isinstance(e, _GENERATION_LEG_RETRYABLE_ERRORS)
+                ):
+                    logger.error(
+                        f"Client error to {url}: {e} - not retrying a generation request "
+                        "the generation server may have accepted",
                         traceback.format_exc(),
                     )
                     raise

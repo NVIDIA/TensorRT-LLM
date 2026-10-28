@@ -1415,8 +1415,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             has_pending_snapshot = any(
                 point > request.context_current_position for point in request.expect_snapshot_points
             )
+            # commit_min_snapshot accepts a commit only if it starts or ends at
+            # history_length. While a snapshot point is pending, history stays
+            # at the committed end, so the next commit starts there. Once
+            # history has passed it (chunks without a pending point, then a
+            # waiter's point arrived, see request_prefix_snapshot), the next
+            # commit can only end at history, so history follows the context.
             should_resize = not should_block_reuse or (
-                not is_all_reusable and not has_pending_snapshot
+                not is_all_reusable
+                and (
+                    not has_pending_snapshot
+                    or kv_cache.history_length > kv_cache.num_committed_tokens
+                )
             )
             should_commit = (
                 is_all_reusable or is_snapshot_boundary or request.context_remaining_length == 0
@@ -1439,13 +1449,31 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     @override
     def prepare_expect_snapshot_points(self, requests: List[LlmRequest]) -> None:
         super().prepare_expect_snapshot_points(requests)
-        if (
-            not self.enable_block_reuse
-            or not self.kv_cache_config.block_reuse_config.enable_branch_snapshot
-        ):
-            return
-        for request in requests:
-            self._apply_branch_snapshot_point(request)
+        block_reuse_config = self.kv_cache_config.block_reuse_config
+        if self.enable_block_reuse and block_reuse_config.enable_branch_snapshot:
+            for request in requests:
+                self._apply_branch_snapshot_point(request)
+        if self.enable_block_reuse and self._waiter_snapshot_points:
+            for request in requests:
+                self._merge_waiter_snapshot_points(request)
+
+    @override
+    def _can_share_inflight_prefix(self) -> bool:
+        """Snapshots requested for waiting requests need no branch snapshot config."""
+        return self.enable_block_reuse and self._can_publish_block_reuse
+
+    @override
+    def request_prefix_snapshot(self, owner: LlmRequest, num_tokens: int) -> bool:
+        """Snapshot ``owner`` at ``num_tokens`` for a request waiting for that prefix.
+
+        The recurrent state reaches the radix tree only at snapshot points, so
+        ``owner`` always needs one there; its context chunk ends there too. The
+        point may arrive after ``owner``'s history has passed its committed
+        tokens; update_context_resources then advances history to each chunk
+        end, so the commit at the point ends at history as commit_min_snapshot
+        requires.
+        """
+        return self._add_waiter_snapshot_point(owner, num_tokens)
 
     def _skip_branch_snapshot(self, reason: str) -> None:
         self._branch_snapshots_skipped_total[reason] = (

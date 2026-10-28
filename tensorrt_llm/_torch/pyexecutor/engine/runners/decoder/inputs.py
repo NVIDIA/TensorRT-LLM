@@ -844,11 +844,7 @@ class DecoderInputPreparer:
         if self.log_cached_kv_tokens_per_req:
             self.record_cached_kv_tokens_per_req(num_cached_tokens_per_seq)
 
-        return PreparedInputs(
-            inputs,
-            self._buffers.gather_ids_cuda[:num_tokens],
-            static_inputs_staged=static_inputs_staged,
-        )
+        return PreparedInputs(inputs, static_inputs_staged=static_inputs_staged)
 
     def _build_multimodal_data_for_llm(
         self,
@@ -886,12 +882,9 @@ class DecoderInputPreparer:
         buffers, and the attention and speculative metadata are prepared.
         """
         set_per_request_prefill_cuda_graph_flag(False)
-        if self.mapping is not None and "cp_type" in self.mapping.cp_config:
+        if "cp_type" in self.mapping.cp_config:
             cp_type = self.mapping.cp_config["cp_type"]
-            if cp_type in (CpType.HELIX, CpType.ULYSSES):
-                # Prepared like any other batch.
-                pass
-            else:
+            if cp_type not in (CpType.HELIX, CpType.ULYSSES):
                 raise NotImplementedError(
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}."
                 )
@@ -1111,13 +1104,8 @@ class DecoderInputPreparer:
                     runtime_draft_len,
                 )
 
-        gather_ids_device = (
-            self._gather_ids_buffer.tensor[: len(host.lists.gather_ids)]
-            if enable_spec_decode
-            else None
-        )
         return self._finish_prepared(
-            PreparedInputs(inputs, gather_ids_device),
+            PreparedInputs(inputs),
             scheduled_requests,
             kv_cache_manager,
             runtime_draft_len,

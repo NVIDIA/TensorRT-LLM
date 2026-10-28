@@ -350,9 +350,7 @@ class EncoderStage(EncoderMixin):
         inputs: ScheduledInputs,
         *,
         resource_manager: ResourceManager,
-        is_dummy: bool = False,
     ) -> dict[str, Any]:
-        del is_dummy
         prepared = self._prepare_inputs(
             inputs.batch,
             resource_manager=resource_manager,
@@ -1367,12 +1365,9 @@ class EncoderDecoderRunner(DecoderRunner):
         inputs: ScheduledInputs,
         *,
         resource_manager: ResourceManager,
-        is_dummy: bool = False,
     ) -> dict[str, Any]:
         """Run the encoder phase for ``inputs.batch.encoder_requests``."""
-        return self._encoder_stage.forward(
-            inputs, resource_manager=resource_manager, is_dummy=is_dummy
-        )
+        return self._encoder_stage.forward(inputs, resource_manager=resource_manager)
 
     def warmup_encoder(self, resource_manager: ResourceManager) -> None:
         """Warm up and capture the encoder graph shapes."""

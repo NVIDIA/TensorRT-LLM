@@ -30,7 +30,6 @@ class PreparedInputs:
     """
 
     kwargs: dict[str, Any]
-    gather_ids: torch.Tensor | None = None
     runtime_draft_len: int = 0
     static_inputs_staged: int = 0
 

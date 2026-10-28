@@ -8,7 +8,6 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner, CUDAGraphRunnerConfig)
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.mapping import Mapping
 
 
@@ -245,25 +244,22 @@ def create_mock_cuda_graph_runner(
         max_num_tokens: int = 1,
         static_input_ids: Optional[torch.Tensor] = None,
         static_position_ids: Optional[torch.Tensor] = None):
-    config = CUDAGraphRunnerConfig(
-        use_cuda_graph=True,
-        cuda_graph_padding_enabled=False,
-        cuda_graph_batch_sizes=[batch_size],
-        max_cuda_graph_batch_size=batch_size,
-        batch_size=batch_size,
-        max_beam_width=1,
-        max_num_tokens=max_num_tokens,
-        use_mrope=use_mrope,
-        spec_config=None,
-        cuda_graph_mem_pool=None,
-        enable_attention_dp=False,
-        original_max_total_draft_tokens=0,
-        is_encoder_decoder=False,
-        mapping=Mapping(),
-        dist=None,
-        kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
-        static_input_ids=static_input_ids,
-        static_position_ids=static_position_ids)
+    config = CUDAGraphRunnerConfig(use_cuda_graph=True,
+                                   cuda_graph_padding_enabled=False,
+                                   cuda_graph_batch_sizes=[batch_size],
+                                   max_cuda_graph_batch_size=batch_size,
+                                   batch_size=batch_size,
+                                   max_beam_width=1,
+                                   max_num_tokens=max_num_tokens,
+                                   use_mrope=use_mrope,
+                                   spec_config=None,
+                                   enable_attention_dp=False,
+                                   original_max_total_draft_tokens=0,
+                                   is_encoder_decoder=False,
+                                   mapping=Mapping(),
+                                   dist=None,
+                                   static_input_ids=static_input_ids,
+                                   static_position_ids=static_position_ids)
     return CUDAGraphRunner(config)
 
 

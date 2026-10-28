@@ -1091,8 +1091,10 @@ def create_input_processor(
     Args:
         model_path_or_dir: Path or repo id used to locate pretrained config/tokenizer.
         tokenizer: Tokenizer instance.
-        checkpoint_format: Checkpoint format identifier. "HF" uses Hugging Face-style
-            config loading; any other value skips HF config loading. Default is "HF".
+        checkpoint_format: Checkpoint format identifier. "HF" and "MX" use Hugging
+            Face-style config loading, because MX loads Hugging Face-format
+            checkpoints; "mistral" and "mistral_large_3" use the native Mistral
+            config; any other value skips HF config loading. Default is "HF".
         trust_remote_code: Whether Hugging Face config/processor loading may run
             model-provided Python code.
         enable_tokenization_cache: Whether the ``DefaultInputProcessor`` caches
@@ -1111,7 +1113,7 @@ def create_input_processor(
 
     config = None
 
-    if checkpoint_format == "HF":
+    if checkpoint_format in ("HF", "MX"):
         try:
             model_config = ModelConfig.from_pretrained(
                 model_path_or_dir, trust_remote_code=trust_remote_code)

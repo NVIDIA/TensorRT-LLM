@@ -15,6 +15,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 
 def _register_fake():
+    from .._experimental.modeling_v2.models.kimi_k3_vl.ops import \
+        _native as _native
 
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(

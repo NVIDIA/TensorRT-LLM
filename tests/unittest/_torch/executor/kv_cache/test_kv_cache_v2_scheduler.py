@@ -30,6 +30,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
+from tensorrt_llm._torch.pyexecutor.scheduler.prefix_wait_planner import (
+    MAX_WAIT_PASSES,
+    MIN_GAIN_BLOCKS,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import BudgetTracker, ScheduleAction
 from tensorrt_llm.llmapi.llm_args import (
     CapacitySchedulerPolicy,
@@ -646,6 +650,7 @@ def make_kv_cache_manager(
     # Default: no request contributes a full new block, so the prefix-aware
     # skip never fires and tests that don't care about it are unaffected.
     mgr.probe_first_new_block_key.side_effect = first_new_block_fn or (lambda req: None)
+    mgr.can_share_inflight_prefix = False
     mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req, reuse_limit=None: True)
     mgr.prepare_context_cache.side_effect = lambda req, reuse_limit=None: 0
@@ -931,6 +936,138 @@ class TestTokenBudget:
 # ===========================================================================
 # Draft Token Budget Interaction (Non-Chunked)
 # ===========================================================================
+
+
+class TestInflightPrefixWait:
+    """Scheduling around PrefixWaitPlanner, over a mock cache manager.
+
+    Every request shares a prefix deep enough to wait for; the reuse tree
+    offers none of it and every requested snapshot is accepted.
+    """
+
+    TOKENS_PER_BLOCK = 64
+    PROMPT_LEN = 2 * MIN_GAIN_BLOCKS * TOKENS_PER_BLOCK
+
+    def make_manager(self, **kwargs):
+        def claim(req, reuse_limit=None):
+            # Creates the claim, like a real prepare_context.
+            mgr.kv_cache_map[req.py_request_id]
+            return True
+
+        mgr = make_kv_cache_manager(
+            tokens_per_block=self.TOKENS_PER_BLOCK, prepare_context_fn=claim, **kwargs
+        )
+        mgr.can_share_inflight_prefix = True
+        mgr.probe_context_reuse.side_effect = lambda req: 0
+        mgr.request_prefix_snapshot.return_value = True
+        return mgr
+
+    def make_request(self, request_id, shared=True):
+        tokens = list(range(self.PROMPT_LEN)) if shared else [request_id] * self.PROMPT_LEN
+        req = make_ctx_request(request_id, context_remaining_length=self.PROMPT_LEN)
+        req.get_tokens_view.return_value = tokens
+        req.cache_salt = None
+        req.multimodal_hashes = None
+        req.is_dummy_request = False
+        return req
+
+    @staticmethod
+    def run_chunk(req, num_tokens=64):
+        """What the executor does once the forward of an admitted chunk ran."""
+        req.is_first_context_chunk = False
+        req.context_current_position += num_tokens
+        req.context_remaining_length -= num_tokens
+
+    def test_request_waits_for_a_prefilling_owner(self):
+        mgr = self.make_manager()
+        sched = make_scheduler(mgr, max_num_tokens=100000)
+        owner = self.make_request(0)
+        assert ids(sched.schedule_request([owner], set()).context_requests) == [0]
+        self.run_chunk(owner)
+        reqs = [owner, self.make_request(1), self.make_request(2, shared=False)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0, 2]
+        assert mgr.request_prefix_snapshot.call_args.args[0] is owner
+
+    def test_request_waits_for_a_new_request_admitted_ahead_of_it(self):
+        mgr = self.make_manager()
+        sched = make_scheduler(mgr, max_num_tokens=100000)
+        reqs = [self.make_request(i) for i in range(3)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0]
+
+    def test_request_does_not_wait_for_a_new_request_left_queued(self):
+        # Request 0 does not get its pages, so it prefills nothing this pass.
+        mgr = self.make_manager(resize_context_fn=lambda req, n: req.py_request_id != 0)
+        sched = make_scheduler(mgr, max_num_tokens=100000)
+        reqs = [self.make_request(i) for i in range(2)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [1]
+
+    def _owner_in_flight(self, sched):
+        """An owner admitted earlier whose next chunk is in flight (pipeline parallel)."""
+        owner = self.make_request(0)
+        assert ids(sched.schedule_request([owner], set()).context_requests) == [0]
+        self.run_chunk(owner)
+        return owner
+
+    def test_pass_where_every_request_waits_is_a_bounded_stall(self):
+        """A pass in which every pending request waits for a prefilling owner
+        schedules nothing and counts as a stall, but the wait bound ends it
+        long before the deadlock threshold."""
+        mgr = self.make_manager()
+        sched = make_scheduler(mgr, max_num_tokens=100000)
+        owner = self._owner_in_flight(sched)
+        reqs = [owner] + [self.make_request(i) for i in range(1, 3)]
+        assert MAX_WAIT_PASSES < sched._DEADLOCK_STALL_ITERS
+        for num_passes in range(1, MAX_WAIT_PASSES + 1):
+            out = sched.schedule_request(reqs, {owner.request_id})
+            assert ids(out.context_requests) == []
+            assert sched._stalled_schedules == num_passes
+        out = sched.schedule_request(reqs, {owner.request_id})
+        assert ids(out.context_requests) == [1, 2]
+        assert sched._stalled_schedules == 0
+
+    def test_prefix_wait_does_not_hide_a_stall(self):
+        """A pass that only waits is reported like any other stall."""
+        mgr = self.make_manager()
+        sched = make_scheduler(mgr, max_num_tokens=100000)
+        owner = self._owner_in_flight(sched)
+        sched._DEADLOCK_STALL_ITERS = 3
+        reqs = [owner, self.make_request(1)]
+        for _ in range(2):
+            sched.schedule_request(reqs, {owner.request_id})
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            sched.schedule_request(reqs, {owner.request_id})
+
+    def test_pipeline_ranks_agree_on_each_wait_through_its_expiry(self):
+        """Under attention DP with pipeline parallelism, the first PP rank of
+        an attention-DP group schedules and propagates its batch, and the next
+        PP rank schedules its own copy of the requests locally. Each schedules
+        once per iteration (PyExecutor._pp_rank_schedules), so a waiting request
+        spends its wait budget in step on both, up to the pass in which both
+        admit it. A rank that admitted it alone would run the propagated batch
+        without its KV cache."""
+        ranks = []
+        for _ in range(2):
+            mgr = self.make_manager()
+            sched = make_scheduler(mgr, max_num_tokens=100000)
+            owner = self.make_request(0)
+            assert ids(sched.schedule_request([owner], set()).context_requests) == [0]
+            self.run_chunk(owner)
+            ranks.append((sched, [owner, self.make_request(1)]))
+
+        admitted_at = []
+        for iteration in range(MAX_WAIT_PASSES + 1):
+            outputs = []
+            for sched, reqs in ranks:
+                outputs.append(ids(sched.schedule_request(reqs, set()).context_requests))
+                # The owner keeps prefilling a long context.
+                reqs[0].context_current_position += 64
+            assert outputs[0] == outputs[1]
+            if 1 in outputs[0]:
+                admitted_at.append(iteration)
+        assert admitted_at == [MAX_WAIT_PASSES]
 
 
 class TestDraftTokenBudget:

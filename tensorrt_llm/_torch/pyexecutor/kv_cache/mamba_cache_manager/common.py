@@ -38,7 +38,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     get_pp_layers,
 )
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
@@ -316,6 +316,16 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
     @override
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
         return self.all_conv_states[self.mamba_layer_offsets[layer_idx]]
+
+
+def _host_slots_to_device(slots: list[int], device: torch.device) -> torch.Tensor:
+    """Copy host slot IDs without synchronizing queued GPU work.
+
+    Each copy uses fresh pinned storage so later host writes cannot race it.
+    """
+    return torch.tensor(
+        slots, dtype=torch.long, pin_memory=device.type == "cuda" and prefer_pinned()
+    ).to(device, non_blocking=True)
 
 
 def _get_mamba_hybrid_pool_size(max_batch_size: int, mapping: Mapping) -> int:
