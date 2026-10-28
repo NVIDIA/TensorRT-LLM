@@ -310,6 +310,7 @@ def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
             side_effect=lambda request, resources: contextlib.nullcontext(request),
         ),
         patch.object(runner, "_forward_warmup", forward_warmup),
+        patch.object(torch.cuda, "synchronize"),
     ):
         if fails:
             with pytest.raises(RuntimeError, match="capture failure"):
