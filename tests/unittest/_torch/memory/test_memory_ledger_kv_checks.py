@@ -48,8 +48,19 @@ def _stats(total, free, evictable, slot_sizes=(MB,)):
     return obj
 
 
+class _Manager:
+    """A real class, not a SimpleNamespace: the provider holds it weakly and
+    SimpleNamespace forbids weak references."""
+
+    def __init__(self, *stats):
+        self._stats = list(stats)
+
+    def _get_storage_statistics(self, level):
+        return self._stats
+
+
 def _manager(*stats):
-    return types.SimpleNamespace(_get_storage_statistics=lambda level: list(stats))
+    return _Manager(*stats)
 
 
 class TestCheckCIsNotVacuous:
@@ -131,7 +142,8 @@ class TestSlotsToBytes:
 
 class TestPhysicalVersusLogical:
     def test_capacity_is_physical_and_counts(self):
-        provider = KvCacheProvider(_manager(_stats(100, 60, 20)))
+        manager = _manager(_stats(100, 60, 20))
+        provider = KvCacheProvider(manager)
         physical = [e for e in provider.collect() if e.basis is Basis.PHYSICAL_BACKING]
         assert len(physical) == 1
         # The pool is resident in full; free blocks are not given back.
@@ -139,7 +151,8 @@ class TestPhysicalVersusLogical:
         assert physical[0].counts_toward_total is True
 
     def test_in_use_is_logical_and_does_not_count(self):
-        provider = KvCacheProvider(_manager(_stats(100, 60, 20)))
+        manager = _manager(_stats(100, 60, 20))
+        provider = KvCacheProvider(manager)
         logical = [e for e in provider.collect() if e.basis is Basis.LOGICAL]
         assert len(logical) == 1
         assert logical[0].size_bytes == 20 * MB
@@ -148,8 +161,12 @@ class TestPhysicalVersusLogical:
         )
 
     def test_freeing_blocks_does_not_shrink_the_physical_figure(self):
-        busy = KvCacheProvider(_manager(_stats(100, 0, 0))).collect()
-        idle = KvCacheProvider(_manager(_stats(100, 100, 0))).collect()
+        # The provider holds the manager weakly, so the caller keeps it
+        # alive -- in production the ResourceManager owns it.
+        busy_manager = _manager(_stats(100, 0, 0))
+        idle_manager = _manager(_stats(100, 100, 0))
+        busy = KvCacheProvider(busy_manager).collect()
+        idle = KvCacheProvider(idle_manager).collect()
 
         def physical(entries):
             return next(e.size_bytes for e in entries if e.basis is Basis.PHYSICAL_BACKING)
@@ -158,7 +175,8 @@ class TestPhysicalVersusLogical:
         assert physical(busy) == physical(idle) == 100 * MB
 
     def test_category_and_owner(self):
-        entries = KvCacheProvider(_manager(_stats(8, 1, 1))).collect()
+        manager = _manager(_stats(8, 1, 1))
+        entries = KvCacheProvider(manager).collect()
         assert all(e.category is Category.KV_CACHE_POOL for e in entries)
         assert "pool_group[0]" in entries[0].owner
 

@@ -27,6 +27,10 @@ from the same three (``free + evictable`` and ``total - available()``,
 conservation check into a tautology.
 """
 
+import weakref
+
+from tensorrt_llm.logger import logger
+
 from ..schema import Basis, Category, Entry, Placement, Source
 
 __all__ = ["KvCacheProvider", "kv_pool_group_stats"]
@@ -82,18 +86,43 @@ class KvCacheProvider:
 
     Takes the manager explicitly: it lives in a ``ResourceManager`` owned by
     the executor, with no process-wide accessor, so it cannot be discovered
-    the way ``MnnvlMemory`` can. The capture site inside the executor has the
-    reference and passes it in.
+    the way ``MnnvlMemory`` can. The code that builds it registers one of
+    these via ``register_provider``.
+
+    The reference is weak. A ledger that kept the manager alive would pin
+    the largest allocation in the process -- the pool is tens of GiB -- and
+    a diagnostic that prevents memory from being released is worse than one
+    that reports nothing. Once the manager is gone the provider reports
+    unavailable, which is the truth: there is no pool left to measure.
     """
 
     name = "kv_cache_v2"
     category = Category.KV_CACHE_POOL
 
     def __init__(self, manager=None) -> None:
-        self._manager = manager
+        self._ref = None
+        if manager is None:
+            return
+        try:
+            self._ref = weakref.ref(manager)
+        except TypeError:
+            # A manager type that forbids weak references (``__slots__``
+            # without ``__weakref__``) would otherwise raise here, and this
+            # runs on the executor's startup path. Report nothing rather
+            # than take a strong reference that would outlive the executor
+            # in the module-level registry and pin the pool forever.
+            logger.warning(
+                f"memory ledger: {type(manager).__name__} cannot be "
+                "referenced weakly; KV cache rows will be absent"
+            )
+
+    @property
+    def _manager(self):
+        return self._ref() if self._ref is not None else None
 
     def available(self) -> bool:
-        return self._manager is not None and hasattr(self._manager, "_get_storage_statistics")
+        manager = self._manager
+        return manager is not None and hasattr(manager, "_get_storage_statistics")
 
     def collect(self) -> list[Entry]:
         if not self.available():
