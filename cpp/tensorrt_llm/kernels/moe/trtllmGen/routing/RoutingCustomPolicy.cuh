@@ -587,6 +587,8 @@ struct PolicyTraits<NoOpPreprocess, SoftmaxPostprocess>
             Tier<512, 16>,       // Various 512-expert models with high topK
             Tier<512, 22>,       // Nemotron Super V3 (512 experts, topK=22)
             Tier<576, 8>,        // Customized model with 576 experts
+            Tier<1024, 32>,      // Kimi K3 post-topK permutation (896 experts, topK 16): without this tier the
+                                 // >128-token cluster launch and the dyn-block dispatch fell to <2048,32>
             Tier<2048, 32>       // Large-expert fallback
             >;
 };

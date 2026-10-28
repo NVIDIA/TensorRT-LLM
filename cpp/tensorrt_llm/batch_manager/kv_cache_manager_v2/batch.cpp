@@ -73,8 +73,8 @@ Batch::Batch(std::shared_ptr<KvCacheManager> manager, int maxRows, int maxBlocks
     mDeviceMemory.reset(reinterpret_cast<std::byte*>(ptr));
     // Two generations cover the usual publication/consumer overlap without
     // allocating or registering pinned memory in the publication path.
-    mUploads.push_back({std::make_unique<HostMem>(mTotalBytes)});
-    mUploads.push_back({std::make_unique<HostMem>(mTotalBytes)});
+    mUploads.push_back({std::make_unique<StaticHostMem>(mTotalBytes)});
+    mUploads.push_back({std::make_unique<StaticHostMem>(mTotalBytes)});
 }
 
 Batch::~Batch()
@@ -268,7 +268,7 @@ std::vector<int> Batch::publish(CudaStream stream)
 
     // A busy staging buffer cannot be overwritten by the CPU just by queueing a
     // stream wait. Reuse only completed buffers; retain each in-flight generation.
-    std::unique_ptr<HostMem> staging;
+    std::unique_ptr<StaticHostMem> staging;
     for (auto it = mUploads.begin(); it != mUploads.end();)
     {
         if (it->completion.queryComplete())
@@ -284,7 +284,7 @@ std::vector<int> Batch::publish(CudaStream stream)
     }
     if (!staging)
     {
-        staging = std::make_unique<HostMem>(mTotalBytes);
+        staging = std::make_unique<StaticHostMem>(mTotalBytes);
     }
     auto* host = reinterpret_cast<int32_t*>(staging->address());
     for (size_t i = 0; i < rows.size(); ++i)

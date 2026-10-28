@@ -397,6 +397,24 @@
           "title": "Ring Size",
           "type": "integer"
         },
+        "tp_layout": {
+          "anyOf": [
+            {
+              "enum": [
+                "replicated",
+                "token_sharded"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Activation layout between TP projections: 'replicated' (all-reduce TP; the default when unset) or 'token_sharded' (each TP rank holds 1/tp_size of the tokens; each all-reduce becomes a reduce-scatter plus an all-gather). 'token_sharded' requires tp_size > 1 and no ulysses/ring/attn2d.",
+          "status": "prototype",
+          "title": "Tp Layout"
+        },
         "tp_size": {
           "default": 1,
           "description": "Tensor parallel group size. Heads are sharded across tp_size GPUs.",
@@ -490,6 +508,13 @@
           "description": "Subtract the per-channel K mean before quantizing K, which narrows the range the quantized type has to cover. SageAttention only.",
           "status": "prototype",
           "title": "Smooth K",
+          "type": "boolean"
+        },
+        "smooth_v": {
+          "default": false,
+          "description": "Subtract the per-channel V mean before quantizing V and add it back to the output. SageAttention only; applied where the attention runs on the PrimTS kernels, while the trtllm-gen kernels quantize V without it.",
+          "status": "prototype",
+          "title": "Smooth V",
           "type": "boolean"
         },
         "v_block_size": {
@@ -962,7 +987,7 @@
       "type": "object"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc1/_static/schemas/trtllm-serve-visual-gen-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc3/_static/schemas/trtllm-serve-visual-gen-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Static YAML checks only; runtime validation remains authoritative.",
@@ -1086,6 +1111,6 @@
       "status": "prototype"
     }
   },
-  "title": "TensorRT-LLM 1.4.0rc1 trtllm-serve --visual_gen_args",
+  "title": "TensorRT-LLM 1.4.0rc3 trtllm-serve --visual_gen_args",
   "type": "object"
 }

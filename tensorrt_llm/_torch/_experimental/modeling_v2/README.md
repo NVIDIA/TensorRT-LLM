@@ -36,10 +36,15 @@ exists to catch.
 
 The decision is one function, `route`, in the family's `routing.py`. It reads
 the facts that fix which code runs -- the checkpoint's config shape, the
-parallel mapping, the GPU's compute capability and the speculative-decoding
-config -- and either returns a target class or raises `NoTarget` with the
-reason in words. Tuning knobs such as `max_batch_size`, `max_num_tokens` and CUDA graph
-settings are not routing inputs: they do not change which code runs, so a
+parallel mapping, the GPU's compute capability, the speculative-decoding
+config, the KV cache algorithm the engine will run with, and the engine choices
+it derives from the `ModelConfig` and the LLM arguments it is also given
+(qwen4_exp: MoE backend, recurrent-state cache dtype, prefill CUDA graph
+backend) -- and either returns a target class or raises `NoTarget` with the
+reason in words. A target declines what its
+constructor would refuse, so that `auto` falls back instead of failing mid-build.
+Tuning knobs such as `max_batch_size`, `max_num_tokens` and the CUDA graph
+bucket lists are not routing inputs: they do not change which code runs, so a
 target claims a configuration regardless of them. `require` therefore promises
 that the target ran, not that a particular knob setting was measured. The model
 loader decides when it is about to build the model, after the built-in model's
@@ -66,8 +71,9 @@ LLM(model=..., modeling_v2=...)  ->  ModelLoader
                                         +-- modeling_v2_resolve(config, llm_args)
                                               |
                     _router_index.py          +-- architectures[0] -> routing module
-                    models/<x>/routing.py     +-- route(config, mapping, compute_capability,
-                                              |         spec_config) -> target class, or NoTarget
+                    models/<x>/routing.py     +-- route(model_config, llm_args,
+                                              |         compute_capability)
+                                              |         -> target class, or NoTarget
                                         |
                                      config.modeling_v2_target = class
                                         |
@@ -105,11 +111,16 @@ checkpoint of the same shape is ungated.
 
 ```
 _router_index.py    architectures[0] -> routing module. Small, stable, test-guarded.
+_native.py          loads a target's native code (see "Native code" below)
 models/<family>/
   routing.py        one forward-reading decision tree per architecture family
+  fake_ops.py       fakes of the family's shared native ops, if it has any
+  csrc/             the family's CMakeLists.txt and the native code its targets share
   <checkpoint>__<gpu arch>__<parallel>/
                       modeling.py  weights.py
                       ops/<category>/   entries only this target calls
+                      fake_ops.py       fakes of the target's native ops, if it has any
+                      csrc/             the target's own kernels and torch bindings
 catalog/<category>/ entries more than one target calls
 ```
 
@@ -132,7 +143,9 @@ tests/unittest/_torch/modeling_v2/
   _validating.py                 the fixtures that interpose is_valid and arm reference
   <category>/test_modeling_v2_<entry>.py                      shared entries
   models/<family>/<target>/<category>/test_modeling_v2_<entry>.py   owned entries
-  comm/_<entry>_op_matrix.py   the two collectives' 4-rank rank bodies
+  comm/_<entry>_op_matrix.py   the collectives' rank bodies: allgather, reducescatter
+                               and allreduce at 2/4/8 ranks in one node, mnnvl_allreduce
+                               at 8 ranks over two trays (srun only, see its docstring)
   comm/_rank_job.py            starts one of those and asserts on its exit code
 ```
 
@@ -142,7 +155,7 @@ an in-package test is on no list. Each test is parametrized off its entry's
 and derives, so the certification is re-proved on every commit rather than
 recorded once.
 
-The two collectives' rank bodies sit in the tests tree with everything else
+The collectives' rank bodies sit in the tests tree with everything else
 that only tests run. Both halves are started by file path -- the launcher must
 not import `tensorrt_llm`, because that calls `MPI_Init` and an
 MPI-initialized process cannot start `mpirun`, and the ranks reach the catalog
@@ -151,10 +164,148 @@ file names nor their `check_*` bodies match pytest's collection patterns:
 each is one fixed 4-rank sequence that cannot run as independent cases.
 
 Identity is the directory name, and it carries all three segments:
-`gpt_oss_120b__sm_103__tp1`. They were three nested directories once, which
+`gpt_oss_120b__sm_10x__default`. They were three nested directories once, which
 read as a hierarchy that was never one -- every level had exactly one child,
 and each needed an `__init__.py` whose only job was to exist. The class name
 carries the same triple; `test_modeling_v2_claims.py` asserts they agree.
+
+### Native code
+
+A target's C++/CUDA lives with its Python code: `<target>/csrc/`, and the family's
+`csrc/` for code several targets share. Each family builds into one torch-op library,
+`libth_modeling_v2_<family>.so`, installed next to `libth_common.so`; nothing of it is
+linked into the stock libraries, and it loads only when routing picks one of the
+family's targets. Adding a model with kernels edits nothing under `cpp/`.
+`models/gpt_oss/` is the example: one kernel, used by its weight loader.
+
+Adding native code to target `foo_nvfp4__sm_103__tp4` of family `foo`:
+
+1. **Declare it** in `models/foo/csrc/CMakeLists.txt`:
+
+   ```cmake
+   add_modeling_v2_family(foo)
+   add_modeling_v2_target(foo foo_nvfp4__sm_103__tp4 ARCHS 103a SOURCES *.cu *.cpp)
+   ```
+
+2. **Write the kernels and their torch bindings** in `foo_nvfp4__sm_103__tp4/csrc/`, in
+   the target's namespaces:
+
+   ```cpp
+   TRTLLM_MV2_NAMESPACE_BEGIN   // tensorrt_llm::modeling_v2::foo::foo_nvfp4_sm_103_tp4
+   ...
+   TRTLLM_MV2_NAMESPACE_END
+   TRTLLM_MV2_LIBRARY_FRAGMENT(m) { m.def("my_op(Tensor x) -> Tensor"); }
+   TRTLLM_MV2_LIBRARY_IMPL(CUDA, m) { m.impl("my_op", &TRTLLM_MV2_NS::myOp); }
+   ```
+
+   Include the family's own headers from `models/` (`"foo/foo_nvfp4__sm_103__tp4/csrc/x.h"`);
+   any stock header is fine, another target's or family's code is not.
+
+3. **Load it** from the target's `__init__.py`, `native_ops = load_target_ops(__name__)`
+   (from `_native`); the target's modules use `from . import native_ops`.
+
+4. **Fake every op** in the target's `fake_ops.py`, which the loader imports right after
+   the library opens: `@torch.library.register_fake(f"{namespace_of(__name__)}::my_op")`.
+
+5. **Test it** under `tests/unittest/_torch/modeling_v2/models/foo/`. The modeling_v2 entry
+   of `l0_b300.yml` collects it, so a target that runs on GB300 changes no test list; a
+   test for another GPU, or for several GPUs, is listed in that GPU's test list.
+
+Code several targets call goes once in the family's `csrc/`, declared with
+`add_modeling_v2_shared(foo ARCHS ... SOURCES ...)`; its ops are in `torch.ops.mv2_foo`,
+reached with `load_family_ops(__name__)` and faked in `models/foo/fake_ops.py`. A target
+with no code of its own declares no `SOURCES`.
+
+- **`ARCHS`** (`NN`, `NNa`, `NNf`) is intersected with the build's architectures; a target
+  with none is not built, and is a `NoTarget` at run time. `REQUIRES` (`MULTI_DEVICE`,
+  `NVSHMEM`) and `DEPS` (a closed list) are the other keywords; a per-file compile option
+  goes on the file with `set_source_files_properties`.
+- **Loading**: a library this installation does not carry, or a target it did not build,
+  is a `NoTarget` (`auto` keeps the built-in model); one that is installed but fails to
+  load, or lacks an op a `fake_ops.py` declares, is a `NativeLoadError`.
+- **Building only your family**: `build_wheel.py -D "TRTLLM_MODELING_V2_TARGETS=foo/*"`, and
+  after an edit `cmake --build cpp/build --target th_modeling_v2_foo`.
+- `test_modeling_v2_native_claims.py` checks these rules on CPU; run it before sending the PR.
+
+### Default and specialized targets
+
+The parallel segment of a target's name is either one topology (for
+example `dep4`) or `default`. A `default` target computes its weight shapes
+from the engine's `Mapping` and covers every layout its routing module
+admits. A named topology is a specialization, written only where one layout
+earns its own forward, and routing tries it before the default. This keeps
+the number of targets proportional to the specializations someone chose to
+write, not to the number of layouts a model is deployed at. Neither model
+has one today: the default forward computes the same thing at every layout
+a specialization once served.
+
+The architecture segment `sm_10x` covers sm_100 (B200, GB200) and sm_103
+(B300, GB300): both run the same kernels, and every entry the two targets
+call is certified on both. A node holds four GPUs on GB200/GB300 and eight
+on B200/B300, so the same layout can sit inside one node on one machine and
+span two on the other; the target picks its allreduce from the mapping, not
+from the GPU name.
+
+`gpt_oss_120b__sm_10x__default` is the first, and gpt-oss's only target. It
+admits 12 layouts, the ones it has been gated on: tp1, tp2 (MoE split by
+intermediate or by expert), tp4 (by intermediate, by expert, or tp2 x ep2),
+tp8 (by intermediate or by expert), dep2, dep4 (by expert or tp2 x ep2) and
+dep8. No layout has a specialization: at one GPU the default forward is the
+single-GPU forward, with no collective. The layout is settled once, when a
+target is constructed, not by branching in the forward: at one GPU both
+residual-norm slots are the local fused-add norm; under attention TP they are
+an allreduce with the norm fused in (`comm/allreduce` inside one node,
+`comm/mnnvl_allreduce` across the trays of an NVLink domain); under attention DP they are the local
+fused-add norm and the MoE runs between `comm/allgather` and
+`comm/reducescatter`. Routing also refuses three mapping facts the table does
+not show: an attention TP size other than the TP size, lm_head TP under
+attention DP, and attention TP across nodes without multi-node NVLink (the
+built-in model falls back to NCCL there; the target has no such path).
+
+Where it differs from the built-in `GptOssForCausalLM` at the same layout:
+
+| | built-in | default target |
+|---|---|---|
+| allreduce inside one node | `AllReduce` module: symmetric memory, then the raw op with a strategy autotuner | the raw op with AUTO: one-shot / two-shot over the IPC workspace |
+| MoE under attention DP, pure EP | all-to-all (NVLink one-sided first) when available | always allgather + reduce-scatter |
+| embedding under attention TP | vocab-split, then gathered | replicated on every rank |
+
+Across trays the two agree: both run the MNNVL kernel with the norm fused
+in, the built-in model through `MNNVLAllReduce` and this target through
+`comm/mnnvl_allreduce`.
+
+`r1_0528_nvfp4__sm_10x__default` is the second, and the only deepseek
+target: at dep4 it computes what a dep4 specialization would, so there is
+none. It admits tp2, tp4 and tp8 (experts split by intermediate or by
+expert, tp4 also by tp2 x ep2, and tp8 also by tp4 x ep2 and tp2 x ep4),
+dep2, dep4 with experts split by expert, by intermediate or tp2 x ep2, dep8
+with experts split by expert, by intermediate or tp2 x ep4, and dep16. dep16
+runs the same allgather and reduce-scatter round trip as dep8. The bitwise
+collective matrices stop at 8 ranks: their exact value sets and the ring
+summation order they pin hold only up to there. So dep16 rests on the gsm8k
+run that admitted it. Under attention TP a rank holds its share of the 128
+MLA heads (`q_b_proj` and `kv_b_proj` rows, `o_proj` columns) and of every
+dense MLP and shared expert; `q_a_proj`, `kv_a_proj_with_mqa` and the latent
+KV cache are the same on every rank. The residual-norm slots and the
+attention-DP round trip are bound the same way as gpt-oss's.
+
+The checkpoint's MTP layer (one-model MTP-Eagle) is one more decoder layer of
+this target, cut per rank like the others and run through the same
+residual-norm slots and expert round trip. Its experts are bf16 -- modelopt
+excludes layer 61 from NVFP4 -- so they go to `fused_moe`, an entry this
+target owns, rather than the NVFP4-only trtllm-gen runner. The forward
+computes the MTP layer at every layout, but routing admits a
+`speculative_config` only at the six its draft acceptance was measured at:
+dep4, tp4, tp4+ep4, dep4 with experts split by intermediate, tp8 with tp2 x
+ep4, and dep8 -- each residual-norm path and each expert split.
+
+Where it differs from the built-in `DeepseekV3ForCausalLM` at the same layout,
+beyond the two allreduce and all-to-all rows above:
+
+| | built-in | default target |
+|---|---|---|
+| dense MLP (layers 0-2) at tp8 over two trays | split 4 ways inside a tray (`_compute_mlp_tp_size`) | split 8 ways, completed by the same allreduce |
+| fusions around the norms | NVFP4 quantization fused into the norm, MoE allreduce fused with the residual add | separate quantize and norm calls |
 
 ### Why beside `_torch/models/`, not inside it
 
@@ -194,11 +345,21 @@ Perf is measured, never gated.
 
 ## Status of every record in this tree
 
-**Every entry is certified on sm_103, and both targets are gated there.**
+**Every entry the gpt-oss and deepseek default targets call is certified on
+sm_100 and sm_103, and both targets are gated on both.** The qwen4_exp target
+and the entries it owns are certified on sm_103.
 
-The 19 entries -- 8 shared, 8 owned by deepseek, 3 by gpt-oss -- each drive
-their cells through `__call__` and `reference` in pre-merge CI, plus the two
-4-rank collective matrices. Certification is per architecture: `ARCHS` says
+The default targets' 21 entries -- 20 shared, 1 (`fused_moe`) owned by deepseek's default target -- each drive
+their cells through `__call__` and `reference`. Where that runs depends on the
+entry:
+
+* the 17 single-GPU entries run in pre-merge CI;
+* `allgather` and `reducescatter` run their 4-rank matrices, and `allreduce`
+  its 2- and 4-rank matrices, in the post-merge 4-GPU job;
+* `mnnvl_allreduce` needs 8 ranks over two trays. Its matrix runs only by
+  hand under srun (see its docstring), and no CI job re-runs it.
+
+Certification is per architecture: `ARCHS` says
 where the cells were driven, and a missing architecture reads as unknown,
 which is the honest state.
 
@@ -209,9 +370,10 @@ widening a tolerance, and each is written up in its own entry:
   `mla_rope_append_paged_kv_assign_q`). Parameters were renamed and added. The
   wrappers now mirror their schemas argument for argument, so the next drift
   fails loudly rather than shifting a positional list silently.
-* **The MoE FC1 epilogue changed block-scale recipe**, bit-exactly:
-  `floor(log2(amax))-8` on sm_100, `ceil(log2(amax/448))` on sm_103. The
-  reference is architecture-keyed and each arch refutes the other's recipe.
+* **The MoE FC1 epilogue's block-scale recipe**, bit-exactly:
+  `ceil(log2(amax/448))` on both sm_100 and sm_103, not the OCP
+  `floor(log2(amax))-8`. The reference is architecture-keyed, and the probe
+  refutes the OCP form, so a cubin that switches to it fails.
 * **torch 2.12 made fp32 matmul default to TF32**, so `cublas_mm`'s *reference*
   was the imprecise side; the op is bit-identical to a TF32-disabled product.
 * **The MLA append op now accepts NVFP4 latent pools** as well as fp8 (accepted
@@ -220,10 +382,16 @@ widening a tolerance, and each is written up in its own entry:
 Both targets are gated by the accuracy suite's modeling_v2 files,
 `tests/integration/defs/accuracy/modeling_v2/test_{gpt_oss,deepseek_v3}.py`,
 with `modeling_v2="require"` in force, which is what rules out the built-in
-implementation having been measured instead. gpt-oss-120b / sm_103 / tp1 runs
-gsm8k; deepseek-r1-0528-nvfp4 / sm_103 / dep4 runs gsm8k for the identity
-forward and the `mtp3` variant **paired in one session**, and the acceptance
-gate against stock modeling under the same `speculative_config`. The numbers
+implementation having been measured instead. The two `default` targets ran
+gsm8k at every layout before their routing admitted it, gpt-oss's tp1
+included; deepseek-r1-0528-nvfp4 / sm_10x / default also runs gsm8k for the
+identity forward and the `mtp3` variant **paired in one session**, and the
+acceptance gate against stock modeling under the same `speculative_config`,
+at each of the six layouts MTP is admitted at. CI runs a representative
+subset -- one layout per residual-norm path and per expert split, gpt-oss
+tp1, the deepseek `mtp3` pair and acceptance gate at dep4, and deepseek
+chunked prefill at tp4+ep4 and dep4 -- and the default shards tests pin
+every layout's weight cut, the MTP layer's included, on the CPU. The numbers
 live with those runs, not here: a number written into this file is one that
 drifts with nothing to notice.
 

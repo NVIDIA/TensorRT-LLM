@@ -26,7 +26,9 @@ from cutlass import Int32
 from cutlass.experimental.task_scheduling.resources import StageInfo
 
 from ...mask import kv_tile_is_fully_visible
+from ...stage import FmhaStage
 from ..fmha_decode_config import CAUSAL, FmhaDecodeConfig
+from ..fmha_decode_constants import KV_KIND_V
 from .helpers_common import (
     Constexpr,
     _TASK_CACHE_KV_RAW_TILE_BASE,
@@ -349,6 +351,34 @@ def _runtime_split_kv_global_tile_idx(
 
 
 @cute.jit
+def _local_kv_tile_idx_for_section(
+    cfg: Constexpr[FmhaDecodeConfig],
+    stage_info: StageInfo,
+    inst_id: Constexpr[int],
+    kv_kind: Constexpr[int],
+    section: Constexpr[FmhaStage],
+) -> Int32:
+    """Return the local K/V tile index implied by the TS HEAD/LOOP/TAIL cadence.
+
+    The schedule names whether a producer is K0/K1/V0/V1, while the phase
+    defines where that logical tile sits in the staggered decode pipeline:
+
+    - HEAD produces only initial K tiles.
+    - LOOP produces V for the current MMA iteration and K for the next one.
+    - TAIL drains the final V tiles after the last loop iteration.
+    """
+    num_insts_kv = Int32(cfg.num_insts_kv)
+    if cutlass.const_expr(section == FmhaStage.Head):
+        return Int32(inst_id)
+    if cutlass.const_expr(section == FmhaStage.Loop):
+        base = stage_info.loop_offset * num_insts_kv + Int32(inst_id)
+        if cutlass.const_expr(kv_kind == KV_KIND_V):
+            return base
+        return base + num_insts_kv
+    return stage_info.loop_end * num_insts_kv + Int32(inst_id)
+
+
+@cute.jit
 def resolve_keeps_tile_context(
     cfg: Constexpr[FmhaDecodeConfig],
     stage_info: StageInfo,
@@ -358,12 +388,16 @@ def resolve_keeps_tile_context(
     max_seq_len_kv: Int32,
     seq_len_q: Int32,
     q_group_idx: Int32 | None,
+    local_tile_idx: Int32 | None = None,
 ):
     """Resolve one score tile's logical position and boundary-mask state.
 
-    Every consumer of a softmax instance's tiles (the S resource and the
-    Sage K scale resource) derives the tile's token range from the same
-    sequence-length sources, so the resolution lives outside the S resource.
+    Every user of a softmax instance's dense tiles (the S resource, and the
+    load warp copying a dense Sage plan's K scales for the tile) derives the
+    tile's token range from the same sequence-length sources, so the
+    resolution lives outside the S resource; block-sparse routes take their
+    origins from the prepared record instead. ``local_tile_idx`` defaults to
+    the softmax's tile; a producer passes the tile it loads.
     """
     task_cache = _decode_gen_task_cache(stage_info)
     if cutlass.const_expr(seqlens_kv is None):
@@ -384,7 +418,8 @@ def resolve_keeps_tile_context(
         element_mask_end_idx = seq_len_kv - seq_len_q + q_token_base + Int32(1)
 
     use_runtime_kv_domain = seqlens_kv is not None or cfg.uses_runtime_q_kv_union
-    local_tile_idx = _softmax_tile_idx(cfg, stage_info, inst_id)
+    if cutlass.const_expr(local_tile_idx is None):
+        local_tile_idx = _softmax_tile_idx(cfg, stage_info, inst_id)
     if cutlass.const_expr(not use_runtime_kv_domain):
         effective_tile_idx = _static_split_kv_global_tile_idx(
             cfg, stage_info, local_tile_idx

@@ -30,10 +30,13 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..distributed import AllReduceStrategy
+from ..modules.linear import Linear, TensorParallelMode
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
-from .dflash import DFlashWorker, dflash_draft_slot_ids
+from .dflash import DFlashWorker, VocabParallelDraftTokens, dflash_draft_slot_ids
 from .dspark_schedule import NEUTRAL_CONFIDENCE_LOGIT
 from .interface import SpecMetadata, SpecWorkerBase
+from .vocab_parallel import tp_pair_exchange
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
@@ -233,9 +236,9 @@ class DSparkSpecMetadata(SpecMetadata):
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
-                    worker._ctx_len[slot] = 0
-                    worker._valid_len[slot] = 0
-                    worker._position_initialized[slot] = False
+                    worker._ctx_len[slot].zero_()
+                    worker._valid_len[slot].zero_()
+                    worker._position_initialized[slot].zero_()
                     worker._kv_windows[slot].zero_()
                     worker._free_slots.append(slot)
             # Assign a persistent rolling-window slot to every real generation
@@ -268,9 +271,9 @@ class DSparkSpecMetadata(SpecMetadata):
             # unconditional advance would leave its ABSOLUTE position climbing
             # across graph shapes and iterations until it indexes past the RoPE
             # table. A real slot is bounded instead by its request's lifetime.
-            worker._ctx_len[scratch] = 0
-            worker._valid_len[scratch] = 0
-            worker._position_initialized[scratch] = False
+            worker._ctx_len[scratch].zero_()
+            worker._valid_len[scratch].zero_()
+            worker._position_initialized[scratch].zero_()
             mapping = torch.tensor(
                 [worker._req_to_slot.get(rid, scratch) for rid in self.request_ids],
                 dtype=torch.long,
@@ -506,8 +509,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
         Two bounds exist and neither dominates: ``attn_metadata`` carries the KV
         manager's ``max_seq_len`` while ``_freqs_cap`` carries the user's, and
-        ``_create_cuda_graph_warmup_request`` sizes its dummy request at whichever is
-        larger. Covering both is what keeps warmup off the end of the table.
+        ``DummyRequestFactory.create_cuda_graph_warmup_request`` sizes its dummy
+        request at whichever is larger. Covering both is what keeps warmup off
+        the end of the table.
         """
         inner_model = getattr(draft_model, "dspark_model", None) or draft_model
         config_cap = int(getattr(inner_model, "_freqs_cap", 0) or 0)
@@ -696,9 +700,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         """Get (or refresh) the slot for a request; reset clears its window."""
         if reset and req_id in self._req_to_slot:
             old = self._req_to_slot.pop(req_id)
-            self._ctx_len[old] = 0
-            self._valid_len[old] = 0
-            self._position_initialized[old] = False
+            self._ctx_len[old].zero_()
+            self._valid_len[old].zero_()
+            self._position_initialized[old].zero_()
             self._kv_windows[old].zero_()
             self._free_slots.append(old)
         if req_id not in self._req_to_slot:
@@ -709,9 +713,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 )
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
-            self._ctx_len[slot] = 0
-            self._valid_len[slot] = 0
-            self._position_initialized[slot] = False
+            self._ctx_len[slot].zero_()
+            self._valid_len[slot].zero_()
+            self._position_initialized[slot].zero_()
             self._kv_windows[slot].zero_()
             if self._confidence_logits is not None:
                 # A recycled slot still holds the previous occupant's scores;
@@ -1207,6 +1211,31 @@ class DSparkWorker(DFlashWorker):
                 "(d2t vocab mapping is not supported); drafter "
                 f"{type(draft_model).__name__} declares one."
             )
+        # Built by bind_draft_lm_head when the drafter's head is known.
+        self._markov_tp_exchange = None
+
+    def bind_draft_lm_head(self, draft_model) -> None:
+        """Also build the Markov chain's TP exchange where it is used.
+
+        A Markov drafter with its own column-parallel LM head that does not
+        gather its output drafts from vocab-shard logits; its chain exchanges
+        each step's argmax over the TP group (see _apply_dspark_markov_bias).
+        NCCL: the path is rare and needs no all-reduce workspace.
+        """
+        super().bind_draft_lm_head(draft_model)
+        head = draft_model.lm_head
+        mapping = self.mapping
+        if (
+            self._markov_tp_exchange is None
+            and getattr(draft_model, "has_markov_head", False)
+            and isinstance(head, Linear)
+            and head.tp_mode == TensorParallelMode.COLUMN
+            and not head.gather_output
+            and mapping is not None
+            and mapping.tp_size > 1
+            and not mapping.enable_attention_dp
+        ):
+            self._markov_tp_exchange = tp_pair_exchange(mapping, AllReduceStrategy.NCCL)
 
     def _draft_block_width(self, draft_model) -> int:
         """Block width under the dspark ``shift_label`` convention.
@@ -1234,6 +1263,20 @@ class DSparkWorker(DFlashWorker):
             num_gens, block_size, num_draft_tokens, shift_label, device="cuda"
         )
 
+    def _vocab_parallel_draft_tokens(self, draft_model) -> Optional[VocabParallelDraftTokens]:
+        """A drafter with a Markov head chains the greedy block through it."""
+        draft_tokens = super()._vocab_parallel_draft_tokens(draft_model)
+        if draft_tokens is None or not getattr(draft_model, "has_markov_head", False):
+            return draft_tokens
+        return self._markov_block_tokens
+
+    def _markov_block_tokens(
+        self, draft_model, local_block: torch.Tensor, inputs: dict
+    ) -> torch.Tensor:
+        return self._vocab_parallel.head.markov_tokens(
+            local_block, inputs["first_prev_tokens"], draft_model.markov_w1, draft_model.markov_w2
+        )
+
     def _refine_block_logits(
         self,
         draft_model,
@@ -1249,16 +1292,13 @@ class DSparkWorker(DFlashWorker):
         """
         if not getattr(draft_model, "has_markov_head", False):
             return gen_logits
-        return self._apply_dspark_markov_bias(
-            draft_model, gen_logits, inputs["first_prev_tokens"], spec_metadata
-        )
+        return self._apply_dspark_markov_bias(draft_model, gen_logits, inputs["first_prev_tokens"])
 
     def _apply_dspark_markov_bias(
         self,
         draft_model,
         gen_logits: torch.Tensor,
         first_prev_tokens: torch.Tensor,
-        spec_metadata,
     ) -> torch.Tensor:
         """Apply the dspark vanilla-Markov intra-block bias to block logits.
 
@@ -1270,9 +1310,9 @@ class DSparkWorker(DFlashWorker):
         sampled chain; the rejection-sampling path samples from the same
         biased distributions (proposal conditioned on the greedy chain).
 
-        Handles a TP vocab-sharded draft lm_head by slicing markov_w2's rows
-        to this rank's contiguous shard and chaining through the TP-aware
-        global argmax.
+        A TP vocab-sharded draft lm_head yields this rank's vocab shard of the
+        logits; the chain then takes each step's global argmax over the TP
+        group.
         """
         # The d2t guard lives in set_draft_model: it is model-static, so raising
         # it here would surface a load-time config error per decode step.
@@ -1280,32 +1320,18 @@ class DSparkWorker(DFlashWorker):
         # keys on the runtime logits width, and reproducing that at init would
         # duplicate the draft head's sharding rules. A standalone drafter
         # borrows the target lm_head, whose gather_output defaults to True, so
-        # the logits normally arrive full-vocab and this branch is skipped.
+        # the logits normally arrive full-vocab.
         full_vocab = draft_model.markov_w2.shape[0]
         shard = gen_logits.shape[-1]
-        vocab_slice = None
-        if shard != full_vocab:
-            mapping = self.mapping
-            if (
-                mapping is None
-                or getattr(mapping, "enable_attention_dp", False)
-                or shard * mapping.tp_size != full_vocab
-            ):
-                raise NotImplementedError(
-                    f"DSpark Markov head: draft logits width {shard} does not "
-                    f"match the drafter vocab {full_vocab} and is not a plain "
-                    "TP column shard of it."
-                )
-            vocab_slice = slice(mapping.tp_rank * shard, (mapping.tp_rank + 1) * shard)
-
-        def argmax_fn(step_logits):
-            # Full-vocab token ids (TP-aware when sharded); tokens stay in
-            # draft-vocab space, which is what markov_w1 indexes.
-            return self.greedy_sample_draft_with_tp_gather(step_logits, spec_metadata).long()
-
+        if shard == full_vocab:
+            return draft_model.apply_markov_chain_logits(gen_logits, first_prev_tokens)
+        exchange = self._markov_tp_exchange
+        if exchange is None or shard * exchange.tp_size != full_vocab:
+            raise NotImplementedError(
+                f"DSpark Markov head: draft logits width {shard} does not "
+                f"match the drafter vocab {full_vocab} and is not a plain "
+                "TP column shard of it."
+            )
         return draft_model.apply_markov_chain_logits(
-            gen_logits,
-            first_prev_tokens,
-            argmax_fn=argmax_fn,
-            vocab_slice=vocab_slice,
+            gen_logits, first_prev_tokens, tp_exchange=exchange
         )

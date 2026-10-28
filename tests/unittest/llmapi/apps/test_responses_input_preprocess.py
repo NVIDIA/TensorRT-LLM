@@ -20,13 +20,21 @@ them - carry the role on each item, and losing it silently turns the caller's
 question into an assistant turn.
 """
 
+import asyncio
+
 import pytest
 
+from tensorrt_llm.inputs.utils import MultimodalDataTracker
+from tensorrt_llm.serve.chat_utils import parse_chat_message_content
 from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
     _create_input_messages,
+    _get_chat_completion_function_tools,
+    _render_developer_as_system,
     _response_output_item_to_chat_completion_message,
+    _tool_resolution,
 )
+from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 
 # The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
 # test in the file is deselected, which pytest reports as exit code 5 and the
@@ -91,10 +99,11 @@ def test_role_defaults_to_assistant_when_absent():
     assert msg["role"] == "assistant"
 
 
-def test_empty_content_is_rejected():
+@pytest.mark.parametrize("content", [[], None])
+def test_empty_content_is_rejected(content):
     with pytest.raises(ValueError, match="empty or missing"):
         _response_output_item_to_chat_completion_message(
-            {"type": "message", "role": "user", "content": []}
+            {"type": "message", "role": "user", "content": content}
         )
 
 
@@ -393,3 +402,464 @@ def test_meaningful_values_survive_the_null_scrub():
     )
     assert request.temperature == 0.25
     assert request.tool_choice == "none"
+
+
+# ---------------------------------------------------------------------------
+# Item shapes beyond a list of text parts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "item, expected",
+    [
+        (
+            {"type": "message", "role": "user", "content": "hello"},
+            {"role": "user", "content": "hello"},
+        ),
+        ({"type": "message", "role": "user", "content": ""}, {"role": "user", "content": ""}),
+        (
+            {"type": "reasoning", "content": "thinking"},
+            {"role": "assistant", "reasoning": "thinking"},
+        ),
+        (
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "weighed it"}]},
+            {"role": "assistant", "reasoning": "weighed it"},
+        ),
+        ({"type": "reasoning", "summary": [], "encrypted_content": "gAAAAA"}, None),
+        ({"type": "output_text", "text": "hi"}, {"role": "assistant", "content": "hi"}),
+        (
+            {
+                "type": "agent_message",
+                "content": [
+                    {"type": "input_text", "text": "Payload:"},
+                    {"type": "encrypted_content", "encrypted_content": "write the file"},
+                    {"type": "encrypted_content", "encrypted_content": {"blob": "aGk="}},
+                    {"type": "encrypted_content", "encrypted_content": "gAAAAABo" + "Zm9v" * 16},
+                ],
+            },
+            {"role": "user", "content": "Payload:\nwrite the file"},
+        ),
+    ],
+)
+def test_item_text_is_read_from_every_shape_that_carries_it(item, expected):
+    assert _response_output_item_to_chat_completion_message(item) == expected
+
+
+@pytest.mark.parametrize("item_type", ["function_call_output", "custom_tool_call_output"])
+@pytest.mark.parametrize(
+    "output, expected",
+    [
+        (
+            [{"type": "input_text", "text": "ok"}, {"type": "input_text", "text": " done"}],
+            [{"type": "text", "text": "ok"}, {"type": "text", "text": " done"}],
+        ),
+        ("plain text", "plain text"),
+    ],
+)
+def test_tool_results_are_translated_to_chat_parts(item_type, output, expected):
+    msg = _response_output_item_to_chat_completion_message(
+        {"type": item_type, "call_id": "call_1", "output": output}
+    )
+    assert msg == {"role": "tool", "content": expected, "tool_call_id": "call_1"}
+
+
+def test_a_missing_custom_tool_result_is_empty():
+    msg = _response_output_item_to_chat_completion_message(
+        {"type": "custom_tool_call_output", "call_id": "call_4"}
+    )
+    assert msg["content"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Tools declared in an `additional_tools` input item
+# ---------------------------------------------------------------------------
+
+
+def _additional_tools_item(tools):
+    return {"type": "additional_tools", "role": "developer", "tools": tools}
+
+
+def _namespace(name, *functions):
+    return {
+        "type": "namespace",
+        "name": name,
+        "description": "",
+        "tools": [
+            {
+                "type": "function",
+                "name": f,
+                "description": "",
+                "parameters": {"type": "object", "properties": {}},
+            }
+            for f in functions
+        ],
+    }
+
+
+def test_additional_tools_are_hoisted_after_the_declared_tools():
+    request = ResponsesRequest(
+        model="m",
+        tools=[_namespace("existing", "a")],
+        input=[
+            _additional_tools_item([_namespace("collaboration", "spawn_agent")]),
+            {"role": "user", "content": "go"},
+        ],
+    )
+
+    assert [item.get("type") for item in request.input] == [None]
+    assert [t.name for t in request.tools] == ["existing", "collaboration"]
+    offered = [t.function.name for t in _get_chat_completion_function_tools(request.tools)]
+    assert offered == ["existing.a", "collaboration.spawn_agent"]
+    resolution = _tool_resolution(request.tools)
+    assert resolution["collaboration.spawn_agent"] == ("collaboration", "spawn_agent", False)
+    assert resolution["spawn_agent"] == ("collaboration", "spawn_agent", False)
+
+
+def test_a_malformed_additional_tools_item_is_not_hoisted():
+    request = {"model": "m", "input": [_additional_tools_item("not a list")], "tools": None}
+    assert ResponsesRequest.hoist_additional_tools(request) is request
+
+
+def test_calls_echoed_without_their_namespace_replay_under_the_offered_names():
+    """The Codex CLI may echo a namespaced call back without its namespace."""
+    functions = {
+        "type": "namespace",
+        "name": "functions",
+        "description": "",
+        "tools": [{"type": "custom", "name": "exec", "description": "Run code."}],
+    }
+    messages = _messages(
+        {
+            "input": [
+                _additional_tools_item([functions, _namespace("collaboration", "spawn_agent")]),
+                _message_item("user", "go"),
+                {"type": "custom_tool_call", "call_id": "call_1", "name": "exec", "input": "ls"},
+                {"type": "custom_tool_call_output", "call_id": "call_1", "output": "a.txt"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "spawn_agent",
+                    "arguments": "{}",
+                },
+                {"type": "function_call_output", "call_id": "call_2", "output": "started"},
+            ]
+        }
+    )
+    calls = [call["function"]["name"] for m in messages for call in m.get("tool_calls") or []]
+    assert calls == ["functions.exec", "collaboration.spawn_agent"]
+
+
+# ---------------------------------------------------------------------------
+# developer messages
+# ---------------------------------------------------------------------------
+
+
+class _TemplateTokenizer:
+    def __init__(self, template):
+        self.template = template
+
+    def get_chat_template(self, chat_template, tools=None):
+        return self.template
+
+
+_DEVELOPER_TURN = [{"role": "developer", "content": "brief"}, {"role": "user", "content": "q"}]
+
+
+def _template(body):
+    return _TemplateTokenizer("{% for m in messages %}" + body + "{% endfor %}")
+
+
+@pytest.mark.parametrize(
+    "tokenizer, role",
+    [
+        (_template("{% if m.role in ('system', 'user') %}{{ m.content }}{% endif %}"), "system"),
+        (
+            _template(
+                "{% if m.role in ('system', 'developer', 'user') %}{{ m.content }}{% endif %}"
+            ),
+            "developer",
+        ),
+        # Naming the role is not handling it.
+        (
+            _template(
+                "{% if m.role == 'developer' %}"
+                "{{ raise_exception('Unsupported role: developer') }}{% endif %}{{ m.content }}"
+            ),
+            "system",
+        ),
+        (
+            _TemplateTokenizer(
+                "{# developer messages are not supported #}{% for m in messages %}"
+                "{% if m.role != 'developer' %}{{ m.content }}{% endif %}{% endfor %}"
+            ),
+            "system",
+        ),
+        # A template that renders neither role tells nothing; the roles stay.
+        (_template("{{ m.content.missing.attribute }}"), "developer"),
+        (DeepseekV4Tokenizer.__new__(DeepseekV4Tokenizer), "developer"),
+    ],
+    ids=[
+        "no_developer_branch",
+        "developer_branch",
+        "rejects_developer",
+        "developer_only_in_a_comment",
+        "renders_neither",
+        "deepseek_v4",
+    ],
+)
+def test_developer_renders_as_system_only_where_the_template_lacks_it(tokenizer, role):
+    messages = _render_developer_as_system(_DEVELOPER_TURN, tokenizer, None, None)
+    assert [m["role"] for m in messages] == [role, "user"]
+    assert _DEVELOPER_TURN[0]["role"] == "developer"
+
+
+# ---------------------------------------------------------------------------
+# A multi-call assistant turn stays one assistant message, so the chat
+# template can bind each tool result to its call by id
+# ---------------------------------------------------------------------------
+
+
+def _function_call_item(index):
+    return {
+        "type": "function_call",
+        "id": f"fc_{index}",
+        "call_id": f"call_{index}",
+        "name": "exec",
+        "arguments": f'{{"cmd": "step {index}"}}',
+        "status": "completed",
+    }
+
+
+def _function_call_output_item(index):
+    return {"type": "function_call_output", "call_id": f"call_{index}", "output": f"result {index}"}
+
+
+def test_calls_from_one_turn_become_one_assistant_message():
+    messages = _messages(
+        {
+            "input": [
+                _message_item("user", "run the plan"),
+                {
+                    "id": "msg_a",
+                    "status": "completed",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Running.", "annotations": []}],
+                },
+                *[_function_call_item(i) for i in range(3)],
+                *[_function_call_output_item(i) for i in range(3)],
+            ]
+        }
+    )
+
+    assert [m["role"] for m in messages] == ["user", "assistant"] + ["tool"] * 3
+    assert messages[1]["content"] == "Running."
+    assert [c["id"] for c in messages[1]["tool_calls"]] == ["call_0", "call_1", "call_2"]
+    assert [m["tool_call_id"] for m in messages[2:]] == ["call_0", "call_1", "call_2"]
+
+
+@pytest.mark.parametrize(
+    "between",
+    [_function_call_output_item(0), _message_item("user", "also do this")],
+    ids=["tool_result", "user_message"],
+)
+def test_a_turn_in_between_ends_the_assistant_message(between):
+    messages = _messages({"input": [_function_call_item(0), between, _function_call_item(1)]})
+    assert [len(m.get("tool_calls") or []) for m in messages] == [1, 0, 1]
+
+
+def test_calls_fold_onto_a_reasoning_message():
+    messages = _messages(
+        {
+            "input": [
+                {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "plan"}]},
+                _function_call_item(0),
+                _function_call_item(1),
+            ]
+        }
+    )
+    assert len(messages) == 1
+    assert messages[0]["reasoning"] == "plan"
+    assert [c["id"] for c in messages[0]["tool_calls"]] == ["call_0", "call_1"]
+
+
+def test_folding_leaves_the_request_unchanged():
+    request = ResponsesRequest(
+        model="m",
+        input=[{"role": "assistant", "content": "Running."}, _function_call_item(0)],
+    )
+    for _ in range(2):
+        messages = asyncio.run(_create_input_messages(request=request, prev_msgs=[]))
+        assert [c["id"] for c in messages[0]["tool_calls"]] == ["call_0"]
+    assert "tool_calls" not in request.input[0]
+
+
+def test_calls_never_fold_into_replayed_history():
+    request = ResponsesRequest(model="m", input=[_function_call_item(0)])
+    history = [{"role": "assistant", "content": "a stored turn"}]
+    messages = asyncio.run(_create_input_messages(request=request, prev_msgs=history))
+
+    assert messages[0] == {"role": "assistant", "content": "a stored turn"}
+    assert [c["id"] for c in messages[1]["tool_calls"]] == ["call_0"]
+
+
+# Multimodal content
+# ---------------------------------------------------------------------------
+
+_IMAGE_URL = "data:image/png;base64,iVBORw0KGgo="
+_QUESTION = {"type": "input_text", "text": "What is in this image?"}
+
+
+def _user_item(*parts, typed=True):
+    item = {"role": "user", "content": list(parts)}
+    if typed:
+        item["type"] = "message"
+    return item
+
+
+@pytest.mark.parametrize("typed", [True, False], ids=["message", "untyped"])
+def test_input_image_becomes_a_chat_image_part(typed):
+    """The image has to reach the chat parser, where the client placed it.
+
+    Keeping only the text parts left the model answering about an image it
+    never received.
+    """
+    image = {"type": "input_image", "image_url": _IMAGE_URL, "detail": "auto"}
+    msg = _response_output_item_to_chat_completion_message(
+        _user_item(_QUESTION, image, typed=typed)
+    )
+    assert msg == {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What is in this image?"},
+            {"type": "image_url", "image_url": {"url": _IMAGE_URL, "detail": "auto"}},
+        ],
+    }
+
+
+def _chat_text(message):
+    """The prompt text the chat parser reads from a converted message."""
+    return parse_chat_message_content(message, MultimodalDataTracker("llama"))["content"]
+
+
+def test_untyped_input_text_becomes_chat_text_parts():
+    """input_text parts are not chat parts; passed through, the chat parser rejects them."""
+    msg = _response_output_item_to_chat_completion_message(
+        _user_item(
+            {"type": "input_text", "text": "hello"},
+            {"type": "input_text", "text": "there"},
+            typed=False,
+        )
+    )
+    assert msg == {
+        "role": "user",
+        "content": [{"type": "text", "text": "hello"}, {"type": "text", "text": "there"}],
+    }
+    assert _chat_text(msg) == "hello\nthere"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [{"type": "text", "text": "First"}, {"type": "text", "text": "Second"}],
+        ["First", "Second"],
+    ],
+    ids=["text-parts", "string-parts"],
+)
+def test_untyped_chat_content_reads_as_in_a_chat_request(content):
+    """Chat-style parts are left for the chat parser, which joins them by line.
+
+    Converting them as Responses parts glued the text parts together and
+    dropped the plain strings, which changed or erased the prompt.
+    """
+    item = {"role": "user", "content": content}
+    msg = _response_output_item_to_chat_completion_message(item)
+    assert msg == item
+    assert _chat_text(msg) == "First\nSecond"
+    (message,) = _messages({"input": [item]})
+    assert _chat_text(message) == "First\nSecond"
+
+
+def test_typed_message_keeps_plain_string_parts():
+    """A plain string is a text part; skipping it erased the prompt without an error."""
+    item = _user_item("first ", {"type": "input_text", "text": "second"})
+    assert _response_output_item_to_chat_completion_message(item) == {
+        "role": "user",
+        "content": "first second",
+    }
+    assert _messages({"input": [item]}) == [{"role": "user", "content": "first second"}]
+
+
+def test_typed_message_keeps_plain_string_parts_beside_media():
+    image = {"type": "input_image", "image_url": _IMAGE_URL}
+    item = _user_item("Describe it.", image)
+    expected = [
+        {"type": "text", "text": "Describe it."},
+        {"type": "image_url", "image_url": {"url": _IMAGE_URL}},
+    ]
+    assert _response_output_item_to_chat_completion_message(item)["content"] == expected
+    assert _messages({"input": [item]}) == [{"role": "user", "content": expected}]
+
+
+@pytest.mark.parametrize(
+    "part", [42, {"type": "input_video", "video_id": "v-1"}], ids=["non-dict", "unknown-dict"]
+)
+def test_typed_message_rejects_a_part_without_text(part):
+    with pytest.raises(ValueError, match="Unsupported message content part"):
+        _response_output_item_to_chat_completion_message(_user_item(_QUESTION, part))
+
+
+def test_replayed_refusal_is_skipped():
+    """A refusal in a replayed assistant turn has no text for the model, and must not fail the request."""
+    item = {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "refusal", "refusal": "I can't help with that."}],
+    }
+    assert _response_output_item_to_chat_completion_message(item) == {
+        "role": "assistant",
+        "content": "",
+    }
+
+
+def test_input_image_accepts_the_chat_url_object():
+    image = {"type": "input_image", "image_url": {"url": _IMAGE_URL}}
+    msg = _response_output_item_to_chat_completion_message(_user_item(_QUESTION, image))
+    assert msg["content"][1] == {"type": "image_url", "image_url": {"url": _IMAGE_URL}}
+
+
+def test_chat_style_media_parts_pass_through():
+    image = {"type": "image_url", "image_url": {"url": _IMAGE_URL}}
+    msg = _response_output_item_to_chat_completion_message(
+        _user_item({"type": "text", "text": "Describe it."}, image, typed=False)
+    )
+    assert msg["content"] == [{"type": "text", "text": "Describe it."}, image]
+
+
+def test_input_image_without_a_url_is_rejected():
+    """A file_id cannot be resolved here, and dropping the image is worse than failing."""
+    image = {"type": "input_image", "file_id": "file-123", "detail": "auto"}
+    with pytest.raises(ValueError, match="file_id"):
+        _response_output_item_to_chat_completion_message(_user_item(_QUESTION, image))
+
+
+def test_input_file_is_rejected():
+    document = {"type": "input_file", "filename": "spec.pdf", "file_data": "JVBERi0="}
+    with pytest.raises(ValueError, match="input_file"):
+        _response_output_item_to_chat_completion_message(_user_item(_QUESTION, document))
+
+
+@pytest.mark.parametrize("image_part", [{"detail": "auto"}, {}], ids=["detail", "no-detail"])
+def test_image_request_reaches_the_chat_messages(image_part):
+    """The OpenAI SDK sends an untyped user item; the image must survive validation."""
+    image = {"type": "input_image", "image_url": _IMAGE_URL, **image_part}
+    messages = _messages({"input": [_user_item(_QUESTION, image, typed=False)]})
+    assert messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                {"type": "image_url", "image_url": {"url": _IMAGE_URL, **image_part}},
+            ],
+        }
+    ]

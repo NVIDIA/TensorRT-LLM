@@ -1119,7 +1119,24 @@ def _qsa_paged_index_scores_kernel(
     BLOCK_N: tl.constexpr,
     TILES_PER_PROGRAM: tl.constexpr,
     ONLY_VISIBLE_BLOCKS: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
+    PREFETCH: tl.constexpr = False,
 ):
+    if PREFETCH:
+        # One tile a program: its pages and keys are read before the wait (see
+        # ``triton_qsa_paged_index_scores``), q after it.
+        tl.static_assert(USE_PDL and TILES_PER_PROGRAM == 1 and ONLY_VISIBLE_BLOCKS)
+        _qsa_paged_index_scores_prefetch_tile(
+            q, index_cache, block_table, query_positions, request_indices, output, score_scale,
+            q_stride_row, q_stride_head, q_stride_dim, cache_stride_page, cache_stride_token,
+            cache_stride_dim, block_table_stride_request, block_table_stride_page,
+            output_stride_row, output_stride_block, NUM_INDEX_HEADS, INDEX_HEAD_DIM, BLOCK_D,
+            TOKENS_PER_BLOCK, COMPRESS_RATIO, MAX_COMPRESSED_BLOCKS, BLOCK_H, BLOCK_N,
+        )  # fmt: skip
+        return
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     request = tl.load(request_indices + row).to(tl.int64)
     query_position = tl.load(query_positions + row)
@@ -1189,6 +1206,95 @@ def _qsa_paged_index_scores_kernel(
 
 
 @triton.jit
+def _qsa_paged_index_scores_prefetch_tile(
+    q,
+    index_cache,
+    block_table,
+    query_positions,
+    request_indices,
+    output,
+    score_scale,
+    q_stride_row: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    q_stride_dim: tl.constexpr,
+    cache_stride_page: tl.constexpr,
+    cache_stride_token: tl.constexpr,
+    cache_stride_dim: tl.constexpr,
+    block_table_stride_request: tl.constexpr,
+    block_table_stride_page: tl.constexpr,
+    output_stride_row: tl.constexpr,
+    output_stride_block: tl.constexpr,
+    NUM_INDEX_HEADS: tl.constexpr,
+    INDEX_HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    TOKENS_PER_BLOCK: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    MAX_COMPRESSED_BLOCKS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """One generation row's tile of visible compressed blocks under PDL, its static
+    operands read before ``gdc_wait``: the row's metadata, the tile's pages and every
+    key but the one a decode step's own prologue may have just written -- the last
+    visible block's, compressed at its anchor when the row's position ends a group --
+    which is read again after the wait, with q."""
+    tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0)
+    request = tl.load(request_indices + row).to(tl.int64)
+    query_position = tl.load(query_positions + row)
+    visible_blocks = (query_position + 1) // COMPRESS_RATIO
+    first_tile = tl.program_id(1)
+    if first_tile * BLOCK_N >= visible_blocks:
+        tl.extra.cuda.gdc_wait()
+        return
+    dim_offsets = tl.arange(0, BLOCK_D)
+    head_offsets = tl.arange(0, BLOCK_H)
+    block_columns = first_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    valid_blocks = (block_columns < MAX_COMPRESSED_BLOCKS) & (block_columns < visible_blocks)
+    anchor_positions = block_columns * COMPRESS_RATIO + COMPRESS_RATIO - 1
+    logical_pages = anchor_positions // TOKENS_PER_BLOCK
+    token_in_page = anchor_positions % TOKENS_PER_BLOCK
+    physical_pages = tl.load(
+        block_table
+        + request * block_table_stride_request
+        + logical_pages * block_table_stride_page,
+        mask=valid_blocks,
+        other=0,
+    ).to(tl.int64)
+    key_ptrs = (
+        index_cache
+        + physical_pages[:, None] * cache_stride_page
+        + token_in_page[:, None] * cache_stride_token
+        + dim_offsets[None, :] * cache_stride_dim
+    )
+    key_mask = valid_blocks[:, None] & (dim_offsets[None, :] < INDEX_HEAD_DIM)
+    keys = tl.load(key_ptrs, mask=key_mask, other=0.0, eviction_policy="evict_first")
+    tl.extra.cuda.gdc_wait()
+    fresh = (block_columns == visible_blocks - 1) & ((query_position + 1) % COMPRESS_RATIO == 0)
+    keys = tl.where(
+        fresh[:, None], tl.load(key_ptrs, mask=key_mask & fresh[:, None], other=0.0), keys
+    )
+    query_values = tl.load(
+        q
+        + row * q_stride_row
+        + dim_offsets[:, None] * q_stride_dim
+        + head_offsets[None, :] * q_stride_head,
+        mask=(dim_offsets[:, None] < INDEX_HEAD_DIM) & (head_offsets[None, :] < NUM_INDEX_HEADS),
+        other=0.0,
+    )
+    per_head_scores = tl.dot(keys, query_values, out_dtype=tl.float32)
+    scores = tl.sum(
+        tl.where(head_offsets[None, :] < NUM_INDEX_HEADS, tl.maximum(per_head_scores, 0.0), 0.0),
+        axis=1,
+    )
+    tl.store(
+        output + row * output_stride_row + block_columns * output_stride_block,
+        scores * score_scale,
+        mask=valid_blocks,
+    )
+
+
+@triton.jit
 def _qsa_paged_index_scores_qtile_kernel(
     q,
     index_cache,
@@ -1248,6 +1354,11 @@ def _qsa_paged_index_scores_qtile_kernel(
         other=0.0,
     )
     column_offsets = tl.arange(0, BLOCK_N)
+    # Each tile row's (lane's) visible bound, indexed by lane instead of by column.
+    lane_rows = row_base + tl.arange(0, QUERY_TILE)
+    lane_present = lane_rows < num_rows
+    lane_positions = tl.load(query_positions + lane_rows, mask=lane_present, other=0)
+    lane_visible = tl.where(lane_present, (lane_positions + 1) // COMPRESS_RATIO, 0)
 
     # A gather is only shareable across rows that page through the same block
     # table, so score one request at a time. Context rows arrive packed per
@@ -1266,6 +1377,10 @@ def _qsa_paged_index_scores_qtile_kernel(
         request = tl.max(tl.where(dot_columns == leader, requests, 0))
         group = pending & (requests == request)
         pending = pending & (requests != request)
+        # The lanes whose columns are in this group (none on a pass past the last group).
+        lane_group = (
+            tl.max(tl.reshape(group.to(tl.int32), [QUERY_TILE, NUM_INDEX_HEADS]), axis=1) > 0
+        )
         group_visible = tl.max(tl.where(group, visible_blocks, 0))
         last_tile = tl.minimum(
             first_tile + TILES_PER_PROGRAM,
@@ -1300,37 +1415,34 @@ def _qsa_paged_index_scores_qtile_kernel(
                 tl.dot(keys, query_values, out_dtype=tl.float32),
                 0.0,
             )
-            for lane in tl.static_range(QUERY_TILE):
-                row_columns = group & (column_row == lane)
-                scored = tl.max(row_columns.to(tl.int32)) > 0
-                row_visible = tl.max(tl.where(row_columns, visible_blocks, 0))
-                scores = tl.sum(
-                    tl.where(row_columns[None, :], positive_scores, 0.0),
-                    axis=1,
+            # Each row's heads are adjacent dot columns: sum them per row.
+            scores = tl.sum(
+                tl.reshape(positive_scores, [BLOCK_N, QUERY_TILE, NUM_INDEX_HEADS]), axis=2
+            )
+            output_ptrs = (
+                output
+                + lane_rows[None, :] * output_stride_row
+                + block_columns[:, None] * output_stride_block
+            )
+            row_valid = block_columns[:, None] < lane_visible[None, :]
+            if ONLY_VISIBLE_BLOCKS:
+                tl.store(
+                    output_ptrs,
+                    scores * score_scale,
+                    mask=lane_group[None, :] & row_valid,
                 )
-                output_ptrs = (
-                    output
-                    + (row_base + lane) * output_stride_row
-                    + block_columns * output_stride_block
+            else:
+                tl.store(
+                    output_ptrs,
+                    tl.where(row_valid, scores * score_scale, -float("inf")),
+                    mask=lane_group[None, :] & (block_columns[:, None] < MAX_COMPRESSED_BLOCKS),
                 )
-                row_valid = block_columns < row_visible
-                if ONLY_VISIBLE_BLOCKS:
-                    tl.store(
-                        output_ptrs,
-                        scores * score_scale,
-                        mask=scored & row_valid,
-                    )
-                else:
-                    tl.store(
-                        output_ptrs,
-                        tl.where(row_valid, scores * score_scale, -float("inf")),
-                        mask=scored & (block_columns < MAX_COMPRESSED_BLOCKS),
-                    )
 
 
-# ``tl.dot`` needs at least 16 columns on SM90+, so a narrower model dimension
-# leaves the rest of every tensor-core tile computed and discarded.
-_INDEX_SCORE_TILE_WIDTH = 16
+# Dot columns of a context-row index-scoring tile: whole query rows of
+# ``num_index_heads`` columns each. A wide tile serves more rows with each
+# gathered key tile (``tl.dot`` needs at least 16 columns on SM90+).
+_INDEX_SCORE_TILE_WIDTH = 128
 
 
 def _qsa_index_scores_query_tile(num_index_heads: int) -> int:
@@ -1358,6 +1470,8 @@ def triton_qsa_paged_index_scores(
     compress_ratio: int,
     only_visible_blocks: bool = False,
     context_rows: bool = False,
+    use_pdl: bool = False,
+    prefetch: bool = False,
 ) -> torch.Tensor:
     """Score compressed keys directly in the paged side cache.
 
@@ -1368,6 +1482,17 @@ def triton_qsa_paged_index_scores(
     ``context_rows`` declares that consecutive rows mostly share a request, so
     one gather of compressed keys can serve a tile of query rows. Generation
     batches hold one row per request and would only lose parallelism.
+
+    ``use_pdl`` launches the generation-row kernel with programmatic dependent
+    launch: it waits for its predecessor before its first read and releases its
+    dependents at once, so every dependent must itself wait before reading the
+    scores.
+
+    ``prefetch`` (with ``use_pdl``, ``only_visible_blocks`` and generation-sized
+    batches) reads the pages and compressed keys before the wait: sound only when the
+    predecessor writes no compressed key but, at a row whose position ends a group, the
+    last visible block's -- the decode step's own K/V-and-index prologue -- which is
+    read again after the wait.
     """
     if q.ndim != 3:
         raise ValueError("QSA index queries must have shape [rows, heads, dim]")
@@ -1401,10 +1526,12 @@ def triton_qsa_paged_index_scores(
     )
     if rows == 0:
         return output
-    # Decode favors many narrow score tiles; large prefill batches reuse each
-    # query across a deeper column range to reduce launch and gather overhead.
+    # A decode batch of a few rows favors many narrow score tiles; past that,
+    # each program's fixed cost (the query load, the page lookups) is spread
+    # over a wider tile. Large prefill batches also reuse each query across a
+    # deeper column range to reduce launch and gather overhead.
     is_prefill_sized = rows > 256
-    block_n = 64 if is_prefill_sized else 8
+    block_n = 64 if rows > 4 else 8
     tiles_per_program = 8 if is_prefill_sized else 1
     query_tile = 1
     if context_rows and is_prefill_sized:
@@ -1412,7 +1539,7 @@ def triton_qsa_paged_index_scores(
     if query_tile > 1:
         # Row packing reduces the grid, so each program walks a deeper column
         # range to retain enough work per launch.
-        tiles_per_program = 32
+        tiles_per_program = 8
         grid = (
             triton.cdiv(rows, query_tile),
             triton.cdiv(max_compressed_blocks, block_n * tiles_per_program),
@@ -1488,7 +1615,10 @@ def triton_qsa_paged_index_scores(
         BLOCK_N=block_n,
         TILES_PER_PROGRAM=tiles_per_program,
         ONLY_VISIBLE_BLOCKS=only_visible_blocks,
+        USE_PDL=use_pdl,
+        PREFETCH=prefetch and use_pdl and tiles_per_program == 1 and only_visible_blocks,
         num_warps=2,
+        launch_pdl=use_pdl,
     )
     return output
 
@@ -2178,6 +2308,7 @@ def _qsa_mtp_reuse_topk_kernel(
     visible_ptr,
     out_ptr,
     BLOCK_TOPK: tl.constexpr,
+    DISPLACE_OLDEST: tl.constexpr,
 ):
     """Rebuild a query row's selection from its request's captured row.
 
@@ -2185,6 +2316,10 @@ def _qsa_mtp_reuse_topk_kernel(
     groups that completed afterwards are written on top of it. They are always
     larger than every captured ID, because the capture's Top-K searched only
     ``[0, captured_visible)``, so the row never gains a duplicate.
+
+    A full row has no room for them: they take the slots of the row's last IDs,
+    or with ``DISPLACE_OLDEST`` the survivors shift to the front and they take
+    the slots after them, which for an ascending row displaces its smallest IDs.
     """
     row = tl.program_id(0)
     request = tl.load(request_ptr + row).to(tl.int32)
@@ -2197,8 +2332,16 @@ def _qsa_mtp_reuse_topk_kernel(
     # Valid captured IDs form a prefix; the rest is -1 padding.
     filled = tl.sum((values >= 0).to(tl.int32))
     fresh = tl.minimum(tl.maximum(current - captured, 0), BLOCK_TOPK)
-    # Append after the prefix when there is room, otherwise displace its tail.
+    # Append after the prefix when there is room, otherwise displace its tail, or its head
+    # (the survivors shifted to the front) with DISPLACE_OLDEST.
     start = tl.minimum(filled, BLOCK_TOPK - fresh)
+    if DISPLACE_OLDEST:
+        source = slots + (filled - start)
+        values = tl.load(
+            shared_ptr + request.to(tl.int64) * BLOCK_TOPK + source,
+            mask=source < BLOCK_TOPK,
+            other=-1,
+        )
     offset = slots - start
     is_fresh = (offset >= 0) & (offset < fresh)
     values = tl.where(is_fresh, (captured + offset).to(values.dtype), values)
@@ -2212,8 +2355,13 @@ def triton_qsa_mtp_reuse_topk(
     request_indices: torch.Tensor,
     visible_blocks: torch.Tensor,
     output: torch.Tensor,
+    displace_oldest: bool = False,
 ) -> torch.Tensor:
-    """Expand captured per-request selections back to per-query-row selections."""
+    """Expand captured per-request selections back to per-query-row selections.
+
+    ``displace_oldest`` is for captured rows in ascending order: a full row gives up
+    its first IDs, rather than its last, to the groups completed since the capture.
+    """
     rows, block_topk = output.shape
     if shared_indices.shape[1] != block_topk:
         raise ValueError(
@@ -2239,6 +2387,7 @@ def triton_qsa_mtp_reuse_topk(
         visible_blocks,
         output,
         BLOCK_TOPK=block_topk,
+        DISPLACE_OLDEST=displace_oldest,
         num_warps=4,
     )
     return output

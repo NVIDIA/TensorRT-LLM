@@ -1,0 +1,17 @@
+# Wan-AI/Wan2.2-TI2V-5B-Diffusers  ·  WanPipeline  ·  t2v
+# guidance_scale · max_sequence_length: _WAN22_5B_PARAMS defaults.
+backend: openai-videos
+
+common_params:
+  width: 1280
+  height: 704
+  num_frames: 121
+  frame_rate: 24.0
+  num_inference_steps: 50
+  guidance_scale: 5.0
+  max_sequence_length: 512
+  seed: 42
+
+# Prompt verbatim from test_wan22_ti2v_5b_pipeline.py's `PROMPT` -- this model's own.
+requests:
+  - prompt: "A cat sitting on a sunny windowsill watching birds outside."

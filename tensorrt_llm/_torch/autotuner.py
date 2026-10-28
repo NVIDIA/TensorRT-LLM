@@ -33,6 +33,11 @@ from cuda.bindings import driver
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.nccl_window_graph import (
+    abandon_nccl_window_graph_owner, nccl_window_graph_capture,
+    release_nccl_window_graph_owner)
+from tensorrt_llm._torch.nccl_window_tensor_scope import \
+    nccl_window_tensor_scope
 from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
                                                     record_global_timer)
@@ -1327,6 +1332,22 @@ class AutoTuner:
         tuning_config: TuningConfig,
         **kwargs,
     ) -> float:
+        with nccl_window_tensor_scope(input_tensors) as scope:
+            scope.escape(input_tensors)
+            if tuning_config.inputs_pre_hook is not None:
+                input_tensors = tuning_config.inputs_pre_hook(input_tensors)
+            return self._profile_runners_impl(custom_op, runners, input_tensors,
+                                              profile, tuning_config, **kwargs)
+
+    def _profile_runners_impl(
+        self,
+        custom_op: str,
+        runners: List[TunableRunner],
+        input_tensors: List[torch.Tensor],
+        profile: OptimizationProfile,
+        tuning_config: TuningConfig,
+        **kwargs,
+    ) -> float:
         """Profile runners and select the best tactic.
 
         For multi-rank profiling, only rank 0 performs the actual profiling
@@ -1337,10 +1358,6 @@ class AutoTuner:
         min_time = float('inf')
         has_tuning_failure_occurred = False
         best_runner_id, best_tactic = None, None
-        # If the inputs_pre_hook is provided, it will be called before profiling.
-        if tuning_config.inputs_pre_hook is not None:
-            input_tensors = tuning_config.inputs_pre_hook(input_tensors)
-
         # Pre-walk the runners so we know the total candidate (runner, tactic)
         # pair count before deciding whether to short-circuit profiling. The
         # count is taken BEFORE distributed-strategy splitting; the PARALLEL
@@ -1382,7 +1399,8 @@ class AutoTuner:
                 runner(input_tensors, tactic=-1, do_preparation=True, **kwargs)
             try:
                 with nvtx_range(f"r{runner_id}, tactic {tac} (single-pair)"):
-                    runner(input_tensors, tactic=tac, **kwargs)
+                    self._run_profile_runner(runner, input_tensors, tac,
+                                             **kwargs)
                 best_runner_id, best_tactic = runner_id, tac
                 # No comparable measurement exists; min_time stays 0.0 to
                 # distinguish "recorded without profiling" from a real
@@ -1511,6 +1529,17 @@ class AutoTuner:
 
         return best_runner_id, best_tactic, min_time, has_tuning_failure_occurred
 
+    @staticmethod
+    def _run_profile_runner(runner: TunableRunner, inputs: List[torch.Tensor],
+                            tactic: Any, **kwargs) -> None:
+        with nccl_window_tensor_scope(inputs) as scope:
+            try:
+                runner(inputs, tactic=tactic, **kwargs)
+            finally:
+                # Profiling inputs outlive each candidate run; everything newly
+                # allocated by the runner is an internal, discarded result.
+                scope.escape(inputs)
+
     def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
 
         # Handle None tensors for optional inputs and non-Tensor scalar values
@@ -1558,6 +1587,24 @@ class AutoTuner:
         def pure_profile(stream: torch.cuda.Stream, repeat: int):
             graph = torch.cuda.CUDAGraph()
 
+            @contextlib.contextmanager
+            def graph_pool_lifetime():
+                if not use_cuda_graph:
+                    yield None
+                    return
+                graph_pool = torch.cuda.graph_pool_handle()
+                completed = False
+                try:
+                    yield graph_pool
+                    completed = True
+                finally:
+                    graph.reset()
+                    if completed:
+                        release_nccl_window_graph_owner(graph_pool)
+                    else:
+                        # Local profiling failures need not occur on every rank.
+                        abandon_nccl_window_graph_owner(graph_pool)
+
             if self._use_global_timer:
                 start_ts = torch.empty(1, dtype=torch.int64, device='cuda')
                 end_ts = torch.empty(1, dtype=torch.int64, device='cuda')
@@ -1585,14 +1632,15 @@ class AutoTuner:
                 def elapsed_time():
                     return start_evt.elapsed_time(end_evt)
 
-            with torch.cuda.stream(stream):
+            with graph_pool_lifetime() as graph_pool, torch.cuda.stream(stream):
                 if use_cuda_graph:
-                    with torch.cuda.graph(graph):
+                    with nccl_window_graph_capture(graph, graph_pool):
                         for r in range(repeat):
-                            runner(
+                            self._run_profile_runner(
+                                runner,
                                 input_tensor_batches[r %
                                                      len(input_tensor_batches)],
-                                tactic=tactic,
+                                tactic,
                                 **kwargs,
                             )
 
@@ -1613,9 +1661,10 @@ class AutoTuner:
                     graph.replay()
                 else:
                     for r in range(repeat):
-                        runner(
+                        self._run_profile_runner(
+                            runner,
                             input_tensor_batches[r % len(input_tensor_batches)],
-                            tactic=tactic,
+                            tactic,
                             **kwargs,
                         )
 
@@ -1626,7 +1675,8 @@ class AutoTuner:
 
         # warm up, no timing
         for _ in range(self.warmup):
-            runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
+            self._run_profile_runner(runner, input_tensor_batches[-1], tactic,
+                                     **kwargs)
 
         fewer_repeat_avg_time = pure_profile(stream, profile_fewer_repeat)
 
@@ -2059,25 +2109,41 @@ class AutoTuner:
             f"[AutoTuner] Whether using distributed tuning: {self._is_distributed()}"
         )
 
+    def _tuning_group(self) -> Tuple[int, int]:
+        """Return ``(size, index)`` of this rank's tuning group.
+
+        The group is the TP group. Helix CP ranks run the same SPMD forward
+        on the same token batch, so Helix adds the CP ranks too. Otherwise a
+        Helix generation worker with ``tp_size == 1`` would profile every
+        tactic on every CP rank. The index matches the TP-major, CP-minor
+        order of ``Distributed.tp_cp_allgather``, which merges the results.
+        """
+        if self.mapping is None:
+            return 1, 0
+        size = self.mapping.tp_size
+        index = self.mapping.tp_rank
+        if self.mapping.has_cp_helix():
+            size *= self.mapping.cp_size
+            index = index * self.mapping.cp_size + self.mapping.cp_rank
+        return size, index
+
     def _is_distributed(self) -> bool:
         """Check if we're in a distributed environment."""
-        return self.mapping is not None and self.mapping.tp_size > 1 and self._dist is not None
+        return self._dist is not None and self._tuning_group()[0] > 1
 
     def _maybe_parallelize_tactics(
             self, all_valid_tactics: List[Any],
             strategy: DistributedTuningStrategy) -> List[Any]:
-        """Parallelize tactics across all TP ranks if strategy is PARALLEL."""
+        """Split tactics across the tuning group if strategy is PARALLEL."""
         if strategy == DistributedTuningStrategy.PARALLEL and self._is_distributed(
         ):
-            # only distribute across TP ranks
-            # each TP rank will only tune the tactics that are assigned to it
-            tp_size = self.mapping.tp_size
-            tp_rank = self.mapping.tp_rank
-            valid_tactics = []
-            for idx, tactic in enumerate(all_valid_tactics):
-                if idx % tp_size == tp_rank:
-                    valid_tactics.append(tactic)
-            return valid_tactics
+            # Each rank of the tuning group only tunes its share of tactics;
+            # _merge_cache_data then keeps the fastest across the group.
+            group_size, group_index = self._tuning_group()
+            return [
+                tactic for idx, tactic in enumerate(all_valid_tactics)
+                if idx % group_size == group_index
+            ]
         else:
             return all_valid_tactics
 

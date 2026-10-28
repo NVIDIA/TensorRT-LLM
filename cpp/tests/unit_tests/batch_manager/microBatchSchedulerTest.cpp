@@ -66,9 +66,7 @@ protected:
             /*multimodalHashes=*/std::nullopt, /*multimodalPos=*/std::nullopt, /*multimodalLength=*/std::nullopt,
             /*multimodalUuids=*/std::nullopt,
             /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-            /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
-            /*returnLogProbs=*/false,
-            /*returnContextLogits=*/false, /*returnGenerationLogits=*/false, draftTokens);
+            /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, draftTokens);
     }
 
     RequestTable forward(

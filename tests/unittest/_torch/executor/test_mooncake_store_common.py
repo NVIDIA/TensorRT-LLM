@@ -16,7 +16,7 @@
 
 Covers how a block of tokens becomes a store key, how the JSON config is read,
 the address a rank registers its segment under, and the pinned host slots
-every page passes through.
+pages pass through where GPUDirect RDMA is unavailable.
 
 Runs without a Mooncake installation: the store handle is replaced by an
 in-process fake that records what it was handed.
@@ -168,6 +168,17 @@ def test_hash_chain_separates_cache_salts():
     assert salted[0] != other[0]
 
 
+def test_reuse_scope_distinguishes_absent_empty_and_zero_salts():
+    """Salt equality is exact: no salt, an empty salt and "0" are three scopes."""
+    seeds = {
+        ReuseScope().seed(),
+        ReuseScope(cache_salt="").seed(),
+        ReuseScope(cache_salt="0").seed(),
+        ReuseScope(cache_salt="\x00").seed(),
+    }
+    assert len(seeds) == 4
+
+
 def test_reuse_scope_fields_cannot_be_confused_for_one_another():
     """A scope's seed reads its fields apart, however their bytes line up.
 
@@ -242,16 +253,17 @@ def set_pool_setting(store_config, **settings):
 
 
 def test_config_reads_sizes_and_staging_from_the_json(store_config):
-    """Sizes arrive as unit strings, and every page is staged through host."""
+    """Sizes arrive as unit strings, and staging is off until the JSON asks."""
     config = resolve_config()
     assert config.global_segment_size == 1024**3
     assert config.local_buffer_size == 256 * 1024**2
     assert config.role is StoreRole.BOTH
     assert config.resolve_model_key("/models/ignored") == "test-model"
-    assert config.stage_through_host is True
+    assert config.stage_through_host is False
 
-    # A config asking for the unsupported path is served by staging anyway.
-    set_pool_setting(store_config, stage_through_host=False)
+    raw = json.loads(store_config.read_text())
+    raw["stage_through_host"] = True
+    store_config.write_text(json.dumps(raw))
 
     config = resolve_config()
     assert config.stage_through_host is True

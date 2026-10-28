@@ -18,6 +18,8 @@ from _torch.executor.kv_cache.test_kv_cache_v2_scheduler import (
 )
 
 from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -431,13 +433,13 @@ def test_idle_execution_reuses_retained_row_without_changing_semantic_batch(
 ) -> None:
     dummy = object()
     runner = SimpleNamespace(padding_dummy_requests={0: dummy})
-    engine = SimpleNamespace(cuda_graph_runner=runner)
+    graphs = SimpleNamespace(cuda_graph_runner=runner)
     semantic_batch = ScheduledRequests()
     semantic_batch.attention_dp_phase = phase
     semantic_batch.is_attention_dp_phase_idle = True
 
     for _ in range(2):
-        execution_batch = DecoderRunner._get_attention_dp_execution_batch(engine, semantic_batch)
+        execution_batch = DecoderCudaGraphs.attention_dp_execution_batch(graphs, semantic_batch)
         assert execution_batch is not semantic_batch
         assert execution_batch.generation_requests == [dummy]
         assert execution_batch.attention_dp_phase is phase
@@ -449,15 +451,15 @@ def test_idle_execution_reuses_retained_row_without_changing_semantic_batch(
 
 
 def test_idle_execution_refuses_missing_row_or_nonempty_semantic_batch() -> None:
-    engine = SimpleNamespace(cuda_graph_runner=SimpleNamespace(padding_dummy_requests={}))
+    graphs = SimpleNamespace(cuda_graph_runner=SimpleNamespace(padding_dummy_requests={}))
     batch = ScheduledRequests()
     batch.is_attention_dp_phase_idle = True
     with pytest.raises(RuntimeError, match="execution row is missing"):
-        DecoderRunner._get_attention_dp_execution_batch(engine, batch)
+        DecoderCudaGraphs.attention_dp_execution_batch(graphs, batch)
     for bucket in (batch.generation_requests, batch.encoder_requests):
         bucket.append(object())
         with pytest.raises(ValueError, match="semantically empty"):
-            DecoderRunner._get_attention_dp_execution_batch(engine, batch)
+            DecoderCudaGraphs.attention_dp_execution_batch(graphs, batch)
         bucket.clear()
 
 
@@ -476,7 +478,7 @@ def test_semantic_outputs_hide_execution_row_and_preserve_retained_graph_outputs
     assert restored["hidden_states"] is outputs["hidden_states"]
     assert (restored is outputs) is not idle
     if not idle:
-        assert DecoderRunner._get_attention_dp_execution_batch(object(), batch) is batch
+        assert DecoderCudaGraphs.attention_dp_execution_batch(object(), batch) is batch
 
 
 def test_context_phase_disables_graph_for_real_work_and_idle_rows() -> None:
@@ -505,12 +507,12 @@ def test_decode_graph_requirement_uses_token_count_collective(
     engine = SimpleNamespace(dist=dist)
     metadata = SimpleNamespace(num_tokens=16)
     if all(graph_flags):
-        assert DecoderRunner._get_remote_tail_decode_rank_tokens(
+        assert DecoderInputPreparer._get_remote_tail_decode_rank_tokens(
             engine, metadata, bool(graph_flags[0])
         ) == [16, 16]
     else:
         with pytest.raises(RuntimeError, match="at least one rank missed its graph"):
-            DecoderRunner._get_remote_tail_decode_rank_tokens(
+            DecoderInputPreparer._get_remote_tail_decode_rank_tokens(
                 engine, metadata, bool(graph_flags[0])
             )
     dist.tp_allgather_int64.assert_called_once_with([16, graph_flags[0]])
@@ -612,6 +614,10 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
     engine = SimpleNamespace(
         enable_attention_dp=True,
         spec_config=None,
+        is_spec_decode=False,
+        enable_in_graph_sampling=False,
+        enable_overlap_headroom=False,
+        mm_encoder_item_scheduling_enabled=False,
         cuda_graph_runner=runner,
         model=SimpleNamespace(
             model=SimpleNamespace(
@@ -628,12 +634,14 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
             iter_perf_stats_interval=1,
             stream_interval=1,
             attention_dp_config=None,
+            kv_connector_config=None,
             batch_wait_timeout_ms=0,
             batch_wait_timeout_iters=0,
             batch_wait_max_tokens_ratio=0,
         ),
         get_max_num_sequences=lambda: 8,
         warmup=warmup,
+        warmup_scope=nullcontext,
     )
     should_enable = has_transceiver and not context_only
 
@@ -720,7 +728,15 @@ def test_rank_state_appends_forward_counts_without_changing_legacy_stats() -> No
     state.iter_stats.num_context_requests = 7
     payload = state.serialize()
     assert RankState.deserialize(payload) == state
-    legacy = RankState.deserialize(payload[:-2])
+    legacy = RankState.deserialize(
+        [
+            state.rank,
+            state.num_active_requests,
+            state.num_active_tokens,
+            state.num_retiring_requests,
+            *state.iter_stats.serialize(),
+        ]
+    )
     assert legacy.iter_stats == state.iter_stats
     assert legacy.num_context_requests == legacy.num_generation_requests == 0
     short_legacy = RankState.deserialize([3, 8])

@@ -42,10 +42,14 @@ class FakeKvCache:
         self.is_active = True
         self.grow_ok = grow_ok
         self.resize_calls = []
+        self.connector_reuse_calls = []
         self.closed = False
 
     def close(self) -> None:
         self.closed = True
+
+    def record_connector_reuse(self, token_begin, token_end):
+        self.connector_reuse_calls.append((token_begin, token_end))
 
     def discard_pending_stats(self) -> None:
         pass
@@ -271,6 +275,9 @@ def make_manager(connector, num_extra_kv_tokens=0, is_draft=False):
     manager._request_stats_enabled_ids = set()
     manager._fresh_pages_filled = {}
     manager._disagg_receive_ready = {}
+    manager._allocation_stream = None
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
     manager._pending_preemption = {}
     manager._early_freed_index_requests = set()
     manager.impl = Mock()
@@ -448,6 +455,53 @@ class TestOfferIsClamped:
         assert req.context_current_position == 64
         assert kv_cache.resize_calls == []
         assert connector.commits == [(0, 0, False)]
+
+
+class TestConnectorReuseStats:
+    """The served token span is reported to the core's stats.
+
+    The span runs from the local match to the honoured end. The core counts
+    its tokens as connector cached tokens and rebooks the blocks they fill
+    completely from missed to reused.
+    """
+
+    def test_the_served_span_is_recorded(self):
+        connector = FakeConnectorManager(num_matched=96)
+        manager = make_manager(connector)
+        kv_cache = FakeKvCache(committed=32, capacity=PROMPT_LEN)
+
+        assert serve(manager, FakeRequest(), kv_cache)
+
+        assert kv_cache.connector_reuse_calls == [(32, 128)]
+
+    def test_the_span_ends_at_the_honoured_position(self):
+        connector = FakeConnectorManager(num_matched=PROMPT_LEN)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=0, capacity=PROMPT_LEN)
+
+        assert serve(manager, req, kv_cache)
+
+        assert req.context_current_position == PROMPT_LEN - 1
+        assert kv_cache.connector_reuse_calls == [(0, PROMPT_LEN - 1)]
+
+    def test_the_span_starts_at_a_mid_block_local_match(self):
+        connector = FakeConnectorManager(num_matched=47)
+        manager = make_manager(connector)
+        kv_cache = FakeKvCache(committed=17, capacity=PROMPT_LEN)
+
+        assert serve(manager, FakeRequest(), kv_cache)
+
+        assert kv_cache.connector_reuse_calls == [(17, 64)]
+
+    def test_nothing_is_rebooked_when_nothing_is_served(self):
+        connector = FakeConnectorManager(num_matched=0)
+        manager = make_manager(connector)
+        kv_cache = FakeKvCache(committed=64, capacity=PROMPT_LEN)
+
+        assert not serve(manager, FakeRequest(), kv_cache)
+
+        assert kv_cache.connector_reuse_calls == []
 
 
 class TestUnchunkedIsPureShrink:
@@ -932,6 +986,24 @@ class TestPrefixReservations:
         manager.report_batch_to_connector(batch)
         assert len(connector.accepted) == 1
         assert len(connector.allocs) == 1
+
+    def test_an_accepted_load_is_rebooked_as_reused(self) -> None:
+        manager, connector, req, cache = self.prepare()
+        assert manager.resize_context(req, 32)
+        req.context_chunk_size = 32
+
+        manager.report_batch_to_connector(scheduled(req))
+
+        assert len(connector.accepted) == 1
+        assert cache.connector_reuse_calls == [(0, 64)]
+
+    def test_an_unaccepted_reservation_is_not_rebooked(self) -> None:
+        manager, connector, req, cache = self.prepare()
+        assert manager.resize_context(req, 32)
+
+        manager.release_unused_connector_reservations(set())
+
+        assert cache.connector_reuse_calls == []
 
     @pytest.mark.parametrize("capacity", [0, PROMPT_LEN])
     def test_rejection_rewinds_even_without_capacity_growth(self, capacity: int) -> None:

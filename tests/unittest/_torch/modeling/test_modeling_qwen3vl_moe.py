@@ -16,6 +16,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_moe_weight_mapper import 
     Qwen3VLMoeHfWeightMapper,
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl_moe import Qwen3MoeVLModel
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._utils import get_sm_version
 
 QWEN3_VL_30B_A3B_CONFIG = {
@@ -162,7 +163,7 @@ class TestQwen3VLMoe(TestModelingMultimodal):
             )
         else:
             # Mrope position ids. For chunked prefill / KV cache reuse we must
-            # mirror production `PyTorchModelEngine` behavior and slice the
+            # mirror production `ModelEngine` behavior and slice the
             # request's full `mrope_position_ids` to the current chunk's range.
             chunk_len = input_ids.shape[-1]
             if num_cached_tokens_per_seq is None:
@@ -226,7 +227,7 @@ class TestQwen3VLMoe(TestModelingMultimodal):
             # Prepare metadata before capture (like in working Qwen2.5-VL test)
             trtllm_inputs["attn_metadata"].prepare()
 
-            key = (1, 0, False)
+            key = KeyType(batch_size=1, draft_len=0)
             graph_runner.capture(
                 key=key,
                 forward_fn=lambda inputs: self.trtllm_model.forward(**inputs),

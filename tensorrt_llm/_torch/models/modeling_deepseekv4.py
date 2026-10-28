@@ -92,7 +92,13 @@ from ..utils import (
     replace_parameter_and_save_metadata,
 )
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, EagerFusionConfig, filter_weights, register_auto_model
+from .modeling_utils import (
+    DecoderModel,
+    EagerFusionConfig,
+    filter_weights,
+    layerwise_moe_quant_config,
+    register_auto_model,
+)
 
 
 @triton.jit
@@ -1775,9 +1781,12 @@ class DeepseekV4MoE(nn.Module):
     def _get_experts_quant_config(model_config, layer_idx: int) -> QuantConfig:
         if getattr(model_config, "quant_config_dict", None) is None:
             return model_config.quant_config
-        return model_config.quant_config_dict.get(
-            f"model.layers.{layer_idx}.mlp.experts", model_config.quant_config
+        experts_quant_config = layerwise_moe_quant_config(
+            model_config.quant_config_dict, f"model.layers.{layer_idx}.mlp.experts"
         )
+        if experts_quant_config is None:
+            return model_config.quant_config
+        return experts_quant_config
 
     def compute_routed_output(
         self,
@@ -2912,7 +2921,10 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             kv_cache_defaults["dtype"] = "fp8_ds_mla"
         elif llm_args is not None and llm_args.kv_cache_config.dtype == "fp8_ds_mla":
             kv_cache_defaults["tokens_per_block"] = 256
-        return {"kv_cache_config": kv_cache_defaults}
+        return {
+            "kv_cache_config": kv_cache_defaults,
+            "use_cute_dsl_blockscaling_mm": get_sm_version() == 107,
+        }
 
     @classmethod
     def get_preferred_kv_cache_manager_version(

@@ -58,25 +58,36 @@ class Cosmos3Config(PreTrainedConfig):
 
     @classmethod
     def from_dict(cls, config_dict, **kwargs):
+        # ``return_unused_kwargs=True`` makes transformers return ``(config, unused)``.
         config = super().from_dict(config_dict, **kwargs)
-        # PreTrainedConfig.from_pretrained / from_dict hydrate declared fields from
-        # config.json only. ``_name_or_path`` is runtime metadata (not stored in the
-        # JSON) and is not set to the checkpoint directory automatically. Cosmos3
-        # needs that path to locate ``transformer/`` and ``vision_encoder/``; TRT-LLM
-        # does not pass it separately on ModelConfig, so set it when callers provide
-        # one via kwargs.
         name_or_path = kwargs.get("_name_or_path") or kwargs.get("name_or_path")
-        if name_or_path and (
-            not getattr(config, "_name_or_path", None) or len(str(config._name_or_path)) < 2
-        ):
-            config._name_or_path = os.fspath(name_or_path)
-        return config
+        return _with_checkpoint_name(
+            config, name_or_path, bool(kwargs.get("return_unused_kwargs", False))
+        )
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         config = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
-        # Same as from_dict above: copy the resolved checkpoint identifier onto the
-        # config so Cosmos3Model can find the unified checkpoint root.
-        if not getattr(config, "_name_or_path", None) or len(str(config._name_or_path)) < 2:
-            config._name_or_path = os.fspath(pretrained_model_name_or_path)
-        return config
+        return _with_checkpoint_name(
+            config,
+            pretrained_model_name_or_path,
+            bool(kwargs.get("return_unused_kwargs", False)),
+        )
+
+
+def _with_checkpoint_name(result, name_or_path, return_unused_kwargs: bool):
+    """Attach the checkpoint path, including when transformers returns unused kwargs."""
+    if return_unused_kwargs:
+        config, unused_kwargs = result
+    else:
+        config = result
+        unused_kwargs = None
+    # ``_name_or_path`` is runtime metadata. Cosmos3 needs it to find
+    # ``transformer/`` and ``vision_encoder/``.
+    if name_or_path and (
+        not getattr(config, "_name_or_path", None) or len(str(config._name_or_path)) < 2
+    ):
+        config._name_or_path = os.fspath(name_or_path)
+    if return_unused_kwargs:
+        return config, unused_kwargs
+    return config

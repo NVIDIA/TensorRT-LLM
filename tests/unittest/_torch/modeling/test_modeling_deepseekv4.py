@@ -168,7 +168,8 @@ def test_deepseek_v4_kv_cache_defaults_and_v2_preference(monkeypatch):
         "kv_cache_config": {
             "tokens_per_block": 128,
             "enable_swa_scratch_reuse": True,
-        }
+        },
+        "use_cute_dsl_blockscaling_mm": False,
     }
     assert DeepseekV4ForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
 
@@ -183,8 +184,19 @@ def test_deepseek_v4_hopper_uses_fp8_ds_mla_defaults(monkeypatch) -> None:
             "dtype": "fp8_ds_mla",
             "tokens_per_block": 128,
             "enable_swa_scratch_reuse": True,
-        }
+        },
+        "use_cute_dsl_blockscaling_mm": False,
     }
+
+
+def test_deepseek_v4_sm107_enables_cute_dsl_blockscaling_mm(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version", lambda: 107
+    )
+
+    defaults = DeepseekV4ForCausalLM.get_model_defaults(None)
+
+    assert defaults["use_cute_dsl_blockscaling_mm"] is True
 
 
 def test_deepseek_v4_fp8_ds_mla_uses_256_token_blocks(monkeypatch) -> None:
@@ -201,7 +213,8 @@ def test_deepseek_v4_fp8_ds_mla_uses_256_token_blocks(monkeypatch) -> None:
         "kv_cache_config": {
             "tokens_per_block": 256,
             "enable_swa_scratch_reuse": True,
-        }
+        },
+        "use_cute_dsl_blockscaling_mm": False,
     }
 
 

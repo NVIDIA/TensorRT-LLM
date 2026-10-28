@@ -94,7 +94,7 @@ def _glue_kernels():
     from cutlass.cutlass_dsl import T, dsl_user_op
     from cutlass.utils import SmemAllocator
 
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.utils import make_ptr
+    from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
     Int32, Int64, Float32 = cutlass.Int32, cutlass.Int64, cutlass.Float32
 
@@ -4398,7 +4398,7 @@ def _indexer_projection_runner_type():
     from cutlass._mlir.dialects import llvm
 
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLIndexerQBlackwellRunner
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import (
+    from tensorrt_llm._torch.kernels.blackwell.dense_blockscaled_gemm_persistent import (
         Sm100BlockScaledPersistentDenseGemmKernel,
         _indexer_q_pack_fp4x4,
     )

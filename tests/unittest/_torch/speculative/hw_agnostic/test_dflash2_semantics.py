@@ -21,12 +21,12 @@ from tensorrt_llm._torch.models.modeling_dflash import (
     DFlash2BlockConv,
     DFlash2CandidateSelector,
     DFlashForCausalLM,
-    _is_dflash2_architecture,
     dflash2_grouped_conv,
     dflash2_score_edges,
     dflash2_walk_candidate_paths,
 )
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+from tensorrt_llm.llmapi.llm_args import is_dflash2_checkpoint
 
 # ---------------------------------------------------------------------------
 # Two-tap dynamic depthwise convolution
@@ -486,16 +486,21 @@ RELEASED_DFLASH_CONFIG = {
 
 def test_architecture_detection():
     """Matching on the "dflash2" stem picks up per-target label variants."""
+    assert is_dflash2_checkpoint(["DFlash2DraftModel"], {})
+    assert is_dflash2_checkpoint(["DFlash2Qwen3ForCausalLM"], {})
+    assert is_dflash2_checkpoint(["dflash_2_draft_model"], {})
+    assert not is_dflash2_checkpoint(["DFlashDraftModel"], {})
+    assert not is_dflash2_checkpoint(["Qwen3ForCausalLM"], {})
+    assert not is_dflash2_checkpoint(None, {})
 
-    def config(architectures):
-        return SimpleNamespace(architectures=architectures)
 
-    assert _is_dflash2_architecture(config(["DFlash2DraftModel"]))
-    assert _is_dflash2_architecture(config(["DFlash2Qwen3ForCausalLM"]))
-    assert _is_dflash2_architecture(config(["dflash_2_draft_model"]))
-    assert not _is_dflash2_architecture(config(["DFlashDraftModel"]))
-    assert not _is_dflash2_architecture(config(["Qwen3ForCausalLM"]))
-    assert not _is_dflash2_architecture(config(None))
+def test_settings_detection():
+    """Either DFlash 2 feature's settings declare it without the label."""
+    assert is_dflash2_checkpoint(["DFlashDraftModel"], {"conv_kernel_size": 2})
+    assert is_dflash2_checkpoint(["DFlashDraftModel"], {"selector_rank": 4})
+    assert not is_dflash2_checkpoint(
+        ["DFlashDraftModel"], {"conv_kernel_size": 0, "selector_rank": None}
+    )
 
 
 def _validation_wrapper(**overrides):
