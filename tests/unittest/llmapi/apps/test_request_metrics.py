@@ -558,6 +558,9 @@ class TestJsonlWriterSurvival:
         assert writer.dropped_records == 2, "every record in the failed batch counts as dropped"
         assert any(
             "Dropped 2 performance metrics record(s) that failed to write (RuntimeError" in message
+            # The traceback shows where the write failed.
+            and "Traceback (most recent call last)" in message
+            and "write_failing_once" in message
             for message in logged_errors
         )
 

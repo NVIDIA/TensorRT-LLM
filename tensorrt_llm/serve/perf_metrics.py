@@ -52,6 +52,7 @@ import json
 import math
 import os
 import socket
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -755,16 +756,20 @@ class PerfMetricsJsonlWriter:
                 self._drop_after_unexpected_error(len(serialized), "write", error)
 
     def _drop_after_unexpected_error(self, num_records: int, stage: str, error: Exception) -> None:
-        """Count records lost to an unexpected exception and log it, rate-limited."""
+        """Count records lost to an unexpected exception and log it, rate-limited.
+
+        The message carries the traceback, which shows where serializing or writing failed.
+        """
         self.dropped_records += num_records
         self._unexpected_error_count += 1
         if self._unexpected_error_count == 1 or self._unexpected_error_count % 1000 == 0:
             logger.error(
-                "Dropped %d performance metrics record(s) that failed to %s (%s: %s)",
+                "Dropped %d performance metrics record(s) that failed to %s (%s: %s)\n%s",
                 num_records,
                 stage,
                 type(error).__name__,
                 error,
+                "".join(traceback.format_exception(error)).rstrip(),
             )
 
     def _write(self, data: str) -> None:
