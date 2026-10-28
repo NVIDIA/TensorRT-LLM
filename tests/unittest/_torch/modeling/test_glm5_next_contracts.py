@@ -38,6 +38,140 @@ from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCuda
 from tensorrt_llm.mapping import Mapping
 
 
+@torch.no_grad()
+def test_registered_vlm_text_forward():
+    from tensorrt_llm._torch.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+
+    text_fields = _config().text_config.to_dict()
+    text_fields.update(
+        vocab_size=32,
+        pad_token_id=None,
+        bos_token_id=None,
+        eos_token_id=None,
+        tie_word_embeddings=False,
+        num_hidden_layers=1,
+        layer_types=["deepseek_sparse_attention"],
+        mlp_layer_types=["dense"],
+        first_k_dense_replace=1,
+        intermediate_size=512,
+        max_position_embeddings=32,
+    )
+    config = Glm5NextConfig(
+        text_config=Glm5NextTextConfig(**text_fields),
+        vision_config=_config().vision_config,
+        architectures=["Glm5NextForConditionalGeneration"],
+        image_token_id=26,
+        video_token_id=27,
+        image_start_token_id=28,
+        image_end_token_id=29,
+        video_start_token_id=30,
+        video_end_token_id=31,
+        pad_token_id=None,
+        bos_token_id=None,
+        eos_token_id=None,
+    )
+    Glm5NextForConditionalGeneration = get_registered_model_class(
+        "Glm5NextForConditionalGeneration"
+    )
+    assert Glm5NextForConditionalGeneration is Glm5NextVLM
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(17)
+        model = Glm5NextForConditionalGeneration(
+            ModelConfig(
+                pretrained_config=config,
+                attn_backend="TRTLLM",
+                max_num_tokens=13,
+                disable_mm_encoder=True,
+            )
+        )
+        model.cuda().eval()
+        for parameter in model.parameters():
+            if parameter.ndim == 1:
+                parameter.fill_(1)
+            else:
+                parameter.normal_(0, 0.05)
+
+    assert isinstance(model.llm, Glm5NextForCausalLM)
+    assert len(model.llm.model.layers) == 1
+    layer = model.llm.model.layers[0].self_attn
+    assert isinstance(layer, Glm5NextSparseAttention)
+    input_ids = torch.arange(1, 14, device="cuda", dtype=torch.long)
+    position_ids = torch.arange(13, device="cuda", dtype=torch.long)
+    embeddings = model.text_embedding_layer(input_ids)
+
+    def make_metadata():
+        # Supply storage only; the real sparse backend populates both pools.
+        latent = torch.zeros(4, 8, 1, layer.kv_lora_rank, device="cuda", dtype=torch.bfloat16)
+        index = torch.zeros(
+            4, 8, 1, layer.indexer.cache_state_dim, device="cuda", dtype=torch.bfloat16
+        )
+
+        def get_latent_state_buffer(layer_idx):
+            assert layer_idx == 0
+            return latent
+
+        def get_index_state_buffer(layer_idx):
+            assert layer_idx == 0
+            return index
+
+        tables = torch.zeros(1, 256, device="cuda", dtype=torch.long)
+        tables[0, :2] = torch.tensor([2, 0], device="cuda")
+        prepared = object.__new__(Glm5NextMamba2Metadata)
+        prepared.glm_block_tables = tables
+        prepared.glm_ctx_cu_seqlens = [0, 13]
+        prepared.glm_cached_lens_host = [0]
+        return SimpleNamespace(
+            kv_cache_manager=SimpleNamespace(
+                tokens_per_block=8,
+                get_latent_state_buffer=get_latent_state_buffer,
+                get_index_state_buffer=get_index_state_buffer,
+            ),
+            seq_lens=torch.tensor([13], dtype=torch.int32),
+            seq_lens_cuda=torch.tensor([13], device="cuda", dtype=torch.int32),
+            num_contexts=1,
+            num_ctx_tokens=13,
+            num_generations=0,
+            num_tokens=13,
+            padded_num_tokens=None,
+            all_rank_num_tokens=None,
+            kv_lens_cuda=torch.tensor([13], device="cuda", dtype=torch.int32),
+            mamba_metadata=prepared,
+        )
+
+    logits = model(
+        attn_metadata=make_metadata(),
+        input_ids=input_ids,
+        position_ids=position_ids,
+        return_context_logits=True,
+    )
+    embedded_logits = model(
+        attn_metadata=make_metadata(),
+        input_ids=input_ids + 13,
+        position_ids=position_ids,
+        inputs_embeds=embeddings,
+        return_context_logits=True,
+    )
+    changed_ids = input_ids.clone()
+    changed_ids[:-1] += 13
+    changed_logits = model(
+        attn_metadata=make_metadata(),
+        input_ids=changed_ids,
+        position_ids=position_ids,
+        return_context_logits=True,
+    )
+
+    for output in (logits, embedded_logits, changed_logits):
+        assert output.shape == (13, 32)
+        assert output.dtype == torch.float32
+        assert torch.isfinite(output).all()
+    torch.testing.assert_close(embedded_logits, logits, rtol=0.02, atol=1e-3)
+    assert not torch.allclose(changed_logits[-1], logits[-1], rtol=0.02, atol=1e-3)
+
+    bypass_logits = model.llm.lm_head(model.llm.model.norm(embeddings)).float()
+    assert not torch.allclose(logits, bypass_logits, rtol=0.02, atol=1e-3)
+
+
 @pytest.mark.cpu_only
 def test_config_fallback_round_trip(tmp_path):
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
