@@ -153,13 +153,14 @@ def test_fwd_preserves_initial_state(
 ) -> None:
     """The varlen prefill kernel must convolve against the *old* conv_state.
 
-    ``seq_lens`` mixes sequences longer and shorter than ``state_len`` so both
-    conv_state update branches of the kernel are covered.
+    ``seq_lens`` mixes sequences longer and shorter than ``state_len``, with and
+    without an initial state, so every conv_state update branch of the kernel is
+    covered, including the zero-padded one for a fresh short sequence.
     """
     device = "cuda"
     dim = 64
     state_len = width - 1
-    seq_lens = [7, 3, 1]
+    seq_lens = [7, 3, 1, 1]
     batch = len(seq_lens)
     num_cache_lines = batch + 2
 
@@ -180,7 +181,7 @@ def test_fwd_preserves_initial_state(
     )
     cache_indices = torch.arange(1, batch + 1, dtype=torch.int32, device=device)
     # Mix cached and fresh sequences: only the cached ones read conv_state first.
-    has_initial_state = torch.tensor([True, False, True], device=device)
+    has_initial_state = torch.tensor([True, False, True, False], device=device)
 
     out = causal_conv1d_fn(
         x,
