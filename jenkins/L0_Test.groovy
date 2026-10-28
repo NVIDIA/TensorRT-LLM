@@ -4046,8 +4046,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.michaeln_blossom
     """
 
-    // RTXPro6000D, RTX5080 and GH200 use the Austin model scratch.
-    if (type.contains("6000d") || type.contains("rtx-5080") || type == "gh200") {
+    // RTXPro6000D and RTX5080 use the Austin model scratch.
+    if (type.contains("6000d") || type.contains("rtx-5080")) {
         llmModelVolume = """
                 - name: scratch-trt-llm-data
                   nfs:

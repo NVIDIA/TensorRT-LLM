@@ -73,7 +73,7 @@ from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager,
                                            use_py_mamba_cache_manager)
 from .llm_request import ExecutorResponse, LlmRequestState
-from .model_engine import PyTorchModelEngine
+from .model_engine import ModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
@@ -96,6 +96,10 @@ GB = 1 << 30
 # size its pool is carved with, so the pool picks one every drafter kernel
 # accepts. Matches the KvCacheConfig.tokens_per_block default.
 _STANDALONE_DRAFT_TOKENS_PER_BLOCK = 32
+
+# Aggregated helix skips memory profiling, so its default KV fraction leaves
+# room for prefill activations. TODO(TRTLLM-17127): remove once helix profiles.
+_HELIX_AGG_FREE_GPU_MEMORY_FRACTION = 0.6
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -920,7 +924,7 @@ class KvCacheCreator:
     def __init__(
         self,
         *,
-        model_engine: PyTorchModelEngine,
+        model_engine: ModelEngine,
         mapping: Mapping,
         net_max_seq_len: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
@@ -967,6 +971,24 @@ class KvCacheCreator:
             model_engine)
         self._is_kv_cache_manager_v2 = issubclass(self._kv_cache_manager_cls,
                                                   KVCacheManagerV2)
+        if mapping.has_cp_helix() and not is_disagg:
+            if not self._is_kv_cache_manager_v2:
+                raise ValueError(
+                    "Aggregated helix context parallelism requires "
+                    f"KVCacheManagerV2, got {self._kv_cache_manager_cls.__name__}: "
+                    "only V2 sizes prefill KV in global ledger blocks shared "
+                    "by every CP rank. Set "
+                    "kv_cache_config.use_kv_cache_manager_v2=True and disable "
+                    "features that fall back to V1.")
+            # Read from the engine rather than llm_args: an SM-version fallback
+            # may have turned chunked prefill off after the args were parsed.
+            if not model_engine.attn_runtime_features.chunked_prefill:
+                raise ValueError(
+                    "Aggregated helix context parallelism requires chunked "
+                    "prefill: the context phase gathers cached KV across CP "
+                    "ranks only in the chunked-context path. Set "
+                    "enable_chunked_prefill=True on a GPU that supports it "
+                    "for MLA.")
         self._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
         self._draft_config = draft_config
         self._skip_est = skip_est
@@ -977,7 +999,7 @@ class KvCacheCreator:
 
     def _get_model_kv_cache_manager_cls(
         self,
-        model_engine: PyTorchModelEngine,
+        model_engine: ModelEngine,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
     ):
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
@@ -1252,10 +1274,9 @@ class KvCacheCreator:
         token (the target stores only every cp_size-th page per rank).
         Intercepts are per-request rank-local bytes and stay unscaled.
         """
-        draft_mapping = self._mapping
+        draft_mapping = self._get_draft_mapping()
         helix_cp_scale = 1
         if self._mapping.has_cp_helix():
-            draft_mapping = self._mapping.repurpose_helix_cp_to_tp()
             helix_cp_scale = self._mapping.cp_size
 
         def scaled(cost: CacheCost) -> CacheCost:
@@ -1732,6 +1753,16 @@ class KvCacheCreator:
                         "the explicitly configured quota.")
             return
         fraction = self._kv_cache_config.free_gpu_memory_fraction
+        default_fraction = KvCacheConfig.model_fields[
+            "free_gpu_memory_fraction"].default
+        if fraction == default_fraction and not self._is_disagg:
+            fraction = _HELIX_AGG_FREE_GPU_MEMORY_FRACTION
+            logger.warning(
+                "Helix CP (aggregated): capacity profiling is unsupported, so "
+                f"the default free_gpu_memory_fraction {default_fraction} is "
+                f"lowered to {fraction} to leave room for prefill "
+                "activations. Set kv_cache_config.max_tokens or "
+                "max_gpu_total_bytes to override.")
         free_mem, _total = torch.cuda.mem_get_info()
         budget_bytes = int(free_mem * fraction)
         if budget_bytes <= 0:
@@ -2040,7 +2071,7 @@ class KvCacheCreator:
 
     def _create_kv_cache_manager(
         self,
-        model_engine: PyTorchModelEngine,
+        model_engine: ModelEngine,
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
         cold_page_codec_provider: Optional[object] = None,
@@ -2166,6 +2197,22 @@ class KvCacheCreator:
             # every backoff-sized path stays a no-op and the pairing is safe.
             return False
         return True
+
+    def _get_draft_mapping(self) -> Mapping:
+        """Mapping the drafter's KV is sized and allocated with.
+
+        Under helix the drafter is dense, built against the repurposed mapping
+        (CP ranks become TP ranks), so its paged manager needs the CP-free
+        mapping: the round-robin ledger applies to the TARGET KV alone, and
+        KVCacheManagerV2 rejects is_draft x helix outright.
+
+        Heads are sharded like the drafter's attention: helix + attention DP
+        builds it head-TP (``mapping_for_full_rows``), unlike the executor mapping.
+        """
+        mapping = (self._draft_config.mapping
+                   if self._draft_config is not None else self._mapping)
+        return (mapping.repurpose_helix_cp_to_tp()
+                if mapping.has_cp_helix() else mapping)
 
     def _get_effective_draft_config(self) -> ModelConfig:
         """
@@ -2358,14 +2405,7 @@ class KvCacheCreator:
         # the sparse_attention_config. Get it from effective_draft_config which
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
-        # Under helix the standalone drafter is built against the repurposed
-        # mapping (CP ranks become TP ranks) and every rank keeps its full
-        # drafter KV, so its paged manager needs the CP-free mapping: the
-        # round-robin ledger applies to the TARGET KV alone, and
-        # KVCacheManagerV2 rejects is_draft x helix outright.
-        draft_mapping = self._mapping
-        if draft_mapping.has_cp_helix():
-            draft_mapping = draft_mapping.repurpose_helix_cp_to_tp()
+        draft_mapping = self._get_draft_mapping()
         draft_tokens_per_block = self._get_draft_tokens_per_block()
         if draft_tokens_per_block != self._tokens_per_block:
             # Logged because nothing fails when the two differ: only the draft
@@ -2581,10 +2621,8 @@ class KvCacheCreator:
         throughput than the extra concurrency buys; still valid at low load,
         hence a warning that names the knobs rather than a refusal.
         """
-        capture_sizes = getattr(self._model_engine, "_cuda_graph_batch_sizes",
-                                None)
-        padding = getattr(self._model_engine, "_cuda_graph_padding_enabled",
-                          None)
+        capture_sizes = self._model_engine.cuda_graph_batch_sizes
+        padding = self._model_engine.cuda_graph_padding_enabled
         if (not isinstance(capture_sizes, (list, tuple)) or not capture_sizes
                 or not all(isinstance(s, int) for s in capture_sizes)):
             # CUDA graphs disabled, or the engine does not expose its capture
@@ -3244,7 +3282,7 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
 
 
 def _create_kv_cache_manager(
-        model_engine: Optional[PyTorchModelEngine],
+        model_engine: Optional[ModelEngine],
         kv_cache_manager_cls,
         mapping: Mapping,
         kv_cache_config: KvCacheConfig,
@@ -3808,7 +3846,7 @@ def validate_kv_cache_compression_compatibility(
 def create_kv_cache_compression_manager(
     config: Optional[KvCacheCompressionConfig],
     *,
-    model_engine: PyTorchModelEngine,
+    model_engine: ModelEngine,
     kv_cache_config: KvCacheConfig,
     estimating_kv_cache: bool = False,
 ) -> Optional[KVCacheCompressionManager]:
@@ -4467,7 +4505,7 @@ def create_torch_sampler_args(
 
 
 def instantiate_sampler(
-    engine: PyTorchModelEngine,
+    engine: ModelEngine,
     llm_args: TorchLlmArgs,
     mapping: Mapping,
     *,

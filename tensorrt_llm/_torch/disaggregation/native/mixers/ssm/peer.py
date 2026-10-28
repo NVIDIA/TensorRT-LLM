@@ -610,14 +610,18 @@ class MambaPolicy:
     def _mamba_tp(ri: RankInfo) -> Tuple[int, int]:
         """Return (mamba_effective_tp_size, mamba_effective_tp_rank).
 
-        When attention_dp is enabled, mamba is not TP-sharded.
+        When attention_dp is enabled, mamba is not TP-sharded, except across
+        a helix CP group at tp_size 1 (config_utils.mamba_effective_tp_size).
         """
-        if ri.attention and ri.attention.enable_attention_dp:
-            return 1, 0
+        attention_dp = bool(ri.attention and ri.attention.enable_attention_dp)
         if ri.cp_size > 1:
+            if attention_dp:
+                return (ri.cp_size, ri.cp_rank) if ri.tp_size == 1 else (1, 0)
             # Helix repurposes CP ranks as TP for the mamba layers, so the
             # shard grid is tp*cp with CP-minor flat rank (matches Mapping).
             return ri.tp_size * ri.cp_size, ri.tp_rank * ri.cp_size + ri.cp_rank
+        if attention_dp:
+            return 1, 0
         return ri.tp_size, ri.tp_rank
 
     @staticmethod

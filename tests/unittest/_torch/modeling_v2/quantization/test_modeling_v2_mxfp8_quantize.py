@@ -7,11 +7,13 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_quantize import (  # noqa: E501
     mxfp8_quantize as op,
 )
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mxfp8_quantize requires a CUDA device"
@@ -36,7 +38,21 @@ def _build(spec, seed):
     return torch.randn(spec["shape"], generator=g, device="cuda").to(spec["dtype"])
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "gpt_oss/gpt_oss_120b__sm_10x__default": (
+        Cell(
+            why="gpt-oss hidden 2880, linear scales, aligned to 512 -> padded 3072",
+            spec=dict(shape=(16, 2880), dtype=torch.bfloat16, swizzled=False, alignment=512),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell) -> None:
     x = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     swizzled, alignment = cell.spec["swizzled"], cell.spec["alignment"]
