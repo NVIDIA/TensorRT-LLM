@@ -764,6 +764,27 @@ def test_mhc_fused_hc_mma_split_k_deterministic(n: int, hidden_size: int, tactic
     torch.testing.assert_close(layer_input_cur, layer_input_ref, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize("n", [1, 6, 8, 16, 32])
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
+def test_mhc_fused_hc_small_m_fma_candidates_agree(n: int, hidden_size: int):
+    """The small-M half-FMA candidates the autotuner chooses from compute the same bits.
+
+    They share one split count and BigFuse block size and differ only in tile width, so
+    whichever one wins the timing, the outputs are identical.
+    """
+    runner, inputs = _make_fused_hc_runner_case(
+        n=n, hidden_size=hidden_size, hc_mult=4, seed=97 + n
+    )
+    half_fma = [t for t in runner.get_valid_tactics(inputs, None) if t[0] == "fused_half_fma"]
+    assert half_fma, "no half-FMA candidate at small M"
+    assert len({(t[2], t[3]) for t in half_fma}) == 1, half_fma
+
+    reference = [t.clone() for t in runner(inputs=inputs, tactic=half_fma[0])]
+    for tactic in half_fma[1:]:
+        for expected, actual in zip(reference, runner(inputs=inputs, tactic=tactic)):
+            assert torch.equal(expected, actual), f"{tactic} differs from {half_fma[0]}"
+
+
 @pytest.mark.parametrize("n", list(_BACKEND_TACTICS_BY_M.keys()))
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("hc_mult", [4])
