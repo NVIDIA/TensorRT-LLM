@@ -53,6 +53,7 @@ as the reference script, so a lane is configured purely through the YAML's
 """
 
 import argparse
+import http.client
 import json
 import os
 import subprocess
@@ -223,13 +224,28 @@ def aiperf_is_usable() -> bool:
     return result.returncode == 0
 
 
+def _http_error_text(error: urllib.error.HTTPError) -> str:
+    """Describe an HTTP error as ``HTTP <code>: <first 2 KB of its body>`` and close it.
+
+    A body that cannot be read still yields a description, so the best-effort
+    callers never see an exception from here.
+    """
+    with error:
+        try:
+            body = error.read(2048).decode(errors="replace")
+        except (OSError, ValueError, http.client.HTTPException) as read_error:
+            body = f"<unreadable body: {read_error!r}>"
+    return f"HTTP {error.code}: {body}"
+
+
 def post_one_token(
     url: str, model: str, timeout: float, *, fail_on_client_error: bool = False
 ) -> "str | None":
-    """POST one token, optionally raising with the reason for a rejected request.
+    """POST one token and return the response body.
 
-    Transport failures, server errors, and retryable HTTP 408/429 responses
-    return None. Heartbeats also ignore request rejections by default.
+    An HTTP error comes back as ``HTTP <code>: <body>`` so callers can report the
+    server's reason. With ``fail_on_client_error``, a permanent 4xx (anything but
+    408/429) raises instead. Transport failures return None.
     """
     payload = json.dumps(
         {
@@ -249,14 +265,12 @@ def post_one_token(
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode(errors="replace")
     except urllib.error.HTTPError as error:
+        reason = _http_error_text(error)
         if fail_on_client_error and 400 <= error.code < 500 and error.code not in (408, 429):
-            with error:
-                body = error.read(2048).decode(errors="replace")
             raise RuntimeError(
-                f"{req.full_url} rejected the 1-token readiness request: HTTP {error.code}: {body}"
+                f"{req.full_url} rejected the 1-token readiness request: {reason}"
             ) from error
-        error.close()
-        return None
+        return reason
     except (urllib.error.URLError, OSError, TimeoutError):
         return None
 
@@ -317,6 +331,15 @@ def ensure_aiperf(url: str, model: str) -> None:
         )
 
 
+def _is_completion(response: "str | None") -> bool:
+    """Whether a post_one_token result is a chat completion, not an error description."""
+    try:
+        payload = json.loads(response or "")
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and "choices" in payload
+
+
 def verify_endpoint(url: str, model: str) -> None:
     """Prove the endpoint serves one real token before spending GPU-hours.
 
@@ -331,7 +354,7 @@ def verify_endpoint(url: str, model: str) -> None:
     last = None
     while time.monotonic() < deadline:
         last = post_one_token(url, model, timeout=300, fail_on_client_error=True)
-        if last and '"choices"' in last:
+        if _is_completion(last):
             _log("1-token completion OK -- the inference endpoint is ready")
             return
         _log(f"not serving yet (response head: {str(last)[:200]})")

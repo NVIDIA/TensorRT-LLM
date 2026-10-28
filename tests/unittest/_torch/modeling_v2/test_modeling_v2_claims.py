@@ -128,6 +128,7 @@ def _is_entry_module(module: str, target_dir: Path) -> bool:
     family = f"{_modeling_v2.__name__}.models.{target_dir.parent.name}"
     roots = (
         f"{_modeling_v2.__name__}.catalog",
+        f"{_modeling_v2.__name__}._native",
         f"{family}.ops",
         f"{family}.{target_dir.name}.ops",
     )
@@ -178,6 +179,7 @@ def test_targets_do_not_share_files():
         ("modeling.py", "from ..ops.attention.entry import op", True),
         ("modeling.py", "from ..kernels.kernel import op", True),
         ("modeling.py", "from ....catalog.attention.entry import op", True),
+        ("__init__.py", "from ...._native import load_target_ops", True),
         ("modeling.py", "from ..sibling.ops.attention.entry import op", False),
         ("modeling.py", "from ...other.ops.attention.entry import op", False),
         ("modeling.py", "from ..helper import op", False),

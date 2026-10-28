@@ -112,16 +112,19 @@ checkpoint of the same shape is ungated.
 
 ```
 _router_index.py    architectures[0] -> routing module. Small, stable, test-guarded.
+_native.py          loads a target's native code (see "Native code" below)
 models/<family>/
   routing.py        one forward-reading decision tree per architecture family
-  ops/<category>/   entries shared only by this family's targets
-  kernels/          CuTe DSL packages shared only by this family's targets
-  csrc/             model-owned compiled specializations and native op bridges
+  ops/<category>/   entries shared only by this family
+  kernels/          family-owned CuTe DSL packages
+  fake_ops.py       fakes of the family's shared native ops, if it has any
+  csrc/             the family's CMakeLists.txt and the native code its targets share
   <checkpoint>__<gpu arch>__<parallel>/
                       modeling.py  weights.py
                       ops/<category>/   entries only this target calls
-                      kernels/          target-only kernel implementations
-catalog/<category>/ entries shared across model families
+                      fake_ops.py       fakes of the target's native ops, if it has any
+                      csrc/             the target's own kernels and torch bindings
+catalog/<category>/ entries more than one target calls
 ```
 
 An entry, shared or owned, is one `OpWrapper` subclass: `__call__` is the op
@@ -234,6 +237,69 @@ Identity is the directory name, and it carries all three segments:
 read as a hierarchy that was never one -- every level had exactly one child,
 and each needed an `__init__.py` whose only job was to exist. The class name
 carries the same triple; `test_modeling_v2_claims.py` asserts they agree.
+
+### Native code
+
+Kimi K3 retains its stock-linked `kimi_k3_model_src` objects, `libth_common` torch bindings,
+and existing operator names and fake registrations. Its `csrc/` directory is excluded from
+per-family library discovery. The per-family mechanism below applies to the other native
+families.
+
+A target's C++/CUDA lives with its Python code: `<target>/csrc/`, and the family's
+`csrc/` for code several targets share. Each family builds into one torch-op library,
+`libth_modeling_v2_<family>.so`, installed next to `libth_common.so`; nothing of it is
+linked into the stock libraries, and it loads only when routing picks one of the
+family's targets. Adding a model with kernels edits nothing under `cpp/`.
+`models/gpt_oss/` is the example: one kernel, used by its weight loader.
+
+Adding native code to target `foo_nvfp4__sm_103__tp4` of family `foo`:
+
+1. **Declare it** in `models/foo/csrc/CMakeLists.txt`:
+
+   ```cmake
+   add_modeling_v2_family(foo)
+   add_modeling_v2_target(foo foo_nvfp4__sm_103__tp4 ARCHS 103a SOURCES *.cu *.cpp)
+   ```
+
+2. **Write the kernels and their torch bindings** in `foo_nvfp4__sm_103__tp4/csrc/`, in
+   the target's namespaces:
+
+   ```cpp
+   TRTLLM_MV2_NAMESPACE_BEGIN   // tensorrt_llm::modeling_v2::foo::foo_nvfp4_sm_103_tp4
+   ...
+   TRTLLM_MV2_NAMESPACE_END
+   TRTLLM_MV2_LIBRARY_FRAGMENT(m) { m.def("my_op(Tensor x) -> Tensor"); }
+   TRTLLM_MV2_LIBRARY_IMPL(CUDA, m) { m.impl("my_op", &TRTLLM_MV2_NS::myOp); }
+   ```
+
+   Include the family's own headers from `models/` (`"foo/foo_nvfp4__sm_103__tp4/csrc/x.h"`);
+   any stock header is fine, another target's or family's code is not.
+
+3. **Load it** from the target's `__init__.py`, `native_ops = load_target_ops(__name__)`
+   (from `_native`); the target's modules use `from . import native_ops`.
+
+4. **Fake every op** in the target's `fake_ops.py`, which the loader imports right after
+   the library opens: `@torch.library.register_fake(f"{namespace_of(__name__)}::my_op")`.
+
+5. **Test it** under `tests/unittest/_torch/modeling_v2/models/foo/`. The modeling_v2 entry
+   of `l0_b300.yml` collects it, so a target that runs on GB300 changes no test list; a
+   test for another GPU, or for several GPUs, is listed in that GPU's test list.
+
+Code several targets call goes once in the family's `csrc/`, declared with
+`add_modeling_v2_shared(foo ARCHS ... SOURCES ...)`; its ops are in `torch.ops.mv2_foo`,
+reached with `load_family_ops(__name__)` and faked in `models/foo/fake_ops.py`. A target
+with no code of its own declares no `SOURCES`.
+
+- **`ARCHS`** (`NN`, `NNa`, `NNf`) is intersected with the build's architectures; a target
+  with none is not built, and is a `NoTarget` at run time. `REQUIRES` (`MULTI_DEVICE`,
+  `NVSHMEM`) and `DEPS` (a closed list) are the other keywords; a per-file compile option
+  goes on the file with `set_source_files_properties`.
+- **Loading**: a library this installation does not carry, or a target it did not build,
+  is a `NoTarget` (`auto` keeps the built-in model); one that is installed but fails to
+  load, or lacks an op a `fake_ops.py` declares, is a `NativeLoadError`.
+- **Building only your family**: `build_wheel.py -D "TRTLLM_MODELING_V2_TARGETS=foo/*"`, and
+  after an edit `cmake --build cpp/build --target th_modeling_v2_foo`.
+- `test_modeling_v2_native_claims.py` checks these rules on CPU; run it before sending the PR.
 
 ### Default and specialized targets
 
