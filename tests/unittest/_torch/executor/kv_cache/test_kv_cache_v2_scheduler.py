@@ -5304,6 +5304,96 @@ class TestShortestFirstAging:
         assert rank(0.9) == rank(1.7)
 
 
+class TestFirstChunkBudgetBeforeClaim:
+    """A first chunk that cannot run is turned away before its prefix is claimed, so it pays no
+    claim and release (release_context_admission) on every pass it waits."""
+
+    SRPT = {"TRTLLM_CTX_SCHED_SRPT": "1"}
+    AGED = {"TRTLLM_CTX_SCHED_SRPT": "1", "TRTLLM_CTX_SCHED_SRPT_AGE_S": "8"}
+
+    def _sched(self, env, mgr):
+        sched = _make_srpt_scheduler(env, 8192, mgr=mgr, policy=ContextChunkingPolicy.FORCE_CHUNK)
+        sched._clock = lambda: 100.0
+        return sched
+
+    @staticmethod
+    def _shorts(first_id, lengths):
+        return [
+            make_ctx_request(first_id + i, context_remaining_length=n)
+            for i, n in enumerate(lengths)
+        ]
+
+    @staticmethod
+    def _claimed(mgr):
+        return {call.args[0].py_request_id for call in mgr.prepare_context.call_args_list}
+
+    def test_leftover_below_a_unit_does_not_claim_a_long_first_chunk(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = self._sched(self.SRPT, mgr)
+        long = make_ctx_request(0, context_remaining_length=50000)
+        long.expect_snapshot_points = [49998]
+        shorts = self._shorts(1, [2100, 2100, 2100, 1856])  # leave 36 tokens
+        out = sched.schedule_request([long] + shorts, set())
+        assert sorted(ids(out.context_requests)) == [1, 2, 3, 4]
+        assert self._claimed(mgr) == {1, 2, 3, 4}
+
+    def test_leftover_still_takes_a_first_chunk_that_reaches_a_snapshot_point(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = self._sched({}, mgr)  # arrival order, so the short request meets the leftover
+        tiny = make_ctx_request(0, context_remaining_length=30)
+        tiny.expect_snapshot_points = [28]
+        out = sched.schedule_request(self._shorts(1, [2100, 2100, 2100, 1856]) + [tiny], set())
+        assert 0 in ids(out.context_requests)
+        assert tiny.context_chunk_size == 28
+
+    def test_reuse_estimate_counts_for_the_leftover(self):
+        """A mostly-cached first chunk whose uncached tail fits the leftover is still claimed."""
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.probe_context_reuse.side_effect = lambda req: 49980 if req.py_request_id == 0 else 0
+
+        def claim(req, reuse_limit=None):
+            if req.py_request_id == 0:
+                req.context_current_position = 49980
+                req.context_remaining_length = 20
+            return True
+
+        mgr.prepare_context.side_effect = claim
+        sched = self._sched({}, mgr)
+        cached = make_ctx_request(0, context_remaining_length=50000)
+        out = sched.schedule_request(self._shorts(1, [2100, 2100, 2100, 1856]) + [cached], set())
+        assert 0 in ids(out.context_requests)
+        assert cached.context_chunk_size == 20
+
+    def test_unfunded_aged_request_is_not_claimed(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = self._sched(self.AGED, mgr)
+        aged = []
+        for i, length in enumerate([50000, 50000, 50000, 2000, 50000]):
+            req = make_ctx_request(i, context_remaining_length=length)
+            req.py_ctx_sched_since = float(i)
+            if length > 2000:
+                req.expect_snapshot_points = [length - 2]
+            aged.append(req)
+        out = sched.schedule_request(aged, set())
+        # Shares 2048 x 3 + 2000 leave 48 tokens: no chunk for the youngest, which is never claimed.
+        assert sorted(ids(out.context_requests)) == [0, 1, 2, 3]
+        assert aged[3].context_chunk_size == 2000
+        assert self._claimed(mgr) == {0, 1, 2, 3}
+
+    def test_first_chunk_holding_a_cache_is_still_released(self):
+        """A first chunk that already holds a cache goes through preparation, so the failed
+        admission releases its claim as before."""
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = self._sched(self.SRPT, mgr)
+        long = make_ctx_request(0, context_remaining_length=50000)
+        long.expect_snapshot_points = [49998]
+        mgr.kv_cache_map[0].is_active = True  # admitted in a pass whose batch did not run
+        out = sched.schedule_request([long] + self._shorts(1, [2100, 2100, 2100, 1856]), set())
+        assert 0 not in ids(out.context_requests)
+        assert 0 in self._claimed(mgr)
+        mgr.free_resources.assert_called_once_with(long)
+
+
 class TestInforwardMambaSnapshot:
     """A forced chunk ending at the last snapshot point P runs through the prompt end
     instead when the Mamba manager takes the snapshot inside the forward."""

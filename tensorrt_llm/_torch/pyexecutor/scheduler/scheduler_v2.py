@@ -1085,6 +1085,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         """
         first_chunk = req.is_first_context_chunk
         if self.chunking_enabled:
+            if (
+                first_chunk
+                and not self._holds_context_cache(req)
+                and not self._first_chunk_fits_budget(req, budget, token_cap)
+            ):
+                # Nothing is claimed yet, so there is nothing to release.
+                return ScheduleAction.SKIP, 0, False
             result = self._try_schedule_context_chunked(req, budget, preempt_for_pages, token_cap)
         else:
             result = self._try_schedule_context_full(req, budget, preempt_for_pages)
@@ -1095,6 +1102,54 @@ class KVCacheV2Scheduler(RequestScheduler):
             self.release_context_admission(req)
 
         return result
+
+    def _holds_context_cache(self, req: LlmRequest) -> bool:
+        """Whether *req* holds a cache in any pool, which a failed first admission must release."""
+        return any(
+            manager is not None and req.py_request_id in manager.kv_cache_map
+            for manager in (
+                self.kv_cache_manager,
+                self.draft_kv_cache_manager,
+                self.cross_kv_cache_manager,
+            )
+        )
+
+    def _first_chunk_fits_budget(
+        self, req: LlmRequest, budget: BudgetTracker, token_cap: Optional[int]
+    ) -> bool:
+        """Whether a first chunk can come out non-empty, decided before its prefix is claimed.
+
+        Preparing a first chunk claims its reusable prefix, and a first chunk that then fails
+        admission gives the claim back (release_context_admission). A request turned away only
+        after preparation therefore pays a full claim and release, every pass it waits. Two budget
+        states never yield a chunk:
+        - an aged request's token_cap leaves no budget, which _has_context_chunk_budget does not see;
+        - under FORCE_CHUNK any leftover passes _has_context_chunk_budget, but a leftover below
+          chunk_unit_size is rounded down to nothing unless the chunk reaches the next snapshot
+          point or the prompt end.
+        The claim's end is estimated with the shortest-first reuse probe. Reuse only grows between
+        passes, so a stale probe can only defer a request by one pass, not admit one that cannot run.
+        """
+        remaining = budget.remaining_tokens
+        if remaining is None:
+            return True
+        if token_cap is not None:
+            remaining = min(remaining, token_cap)
+        if remaining <= 0:
+            return False
+        if (
+            self.chunking_policy != ContextChunkingPolicy.FORCE_CHUNK
+            or remaining >= self.chunk_unit_size
+        ):
+            return True
+        pos = (
+            req.context_current_position + req.context_remaining_length - self._uncached_tokens(req)
+        )
+        next_point = min(
+            (point for point in req.expect_snapshot_points if point > pos),
+            default=req.prompt_len,
+        )
+        return min(next_point, req.prompt_len) - pos <= remaining
 
     def release_context_admission(self, req: LlmRequest) -> None:
         """Free a first-chunk context's caches in every pool and rewind its cursor.

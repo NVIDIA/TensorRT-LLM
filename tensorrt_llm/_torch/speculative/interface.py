@@ -1455,8 +1455,6 @@ class SpecMetadata:
                                               dtype=torch.float32,
                                               device='cuda')
 
-        self._populate_request_rng_state(requests, per_request_normalized)
-
         # Always-populate the per-request slot id table when rejection sampling
         # is configured: it's tiny (max_num_requests longs) and needed at
         # draft-sampler time to scatter draft probs by slot. The penalties need the
@@ -1480,6 +1478,13 @@ class SpecMetadata:
         # read. Skip the heavier H->D copies.
         if self.is_all_greedy_sample:
             return
+
+        # The Philox seed / offset state is read only on the non-greedy paths
+        # (the target sampler, the advanced draft sampler and the rejection
+        # kernels; forced acceptance draws from its own pool), so all-greedy
+        # batches skip its host-to-device copies. Filled before the cached
+        # parameter check below: the offsets advance every step.
+        self._populate_request_rng_state(requests, per_request_normalized)
 
         # Phase 2: build per-token / per-request lists and copy to GPU.
         #
