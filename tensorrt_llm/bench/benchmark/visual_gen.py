@@ -40,6 +40,7 @@ from tensorrt_llm.bench.benchmark.visual_gen_utils import (
 )
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.logger import logger
+from tensorrt_llm.usage.usage_lib import _mark_visual_gen
 
 
 def _parse_size(size_str: str) -> tuple[Optional[int], Optional[int]]:
@@ -195,6 +196,9 @@ def visual_gen_command(
     metric_percentiles: str,
 ) -> None:
     """Benchmark VisualGen (image/video generation) models offline."""
+    # VisualGen reports no startup error category or startup state.
+    _mark_visual_gen()
+
     import yaml
 
     from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
