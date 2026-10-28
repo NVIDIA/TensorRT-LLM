@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Frame arithmetic and reporting rules for the GPU memory ledger.
+"""Frame arithmetic and reporting rules for the GPU memory monitor.
 
 Several tests here are deliberately adversarial: they encode a rule by
 constructing the input that violates it. If someone reintroduces the
@@ -25,16 +25,16 @@ CPU only: the frame is a pure function over injected readings.
 
 import pytest
 
-from tensorrt_llm._torch.memory.ledger.capability import Capability
-from tensorrt_llm._torch.memory.ledger.frame import (
+from tensorrt_llm._torch.memory.monitor.capability import Capability
+from tensorrt_llm._torch.memory.monitor.frame import (
     DeviceReading,
     Frame,
     TorchReading,
     build_frame,
     derived_entries,
 )
-from tensorrt_llm._torch.memory.ledger.report import UNAVAILABLE, render, summarize_by_category
-from tensorrt_llm._torch.memory.ledger.schema import Basis, Category, Entry, Placement, Source
+from tensorrt_llm._torch.memory.monitor.report import UNAVAILABLE, render, summarize_by_category
+from tensorrt_llm._torch.memory.monitor.schema import Basis, Category, Entry, Placement, Source
 
 GIB = 1 << 30
 
@@ -71,7 +71,9 @@ class TestFrameArithmetic:
             TorchReading(reserved=96 * GIB, live=78 * GIB),
             [
                 _entry(Category.WEIGHTS, 52 * GIB),
-                _entry(Category.KV_CACHE_POOL, 40 * GIB, Placement.NON_TORCH, source=Source.LEDGER),
+                _entry(
+                    Category.KV_CACHE_POOL, 40 * GIB, Placement.NON_TORCH, source=Source.COMPONENT
+                ),
             ],
         )
         assert frame.tagged_total == 52 * GIB
@@ -125,7 +127,7 @@ class TestUnknownIsNotZero:
             DeviceReading(total=180 * GIB, free=10 * GIB, process_used=100 * GIB),
             TorchReading(reserved=50 * GIB, live=40 * GIB),
             [
-                _entry(Category.DWDP_PAGES, None, Placement.NON_TORCH, source=Source.LEDGER),
+                _entry(Category.DWDP_PAGES, None, Placement.NON_TORCH, source=Source.COMPONENT),
             ],
         )
         assert frame.nontorch_known == 0
@@ -136,7 +138,7 @@ class TestUnknownIsNotZero:
             DeviceReading(total=180 * GIB, free=10 * GIB, process_used=100 * GIB),
             TorchReading(reserved=50 * GIB, live=40 * GIB),
             [
-                _entry(Category.DWDP_PAGES, None, Placement.NON_TORCH, source=Source.LEDGER),
+                _entry(Category.DWDP_PAGES, None, Placement.NON_TORCH, source=Source.COMPONENT),
             ],
         )
         text = render(frame, _capability())
@@ -150,7 +152,7 @@ class TestUnknownIsNotZero:
             DeviceReading(total=180 * GIB, free=10 * GIB, process_used=100 * GIB),
             TorchReading(reserved=50 * GIB, live=40 * GIB),
             [
-                _entry(Category.DWDP_PAGES, None, Placement.NON_TORCH, source=Source.LEDGER),
+                _entry(Category.DWDP_PAGES, None, Placement.NON_TORCH, source=Source.COMPONENT),
             ],
         )
         assert summarize_by_category(frame)[Category.DWDP_PAGES] is None
@@ -230,12 +232,12 @@ class TestExcludedFromTotals:
             DeviceReading(total=180 * GIB, free=10 * GIB, process_used=100 * GIB),
             TorchReading(reserved=50 * GIB, live=40 * GIB),
             [
-                _entry(Category.COMM_MNNVL, local, Placement.NON_TORCH, source=Source.LEDGER),
+                _entry(Category.COMM_MNNVL, local, Placement.NON_TORCH, source=Source.COMPONENT),
                 _entry(
                     Category.COMM_MNNVL,
                     peers,
                     Placement.NON_TORCH,
-                    source=Source.LEDGER,
+                    source=Source.COMPONENT,
                     basis=Basis.LOGICAL,
                     note="remote mapped",
                     counts_toward_total=False,
@@ -271,7 +273,7 @@ class TestSchemaGuards:
             Entry(
                 category=Category.DWDP_PAGES,
                 size_bytes=GIB,
-                source=Source.LEDGER,
+                source=Source.COMPONENT,
                 placement=Placement.NON_TORCH,
             )
 

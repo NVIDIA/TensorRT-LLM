@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Provider tests for the GPU memory ledger.
+"""Provider tests for the GPU memory monitor.
 
 The MNNVL cases are the point of this file. Backing is created *after* the
 record moves to ``RESTORING``, so a ``MAPPED``-only rollup reports zero
@@ -28,12 +28,12 @@ import types
 
 import pytest
 
-from tensorrt_llm._torch.memory.ledger.providers.misc import (
+from tensorrt_llm._torch.memory.monitor.providers.misc import (
     DwdpPagePoolProvider,
     MemoryCountersProvider,
 )
-from tensorrt_llm._torch.memory.ledger.providers.mnnvl import MnnvlProvider
-from tensorrt_llm._torch.memory.ledger.schema import Basis, Category, Source
+from tensorrt_llm._torch.memory.monitor.providers.mnnvl import MnnvlProvider
+from tensorrt_llm._torch.memory.monitor.schema import Basis, Category, Source
 
 MB = 1 << 20
 
@@ -244,14 +244,14 @@ class TestMemoryCountersIsDiagnosticOnly:
 
         entry = provider.collect()[0]
         assert entry.counts_toward_total is False
-        assert entry.source is Source.LEDGER
+        assert entry.source is Source.COMPONENT
         assert entry.category is Category.CPP_BUFFERS
 
 
 class TestCollectAllIsFaultTolerant:
     def test_failing_provider_does_not_break_collection(self):
-        from tensorrt_llm._torch.memory.ledger.providers import collect_all
-        from tensorrt_llm._torch.memory.ledger.schema import Entry, Placement
+        from tensorrt_llm._torch.memory.monitor.providers import collect_all
+        from tensorrt_llm._torch.memory.monitor.schema import Entry, Placement
 
         class _Boom:
             name = "boom"
@@ -275,7 +275,7 @@ class TestCollectAllIsFaultTolerant:
                     Entry(
                         category=Category.COMM_DEEPEP,
                         size_bytes=MB,
-                        source=Source.LEDGER,
+                        source=Source.COMPONENT,
                         placement=Placement.NON_TORCH,
                         basis=Basis.REQUESTED,
                     )

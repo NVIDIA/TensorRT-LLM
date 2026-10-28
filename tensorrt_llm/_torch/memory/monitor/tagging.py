@@ -134,7 +134,7 @@ def tag(name: str):
     try:
         memory._set_memory_metadata(name)
     except Exception:  # noqa: BLE001
-        logger.debug(f"memory ledger: could not set tag {name!r}")
+        logger.debug(f"memory monitor: could not set tag {name!r}")
         yield
         return
 
@@ -144,7 +144,7 @@ def tag(name: str):
         try:
             memory._set_memory_metadata(previous)
         except Exception:  # noqa: BLE001
-            logger.debug("memory ledger: could not restore the previous tag")
+            logger.debug("memory monitor: could not restore the previous tag")
 
 
 def start_tagging_window(max_entries: int = _DEFAULT_MAX_ENTRIES) -> bool:
@@ -158,7 +158,7 @@ def start_tagging_window(max_entries: int = _DEFAULT_MAX_ENTRIES) -> bool:
     try:
         torch.cuda.memory._record_memory_history(max_entries=max_entries)
     except Exception:  # noqa: BLE001
-        logger.debug("memory ledger: could not start history recording")
+        logger.debug("memory monitor: could not start history recording")
         return False
     return True
 
@@ -168,7 +168,7 @@ def stop_tagging_window() -> None:
     try:
         torch.cuda.memory._record_memory_history(None)
     except Exception:  # noqa: BLE001
-        logger.debug("memory ledger: could not stop history recording")
+        logger.debug("memory monitor: could not stop history recording")
 
 
 @dataclass(frozen=True)
@@ -200,7 +200,7 @@ def freeze_tag_map() -> TagSnapshot:
     try:
         snapshot = torch.cuda.memory._snapshot()
     except Exception:  # noqa: BLE001
-        logger.debug("memory ledger: snapshot failed while freezing tags")
+        logger.debug("memory monitor: snapshot failed while freezing tags")
         return TagSnapshot(supported=False)
 
     owners: dict[int, str] = {}
@@ -238,7 +238,7 @@ def live_bytes_by_tag(snapshot: TagSnapshot) -> dict[str, int]:
     try:
         segments = torch.cuda.memory._snapshot()["segments"]
     except Exception:  # noqa: BLE001
-        logger.debug("memory ledger: snapshot failed while reading tags")
+        logger.debug("memory monitor: snapshot failed while reading tags")
         return {}
 
     totals: dict[str, int] = {UNTAGGED: 0}
@@ -277,7 +277,7 @@ def get_frozen_map() -> TagSnapshot:
 def startup_window(rank: int | None = None):
     """Record tags for the duration of startup, then freeze and stop.
 
-    Costs roughly 2x per allocation while open, so it is gated on the ledger
+    Costs roughly 2x per allocation while open, so it is gated on the monitor
     being enabled and closes before steady state begins. Tagged categories
     are all allocated during startup, so nothing is lost by closing it.
 
@@ -311,14 +311,14 @@ def _log_window_result(snapshot: TagSnapshot) -> None:
     report read much later.
     """
     if not snapshot.supported:
-        logger.info("memory ledger: tagging unsupported; no startup tags")
+        logger.info("memory monitor: tagging unsupported; no startup tags")
         return
 
     totals = live_bytes_by_tag(snapshot)
     tagged = {k: v for k, v in totals.items() if k != UNTAGGED and v}
     if not tagged:
         logger.warning(
-            "memory ledger: startup window closed with no tagged bytes; "
+            "memory monitor: startup window closed with no tagged bytes; "
             "torch-side rows will be absent rather than zero"
         )
         return
@@ -326,7 +326,7 @@ def _log_window_result(snapshot: TagSnapshot) -> None:
     summary = ", ".join(
         f"{name}={size / (1 << 20):.1f} MiB" for name, size in sorted(tagged.items())
     )
-    logger.info(f"memory ledger: startup tags captured -- {summary}")
+    logger.info(f"memory monitor: startup tags captured -- {summary}")
 
     # The executor's process is the one holding the memory, and this is the
     # first moment every provider has something to report, so emit the full
@@ -336,7 +336,7 @@ def _log_window_result(snapshot: TagSnapshot) -> None:
 
     report = report_now(tag="startup_complete")
     if report is not None:
-        logger.info(f"memory ledger: startup breakdown\n{report}")
+        logger.info(f"memory monitor: startup breakdown\n{report}")
 
 
 def _block_index() -> list[tuple[int, int]]:
