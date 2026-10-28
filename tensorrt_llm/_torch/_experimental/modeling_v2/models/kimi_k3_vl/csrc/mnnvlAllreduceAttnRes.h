@@ -23,7 +23,6 @@ TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::kimiK3Mnnvl
 {
-using namespace ::tensorrt_llm::kernels;
 
 struct AttnResEpilogueParams
 {
@@ -36,7 +35,8 @@ struct AttnResEpilogueParams
     int numCandidates;
 };
 
-void oneshotAllreduceAttnResOp(mnnvl::AllReduceFusionParams const& params, AttnResEpilogueParams const& epilogue);
+void oneshotAllreduceAttnResOp(
+    ::tensorrt_llm::kernels::mnnvl::AllReduceFusionParams const& params, AttnResEpilogueParams const& epilogue);
 
 }
 

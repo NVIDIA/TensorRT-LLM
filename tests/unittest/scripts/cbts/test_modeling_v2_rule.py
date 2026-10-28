@@ -158,7 +158,7 @@ def test_scope(rule):
     assert _COMM in _selected(result)  # unreadable family falls back to all modeling_v2
 
 
-@pytest.mark.parametrize("relative", ["csrc/kernel.cu", "ops/_native.py", "routing.py"])
+@pytest.mark.parametrize("relative", ["csrc/kernel.cu", "fake_ops.py", "routing.py"])
 def test_k3_uses_modeling_v2_selection(rule, relative):
     path = f"{_PY}/models/kimi_k3_vl/{relative}"
     assert _is_mv2_claim(path)

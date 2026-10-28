@@ -717,7 +717,6 @@ TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::kimiK3DecodeAttnRes
 {
-using namespace ::tensorrt_llm::kernels;
 
 template <int N, bool FUSE_LAYER_ADD>
 static void launchAttnResDecodeRmsNorm(AttnResFwdParams const& params, cudaStream_t stream)

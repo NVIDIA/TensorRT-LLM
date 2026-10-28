@@ -23,9 +23,8 @@ TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::kimiK3MnnvlOneShot
 {
-using namespace ::tensorrt_llm::kernels;
 
-struct AllReduceFusionParams : mnnvl::AllReduceFusionParams
+struct AllReduceFusionParams : ::tensorrt_llm::kernels::mnnvl::AllReduceFusionParams
 {
     bool earlyTrigger = false;
 };

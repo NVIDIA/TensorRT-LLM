@@ -27,7 +27,6 @@ TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::kimiK3Mnnvl
 {
-using namespace ::tensorrt_llm::kernels;
 
 struct AllGatherSplitParams
 {

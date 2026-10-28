@@ -16,7 +16,7 @@
 one kernel, M <= 8) at the Kimi K3 TP16 per-rank shapes, one process per GPU over the TP group of this run (4 on one
 GB200 tray; the per-rank shapes do not depend on the group size, the reduction is 4-way instead of 16-way), at every M
 in 1..8:
-  oproj  against o_proj (cuBLAS, rows as in an 8-row call) -> trtllm::mnnvl_allreduce_attn_res, bit for bit,
+  oproj  against o_proj (cuBLAS, rows as in an 8-row call) -> mv2_kimi_k3_vl::mnnvl_allreduce_attn_res, bit for bit,
          0 / 1 / 3 / 8 snapshots, with and without the prefix sum;
   tail   against the tail in torch (fp32 accumulators, the latent RMS on the latent one) -> mnnvl_allreduce_attn_res
          (fp32 tolerance: another summation order), and with the DSpark capture tap (the pre-norm mixture against

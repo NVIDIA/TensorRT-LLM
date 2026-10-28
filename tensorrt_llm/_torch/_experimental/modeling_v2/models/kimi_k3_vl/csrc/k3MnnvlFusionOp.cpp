@@ -163,10 +163,11 @@ std::vector<torch::Tensor> k3MnnvlFusionAllReduce(torch::Tensor& input, torch::o
 
             std::vector<int64_t> quantShape(input.sizes().begin(), input.sizes().end());
             quantShape.back() /= 2;
-            quantOut = at::detail::empty_cuda(quantShape, FLOAT4_E2M1X2, input.device(), std::nullopt);
+            quantOut = at::detail::empty_cuda(
+                quantShape, ::tensorrt_llm::torch_ext::FLOAT4_E2M1X2, input.device(), std::nullopt);
             scaleOut
                 = at::detail::empty_cuda({tensorrt_llm::computeSwizzledLayoutSFSize(numTokens, hiddenDim / kSfVecSize)},
-                    SF_DTYPE, input.device(), std::nullopt);
+                    ::tensorrt_llm::torch_ext::SF_DTYPE, input.device(), std::nullopt);
         }
         else
         {

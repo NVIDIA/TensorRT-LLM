@@ -23,9 +23,8 @@ TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::kimiK3DecodeAttnRes
 {
-using namespace ::tensorrt_llm::kernels;
 
-struct AttnResFwdParams : kimiK3AttnRes::AttnResFwdParams
+struct AttnResFwdParams : ::tensorrt_llm::kernels::kimiK3AttnRes::AttnResFwdParams
 {
     bool earlyTrigger = false;
 };

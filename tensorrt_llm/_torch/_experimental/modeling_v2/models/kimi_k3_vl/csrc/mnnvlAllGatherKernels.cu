@@ -25,7 +25,6 @@ TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::kimiK3Mnnvl
 {
-using namespace ::tensorrt_llm::kernels;
 
 using tensorrt_llm::common::isLamportDirty;
 using tensorrt_llm::common::LamportFlags;
