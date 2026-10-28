@@ -17,8 +17,13 @@
 from multiprocessing import Event
 from unittest import mock
 
+import pytest
+
 from tensorrt_llm.bench.benchmark.utils import processes
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
+
+# The CPU CI stage runs pytest with -m cpu_only and skips files without this marker.
+pytestmark = pytest.mark.cpu_only
 
 
 def _run_with_socket(socket, tmp_path):
@@ -45,6 +50,8 @@ def test_interrupt_during_recv_drains_until_end_sentinel(tmp_path):
 def test_interrupt_during_bind_does_not_drain(tmp_path):
     socket = mock.MagicMock()
     socket.bind.side_effect = KeyboardInterrupt()
+    # Fail fast instead of hanging in the drain loop if the guard regresses.
+    socket.recv_json.side_effect = AssertionError("receive on unbound socket")
 
     context = _run_with_socket(socket, tmp_path)
 
