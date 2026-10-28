@@ -40,7 +40,8 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatMessage,
     UsageInfo,
 )
-from tensorrt_llm.serve.openai_server import OpenAIServer
+
+from .openai_server_stub import make_stub_openai_server
 
 # No GPU, engine or sockets: this runs in the CPU-Generic CI stage, which
 # selects with `-m cpu_only`.
@@ -139,42 +140,19 @@ def _stub_response() -> ChatCompletionResponse:
 
 
 @pytest.fixture
-def route_client():
+def route_client(tmp_path):
     """`openai_chat` on a bare app, with everything past prompt-building cut.
 
-    The server is built with `object.__new__` and hand-set attributes, so the
-    handler runs for real and the engine never does.
+    The engine is a stub behind the real server constructor, so the handler
+    runs for real and the engine never does.
     """
-    server = object.__new__(OpenAIServer)
     captured = {}
 
     def generate_async(*, inputs, **kwargs):
         captured["inputs"] = inputs
         return SimpleNamespace(prompt_token_ids=RELAYED_TOKEN_IDS, finished=True)
 
-    server.model = MODEL
-    server.allow_request_chat_template = False
-    server.model_config = _StubModelConfig()
-    server.processor = None
-    server.tokenizer = SimpleNamespace(
-        tokenizer=SimpleNamespace(vocab_size=_StubModelConfig.vocab_size)
-    )
-    server.chat_template = None
-    server.tool_parser = None
-    server.tool_call_id_type = "random"
-    server.multimodal_server_config = None
-    # No `preprocess` attribute, so the handler skips the input-processor
-    # executor; `num_postprocess_workers=0` keeps post-processing in-process.
-    server.generator = SimpleNamespace(
-        args=SimpleNamespace(
-            gather_generation_logits=False,
-            reasoning_parser=None,
-            backend="pytorch",
-            guided_decoding_backend=None,
-            num_postprocess_workers=0,
-        ),
-        generate_async=generate_async,
-    )
+    server = make_stub_openai_server(tmp_path, MODEL, _StubModelConfig(), generate_async)
     server.await_disconnected = AsyncMock()
     server._create_chat_response = AsyncMock(return_value=_stub_response())
 

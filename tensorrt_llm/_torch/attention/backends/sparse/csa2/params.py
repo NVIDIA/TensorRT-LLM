@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
+from tensorrt_llm._utils import is_sm_100f, is_sm_120f
+
 from ..params import SparseBackendForwardArgs, SparseMetadataParams, SparseParams
 
 if TYPE_CHECKING:
@@ -190,9 +192,9 @@ def select_csa2_backend(sm_version: int) -> str:
     """Match the DSV4 hardware families without confusing SM120 with SM100."""
     if sm_version == 90:
         return "flash_mla"
-    if 100 <= sm_version < 110:
+    if is_sm_100f(sm_version):
         return "trtllm"
-    if sm_version in (120, 121):
+    if is_sm_120f(sm_version):
         return "flashinfer"
     raise ValueError(f"CSA2 attention is unsupported on SM{sm_version}")
 

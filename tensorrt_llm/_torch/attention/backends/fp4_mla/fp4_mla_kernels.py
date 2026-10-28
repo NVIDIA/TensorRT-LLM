@@ -673,6 +673,7 @@ def _fp4_mla_context_cache_update_kernel(
     POOL_HEAD_D: tl.constexpr,
     STORE_HP_TAIL: tl.constexpr,
     WRITE_V_PACKED: tl.constexpr,
+    STORE_V_SCALE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     work_idx = tl.program_id(1)
@@ -988,20 +989,22 @@ def _fp4_mla_context_cache_update_kernel(
                 mask=valid_tokens,
             )
 
-    v_sf_base = tl.cast(local_layer, tl.int64) * tl.cast(
-        vsf_s0, tl.int64
-    ) + physical_page * tl.cast(vsf_s1, tl.int64)
-    token_scale_col = page_pos // HP_BLOCK
-    sf_offsets = _fp4_mla_swizzled_sf_offset(
-        safe_all_d,
-        token_scale_col,
-        SF_PER_PAGE,
-    )
-    tl.store(
-        v_sf_ptr + v_sf_base + sf_offsets.to(tl.int64),
-        v_stored_scale,
-        mask=mask_all_d & (all_d < V_HEAD_D),
-    )
+    # A context-only cache (disaggregated context worker) has no V scales.
+    if STORE_V_SCALE:
+        v_sf_base = tl.cast(local_layer, tl.int64) * tl.cast(
+            vsf_s0, tl.int64
+        ) + physical_page * tl.cast(vsf_s1, tl.int64)
+        token_scale_col = page_pos // HP_BLOCK
+        sf_offsets = _fp4_mla_swizzled_sf_offset(
+            safe_all_d,
+            token_scale_col,
+            SF_PER_PAGE,
+        )
+        tl.store(
+            v_sf_ptr + v_sf_base + sf_offsets.to(tl.int64),
+            v_stored_scale,
+            mask=mask_all_d & (all_d < V_HEAD_D),
+        )
 
 
 @triton.jit
@@ -1014,6 +1017,7 @@ def _fp4_mla_generation_q1_kv_tile_update(
     hp_index,
     kv_len,
     block_base_pos,
+    hp_pos_offset,
     page_pos,
     physical_page,
     dim_blocks,
@@ -1052,7 +1056,7 @@ def _fp4_mla_generation_q1_kv_tile_update(
 
     abs_positions = block_base_pos + token_offsets
     valid_tokens = abs_positions < kv_len
-    hp_slots = abs_positions % HP_POOL_SIZE
+    hp_slots = (abs_positions + hp_pos_offset) % HP_POOL_SIZE
 
     hp_even_ptrs = (
         hp_pool_ptr
@@ -1178,6 +1182,7 @@ def _fp4_mla_generation_q1_kv_tail8_update(
     hp_index,
     kv_len,
     block_base_pos,
+    hp_pos_offset,
     page_pos,
     physical_page,
     dim_block_base,
@@ -1223,8 +1228,8 @@ def _fp4_mla_generation_q1_kv_tail8_update(
     token1_valid = token1 < tail_count
     abs_position0 = block_base_pos + token0
     abs_position1 = block_base_pos + token1
-    hp_slot0 = abs_position0 % HP_POOL_SIZE
-    hp_slot1 = abs_position1 % HP_POOL_SIZE
+    hp_slot0 = (abs_position0 + hp_pos_offset) % HP_POOL_SIZE
+    hp_slot1 = (abs_position1 + hp_pos_offset) % HP_POOL_SIZE
     dim_even = dim_block * FP4_BLOCK + byte_offset * 2
     hp_base = hp_index * pool_s0 + local_layer * pool_s1
     pair0_ptr = (hp_pool_ptr + hp_base + hp_slot0 * HEAD_D + dim_even).to(
@@ -1438,6 +1443,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     Q_SF_COLS: tl.constexpr,
     WRITE_Q: tl.constexpr,
     Q1_KV_BLOCKS_PER_PROGRAM: tl.constexpr,
+    Q_ROWS_PER_SEQ: tl.constexpr = 0,
 ):
     q1_shared_main: tl.constexpr = FUSE_ROPE_CACHE_STORE and MAX_GEN_TILES == 1
     q1_grouped_kv: tl.constexpr = q1_shared_main and Q1_KV_BLOCKS_PER_PROGRAM > 1
@@ -1476,6 +1482,27 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 other=-1,
             )
             first_new_pos = tl.minimum(first_new_pos, tl.where(local_slot >= 0, local_slot, kv_len))
+    # HP ring slots are addressed by global position (the context writer and
+    # the ring transfer use it). Helix cache positions are rank-local; the
+    # difference only cancels when HP_POOL_SIZE divides the page size.
+    hp_pos_offset = first_new_pos - first_new_pos
+    if USE_HELIX_LOCAL_SLOTS:
+        for token_idx in tl.static_range(0, MAX_GEN_TILES * HP_BLOCK):
+            local_slot = tl.load(
+                helix_local_slots_ptr + seq_idx * gen_len + token_idx,
+                mask=token_idx < gen_len,
+                other=-1,
+            )
+            global_pos = tl.load(
+                helix_position_offsets_ptr + seq_idx * gen_len + token_idx,
+                mask=token_idx < gen_len,
+                other=0,
+            )
+            hp_pos_offset = tl.where(
+                local_slot == first_new_pos, global_pos - local_slot, hp_pos_offset
+            )
+    elif USE_HELIX:
+        hp_pos_offset = rope_first_new_pos - first_new_pos
     if FUSE_ROPE_CACHE_STORE:
         work_idx = tl.program_id(1)
         dim_block = work_idx
@@ -1508,7 +1535,15 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 q_token = seq_idx * gen_len + q_token_idx
                 head_lanes = tl.arange(0, BLOCK_Q_HEADS)
                 head_offsets = q_head_block * BLOCK_Q_HEADS + head_lanes
-                q_rows = q_token * NUM_Q_HEADS + head_offsets
+                # The BF16 Q input is token-major; the FP4 output follows the
+                # decode layout: token-major, or packed per request where each
+                # request owns Q_ROWS_PER_SEQ rows (a multiple of 128) holding
+                # its [query token, head] pairs.
+                q_in_rows = q_token * NUM_Q_HEADS + head_offsets
+                if Q_ROWS_PER_SEQ > 0:
+                    q_rows = seq_idx * Q_ROWS_PER_SEQ + q_token_idx * NUM_Q_HEADS + head_offsets
+                else:
+                    q_rows = q_in_rows
                 q_input_row_stride: tl.constexpr = Q_PREFIX_D + ROPE_DIM
                 q_packed_row_stride: tl.constexpr = (Q_PREFIX_D + 2 * ROPE_DIM) // 2
                 # Every lane is valid only when the launch covers the head
@@ -1528,7 +1563,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                         tl.static_assert(Q_PREFIX_BLOCK_D % FP4_BLOCK == 0)
                         q_global_scale = tl.load(q_global_scale_ptr).to(tl.float32)
                         prefix_dims = tl.arange(0, Q_PREFIX_BLOCK_D)
-                        prefix_base = q_rows[:, None].to(tl.int64) * q_input_row_stride
+                        prefix_base = q_in_rows[:, None].to(tl.int64) * q_input_row_stride
                         prefix_groups: tl.constexpr = Q_PREFIX_BLOCK_D // FP4_BLOCK
                         q_prefix_iterations: tl.constexpr = Q_PREFIX_BLOCKS_PER_PROGRAM
                         for q_prefix_iteration in tl.range(
@@ -1797,7 +1832,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 + latent_token.to(tl.int64) * (NUM_DIM_BLOCKS * FP4_BLOCK)
                 + prestage_dim.to(tl.int64)
             )
-            prestage_slot = first_new_pos % HP_POOL_SIZE
+            prestage_slot = (first_new_pos + hp_pos_offset) % HP_POOL_SIZE
             tl.store(
                 hp_pool_ptr
                 + hp_index * pool_s0
@@ -1827,6 +1862,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                         hp_index,
                         kv_len,
                         block_base_pos,
+                        hp_pos_offset,
                         page_pos,
                         physical_page,
                         dim_block_base,
@@ -1874,6 +1910,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                         hp_index,
                         kv_len,
                         block_base_pos,
+                        hp_pos_offset,
                         page_pos,
                         physical_page,
                         pair_dim_blocks,
@@ -2034,7 +2071,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
                 residual_stored_scale,
             )
 
-            hp_slot = position % HP_POOL_SIZE
+            hp_slot = (position + hp_pos_offset) % HP_POOL_SIZE
             hp_store_base = (
                 hp_pool_ptr + hp_index * pool_s0 + local_layer * pool_s1 + hp_slot * HEAD_D
             )
@@ -2076,7 +2113,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
 
         abs_positions = block_base_pos + token_offsets
         valid_tokens = abs_positions < kv_len
-        hp_slots = abs_positions % HP_POOL_SIZE
+        hp_slots = (abs_positions + hp_pos_offset) % HP_POOL_SIZE
         if USE_HELIX_LOCAL_SLOTS:
             from_latent = abs_positions < 0
             new_token_offsets = abs_positions - abs_positions

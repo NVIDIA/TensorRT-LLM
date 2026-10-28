@@ -19,6 +19,7 @@ attributes that the fingerprint projection reads.
 """
 
 import copy
+import re
 from pathlib import Path
 
 import pytest
@@ -33,18 +34,27 @@ from _source_identity_fakes import (
     make_artifact_identity,
 )
 
+import tensorrt_llm._torch.weight_sharing as weight_sharing
+import tensorrt_llm._torch.weight_sharing.post_transform_profiles as post_transform_profiles
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
-    MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
-    QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
-    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     IdentityCheckPolicy,
     SourceIdentity,
     SourceIdentityMismatchError,
     check_weight_sharing_compatibility,
 )
+from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig
 
 pytestmark = pytest.mark.cpu_only
+
+# Constant names of transform-layout ABIs, any version.
+_TRANSFORM_ABI_NAME = re.compile(r".*_POST_TRANSFORM_LAYOUT_ABI_V\d+")
+# Every transform-layout ABI that the package publishes.
+_PUBLISHED_TRANSFORM_ABI_IDS = tuple(
+    getattr(weight_sharing, name)
+    for name in weight_sharing.__all__
+    if _TRANSFORM_ABI_NAME.fullmatch(name)
+)
 
 
 def test_identical_configs_match():
@@ -74,16 +84,22 @@ def test_from_model_config_requires_one_artifact_source() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "transform_abi_id",
-    [
-        LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
-        MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
-        QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
-        QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
-    ],
-)
+def test_transform_abi_ids_are_published_and_distinct() -> None:
+    """Every transform-layout ABI constant is published, with its own identifier."""
+    defined_names = {
+        name for name in vars(post_transform_profiles) if _TRANSFORM_ABI_NAME.fullmatch(name)
+    }
+    published_names = {
+        name for name in weight_sharing.__all__ if _TRANSFORM_ABI_NAME.fullmatch(name)
+    }
+    assert defined_names
+    assert published_names == defined_names
+    assert len(set(_PUBLISHED_TRANSFORM_ABI_IDS)) == len(_PUBLISHED_TRANSFORM_ABI_IDS)
+
+
+@pytest.mark.parametrize("transform_abi_id", _PUBLISHED_TRANSFORM_ABI_IDS)
 def test_from_model_config_binds_transform_abi(transform_abi_id: str) -> None:
+    """Each published transform-layout ABI is bound into the generated identity."""
     identity = SourceIdentity.from_model_config(
         FakeModelConfig(),
         artifact_identity=make_artifact_identity(),
@@ -115,6 +131,21 @@ def test_backend_mismatch_flags_global():
     result = a.matches(b)
     assert not result.matched
     assert "backend_fingerprint" in result.mismatched_fields
+
+
+def test_moe_load_balancer_config_controls_backend_identity():
+    base = identity_from(FakeModelConfig())
+    standard = identity_from(FakeModelConfig(moe_load_balancer=MoeLoadBalancerConfig(num_slots=64)))
+    per_layer_dynamic = identity_from(
+        FakeModelConfig(moe_load_balancer=MoePerLayerDynamicLoadBalancerConfig(num_slots=72))
+    )
+    same_per_layer_dynamic = identity_from(
+        FakeModelConfig(moe_load_balancer=MoePerLayerDynamicLoadBalancerConfig(num_slots=72))
+    )
+
+    assert not base.matches(standard).matched
+    assert not standard.matches(per_layer_dynamic).matched
+    assert per_layer_dynamic.matches(same_per_layer_dynamic).matched
 
 
 def test_model_layout_field_mismatch_flags_global_and_shard():
@@ -368,6 +399,30 @@ def test_transform_abi_participates_in_global_fingerprint():
 
     assert result.mismatched_fields == ["transform_abi_id"]
     assert without_abi.global_fingerprint != with_abi.global_fingerprint
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [IdentityCheckPolicy.WARN_FALLBACK, IdentityCheckPolicy.ENFORCE],
+    ids=lambda policy: policy.value,
+)
+@pytest.mark.parametrize("source_transform_abi_id", (*_PUBLISHED_TRANSFORM_ABI_IDS, None))
+@pytest.mark.parametrize("local_transform_abi_id", _PUBLISHED_TRANSFORM_ABI_IDS)
+def test_transform_abi_shares_only_with_the_same_abi(
+    local_transform_abi_id: str,
+    source_transform_abi_id: str | None,
+    policy: IdentityCheckPolicy,
+) -> None:
+    """A receiver shares only with a donor of the same published ABI, under either policy."""
+    should_share = source_transform_abi_id == local_transform_abi_id
+    local = identity_from(FakeModelConfig(), transform_abi_id=local_transform_abi_id)
+    source = identity_from(FakeModelConfig(), transform_abi_id=source_transform_abi_id)
+
+    decision = check_weight_sharing_compatibility(local, source, policy)
+
+    assert decision.should_share is should_share
+    assert decision.match_result.mismatched_fields == ([] if should_share else ["transform_abi_id"])
+    assert (local.global_fingerprint == source.global_fingerprint) is should_share
 
 
 def test_format_version_mismatch_never_matches():

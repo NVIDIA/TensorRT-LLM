@@ -31,7 +31,8 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
 
@@ -56,13 +57,15 @@ from cbts.coverage.tier import (
     open_db,
     write_coverage_test_db,
 )
-from cbts.rules._helpers import strip_noop_diff_lines
+from cbts.python_docstring_analysis import split_docstring_diff
+from cbts.rules._helpers import iter_diff_changes, strip_noop_diff_lines
 from cbts.rules.agent_flow import AgentFlowRule
 from cbts.rules.base import PRInputs, Rule, RuleResult, format_reason
 from cbts.rules.docs import DocsRule
 from cbts.rules.modeling_v2 import ModelingV2Rule
 from cbts.rules.openengine import OpenEngineRule
-from cbts.rules.out_of_scope import OutOfScopeRule
+from cbts.rules.out_of_scope import OutOfScopeRule, is_out_of_scope
+from cbts.rules.python_formatting import PythonFormattingRule, is_formatting_only_change
 from cbts.rules.spec_dec import SpecDecRule
 from cbts.rules.test_list import TestListRule
 from cbts.rules.tests_def import TestsDefRule
@@ -76,6 +79,7 @@ COVERAGE_NEEDS_DIFF_FOR: tuple[str, ...] = ("tensorrt_llm/**/*.py",)
 
 # Classes are used for `--list-needed-diffs` (no need to construct).
 RULE_CLASSES: list[type[Rule]] = [
+    PythonFormattingRule,
     WaivesRule,
     TestsDefRule,
     TestListRule,
@@ -95,16 +99,17 @@ def build_rules(
     repo_root: Path,
 ) -> list[Rule]:
     return [
+        PythonFormattingRule(),
         WaivesRule(yaml_index, stages),
         TestsDefRule(yaml_index, stages, repo_root=repo_root),
         TestListRule(yaml_index, stages, repo_root=repo_root),
         VisualGenRule(yaml_index, stages),
         SpecDecRule(yaml_index, stages),
-        ModelingV2Rule(yaml_index, stages),
+        ModelingV2Rule(yaml_index, stages, repo_root=repo_root),
         AgentFlowRule(yaml_index, stages),
         OpenEngineRule(yaml_index, stages),
         DocsRule(yaml_index, stages),
-        OutOfScopeRule(yaml_index, stages),
+        OutOfScopeRule(yaml_index, stages, repo_root=repo_root),
     ]
 
 
@@ -270,9 +275,17 @@ class Selector:
         self.stages = stages
 
     def run(self, pr: PRInputs, rules: list[Rule]) -> SelectionResult:
+        code_pr = replace(
+            pr,
+            changed_files=[
+                path
+                for path in pr.changed_files
+                if path not in pr.docstring_only_files | pr.formatting_only_files
+            ],
+        )
         pairs: list[tuple[Rule, RuleResult]] = []
         for rule in rules:
-            result = rule.apply(pr)
+            result = rule.apply(pr if rule.handles_docstrings else code_pr)
             if result is not None:
                 pairs.append((rule, result))
 
@@ -350,7 +363,7 @@ class Selector:
 # --- Input loading ----------------------------------------------------------
 
 
-def _load_pr_inputs(input_json_path: Path) -> PRInputs:
+def _load_pr_inputs(input_json_path: Path, repo_root: Path) -> PRInputs:
     data = json.loads(input_json_path.read_text())
     # Pre-strip blank- and comment-only `+/-` lines once so every rule
     # sees a "meaningful changes only" diff. Avoids spurious anchor
@@ -358,12 +371,37 @@ def _load_pr_inputs(input_json_path: Path) -> PRInputs:
     # A null diff (PR API omits the patch for binary, rename, or
     # too-large diffs) normalizes to an empty diff.
     raw_diffs = {path: d or "" for path, d in data.get("diffs", {}).items()}
+    raw_diff_counts = Counter(raw_diffs.values())
     diffs = {path: strip_noop_diff_lines(diff) for path, diff in raw_diffs.items()}
+    docstring_files: set[str] = set()
+    docstring_only_files: set[str] = set()
+    formatting_only_files: set[str] = set()
+    for path, raw_diff in raw_diffs.items():
+        if not path.endswith(".py") or not raw_diff or is_out_of_scope(path):
+            continue
+        try:
+            source = (repo_root / path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        # Forge APIs repeat a renamed file's patch for its old and new paths.
+        # Content equivalence alone cannot prove that such a move has no impact.
+        if raw_diff_counts[raw_diff] == 1 and is_formatting_only_change(source, raw_diff):
+            formatting_only_files.add(path)
+            continue
+        executable, changed = split_docstring_diff(source, raw_diff)
+        if changed:
+            docstring_files.add(path)
+            diffs[path] = strip_noop_diff_lines(executable)
+            if not any(iter_diff_changes(diffs[path])):
+                docstring_only_files.add(path)
     return PRInputs(
         changed_files=list(data.get("changed_files", [])),
         diffs=diffs,
         post_merge=bool(data.get("post_merge", False)),
         raw_diffs=raw_diffs,
+        docstring_files=docstring_files,
+        docstring_only_files=docstring_only_files,
+        formatting_only_files=formatting_only_files,
     )
 
 
@@ -492,7 +530,7 @@ def _run(args: _Args) -> int:
     # Include post-merge stages; the trigger-mode filter below selects the
     # subset matching the user's flag.
     stages = parse_stages_from_groovy(groovy_path, include_post_merge=True)
-    pr = _load_pr_inputs(input_path)
+    pr = _load_pr_inputs(input_path, repo_root)
     rules = build_rules(yaml_index, stages, repo_root)
     selector = Selector(stages)
     result = selector.run(pr, rules)

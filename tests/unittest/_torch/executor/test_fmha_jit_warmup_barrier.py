@@ -72,6 +72,9 @@ class _GraphRunnerStub:
     def preallocate_padding_dummies(self, resource_manager: object) -> None:
         pass
 
+    def reset_padding_dummies(self) -> None:
+        self.padding_dummy_requests = {}
+
 
 class _RecordingGraphs(DecoderCudaGraphs):
     """The real two-pass ``warmup_and_capture`` over a recording graph pass."""
@@ -105,10 +108,12 @@ def _engine(
     engine._agreement = WarmupAgreement(dist, mapping)
     engine.dist = dist
     engine.mapping = mapping
+    engine.model = SimpleNamespace(modules=lambda: iter(()))
     engine._config = SimpleNamespace(
+        max_beam_width=1,
         attention_backend=SimpleNamespace(
             Metadata=TrtllmAttentionMetadata if trtllm_attention else AttentionMetadata
-        )
+        ),
     )
     engine._warmup_timer = _WarmupTimer(rank=0)
     engine._metrics = {}
@@ -117,12 +122,12 @@ def _engine(
     engine._metadata = SimpleNamespace(attn_metadata=None)
     engine._context_warmups_supported = False
     engine._eager_workspace_reclaimable = False
-    engine.kv_cache_manager_key = "kv_cache_manager"
     # Model-specific prewarms the scheduled path runs unconditionally; each
     # needs a model or a device to decide it has nothing to do.
     engine._prewarm_engram_kernels = mock.Mock()
     engine._prewarm_csa2_sparse_indexer = mock.Mock()
     engine._prewarm_cute_dsl_indexer_q = mock.Mock()
+    engine._prewarm_minimax_m3_msa_indexer = mock.Mock()
     engine._ensure_dsa_attn_metadata_for_warmup = mock.Mock()
     return engine
 
@@ -135,6 +140,7 @@ def _resource_manager() -> SimpleNamespace:
 @contextlib.contextmanager
 def _patched(recorder: _Recorder) -> Iterator[None]:
     with (
+        mock.patch.object(warmup_module, "warmup_named_allreduce_topologies"),
         mock.patch.object(warmup_module, "warmup_sampling_module"),
         mock.patch.object(warmup_module, "log_mem_snapshot"),
         mock.patch.object(warmup_module, "AutoTuner"),

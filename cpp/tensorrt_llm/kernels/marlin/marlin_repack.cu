@@ -324,7 +324,7 @@ void gptq_marlin_repack_dispatch(uint32_t const* b_q_weight_ptr, uint32_t const*
 {
     int const sm = tensorrt_llm::common::getSMVersion();
     TLLM_CHECK_WITH_INFO(isMarlinNvfp4DenseSmSupported(sm),
-        "Marlin NVFP4 repack is only supported on SM89, SM90-99, and SM120/121; current SM = %d", sm);
+        "Marlin NVFP4 repack is only supported on SM89, SM90-99, and the SM120 family; current SM = %d", sm);
 
     int blocks;
     int dev;

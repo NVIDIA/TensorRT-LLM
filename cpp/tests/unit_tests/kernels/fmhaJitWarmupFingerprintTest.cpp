@@ -125,6 +125,22 @@ TEST(TllmGenFmhaJitWarmupFingerprint, DistinguishesKernelSelectingRunnerParams)
     EXPECT_NE(kernel->jitWarmupFingerprint(sparse, 0), baseKey);
 }
 
+TEST(TllmGenFmhaJitWarmupFingerprint, DistinguishesSlidingWindows)
+{
+    auto const kernel = makeKernel();
+    auto const base = makeParams();
+    auto const baseKey = kernel->jitWarmupFingerprint(base, 0);
+
+    auto leftWindow = base;
+    leftWindow.mLeftSlidingWindow = 128;
+    EXPECT_NE(kernel->jitWarmupFingerprint(leftWindow, 0), baseKey);
+
+    auto rightWindow = base;
+    rightWindow.mRightSlidingWindow = 128;
+    EXPECT_NE(kernel->jitWarmupFingerprint(rightWindow, 0), baseKey);
+    EXPECT_NE(kernel->jitWarmupFingerprint(leftWindow, 0), kernel->jitWarmupFingerprint(rightWindow, 0));
+}
+
 TEST(TllmGenFmhaJitWarmupFingerprint, DistinguishesDsv4EpilogueFusion)
 {
     // The fused epilogue selects a different kernel (and forces an E4M3
