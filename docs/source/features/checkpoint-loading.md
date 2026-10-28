@@ -376,6 +376,9 @@ options to speed up weight loading via efficient streaming from storage.
   minus some headroom. Otherwise it falls back to `native`.
 - `auto` (default): use `rank_striped_read_ahead` when the load supports it,
   and `native` I/O otherwise.
+- `model_streamer` (prototype): It streams the SafeTensors tensors that each
+  node needs to GPU with Run:ai Model Streamer, and the ranks of a node share
+  the reads. See [Model Streamer](#model-streamer).
 
 Apart from built-in HF checkpoint and built-in checkpoint loader, to enable
 non-native I/O policy, the following must all be true:
@@ -409,6 +412,40 @@ is a refresh.
   part of the checkpoint is missing from the page cache.
 - Tensor copies to GPU continue while a refresh waits.
 
+### Model Streamer
+
+With `model_streamer`, each node reads each checkpoint byte once and shares it
+among its ranks over `torch.distributed`, so a large checkpoint loads faster
+when storage bandwidth limits the load. Each node streams only the tensors
+that its own ranks need.
+
+In addition to the requirements above, it needs:
+- `runai-model-streamer` 0.17.0 or later. TensorRT-LLM does not install it.
+- A model that implements `plan_model_streamer_load()`, which names the
+  tensors that each rank needs and how to load them.
+- The other startup checks of the loader. The load fails before it streams
+  when one of them fails.
+
+Unlike `auto` and `rank_striped_read_ahead`, `model_streamer` never falls back
+to `native`: an unsupported configuration or a failed read raises an error.
+A separate draft checkpoint, for example of a speculative decoding draft
+model, is read with `native` I/O.
+
+These environment variables change how Model Streamer shares the reads:
+- `RUNAI_STREAMER_DIST`: Model Streamer shares reads by default only over a
+  process group whose backend is exactly `nccl`. When the existing group uses
+  `cuda:nccl,cpu:gloo`, for example under Ray, TensorRT-LLM sets
+  `RUNAI_STREAMER_DIST=1` during the load. Set it to `0` to turn off read
+  sharing; each rank then reads only its own tensors.
+- `RUNAI_STREAMER_DIST_GLOBAL`: Each node streams different tensors, so the
+  load raises an error when this variable is `1` and the ranks are on more
+  than one node.
+
+When the ranks of a node should share the reads but Model Streamer does not,
+the load raises an error. One cause is a rank whose free GPU memory is less
+than twice the largest tensor of a batch. Set `RUNAI_STREAMER_LOG_TO_STDERR=1`
+to see the reason that Model Streamer logs.
+
 ### Logs
 
 Each rank logs one line per checkpoint read (draft checkpoint loading has
@@ -427,12 +464,25 @@ started.
 like communication error, it could fall back to `native`.
 - `fallback_reason`: why loading switched to native I/O.
 
-The `/server_info` response also reports these five fields in
-`startup_metrics.model_loader`: `checkpoint_io_policy` for the target
+With `model_streamer`, each rank logs its Model Streamer metrics instead for
+the target checkpoint:
+
+```text
+Model Streamer metrics for rank <rank>: model_streamer_seconds=<seconds>, model_streamer_node_tensors=<count>, model_streamer_node_bytes=<bytes>, model_streamer_batches=<count>, model_streamer_rank_tensors=<count>
+```
+
+- `model_streamer_seconds`: the time to stream all batches.
+- `model_streamer_node_tensors` and `model_streamer_node_bytes`: what the node
+  streamed for all its ranks.
+- `model_streamer_batches`: the number of batches that the model's plan asked for.
+- `model_streamer_rank_tensors`: the tensors that this rank loads.
+
+The `/server_info` response also reports the five checkpoint I/O policy fields
+in `startup_metrics.model_loader`: `checkpoint_io_policy` for the target
 checkpoint read, and `draft_checkpoint_io_policy` for a separate draft
 checkpoint read. The value is `null` when the built-in HF weight loader did not
-read the checkpoint from storage, for example with preloaded weights, a custom
-weight loader, or a GMS reader.
+read the checkpoint from storage, for example with `model_streamer`, preloaded
+weights, a custom weight loader, or a GMS reader.
 
 ## Startup Telemetry
 
