@@ -137,10 +137,17 @@ def test_config_validation():
         MetadataServerConfig(server_type="etcd", cert_key="k")
     with pytest.raises(ValueError):
         MetadataServerConfig(server_type="etcd", cert_key="k", cert_cert="c")
+    with pytest.raises(ValueError, match="require ca_cert"):
+        MetadataServerConfig(server_type="etcd", user=ETCD_USER, password=ETCD_SECRET)
     cfg = MetadataServerConfig(
-        server_type="etcd", user=ETCD_USER, password=ETCD_SECRET, record_auth_key=RECORD_KEY
+        server_type="etcd",
+        user=ETCD_USER,
+        password=ETCD_SECRET,
+        ca_cert="/ca.pem",
+        record_auth_key=RECORD_KEY,
     )
     assert cfg.port == 2379
+    assert MetadataServerConfig(server_type="etcd", ca_cert="/ca.pem").user is None
 
 
 def test_create_metadata_server_passes_credentials():

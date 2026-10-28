@@ -219,6 +219,11 @@ class MetadataServerConfig():
         if (self.user is None) != (self.password is None):
             raise ValueError(
                 "metadata server user and password must be set together")
+        if self.user is not None and self.ca_cert is None:
+            raise ValueError(
+                "metadata server user and password require ca_cert: the etcd "
+                "client sends its authentication token only over a TLS "
+                "connection")
         if (self.cert_key is None) != (self.cert_cert is None):
             raise ValueError(
                 "metadata server cert_key and cert_cert must be set together")
