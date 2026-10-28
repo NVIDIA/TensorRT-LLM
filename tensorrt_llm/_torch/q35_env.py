@@ -41,15 +41,22 @@ PROFILE_ENV = "TRTLLM_Q35_PROFILE"
 _PROFILES = ("gen", "ctx")
 _PROFILE_OFF = ("", "off")
 
-# Generation (decode) workers.
+# Generation (decode) workers. FUSED_AR_TPC and MOE_FRONT_BIG_C16 / _C16W act only beyond the row counts the
+# defaults reach: fused all-reduce calls above one CTA wave (2 rows per SM) and MoE front steps above 256 tokens.
+# TEMPERATURE_GRAPHS adds a CUDA graph capture pass so that temperature-only batches (requests without top-k /
+# top-p / min-p / seed, e.g. OpenAI requests that set none) sample on the vocabulary-sharded logits.
 _GEN = {
     "TRTLLM_Q35_CACHED_STREAM_EVENTS": "1",
+    "TRTLLM_Q35_DRAFT_ARGMAX_LOGITS": "1",
     "TRTLLM_Q35_DRAFT_BOOKKEEPING": "1",
     "TRTLLM_Q35_DRAFT_FP8_HEAD": "1",
     "TRTLLM_Q35_DRAFT_TAIL": "1",
     "TRTLLM_Q35_FUSED_ACCEPT": "1",
+    "TRTLLM_Q35_FUSED_AR_TPC": "1",
     "TRTLLM_Q35_FUSED_STEP0": "1",
     "TRTLLM_Q35_LL_ARGMAX_EXCHANGE": "1",
+    "TRTLLM_Q35_MOE_FRONT_BIG_C16": "1",
+    "TRTLLM_Q35_MOE_FRONT_BIG_C16W": "1",
     "TRTLLM_Q35_PDL_EARLY_TRIGGER": "1",
     "TRTLLM_Q35_POSITIONS_HOIST": "1",
     "TRTLLM_Q35_REPLICATED_EMBED": "1",
@@ -60,6 +67,7 @@ _GEN = {
     "TRTLLM_Q35_SHARDED_TARGET_SAMPLING": "1",
     "TRTLLM_Q35_SKIP_MROPE_COS_SIN": "1",
     "TRTLLM_Q35_SPEC_PREPARE_CACHE": "1",
+    "TRTLLM_Q35_TEMPERATURE_GRAPHS": "1",
 }
 # Context (prefill) workers without attention DP.
 _CTX = {

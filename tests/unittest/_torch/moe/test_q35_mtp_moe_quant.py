@@ -31,6 +31,23 @@ def _bf16_moe_reference(x, router_logits, w1, w3, w2, top_k):
     return out
 
 
+@pytest.mark.parametrize("env,expected", [(None, 28), ("0", 0), ("56", 56)])
+def test_quant_max_m_env_override(monkeypatch, env, expected):
+    """TRTLLM_Q35_MTP_MOE_QUANT_MAX_M replaces the BF16-twin cap at import; 0 means no twin."""
+    import importlib
+
+    m = _mod()
+    if env is None:
+        monkeypatch.delenv("TRTLLM_Q35_MTP_MOE_QUANT_MAX_M", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_Q35_MTP_MOE_QUANT_MAX_M", env)
+    try:
+        assert importlib.reload(m).MTP_MOE_QUANT_MAX_M == expected
+    finally:
+        monkeypatch.delenv("TRTLLM_Q35_MTP_MOE_QUANT_MAX_M", raising=False)
+        importlib.reload(m)
+
+
 def test_nvfp4_e2m1_rounding_grid():
     """Round to nearest, ties to the even code (cvt.rn.satfinite.e2m1x2): 0.25 -> 0, 0.75 -> 1, 1.25 -> 1,
     1.75 -> 2, 2.5 -> 2, 3.5 -> 4, 5 -> 4, above 5 -> 6; negative values keep the sign, -0 stays 0."""

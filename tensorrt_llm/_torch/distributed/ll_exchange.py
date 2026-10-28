@@ -62,19 +62,23 @@ def _q35_read_switches() -> None:
     _PDL_EARLY_TRIGGER = os.environ.get("TRTLLM_Q35_PDL_EARLY_TRIGGER", "0") == "1"
 
 
-# Sizes tuned for Qwen3.5-397B decode on SM 10.3 (GB300).
+# Sizes tuned for Qwen3.5-397B decode on SM 10.3 (GB300). Deployments above batch 64 raise them with
+# TRTLLM_Q35_LL_EXCHANGE_MAX_ROWS, TRTLLM_Q35_CP_EXCHANGE_KB and TRTLLM_Q35_CP_MERGE_MAX_ROWS (e.g. 1024, 2048 and
+# 4096 for TEP8 at batch 128).
 # Rows (keys) per rank and launch of TPKeyExchange, a power of two: covers the vocabulary-sharded target sampling of
 # an MTP-6 verify at b64 (448 rows).
-_MAX_ROWS = triton.next_power_of_2(512)
+_MAX_ROWS = triton.next_power_of_2(
+    max(64, int(os.environ.get("TRTLLM_Q35_LL_EXCHANGE_MAX_ROWS", "512")))
+)
 _WORDS = 2 * _MAX_ROWS  # 32-bit words per rank: (lo, hi) per key
 # Independent epoch channels of TPKeyExchange.
 _NUM_CHANNELS = 16
 # Largest per-(source, destination) payload of TPGroupExchange (CP-lite decode attention: q all-gather and the
 # alltoall_merge partials: (rows x D / 2 + _MERGE_MAX_ROWS) words, 904 KiB for the 1792 rows of b64 MTP-6 at D 256).
-_CP_EXCHANGE_BYTES = 1024 * 1024
+_CP_EXCHANGE_BYTES = int(os.environ.get("TRTLLM_Q35_CP_EXCHANGE_KB", "1024")) * 1024
 # Rows (tokens x heads x partials) one alltoall_merge may carry: TEP8 MTP-6 verify needs 896 at b32, 1344 at b48 and
 # 1792 at b64 (the backend admits CP-lite up to batch 64).
-_MERGE_MAX_ROWS = 2048
+_MERGE_MAX_ROWS = int(os.environ.get("TRTLLM_Q35_CP_MERGE_MAX_ROWS", "2048"))
 # Programs per SM of the group all-gather (one 256-word block each, up to this many blocks per SM).
 _GROUP_GRID = 2
 # Programs per SM of alltoall_merge (one wave: every program is resident, so a program polling for a peer's rows

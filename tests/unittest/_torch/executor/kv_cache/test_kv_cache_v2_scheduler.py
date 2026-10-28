@@ -5382,7 +5382,7 @@ class TestFirstChunkBudgetBeforeClaim:
 
     def test_first_chunk_holding_a_cache_is_still_released(self):
         """A first chunk that already holds a cache goes through preparation, so the failed
-        admission releases its claim as before."""
+        admission releases its claim."""
         mgr = make_kv_cache_manager(tokens_per_block=64)
         sched = self._sched(self.SRPT, mgr)
         long = make_ctx_request(0, context_remaining_length=50000)
@@ -5459,3 +5459,155 @@ class TestInforwardMambaSnapshot:
         sched.schedule_request([req], set())
         assert req.context_chunk_size == 2944
         assert req.py_mamba_inforward_snapshot_point is None
+
+
+# ===========================================================================
+# TRTLLM_DISAGG_GEN_ADMIT_BEFORE_ALLOC: the transfer window before KV allocation
+# ===========================================================================
+
+
+class TestDisaggAdmitBeforeAlloc:
+    """Without a gate the scheduler allocates KV for every generation-init request, select() admits the FCFS prefix
+    that fits the transfer budget and the coordinator reverts the rest. With the gate the scheduler skips the
+    generation-init requests after the one that closed it: the admitted set, limited_by_budget and the
+    blocked-by-active-transfers signal stay the same, only the allocate / revert work changes."""
+
+    @staticmethod
+    def _req(request_id, prompt_len, lora_task_id=None, in_flight=False):
+        req = make_disagg_request(
+            request_id, context_remaining_length=prompt_len, lora_task_id=lora_task_id
+        )
+        req.total_input_len_cp = prompt_len
+        req.py_prompt_len = prompt_len
+        req.is_disagg_generation_transmission_in_progress = in_flight
+        if in_flight:
+            req.state_value = DISAGG_GEN_TRANS_IN_PROGRESS
+        return req
+
+    @staticmethod
+    def _gen(request_id):
+        req = make_gen_request(request_id)
+        req.is_disagg_generation_transmission_in_progress = False
+        return req
+
+    @staticmethod
+    def _run_pass(controller, requests, use_gate, prepare_fn=None, peft_cache_manager=None):
+        """One scheduling pass + the coordinator's admission and revert, with or without the gate.
+
+        Returns (admitted ids, reverted ids, ids passed to prepare_disagg_gen_init, admission result, gate, output).
+        """
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=prepare_fn)
+        sched = make_scheduler(mgr, max_num_tokens=4096, peft_cache_manager=peft_cache_manager)
+        gate = controller.begin_gate(requests) if use_gate else None
+        sched.set_disagg_transfer_admission_gate(gate)
+        try:
+            out = sched.schedule_request(requests, set())
+        finally:
+            sched.set_disagg_transfer_admission_gate(None)
+        candidates = out.fitting_disagg_gen_init_requests
+        result = controller.select(requests, candidates)
+        admitted = set(ids(result.admitted_requests))
+        reverted = [r.request_id for r in candidates if r.request_id not in admitted]
+        allocated = [c.args[0].request_id for c in mgr.prepare_disagg_gen_init.call_args_list]
+        return ids(result.admitted_requests), reverted, allocated, result, gate, out
+
+    @staticmethod
+    def _controller(max_tokens_in_buffer):
+        from tensorrt_llm._torch.disaggregation.orchestration.admission import (
+            DisaggTransferAdmissionController,
+        )
+
+        return DisaggTransferAdmissionController(
+            max_tokens_in_buffer=max_tokens_in_buffer, tokens_per_block=64
+        )
+
+    def test_skips_allocation_after_budget_closes(self):
+        # 100-token prompts = 2 blocks of 64; budget 320 tokens = 5 blocks: 2 admitted, the 3rd closes.
+        controller = self._controller(320)
+        reqs = [self._req(i, 100) for i in range(6)]
+        base = self._run_pass(controller, reqs, use_gate=False)
+        gated = self._run_pass(controller, reqs, use_gate=True)
+        assert base[0] == gated[0] == [0, 1]
+        assert base[1] == [2, 3, 4, 5]
+        assert gated[1] == [2]
+        assert base[2] == [0, 1, 2, 3, 4, 5]
+        assert gated[2] == [0, 1, 2]
+        assert gated[4].num_skipped == 3
+        assert base[3].limited_by_budget and gated[3].limited_by_budget
+
+    def test_allocation_failure_keeps_gate_open(self):
+        # Request 1 cannot be allocated (not a candidate in either path); 0 and 2 fit, 3 closes.
+        controller = self._controller(256)
+        reqs = [self._req(i, 100) for i in range(6)]
+        prepare_fn = lambda req: req.request_id != 1  # noqa: E731
+        base = self._run_pass(controller, reqs, use_gate=False, prepare_fn=prepare_fn)
+        gated = self._run_pass(controller, reqs, use_gate=True, prepare_fn=prepare_fn)
+        assert base[0] == gated[0] == [0, 2]
+        assert gated[2] == [0, 1, 2, 3]
+        assert gated[1] == [3]
+
+    def test_blocked_by_active_transfers_unchanged(self):
+        # An in-flight transfer fills the whole budget: nothing is admitted and the executor must keep polling
+        # transfer progress, with or without the gate.
+        controller = self._controller(128)
+        reqs = [self._req(100, 128, in_flight=True)] + [self._req(i, 64) for i in range(5)]
+        base = self._run_pass(controller, reqs, use_gate=False)
+        gated = self._run_pass(controller, reqs, use_gate=True)
+        assert base[0] == gated[0] == []
+        assert base[3].is_blocked_by_active_transfers()
+        assert gated[3].is_blocked_by_active_transfers()
+        assert gated[2] == [0]
+        assert gated[4].num_skipped == 4
+
+    def test_oversized_head_admitted_when_idle(self):
+        controller = self._controller(128)
+        reqs = [self._req(0, 1000)] + [self._req(i, 64) for i in range(1, 4)]
+        base = self._run_pass(controller, reqs, use_gate=False)
+        gated = self._run_pass(controller, reqs, use_gate=True)
+        assert base[0] == gated[0] == [0]
+        assert gated[2] == [0, 1]
+        assert gated[1] == [1]
+
+    def test_generation_requests_still_scheduled(self):
+        # The gate only touches generation-init requests: decode requests after them are unaffected.
+        controller = self._controller(64)
+        reqs = [self._req(0, 64), self._req(1, 64), self._gen(2), self._req(3, 64), self._gen(4)]
+        base = self._run_pass(controller, reqs, use_gate=False)
+        gated = self._run_pass(controller, reqs, use_gate=True)
+        assert ids(base[5].generation_requests) == ids(gated[5].generation_requests) == [2, 4]
+        assert base[0] == gated[0] == [0]
+        assert gated[2] == [0, 1]
+
+    def test_no_skip_when_budget_never_closes(self):
+        controller = self._controller(10**6)
+        reqs = [self._req(i, 100) for i in range(5)]
+        gated = self._run_pass(controller, reqs, use_gate=True)
+        assert gated[0] == [0, 1, 2, 3, 4]
+        assert gated[1] == []
+        assert gated[4].num_skipped == 0 and not gated[4].closed
+
+    def test_peft_charged_as_for_deferred_candidates(self):
+        # A skipped request is charged PEFT like a deferred candidate, so a later request that needs the last PEFT
+        # pages sees the same budget with and without the gate.
+        controller = self._controller(64)
+        reqs = [self._req(i, 64, lora_task_id=i) for i in range(6)]
+        charged = {}
+        for use_gate in (False, True):
+            calls = []
+            orig = BudgetTracker.commit_peft
+
+            def rec(self, req, pages, _calls=calls, _orig=orig):
+                _calls.append(req.request_id)
+                return _orig(self, req, pages)
+
+            with patch.object(BudgetTracker, "commit_peft", rec):
+                self._run_pass(
+                    controller,
+                    reqs,
+                    use_gate=use_gate,
+                    peft_cache_manager=make_peft_cache_manager(
+                        max_device_pages=4, pages_per_task=1
+                    ),
+                )
+            charged[use_gate] = calls
+        assert charged[True] == charged[False]

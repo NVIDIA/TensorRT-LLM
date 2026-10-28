@@ -28,17 +28,22 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
+
+from tensorrt_llm._torch.q35_env import register as _q35_register
 
 if TYPE_CHECKING:
     from .ops import AllReduce
 
 # Rows from which the fused all-reduces go two-shot (tuned for Qwen3.5-397B decode, SM 10.3, TP8 / TP16).
 FUSED_AR_TWOSHOT_ROWS = 64
-# Larger calls use the library op: above ~2 x SMs rows the CuTe two-shot needs a second wave and loses.
-FUSED_AR_MAX_ROWS = 256
+# Larger calls use the library op: above ~2 x SMs rows the CuTe two-shot needs a second wave and loses, unless
+# TRTLLM_Q35_FUSED_AR_TPC keeps it one wave; deployments raise the bound with
+# TRTLLM_Q35_FUSED_AR_MAX_ROWS (e.g. 512 / 1024 for TEP8 at batch 64 / 128).
+FUSED_AR_MAX_ROWS = int(os.environ.get("TRTLLM_Q35_FUSED_AR_MAX_ROWS", "256"))
 ZERO_RESIDUAL_MAX_TOKENS = 1024
 
 _zero_residuals: Dict[Tuple[torch.device, torch.dtype], torch.Tensor] = {}
@@ -110,6 +115,34 @@ def _ctas_per_token(rows: int, hidden: int) -> int:
     return ctas
 
 
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _FUSED_AR_FP8, _FUSED_AR_TPC
+    # TRTLLM_Q35_FUSED_AR_FP8=1 (default off): the CuTe kernel's two-shot calls carry E4M3 + per-256-element FP32
+    # scales in both stages instead of BF16 (half the NVLink bytes; changes the reduced values, not bitwise the
+    # library). It does not change which calls take the CuTe kernel: the TEP8 MTP-6 verify of batches 40-64
+    # (280-448 rows) needs FUSED_AR_MAX_ROWS 512.
+    _FUSED_AR_FP8 = os.environ.get("TRTLLM_Q35_FUSED_AR_FP8", "0") == "1"
+    # TRTLLM_Q35_FUSED_AR_TPC=1 (default off): a BF16 two-shot call larger than one wave of CTAs runs
+    # ceil(rows / wave) consecutive tokens per CTA with its phases decoupled across them (q35_allreduce_norm.py,
+    # ``tpc``), so it stays one wave instead of two or three back-to-back cross-rank latency chains (TEP8 MTP-6
+    # verify: b48-b64 = 336-448 rows, b80-b128 = 560-896 rows); bitwise the one-token kernel. The wave is
+    # TRTLLM_Q35_FUSED_AR_WAVE_ROWS rows (default two 512-thread CTAs per SM, which the kernel's <= 64 registers
+    # allow: 304 rows on 152 SMs).
+    _FUSED_AR_TPC = os.environ.get("TRTLLM_Q35_FUSED_AR_TPC", "0") == "1"
+
+
+def _tokens_per_cta(rows: int, ctas: int, two_shot: bool, fp8: bool) -> int:
+    if not (_FUSED_AR_TPC and two_shot and not fp8 and ctas == 1):
+        return 1
+    wave = (
+        int(os.environ.get("TRTLLM_Q35_FUSED_AR_WAVE_ROWS", "0"))
+        or 2 * torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    )
+    return 1 if rows <= wave else -(-rows // wave)
+
+
 @functools.lru_cache(maxsize=None)
 def _compiled_cute_ar(
     m: int,
@@ -124,6 +157,8 @@ def _compiled_cute_ar(
     moe_topk: int = 0,
     fc2_row: int = 0,
     two_shot: bool = False,
+    fp8: bool = False,
+    tpc: int = 1,
 ):
     import cuda.bindings.driver as cuda
     import cutlass
@@ -143,6 +178,8 @@ def _compiled_cute_ar(
         moe_topk=moe_topk,
         fc2_row=fc2_row,
         two_shot=two_shot,
+        fp8=fp8,
+        tpc=tpc,
     )
     dev = torch.device("cuda")
     x = torch.empty((m, hidden), dtype=torch.bfloat16, device=dev)
@@ -268,10 +305,14 @@ class Q35CuteAllReduce:
         scale: Optional[torch.Tensor] = None,
         norm_out: bool = True,
         two_shot: Optional[bool] = None,
+        fp8: Optional[bool] = None,
+        tpc: Optional[int] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """Input ``x`` [M, H] BF16, or ``shared_fold`` = (routed [M, H], shared [M, H], gate [M] / [M, 1])
         giving ``routed + sigmoid(gate) * shared``; ``routed`` may be the un-finalized MoE output
         ``(fc2 [P, >= H] BF16, topk_weights [M, K] BF16, expanded_idx_to_permuted_idx [M, K] int32)``.
+        ``fp8``: E4M3 payload of a two-shot call (None = TRTLLM_Q35_FUSED_AR_FP8); ``tpc``: tokens per CTA of a
+        BF16 two-shot call (None = ``_tokens_per_cta``).
 
         Returns ``(norm, residual_out)``, ``(norm, fp8, residual_out)`` with ``scale``, or
         ``(fp8, residual_out)`` with ``scale`` and ``norm_out=False``, as the library op."""
@@ -286,11 +327,25 @@ class Q35CuteAllReduce:
         nranks = self.mapping.tp_size
         if two_shot is None:
             two_shot = _two_shot(m)
-        # one-shot: [rank][token][H] in one stage; two-shot: two stages of max(scatter, broadcast) each
-        table = self._table(
-            max(m * hidden * nranks * 2, 2 * ((m + nranks - 1) // nranks) * nranks * hidden * 2)
-        )
+        fp8 = bool(_FUSED_AR_FP8 if fp8 is None else fp8) and bool(two_shot)
+        if fp8:
+            from tensorrt_llm.logger import logger
+
+            logger.info_once(
+                "TRTLLM_Q35_FUSED_AR_FP8: two-shot all-reduce with an E4M3 payload",
+                key="q35_fused_ar_fp8",
+            )
+        # one-shot: [rank][token][H] in one stage; two-shot: two stages of max(scatter, broadcast) each (BF16 sizes,
+        # which also hold the smaller FP8 rows). A two-shot call asks for the two-shot size only: the MNNVL workspace
+        # (sized once) is sealed at >= 16 MiB per buffer, which the one-shot size of a call above 256 rows (TP8,
+        # H 4096) exceeds while its two-shot size (2 x 8 KiB per row) does not.
+        if two_shot:
+            table = self._table(2 * ((m + nranks - 1) // nranks) * nranks * hidden * 2)
+        else:
+            table = self._table(m * hidden * nranks * 2)
         ctas = _ctas_per_token(m, hidden)
+        if tpc is None:
+            tpc = _tokens_per_cta(m, ctas, bool(two_shot), fp8)
         topk = moe[2].shape[1] if moe is not None else 0
         fc2_row = moe[0].stride(0) if moe is not None else 0
         fn = _compiled_cute_ar(
@@ -306,6 +361,8 @@ class Q35CuteAllReduce:
             topk,
             fc2_row,
             bool(two_shot),
+            fp8,
+            tpc,
         )
         res_out = torch.empty_like(residual)
         norm = torch.empty_like(residual) if norm_out else res_out

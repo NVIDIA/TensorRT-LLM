@@ -75,6 +75,10 @@ class KeyType(NamedTuple):
     num_encoder_tokens: int = 0
     peft_cache_data_type: Optional[torch.dtype] = None
     use_lora_graph: bool = False
+    # TRTLLM_Q35_TEMPERATURE_GRAPHS: the one-engine temperature-only sampling
+    # variant (vocabulary-sharded Gumbel-max target sampling); False unless that
+    # variant was captured, so the stock keys are unchanged otherwise.
+    q35_temperature_only: bool = False
 
 
 def _save_spec_decode_capture_state(
@@ -387,6 +391,10 @@ class CUDAGraphRunner:
         # this field (non-one-engine paths or non-spec batches).
         is_all_greedy_sample = bool(
             getattr(spec_metadata, "is_all_greedy_sample", True))
+        # TRTLLM_Q35_TEMPERATURE_GRAPHS: the temperature-only variant of the
+        # advanced-sampling graphs.
+        q35_temperature_only = (not is_all_greedy_sample and bool(
+            getattr(spec_metadata, "q35_temperature_only", False)))
 
         # Sampling tier this graph must contain. Only meaningful when the fast
         # sampler is enabled; otherwise it stays FULL so every batch shares one
@@ -425,7 +433,8 @@ class CUDAGraphRunner:
                        context_query_len=context_query_len,
                        num_encoder_tokens=num_encoder_tokens,
                        peft_cache_data_type=peft_cache_data_type,
-                       use_lora_graph=use_lora_graph)
+                       use_lora_graph=use_lora_graph,
+                       q35_temperature_only=q35_temperature_only)
 
     def set_capture_sample_type(self,
                                 sample_type: Optional[SampleType]) -> None:

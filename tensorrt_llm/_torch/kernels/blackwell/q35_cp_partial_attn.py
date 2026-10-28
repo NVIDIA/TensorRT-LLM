@@ -55,12 +55,22 @@ total KV rather than its longest request:
 * plan (every CTA, warp 2, from seq_lens before the dependency wait; graph-safe, all CTAs derive the same plan):
   request r owns t_r tiles on this rank; T = the smallest tile count with sum_r max(1, ceil(t_r / T)) <= n_ctas;
   request r gets c_r = max(1, ceil(t_r / T)) consecutive CTAs (the longest one also the spares), each taking a
-  near-equal block of its tiles.
+  near-equal block of its tiles. A lane of the plan warp plans one request up to 32 requests, two (r, r + 32) with
+  ``wide_plan`` (33..64) and four (r, r + 32, r + 64, r + 96) with ``quad_plan`` (65..128); all compute the same
+  plan, and every request needs a CTA (batch < n_ctas).
 * partials: chunk-major in the workspace slots of the request's CTAs (cp_partial_balanced_geometry).
 * grid barrier per request: the request's first CTA adds n_ctas - c_r + 1 and every other one 1, so every launch adds
   n_ctas to each counter of its row whatever the plan (assumption (c)).
 * combine: CTA j of the request finalizes chunk j; the merge loop is dispatched to a compile-time lanes-per-granule
   variant.
+
+Two-slot plan (``two_slot``, kernel_two, 65..128 requests): the plans above give every request at least one CTA, so
+past ~n_ctas / 2 uniform requests a CTA runs a whole request (64k contexts, b96: 128 tiles where 81 would balance).
+Here T = the smallest tile count with sum_r max(t_r, T) <= n_ctas * T; request r takes the virtual tile range
+[V_r, V_r + max(t_r, T)) (requests in order) and CTA i the range [i * T, (i + 1) * T), so a CTA computes at most T
+tiles, of at most two requests (slot 0, then slot 1, through one K / V ring and one O accumulator). Each request keeps
+the layout above with c_r = the CTAs meeting its tiles; its workspace slots start at the exclusive prefix sum of c_r
+(sum <= 2 n_ctas, twice the slots); the grid barrier and the combine run once per slot.
 """
 
 from __future__ import annotations
@@ -106,14 +116,15 @@ PLAN_WORDS = (
 )
 
 
-def cp_partial_balanced_geometry(rows: int, n_ctas: int) -> dict:
+def cp_partial_balanced_geometry(rows: int, n_ctas: int, slots: int = 1) -> dict:
     """Workspace and combine bounds for ``rows`` q rows and ``n_ctas`` CTAs (host and kernel).
 
     A request with c CTAs splits its row-major [rows][256] partials into chunks of chunk(c) elements (CTA j of the
     request finalizes chunk j); its partials [n_chunks(c)][c][chunk_pad(c)] FP16 occupy the O slots of its c
     consecutive CTAs (slot_o_bytes >= n_chunks(c) * chunk_pad(c) * 2 for every c), its LSEs [rows][lse_stride(c)] FP32
     the LSE slots (16 * rows bytes per CTA >= rows * lse_stride(c) * 4 / c). The combine stages c x chunk_pad FP16
-    (<= COMB_LSE_OFF bytes) and nrows x lse_stride FP32."""
+    (<= COMB_LSE_OFF bytes) and nrows x lse_stride FP32. ``slots`` = 2 (the two-slot plan, where a CTA works for up
+    to two requests) gives every CTA two slots: the sum of c is <= 2 x n_ctas there."""
     total = rows * HEAD_DIM
     slot_o, max_o, max_l = 0, 0, 0
     for c in range(1, n_ctas + 1):
@@ -128,11 +139,12 @@ def cp_partial_balanced_geometry(rows: int, n_ctas: int) -> dict:
         max_o = max(max_o, c * chunk_pad * 2)
         max_l = max(max_l, nrows * lse_stride * 4)
     slot_o = 16 * ((slot_o + 15) // 16)
+    n_slots = slots * n_ctas
     return dict(
         slot_o_bytes=slot_o,
-        lse_area_off=n_ctas * slot_o,
+        lse_area_off=n_slots * slot_o,
         lse_cta_bytes=16 * rows,
-        ws_bytes=n_ctas * (slot_o + 16 * rows),
+        ws_bytes=n_slots * (slot_o + 16 * rows),
         max_comb_o_bytes=max_o,
         max_comb_lse_bytes=max_l,
     )
@@ -579,8 +591,14 @@ class Q35CpPartialAttnKernel:
 
     q_len, gh, hql, cp_size: tokens per request, group heads (= cp_size * hql), q heads per rank, CP group size;
                      rows = q_len * gh <= 128.
-    n_ctas:          CTAs of the grid (batch < n_ctas <= SMs, batch <= 32), shared among the requests by the
-                     in-kernel plan (module docstring).
+    n_ctas:          CTAs of the grid (batch < n_ctas <= SMs, batch <= 32 or the variants below), shared among the
+                     requests by the in-kernel plan (module docstring).
+    wide_plan:       33..64 requests: the plan warp handles requests lane and lane + 32 (_plan_wide, the plan _plan
+                     would compute with 64 lanes); the host compiles it only for batch > 32.
+    quad_plan:       65..128 requests: lanes plan requests lane, lane + 32, lane + 64 and lane + 96 (_plan_quad, the
+                     same plan again); the host compiles it only on request (tests).
+    two_slot:        the two-slot plan (module docstring; kernel_two, _plan_two, up to 128 requests): the host's
+                     choice above 64 requests.
     bmm1_from_ptr:   read the log2-domain QK scale from ``bmm1_ptr[1]`` (trtllm-gen [raw, raw * log2e] layout) after the
                      dependency wait, else use ``bmm1_log2``. Same for ``bmm2`` (``bmm2_ptr[0]``).
     o_vec16:         out_o rows are 16-byte aligned (8-element vector stores), else 4-byte stores.
@@ -605,8 +623,15 @@ class Q35CpPartialAttnKernel:
         fresh_margin_pages: int = 1,
         evict_first: bool = True,
         p_shift: float = 5.0,
+        wide_plan: bool = False,
+        quad_plan: bool = False,
+        two_slot: bool = False,
     ):
         assert gh == cp_size * hql, "group heads = cp_size x q heads per rank"
+        assert int(wide_plan) + int(quad_plan) + int(two_slot) <= 1, "one plan variant"
+        self.wide_plan = bool(wide_plan)
+        self.quad_plan = bool(quad_plan)
+        self.two_slot = bool(two_slot)
         self.q_len = q_len
         self.gh = gh
         self.hql = hql
@@ -628,7 +653,7 @@ class Q35CpPartialAttnKernel:
         self.p_shift = float(p_shift)
         self.rescale_threshold = min(RESCALE_THRESHOLD, P_TOP - self.p_shift)
         assert 32 * self.act_warps * STAGE_ROW <= KV_REGION
-        geo = cp_partial_balanced_geometry(self.rows, n_ctas)
+        geo = cp_partial_balanced_geometry(self.rows, n_ctas, 2 if self.two_slot else 1)
         self.ws_bytes = geo["ws_bytes"]
         self.slot_o_bytes = geo["slot_o_bytes"]
         self.lse_area_off = geo["lse_area_off"]
@@ -750,47 +775,90 @@ class Q35CpPartialAttnKernel:
         q_bytes = cute.size_in_bytes(FP8, sQ_one)
 
         grid = [NS, 1, 1]
-        self.kernel(
-            mma_qk,
-            mma_pv,
-            tma_k,
-            gK_tma,
-            tma_v,
-            gV_tma,
-            tma_q,
-            gQ_tma,
-            mTab,
-            mSeq,
-            cp_rank,
-            mBmm1,
-            bmm1_log2,
-            mBmm2,
-            bmm2,
-            mO,
-            o_sd,
-            o_st,
-            o_sh,
-            mLse,
-            l_sd,
-            l_st,
-            l_sh,
-            mWs,
-            mCnt,
-            sQ_l,
-            sK_l,
-            sV_l,
-            sP_l,
-            sK_tma_l,
-            sV_tma_l,
-            sP_mk_l,
-            q_bytes,
-        ).launch(
-            grid=grid,
-            block=[NUM_THREADS, 1, 1],
-            stream=stream,
-            use_pdl=self.use_pdl,
-            min_blocks_per_mp=1,
-        )
+        if const_expr(self.two_slot):
+            self.kernel_two(
+                mma_qk,
+                mma_pv,
+                tma_k,
+                gK_tma,
+                tma_v,
+                gV_tma,
+                tma_q,
+                gQ_tma,
+                mTab,
+                mSeq,
+                cp_rank,
+                mBmm1,
+                bmm1_log2,
+                mBmm2,
+                bmm2,
+                mO,
+                o_sd,
+                o_st,
+                o_sh,
+                mLse,
+                l_sd,
+                l_st,
+                l_sh,
+                mWs,
+                mCnt,
+                sQ_l,
+                sK_l,
+                sV_l,
+                sP_l,
+                sK_tma_l,
+                sV_tma_l,
+                sP_mk_l,
+                q_bytes,
+            ).launch(
+                grid=grid,
+                block=[NUM_THREADS, 1, 1],
+                stream=stream,
+                use_pdl=self.use_pdl,
+                min_blocks_per_mp=1,
+            )
+        else:
+            self.kernel(
+                mma_qk,
+                mma_pv,
+                tma_k,
+                gK_tma,
+                tma_v,
+                gV_tma,
+                tma_q,
+                gQ_tma,
+                mTab,
+                mSeq,
+                cp_rank,
+                mBmm1,
+                bmm1_log2,
+                mBmm2,
+                bmm2,
+                mO,
+                o_sd,
+                o_st,
+                o_sh,
+                mLse,
+                l_sd,
+                l_st,
+                l_sh,
+                mWs,
+                mCnt,
+                sQ_l,
+                sK_l,
+                sV_l,
+                sP_l,
+                sK_tma_l,
+                sV_tma_l,
+                sP_mk_l,
+                q_bytes,
+            ).launch(
+                grid=grid,
+                block=[NUM_THREADS, 1, 1],
+                stream=stream,
+                use_pdl=self.use_pdl,
+                min_blocks_per_mp=1,
+            )
 
     @cute.jit
     def _produce(
@@ -868,17 +936,20 @@ class Q35CpPartialAttnKernel:
         empty_v,
         p_empty,
         o_done,
+        j_loc=None,
     ):
         """O += P(tile j) . V(tile j) (two d halves); releases the V stage and the P buffer, signals o_done. Returns
-        mma_pv: its ACCUMULATE field is updated here, and the caller must rebind it."""
+        mma_pv: its ACCUMULATE field is updated here, and the caller must rebind it. j counts the CTA's tiles (ring
+        and barrier phases); j_loc (kernel_two) is the tile's index in its request: O restarts at j_loc 0."""
         S: cutlass.Constexpr = KV_STAGES
         sj = j % S
         pb = j % 2
+        jl = j if j_loc is None else j_loc
         cute.arch.mbarrier_wait(full_v + sj, (j // S) & 1)
         cute.arch.mbarrier_wait(p_full + pb, (j // 2) & 1)
         for h in cutlass.range_constexpr(2):
             for kk in cutlass.range_constexpr(TILE_KEYS // 32):
-                mma_pv.set(tcgen05.Field.ACCUMULATE, (j > 0) or (kk != 0))
+                mma_pv.set(tcgen05.Field.ACCUMULATE, (jl > 0) or (kk != 0))
                 cute.gemm(
                     mma_pv,
                     tOtO[(None, 0, h)],
@@ -915,12 +986,15 @@ class Q35CpPartialAttnKernel:
         cnt_b,
         scale,
         apply_mask: cutlass.Constexpr,
+        i_loc=None,
     ):
         """Softmax of tile i (CTA-local) for row st (TMEM lane st): S -> x, mask (apply_mask: keys of slot 0 / 1 visible
         iff key < cnt_a / cnt_b), lazy rescale of (m, l, O row), P -> SMEM as E4M3. stt = [m_ref, l_acc].
         The O rescale of a lazy-rescale tile runs after P(i) is in SMEM (by then GEMM2(i - 1) has normally completed,
-        and the S registers are free for 64-column TMEM round trips), before P(i) is released to GEMM2(i)."""
+        and the S registers are free for 64-column TMEM round trips), before P(i) is released to GEMM2(i).
+        i_loc (kernel_two): the tile's index in its request (O holds nothing of the request before i_loc 1)."""
         s_full, s_empty, p_full, p_empty, o_done = bars_sm
+        il = i if i_loc is None else i_loc
         sb = i % 2
         cute.arch.mbarrier_wait(s_full + sb, (i // 2) & 1)
         accS = tStS[(None, None), 0, 0, sb]
@@ -994,7 +1068,7 @@ class Q35CpPartialAttnKernel:
                 sP_base + off, pw[4 * c16], pw[4 * c16 + 1], pw[4 * c16 + 2], pw[4 * c16 + 3]
             )
         if resc != 0:
-            if i > 0:
+            if il > 0:
                 # O holds GEMM2 of tiles < i once GEMM2(i - 1) completed; GEMM2(i) waits for P(i) (released below).
                 cute.arch.mbarrier_wait(o_done, (i - 1) & 1)
                 for h in cutlass.range_constexpr(2):
@@ -1079,6 +1153,425 @@ class Q35CpPartialAttnKernel:
                     sPlan[7] = cutlass.min(c, t)
 
     @cute.jit
+    def _plan_wide(
+        self, mSeq: cute.Tensor, cp_rank: Int32, cta: Int32, lane: Int32, sPlan: cute.Tensor
+    ):
+        """_plan for up to 64 requests (wide_plan): lane r plans request r (lower half) and request r + 32 (upper
+        half). Same plan as _plan with 64 lanes and as the host mirror q35_cp_fused.balanced_split_plan: T by the same
+        binary search, the spare CTAs to the highest-numbered longest request, CTAs in request order."""
+        CP: cutlass.Constexpr = self.cp
+        NC: cutlass.Constexpr = self.n_ctas
+        batch = mSeq.shape[0]
+        lane_b = lane + 32
+        La = Int32(0)
+        Lb = Int32(0)
+        if lane < batch:
+            La = mSeq[lane]
+        if lane_b < batch:
+            Lb = mSeq[lane_b]
+        # owned tiles on this rank of requests `lane` / `lane + 32` (0 past the batch: L = 0)
+        ta = ((((La + PAGE - 1) // PAGE) - cp_rank + CP - 1) // CP + 1) // 2
+        tb = ((((Lb + PAGE - 1) // PAGE) - cp_rank + CP - 1) // CP + 1) // 2
+        total = _redux_add_s32(ta + tb)
+        tmax = _redux_max_s32(cutlass.max(ta, tb))
+        lo = cutlass.max((total + NC - 1) // NC, 1)
+        hi = cutlass.max(cutlass.min(tmax, _div_floor_s32(total + NC - batch - 1, NC - batch)), lo)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            need = Int32(0)
+            if lane < batch:
+                need = cutlass.max(_div_floor_s32(ta + mid - 1, mid), 1)
+            if lane_b < batch:
+                need = need + cutlass.max(_div_floor_s32(tb + mid - 1, mid), 1)
+            if _redux_add_s32(need) <= NC:
+                hi = mid
+            else:
+                lo = mid + 1
+        ca = Int32(0)
+        cb = Int32(0)
+        if lane < batch:
+            ca = cutlass.max(_div_floor_s32(ta + lo - 1, lo), 1)
+        if lane_b < batch:
+            cb = cutlass.max(_div_floor_s32(tb + lo - 1, lo), 1)
+        spare = NC - _redux_add_s32(ca + cb)
+        top_a = Int32(0)
+        top_b = Int32(0)
+        if lane < batch:
+            if ta == tmax:
+                top_a = Int32(1)
+        if lane_b < batch:
+            if tb == tmax:
+                top_b = Int32(1)
+        # the spare CTAs go to the highest-numbered longest request (an upper-half one when there is one)
+        hb = _ballot_top(top_b)
+        ha = _ballot_top(top_a)
+        if hb >= 0:
+            if lane == hb:
+                cb = cb + spare
+        else:
+            if lane == ha:
+                ca = ca + spare
+        # first CTA of each request: requests 0..31 (lower half) take CTAs first, then 32..63
+        incl_a = ca
+        incl_b = cb
+        for k in cutlass.range_constexpr(5):
+            up_a = _shfl_up_s32(incl_a, 1 << k)
+            up_b = _shfl_up_s32(incl_b, 1 << k)
+            if lane >= (1 << k):
+                incl_a = incl_a + up_a
+                incl_b = incl_b + up_b
+        incl_b = incl_b + _redux_add_s32(ca)
+        first_a = incl_a - ca
+        first_b = incl_b - cb
+        if lane < batch:
+            if first_a <= cta:
+                if cta < incl_a:
+                    self._plan_store(sPlan, lane, cta - first_a, ta, ca, first_a, La)
+        if lane_b < batch:
+            if first_b <= cta:
+                if cta < incl_b:
+                    self._plan_store(sPlan, lane_b, cta - first_b, tb, cb, first_b, Lb)
+
+    @cute.jit
+    def _plan_quad(
+        self, mSeq: cute.Tensor, cp_rank: Int32, cta: Int32, lane: Int32, sPlan: cute.Tensor
+    ):
+        """_plan for up to 128 requests (quad_plan): lane r plans requests r, r + 32, r + 64 and r + 96 (quarters a, b,
+        c, d). Same plan as _plan with 128 lanes and as the host mirror q35_cp_fused.balanced_split_plan: T by the same
+        binary search, the spare CTAs to the highest-numbered longest request, CTAs in request order."""
+        CP: cutlass.Constexpr = self.cp
+        NC: cutlass.Constexpr = self.n_ctas
+        batch = mSeq.shape[0]
+        lane_b = lane + 32
+        lane_c = lane + 64
+        lane_d = lane + 96
+        La = Int32(0)
+        Lb = Int32(0)
+        Lc = Int32(0)
+        Ld = Int32(0)
+        if lane < batch:
+            La = mSeq[lane]
+        if lane_b < batch:
+            Lb = mSeq[lane_b]
+        if lane_c < batch:
+            Lc = mSeq[lane_c]
+        if lane_d < batch:
+            Ld = mSeq[lane_d]
+        # owned tiles on this rank of the lane's four requests (0 past the batch: L = 0)
+        ta = ((((La + PAGE - 1) // PAGE) - cp_rank + CP - 1) // CP + 1) // 2
+        tb = ((((Lb + PAGE - 1) // PAGE) - cp_rank + CP - 1) // CP + 1) // 2
+        tc = ((((Lc + PAGE - 1) // PAGE) - cp_rank + CP - 1) // CP + 1) // 2
+        td = ((((Ld + PAGE - 1) // PAGE) - cp_rank + CP - 1) // CP + 1) // 2
+        total = _redux_add_s32(ta + tb + tc + td)
+        tmax = _redux_max_s32(cutlass.max(cutlass.max(ta, tb), cutlass.max(tc, td)))
+        lo = cutlass.max((total + NC - 1) // NC, 1)
+        hi = cutlass.max(cutlass.min(tmax, _div_floor_s32(total + NC - batch - 1, NC - batch)), lo)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            need = Int32(0)
+            if lane < batch:
+                need = cutlass.max(_div_floor_s32(ta + mid - 1, mid), 1)
+            if lane_b < batch:
+                need = need + cutlass.max(_div_floor_s32(tb + mid - 1, mid), 1)
+            if lane_c < batch:
+                need = need + cutlass.max(_div_floor_s32(tc + mid - 1, mid), 1)
+            if lane_d < batch:
+                need = need + cutlass.max(_div_floor_s32(td + mid - 1, mid), 1)
+            if _redux_add_s32(need) <= NC:
+                hi = mid
+            else:
+                lo = mid + 1
+        ca = Int32(0)
+        cb = Int32(0)
+        cc = Int32(0)
+        cd = Int32(0)
+        if lane < batch:
+            ca = cutlass.max(_div_floor_s32(ta + lo - 1, lo), 1)
+        if lane_b < batch:
+            cb = cutlass.max(_div_floor_s32(tb + lo - 1, lo), 1)
+        if lane_c < batch:
+            cc = cutlass.max(_div_floor_s32(tc + lo - 1, lo), 1)
+        if lane_d < batch:
+            cd = cutlass.max(_div_floor_s32(td + lo - 1, lo), 1)
+        spare = NC - _redux_add_s32(ca + cb + cc + cd)
+        top_a = Int32(0)
+        top_b = Int32(0)
+        top_c = Int32(0)
+        top_d = Int32(0)
+        if lane < batch:
+            if ta == tmax:
+                top_a = Int32(1)
+        if lane_b < batch:
+            if tb == tmax:
+                top_b = Int32(1)
+        if lane_c < batch:
+            if tc == tmax:
+                top_c = Int32(1)
+        if lane_d < batch:
+            if td == tmax:
+                top_d = Int32(1)
+        # the spare CTAs go to the highest-numbered longest request (the highest quarter that has one); every lane
+        # takes part in the four ballots, the branches below are warp-uniform
+        hd = _ballot_top(top_d)
+        hc = _ballot_top(top_c)
+        hb = _ballot_top(top_b)
+        ha = _ballot_top(top_a)
+        if hd >= 0:
+            if lane == hd:
+                cd = cd + spare
+        else:
+            if hc >= 0:
+                if lane == hc:
+                    cc = cc + spare
+            else:
+                if hb >= 0:
+                    if lane == hb:
+                        cb = cb + spare
+                else:
+                    if lane == ha:
+                        ca = ca + spare
+        # first CTA of each request: requests 0..31 take CTAs first, then 32..63, 64..95 and 96..127
+        incl_a = ca
+        incl_b = cb
+        incl_c = cc
+        incl_d = cd
+        for k in cutlass.range_constexpr(5):
+            up_a = _shfl_up_s32(incl_a, 1 << k)
+            up_b = _shfl_up_s32(incl_b, 1 << k)
+            up_c = _shfl_up_s32(incl_c, 1 << k)
+            up_d = _shfl_up_s32(incl_d, 1 << k)
+            if lane >= (1 << k):
+                incl_a = incl_a + up_a
+                incl_b = incl_b + up_b
+                incl_c = incl_c + up_c
+                incl_d = incl_d + up_d
+        sum_a = _redux_add_s32(ca)
+        sum_b = _redux_add_s32(cb)
+        sum_c = _redux_add_s32(cc)
+        incl_b = incl_b + sum_a
+        incl_c = incl_c + sum_a + sum_b
+        incl_d = incl_d + sum_a + sum_b + sum_c
+        first_a = incl_a - ca
+        first_b = incl_b - cb
+        first_c = incl_c - cc
+        first_d = incl_d - cd
+        if lane < batch:
+            if first_a <= cta:
+                if cta < incl_a:
+                    self._plan_store(sPlan, lane, cta - first_a, ta, ca, first_a, La)
+        if lane_b < batch:
+            if first_b <= cta:
+                if cta < incl_b:
+                    self._plan_store(sPlan, lane_b, cta - first_b, tb, cb, first_b, Lb)
+        if lane_c < batch:
+            if first_c <= cta:
+                if cta < incl_c:
+                    self._plan_store(sPlan, lane_c, cta - first_c, tc, cc, first_c, Lc)
+        if lane_d < batch:
+            if first_d <= cta:
+                if cta < incl_d:
+                    self._plan_store(sPlan, lane_d, cta - first_d, td, cd, first_d, Ld)
+
+    @cute.jit
+    def _plan_two(
+        self, mSeq: cute.Tensor, cp_rank: Int32, cta: Int32, lane: Int32, sPlan: cute.Tensor
+    ):
+        """Two-slot plan (two_slot, up to 128 requests; lanes plan requests r, r + 32, r + 64, r + 96). T = the smallest
+        tile count with sum_r max(t_r, T) <= NC * T. Request r occupies the virtual tile range [V_r, V_r + max(t_r, T))
+        (requests in order) and CTA i the range [i * T, (i + 1) * T): a CTA meets at most two requests (every range is
+        at least T long), slot 0 = the request whose range holds the CTA's first position, slot 1 = the request that
+        starts inside it. The CTAs of request r are those meeting its real tiles [V_r, V_r + t_r) (the one holding V_r
+        when t_r = 0; it writes O = 0 / LSE = -inf). sPlan[8 k + w], slot k: (request or -1 for none, index among the
+        request's CTAs, its CTAs, first tile, tiles, first workspace slot, L, CTAs with work). Host mirror:
+        q35_cp_fused.balanced_split_plan_two."""
+        CP: cutlass.Constexpr = self.cp
+        NC: cutlass.Constexpr = self.n_ctas
+        batch = mSeq.shape[0]
+        if lane < 2 * PLAN_WORDS:
+            sPlan[lane] = Int32(0)
+            if lane % PLAN_WORDS == 0:
+                sPlan[lane] = Int32(-1)  # no request in the slot unless one is stored below
+        cute.arch.sync_warp()
+        lane_b = lane + 32
+        lane_c = lane + 64
+        lane_d = lane + 96
+        La = Int32(0)
+        Lb = Int32(0)
+        Lc = Int32(0)
+        Ld = Int32(0)
+        if lane < batch:
+            La = mSeq[lane]
+        if lane_b < batch:
+            Lb = mSeq[lane_b]
+        if lane_c < batch:
+            Lc = mSeq[lane_c]
+        if lane_d < batch:
+            Ld = mSeq[lane_d]
+        ta = ((((La + PAGE - 1) // PAGE) - cp_rank + CP - 1) // CP + 1) // 2
+        tb = ((((Lb + PAGE - 1) // PAGE) - cp_rank + CP - 1) // CP + 1) // 2
+        tc = ((((Lc + PAGE - 1) // PAGE) - cp_rank + CP - 1) // CP + 1) // 2
+        td = ((((Ld + PAGE - 1) // PAGE) - cp_rank + CP - 1) // CP + 1) // 2
+        total = _redux_add_s32(ta + tb + tc + td)
+        tmax = _redux_max_s32(cutlass.max(cutlass.max(ta, tb), cutlass.max(tc, td)))
+        # smallest T with sum max(t_r, T) <= NC * T (the left side grows by at most batch < NC per step of T)
+        lo = cutlass.max((total + NC - 1) // NC, 1)
+        hi = cutlass.max(tmax, lo)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            need = Int32(0)
+            if lane < batch:
+                need = cutlass.max(ta, mid)
+            if lane_b < batch:
+                need = need + cutlass.max(tb, mid)
+            if lane_c < batch:
+                need = need + cutlass.max(tc, mid)
+            if lane_d < batch:
+                need = need + cutlass.max(td, mid)
+            if _redux_add_s32(need) <= NC * mid:
+                hi = mid
+            else:
+                lo = mid + 1
+        T = lo
+        # virtual lengths, then their exclusive prefix sums V in request order (quarters a, b, c, d)
+        va = Int32(0)
+        vb = Int32(0)
+        vc = Int32(0)
+        vd = Int32(0)
+        if lane < batch:
+            va = cutlass.max(ta, T)
+        if lane_b < batch:
+            vb = cutlass.max(tb, T)
+        if lane_c < batch:
+            vc = cutlass.max(tc, T)
+        if lane_d < batch:
+            vd = cutlass.max(td, T)
+        iva = va
+        ivb = vb
+        ivc = vc
+        ivd = vd
+        for k in cutlass.range_constexpr(5):
+            ua = _shfl_up_s32(iva, 1 << k)
+            ub = _shfl_up_s32(ivb, 1 << k)
+            uc = _shfl_up_s32(ivc, 1 << k)
+            ud = _shfl_up_s32(ivd, 1 << k)
+            if lane >= (1 << k):
+                iva = iva + ua
+                ivb = ivb + ub
+                ivc = ivc + uc
+                ivd = ivd + ud
+        sva = _redux_add_s32(va)
+        svb = _redux_add_s32(vb)
+        svc = _redux_add_s32(vc)
+        Va = iva - va
+        Vb = ivb + sva - vb
+        Vc = ivc + sva + svb - vc
+        Vd = ivd + sva + svb + svc - vd
+        # first / last CTA meeting the real tiles (one position when t = 0) and the request's CTA count
+        fa = _div_floor_s32(Va, T)
+        fb = _div_floor_s32(Vb, T)
+        fc = _div_floor_s32(Vc, T)
+        fd = _div_floor_s32(Vd, T)
+        ca = Int32(0)
+        cb = Int32(0)
+        cc = Int32(0)
+        cd = Int32(0)
+        if lane < batch:
+            ca = _div_floor_s32(Va + cutlass.max(ta, 1) - 1, T) - fa + 1
+        if lane_b < batch:
+            cb = _div_floor_s32(Vb + cutlass.max(tb, 1) - 1, T) - fb + 1
+        if lane_c < batch:
+            cc = _div_floor_s32(Vc + cutlass.max(tc, 1) - 1, T) - fc + 1
+        if lane_d < batch:
+            cd = _div_floor_s32(Vd + cutlass.max(td, 1) - 1, T) - fd + 1
+        # first workspace slot of each request: exclusive prefix sums of the CTA counts
+        ica = ca
+        icb = cb
+        icc = cc
+        icd = cd
+        for k in cutlass.range_constexpr(5):
+            ua = _shfl_up_s32(ica, 1 << k)
+            ub = _shfl_up_s32(icb, 1 << k)
+            uc = _shfl_up_s32(icc, 1 << k)
+            ud = _shfl_up_s32(icd, 1 << k)
+            if lane >= (1 << k):
+                ica = ica + ua
+                icb = icb + ub
+                icc = icc + uc
+                icd = icd + ud
+        sca = _redux_add_s32(ca)
+        scb = _redux_add_s32(cb)
+        scc = _redux_add_s32(cc)
+        Sa = ica - ca
+        Sb = icb + sca - cb
+        Sc = icc + sca + scb - cc
+        Sd = icd + sca + scb + scc - cd
+        if lane < batch:
+            self._plan_two_store(sPlan, cta, T, lane, Va, ta, fa, ca, Sa, La)
+        if lane_b < batch:
+            self._plan_two_store(sPlan, cta, T, lane_b, Vb, tb, fb, cb, Sb, Lb)
+        if lane_c < batch:
+            self._plan_two_store(sPlan, cta, T, lane_c, Vc, tc, fc, cc, Sc, Lc)
+        if lane_d < batch:
+            self._plan_two_store(sPlan, cta, T, lane_d, Vd, td, fd, cd, Sd, Ld)
+
+    @cute.jit
+    def _plan_two_store(
+        self,
+        sPlan: cute.Tensor,
+        cta: Int32,
+        T: Int32,
+        r: Int32,
+        V: Int32,
+        t: Int32,
+        f: Int32,
+        c: Int32,
+        s0: Int32,
+        L: Int32,
+    ):
+        """This CTA's slot for request r (if the CTA meets its real tiles): see _plan_two."""
+        if f <= cta:
+            if cta < f + c:
+                lo_t = cutlass.max(V, cta * T) - V
+                hi_t = cutlass.min(V + cutlass.max(t, 1), (cta + 1) * T) - V
+                n_t = hi_t - lo_t
+                n_valid = c
+                if t == 0:
+                    lo_t = Int32(0)
+                    n_t = Int32(0)
+                    n_valid = Int32(0)
+                base = Int32(8)
+                if V <= cta * T:
+                    base = Int32(0)
+                sPlan[base] = r
+                sPlan[base + 1] = cta - f
+                sPlan[base + 2] = c
+                sPlan[base + 3] = lo_t
+                sPlan[base + 4] = n_t
+                sPlan[base + 5] = s0
+                sPlan[base + 6] = L
+                sPlan[base + 7] = n_valid
+
+    @cute.jit
+    def _plan_store(
+        self, sPlan: cute.Tensor, r: Int32, j: Int32, t: Int32, c: Int32, first: Int32, L: Int32
+    ):
+        """This CTA's plan words (as in _plan): CTA j of request r's c CTAs takes the j-th of c near-equal blocks of
+        its t tiles."""
+        base = _div_floor_s32(t, c)
+        rem = t - base * c
+        n_t = base
+        if j < rem:
+            n_t = base + 1
+        sPlan[0] = r
+        sPlan[1] = j
+        sPlan[2] = c
+        sPlan[3] = j * base + cutlass.min(j, rem)
+        sPlan[4] = n_t
+        sPlan[5] = first
+        sPlan[6] = L
+        sPlan[7] = cutlass.min(c, t)
+
+    @cute.jit
     def _combine(
         self,
         tidx: Int32,
@@ -1104,6 +1597,7 @@ class Q35CpPartialAttnKernel:
         l_st: Int32,
         l_sh: Int32,
         sScal: cute.Tensor,
+        comb_phase=0,
     ):
         """CTA ``split`` of the request's ``c_req`` CTAs finalizes elements [o_lo, o_hi) of the request with the
         request's chunk geometry (run time); its lanes per granule are dispatched to a compile-time variant (_merge).
@@ -1111,7 +1605,8 @@ class Q35CpPartialAttnKernel:
         gps lanes (a power of two inside one warp) share one 8-element granule g of row r and take partials j = jg,
         jg + gps, ...: one pass for the row max of the partial LSEs, one for the weights 2^(lse_j - M), the weighted
         sum of the FP16 partials and the denominator, then butterflies over the gps lanes (no weights phase, no CTA
-        barrier). The granule holding (r, d = 0) also writes the row's LSE."""
+        barrier). The granule holding (r, d = 0) also writes the row's LSE. comb_phase: comb_bar's phase (kernel_two's
+        second combine after a first one that loaded partials uses 1)."""
         TOT: cutlass.Constexpr = self.rows * HEAD_DIM
         o_lo = split * chunk
         if o_lo < TOT:
@@ -1135,9 +1630,9 @@ class Q35CpPartialAttnKernel:
                         )
                         _bulk_g2s(s_lse, ws_lse + (row0 * lse_stride) * 4, nb_l, comb_bar.toint())
                 # spin (no suspend hint): every lane of a warp must be awake for the shuffles below
-                landed = cute.arch.mbarrier_try_wait(comb_bar, 0)
+                landed = cute.arch.mbarrier_try_wait(comb_bar, comb_phase)
                 while not landed:
-                    landed = cute.arch.mbarrier_try_wait(comb_bar, 0)
+                    landed = cute.arch.mbarrier_try_wait(comb_bar, comb_phase)
             # lanes per granule: the largest power of two <= 32 with gps * (chunk // 8) <= NUM_THREADS
             lg_gps = cutlass.min(
                 _bfind_u32(cutlass.max(_div_floor_s32(NUM_THREADS, chunk // 8), 1)), 5
@@ -1395,7 +1890,12 @@ class Q35CpPartialAttnKernel:
         # the block tables are host-uploaded or written before the q all-gather, so they are read before the wait
         sPlan = smem.allocate_tensor(Int32, cute.make_layout((PLAN_WORDS,)), 16)
         if warp == 2:
-            self._plan(mSeq, cp_rank, cta, lane, sPlan)
+            if const_expr(self.quad_plan):
+                self._plan_quad(mSeq, cp_rank, cta, lane, sPlan)
+            elif const_expr(self.wide_plan):
+                self._plan_wide(mSeq, cp_rank, cta, lane, sPlan)
+            else:
+                self._plan(mSeq, cp_rank, cta, lane, sPlan)
 
         if warp == 0:
             cpasync.prefetch_descriptor(tma_k)
@@ -1770,6 +2270,570 @@ class Q35CpPartialAttnKernel:
             sScal,
         )
         # Release the dependents: after a CTA barrier that follows the last global store
+        cute.arch.sync_threads()
+        if const_expr(self.use_pdl):
+            if tidx == 0:
+                _griddep_launch()
+        if warp == 1:
+            cute.arch.relinquish_tmem_alloc_permit()
+            cute.arch.dealloc_tmem(tmem_ptr, TMEM_COLS)
+
+    # ---------------------------------------------------------------- device kernel, two-slot plan
+    @cute.kernel
+    def kernel_two(
+        self,
+        mma_qk: cute.TiledMma,
+        mma_pv: cute.TiledMma,
+        tma_k: cute.CopyAtom,
+        gK_tma: cute.Tensor,
+        tma_v: cute.CopyAtom,
+        gV_tma: cute.Tensor,
+        tma_q: cute.CopyAtom,
+        gQ_tma: cute.Tensor,
+        mTab: cute.Tensor,
+        mSeq: cute.Tensor,
+        cp_rank: Int32,
+        mBmm1: cute.Tensor,
+        bmm1_log2: Float32,
+        mBmm2: cute.Tensor,
+        bmm2: Float32,
+        mO: cute.Tensor,
+        o_sd: Int32,
+        o_st: Int32,
+        o_sh: Int32,
+        mLse: cute.Tensor,
+        l_sd: Int32,
+        l_st: Int32,
+        l_sh: Int32,
+        mWs: cute.Tensor,
+        mCnt: cute.Tensor,
+        sQ_l: cute.ComposedLayout,
+        sK_l: cute.ComposedLayout,
+        sV_l: cute.ComposedLayout,
+        sP_l: cute.ComposedLayout,
+        sK_tma_l: cute.ComposedLayout,
+        sV_tma_l: cute.ComposedLayout,
+        sP_mk_l: cute.ComposedLayout,
+        q_bytes: cutlass.Constexpr,
+    ):
+        """``kernel`` on the two-slot plan (_plan_two): the CTA computes up to two requests back to back (slot 0, then
+        slot 1) through one K / V ring and one O accumulator, then runs the grid barrier and the combine of each slot's
+        request. Ring and barrier phases count the CTA's tiles across both slots; the q buffer (q_empty: MMA -> q
+        loader, after slot 0's last GEMM1) and O (o_empty: softmax -> MMA) change hands between the slots. The K / V
+        ring the one-slot kernel stages the FP16 partials through holds slot 1's tiles by then, so the softmax rows
+        store theirs straight to the workspace (staging them through each warp's own P rows is slower)."""
+        S: cutlass.Constexpr = KV_STAGES
+        R: cutlass.Constexpr = self.rows
+        QL: cutlass.Constexpr = self.q_len
+        GH: cutlass.Constexpr = self.gh
+        CP: cutlass.Constexpr = self.cp
+        NS: cutlass.Constexpr = self.n_ctas
+        AW: cutlass.Constexpr = self.act_warps
+        TOT: cutlass.Constexpr = self.rows * HEAD_DIM
+        tidx, _, _ = cute.arch.thread_idx()
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = tidx % 32
+        cta, _, _ = cute.arch.block_idx()
+        o_base = mO.iterator.toint()
+        l_base = mLse.iterator.toint()
+
+        # ---- shared memory (as ``kernel``, + q_empty / o_empty and a second plan) ----
+        smem = SmemAllocator()
+        sK = smem.allocate_tensor(FP8, sK_l.outer, 1024, sK_l.inner)
+        sV = smem.allocate_tensor(FP8, sV_l.outer, 1024, sV_l.inner)
+        sQ = smem.allocate_tensor(FP8, sQ_l.outer, 1024, sQ_l.inner)
+        sP = smem.allocate_tensor(FP8, sP_l.outer, 1024, sP_l.inner)
+        bars = smem.allocate_array(Int64, 4 * S + 14)
+        full_k = bars
+        empty_k = bars + S
+        full_v = bars + 2 * S
+        empty_v = bars + 3 * S
+        q_full = bars + 4 * S
+        s_full = bars + 4 * S + 1  # [2]
+        s_empty = bars + 4 * S + 3  # [2]
+        p_full = bars + 4 * S + 5  # [2]
+        p_empty = bars + 4 * S + 7  # [2]
+        o_done = bars + 4 * S + 9
+        o_full = bars + 4 * S + 10
+        comb_bar = bars + 4 * S + 11
+        q_empty = bars + 4 * S + 12  # slot 0's GEMM1s done: q of slot 1 may overwrite sQ
+        o_empty = (
+            bars + 4 * S + 13
+        )  # slot 0's O read by the softmax rows: slot 1's first GEMM2 may overwrite it
+        tmem_holder = smem.allocate_array(Int32, 4)
+        sTab = smem.allocate_tensor(Int32, cute.make_layout((2, TAB_MAX), stride=(TAB_MAX, 1)), 16)
+        sTarget = smem.allocate_tensor(Int64, cute.make_layout((2,)), 16)
+        sScal = smem.allocate_tensor(Float32, cute.make_layout((4,)), 16)
+        sK_tma = cute.make_tensor(
+            cute.recast_ptr(sK.iterator, sK_tma_l.inner, dtype=FP8), sK_tma_l.outer
+        )
+        sV_tma = cute.make_tensor(
+            cute.recast_ptr(sV.iterator, sV_tma_l.inner, dtype=FP8), sV_tma_l.outer
+        )
+        kv_base = sK.iterator.toint()
+        sP_base = sP.iterator.toint()
+        sPlan = smem.allocate_tensor(Int32, cute.make_layout((2 * PLAN_WORDS,)), 16)
+        if warp == 2:
+            self._plan_two(mSeq, cp_rank, cta, lane, sPlan)
+
+        if warp == 0:
+            cpasync.prefetch_descriptor(tma_k)
+            cpasync.prefetch_descriptor(tma_v)
+            cpasync.prefetch_descriptor(tma_q)
+        if tidx == 0:
+            for i in cutlass.range_constexpr(4 * S + 1):
+                cute.arch.mbarrier_init(bars + i, 1)
+            for i in cutlass.range_constexpr(2):
+                cute.arch.mbarrier_init(s_full + i, 1)
+                cute.arch.mbarrier_init(s_empty + i, 32 * AW)
+                cute.arch.mbarrier_init(p_full + i, 32 * AW)
+                cute.arch.mbarrier_init(p_empty + i, 1)
+            cute.arch.mbarrier_init(o_done, 1)
+            cute.arch.mbarrier_init(o_full, 1)
+            cute.arch.mbarrier_init(comb_bar, 1)
+            cute.arch.mbarrier_init(q_empty, 1)
+            cute.arch.mbarrier_init(o_empty, 32 * AW)
+        cute.arch.mbarrier_init_fence()
+        if const_expr(AW < 4):
+            n_zero: cutlass.Constexpr = (
+                (M_ROWS - 32 * AW) * TILE_KEYS // 16
+            )  # 16-byte words per buffer
+            for z in cutlass.range(tidx, 2 * n_zero, NUM_THREADS):
+                zb = z // n_zero
+                zw = z - zb * n_zero
+                _st_shared_v4(
+                    sP_base + zb * (M_ROWS * TILE_KEYS) + 32 * AW * TILE_KEYS + zw * 16,
+                    Uint32(0),
+                    Uint32(0),
+                    Uint32(0),
+                    Uint32(0),
+                )
+            cute.arch.fence_proxy("async.shared", space="cta")
+        if warp == 1:
+            cute.arch.alloc_tmem(TMEM_COLS, tmem_holder)
+        cute.arch.sync_threads()
+
+        # ---- the two slots (request -1: no slot; tiles 0 then) ----
+        req0 = cute.arch.make_warp_uniform(sPlan[0])
+        split0 = cute.arch.make_warp_uniform(sPlan[1])
+        c0 = cute.arch.make_warp_uniform(sPlan[2])
+        klo0 = cute.arch.make_warp_uniform(sPlan[3])
+        nt0 = cute.arch.make_warp_uniform(sPlan[4])
+        first0 = cute.arch.make_warp_uniform(sPlan[5])
+        L0 = cute.arch.make_warp_uniform(sPlan[6])
+        nv0 = cute.arch.make_warp_uniform(sPlan[7])
+        req1 = cute.arch.make_warp_uniform(sPlan[8])
+        split1 = cute.arch.make_warp_uniform(sPlan[9])
+        c1 = cute.arch.make_warp_uniform(sPlan[10])
+        klo1 = cute.arch.make_warp_uniform(sPlan[11])
+        nt1 = cute.arch.make_warp_uniform(sPlan[12])
+        first1 = cute.arch.make_warp_uniform(sPlan[13])
+        L1 = cute.arch.make_warp_uniform(sPlan[14])
+        nv1 = cute.arch.make_warp_uniform(sPlan[15])
+        a0 = Int32(
+            0
+        )  # slot 0 has tiles (loads q, runs the MMA / softmax pipeline, writes a partial)
+        if nt0 > 0:
+            a0 = Int32(1)
+        own0 = (((L0 + PAGE - 1) // PAGE) - cp_rank + CP - 1) // CP
+        own1 = (((L1 + PAGE - 1) // PAGE) - cp_rank + CP - 1) // CP
+        prefix0 = L0 - QL
+        prefix1 = L1 - QL
+        fresh0 = cutlass.max(prefix0 // PAGE - self.fresh_margin_pages, 0)
+        fresh1 = cutlass.max(prefix1 // PAGE - self.fresh_margin_pages, 0)
+        # each request's combine geometry (cp_partial_geometry with its CTA count) and workspace slots
+        cc0 = cutlass.max(c0, 1)
+        cc1 = cutlass.max(c1, 1)
+        bch0 = 8 * _div_floor_s32(R * HEAD_DIM + 8 * cc0 - 1, 8 * cc0)
+        bch1 = 8 * _div_floor_s32(R * HEAD_DIM + 8 * cc1 - 1, 8 * cc1)
+        bpad0 = bch0
+        if (bch0 // 8) % 2 == 0:
+            bpad0 = bch0 + 8
+        bpad1 = bch1
+        if (bch1 // 8) % 2 == 0:
+            bpad1 = bch1 + 8
+        blse0 = 4 * ((cc0 + 3) // 4)
+        blse1 = 4 * ((cc1 + 3) // 4)
+        ws_req0 = mWs.iterator.toint() + first0 * self.slot_o_bytes
+        ws_req1 = mWs.iterator.toint() + first1 * self.slot_o_bytes
+        ws_lse0 = mWs.iterator.toint() + self.lse_area_off + first0 * self.lse_cta_bytes
+        ws_lse1 = mWs.iterator.toint() + self.lse_area_off + first1 * self.lse_cta_bytes
+        tmem_ptr = cute.arch.retrieve_tmem_ptr(Float32, 16, tmem_holder)
+        tStS = mma_qk.make_fragment_C(mma_qk.partition_shape_C((M_ROWS, TILE_KEYS, 2)))
+        tStS = cute.make_tensor(tmem_ptr, tStS.layout)
+        s_cols = tcgen05.find_tmem_tensor_col_offset(tStS)
+        tOtO = mma_pv.make_fragment_C(mma_pv.partition_shape_C((M_ROWS, HEAD_DIM)))
+        tOtO = cute.make_tensor(tmem_ptr + s_cols, tOtO.layout)
+
+        if warp == 0:
+            # ======================= TMA producer (tile index i of the CTA runs on across the slots) ============
+            gK = cute.tiled_divide(gK_tma, (PAGE, SW_BYTES))
+            gV = cute.tiled_divide(gV_tma, (SW_BYTES, PAGE))
+            tKs, tKg = cpasync.tma_partition(tma_k, 0, cute.make_layout(1), sK_tma, gK)
+            tVs, tVg = cpasync.tma_partition(tma_v, 0, cute.make_layout(1), sV_tma, gV)
+            waited = Int32(0)
+            for k in cutlass.range_constexpr(2):
+                rq = (req0, req1)[k]
+                klo = (klo0, klo1)[k]
+                nt = (nt0, nt1)[k]
+                n_own = (own0, own1)[k]
+                fresh = (fresh0, fresh1)[k]
+                gb = (Int32(0), nt0)[k]  # tiles of the slots before this one
+                if nt > 0:
+                    cute.arch.sync_warp()  # every lane is past the previous slot's table reads
+                    for j in cutlass.range(lane, cutlass.min(2 * nt, TAB_MAX), 32):
+                        oi = cutlass.min(2 * klo + j, n_own - 1)
+                        pg = cp_rank + oi * CP
+                        sTab[0, j] = mTab[rq, 0, pg]
+                        sTab[1, j] = mTab[rq, 1, pg]
+                    cute.arch.sync_warp()
+                    for i in cutlass.range(nt):
+                        if waited == 0:
+                            if cp_rank + cutlass.min(2 * (klo + i) + 1, n_own - 1) * CP >= fresh:
+                                if const_expr(self.use_pdl):
+                                    _griddep_wait()
+                                waited = Int32(1)
+                        ti = i % (TAB_MAX // 2)
+                        if ti == 0:
+                            if i > 0:
+                                cute.arch.sync_warp()
+                                for j in cutlass.range(
+                                    lane, cutlass.min(2 * (nt - i), TAB_MAX), 32
+                                ):
+                                    oi = cutlass.min(2 * (klo + i) + j, n_own - 1)
+                                    pg = cp_rank + oi * CP
+                                    sTab[0, j] = mTab[rq, 0, pg]
+                                    sTab[1, j] = mTab[rq, 1, pg]
+                                cute.arch.sync_warp()
+                        self._produce(
+                            gb + i,
+                            sTab[0, 2 * ti],
+                            sTab[0, 2 * ti + 1],
+                            sTab[1, 2 * ti],
+                            sTab[1, 2 * ti + 1],
+                            tma_k,
+                            tKg,
+                            tKs,
+                            tma_v,
+                            tVg,
+                            tVs,
+                            full_k,
+                            empty_k,
+                            full_v,
+                            empty_v,
+                        )
+        elif warp == 1:
+            # ======================= MMA issuer =======================
+            tCrQ = mma_qk.make_fragment_A(sQ)
+            tCrK = mma_qk.make_fragment_B(sK)
+            tCrP = mma_pv.make_fragment_A(sP)
+            tCrV = mma_pv.make_fragment_B(sV)
+            for k in cutlass.range_constexpr(2):
+                nt = (nt0, nt1)[k]
+                gb = (Int32(0), nt0)[k]
+                qph = (Int32(0), a0)[k]  # q loads before this slot's
+                if nt > 0:
+                    cute.arch.mbarrier_wait(q_full, qph)
+                    for i in cutlass.range(nt + 1):
+                        if i < nt:
+                            g = gb + i
+                            s = g % S
+                            sb = g % 2
+                            cute.arch.mbarrier_wait(full_k + s, (g // S) & 1)
+                            cute.arch.mbarrier_wait(s_empty + sb, ((g // 2) & 1) ^ 1)
+                            for kk in cutlass.range_constexpr(HEAD_DIM // 32):
+                                mma_qk.set(tcgen05.Field.ACCUMULATE, kk != 0)
+                                cute.gemm(
+                                    mma_qk,
+                                    tStS[(None, 0, 0, sb)],
+                                    tCrQ[(None, 0, kk, 0)],
+                                    tCrK[(None, 0, kk, s)],
+                                    tStS[(None, 0, 0, sb)],
+                                )
+                            with cute.arch.elect_one():
+                                tcgen05.commit(s_full + sb)
+                                tcgen05.commit(empty_k + s)
+                                if const_expr(k == 0):
+                                    if i == nt - 1:
+                                        tcgen05.commit(
+                                            q_empty
+                                        )  # slot 0's last GEMM1: sQ may take slot 1's q
+                        if i >= 1:
+                            if const_expr(k == 1):
+                                if i == 1:
+                                    if a0 != 0:
+                                        cute.arch.mbarrier_wait(
+                                            o_empty, 0
+                                        )  # slot 0's O has been read out
+                            mma_pv = self._gemm2(
+                                gb + i - 1,
+                                mma_pv,
+                                tOtO,
+                                tCrP,
+                                tCrV,
+                                full_v,
+                                p_full,
+                                empty_v,
+                                p_empty,
+                                o_done,
+                                j_loc=i - 1,
+                            )
+                    with cute.arch.elect_one():
+                        tcgen05.commit(o_full)
+        elif warp >= SOFTMAX_WARP0:
+            # ======================= softmax (thread st = q row st = TMEM lane st) =======================
+            st = tidx - SOFTMAX_WARP0 * 32
+            sw = warp - SOFTMAX_WARP0
+            if const_expr(self.use_pdl):
+                _griddep_wait()  # the scales may come from the preceding kernels
+            if sw < AW:
+                scale = bmm1_log2
+                if const_expr(self.bmm1_from_ptr):
+                    scale = mBmm1[1]
+                atom_ld = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(32)), Float32)
+                tmpl = cute.local_tile(tStS[(None, None), 0, 0, 0], (M_ROWS, 32), (0, 0))
+                t2r = tcgen05.make_tmem_copy(atom_ld, tmpl)
+                thr_ld = t2r.get_slice(st)
+                frag = thr_ld.partition_D(cute.make_identity_tensor((M_ROWS, 32)))
+                ob = cute.make_rmem_tensor_like(frag, Float32)
+                atom_ld64 = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(64)), Float32)
+                atom_st64 = cute.make_copy_atom(tcgen05.St32x32bOp(tcgen05.Repetition(64)), Float32)
+                tmpl64 = cute.local_tile(tOtO[(None, None), 0, 0], (M_ROWS, 64), (0, 0))
+                t2r64 = tcgen05.make_tmem_copy(atom_ld64, tmpl64)
+                r2t64 = tcgen05.make_tmem_copy(atom_st64, tmpl64)
+                thr_ld64 = t2r64.get_slice(st)
+                thr_st64 = r2t64.get_slice(st)
+                ob64 = cute.make_rmem_tensor_like(
+                    thr_ld64.partition_D(cute.make_identity_tensor((M_ROWS, 64))), Float32
+                )
+                x0 = cute.make_rmem_tensor_like(frag, Float32)
+                x1 = cute.make_rmem_tensor_like(frag, Float32)
+                x2 = cute.make_rmem_tensor_like(frag, Float32)
+                x3 = cute.make_rmem_tensor_like(frag, Float32)
+                xs = (x0, x1, x2, x3)
+                stt = cute.make_rmem_tensor((2,), Float32)
+                bars_sm = (s_full, s_empty, p_full, p_empty, o_done)
+                for k in cutlass.range_constexpr(2):
+                    nt = (nt0, nt1)[k]
+                    klo = (klo0, klo1)[k]
+                    n_own = (own0, own1)[k]
+                    prefix = (prefix0, prefix1)[k]
+                    gb = (Int32(0), nt0)[k]
+                    oph = (Int32(0), a0)[k]  # o_full completions before this slot's
+                    split_k = (split0, split1)[k]
+                    c_k = (cc0, cc1)[k]
+                    bch = (bch0, bch1)[k]
+                    bpad = (bpad0, bpad1)[k]
+                    blse = (blse0, blse1)[k]
+                    ws_req = (ws_req0, ws_req1)[k]
+                    ws_lse = (ws_lse0, ws_lse1)[k]
+                    if nt > 0:
+                        stt[0] = -Float32.inf
+                        stt[1] = Float32(0.0)
+                        lim = prefix + cutlass.min(
+                            st // GH, QL - 1
+                        )  # last visible key position of this row
+                        for i in cutlass.range(nt):
+                            oa = 2 * (klo + i)
+                            pg_a = cp_rank + oa * CP
+                            pg_b = pg_a + CP
+                            cnt_a = cutlass.min(cutlass.max(lim - pg_a * PAGE + 1, 0), PAGE)
+                            cnt_b = cutlass.min(cutlass.max(lim - pg_b * PAGE + 1, 0), PAGE)
+                            masked = Int32(0)
+                            if (pg_b + 1) * PAGE > prefix:
+                                masked = Int32(1)  # holds new tokens or the request tail
+                            if oa + 1 >= n_own:
+                                masked = Int32(1)
+                                cnt_b = Int32(0)  # duplicate second slot
+                            if masked != 0:
+                                self._softmax_tile(
+                                    gb + i,
+                                    xs,
+                                    ob64,
+                                    stt,
+                                    tStS,
+                                    tOtO,
+                                    t2r,
+                                    thr_ld,
+                                    t2r64,
+                                    thr_ld64,
+                                    r2t64,
+                                    thr_st64,
+                                    bars_sm,
+                                    sP_base,
+                                    sP_mk_l,
+                                    st,
+                                    cnt_a,
+                                    cnt_b,
+                                    scale,
+                                    True,
+                                    i_loc=i,
+                                )
+                            else:
+                                self._softmax_tile(
+                                    gb + i,
+                                    xs,
+                                    ob64,
+                                    stt,
+                                    tStS,
+                                    tOtO,
+                                    t2r,
+                                    thr_ld,
+                                    t2r64,
+                                    thr_ld64,
+                                    r2t64,
+                                    thr_st64,
+                                    bars_sm,
+                                    sP_base,
+                                    sP_mk_l,
+                                    st,
+                                    cnt_a,
+                                    cnt_b,
+                                    scale,
+                                    False,
+                                    i_loc=i,
+                                )
+                        # ---- normalized FP16 partial row -> the workspace (chunk-major, see _combine) ----
+                        l_tot = stt[1]
+                        inv_l = Float32(0.0)
+                        lse = -Float32.inf
+                        if l_tot > Float32(0.0):
+                            inv_l = Float32(1.0) / l_tot
+                            lse = stt[0] + _lg2(l_tot) - self.p_shift
+                        cute.arch.mbarrier_wait(o_full, oph)
+                        for h in cutlass.range_constexpr(2):
+                            accO = tOtO[(None, None), 0, h]
+                            for c in cutlass.range_constexpr(4):
+                                cute.copy(
+                                    t2r,
+                                    thr_ld.partition_S(cute.local_tile(accO, (M_ROWS, 32), (0, c))),
+                                    ob,
+                                )
+                                cute.arch.fence_view_async_tmem_load()
+                                if st < R:
+                                    for q8 in cutlass.range_constexpr(4):
+                                        e = st * HEAD_DIM + (h * 128 + c * 32 + 8 * q8)
+                                        ch = _div_floor_s32(e, bch)
+                                        _st_global_v4_u32(
+                                            ws_req
+                                            + ((ch * c_k + split_k) * bpad + e - ch * bch) * 2,
+                                            _pack_f16x2(ob[8 * q8] * inv_l, ob[8 * q8 + 1] * inv_l),
+                                            _pack_f16x2(
+                                                ob[8 * q8 + 2] * inv_l, ob[8 * q8 + 3] * inv_l
+                                            ),
+                                            _pack_f16x2(
+                                                ob[8 * q8 + 4] * inv_l, ob[8 * q8 + 5] * inv_l
+                                            ),
+                                            _pack_f16x2(
+                                                ob[8 * q8 + 6] * inv_l, ob[8 * q8 + 7] * inv_l
+                                            ),
+                                        )
+                        if st < R:
+                            _st_global_f32(ws_lse + (st * blse + split_k) * 4, lse)
+                        if const_expr(k == 0):
+                            cute.arch.mbarrier_arrive(o_empty)  # this row's share of O is read out
+        elif warp == 2:
+            if const_expr(self.use_pdl):
+                _griddep_wait()  # the epoch counters of the previous launch, bmm2
+            if lane == 0:
+                ns64 = Int64(NS)
+                if req0 >= 0:
+                    cv0 = _ld_relaxed_gpu_u64(mCnt.iterator.toint() + req0 * 8)
+                    sTarget[0] = (cv0 // ns64 + 1) * ns64
+                if req1 >= 0:
+                    cv1 = _ld_relaxed_gpu_u64(mCnt.iterator.toint() + req1 * 8)
+                    sTarget[1] = (cv1 // ns64 + 1) * ns64
+                b2v = bmm2
+                if const_expr(self.bmm2_from_ptr):
+                    b2v = mBmm2[0]
+                sScal[0] = b2v
+        elif warp == 3:
+            # q of each slot's request after the dependency wait; slot 1's once slot 0's GEMM1s are done with sQ
+            if const_expr(self.use_pdl):
+                _griddep_wait()
+            if nt0 + nt1 > 0:
+                gQ = cute.local_tile(
+                    gQ_tma,
+                    cute.slice_((M_ROWS, TILE_KEYS, HEAD_DIM), (None, 0, None)),
+                    (None, None, None),
+                )
+                tCgQ = mma_qk.get_slice(0).partition_A(gQ)
+                tQs, tQg = cpasync.tma_partition(
+                    tma_q,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sQ, 0, 3),
+                    cute.group_modes(tCgQ, 0, 3),
+                )
+                if nt0 > 0:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(q_full, q_bytes)
+                    cute.copy(tma_q, tQg[(None, 0, 0, req0)], tQs[(None, 0)], tma_bar_ptr=q_full)
+                if nt1 > 0:
+                    if nt0 > 0:
+                        cute.arch.mbarrier_wait(q_empty, 0)
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(q_full, q_bytes)
+                    cute.copy(tma_q, tQg[(None, 0, 0, req1)], tQs[(None, 0)], tma_bar_ptr=q_full)
+
+        # ======================= grid barrier and combine of each slot's request =======================
+        cute.arch.sync_threads()  # both partials written (softmax rows); epoch targets and bmm2 in SMEM
+        if tidx == 0:
+            # red.release is cumulative over the CTA's partial stores ordered before it by the bar.sync above; every
+            # launch adds NS per counter: the request's first CTA also adds the NS - c absent CTAs
+            if req0 >= 0:
+                add0 = Int64(1)
+                if split0 == 0:
+                    add0 = Int64(NS + 1) - Int64(c0)
+                _red_release_add_u64(mCnt.iterator.toint() + req0 * 8, add0)
+            if req1 >= 0:
+                add1 = Int64(1)
+                if split1 == 0:
+                    add1 = Int64(NS + 1) - Int64(c1)
+                _red_release_add_u64(mCnt.iterator.toint() + req1 * 8, add1)
+        cph1 = Int32(0)  # comb_bar phase of slot 1: 1 when slot 0's combine loaded partials
+        if req0 >= 0:
+            if nv0 > 0:
+                if split0 * bch0 < TOT:
+                    cph1 = Int32(1)
+        for k in cutlass.range_constexpr(2):
+            rq = (req0, req1)[k]
+            if rq >= 0:
+                if tidx == 0:
+                    cnt = mCnt.iterator.toint() + rq * 8
+                    target = sTarget[k]
+                    seen = _ld_acquire_gpu_u64(cnt)
+                    while seen < target:
+                        _nanosleep(32)
+                        seen = _ld_acquire_gpu_u64(cnt)
+                cute.arch.sync_threads()
+                self._combine(
+                    tidx,
+                    warp,
+                    lane,
+                    rq,
+                    (split0, split1)[k],
+                    (cc0, cc1)[k],
+                    (nv0, nv1)[k],
+                    (bch0, bch1)[k],
+                    (bpad0, bpad1)[k],
+                    (blse0, blse1)[k],
+                    (ws_req0, ws_req1)[k],
+                    (ws_lse0, ws_lse1)[k],
+                    kv_base,
+                    comb_bar,
+                    o_base,
+                    o_sd,
+                    o_st,
+                    o_sh,
+                    l_base,
+                    l_sd,
+                    l_st,
+                    l_sh,
+                    sScal,
+                    comb_phase=(Int32(0), cph1)[k],
+                )
+        # ======================= release the dependents: after a CTA barrier that follows the last global store =====
         cute.arch.sync_threads()
         if const_expr(self.use_pdl):
             if tidx == 0:

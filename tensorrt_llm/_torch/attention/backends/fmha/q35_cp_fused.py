@@ -16,20 +16,46 @@
 
 One launch computes this CP rank's partial attention over the pages it owns for every q row of the KV group, written
 straight into alltoall_merge's input layout (contract: q35_cp.q35_cp_fused_partial_ref). One CTA per SM; an in-kernel
-plan shares the CTAs among requests (balanced_split_plan is its host mirror). The per-device grid-barrier counters
-and workspace must be allocated by q35_cp_fused_prepare() or an eager call before CUDA graph capture.
+plan shares the CTAs among requests (balanced_split_plan is its host mirror); above 64 requests the two-slot plan
+(balanced_split_plan_two) lets a CTA compute two requests. The per-device grid-barrier counters and workspace must
+be allocated by q35_cp_fused_prepare() or an eager call before CUDA graph capture.
 """
 
 import functools
+import os
 from typing import Dict, Optional, Union
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 PAGE = 64
 HEAD_DIM = 256
 MAX_ROWS = 128
-# Largest batch of one call: the in-kernel plan runs in one warp, one lane per request.
-MAX_BATCH = 32
+# Plan variants by batch: one request per lane of the plan warp up to 32, two per lane up to 64 (wide plan), and above
+# 64 the two-slot kernel (kernel_two, four requests per lane): a CTA computes up to two requests, so no request is held
+# to whole CTAs. The one-slot plans give every request at least one CTA; past ~SMs / 2 uniform long requests then get
+# exactly one each and the slowest CTA runs a whole request (64k contexts, b96: 128 tiles where 81 would balance).
+# The quad plan (the one-slot plan for 65..128 requests) is reachable through ``plan`` only.
+_LANE_PLAN_MAX_BATCH = 32
+_WIDE_PLAN_MAX_BATCH = 64
+_QUAD_PLAN_MAX_BATCH = 128
+_TWO_SLOT_MAX_BATCH = 128
+_PLAN_MAX_BATCH = dict(
+    lane=_LANE_PLAN_MAX_BATCH,
+    wide=_WIDE_PLAN_MAX_BATCH,
+    quad=_QUAD_PLAN_MAX_BATCH,
+    two=_TWO_SLOT_MAX_BATCH,
+)
+# Largest batch of one call: the lane plan's 32 unless raised with TRTLLM_Q35_ATTN_CP_FUSED_MAX_BATCH (up to 128,
+# e.g. for TEP8 at batch 64 / 128); single-token (MTP draft) calls up to
+# TRTLLM_Q35_ATTN_CP_FUSED_MAX_BATCH_Q1 (default: the same).
+MAX_BATCH = max(
+    1, min(_TWO_SLOT_MAX_BATCH, int(os.environ.get("TRTLLM_Q35_ATTN_CP_FUSED_MAX_BATCH", "32")))
+)
+MAX_BATCH_Q1 = max(
+    1, min(MAX_BATCH, int(os.environ.get("TRTLLM_Q35_ATTN_CP_FUSED_MAX_BATCH_Q1", str(MAX_BATCH))))
+)
 LOG2E = 1.4426950408889634
 
 # Prefix pages below the new tokens' first page that are read only after griddepcontrol.wait (MTP passes write them
@@ -45,10 +71,11 @@ _P_SHIFT = 5.0
 _ALIGN = dict(q=16, kv=16, tab=4, seq=4, bmm1=4, bmm2=4, lse=4, ws=16, cnt=8)
 
 
-def cp_partial_balanced_ws_bytes(rows: int, n_ctas: int) -> int:
+def cp_partial_balanced_ws_bytes(rows: int, n_ctas: int, slots: int = 1) -> int:
     """Mirror of q35_cp_partial_attn.cp_partial_balanced_geometry()["ws_bytes"].
 
-    Per CTA: one FP16 O slot (largest per-CTA share over c = 1..n_ctas CTAs per request) and 16 * rows bytes of LSE.
+    Per CTA: one FP16 O slot (largest per-CTA share over c = 1..n_ctas CTAs per request) and 16 * rows bytes of LSE;
+    ``slots`` per CTA (2 for the two-slot plan).
     """
     total = rows * HEAD_DIM
     slot_o = 0
@@ -56,7 +83,7 @@ def cp_partial_balanced_ws_bytes(rows: int, n_ctas: int) -> int:
         chunk = 8 * ((total + 8 * c - 1) // (8 * c))
         chunk_pad = chunk + (8 if (chunk // 8) % 2 == 0 else 0)
         slot_o = max(slot_o, ((total + chunk - 1) // chunk) * chunk_pad * 2)
-    return n_ctas * (16 * ((slot_o + 15) // 16) + 16 * rows)
+    return slots * n_ctas * (16 * ((slot_o + 15) // 16) + 16 * rows)
 
 
 def balanced_split_plan(seq_lens, cp_rank: int, cp_size: int, n_ctas: int):
@@ -70,7 +97,7 @@ def balanced_split_plan(seq_lens, cp_rank: int, cp_size: int, n_ctas: int):
         for L in seq_lens
     ]
     b = len(t)
-    assert 1 <= b < n_ctas and b <= 32
+    assert 1 <= b < n_ctas and b <= _QUAD_PLAN_MAX_BATCH
     total, tmax = sum(t), max(t)
     lo = max(-(-total // n_ctas), 1)
     hi = max(min(tmax, -(-total // (n_ctas - b))), lo)
@@ -91,6 +118,50 @@ def balanced_split_plan(seq_lens, cp_rank: int, cp_size: int, n_ctas: int):
     return lo, c, ctas
 
 
+def balanced_split_plan_two(seq_lens, cp_rank: int, cp_size: int, n_ctas: int):
+    """Host mirror of the two-slot plan (q35_cp_partial_attn.Q35CpPartialAttnKernel._plan_two).
+
+    T = the smallest tile count with sum_r max(t_r, T) <= n_ctas * T; request r takes the virtual tile range [V_r, V_r
+    + max(t_r, T)) (requests in order), CTA i the range [i * T, (i + 1) * T). Returns (T, slots): slots[i] = [slot 0,
+    slot 1] of CTA i, each None or (request, index among the request's CTAs, its CTAs, first workspace slot, first
+    tile, tiles, CTAs with work); slot 0 is the request holding the CTA's first position, slot 1 the one starting
+    inside its range.
+    """
+    t = [
+        ((((int(L) + PAGE - 1) // PAGE) - cp_rank + cp_size - 1) // cp_size + 1) // 2
+        for L in seq_lens
+    ]
+    b = len(t)
+    assert 1 <= b < n_ctas and b <= _TWO_SLOT_MAX_BATCH
+    total, tmax = sum(t), max(t)
+    lo = max(-(-total // n_ctas), 1)
+    hi = max(tmax, lo)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if sum(max(x, mid) for x in t) <= n_ctas * mid:
+            hi = mid
+        else:
+            lo = mid + 1
+    T = lo
+    slots = [[None, None] for _ in range(n_ctas)]
+    V = s0 = 0
+    for r, x in enumerate(t):
+        te = max(x, 1)
+        f, last = V // T, (V + te - 1) // T
+        c = last - f + 1
+        for j in range(c):
+            i = f + j
+            lo_t, hi_t = max(V, i * T) - V, min(V + te, (i + 1) * T) - V
+            slot = (r, j, c, s0, lo_t if x else 0, hi_t - lo_t if x else 0, c if x else 0)
+            k = 0 if V <= i * T else 1
+            assert slots[i][k] is None
+            slots[i][k] = slot
+        s0 += c
+        V += max(x, T)
+    assert V <= n_ctas * T and s0 <= 2 * n_ctas
+    return T, slots
+
+
 def _num_ctas(sm_count: int) -> int:
     """Grid of the kernel (any batch): one CTA per SM."""
     return max(sm_count, 1)
@@ -99,8 +170,9 @@ def _num_ctas(sm_count: int) -> int:
 def q35_cp_fused_supported(q_len: int, cp_size: int, hq: int, batch: int, sm_count: int) -> bool:
     """Shapes the kernel handles (D 256, FP8 q / KV and 64-token pages are checked by the caller)."""
     rows = q_len * cp_size * hq
+    max_batch = MAX_BATCH if q_len > 1 else MAX_BATCH_Q1
     # the plan gives every request at least one CTA
-    return 1 <= rows <= MAX_ROWS and 1 <= batch <= MAX_BATCH and batch < _num_ctas(sm_count)
+    return 1 <= rows <= MAX_ROWS and 1 <= batch <= max_batch and batch < _num_ctas(sm_count)
 
 
 class _DeviceState:
@@ -111,7 +183,9 @@ class _DeviceState:
 
     def __init__(self, device: torch.device, sm_count: int):
         self.sm_count = sm_count
-        need = cp_partial_balanced_ws_bytes(MAX_ROWS, _num_ctas(sm_count))
+        need = cp_partial_balanced_ws_bytes(
+            MAX_ROWS, _num_ctas(sm_count), 2 if MAX_BATCH > _WIDE_PLAN_MAX_BATCH else 1
+        )
         self.workspace = torch.empty(need // 4 + 64, dtype=torch.float32, device=device)
         self.counters = torch.zeros(MAX_BATCH + 1, MAX_BATCH, dtype=torch.int64, device=device)
 
@@ -162,6 +236,7 @@ def _compiled(
     bmm2_from_ptr: bool,
     o_vec16: bool,
     use_pdl: bool,
+    plan: str,
 ):
     import cuda.bindings.driver as cuda
     import cutlass
@@ -181,8 +256,13 @@ def _compiled(
         use_pdl=use_pdl,
         fresh_margin_pages=_FRESH_MARGIN,
         p_shift=_P_SHIFT,
+        wide_plan=plan == "wide",
+        quad_plan=plan == "quad",
+        two_slot=plan == "two",
     )
-    assert kernel.ws_bytes == cp_partial_balanced_ws_bytes(q_len * gh, n_ctas)
+    assert kernel.ws_bytes == cp_partial_balanced_ws_bytes(
+        q_len * gh, n_ctas, 2 if plan == "two" else 1
+    )
     dev = torch.device("cuda")
     f32 = torch.empty(1024, dtype=torch.float32, device=dev)
     i32 = torch.zeros(64, dtype=torch.int32, device=dev)
@@ -236,6 +316,7 @@ def q35_cp_fused_partial(
     out_lse: torch.Tensor,
     sm_count: int = 0,
     enable_pdl: bool = False,
+    plan: Optional[str] = None,
 ) -> None:
     """This CP rank's partial attention of every group head over the pages it owns (q35_cp_fused_partial_ref).
 
@@ -254,6 +335,8 @@ def q35_cp_fused_partial(
         out_lse: [cp, rows, hq] FP32 (base 2).
         sm_count: SMs of the device (0: queried).
         enable_pdl: Launch as a programmatic dependent.
+        plan: The plan variant ("lane" <= 32 requests, "wide" <= 64, "quad" or "two" <= 128) instead of the one the
+            batch selects (lane, wide, then two); lane / wide / quad compute the same one-slot plan (tests).
     """
     import cuda.bindings.driver as cuda
     import cutlass
@@ -283,6 +366,12 @@ def q35_cp_fused_partial(
     )
     assert tuple(out_lse.shape) == (cp, rows, hq) and out_lse.dtype == torch.float32
     assert 1 <= b <= MAX_BATCH
+    if plan is None:
+        plan = (
+            "two" if b > _WIDE_PLAN_MAX_BATCH else ("wide" if b > _LANE_PLAN_MAX_BATCH else "lane")
+        )
+    assert b <= _PLAN_MAX_BATCH[plan], f"batch {b} above the {plan} plan's {_PLAN_MAX_BATCH[plan]}"
+    slots = 2 if plan == "two" else 1
     device = q_all.device
     sms = sm_count or _sm_count(device)
     state = _state(device, sms)
@@ -290,7 +379,7 @@ def q35_cp_fused_partial(
     assert b < n_ctas <= sms, "more CTAs than requests, every CTA co-resident (one per SM)"
     cnt = state.counters
     ws = state.workspace
-    assert ws.numel() * 4 >= cp_partial_balanced_ws_bytes(R, n_ctas), (
+    assert ws.numel() * 4 >= cp_partial_balanced_ws_bytes(R, n_ctas, slots), (
         "CP partial workspace too small"
     )
     # q: the native all-gather layout is one [b * rows_per_request, 256] matrix read by TMA in place
@@ -316,7 +405,13 @@ def q35_cp_fused_partial(
     assert out_o.data_ptr() % 4 == 0 and all(out_o.stride(i) % 2 == 0 for i in range(3)), (
         "out_o: 4-byte aligned rows (alltoall_merge reads it as int32)"
     )
-    fn = _compiled(q_len, gh, hq, cp, n_ctas, b1_ptr, b2_ptr, o_vec16, bool(enable_pdl))
+    if plan != "lane":
+        logger.info_once(
+            f"Qwen3.5 CP-lite fused partial attention: {plan} plan above {_LANE_PLAN_MAX_BATCH} requests "
+            f"(first call: batch {b}, q_len {q_len})",
+            key=f"q35_cp_fused_{plan}",
+        )
+    fn = _compiled(q_len, gh, hq, cp, n_ctas, b1_ptr, b2_ptr, o_vec16, bool(enable_pdl), plan)
     fp8 = cutlass.Float8E4M3FN
     f32 = cutlass.Float32
     I32 = cutlass.Int32

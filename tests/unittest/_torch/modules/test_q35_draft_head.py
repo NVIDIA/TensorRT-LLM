@@ -310,3 +310,117 @@ def test_pdl_waits_for_a_delayed_producer():
     stale = run(copy_no_wait, lambda: torch.equal(snap, x_old))
     assert any(stale), "the delayed producer did not overlap a PDL dependent: the test is not valid"
     assert run(head, lambda: int(_keys_to_ids(keys)[0])) == [ref_new] * 5
+
+
+def _mx_head(monkeypatch, mx_rows=64, seed=51):
+    """Q35DraftHead (TP 1) with TRTLLM_Q35_DRAFT_HEAD_MX_ROWS=mx_rows."""
+    import types
+
+    mod = _mod()
+    monkeypatch.setenv("TRTLLM_Q35_DRAFT_HEAD_MX_ROWS", str(mx_rows))
+    w = _weights(N_VOCAB_SHARD, seed=seed)
+    head = types.SimpleNamespace(
+        weight=w, out_features=N_VOCAB_SHARD, num_embeddings=N_VOCAB_SHARD, tp_size=1
+    )
+    return mod, mod.Q35DraftHead(head, None)
+
+
+@pytest.mark.parametrize("rows,cols", [(64, 128), (130, 9), (N_VOCAB_SHARD, K // 32)])
+def test_blocked_scales_layout(rows, cols):
+    """blocked_scales against the closed form of cuBLAS's 128 x 4 tiled block-scale layout."""
+    mod = _mod()
+    s = torch.randint(0, 255, (rows, cols), dtype=torch.uint8, device="cuda")
+    got = mod.blocked_scales(s)
+    nc = -(-cols // 4)
+    r = torch.arange(rows, device="cuda")[:, None]
+    c = torch.arange(cols, device="cuda")[None, :]
+    off = ((r // 128) * nc + c // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 + c % 4
+    assert got.numel() == -(-rows // 128) * 128 * nc * 4
+    assert torch.equal(got[off.flatten()], s.flatten())
+    pad = torch.ones(got.numel(), dtype=torch.bool, device="cuda")
+    pad[off.flatten()] = False
+    assert torch.all(got[pad] == 127)
+
+
+@pytest.mark.parametrize("m", [17, 33, 48, 64, 128])
+def test_mx_quant_matches_quantize_mxfp8_rows(m):
+    """The Triton activation quantizer = quantize_mxfp8_rows, bit for bit (values; scales in the tiled layout),
+    including an all-zero block and block maxima with significand exactly 1.75 and just above it."""
+    mod = _mod()
+    x = _acts(m, seed=60 + m)
+    x[0, :32] = 0
+    x[1, 32:64] = 0
+    x[1, 40] = 1.75 * 2**3  # amax / 448 = 2^-5 exactly: e = -5
+    x[2, 64:96] = 0.01
+    x[2, 70] = -1.7578125 * 2**-5  # significand above 1.75: e rounds up
+    x[3, 96:128] = 1e-30  # small exponents (e = -108)
+    ref_v, ref_s = mod.quantize_mxfp8_rows(x)
+    q = torch.empty((m, K), dtype=torch.float8_e4m3fn, device="cuda")
+    blk = torch.full((128 * (K // 32),), 127, dtype=torch.uint8, device="cuda")
+    mod.mxfp8_quantize_rows_blocked(x, q, blk)
+    torch.cuda.synchronize()
+    assert torch.equal(q.view(torch.uint8), ref_v.view(torch.uint8))
+    assert torch.equal(blk, mod.blocked_scales(ref_s))
+
+
+@pytest.mark.parametrize("m", [17, 48, 64])
+def test_mx_logits_match_reference(monkeypatch, m):
+    """cuBLAS MXFP8 logits = dequantized MXFP8 activation x dequantized head copy (exact products, FP32 sums)."""
+    mod, dh = _mx_head(monkeypatch)
+    x = _acts(m, seed=70 + m)
+    logits = dh.mx_logits(x)
+    torch.cuda.synchronize()
+    xd = mod.dequantize_mxfp8_rows(*mod.quantize_mxfp8_rows(x)).double()
+    wd = mod.dequantize_mxfp8_rows(dh.values, dh.scales).double()
+    ref = xd @ wd.T
+    bound = xd.abs() @ wd.abs().T
+    err = (logits.double() - ref).abs()
+    assert logits.dtype == torch.float32 and logits.shape == (m, N_VOCAB_SHARD)
+    assert torch.all(err <= 1e-5 * bound + 1e-6), float((err / (bound + 1e-9)).max())
+
+
+@pytest.mark.parametrize("m", [17, 33, 48, 64])
+def test_mx_sample_is_argmax_of_mx_logits(monkeypatch, m):
+    """Q35DraftHead.sample above 16 rows (TP 1): the argmax (lowest id on ties) of its MXFP8 logits."""
+    _, dh = _mx_head(monkeypatch)
+    assert dh.supports(m) and dh.supports(16) and not dh.supports(65)
+    x = _acts(m, seed=80 + m)
+    out = torch.empty(m, dtype=torch.int32, device="cuda")
+    tokens = dh.sample(x, out=out)
+    logits = dh.mx_logits(x)
+    torch.cuda.synchronize()
+    assert tokens.data_ptr() == out.data_ptr()
+    assert torch.equal(tokens.long(), logits.argmax(dim=-1))
+
+
+def test_mx_rows_default_off(monkeypatch):
+    import types
+
+    mod = _mod()
+    monkeypatch.delenv("TRTLLM_Q35_DRAFT_HEAD_MX_ROWS", raising=False)
+    w = _weights(N_VOCAB_SHARD, seed=52)
+    head = types.SimpleNamespace(
+        weight=w, out_features=N_VOCAB_SHARD, num_embeddings=N_VOCAB_SHARD, tp_size=1
+    )
+    dh = mod.Q35DraftHead(head, None)
+    assert dh.mx_rows == 0 and dh.supports(16) and not dh.supports(17)
+
+
+def test_mx_graph_replay(monkeypatch):
+    """The 17..64-row path captured in a CUDA graph follows new activations on replay."""
+    _, dh = _mx_head(monkeypatch)
+    m = 48
+    xs = torch.empty((m, K), dtype=torch.bfloat16, device="cuda")
+    xs.copy_(_acts(m, seed=90))
+    dh.sample(xs)  # warmup / compile
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        with torch.cuda.graph(graph, stream=stream):
+            tokens = dh.sample(xs)
+    for seed in range(91, 95):
+        xs.copy_(_acts(m, seed=seed))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(tokens.long(), dh.mx_logits(xs).argmax(dim=-1))

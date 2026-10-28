@@ -22,7 +22,7 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.logger import logger
 
-from .admission import DisaggTransferAdmissionController
+from .admission import DisaggTransferAdmissionController, keep_transfer_window
 from .interfaces import ActiveRequestRegistry, ExecutorEffects
 
 if TYPE_CHECKING:
@@ -51,7 +51,9 @@ def transfer_window_bypass_eligible(transceiver, dist, is_kv_manager_v2: bool) -
     The asynchronous Python transceiver does not consume it, and with KV cache
     manager V2 and PP1 its generation requests stay bounded by the scheduler's
     inline KV admission, so no second budget is applied. Other configurations
-    keep the window.
+    keep the window, and so do TRTLLM_DISAGG_GEN_KEEP_TRANSFER_WINDOW=1 and
+    TRTLLM_DISAGG_GEN_ADMIT_BEFORE_ALLOC=1 (which applies it before the KV
+    allocation).
     """
     return (
         transceiver is not None
@@ -59,6 +61,7 @@ def transfer_window_bypass_eligible(transceiver, dist, is_kv_manager_v2: bool) -
         and uses_async_gen_transfer()
         and dist.pp_size == 1
         and is_kv_manager_v2
+        and not keep_transfer_window()
     )
 
 
@@ -373,6 +376,8 @@ class DisaggTransferCoordinator:
                     req,
                     fences.get(req.py_request_id),
                 )
+            # Admission is rank-uniform: report before any rank starts one.
+            self._report_deferred_gen_receives()
             self._publish_ready_gen_receives()
             # A request still waiting leaves DISAGG_GENERATION_INIT as well, so
             # every admitted request ends in the same state on every rank and
@@ -421,6 +426,19 @@ class DisaggTransferCoordinator:
             self._transceiver.request_and_receive_async(req)
             published.append(req)
         self._stamp_gen_transfer_start(published)
+        self._report_deferred_gen_receives()
+
+    def _report_deferred_gen_receives(self) -> None:
+        """Tell the transceiver how many admitted receives wait for publication.
+
+        Every rank admits the same receives, but each publishes them as its own
+        readiness events complete. The transceiver's idle-poll skip must see a
+        waiting receive from admission on: if a peer starts it first, the peer
+        resumes the status collectives while this rank would still skip them.
+        """
+        report = getattr(self._transceiver, "set_gen_deferred_receives", None)
+        if report is not None:
+            report(len(self._unpublished_gen_receives))
 
     def _stamp_gen_transfer_start(self, requests: List[LlmRequest]) -> None:
         """Start the transfer-timeout clock of each receive now in flight."""

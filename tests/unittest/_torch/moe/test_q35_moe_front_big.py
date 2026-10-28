@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The Qwen3.5 MoE front above 32 tokens (kernels/blackwell/q35_moe_front_big.py) after the stock router GEMM:
 ids / weights / xq / xsf bitwise vs the Triton route kernel and ``fp4_quantize``, tables equivalent up to the row
-order inside an expert's block, and the pre-routed trtllm-gen MoE output vs stock routing. Needs SM100/SM103.
+order inside an expert's block, and the pre-routed trtllm-gen MoE output vs stock routing; 257..1024 tokens on
+clusters of 16 (TRTLLM_Q35_MOE_FRONT_BIG_C16 / _C16W). Needs SM100/SM103.
 """
 
 import pytest
@@ -214,9 +215,10 @@ def _rand_fp4_moe(nl, inter, seed):
     "m,nl,ls,inter,tile",
     [(112, 128, 128, 512, 8), (224, 128, 384, 512, 16)],
 )
-def test_moe_parity(m, nl, ls, inter, tile):
+def test_moe_parity(m, nl, ls, inter, tile, force_cfgs=None):
     """Pre-routed trtllm-gen MoE output with the front's (xq, xsf, tables, ids, weights) == the stock op routing the
-    same logits itself (bitwise)."""
+    same logits itself (bitwise). force_cfgs: run these configs of ``tile`` even when get_valid_configs does not list
+    them at m (the autotuner tunes 257..511 tokens in its 256 bucket, e.g. tactic (16, 0) at m = 448)."""
     from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
     from tensorrt_llm._torch.moe.fused_moe.routing import RoutingMethodType
     from tensorrt_llm._torch.utils import ActType_TrtllmGen
@@ -270,6 +272,8 @@ def test_moe_parity(m, nl, ls, inter, tile):
         for t, c in runner.get_runner().get_valid_configs(K, H, inter, nl, m)
         if int(t) == tile
     )
+    if force_cfgs is not None:
+        cfgs = list(force_cfgs)
     assert cfgs, f"no trtllm-gen config of tile {tile} at m={m}"
     run = _front(m, nl, tile)
     flat = torch.full((_sizes(m, nl, tile),), -7, dtype=torch.int32, device="cuda")
@@ -288,3 +292,63 @@ def test_moe_parity(m, nl, ls, inter, tile):
         (m, nl, ls, inter, tile, cfg),
         "pre-routed vs stock routing",
     )
+
+
+@pytest.fixture
+def route_max_1024(monkeypatch):
+    """Route launches up to 1024 tokens on clusters of 16 (what TRTLLM_Q35_MOE_FRONT_BIG_C16 / _C16W enable)."""
+    monkeypatch.setattr(qf, "Q35_MOE_FRONT_BIG_ROUTE_MAX", 1024)
+
+
+# 257..512 tokens (MTP-6 verify of b37-b73, C16) and 513..1024 tokens (b74-b146, C16W: two-word token masks) on
+# clusters of 16.
+@pytest.mark.parametrize(
+    "m,nl,ls,tile,dup,crowd",
+    [
+        (m, 128, 128, tile, False, False)
+        for m in (257, 280, 336, 392, 448, 512)
+        for tile in (8, 16, 32)
+    ]
+    + [(448, nl, ls, 16, False, False) for nl, ls in ((128, 0), (256, 256), (64, 448))]
+    + [(448, 128, 0, 16, True, False), (448, 128, 0, 16, False, True)]
+    + [(m, 128, 0, 16, False, False) for m in (513, 560, 672, 784, 896, 1024)]
+    + [(896, nl, ls, 32, False, False) for nl, ls in ((128, 384), (256, 256), (64, 448))]
+    + [(896, 128, 0, 16, True, False), (896, 128, 0, 16, False, True)],
+)
+def test_parity_c16(m, nl, ls, tile, dup, crowd, route_max_1024):
+    test_parity(m, nl, ls, tile, dup, crowd)
+
+
+# m 448 tile 16 config 0: the tactic the autotuner picks there from its 256 bucket
+@pytest.mark.parametrize("m,tile,force_cfgs", [(336, 16, None), (448, 32, None), (448, 16, [0])])
+def test_moe_parity_c16(m, tile, force_cfgs, route_max_1024):
+    test_moe_parity(m, 128, 128, 512, tile, force_cfgs=force_cfgs)
+
+
+@pytest.mark.parametrize("m", [560, 672, 784, 896])
+def test_moe_parity_c16w(m, route_max_1024):
+    """test_moe_parity at the two smallest tiles the trtllm-gen runner offers at m (above 512 tokens it drops the small
+    tiles, so a fixed tile can have no config there)."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+    from tensorrt_llm._torch.moe.fused_moe.routing import RoutingMethodType
+    from tensorrt_llm._torch.utils import ActType_TrtllmGen
+
+    if not FP4BlockScaleMoERunner.supports_prerouted():
+        pytest.skip("libth_common without run_moe_prerouted")
+    runner = FP4BlockScaleMoERunner(
+        E,
+        K,
+        None,
+        None,
+        512,
+        128,
+        128,
+        None,
+        int(RoutingMethodType.Renormalize),
+        True,
+        ActType_TrtllmGen.SwiGlu.value,
+    )
+    tiles = sorted({int(t) for t, _ in runner.get_runner().get_valid_configs(K, H, 512, 128, m)})
+    assert tiles, f"no trtllm-gen config at m={m}"
+    for tile in tiles[:2]:
+        test_moe_parity(m, 128, 128, 512, tile)

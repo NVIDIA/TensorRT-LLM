@@ -20,6 +20,14 @@ max over TP ranks is the global argmax with ties to the smallest id. ``exchange_
 or NCCL all-gather + ``decode_keys`` turn the keys into token ids and re-arm the key buffer to INT64_MIN.
 
 Only the draft logits change (the target head stays BF16), which can change the acceptance length.
+
+The GEMV keeps the activation in registers, so it takes at most ``MAX_ROWS`` (16) rows.
+``TRTLLM_Q35_DRAFT_HEAD_MX_ROWS=<n>`` (default 0 = off; MXFP8 copy only) runs draft passes of 17..n rows
+(n <= 128) as a cuBLAS block-scaled MXFP8 GEMM (``torch._scaled_mm``) on the same head copy, with the
+activation quantized to MXFP8 exactly as ``quantize_mxfp8_rows`` quantizes the weights (one Triton
+launch, scales written in cuBLAS's tiled layout); the FP32 logits go through the one-launch argmax + key
+exchange (``TPKeyExchange.argmax_logits``). Unlike the GEMV, the activation is quantized, which changes
+the draft logits of those passes - gate with the unforced acceptance-length check.
 """
 
 from __future__ import annotations
@@ -33,9 +41,12 @@ import torch
 from tensorrt_llm.logger import logger
 
 _ENV_ENABLE = "TRTLLM_Q35_DRAFT_FP8_HEAD"
+# TRTLLM_Q35_DRAFT_HEAD_MX_ROWS=<n>: passes of MAX_ROWS + 1 .. n rows on the cuBLAS MXFP8 GEMM (module docstring).
+_ENV_MX_ROWS = "TRTLLM_Q35_DRAFT_HEAD_MX_ROWS"
 # Rows of the head quantized per step of the one-time conversion (bounds its FP32 scratch).
 _QUANT_ROWS = 4096
 MAX_ROWS = 16
+MX_MAX_ROWS = 128  # one 128-row tile of activation block scales
 INT64_MIN = -(1 << 63)
 
 
@@ -98,6 +109,18 @@ def dequantize_mxfp8_rows(values: torch.Tensor, scales: torch.Tensor) -> torch.T
     rows, k = values.shape
     scale = torch.exp2(scales.float() - 127.0)
     return (values.float().view(rows, k // 32, 32) * scale[..., None]).view(rows, k)
+
+
+def blocked_scales(scales: torch.Tensor) -> torch.Tensor:
+    """``scales`` [rows, cols] (UE8M0 bytes) in the 128 x 4 tiled layout cuBLAS block scaling reads, flattened
+    (rows padded to a multiple of 128, cols to a multiple of 4, padding = 2^0): entry (r, c) lands at
+    ``((r // 128) * ceil(cols / 4) + c // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 + c % 4``."""
+    rows, cols = scales.shape
+    nr, nc = -(-rows // 128), -(-cols // 4)
+    padded = torch.full((nr * 128, nc * 4), 127, dtype=torch.uint8, device=scales.device)
+    padded[:rows, :cols] = scales
+    tiles = padded.view(nr, 128, nc, 4).permute(0, 2, 1, 3)
+    return tiles.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1).contiguous()
 
 
 class _GraphSafeDlpack:
@@ -265,6 +288,37 @@ try:
         # Re-arm this rank's key buffer for the next head launch.
         tl.store(keys_ptr + offs, lowest, mask=mask)
 
+    @triton.jit
+    def _q35_mx_quant_kernel(
+        x_ptr, stride_x, q_ptr, s_ptr, K: tl.constexpr, NC: tl.constexpr, BLOCK: tl.constexpr
+    ):
+        """Row ``program_id(0)``, elements ``program_id(1) * BLOCK ..`` of the activation as MXFP8, bit for bit
+        ``quantize_mxfp8_rows``: per 32 elements the exponent e = ceil(log2(amax / 448)), taken from the bits of
+        amax (its exponent - 8, + 1 when its significand exceeds 1.75), values x * 2^-e rounded to E4M3, and the
+        scale byte e + 127 stored at its place in the 128 x 4 tiled layout (``blocked_scales``; ``NC`` = tiles
+        across the K / 32 scale columns)."""
+        row = tl.program_id(0)
+        part = tl.program_id(1)
+        offs = part * BLOCK + tl.arange(0, BLOCK)
+        x = tl.load(x_ptr + row.to(tl.int64) * stride_x + offs).to(tl.float32)
+        xb = tl.reshape(x, (BLOCK // 32, 32))
+        amax = tl.maximum(tl.max(tl.abs(xb), axis=1), 1.1754943508222875e-38)  # clamp_min(2^-126)
+        bits = amax.to(tl.int32, bitcast=True)
+        e = ((bits >> 23) & 0xFF) - 135 + ((bits & 0x7FFFFF) > 0x600000).to(tl.int32)
+        # BF16 activations keep e <= 120; 126 keeps 2^-e a normal FP32 power of two.
+        e = tl.minimum(tl.maximum(e, -127), 126)
+        inv = ((127 - e) << 23).to(tl.float32, bitcast=True)
+        q = (xb * inv[:, None]).to(tl.float8e4nv)
+        tl.store(q_ptr + row.to(tl.int64) * K + offs, tl.reshape(q, (BLOCK,)))
+        col = part * (BLOCK // 32) + tl.arange(0, BLOCK // 32)
+        soff = (
+            ((row // 128) * NC + col // 4) * 512
+            + (row % 32) * 16
+            + ((row % 128) // 32) * 4
+            + col % 4
+        )
+        tl.store(s_ptr + soff, (e + 127).to(tl.uint8))
+
     _TRITON_OK = True
 except ImportError:  # pragma: no cover
     _TRITON_OK = False
@@ -289,6 +343,22 @@ def decode_keys(
         )
         keys.fill_(INT64_MIN)
     return tokens
+
+
+def mxfp8_quantize_rows_blocked(
+    x: torch.Tensor, values: torch.Tensor, blocked: torch.Tensor
+) -> None:
+    """``x`` [M, K] (BF16, unit column stride, M <= MX_MAX_ROWS) as MXFP8, bit for bit ``quantize_mxfp8_rows``:
+    E4M3 values into rows 0..M-1 of ``values`` ([>= M, K], contiguous) and the UE8M0 block scales into ``blocked``
+    (uint8, one 128-row band of the ``blocked_scales`` layout: >= 128 * ceil(K / 128) * 4 bytes)."""
+    m, k = x.shape
+    assert x.stride(1) == 1 and 0 < m <= MX_MAX_ROWS and k % 512 == 0, (x.shape, x.stride())
+    assert values.is_contiguous() and values.shape[1] == k and values.shape[0] >= m
+    nc = -(-(k // 32) // 4)
+    assert blocked.dtype == torch.uint8 and blocked.numel() >= 128 * nc * 4
+    _q35_mx_quant_kernel[(m, k // 512)](
+        x, x.stride(0), values, blocked, K=k, NC=nc, BLOCK=512, num_warps=4
+    )
 
 
 # ----------------------------------------------------------------------------------------------
@@ -316,9 +386,36 @@ class Q35DraftHead:
             f"{self.vocab_offset}), K {self.k}, {self.values.numel() / 2**20:.1f} MiB values + "
             f"{self.scales.numel() / 2**20:.1f} MiB scales"
         )
+        # TRTLLM_Q35_DRAFT_HEAD_MX_ROWS: MAX_ROWS + 1 .. mx_rows rows on the cuBLAS MXFP8 GEMM.
+        self.mx_rows = 0
+        mx_rows = int(os.environ.get(_ENV_MX_ROWS, "0") or "0")
+        if mx_rows > MAX_ROWS:
+            if not _TRITON_OK or not hasattr(torch, "float8_e8m0fnu") or self.k % 512:
+                logger.warning(
+                    f"[Q35DraftHead] {_ENV_MX_ROWS}={mx_rows} ignored: needs Triton, "
+                    f"torch.float8_e8m0fnu and K % 512 == 0"
+                )
+            else:
+                self.mx_rows = min(mx_rows, MX_MAX_ROWS)
+                self.mx_w_scales = blocked_scales(self.scales)
+                self.mx_x = torch.empty(
+                    (self.mx_rows, self.k), dtype=torch.float8_e4m3fn, device=weight.device
+                )
+                self.mx_x_scales = torch.full(
+                    (128 * -(-(self.k // 32) // 4) * 4,),
+                    127,
+                    dtype=torch.uint8,
+                    device=weight.device,
+                )
+                logger.info(
+                    f"[Q35DraftHead] {_ENV_MX_ROWS}={self.mx_rows}: draft passes of {MAX_ROWS + 1}.."
+                    f"{self.mx_rows} rows on the cuBLAS MXFP8 GEMM (activation quantized to MXFP8)"
+                )
 
     def supports(self, rows: int) -> bool:
-        return 0 < rows <= MAX_ROWS and self.k % 512 == 0
+        return self.k % 512 == 0 and (
+            0 < rows <= MAX_ROWS or MAX_ROWS < rows <= getattr(self, "mx_rows", 0)
+        )
 
     def local_keys(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's packed argmax keys ``[M]`` int64 (a view of the persistent key buffer)."""
@@ -335,9 +432,49 @@ class Q35DraftHead:
         )
         return keys
 
+    def mx_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """FP32 logits ``[M, rows of this shard]`` of ``MAX_ROWS < M <= mx_rows`` rows: the activation quantized to
+        MXFP8 (one launch) and the cuBLAS block-scaled MXFP8 GEMM on the head copy."""
+        m = x.shape[0]
+        q = self.mx_x[:m]
+        mxfp8_quantize_rows_blocked(x if x.stride(1) == 1 else x.contiguous(), q, self.mx_x_scales)
+        return torch._scaled_mm(
+            q,
+            self.values.t(),
+            scale_a=self.mx_x_scales.view(torch.float8_e8m0fnu),
+            scale_b=self.mx_w_scales.view(torch.float8_e8m0fnu),
+            out_dtype=torch.float32,
+        )
+
+    def _sample_mx(self, x: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """``sample`` for ``MAX_ROWS < M <= mx_rows``: ``mx_logits``, then the argmax + key exchange in one launch
+        (``TPKeyExchange.argmax_logits``; without it: row maxima, keys, NCCL all-gather + ``decode_keys``)."""
+        logits = self.mx_logits(x)
+        tp_size = getattr(self.mapping, "tp_size", 1) if self.mapping is not None else 1
+        if tp_size > 1:
+            from ..distributed import ll_exchange
+
+            if ll_exchange.ll_argmax_exchange_enabled():
+                exchange = ll_exchange.get_tp_key_exchange(self.mapping)
+                if exchange is not None and logits.shape[0] <= exchange.MAX_ROWS:
+                    return exchange.argmax_logits(
+                        logits, self.vocab_offset, tokens_out=out, channel=0
+                    )
+        from ..distributed.ll_exchange import pack_argmax_keys
+
+        vmax, imax = torch.max(logits, dim=-1)
+        keys = pack_argmax_keys(vmax, imax, self.vocab_offset)
+        if tp_size > 1:
+            from ..distributed import allgather
+
+            return decode_keys(allgather(keys, self.mapping, dim=0), tp_size, keys, out)
+        return decode_keys(keys, 1, keys, out)
+
     def sample(self, x: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Greedy draft token ids ``[M]`` int32 (global vocabulary), identical on every TP rank; written into
         ``out`` (contiguous int32 ``[M]``) when given."""
+        if x.shape[0] > MAX_ROWS:
+            return self._sample_mx(x, out)
         keys = self.local_keys(x)
         tp_size = getattr(self.mapping, "tp_size", 1) if self.mapping is not None else 1
         if tp_size > 1:
@@ -374,11 +511,13 @@ def build_draft_head_if_enabled(lm_head, mapping) -> Optional[Q35DraftHead]:
 
 __all__ = [
     "Q35DraftHead",
+    "blocked_scales",
     "build_draft_head_if_enabled",
     "decode_keys",
     "draft_fp8_head_enabled",
     "dequantize_mxfp8_rows",
     "exchange_argmax_keys",
     "mxfp8_head_gemv",
+    "mxfp8_quantize_rows_blocked",
     "quantize_mxfp8_rows",
 ]

@@ -9,13 +9,16 @@ scales come from MTP_MOE_NVFP4_FC1_AMAX / _FC2_AMAX. Only draft proposals (accep
 
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
 # MoE inputs above this many tokens take a BF16 twin of the experts built the stock way (CUTLASS): the MTP-6 verify
 # rows at batch 4 (7 x 4), so the quantized experts serve the decode steps and context-sized calls stay BF16.
-MTP_MOE_QUANT_MAX_M = 28
+# TRTLLM_Q35_MTP_MOE_QUANT_MAX_M=<rows> overrides it; 0 builds no twin, so every input runs on
+# the quantized experts.
+MTP_MOE_QUANT_MAX_M = int(os.environ.get("TRTLLM_Q35_MTP_MOE_QUANT_MAX_M", "28") or 0)
 NVFP4_BLOCK = 16
 # NVFP4 global scale convention (ModelOpt / TRT-LLM): amax maps to E2M1 max (6) x E4M3 max (448).
 _E2M1_MAX = 6.0

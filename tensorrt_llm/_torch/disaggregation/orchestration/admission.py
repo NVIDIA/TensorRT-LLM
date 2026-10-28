@@ -2,9 +2,30 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
+import os
 from typing import Iterable, List, Optional
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+
+# TRTLLM_DISAGG_GEN_KEEP_TRANSFER_WINDOW=1 (default off): the transfer window stays on where the
+# coordinator would otherwise bypass it (transfer_window_bypass_eligible: Python transceiver, KV
+# cache manager V2, PP1), so max_tokens_in_buffer (default max_seq_len) bounds the KV transfers in
+# flight there too.
+KEEP_TRANSFER_WINDOW_ENV = "TRTLLM_DISAGG_GEN_KEEP_TRANSFER_WINDOW"
+# TRTLLM_DISAGG_GEN_ADMIT_BEFORE_ALLOC=1 (default off): KVCacheV2Scheduler applies the transfer
+# window to generation-init requests before it allocates their KV (DisaggTransferAdmissionGate);
+# it keeps the window on as TRTLLM_DISAGG_GEN_KEEP_TRANSFER_WINDOW does.
+ADMIT_BEFORE_ALLOC_ENV = "TRTLLM_DISAGG_GEN_ADMIT_BEFORE_ALLOC"
+
+
+def admit_before_alloc_enabled() -> bool:
+    """Whether TRTLLM_DISAGG_GEN_ADMIT_BEFORE_ALLOC is on."""
+    return os.environ.get(ADMIT_BEFORE_ALLOC_ENV, "0") == "1"
+
+
+def keep_transfer_window() -> bool:
+    """Whether the transfer window stays on where the coordinator would bypass it."""
+    return os.environ.get(KEEP_TRANSFER_WINDOW_ENV, "0") == "1" or admit_before_alloc_enabled()
 
 
 @dataclasses.dataclass
@@ -112,3 +133,61 @@ class DisaggTransferAdmissionController:
 
         result.deferred_request_count = len(candidates) - len(result.admitted_requests)
         return result
+
+    def begin_gate(
+        self, active_requests: Iterable[LlmRequest]
+    ) -> Optional["DisaggTransferAdmissionGate"]:
+        """A pre-allocation gate for one scheduling pass, or None when the budget is disabled
+        (select() then admits every candidate)."""
+        if not self.enabled():
+            return None
+        return DisaggTransferAdmissionGate(self, active_requests)
+
+
+class DisaggTransferAdmissionGate:
+    """Pre-allocation view of DisaggTransferAdmissionController.select() for one scheduling pass
+    (TRTLLM_DISAGG_GEN_ADMIT_BEFORE_ALLOC=1).
+
+    KVCacheV2Scheduler allocates KV for every DISAGG_GENERATION_INIT request it visits. select()
+    then admits the longest FCFS prefix of those candidates that fits the transfer budget, and the
+    coordinator reverts every later candidate's allocation. With many waiting requests, most of
+    each iteration's host time goes to allocating and reverting KV for requests that cannot be
+    admitted.
+
+    select() stops at the first candidate that misses the budget and defers every candidate after
+    it. The scheduler reports each candidate here after its allocation succeeds. Once one misses
+    the budget the gate closes, and the scheduler skips the remaining generation-init requests of
+    the pass without allocating them. The candidate that closed the gate is still passed on, so
+    select() sees the same prefix, admits the same requests, reports the same limited_by_budget,
+    and reverts only that one allocation.
+    """
+
+    def __init__(
+        self, controller: DisaggTransferAdmissionController, active_requests: Iterable[LlmRequest]
+    ) -> None:
+        self._controller = controller
+        self.active_transfer_blocks = controller._estimate_active_transfer_blocks(active_requests)
+        self._used_blocks = self.active_transfer_blocks
+        self._num_fitting = 0
+        self.closed = False
+        # Generation-init requests skipped without allocation in this pass.
+        self.num_skipped = 0
+
+    def observe_candidate(self, request: LlmRequest) -> None:
+        """Account a candidate whose KV allocation succeeded, with the rule of select(): FCFS,
+        plus an oversized head when nothing is in flight."""
+        if self.closed:
+            return
+        max_transfer_blocks = self._controller.max_transfer_blocks
+        request_blocks = self._controller._estimate_request_blocks(request)
+        fits_budget = self._used_blocks + request_blocks <= max_transfer_blocks
+        admit_oversized_head = (
+            self._num_fitting == 0
+            and self.active_transfer_blocks == 0
+            and request_blocks > max_transfer_blocks
+        )
+        if fits_budget or admit_oversized_head:
+            self._num_fitting += 1
+            self._used_blocks += request_blocks
+        else:
+            self.closed = True

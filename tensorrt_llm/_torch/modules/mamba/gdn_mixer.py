@@ -67,7 +67,8 @@ from .recurrent_state_cache import reset_recurrent_state_rows
 # Qwen3.5 GDN target-verify fast path (tuned for Qwen3.5-397B on SM 10.3): a decode-only cached-replay MTP verify
 # step of at most _Q35_FUSE_MAX_BATCH requests runs low-M in_proj (+ conv1d epilogue) -> q35_gdn_core, or conv1d ->
 # one fused replay + gated RMSNorm launch (Triton below _Q35_CORE_MIN_BATCH requests, else q35_gdn_core).
-_Q35_FUSE_MAX_BATCH = 64
+# Deployments above batch 64 raise it with TRTLLM_Q35_GDN_FUSE_MAX_BATCH (e.g. 128 for TEP8 at batch 128).
+_Q35_FUSE_MAX_BATCH = int(os.environ.get("TRTLLM_Q35_GDN_FUSE_MAX_BATCH", "64"))
 # At TP8 the in_proj leaves the low-M kernel from 5 requests on, where the CUDA core kernel beats the Triton one.
 _Q35_CORE_MIN_BATCH = 5
 # The CUDA core kernel releases its PDL dependents at entry.

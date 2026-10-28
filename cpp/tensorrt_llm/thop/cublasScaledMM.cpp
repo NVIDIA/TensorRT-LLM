@@ -22,9 +22,18 @@
 #include "tensorrt_llm/thop/outputTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "userbuffersTensor.h"
+#include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <cublasLt.h>
+#include <map>
+#include <sstream>
+#include <stdexcept>
+#include <string>
 #include <torch/extension.h>
+#include <tuple>
 #include <unordered_map>
+#include <vector>
 
 using torch::Tensor;
 
@@ -103,6 +112,94 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
         return false;
     }
     TLLM_LOG_DEBUG("Found special cublasLt algo for m=%d, k=%d, n=%d\n", m, k, n);
+    return true;
+}
+
+// TRTLLM_CUBLAS_FP8_ALGO (default unset): explicit cuBLASLt configs for FP8 GEMMs of exact shapes, ahead of the LUT
+// and the heuristic (e.g. fewer CTAs for a GEMM that overlaps other kernels). Entries
+// "m,n,k=algo,tile,stages,splitK,reduction,swizzle,customOption,cluster[,innerShape]" separated by ';', with m, n, k
+// as in cublas_gemm_caller (out[m, n] = a[m, k] @ b[k, n]) and values of cublasLtMatmulAlgoConfigAttributes_t.
+// A config that cublasLtMatmulAlgoCheck rejects falls back to the heuristic (CublasMMWrapper::Gemm).
+using Fp8AlgoOverrides = std::map<std::tuple<int32_t, int32_t, int32_t>, std::array<int, 9>>;
+
+Fp8AlgoOverrides parse_fp8_algo_overrides(char const* spec)
+{
+    Fp8AlgoOverrides table;
+    std::stringstream entries(spec);
+    std::string entry;
+    while (std::getline(entries, entry, ';'))
+    {
+        if (entry.find_first_not_of(" \t") == std::string::npos)
+        {
+            continue;
+        }
+        std::string flat = entry;
+        auto const eq = flat.find('=');
+        bool ok = eq != std::string::npos;
+        if (ok)
+        {
+            flat[eq] = ',';
+        }
+        std::vector<int> v;
+        std::stringstream fields(flat);
+        std::string field;
+        while (ok && std::getline(fields, field, ','))
+        {
+            try
+            {
+                std::size_t used = 0;
+                v.push_back(std::stoi(field, &used));
+                ok = field.find_first_not_of(" \t", used) == std::string::npos;
+            }
+            catch (std::exception const&)
+            {
+                ok = false;
+            }
+        }
+        // m, n, k and 8 or 9 config values
+        if (!ok || v.size() < 11 || v.size() > 12)
+        {
+            TLLM_LOG_WARNING("TRTLLM_CUBLAS_FP8_ALGO: ignoring malformed entry '%s'", entry.c_str());
+            continue;
+        }
+        std::array<int, 9> cfg{};
+        std::copy(v.begin() + 3, v.end(), cfg.begin());
+        table[{v[0], v[1], v[2]}] = cfg;
+        TLLM_LOG_INFO(
+            "TRTLLM_CUBLAS_FP8_ALGO: m=%d n=%d k=%d -> algo %d tile %d stages %d splitK %d reduction %d swizzle %d "
+            "custom %d cluster %d inner %d",
+            v[0], v[1], v[2], cfg[0], cfg[1], cfg[2], cfg[3], cfg[4], cfg[5], cfg[6], cfg[7], cfg[8]);
+    }
+    return table;
+}
+
+Fp8AlgoOverrides const& fp8_algo_overrides()
+{
+    static Fp8AlgoOverrides const table = []()
+    {
+        char const* spec = std::getenv("TRTLLM_CUBLAS_FP8_ALGO");
+        return spec == nullptr ? Fp8AlgoOverrides{} : parse_fp8_algo_overrides(spec);
+    }();
+    return table;
+}
+
+bool find_override_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapper> const& cublasWrapper, int32_t m,
+    int32_t n, int32_t k, cublasComputeType_t compType, cudaDataType_t scaleType, cudaDataType_t aType,
+    cudaDataType_t bType, cudaDataType_t outType)
+{
+    auto const& table = fp8_algo_overrides();
+    auto const it = table.find({m, n, k});
+    if (it == table.end())
+    {
+        return false;
+    }
+    auto const& c = it->second;
+    check_cuda_error(cublasLtMatmulAlgoInit(
+        cublasWrapper->getCublasLtHandle(), compType, scaleType, aType, bType, outType, outType, c[0], &algo));
+    set_algo_attr(algo, {c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]});
+    uint16_t const inner = static_cast<uint16_t>(c[8]);
+    check_cuda_error(
+        cublasLtMatmulAlgoConfigSetAttribute(&algo, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, &inner, sizeof(inner)));
     return true;
 }
 
@@ -249,6 +346,11 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
 #else
     bool has_algo = find_special_algo(algo, cublasWrapper, m, n, k, compType, scaleType, aType, bType, outType);
 #endif
+    if (aType == CUDA_R_8F_E4M3
+        && find_override_algo(algo, cublasWrapper, m, n, k, compType, scaleType, aType, bType, outType))
+    {
+        has_algo = true;
+    }
 
     // swap A and B. A is column major, B is row major.
     cublasWrapper->createDescriptors(

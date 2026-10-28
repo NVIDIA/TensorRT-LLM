@@ -49,6 +49,7 @@ from ..attention.backends import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..distributed.q35_allreduce import (FUSED_AR_MAX_ROWS,
+                                         FUSED_AR_TWOSHOT_ROWS,
                                          get_q35_cute_allreduce,
                                          get_q35_gemm_ar, q35_mnnvl_fusable,
                                          q35_zero_residual)
@@ -146,6 +147,20 @@ def _q35_replicated_embed() -> bool:
 _Q35_PLAIN_AR_MAX_BYTES = 1 << 20
 
 
+@q35_env.register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global _Q35_PLAIN_AR_TWOSHOT
+    # TRTLLM_Q35_FUSED_AR_PLAIN_TWOSHOT=<lo>-<hi> (default off): the plain all-reduces of lo..hi rows above that
+    # bound also take the CuTe kernel's two-shot, bitwise the library two-shot + Lamport RMSNorm pair it replaces
+    # (lo >= FUSED_AR_TWOSHOT_ROWS: below it the CuTe call is one-shot, (x * rstd) * w, not bitwise). On TP8
+    # the CuTe two-shot is faster within one wave of CTAs (up to ~2 rows per SM); above it the library pair is
+    # faster, even with TRTLLM_Q35_FUSED_AR_TPC.
+    _Q35_PLAIN_AR_TWOSHOT = tuple(
+        int(v) for v in os.environ.get("TRTLLM_Q35_FUSED_AR_PLAIN_TWOSHOT",
+                                       "0-0").split("-"))
+
+
 def _q35_fused_ar(allreduce, rows: int, is_post_moe: bool, hidden: int = 4096):
     """The fused all-reduce + RMSNorm callable for this call, or None (the library op).
 
@@ -157,8 +172,10 @@ def _q35_fused_ar(allreduce, rows: int, is_post_moe: bool, hidden: int = 4096):
             or getattr(allreduce, "mnnvl_allreduce", None) is None
             or not 0 < rows <= FUSED_AR_MAX_ROWS):
         return None
+    lo, hi = _Q35_PLAIN_AR_TWOSHOT
     if (not is_post_moe and rows * hidden * allreduce.mapping.tp_size * 2
-            > _Q35_PLAIN_AR_MAX_BYTES):
+            > _Q35_PLAIN_AR_MAX_BYTES
+            and not FUSED_AR_TWOSHOT_ROWS <= lo <= rows <= hi):
         return None
     inst = get_q35_cute_allreduce(allreduce.mapping)
     return get_q35_ar2(allreduce.mapping, inst) or inst
@@ -620,35 +637,38 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             from ..modules.q35_mtp_moe_quant import (MTP_MOE_QUANT_MAX_M,
                                                      wrap_experts_loader)
             self._q35_quant_max_m = MTP_MOE_QUANT_MAX_M
-            # Inputs above MTP_MOE_QUANT_MAX_M rows run on a BF16 twin built as
-            # the stock MTP experts (CUTLASS).
-            twin_config = copy.copy(model_config)
-            twin_config._frozen = False
-            twin_config.moe_backend = "CUTLASS"
-            twin_config._frozen = True
-            self.q35_experts_bf16 = create_moe(
-                num_experts=self.num_experts,
-                routing_method=self.gate.routing_method,
-                hidden_size=self.hidden_dim,
-                intermediate_size=self.moe_intermediate_size,
-                aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
-                dtype=config.torch_dtype,
-                reduce_results=False,
-                model_config=twin_config,
-                # Not registered under this layer's index (that slot is the
-                # quantized experts'; no EPLB / torch.compile custom op).
-                layer_idx=None,
-                weight_loading_mode=stock_weight_loading_mode,
-                override_quant_config=QuantConfig(
-                    kv_cache_quant_algo=model_config.quant_config.
-                    kv_cache_quant_algo),
-            )
+            if self._q35_quant_max_m > 0:
+                # Inputs above MTP_MOE_QUANT_MAX_M rows run on a BF16 twin built
+                # as the stock MTP experts (CUTLASS).
+                twin_config = copy.copy(model_config)
+                twin_config._frozen = False
+                twin_config.moe_backend = "CUTLASS"
+                twin_config._frozen = True
+                self.q35_experts_bf16 = create_moe(
+                    num_experts=self.num_experts,
+                    routing_method=self.gate.routing_method,
+                    hidden_size=self.hidden_dim,
+                    intermediate_size=self.moe_intermediate_size,
+                    aux_stream_dict={
+                        AuxStreamType.MoeChunkingOverlap: aux_stream
+                    },
+                    dtype=config.torch_dtype,
+                    reduce_results=False,
+                    model_config=twin_config,
+                    # Not registered under this layer's index (that slot is the
+                    # quantized experts'; no EPLB / torch.compile custom op).
+                    layer_idx=None,
+                    weight_loading_mode=stock_weight_loading_mode,
+                    override_quant_config=QuantConfig(
+                        kv_cache_quant_algo=model_config.quant_config.
+                        kv_cache_quant_algo),
+                )
             wrap_experts_loader(self.experts, self.q35_experts_bf16)
             logger.info(
                 f"Layer {layer_idx} (MTP) MoE experts: bf16 checkpoint "
                 "weights quantized to NVFP4 at load time for "
-                f"moe_backend=TRTLLM; inputs above {self._q35_quant_max_m} "
-                "tokens on a BF16 twin")
+                "moe_backend=TRTLLM; inputs above "
+                f"{self._q35_quant_max_m or 'no'} tokens on a BF16 twin")
 
         self.shared_expert = GatedMLP(
             hidden_size=self.hidden_dim,

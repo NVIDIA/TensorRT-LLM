@@ -702,7 +702,9 @@ def _q35_tactic_table(*groups: str) -> dict:
 # tactics for identical shapes, and the slowest rank sets every layer's pace.
 _Q35_SM103_MOE_HIDDEN_SIZE = 4096
 _Q35_SM103_MOE_TOP_K = 10
-_Q35_SM103_MOE_TACTICS = _q35_tactic_table(
+# TRTLLM_Q35_MOEGEMM_PIN=<group>|<group>|... (same group format) overrides the default table: rows for larger
+# batches, or tactics re-derived for another trtllm-gen build.
+_Q35_SM103_MOE_TACTICS_DEFAULT = (
     "512x64:7=8/70,14=8/70,21=8/70,28=8/70",
     "512x128:3=8/59,5=8/59,6=8/70,7=8/70,8=8/48,9=8/48,10=8/70,11=8/70,12=8/70,"
     "13=8/70,14=8/48,15=8/70,16=8/4,18=8/4,20=8/4,21=8/4,22=8/4,24=8/48,26=8/4,"
@@ -712,6 +714,9 @@ _Q35_SM103_MOE_TACTICS = _q35_tactic_table(
     "256x256:7=8/55,14=8/66,28=8/66",
     "256x128:7=8/59,14=8/44,28=8/66",
 )
+_Q35_SM103_MOE_TACTICS = _q35_tactic_table(
+    *(os.environ.get("TRTLLM_Q35_MOEGEMM_PIN")
+      or "|".join(_Q35_SM103_MOE_TACTICS_DEFAULT)).split("|"))
 _q35_tactic_valid: dict = {}
 
 

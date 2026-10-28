@@ -29,13 +29,18 @@ import triton
 import triton.language as tl
 
 from ...autotuner import AutoTuner
+from ...q35_env import register as _q35_register
 
 # Largest step of the router GEMM, the low-M router and the route + tables launch.
 Q35_MOE_ROUTER_MAX_TOKENS = 32
 # Largest step of the one-launch front (faster in-model up to MTP-6 verify at b2, TEP8/TEP16, SM 10.3).
 Q35_MOE_FRONT_MAX_M = 16
-# Steps of the big front: MTP-6 target verify rows 7 * b for b = 5..32.
-Q35_MOE_FRONT_BIG_MS = frozenset(range(35, 225, 7))
+# Steps of the big front: MTP-6 target verify rows 7 * b for b = 5..32. TRTLLM_Q35_MOE_FRONT_BIG_MS=<m>,... overrides
+# the set (e.g. with the verify and draft steps of larger batches, together with
+# TRTLLM_Q35_MOE_FRONT_BIG_C16 / _C16W above 256 tokens).
+Q35_MOE_FRONT_BIG_MS = frozenset(
+    int(v) for v in os.environ.get("TRTLLM_Q35_MOE_FRONT_BIG_MS", "").split(",") if v.strip()
+) or frozenset(range(35, 225, 7))
 # Warps per program of the per-token route + tables kernel (one warp leaves the last program's table phase
 # serial).
 _ROUTE_WARPS = 4
@@ -853,6 +858,26 @@ def _q35_front_fused(moe, weight: torch.Tensor, x: torch.Tensor, global_scale: t
     return logits, xq, xsf
 
 
+@_q35_register
+def _q35_read_switches() -> None:
+    """This module's TRTLLM_Q35_* switches; q35_env.activate() re-reads them."""
+    global Q35_MOE_FRONT_BIG_C16, Q35_MOE_FRONT_BIG_C16W, Q35_MOE_FRONT_BIG_ROUTE_MAX
+    # TRTLLM_Q35_MOE_FRONT_BIG_C16=1 (default off): token counts of Q35_MOE_FRONT_BIG_MS in 257..512 (the MTP-6
+    # target verify of CUDA-graph batches 37-73, e.g. 280 / 336 / 392 / 448 at b40 / 48 / 56 / 64) take the
+    # route-only launch with thread-block clusters of 16 (q35_moe_front_big.ROUTE_CLUSTER_WIDE) instead of the stock
+    # routing kernels + fp4_quantize. Without it such counts keep the stock path.
+    Q35_MOE_FRONT_BIG_C16 = os.environ.get("TRTLLM_Q35_MOE_FRONT_BIG_C16", "0") == "1"
+    # TRTLLM_Q35_MOE_FRONT_BIG_C16W=1 (default off; with C16): also 513..1024 tokens (the MTP-6 target verify of
+    # CUDA-graph batches 74-146, e.g. 560 / 672 / 784 / 896 at b80 / 96 / 112 / 128): the same clusters of 16 with up
+    # to 64 tokens per routing CTA (two per warp, two-word token masks).
+    Q35_MOE_FRONT_BIG_C16W = (
+        Q35_MOE_FRONT_BIG_C16 and os.environ.get("TRTLLM_Q35_MOE_FRONT_BIG_C16W", "0") == "1"
+    )
+    Q35_MOE_FRONT_BIG_ROUTE_MAX = (
+        1024 if Q35_MOE_FRONT_BIG_C16W else (512 if Q35_MOE_FRONT_BIG_C16 else 256)
+    )
+
+
 _Q35_ROUTE_BIG_COMPILED = {}
 
 
@@ -875,8 +900,15 @@ def _q35_route_big_compile(
     import cutlass
     import cutlass.cute as cute
 
-    from ...kernels.blackwell.q35_moe_front_big import Q35MoeRouteBigKernel
+    from ...kernels.blackwell.q35_moe_front_big import (
+        ROUTE_CLUSTER,
+        ROUTE_CLUSTER_WIDE,
+        Q35MoeRouteBigKernel,
+    )
 
+    wide = (
+        m > ROUTE_CLUSTER * 32
+    )  # 257..512 (..1024 with C16W) tokens: clusters of 16 (TRTLLM_Q35_MOE_FRONT_BIG_C16)
     try:
         kernel = Q35MoeRouteBigKernel(
             num_rows=m,
@@ -887,6 +919,8 @@ def _q35_route_big_compile(
             tile=tile,
             a_stride=a_stride,
             use_pdl=use_pdl,
+            cluster=ROUTE_CLUSTER_WIDE if wide else ROUTE_CLUSTER,
+            quant_clusters=3 if wide else 7,
         )
     except ValueError:
         _Q35_ROUTE_BIG_COMPILED[key] = None
@@ -919,7 +953,7 @@ class Q35RouteBig:
             return None
         m, k = x.shape
         if (
-            m > 256
+            m > Q35_MOE_FRONT_BIG_ROUTE_MAX
             or n != 512
             or top_k != 10
             or k % 16
@@ -1218,7 +1252,9 @@ def q35_routed_forward(gate, moe, x: torch.Tensor, **moe_kwargs):
         return None
     if x.dim() != 2 or gate.out_dtype != torch.bfloat16:
         return None
-    if x.shape[0] in Q35_MOE_FRONT_BIG_MS and _trtllm_quant_eligible(moe, x, max_tokens=256):
+    if x.shape[0] in Q35_MOE_FRONT_BIG_MS and _trtllm_quant_eligible(
+        moe, x, max_tokens=Q35_MOE_FRONT_BIG_ROUTE_MAX
+    ):
         big = _q35_route_big(moe, gate, x, moe.backend.fc31_input_scale)
         if big is not None:
             logits, xq, xsf = big

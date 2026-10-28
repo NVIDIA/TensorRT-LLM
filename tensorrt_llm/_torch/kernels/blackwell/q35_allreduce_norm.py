@@ -26,7 +26,10 @@ kernels in one graph; only the byte counts in the flags cross launches, its data
 Extensions: ``se_fold`` computes ``routed + sigmoid(gate) * shared`` in-kernel with
 ``fused_sigmoid_gate_mul_add``'s arithmetic; ``moe_topk`` finalizes ``routed`` from the un-finalized
 trtllm-gen MoE output with the finalize kernel's arithmetic; ``two_shot`` is bitwise the library's two-shot
-+ Lamport RMSNorm pair in one launch.
++ Lamport RMSNorm pair in one launch; ``fp8`` (with ``two_shot``) carries E4M3 plus one FP32 scale per 256
+elements in both stages (half the bytes; two E4M3 roundings per element, so not bitwise the library);
+``tpc`` > 1 (BF16 two-shot) gives each CTA ``tpc`` consecutive tokens, so a call larger than one wave of
+CTAs still runs as one wave, with every token's output bits those of the one-token kernel.
 
 PDL: only the workspace table and the norm weight are read before ``griddepcontrol.wait``; never the
 input, the residual (the previous all-reduce's output) or the flags.
@@ -429,6 +432,134 @@ def _e4m3x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Int32:
 
 
 @dsl_user_op
+def _e4m3x4_f32(word: Int32, *, loc=None, ip=None):
+    """Four E4M3 (byte i = element i) -> four FP32 (exact, via FP16)."""
+    out = _asm(
+        ir.Type.parse("!llvm.struct<(f32,f32,f32,f32)>"),
+        [_v(Int32(word), loc, ip)],
+        "{\n\t.reg .b16 lo, hi, a, b, c, d;\n\t.reg .b32 h01, h23;\n\tmov.b32 {lo, hi}, $4;\n\t"
+        "cvt.rn.f16x2.e4m3x2 h01, lo;\n\tcvt.rn.f16x2.e4m3x2 h23, hi;\n\tmov.b32 {a, b}, h01;\n\t"
+        "mov.b32 {c, d}, h23;\n\tcvt.f32.f16 $0, a;\n\tcvt.f32.f16 $1, b;\n\tcvt.f32.f16 $2, c;\n\t"
+        "cvt.f32.f16 $3, d;\n\t}",
+        "=f,=f,=f,=f,r",
+        False,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Float32(llvm.extractvalue(T.f32(), out, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
+def _sanitize_e4m3(word: Int32, *, loc=None, ip=None) -> Int32:
+    """Four E4M3 with the one pattern equal to the sentinel (+0, +0, +0, -0) replaced by four +0."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_v(Int32(word), loc, ip)],
+            "{\n\t.reg .pred p;\n\tsetp.eq.b32 p, $1, 0x80000000;\n\tselp.b32 $0, 0, $1, p;\n\t}",
+            "=r,r",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _f32_bits(x: Float32, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        _asm(T.i32(), [_v(Float32(x), loc, ip)], "mov.b32 $0, $1;", "=r,f", False, loc=loc, ip=ip)
+    )
+
+
+@dsl_user_op
+def _bits_f32(w: Int32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        _asm(T.f32(), [_v(Int32(w), loc, ip)], "mov.b32 $0, $1;", "=f,r", False, loc=loc, ip=ip)
+    )
+
+
+@dsl_user_op
+def _amax8(
+    a0: Float32,
+    a1: Float32,
+    a2: Float32,
+    a3: Float32,
+    a4: Float32,
+    a5: Float32,
+    a6: Float32,
+    a7: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Float32:
+    """max |a_i| (NaN-free inputs)."""
+    return Float32(
+        _asm(
+            T.f32(),
+            [_v(Float32(a), loc, ip) for a in (a0, a1, a2, a3, a4, a5, a6, a7)],
+            "{\n\t.reg .f32 m, t;\n\tabs.f32 m, $1;\n\tabs.f32 t, $2;\n\tmax.f32 m, m, t;\n\tabs.f32 t, $3;\n\t"
+            "max.f32 m, m, t;\n\tabs.f32 t, $4;\n\tmax.f32 m, m, t;\n\tabs.f32 t, $5;\n\tmax.f32 m, m, t;\n\t"
+            "abs.f32 t, $6;\n\tmax.f32 m, m, t;\n\tabs.f32 t, $7;\n\tmax.f32 m, m, t;\n\tabs.f32 t, $8;\n\t"
+            "max.f32 $0, m, t;\n\t}",
+            "=f,f,f,f,f,f,f,f,f",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _sel_eq(p: Int32, q: Int32, a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    """``a if p == q else b`` (selp, no branch)."""
+    return Float32(
+        _asm(
+            T.f32(),
+            [
+                _v(Int32(p), loc, ip),
+                _v(Int32(q), loc, ip),
+                _v(Float32(a), loc, ip),
+                _v(Float32(b), loc, ip),
+            ],
+            "{\n\t.reg .pred c;\n\tsetp.eq.s32 c, $1, $2;\n\tselp.f32 $0, $3, $4, c;\n\t}",
+            "=f,r,r,f,f",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _fmax(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        _asm(
+            T.f32(),
+            [_v(Float32(a), loc, ip), _v(Float32(b), loc, ip)],
+            "max.f32 $0, $1, $2;",
+            "=f,f,f",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_volatile_v2(addr: Int64, *, loc=None, ip=None):
+    words = _asm(
+        ir.Type.parse("!llvm.struct<(i32,i32)>"),
+        [_v(Int64(addr), loc, ip)],
+        "ld.volatile.global.v2.b32 {$0, $1}, [$2];",
+        "=r,=r,l,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), words, [i], loc=loc, ip=ip)) for i in range(2))
+
+
+@dsl_user_op
 def _shfl_bfly(x: Float32, mask: Int32, *, loc=None, ip=None) -> Float32:
     return Float32(
         _asm(
@@ -490,6 +621,48 @@ def _ld_shared_f32(addr: Int32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def _st_shared_v4(
+    addr: Int32, w0: Int32, w1: Int32, w2: Int32, w3: Int32, *, loc=None, ip=None
+) -> None:
+    _asm(
+        None,
+        [_v(Int32(addr), loc, ip)] + [_v(Int32(w), loc, ip) for w in (w0, w1, w2, w3)],
+        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _ld_shared_v4(addr: Int32, *, loc=None, ip=None):
+    words = _asm(
+        ir.Type.parse("!llvm.struct<(i32,i32,i32,i32)>"),
+        [_v(Int32(addr), loc, ip)],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), words, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
+def _min_s32(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        _asm(
+            T.i32(),
+            [_v(Int32(a), loc, ip), _v(Int32(b), loc, ip)],
+            "min.s32 $0, $1, $2;",
+            "=r,r,r",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _st_dsmem_f32(addr: Int32, cta_rank: Int32, value: Float32, *, loc=None, ip=None) -> None:
     """Store at this CTA's shared address ``addr`` in cluster CTA ``cta_rank``."""
     _asm(
@@ -538,17 +711,31 @@ class Q35AllReduceNormKernel:
         moe_topk: int = 0,
         fc2_row: int = 0,
         two_shot: bool = False,
+        fp8: bool = False,
+        tpc: int = 1,
     ):
         if hidden % (VEC * ctas) or (hidden // VEC // ctas) % 32 or hidden // VEC // ctas > 1024:
             raise ValueError(f"unsupported hidden size {hidden} for {ctas} CTAs per token")
         if nranks not in (2, 4, 8, 16) or ctas not in (1, 2, 4, 8):
             raise ValueError("unsupported group / cluster size")
+        if fp8 and not two_shot:
+            raise ValueError("the FP8 payload needs the two-shot mode")
+        if tpc < 1 or (tpc > 1 and (not two_shot or fp8 or ctas != 1)):
+            raise ValueError(
+                "more than one token per CTA needs the BF16 two-shot mode with one CTA per token"
+            )
+        self.tpc = tpc  # tokens per CTA (see the module docstring)
         self.hidden = hidden
         self.norm_eps = float(norm_eps)
         self.nranks = nranks
         self.ctas = ctas
         self.threads = hidden // VEC // ctas
         self.num_warps = self.threads // 32
+        # 512-thread CTAs (one CTA per token) are launched with two CTAs per SM as the bound (at most 64 registers):
+        # one wave then covers 2 x SMs tokens (304 rows on GB300), the wave size tpc assumes. Without the bound the
+        # compiler uses more registers and fits one CTA per SM, so a 448-row call needs two waves, one more
+        # cross-rank latency chain.
+        self.min_ctas_per_sm = 2 if self.threads == 512 else 0
         self.use_pdl = use_pdl
         self.se_fold = se_fold
         # moe_topk > 0: routed = sum_k w[t, k] * fc2[perm[t, k]] over local experts (perm < 0 skipped),
@@ -558,6 +745,10 @@ class Q35AllReduceNormKernel:
         self.norm_out = norm_out
         self.quant = quant
         self.two_shot = two_shot
+        # fp8: E4M3 payload in both two-shot stages, one FP32 scale per 256 elements (a warp's 32 vectors) after the
+        # H data bytes of a row; bf16: H BF16.
+        self.fp8 = fp8
+        self.row_bytes = hidden + hidden // 64 if fp8 else hidden * 2
 
     @cute.jit
     def __call__(
@@ -580,30 +771,59 @@ class Q35AllReduceNormKernel:
         stream,
     ) -> None:
         m = cute.size(gRes, mode=[0])
-        self.kernel(
-            gX,
-            gRouted,
-            gShared,
-            gGate,
-            gRes,
-            gW,
-            gScale,
-            gResOut,
-            gOut,
-            gQuant,
-            gWs,
-            fc2_ptr,
-            topw_ptr,
-            perm_ptr,
-            rank,
-        ).launch(
-            grid=[m * self.ctas, 1, 1],
-            block=[self.threads, 1, 1],
-            cluster=[self.ctas, 1, 1],
-            smem=512,
-            stream=stream,
-            use_pdl=self.use_pdl,
-        )
+        if const_expr(self.tpc > 1):
+            # smem: the CTA's residual vectors (tpc x H BF16), per-token warp sums, the flags
+            self.kernel_mt(
+                gX,
+                gRouted,
+                gShared,
+                gGate,
+                gRes,
+                gW,
+                gScale,
+                gResOut,
+                gOut,
+                gQuant,
+                gWs,
+                fc2_ptr,
+                topw_ptr,
+                perm_ptr,
+                rank,
+            ).launch(
+                grid=[(m + self.tpc - 1) // self.tpc, 1, 1],
+                block=[self.threads, 1, 1],
+                cluster=[1, 1, 1],
+                smem=1024 + self.tpc * self.hidden * 2,
+                stream=stream,
+                use_pdl=self.use_pdl,
+                min_blocks_per_mp=self.min_ctas_per_sm,
+            )
+        else:
+            self.kernel(
+                gX,
+                gRouted,
+                gShared,
+                gGate,
+                gRes,
+                gW,
+                gScale,
+                gResOut,
+                gOut,
+                gQuant,
+                gWs,
+                fc2_ptr,
+                topw_ptr,
+                perm_ptr,
+                rank,
+            ).launch(
+                grid=[m * self.ctas, 1, 1],
+                block=[self.threads, 1, 1],
+                cluster=[self.ctas, 1, 1],
+                smem=512,
+                stream=stream,
+                use_pdl=self.use_pdl,
+                min_blocks_per_mp=self.min_ctas_per_sm,
+            )
 
     @cute.kernel
     def kernel(
@@ -745,17 +965,51 @@ class Q35AllReduceNormKernel:
         idx = Int64(tok) * Int64(vecs) + Int64(vi)
         data_off = Int64(cur) * buf_bytes
         lt = tok // Int32(nranks)
+        rb: cutlass.Constexpr = self.row_bytes
+        hb: cutlass.Constexpr = self.hidden  # FP8 rows: the scales start after the H data bytes
+        wi = vi // Int32(32)  # FP8: this thread's 256-element scale block (its warp's 32 vectors)
+        xq = cute.make_rmem_tensor(
+            (VEC,), Float32
+        )  # FP8: this rank's input as FP32 (exact, BF16 values)
         if const_expr(self.two_shot):
-            # ---- scatter: unicast into the owner's SCATTER stage [t / W][rank][H] ----
-            _st_v4(
-                peer
-                + data_off
-                + ((Int64(lt) * Int64(nranks) + Int64(rank)) * Int64(vecs) + Int64(vi)) * Int64(16),
-                _sanitize(x0),
-                _sanitize(x1),
-                _sanitize(x2),
-                _sanitize(x3),
-            )
+            if const_expr(self.fp8):
+                # ---- scatter, E4M3: per-warp amax -> scale = amax / 448 (FP32 after the row's H data bytes) ----
+                xw = (x0, x1, x2, x3)
+                for i in cutlass.range_constexpr(4):
+                    xq[2 * i] = _lo(xw[i])
+                    xq[2 * i + 1] = _hi(xw[i])
+                amax = _amax8(xq[0], xq[1], xq[2], xq[3], xq[4], xq[5], xq[6], xq[7])
+                for k in cutlass.range_constexpr(5):
+                    amax = _fmax(amax, _shfl_bfly(amax, Int32(16 >> k)))
+                amax = _fmax(amax, Float32(1e-30))
+                inv = _div_rn(Float32(448.0), amax)
+                q0 = _sanitize_e4m3(
+                    _e4m3x2(_mul(xq[0], inv), _mul(xq[1], inv))
+                    | (_e4m3x2(_mul(xq[2], inv), _mul(xq[3], inv)) << Int32(16))
+                )
+                q1 = _sanitize_e4m3(
+                    _e4m3x2(_mul(xq[4], inv), _mul(xq[5], inv))
+                    | (_e4m3x2(_mul(xq[6], inv), _mul(xq[7], inv)) << Int32(16))
+                )
+                srow = peer + data_off + (Int64(lt) * Int64(nranks) + Int64(rank)) * Int64(rb)
+                _st_v2(srow + Int64(vi) * Int64(8), q0, q1)
+                if lane == 0:
+                    _st_s32(
+                        srow + Int64(hb) + Int64(wi) * Int64(4),
+                        _f32_bits(_mul(amax, Float32(1.0 / 448.0))),
+                    )
+            else:
+                # ---- scatter: unicast into the owner's SCATTER stage [t / W][rank][H] ----
+                _st_v4(
+                    peer
+                    + data_off
+                    + ((Int64(lt) * Int64(nranks) + Int64(rank)) * Int64(vecs) + Int64(vi))
+                    * Int64(16),
+                    _sanitize(x0),
+                    _sanitize(x1),
+                    _sanitize(x2),
+                    _sanitize(x3),
+                )
         else:
             # ---- one multicast store reaches every rank's current buffer ([rank][token][H]) ----
             _st_v4(
@@ -791,7 +1045,84 @@ class Q35AllReduceNormKernel:
         ww = (w0, w1, w2, w3)
         res = cute.make_rmem_tensor((VEC,), Float32)  # residual out (BF16 values)
         got = cute.make_rmem_tensor((nranks * 4,), Int32)
-        if const_expr(self.two_shot):
+        if const_expr(self.two_shot and self.fp8):
+            # (names below are unique in this function: the DSL rejects a dynamic-if region that retypes a name)
+            half8 = buf_bytes // Int64(2)  # BROADCAST stage offset within the current buffer
+            oacc = cute.make_rmem_tensor((VEC,), Float32)  # owner: FP32 rank-order sum
+            if owner == rank:
+                # ---- owner: wait for every rank's E4M3 vector + scale; FP32 sum in rank order (own input exact) ----
+                fpend_o = Int32(1)
+                while fpend_o != 0:
+                    fpend_o = Int32(0)
+                    for r in cutlass.range_constexpr(nranks):
+                        orow = own + data_off + (Int64(lt) * Int64(nranks) + Int64(r)) * Int64(rb)
+                        oa, ob = _ld_volatile_v2(orow + Int64(vi) * Int64(8))
+                        osw = _ld_volatile_s32(orow + Int64(hb) + Int64(wi) * Int64(4))
+                        got[r * 3 + 0] = oa
+                        got[r * 3 + 1] = ob
+                        got[r * 3 + 2] = osw
+                        if oa == neg0:
+                            fpend_o = Int32(1)
+                        if ob == neg0:
+                            fpend_o = Int32(1)
+                        if osw == neg0:
+                            fpend_o = Int32(1)
+                for e in cutlass.range_constexpr(VEC):
+                    oacc[e] = Float32(0.0)
+                for r in cutlass.range_constexpr(nranks):
+                    osc = _bits_f32(got[r * 3 + 2])
+                    d0, d1, d2, d3 = _e4m3x4_f32(got[r * 3 + 0])
+                    d4, d5, d6, d7 = _e4m3x4_f32(got[r * 3 + 1])
+                    dr = (d0, d1, d2, d3, d4, d5, d6, d7)
+                    for e in cutlass.range_constexpr(VEC):
+                        oacc[e] = _add(oacc[e], _sel_eq(rank, Int32(r), xq[e], _mul(dr[e], osc)))
+                # ---- quantize the sum (per-warp scale) and multicast it into every rank's BROADCAST stage ----
+                bmax = _amax8(
+                    oacc[0], oacc[1], oacc[2], oacc[3], oacc[4], oacc[5], oacc[6], oacc[7]
+                )
+                for k in cutlass.range_constexpr(5):
+                    bmax = _fmax(bmax, _shfl_bfly(bmax, Int32(16 >> k)))
+                bmax = _fmax(bmax, Float32(1e-30))
+                binv = _div_rn(Float32(448.0), bmax)
+                bw0 = _sanitize_e4m3(
+                    _e4m3x2(_mul(oacc[0], binv), _mul(oacc[1], binv))
+                    | (_e4m3x2(_mul(oacc[2], binv), _mul(oacc[3], binv)) << Int32(16))
+                )
+                bw1 = _sanitize_e4m3(
+                    _e4m3x2(_mul(oacc[4], binv), _mul(oacc[5], binv))
+                    | (_e4m3x2(_mul(oacc[6], binv), _mul(oacc[7], binv)) << Int32(16))
+                )
+                brow = mcast + data_off + half8 + Int64(tok) * Int64(rb)
+                _st_v2(brow + Int64(vi) * Int64(8), bw0, bw1)
+                if lane == 0:
+                    _st_s32(
+                        brow + Int64(hb) + Int64(wi) * Int64(4),
+                        _f32_bits(_mul(bmax, Float32(1.0 / 448.0))),
+                    )
+            # ---- every rank: wait for the reduced E4M3 vector + scale in the BROADCAST stage ----
+            fpend_b = Int32(1)
+            while fpend_b != 0:
+                fpend_b = Int32(0)
+                brow_o = own + data_off + half8 + Int64(tok) * Int64(rb)
+                ba, bb = _ld_volatile_v2(brow_o + Int64(vi) * Int64(8))
+                bsw = _ld_volatile_s32(brow_o + Int64(hb) + Int64(wi) * Int64(4))
+                got[0] = ba
+                got[1] = bb
+                got[2] = bsw
+                if ba == neg0:
+                    fpend_b = Int32(1)
+                if bb == neg0:
+                    fpend_b = Int32(1)
+                if bsw == neg0:
+                    fpend_b = Int32(1)
+            bs = _bits_f32(got[2])
+            g0, g1, g2, g3 = _e4m3x4_f32(got[0])
+            g4, g5, g6, g7 = _e4m3x4_f32(got[1])
+            gr = (g0, g1, g2, g3, g4, g5, g6, g7)
+            for i in cutlass.range_constexpr(4):
+                res[2 * i] = _bf16r(_add(_bf16r(_mul(gr[2 * i], bs)), _lo(rw[i])))
+                res[2 * i + 1] = _bf16r(_add(_bf16r(_mul(gr[2 * i + 1], bs)), _hi(rw[i])))
+        elif const_expr(self.two_shot):
             half = buf_bytes // Int64(2)  # BROADCAST stage offset within the current buffer
             if owner == rank:
                 # ---- owner: wait for every rank's vector, FP32 sum in rank order -> BF16, multicast ----
@@ -949,17 +1280,355 @@ class Q35AllReduceNormKernel:
                 _st_s32(flags, (cur + Int32(1)) % Int32(3))
                 _st_s32(flags + Int64(4), cur)
                 if const_expr(self.two_shot):
+                    # bytes written per stage (rows of row_bytes: H BF16, or H E4M3 + H / 256 FP32 scales)
                     _st_s32(flags + Int64(12), Int32(2))
                     _st_s32(
                         flags + Int64(16),
                         ((Int32(m) + Int32(nranks - 1)) // Int32(nranks))
-                        * Int32(self.hidden * nranks * 2),
+                        * Int32(self.row_bytes * nranks),
                     )
-                    _st_s32(flags + Int64(20), Int32(m) * Int32(self.hidden * 2))
+                    _st_s32(flags + Int64(20), Int32(m) * Int32(self.row_bytes))
                 else:
                     _st_s32(flags + Int64(12), Int32(1))
                     _st_s32(flags + Int64(16), Int32(m) * Int32(self.hidden * nranks * 2))
                     _st_s32(flags + Int64(20), Int32(0))
+                _st_s32(flags + Int64(24), Int32(0))
+                _st_s32(flags + Int64(28), Int32(0))
+                _st_s32(flags + Int64(32), Int32(0))
+
+    # ---- tpc > 1: several tokens per CTA (BF16 two-shot, ctas == 1) ----
+
+    def _mt_load(self, tok, vi, gX, gRouted, gShared, gGate, gRes, topw_ptr, perm_ptr):
+        """Issue token ``tok``'s input loads (consumed later): residual, and x or the fold operands."""
+        row_off = (Int64(tok) * Int64(self.hidden // VEC) + Int64(vi)) * Int64(16)
+        d = {"r": _ld_v4(Int64(gRes.iterator.toint()) + row_off)}
+        if self.se_fold:
+            if self.moe_topk > 0:
+                kbase = Int64(tok) * Int64(self.moe_topk)
+                pk = cute.make_rmem_tensor((self.moe_topk,), Int32)
+                wk = cute.make_rmem_tensor((self.moe_topk,), Int32)
+                for k in range(self.moe_topk):
+                    pk[k] = _ld_s32(perm_ptr + (kbase + Int64(k)) * Int64(4))
+                    wk[k] = _ld_u16(topw_ptr + (kbase + Int64(k)) * Int64(2))
+                d["pk"] = pk
+                d["wk"] = wk
+            else:
+                d["f"] = _ld_v4(Int64(gRouted.iterator.toint()) + row_off)
+            d["h"] = _ld_v4(Int64(gShared.iterator.toint()) + row_off)
+            d["gw"] = _ld_u16(Int64(gGate.iterator.toint()) + Int64(tok) * Int64(2))
+        else:
+            d["x"] = _ld_v4(Int64(gX.iterator.toint()) + row_off)
+        return d
+
+    def _mt_x(self, d, vi, fc2_ptr):
+        """A token's all-reduce input (four BF16x2 words) from its loaded operands: the one-token kernel's MoE
+        finalize and shared-expert combine, same operations in the same order."""
+        if not self.se_fold:
+            return d["x"]
+        if self.moe_topk > 0:
+            topk = self.moe_topk
+            pk = d["pk"]
+            wk = d["wk"]
+            ev = cute.make_rmem_tensor((topk * 4,), Int32)
+            for k in range(topk):
+                e0, e1, e2, e3 = _ld_v4(
+                    fc2_ptr
+                    + (Int64(_max0(pk[k])) * Int64(self.fc2_row) + Int64(vi) * Int64(VEC))
+                    * Int64(2)
+                )
+                ev[4 * k + 0] = e0
+                ev[4 * k + 1] = e1
+                ev[4 * k + 2] = e2
+                ev[4 * k + 3] = e3
+            acc = cute.make_rmem_tensor((VEC,), Float32)
+            for e in range(VEC):
+                acc[e] = Float32(0.0)
+            for k in range(topk):
+                wf = _lo(wk[k])
+                for i in range(4):
+                    acc[2 * i] = _sel_ge0(
+                        pk[k], _fma(wf, _lo(ev[4 * k + i]), acc[2 * i]), acc[2 * i]
+                    )
+                    acc[2 * i + 1] = _sel_ge0(
+                        pk[k], _fma(wf, _hi(ev[4 * k + i]), acc[2 * i + 1]), acc[2 * i + 1]
+                    )
+            f = (
+                _pack_bf16(acc[0], acc[1]),
+                _pack_bf16(acc[2], acc[3]),
+                _pack_bf16(acc[4], acc[5]),
+                _pack_bf16(acc[6], acc[7]),
+            )
+        else:
+            f = d["f"]
+        h = d["h"]
+        s = _sigmoid_triton(_lo(d["gw"]))
+        return tuple(
+            _pack_bf16(_fma(s, _lo(h[i]), _lo(f[i])), _fma(s, _hi(h[i]), _hi(f[i])))
+            for i in range(4)
+        )
+
+    @cute.kernel
+    def kernel_mt(
+        self,
+        gX: cute.Tensor,
+        gRouted: cute.Tensor,
+        gShared: cute.Tensor,
+        gGate: cute.Tensor,
+        gRes: cute.Tensor,
+        gW: cute.Tensor,
+        gScale: cute.Tensor,
+        gResOut: cute.Tensor,
+        gOut: cute.Tensor,
+        gQuant: cute.Tensor,
+        gWs: cute.Tensor,
+        fc2_ptr: Int64,
+        topw_ptr: Int64,
+        perm_ptr: Int64,
+        rank: Int32,
+    ) -> None:
+        """BF16 two-shot, ``tpc`` consecutive tokens per CTA (module docstring); per token the ``kernel`` path's
+        arithmetic (two-shot, BF16, ctas == 1)."""
+        tidx, _, _ = cute.arch.thread_idx()
+        bid, _, _ = cute.arch.block_idx()
+        grid, _, _ = cute.arch.grid_dim()
+        nranks: cutlass.Constexpr = self.nranks
+        vecs: cutlass.Constexpr = self.hidden // VEC
+        num_warps: cutlass.Constexpr = self.num_warps
+        tpc: cutlass.Constexpr = self.tpc
+        m = cute.size(gRes, mode=[0])
+        last = Int32(m - 1)
+        vi = tidx  # this thread's 16-byte vector of every token
+        warp = tidx // 32
+        lane = tidx % 32
+        tok0 = bid * Int32(tpc)  # the CTA's first token; token j = min(tok0 + j, m - 1)
+
+        smem = cutlass.utils.SmemAllocator()
+        red = smem.allocate_tensor(Float32, cute.make_layout((tpc * num_warps,)), byte_alignment=16)
+        fl = smem.allocate_tensor(Int32, cute.make_layout((8,)), byte_alignment=16)
+        stash = smem.allocate_tensor(Int32, cute.make_layout((tpc * vecs * 4,)), byte_alignment=16)
+        red_addr = _smem_addr(red.iterator)
+        stash_addr = _smem_addr(stash.iterator) + vi * Int32(
+            16
+        )  # token j's residual vector at + j x vecs x 16
+
+        # ---- ahead of the dependency wait: host-written addresses and the norm weight (parameters) ----
+        tbl = gWs.iterator.toint()
+        own = _ld_s64(Int64(tbl))
+        mcast = _ld_s64(Int64(tbl) + Int64(8))
+        flags = _ld_s64(Int64(tbl) + Int64(16))
+        w0, w1, w2, w3 = _ld_v4(Int64(gW.iterator.toint()) + Int64(vi) * Int64(16))
+        first = _min_s32(tok0, last)
+        peer0 = _ld_s64(Int64(tbl) + Int64(24) + Int64(first % Int32(nranks)) * Int64(8))
+
+        if const_expr(self.use_pdl):
+            griddepcontrol_wait()
+
+        # ---- the first token's inputs ahead of the flag loads (as ``kernel``) ----
+        ins0 = self._mt_load(first, vi, gX, gRouted, gShared, gGate, gRes, topw_ptr, perm_ptr)
+        if tidx == 0:
+            lf0, lf1, lf2, lf3 = _ld_volatile_v4(flags)
+            lf4, lf5, lf6, lf7 = _ld_volatile_v4(flags + Int64(16))
+            fl[0] = lf0
+            fl[1] = lf1
+            fl[2] = lf2
+            fl[3] = lf3
+            fl[4] = lf4
+            fl[5] = lf5
+            fl[6] = lf6
+            fl[7] = lf7
+        cute.arch.sync_threads()
+        cur = fl[0]
+        dirty = fl[1]
+        buf_bytes = Int64(fl[2])
+        dirty_stages = fl[3]
+        sb0 = fl[4]
+        sb1 = fl[5]
+        sb2 = fl[6]
+        sb3 = fl[7]
+        if tidx == 0:
+            _red_release_add_s32(flags + Int64(32), Int32(1))
+        data_off = Int64(cur) * buf_bytes
+        half = buf_bytes // Int64(2)  # BROADCAST stage offset within the current buffer
+
+        # ---- every token: input -> unicast into its owner's SCATTER stage [t / W][rank][H]; residual -> smem ----
+        for j in cutlass.range_constexpr(tpc):
+            tj = _min_s32(tok0 + Int32(j), last)
+            pj = (
+                peer0
+                if j == 0
+                else _ld_s64(Int64(tbl) + Int64(24) + Int64(tj % Int32(nranks)) * Int64(8))
+            )
+            ins = (
+                ins0
+                if j == 0
+                else self._mt_load(tj, vi, gX, gRouted, gShared, gGate, gRes, topw_ptr, perm_ptr)
+            )
+            r0, r1, r2, r3 = ins["r"]
+            _st_shared_v4(stash_addr + Int32(j * vecs * 16), r0, r1, r2, r3)
+            x0, x1, x2, x3 = self._mt_x(ins, vi, fc2_ptr)
+            lt = tj // Int32(nranks)
+            _st_v4(
+                pj
+                + data_off
+                + ((Int64(lt) * Int64(nranks) + Int64(rank)) * Int64(vecs) + Int64(vi)) * Int64(16),
+                _sanitize(x0),
+                _sanitize(x1),
+                _sanitize(x2),
+                _sanitize(x3),
+            )
+
+        # ---- PDL: every input consumed (the residual words went to smem, x to the scatter) by every thread ----
+        if const_expr(self.use_pdl):
+            cute.arch.sync_threads()
+            griddepcontrol_launch_dependents()
+
+        # ---- clear this thread's share of the previous call's buffer (every dirty stage) ----
+        neg0 = Int32(_NEG_ZERO)
+        fidx = Int64(bid) * Int64(self.threads) + Int64(tidx)
+        fstride = Int64(grid) * Int64(self.threads)
+        for s_i in cutlass.range_constexpr(4):
+            if Int32(s_i) < dirty_stages:
+                stage_bytes = buf_bytes // Int64(dirty_stages)
+                stage = own + (Int64(dirty) * Int64(dirty_stages) + Int64(s_i)) * stage_bytes
+                sb = sb0 if s_i == 0 else (sb1 if s_i == 1 else (sb2 if s_i == 2 else sb3))
+                clear_vecs = (Int64(sb) + Int64(15)) // Int64(16)
+                c = fidx
+                while c < clear_vecs:
+                    _st_v4(stage + c * Int64(16), neg0, neg0, neg0, neg0)
+                    c = c + fstride
+
+        # ---- owner (consecutive tokens: at most one per CTA up to 8 tokens): wait for every rank's vector, FP32 sum
+        # in rank order -> BF16, multicast into every rank's BROADCAST stage ----
+        got = cute.make_rmem_tensor((nranks * 4,), Int32)
+        for j in cutlass.range_constexpr(tpc):
+            to = _min_s32(tok0 + Int32(j), last)
+            if to % Int32(nranks) == rank:
+                lto = to // Int32(nranks)
+                pend_o = Int32(1)
+                while pend_o != 0:
+                    pend_o = Int32(0)
+                    for r in cutlass.range_constexpr(nranks):
+                        a1, b1, c1, d1 = _ld_volatile_v4(
+                            own
+                            + data_off
+                            + ((Int64(lto) * Int64(nranks) + Int64(r)) * Int64(vecs) + Int64(vi))
+                            * Int64(16)
+                        )
+                        got[r * 4 + 0] = a1
+                        got[r * 4 + 1] = b1
+                        got[r * 4 + 2] = c1
+                        got[r * 4 + 3] = d1
+                        if a1 == neg0:
+                            pend_o = Int32(1)
+                        if b1 == neg0:
+                            pend_o = Int32(1)
+                        if c1 == neg0:
+                            pend_o = Int32(1)
+                        if d1 == neg0:
+                            pend_o = Int32(1)
+                rsum = cute.make_rmem_tensor((4,), Int32)
+                for i in cutlass.range_constexpr(4):
+                    slo = Float32(0.0)
+                    shi = Float32(0.0)
+                    for r in cutlass.range_constexpr(nranks):
+                        slo = _add(slo, _lo(got[r * 4 + i]))
+                        shi = _add(shi, _hi(got[r * 4 + i]))
+                    rsum[i] = _sanitize(_pack_bf16(slo, shi))
+                _st_v4(
+                    mcast + data_off + half + (Int64(to) * Int64(vecs) + Int64(vi)) * Int64(16),
+                    rsum[0],
+                    rsum[1],
+                    rsum[2],
+                    rsum[3],
+                )
+
+        # ---- every token: wait for the reduced vector, + residual, RMSNorm (rmsNormLamport: (w * x) * rstd) ----
+        ww = (w0, w1, w2, w3)
+        for j in cutlass.range_constexpr(tpc):
+            tb = _min_s32(tok0 + Int32(j), last)
+            bidx = Int64(tb) * Int64(vecs) + Int64(vi)
+            pend_b = Int32(1)
+            while pend_b != 0:
+                pend_b = Int32(0)
+                a2, b2, c2, d2 = _ld_volatile_v4(own + data_off + half + bidx * Int64(16))
+                got[0] = a2
+                got[1] = b2
+                got[2] = c2
+                got[3] = d2
+                if a2 == neg0:
+                    pend_b = Int32(1)
+                if b2 == neg0:
+                    pend_b = Int32(1)
+                if c2 == neg0:
+                    pend_b = Int32(1)
+                if d2 == neg0:
+                    pend_b = Int32(1)
+            q0, q1, q2, q3 = _ld_shared_v4(stash_addr + Int32(j * vecs * 16))
+            rw = (q0, q1, q2, q3)
+            res = cute.make_rmem_tensor((VEC,), Float32)
+            for i in cutlass.range_constexpr(4):
+                res[2 * i] = _bf16r(_add(_lo(got[i]), _lo(rw[i])))
+                res[2 * i + 1] = _bf16r(_add(_hi(got[i]), _hi(rw[i])))
+            _st_v4(
+                Int64(gResOut.iterator.toint()) + bidx * Int64(16),
+                _pack_bf16(res[0], res[1]),
+                _pack_bf16(res[2], res[3]),
+                _pack_bf16(res[4], res[5]),
+                _pack_bf16(res[6], res[7]),
+            )
+            tsum = Float32(0.0)
+            for e in cutlass.range_constexpr(VEC):
+                tsum = _add(tsum, _bf16r(_mul(res[e], res[e])))
+            for k in cutlass.range_constexpr(5):
+                tsum = _add(tsum, _shfl_bfly(tsum, Int32(16 >> k)))
+            if lane == 0:
+                _st_shared_f32(red_addr + Int32(4 * j * num_warps) + Int32(4) * warp, tsum)
+            cute.arch.sync_threads()
+            bsum = Float32(0.0)
+            if lane < num_warps:
+                bsum = _ld_shared_f32(red_addr + Int32(4 * j * num_warps) + Int32(4) * lane)
+            for k in cutlass.range_constexpr(5):
+                bsum = _add(bsum, _shfl_bfly(bsum, Int32(16 >> k)))
+            rstd = _rsqrt(_add(_div_rn(bsum, Float32(float(self.hidden))), Float32(self.norm_eps)))
+            y = cute.make_rmem_tensor((VEC,), Float32)
+            for i in cutlass.range_constexpr(4):
+                y[2 * i] = _bf16r(_mul(_mul(_lo(ww[i]), res[2 * i]), rstd))
+                y[2 * i + 1] = _bf16r(_mul(_mul(_hi(ww[i]), res[2 * i + 1]), rstd))
+            if const_expr(self.norm_out):
+                _st_v4(
+                    Int64(gOut.iterator.toint()) + bidx * Int64(16),
+                    _pack_bf16(y[0], y[1]),
+                    _pack_bf16(y[2], y[3]),
+                    _pack_bf16(y[4], y[5]),
+                    _pack_bf16(y[6], y[7]),
+                )
+            if const_expr(self.quant):
+                inv = _div_rn(Float32(1.0), gScale[0])
+                q01 = _e4m3x2(_mul(y[0], inv), _mul(y[1], inv))
+                q23 = _e4m3x2(_mul(y[2], inv), _mul(y[3], inv))
+                q45 = _e4m3x2(_mul(y[4], inv), _mul(y[5], inv))
+                q67 = _e4m3x2(_mul(y[6], inv), _mul(y[7], inv))
+                _st_v2(
+                    Int64(gQuant.iterator.toint()) + bidx * Int64(8),
+                    q01 | (q23 << 16),
+                    q45 | (q67 << 16),
+                )
+
+        # ---- hand the triple buffer to the next call once every CTA has read the flags ----
+        if bid == 0:
+            if tidx == 0:
+                arrived = _ld_acquire_s32(flags + Int64(32))
+                while arrived != grid:
+                    arrived = _ld_acquire_s32(flags + Int64(32))
+                _st_s32(flags, (cur + Int32(1)) % Int32(3))
+                _st_s32(flags + Int64(4), cur)
+                _st_s32(flags + Int64(12), Int32(2))
+                _st_s32(
+                    flags + Int64(16),
+                    ((Int32(m) + Int32(nranks - 1)) // Int32(nranks))
+                    * Int32(self.row_bytes * nranks),
+                )
+                _st_s32(flags + Int64(20), Int32(m) * Int32(self.row_bytes))
                 _st_s32(flags + Int64(24), Int32(0))
                 _st_s32(flags + Int64(28), Int32(0))
                 _st_s32(flags + Int64(32), Int32(0))

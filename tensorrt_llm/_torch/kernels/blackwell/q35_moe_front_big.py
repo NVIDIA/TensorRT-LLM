@@ -83,6 +83,12 @@ def _keys2(word: Int32, idx: Int32, *, loc=None, ip=None):
 
 ROUTE_CLUSTER = 8
 ROUTE_THREADS = 1024
+# Clusters of 16 (route mode, TRTLLM_Q35_MOE_FRONT_BIG_C16; a non-portable size, which the DSL allows on every
+# kernel) take 257..512 tokens with the same one-warp-per-token routing and 32-bit per-CTA token masks
+# (TPC = ceil(M / 16) <= 32). The launcher then uses 3 quantization clusters, so the grid stays at 64 CTAs.
+# With TRTLLM_Q35_MOE_FRONT_BIG_C16W the same clusters take 513..1024 tokens: TPC <= 64, two tokens per warp
+# (the full-sort routing path) and two-word per-expert token masks.
+ROUTE_CLUSTER_WIDE = 16
 
 
 @dsl_user_op
@@ -189,12 +195,14 @@ def _top4of8(a, b):
 class Q35MoeRouteBigKernel:
     """Route-only big front: router logits [M, E] BF16 from the stock GEMM -> top-k ids / BF16 weights, the
     trtllm-gen pre-routed tables (``q35_prerouted_sizes`` order, token order inside an expert's block) and the
-    launch of ``1 + quant_clusters`` clusters of 8 CTAs (``threads`` each, default 1024):
+    launch of ``1 + quant_clusters`` clusters of C CTAs (``threads`` each, default 1024; C = ``cluster``: 8, or 16
+    for 257..1024 tokens):
 
-    * cluster 0 routes: CTA c takes tokens [c TPC, (c + 1) TPC) (TPC = ceil(M / 8) <= 32), one warp per token (two
-      interleaved when TPC > #warps; the routing arithmetic of :mod:`q35_moe_front`); the local picks set the token's
-      bit in the CTA's per-expert token mask (shared memory). After a cluster barrier every routing CTA reads the 8
-      CTAs' per-expert counts through distributed shared memory, scans the CTAs per expert (``tile``) and writes
+    * cluster 0 routes: CTA c takes tokens [c TPC, (c + 1) TPC) (TPC = ceil(M / C) <= 32, or <= 64 with clusters of
+      16), one warp per token (two interleaved when TPC > #warps; the routing arithmetic of :mod:`q35_moe_front`);
+      the local picks set the token's bit in the CTA's per-expert token mask (shared memory; ceil(TPC / 32)
+      words per expert). After a cluster barrier every routing CTA reads the
+      cluster's per-expert counts through distributed shared memory, scans the CTAs per expert (``tile``) and writes
       the expanded -> permuted / permuted -> token entries of its own picks (CTA 0 also the CTA tables and totals);
     * the other clusters NVFP4-quantize x (``fp4_quantize`` arithmetic, linear scale layout).
 
@@ -215,11 +223,17 @@ class Q35MoeRouteBigKernel:
         use_pdl: bool,
         quant_clusters: int = 7,
         threads: int = ROUTE_THREADS,
+        cluster: int = ROUTE_CLUSTER,
     ) -> None:
         if threads % 32 or not 256 <= threads <= 1024:
             raise ValueError(f"threads={threads} must be a multiple of 32 in [256, 1024]")
-        if not 1 <= num_rows <= ROUTE_CLUSTER * 32:
-            raise ValueError(f"num_rows={num_rows} must be in [1, {ROUTE_CLUSTER * 32}]")
+        if cluster not in (ROUTE_CLUSTER, ROUTE_CLUSTER_WIDE):
+            raise ValueError(f"cluster={cluster} must be {ROUTE_CLUSTER} or {ROUTE_CLUSTER_WIDE}")
+        max_tpc = 64 if cluster == ROUTE_CLUSTER_WIDE else 32  # token-mask words per expert: 2 / 1
+        if not 1 <= num_rows <= cluster * max_tpc:
+            raise ValueError(
+                f"num_rows={num_rows} must be in [1, {cluster * max_tpc}] with clusters of {cluster}"
+            )
         if top_k != 10:
             raise ValueError("the renormalization tree is the route kernel's top-10 tree")
         if num_experts != 32 * 16:
@@ -241,14 +255,20 @@ class Q35MoeRouteBigKernel:
         self.a_stride = a_stride
         self.use_pdl = use_pdl
         self.threads = threads
-        self.tpc = -(-num_rows // ROUTE_CLUSTER)
+        self.cluster = cluster
+        self.tpc = -(-num_rows // cluster)
+        self.mw = -(-self.tpc // 32)  # token-mask words per expert (TPC > 32: two)
+        if num_local * self.mw > threads:
+            raise ValueError(
+                "one thread per token-mask word: num_local * ceil(TPC / 32) <= threads"
+            )
         self.warps = threads // 32
         self.tpw = -(-self.tpc // self.warps)
         if self.tpw > 2:
             raise ValueError("at most two tokens per warp")
         self.quant_clusters = quant_clusters
-        self.ctas = ROUTE_CLUSTER * (1 + quant_clusters)
-        self.q_ctas = ROUTE_CLUSTER * quant_clusters
+        self.ctas = cluster * (1 + quant_clusters)
+        self.q_ctas = cluster * quant_clusters
         self.blocks = num_rows * (k_extent // 16)
         self.q_passes = -(-self.blocks // (self.q_ctas * threads))
         self.max_ctas = max_num_tiles(num_rows, top_k, num_local, tile)
@@ -258,16 +278,17 @@ class Q35MoeRouteBigKernel:
         self.off_ctl = self.off_cte + self.max_ctas
         self.off_nct = self.off_ctl + self.max_ctas
         self.off_npd = self.off_nct + 1
-        # shared memory words: mask, count, prefix (earlier CTAs), total, block offset [NL] each, warp sums [32],
-        # picks [TPC * K]
+        # shared memory words: mask [NL * MW], count, prefix (earlier CTAs), total, block offset [NL] each, warp
+        # sums [32], picks [TPC * K]
         nl = num_local
+        mw = self.mw
         self.o_mask = 0
-        self.o_cnt = nl
-        self.o_pre = 2 * nl
-        self.o_tot = 3 * nl
-        self.o_offs = 4 * nl
-        self.o_wsum = 5 * nl
-        self.o_pick = 5 * nl + 32
+        self.o_cnt = mw * nl
+        self.o_pre = (mw + 1) * nl
+        self.o_tot = (mw + 2) * nl
+        self.o_offs = (mw + 3) * nl
+        self.o_wsum = (mw + 4) * nl
+        self.o_pick = (mw + 4) * nl + 32
         self.smem_words = self.o_pick + self.tpc * top_k + 16
 
     @cute.jit
@@ -297,7 +318,7 @@ class Q35MoeRouteBigKernel:
         ).launch(
             grid=[self.ctas, 1, 1],
             block=[self.threads, 1, 1],
-            cluster=[ROUTE_CLUSTER, 1, 1],
+            cluster=[self.cluster, 1, 1],
             smem=self.smem_words * 4,
             stream=stream,
             use_pdl=self.use_pdl,
@@ -322,10 +343,10 @@ class Q35MoeRouteBigKernel:
         smem = _SmemAllocator()
         buf = smem.allocate_tensor(Int32, cute.make_layout((self.smem_words,)), byte_alignment=16)
         base = _smem_addr(buf.iterator)
-        if bidx < ROUTE_CLUSTER:
+        if bidx < self.cluster:
             self._route_cta(logits_ptr, ids_ptr, wts_ptr, tab_ptr, local_start, base, bidx, tidx)
         else:
-            self._quant_cta(x_ptr, gs_ptr, xq_ptr, xsf_ptr, bidx - ROUTE_CLUSTER, tidx)
+            self._quant_cta(x_ptr, gs_ptr, xq_ptr, xsf_ptr, bidx - self.cluster, tidx)
 
     @cute.jit
     def _quant_cta(
@@ -377,7 +398,8 @@ class Q35MoeRouteBigKernel:
         soffs = base + Int32(self.o_offs * 4)
         swsum = base + Int32(self.o_wsum * 4)
         spick = base + Int32(self.o_pick * 4)
-        if tidx < num_local:
+        mw: cutlass.Constexpr = self.mw
+        if tidx < num_local * mw:
             _st_shared(smask + tidx * 4, Int32(0))
         # this CTA's tokens [c TPC, c TPC + n_tok)
         t_first = c * tpc
@@ -410,7 +432,14 @@ class Q35MoeRouteBigKernel:
                 )
         cute.arch.sync_threads()
         if tidx < num_local:
-            _st_shared(scnt + tidx * 4, _popc(_ld_shared(smask + tidx * 4)))
+            if const_expr(mw == 1):
+                _st_shared(scnt + tidx * 4, _popc(_ld_shared(smask + tidx * 4)))
+            else:
+                _st_shared(
+                    scnt + tidx * 4,
+                    _popc(_ld_shared(smask + (tidx * 2) * 4))
+                    + _popc(_ld_shared(smask + (tidx * 2 + 1) * 4)),
+                )
         # The 8 CTAs' counts through distributed shared memory.
         _cluster_arrive_release()
         _cluster_wait_acquire()
@@ -425,10 +454,10 @@ class Q35MoeRouteBigKernel:
         e = tidx
         if e < num_local:
             cnts = []
-            for k in cutlass.range_constexpr(ROUTE_CLUSTER):
+            for k in cutlass.range_constexpr(self.cluster):
                 cnts.append(_ld_dsmem_b32(scnt + e * 4, Int32(k)))
             pre = Int32(0)
-            for k in cutlass.range_constexpr(ROUTE_CLUSTER):
+            for k in cutlass.range_constexpr(self.cluster):
                 tot = tot + cnts[k]
                 pre = pre + _sel_lt(Int32(k), c, cnts[k], Int32(0))
             _st_shared(spre + e * 4, pre)
@@ -476,9 +505,19 @@ class Q35MoeRouteBigKernel:
                 pick = _ld_shared(spick + i * 4)
                 perm = Int32(-1)
                 if pick >= Int32(0):
-                    rank = _ld_shared(spre + pick * 4) + _popc(
-                        _ld_shared(smask + pick * 4) & _below(tl)
-                    )
+                    if const_expr(mw == 1):
+                        rank = _ld_shared(spre + pick * 4) + _popc(
+                            _ld_shared(smask + pick * 4) & _below(tl)
+                        )
+                    else:
+                        # tokens before tl: in word 0 (all of word 0 from tl 32 on), in word 1 below tl - 32
+                        mw_w0 = _ld_shared(smask + (pick * 2) * 4)
+                        mw_w1 = _ld_shared(smask + (pick * 2 + 1) * 4)
+                        mw_lo = _sel_lt(tl, Int32(32), _popc(mw_w0 & _below(tl)), _popc(mw_w0))
+                        mw_hi = _sel_lt(
+                            tl, Int32(32), Int32(0), _popc(mw_w1 & _below(tl - Int32(32)))
+                        )
+                        rank = _ld_shared(spre + pick * 4) + mw_lo + mw_hi
                     perm = _ld_shared(soffs + pick * 4) * Int32(tile) + rank
                     _st_b32(tab_ptr + Int64(self.off_p2t + perm) * Int64(4), tok)
                 _st_b32(
@@ -672,5 +711,9 @@ class Q35MoeRouteBigKernel:
                     lid = my_sel - local_start
                     pick = _sel_lt(lid, Int32(num_local), lid, Int32(-1))
                     if pick >= Int32(0):
-                        _red_or_shared(smask + pick * 4, _bit(tl))
+                        # token tl's bit in word tl // 32 of the expert's ceil(TPC / 32) mask words
+                        _red_or_shared(
+                            smask + (pick * Int32(self.mw) + tl // Int32(32)) * 4,
+                            _bit(tl % Int32(32)),
+                        )
                     _st_shared(spick + (tl * top_k + lane) * 4, pick)

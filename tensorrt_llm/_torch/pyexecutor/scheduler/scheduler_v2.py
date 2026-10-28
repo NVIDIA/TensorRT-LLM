@@ -336,6 +336,17 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
+        # TRTLLM_DISAGG_GEN_ADMIT_BEFORE_ALLOC: the executor's KV-transfer admission gate for the current
+        # pass (DisaggTransferAdmissionGate), or None. PyExecutor sets and clears it around schedule_request.
+        self._disagg_transfer_gate = None
+
+    def set_disagg_transfer_admission_gate(self, gate) -> None:
+        """Install (or clear, with None) the KV-transfer admission gate for the next pass.
+
+        While the gate is closed, generation-init requests are skipped without KV allocation: the
+        executor's FCFS transfer admission would defer them and revert the allocation.
+        """
+        self._disagg_transfer_gate = gate
 
     @staticmethod
     def _ranks_share_schedule(kv_cache_manager) -> bool:
@@ -491,6 +502,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         req_it_end = len(requests_list)
         recompute_pause_state = _RecomputePauseState(req_it_end)
         req_it = 0
+        disagg_gate = self._disagg_transfer_gate
 
         # Context requests are always deferred to a second phase so that
         # generation requests are fully accounted for in the budget before
@@ -543,6 +555,17 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if peft_pages is None:
                     break
 
+                if disagg_gate is not None and disagg_gate.closed:
+                    # The KV-transfer budget of this pass is exhausted: the executor's FCFS admission
+                    # defers every candidate after the one that closed the gate and reverts its KV,
+                    # so do not allocate it. PEFT is charged as for such a deferred candidate, so the
+                    # rest of the pass sees the same budget as without the gate.
+                    disagg_gate.num_skipped += 1
+                    if peft_pages > 0:
+                        budget.commit_peft(req, peft_pages)
+                    req_it += 1
+                    continue
+
                 action, tokens = self._try_schedule_disagg_gen_init(req, budget)
                 if action is ScheduleAction.STOP:
                     break
@@ -550,6 +573,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                     req_it += 1
                     continue
                 disagg_candidates.append(req)
+                if disagg_gate is not None:
+                    disagg_gate.observe_candidate(req)
                 # Disagg requests only commit PEFT (not num_requests/num_tokens)
                 # because they don't participate in the forward pass. Counting
                 # them toward num_requests would steal batch slots from gen/ctx

@@ -432,6 +432,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # skips the status-poll collectives.
         self._gen_idle_poll_skip = self._gen_idle_poll_skip_applies(m, self._gen_need_sync)
         self._gen_idle_agreed = False
+        # Admitted receives the caller has not started yet (set_gen_deferred_receives);
+        # they count as sessions in the idle check.
+        self._gen_deferred_receives = 0
         pp_allgather: Callable = getattr(self._dist, "pp_allgather")
         self._gen_allgather: Callable = (
             pp_allgather if m.enable_attention_dp else self._dist.allgather
@@ -803,6 +806,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 locally_retirable.append(rid)
         # Read through getattr: unit tests assemble transceivers without __init__.
         idle_skip = getattr(self, "_gen_idle_poll_skip", False)
+        deferred = getattr(self, "_gen_deferred_receives", 0)
         outcome = self._consensus_outcome(
             to_process,
             cancelled,
@@ -812,7 +816,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._gen_need_sync,
             locally_retirable,
             locally_verified,
-            local_session_count=len(self._recv_sessions) if idle_skip else None,
+            local_session_count=len(self._recv_sessions) + deferred if idle_skip else None,
         )
         new_cancelled, new_failed, new_completed, globally_retirable, verified = outcome[:5]
         if idle_skip:
@@ -1222,6 +1226,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         everything here yet.
         """
         return fetches.session
+
+    def set_gen_deferred_receives(self, count: int) -> None:
+        """Report the admitted receives whose start the caller defers.
+
+        The disagg coordinator starts each admitted receive only once that
+        rank's admission readiness event completes, so ranks start the same
+        receive in different iterations, while admission is the same on every
+        rank. A nonzero count clears the idle-poll agreement on every rank in
+        the admitting iteration, and the count joins the session count of the
+        idle check, so no rank agrees it is idle while a peer still has a
+        receive to start (the start would clear the flag on that rank only and
+        send it into a status collective its peers skip).
+        """
+        if count:
+            self._gen_idle_agreed = False
+        self._gen_deferred_receives = count
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest) -> None:

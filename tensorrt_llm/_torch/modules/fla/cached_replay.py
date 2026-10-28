@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from typing import Optional
 
 import torch
@@ -27,8 +28,11 @@ _L2_STREAMING_HEAD_TILES = 8192
 # checkpoint commit per step; smaller ones commit inside each layer's replay.
 _DEFAULT_PARTITION_MIN_BATCH_SIZE = 16
 # Qwen3.5 on SM 10.3: the fused GDN target-verify kernels (gdn_mixer.py) commit in-layer up to 64 requests, so the
-# partitioned replay starts above that.
-Q35_PARTITION_MIN_BATCH_SIZE = 65
+# partitioned replay starts above that (when TRTLLM_Q35_GDN_FUSE_MAX_BATCH is raised, raise
+# TRTLLM_Q35_GDN_REPLAY_PARTITION_MIN_BATCH with it, e.g. 129 for TEP8 at batch 128).
+Q35_PARTITION_MIN_BATCH_SIZE = int(
+    os.environ.get("TRTLLM_Q35_GDN_REPLAY_PARTITION_MIN_BATCH", "65")
+)
 
 
 @_q35_register

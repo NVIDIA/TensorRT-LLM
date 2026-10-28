@@ -53,6 +53,47 @@ from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 # sampling config is fixed for its lifetime.
 SAMPLING_SCAN_CACHE_ENV = "TRTLLM_Q35_SAMPLING_SCAN_CACHE"
 
+# TRTLLM_Q35_TEMPERATURE_GRAPHS=1 (default off; requires
+# TRTLLM_Q35_SHARDED_TARGET_SAMPLING=1): capture a temperature-only variant of
+# the one-engine advanced-sampling CUDA graphs (graph key bit
+# ``q35_temperature_only``). A batch whose sampled rows use temperature only
+# (no top-k / top-p / min-p and no seed of their own), without rejection
+# sampling or penalties, replays it: the target logits stay vocabulary-sharded
+# and the worker draws the target tokens by Gumbel-max in the LL key exchange,
+# one launch, instead of the all-gather, the fp32 cast and the stock sampler.
+# The advanced-sampling pass captures with top-k / top-p / min-p set, so it
+# records the stock sampler.
+Q35_TEMPERATURE_GRAPHS_ENV = "TRTLLM_Q35_TEMPERATURE_GRAPHS"
+
+
+def q35_temperature_graphs_enabled(spec_config, mapping) -> bool:
+    """Whether to capture the TRTLLM_Q35_TEMPERATURE_GRAPHS variant: the flag
+    and TRTLLM_Q35_SHARDED_TARGET_SAMPLING are set, the model runs one-model
+    MTP-Eagle, and the target head is plain TP (no attention DP), i.e. the
+    sharded target sampling can be taken at all."""
+    if os.environ.get(Q35_TEMPERATURE_GRAPHS_ENV, "0") != "1":
+        return False
+    if os.environ.get("TRTLLM_Q35_SHARDED_TARGET_SAMPLING", "0") != "1":
+        return False
+    if spec_config is None or mapping is None:
+        return False
+    if not spec_config.spec_dec_mode.is_mtp_eagle_one_model():
+        return False
+    return mapping.tp_size > 1 and not mapping.enable_attention_dp
+
+
+def _q35_temperature_only(spec_metadata, temperature_capable: bool) -> bool:
+    """TRTLLM_Q35_TEMPERATURE_GRAPHS graph key bit: the variant is captured,
+    the batch samples, every sampled row can be drawn on the sharded logits
+    (temperature only, no seed of its own), and the batch takes neither
+    rejection sampling nor penalties. Seeded rows keep their per-row Philox
+    streams on the stock sampler."""
+    return bool(
+        getattr(spec_metadata, "q35_temperature_graphs", False)
+        and temperature_capable and not spec_metadata.is_all_greedy_sample
+        and not getattr(spec_metadata, "use_rejection_sampling", False)
+        and not getattr(spec_metadata, "enable_penalty", False))
+
 
 def _sampling_scan_cache_key(spec_metadata, requests: list["LlmRequest"]):
     """Key under which ``SpecMetadata._scan_one_model_sampling`` may reuse its
@@ -77,6 +118,14 @@ def _sampling_scan_cache_key(spec_metadata, requests: list["LlmRequest"]):
                         request.py_seq_slot))
     return (tuple(entries), spec_metadata.runtime_draft_len,
             spec_metadata.group_all_greedy_sample, spec_metadata.dummy_slot_row)
+
+
+# With TRTLLM_Q35_LL_ARGMAX_EXCHANGE=1, greedy draft tokens from
+# vocabulary-sharded draft logits (the BF16 draft head, i.e. the batches the
+# FP8 draft head does not take) in one launch (TPKeyExchange.argmax_logits: row
+# maxima, key packing and exchange) instead of torch.max + argmax_tokens. Same
+# tokens (largest logit, lowest global index on ties).
+DRAFT_ARGMAX_LOGITS_ENV = "TRTLLM_Q35_DRAFT_ARGMAX_LOGITS"
 
 
 def rejection_sampling_one_model(
@@ -603,8 +652,14 @@ class SpecMetadata:
     use_rejection_sampling: bool = False
     # Whether this step's target logits are this rank's vocabulary shard
     # (TRTLLM_Q35_SHARDED_TARGET_SAMPLING; set by the one-model forward), so
-    # the worker samples the greedy target tokens with a cross-rank argmax.
+    # the worker samples the target tokens with a cross-rank argmax (Gumbel-max
+    # for the temperature rows of a q35_temperature_only batch).
     sharded_target_logits: bool = False
+    # TRTLLM_Q35_TEMPERATURE_GRAPHS: whether the temperature-only graph variant
+    # is captured (set by the decoder runner before capture), and the graph key
+    # bit that selects it for the current batch (see _q35_temperature_only).
+    q35_temperature_graphs: bool = False
+    q35_temperature_only: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
     # Whether the occurrence penalties are enabled (deploy-time; from
@@ -1289,11 +1344,20 @@ class SpecMetadata:
             cached = getattr(self, "_sampling_scan_cache", None)
             if cached is not None and cached[0] == scan_key:
                 (_, per_request_normalized, per_request_slot_ids,
-                 self.is_all_greedy_sample) = cached
+                 self.is_all_greedy_sample, temperature_capable) = cached
+                self.q35_temperature_only = _q35_temperature_only(
+                    self, temperature_capable)
                 return per_request_normalized, per_request_slot_ids
 
         per_request_normalized: list[tuple[float, int, float, float, int]] = []
         has_non_greedy_requests = False
+        # TRTLLM_Q35_TEMPERATURE_GRAPHS: whether every sampled row can be drawn
+        # on the sharded logits (see _q35_temperature_only).
+        temperature_capable = True
+        temperature_graphs = getattr(self, "q35_temperature_graphs", False)
+        if temperature_graphs:
+            from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import \
+                request_random_seed
         per_request_slot_ids: list[int] = []
         ragged_verify = self.is_ragged_verify
         default_generation_tokens = 1 + self.runtime_draft_len
@@ -1330,6 +1394,10 @@ class SpecMetadata:
             )
 
             has_non_greedy_requests |= not is_greedy
+            if (temperature_graphs and not is_greedy and
+                (tk_val != DISABLE_TOPK_VAL or tp_val < 1.0 or mp_val > 0.0
+                 or request_random_seed(request) is not None)):
+                temperature_capable = False
 
             per_request_normalized.append(
                 (temp_val, tk_val, tp_val, mp_val, num_tokens))
@@ -1354,10 +1422,13 @@ class SpecMetadata:
         # value rather than resurrect the local value.
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
+        self.q35_temperature_only = _q35_temperature_only(
+            self, temperature_capable)
         if scan_key is not None:
             self._sampling_scan_cache = (scan_key, per_request_normalized,
                                          per_request_slot_ids,
-                                         self.is_all_greedy_sample)
+                                         self.is_all_greedy_sample,
+                                         temperature_capable)
         return per_request_normalized, per_request_slot_ids
 
     @property
@@ -1482,9 +1553,12 @@ class SpecMetadata:
         # The Philox seed / offset state is read only on the non-greedy paths
         # (the target sampler, the advanced draft sampler and the rejection
         # kernels; forced acceptance draws from its own pool), so all-greedy
-        # batches skip its host-to-device copies. Filled before the cached
+        # batches skip its host-to-device copies, and so do temperature-only
+        # batches on the sharded logits (TRTLLM_Q35_TEMPERATURE_GRAPHS), which
+        # draw with the worker's own per-step seed. Filled before the cached
         # parameter check below: the offsets advance every step.
-        self._populate_request_rng_state(requests, per_request_normalized)
+        if not getattr(self, "q35_temperature_only", False):
+            self._populate_request_rng_state(requests, per_request_normalized)
 
         # Phase 2: build per-token / per-request lists and copy to GPU.
         #
@@ -2957,6 +3031,18 @@ class SpecWorkerBase(nn.Module, ABC):
                 exchange = ll_exchange.get_tp_key_exchange(mapping)
                 if exchange is not None and 1 <= logits.shape[
                         0] <= exchange.MAX_ROWS:
+                    if (os.environ.get(DRAFT_ARGMAX_LOGITS_ENV, "0") == "1"
+                            and logits.stride(-1) == 1):
+                        # TRTLLM_Q35_DRAFT_ARGMAX_LOGITS: row maxima, packing
+                        # and exchange in one launch.
+                        logger.info_once(
+                            "TRTLLM_Q35_DRAFT_ARGMAX_LOGITS: draft argmax "
+                            "and key exchange in one launch",
+                            key="q35_draft_argmax_logits")
+                        return exchange.argmax_logits(logits,
+                                                      mapping.tp_rank *
+                                                      logits.shape[-1],
+                                                      channel=0)
                     local_max, local_argmax = torch.max(logits, dim=-1)
                     return exchange.argmax_tokens(local_max,
                                                   local_argmax,
@@ -3306,6 +3392,38 @@ class SpecWorkerBase(nn.Module, ABC):
         finally:
             restore_attn_metadata_after_draft_replay(attn_metadata, saved_state)
 
+    def _q35_sample_sharded_temperature(
+            self, logits: torch.Tensor,
+            temperatures: torch.Tensor) -> torch.Tensor:
+        """TRTLLM_Q35_TEMPERATURE_GRAPHS: target tokens of a temperature-only
+        batch from this rank's vocabulary shard of the logits.
+
+        Gumbel-max over the shard + LL key exchange is an exact temperature
+        sample (rows below GREEDY_TEMPERATURE_THRESHOLD stay greedy), in one
+        launch. The seed is a device counter advanced inside the captured
+        graph, so every step draws fresh noise; every rank replays the same
+        graphs, so all ranks pass the same seed, as the exchange requires. A
+        row's noise follows its batch position, not its request: such batches
+        hold no seeded request (see _q35_temperature_only).
+        """
+        from ..distributed import ll_exchange
+        from ..pyexecutor.sampler.ops.vanilla import \
+            GREEDY_TEMPERATURE_THRESHOLD
+        if getattr(self, "_q35_gumbel_seed", None) is None:
+            # First call in the eager warmup forward, never inside a capture.
+            self._q35_gumbel_seed = torch.zeros(1,
+                                                dtype=torch.int64,
+                                                device=logits.device)
+        self._q35_gumbel_seed.add_(1)
+        exchange = ll_exchange.get_tp_key_exchange(self.mapping)
+        return exchange.argmax_logits(
+            logits,
+            vocab_offset=self.mapping.tp_rank * logits.shape[-1],
+            temperature=temperatures,
+            seed=self._q35_gumbel_seed,
+            greedy_threshold=GREEDY_TEMPERATURE_THRESHOLD,
+            channel=1)
+
     def _sample_tokens_for_batch(
         self,
         logits: torch.Tensor,
@@ -3334,6 +3452,11 @@ class SpecWorkerBase(nn.Module, ABC):
             num_tokens = logits.shape[0]
 
             temperatures = spec_metadata.temperatures[:num_tokens]
+            if getattr(spec_metadata, "sharded_target_logits", False):
+                # TRTLLM_Q35_TEMPERATURE_GRAPHS, temperature-only batch: the
+                # logits are this rank's vocabulary shard.
+                return self._q35_sample_sharded_temperature(
+                    logits, temperatures)
             top_ks = spec_metadata.top_ks[:num_tokens]
             top_ps = spec_metadata.top_ps[:num_tokens]
             min_ps = spec_metadata.min_ps[:num_tokens]

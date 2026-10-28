@@ -313,3 +313,48 @@ def test_staggered_transfers_keep_lockstep_and_agreed_flag() -> None:
     for _ in range(3):
         assert round_() == []
     assert collective.calls == calls
+
+
+def test_deferred_publication_keeps_lockstep() -> None:
+    """Deferred receive starts keep the ranks in lockstep.
+
+    A receive admitted on every rank in one round but started in staggered later rounds (each rank
+    waits for its own admission readiness event) keeps the ranks in lockstep: the admission report
+    clears the idle flag on every rank, and a deferred receive counts as a session until it starts.
+
+    Without the report the admission round would agree idle (no rank holds a session yet), and the
+    first rank to start the receive would enter the status collective that its peers skip.
+    """
+    world = 4
+    collective = _Collective(world)
+    ranks = [_make_receiving_rank(collective, r) for r in range(world)]
+    _poll(ranks)
+    assert all(t._gen_idle_agreed for t in ranks)
+
+    def round_(start=(), admit=0):
+        def step(i, t):
+            if admit:
+                t.set_gen_deferred_receives(admit)
+            if i in start:
+                t.request_and_receive_async(_request(11))
+                t.set_gen_deferred_receives(0)
+            return t.check_gen_transfer_status(0)
+
+        statuses = _lockstep(ranks, step)
+        assert len(set(collective.calls)) == 1, collective.calls
+        assert len({t._gen_idle_agreed for t in ranks}) == 1
+        return [sorted(s[0]) for s in statuses]
+
+    calls = list(collective.calls)
+    round_(admit=1)  # admitted everywhere, started nowhere: no rank may stay idle
+    assert collective.calls == [c + 2 for c in calls]
+    assert not any(t._gen_idle_agreed for t in ranks)
+    round_(start=(0, 2))
+    assert not any(t._gen_idle_agreed for t in ranks)
+    round_(start=(1, 3))
+    for t in ranks:
+        t._recv_sessions[11].completed = True
+    assert round_() == [[11]] * world
+    assert not any(t._recv_sessions for t in ranks)
+    round_()
+    assert all(t._gen_idle_agreed for t in ranks)

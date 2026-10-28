@@ -60,11 +60,12 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
 
 from ..disaggregation.base.transfer import get_unique_rid
 from ..disaggregation.kv_cache_transceiver import KvCacheTransceiver
-from ..disaggregation.orchestration.admission import \
-    DisaggTransferAdmissionController
+from ..disaggregation.orchestration.admission import (
+    DisaggTransferAdmissionController, DisaggTransferAdmissionGate,
+    admit_before_alloc_enabled)
 from ..disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator, NoopDisaggCoordinator, attach_ctx_usage,
-    transfer_window_bypass_eligible)
+    is_gen_only_no_context_benchmark, transfer_window_bypass_eligible)
 from ..disaggregation.orchestration.pp_termination import \
     DisaggPPTerminationHandler
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
@@ -7186,6 +7187,23 @@ class PyExecutor:
                 return context_requests[:i]
         return context_requests
 
+    def _make_disagg_transfer_admission_gate(
+            self) -> Optional[DisaggTransferAdmissionGate]:
+        """TRTLLM_DISAGG_GEN_ADMIT_BEFORE_ALLOC=1: the gate that lets the V2
+        scheduler skip KV allocation for generation-init requests that the
+        transfer window (DisaggTransferCoordinator.admit) would defer. None
+        when the switch is off or no window applies (the conditions of admit:
+        the switch keeps the window on), so scheduling is unchanged."""
+        if not admit_before_alloc_enabled():
+            return None
+        controller = getattr(self, "_disagg_transfer_admission_controller",
+                             None)
+        if (controller is None
+                or getattr(self, "kv_cache_transceiver", None) is None
+                or is_gen_only_no_context_benchmark()):
+            return None
+        return controller.begin_gate(self.active_requests)
+
     @nvtx_range("_schedule")
     def _schedule(self):
         self._maybe_record_hang_diagnostic_phase("scheduling",
@@ -7194,8 +7212,28 @@ class PyExecutor:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
-        scheduler_output = self.scheduler.schedule_request(
-            self.active_requests, self.inflight_req_ids)
+        # TRTLLM_DISAGG_GEN_ADMIT_BEFORE_ALLOC: the KV-transfer admission gate
+        # rides along with this pass (None when the switch is off or no
+        # transfer window applies: scheduling unchanged). The multimodal
+        # scheduler wraps the LLM scheduler as .scheduler.
+        set_gate = (getattr(self.scheduler,
+                            "set_disagg_transfer_admission_gate", None)
+                    or getattr(getattr(self.scheduler, "scheduler", None),
+                               "set_disagg_transfer_admission_gate", None))
+        gate = (self._make_disagg_transfer_admission_gate()
+                if set_gate is not None else None)
+        if gate is not None:
+            set_gate(gate)
+        try:
+            scheduler_output = self.scheduler.schedule_request(
+                self.active_requests, self.inflight_req_ids)
+        finally:
+            if gate is not None:
+                set_gate(None)
+        if gate is not None and gate.num_skipped:
+            logger.debug(
+                f"Disagg transfer budget exhausted: skipped KV allocation "
+                f"for {gate.num_skipped} generation-init requests")
 
         scheduled_encoder_requests = scheduler_output.encoder_requests
         should_batch_encoder_requests = (self.is_encoder_decoder

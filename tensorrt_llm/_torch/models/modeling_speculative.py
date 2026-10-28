@@ -1968,20 +1968,24 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
     def _sharded_target_logits(self, hidden_states: torch.Tensor,
                                spec_metadata) -> Optional[torch.Tensor]:
         """Vocabulary-sharded target logits for an all-greedy one-model
-        MTP-Eagle batch (TRTLLM_Q35_SHARDED_TARGET_SAMPLING=1), or None for the
-        gathered full-vocabulary logits.
+        MTP-Eagle batch (TRTLLM_Q35_SHARDED_TARGET_SAMPLING=1) or, with
+        TRTLLM_Q35_TEMPERATURE_GRAPHS=1, a temperature-only one
+        (``spec_metadata.q35_temperature_only``), or None for the gathered
+        full-vocabulary logits.
 
         The sharded logits ([tokens, V / tp] in the LM head dtype) skip the
         all-gather and the fp32 cast; the worker then takes the global argmax
-        with one local-argmax + LL key exchange launch. Sets
-        ``spec_metadata.sharded_target_logits`` accordingly.
+        (Gumbel-max for temperature rows) with one local-argmax + LL key
+        exchange launch. Sets ``spec_metadata.sharded_target_logits``
+        accordingly.
         """
         spec_metadata.sharded_target_logits = False
         if os.environ.get("TRTLLM_Q35_SHARDED_TARGET_SAMPLING", "0") != "1":
             return None
         mapping = self.model_config.mapping
         head = self.lm_head
-        if (not spec_metadata.is_all_greedy_sample
+        if ((not spec_metadata.is_all_greedy_sample
+             and not getattr(spec_metadata, "q35_temperature_only", False))
                 or spec_metadata.enable_penalty
                 or not self.spec_config.spec_dec_mode.is_mtp_eagle_one_model()
                 or getattr(self.spec_config,

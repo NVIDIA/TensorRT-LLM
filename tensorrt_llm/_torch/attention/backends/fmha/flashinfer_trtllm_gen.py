@@ -39,6 +39,7 @@ Example:
 """
 
 import math
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -232,15 +233,18 @@ _MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
 
 # Qwen3.5 decode paths of run_generation (generation-only, one KV head per rank, FP8 KV, uniform q_len), in order of
 # precedence: CP-lite (q35_cp.py, KV head replicated over attn.q35_cp_group), fused decode (q35_fused_decode.py),
-# segmented (q35_segmented.py). Thresholds tuned for Qwen3.5-397B on SM 10.3.
+# segmented (q35_segmented.py). Thresholds tuned for Qwen3.5-397B on SM 10.3; a layout above batch 64 raises the
+# CP-lite bound in its run file (TRTLLM_Q35_ATTN_CP_MAX_BATCH, TEP8 b128: 128).
 _Q35_ATTN_CP_MIN_BATCH = 2
-_Q35_ATTN_CP_MAX_BATCH = 64
+_Q35_ATTN_CP_MAX_BATCH = int(os.environ.get("TRTLLM_Q35_ATTN_CP_MAX_BATCH", "64"))
 _Q35_ATTN_FUSED_MAX_BATCH = 4
 _Q35_ATTN_SEGMENTS = 16
 # At b4 the trtllm-gen kernel is already bandwidth-bound and segmenting loses ~3 us per call.
 _Q35_ATTN_SEG_MAX_BATCH = 2
-# Counter slots for segmented / CP-lite calls: >= max(b * segments * folded heads, #SMs).
-_Q35_COUNTER_SLOTS = 64 * 128
+# Counter slots for segmented / CP-lite calls: >= max(b * segments * folded heads, #SMs). segments * folded heads
+# is <= 128 here (MTP-6 verify: 1 x 7 x 16 = 112), so 128 slots per request up to the CP-lite batch cap (>= 64):
+# TEP8 b80 / b128 need 8960 / 14336 slots, more than the 64 * 128 that capped CP-lite at b73.
+_Q35_COUNTER_SLOTS = max(64, _Q35_ATTN_CP_MAX_BATCH) * 128
 
 
 def _q35_cp_segments(num_requests: int, q_len: int) -> int:

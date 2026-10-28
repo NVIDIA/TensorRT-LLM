@@ -30,6 +30,10 @@ NON_GREEDY_CAPTURE_SAMPLING_PARAMS = SamplingParams(
     temperature=0.7, top_k=50, top_p=0.9, min_p=0.05
 )
 
+# TRTLLM_Q35_TEMPERATURE_GRAPHS: temperature-only params (no top-k / top-p / min-p, no seed) for the
+# capture pass of the one-engine temperature-only graph variant.
+TEMPERATURE_ONLY_CAPTURE_SAMPLING_PARAMS = SamplingParams(temperature=0.7)
+
 
 class DummyRequestFactory:
     """Builds the dummy batches that warmup and CUDA graph capture run.
@@ -289,14 +293,19 @@ class DummyRequestFactory:
         force_non_greedy: bool = False,
         context_token_nums: Sequence[int] = (),
         context_request_kwargs: dict[str, Any] | None = None,
+        temperature_only: bool = False,
     ) -> ScheduledRequests | None:
         """Creates a dummy ScheduledRequests tailored for CUDA graph capture.
 
         With ``context_token_nums``, the first rows are context requests of
         those lengths, created with ``context_request_kwargs``; the rest are
-        generation requests.
+        generation requests. ``temperature_only`` (with ``force_non_greedy``)
+        gives the dummies temperature-only sampling params, for the
+        TRTLLM_Q35_TEMPERATURE_GRAPHS capture pass.
         """
         capture_sampling_params = NON_GREEDY_CAPTURE_SAMPLING_PARAMS if force_non_greedy else None
+        if force_non_greedy and temperature_only:
+            capture_sampling_params = TEMPERATURE_ONLY_CAPTURE_SAMPLING_PARAMS
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         if getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None:
             return None
