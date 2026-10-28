@@ -21,6 +21,8 @@ from contextlib import nullcontext
 from typing import Dict, Optional, cast
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
@@ -64,6 +66,85 @@ from .backends.interface import AttentionBackend, PositionalEmbeddingParams, Pre
 from .backends.sparse.hooks import get_sparse_mla_hooks
 from .backends.utils import create_attention
 from .rotary_embedding import RotaryEmbedding
+
+
+# num_tokens is not specialized: a chunk whose token count is not a multiple of
+# 16 (typically the last chunk of a prompt) would otherwise compile a second
+# variant in the middle of a request.
+@triton.jit(do_not_specialize=["num_tokens"])
+def _pack_context_k_kernel(
+    kv_ptr,
+    k_pe_ptr,
+    k_ptr,
+    num_tokens,
+    kv_stride,
+    k_pe_stride,
+    NUM_HEADS: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+):
+    """K[t, h] = [k_nope[t, h] | k_pe[t]] in one pass over the kv_b_proj output and the shared k_pe."""
+    head = tl.program_id(1)
+    tokens = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
+    mask = (tokens < num_tokens)[:, None]
+    rows = tokens.to(tl.int64)[:, None]
+    nope = tl.arange(0, NOPE_DIM)[None, :]
+    rope = tl.arange(0, ROPE_DIM)[None, :]
+    out = k_ptr + rows * (NUM_HEADS * (NOPE_DIM + ROPE_DIM)) + head * (NOPE_DIM + ROPE_DIM)
+    tl.store(
+        out + nope,
+        tl.load(kv_ptr + rows * kv_stride + head * NOPE_DIM + nope, mask=mask),
+        mask=mask,
+    )
+    tl.store(
+        out + NOPE_DIM + rope,
+        tl.load(k_pe_ptr + rows * k_pe_stride + rope, mask=mask),
+        mask=mask,
+    )
+
+
+def _pack_context_k(
+    kv: torch.Tensor, k_pe: torch.Tensor, num_heads: int, nope_dim: int, rope_dim: int
+) -> torch.Tensor:
+    """[t, H * (nope + rope)] K for the context FMHA.
+
+    ``kv`` is the kv_b_proj output ([t, H * (nope + v)], k_nope columns first)
+    and ``k_pe`` the shared roped key ([t, rope], any row stride). A pure copy,
+    so bitwise the ``cat((k_nope, k_pe.expand(...)), -1)`` that remains the
+    fallback for layouts the kernel does not take.
+    """
+    num_tokens = kv.shape[0]
+    if (
+        not kv.is_cuda
+        or kv.dtype != k_pe.dtype
+        or kv.stride(-1) != 1
+        or k_pe.stride(-1) != 1
+        or k_pe.shape[0] != num_tokens
+        or nope_dim & (nope_dim - 1)
+        or rope_dim & (rope_dim - 1)
+    ):
+        k_nope = kv[:, : num_heads * nope_dim].view(-1, num_heads, nope_dim)
+        k = maybe_compiled_cat(
+            (k_nope, k_pe.view(-1, 1, rope_dim).expand(-1, num_heads, -1)), dim=-1
+        )
+        return k.view(-1, num_heads * (nope_dim + rope_dim))
+    k = torch.empty(num_tokens, num_heads * (nope_dim + rope_dim), dtype=kv.dtype, device=kv.device)
+    if num_tokens:
+        block_tokens = 64
+        _pack_context_k_kernel[(triton.cdiv(num_tokens, block_tokens), num_heads)](
+            kv,
+            k_pe,
+            k,
+            num_tokens,
+            kv.stride(0),
+            k_pe.stride(0),
+            num_heads,
+            nope_dim,
+            rope_dim,
+            block_tokens,
+        )
+    return k
 
 
 def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
@@ -1256,28 +1337,18 @@ class MLA(nn.Module):
         assert full_compressed_kv.is_contiguous()
         assert full_k_pe.is_contiguous()
 
-        # compute full_k_nope and full_v from full_compressed_kv
+        # compute full_k and full_v from full_compressed_kv
         full_kv = self.kv_b_proj(full_compressed_kv)
-        full_k_nope, full_v = full_kv.split(
-            [
-                self.num_heads_tp * self.qk_nope_head_dim,
-                self.num_heads_tp * self.v_head_dim,
-            ],
-            -1,
-        )
+        full_v = full_kv[:, self.num_heads_tp * self.qk_nope_head_dim :]
 
-        full_k_nope = full_k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
-        full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
-        full_k = maybe_compiled_cat(
-            (full_k_nope, full_k_pe.expand(-1, self.num_heads_tp, -1)), dim=-1
+        full_k = _pack_context_k(
+            full_kv, full_k_pe, self.num_heads_tp, self.qk_nope_head_dim, self.qk_rope_head_dim
         )
-        full_k = full_k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
         # release pytorch activation memory
         full_compressed_kv = None
         full_k_pe = None
         full_kv = None
-        full_k_nope = None
 
         # latent_cache must be None to differentiate from normal context phase,
         # so that we can skip applying RoPE and appending KV cache inside attention op
@@ -1357,26 +1428,19 @@ class MLA(nn.Module):
             # up proj to uncompressed kv
             # [tokens, 2, h, kv_dim], without rope_dim
             chunked_kv = self.kv_b_proj(chunked_compressed_kv)
-            chunked_k_nope, chunked_v = chunked_kv.split(
-                [
-                    self.num_heads_tp * self.qk_nope_head_dim,
-                    self.num_heads_tp * self.v_head_dim,
-                ],
-                -1,
+            chunked_v = chunked_kv[:, self.num_heads_tp * self.qk_nope_head_dim :]
+            chunked_k = _pack_context_k(
+                chunked_kv,
+                chunked_k_pe,
+                self.num_heads_tp,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
             )
-
-            chunked_k_nope = chunked_k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
-            chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
-            chunked_k = maybe_compiled_cat(
-                (chunked_k_nope, chunked_k_pe.expand(-1, self.num_heads_tp, -1)), dim=-1
-            )
-            chunked_k = chunked_k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
             # release pytorch activation memory
             chunked_compressed_kv = None
             chunked_k_pe = None
             chunked_kv = None
-            chunked_k_nope = None
 
             # copy chunked_seq_len to replace kv_lens_runtime
             attn_metadata.kv_lens_runtime = attn_metadata.host_chunked_seq_len[loop_idx]
@@ -1419,18 +1483,10 @@ class MLA(nn.Module):
         )
         # final round of attention
 
-        k_nope, v = kv.split(
-            [
-                self.num_heads_tp * self.qk_nope_head_dim,
-                self.num_heads_tp * self.v_head_dim,
-            ],
-            -1,
+        v = kv[:, self.num_heads_tp * self.qk_nope_head_dim :]
+        k = _pack_context_k(
+            kv, k_pe, self.num_heads_tp, self.qk_nope_head_dim, self.qk_rope_head_dim
         )
-
-        k_nope = k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
-        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        k = maybe_compiled_cat((k_nope, k_pe.expand(-1, self.num_heads_tp, -1)), dim=-1)
-        k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
 
         # copy q_lens to replace kv_lens_runtime
         attn_metadata.kv_lens_runtime = attn_metadata.prompt_lens_cpu_runtime

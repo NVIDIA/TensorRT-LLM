@@ -725,11 +725,17 @@ def _create_py_executor(
                 "MiniMax-M3 Eagle3 supports the linear draft chain only.")
 
     # chunk_unit_size may be changed to 64 when using flash mla
+    # TLLM_MLA_CHUNKED_PREFILL_BUFFER_BATCH_SIZE: MLA chunked prefill expands the
+    # cached KV in loops of chunk_size * this many tokens (default 4). Larger
+    # values mean fewer loops (kernel launches) per chunk; the KV cache
+    # profiling run sizes its cached prefix from it.
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=enable_chunked_context,
         cache_reuse=kv_cache_config.enable_block_reuse,
         has_speculative_draft_tokens=has_spec_drafter,
         chunk_size=max_num_tokens,
+        chunked_prefill_buffer_batch_size=int(
+            os.environ.get("TLLM_MLA_CHUNKED_PREFILL_BUFFER_BATCH_SIZE", "4")),
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
