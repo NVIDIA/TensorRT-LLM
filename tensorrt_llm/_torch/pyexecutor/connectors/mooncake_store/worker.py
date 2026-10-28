@@ -43,7 +43,9 @@ stored once `wait_for_save` has queued it, so saves bound for a pass that never
 ran are emitted again. A save that fails is logged and dropped: a write that
 did not land costs a future cache miss and nothing else, so the request retires
 either way. Only the save thread failing to start is fatal, because that would
-strand every request behind pages nothing will release.
+strand every request behind pages nothing will release. With `soft_pin_ttl_ms`
+or `group_blocks` set, each put also carries a Mooncake `ReplicateConfig` that
+soft-pins its pages or names each page's eviction group.
 
 Next to one-model MTP or EAGLE3 on a disaggregated context server, the draft
 layers share the target pool, so they move with every page. Any other drafter,
@@ -204,6 +206,41 @@ def _stream_handle(stream: Optional[torch.cuda.Stream]) -> int:
     return int(stream.cuda_stream)
 
 
+def _replicate_config(soft_pin_ttl_ms: Optional[int], group_ids: Optional[Sequence[str]] = None):
+    """The Mooncake `ReplicateConfig` for one put call, or None for the store's defaults.
+
+    Args:
+        soft_pin_ttl_ms: Soft-pin every page of the call for this long, if set.
+        group_ids: One eviction group per key of the call, if set.
+
+    Returns:
+        A `mooncake.store.ReplicateConfig`, or None when neither option is set,
+        in which case the put keeps its three-argument form.
+
+    Raises:
+        ImportError: When the installed bindings predate either option.
+    """
+    if soft_pin_ttl_ms is None and group_ids is None:
+        return None
+    try:
+        import mooncake.store as mooncake_store
+
+        config = mooncake_store.ReplicateConfig()
+        if soft_pin_ttl_ms is not None:
+            config.soft_pin_action = mooncake_store.SoftPinAction.ENABLE
+            config.soft_pin_ttl_ms = soft_pin_ttl_ms
+        if group_ids is not None:
+            config.group_ids = list(group_ids)
+    except (ImportError, AttributeError) as exc:
+        raise ImportError(
+            "mooncake_store.soft_pin_ttl_ms and group_blocks need "
+            "mooncake-transfer-engine-cuda13 0.3.13 or newer, whose mooncake.store "
+            "exposes SoftPinAction and a ReplicateConfig with soft_pin_action, "
+            "soft_pin_ttl_ms and group_ids"
+        ) from exc
+    return config
+
+
 class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     """Moves KV pages between this rank's GPU cache and the Mooncake pool."""
 
@@ -292,6 +329,19 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # allocation.
         validate_node_budget(self._config)
 
+        # Write options exist only for a role that writes, so consumer and
+        # capacity roles build nothing and need no particular binding.
+        saves = self._config.role.saves
+        self._soft_pin_ttl_ms = self._config.soft_pin_ttl_ms if saves else None
+        self._group_blocks = self._config.group_blocks and saves
+        # Shared by every put; None keeps the store's defaults. Grouped puts
+        # need one group per key and build their own per call, and building a
+        # probe here proves the binding supports them before a segment is
+        # mounted.
+        self._put_config = _replicate_config(
+            self._soft_pin_ttl_ms, ["probe"] if self._group_blocks else None
+        )
+
         self._store, self._segment_host = _open_store(self._config)
         record_segment(
             self._run_dir,
@@ -345,7 +395,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             f"role={self._config.role.value}, model_key={self._model_key}, "
             f"master={self._config.master_server_address}, "
             f"segment={self._config.global_segment_size / (1 << 30):.1f} GiB "
-            f"on {self._segment_host})"
+            f"on {self._segment_host}"
+            f"{f', soft_pin_ttl_ms={self._soft_pin_ttl_ms}' if self._soft_pin_ttl_ms is not None else ''}"
+            f"{', group_blocks=1' if self._group_blocks else ''})"
         )
         if self.capacity_only:
             # Said plainly, since every other sign of a working connector is
@@ -967,13 +1019,15 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         staging = self._save_staging
         handle = _stream_handle(self._save_stream) if staging is not None else 0
+        groups = self._block_groups(transfers) if self._group_blocks else [None] * len(keys)
 
         for batch in zip(
             _batched(keys, self._batch_size),
             _batched(addresses, self._batch_size),
             _batched(sizes, self._batch_size),
+            _batched(groups, self._batch_size),
         ):
-            batch_keys, batch_addresses, batch_sizes = batch
+            batch_keys, batch_addresses, batch_sizes, batch_groups = batch
             # Skip pages another rank or another instance already wrote. The
             # scheduler holds no store handle, and the answer changes between
             # the time it builds metadata and now.
@@ -995,11 +1049,16 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 )
                 # The store reads the slots on this thread, so fill them first.
                 _sync_stream(handle)
-            results = self._store.batch_put_from_multi_buffers(
-                [batch_keys[i] for i in pending],
-                source_addresses,
-                source_sizes,
-            )
+            put_args = ([batch_keys[i] for i in pending], source_addresses, source_sizes)
+            if self._group_blocks:
+                # One group per key that survived the existence filter.
+                put_args += (
+                    _replicate_config(self._soft_pin_ttl_ms, [batch_groups[i] for i in pending]),
+                )
+            elif self._put_config is not None:
+                put_args += (self._put_config,)
+            # With neither option set this is the plain three-argument put.
+            results = self._store.batch_put_from_multi_buffers(*put_args)
             failures = sum(1 for result in results if not isinstance(result, int) or result < 0)
             if failures:
                 # A dropped write only costs a future cache miss, which is not
@@ -1008,6 +1067,28 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                     f"mooncake-store rank {self._rank} failed to save {failures} of "
                     f"{len(pending)} pages"
                 )
+                if self._soft_pin_ttl_ms is not None and failures == len(pending):
+                    logger.warning_once(
+                        f"mooncake-store rank {self._rank}: the pool refused every page "
+                        f"of a put with soft_pin_ttl_ms={self._soft_pin_ttl_ms}. A "
+                        "soft_pin_ttl_ms above the master's --max_kv_soft_pin_ttl (24 h "
+                        "by default) makes the master refuse every put.",
+                        key="mooncake-store-soft-pin-refused",
+                    )
+
+    def _block_groups(self, transfers: Sequence[RequestTransfers]) -> List[str]:
+        """The eviction group of every page `_resolve` lists, in the same order.
+
+        One group per block covers every layer group and attention shard of it.
+        A block is reusable only while all of those pages survive, so the master
+        should evict them together rather than leave orphans that hold space and
+        still miss.
+        """
+        return [
+            self._namespaces[page.layer_group_id].group(page.block_hash)
+            for entry in transfers
+            for page in entry.pages
+        ]
 
     # ---- shared ----
 

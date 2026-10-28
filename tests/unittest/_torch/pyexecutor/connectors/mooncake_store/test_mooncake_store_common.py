@@ -29,6 +29,7 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import config as config_module
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import master as master_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     MooncakeStoreConnectorConfig,
@@ -41,6 +42,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import (
     KeyNamespace,
     ReuseScope,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import PoolManifest
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.staging import (
     HostStagingPool,
     describe_batch_for_get,
@@ -48,6 +50,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.staging import (
     stage_batch_for_put,
     unstage_batch_after_get,
 )
+from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -455,6 +458,35 @@ def test_key_namespace_separates_every_dimension():
         assert KeyNamespace(**{**base, field: value}).key(block_hash) != reference
 
 
+def test_key_namespace_group_ignores_rank_and_layer_group():
+    """Every page a hit on a block needs shares one eviction group."""
+    base = dict(
+        namespace="trtllm",
+        model_key="m",
+        rank=0,
+        world_size=2,
+        layer_group_id=0,
+        tokens_per_block=4,
+        bytes_per_page=64,
+    )
+    block = b"\x01" * 16
+    group = KeyNamespace(**base).group(block)
+
+    for field, value in [
+        ("rank", 1),
+        ("layer_group_id", 3),
+        ("tokens_per_block", 8),
+        ("bytes_per_page", 128),
+    ]:
+        assert KeyNamespace(**{**base, field: value}).group(block) == group
+    for field, value in [("world_size", 4), ("namespace", "other"), ("model_key", "n")]:
+        assert KeyNamespace(**{**base, field: value}).group(block) != group
+    assert KeyNamespace(**base).group(b"\x02" * 16) != group
+    # The key still names one shard's page.
+    assert KeyNamespace(**base).key(block) != KeyNamespace(**{**base, "rank": 1}).key(block)
+    assert group == f"trtllm/m/w2/{block.hex()}"
+
+
 # ---- config ----
 
 
@@ -592,6 +624,75 @@ def test_config_requires_an_explicit_model_key(store_config, tmp_path, monkeypat
     config = resolve_config()
     with pytest.raises(ValueError, match="needs a model key"):
         config.resolve_model_key("/models/MiniMax-M3/")
+
+
+# ---- pool eviction settings ----
+
+
+def test_config_eviction_settings_default_off_and_read_the_json(store_config):
+    config = resolve_config()
+    assert config.soft_pin_ttl_ms is None
+    assert config.group_blocks is False
+
+    set_pool_setting(store_config, soft_pin_ttl_ms=86400000, group_blocks=True)
+    config = resolve_config()
+    assert config.soft_pin_ttl_ms == 86400000
+    assert config.group_blocks is True
+
+    # An explicit null is the same as leaving the TTL out.
+    set_pool_setting(store_config, soft_pin_ttl_ms=None)
+    assert resolve_config().soft_pin_ttl_ms is None
+
+
+@pytest.mark.parametrize("ttl", [0, -1])
+def test_config_rejects_a_soft_pin_ttl_that_is_not_positive(store_config, ttl):
+    set_pool_setting(store_config, soft_pin_ttl_ms=ttl)
+    with pytest.raises(ValueError, match="soft_pin_ttl_ms"):
+        resolve_config()
+
+
+@pytest.mark.parametrize("value", ["yes", "false", 1])
+def test_config_group_blocks_must_be_a_json_boolean(store_config, value):
+    """`bool("false")` is True, so anything but a JSON boolean is refused."""
+    set_pool_setting(store_config, group_blocks=value)
+    with pytest.raises(ValueError, match="group_blocks"):
+        resolve_config()
+
+
+def test_config_has_no_environment_override_for_eviction_settings(store_config, monkeypatch):
+    """The source branch read these from the environment; this connector reads the JSON only."""
+    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_SOFT_PIN_TTL_MS", "86400000")
+    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_GROUP_BLOCKS", "1")
+
+    config = resolve_config()
+
+    assert config.soft_pin_ttl_ms is None
+    assert config.group_blocks is False
+
+
+def _rendered_client_config(tmp_path, **settings):
+    """What `provision_pool` writes for a block with `settings`, and that file read back."""
+    pool = MooncakeStoreConfig(pool="h:1", model_key="m", **settings)
+    rendered = master_module._client_config(pool, PoolManifest(master_server_address="h:1"), "")
+    path = tmp_path / "rendered.json"
+    path.write_text(json.dumps(rendered))
+    return rendered, MooncakeStoreConnectorConfig.from_file(str(path))
+
+
+def test_client_config_renders_eviction_settings(tmp_path):
+    rendered, config = _rendered_client_config(
+        tmp_path, soft_pin_ttl_ms=86400000, group_blocks=True
+    )
+    assert rendered["soft_pin_ttl_ms"] == 86400000
+    assert rendered["group_blocks"] is True
+    assert config.soft_pin_ttl_ms == 86400000
+    assert config.group_blocks is True
+
+    rendered, config = _rendered_client_config(tmp_path)
+    assert "soft_pin_ttl_ms" not in rendered
+    assert rendered["group_blocks"] is False
+    assert config.soft_pin_ttl_ms is None
+    assert config.group_blocks is False
 
 
 # The connector itself, the registry preset that selects it, and the startup
