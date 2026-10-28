@@ -1231,10 +1231,10 @@ class TestRequestTimeout:
     _INTERVAL_SECS = 0.25
 
     @staticmethod
-    def _request(stream: bool) -> CompletionRequest:
+    def _request(stream: bool, prompt: str = "hi") -> CompletionRequest:
         return CompletionRequest(
             model="m",
-            prompt="hi",
+            prompt=prompt,
             stream=stream,
             disaggregated_params=DisaggregatedParams(
                 request_type="generation_only", first_gen_tokens=[7], ctx_request_id=1
@@ -1313,6 +1313,33 @@ class TestRequestTimeout:
         assert router.finish_request.await_args.kwargs["success"] is False
 
     @pytest.mark.asyncio
+    async def test_a_stream_whose_request_the_worker_does_not_read_fails(self):
+        client_gave_up = asyncio.Event()
+
+        async def stall_before_reading(request):
+            # Far longer than the timeout unless the client gives up first; the
+            # stream would end cleanly here if nothing bounded sending the request.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(client_gave_up.wait(), self._TIMEOUT_SECS * 10)
+            response = await self._open_response(request, "text/event-stream")
+            await response.write(b"data: [DONE]\n\n")
+            return response
+
+        # Far more than the socket buffers between client and worker hold, so
+        # sending it waits for the worker to read it.
+        request = self._request(stream=True, prompt="x" * (32 << 20))
+        async with self._worker(stall_before_reading) as (client, router):
+            response = await client.send_request(request)
+            with pytest.raises(asyncio.TimeoutError):
+                _ = [chunk async for chunk in response]
+            # A worker that is not reading cannot see the client leave, so
+            # release it rather than have the server's shutdown wait out the stall.
+            client_gave_up.set()
+
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
     async def test_a_non_streamed_response_is_bounded_by_its_total_time(self):
         body = json.dumps(TestOpenAIHttpClient().dummy_response().model_dump()).encode()
         piece = -(-len(body) // self._CHUNKS)
@@ -1352,6 +1379,26 @@ class TestRequestTimeout:
 
         timeout = mock_session.post.call_args.kwargs["timeout"]
         assert (timeout.total, timeout.connect, timeout.sock_read) == (None, 180, 180)
+
+    @pytest.mark.asyncio
+    async def test_a_zero_timeout_does_not_bound_the_response_start(
+        self, mock_router, mock_session, completion_request
+    ):
+        _reset_prometheus_registry()
+        client = OpenAIHttpClient(
+            router=mock_router, role=ServerRole.GENERATION, timeout_secs=0, session=mock_session
+        )
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {"Content-Type": "application/json"}
+        http_response.json.return_value = TestOpenAIHttpClient().dummy_response().model_dump()
+        http_response.__aenter__.return_value = http_response
+        http_response.__aexit__.return_value = False
+        mock_session.post.return_value = http_response
+
+        response = await client.send_request(completion_request)
+
+        assert isinstance(response, CompletionResponse)
 
 
 def test_a_forwarded_request_keeps_the_field_names_it_arrived_with():
