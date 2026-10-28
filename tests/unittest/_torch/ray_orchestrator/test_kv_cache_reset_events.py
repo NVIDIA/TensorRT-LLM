@@ -21,6 +21,7 @@ from tensorrt_llm.scheduling_params import SchedulingParams
 class ResetEventsWorkerExtension(WorkerExtension):
     @control_action_decorator
     def reset_and_wait_for_observer(self, endpoint):
+        """Reset reuse state and hold every executor until its events are observed."""
         # Keep the real executor parked until the driver observes the events;
         # resuming it early could hide a missing reset-time flush.
         assert self.engine.control_request_barrier.is_set()
@@ -39,6 +40,7 @@ class ResetEventsWorkerExtension(WorkerExtension):
 
 
 def _replay_until(replay, start_seq, event_type):
+    """Read retained batches until the requested event appears, without resuming inference."""
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         replay.send_multipart([b"", start_seq.to_bytes(8, "big")])
@@ -59,6 +61,7 @@ def _buffered_events(llm):
 
 
 def _check_cache_reset_events_through_control_rpc(streaming, tmp_path):
+    """Observe reset events through public transports while the control RPC is parked."""
     ranks = 1 if streaming else 2
     endpoint = f"ipc://{tmp_path}/events"
     replay_endpoint = f"ipc://{tmp_path}/replay"
@@ -126,14 +129,19 @@ def _check_cache_reset_events_through_control_rpc(streaming, tmp_path):
                 before = _replay_until(replay, 0, "BlockStored")
                 start_seq = before[-1][0] + 1
             else:
+                # The 65-token prompt stores two full blocks and one partial
+                # tail, which can arrive in separate publisher batches.
+                expected_blocks = 3
                 deadline = time.monotonic() + 10
-                while time.monotonic() < deadline and not stored[0]:
+                while time.monotonic() < deadline and len(stored[0]) < expected_blocks:
                     for event in _buffered_events(llm):
                         if event and event["data"]["type"] == "stored":
                             stored[event["attention_dp_rank"]].update(
                                 block["block_hash"] for block in event["data"]["blocks"]
                             )
-                assert stored[0], "Rank 0 must have cached blocks"
+                assert len(stored[0]) == expected_blocks, (
+                    "Rank 0 must publish all three cached blocks"
+                )
                 assert not stored[1], "Rank 1 must exercise the empty-cache gather path"
 
             refs = llm._collective_rpc(

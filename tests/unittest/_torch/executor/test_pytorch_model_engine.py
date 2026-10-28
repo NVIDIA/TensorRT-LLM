@@ -1904,12 +1904,12 @@ class DecoderForwardTestCase(unittest.TestCase):
         """Every beam row gets its request's `past + delta` on all 3 axes."""
         beam_width = 2
         engine, kv_cache_manager = create_model_engine_and_kvcache(
+            self,
             llm_args=TorchLlmArgs(model="dummy",
                                   max_batch_size=4,
                                   max_num_tokens=64,
                                   max_beam_width=beam_width),
             model=DummyModel(torch.half, rope_scaling={"type": "mrope"}))
-        self.addCleanup(kv_cache_manager.shutdown)
         preparer = engine._runner._inputs
         # (num_tokens, delta): one delta arrives on the host and one is
         # already a CUDA int32 scalar.
@@ -1973,11 +1973,11 @@ class DecoderForwardTestCase(unittest.TestCase):
             self) -> None:
         """Mixed scalar batching matches the old per-request writes exactly."""
         engine, kv_cache_manager = create_model_engine_and_kvcache(
+            self,
             llm_args=TorchLlmArgs(model="dummy",
                                   max_batch_size=2,
                                   max_num_tokens=64),
             model=DummyModel(torch.half, rope_scaling={"type": "mrope"}))
-        self.addCleanup(kv_cache_manager.shutdown)
         preparer = engine._runner._inputs
         sentinel = 123
 
