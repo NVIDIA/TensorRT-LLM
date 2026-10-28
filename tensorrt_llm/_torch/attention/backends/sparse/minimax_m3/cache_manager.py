@@ -28,12 +28,17 @@ Provides:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheManagerV2,
+    Role,
+    _BasePageTableMaterializer,
+)
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -54,7 +59,11 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PageIndexMode,
 )
 
+from .common import get_sparse_layer_ids
+
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 
@@ -185,6 +194,39 @@ def derive_shared_draft_layout(
     return list(range(num_target, total)), num_target
 
 
+def default_sparse_layer_ids(
+    pretrained_config: Optional[PretrainedConfig], num_target_layers: Optional[int]
+) -> List[int]:
+    """Sparse target layers for a manager built without ``sparse_layer_ids``.
+
+    The model picks dense or sparse attention per layer from the checkpoint's
+    ``sparse_attention_config`` (:func:`get_sparse_layer_ids`), so the index-K
+    cache follows the same split whenever the config describes exactly the
+    target layers. Without such a config, layers 0..2 are dense and the rest
+    sparse, as in the MiniMax-M3 checkpoint.
+    """
+    if num_target_layers is None:
+        return []
+    num_hidden_layers = getattr(pretrained_config, "num_hidden_layers", None)
+    if num_hidden_layers is not None and int(num_hidden_layers) == num_target_layers:
+        return get_sparse_layer_ids(pretrained_config)[1]
+    if num_hidden_layers is not None:
+        # Expected for a manager that does not hold the target decoder layers
+        # (a separate draft manager). Say so when the config's own split is not
+        # the default, since the cache then follows a different split than the model.
+        try:
+            config_sparse = get_sparse_layer_ids(pretrained_config)[1]
+        except ValueError:
+            config_sparse = None
+        if config_sparse is not None and config_sparse != list(range(3, int(num_hidden_layers))):
+            logger.info(
+                f"MiniMax-M3 KV cache: the model config has {int(num_hidden_layers)} layers but this "
+                f"manager holds {num_target_layers} target layers, so its sparse layers default to "
+                f"layers 3..{num_target_layers - 1} instead of the config's split."
+            )
+    return list(range(3, num_target_layers))
+
+
 def extend_attention_op_pools_for_shared_draft_layers(
     pool_pointers: torch.Tensor,
     pool_mapping: torch.Tensor,
@@ -265,7 +307,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     stays empty in production.
 
     Constructor extras (forwarded kwargs go to :class:`KVCacheManagerV2`):
-      * ``sparse_layer_ids`` — layer indices using sparse attention.
+      * ``sparse_layer_ids`` — layer indices using sparse attention;
+        defaults to :func:`default_sparse_layer_ids`.
       * ``disable_index_value_layer_ids`` — subset whose index-V is
         omitted.
       * ``sparse_index_dim`` — width of the index-K/V vectors.
@@ -282,12 +325,17 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     :meth:`_prepare_page_table_tensor`.
     """
 
+    # Decode-step shortcuts a model opts into (RuntimeHooks.msa); see configure_decode_shortcuts.
+    skip_unchanged_block_offsets = False
+    reuse_pool_views = False
+
     _main_kv_mapper_kind = MapperKind.HND
     _main_kv_view_layout = "NHD"
     _dense_native_layer_ids: Tuple[int, ...] = ()
     # Virtual attention-op pools for dense target and shared draft layers:
     # (attention_op_pool_id, source_storage_pool_id) plus their copy parameters.
     _draft_op_pools: Tuple[Tuple[int, int], ...] = ()
+    _draft_page_table_materializers: Tuple[_BasePageTableMaterializer, ...] = ()
     _draft_index_scales: Optional[torch.Tensor] = None
     _draft_kv_offsets: Optional[torch.Tensor] = None
     # Extra page sizes trtllm-gen may use with this manager (see
@@ -303,11 +351,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         **kwargs,
     ):
         # Resolve M3 sparse-layer metadata from explicit kwargs first, then
-        # from the executor's ``sparse_attention_config`` keyword, then from
-        # the M3 checkpoint convention (layers 0..2 dense, 3..N-1 sparse,
+        # from the executor's ``sparse_attention_config`` and
+        # ``pretrained_config`` keywords, then from the M3 checkpoint
+        # convention (layers 0..2 dense, 3..N-1 sparse,
         # disable_index_value=True, sparse_index_dim=128). Honoring the
-        # executor keyword also makes non-default sparse_index_dim values
-        # authoritative for the cache layout instead of falling back to 128.
+        # executor keywords also makes a non-default sparse layer split or
+        # sparse_index_dim authoritative for the cache layout.
         # Peeked (not popped) so the base __init__ still receives them.
         sparse_attention_config = kwargs.get("sparse_attention_config")
         num_layers = kwargs.get("num_layers")
@@ -334,10 +383,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             shared_draft_layer_count(kwargs.get("spec_config"), kwargs.get("layer_mask")),
         )
         if sparse_layer_ids is None:
-            if num_target_layers is not None:
-                sparse_layer_ids = list(range(3, num_target_layers))
-            else:
-                sparse_layer_ids = []
+            sparse_layer_ids = default_sparse_layer_ids(
+                kwargs.get("pretrained_config"), num_target_layers
+            )
         if disable_index_value_layer_ids is None:
             disable_index_value_layer_ids = list(sparse_layer_ids)
 
@@ -361,6 +409,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self._kv_buffers: dict[tuple[int, str], torch.Tensor] = {}
         self._block_scale_buffers: dict[tuple[int, str], torch.Tensor] = {}
         super().__init__(*args, **kwargs)
+        self._unchanged_copies: Dict[int, DeviceCopyBuffer] = {}
+        self._pool_views: Dict[tuple, torch.Tensor] = {}
 
         if self.dtype == DataType.NVFP4:
             dense_target_layers = [
@@ -623,6 +673,16 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             self.kv_cache_pool_pointers, self.kv_cache_pool_mapping, self.num_pools, geometry
         )
         self._draft_op_pools = tuple(op_pools)
+        if self._page_table_materializer.uses_device_expansion:
+            self._draft_page_table_materializers = tuple(
+                _BasePageTableMaterializer(
+                    self.host_kv_cache_block_offsets[source_pool_id : source_pool_id + 1],
+                    self._stream,
+                    self._draft_index_scales[i : i + 1],
+                    self._draft_kv_offsets[i : i + 1],
+                )
+                for i, (_, source_pool_id) in enumerate(op_pools)
+            )
         self.num_attention_op_pools = self.num_pools + len(op_pools)
         logger.info(
             f"[unified-kv] native attention layers {native_layers} share the target KV cache manager; "
@@ -645,15 +705,48 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     ) -> None:
         if self.num_attention_op_pools == 0:
             return
+        guard = None
+        key = (
+            dst_tensor.dtype,
+            dst_tensor.storage_offset(),
+            tuple(dst_tensor.shape),
+            tuple(dst_tensor.stride()),
+            tuple(request_ids),
+            beam_width,
+            num_seqs,
+            max_blocks,
+        )
+        if self.skip_unchanged_block_offsets:
+            address = dst_tensor.untyped_storage().data_ptr()
+            guard = self._unchanged_copies.setdefault(address, DeviceCopyBuffer(dst_tensor))
+            if num_contexts != 0 or (
+                dst_tensor.is_cuda and torch.cuda.is_current_stream_capturing()
+            ):
+                guard.invalidate()
+                guard = None
+            elif guard.matches(self.host_kv_cache_block_offsets, key=key, exact=True):
+                return
+            else:
+                guard.invalidate()
+        # The base materializer owns only the storage-pool output rows; virtual
+        # draft pools are filled below with their own conversion metadata.
+        base_dst = dst_tensor[: self.num_pools] if self._draft_op_pools else dst_tensor
         super().copy_batch_block_offsets(
-            dst_tensor, request_ids, beam_width, num_contexts, num_seqs, max_blocks=max_blocks
+            base_dst, request_ids, beam_width, num_contexts, num_seqs, max_blocks=max_blocks
         )
         if not self._draft_op_pools:
+            if guard is not None:
+                guard.record(self.host_kv_cache_block_offsets, key=key)
             return
         # Fill each virtual pool from its source pool's slot ids with the draft
         # layer's scale.
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         for i, (op_pool_id, source_pool_id) in enumerate(self._draft_op_pools):
+            if self._draft_page_table_materializers:
+                self._draft_page_table_materializers[i].copy_block_offsets_to(
+                    dst_tensor[op_pool_id : op_pool_id + 1], copy_idx
+                )
+                continue
             copy_batch_block_offsets_to_device(
                 self.host_kv_cache_block_offsets[source_pool_id : source_pool_id + 1],
                 dst_tensor[op_pool_id : op_pool_id + 1],
@@ -662,6 +755,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 self._draft_kv_offsets[i : i + 1],
                 self._stream.cuda_stream,
             )
+
+        if guard is not None:
+            guard.record(self.host_kv_cache_block_offsets, key=key)
 
     def update_resources(self, scheduled_batch, attn_metadata=None, kv_cache_dtype_byte_size=None):
         # Only tree acceptance relocates draft KV, which M3's pool layout cannot do.
@@ -846,12 +942,71 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_slot_geometry(
             layer_idx, self._main_kv_layout_name()
         )
-        full_slot_shape = [num_slots, scale, *page_shape]
-        full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
-        kv = full_view[:, :2]
         # Sparse reference kernels use token-major indexing; preserve the
         # native head-major backing and expose a zero-copy strided view.
-        return kv if kv_layout == self._main_kv_layout_name() else kv.transpose(2, 3)
+        return self._pool_view(
+            "kv",
+            addr_key,
+            torch_dtype,
+            num_slots,
+            scale,
+            page_shape,
+            transpose=kv_layout != self._main_kv_layout_name(),
+        )
+
+    def configure_decode_shortcuts(
+        self, skip_unchanged_block_offsets: bool, reuse_pool_views: bool
+    ) -> None:
+        """Turn on the decode-step shortcuts a model opted into.
+
+        ``skip_unchanged_block_offsets``: skip a decode-only block-table copy
+        whose inputs equal the previous copy's into the same destination.
+        ``reuse_pool_views``: hand out one pool view per geometry instead of
+        re-wrapping the pool memory on every attention call.
+        """
+        self.skip_unchanged_block_offsets = skip_unchanged_block_offsets
+        self.reuse_pool_views = reuse_pool_views
+
+    def _pool_view(
+        self,
+        kind: str,
+        addr_key: int,
+        torch_dtype: torch.dtype,
+        num_slots: int,
+        scale: int,
+        page_shape: List[int],
+        transpose: bool = False,
+    ) -> torch.Tensor:
+        """The ``[num_slots, 2, ...]`` K+V view of a pool rooted at ``addr_key``; ``transpose`` swaps the
+        page's head and token axes (the token-major view of head-major storage).
+
+        The view is a pure function of the pool geometry, which is static once the
+        pool is laid out, so with ``reuse_pool_views`` it is built once per geometry
+        (a re-laid-out pool has another key). Inference-mode views are inference
+        tensors, so each mode keeps its own.
+        """
+        key = (
+            kind,
+            addr_key,
+            torch_dtype,
+            num_slots,
+            scale,
+            tuple(page_shape),
+            transpose,
+            torch.is_inference_mode_enabled(),
+        )
+        view = self._pool_views.get(key) if self.reuse_pool_views else None
+        if view is None:
+            full_slot_shape = [num_slots, scale, *page_shape]
+            full_view = convert_to_torch_tensor(
+                TensorWrapper(addr_key, torch_dtype, full_slot_shape)
+            )
+            view = full_view[:, :2]
+            if transpose:
+                view = view.transpose(2, 3)
+            if self.reuse_pool_views:
+                self._pool_views[key] = view
+        return view
 
     def _kv_scale_slot_geometry(
         self, layer_idx: int, kv_layout: Optional[str]
@@ -922,9 +1077,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_scale_slot_geometry(
             layer_idx, kv_layout
         )
-        full_slot_shape = [num_slots, scale, *page_shape]
-        full_view = convert_to_torch_tensor(TensorWrapper(addr_key, torch_dtype, full_slot_shape))
-        return full_view[:, :2]
+        return self._pool_view("scale", addr_key, torch_dtype, num_slots, scale, page_shape)
 
     def get_kv_subpage_pool(
         self, layer_idx: int, kv_layout: str = "HND"
@@ -1086,6 +1239,7 @@ class MiniMaxM3DraftKVCacheView:
         if manager.tokens_per_block in self.trtllm_gen_extra_tokens_per_block:
             _require_trtllm_gen_extra_page_route(manager.tokens_per_block)
         self._manager = manager
+        self._unchanged_copies: Dict[int, DeviceCopyBuffer] = {}
         layer_id = draft_layer_ids[0]
         local = int(manager.layer_offsets[layer_id])
         self._local_layer_idx = local
@@ -1110,6 +1264,12 @@ class MiniMaxM3DraftKVCacheView:
         self.host_kv_cache_block_offsets = manager.host_kv_cache_block_offsets[
             source_pool : source_pool + 1
         ]
+        self._page_table_materializer = _BasePageTableMaterializer(
+            self.host_kv_cache_block_offsets,
+            manager._stream,
+            self.index_scales,
+            self.kv_offset,
+        )
 
     def _check_layer(self, local_layer_idx: int) -> None:
         if local_layer_idx != self._local_layer_idx:
@@ -1150,16 +1310,44 @@ class MiniMaxM3DraftKVCacheView:
         """
         assert beam_width == 1, "beam_width must be 1 for KVCacheManagerV2"
         manager = self._manager
+        guard = None
+        key = (
+            dst_tensor.dtype,
+            dst_tensor.storage_offset(),
+            tuple(dst_tensor.shape),
+            tuple(dst_tensor.stride()),
+            tuple(request_ids),
+            beam_width,
+            num_seqs,
+            max_blocks,
+        )
+        if manager.skip_unchanged_block_offsets:
+            address = dst_tensor.untyped_storage().data_ptr()
+            guard = self._unchanged_copies.setdefault(address, DeviceCopyBuffer(dst_tensor))
+            if num_contexts != 0 or (
+                dst_tensor.is_cuda and torch.cuda.is_current_stream_capturing()
+            ):
+                guard.invalidate()
+                guard = None
+            elif guard.matches(self.host_kv_cache_block_offsets, key=key, exact=True):
+                return
+            else:
+                guard.invalidate()
         copy_idx = manager.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         assert copy_idx.shape[0] == num_seqs
-        copy_batch_block_offsets_to_device(
-            self.host_kv_cache_block_offsets,
-            dst_tensor,
-            copy_idx,
-            self.index_scales,
-            self.kv_offset,
-            manager._stream.cuda_stream,
-        )
+        if self._page_table_materializer.uses_device_expansion:
+            self._page_table_materializer.copy_block_offsets_to(dst_tensor, copy_idx)
+        else:
+            copy_batch_block_offsets_to_device(
+                self.host_kv_cache_block_offsets,
+                dst_tensor,
+                copy_idx,
+                self.index_scales,
+                self.kv_offset,
+                manager._stream.cuda_stream,
+            )
+        if guard is not None:
+            guard.record(self.host_kv_cache_block_offsets, key=key)
 
 
 def get_minimax_m3_kv_cache_manager_cls():
@@ -1171,6 +1359,7 @@ __all__ = [
     "MiniMaxM3DraftKVCacheView",
     "MiniMaxM3KVCacheManagerV2",
     "MiniMaxM3SparseIndexCache",
+    "default_sparse_layer_ids",
     "derive_shared_draft_layout",
     "extend_attention_op_pools_for_shared_draft_layers",
     "get_minimax_m3_kv_cache_manager_cls",

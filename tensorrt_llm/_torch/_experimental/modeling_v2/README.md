@@ -6,10 +6,11 @@ built-in model zoo rather than inside it.
 Where `_torch/models/modeling_deepseekv3.py` is one class serving V3, V3-Lite,
 R1 and V3.2 across every GPU generation and parallel topology,
 `_torch/_experimental/modeling_v2/models/deepseek_v3/` is one flat forward per (checkpoint,
-GPU architecture, parallel topology) triple — assembled only from `catalog/`
-entries, sharing nothing with its siblings, and trusted through accuracy gates
-instead of shared abstractions. The one-to-one correspondence between
-`models/<x>/` here and `modeling_<x>.py` there is the point of the exercise.
+GPU architecture, parallel topology) triple — assembled from certified `OpWrapper`
+entries and trusted through accuracy gates. Model-family ops and kernels may be
+shared by that family's targets; target-only code remains inside its target.
+The one-to-one correspondence between `models/<x>/` here and `modeling_<x>.py`
+there is the point of the exercise.
 
 ## Using it
 
@@ -82,10 +83,6 @@ LLM(model=..., modeling_v2=...)  ->  ModelLoader
                                      returns that class; the registry is not consulted
 ```
 
-`route` imports the target class on the branch that returns it, so a routing
-module that declines never loads modeling code, and the class a reader sees
-returned is the class that runs -- no name to look up elsewhere.
-
 ## What may decide a target
 
 A quantity may be a routing criterion only if it is known when
@@ -111,13 +108,25 @@ checkpoint of the same shape is ungated.
 
 ```
 _router_index.py    architectures[0] -> routing module. Small, stable, test-guarded.
+_native.py          loads a target's native code (see "Native code" below)
 models/<family>/
   routing.py        one forward-reading decision tree per architecture family
+  ops/<category>/   entries shared only by this family
+  kernels/          family-owned CuTe DSL packages
+  fake_ops.py       fakes of the family's shared native ops, if it has any
+  csrc/             the family's CMakeLists.txt and the native code its targets share
   <checkpoint>__<gpu arch>__<parallel>/
                       modeling.py  weights.py
                       ops/<category>/   entries only this target calls
+                      kernels/<category>/  kernel sources its entries launch (optional)
+                      fake_ops.py       fakes of the target's native ops, if it has any
+                      csrc/             the target's own kernels and torch bindings
 catalog/<category>/ entries more than one target calls
 ```
+
+`kernels/` holds the kernel sources a target's entries launch and nothing else
+does. It has one subdirectory per `ops/` category, plus `common/` for helpers
+that more than one category imports.
 
 An entry, shared or owned, is one `OpWrapper` subclass: `__call__` is the op
 call a target makes, `reference` is what it is supposed to compute in plain
@@ -125,6 +134,19 @@ torch, `is_valid` names the inputs it accepts and answers wrongly, and `CELLS`
 / `ARCHS` are the configurations and architectures it is proven at. The
 wrapper is stateless and `__call__` reads nothing off `self`, so a call site
 shows exactly what the kernel receives; `catalog/_op.py` states the rest.
+
+Kimi K3's `csrc/` is compiled into the existing native libraries through CMake
+OBJECT targets and `target_sources`; it has no runtime extension loader. Its
+one-shot MNNVL specialization and fused attention-residual decode kernels are
+family-owned. The generic attention-residual, persistent fallback and two-shot
+MNNVL kernels remain stock, as do the shared native schemas and workspace
+ownership. Rebuild the native libraries when these model-owned sources change.
+
+K3's all-reduce adapter keeps its one-shot ceiling and entry-release setting on
+the selected model's modules. Stock PDL releases after rank reduction; K3 can
+release immediately after its entry dependency wait. Neither release implies
+output readiness: a dependent must wait before reading producer outputs or
+reusing its workspace. Shared kernels and defaults are unchanged.
 
 Accuracy anchors are not kept here. They live where every other model's do,
 `tests/integration/defs/accuracy/references/`, read by the gates CI runs.
@@ -137,11 +159,14 @@ tests/unittest/_torch/modeling_v2/
   test_modeling_v2_routing.py    what modeling_v2_resolve does (no GPU)
   _validating.py                 the fixtures that interpose is_valid and arm reference
   <category>/test_modeling_v2_<entry>.py                      shared entries
+  models/<family>/test_<entry>.py                            family-owned entries
   models/<family>/<target>/<category>/test_modeling_v2_<entry>.py   owned entries
   comm/_<entry>_op_matrix.py   the collectives' rank bodies: allgather, reducescatter
                                and allreduce at 2/4/8 ranks in one node, mnnvl_allreduce
                                at 8 ranks over two trays (srun only, see its docstring)
-  comm/_rank_job.py            starts one of those and asserts on its exit code
+  comm/_lockstep.py            the stateful matrices' launcher and shared reference
+  comm/_rank_job.py            starts one at a world size and asserts on its exit code
+  models/<family>/<target>/comm/_<entry>_op_matrix.py   an owned collective's rank bodies
 ```
 
 That split is not a preference; it is where this repo's CI collects from, and
@@ -150,19 +175,136 @@ an in-package test is on no list. Each test is parametrized off its entry's
 and derives, so the certification is re-proved on every commit rather than
 recorded once.
 
+Kimi K3's shared TP4×EP4 / TP16×EP1 wrappers and CuTe packages live once under
+`models/kimi_k3_vl/{ops,kernels}/`. The TP16×EP1 M1/M2 MoE engines live under
+that target's `kernels/k3_moe_engines/`; target-only wrappers live under their
+target's `ops/`. K3 tests and K3-specific helpers live directly in the flat
+`tests/unittest/_torch/modeling_v2/models/kimi_k3_vl/` directory. Test-list entries
+assign them to CPU, single-GPU, or multi-GPU stages; CBTS uses the standard
+family-path selection.
+Claims discovery covers both family-owned and target-owned entries, and import
+isolation rejects sibling-target and unrelated-family dependencies.
+
+The Markov chain declares its Lamport buffers, rotation flags and optional
+KV-length rewind as mutable custom-op inputs. Its no-rewind call uses a
+separate cached length buffer, allocated before CUDA-graph capture.
+
+Model-owned native fake implementations register with the standard native-op
+initialization, without importing a target. KDA verify consumes the cache
+manager's bf16 convolution pools and independent per-slot strides directly;
+standalone fp32 convolution pools remain supported. Pool views are never
+copied or cast on the call path.
+
+KDA prefill takes raw packed BF16 Q/K/V, gate and beta logits with mandatory
+int64 sequence offsets, FP32 gate parameters and indexed BF16/FP32 state rows.
+Normalization and gate/beta activation run inside the shared prefill op; the
+model-owned wrapper uses its current 16-argument contract, including optional
+sequence-order and chunk-prefix metadata.
+
+KDA verify's sequential FP32 FMA recurrence and main's chunked 3xTF32
+tensor-core recurrence agree numerically, not bit-for-bit. With the same
+external gate, 48 SM100 rounds across dense and strided pools measured maximum
+state divergence of 6.31e-6 relative to the largest reference-state entry.
+The cross-implementation gate is 1e-5; the existing 2e-2 output and 1e-3
+FP64-reference state bands remain unchanged. Repeated same-implementation
+states and outputs, convolution caches and graph replay remain bit-exact.
+
+MLA launch admission queries the launch stream's owning context resources,
+including converted green contexts, without querying stream execution during
+graph capture. Invalid resources still reject the launch. Wide MoE states use
+the canonical decode build for up to eight tokens, sharing their preallocated
+scratch through prefix views; larger steps retain the wide build.
+
+
 The collectives' rank bodies sit in the tests tree with everything else
 that only tests run. Both halves are started by file path -- the launcher must
 not import `tensorrt_llm`, because that calls `MPI_Init` and an
 MPI-initialized process cannot start `mpirun`, and the ranks reach the catalog
 by absolute import -- so neither needs a package to live in. Neither those
 file names nor their `check_*` bodies match pytest's collection patterns:
-each is one fixed 4-rank sequence that cannot run as independent cases.
+each is one fixed sequence over one job's ranks that cannot run as
+independent cases. CI runs them at 4 ranks on one node. A stateful entry's
+launcher also takes `--world-size N --launcher srun`, which runs the same
+body as one of N ranks started across nodes: that is how its multi-node
+receipt is recorded.
+
+Stateful matrices compare ordered per-tensor SHA-256 fingerprints of raw
+bytes together with shape and dtype across ranks. The large KDA-pool tests
+check free CUDA memory before allocating their full pools, including 1 GiB
+of headroom for weights, small reference pools and compilation.
+
+Routing and claims tests run on the CPU list; GPU lists exclude their
+`cpu_only` marker. KDA post-convolution cells exercise both channel-major and
+transposed token-major inputs accepted by the shared kernel.
 
 Identity is the directory name, and it carries all three segments:
 `gpt_oss_120b__sm_10x__default`. They were three nested directories once, which
 read as a hierarchy that was never one -- every level had exactly one child,
 and each needed an `__init__.py` whose only job was to exist. The class name
 carries the same triple; `test_modeling_v2_claims.py` asserts they agree.
+
+### Native code
+
+Kimi K3 retains its stock-linked `kimi_k3_model_src` objects, `libth_common` torch bindings,
+and existing operator names and fake registrations. Its `csrc/` directory is excluded from
+per-family library discovery. The per-family mechanism below applies to the other native
+families.
+
+A target's C++/CUDA lives with its Python code: `<target>/csrc/`, and the family's
+`csrc/` for code several targets share. Each family builds into one torch-op library,
+`libth_modeling_v2_<family>.so`, installed next to `libth_common.so`; nothing of it is
+linked into the stock libraries, and it loads only when routing picks one of the
+family's targets. Adding a model with kernels edits nothing under `cpp/`.
+`models/gpt_oss/` is the example: one kernel, used by its weight loader.
+
+Adding native code to target `foo_nvfp4__sm_103__tp4` of family `foo`:
+
+1. **Declare it** in `models/foo/csrc/CMakeLists.txt`:
+
+   ```cmake
+   add_modeling_v2_family(foo)
+   add_modeling_v2_target(foo foo_nvfp4__sm_103__tp4 ARCHS 103a SOURCES *.cu *.cpp)
+   ```
+
+2. **Write the kernels and their torch bindings** in `foo_nvfp4__sm_103__tp4/csrc/`, in
+   the target's namespaces:
+
+   ```cpp
+   TRTLLM_MV2_NAMESPACE_BEGIN   // tensorrt_llm::modeling_v2::foo::foo_nvfp4_sm_103_tp4
+   ...
+   TRTLLM_MV2_NAMESPACE_END
+   TRTLLM_MV2_LIBRARY_FRAGMENT(m) { m.def("my_op(Tensor x) -> Tensor"); }
+   TRTLLM_MV2_LIBRARY_IMPL(CUDA, m) { m.impl("my_op", &TRTLLM_MV2_NS::myOp); }
+   ```
+
+   Include the family's own headers from `models/` (`"foo/foo_nvfp4__sm_103__tp4/csrc/x.h"`);
+   any stock header is fine, another target's or family's code is not.
+
+3. **Load it** from the target's `__init__.py`, `native_ops = load_target_ops(__name__)`
+   (from `_native`); the target's modules use `from . import native_ops`.
+
+4. **Fake every op** in the target's `fake_ops.py`, which the loader imports right after
+   the library opens: `@torch.library.register_fake(f"{namespace_of(__name__)}::my_op")`.
+
+5. **Test it** under `tests/unittest/_torch/modeling_v2/models/foo/`. The modeling_v2 entry
+   of `l0_b300.yml` collects it, so a target that runs on GB300 changes no test list; a
+   test for another GPU, or for several GPUs, is listed in that GPU's test list.
+
+Code several targets call goes once in the family's `csrc/`, declared with
+`add_modeling_v2_shared(foo ARCHS ... SOURCES ...)`; its ops are in `torch.ops.mv2_foo`,
+reached with `load_family_ops(__name__)` and faked in `models/foo/fake_ops.py`. A target
+with no code of its own declares no `SOURCES`.
+
+- **`ARCHS`** (`NN`, `NNa`, `NNf`) is intersected with the build's architectures; a target
+  with none is not built, and is a `NoTarget` at run time. `REQUIRES` (`MULTI_DEVICE`,
+  `NVSHMEM`) and `DEPS` (a closed list) are the other keywords; a per-file compile option
+  goes on the file with `set_source_files_properties`.
+- **Loading**: a library this installation does not carry, or a target it did not build,
+  is a `NoTarget` (`auto` keeps the built-in model); one that is installed but fails to
+  load, or lacks an op a `fake_ops.py` declares, is a `NativeLoadError`.
+- **Building only your family**: `build_wheel.py -D "TRTLLM_MODELING_V2_TARGETS=foo/*"`, and
+  after an edit `cmake --build cpp/build --target th_modeling_v2_foo`.
+- `test_modeling_v2_native_claims.py` checks these rules on CPU; run it before sending the PR.
 
 ### Default and specialized targets
 
@@ -284,7 +426,14 @@ Perf is measured, never gated.
 
 **Every entry the gpt-oss and deepseek default targets call is certified on
 sm_100 and sm_103, and both targets are gated on both.** The qwen4_exp target
-and the entries it owns are certified on sm_103.
+and glm-5.2's sm_103 tep4 target, and the entries they own, are certified on
+sm_103. Kimi K3's sm_100 operation
+receipts remain in its adjacent records; its generic-operation regressions
+exercise the relocated entries.
+
+The K3 targets use the engine-selected `KimiK3HybridCacheManager`; its
+model-owned replay state supplies the pending accepted-draft counts consumed
+by fused acceptance and KDA verification.
 
 The default targets' 21 entries -- 20 shared, 1 (`fused_moe`) owned by deepseek's default target -- each drive
 their cells through `__call__` and `reference`. Where that runs depends on the
@@ -295,6 +444,14 @@ entry:
   its 2- and 4-rank matrices, in the post-merge 4-GPU job;
 * `mnnvl_allreduce` needs 8 ranks over two trays. Its matrix runs only by
   hand under srun (see its docstring), and no CI job re-runs it.
+
+The glm-5.2 tep4 target's 39 owned entries run in the same pre-merge job as
+the 17, and its all-reduce's 4-rank matrix in the pre-merge 4-GPU job.
+
+Matrix subprocesses use the launcher's interpreter and inherited Python search
+path to import the installed TensorRT-LLM package. Install a matching wheel or
+complete editable build before running them; an unbuilt checkout must not be
+prepended to `PYTHONPATH` in place of the installed package.
 
 Certification is per architecture: `ARCHS` says
 where the cells were driven, and a missing architecture reads as unknown,
@@ -316,8 +473,8 @@ widening a tolerance, and each is written up in its own entry:
 * **The MLA append op now accepts NVFP4 latent pools** as well as fp8 (accepted
   by the op, not certified here).
 
-Both targets are gated by the accuracy suite's modeling_v2 files,
-`tests/integration/defs/accuracy/modeling_v2/test_{gpt_oss,deepseek_v3}.py`,
+The targets are gated by the accuracy suite's modeling_v2 files,
+`tests/integration/defs/accuracy/modeling_v2/test_<family>.py`,
 with `modeling_v2="require"` in force, which is what rules out the built-in
 implementation having been measured instead. The two `default` targets ran
 gsm8k at every layout before their routing admitted it, gpt-oss's tp1
@@ -328,7 +485,10 @@ at each of the six layouts MTP is admitted at. CI runs a representative
 subset -- one layout per residual-norm path and per expert split, gpt-oss
 tp1, the deepseek `mtp3` pair and acceptance gate at dep4, and deepseek
 chunked prefill at tp4+ep4 and dep4 -- and the default shards tests pin
-every layout's weight cut, the MTP layer's included, on the CPU. The numbers
+every layout's weight cut, the MTP layer's included, on the CPU.
+glm-5.2-nvfp4 / sm_103 / tep4 runs gsm8k for the identity forward and the
+`mtp1` variant paired in one session, and checks the `mtp1` acceptance length
+against an anchor measured on stock modeling, all in one test. The numbers
 live with those runs, not here: a number written into this file is one that
 drifts with nothing to notice.
 

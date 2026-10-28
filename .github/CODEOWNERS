@@ -1,5 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # ============================================================================
-# PRECEDENCE: last matching pattern wins — fallback first, module rules next, governance last.
+# PRECEDENCE: last matching pattern wins — fallback first, module rules next, governance last, then scoped exceptions.
 #
 #   Domain (in file order)   Handle
 #   Engineering baseline/ fallback / untriaged     @NVIDIA/trt-llm-devs   (global `*`, declared FIRST; incl. deprecating TRT backend)
@@ -138,7 +140,6 @@
 # Matches nothing today -- PR #17968 moved these tests out -- but kept so a recreated custom_ops/ lands here instead of on the global fallback.
 /tests/unittest/_torch/custom_ops @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/distributed @NVIDIA/trt-llm-runtime-devs
-/tests/unittest/_torch/executor @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/peft @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/misc/test_autotuner.py @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/modules @NVIDIA/trt-llm-runtime-devs
@@ -228,8 +229,8 @@
 /tensorrt_llm/_torch/pyexecutor/kv_cache @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/runtime/kv_cache_manager_v2 @NVIDIA/trt-llm-kv-cache-manager-devs
-/tests/unittest/_torch/executor/kv_cache @NVIDIA/trt-llm-kv-cache-manager-devs
-/tests/unittest/_torch/executor/test_kvcache_aware_router.py @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/pyexecutor/kv_cache @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/pyexecutor/test_kvcache_aware_router.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tests/unittest/kv_cache_manager_v2_tests @NVIDIA/trt-llm-kv-cache-manager-devs
 
 # ===== DISAGGREGATED SERVING =====
@@ -382,24 +383,6 @@
 /tensorrt_llm/scaffolding @WeiHaocheng @dc3671
 /tests/unittest/scaffolding @WeiHaocheng @dc3671
 
-# ===== MODELING_V2 =====
-# Overrides the /tensorrt_llm/_torch runtime-devs rule above for this subtree.
-# Individual handles rather than a team, like SCAFFOLDING: this is one bounded
-# experiment with named owners, not a standing domain.
-/tensorrt_llm/_torch/_experimental/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
-/tests/unittest/_torch/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
-/tests/integration/defs/accuracy/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
-# The two catalog categories whose contracts state kernel behaviour the
-# attention and MoE owners are the authority on; co-owned rather than reassigned.
-/tensorrt_llm/_torch/_experimental/modeling_v2/catalog/attention @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @xxi-nv @yuxianq
-/tensorrt_llm/_torch/_experimental/modeling_v2/catalog/moe @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @xxi-nv @yuxianq
-# The GlmMoeDsa (GLM-5) model and its GLM-only kernels and ops: the GLM owners
-# co-own them with each parent path's owners.
-/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @dongfengy @Tabrizian @xwang233
-/tests/unittest/_torch/modeling_v2/models/glm_moe_dsa @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @dongfengy @Tabrizian @xwang233
-/cpp/tensorrt_llm/kernels/glmMoeDsa @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
-/cpp/tensorrt_llm/thop/glmMoeDsa/ @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
-
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
 /examples/disaggregated/slurm/benchmark @NVIDIA/trt-llm-disagg-devs @NVIDIA/trtllm-bench-reviewers
@@ -489,6 +472,60 @@
 /tensorrt_llm/usage/ @NVIDIA/trt-llm-usage-telemetry-devs
 /tests/unittest/usage/ @NVIDIA/trt-llm-usage-telemetry-devs
 /tensorrt_llm/usage/llm_args_golden_manifest.json @NVIDIA/trt-llm-usage-telemetry-devs
+
+# ===== MODELING_V2 =====
+# Scoped ownership follows broad runtime, test, and CMake rules.
+
+# General / shared infrastructure
+/tensorrt_llm/_torch/_experimental/modeling_v2 @NVIDIA/trt-llm-modeling_v2-dev
+/cpp/tensorrt_llm/modeling_v2 @NVIDIA/trt-llm-modeling_v2-dev
+/cpp/cmake/modules/modeling_v2.cmake @NVIDIA/trt-llm-modeling_v2-dev
+/tests/unittest/_torch/modeling_v2 @NVIDIA/trt-llm-modeling_v2-dev
+/tests/integration/defs/accuracy/modeling_v2 @NVIDIA/trt-llm-modeling_v2-dev
+/jenkins/scripts/cbts/cbts/rules/modeling_v2.py @NVIDIA/trt-llm-modeling_v2-dev
+/tests/unittest/scripts/cbts/test_modeling_v2.py @NVIDIA/trt-llm-modeling_v2-dev
+/tests/unittest/scripts/cbts/test_modeling_v2_rule.py @NVIDIA/trt-llm-modeling_v2-dev
+/tests/unittest/scripts/test_build_wheel_modeling_v2.py @NVIDIA/trt-llm-modeling_v2-dev
+
+# Shared attention and MoE catalogs and tests are co-owned with their domain teams.
+/tensorrt_llm/_torch/_experimental/modeling_v2/catalog/attention @NVIDIA/trt-llm-modeling_v2-dev @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/_experimental/modeling_v2/catalog/moe @NVIDIA/trt-llm-modeling_v2-dev @NVIDIA/trt-llm-moe-devs
+/tests/unittest/_torch/modeling_v2/attention @NVIDIA/trt-llm-modeling_v2-dev @NVIDIA/trt-llm-torch-attention-devs
+/tests/unittest/_torch/modeling_v2/moe @NVIDIA/trt-llm-modeling_v2-dev @NVIDIA/trt-llm-moe-devs
+
+# Model families / targets
+# DeepSeek and GPT-OSS examples retain the Modeling V2 team ownership above.
+# Other model implementations and their tests belong to their submitting authors.
+
+# Qwen4
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/qwen4_exp @Wanli-Jiang
+/tests/unittest/_torch/modeling_v2/models/qwen4_exp @Wanli-Jiang
+/tests/integration/defs/accuracy/modeling_v2/test_qwen4_exp.py @Wanli-Jiang
+
+# Kimi K3
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl @vsabavat
+/tests/unittest/_torch/modeling_v2/models/kimi_k3_vl @vsabavat
+/tests/integration/defs/accuracy/modeling_v2/test_kimi_k3_vl.py @vsabavat
+
+# MiniMax M3
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3 @peihu-nv
+/tests/unittest/_torch/modeling_v2/models/minimax_m3 @peihu-nv
+/tests/integration/defs/accuracy/modeling_v2/test_minimax_m3.py @peihu-nv
+
+# GLM family routing and accuracy tests are shared by its target owners.
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa @dongfengy @Tabrizian @xwang233 @erictsai-nv
+/tests/unittest/_torch/modeling_v2/models/glm_moe_dsa @dongfengy @Tabrizian @xwang233 @erictsai-nv
+/tests/integration/defs/accuracy/modeling_v2/test_glm_moe_dsa.py @dongfengy @Tabrizian @xwang233 @erictsai-nv
+
+# GLM SM103 target: source, ops, kernels, native code, and tests.
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4 @erictsai-nv
+/tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4 @erictsai-nv
+
+# GLM SM107 target and its native kernels/bindings
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16 @dongfengy @Tabrizian @xwang233
+/tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16 @dongfengy @Tabrizian @xwang233
+/cpp/tensorrt_llm/kernels/glmMoeDsa @dongfengy @Tabrizian @xwang233
+/cpp/tensorrt_llm/thop/glmMoeDsa/ @dongfengy @Tabrizian @xwang233
 
 # Uncomment only on release branches (e.g. release/0.19):
 # * @NVIDIA/trt-llm-release-branch-approval

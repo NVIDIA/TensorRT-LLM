@@ -40,30 +40,13 @@ struct AttnLifeCycle
 {
     std::optional<int> windowSize; // nullopt = no sliding window
     int numSinkBlocks = 0;         // divUp(numSinkTokens, tokensPerBlock)
-    bool isSparse = false;
-    AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
-
-    bool isPrivate() const noexcept
-    {
-        return reusePolicy == AttentionReusePolicy::PRIVATE;
-    }
-
-    bool requiresPrefixCoverage() const noexcept
-    {
-        return reusePolicy == AttentionReusePolicy::REQUIRED;
-    }
-
-    bool allowsCheckpoint() const noexcept
-    {
-        return reusePolicy == AttentionReusePolicy::OPTIONAL;
-    }
+    ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
 
     HalfOpenRange<BlockOrdinal> getStaleRange(int historyLength, int tokensPerBlock) const
     {
         int numBlocks = divUp(historyLength, tokensPerBlock);
         BlockOrdinal start{std::min(numBlocks, numSinkBlocks)};
-        // Sparse selection may revisit any history block, including outside the sliding window.
-        if (isSparse || !windowSize.has_value())
+        if (!windowSize.has_value())
             return {start, start};
         // `+ 1` is intentional: attention always runs for >= 1 in-flight input
         // token at position `historyLength`, so the live window is
@@ -74,8 +57,7 @@ struct AttnLifeCycle
 
     bool operator==(AttnLifeCycle const& o) const noexcept
     {
-        return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks && isSparse == o.isSparse
-            && reusePolicy == o.reusePolicy;
+        return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks && reusePolicy == o.reusePolicy;
     }
 
     bool operator<(AttnLifeCycle const& o) const noexcept
@@ -88,45 +70,43 @@ struct AttnLifeCycle
         {
             return numSinkBlocks < o.numSinkBlocks;
         }
-        if (isSparse != o.isSparse)
-        {
-            return isSparse < o.isSparse;
-        }
         return reusePolicy < o.reusePolicy;
     }
 
     static AttnLifeCycle make(std::optional<int> ws, std::optional<int> numSinkTokens, int tokensPerBlock,
-        bool isSparse = false, AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED)
+        ReusePolicy reusePolicy = ReusePolicy::REQUIRED)
     {
         TLLM_CHECK_DEBUG(tokensPerBlock > 0);
         TLLM_CHECK_DEBUG(!ws.has_value() || *ws > 0);
         TLLM_CHECK_DEBUG(!numSinkTokens.has_value() || *numSinkTokens >= 0);
         TLLM_CHECK_DEBUG((!numSinkTokens.has_value() || *numSinkTokens == 0) || ws.has_value());
         int sinkBlocks = divUp(numSinkTokens.value_or(0), tokensPerBlock);
-        return AttnLifeCycle{ws, sinkBlocks, isSparse, reusePolicy};
+        return AttnLifeCycle{ws, sinkBlocks, reusePolicy};
     }
 };
 
 // ---------------------------------------------------------------------------
-// SsmLifeCycle — lifecycle for SSM (State Space Model) layers.
+// SsmLifeCycle — lifecycle for SSM (State Space Model) buffers.
 // All blocks before the last full block are stale (recurrent state).
-// Singleton: all SSM layers share the same lifecycle.
+// SSM buffers with the same effective reuse policy share a lifecycle.
 // ---------------------------------------------------------------------------
 struct SsmLifeCycle
 {
+    ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
+
     HalfOpenRange<BlockOrdinal> getStaleRange(int historyLength, int tokensPerBlock) const
     {
         return {BlockOrdinal{0}, BlockOrdinal{historyLength / tokensPerBlock}};
     }
 
-    bool operator==(SsmLifeCycle const&) const noexcept
+    bool operator==(SsmLifeCycle const& other) const noexcept
     {
-        return true;
+        return reusePolicy == other.reusePolicy;
     }
 
-    bool operator<(SsmLifeCycle const&) const noexcept
+    bool operator<(SsmLifeCycle const& other) const noexcept
     {
-        return false;
+        return reusePolicy < other.reusePolicy;
     }
 };
 
@@ -135,16 +115,24 @@ struct SsmLifeCycle
 // ---------------------------------------------------------------------------
 using LifeCycle = std::variant<AttnLifeCycle, SsmLifeCycle>;
 
+inline ReusePolicy reusePolicy(LifeCycle const& lc)
+{
+    return std::visit([](auto const& value) { return value.reusePolicy; }, lc);
+}
+
 inline bool isPrivateLifeCycle(LifeCycle const& lc)
 {
-    auto const* attn = std::get_if<AttnLifeCycle>(&lc);
-    return attn && attn->isPrivate();
+    return reusePolicy(lc) == ReusePolicy::PRIVATE;
 }
 
 inline bool requiresPrefixCoverage(LifeCycle const& lc)
 {
-    auto const* attn = std::get_if<AttnLifeCycle>(&lc);
-    return !attn || attn->requiresPrefixCoverage();
+    return reusePolicy(lc) == ReusePolicy::REQUIRED;
+}
+
+inline bool allowsCheckpoint(LifeCycle const& lc)
+{
+    return reusePolicy(lc) == ReusePolicy::OPTIONAL;
 }
 
 // Free function: compute stale range via std::visit.
@@ -173,13 +161,16 @@ inline HalfOpenRange<BlockOrdinal> computeScratchRange(
     return intersect(capStale, inputRange);
 }
 
-// Factory: create a LifeCycle from a LayerConfig variant.
-LifeCycle makeLifeCycle(LayerConfig const& layer, int tokensPerBlock);
+// Factory: create the LifeCycle that holds one buffer of a layer, using the buffer's effective reuse policy.
+LifeCycle makeLifeCycle(LayerConfig const& layer, BufferConfig const& buffer, int tokensPerBlock);
 
 // Integer id assigned to each unique LifeCycle.
 using LifeCycleId = StrongIndex<int, struct LifeCycleIdTag>;
 
-// Alias for public exposure (same meaning as LifeCycleId).
+// Public cache groups correspond one-to-one with lifecycles.
+using CacheGroupId = LifeCycleId;
+
+// Legacy public name for a lifecycle group.
 using LayerGroupId = LifeCycleId;
 
 // ---------------------------------------------------------------------------
@@ -199,7 +190,11 @@ public:
     LifeCycleId getId(LifeCycle const& lc) const;
 
     // Number of unique life cycles.
-    LifeCycleId size() const noexcept;
+    [[nodiscard]] LifeCycleId size() const noexcept
+    {
+        check();
+        return mLifeCycleList.size();
+    }
 
     // Iteration over LifeCycles in registration order.
     TypedVec<LifeCycleId, LifeCycle> const& getAll() const noexcept
@@ -213,14 +208,31 @@ public:
     }
 
     // SSM helpers.
-    std::optional<LifeCycleId> ssmLifeCycleId() const noexcept
+    std::vector<LifeCycleId> const& ssmLifeCycleIds() const noexcept
     {
-        return mSsmLifeCycleId;
+        return mSsmLifeCycleIds;
+    }
+
+    bool isSsm(LifeCycleId id) const
+    {
+        return std::holds_alternative<SsmLifeCycle>((*this)[id]);
+    }
+
+    std::optional<LifeCycleId> requiredSsmLifeCycleId() const
+    {
+        for (auto id : mSsmLifeCycleIds)
+        {
+            if (requiresPrefixCoverage((*this)[id]))
+            {
+                return id;
+            }
+        }
+        return std::nullopt;
     }
 
     bool hasSSM() const noexcept
     {
-        return mSsmLifeCycleId.has_value();
+        return !mSsmLifeCycleIds.empty();
     }
 
     // Return (id, AttnLifeCycle*) pairs for attention lifecycles only. Used by _setupForReuse.
@@ -283,11 +295,20 @@ public:
     }
 
 private:
-    void check() const;
+    //! Gated on the package's cached gDebug: TLLM_CHECK_DEBUG_WITH_INFO's own gate is an
+    //! out-of-line call into another TU, which would undo size() being inline.
+    void check() const
+    {
+        if (TLLM_UNLIKELY(gDebug))
+        {
+            TLLM_CHECK_WITH_INFO(
+                toSizeT(mLifeCycleList.size()) == mLifeCycleIdMap.size(), "corrupted life cycle registry");
+        }
+    }
 
     TypedVec<LifeCycleId, LifeCycle> mLifeCycleList;
     std::map<LifeCycle, LifeCycleId> mLifeCycleIdMap;
-    std::optional<LifeCycleId> mSsmLifeCycleId;
+    std::vector<LifeCycleId> mSsmLifeCycleIds;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -83,22 +83,24 @@ import math
 import os
 import re
 from functools import lru_cache
-from typing import Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm.functional import RopeEmbeddingUtils
+from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
+from ..attention.attention import Attention
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from ..distributed import AllReduceParams
+from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -106,8 +108,10 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
-from ..pyexecutor.config_utils import is_mla
+from ..pyexecutor.config_utils import MINIMAX_DSPARK_DRAFT_ARCH, is_mla
 from ..speculative.interface import SpeculativeDecodingMode
+from ..speculative.spec_tail_kernels import DraftBlockPlacement
+from ..speculative.vocab_parallel import markov_chain_logits
 from ..utils import AuxStreamType
 from .modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
@@ -118,14 +122,18 @@ from .modeling_deepseekv4 import (
     _rename_deepseek_v4_attn_subkey,
     _rename_deepseek_v4_ffn_subkey,
 )
-from .modeling_dflash import DFlashForCausalLM, resolve_dspark_head_config
+from .modeling_dflash import TRTLLM_GEN_LSE_LN2, DFlashForCausalLM, resolve_dspark_head_config
 from .modeling_speculative import (
     DSparkConfidenceHead,
     SpecDecOneEngineForCausalLM,
     build_markov_head,
-    dspark_markov_chain_logits,
 )
-from .modeling_utils import DecoderModel, register_auto_model, register_draft_model
+from .modeling_utils import (
+    DecoderModel,
+    DecoderModelForCausalLM,
+    register_auto_model,
+    register_draft_model,
+)
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from ..custom_ops.dspark_attention_custom_op import (
@@ -2458,8 +2466,6 @@ _DSPARK_HEAD_WEIGHT_ALIASES = {
     "confidence_proj.bias": ("confidence_head.proj.bias", "confidence_proj.bias"),
 }
 
-
-_LN2 = math.log(2.0)
 # flashinfer sizes its own scratch from this; the MLA decode path is the only
 # consumer here and 256 MiB is what the DFlash TRTLLM buffers already reserve.
 _MLA_DECODE_WORKSPACE_BYTES = 256 * 1024 * 1024
@@ -2524,18 +2530,36 @@ def cute_dsl_mla_decode_unavailability_reason() -> Optional[str]:
     return None
 
 
+def _all_reduce_add_norm(
+    all_reduce: AllReduce, partial: torch.Tensor, residual: torch.Tensor, norm: RMSNorm
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``norm(all_reduce(partial) + residual)`` and the new residual, fused."""
+    return all_reduce(
+        partial,
+        all_reduce_params=AllReduceParams(
+            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            residual=residual,
+            norm_weight=norm.weight,
+            eps=norm.variance_epsilon,
+        ),
+    )
+
+
+def _block_upper_triangle(block_size: int, device) -> torch.Tensor:
+    """``[1, block, 1, block]``: query i sees block key j > i (the fixup's part)."""
+    idx = torch.arange(block_size, device=device)
+    return (idx.view(1, block_size) > idx.view(block_size, 1)).view(1, block_size, 1, block_size)
+
+
 def _build_mla_block_fixup(ctx_len, page_tables, block_size, page_size) -> _MLABlockFixup:
     """Where the block's latents go, and the upper-triangle mask, for all layers."""
     device = ctx_len.device
     pos = ctx_len.view(-1, 1) + torch.arange(block_size, device=device)
-    idx = torch.arange(block_size, device=device)
     seq_lens = (ctx_len + block_size).to(torch.int32)
     return _MLABlockFixup(
         pages=page_tables.gather(1, pos // page_size),
         offsets=pos % page_size,
-        valid=(idx.view(1, block_size) > idx.view(block_size, 1)).view(
-            1, block_size, 1, block_size
-        ),
+        valid=_block_upper_triangle(block_size, device),
         page_tables_i32=page_tables.to(torch.int32),
         seq_lens_i32=seq_lens,
         # repeat_interleave, not repeat: the kernel indexes kv_bounds at
@@ -2652,23 +2676,20 @@ class _DSparkHeadMixin:
         self,
         base_logits: torch.Tensor,
         first_prev_tokens: torch.Tensor,
-        argmax_fn=None,
-        vocab_slice: Optional[slice] = None,
+        tp_exchange=None,
     ) -> torch.Tensor:
-        """Apply the vanilla-Markov intra-block bias to block logits.
+        """Apply the vanilla-Markov intra-block bias to float32 block logits.
 
         No-op (returns ``base_logits`` unchanged) when the checkpoint ships no
-        Markov head. See :func:`dspark_markov_chain` for the semantics; when
-        ``base_logits`` is a TP vocab shard the caller must pass this rank's
-        ``vocab_slice`` (to shard the markov_w2 rows identically) and an
-        ``argmax_fn`` returning full-vocab token ids -- ``DFlashWorker`` handles
-        both.
+        Markov head. See :func:`dspark_markov_chain` for the semantics and
+        :func:`markov_chain_logits` for the arguments: ``base_logits`` is the
+        full vocab, or this rank's vocab shard with the TP group's
+        ``tp_exchange`` -- ``DSparkWorker`` handles both.
         """
         if not self.has_markov_head:
             return base_logits
-        markov_w2 = self.markov_w2 if vocab_slice is None else self.markov_w2[vocab_slice]
-        return dspark_markov_chain_logits(
-            base_logits, first_prev_tokens, self.markov_w1, markov_w2, argmax_fn=argmax_fn
+        return markov_chain_logits(
+            base_logits, first_prev_tokens, self.markov_w1, self.markov_w2, tp_exchange
         )
 
     def _take_dspark_head_weights(self, weights: Dict) -> tuple[Dict, Dict]:
@@ -2764,6 +2785,42 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             )
             self.mask_token_id = int(spec_mask_token_id)
         self._init_dspark_heads(draft_config.pretrained_config)
+
+    def _get_attention_mask_args(self, layer_idx):
+        """DSpark block attention is non-causal on every layer.
+
+        The DFlash default reads a windowed sliding layer as causal. DSpark
+        drafters are trained non-causal (the heads refuse ``causal=true``, see
+        :class:`_DSparkHeadMixin`), and a windowed layer bounds both sides by
+        the window, as the HF flash path they are trained under does (see
+        ``dspark_layer_window_size``).
+
+        Explicit checkpoint metadata wins over this default: a config that
+        declares a causal window (``is_causal: true``, or the speculators
+        schema's ``sliding_window_non_causal: false``) keeps the DFlash
+        resolution, the causal windowed decode.
+        """
+        base = super()._get_attention_mask_args(layer_idx)
+        if self._declares_causal_window():
+            causal, _ = base
+            layer_window = (
+                self._layer_windows[layer_idx] if layer_idx < len(self._layer_windows) else (-1, -1)
+            )
+            if not causal and layer_window[0] >= 0:
+                # The window comes from ``dflash_config.use_swa`` alone, which
+                # the DFlash default reads as a full-attention layer.
+                return True, (layer_window[0], 0)
+            return base
+        _, (window_left, _) = base
+        return False, (window_left, window_left)
+
+    def _declares_causal_window(self) -> bool:
+        """Whether the drafter config states that its sliding window is causal."""
+        is_causal = getattr(self.config, "is_causal", None)
+        if is_causal is not None:
+            return bool(is_causal)
+        non_causal = getattr(self.config, "sliding_window_non_causal", None)
+        return non_causal is not None and not bool(non_causal)
 
     def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
         """Take the DSpark head weights, then hand the rest to DFlash."""
@@ -2863,6 +2920,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # max_seq_len that free_gpu_memory_fraction never bounds. Independent of the
     # backend field, which is why either value of it works here.
     _paged_ctx_cache = True
+
+    # Acceptance length is measured with the TP fusions: the split fc, and each
+    # o_proj / down_proj all-reduce of the block decode below fused with the
+    # residual add and the RMSNorm after it.
+    _tp_fusions = True
 
     def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
         cfg = draft_config.pretrained_config
@@ -3172,7 +3234,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # --- log-sum-exp merge (flash-decoding combine), kernel LSE is base 2 ---
         # w_u / (w_l + w_u) == sigmoid(lse_u - lse_l): one sigmoid and one lerp, no
         # explicit max needed. The last query's triangle is empty, so sigmoid is 0.
-        lse_l = lse_lower.view(batch, block_size, num_heads).float() * _LN2
+        lse_l = lse_lower.view(batch, block_size, num_heads).float() * TRTLLM_GEN_LSE_LN2
         weight_upper = torch.sigmoid(lse_upper - lse_l).unsqueeze(-1)
         merged = torch.lerp(out_lower.float(), out_upper.float(), weight_upper)
         return merged.to(query.dtype)
@@ -3299,12 +3361,14 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         ctx_cache_batch_idx,
         ctx_kv_cache=None,
         ctx_page_table=None,
+        block_placement: Optional[DraftBlockPlacement] = None,
     ):
         """Eager absorbed-MLA block decode over the drafter's latent cache.
 
         Args mirror the base: ``ctx_k_cache`` is
         ``[pool_slots, L, max_ctx+block_size, 1, kv_cache_head_dim]`` and
-        ``ctx_v_cache`` is unused (``None``).
+        ``ctx_v_cache`` is unused (``None``). ``block_placement`` is where the
+        worker already placed the block in the pages (paged context only).
         """
         if self._fused_kv_weight is None:
             self._build_fused_kv_buffers()
@@ -3319,43 +3383,54 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         blk_freqs = self._mla_freqs_cis(device)[query_positions.long()]
 
         slots = ctx_cache_batch_idx.long()
+        paged = ctx_page_table is not None
+        # attention_backend picks the implementation; both kernel backends need
+        # page tables, so the eager gather also covers the private arena.
+        variant = self._mla_block_decode_variant(paged)
+        use_kernel = variant != "eager"
         # Context pages for this batch, resolved once: rows are batch positions
         # when bound to the manager's per-request block table and slots on the
         # private arena, which is exactly what ctx_cache_batch_idx already is.
-        page_tables = (
-            None if ctx_page_table is None else ctx_page_table.index_select(0, slots).long()
-        )
+        page_tables = None if not paged else ctx_page_table.index_select(0, slots)
 
         # Valid-key mask, shared by every layer: context slots below this
         # request's length, then the whole block (DSpark is non-causal). Pages
         # past a request's allocation hold another request's data, so the mask
         # is what keeps them out -- not the block table.
-        page_size = None if page_tables is None else ctx_kv_cache[0].shape[-2]
-        capacity = ctx_k_cache.shape[2] if page_tables is None else page_tables.shape[1] * page_size
-        # attention_backend picks the implementation; both kernel backends need
-        # page tables, so the eager gather also covers the private arena.
-        variant = self._mla_block_decode_variant(page_tables is not None)
-        use_kernel = variant != "eager"
+        page_size = None if not paged else ctx_kv_cache[0].shape[-2]
+        capacity = ctx_k_cache.shape[2] if not paged else ctx_page_table.shape[1] * page_size
         # Kernel path: index and mask operands are layer-invariant, so build
         # them once here rather than five times inside the decode loop.
-        fixup = (
-            _build_mla_block_fixup(num_ctx_per_req[:batch], page_tables, block_size, page_size)
-            if use_kernel
-            else None
-        )
+        if not use_kernel:
+            fixup = None
+        elif block_placement is not None:
+            fixup = _MLABlockFixup(
+                pages=block_placement.pages,
+                offsets=block_placement.offsets,
+                valid=_block_upper_triangle(block_size, device),
+                page_tables_i32=page_tables,
+                seq_lens_i32=block_placement.seq_lens,
+                kv_bounds_i32=block_placement.kv_bounds,
+            )
+        else:
+            fixup = _build_mla_block_fixup(
+                num_ctx_per_req[:batch], page_tables.long(), block_size, page_size
+            )
         logger.info_once(
             "MLA DSpark block decode: "
             + {
                 "trtllm_gen": "trtllm-gen paged kernel, block in pool + upper-triangle fixup",
                 "cute_dsl": "one cute-dsl pass over context and block, no fixup",
                 "eager": f"eager (backend={self.dflash_attention_backend!r}, "
-                f"paged={page_tables is not None}, "
+                f"paged={paged}, "
                 f"flashinfer={self._mla_decode_op() is not None})",
             }[variant],
             key="mla_dspark_block_decode_variant",
         )
         # Eager path only: dense key mask over the gathered context.
         if not use_kernel:
+            if paged:
+                page_tables = page_tables.long()
             ctx_valid = torch.arange(capacity, device=device).unsqueeze(0) < num_ctx_per_req[
                 :batch
             ].view(-1, 1)
@@ -3364,12 +3439,23 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             )
         hidden_states = noise_embedding
         residual = None
+        # With the fused all-reduce, the previous layer's un-reduced MLP output
+        # and the all-reduce that sums it.
+        partial, partial_all_reduce = None, None
         for layer_idx, layer in enumerate(self.model.layers):
             attn = layer.self_attn
             hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
             if residual is None:
                 residual = hidden_states.clone()
                 hs_normed = layer.input_layernorm(hs_flat)
+            elif partial is not None:
+                hs_normed, res_flat = _all_reduce_add_norm(
+                    partial_all_reduce,
+                    partial,
+                    residual.reshape(-1, residual.shape[-1]),
+                    layer.input_layernorm,
+                )
+                residual = res_flat.reshape(batch, block_size, -1)
             else:
                 res_flat = residual.reshape(-1, residual.shape[-1])
                 hs_normed, res_flat = layer.input_layernorm(hs_flat, res_flat)
@@ -3442,7 +3528,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                     capacity,
                 )
             else:
-                if page_tables is None:
+                if not paged:
                     ctx = ctx_k_cache[slots, layer_idx, :, 0, :]
                 else:
                     # [pages, kv_factor=1, nkv=1, page, hd] -> gather this
@@ -3456,16 +3542,37 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 ctx_out = torch.einsum("bsht,btc->bshc", probs, kv_full[..., :latent_dim])
             attn_out = torch.einsum("bshc,hvc->bshv", ctx_out, attn._v_b_proj.to(ctx_out.dtype))
 
-            hidden_out = attn.o_proj(attn_out.reshape(batch * block_size, -1))
             res_flat = residual.reshape(-1, residual.shape[-1])
-            hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)
-            hidden_out = layer.mlp(hidden_out)
-            hidden_states = hidden_out.reshape(batch, block_size, -1)
+            # With the TP fusions, o_proj and down_proj reduce their outputs;
+            # fuse each all-reduce with the residual add and the RMSNorm after it.
+            if self._tp_split:
+                hidden_out = attn.o_proj(
+                    attn_out.reshape(batch * block_size, -1),
+                    all_reduce_params=AllReduceParams(enable_allreduce=False),
+                )
+                hidden_out, res_flat = _all_reduce_add_norm(
+                    attn.o_proj.all_reduce, hidden_out, res_flat, layer.post_attention_layernorm
+                )
+                partial = layer.mlp(
+                    hidden_out, final_all_reduce_params=AllReduceParams(enable_allreduce=False)
+                )
+                partial_all_reduce = layer.mlp.down_proj.all_reduce
+                hidden_states = partial
+            else:
+                hidden_out = attn.o_proj(attn_out.reshape(batch * block_size, -1))
+                hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)
+                hidden_out = layer.mlp(hidden_out)
+                hidden_states = hidden_out.reshape(batch, block_size, -1)
             residual = res_flat.reshape(batch, block_size, -1)
 
+        res_flat = residual.reshape(-1, residual.shape[-1])
+        if partial is not None:
+            hidden_states_out, _ = _all_reduce_add_norm(
+                partial_all_reduce, partial, res_flat, self.model.norm
+            )
+            return hidden_states_out
         hidden_states_out, _ = self.model.norm(
-            hidden_states.reshape(-1, hidden_states.shape[-1]),
-            residual.reshape(-1, residual.shape[-1]),
+            hidden_states.reshape(-1, hidden_states.shape[-1]), res_flat
         )
         return hidden_states_out
 
@@ -3503,6 +3610,266 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         """
         self.draft_model_full.lm_head = target_model.lm_head
         self.lm_head = target_model.lm_head
+
+
+# ----------------------------------------------------------------------------
+# MiniMax-M3 standalone DSpark drafter (architecture ``DSparkMiniMaxDraftModel``).
+#
+# A GQA backbone (64 heads / 4 KV heads / head_dim 128 at hidden 6144), per-head
+# Gemma Q/K norm, NeoX RoPE over the first ``rotary_dim`` channels of each head,
+# a dense swiglu-oai MLP and Gemma boundary norms: the dense-layer block of the
+# MiniMax-M3 target. Weights ship MXFP8 (e4m3 + UE8M0 1x32 block scales) under
+# ``language_model.model.dspark.layers.<i>.decoder_layer.*``; the heads are
+# ``language_model.model.dspark.{fc,hidden_norm,final_norm,markov_head.*,
+# confidence_head.proj.*}``.
+# ----------------------------------------------------------------------------
+
+MINIMAX_DSPARK_WEIGHT_PREFIX = "language_model.model.dspark."
+_MINIMAX_DSPARK_DECODER_LAYER_INFIX = ".decoder_layer."
+_MINIMAX_DSPARK_RENAMES = {"final_norm.weight": "norm.weight"}
+# Every RMSNorm in this drafter is a Gemma norm, (1 + weight) * x. The three
+# backbone norms (``input_layernorm``, ``post_attention_layernorm``, ``norm``)
+# are built with ``use_gemma=True`` and keep the stored weight. Only the norms
+# whose consumers read the raw weight get ``1 + weight`` folded in at load:
+# ``q_norm`` / ``k_norm`` (the stacked k_norm read and the fused qk-norm + RoPE
+# kernel in the block decode) and the wrapper-owned ``hidden_norm`` (a torch
+# ``nn.RMSNorm``). The fold rounds ``1 + weight`` to bf16 once, which the
+# MiniMax-M3 target also accepts for its layer-boundary norms.
+_MINIMAX_DSPARK_GEMMA_NORM_SUFFIXES = (
+    "q_norm.weight",
+    "k_norm.weight",
+    "hidden_norm.weight",
+)
+_MXFP8_BLOCK_SIZE = 32
+_MXFP8_SCALE_SUFFIX = ".weight_scale_inv"
+
+
+def remap_minimax_dspark_weight_name(name: str) -> str:
+    """Checkpoint tensor name -> the name the DFlash/DSpark loaders expect.
+
+    Strips the ``language_model.model.dspark.`` namespace and the
+    ``.decoder_layer.`` level, and renames ``final_norm`` to ``norm``. Names
+    outside the namespace are returned unchanged.
+    """
+    if not name.startswith(MINIMAX_DSPARK_WEIGHT_PREFIX):
+        return name
+    name = name[len(MINIMAX_DSPARK_WEIGHT_PREFIX) :]
+    name = name.replace(_MINIMAX_DSPARK_DECODER_LAYER_INFIX, ".")
+    return _MINIMAX_DSPARK_RENAMES.get(name, name)
+
+
+def dequantize_mxfp8_weight(
+    weight: torch.Tensor, scale_inv: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
+    """``weight`` (e4m3, ``[out, in]``) times ``2 ** (scale_inv - 127)`` per
+    ``[1, 32]`` block (``scale_inv``: UE8M0 as uint8, ``[out, in / 32]``), in
+    ``dtype``."""
+    if scale_inv.dtype != torch.uint8:
+        # The exponent code is wanted, not the value it encodes: ``.to`` of a
+        # float8_e8m0fnu tensor would convert ``2 ** k``, not ``k``.
+        if scale_inv.element_size() != 1:
+            raise ValueError(
+                "MXFP8 weight_scale_inv must hold UE8M0 bytes (uint8 or "
+                f"float8_e8m0fnu), got {scale_inv.dtype}"
+            )
+        scale_inv = scale_inv.view(torch.uint8)
+    w = weight.to(torch.float32)
+    exponent = scale_inv.to(torch.int32) - 127
+    scale = torch.exp2(exponent.to(torch.float32))
+    scale = scale.repeat_interleave(_MXFP8_BLOCK_SIZE, dim=1)[:, : w.shape[1]]
+    return (w * scale).to(dtype)
+
+
+def prepare_minimax_dspark_weights(weights: Dict, dtype: torch.dtype) -> Dict:
+    """Rename, dequantize and norm-fold a MiniMax DSpark drafter checkpoint.
+
+    Returns a new dict keyed by the DFlash/DSpark loader names, with every
+    MXFP8 ``weight`` / ``weight_scale_inv`` pair replaced by one ``dtype``
+    tensor and the raw-weight-consumed Gemma norms
+    (``_MINIMAX_DSPARK_GEMMA_NORM_SUFFIXES``) incremented by one.
+    """
+    renamed = {remap_minimax_dspark_weight_name(k): v for k, v in weights.items()}
+    # Every tensor is materialized whole on the host, and the dequantization
+    # goes through float32, before any TP slicing: sized for this five-layer
+    # drafter, not a pattern for a full backbone.
+    out = {}
+    for name, value in renamed.items():
+        if name.endswith(_MXFP8_SCALE_SUFFIX):
+            continue
+        tensor = value[:] if hasattr(value, "__getitem__") else value
+        scale_name = name[: -len(".weight")] + _MXFP8_SCALE_SUFFIX
+        if name.endswith(".weight") and scale_name in renamed:
+            scale = renamed[scale_name]
+            scale = scale[:] if hasattr(scale, "__getitem__") else scale
+            tensor = dequantize_mxfp8_weight(tensor, scale, dtype)
+        elif name.endswith(_MINIMAX_DSPARK_GEMMA_NORM_SUFFIXES):
+            tensor = tensor + 1.0
+        out[name] = tensor
+    return out
+
+
+class MiniMaxDSparkAttention(Attention):
+    """GQA attention of the MiniMax DSpark drafter: fused ``qkv_proj`` +
+    ``o_proj`` with per-head ``q_norm`` / ``k_norm`` and partial NeoX RoPE.
+
+    Only the projections, norms and RoPE parameters are read; the block decode
+    is ``DFlashForCausalLM.dflash_forward``. ``self.pretrained_config`` is what
+    that decode reads ``partial_rotary_factor`` from.
+    """
+
+    def __init__(self, model_config: ModelConfig, layer_idx: int) -> None:
+        config = model_config.pretrained_config
+        self.pretrained_config = config
+        head_dim = int(
+            getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        )
+        super().__init__(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            bias=False,
+            pos_embd_params=PositionalEmbeddingParams(
+                type=PositionEmbeddingType.rope_gpt_neox,
+                rope=RopeParams.from_config(config),
+            ),
+            rope_fusion=False,
+            layer_idx=layer_idx,
+            dtype=config.torch_dtype,
+            dense_bias=False,
+            config=model_config,
+            head_dim=head_dim,
+        )
+        self.q_norm = RMSNorm(
+            hidden_size=head_dim, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
+        self.k_norm = RMSNorm(
+            hidden_size=head_dim, eps=config.rms_norm_eps, dtype=config.torch_dtype
+        )
+
+
+class MiniMaxDSparkDecoderLayer(DecoderLayer):
+    """One drafter layer: GQA projections + dense swiglu-oai MLP + the two norms."""
+
+    def __init__(self, model_config: ModelConfig, layer_idx: int) -> None:
+        super().__init__()
+        config = model_config.pretrained_config
+        self.layer_idx = layer_idx
+        self.self_attn = MiniMaxDSparkAttention(model_config, layer_idx)
+        intermediate_size = int(
+            getattr(config, "dspark_ffn_hidden_size", None)
+            or getattr(config, "dense_intermediate_size", config.intermediate_size)
+        )
+        self.mlp = GatedMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=intermediate_size,
+            bias=False,
+            activation=torch.nn.functional.silu,
+            swiglu_alpha=float(getattr(config, "swiglu_alpha", 1.702)),
+            swiglu_beta=1.0,
+            swiglu_limit=float(getattr(config, "swiglu_limit", 7.0)),
+            dtype=config.torch_dtype,
+            config=model_config,
+            overridden_tp_size=1 if model_config.mapping.enable_attention_dp else None,
+            layer_idx=layer_idx,
+        )
+        self.input_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
+        self.post_attention_layernorm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
+
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        raise NotImplementedError(
+            "MiniMaxDSparkDecoderLayer is driven by DFlashForCausalLM.dflash_forward, "
+            "not by the generic decoder loop."
+        )
+
+
+class MiniMaxDSparkModel(DecoderModel):
+    """Weight container for the MiniMax DSpark block decode."""
+
+    def __init__(self, model_config: ModelConfig) -> None:
+        super().__init__(model_config)
+        config = model_config.pretrained_config
+        # Replaced by the target's embedding in load_weights_from_target_model;
+        # the checkpoint ships none.
+        self.embed_tokens = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=config.torch_dtype,
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            gather_output=True,
+        )
+        self.layers = nn.ModuleList(
+            [
+                MiniMaxDSparkDecoderLayer(model_config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
+        self.norm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
+
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        raise NotImplementedError(
+            "MiniMaxDSparkModel is a weight container for the DSpark block decode; "
+            "see DFlashForCausalLM.dflash_forward."
+        )
+
+
+@register_auto_model("DSparkMiniMaxDraftModel")
+class MiniMaxDSparkBackbone(DecoderModelForCausalLM[MiniMaxDSparkModel, PretrainedConfig]):
+    """Registry entry for the MiniMax DSpark drafter checkpoint
+    (``config.architectures == ["DSparkMiniMaxDraftModel"]``)."""
+
+    def __init__(self, model_config: ModelConfig) -> None:
+        config = model_config.pretrained_config
+        super().__init__(
+            MiniMaxDSparkModel(model_config),
+            config=model_config,
+            hidden_size=config.hidden_size,
+            vocab_size=config.vocab_size,
+        )
+
+
+class MiniMaxDSparkForCausalLM(GQADSparkForCausalLM):
+    """DSpark drafter on the MiniMax-M3 GQA backbone, from a standalone checkpoint.
+
+    The GQA block decode and head set are inherited; this class only translates
+    the checkpoint (namespace, MXFP8 dequantization, Gemma norm fold) before
+    the DFlash loader sees it. See :func:`prepare_minimax_dspark_weights`.
+    """
+
+    def __init__(self, draft_config, *args: Any, **kwargs: Any) -> None:
+        # The backbone must be built unquantized: the loader hands it bf16
+        # tensors. ``quantization_config`` is dropped from config.json by
+        # ``build_minimax_dspark_draft_config``, but a ``hf_quant_config.json``
+        # next to the checkpoint would still quantize the Linears.
+        quant_algo = getattr(draft_config.quant_config, "quant_algo", None)
+        if quant_algo is not None:
+            raise ValueError(
+                "The MiniMax DSpark drafter dequantizes its MXFP8 weights at "
+                f"load and must be built unquantized; the draft config carries "
+                f"quant_algo={quant_algo}. Remove hf_quant_config.json from the "
+                "drafter directory."
+            )
+        super().__init__(draft_config, *args, **kwargs)
+
+    def load_weights(self, weights: Dict, weight_mapper: Any = None, **kwargs: Any) -> Any:
+        weights = prepare_minimax_dspark_weights(weights, self.config.torch_dtype)
+        return super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
 
 
 def draft_is_embedded_in_target(model_config) -> bool:
@@ -3562,14 +3929,21 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
     # what differs between the two wrappers, and everything below it
     # (``DFlashForCausalLM.__init__``) already resolves the backbone through the
     # model registry, so keying on model_type a second time would force a new
-    # entry for every GQA family that already works.
-    if is_mla(draft_config.pretrained_config):
+    # entry for every GQA family that already works. The MiniMax drafter is the
+    # one architecture-keyed exception: its checkpoint needs a translation step
+    # (namespace, MXFP8, Gemma norms) that the generic GQA loader has no hook for.
+    draft_arches = getattr(draft_config.pretrained_config, "architectures", None) or []
+    if draft_arches and draft_arches[0] == MINIMAX_DSPARK_DRAFT_ARCH:
+        drafter_cls = MiniMaxDSparkForCausalLM
+    elif is_mla(draft_config.pretrained_config):
         return MLADSparkForCausalLM(
             draft_config,
             dflash_attention_backend=model_config.spec_config.attention_backend,
         )
+    else:
+        drafter_cls = GQADSparkForCausalLM
     # The drafter's own ModelConfig has no spec_config, so the worker's mask id is handed over here.
-    return GQADSparkForCausalLM(
+    return drafter_cls(
         draft_config,
         dflash_attention_backend=model_config.spec_config.attention_backend,
         spec_mask_token_id=model_config.spec_config.mask_token_id,
@@ -3584,6 +3958,13 @@ __all__ = [
     # Standalone flavour.
     "GQADSparkForCausalLM",
     "MLADSparkForCausalLM",
+    # MiniMax-M3 GQA drafter and its checkpoint translation.
+    "MiniMaxDSparkForCausalLM",
+    "MiniMaxDSparkBackbone",
+    "MiniMaxDSparkModel",
+    "prepare_minimax_dspark_weights",
+    "remap_minimax_dspark_weight_name",
+    "dequantize_mxfp8_weight",
     # MLA drafter backbone (a weight container for the block decode).
     "K3DsparkForCausalLM",
     "K3DsparkModel",

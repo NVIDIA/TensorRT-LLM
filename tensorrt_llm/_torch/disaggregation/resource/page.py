@@ -89,11 +89,15 @@ class RoleLayout:
     ``section_bytes`` describes a SECTIONED role (one entry per section, in
     slot order); ``bytes_per_head`` describes an INDEXED role whose head
     count is not derivable from ``RankInfo.attention`` (recurrent SSM state).
-    Roles with neither need no geometry (REPLICATED, attention K/V).
+    ``ring_slot_bytes`` describes a REPLICATED role whose per-layer region is
+    a ring of token slots addressed by global token position modulo the slot
+    count (see :attr:`PoolView.ring_slot_bytes`). Roles with none of these need
+    no geometry (plain REPLICATED, attention K/V).
     """
 
     section_bytes: Optional[Tuple[int, ...]] = None
     bytes_per_head: Optional[int] = None
+    ring_slot_bytes: Optional[int] = None
 
 
 @dataclass
@@ -202,6 +206,13 @@ class PoolView:
             ``RankInfo.attention`` (recurrent SSM state). ``bytes_per_layer //
             bytes_per_head`` is the per-rank head count. Attention K/V leaves
             it ``None`` and uses ``kv_heads_per_rank`` instead.
+        ring_slot_bytes: REPLICATED views only. When set, each layer's region
+            is a ring of ``bytes_per_layer // ring_slot_bytes`` token slots,
+            and the token at global position ``p`` lives in slot
+            ``p % num_slots`` of the ring in the page that holds ``p``. The two
+            sides may size their rings differently, so the transfer moves the
+            positions both rings retain slot by slot instead of copying the
+            region verbatim.
     """
 
     pool_idx: int
@@ -211,6 +222,7 @@ class PoolView:
     bytes_per_layer: Optional[int] = None
     section_bytes: Optional[List[int]] = None
     bytes_per_head: Optional[int] = None
+    ring_slot_bytes: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -226,6 +238,9 @@ class PoolView:
             ),
             "bytes_per_head": (
                 int(self.bytes_per_head) if self.bytes_per_head is not None else None
+            ),
+            "ring_slot_bytes": (
+                int(self.ring_slot_bytes) if self.ring_slot_bytes is not None else None
             ),
         }
 
@@ -252,6 +267,9 @@ class PoolView:
             ),
             bytes_per_head=(
                 int(data["bytes_per_head"]) if data.get("bytes_per_head") is not None else None
+            ),
+            ring_slot_bytes=(
+                int(data["ring_slot_bytes"]) if data.get("ring_slot_bytes") is not None else None
             ),
         )
 

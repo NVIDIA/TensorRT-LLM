@@ -42,7 +42,7 @@ from tensorrt_llm.executor.result import Logprob
 
 from ..llm_request import LlmRequest, LlmRequestState
 from .logprobs import LogProbsStore
-from .ops.flashinfer import radix_topk_op
+from .ops.flashinfer import radix_topk_op, topk_module_ready
 from .ops.triton import reorder_compact_stop_word_history
 from .sampler_common import _get_beam_width_out, _request_get_sampling_params, int_tensor
 from .sampler_features import _SideStreamCopier
@@ -110,12 +110,14 @@ def _beam_topk(values: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor
     follows flashinfer's own guidance (``flashinfer.top_k`` docstring).
 
     Beam search is not a flashinfer-gated feature, so fall back to torch.topk
-    when flashinfer is missing: real vocabularies are always past the crossover,
-    which would otherwise make the whole default beam path require it. The two
-    kernels agree on values and on descending order; only the index order among
-    equal values may differ, which torch.topk leaves unspecified anyway.
+    when flashinfer is missing or its topk module is not built yet (a cold
+    build takes ~10 minutes, see ``warmup_topk_module``): real vocabularies are
+    always past the crossover, which would otherwise make the whole default
+    beam path require it. The two kernels agree on values and on descending
+    order; only the index order among equal values may differ, which torch.topk
+    leaves unspecified anyway.
     """
-    if IS_FLASHINFER_AVAILABLE and values.size(-1) > 10000:
+    if IS_FLASHINFER_AVAILABLE and values.size(-1) > 10000 and topk_module_ready():
         return radix_topk_op(values, k)
     return torch.topk(values, k=k, dim=-1, sorted=True)
 
@@ -1104,7 +1106,7 @@ class BeamSearchStep:
         beam_width_in: int,
         beam_width_out: int,
         row_stride: int,
-        temperature: torch.Tensor,
+        temperature: Optional[torch.Tensor],
         length_penalty: Optional[torch.Tensor],
         diversity_rate: Optional[torch.Tensor],
         early_stopping: BeamSearchEarlyStop,
@@ -1133,13 +1135,16 @@ class BeamSearchStep:
             )
 
         # Unset length_penalty / diversity_rate stay None so the op skips them.
+        # Temperature stays None when it is 1.0 everywhere, so ``sample`` skips
+        # the full-vocab rescaling pass over the logits.
+        temperatures = [p.temperature for p in params]
         length_penalties = [p.length_penalty for p in params]
         diversity_rates = [p.diversity_rate for p in params]
         return cls(
             beam_width_in,
             beam_width_out,
             row_stride,
-            _to_device([p.temperature for p in params]),
+            _to_device(temperatures) if any(t != 1.0 for t in temperatures) else None,
             _to_device(length_penalties) if any(length_penalties) else None,
             _to_device(diversity_rates) if any(diversity_rates) else None,
             early_stopping,
@@ -1150,11 +1155,13 @@ class BeamSearchStep:
         self, logits: torch.Tensor, *, metadata: BeamSearchMetadata
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Sample the group's logits rows, ``row_stride`` per request."""
-        # Temperature is applied before the op slices the padding rows off, so
-        # it must cover every row the forward laid out.
-        temperature = self.temperature.repeat_interleave(self._row_stride).unsqueeze(-1)
+        if self.temperature is not None:
+            # Temperature is applied before the op slices the padding rows off,
+            # so it must cover every row the forward laid out.
+            temperature = self.temperature.repeat_interleave(self._row_stride).unsqueeze(-1)
+            logits = logits / temperature
         return beam_search_sampling_batch_cba(
-            logits / temperature,
+            logits,
             beam_width_in=self._beam_width_in,
             beam_width_out=self._beam_width_out,
             row_stride=self._row_stride,

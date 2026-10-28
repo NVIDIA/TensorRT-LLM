@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import atexit
 import os
@@ -13,7 +28,7 @@ from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import get_unique_ipc_addr
-from .utils import ErrorResponse, is_llm_response
+from .utils import ErrorResponse, RequestError, is_llm_response
 
 
 class RpcExecutorMixin:
@@ -81,6 +96,8 @@ class RpcExecutorMixin:
         atexit.register(self.shutdown)
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
+        if request.prompt_adapter_request is not None:
+            raise RequestError("Prompt adapters are not supported by the PyTorch executor.")
         request.set_id(self._get_next_client_id())
         logprob_params = self._get_logprob_params(request)
 

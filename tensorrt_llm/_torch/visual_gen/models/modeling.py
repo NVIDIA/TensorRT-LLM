@@ -21,6 +21,7 @@ import torch.nn as nn
 
 from tensorrt_llm._torch.attention.backends.sparse.timestep_phase import graph_phase_for_timestep
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.token_order import require_native_token_order
 from tensorrt_llm.visual_gen.sparse_attention import BaseSparseAttentionConfig
 
 if TYPE_CHECKING:
@@ -32,6 +33,9 @@ class BaseDiffusionModel(nn.Module):
 
     # Set to True by models that implement parallel_config.tp_layout='token_sharded'.
     _supports_token_sharded_tp = False
+    # Set to True by models that apply ``TokenReorder`` around their block stack, so
+    # ``sparse_attention_config.token_order`` takes effect.
+    _supports_token_order = False
 
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__()
@@ -39,6 +43,10 @@ class BaseDiffusionModel(nn.Module):
             raise ValueError(
                 "parallel_config.tp_layout='token_sharded' is not implemented for "
                 f"{type(self).__name__}; unset tp_layout to use all-reduce tensor parallelism."
+            )
+        if not self._supports_token_order:
+            require_native_token_order(
+                model_config.attention.sparse_attention_config, type(self).__name__
             )
         self.model_config = model_config
         self.component_name = model_config.component_name

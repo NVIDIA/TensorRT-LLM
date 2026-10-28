@@ -16,7 +16,9 @@
 modeling_v2 is a second modeling path living entirely under
 `tensorrt_llm/_torch/_experimental/modeling_v2/`: one self-contained forward per
 (checkpoint, GPU arch, parallel topology), assembled from a catalog of
-op wrappers.
+op wrappers. Native code lives beside each model in `csrc/`; shared build
+infrastructure lives under `cpp/tensorrt_llm/modeling_v2/` and
+`cpp/cmake/modules/modeling_v2.cmake` and selects every modeling_v2 entry.
 
 Block selection: a block belongs to modeling_v2 iff one of its `tests:`
 entries matches a marker in `_MV2_ENTRY_PATTERNS`. Those markers are exact
@@ -95,7 +97,12 @@ from .docs import is_docs_path
 
 # Source-path prefixes the rule may claim. Tests under tests/** are left
 # to TestsDefRule; the two scopes combine via _TESTSONLY_FAMILY.
-_MV2_SRC_PREFIXES: tuple[str, ...] = ("tensorrt_llm/_torch/_experimental/modeling_v2/",)
+_MV2_SRC_PREFIXES: tuple[str, ...] = (
+    "tensorrt_llm/_torch/_experimental/modeling_v2/",
+    "cpp/tensorrt_llm/modeling_v2/",
+)
+_CPP_BUILD_FILES = frozenset({"cpp/cmake/modules/modeling_v2.cmake"})
+_IGNORE = re.compile(r"--ignore=(\S+)")
 
 _UNIT_ROOT = "unittest/_torch/modeling_v2"
 _ACCURACY_ROOT = "accuracy/modeling_v2"
@@ -114,7 +121,9 @@ _MV2_ENTRY_PATTERNS: tuple[str, ...] = (
 # A family's `routing.py` imports each target it routes to by this line, from
 # the target directory directly under the family. The claims test reads the
 # same line with the same pattern.
-_TARGET_IMPORT = re.compile(r"^\s*from \.(\w+)\.modeling import (\w+)$", re.MULTILINE)
+_TARGET_IMPORT = re.compile(
+    r"^\s*from \.(\w+)\.modeling import (?:(\w+)|\(\s*(\w+),?\s*\))$", re.MULTILINE
+)
 
 
 def _is_mv2_claim(path: str) -> bool:
@@ -126,7 +135,7 @@ def _is_mv2_claim(path: str) -> bool:
     fixture, so the rule keeps claiming it and re-runs the stages (safe
     over-run).
     """
-    if not path.startswith(_MV2_SRC_PREFIXES):
+    if not (path.startswith(_MV2_SRC_PREFIXES) or path in _CPP_BUILD_FILES):
         return False
     if is_docs_path(path):
         return False
@@ -134,7 +143,9 @@ def _is_mv2_claim(path: str) -> bool:
 
 
 def _entry_is_mv2(entry: str) -> bool:
-    return any(p in entry for p in _MV2_ENTRY_PATTERNS)
+    return entry.split()[0].rstrip("/") == _UNIT_ROOT or any(
+        p in entry for p in _MV2_ENTRY_PATTERNS
+    )
 
 
 def _mv2_entries(block) -> list[str]:
@@ -174,12 +185,20 @@ def _kept_entries(entries: list[str], prefixes: set[str]) -> list[str]:
     file in a directory above a prefix is kept as well; it does not count as
     sitting under the prefix, so it never displaces the covering entry.
     """
-    targets = {entry: _entry_target(entry) for entry in entries}
+    targets = {entry: _entry_target(entry).split()[0] for entry in entries}
     kept = {e for e, t in targets.items() if _is_whole_tree_test(t)}
     for prefix in prefixes:
         under = {e for e, t in targets.items() if _target_in_filter_subtree(t, prefix)}
         if not under:
-            covering = [e for e, t in targets.items() if _target_in_filter_subtree(prefix, t)]
+            covering = [
+                e
+                for e, t in targets.items()
+                if _target_in_filter_subtree(prefix, t)
+                and not any(
+                    _target_in_filter_subtree(prefix, ignored.rstrip("/"))
+                    for ignored in _IGNORE.findall(e)
+                )
+            ]
             under = {max(covering, key=lambda e: len(targets[e]))} if covering else set()
         kept |= under
         kept |= {e for e, t in targets.items() if _is_ancestor_file(t, prefix)}
@@ -213,7 +232,8 @@ class ModelingV2Rule(Rule):
         if not routing.is_file():
             return None
         routed, gates = set(), set()
-        for target, target_cls in _TARGET_IMPORT.findall(routing.read_text(encoding="utf-8")):
+        for target, plain, wrapped in _TARGET_IMPORT.findall(routing.read_text(encoding="utf-8")):
+            target_cls = plain or wrapped
             leaf = Path(family, target)
             routed.add(leaf)
             if leaf == node or node in leaf.parents:
@@ -226,6 +246,8 @@ class ModelingV2Rule(Rule):
 
     def _prefixes_for(self, path: str) -> Optional[set[str]]:
         """Filter prefixes a changed file selects; None selects every modeling_v2 entry."""
+        if not path.startswith(_MV2_SRC_PREFIXES[0]):
+            return None
         rel = Path(path[len(_MV2_SRC_PREFIXES[0]) :])
         if rel.parts[0] != "models" or len(rel.parts) < 3:
             return None

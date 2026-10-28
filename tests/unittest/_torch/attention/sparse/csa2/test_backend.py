@@ -6,6 +6,7 @@ import math
 
 import pytest
 import torch
+from utils.util import skip_blackwell_geforce
 
 from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2FlashInfer, CSA2FlashMLA
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Params
@@ -425,7 +426,9 @@ def test_cold_metadata_rejects_capture():
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("implementation", ["flash_mla", "flashinfer"])
+@pytest.mark.parametrize(
+    "implementation", [pytest.param("flash_mla", marks=skip_blackwell_geforce), "flashinfer"]
+)
 @pytest.mark.parametrize("context", [False, True])
 @torch.inference_mode()
 def test_alternative_helper_dispatch(implementation, context, monkeypatch):
@@ -847,6 +850,7 @@ def test_fixed_plan_ignores_dirty_workspace_padding(monkeypatch):
 
 
 @skip_pre_blackwell
+@skip_blackwell_geforce
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("heads", [8, 64])
 @torch.inference_mode()
@@ -867,6 +871,7 @@ def test_flash_mla_combined_pool_and_sink(heads):
 
 
 @skip_pre_blackwell
+@skip_blackwell_geforce
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_flash_mla_cuda_graph_changes_selection():
@@ -1521,10 +1526,12 @@ def test_flashinfer_shared_plans_bound_eager_context_and_keep_protected(monkeypa
         )
     )
 
-    def phase(n, contexts):
+    def phase(n, contexts, graph_reserved=False):
         selection[0] = torch.arange(n * width, dtype=torch.int32).reshape(n, width) % 7
         query = torch.zeros(n, heads * 512, dtype=torch.bfloat16)
-        metadata = SimpleNamespace(num_contexts=contexts, shared_plan=True)
+        metadata = SimpleNamespace(
+            num_contexts=contexts, shared_plan=True, _csa2_graph_reserved=graph_reserved
+        )
         if contexts:
             args = AttentionForwardArgs(attention_input_type=AttentionInputType.context_only)
             return helper.forward_context(query, metadata, args)
@@ -1534,14 +1541,15 @@ def test_flashinfer_shared_plans_bound_eager_context_and_keep_protected(monkeypa
     key = lambda n: (n, heads, width, torch.device("cpu"), 512**-0.5)  # noqa: E731
     phase(3, contexts=1)
     capturing[0] = True
-    phase(3, contexts=1)  # captured: must survive later eviction
+    phase(3, contexts=1, graph_reserved=True)  # captured: must survive later eviction
     capturing[0] = False
     captured = helper._paged_plans[key(3)]
-    phase(1, contexts=0)  # generation plan is protected as well
+    phase(1, contexts=0, graph_reserved=True)  # graph generation plan is protected as well
     generation = helper._paged_plans[key(1)]
+    phase(6, contexts=0)  # eager generation (e.g. a mixed step) is not protected
     for n in (2, 4, 5):
         phase(n, contexts=1)
         assert set(helper._paged_plans) == {key(3), key(1), key(n)}
     assert helper._paged_plans[key(3)] is captured
     assert helper._paged_plans[key(1)] is generation
-    assert plans == [3, 1, 2, 4, 5]
+    assert plans == [3, 1, 6, 2, 4, 5]

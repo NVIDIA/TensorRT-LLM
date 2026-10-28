@@ -33,21 +33,22 @@ l0_a10:
   - unittest/_torch/modeling/test_modeling_cohere2.py
   - unittest/_torch/modeling/test_modeling_parakeet.py
   - unittest/_torch/modeling/test_modeling_radio.py
+  - unittest/_torch/modeling/test_modeling_glm.py
   - unittest/_torch/modeling/test_modeling_minicpmv4_6.py
   - unittest/_torch/modeling/test_multimodal_encoder_mixin.py
   - unittest/_torch/sampler/test_token_ban.py
   - unittest/_torch/sampler/test_in_graph_sampling.py
   - unittest/_torch/disaggregation/test_disagg_index_mapper_early_release.py
-  - unittest/_torch/executor/kv_cache/test_kv_cache_compression_manager.py
-  - unittest/_torch/executor/kv_cache/test_kv_cache_v2_capacity_only.py
-  - unittest/_torch/executor/kv_cache/sharing
-  - unittest/_torch/executor/kv_cache/test_kv_cache_v2_branch_snapshot.py
-  - unittest/_torch/executor/test_kv_cache_layout.py
-  - unittest/_torch/executor/test_kv_connector_v2_prefix_real_manager.py
-  - unittest/_torch/executor/test_error_classification.py
-  - unittest/_torch/executor/test_resource_manager.py
-  - unittest/_torch/executor/test_seq_slot_sizing.py
-  - unittest/_torch/executor/test_profile_endpoints.py
+  - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_compression_manager.py
+  - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_capacity_only.py
+  - unittest/_torch/pyexecutor/kv_cache/sharing
+  - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_branch_snapshot.py
+  - unittest/_torch/pyexecutor/connectors/test_kv_cache_layout.py
+  - unittest/_torch/pyexecutor/kv_cache/test_kv_connector_v2_prefix_real_manager.py
+  - unittest/_torch/pyexecutor/test_error_classification.py
+  - unittest/_torch/pyexecutor/test_resource_manager.py
+  - unittest/_torch/pyexecutor/test_seq_slot_sizing.py
+  - unittest/_torch/pyexecutor/test_profile_endpoints.py
   - unittest/_torch/moe/test_communication_factory.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
@@ -60,15 +61,17 @@ l0_a10:
   - unittest/inputs/test_prefix_token_cache.py
   - unittest/others/test_cache_transceiver_precheck_config.py
   - unittest/others/test_cache_transceiver_precheck_run.py
+  - unittest/others/test_cuda_architecture_check.py
   - unittest/others/test_lora_manager.py
   - unittest/others/test_tracing.py
   - unittest/grpc/test_grpc_optional.py
   - unittest/grpc/smg/test_smg.py
-  # The one OpenEngine test needing a GPU: it builds a real LLM, because a
-  # stubbed engine would accept whatever its fake generate_async accepts and so
-  # would agree with an advertisement the real engine rejects. Any GPU will do
-  # -- the model is TinyLlama-1.1B -- so it sits with the other gateway tests.
+  # OpenEngine capability conformance needs real loaded models: a stub would
+  # accept whatever its fake generate_async tolerates and could agree with a
+  # false advertisement by construction. The image case uses Qwen3-VL-2B.
   - unittest/grpc/openengine/test_capability_conformance.py
+  - unittest/grpc/openengine/test_multimodal_conformance.py
+  - unittest/grpc/openengine/test_image_routing_conformance.py
   - unittest/disaggregated/test_coordinator_e2e.py
   - unittest/disaggregated/test_coordinator_worker.py
   - unittest/disaggregated/test_agent_multi_backends.py

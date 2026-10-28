@@ -20,6 +20,10 @@ from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     model_pb2,
     server_pb2,
 )
+from tensorrt_llm.grpc.openengine.capabilities import (  # noqa: E402
+    MediaCapabilities,
+    supports_image_routing,
+)
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 from tensorrt_llm.llmapi import KVEventsConfig  # noqa: E402
@@ -28,6 +32,40 @@ from tensorrt_llm.llmapi import KVEventsConfig  # noqa: E402
 pytestmark = pytest.mark.cpu_only
 
 MODEL = "test-model"
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_vl", "qwen2_vl", "text"])
+@pytest.mark.parametrize("enabled", [False, True, "auto"])
+@pytest.mark.parametrize(
+    "block_reuse,events_enabled,publisher",
+    [(True, True, "zmq"), (False, True, "zmq"), (True, False, "zmq"), (True, True, "null")],
+)
+def test_image_routing_capability_requires_streaming_v2_and_validated_model(
+    model_type, enabled, block_reuse, events_enabled, publisher
+):
+    llm = SimpleNamespace(
+        input_processor=SimpleNamespace(config=SimpleNamespace(model_type=model_type)),
+        args=SimpleNamespace(
+            kv_cache_config=SimpleNamespace(
+                use_kv_cache_manager_v2=enabled,
+                enable_block_reuse=block_reuse,
+                kv_events_config=SimpleNamespace(
+                    enable_kv_cache_events=events_enabled, publisher=publisher
+                ),
+            )
+        ),
+    )
+    expected = (
+        enabled is True
+        and model_type == "qwen3_vl"
+        and block_reuse
+        and events_enabled
+        and publisher == "zmq"
+    )
+    assert supports_image_routing(llm, {"image"}) is expected
+    assert not supports_image_routing(llm, set())
+    llm.args.cache_transceiver_config = object()
+    assert not supports_image_routing(llm, {"image"})
 
 
 class _FakeHandle:
@@ -86,6 +124,9 @@ def _llm(**overrides):
         args=args,
         llm_id="instance-1",
         tokenizer=overrides.get("_tokenizer", object()),
+        input_processor=SimpleNamespace(
+            supports_token_ids_input=overrides.get("_supports_token_ids_input", True)
+        ),
         _executor=executor,
         _check_health=lambda: executor.check_health(),
     )
@@ -167,6 +208,53 @@ async def test_model_info_reports_the_context_window_and_capabilities():
     assert model_pb2.GUIDED_DECODING_MODE_JSON_SCHEMA in info.generation.guided_decoding.modes
     assert info.generation.output_logprobs.supported is True
     assert info.supports_token_ids_input is True
+    assert info.supports_multimodal is False
+    assert list(info.extra["trtllm_supported_modalities"]) == []
+
+
+@pytest.mark.asyncio
+async def test_model_info_advertises_loaded_image_support(monkeypatch):
+    inference = _inference()
+    monkeypatch.setattr(
+        inference,
+        "_media_capabilities",
+        MediaCapabilities({"image": "<image_{}>"}),
+    )
+
+    info = await _servicer(inference=inference).GetModelInfo(
+        model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
+    )
+
+    assert info.supports_multimodal is True
+    assert list(info.extra["trtllm_supported_modalities"]) == ["image"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("events_enabled", [False, True])
+async def test_model_info_advertises_image_routing_only_with_events(monkeypatch, events_enabled):
+    llm = _llm(
+        kv_cache_config=SimpleNamespace(
+            use_kv_cache_manager_v2=True,
+            enable_block_reuse=True,
+            tokens_per_block=32,
+            kv_events_config=SimpleNamespace(
+                enable_kv_cache_events=events_enabled, publisher="zmq"
+            ),
+        )
+    )
+    llm.input_processor = SimpleNamespace(config=SimpleNamespace(model_type="qwen3_vl"))
+    inference = OpenEngineInferenceServicer(llm, MODEL)
+    monkeypatch.setattr(
+        inference, "_media_capabilities", MediaCapabilities({"image": "<image_{}>"})
+    )
+    info = await OpenEngineControlServicer(llm, MODEL, inference).GetModelInfo(
+        model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
+    )
+    assert info.supports_multimodal
+    if events_enabled:
+        assert info.extra["trtllm_image_routing_version"] == 1
+    else:
+        assert "trtllm_image_routing_version" not in info.extra
 
 
 @pytest.mark.asyncio
@@ -405,6 +493,25 @@ async def test_abort_all_fails_the_rpc_when_any_abort_is_refused():
 
 
 @pytest.mark.asyncio
+async def test_health_probe_is_not_applicable_to_text_only_input_models():
+    llm = _llm(_supports_token_ids_input=False)
+
+    def unexpected_generate(*args, **kwargs):
+        pytest.fail("a token-only probe must not reach a prompt-only model")
+
+    llm.generate_async = unexpected_generate
+    servicer = OpenEngineControlServicer(llm, MODEL, _inference(), kv_transfer_backend="")
+    response = await servicer.Health(
+        lifecycle_pb2.HealthRequest(include_inference_probe=True), FakeServicerContext()
+    )
+    probe = next(check for check in response.checks if check.name == "inference_probe")
+    assert probe.state == lifecycle_pb2.HEALTH_STATE_READY
+    assert "not applicable" in probe.message
+    assert "inference liveness was not tested" in probe.message
+    assert response.state == lifecycle_pb2.HEALTH_STATE_READY
+
+
+@pytest.mark.asyncio
 async def test_health_inference_probe_is_bounded_and_aborts_a_stuck_request():
     """A wedged engine must yield DEGRADED, not a hung RPC or a leaked request."""
     import asyncio
@@ -527,6 +634,15 @@ async def test_text_input_is_not_advertised_without_a_tokenizer():
 async def test_text_input_is_advertised_when_a_tokenizer_exists():
     info = await _servicer().GetModelInfo(model_pb2.GetModelInfoRequest(), FakeServicerContext())
     assert info.supports_text_input is True
+
+
+@pytest.mark.asyncio
+async def test_token_ids_are_not_advertised_when_the_processor_ignores_them():
+    info = await _servicer(_supports_token_ids_input=False).GetModelInfo(
+        model_pb2.GetModelInfoRequest(), FakeServicerContext()
+    )
+    assert info.supports_text_input is True
+    assert info.supports_token_ids_input is False
 
 
 @pytest.mark.asyncio

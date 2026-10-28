@@ -60,6 +60,7 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "CUTLASS"}}, True),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend_typo": "CUTLASS"}}, False),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "not-a-backend"}}, False),
+        (generator.SERVE_SCHEMA, {"moe_config": {"load_balancer": "eplb.yaml"}}, True),
         (generator.SERVE_SCHEMA, {"backend": "pytorch"}, True),
         (generator.SERVE_SCHEMA, {"backend": "_autodeploy"}, False),
         (
@@ -166,12 +167,80 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 1}}, True),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_szie": 1}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 0}}, False),
+        (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 1}}, True),
+        (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 2}}, True),
+        (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 0}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"attention_config": {"backend": "not-a-backend"}}, False),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "native",
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "morton",
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "hilbert",
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "peano",
+                    }
+                }
+            },
+            False,
+        ),
     ],
 )
 def test_config_validation(
     schemas: dict[str, dict], filename: str, config: dict, valid: bool
 ) -> None:
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize("field", ["transfer_timeout_sec", "control_grace_sec"])
+@pytest.mark.parametrize(("value", "valid"), [(0.5, True), (0.0, False), (-1.0, False)])
+def test_connector_timeout_constraints(
+    schemas: dict[str, dict], filename: str, field: str, value: float, valid: bool
+) -> None:
+    config = {"kv_connector_config": {"connector": "lmcache", field: value}}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
 
@@ -185,6 +254,40 @@ def test_branch_snapshot_field_types(
     config = {"kv_cache_config": {section: {"enable_branch_snapshot": value}}}
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize(
+    ("load_balancer", "valid"),
+    [
+        ({"num_slots": 288}, True),
+        ({"mode": "standard", "num_slots": 288, "layer_updates_per_iter": 1}, True),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 4}, True),
+        (
+            {"mode": "per_layer_dynamic", "num_slots": 320, "helper_slot_mode": "shared_banks"},
+            True,
+        ),
+        # A mapping without mode is standard EPLB, which has no auxiliary_sms.
+        ({"num_slots": 320, "auxiliary_sms": 4}, False),
+        ({"mode": "per_layer_dynamic"}, False),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "layer_updates_per_iter": 1}, False),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 9}, False),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "helper_slot_mode": "private"}, False),
+        ({"mode": "dynamic", "num_slots": 320}, False),
+    ],
+)
+def test_load_balancer_schema_matches_runtime(
+    schemas: dict[str, dict], load_balancer: dict, valid: bool
+) -> None:
+    from tensorrt_llm.llmapi.llm_args import MoeConfig
+
+    config = {"moe_config": {"load_balancer": load_balancer}}
+    errors = list(Draft202012Validator(schemas[generator.SERVE_SCHEMA]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+    if valid:
+        MoeConfig(load_balancer=load_balancer)
+    else:
+        with pytest.raises(ValueError):
+            MoeConfig(load_balancer=load_balancer)
 
 
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:
@@ -519,6 +622,45 @@ def test_runtime_only_fields_are_preserved(nullable: bool, union: bool) -> None:
     assert not validator.is_valid({})
     for value in (None, "name", 1, True, [], {}):
         assert validator.is_valid({"external_hook": value}) == (nullable and value is None)
+
+
+@pytest.mark.parametrize("decoding_type", ["Eagle", "Eagle3"])
+def test_eagle_yaml_draft_length(schemas: dict[str, dict], decoding_type: str) -> None:
+    from pydantic import TypeAdapter, ValidationError
+
+    from tensorrt_llm.llmapi.llm_args import SpeculativeConfig
+
+    config = yaml.safe_load(f"""
+speculative_config:
+  decoding_type: {decoding_type}
+  speculative_model: /path/to/draft
+  max_draft_len: 8
+""")
+    adapter = TypeAdapter(SpeculativeConfig)
+    parsed = adapter.validate_python(config["speculative_config"])
+    assert parsed.max_draft_len == 8
+    assert parsed.max_total_draft_tokens == 8
+    assert adapter.validate_json(parsed.model_dump_json()).max_draft_len == 8
+
+    validators = [
+        Draft202012Validator(schemas[generator.SERVE_SCHEMA]),
+        Draft202012Validator(schemas[generator.DISAGG_SCHEMA]),
+    ]
+    for validator in validators:
+        validator.validate(config)
+    for section in ("context_servers", "generation_servers"):
+        validators[1].validate({section: config})
+
+    for retired_value in (None, 8):
+        invalid = copy.deepcopy(config)
+        invalid["speculative_config"]["num_eagle_layers"] = retired_value
+        invalid = yaml.safe_load(yaml.safe_dump(invalid))
+        with pytest.raises(ValidationError, match="num_eagle_layers"):
+            adapter.validate_python(invalid["speculative_config"])
+        for validator in validators:
+            assert not validator.is_valid(invalid)
+        for section in ("context_servers", "generation_servers"):
+            assert not validators[1].is_valid({section: invalid})
 
 
 def test_nested_validation_alias(schemas: dict[str, dict]) -> None:

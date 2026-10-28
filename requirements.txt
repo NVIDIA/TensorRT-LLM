@@ -1,5 +1,9 @@
 --extra-index-url https://download.pytorch.org/whl/cu132
 -c constraints.txt
+# filelock 4.2.1 requires Python 3.11+. Pin Python 3.10 to 3.20.3 to exclude
+# vulnerable releases 3.20.4 through 4.2.0; newer Python can use 4.2.1 or later.
+filelock==3.20.3; python_version < "3.11"
+filelock>=4.2.1; python_version >= "3.11"
 accelerate>=1.7.0
 build
 colored
@@ -68,8 +72,8 @@ peft>=0.18.1,<0.19.0
 patchelf
 einops
 fla-core==0.5.2 # the Kimi Linear / Kimi K3 KDA layers import fla.modules and fla.ops when they load
-flashinfer-python==0.6.18
-xgrammar==0.1.32
+flashinfer-python==0.7.2
+xgrammar==0.2.8
 llguidance==0.7.29
 jsonschema
 backoff
@@ -106,7 +110,7 @@ cuda-core
 llist
 cuda-tile>=1.0.1
 nvidia-cuda-tileiras>=13.1,<13.2
-nvidia-cudnn-frontend>=1.27.0,<1.28
+nvidia-cudnn-frontend>=1.31.0,<1.32
 etcd-sdk-python==0.0.7
 # Required by the checked-in OpenEngine gRPC bindings.
 grpcio>=1.73.1,<2

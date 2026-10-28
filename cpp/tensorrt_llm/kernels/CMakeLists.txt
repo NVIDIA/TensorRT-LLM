@@ -87,6 +87,10 @@ list(FILTER SRC_CU EXCLUDE REGEX "fusedSampling/.*")
 # Marlin is built as its own architecture-scoped OBJECT library below.
 list(FILTER SRC_CPP EXCLUDE REGEX "marlin/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "marlin/.*")
+# The MiniMax-M3 decode attention kernels are built as their own
+# architecture-scoped OBJECT library below.
+list(FILTER SRC_CU EXCLUDE REGEX
+     "minimaxM3/(fusedDecodeAttn|attnMega|attnC1)\\.cu$")
 
 if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
@@ -105,6 +109,11 @@ if(FAST_BUILD)
     STATUS "FAST_BUILD enabled for kernels: using -O1 for CUDA compilation")
 endif()
 
+include(kernelComponents.cmake)
+set(TLLM_KERNEL_COMPONENT_TARGETS
+    ${TLLM_KERNEL_COMPONENT_TARGETS}
+    PARENT_SCOPE)
+
 # Marlin NVFP4: build Ada/Hopper kernels and the dense W4A16/repack kernels used
 # on SM12x. Unsupported device passes emit empty kernel stubs.
 file(GLOB_RECURSE MARLIN_SRC "marlin/*.cu" "marlin/*.cpp")
@@ -121,10 +130,22 @@ if(MARLIN_SRC)
   set_cuda_architectures(marlin_src 89 90 120f)
 endif()
 
+# MiniMax-M3 decode attention: block-scaled tcgen05 MMAs (.scale_vec::1X) exist
+# on the arch-specific sm_100a / sm_103a targets only, not on the sm_100f family
+# target the rest of this library builds. Other targets compile kernels that
+# trap.
+add_library(
+  minimax_m3_attn_src OBJECT minimaxM3/fusedDecodeAttn.cu minimaxM3/attnMega.cu
+                             minimaxM3/attnC1.cu)
+set_property(TARGET minimax_m3_attn_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET minimax_m3_attn_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+set_cuda_architectures(minimax_m3_attn_src 100 103)
+
 add_library(
   kernels_src STATIC
   ${SRC_CPP} ${SRC_CU} ${MOE_KERNELS_SRC}
-  $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>)
+  $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>
+  $<TARGET_OBJECTS:minimax_m3_attn_src>)
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_include_directories(

@@ -33,6 +33,7 @@ from ...sampling_params import SamplingParams
 from ..kernels.spec_step_copies import op as spec_step_copies
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
+from ..pyexecutor.runtime_hooks import SpecStepFold
 from ..pyexecutor.sampler import (
     DEFAULT_BEAM_IDX,
     AsyncWorkerMixin,
@@ -167,6 +168,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     i.e. the target's per-step input width minus one, which is exactly the
     draft length every mode used to compute for itself.
     """
+
+    # The model's speculative step-input staging, when it opted into one (bind_spec_step_fold).
+    spec_step_fold: Optional[SpecStepFold] = None
 
     SampleState = SampleStateSpec
 
@@ -327,6 +331,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             new_tokens_lens=int_tensor((seq_slots,)),
         )
 
+    def bind_spec_step_fold(self, spec_step_fold: SpecStepFold) -> None:
+        """Let the model's forward store into this sampler's per-slot store (see SpecStepFold)."""
+        self.spec_step_fold = spec_step_fold
+        spec_step_fold.bind_sampler_store(self.store)
+
     def _request_common_handling(
         self,
         request: LlmRequest,
@@ -424,6 +433,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             num_skip : num_skip + num_sampling_requests
         ]
         o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
+
+        step_fold = self.spec_step_fold
+        if step_fold is not None and step_fold.scatter(
+            slots_device, o_new_tokens, o_next_new_tokens, o_new_tokens_lens, o_next_draft_tokens
+        ):
+            return
 
         # Pad or truncate to match fixed-size store buffers for index_copy_.
         # The worker output width tracks runtime_draft_len, which dynamic draft
@@ -543,8 +558,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             # The previous step's host copies may still be reading the stores.
             torch.cuda.current_stream().wait_event(self._store_copies_done)
         slots = [r.py_seq_slot for r in sampling_requests]
-        scattered = False
-        if self._store_scatter is not None:
+        step_fold = self.spec_step_fold
+        scattered = step_fold is not None and step_fold.sampler_rows_stored(
+            outputs, num_skip, slots
+        )
+        # A model's step fold scatters the stores itself, in _scatter_to_stores.
+        if not scattered and step_fold is None and self._store_scatter is not None:
             # A step whose batch is unchanged leaves the slot table as it is.
             self._slot_table_buffer.update(torch.tensor(slots, dtype=torch.int32))
             scattered = self._store_scatter.scatter(

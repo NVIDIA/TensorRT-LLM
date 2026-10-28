@@ -35,6 +35,7 @@ from tensorrt_llm._utils import get_sm_version
 
 from ...conftest import llm_models_root
 from ..accuracy_core import GSM8K, LlmapiAccuracyTestHarness
+from ._env import scoped_env_overrides
 
 # The targets assert their own SM at construction: certification is per GPU
 # architecture, and a receipt from another one says nothing here.
@@ -114,14 +115,17 @@ class TestModelingV2GptOss120bSm10xDefault(LlmapiAccuracyTestHarness):
         # checking the synthesizer. One forward of the run below pays for it.
         # It travels as ``env_overrides``: the check runs where the metadata
         # does, which is the rank rather than this process.
-        with LLM(
-            self.MODEL_PATH,
-            tensor_parallel_size=world_size,
-            moe_tensor_parallel_size=moe_tp_size,
-            moe_expert_parallel_size=moe_ep_size,
-            enable_attention_dp=attention_dp,
-            modeling_v2="require",
-            env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
-        ) as llm:
+        with (
+            scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=world_size,
+                moe_tensor_parallel_size=moe_tp_size,
+                moe_expert_parallel_size=moe_ep_size,
+                enable_attention_dp=attention_dp,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_evaluator_kwargs=self.extra_evaluator_kwargs)

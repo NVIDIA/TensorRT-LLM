@@ -32,18 +32,19 @@ Precision comes down to which qualname a changed line lands on. The shared
 
 | Changed line sits in | Attributed to | Note |
 |---|---|---|
-| A function or method body | `Class.method` / `func` | the only precise case |
+| A function or method body | `Class.method` / `func` | precise |
+| A closure body | `outer.<locals>.inner` | also precise: recorded under its own qualname, same as any function |
 | A module-level statement | `<module>` | module body, executed once at import |
 | A class body (class attribute) | `ClassName` | class body, executed once at import |
 | **A signature or decorator line** | **the enclosing scope** | a method's `def` line lands on `ClassName`, not on the method |
-| A closure body (`<locals>`) | **the nearest recorded enclosing scope** | changing `inner` in `def outer(): def inner()` lands on `outer` |
+| A lambda or genexpr body | **the nearest enclosing named def** | `_collect_scopes` only discovers named `def`/`class` statements; changing a lambda in `def outer(): f = lambda: ...` lands on `outer` |
 
-The last three are where both the precision and the correctness problems come from: **the
+The last two are where both the precision and the correctness problems come from: **the
 attributed qualname's DB rows do not represent the changed code's executions.**
 
-DB qualnames come from `co_qualname`, so they match what the AST derives (`Class.method`), but
-comprehensions, lambdas and closures are skipped during collection, so those names do not exist
-in the DB at all.
+DB qualnames come from `co_qualname`, so they match what the AST derives (`Class.method`,
+`outer.<locals>.inner`), but collection drops lambda and genexpr frames since selection has no way
+to resolve a line to them (`COLLECTION.md` §5.1), so those names do not exist in the DB at all.
 
 ## 3. The decline gates
 
@@ -61,12 +62,14 @@ of:
 
 ## 4. Bounding low-risk import-executed changes
 
-Import-phase rows are recorded only by the tests that spawn subprocesses (`../collection/COLLECTION.md`
-§5.2), so a `<module>` or `ClassName` row set is missing the tests served by MPI pool workers. Widening
-to the file's row set recovers some of them but is a **recovery heuristic, not an upper bound**: a test
-that imports the file and never enters any function in it records nothing there at all, so it is absent
-from the file set too. Measured on `llmapi/llm_args.py`, the widening goes from 509 holders to 735 while
-about 746 tests import the file — the gap does not close.
+Every process, including an `mpi4py.futures` pool worker, records its own import phase (see
+`../collection/COLLECTION.md` §5.2); only the outer pytest's own pre-test import is unattributed,
+since it runs under the empty context and the merge filters that out with `WHERE test != ''`. So a
+`<module>` or `ClassName` row set can still fall short of the full set of tests that import the file:
+a test that imports it and never enters any function in it records nothing there at all. Widening to
+the file's row set recovers those cases but is a **recovery heuristic, not an upper bound** for the
+same reason — a test whose only interaction with the file is the bare import still records nothing,
+so it is absent from the file set too.
 
 Consequently, Tier 2 never uses `<module>` or class-body rows as an impact bound. Most import-executed
 changes still decline. A small AST allowlist can instead translate these low-risk module statements to
@@ -141,24 +144,31 @@ callers without treating all import-time execution as safe or assuming that `_` 
 
 ### 4.1 Closures
 
-A closure body is not recorded at all, so a changed closure is attributed to its nearest recorded
-enclosing scope and put through `_underrecorded_bound(cf, qualname)`:
+A named closure's body is recorded under its own qualname (`COLLECTION.md` §2.1), so both ways a
+changed line reaches it resolve to the closure itself, not its enclosing def:
 
-```
-file rows > that qualname's rows  →  use the file rows (the wider bound)
-otherwise                        →  decline, run in full
-```
+- **A direct line change inside the closure** resolves to that qualname through `qualnames_for_lines`
+  and goes through the ordinary `_qualname_impact` path below like any other function:
+  `tests_touching_func(f, q)` if it has rows, a local-caller bound or the configured no-data fallback
+  (file-level by default) if it does not yet.
+- **Binding-consumer resolution** — "does this def use a binding that just changed" — is a separate
+  mechanism, `_FunctionNames` in `python_change_analysis.py`. `_recorded_definition_groups` records a
+  nested def under its own qualname, so it gets its own fact there too; only a nested def's *signature*
+  (decorators, defaults, annotations), which genuinely runs in the outer scope at definition time, rolls
+  up into the outer def's own fact (`_include_signature_loads`) — its body, which only runs when the
+  nested def itself is later called, gets its own independent `_FunctionNames` fact instead, same as
+  any other qualname in `definition_groups`. A closure built by one test and invoked by a different one
+  (a cached decorator, a session-scoped fixture) is why this distinction matters: resolving to the outer
+  def would only find the constructing test, missing the one that actually depends on the binding.
 
-`tests_touching_func(f, q)` is by construction a subset of `tests_touching_file(f)`, so a strictly
-larger file set contains tests the qualname set does not — tests that recorded some *other* function
-in the same file, which is what makes the file exercised beyond import time. When the two are equal
-the file is only ever recorded at import time (`__init__.py` and similar, 881 of 1149 files) and no
-bound exists.
-
-This bound carries the same incompleteness as the file-level widening of §4. It is narrower in blast radius
-(4.3% of core-Python commits touch a closure, against 82.6% for import-executed lines) but it is not
-sound either: a decorator's `wrapper` is created at import time, so the enclosing scope it attributes
-to can itself be import-only.
+One case remains conservative by construction: **a lambda or genexpr body** attributes to its nearest
+enclosing *named* def, since `_collect_scopes` only discovers named `def`/`class` statements. A lambda or
+genexpr can appear anywhere an expression can, nested inside each other and themselves to arbitrary depth,
+so there is no static-analysis path to resolve a changed line to it directly; collection follows this by
+dropping their frames too (`COLLECTION.md` §5.1). The enclosing def's rows stand in instead, but only
+reflect when the enclosing def *itself* ran, not when the lambda inside it did, so the gap is the same
+shape as the cached-closure case above: a lambda created by one test and invoked by another gives the
+invoking test no rows on the enclosing def, and it can be missed.
 
 ## 5. Full impact resolution
 
@@ -171,8 +181,7 @@ for each residual file:
        │    ├ external reference / import-time consumer → decline
        │    └ local consumers → rows / local caller bound / no-data fallback
        ├ other import-executed change          → decline
-       ├ closure         → _underrecorded_bound(cf, q)      bound or decline
-       ├ has DB rows     → tests_touching_func(cf, q)       precise
+       ├ has DB rows     → tests_touching_func(cf, q)       precise (includes closures, §4.1)
        └ no DB rows      → no_data_policy fallback (file by default)
 ```
 
@@ -197,7 +206,7 @@ The resulting stage set unions with every rule contribution, including
 
 | Signal | Meaning |
 |---|---|
-| `test_case_meta` reports incomplete | `outcome != passed`, `saved_procs < expected_workers + 1`, or `tainted != 0` — the compact DB's logical completeness view |
+| `test_case_meta` reports incomplete | `outcome` is missing or not `passed`, or `tainted != 0` — the compact DB's logical completeness view |
 | Drove inference but has no `py_executor` rows | the coordinator ran but the worker's coverage never arrived |
 | Footprint < 30 functions | the record is near-empty |
 | On a `-Ray-` stage | the GPU worker is uninstrumented, only driver-side rows exist |

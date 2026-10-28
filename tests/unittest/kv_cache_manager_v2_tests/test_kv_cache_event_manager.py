@@ -19,12 +19,15 @@ import pickle
 import sys
 import threading
 import time
+import uuid
 from importlib.util import find_spec
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
+from unittest.mock import Mock
 
 import msgspec
 import pytest
+import zmq
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
     KVEventBatch,
@@ -56,6 +59,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         CacheLevel,
         CudaStream,
         KVCacheManager,
+        MmItemContext,
         ReuseScope,
         TokenId,
         _introspection,
@@ -66,6 +70,7 @@ else:
         CacheLevel,
         CudaStream,
         KVCacheManager,
+        MmItemContext,
         ReuseScope,
         TokenId,
         _introspection,
@@ -347,6 +352,236 @@ def test_native_streaming_sink_to_python_wire_structs(real_block_factory, lora_i
         manager.shutdown()
 
 
+@pytest.mark.parametrize(
+    "failure_stage", [None, "native_clear", "conversation_clear", "sharing_reset"]
+)
+def test_buffered_cache_reset_does_not_start_event_gather(failure_stage):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    gather = Mock(return_value=[[], []])
+    wrapper = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    wrapper.event_manager = KVCacheEventManager(
+        max_kv_event_entries=128,
+        window_size=128,
+        attention_dp_rank=1,
+        attention_dp_gather=gather,
+    )
+    wrapper.impl = SimpleNamespace(clear_reusable_blocks=Mock())
+    wrapper.conversation_manager = SimpleNamespace(clear=Mock())
+    wrapper._sharing = SimpleNamespace(_on_reset=Mock())
+    stages = {
+        "native_clear": wrapper.impl.clear_reusable_blocks,
+        "conversation_clear": wrapper.conversation_manager.clear,
+        "sharing_reset": wrapper._sharing._on_reset,
+    }
+    error = RuntimeError("reset failed on this rank")
+    if failure_stage is not None:
+        stages[failure_stage].side_effect = error
+        with pytest.raises(RuntimeError) as exc_info:
+            wrapper.reset_reuse_state()
+        assert exc_info.value is error
+    else:
+        wrapper.reset_reuse_state()
+
+    # Buffered ADP publication must not introduce a reset-time collective.
+    gather.assert_not_called()
+    assert wrapper.event_manager.get_latest_events(0) == []
+    wrapper.flush_iteration_events()
+    gather.assert_called_once()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("failure_stage", ["native_clear", "conversation_clear"])
+def test_reset_route_state_follows_native_cache_clear(failure_stage):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.route_capture import RouteCapture
+
+    init_cuda_once()
+    native = _create_test_manager(None)
+    stream_holder = CachedCudaStream()
+    tokens = _token_ids(1, 9)
+    _commit_and_close(native, cast(CudaStream, stream_holder.handle), tokens)
+    assert native.probe_reuse(input_tokens=tokens) == len(tokens)
+    held = native.create_kv_cache() if failure_stage == "native_clear" else None
+    wrapper = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    wrapper.impl = native
+    wrapper.event_manager = None
+    wrapper.conversation_manager = Mock()
+    wrapper._sharing = None
+    if failure_stage == "conversation_clear":
+        wrapper.conversation_manager.clear.side_effect = RuntimeError("conversation clear failed")
+    route_capture = RouteCapture(rank=0)
+    route_capture._shared[1] = torch.ones((1, 1), dtype=torch.int16)
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_manager = wrapper
+    executor.enable_joint_kv_cache_reuse = False
+    executor.model_engine = SimpleNamespace(route_capture=route_capture)
+
+    try:
+        expected_error = (
+            r"KV cache\(s\) still open"
+            if failure_stage == "native_clear"
+            else "conversation clear failed"
+        )
+        with pytest.raises(RuntimeError, match=expected_error):
+            PyExecutor.reset_prefix_cache(executor)
+        if failure_stage == "native_clear":
+            assert native.probe_reuse(input_tokens=tokens) == len(tokens)
+            assert 1 in route_capture._shared
+        else:
+            assert native.probe_reuse(input_tokens=tokens) == 0
+            assert not route_capture._shared
+    finally:
+        if held is not None:
+            held.close()
+        native.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("failure_stage", ["native_clear", "conversation_clear"])
+def test_streaming_reset_failure_flushes_pending_events(failure_stage):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    init_cuda_once()
+    events = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+    )
+    events.set_layer_group_window_sizes({0: 128})
+    published = []
+    events._publisher.publish = lambda batch: published.append(batch) or True
+    native = _create_test_manager(events.event_sink)
+    wrapper = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    wrapper.impl = native
+    wrapper.event_manager = events
+    wrapper.conversation_manager = Mock()
+    wrapper._sharing = None
+    stream_holder = CachedCudaStream()
+    _commit_and_close(native, cast(CudaStream, stream_holder.handle), _token_ids(1, 5))
+    held = native.create_kv_cache() if failure_stage == "native_clear" else None
+    if failure_stage == "conversation_clear":
+        wrapper.conversation_manager.clear.side_effect = RuntimeError("conversation clear failed")
+    try:
+        with pytest.raises(RuntimeError):
+            wrapper.reset_reuse_state()
+        assert len(published) == 1
+        wire_events = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]))[1]
+        assert wire_events[0]["type"] == "BlockStored"
+        assert (wire_events[-1]["type"] == "AllBlocksCleared") == (
+            failure_stage == "conversation_clear"
+        )
+    finally:
+        if held is not None:
+            held.close()
+        native.shutdown()
+        events.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("populated", [False, True])
+def test_streaming_cache_reset_is_published_while_idle_and_replayed(populated):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    init_cuda_once()
+    endpoint = f"inproc://kv-reset-{uuid.uuid4().hex}"
+    events = StreamingKVCacheEventManager(
+        KVEventsConfig(
+            enable_kv_cache_events=True,
+            publisher="zmq",
+            endpoint=endpoint,
+            replay_endpoint=f"{endpoint}-replay",
+        ),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+        max_entries=1,
+    )
+    events.set_layer_group_window_sizes({0: 128})
+    manager = _create_test_manager(events.event_sink)
+    wrapper = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    wrapper.impl = manager
+    wrapper.event_manager = events
+    wrapper.conversation_manager = None
+    wrapper._sharing = None
+    stream_holder = CachedCudaStream()
+    stream = cast(CudaStream, stream_holder.handle)
+    replay = zmq.Context.instance().socket(zmq.DEALER)
+    replay.setsockopt(zmq.RCVTIMEO, 5000)
+    replay.setsockopt(zmq.SNDTIMEO, 5000)
+    subscriber = zmq.Context.instance().socket(zmq.SUB)
+    subscriber.setsockopt(zmq.SUBSCRIBE, b"")
+    subscriber.setsockopt(zmq.RCVTIMEO, 5000)
+    events.start()
+    replay.connect(f"{endpoint}-replay")
+    subscriber.connect(endpoint)
+
+    def replay_through(expected_batches, start_seq):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            replay.send_multipart((b"", start_seq.to_bytes(8, "big")))
+            batches = []
+            while True:
+                _, _, seq, payload = replay.recv_multipart()
+                if seq == events._publisher.END_SEQ:
+                    break
+                batches.append((int.from_bytes(seq, "big"), msgspec.msgpack.decode(payload)))
+            if len(batches) >= expected_batches:
+                return batches
+        pytest.fail("Reset was not published without another inference iteration")
+
+    try:
+        # Establish the SUB subscription using real resets, without relying on a
+        # sleep or on future inference traffic to make the connection usable.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            wrapper.reset_reuse_state()
+            if subscriber.poll(100):
+                _, seq, payload = subscriber.recv_multipart()
+                # A subscription may become ready after an earlier reset was
+                # queued. Consume through this attempt before fixing the cursor.
+                while int.from_bytes(seq, "big") < events.enqueued_batches - 1:
+                    _, seq, payload = subscriber.recv_multipart()
+                assert msgspec.msgpack.decode(payload)[1][-1] == {"type": "AllBlocksCleared"}
+                start_seq = int.from_bytes(seq, "big") + 1
+                break
+        else:
+            pytest.fail("Idle reset did not reach the live subscriber")
+
+        if populated:
+            _commit_and_close(manager, stream, _token_ids(1, 5))
+        # Reset must flush both pending cache changes and the reset itself. No
+        # executor iteration or explicit flush is allowed between reset and replay.
+        wrapper.reset_reuse_state()
+        _, seq, payload = subscriber.recv_multipart()
+        assert int.from_bytes(seq, "big") == start_seq
+        assert msgspec.msgpack.decode(payload)[1][-1] == {"type": "AllBlocksCleared"}
+        batches = replay_through(1, start_seq)
+        first_events = batches[0][1][1]
+        assert first_events[-1] == {"type": "AllBlocksCleared"}
+        if populated:
+            assert first_events[0]["type"] == "BlockStored"
+            assert first_events[0]["token_ids"] == [1, 2, 3, 4]
+
+        # Reusing the same tokens after reset must emit fresh stored data.
+        _commit_and_close(manager, stream, _token_ids(1, 5))
+        events.flush_iteration_events()
+        wrapper.reset_reuse_state()
+        batches = replay_through(3, start_seq)
+        assert [seq for seq, _ in batches] == list(range(start_seq, start_seq + 3))
+        assert batches[1][1][1][0]["type"] == "BlockStored"
+        assert batches[1][1][1][0]["token_ids"] == [1, 2, 3, 4]
+        assert batches[2][1][1][-1] == {"type": "AllBlocksCleared"}
+        assert events.dropped_events == 0
+    finally:
+        replay.close(linger=0)
+        subscriber.close(linger=0)
+        manager.shutdown()
+        events.shutdown()
+
+
 def test_native_streaming_sink_separates_lora_scopes(real_block_factory):
     manager = StreamingKVCacheEventManager(
         KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
@@ -375,7 +610,10 @@ def test_native_streaming_sink_separates_lora_scopes(real_block_factory):
         manager.shutdown()
 
 
-def test_native_streaming_sink_preserves_multimodal_event_data(real_block_factory):
+@pytest.mark.parametrize(
+    "uuid_a,uuid_b", [(None, None), ("frontend-a", "frontend-b"), ("", None), ("image-图片", None)]
+)
+def test_native_streaming_sink_preserves_multimodal_event_data(real_block_factory, uuid_a, uuid_b):
     manager = StreamingKVCacheEventManager(
         KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
         data_parallel_rank=0,
@@ -393,10 +631,10 @@ def test_native_streaming_sink_preserves_multimodal_event_data(real_block_factor
         make_block = real_block_factory(event_sink, tokens_per_block=4)
         digest_a = bytes(range(32))
         digest_b = bytes(reversed(range(32)))
-        first = make_block([1, digest_a, 1001, 1002], [4])
+        first = make_block([1, MmItemContext(digest_a, uuid_a), 1001, 1002], [4])
         gap = make_block([2, 3, 4, 5], [4], parent=first)
         continued = make_block([1003, 7, 1004, 1005], [4], parent=gap)
-        last = make_block([1006, digest_b, 1001, 9], [4], parent=continued)
+        last = make_block([1006, MmItemContext(digest_b, uuid_b), 1001, 9], [4], parent=continued)
 
         for block in (first, gap, continued, last):
             _add_streaming_stored_block(event_sink, block)
@@ -424,14 +662,44 @@ def test_native_streaming_sink_preserves_multimodal_event_data(real_block_factor
             9,
         ]
         assert [
-            [(key.hash, key.start_offset) for key in block_keys] for block_keys in stored.mm_keys
+            [(key.hash, key.start_offset, key.uuid) for key in block_keys]
+            for block_keys in stored.mm_keys
         ] == [
-            [(digest_a.hex(), 0)],
+            [(digest_a.hex(), 0, uuid_a)],
             [],
-            [(digest_a.hex(), 3), (digest_a.hex(), 4)],
-            [(digest_a.hex(), 6), (digest_b.hex(), 0)],
+            [(digest_a.hex(), 3, uuid_a), (digest_a.hex(), 4, uuid_a)],
+            [(digest_a.hex(), 6, uuid_a), (digest_b.hex(), 0, uuid_b)],
         ]
+        # UUIDs are event metadata, not an additional input to the block-key hash.
+        digest_only_tokens = [
+            bytes.fromhex(token) if isinstance(token, str) else token for token in stored.token_ids
+        ]
+        assert stored.block_hashes == [
+            int.from_bytes(key[:8], byteorder="big", signed=True)
+            for key in _blockchain_keys(4, digest_only_tokens)
+        ]
+        payload = msgspec.msgpack.encode(published[0])
+        assert msgspec.msgpack.decode(payload, type=KVEventBatch) == published[0]
+        wire_keys = msgspec.msgpack.decode(payload)[1][0]["mm_keys"]
+        for actual_keys, expected_keys in zip(wire_keys, stored.mm_keys, strict=True):
+            assert actual_keys == [
+                {
+                    "type": "mm_key",
+                    "hash": key.hash,
+                    "start_offset": key.start_offset,
+                    **({"uuid": key.uuid} if key.uuid is not None else {}),
+                }
+                for key in expected_keys
+            ]
         assert manager.stored_blocks == 4
+        assert stored.trtllm_image_routing.version == 1
+        assert stored.trtllm_image_routing.token_id_offset == 1000
+        assert [[key.uuid for key in keys] for keys in stored.mm_keys] == [
+            [uuid_a],
+            [],
+            [uuid_a] * 2,
+            [uuid_a, uuid_b],
+        ]
     finally:
         manager.shutdown()
 
@@ -557,7 +825,11 @@ def test_event_data_pickle_round_trip_preserves_value_semantics():
         [token],
         cache_level=1,
         priority=35,
-        mm_keys=[(b"short-mm-key", 3), (b"another-key", 5, "uuid")],
+        mm_keys=[
+            (b"short-mm-key", 3),
+            (b"another-key", 5, "uuid"),
+            (b"digest-key", 7, "routing-identity", True),
+        ],
         cache_salt="salt",
     )
     diff = KVCacheEventDiff(0, 1)
@@ -1240,7 +1512,8 @@ def test_v2_kv_cache_event_manager_derives_mm_keys_across_blocks(
     make_block = real_block_factory(event_manager)
     digest_a = bytes(range(32))
     digest_b = bytes(reversed(range(32)))
-    first = make_block([1, digest_a, 1001, 1002], [ancestor_coverage])
+    uuid_a = "frontend-h-a"
+    first = make_block([1, MmItemContext(digest_a, uuid_a), 1001, 1002], [ancestor_coverage])
     gap = make_block([2, 3, 4, 5], [ancestor_coverage], parent=first)
     continued = make_block([1003, 7, 1004, 1005], [4], parent=gap)
     last = make_block([1006, digest_b, 1001, 9], [4], parent=continued)
@@ -1257,17 +1530,37 @@ def test_v2_kv_cache_event_manager_derives_mm_keys_across_blocks(
     }
     expected = {
         _block_key(continued).hex(): [
-            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 3},
-            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 4},
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 3,
+            },
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 4,
+            },
         ],
         _block_key(last).hex(): [
-            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 6},
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 6,
+            },
             {"type": "mm_key", "hash": digest_b.hex(), "start_offset": 0},
         ],
     }
     if ancestor_coverage == 4:
         expected[_block_key(first).hex()] = [
-            {"type": "mm_key", "hash": digest_a.hex(), "start_offset": 0}
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 0,
+            }
         ]
         expected[_block_key(gap).hex()] = []
     assert mm_keys_by_hash == expected
@@ -1279,7 +1572,9 @@ def test_v2_kv_cache_event_manager_preserves_mm_keys_after_life_cycle_removal(re
     )
     make_block = real_block_factory(event_manager, num_life_cycles=2)
     mm_hash = bytes(range(32))
-    block = make_block([mm_hash, 1001], [2, 2])
+    uuid = "frontend-routing-identity-" + "x" * 1024
+    assert uuid != mm_hash.hex()[:16]
+    block = make_block([MmItemContext(mm_hash, uuid), 1001], [2, 2])
     block_key = _block_key(block)
 
     _add_stored_block(event_manager, block)
@@ -1289,6 +1584,7 @@ def test_v2_kv_cache_event_manager_preserves_mm_keys_after_life_cycle_removal(re
         {
             "type": "mm_key",
             "hash": mm_hash.hex(),
+            "uuid": uuid,
             "start_offset": 0,
         }
     ]

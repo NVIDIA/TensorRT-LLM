@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import copy
 import json
+import pickle
+from dataclasses import fields
 from typing import Any
 
 import pytest
@@ -299,6 +302,21 @@ def test_sampling_params_rejects_out_of_range(field, value):
 )
 def test_sampling_params_accepts_in_range_values(field, value):
     assert getattr(SamplingParams(**{field: value}), field) == value
+
+
+@pytest.mark.parametrize(
+    "round_trip",
+    [lambda params: pickle.loads(pickle.dumps(params)), copy.copy, copy.deepcopy],
+)
+def test_sampling_params_copy_round_trip_keeps_every_field(round_trip):
+    # A distinct value in every field, so a field the pickling misses fails.
+    params = SamplingParams()
+    for f in fields(SamplingParams):
+        object.__setattr__(params, f.name, f"value of {f.name}")
+    restored = round_trip(params)
+    assert type(restored) is SamplingParams
+    for f in fields(SamplingParams):
+        assert getattr(restored, f.name) == getattr(params, f.name), f.name
 
 
 @pytest.mark.parametrize("value", [None, -1])

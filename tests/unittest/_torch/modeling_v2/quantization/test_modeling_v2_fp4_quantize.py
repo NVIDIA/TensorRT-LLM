@@ -64,6 +64,28 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(shape=(8192, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),
         ),
     ),
+    "glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4": (
+        Cell(
+            why="glm-5.2 decode: 1 token, hidden 6144, linear",
+            spec=dict(shape=(1, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="glm-5.2, 64 rows: its own quantizer's ceiling",
+            spec=dict(shape=(64, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="glm-5.2, 65 rows: the first row count past its own quantizer",
+            spec=dict(shape=(65, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="glm-5.2 prefill chunk, 2048 rows at hidden 6144, linear",
+            spec=dict(shape=(2048, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="glm-5.2 at its MoE chunk bound, 8192 rows at hidden 6144",
+            spec=dict(shape=(8192, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

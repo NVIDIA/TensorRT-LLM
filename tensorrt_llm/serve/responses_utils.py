@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from typing import (Any, Callable, List, Literal, Optional, OrderedDict, Tuple,
                     Union)
 
+import anyio
+from fastapi.responses import StreamingResponse
 from jinja2.exceptions import TemplateError
 from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
@@ -77,6 +79,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ChatCompletionToolsParam,
                                                 FunctionDefinition,
                                                 InputTokensDetails,
+                                                NamespacedFunctionToolParam,
                                                 OpenAIBaseModel,
                                                 OutputTokensDetails,
                                                 ReasoningAssistantMessage,
@@ -1294,21 +1297,24 @@ def _get_chat_completion_function_tools(
     if tools is None:
         return function_tools
 
+    def definition(name: str, description: Optional[str],
+                   parameters: Optional[Any]) -> FunctionDefinition:
+        return FunctionDefinition(
+            name=name,
+            description=description,
+            # A tool with no schema still has to present an object schema,
+            # or the chat template renders a call the model cannot fill in.
+            parameters=parameters if parameters is not None else {
+                "type": "object",
+                "properties": {},
+            },
+        )
+
     def as_function(name: str, description: Optional[str],
                     parameters: Optional[Any]) -> ChatCompletionToolsParam:
-        return ChatCompletionToolsParam(
-            type="function",
-            function=FunctionDefinition(
-                name=name,
-                description=description,
-                # A tool with no schema still has to present an object schema,
-                # or the chat template renders a call the model cannot fill in.
-                parameters=parameters if parameters is not None else {
-                    "type": "object",
-                    "properties": {},
-                },
-            ),
-        )
+        return ChatCompletionToolsParam(type="function",
+                                        function=definition(
+                                            name, description, parameters))
 
     def custom_parameters() -> dict[str, Any]:
         # A custom tool takes one freeform string rather than JSON arguments -
@@ -1343,7 +1349,9 @@ def _get_chat_completion_function_tools(
             # Skipping it drops every tool inside, which is most of an agentic
             # client's toolset: the model then has nothing to call, announces
             # an action and does nothing. Names are qualified with the
-            # namespace so two namespaces can define the same tool name.
+            # namespace so two namespaces can define the same tool name. The
+            # declaration is kept beside the flattened function, for a model
+            # whose renderer shows namespaces itself.
             for inner in getattr(tool, "tools", None) or []:
                 inner_name = getattr(inner, "name", None)
                 if not inner_name:
@@ -1358,11 +1366,18 @@ def _get_chat_completion_function_tools(
                     inner_parameters = custom_parameters()
                 else:
                     inner_parameters = getattr(inner, "parameters", None)
+                inner_description = getattr(inner, "description", None)
                 function_tools.append(
-                    as_function(
-                        f"{tool.name}.{inner_name}",
-                        getattr(inner, "description", None) or tool.description,
-                        inner_parameters,
+                    NamespacedFunctionToolParam(
+                        function=definition(
+                            f"{tool.name}.{inner_name}",
+                            inner_description or tool.description,
+                            inner_parameters,
+                        ),
+                        namespace=tool.name,
+                        namespace_description=tool.description,
+                        declared_name=inner_name,
+                        declared_description=inner_description,
                     ))
         elif tool_type in ("custom", ):
             function_tools.append(
@@ -1621,11 +1636,17 @@ def reasoning_chat_template_kwargs(request) -> dict:
     raw = getattr(request, "chat_template_kwargs", None)
     kwargs = dict(raw) if isinstance(raw, Mapping) else {}
     reasoning = getattr(request, "reasoning", None)
-    effort = getattr(reasoning, "effort",
-                     None) if reasoning is not None else None
+    if reasoning is None:
+        return kwargs
+    effort = getattr(reasoning, "effort", None)
+    if effort == "none":
+        kwargs.setdefault("thinking", False)
+        return kwargs
     if isinstance(effort, str) and effort:
         kwargs.setdefault("reasoning_effort", effort)
-        kwargs.setdefault("thinking", True)
+    # A `reasoning` object asks a reasoning model to reason; without an
+    # effort it reasons at the model's default effort.
+    kwargs.setdefault("thinking", True)
     return kwargs
 
 
@@ -3264,6 +3285,194 @@ async def guard_responses_stream(
         for frame in frames:
             yield frame
         raise
+
+
+# --------------------------------------------------------------------------
+# Keepalive while a stream is silent
+# --------------------------------------------------------------------------
+
+# Seconds a stream may stay silent before its response.in_progress event is
+# sent again. Clients and proxies cut a stream that sends nothing for long
+# enough, and a stream is silent until its first token (queueing and prefill)
+# and for as long as the model writes a tool call, which is sent only once
+# complete.
+RESPONSES_STREAM_KEEPALIVE_INTERVAL_S = 15.0
+
+_IN_PROGRESS_FRAME_START = "event: response.in_progress\n"
+# The response is over once one of these has gone out.
+_FINAL_FRAME_STARTS = ("event: error\n", "event: response.completed\n",
+                       "event: response.incomplete\n",
+                       "event: response.failed\n")
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _top_level_member(payload: str, key: str) -> Optional[Tuple[int, int, Any]]:
+    """Where the value of ``key`` starts and ends in a compact JSON object, and the value.
+
+    Only a member of the object itself counts: each member is decoded to find
+    where it ends, so the same key nested in a value, or written inside a
+    string, is passed over. None when ``key`` is not a member.
+    """
+    if not payload.startswith("{"):
+        return None
+    pos = 1
+    try:
+        while True:
+            name, pos = _JSON_DECODER.raw_decode(payload, pos)
+            if payload[pos] != ":":
+                return None
+            start = pos + 1
+            value, pos = _JSON_DECODER.raw_decode(payload, start)
+            if name == key:
+                return start, pos, value
+            if payload[pos] != ",":
+                return None
+            pos += 1
+    except (ValueError, IndexError):
+        return None
+
+
+def _stamp_sequence_number(frame: str, sequence_number: int) -> str:
+    """``frame`` with ``sequence_number`` as its event's sequence number.
+
+    Only the digits of the event's own number change: the payload is not
+    serialized again, and a ``sequence_number`` inside the response or the
+    model's output is left alone. A frame without a number of its own is
+    returned unchanged.
+    """
+    head, sep, rest = frame.partition("\ndata: ")
+    payload, newline, tail = rest.partition("\n")
+    member = _top_level_member(payload, "sequence_number") if sep else None
+    if member is None or type(member[2]) is not int:
+        return frame
+    start, end, _ = member
+    return (f"{head}{sep}{payload[:start]}{sequence_number}{payload[end:]}"
+            f"{newline}{tail}")
+
+
+async def _with_ticks(
+        source: AsyncGenerator[Any, None],
+        timeout: Callable[[], Optional[float]]) -> AsyncGenerator[Any, None]:
+    """Yield the items of ``source``, and None each time ``timeout()`` seconds pass first.
+
+    ``timeout()`` is asked before every wait; None waits for the next item. One
+    task reads ``source`` to its end, so a tick never interrupts a read and the
+    source is never resumed from another task; that task is cancelled, and the
+    source closed, when the consumer stops.
+    """
+    # One item at a time: the reader waits for the consumer, so a slow client
+    # holds back the source as reading it directly would.
+    items: asyncio.Queue = asyncio.Queue(maxsize=1)
+    end = object()
+    consumer_stopped = False
+
+    async def read_all() -> None:
+        try:
+            async for item in source:
+                await items.put(item)
+        except asyncio.CancelledError:
+            # Stopped while handing over an item, the reader leaves the source
+            # suspended at its yield, so it closes the source itself.
+            aclose = getattr(source, "aclose", None)
+            if aclose is not None:
+                await aclose()
+            if not consumer_stopped:
+                # Not stopped by the consumer, which still waits for the end.
+                await items.put(end)
+            raise
+        except Exception:
+            await items.put(end)
+            raise
+        await items.put(end)
+
+    reader = asyncio.create_task(read_all())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(items.get(), timeout())
+            except asyncio.TimeoutError:
+                yield None
+                continue
+            if item is end:
+                # Raises what reading the source raised.
+                await reader
+                return
+            yield item
+    finally:
+        consumer_stopped = True
+        reader.cancel()
+        # Return only once the reader has stopped and closed the source.
+        await asyncio.gather(reader, return_exceptions=True)
+
+
+class ClosingStreamingResponse(StreamingResponse):
+    """A streaming response that closes its body iterator however it ends.
+
+    A client that disconnects while a frame is being sent leaves the iterator
+    suspended at its yield: on ASGI 2.3 the send is cancelled, on 2.4 it raises
+    and Starlette raises ``ClientDisconnect``, skipping any background task. The
+    iterator, and the generation stream it reads, would then be closed only when
+    garbage-collected.
+    """
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self.body_iterator.aclose()
+
+
+async def keep_responses_stream_alive(
+        frames: AsyncGenerator[str, None]) -> AsyncGenerator[str, None]:
+    """Send ``frames``, repeating ``response.in_progress`` while they are silent.
+
+    ``frames`` yields one SSE event per item, numbered from 0, the first two
+    being ``response.created`` and ``response.in_progress``. Until the response
+    ends, the ``response.in_progress`` event is sent again whenever no event has
+    gone out for ``RESPONSES_STREAM_KEEPALIVE_INTERVAL_S`` seconds, before the
+    first token too. It is part of the stream format and carries the same
+    response as at the start, which clients already hold.
+
+    Events are numbered here, where they leave the server. The processor that
+    makes them cannot do it: postprocess workers each format events with their
+    own copy of it, and when a keepalive is due the reader may already hold the
+    next numbered event. A repeated event takes the next number, and every event
+    after it is renumbered to its place in the stream. Until then each event
+    already carries its place and goes out as it came.
+    """
+    in_progress: Optional[str] = None
+    ended = False
+    renumber = False
+    sent = 0
+    loop = asyncio.get_running_loop()
+    last_sent = loop.time()
+
+    def until_keepalive() -> Optional[float]:
+        if in_progress is None or ended:
+            return None
+        return max(
+            0.0,
+            RESPONSES_STREAM_KEEPALIVE_INTERVAL_S - (loop.time() - last_sent))
+
+    items = _with_ticks(frames, until_keepalive)
+    try:
+        async for frame in items:
+            if frame is None:
+                frame = in_progress
+                renumber = True
+            elif in_progress is None and frame.startswith(
+                    _IN_PROGRESS_FRAME_START):
+                in_progress = frame
+            if renumber:
+                frame = _stamp_sequence_number(frame, sent)
+            ended = ended or frame.startswith(_FINAL_FRAME_STARTS)
+            yield frame
+            sent += 1
+            last_sent = loop.time()
+    finally:
+        # Stops the task reading ``frames`` when this stream ends early.
+        await items.aclose()
 
 
 class ServerArrivalTimeMiddleware:
