@@ -48,6 +48,10 @@ from ..attention.backends.sparse.params import \
 from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
                                                    create_kv_cache_transceiver)
 from ..hostfunc import set_low_latency_dispatch
+from ..memory.monitor.providers import \
+    register_provider as _monitor_register_provider
+from ..memory.monitor.providers.kv_cache import \
+    KvCacheProvider as _MonitorKvCacheProvider
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
@@ -3182,6 +3186,20 @@ class KvCacheCreator:
             cross_kv_cache_manager = self._create_cross_kv_cache_manager(
                 cross_kv_cache_config, estimating_kv_cache,
                 original_max_seq_len)
+
+        # The pool is usually the largest single allocation in the process,
+        # and nothing outside this function has a handle on its manager, so
+        # register it here rather than leaving it to be rediscovered. The
+        # provider holds the manager weakly.
+        if kv_cache_manager is not None:
+            try:
+                _monitor_register_provider(
+                    _MonitorKvCacheProvider(kv_cache_manager))
+            except Exception as exc:  # noqa: BLE001
+                # A diagnostic must never be the reason an executor fails
+                # to come up.
+                logger.debug(f"memory monitor: could not register the KV "
+                             f"cache provider ({type(exc).__name__}: {exc})")
 
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
