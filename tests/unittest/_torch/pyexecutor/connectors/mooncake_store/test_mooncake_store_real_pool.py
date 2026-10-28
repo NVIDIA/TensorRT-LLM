@@ -178,12 +178,15 @@ def _layout(buffer: torch.Tensor) -> KvCacheLayout:
     return KvCacheLayout(tokens_per_block=TOKENS_PER_BLOCK, groups=tuple(groups))
 
 
-def _llm_args(store_config: MooncakeStoreConfig) -> SimpleNamespace:
+def _llm_args(
+    store_config: MooncakeStoreConfig, *, enable_attention_dp: bool = False
+) -> SimpleNamespace:
     """The fields the worker reads off `TorchLlmArgs`, and nothing else."""
     return SimpleNamespace(
         model=f"/models/{store_config.model_key}",
         kv_cache_config=SimpleNamespace(tokens_per_block=TOKENS_PER_BLOCK),
         tensor_parallel_size=1,
+        enable_attention_dp=enable_attention_dp,
         pipeline_parallel_size=1,
         context_parallel_size=1,
         sparse_attention_config=None,
@@ -274,6 +277,7 @@ def open_worker(
     layout: KvCacheLayout | None = None,
     stage_through_host: bool,
     model_key: str = MODEL_KEY,
+    enable_attention_dp: bool = False,
 ) -> Iterator[MooncakeStoreConnectorWorker]:
     """A worker holding a real store handle, over `buffer` or `layout` as its KV cache.
 
@@ -289,7 +293,9 @@ def open_worker(
         run_dir=pool.run_dir,
     )
     with provision_pool(store_config, run_dir=pool.run_dir):
-        worker = MooncakeStoreConnectorWorker(_llm_args(store_config))
+        worker = MooncakeStoreConnectorWorker(
+            _llm_args(store_config, enable_attention_dp=enable_attention_dp)
+        )
         try:
             worker.register_kv_cache_layout(layout if layout is not None else _layout(buffer))
             yield worker
@@ -442,6 +448,46 @@ def test_a_prefix_counts_only_once_every_rank_has_its_shard(mooncake_pool, monke
         assert rank_one.count_prefix_hit([BLOCK_HASH]) == 1, (
             "Both ranks' shards are in the pool and the block was still not "
             "offered, so nothing saved above one rank is ever reused."
+        )
+
+
+def test_attention_dp_owners_share_one_shard(mooncake_pool, monkeypatch):
+    """A page one attention-DP owner saved is a hit for another, and loads back intact.
+
+    Every owner holds all heads, so all of them key their pages as attention
+    shard 0 of 1. Owner 1 saves nothing here, so its hit can only be owner 0's
+    page. A tensor-parallel rank of the same world size keys per-rank shards
+    and misses the same block, which shows the hit came from the shared
+    attention-DP key space rather than from a lookup that matches anything.
+    """
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 2)
+    page_index, reader_page = 1, 6
+
+    writer_buffer = _device_buffer(filled=True)
+    expected = _snapshot(writer_buffer, page_index)
+    with open_worker(
+        mooncake_pool, buffer=writer_buffer, stage_through_host=True, enable_attention_dp=True
+    ) as owner_zero:
+        save_page(owner_zero, request_id=1, page_index=page_index)
+
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 1)
+    reader_buffer = _device_buffer(filled=False)
+    with open_worker(
+        mooncake_pool, buffer=reader_buffer, stage_through_host=True, enable_attention_dp=True
+    ) as owner_one:
+        assert owner_one.count_prefix_hit([BLOCK_HASH]) == 1, (
+            "Attention-DP owner 1 did not find the block owner 0 published, so "
+            "nothing one owner computes would be reused by another."
+        )
+        load_page(owner_one, request_id=2, page_index=reader_page)
+    assert_page_matches(
+        reader_buffer, reader_page, expected, context="Replay by another attention-DP owner"
+    )
+
+    with open_worker(mooncake_pool, buffer=reader_buffer, stage_through_host=True) as tp_rank_one:
+        assert tp_rank_one.count_prefix_hit([BLOCK_HASH]) == 0, (
+            "A tensor-parallel rank found a block only attention-DP owners saved. "
+            "Its shard holds a slice of the heads, so it would load the wrong bytes."
         )
 
 

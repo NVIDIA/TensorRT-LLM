@@ -18,15 +18,16 @@ The unit tests drive the connector's own APIs. These drive a model: a real
 engine publishes its KV cache into a real Mooncake pool, a second engine
 replays it, and the generated tokens have to agree. That covers the seams no
 narrower test reaches, namely the KV cache layout a `KVCacheManagerV2` actually
-reports, per-rank namespacing under tensor parallelism, and the scheduler
-interaction when a request is preempted while the connector is still reading
-its pages.
+reports, per-rank namespacing under tensor parallelism, the key space attention
+DP owners share, and the scheduler interaction when a request is preempted while
+the connector is still reading its pages.
 
 One master and pool serve the whole module and nothing else on the machine.
 Each test gets a key namespace of its own; see `mooncake_pool`.
 """
 
 import contextlib
+import glob
 import json
 import math
 import os
@@ -41,7 +42,10 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     MooncakeStoreConnectorConfig,
     parse_size,
 )
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.ledger import read_segments
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.ledger import (
+    read_segments,
+    segments_dir,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
     POOL_MANIFEST_NAME,
     provision_pool,
@@ -49,6 +53,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
     MooncakeStoreConnectorScheduler,
 )
+from tensorrt_llm.llmapi import SchedulingParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvCacheConnectorConfig, MooncakeStoreConfig
 
 from ..conftest import llm_models_root
@@ -341,6 +346,143 @@ def test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks(mooncake_pool):
         list(warm_output[0].outputs[0].token_ids),
         context="Prefix reuse at TP 2",
     )
+
+
+def _segment_record_stamps(run_dir: str) -> dict:
+    """Each segment record under `run_dir`, with the inode and time it was last written."""
+    stamps = {}
+    for path in glob.glob(os.path.join(segments_dir(run_dir), "*.json")):
+        with contextlib.suppress(FileNotFoundError):
+            info = os.stat(path)
+            stamps[path] = (info.st_ino, info.st_mtime_ns)
+    return stamps
+
+
+def _ranks_recorded_since(run_dir: str, stamps: dict) -> set:
+    """Ranks whose segment record is new or rewritten since `stamps` was taken.
+
+    Not a count of records: a record is named by host and pid, and the test
+    session reuses MPI worker processes across engines, so an engine can
+    rewrite an earlier engine's record instead of adding one. A rewrite renames
+    a new file into place, which changes the inode.
+    """
+    ranks = set()
+    for path, stamp in _segment_record_stamps(run_dir).items():
+        if stamps.get(path) != stamp:
+            with open(path) as handle:
+                ranks.add(int(json.load(handle)["rank"]))
+    return ranks
+
+
+def _rank0_rows(stats) -> list:
+    """Rank 0's iteration statistics.
+
+    Under attention DP rank 0 reports one row per owner, each tagged with
+    `attentionDpRank`. Connector and KV cache counters ride on rank 0's rows
+    only.
+    """
+    return [entry for entry in stats if entry.get("attentionDpRank", 0) == 0]
+
+
+def _connector_cached_tokens(stats) -> int:
+    """Prompt tokens rank 0's connector served, summed over iteration statistics."""
+    return sum(entry.get("iterConnectorCachedTokens", 0) for entry in _rank0_rows(stats))
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+@pytest.mark.skip_less_device(2)
+def test_mooncake_e2e_prefix_reuse_across_attention_dp_owners(
+    mooncake_pool, disable_overlap_scheduler
+):
+    """Save and reuse at TP 2 with attention DP, where each owner holds every head.
+
+    Every owner keys its pages as attention shard 0 of 1, so a prefix one owner
+    saved is a hit for the other. Under the per-rank keys tensor parallelism
+    uses, an owner would ask for both ranks' shards of a page only one of them
+    could have written, and nothing would ever be reused.
+
+    The cold engine serves one request pinned to owner 1, so rank 0 saves
+    nothing and every page of the prompt in the pool is one owner 1 saved. The
+    warm engine starts with empty GPU caches and serves four copies with one
+    request per owner at a time, so both owners serve the prompt and each one's
+    first copy finds nothing in its own GPU cache. The assertions read rank 0's
+    rows of the iteration statistics. Rank 0 serves at least one of the copies
+    and saved none of the prompt's pages before its first copy looked them up,
+    so a hit there is a page owner 1 saved: a read across owners, not a
+    same-owner hit.
+
+    This runs aggregated serving, which the connector documents as not
+    supported yet under attention DP because of a skipped-pass hazard on
+    generation pages; one request per owner and short generations do not
+    provoke it, and the key space under test is the same on a disaggregated
+    context server.
+    """
+    sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+    kwargs = llm_kwargs(
+        mooncake_pool,
+        tensor_parallel_size=2,
+        enable_attention_dp=True,
+        max_batch_size=1,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        enable_iter_perf_stats=True,
+        # Keep every iteration rather than the most recent 1000, so the sums
+        # below cover the whole run.
+        iter_stats_max_iterations=-1,
+    )
+    records_before = _segment_record_stamps(mooncake_pool.run_dir)
+
+    cold = LLM(**kwargs)
+    try:
+        # Strict, so the router cannot move it to rank 0 for balance.
+        cold_output = cold.generate(
+            [PROMPT],
+            sampling_params,
+            scheduling_params=SchedulingParams(attention_dp_rank=1, attention_dp_relax=False),
+        )
+        cold_stats = cold.get_stats(timeout=30)
+    finally:
+        cold.shutdown()
+    cold_token_ids = list(cold_output[0].outputs[0].token_ids)
+
+    joined = _ranks_recorded_since(mooncake_pool.run_dir, records_before)
+    assert joined == {0, 1}, (
+        "Both attention-DP owners should have joined the pool, but this run recorded "
+        f"ranks {sorted(joined)}. An owner that never opened a store handle saves "
+        "nothing and reads every prefix as a miss."
+    )
+    # The test's own key namespace keeps the pool cold. Rank 0's rows cannot
+    # see owner 1's load, but they do show where the request ran: attention-DP
+    # padding requests are left out of them.
+    cold_context_tokens = sum(
+        entry.get("inflightBatchingStats", {}).get("numCtxTokens", 0)
+        for entry in _rank0_rows(cold_stats)
+    )
+    assert cold_context_tokens == 0, (
+        f"Rank 0 prefilled {cold_context_tokens} tokens in the cold engine, so the cold "
+        "request did not stay on owner 1 and a hit on rank 0 below could be a page rank 0 "
+        "saved itself."
+    )
+
+    warm = LLM(**kwargs)
+    try:
+        warm_outputs = warm.generate([PROMPT] * 4, sampling_params)
+        warm_stats = warm.get_stats(timeout=30)
+    finally:
+        warm.shutdown()
+
+    assert warm_stats, "The warm engine returned no iteration statistics to assert on."
+    assert _connector_cached_tokens(warm_stats) > 0, (
+        f"Rank 0 served no prompt tokens from the pool across {len(warm_stats)} "
+        "iterations, so it recomputed a prefix owner 1 stored and no owner read "
+        "another owner's pages."
+    )
+    for index, output in enumerate(warm_outputs):
+        assert_tokens_agree(
+            cold_token_ids,
+            list(output.outputs[0].token_ids),
+            context=f"Copy {index} replayed under attention DP",
+        )
 
 
 @pytest.mark.threadleak(enabled=False)

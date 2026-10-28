@@ -12,10 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Leader side of the Mooncake store KV cache connector.
+"""Scheduler adapter side of the Mooncake store KV cache connector.
 
-Runs only on rank 0, deciding what to load and what to save while the workers
-do the moving. That needs two pieces of per-request bookkeeping:
+Runs on rank 0 under tensor parallelism and on every owner under attention data
+parallelism, deciding what to load and what to save for its own requests while
+the workers do the moving. Each adapter asks the worker in its own process to
+look prefixes up. That needs two pieces of per-request bookkeeping:
 
 * a hash chain, since `KVCacheManagerV2` reports `RequestData.block_hashes`
   empty and a block has no content identity otherwise;
@@ -130,6 +132,10 @@ class _RequestState:
 class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     """Chooses which pages the Mooncake pool serves and which it receives."""
 
+    #: Request state is owner-local and lookups go to the worker in this
+    #: process, whose attention-DP keys every owner shares.
+    supports_attention_dp = True
+
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
 
@@ -143,7 +149,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         self._unconfirmed_saves: Dict[int, int] = {}
 
         logger.warning(
-            f"mooncake-store leader ready (role={self._config.role.value}, "
+            f"mooncake-store scheduler adapter ready (role={self._config.role.value}, "
             f"tokens_per_block={self._tokens_per_block})"
         )
 
@@ -278,11 +284,13 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     def request_finished(self, request: LlmRequest, cache_block_ids: List[int]) -> bool:
         """Report whether pages must stay pinned for in-flight saves.
 
-        Whether a write has landed is known per rank and this runs only on the
-        leader, so the answer is "any save was emitted" rather than "a save is
-        in flight". A request whose writes already retired is reported done by
-        the next `get_finished`, costing one iteration; the exact answer would
-        cost a per-rank report back to the leader.
+        The answer is "any save was emitted" rather than "a save is in
+        flight". Under tensor parallelism only rank 0's adapter answers while
+        write completion is known per rank; under attention DP the adapter and
+        its worker share the owner. Either way a request whose writes already
+        retired, or whose emitted saves were never queued because their pass
+        did not run, is reported done by the next `get_finished`, costing one
+        iteration.
 
         Returns:
             True when this request handed any page to the background save

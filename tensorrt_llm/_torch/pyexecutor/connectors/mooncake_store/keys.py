@@ -20,9 +20,10 @@ so a key can only be reused by a request whose prefix is byte-identical. The
 chain is seeded with a `ReuseScope` covering what the tokens do not record.
 
 A key is `<namespace>/<block hash>`. The namespace pins down everything else
-that decides what the stored bytes mean: the model, the shard that produced
-them, the layer group inside that shard, the tokens each page holds and how many
-bytes a page is. A change to any of those reads as a miss rather than as garbage.
+that decides what the stored bytes mean: the model, the attention shard that
+produced them, the layer group inside that shard, the tokens each page holds and
+how many bytes a page is. A change to any of those reads as a miss rather than
+as garbage.
 """
 
 import hashlib
@@ -156,9 +157,10 @@ class KeyNamespace:
 
     namespace: str
     model_key: str
-    #: Global rank of the shard whose KV these bytes are, and the world size it
-    #: was produced under. Both are needed: rank 3 of 8 holds different heads
-    #: than rank 3 of 4.
+    #: The attention shard whose KV these bytes are, and the shard count it was
+    #: produced under: the global rank and world size under tensor parallelism,
+    #: 0 of 1 under attention DP, where every owner holds all heads. Both are
+    #: needed: rank 3 of 8 holds different heads than rank 3 of 4.
     rank: int
     world_size: int
     layer_group_id: int

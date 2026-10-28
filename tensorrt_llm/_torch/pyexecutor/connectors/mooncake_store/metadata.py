@@ -14,10 +14,12 @@
 # limitations under the License.
 """The per-iteration work list the scheduler hands the workers.
 
-Instances are broadcast from rank 0 to every worker, so these carry only plain
-data: a page's identity (its block hash) and where that page currently lives on
-this rank (a layer group and a page slot index). Deliberately no store keys:
-each worker prefixes its own rank namespace, so one broadcast serves all shards.
+Built by the scheduler adapter, then broadcast from rank 0 to every worker
+under tensor parallelism, or bound locally on its owner under attention data
+parallelism. These carry only plain data: a page's identity (its block hash) and
+where that page currently lives on this rank (a layer group and a page slot
+index). Deliberately no store keys: each worker prefixes its own attention-shard
+namespace, so one work list serves every shard.
 """
 
 from dataclasses import dataclass, field

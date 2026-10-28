@@ -288,11 +288,14 @@ def set_pool_setting(store_config, **settings):
     store_config.write_text(json.dumps(raw))
 
 
-def make_llm_args(*, run_dir: str | None = None) -> SimpleNamespace:
+def make_llm_args(
+    *, run_dir: str | None = None, enable_attention_dp: bool = False
+) -> SimpleNamespace:
     return SimpleNamespace(
         model="/models/test-model",
         kv_cache_config=SimpleNamespace(tokens_per_block=TOKENS_PER_BLOCK),
         tensor_parallel_size=1,
+        enable_attention_dp=enable_attention_dp,
         pipeline_parallel_size=1,
         context_parallel_size=1,
         sparse_attention_config=None,
@@ -326,6 +329,7 @@ def make_worker(
     *,
     layout: KvCacheLayout | None = None,
     run_dir: str | None = None,
+    enable_attention_dp: bool = False,
 ) -> Iterator[MooncakeStoreConnectorWorker]:
     """Build a worker and shut it down before the test call phase ends.
 
@@ -333,7 +337,9 @@ def make_worker(
     pytest-threadleak snapshots threads around the call phase only, so
     fixture teardown would run too late to keep it quiet.
     """
-    worker = MooncakeStoreConnectorWorker(make_llm_args(run_dir=run_dir))
+    worker = MooncakeStoreConnectorWorker(
+        make_llm_args(run_dir=run_dir, enable_attention_dp=enable_attention_dp)
+    )
     fake_store.workers.append(worker)
     if layout is not None:
         worker.register_kv_cache_layout(layout)
@@ -1214,6 +1220,142 @@ def test_worker_reports_the_saves_it_queued(store_config, fake_store, monkeypatc
         assert worker.take_submitted_saves() == {7}
         # Cleared on return.
         assert worker.take_submitted_saves() == set()
+
+
+# ---- attention data parallelism ----
+
+
+def test_mooncake_declares_adp_support():
+    assert MooncakeStoreConnectorScheduler.supports_attention_dp is True
+    assert MooncakeStoreConnectorWorker.supports_attention_dp is True
+    # The gate the executor creator runs before constructing either half.
+    KvCacheConnectorManager.validate_attention_dp(
+        MooncakeStoreConnectorWorker, MooncakeStoreConnectorScheduler, pp_size=1, cp_size=1
+    )
+
+
+@pytest.mark.parametrize("producer_rank,consumer_rank", [(0, 3), (3, 1), (1, 0)])
+def test_adp_reuses_another_owners_pages(
+    store_config, fake_store, monkeypatch, producer_rank, consumer_rank
+):
+    """A full prefix needs one copy per layer group, whichever owner saved it."""
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 4)
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: producer_rank)
+    layout = make_layout(num_groups=3, regions_per_group=2)
+    hashes = BlockHashChain(TOKENS_PER_BLOCK).extend(list(range(2 * TOKENS_PER_BLOCK)))
+    with make_worker(fake_store, layout=layout, enable_attention_dp=True) as producer:
+        producer._put(
+            [RequestTransfers(7, [PageTransfer(hashes[0], group, 1) for group in range(3)])]
+        )
+        # An incompletely published next block must not extend the offer.
+        producer._put([RequestTransfers(7, [PageTransfer(hashes[1], 0, 2)])])
+        monkeypatch.setattr(worker_module, "mpi_rank", lambda: consumer_rank)
+        with make_worker(fake_store, layout=layout, enable_attention_dp=True) as consumer:
+            assert consumer._namespaces == producer._namespaces
+            assert all("/w1r0/" in namespace.prefix for namespace in consumer._namespaces.values())
+
+            assert consumer.count_prefix_hit(hashes) == 1
+            # Two blocks over three layer groups: one key per page, with no
+            # fan-out over the other owners.
+            assert len(fake_store.exist_calls[-1]) == 2 * 3
+
+            transfers = RequestTransfers(
+                19, [PageTransfer(hashes[0], group, 5) for group in range(3)]
+            )
+            consumer.bind_allocation_fence(AllocationFence(fake_store))
+            consumer.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
+            consumer.start_load_kv(None)
+            assert consumer.take_failed_load_requests() == set()
+            # The consumer's own pages, filled under the producer's keys.
+            keys, addresses, sizes = fake_store.get_calls[-1]
+            assert keys == [producer._namespaces[group].key(hashes[0]) for group in range(3)]
+            addressing = PageAddressing(layout)
+            assert addresses == [addressing.buffers(group, 5)[0] for group in range(3)]
+            assert sizes == [addressing.buffers(group, 5)[1] for group in range(3)]
+
+            # Reuse is shared, while request completion belongs to each owner.
+            producer._outstanding_saves[7] = 1
+            assert producer.get_finished([7], []) == ([], [])
+            assert consumer.get_finished([7], []) == ([7], [])
+            producer._outstanding_saves.clear()
+            assert producer.get_finished([], []) == ([7], [])
+
+
+def test_tp_lookup_still_requires_all_attention_shards(store_config, fake_store, monkeypatch):
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 4)
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 0)
+    block_hash = BlockHashChain(TOKENS_PER_BLOCK).extend(list(range(TOKENS_PER_BLOCK)))[0]
+    with make_worker(fake_store, layout=make_layout(num_groups=2)) as worker:
+        worker._put(
+            [RequestTransfers(7, [PageTransfer(block_hash, group, 1) for group in range(2)])]
+        )
+        # Rank 0's shard alone is not a prefix the other ranks can load.
+        assert worker.count_prefix_hit([block_hash]) == 0
+        for namespaces in worker._peer_namespaces.values():
+            for namespace in namespaces:
+                fake_store.objects.add(namespace.key(block_hash))
+        assert worker.count_prefix_hit([block_hash]) == 1
+        assert len(fake_store.exist_calls[-1]) == 4 * 2
+        # Tensor-parallel shards are not what an attention-DP owner stores.
+        with make_worker(
+            fake_store, layout=make_layout(num_groups=2), enable_attention_dp=True
+        ) as owner:
+            assert owner.count_prefix_hit([block_hash]) == 0
+
+
+def test_tp_keys_are_unchanged(store_config, fake_store, monkeypatch):
+    """Pages written before attention-DP support must still be found."""
+    block_hash = bytes(range(16))
+    suffix = f"/lg0/t{TOKENS_PER_BLOCK}b64/{block_hash.hex()}"
+    with make_worker(fake_store, layout=make_layout()) as single:
+        assert single._namespaces[0].key(block_hash) == f"trtllm/test-model/w1r0{suffix}"
+
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 4)
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 2)
+    with make_worker(fake_store, layout=make_layout()) as rank_two:
+        assert rank_two._namespaces[0].key(block_hash) == f"trtllm/test-model/w4r2{suffix}"
+        assert [namespace.key(block_hash) for namespace in rank_two._peer_namespaces[0]] == [
+            f"trtllm/test-model/w4r{rank}{suffix}" for rank in range(4)
+        ]
+        # The global rank still names the process in the ledger and logs.
+        assert (rank_two._rank, rank_two._world_size) == (2, 4)
+
+
+def test_attention_dp_owner_restarts_a_failed_load_where_tensor_parallel_raises(
+    store_config, fake_store, monkeypatch
+):
+    """An owner holds whole pages and its own batch, so it can restart a request alone."""
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 4)
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 1)
+    transfers = RequestTransfers(7, [PageTransfer(b"\x00" * 16, 0, 1)])
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as owner:
+        owner.bind_allocation_fence(AllocationFence(fake_store))
+        owner.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
+        owner.start_load_kv(None)
+        assert owner.take_failed_load_requests() == {7}
+
+    with make_worker(fake_store, layout=make_layout()) as tp_rank:
+        assert not tp_rank._recover_failed_loads
+        tp_rank.bind_allocation_fence(AllocationFence(fake_store))
+        tp_rank.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
+        with pytest.raises(RuntimeError, match="already"):
+            tp_rank.start_load_kv(None)
+
+
+def test_capacity_only_worker_builds_under_attention_dp(store_config, fake_store, monkeypatch):
+    """A generation server that only lends memory may run with attention DP."""
+    set_pool_setting(store_config, role="capacity")
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 2)
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 1)
+    with make_worker(fake_store, layout=make_layout(), enable_attention_dp=True) as worker:
+        assert worker.capacity_only
+        assert (worker._attention_rank, worker._attention_world_size) == (0, 1)
+        # Nothing registered, no save thread, and nothing to look up.
+        assert worker._addressing is None
+        assert worker._save_thread is None
+        assert fake_store.registered == []
+        assert worker.count_prefix_hit([b"\x01" * 16]) == 0
+        assert fake_store.exist_calls == []
 
 
 # ---- host staging ----
