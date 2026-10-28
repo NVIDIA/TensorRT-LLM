@@ -330,6 +330,65 @@ def test_route_front_parity(m, nl, ls, tile, dup, crowd):
     _check_tables(_tables(flat2, m, nl, tile), _tables(flat, m, nl, tile), tile, (tag, "repeat"))
 
 
+class _Gate:
+    """A router gate as FrontRunner uses it: ``weight`` and the projection (cuBLAS here)."""
+
+    def __init__(self, w):
+        self.weight = w
+
+    def __call__(self, x):
+        return _cublas(x, self.weight)
+
+
+def _front_runner(w, nl, ls, tile):
+    return df.FrontRunner(df.DecodeFront(frozenset()), _Gate(w), nl, ls, K, lambda m: tile)
+
+
+@pytest.mark.parametrize("m,nl,ls", [(1, 64, 448), (7, 64, 448), (14, 128, 128)])
+def test_front_runner_tactics(m, nl, ls, tile=8):
+    """FrontRunner offers the two launches (tactic 0) and the one-launch front for every front-compatible
+    warp split of the low-M candidates; each gives the routed experts' inputs of its own router GEMM bitwise."""
+    x, w, gs = _inputs(m, seed=1500 + m + nl)
+    runner = _front_runner(w, nl, ls, tile)
+    tactics = runner.get_valid_tactics([x, gs], None)
+    assert tactics[0] == 0 and len(tactics) > 1, tactics
+    for t in tactics:
+        out = runner([x, gs], tactic=t)
+        if t == 0:
+            logits = _cublas(x, w)
+        else:
+            logits = low_m_mma_gemm(
+                x16=x, w_bf16=w, out_dtype=torch.bfloat16, tactic_bf16=(t, 1, 1, 0, 1)
+            )
+        ref = df.RouteTables()(
+            logits, K, ls, nl, tile, flat=_flat(m, nl, tile), x=x, global_scale=gs
+        )
+        for name, a, b in zip(
+            ("logits", "xq", "xsf", "ids", "wts"), out, (logits, ref[8], ref[9], ref[0], ref[1])
+        ):
+            assert torch.equal(_bits(a), _bits(b)), (m, nl, t, name)
+
+
+def test_front_runner_race():
+    """Under autotune() the AutoTuner times both fronts at every front token count in CUDA graphs and caches
+    one of the offered tactics per count, which inference-time lookups return."""
+    from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+
+    nl, ls, tile = 64, 448, 8
+    x, w, gs = _inputs(df.FUSED_FRONT_MAX_TOKENS, seed=1600)
+    runner = _front_runner(w, nl, ls, tile)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    with autotune():
+        tuner.choose_one(df.FrontRunner.OP, [runner], df.FrontRunner.TUNING_CONFIG, [x, gs])
+    for m in range(1, df.FUSED_FRONT_MAX_TOKENS + 1):
+        _, tactic = tuner.choose_one(
+            df.FrontRunner.OP, [runner], df.FrontRunner.TUNING_CONFIG, [x[:m], gs]
+        )
+        assert tactic in runner.get_valid_tactics([x[:m], gs], None), (m, tactic)
+    tuner.clear_cache()
+
+
 # front: tables = Triton router GEMM + RouteTables, fused = FusedFront, route = cuBLAS router + RouteFront.
 # tile None: every tile the runner offers at m; "min": its smallest (above 512 tokens it drops the small tiles).
 # cfg None: first and last config of the tile; an int forces it (m 448 tile 16 config 0 is what the autotuner

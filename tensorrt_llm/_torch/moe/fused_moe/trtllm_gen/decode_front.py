@@ -30,12 +30,18 @@ import triton.language as tl
 
 from tensorrt_llm._utils import get_sm_version
 
-from ....autotuner import AutoTuner
+from ....autotuner import (
+    AutoTuner,
+    DistributedTuningStrategy,
+    DynamicTensorSpec,
+    TunableRunner,
+    TuningConfig,
+)
 from ....cute_dsl_utils import graph_safe_cute_tensor
 from ....flashinfer_utils import get_env_enable_pdl
 from ....modules.fla.op import gdc_wait_with_memory_clobber
 from ....modules.low_m_gemm import low_m_gemm_dispatcher
-from ....modules.low_m_mma_gemm import low_m_mma_gemm
+from ....modules.low_m_mma_gemm import candidate_tactics
 from ....utils import Fp4QuantizedTensor
 from ..impl_contract import PreroutedRouting
 
@@ -654,8 +660,8 @@ class FusedFront:
     def supports(
         x: torch.Tensor, weight: torch.Tensor, num_local: int, tile: int, top_k: int, router_tactic
     ) -> bool:
-        """Whether one launch takes this call, reproducing the router GEMM of ``router_tactic`` (the low-M
-        GEMM's (k_warps, n_tiles, ksplit, ...) for the router weight)."""
+        """Whether one launch takes this call with the router GEMM of ``router_tactic`` (a low-M warp-MMA
+        (k_warps, n_tiles, ksplit, ...) for the router weight)."""
         m, k = x.shape
         k_warps, n_tiles, ksplit = router_tactic[:3]
         return (
@@ -839,7 +845,7 @@ def front_eligible(moe, x: torch.Tensor, max_tokens: int) -> bool:
     """Whether ``moe`` and ``x`` take the decode front: a ConfigurableMoE over a TRTLLM-gen NVFP4 leaf that
     takes prerouted routing, without communication, load balancer or DWDP, Renormalize routing over
     ``KERNEL_NUM_EXPERTS`` experts with top-k ``KERNEL_TOP_K``, a 2-D BF16 ``x`` of 1..``max_tokens`` rows, on
-    SM 10.3 (the architecture the front is validated on), outside autotuning."""
+    SM 10.3 (the architecture the front is validated on)."""
     from ..configurable_moe import ConfigurableMoE
     from ..routing import RoutingMethodType
     from .fp4_block_scale import TRTLLMGenFp4BlockScaleBase
@@ -874,16 +880,100 @@ def front_eligible(moe, x: torch.Tensor, max_tokens: int) -> bool:
         return False
     if x.dtype != torch.bfloat16 or x.dim() != 2 or not 1 <= x.shape[0] <= max_tokens:
         return False
-    if x.stride(1) != 1 or x.shape[1] % 16:
-        return False
-    return not AutoTuner.get().is_tuning_mode
+    return x.stride(1) == 1 and x.shape[1] % 16 == 0
+
+
+class FrontRunner(TunableRunner):
+    """The two ways a step of up to ``FUSED_FRONT_MAX_TOKENS`` tokens can produce the routed experts' inputs,
+    timed whole by the AutoTuner (the experts after them are the same): tactic ``k_warps`` > 0 is the one-launch
+    front with the router GEMM split over that many warps; tactic 0 (and the fallback -1) is the gate's own
+    projection (the low-M race's pick) followed by the route + tables launch.
+
+    Inputs: [x [m, H] bf16, NVFP4 global scale]. ``tile_of(m)``: the MoE tactic's tile for m tokens, or None."""
+
+    OP = "trtllm::moe_decode_front"
+    TUNING_CONFIG = TuningConfig(
+        # The one-launch front is compiled per row count, so every count is its own bucket.
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=0,
+                dim_idx=0,
+                gen_tuning_buckets=tuple(range(1, FUSED_FRONT_MAX_TOKENS + 1)),
+                map_to_tuning_buckets=lambda m: m,
+            ),
+        ),
+        use_cold_l2_cache=True,
+        use_cuda_graph=True,
+        # Every rank runs rank 0's choice, as for the low-M race the router GEMM comes from.
+        distributed_tuning_strategy=DistributedTuningStrategy.BROADCAST,
+    )
+
+    def __init__(
+        self, front: "DecodeFront", gate, num_local: int, local_start: int, top_k: int, tile_of
+    ):
+        self.front = front
+        self.gate = gate
+        self.num_local = num_local
+        self.local_start = local_start
+        self.top_k = top_k
+        self.tile_of = tile_of
+
+    def unique_id(self):
+        return (tuple(self.gate.weight.shape), self.num_local, self.top_k)
+
+    def get_valid_tactics(self, inputs, profile, **kwargs):
+        x = inputs[0]
+        m, k = x.shape
+        tile = self.tile_of(m)
+        if tile is None:
+            return []
+        w = self.gate.weight
+        fused = sorted(
+            {
+                t[0]
+                for t in candidate_tactics(m, w.shape[0], k, fp8=False)
+                if t[1] == 1
+                and t[2] == 1
+                and t[3] == 0
+                and FusedFront.supports(x, w, self.num_local, tile, self.top_k, t)
+            }
+        )
+        return [0, *fused]
+
+    def forward(self, inputs, *, tactic=-1, do_preparation=False, **kwargs):
+        x, gs = inputs
+        m = x.shape[0]
+        tile = self.tile_of(m)
+        flat = torch.empty(
+            (sum(prerouted_table_sizes(m, self.top_k, self.num_local, tile)),),
+            dtype=torch.int32,
+            device=x.device,
+        )
+        args = (tile, self.local_start, self.num_local, self.top_k)
+        if tactic > 0:
+            out = self.front.fused(x, self.gate.weight, gs, flat, *args, tactic)
+            if out is not None:
+                return out
+        logits = self.gate(x)
+        ids, wts, *_, xq, xsf = self.front.route(
+            logits,
+            self.top_k,
+            self.local_start,
+            self.num_local,
+            tile,
+            flat=flat,
+            x=x,
+            global_scale=gs,
+        )
+        return logits, xq, xsf, ids, wts
 
 
 class DecodeFront:
     """Per MoE layer decode front (module docstring).
 
     ``route_steps``: token counts the route front takes after the stock router GEMM (``route_front_steps``);
-    other counts up to ``ROUTER_MAX_TOKENS`` run the router GEMM in the front.
+    other counts up to ``ROUTER_MAX_TOKENS`` run the router GEMM in the front, as one launch where the
+    AutoTuner's race of the two (``FrontRunner``) picked it.
     """
 
     def __init__(self, route_steps: frozenset):
@@ -896,6 +986,8 @@ class DecodeFront:
         # during CUDA-graph capture comes from the graph's pool and stays with the layer.
         self._tactics = {}
         self._tables = {}
+        # Per token count: the FrontRunner tactic (k_warps of the one-launch front, 0 for the two launches).
+        self._front_tactics = {}
 
     def _moe_tactic(self, backend, m: int) -> Optional[list]:
         tactic = self._tactics.get(m)
@@ -916,6 +1008,44 @@ class DecodeFront:
             self._tables[(m, tile)] = flat
         return flat
 
+    def _front_runner(self, gate, moe) -> FrontRunner:
+        backend = moe.backend
+        return FrontRunner(
+            self,
+            gate,
+            backend.expert_size_per_partition,
+            backend.slot_start,
+            moe.routing_method.experts_per_token,
+            lambda m: (t[0] if (t := self._moe_tactic(backend, m)) is not None else None),
+        )
+
+    def _front_tactic(self, gate, moe, x: torch.Tensor, gs: torch.Tensor) -> int:
+        """The raced FrontRunner tactic for x's token count (0 until the race has run)."""
+        m = x.shape[0]
+        tactic = self._front_tactics.get(m)
+        if tactic is None:
+            _, tactic = AutoTuner.get().choose_one(
+                FrontRunner.OP, [self._front_runner(gate, moe)], FrontRunner.TUNING_CONFIG, [x, gs]
+            )
+            if tactic == -1:
+                return 0
+            self._front_tactics[m] = tactic
+        return tactic
+
+    def _tune(self, gate, moe, x: torch.Tensor, **moe_kwargs):
+        """Autotuning step: the stock router GEMM and MoE (which tune their own races), then, once the router
+        race covers the front's token counts, the race of the two fronts. Returns the stock output."""
+        out = moe(x, gate(x), output_dtype=x.dtype, **moe_kwargs)
+        dispatcher = low_m_gemm_dispatcher(gate)
+        if dispatcher is not None and x.shape[0] <= ROUTER_MAX_TOKENS:
+            AutoTuner.get().choose_one(
+                FrontRunner.OP,
+                [self._front_runner(gate, moe)],
+                FrontRunner.TUNING_CONFIG,
+                [x[:FUSED_FRONT_MAX_TOKENS], moe.backend.fc31_input_scale],
+            )
+        return out
+
     def __call__(self, gate, moe, x: torch.Tensor, **moe_kwargs):
         """Routed-expert output of ``moe`` for ``x`` through the decode front, or None when it does not apply
         (the caller then runs the stock path).
@@ -935,6 +1065,8 @@ class DecodeFront:
         route_front = m in self.route_steps
         if not front_eligible(moe, x, ROUTE_FRONT_MAX_TOKENS if route_front else ROUTER_MAX_TOKENS):
             return None
+        if AutoTuner.get().is_tuning_mode:
+            return self._tune(gate, moe, x, **moe_kwargs)
         backend = moe.backend
         tactic = self._moe_tactic(backend, m)
         if tactic is None:
@@ -954,23 +1086,21 @@ class DecodeFront:
             )
         else:
             dispatcher = low_m_gemm_dispatcher(gate)
-            router_tactic = (
-                dispatcher.warp_mma_tactic(m, gate.weight) if dispatcher is not None else None
-            )
             fused = None
-            if router_tactic is not None and FusedFront.supports(
-                x, gate.weight, num_local, tile, top_k, router_tactic
-            ):
+            k_warps = (
+                self._front_tactic(gate, moe, x, gs)
+                if dispatcher is not None and m <= FUSED_FRONT_MAX_TOKENS
+                else 0
+            )
+            if k_warps:
                 fused = self.fused(
-                    x, gate.weight, gs, flat, tile, local_start, num_local, top_k, router_tactic[0]
+                    x, gate.weight, gs, flat, tile, local_start, num_local, top_k, k_warps
                 )
             if fused is not None:
                 logits, xq, xsf, ids, wts = fused
-            elif router_tactic is not None:
+            elif dispatcher is not None:
                 # The route + tables launch also quantizes x, so no launch is added.
-                logits = low_m_mma_gemm(
-                    x16=x, w_bf16=gate.weight, out_dtype=torch.bfloat16, tactic_bf16=router_tactic
-                )
+                logits = gate(x)
                 ids, wts, *_, xq, xsf = self.route(
                     logits, top_k, local_start, num_local, tile, flat=flat, x=x, global_scale=gs
                 )
@@ -989,6 +1119,7 @@ class DecodeFront:
 
 __all__ = [
     "DecodeFront",
+    "FrontRunner",
     "KERNEL_NUM_EXPERTS",
     "KERNEL_TOP_K",
     "ROUTE_FRONT_MAX_TOKENS",

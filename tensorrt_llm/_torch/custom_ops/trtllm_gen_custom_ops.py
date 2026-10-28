@@ -675,15 +675,16 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self, inputs: List[Optional[torch.Tensor]]) -> Optional[List[int]]:
         """The [tile, config] the op runs for ``inputs`` (its tensor arguments
         in ``FP4BlockScaleMoEInputs`` order; activations may be meta tensors):
-        the tuned choice, or None (not tuned, or tuning). A caller that routes
-        the tokens itself builds its tables for this tile and passes the tactic
-        as ``prerouted_tactic``."""
-        tuner = AutoTuner.get()
-        if tuner.is_tuning_mode:
-            return None
-        _, tactic = tuner.choose_one("trtllm::fp4_block_scale_moe_runner",
-                                     [self], self.tuning_config, inputs)
-        if tactic == -1:
+        the tuned choice, or None (not tuned yet). A caller that routes the
+        tokens itself builds its tables for this tile and passes the tactic as
+        ``prerouted_tactic``."""
+        shapes = tuple(
+            t.size() if isinstance(t, torch.Tensor) else torch.Size((0, ))
+            for t in inputs)
+        hit, _, tactic, _ = AutoTuner.get().profiling_cache.search_cache(
+            "trtllm::fp4_block_scale_moe_runner", [self], shapes,
+            self.tuning_config)
+        if not hit or tactic == -1:
             return None
         return [int(tactic[0]), int(tactic[1])]
 
