@@ -58,14 +58,15 @@ _MOE_AUTOTUNE_DUMMY_DISTRIBUTION_ENV = (
 # = per-rank tokens when use_dp=False) and must map it to one of the
 # m_values profile buckets. The mapping:
 #
-#   1. Round to last power of 2.
+#   1. Keep counts below 8, round counts up to 128 down to a multiple of 8, larger
+#      ones to the last power of 2.
 #   2. If use_dp=True, deflate by ep_size to assume the avg-case
 #      perfectly-distributed per-rank load `runtime_max_tokens_per_rank`.
 #   3. If the result still exceeds MAX_PROFILE_BUCKET (8192) and the
 #      caller appended a `tune_max_num_tokens` bucket past it, route
 #      there — the caller added that bucket precisely so the kernel
 #      gets timed at runtime scale instead of being clamped to 8192.
-#   4. Otherwise clamp into the small pow2 ladder.
+#   4. Otherwise clamp into the small-count ladder.
 _BALANCED = "balanced"
 _RANDOM = "random"
 
@@ -609,7 +610,13 @@ class FP4BlockScaleMoERunner(TunableRunner):
         TUNED_DIM = 0
         MAX_PROFILE_BUCKET = 8192
 
-        m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
+        # Decode steps run multiples of (1 + draft length) tokens, so small counts get an exact bucket below 8
+        # and a bucket per multiple of 8 up to 128 instead of the power-of-2 ladder alone.
+        m_values = tuple(
+            sorted(
+                set(get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET))
+                | set(range(1, 8))
+                | set(range(8, 129, 8))))
         if tune_max_num_tokens > MAX_PROFILE_BUCKET:
             m_values = tuple(m_values) + (tune_max_num_tokens, )
 
@@ -620,6 +627,10 @@ class FP4BlockScaleMoERunner(TunableRunner):
             if (deflated > MAX_PROFILE_BUCKET
                     and tune_max_num_tokens > MAX_PROFILE_BUCKET):
                 return tune_max_num_tokens
+            if deflated < 8:
+                return max(1, deflated)
+            if deflated <= 128:
+                return deflated // 8 * 8
             value = last_positive_power_of_2(deflated)
             return min(max(1, value), MAX_PROFILE_BUCKET)
 
