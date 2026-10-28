@@ -66,7 +66,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BatchDesc,
     BufferConfig,
     DataRole,
-    GpuCacheTierConfig,
     KVCacheDesc,
     LayerId,
     PageIndexMode,
@@ -104,8 +103,8 @@ GB = 1 << 30
 # iteration for the tail [P, L). The GDN layers leave the state at P live and
 # stage the state at L; see finish_inforward_snapshots. The staging rows (the
 # requests per batch that can take the path, at most max_batch_size and
-# _INFORWARD_SNAPSHOT_MAX_ROWS, within _INFORWARD_SNAPSHOT_STAGING_BYTES) come out
-# of the GPU cache quota.
+# _INFORWARD_SNAPSHOT_MAX_ROWS, within _INFORWARD_SNAPSHOT_STAGING_BYTES) are
+# allocated after the pools, outside the GPU cache quota.
 _INFORWARD_SNAPSHOT_MAX_ROWS = 8
 _INFORWARD_SNAPSHOT_STAGING_BYTES = 512 << 20
 
@@ -652,13 +651,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     @override
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         kv_cache_config = self.kv_cache_config
-        cache_tiers = list(config.cache_tiers)
-        rows, row_bytes = self._inforward_snapshot_layout()
-        if rows > 0:
-            # The in-forward snapshot staging rows are allocated next to the
-            # pools.
-            cache_tiers[0] = GpuCacheTierConfig(quota=cache_tiers[0].quota - rows * row_bytes)
-        gpu_quota = cache_tiers[0].quota
+        gpu_quota = config.cache_tiers[0].quota
         minimum_live_quota = self._minimum_live_gpu_quota()
         if minimum_live_quota > gpu_quota:
             raise ValueError(
@@ -724,7 +717,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             layers=layers,
             typical_step=typical_step,
             constraints=constraints,
-            cache_tiers=cache_tiers,
             # SSM lifecycles require minimum-snapshot commit semantics. The
             # flag is harmless when reuse is disabled because no commits are
             # attempted, while the runtime config still needs the invariant.
@@ -875,8 +867,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return rows, row_bytes
 
     def _setup_inforward_snapshot(self) -> None:
-        """Allocate the in-forward snapshot staging rows when the path applies
-        (budgeted in _build_cache_config)."""
+        """Allocate the in-forward snapshot staging rows when the path applies."""
         rows, row_bytes = self._inforward_snapshot_layout()
         if rows == 0 or not self.enable_block_reuse:
             return
