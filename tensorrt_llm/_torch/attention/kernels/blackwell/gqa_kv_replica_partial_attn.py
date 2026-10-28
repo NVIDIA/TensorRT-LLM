@@ -799,8 +799,6 @@ class GqaKvReplicaPartialAttnKernel:
                 stream=stream,
                 use_pdl=self.use_pdl,
                 min_blocks_per_mp=1,
-                # all CTAs co-resident for the in-kernel grid barrier
-                cooperative=True,
             )
         else:
             self.kernel(
@@ -843,8 +841,6 @@ class GqaKvReplicaPartialAttnKernel:
                 stream=stream,
                 use_pdl=self.use_pdl,
                 min_blocks_per_mp=1,
-                # all CTAs co-resident for the in-kernel grid barrier
-                cooperative=True,
             )
 
     @cute.jit

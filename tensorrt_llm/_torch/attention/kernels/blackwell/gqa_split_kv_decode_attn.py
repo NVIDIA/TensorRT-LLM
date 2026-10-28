@@ -41,7 +41,8 @@ Assumptions of the grid barrier (``counters`` row b, see split_kv_decode):
     ``griddepcontrol.wait``, which must imply that the previous launch completed. True when every kernel
     between two launches on the stream either is a plain (non-PDL) launch or executes ``griddepcontrol.wait`` before
     it exits, as all kernels of the decode step do. Concurrent launches on different streams need separate rows.
-(b) All n_splits x batch CTAs are co-resident (one per SM, grid <= SMs): the kernel is launched cooperatively.
+(b) All n_splits x batch CTAs are co-resident: one CTA per SM and grid <= SMs (split_kv_decode asserts it), and no
+    other kernel holds SMs while it waits for work ordered after this launch.
 (c) Every launch on a row uses the same n_splits (split_kv_decode keeps one counter row per batch size).
 """
 
@@ -879,8 +880,6 @@ class GqaSplitKvDecodeAttnKernel:
             stream=stream,
             use_pdl=self.use_pdl,
             min_blocks_per_mp=1,
-            # all CTAs co-resident for the in-kernel grid barrier
-            cooperative=True,
         )
 
     # fold-mode row layout (one warp per 256-element row): lane m = 8 * w + i holds the element pairs

@@ -17,9 +17,9 @@
 
 One launch computes this member's partial attention over the pages it owns for every q row of the KV-replica group,
 written straight into alltoall_merge's input layout (contract: kv_replica_fused_partial_ref in the unit test). One CTA
-per SM, launched cooperatively for the in-kernel grid barrier; an in-kernel plan shares the CTAs among requests, and
-above 64 requests the two-slot plan lets a CTA compute two requests. The grid-barrier counters and workspace live in
-a KvReplicaFusedState, allocated by kv_replica_fused_state() before CUDA graph capture.
+per SM (n_ctas <= SMs), all co-resident for the in-kernel grid barrier; an in-kernel plan shares the CTAs among
+requests, and above 64 requests the two-slot plan lets a CTA compute two requests. The grid-barrier counters and
+workspace live in a KvReplicaFusedState, allocated by kv_replica_fused_state() before CUDA graph capture.
 """
 
 import functools
