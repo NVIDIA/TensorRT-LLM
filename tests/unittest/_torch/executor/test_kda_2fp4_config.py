@@ -14,7 +14,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_p
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -110,8 +110,9 @@ def test_2fp4_rejects_non_kda_model() -> None:
 
 
 @pytest.mark.parametrize("snapshots", [False, True])
+@pytest.mark.parametrize("dspark", [False, True])
 def test_live_history_budget_does_not_scale_with_snapshot_slots(
-    monkeypatch: pytest.MonkeyPatch, snapshots: bool
+    monkeypatch: pytest.MonkeyPatch, snapshots: bool, dspark: bool
 ) -> None:
     model = _model_config()
     params = extract_mamba_kv_cache_params(model.pretrained_config)
@@ -119,6 +120,10 @@ def test_live_history_budget_does_not_scale_with_snapshot_slots(
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._get_local_mamba_cache_layout",
         lambda *args, **kwargs: (params, 2, 2),
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.kda_mtp_replay_num_spec",
+        lambda *_: pytest.fail("2FP4 must not budget legacy MTP replay buffers"),
     )
     costs = []
     for prefill_only in [True, False]:
@@ -136,18 +141,21 @@ def test_live_history_budget_does_not_scale_with_snapshot_slots(
                 kv_cache_config=config,
                 max_seq_len=2048,
                 tokens_per_block=64,
+                spec_config=DSparkDecodingConfig(max_draft_len=3) if dspark else None,
             )
         )
     assert costs[0][0] == costs[1][0]
     # Two local layers, four live requests plus a reserved dummy row, and
     # four heads. Snapshot slots add packed state but never K/U/G histories.
-    assert costs[1][1] - costs[0][1] == 2 * 5 * (4 * 16 * 128 * 8 + 4)
+    history_bytes = 2 * 5 * (4 * (20 if dspark else 16) * 128 * 8 + 4)
+    candidate_bytes = 2 * 4 * (4 * 3 * 4 * 128 * 2 + 4) if dspark else 0
+    assert costs[1][1] - costs[0][1] == history_bytes + candidate_bytes
 
 
 @pytest.mark.parametrize("prefill_only", [False, True])
-@pytest.mark.parametrize("mtp", [False, True])
+@pytest.mark.parametrize("mtp", [False, True, "dspark"])
 def test_2fp4_factory_keeps_decode_separate_from_mtp(
-    monkeypatch: pytest.MonkeyPatch, prefill_only: bool, mtp: bool
+    monkeypatch: pytest.MonkeyPatch, prefill_only: bool, mtp: bool | str
 ) -> None:
     captured = {}
 
@@ -156,7 +164,13 @@ def test_2fp4_factory_keeps_decode_separate_from_mtp(
             captured.update(kwargs)
 
     monkeypatch.setattr("tensorrt_llm._torch.pyexecutor._util.get_sm_version", lambda: 100)
-    spec = MTPDecodingConfig(max_draft_len=3) if mtp else None
+    spec = (
+        DSparkDecodingConfig(max_draft_len=3)
+        if mtp == "dspark"
+        else MTPDecodingConfig(max_draft_len=3)
+        if mtp
+        else None
+    )
 
     def create() -> None:
         _create_kv_cache_manager(
@@ -176,8 +190,8 @@ def test_2fp4_factory_keeps_decode_separate_from_mtp(
             dtype=torch.bfloat16,
         )
 
-    if mtp:
-        with pytest.raises(ValueError, match="not an MTP path"):
+    if mtp is True:
+        with pytest.raises(ValueError, match="DSpark only"):
             create()
         assert not captured
     else:
@@ -185,6 +199,28 @@ def test_2fp4_factory_keeps_decode_separate_from_mtp(
         assert captured["supports_generation"] is not prefill_only
         assert "kda_replay_num_spec" not in captured
         assert captured["conv_state_layout"] == "q_k_v"
+
+
+def test_separate_dspark_drafter_does_not_inherit_2fp4_state() -> None:
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+
+    creator = object.__new__(KvCacheCreator)
+    creator._get_draft_max_attention_window = lambda *_: None
+    target = _cache_config(prefill_only=True)
+    draft = creator._get_one_model_draft_kv_cache_config(target, 2048)
+    assert target.mamba_state_config.kda_2fp4_replay
+    assert target.mamba_state_config.kda_2fp4_prefill_only
+    assert not draft.mamba_state_config.kda_2fp4_replay
+    assert not draft.mamba_state_config.kda_2fp4_prefill_only
+
+
+def test_dspark_draft_width_is_bounded() -> None:
+    from tensorrt_llm._torch.modules.kimi_kda.kda_2fp4 import validate_speculative_config
+
+    for draft in (1, 3, 6, 7):
+        validate_speculative_config(DSparkDecodingConfig(max_draft_len=draft))
+    with pytest.raises(ValueError, match="1..7"):
+        validate_speculative_config(DSparkDecodingConfig(max_draft_len=8))
 
 
 @pytest.mark.parametrize("dummy", [False, True])

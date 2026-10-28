@@ -4634,8 +4634,8 @@ class MambaStateConfig(StrictBaseModel):
         default=False,
         status="prototype",
         telemetry=True,
-        description="Enable native NVFP4 KDA replay for non-speculative "
-        "one-token decode. Checkpoints contain primary and residual FP4 "
+        description="Enable native NVFP4 KDA replay for one-token decode "
+        "or DSpark verification with up to seven draft tokens. Checkpoints contain primary and residual FP4 "
         "values with E4M3 block scales. Prefill uses a temporary dequantized "
         "FP32 state; decode uses native NVFP4 checkpoint projections and "
         "BF16 K/U plus FP32 cumulative-G history of length 16. Requires "

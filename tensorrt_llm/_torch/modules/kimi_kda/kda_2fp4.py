@@ -1,20 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Native NVFP4 checkpoint replay for non-speculative KDA decoding.
+"""Native NVFP4 checkpoint replay for KDA decoding and DSpark verification.
 
 The V2 checkpoint is one packed byte array per head: primary E2M1 values,
 residual E2M1 values, their E4M3 block scales, and a shared FP32 outer scale.
 Only checkpoint materialization/commit reads the residual. K/U histories
 are BF16 and cumulative per-key G is FP32. Batch and pool sizes are runtime
-parameters; the CuTe DSL replay/commit kernels have no batch-size autotuning.
-Prefill checkpoint packing and materialization use Triton helpers.
+parameters; no kernel specializes on batch size. Prefill checkpoint helpers
+and the all-layer DSpark post-sampling commit use Triton.
 """
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import triton
 import triton.language as tl
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 HEAD_DIM = 128
 HISTORY_SIZE = 16
@@ -28,15 +32,29 @@ STATE_BYTES_PER_HEAD = triton.cdiv(_OUTER_SCALE.value + 4, 16) * 16
 _STATE_BYTES = tl.constexpr(STATE_BYTES_PER_HEAD)
 
 
+def validate_speculative_config(spec_config: "DecodingBaseConfig | None") -> None:
+    """Accept ordinary decoding or linear DSpark verification up to MTP7."""
+    if spec_config is None:
+        return
+    if not spec_config.spec_dec_mode.is_dspark():
+        raise ValueError("KDA 2FP4 speculative decoding currently supports DSpark only")
+    if not 2 <= spec_config.tokens_per_gen_step <= 8:
+        raise ValueError("KDA 2FP4 DSpark requires 1..7 draft tokens")
+    if getattr(spec_config, "use_dynamic_tree", False):
+        raise ValueError("KDA 2FP4 DSpark requires a linear draft chain")
+
+
 @dataclass(frozen=True)
 class ReplayHistory:
     """One layer's live-request histories, independent of V2 snapshot slots."""
 
-    k: torch.Tensor  # [live_capacity, H, 16, 128], BF16
-    u: torch.Tensor  # [live_capacity, H, 16, 128], BF16
-    g: torch.Tensor  # [live_capacity, H, 16, 128], FP32
+    k: torch.Tensor  # [live_capacity, H, history_capacity, 128], BF16
+    u: torch.Tensor  # [live_capacity, H, history_capacity, 128], BF16
+    g: torch.Tensor  # [live_capacity, H, history_capacity, 128], FP32
     length: torch.Tensor  # [live_capacity], int32
     slot_map: torch.Tensor  # [V2 slot capacity], int32; maps to live rows
+    candidate_x: torch.Tensor | None = None  # [B_capacity, T_capacity, 3*H*128], BF16
+    old_lengths: torch.Tensor | None = None  # [B_capacity], immutable verification snapshot
 
 
 @triton.jit
@@ -249,6 +267,25 @@ def replay(
     """
     from ...custom_ops.cute_dsl_kda_2fp4_replay import fused_replay
 
+    if history.candidate_x is not None:
+        return verify(
+            x,
+            conv_state,
+            conv_weight,
+            gate,
+            beta,
+            z,
+            norm_weight,
+            pool,
+            slots,
+            dummy,
+            history,
+            A_log,
+            dt_bias,
+            lower_bound,
+            norm_eps,
+            output,
+        )
     _validate_checkpoint(pool)
     batch, heads = x.shape[0], pool.shape[1]
     width = heads * HEAD_DIM
@@ -305,6 +342,222 @@ def replay(
     )
     commit_history(pool, slots, history, full_only=True, dummy=dummy, old_lengths=old_lengths)
     return output
+
+
+@torch.no_grad()
+def verify(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    z: torch.Tensor,
+    norm_weight: torch.Tensor,
+    pool: torch.Tensor,
+    slots: torch.Tensor,
+    dummy: torch.Tensor,
+    history: ReplayHistory,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float | None,
+    norm_eps: float,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Verify a linear [B,T] candidate block without advancing either checkpoint.
+
+    Inputs are batch-major flattened [B*T,...] BF16 projection views; state indices
+    and the dummy mask have B entries. Only the sampler's accepted prefix
+    may subsequently advance Conv, history lengths, or the packed state.
+    """
+    from ...custom_ops.cute_dsl_kda_2fp4_replay import fused_replay
+
+    _validate_checkpoint(pool)
+    batch, heads = slots.numel(), pool.shape[1]
+    if batch == 0:
+        return x.new_empty((0, heads, HEAD_DIM)) if output is None else output
+    tokens, remainder = divmod(x.shape[0], batch)
+    width = heads * HEAD_DIM
+    if (
+        remainder
+        or not 1 <= tokens <= 8
+        or history.candidate_x is None
+        or history.old_lengths is None
+        or history.candidate_x.shape[0] < batch
+        or history.candidate_x.shape[1] < tokens
+        or history.k.shape[2] < HISTORY_SIZE + tokens
+        or x.shape != (batch * tokens, 3 * width)
+        or gate.shape != (batch * tokens, width)
+        or beta.shape != (batch * tokens, heads)
+        or z.shape != (batch * tokens, heads, HEAD_DIM)
+        or conv_weight.shape != (3 * width, 4)
+        or norm_weight.shape != (HEAD_DIM,)
+        or dummy is None
+        or dummy.shape != (batch,)
+    ):
+        raise ValueError(
+            "2FP4 verification requires 1..8 tokens and sufficiently sized replay buffers"
+        )
+    if any(t.dtype != torch.bfloat16 for t in (x, gate, beta, z, norm_weight, conv_weight)):
+        raise TypeError("2FP4 verification requires BF16 activations and Conv/norm weights")
+    if output is None:
+        output = x.new_empty((batch * tokens, heads, HEAD_DIM))
+    if (
+        output.shape != (batch * tokens, heads, HEAD_DIM)
+        or output.dtype != torch.bfloat16
+        or not output.is_contiguous()
+    ):
+        raise ValueError("2FP4 verification output must be contiguous [B*T,H,128]")
+    fused_replay(
+        x,
+        conv_state,
+        conv_weight,
+        gate,
+        beta,
+        z,
+        norm_weight,
+        pool.view(pool.shape[0], heads, STATE_BYTES_PER_HEAD),
+        slots.to(torch.int32),
+        dummy,
+        history.slot_map,
+        history.k,
+        history.u,
+        history.g,
+        history.length,
+        A_log.reshape(-1),
+        dt_bias.reshape(-1),
+        lower_bound,
+        norm_eps,
+        output,
+        history.old_lengths[:batch],
+        candidate_x=history.candidate_x[:batch, :tokens],
+        tokens_per_step=tokens,
+    )
+    return output
+
+
+@triton.jit
+def _commit_verified_kernel(
+    descriptors,
+    slots,
+    slot_map,
+    accepted,
+    dummy,
+    H: tl.constexpr,
+    CAP: tl.constexpr,
+    TMAX: tl.constexpr,
+    WINDOW: tl.constexpr,
+):
+    batch, head, layer = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    is_dummy = tl.load(dummy + batch)
+    slot = tl.load(slots + batch)
+    live = tl.load(slot_map + slot, mask=~is_dummy, other=-1)
+    if live >= 0:
+        base = descriptors + layer * 10
+        pool = tl.load(base).to(tl.pointer_type(tl.uint8))
+        pool_stride = tl.load(base + 1)
+        conv = tl.load(base + 2).to(tl.pointer_type(tl.bfloat16))
+        conv_stride = tl.load(base + 3)
+        hk = tl.load(base + 4).to(tl.pointer_type(tl.bfloat16))
+        hu = tl.load(base + 5).to(tl.pointer_type(tl.bfloat16))
+        hg = tl.load(base + 6).to(tl.pointer_type(tl.float32))
+        lengths = tl.load(base + 7).to(tl.pointer_type(tl.int32))
+        old_lengths = tl.load(base + 8).to(tl.pointer_type(tl.int32))
+        candidates = tl.load(base + 9).to(tl.pointer_type(tl.bfloat16))
+        count = tl.load(accepted + batch)
+        tl.device_assert((count >= 0) & (count <= TMAX), "invalid accepted prefix")
+        old = tl.load(old_lengths + batch)
+        n = old + count
+        # Each head owns its three disjoint Q/K/V channel sections.
+        channel = tl.arange(0, 512)
+        section, key = channel // 128, channel % 128
+        absolute_channel = (section * H + head) * 128 + key
+        window = tl.arange(0, 4)
+        source = count + window
+        from_old = source < 3
+        old_values = tl.load(
+            conv
+            + slot.to(tl.int64) * conv_stride
+            + absolute_channel[:, None] * 3
+            + source[None, :],
+            mask=(channel[:, None] < 384) & (window[None, :] < 3) & from_old[None, :] & (count > 0),
+            other=0,
+        )
+        new_values = tl.load(
+            candidates
+            + batch.to(tl.int64) * TMAX * (3 * H * 128)
+            + (source[None, :] - 3) * (3 * H * 128)
+            + absolute_channel[:, None],
+            mask=(channel[:, None] < 384)
+            & (window[None, :] < 3)
+            & ~from_old[None, :]
+            & (count > 0),
+            other=0,
+        )
+        tl.store(
+            conv
+            + slot.to(tl.int64) * conv_stride
+            + absolute_channel[:, None] * 3
+            + window[None, :],
+            tl.where(from_old[None, :], old_values, new_values),
+            mask=(channel[:, None] < 384) & (window[None, :] < 3) & (count > 0),
+        )
+        if n >= WINDOW:
+            row = tl.arange(0, 128)
+            col = tl.arange(0, 128)
+            hist = tl.arange(0, 32)
+            state_base = pool + slot.to(tl.int64) * pool_stride + head * _STATE_BYTES
+            state = _load_checkpoint(state_base, row, 128, True)
+            hist_base = (live.to(tl.int64) * H + head) * CAP * 128
+            end_g = tl.load(hg + hist_base + (n - 1) * 128 + col)
+            kval = tl.load(
+                hk + hist_base + hist[:, None] * 128 + col[None, :], mask=hist[:, None] < n, other=0
+            ).to(tl.float32)
+            gval = tl.load(
+                hg + hist_base + hist[:, None] * 128 + col[None, :], mask=hist[:, None] < n, other=0
+            )
+            adjusted = tl.where(hist[:, None] < n, kval * tl.exp(end_g[None, :] - gval), 0).to(
+                tl.bfloat16
+            )
+            uval = tl.load(
+                hu + hist_base + hist[:, None] * 128 + row[None, :], mask=hist[:, None] < n, other=0
+            )
+            updated = state * tl.exp(end_g)[None, :] + tl.dot(tl.trans(uval), adjusted)
+            _store_checkpoint(state_base, updated)
+        if head == 0:
+            tl.store(lengths + live, tl.where(n >= WINDOW, 0, n))
+
+
+def commit_verified(
+    descriptors: torch.Tensor,
+    slots: torch.Tensor,
+    slot_map: torch.Tensor,
+    accepted_tokens: torch.Tensor,
+    dummy: torch.Tensor,
+    heads: int,
+    capacity: int,
+    max_tokens: int,
+) -> None:
+    """Commit accepted Conv and recurrent histories across all local layers.
+
+    Each descriptor row contains checkpoint pointer/slot stride, Conv
+    pointer/slot stride, K/U/G/length pointers, an immutable old-length
+    snapshot pointer, and the compact candidate-Conv pointer (all int64).
+    Accepted counts include the golden token. The candidate buffer keeps
+    its configured max_tokens stride even when verification uses fewer tokens.
+    """
+    if slots.numel():
+        _commit_verified_kernel[(slots.numel(), heads, descriptors.shape[0])](
+            descriptors,
+            slots,
+            slot_map,
+            accepted_tokens.to(torch.int32),
+            dummy,
+            heads,
+            capacity,
+            max_tokens,
+            HISTORY_SIZE,
+            num_warps=8,
+        )
 
 
 def _validate_checkpoint(pool: torch.Tensor) -> None:

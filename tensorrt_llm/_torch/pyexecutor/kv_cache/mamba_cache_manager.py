@@ -1503,6 +1503,16 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
             return
 
         tokens_per_gen_step = spec_config.tokens_per_gen_step
+        if getattr(self, "_kda_2fp4_mtp", False):
+            self.intermediate_conv_states = torch.empty(
+                (self.local_num_mamba_layers, max_batch_size,
+                 tokens_per_gen_step, self.conv_state_shape[0]),
+                dtype=self.conv_state_dtype,
+                device="cuda")
+            self.intermediate_state_indices = torch.arange(max_batch_size,
+                                                           dtype=torch.int32,
+                                                           device="cuda")
+            return
         if not self._use_replay_state_update:
             self.intermediate_ssm_states = torch.zeros(
                 size=[
@@ -2357,7 +2367,13 @@ def _estimate_mamba_hybrid_cache_cost(
     if state_config.kda_2fp4_replay and not state_config.kda_2fp4_prefill_only:
         live_rows = max_resident_sequences + num_reserved_dummy_slots
         heads = params.num_heads // mamba_effective_tp_size(mapping)
-        intercept += local_mamba_layers * live_rows * (heads * 16 * 128 * 8 + 4)
+        tokens = spec_config.tokens_per_gen_step if spec_config is not None else 0
+        intercept += local_mamba_layers * live_rows * (heads *
+                                                       (16 + tokens) * 128 * 8 +
+                                                       4)
+        if tokens:
+            intercept += local_mamba_layers * max_batch_size * (
+                tokens * 3 * heads * 128 * 2 + 4)
 
     if interval is None:
         regular_slope = 0
@@ -3224,9 +3240,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         state_config = kv_cache_config.mamba_state_config
         self.use_kda_2fp4_replay = state_config.kda_2fp4_replay
         if self.use_kda_2fp4_replay:
-            if spec_config is not None:
-                raise ValueError(
-                    "KDA 2FP4 replay does not support speculative decoding.")
+            from tensorrt_llm._torch.modules.kimi_kda.kda_2fp4 import \
+                validate_speculative_config
+            validate_speculative_config(spec_config)
             if use_replay_state_update or kda_replay_num_spec is not None:
                 raise ValueError(
                     "KDA 2FP4 replay cannot share MTP replay buffers.")
@@ -3248,6 +3264,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             kda_replay_num_spec = None
         self._kda_replay_layers: List[Dict[str, torch.Tensor]] = []
         self.supports_generation = supports_generation
+        self._kda_2fp4_mtp = bool(self.use_kda_2fp4_replay
+                                  and spec_config is not None)
+        self._kda_2fp4_step_width = spec_config.tokens_per_gen_step if self._kda_2fp4_mtp else 1
+        self._kda_2fp4_history_capacity = 16 + self._kda_2fp4_step_width if self._kda_2fp4_mtp else 16
+        self._kda_2fp4_old_lengths = None
+        self._kda_2fp4_commit_descriptors = None
         self._kda_2fp4_buffers = []
         self._kda_2fp4_requests: Dict[int, int] = {}
         self._kda_2fp4_free_rows: List[int] = []
@@ -3433,7 +3455,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             capacity = max_batch_size * mapping.pp_size + self._num_reserved_dummy_slots
             self._kda_2fp4_free_rows = list(range(capacity - 1, -1, -1))
             for _ in range(self.local_num_mamba_layers):
-                shape = (capacity, nheads, 16, 128)
+                shape = (capacity, nheads, self._kda_2fp4_history_capacity, 128)
                 buffers = (
                     torch.empty(shape, dtype=torch.bfloat16, device="cuda"),
                     torch.empty(shape, dtype=torch.bfloat16, device="cuda"),
@@ -3443,6 +3465,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 self._kda_2fp4_buffers.append(buffers)
                 history_bytes += sum(t.numel() * t.element_size()
                                      for t in buffers)
+            if self._kda_2fp4_mtp:
+                self._kda_2fp4_old_lengths = torch.empty(
+                    (self.local_num_mamba_layers, max_batch_size),
+                    dtype=torch.int32,
+                    device="cuda")
+                history_bytes += self._kda_2fp4_old_lengths.numel() * 4
+                history_bytes += self.intermediate_conv_states.numel(
+                ) * self.intermediate_conv_states.element_size()
 
         kv_cache_config = kv_cache_config.model_copy(deep=True)
         if history_bytes and kv_cache_config.max_gpu_total_bytes:
@@ -3534,6 +3564,26 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                                      -1,
                                                      dtype=torch.int32,
                                                      device="cuda")
+                if self._kda_2fp4_mtp:
+                    descriptors = []
+                    for i, (hk, hu, hg,
+                            lengths) in enumerate(self._kda_2fp4_buffers):
+                        state, conv = self.all_ssm_states[
+                            i], self.all_conv_states[i]
+                        descriptors.append((
+                            state.data_ptr(),
+                            state.stride(0),
+                            conv.data_ptr(),
+                            conv.stride(0),
+                            hk.data_ptr(),
+                            hu.data_ptr(),
+                            hg.data_ptr(),
+                            lengths.data_ptr(),
+                            self._kda_2fp4_old_lengths[i].data_ptr(),
+                            self.intermediate_conv_states[i].data_ptr(),
+                        ))
+                    self._kda_2fp4_commit_descriptors = torch.tensor(
+                        descriptors, dtype=torch.int64, device="cuda")
             if self.use_kda_2fp4_replay:
                 self._dummy_request_mask_buffer = DeviceCopyBuffer(
                     torch.zeros(state_index_capacity,
@@ -4127,8 +4177,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             num_reserved_dummy_slots=num_reserved_dummy_slots,
             include_explicit_snapshots=True,
             cap_partial_attention_snapshots=True,
-            kda_replay_num_spec=_estimated_kda_replay_num_spec(
-                model_config, spec_config, kwargs.get("is_disagg", False)),
+            kda_replay_num_spec=(
+                None if kv_cache_config.mamba_state_config.kda_2fp4_replay else
+                _estimated_kda_replay_num_spec(model_config, spec_config,
+                                               kwargs.get("is_disagg", False))),
             **kwargs,
         )
 
@@ -5020,7 +5072,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 history = ReplayHistory(
                     *self._kda_2fp4_buffers[
                         self.mamba_layer_offsets[layer_idx]],
-                    self._kda_2fp4_slot_map)
+                    self._kda_2fp4_slot_map,
+                    candidate_x=(self.intermediate_conv_states[
+                        self.mamba_layer_offsets[layer_idx]]
+                                 if self._kda_2fp4_mtp else None),
+                    old_lengths=(self._kda_2fp4_old_lengths[
+                        self.mamba_layer_offsets[layer_idx]]
+                                 if self._kda_2fp4_mtp else None))
             return Kda2Fp4State(conv=self.get_conv_states(layer_idx),
                                 temporal=self.get_ssm_states(layer_idx),
                                 history=history)
@@ -5129,7 +5187,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             num_accepted_tokens: torch.Tensor,
             state_indices: Optional[torch.Tensor] = None,
             accepted_leaf_positions: Optional[torch.Tensor] = None):
-        if self.local_num_mamba_layers == 0 or self.kda_context_only:
+        if (self.local_num_mamba_layers == 0 or self.kda_context_only
+                or not self.supports_generation):
             return
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
@@ -5141,6 +5200,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             state_indices = self.get_state_indices()
         state_indices_d = state_indices[num_contexts:num_contexts +
                                         num_gens].to(torch.int32)
+        if getattr(self, "_kda_2fp4_mtp", False):
+            if num_gens:
+                from tensorrt_llm._torch.modules.kimi_kda.kda_2fp4 import \
+                    commit_verified
+                commit_verified(
+                    self._kda_2fp4_commit_descriptors, state_indices_d,
+                    self._kda_2fp4_slot_map,
+                    num_accepted_tokens[num_contexts:num_contexts + num_gens],
+                    self._dummy_request_mask[num_contexts:num_contexts +
+                                             num_gens], self.ssm_state_shape[0],
+                    self._kda_2fp4_history_capacity, self._kda_2fp4_step_width)
+            return
         if self.use_kda_replay_update:
             assert self._dummy_request_mask is not None
             is_dummy_request = self._dummy_request_mask[
@@ -5292,6 +5363,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._gdn_cached_replay_state_descriptors = None
         self._kda_2fp4_buffers = []
         self._kda_2fp4_slot_map = None
+        self._kda_2fp4_old_lengths = None
+        self._kda_2fp4_commit_descriptors = None
         self._kda_2fp4_requests = {}
         self._kda_2fp4_free_rows = []
         self._gdn_cached_replay_state_strides = None

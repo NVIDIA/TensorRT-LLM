@@ -192,6 +192,214 @@ def _fused_inputs(batch: int, heads: int, slots: int = 11) -> dict[str, torch.Te
     }
 
 
+def _verification_history(history: ops.ReplayHistory, tokens: int) -> ops.ReplayHistory:
+    rows, heads, _, dim = history.k.shape
+    shape = (rows, heads, 16 + tokens, dim)
+    return ops.ReplayHistory(
+        history.k.new_empty(shape),
+        history.u.new_empty(shape),
+        history.g.new_empty(shape),
+        history.length,
+        history.slot_map,
+        history.k.new_empty((rows, tokens, 3 * heads * dim)),
+        history.length.new_empty(rows),
+    )
+
+
+def _verification_descriptors(
+    pool: torch.Tensor, conv: torch.Tensor, history: ops.ReplayHistory
+) -> torch.Tensor:
+    return torch.tensor(
+        [
+            [
+                pool.data_ptr(),
+                pool.stride(0),
+                conv.data_ptr(),
+                conv.stride(0),
+                history.k.data_ptr(),
+                history.u.data_ptr(),
+                history.g.data_ptr(),
+                history.length.data_ptr(),
+                history.old_lengths.data_ptr(),
+                history.candidate_x.data_ptr(),
+            ]
+        ],
+        dtype=torch.int64,
+        device="cuda",
+    )
+
+
+@pytest.mark.parametrize(("heads", "tokens"), [(1, 1), (3, 4), (3, 8), (12, 7)])
+def test_dspark_native_verify_acceptance_and_rollover(heads: int, tokens: int) -> None:
+    """Only accepted candidates advance Conv/state; rejected suffixes are ignored."""
+    batch, capacity = 3, 16 + tokens
+    pool, slots, original, _ = _fixture(batch, heads)
+    shape = (batch, heads, capacity, 128)
+    live = original.slot_map[slots.long()].long()
+    lengths = torch.tensor([11, 15, 3], device="cuda", dtype=torch.int32)
+    history = ops.ReplayHistory(
+        torch.randn(shape, device="cuda").bfloat16() * 0.03,
+        torch.randn(shape, device="cuda").bfloat16() * 0.03,
+        -torch.rand(shape, device="cuda").cumsum(2) * 0.02,
+        original.length,
+        original.slot_map,
+        torch.empty(batch, tokens, 3 * heads * 128, device="cuda", dtype=torch.bfloat16),
+        torch.empty(batch, device="cuda", dtype=torch.int32),
+    )
+    history.length[live] = lengths
+    dummy = torch.tensor([False, False, True], device="cuda")
+    fused = _fused_inputs(batch * tokens, heads)
+    a_log = torch.full((heads,), -2.0, device="cuda")
+    bias = torch.full((heads, 128), -1.0, device="cuda")
+    raw = torch.randn(batch * tokens, 4 * heads * 128, device="cuda", dtype=torch.bfloat16)[
+        :, : 3 * heads * 128
+    ]
+    gate = torch.randn(batch * tokens, heads * 128, device="cuda", dtype=torch.bfloat16)
+    beta = torch.randn(batch * tokens, heads, device="cuda", dtype=torch.bfloat16)
+    before_pool, before_conv, before_lengths = (
+        pool.clone(),
+        fused["conv_state"].clone(),
+        history.length.clone(),
+    )
+    primary, residual = _read_checkpoint(pool, slots)
+    expected_k, expected_u, expected_g = history.k.clone(), history.u.clone(), history.g.clone()
+    ref_fused = dict(fused, conv_state=before_conv.clone())
+    outputs = []
+    for token in range(tokens):
+        x = raw.reshape(batch, tokens, -1)[:, token]
+        conv, next_conv = _conv_reference(x, ref_fused, slots)
+        ref_fused["conv_state"][slots.long()] = next_conv
+        q, k, v = (t.reshape(batch, heads, 128) for t in conv.split(heads * 128, -1))
+        qn = (
+            q.float() * 128**-0.5 / (q.float().square().sum(-1, keepdim=True) + 1e-6).sqrt()
+        ).bfloat16()
+        kn = (k.float() / (k.float().square().sum(-1, keepdim=True) + 1e-6).sqrt()).bfloat16()
+        position = lengths.long() + token
+        prefix = expected_g[live, :, position - 1]
+        pair = torch.stack((kn.float(), qn.float()), -2)
+        dynamic, cumulative = _checkpoint_operands(
+            pair, gate.reshape(batch, tokens, -1)[:, token], a_log, bias, prefix, -5.0
+        )
+        checkpoint = primary @ dynamic.transpose(-1, -2)
+        mask = (
+            torch.arange(capacity, device="cuda")[None, None, :, None]
+            < position[:, None, None, None]
+        )
+        adjusted = torch.where(
+            mask, expected_k[live].float() * (cumulative[:, :, None] - expected_g[live]).exp(), 0
+        ).bfloat16()
+        coefficients = (adjusted.float() @ pair.transpose(-1, -2)).bfloat16()
+        history_pair = expected_u[live].float().transpose(-1, -2) @ coefficients.float()
+        update = torch.sigmoid(beta.reshape(batch, tokens, heads)[:, token].float())[..., None] * (
+            v.float() - checkpoint[..., 0] - history_pair[..., 0]
+        )
+        core = (
+            checkpoint[..., 1]
+            + history_pair[..., 1]
+            + update * (kn.float() * qn.float()).sum(-1, keepdim=True)
+        ).bfloat16()
+        output_fused = dict(fused, z=fused["z"].reshape(batch, tokens, heads, 128)[:, token])
+        outputs.append(_norm_reference(core, output_fused))
+        expected_k[live, :, position] = kn
+        expected_u[live, :, position] = update.bfloat16()
+        expected_g[live, :, position] = cumulative
+    actual = ops.verify(
+        raw,
+        **fused,
+        gate=gate,
+        beta=beta,
+        pool=pool,
+        slots=slots,
+        dummy=dummy,
+        history=history,
+        A_log=a_log,
+        dt_bias=bias,
+        lower_bound=-5.0,
+        norm_eps=1e-6,
+    )
+    expected = torch.stack(outputs, 1)
+    expected[dummy] = 0
+    torch.testing.assert_close(actual.view_as(expected), expected, atol=0.003, rtol=0.03)
+    torch.testing.assert_close(pool, before_pool, rtol=0, atol=0)
+    torch.testing.assert_close(fused["conv_state"], before_conv, rtol=0, atol=0)
+    torch.testing.assert_close(history.length, before_lengths, rtol=0, atol=0)
+    torch.testing.assert_close(history.old_lengths[~dummy], lengths[~dummy], rtol=0, atol=0)
+    descriptor = _verification_descriptors(pool, fused["conv_state"], history)
+    accepted = torch.tensor([min(tokens, 2), tokens, 0], dtype=torch.int32, device="cuda")
+    ops.commit_verified(
+        descriptor, slots, history.slot_map, accepted, dummy, heads, capacity, tokens
+    )
+    for b in range(batch):
+        slot, row = slots[b].item(), live[b].item()
+        if dummy[b]:
+            torch.testing.assert_close(pool[slot], before_pool[slot], rtol=0, atol=0)
+            assert history.length[row] == lengths[b]
+            continue
+        count = accepted[b].item()
+        window = torch.cat((before_conv[slot], raw.reshape(batch, tokens, -1)[b, :count].T), -1)
+        torch.testing.assert_close(fused["conv_state"][slot], window[:, -3:], rtol=0, atol=0)
+        n = lengths[b].item() + count
+        assert history.length[row] == (0 if n >= 16 else n)
+        if n >= 16:
+            last_g = history.g[row, :, n - 1]
+            adjusted = (
+                history.k[row, :, :n].float() * (last_g[:, None] - history.g[row, :, :n]).exp()
+            ).bfloat16()
+            dense = (primary[b] + residual[b]) * last_g.exp()[:, None]
+            dense += history.u[row, :, :n].float().transpose(-1, -2) @ adjusted.float()
+            target_primary, target_residual = _qdq(dense)
+            restored = ops.materialize_checkpoint(
+                pool, slots[b : b + 1], torch.ones(1, device="cuda", dtype=torch.bool)
+            )
+            _assert_repacked_close(restored[0], target_primary + target_residual)
+        else:
+            torch.testing.assert_close(pool[slot], before_pool[slot], rtol=0, atol=0)
+
+    # The next round must ignore the rejected suffix and start from the
+    # accepted Conv window/history, including the freshly repacked row.
+    scalar_pool, scalar_conv = pool.clone(), fused["conv_state"].clone()
+    scalar_history = ops.ReplayHistory(
+        history.k.clone(),
+        history.u.clone(),
+        history.g.clone(),
+        history.length.clone(),
+        history.slot_map,
+    )
+    next_raw = raw.reshape(batch, tokens, -1)[:, 0]
+    kwargs = dict(
+        conv_weight=fused["conv_weight"],
+        gate=gate.reshape(batch, tokens, -1)[:, 0],
+        beta=beta.reshape(batch, tokens, heads)[:, 0],
+        z=fused["z"].reshape(batch, tokens, heads, 128)[:, 0],
+        norm_weight=fused["norm_weight"],
+        slots=slots,
+        dummy=dummy,
+        A_log=a_log,
+        dt_bias=bias,
+        lower_bound=-5.0,
+        norm_eps=1e-6,
+    )
+    reference = ops.replay(
+        next_raw, conv_state=scalar_conv, pool=scalar_pool, history=scalar_history, **kwargs
+    )
+    actual = ops.verify(
+        next_raw, conv_state=fused["conv_state"], pool=pool, history=history, **kwargs
+    )
+    torch.testing.assert_close(actual, reference, atol=0.003, rtol=0.03)
+    ops.commit_verified(
+        descriptor,
+        slots,
+        history.slot_map,
+        torch.ones_like(accepted),
+        dummy,
+        heads,
+        capacity,
+        tokens,
+    )
+    torch.testing.assert_close(history.length, scalar_history.length, rtol=0, atol=0)
+    torch.testing.assert_close(fused["conv_state"], scalar_conv, rtol=0, atol=0)
+
+
 def _conv_reference(
     raw: torch.Tensor, fused: dict[str, torch.Tensor], slots: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -348,13 +556,18 @@ def test_native_replay_rollover_and_partial_flush(heads: int, lower_bound: float
     _assert_repacked_close(restored, primary + residual)
 
 
-def test_dummy_rows_do_not_mutate_checkpoint_or_history() -> None:
+@pytest.mark.parametrize("dspark", [False, True])
+def test_dummy_rows_do_not_mutate_checkpoint_or_history(dspark: bool) -> None:
     pool, slots, history, _ = _fixture(1, 3)
+    tokens = 4 if dspark else 1
+    if dspark:
+        history = _verification_history(history, tokens)
     history.slot_map.fill_(-1)
+    slots.fill_(-1)
     before = pool.clone()
-    fused = _fused_inputs(1, 3)
+    fused = _fused_inputs(tokens, 3)
     conv_before = fused["conv_state"].clone()
-    x = torch.randn((1, 3 * 3 * 128), dtype=torch.bfloat16, device="cuda")
+    x = torch.randn((tokens, 3 * 3 * 128), dtype=torch.bfloat16, device="cuda")
     result = ops.replay(
         x,
         **fused,
@@ -369,6 +582,17 @@ def test_dummy_rows_do_not_mutate_checkpoint_or_history() -> None:
         lower_bound=-5.0,
         norm_eps=1e-6,
     )
+    if dspark:
+        ops.commit_verified(
+            _verification_descriptors(pool, fused["conv_state"], history),
+            slots,
+            history.slot_map,
+            torch.ones_like(slots),
+            torch.ones(1, device="cuda", dtype=torch.bool),
+            3,
+            16 + tokens,
+            tokens,
+        )
     assert torch.count_nonzero(result) == 0
     assert torch.equal(pool, before)
     assert torch.equal(fused["conv_state"], conv_before)
@@ -386,11 +610,15 @@ def test_rne_midpoints_and_e4m3_maximum_scale() -> None:
     assert torch.isfinite(ops.materialize_checkpoint(pool, slots, torch.ones_like(slots))).all()
 
 
-def test_replay_never_reads_residual() -> None:
+@pytest.mark.parametrize("dspark", [False, True])
+def test_replay_never_reads_residual(dspark: bool) -> None:
     pool, slots, history, _ = _fixture(1, 3)
-    fused = _fused_inputs(1, 3)
+    tokens = 4 if dspark else 1
+    if dspark:
+        history = _verification_history(history, tokens)
+    fused = _fused_inputs(tokens, 3)
     conv_before = fused["conv_state"].clone()
-    x = torch.randn((1, 3 * 3 * 128), dtype=torch.bfloat16, device="cuda")
+    x = torch.randn((tokens, 3 * 3 * 128), dtype=torch.bfloat16, device="cuda")
     kwargs = dict(
         **fused,
         gate=x[:, : 3 * 128],
@@ -414,7 +642,10 @@ def test_replay_never_reads_residual() -> None:
 
 
 @pytest.mark.parametrize("prefill_only", [False, True])
-def test_v2_owns_checkpoint_and_only_live_requests_own_history(prefill_only: bool) -> None:
+@pytest.mark.parametrize("dspark", [False, True])
+def test_v2_owns_checkpoint_and_only_live_requests_own_history(
+    prefill_only: bool, dspark: bool
+) -> None:
     from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
         build_page_table_from_manager,
     )
@@ -425,7 +656,7 @@ def test_v2_owns_checkpoint_and_only_live_requests_own_history(prefill_only: boo
     )
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
     from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
-    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, KvCacheConfig
     from tensorrt_llm.mapping import Mapping
 
     config = KvCacheConfig(
@@ -458,6 +689,7 @@ def test_v2_owns_checkpoint_and_only_live_requests_own_history(prefill_only: boo
         max_batch_size=4,
         mapping=Mapping(),
         conv_state_layout="q_k_v",
+        spec_config=DSparkDecodingConfig(max_draft_len=3) if dspark else None,
     )
     request = LlmRequest(
         request_id=123,
@@ -483,8 +715,20 @@ def test_v2_owns_checkpoint_and_only_live_requests_own_history(prefill_only: boo
         if prefill_only:
             assert manager._kda_2fp4_slot_map is None
             assert manager.mamba_layer_cache(0).history is None
+            assert manager.intermediate_conv_states is None
+            # A context-only rank can still receive a synthetic DP decode
+            # row, without owning any accepted-history/commit scratch.
+            manager.update_mamba_states(
+                SimpleNamespace(num_seqs=1, num_contexts=0),
+                torch.ones(1, device="cuda", dtype=torch.int32),
+                state_indices=torch.zeros(1, device="cuda", dtype=torch.int32),
+            )
             return
         assert manager._kda_2fp4_buffers[0][0].shape[0] == 5  # B + persistent padding slot
+        assert manager._kda_2fp4_buffers[0][0].shape[2] == (20 if dspark else 16)
+        assert manager.intermediate_ssm_states is None
+        if dspark:
+            assert manager.intermediate_conv_states.shape == (2, 4, 4, 3 * 3 * 128)
         assert manager.prepare_context(request)
         assert manager.resize_context(request, num_tokens=4)
         torch.cuda.synchronize()
@@ -497,7 +741,7 @@ def test_v2_owns_checkpoint_and_only_live_requests_own_history(prefill_only: boo
         slots = manager.cuda_state_indices[:1].clone()
         x = torch.randn((1, 3 * 3 * 128), dtype=torch.bfloat16, device="cuda")
         dummy = torch.zeros(1, dtype=torch.bool, device="cuda")
-        expected_states, expected_conv = {}, {}
+        expected_states, expected_conv, layer_inputs = {}, {}, {}
         for layer in manager.mamba_pp_layers:
             cache = manager.mamba_layer_cache(layer)
             ops.store_checkpoint(
@@ -505,10 +749,13 @@ def test_v2_owns_checkpoint_and_only_live_requests_own_history(prefill_only: boo
             )
             fused = _fused_inputs(1, 3, cache.conv.shape[0])
             fused["conv_state"] = cache.conv
-            for _ in range(3):
+            layer_inputs[layer] = fused
+        for _ in range(3):
+            for layer in manager.mamba_pp_layers:
+                cache = manager.mamba_layer_cache(layer)
                 ops.replay(
                     x,
-                    **fused,
+                    **layer_inputs[layer],
                     gate=x[:, : 3 * 128],
                     beta=torch.zeros((1, 3), dtype=torch.bfloat16, device="cuda"),
                     pool=cache.temporal,
@@ -520,6 +767,14 @@ def test_v2_owns_checkpoint_and_only_live_requests_own_history(prefill_only: boo
                     lower_bound=-5.0,
                     norm_eps=1e-6,
                 )
+            if dspark:
+                manager.update_mamba_states(
+                    SimpleNamespace(num_seqs=1, num_contexts=0),
+                    torch.ones(1, device="cuda", dtype=torch.int32),
+                    state_indices=slots,
+                )
+        for layer in manager.mamba_pp_layers:
+            cache = manager.mamba_layer_cache(layer)
             assert cache.history.length.sum() == 3
             primary, residual = _read_checkpoint(cache.temporal, slots)
             live = cache.history.slot_map[slots.long()].long()
@@ -685,16 +940,52 @@ def test_model_prefill_qdq_then_native_decode() -> None:
     assert torch.isfinite(actual).all()
     assert history.length[history.slot_map[slots[1].long()].long()] == 2
 
+    # DSpark verification (including a zero-draft T=1 round) uses the
+    # packed-state controller instead of the dense legacy MTP backend.
+    history = _verification_history(history, 8)
+    history.length.zero_()
+    cache = Kda2Fp4State(conv=conv, temporal=pool, history=history)
+    attention.num_contexts = 0
+    attention.num_ctx_tokens = 0
+    attention.seq_lens = torch.ones(batch, dtype=torch.int32)
+    dummy = torch.zeros(batch, device="cuda", dtype=torch.bool)
+    descriptors = _verification_descriptors(pool, conv, history)
+    for tokens in (4, 1):
+        attention.num_tokens = batch * tokens
+        hidden = torch.randn((batch * tokens, 512), device="cuda", dtype=torch.bfloat16) * 0.1
+        before_pool, before_conv, before_lengths = (
+            pool.clone(),
+            conv.clone(),
+            history.length.clone(),
+        )
+        actual = layer._forward_impl(hidden, attention)
+        assert actual.shape == (batch * tokens, heads, 128)
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(pool, before_pool, rtol=0, atol=0)
+        torch.testing.assert_close(conv, before_conv, rtol=0, atol=0)
+        torch.testing.assert_close(history.length, before_lengths, rtol=0, atol=0)
+        ops.commit_verified(
+            descriptors, slots, history.slot_map, torch.ones_like(slots), dummy, heads, 24, 8
+        )
+    assert torch.all(history.length == 2)
 
+
+@pytest.mark.parametrize("dspark", [False, True])
 def test_runtime_batch_reuses_compilation_and_supports_cuda_graphs(
     monkeypatch: pytest.MonkeyPatch,
+    dspark: bool,
 ) -> None:
     pool, slots, history, _ = _fixture(4, 3)
     from tensorrt_llm._torch.custom_ops import cute_dsl_kda_2fp4_replay as replay_ops
 
-    x = torch.randn((4, 3 * 3 * 128), dtype=torch.bfloat16, device="cuda")
-    fused = _fused_inputs(4, 3)
-    beta = torch.zeros((4, 3), dtype=torch.bfloat16, device="cuda")
+    tokens = 4 if dspark else 1
+    if dspark:
+        history = _verification_history(history, tokens)
+    x = torch.randn((4 * tokens, 3 * 3 * 128), dtype=torch.bfloat16, device="cuda")
+    fused = _fused_inputs(4 * tokens, 3)
+    descriptors = _verification_descriptors(pool, fused["conv_state"], history) if dspark else None
+    accepted = torch.ones_like(slots)
+    beta = torch.zeros((4 * tokens, 3), dtype=torch.bfloat16, device="cuda")
     dummy = torch.zeros(4, dtype=torch.bool, device="cuda")
     a_log = torch.zeros(3, device="cuda")
     bias = torch.zeros((3, 128), device="cuda")
@@ -708,13 +999,13 @@ def test_runtime_batch_reuses_compilation_and_supports_cuda_graphs(
     monkeypatch.setattr(replay_ops.cute, "compile", counted_compile)
 
     def run(batch: int) -> torch.Tensor:
-        return ops.replay(
-            x[:batch],
+        output = ops.replay(
+            x[: batch * tokens],
             conv_state=fused["conv_state"],
             conv_weight=fused["conv_weight"],
-            gate=x[:batch, : 3 * 128],
-            beta=beta[:batch],
-            z=fused["z"][:batch],
+            gate=x[: batch * tokens, : 3 * 128],
+            beta=beta[: batch * tokens],
+            z=fused["z"][: batch * tokens],
             norm_weight=fused["norm_weight"],
             pool=pool,
             slots=slots[:batch],
@@ -725,6 +1016,18 @@ def test_runtime_batch_reuses_compilation_and_supports_cuda_graphs(
             lower_bound=-5.0,
             norm_eps=1e-6,
         )
+        if dspark:
+            ops.commit_verified(
+                descriptors,
+                slots[:batch],
+                history.slot_map,
+                accepted[:batch],
+                dummy[:batch],
+                3,
+                16 + tokens,
+                tokens,
+            )
+        return output
 
     run(4)
     count = len(compilations)

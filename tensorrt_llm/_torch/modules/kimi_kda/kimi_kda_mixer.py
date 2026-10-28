@@ -520,7 +520,21 @@ class KimiKDALinearAttention(nn.Module):
                 cores.append(prefill_core)
         if num_decodes > 0:
             decode_rows = num_tokens - num_ctx_tokens
-            if decode_rows == num_decodes:
+            if ssm_pool.dtype == torch.uint8:
+                if decode_rows % num_decodes:
+                    raise ValueError("2FP4 DSpark requires uniform verification widths")
+                decode_core = self.forward_decode_2fp4(
+                    hidden_states[num_ctx_tokens:num_tokens],
+                    conv_pool,
+                    ssm_pool,
+                    generation_state_indices,
+                    attn_metadata.kv_cache_manager._dummy_request_mask[num_prefills:batch_size],
+                    layer_cache,
+                    output=output[num_ctx_tokens:num_tokens] if output is not None else None,
+                )
+                if output is None:
+                    cores.append(decode_core)
+            elif decode_rows == num_decodes:
                 decode_core = self.forward_decode(
                     hidden_states[num_ctx_tokens:num_tokens],
                     conv_pool,
