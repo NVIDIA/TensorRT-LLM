@@ -45,8 +45,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 from ...llmapi.llm_args import LoadFormat
 from .._experimental.modeling_v2 import modeling_v2_resolve
 from ..locality_domain.policy import LocalityDomainPolicy
-from ..memory.ledger.tagging import claim_module_memory as ledger_claim_memory
-from ..memory.ledger.tagging import tag as ledger_tag
+from ..memory.monitor.tagging import claim_module_memory as monitor_claim_memory
+from ..memory.monitor.tagging import tag as monitor_tag
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -1156,7 +1156,7 @@ class ModelLoader:
             # but all of them allocate the same bytes, so tagging per
             # branch would attribute weights only on whichever path a
             # given run happened to take.
-            with ledger_tag("WEIGHTS"):
+            with monitor_tag("WEIGHTS"):
                 if (self.model_weights_memory_tag is not None
                         and load_format != LoadFormat.GMS):
                     # Allocate buffers to the outer virtual_memory_scope,
@@ -1615,7 +1615,7 @@ class ModelLoader:
         # loader replaced -- fusing and quantising free the tagged blocks and
         # allocate untagged ones -- so reading the final state is what makes
         # the weights figure match the model.
-        ledger_claim_memory(model, "WEIGHTS")
+        monitor_claim_memory(model, "WEIGHTS")
         return model, moe_load_balancer
 
     def _check_gms_source_identity(self, gms_backend) -> None:

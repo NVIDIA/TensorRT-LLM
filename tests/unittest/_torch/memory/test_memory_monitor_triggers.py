@@ -14,7 +14,7 @@
 # limitations under the License.
 """Trigger points, and the provider registry they depend on.
 
-Without these the ledger is unreachable in practice: the memory sits in the
+Without these the monitor is unreachable in practice: the memory sits in the
 executor's process while the obvious place to ask for a report is the parent,
 where there is nothing to see. A report that never reaches anyone is the same
 as no report.
@@ -26,15 +26,15 @@ import types
 import pytest
 import torch
 
-from tensorrt_llm._torch.memory.ledger.providers import (
+from tensorrt_llm._torch.memory.monitor.providers import (
     clear_registered_providers,
     collect_all,
     default_providers,
     register_provider,
 )
-from tensorrt_llm._torch.memory.ledger.providers.kv_cache import KvCacheProvider
-from tensorrt_llm._torch.memory.ledger.schema import Basis, Category
-from tensorrt_llm._torch.memory.ledger.triggers import (
+from tensorrt_llm._torch.memory.monitor.providers.kv_cache import KvCacheProvider
+from tensorrt_llm._torch.memory.monitor.schema import Basis, Category
+from tensorrt_llm._torch.memory.monitor.triggers import (
     install_oom_reporter,
     report_now,
     uninstall_oom_reporter,
@@ -111,7 +111,7 @@ class TestProviderDoesNotPinThePool:
         gc.collect()
 
         # Keeping it alive would stop tens of GiB from ever being released.
-        assert not provider.available(), "the ledger must not keep the KV cache manager alive"
+        assert not provider.available(), "the monitor must not keep the KV cache manager alive"
         assert provider.collect() == []
 
     def test_dead_manager_is_skipped_not_reported_as_zero(self):
@@ -125,17 +125,17 @@ class TestProviderDoesNotPinThePool:
 
 class TestReportNow:
     def test_returns_none_when_disabled(self, monkeypatch):
-        monkeypatch.delenv("TLLM_MEM_LEDGER", raising=False)
+        monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
         assert report_now(tag="t", rank=0) is None
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
     def test_returns_text_when_enabled(self, monkeypatch):
-        monkeypatch.setenv("TLLM_MEM_LEDGER", "1")
+        monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
         text = report_now(tag="unit", rank=0)
-        assert text is not None and "memory ledger" in text
+        assert text is not None and "memory monitor" in text
 
     def test_a_broken_provider_does_not_break_the_report(self, monkeypatch):
-        monkeypatch.setenv("TLLM_MEM_LEDGER", "1")
+        monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
         if not torch.cuda.is_available():
             pytest.skip("needs a GPU")
 
@@ -155,12 +155,12 @@ class TestReportNow:
 
 class TestOomReporter:
     def test_not_installed_when_disabled(self, monkeypatch):
-        monkeypatch.delenv("TLLM_MEM_LEDGER", raising=False)
+        monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
         assert install_oom_reporter(rank=0) is False
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
     def test_installs_once_and_stays_installed(self, monkeypatch):
-        monkeypatch.setenv("TLLM_MEM_LEDGER", "1")
+        monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
         attaches = []
         monkeypatch.setattr(
             torch._C, "_cuda_attach_out_of_memory_observer", lambda cb: attaches.append(cb)
@@ -176,9 +176,9 @@ class TestOomReporter:
         # Exercise the callback directly: the attach flag deliberately never
         # resets, so a test cannot rely on capturing it from a second
         # install.
-        import tensorrt_llm._torch.memory.ledger.triggers as mod
+        import tensorrt_llm._torch.memory.monitor.triggers as mod
 
-        monkeypatch.setenv("TLLM_MEM_LEDGER", "1")
+        monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
         monkeypatch.setattr(mod, "_enabled_flag", True)
         monkeypatch.setattr(mod, "_reports_emitted", 0)
         emitted = []
@@ -192,10 +192,10 @@ class TestOomReporter:
         assert len(emitted) == 1
 
     def test_limit_is_configurable(self, monkeypatch):
-        import tensorrt_llm._torch.memory.ledger.triggers as mod
+        import tensorrt_llm._torch.memory.monitor.triggers as mod
 
-        monkeypatch.setenv("TLLM_MEM_LEDGER", "1")
-        monkeypatch.setenv("TLLM_MEM_LEDGER_OOM_REPORTS", "3")
+        monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
+        monkeypatch.setenv("TLLM_MEM_MONITOR_OOM_REPORTS", "3")
         monkeypatch.setattr(mod, "_enabled_flag", True)
         monkeypatch.setattr(mod, "_reports_emitted", 0)
         emitted = []
@@ -206,7 +206,7 @@ class TestOomReporter:
         assert len(emitted) == 3
 
     def test_inert_once_uninstalled(self, monkeypatch):
-        import tensorrt_llm._torch.memory.ledger.triggers as mod
+        import tensorrt_llm._torch.memory.monitor.triggers as mod
 
         monkeypatch.setattr(mod, "_enabled_flag", False)
         monkeypatch.setattr(mod, "_reports_emitted", 0)
@@ -219,7 +219,7 @@ class TestOomReporter:
         assert emitted == []
 
     def test_a_failing_report_does_not_mask_the_oom(self, monkeypatch):
-        import tensorrt_llm._torch.memory.ledger.triggers as mod
+        import tensorrt_llm._torch.memory.monitor.triggers as mod
 
         monkeypatch.setattr(mod, "_enabled_flag", True)
         monkeypatch.setattr(mod, "_reports_emitted", 0)
