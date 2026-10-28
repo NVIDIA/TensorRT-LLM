@@ -28,12 +28,14 @@ where the ranks would be spawned.
 import json
 
 import pytest
+from pydantic import ValidationError
 
 import tensorrt_llm.usage as usage
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import settings
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     CLIENT_CONFIG_NAME,
     CONFIG_PATH_ENV,
+    local_reuse_backoff,
 )
 from tensorrt_llm.llmapi.llm import LLM, _TorchLLM
 from tensorrt_llm.llmapi.llm_args import (
@@ -244,6 +246,36 @@ def test_a_settled_deployment_is_restated_without_a_word(monkeypatch, tmp_path):
     assert logged == []
     assert pool.role == "producer"
     assert args.kv_cache_config.host_cache_size == 0
+
+
+def test_local_reuse_backoff_takes_only_the_modes_it_has():
+    assert mooncake_store_config().local_reuse_backoff == "off"
+    assert mooncake_store_config(local_reuse_backoff="align").local_reuse_backoff == "align"
+    with pytest.raises(ValidationError):
+        mooncake_store_config(local_reuse_backoff="partial")
+
+
+def test_local_reuse_backoff_is_read_from_the_block_with_off_as_its_default():
+    """Every rank reads it off its own arguments, so no block means the default."""
+    pool = mooncake_store_config(local_reuse_backoff="align")
+    assert local_reuse_backoff(llm_args(pool=pool)) == "align"
+    assert local_reuse_backoff(llm_args(pool=mooncake_store_config())) == "off"
+    # An inherited `MOONCAKE_CONFIG_PATH` needs no block at all.
+    assert local_reuse_backoff(llm_args()) == "off"
+
+
+def test_an_inherited_config_leaves_local_reuse_backoff_alone(monkeypatch, tmp_path):
+    """It is an engine setting the client config does not carry, so nothing restates it."""
+    inherited = write_client_config(tmp_path / "external.json", role="consumer")
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(inherited))
+    pool = mooncake_store_config(local_reuse_backoff="align")
+    args = llm_args(pool=pool)
+
+    settings.apply_effective_settings(args)
+
+    assert pool.role == "consumer"
+    assert pool.local_reuse_backoff == "align"
+    assert local_reuse_backoff(args) == "align"
 
 
 def test_another_connector_keeps_its_own_cache_tiers():

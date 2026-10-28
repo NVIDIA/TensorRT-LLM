@@ -2677,6 +2677,19 @@ class MooncakeStoreConfig(StrictBaseModel):
         "master to accept connections. Raise it when the wait spans a "
         "container start on another node. Expiring fails the server at "
         "startup.")
+    local_reuse_backoff: Literal["off", "align"] = Field(
+        "off",
+        telemetry=False,
+        description="How a local prefix match is handled under one-model "
+        "speculative decoding, whose draft reads prompt tokens past each "
+        "position and so backs every local reuse match off by that lookahead. "
+        "'off' drops the backoff: local hits are used whole, and the draft KV "
+        "at the tail of a reused block may belong to a different next token, "
+        "which can lower draft acceptance but does not change the output. "
+        "'align' keeps the backoff and aligns the match down to a block "
+        "boundary, so the pool serves the trimmed block (a transfer) along "
+        "with the rest of the prefix. Has no effect without one-model "
+        "speculative decoding or for a role that does not read the pool.")
 
     @field_validator("segment_size", mode="after")
     @classmethod

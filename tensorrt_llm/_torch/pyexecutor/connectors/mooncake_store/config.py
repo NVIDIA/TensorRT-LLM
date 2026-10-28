@@ -29,7 +29,7 @@ import re
 import socket
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Literal, Optional, Tuple
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig, TorchLlmArgs
@@ -41,6 +41,7 @@ __all__ = [
     "SEGMENTS_DIR_NAME",
     "StoreRole",
     "local_address",
+    "local_reuse_backoff",
     "parse_size",
     "pool_config",
     "provisioned_config_path",
@@ -247,6 +248,25 @@ def pool_config(llm_args: "TorchLlmArgs") -> Optional["MooncakeStoreConfig"]:
     """
     connector = llm_args.kv_connector_config
     return connector.mooncake_store if connector is not None else None
+
+
+def local_reuse_backoff(llm_args: "TorchLlmArgs") -> Literal["off", "align"]:
+    """How a local prefix match is handled ahead of the pool under a one-model draft.
+
+    See `MooncakeStoreConfig.local_reuse_backoff`. It is an engine setting read
+    from `llm_args` on every rank, not part of the rendered client config, so a
+    deployment that inherits `MOONCAKE_CONFIG_PATH` without a `mooncake_store`
+    block gets the field's default.
+
+    Args:
+        llm_args: The engine arguments every rank parses.
+
+    Returns:
+        `"off"` to drop the draft's reuse-match backoff, or `"align"` to keep it
+        and align local matches down to a block boundary.
+    """
+    pool = pool_config(llm_args)
+    return pool.local_reuse_backoff if pool is not None else "off"
 
 
 def provisioned_config_path(run_dir: Optional[str]) -> Optional[str]:

@@ -289,7 +289,10 @@ def set_pool_setting(store_config, **settings):
 
 
 def make_llm_args(
-    *, run_dir: str | None = None, enable_attention_dp: bool = False
+    *,
+    run_dir: str | None = None,
+    enable_attention_dp: bool = False,
+    local_reuse_backoff: str = "off",
 ) -> SimpleNamespace:
     return SimpleNamespace(
         model="/models/test-model",
@@ -303,7 +306,9 @@ def make_llm_args(
         # config could not hand it; see config.pool_config.
         kv_connector_config=SimpleNamespace(
             connector="mooncake-store",
-            mooncake_store=SimpleNamespace(run_dir=run_dir),
+            mooncake_store=SimpleNamespace(
+                run_dir=run_dir, local_reuse_backoff=local_reuse_backoff
+            ),
         ),
     )
 
@@ -330,6 +335,7 @@ def make_worker(
     layout: KvCacheLayout | None = None,
     run_dir: str | None = None,
     enable_attention_dp: bool = False,
+    local_reuse_backoff: str = "off",
 ) -> Iterator[MooncakeStoreConnectorWorker]:
     """Build a worker and shut it down before the test call phase ends.
 
@@ -338,7 +344,11 @@ def make_worker(
     fixture teardown would run too late to keep it quiet.
     """
     worker = MooncakeStoreConnectorWorker(
-        make_llm_args(run_dir=run_dir, enable_attention_dp=enable_attention_dp)
+        make_llm_args(
+            run_dir=run_dir,
+            enable_attention_dp=enable_attention_dp,
+            local_reuse_backoff=local_reuse_backoff,
+        )
     )
     fake_store.workers.append(worker)
     if layout is not None:
@@ -1356,6 +1366,52 @@ def test_capacity_only_worker_builds_under_attention_dp(store_config, fake_store
         assert fake_store.registered == []
         assert worker.count_prefix_hit([b"\x01" * 16]) == 0
         assert fake_store.exist_calls == []
+
+
+# ---- local reuse under a one-model draft ----
+
+
+@pytest.mark.parametrize("mode, drops", [("off", True), ("align", False)])
+def test_worker_local_reuse_backoff_comes_from_the_config(store_config, fake_store, mode, drops):
+    """`mooncake_store.local_reuse_backoff` picks whole local matches or aligned ones."""
+    with make_worker(fake_store, local_reuse_backoff=mode) as worker:
+        assert worker.drops_reuse_match_backoff is drops
+        # Either way an offer starts on a block boundary.
+        assert worker.requires_block_aligned_reuse is True
+
+
+def test_worker_local_reuse_backoff_defaults_off_for_an_inherited_config(store_config, fake_store):
+    """A deployment that provisions the pool itself may set no `mooncake_store` block."""
+    llm_args = make_llm_args()
+    llm_args.kv_connector_config.mooncake_store = None
+    worker = MooncakeStoreConnectorWorker(llm_args)
+    fake_store.workers.append(worker)
+    try:
+        assert worker.drops_reuse_match_backoff is True
+        assert worker.requires_block_aligned_reuse is True
+    finally:
+        worker.shutdown()
+
+
+@pytest.mark.parametrize(
+    "role, declares",
+    [("both", True), ("consumer", True), ("producer", False), ("capacity", False)],
+)
+def test_mooncake_asks_for_block_aligned_local_reuse_only_where_it_loads(
+    store_config, fake_store, role, declares
+):
+    """Only a role that reads the pool reshapes the local match its offer starts from.
+
+    A producer or capacity rank never offers, so it keeps the cache manager's own
+    reuse, draft backoff included.
+    """
+    set_pool_setting(store_config, role=role)
+    with make_worker(fake_store) as worker:
+        assert worker.requires_block_aligned_reuse is declares
+        assert worker.drops_reuse_match_backoff is declares
+    # Class defaults stay off, so a role that loads is the only thing that turns them on.
+    assert MooncakeStoreConnectorWorker.requires_block_aligned_reuse is False
+    assert MooncakeStoreConnectorWorker.drops_reuse_match_backoff is False
 
 
 # ---- host staging ----

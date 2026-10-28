@@ -848,6 +848,24 @@ adapter and a worker on every owner, each deciding and moving pages for its own 
 [speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server) is refused
 for it at startup.
 
+`mooncake_store.local_reuse_backoff` sets how a server that reads the pool (`role: both` or
+`consumer`) treats its local prefix match under one-model speculative decoding. The draft backs
+every local match off by its prompt lookahead, which leaves a match of whole blocks short of the
+block boundary the pool serves from.
+
+* `off`, the default, has the worker declare
+  [`drops_reuse_match_backoff`](#2-worker-interface-kvcacheconnectorworker): local hits are used
+  whole. The draft KV at the tail of a reused block may belong to a different next token, which can
+  lower draft acceptance but never changes the output.
+* `align` keeps the backoff, and `KVCacheManagerV2` aligns the match down to a block instead
+  (`requires_block_aligned_reuse`, which a role that reads the pool always declares). The pool then
+  serves the trimmed block along with the rest of the prefix, at the cost of that block's transfer.
+
+It is an engine setting read from the `mooncake_store` block on every rank rather than part of the
+rendered client config, so a deployment that inherits `MOONCAKE_CONFIG_PATH` without the block gets
+`off`. A `producer` or `capacity` server keeps the cache manager's own reuse either way. The setting
+has no effect while this connector refuses speculative decoding.
+
 ### Restrictions
 
 Checked at startup, before any request is admitted, because each one's failure mode is KV replayed
