@@ -957,10 +957,11 @@ class SpecMetadata:
                                     non_blocking=True)
 
         # An all-greedy batch runs the argmax graph, which reads none of these
-        # buffers, and neither does a temperature-only batch, which draws with
-        # the worker's own per-step seed. The offset windows above still advance, so skipping the copies
-        # changes no later batch's streams.
-        if self.is_all_greedy_sample or self.temperature_only:
+        # buffers. The offset windows above still advance, so skipping the
+        # copies changes no later batch's streams. A temperature-only batch
+        # still uploads: a target head the worker cannot shard (vocab padding)
+        # samples it on the stock path, which reads them.
+        if self.is_all_greedy_sample:
             return
         _upload(self.request_seeds, request_seeds)
         _upload(self.request_offsets, request_offsets)
