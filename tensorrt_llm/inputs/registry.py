@@ -194,9 +194,12 @@ class BaseMultimodalInputProcessor(ABC):
         """Return portable model metadata, or None when preparation cannot be reused."""
         return None
 
-    def restore_decode_state(self, state: Dict[str, Any],
-                             prompt_length: int) -> Dict[str, Any]:
-        """Restore metadata exported by this processor for generation-only execution."""
+    def restore_decode_state(
+            self,
+            state: Dict[str, Any],
+            prompt_length: int,
+            max_length: Optional[int] = None) -> Dict[str, Any]:
+        """Restore metadata, validating positions through max_length tokens if set."""
         raise ValueError(
             "This processor does not support prepared decode inputs")
 

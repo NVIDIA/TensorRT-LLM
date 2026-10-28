@@ -4,6 +4,7 @@
 """Admission ownership and portable generation-only metadata regressions."""
 
 import asyncio
+import base64
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -87,7 +88,9 @@ async def test_cancelled_worker_retains_admission_until_thread_finishes(decode, 
 def _fixture():
     processor = object.__new__(Qwen2VLInputProcessorBase)
     processor._config = SimpleNamespace(
-        model_type="qwen2_vl", to_dict=lambda: {"model_type": "qwen2_vl"}
+        model_type="qwen2_vl",
+        max_position_embeddings=128,
+        to_dict=lambda: {"model_type": "qwen2_vl"},
     )
     processor._processor = None
     llm = SimpleNamespace(input_processor=processor, args=SimpleNamespace(max_seq_len=128))
@@ -101,7 +104,7 @@ def _fixture():
             )
         ],
     )
-    positions = torch.arange(5).reshape(1, 1, 5).expand(3, 1, 5).clone()
+    positions = torch.tensor([0, 1, 1, 1, 2]).reshape(1, 1, 5).expand(3, 1, 5).clone()
     capture = {
         "prompt_token_ids": [1, 2, 3, 4, 5],
         "state": processor.export_decode_state(
@@ -138,6 +141,80 @@ def test_qwen_prepared_decode_roundtrip_preserves_tokens_and_positions():
         assert set(params.multimodal_data) == {"mrope_config"}
     finally:
         params.release_handles()
+
+
+@pytest.mark.parametrize(
+    "positions,delta",
+    [
+        ([0, 1, 1, 1, 2], 1_000_000),
+        ([0, 1, 1, 1, 2], -(2**63)),
+        ([0, 1, 1, 1, 2], 2**63 - 1),
+        ([-1, 1, 1, 1, 2], -2),
+        ([0, 1, 1, 1, 128], 124),
+        ([0, 1, 1, 1, 2**63 - 1], 2**63 - 5),
+        ([0, 1, 1, 1, 5], 1),
+    ],
+)
+def test_prepared_decode_rejects_unsafe_mrope_before_tensor_or_handle_creation(
+    positions, delta, monkeypatch
+):
+    llm, request, capture, _ = _fixture()
+    payload = json.loads(_decode_preparation(request, llm, capture))
+    config = payload["state"]["mrope_config"]
+    for name, values in (
+        ("mrope_position_ids", positions * 3),
+        ("mrope_position_deltas", [delta]),
+    ):
+        config[name]["data"] = base64.b64encode(
+            torch.tensor(values, dtype=torch.int64).numpy().astype("<i8").tobytes()
+        ).decode("ascii")
+    _handoff(request, payload)
+
+    def unexpected_allocation(*args, **kwargs):
+        pytest.fail("invalid mRoPE must be rejected before tensor/IPC handle creation")
+
+    monkeypatch.setattr(torch, "from_numpy", unexpected_allocation)
+    monkeypatch.setattr(MultimodalParams, "to_handle", unexpected_allocation)
+    with pytest.raises(ValueError, match="Qwen mRoPE"):
+        _prepared_decode_from_request(request, llm)
+
+
+@pytest.mark.parametrize("nested_config", [False, True])
+@pytest.mark.parametrize("delta", [-2, 0, 3])
+def test_prepared_decode_accepts_mrope_within_generation_budget(delta, nested_config):
+    llm, request, capture, _ = _fixture()
+    if nested_config:
+        llm.input_processor._config.text_config = SimpleNamespace(max_position_embeddings=128)
+        del llm.input_processor._config.max_position_embeddings
+    positions = torch.tensor([0, 1, 1, 1, 4 + delta]).reshape(1, 1, 5).expand(3, 1, 5)
+    capture["state"] = llm.input_processor.export_decode_state(
+        {
+            "mrope_config": {
+                "mrope_position_ids": positions,
+                "mrope_position_deltas": torch.tensor([[delta]]),
+            }
+        }
+    )
+    # Positive deltas reach exactly the last valid RoPE table row.
+    request.stopping.max_tokens = 128 - delta - 5
+    _handoff(request, _decode_preparation(request, llm, capture))
+    restored = _prepared_decode_from_request(request, llm)
+    restored.multimodal_params.release_handles()
+    if delta > 0:
+        request.stopping.max_tokens += 1
+        with pytest.raises(ValueError, match="decode positions exceed"):
+            _prepared_decode_from_request(request, llm)
+
+
+@pytest.mark.parametrize("max_tokens", [None, 8])
+def test_prepared_decode_uses_model_bound_when_runtime_limit_is_inferred(max_tokens):
+    llm, request, capture, _ = _fixture()
+    llm.args.max_seq_len = None
+    if max_tokens is not None:
+        request.stopping.max_tokens = max_tokens
+    _handoff(request, _decode_preparation(request, llm, capture))
+    restored = _prepared_decode_from_request(request, llm)
+    restored.multimodal_params.release_handles()
 
 
 def test_prepared_decode_preserves_multimodal_cache_identity_and_item_layout():

@@ -164,8 +164,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             }
         }
 
-    def restore_decode_state(self, state: Dict[str, Any],
-                             prompt_length: int) -> Dict[str, Any]:
+    def restore_decode_state(
+            self,
+            state: Dict[str, Any],
+            prompt_length: int,
+            max_length: Optional[int] = None) -> Dict[str, Any]:
         if set(state) != {"mrope_config"}:
             raise ValueError("invalid Qwen decode state")
         config = state["mrope_config"]
@@ -173,7 +176,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 "mrope_position_ids", "mrope_position_deltas"
         }:
             raise ValueError("invalid Qwen mRoPE fields")
-        tensors = {}
+        arrays = {}
 
         for name, value in config.items():
             expected_shape = (
@@ -198,8 +201,31 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 raise ValueError(f"invalid Qwen {name} byte length")
             array = np.frombuffer(raw, dtype="<i8").astype(
                 np.int64).reshape(expected_shape)
-            tensors[name] = torch.from_numpy(array)
-        return {"mrope_config": tensors}
+            arrays[name] = array
+        text_config = getattr(self.config, "text_config", self.config)
+        max_positions = getattr(text_config, "max_position_embeddings", None)
+        if type(max_positions) is not int or not 0 < max_positions <= 2**31:
+            raise ValueError("invalid Qwen mRoPE model position bound")
+        if max_length is None:
+            max_length = max_positions
+        if prompt_length <= 0 or max_length < prompt_length:
+            raise ValueError("invalid Qwen mRoPE prompt length")
+        positions = arrays["mrope_position_ids"]
+        if np.any(positions < 0) or np.any(positions >= max_positions):
+            raise ValueError("Qwen mRoPE positions exceed model bounds")
+        delta = int(arrays["mrope_position_deltas"][0, 0])
+        if delta != int(positions.max()) + 1 - prompt_length:
+            raise ValueError("inconsistent Qwen mRoPE position delta")
+        # Include every possible decode position before handing state to the GPU.
+        last_position = max_length - 1 + delta
+        if not 0 <= last_position < max_positions:
+            raise ValueError("Qwen mRoPE decode positions exceed model bounds")
+        return {
+            "mrope_config": {
+                name: torch.from_numpy(array)
+                for name, array in arrays.items()
+            }
+        }
 
     def __init__(self,
                  model_path: str,

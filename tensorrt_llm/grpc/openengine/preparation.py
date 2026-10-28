@@ -117,7 +117,11 @@ def _prepared_decode_from_request(request: Any, llm: Any) -> PreprocessedInputs 
     state = payload.get("state")
     if not isinstance(state, dict):
         raise ValueError("prepared decode model state must be an object")
-    restored = llm.input_processor.restore_decode_state(state, len(tokens))
+    max_length = getattr(llm.args, "max_seq_len", None)
+    if request.HasField("stopping") and request.stopping.HasField("max_tokens"):
+        requested_length = len(tokens) + request.stopping.max_tokens
+        max_length = min(max_length, requested_length) if max_length else requested_length
+    restored = llm.input_processor.restore_decode_state(state, len(tokens), max_length=max_length)
     mm_input = payload.get("multimodal_input")
     if mm_input is not None:
 
