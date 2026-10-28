@@ -37,6 +37,8 @@ def _manager(
     manager._allocated_draft_lens = {}
     manager._inflight_draft_lens = {}
     manager.kv_cache_map = {}
+    # No windowed pools; the window-crossing check reads them on every growth.
+    manager._windowed_layer_group_sizes = {}
     return manager
 
 
