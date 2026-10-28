@@ -6479,7 +6479,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // may break the mapping functionality.
 
     x86TestConfigs = [
-        "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 1],
+        "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 2],
+        "CPU-Generic-x86-2": ["cpu", "l0_cpu", 2, 2],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 3],
         "A10-PyTorch-2": ["a10", "l0_a10", 2, 3],
@@ -6648,7 +6649,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     // SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
-        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 1],
+        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 2],
+        "CPU-Generic-arm-2": ["cpu", "l0_cpu", 2, 2],
         "GH200-PyTorch-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
