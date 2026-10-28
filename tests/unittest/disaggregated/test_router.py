@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import copy
+import inspect
 import os
 import random
 import threading
@@ -358,6 +359,98 @@ async def test_coordinator_finish_queue_is_bounded():
 
     assert router._finish_queue.qsize() == 1
     assert router._dropped_finishes == 1
+
+
+@pytest.mark.asyncio
+async def test_mirror_servers_replaces_the_list_without_preparing():
+    router = LoadBalancingRouter(server_role=None, servers=["a:1", "b:2"])
+    router._fetch_server_info = mock.AsyncMock(
+        side_effect=lambda server, timeout: {"name": server})
+    await router.prepare_servers()
+
+    new_list = ["b:2", "c:3"]
+    await router.mirror_servers(new_list)
+
+    assert router.servers == ["b:2", "c:3"]
+    # The router must copy the list, not alias the caller's: mutating the
+    # argument after the call must not leak into the router.
+    assert router.servers is not new_list
+    new_list.append("d:4")
+    assert router.servers == ["b:2", "c:3"]
+    assert router.prepared_servers == {"b:2"}
+    # Server info of departed servers is dropped; survivors keep theirs.
+    assert router._server_info == {"b:2": {"name": "b:2"}}
+    fetched = [
+        call.args[0] for call in router._fetch_server_info.await_args_list
+    ]
+    assert sorted(fetched) == ["a:1", "b:2"], \
+        "mirror_servers must not prepare servers; the coordinator prepares them"
+    # _on_servers_updated ran: the load-balancing state follows the new list.
+    assert set(router._server_state) == {"b:2", "c:3"}
+
+
+@pytest.mark.asyncio
+async def test_mirror_servers_runs_the_update_callback_under_the_lock():
+    router = LoadBalancingRouter(server_role=None, servers=["a:1"])
+    locked_during_update = []
+
+    def record_lock_state(old_servers, new_servers):
+        locked_during_update.append(router._lock.locked())
+
+    with mock.patch.object(router,
+                           "_on_servers_updated",
+                           side_effect=record_lock_state):
+        await router.mirror_servers(["b:2"])
+
+    assert locked_during_update == [True], \
+        "mirror_servers must hold the router lock while it updates the list"
+
+
+@pytest.mark.asyncio
+async def test_mirror_servers_with_the_same_list_changes_nothing():
+    router = LoadBalancingRouter(server_role=None, servers=["a:1", "b:2"])
+    router._fetch_server_info = mock.AsyncMock(return_value={})
+    await router.prepare_servers()
+    prepared_before = router.prepared_servers
+
+    with mock.patch.object(router, "_on_servers_updated") as on_updated:
+        await router.mirror_servers(["a:1", "b:2"])
+
+    on_updated.assert_not_called()
+    assert router.prepared_servers == prepared_before
+
+
+@pytest.mark.asyncio
+async def test_delegating_router_sync_servers_uses_the_public_method():
+    local = RoundRobinRouter(server_role=None, servers=["server1"])
+    local.mirror_servers = mock.AsyncMock()
+    router = CoordinatorDelegatingRouter("http://coordinator", local,
+                                         "generation")
+
+    await router.sync_servers(["x:1"])
+
+    local.mirror_servers.assert_awaited_once_with(["x:1"])
+
+
+@pytest.mark.asyncio
+async def test_delegating_router_mirror_servers_reaches_the_wrapped_router():
+    local = RoundRobinRouter(server_role=None, servers=["server1"])
+    local.mirror_servers = mock.AsyncMock()
+    router = CoordinatorDelegatingRouter("http://coordinator", local,
+                                         "generation")
+
+    await router.mirror_servers(["x:1"])
+
+    local.mirror_servers.assert_awaited_once_with(["x:1"])
+    # The wrapper must not grow a server list of its own.
+    assert "_servers" not in vars(router)
+
+
+def test_delegating_router_does_not_reach_into_the_wrapped_router():
+    assert "._local._" not in inspect.getsource(CoordinatorDelegatingRouter), (
+        "CoordinatorDelegatingRouter must use the wrapped router's public "
+        "methods; add a public method on Router instead of reading or "
+        "writing self._local._<private>")
 
 
 @pytest.fixture(autouse=True)
