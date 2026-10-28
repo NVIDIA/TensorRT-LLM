@@ -27,3 +27,9 @@
 # Reason: The H100 cluster is under maintenance.
 # H100_PCIe-*
 # DGX_H100-*
+
+Reason: L40S pre-merge stages are temporarily paused due to Kubernetes agent provisioning and node issues.
+L40S-PyTorch-1
+L40S-PyTorch-1-cbts
+L40S-PyTorch-2
+L40S-PyTorch-2-cbts
