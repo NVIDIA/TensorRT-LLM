@@ -166,10 +166,7 @@ def layer_configs(manager: KVCacheManagerV2) -> dict[int, object]:
 
 def layer_group_layer_ids(manager: KVCacheManagerV2) -> list[list[int]]:
     """Internal layer ids per runtime layer group, in layer-group order."""
-    return [
-        list(dict.fromkeys(int(buffer.layer_id) for buffer in group))
-        for group in manager.impl.buffer_grouping
-    ]
+    return [[int(layer_id) for layer_id in group] for group in manager.impl.layer_grouping]
 
 
 def pool_group_descriptors(manager: KVCacheManagerV2) -> Sequence[PoolGroupDesc]:
@@ -183,7 +180,7 @@ def declared_global_layer_ids(manager: KVCacheManagerV2) -> dict[int, int] | Non
     if getter is None:
         return None
     table: dict[int, int] = {}
-    for layer_group, layer_ids in enumerate(layer_group_layer_ids(manager)):
+    for layer_group, layer_ids in enumerate(manager.impl.layer_grouping):
         ids = [int(value) for value in getter(layer_group)]
         if len(ids) != len(layer_ids):
             raise ValueError(

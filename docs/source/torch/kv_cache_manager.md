@@ -117,15 +117,16 @@ group and raises `ValueError` for a split layer. The latter preserves its
 partition-of-layers result and raises if any layer is split. `LayerGroupId` retains
 its name; it identifies a lifecycle group, not a physical storage pool.
 
-Independent policies require independent indices in the consumer. The default
-attention view requires compatible policies for K/V and scales because they share
-one page table. Current Mamba kernels similarly couple recurrent, convolution,
-PLE and replay buffers through one state-slot index. These consumers reject
-incompatible policies explicitly; this native configuration does not enable
-separate replay indices in those kernels or add an LLM API configuration field.
+Existing Python cache-manager consumers continue using the legacy layer APIs
+and require one lifecycle per layer. They do not adopt per-buffer policy splits;
+the legacy API rejects ambiguous layer mappings. Consumers can migrate to the
+buffer APIs when they add support for independent indices. Current Mamba kernels
+couple recurrent, convolution, PLE and replay buffers through one state-slot
+index; separate replay indices are a follow-up. This native configuration does
+not add an LLM API configuration field.
 
 The native page-index converter also supports unequal layer shares in scratch
 slots, including a layer's block crossing two physical slots. Existing attention
-scratch-table kernels require whole layer blocks per slot. The wrapper rejects
-unequal shares that require crossing slots; use separate `coalescing_group` values
-or disable SWA scratch reuse for those layouts.
+scratch-table kernels require whole layer blocks per slot. Custom consumers of
+unequal shares that cross slots must use the native converter or supply compatible
+index generation; existing Python consumers have not adopted that layout.

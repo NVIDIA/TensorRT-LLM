@@ -68,7 +68,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 INTERNALS = {
     "impl",
     "init_config",
-    "buffer_grouping",
+    "layer_grouping",
     "pool_group_descs",
     "_has_lossy_cold_page_codec",
     "get_disagg_global_layer_ids",
@@ -591,13 +591,7 @@ def test_manager_facade_preserves_layer_group_order_and_normalizes_ids():
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _manager
 
     grouping = [[np.int64(5), "7"], [2]]
-    manager = SimpleNamespace(
-        impl=SimpleNamespace(
-            buffer_grouping=[
-                [SimpleNamespace(layer_id=layer) for layer in group] for group in grouping
-            ]
-        )
-    )
+    manager = SimpleNamespace(impl=SimpleNamespace(layer_grouping=grouping))
     actual = _manager.layer_group_layer_ids(manager)
     assert actual == [[5, 7], [2]]
     assert all(type(layer_id) is int for group in actual for layer_id in group)

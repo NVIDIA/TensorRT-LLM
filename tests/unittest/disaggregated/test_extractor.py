@@ -300,9 +300,7 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
     )
 
     impl = SimpleNamespace(
-        buffer_grouping=(
-            [buffer for coalesced in coalesced_buffers for buffer in coalesced.buffer_ids],
-        ),
+        layer_grouping=((0, 1),),
         init_config=SimpleNamespace(
             tokens_per_block=16,
             layers=[SimpleNamespace(window_size=None), SimpleNamespace(window_size=None)],
@@ -599,15 +597,7 @@ def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
 
     manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.impl = SimpleNamespace(
-        buffer_grouping=tuple(
-            [
-                buffer
-                for variant in pg.slot_desc.variants
-                for coalesced in variant.coalesced_buffers
-                for buffer in coalesced.buffer_ids
-            ]
-            for pg in (recurrent_pg, attention_pg)
-        ),
+        layer_grouping=((0, 1), (2,)),
         init_config=SimpleNamespace(
             tokens_per_block=16,
             layers=[SimpleNamespace(window_size=None) for _ in range(3)],
