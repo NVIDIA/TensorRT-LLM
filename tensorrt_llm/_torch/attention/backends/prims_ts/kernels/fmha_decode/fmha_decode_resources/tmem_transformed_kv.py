@@ -37,6 +37,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from ...task_compat import consumer_work_stage
 from flashinfer.cute_dsl.availability import is_rubin_cute_dsl_available
 from ..fmha_decode_config import FmhaDecodeConfig
 from .helpers_common import (
@@ -222,7 +223,7 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
     def _source_stage(self) -> tuple[cutlass.Array, cutlass.Array]:
         """Return unpacking-TMA NVFP4 and scale arrays for the raw stage."""
         cfg = self.cfg
-        src_stage_idx = self.src_smem_kv.state_src.consumer_work_stage
+        src_stage_idx = consumer_work_stage(self.src_smem_kv)
         src_byte_base = self.src_smem_kv._smem_base_kv.subview(
             src_stage_idx * cfg.smem_kv_tile_elements
         )

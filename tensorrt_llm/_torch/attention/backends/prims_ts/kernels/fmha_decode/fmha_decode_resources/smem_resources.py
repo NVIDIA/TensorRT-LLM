@@ -40,6 +40,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from ...task_compat import consumer_work_stage
 from ...._block_sparse.common import (
     _block_sparse_kv_atom_size,
     _prepared_kv_routes_are_block_aligned,
@@ -693,7 +694,7 @@ class SmemQResource(DecodeGenResourceBase):
         the selected stage in ``consumer_work_stage``, so QK work can derive
         the same descriptor directly from the shared resource state.
         """
-        stage_idx = Int32(self.state_src.consumer_work_stage)
+        stage_idx = Int32(consumer_work_stage(self))
         return prims.Tcgen05SmemDesc(self._q_descs[stage_idx])
 
 
@@ -1760,16 +1761,16 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         cfg = self.cfg
         pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
         if cutlass.const_expr(self.holds_encoded_locator_window):
-            offset = self.consumer_work_stage * Int32(
+            offset = consumer_work_stage(self) * Int32(
                 self.page_ids_per_stage
             ) + local_tile_idx * Int32(pages_per_tile)
         elif cutlass.const_expr(
             self.stage_page_ids_per_tile or self.stages_encoded_locators_per_tile
         ):
-            offset = self.consumer_work_stage * Int32(pages_per_tile)
+            offset = consumer_work_stage(self) * Int32(pages_per_tile)
         else:
             group_page_idx = (tile_idx * Int32(pages_per_tile)) & Int32(31)
-            offset = self.consumer_work_stage * Int32(32) + group_page_idx
+            offset = consumer_work_stage(self) * Int32(32) + group_page_idx
         if cutlass.const_expr(pages_per_tile in (8, 16, 32)):
             # Native shared-memory vector loads top out at four Int32 values.
             # Wide tiles therefore consume their IDs as independently aligned
@@ -1800,16 +1801,16 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         cfg = self.cfg
         pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
         if cutlass.const_expr(self.holds_encoded_locator_window):
-            offset = self.consumer_work_stage * Int32(
+            offset = consumer_work_stage(self) * Int32(
                 self.page_ids_per_stage
             ) + local_tile_idx * Int32(pages_per_tile)
         elif cutlass.const_expr(
             self.stage_page_ids_per_tile or self.stages_encoded_locators_per_tile
         ):
-            offset = self.consumer_work_stage * Int32(pages_per_tile)
+            offset = consumer_work_stage(self) * Int32(pages_per_tile)
         else:
             group_page_idx = (tile_idx * Int32(pages_per_tile)) & Int32(31)
-            offset = self.consumer_work_stage * Int32(32) + group_page_idx
+            offset = consumer_work_stage(self) * Int32(32) + group_page_idx
         return self._smem_page_offsets.data_ptr(offset + page_frag)
 
     @cute.jit
