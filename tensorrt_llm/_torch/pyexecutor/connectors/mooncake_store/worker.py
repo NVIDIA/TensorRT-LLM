@@ -54,11 +54,17 @@ or draft layers in a separate KV cache, is refused at construction.
 A capacity-only worker opens its handle and stops there, with no layout, no
 buffer registration and no save thread, so a node can lend host memory to the
 pool without an HCA that can pin GPU pages.
+
+With `stats_interval` set, a role that reads the pool logs two info-level lines
+per interval: lookups that stopped at a hole the pool evicted from a prefix it
+otherwise still holds, and the time each phase of a load took.
 """
 
 import threading
+import time
 import traceback
 from collections import defaultdict
+from contextlib import contextmanager
 from queue import Queue
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -241,6 +247,187 @@ def _replicate_config(soft_pin_ttl_ms: Optional[int], group_ids: Optional[Sequen
     return config
 
 
+#: The parts of a prefix load timed separately, in the order the stats line
+#: lists them. The synchronous path runs them as: resolve keys, wait for the
+#: allocation fence (zero copy only), describe each batch's destinations, fetch
+#: it, then scatter and sync a staged batch.
+_LOAD_PHASES = ("fence", "resolve", "describe", "get", "unstage", "sync")
+
+
+@contextmanager
+def _timed_phase(phases: Optional[Dict[str, List[float]]], name: str):
+    """Add the block's wall and thread CPU seconds to `phases[name]`.
+
+    Args:
+        phases: Per-phase `[wall, cpu]` totals of one load, or None to time
+            nothing, which costs no clock read.
+        name: One of `_LOAD_PHASES`.
+    """
+    if phases is None:
+        yield
+        return
+    wall, cpu = time.perf_counter(), time.thread_time()
+    try:
+        yield
+    finally:
+        totals = phases.setdefault(name, [0.0, 0.0])
+        totals[0] += time.perf_counter() - wall
+        totals[1] += time.thread_time() - cpu
+
+
+class _LoadStats:
+    """Prefix loads, summarised once per `stats_interval`.
+
+    A load is one pass that moved pages: a `start_load_kv` call with pages to
+    fetch. Every method takes the lock, so a load that runs off the executor
+    thread can record into the same counters the executor thread logs.
+    """
+
+    __slots__ = (
+        "_lock",
+        "loads",
+        "pages",
+        "batches",
+        "loaded_bytes",
+        "xfer_sum",
+        "xfer_max",
+        "phase_wall",
+        "phase_cpu",
+    )
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._reset()
+
+    def _reset(self) -> None:
+        self.loads = 0
+        self.pages = 0
+        self.batches = 0
+        self.loaded_bytes = 0
+        self.xfer_sum = 0.0
+        self.xfer_max = 0.0
+        self.phase_wall = dict.fromkeys(_LOAD_PHASES, 0.0)
+        self.phase_cpu = dict.fromkeys(_LOAD_PHASES, 0.0)
+
+    def record(
+        self,
+        xfer_s: float,
+        pages: int,
+        batches: int,
+        loaded_bytes: int,
+        phases: Optional[Dict[str, List[float]]] = None,
+    ) -> None:
+        """Fold one load into the interval.
+
+        Args:
+            xfer_s: Seconds from the destinations being ready to the last page
+                landing.
+            pages: Pages the load asked for.
+            batches: Store calls it took.
+            loaded_bytes: Bytes that landed.
+            phases: Its per-phase `[wall, cpu]` seconds, from `_timed_phase`.
+        """
+        with self._lock:
+            self.loads += 1
+            self.pages += pages
+            self.batches += batches
+            self.loaded_bytes += loaded_bytes
+            self.xfer_sum += xfer_s
+            self.xfer_max = max(self.xfer_max, xfer_s)
+            for name, (wall, cpu) in (phases or {}).items():
+                self.phase_wall[name] = self.phase_wall.get(name, 0.0) + wall
+                self.phase_cpu[name] = self.phase_cpu.get(name, 0.0) + cpu
+
+    def take_summary(self) -> Optional[str]:
+        """The interval's summary, starting a new interval; None when nothing loaded."""
+        with self._lock:
+            if not self.loads:
+                return None
+            n = self.loads
+            phases = " ".join(
+                f"{name}={1000 * self.phase_wall[name] / n:.1f}/"
+                f"{1000 * self.phase_cpu[name] / n:.1f}"
+                for name in _LOAD_PHASES
+            )
+            summary = (
+                f"loads={n} pages={self.pages} batches={self.batches} "
+                f"loaded_gib={self.loaded_bytes / _GIB:.2f} "
+                f"transfer_ms mean={1000 * self.xfer_sum / n:.1f} "
+                f"max={1000 * self.xfer_max:.1f} "
+                f"phase_ms(wall/cpu per load) {phases}"
+            )
+            self._reset()
+        return summary
+
+
+class _PrefixHoleStats:
+    """Prefix lookups that stopped at a hole, summarised once per `stats_interval`.
+
+    A hole is a missing block followed by stored blocks of the same chain: the
+    pool evicted a block from the middle of a chain it otherwise still holds.
+    The lookup stops at the hole, so the request recomputes every token behind
+    it, including the stored ones counted here as holed.
+    """
+
+    __slots__ = (
+        "lookups",
+        "lookup_blocks",
+        "hit_blocks",
+        "holes",
+        "hole_blocks",
+        "holed_tokens",
+        "max_holed_tokens",
+    )
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.lookups = 0
+        self.lookup_blocks = 0
+        self.hit_blocks = 0
+        self.holes = 0
+        self.hole_blocks = 0
+        self.holed_tokens = 0
+        self.max_holed_tokens = 0
+
+    def record(
+        self,
+        num_blocks: int,
+        hit_blocks: int,
+        stored_after_hole: Sequence[int],
+        tokens_per_block: int,
+    ) -> None:
+        """Account for one lookup.
+
+        Args:
+            num_blocks: Blocks looked up.
+            hit_blocks: Usable prefix length, which is also the hole's index.
+            stored_after_hole: Ascending indices of fully stored blocks after
+                the first missing one.
+            tokens_per_block: Tokens per block.
+        """
+        self.lookups += 1
+        self.lookup_blocks += num_blocks
+        self.hit_blocks += hit_blocks
+        if not stored_after_hole:
+            return
+        self.holes += 1
+        span = stored_after_hole[-1] + 1 - hit_blocks
+        self.hole_blocks += span - len(stored_after_hole)
+        holed_tokens = len(stored_after_hole) * tokens_per_block
+        self.holed_tokens += holed_tokens
+        self.max_holed_tokens = max(self.max_holed_tokens, holed_tokens)
+
+    def summary(self) -> str:
+        return (
+            f"lookups={self.lookups} lookup_blocks={self.lookup_blocks} "
+            f"hit_blocks={self.hit_blocks} holes={self.holes} "
+            f"hole_blocks={self.hole_blocks} holed_tokens={self.holed_tokens} "
+            f"max_holed_tokens={self.max_holed_tokens}"
+        )
+
+
 class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     """Moves KV pages between this rank's GPU cache and the Mooncake pool."""
 
@@ -323,6 +510,15 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # Requests whose last synchronous load came up short, taken by the
         # executor right after `start_load_kv`. Executor thread only.
         self._failed_load_requests: Set[int] = set()
+        # Diagnostics, off unless `stats_interval` is set. Only a role that
+        # reads the pool looks prefixes up or loads them, so the others count
+        # nothing.
+        self._stats_interval = self._config.stats_interval
+        counts = self._stats_interval is not None and loads
+        self._hole_stats: Optional[_PrefixHoleStats] = _PrefixHoleStats() if counts else None
+        self._hole_stats_last = time.monotonic()
+        self._load_stats: Optional[_LoadStats] = _LoadStats() if counts else None
+        self._load_stats_last = time.monotonic()
 
         # Checked before the segment is mounted, since the kernel answers an
         # unaffordable total by killing the process rather than by failing the
@@ -397,7 +593,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             f"segment={self._config.global_segment_size / (1 << 30):.1f} GiB "
             f"on {self._segment_host}"
             f"{f', soft_pin_ttl_ms={self._soft_pin_ttl_ms}' if self._soft_pin_ttl_ms is not None else ''}"
-            f"{', group_blocks=1' if self._group_blocks else ''})"
+            f"{', group_blocks=1' if self._group_blocks else ''}"
+            f"{f', stats_interval={self._stats_interval:g}s' if self._hole_stats is not None else ''})"
         )
         if self.capacity_only:
             # Said plainly, since every other sign of a working connector is
@@ -665,7 +862,82 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             if not all(status == 1 for status in window):
                 break
             hit_blocks += 1
+        if self._hole_stats is not None:
+            # From the same answer, so the diagnostics cost no store call.
+            self._record_prefix_hole(present, keys_per_block, len(block_hashes), hit_blocks)
         return hit_blocks
+
+    def _record_prefix_hole(
+        self, present: Sequence[int], keys_per_block: int, num_blocks: int, hit_blocks: int
+    ) -> None:
+        """Count the stored blocks behind the first missing one. Never changes the hit."""
+        stored_after_hole = [
+            index
+            for index in range(hit_blocks + 1, num_blocks)
+            if all(
+                status == 1
+                for status in present[index * keys_per_block : (index + 1) * keys_per_block]
+            )
+        ]
+        self._hole_stats.record(
+            num_blocks, hit_blocks, stored_after_hole, self._addressing.tokens_per_block
+        )
+        self._maybe_log_hole_stats()
+
+    def _maybe_log_hole_stats(self, force: bool = False) -> Optional[str]:
+        """Log the prefix-hole summary at most once per `stats_interval`.
+
+        Args:
+            force: Log what accumulated even if the interval has not elapsed.
+
+        Returns:
+            The line, when one was logged. Nothing is logged when the stats are
+            off or no lookup ran since the last line.
+        """
+        # Read defensively: `shutdown` also runs from `__del__` on a worker
+        # whose constructor may not have got this far.
+        stats = getattr(self, "_hole_stats", None)
+        if stats is None:
+            return None
+        now = time.monotonic()
+        due = force or now - self._hole_stats_last >= self._stats_interval
+        if not (due and stats.lookups):
+            return None
+        line = (
+            f"mooncake-store prefix-hole stats: rank {self._rank} "
+            f"window_s={now - self._hole_stats_last:.0f} {stats.summary()}"
+        )
+        stats.reset()
+        self._hole_stats_last = now
+        logger.info(line)
+        return line
+
+    def _maybe_log_load_stats(self, force: bool = False) -> Optional[str]:
+        """Log the load summary at most once per `stats_interval`.
+
+        Args:
+            force: Log what accumulated even if the interval has not elapsed.
+
+        Returns:
+            The line, when one was logged. Nothing is logged when the stats are
+            off or nothing loaded since the last line.
+        """
+        stats = getattr(self, "_load_stats", None)
+        if stats is None:
+            return None
+        now = time.monotonic()
+        if not (force or now - self._load_stats_last >= self._stats_interval):
+            return None
+        summary = stats.take_summary()
+        if summary is None:
+            return None
+        line = (
+            f"mooncake-store load stats: rank {self._rank} "
+            f"window_s={now - self._load_stats_last:.0f} {summary}"
+        )
+        self._load_stats_last = now
+        logger.info(line)
+        return line
 
     # ---- load path ----
 
@@ -689,7 +961,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         if metadata is None or not metadata.loads:
             return
 
-        keys, addresses, sizes, total_pages = self._resolve(metadata.loads)
+        # Per-phase times of this load, collected only when stats are on.
+        phases: Optional[Dict[str, List[float]]] = {} if self._load_stats is not None else None
+        with _timed_phase(phases, "resolve"):
+            keys, addresses, sizes, total_pages = self._resolve(metadata.loads)
         if not keys:
             return
         # `_resolve` emits one key per page in transfer order, so this names the
@@ -711,9 +986,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                     "owns. The KV cache manager must offer wait_allocation_fences; "
                     "KVCacheManagerV2 does."
                 )
-            fence({entry.request_id for entry in metadata.loads})
+            with _timed_phase(phases, "fence"):
+                fence({entry.request_id for entry in metadata.loads})
 
-        failed_requests, num_failed_pages, first_failure, _ = self._load_pages(
+        transfer_start = time.perf_counter() if phases is not None else 0.0
+        failed_requests, num_failed_pages, first_failure, loaded_bytes = self._load_pages(
             keys,
             addresses,
             sizes,
@@ -722,7 +999,16 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             handle,
             self._batch_size,
             recover=self._recover_failed_loads,
+            phases=phases,
         )
+        if phases is not None:
+            self._load_stats.record(
+                time.perf_counter() - transfer_start,
+                pages=total_pages,
+                batches=-(-len(keys) // self._batch_size),
+                loaded_bytes=loaded_bytes,
+                phases=phases,
+            )
         if failed_requests:
             # The executor takes these requests out of the batch and restarts
             # them; see `take_failed_load_requests`. Nothing of theirs is
@@ -750,6 +1036,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         batch_size: int,
         *,
         recover: bool,
+        phases: Optional[Dict[str, List[float]]] = None,
     ) -> Tuple[Set[int], int, Optional[str], int]:
         """Fetch pages batch by batch, scattering staged ones onto the device.
 
@@ -768,6 +1055,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             recover: Whether a missing page is handed back rather than raised.
                 The pages of a request that already lost one are then skipped,
                 since the request restarts and recomputes all of them.
+            phases: Per-phase totals the describe, get, unstage and sync
+                phases add to, or None to time nothing; see `_timed_phase`.
 
         Returns:
             The requests that lost a page, how many pages were lost, the first
@@ -793,13 +1082,15 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             batch_keys = [keys[index] for index in indices]
             batch_addresses = [addresses[index] for index in indices]
             batch_sizes = [sizes[index] for index in indices]
-            if staging is None:
-                target_addresses, target_sizes = batch_addresses, batch_sizes
-            else:
-                target_addresses, target_sizes = describe_batch_for_get(staging, batch_sizes)
-            results = self._store.batch_get_into_multi_buffers(
-                batch_keys, target_addresses, target_sizes
-            )
+            with _timed_phase(phases, "describe"):
+                if staging is None:
+                    target_addresses, target_sizes = batch_addresses, batch_sizes
+                else:
+                    target_addresses, target_sizes = describe_batch_for_get(staging, batch_sizes)
+            with _timed_phase(phases, "get"):
+                results = self._store.batch_get_into_multi_buffers(
+                    batch_keys, target_addresses, target_sizes
+                )
             if len(results) != len(batch_keys):
                 # Which pages landed is unknowable, so none of them counts.
                 results = [-1] * len(batch_keys)
@@ -830,10 +1121,14 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             if staging is not None and landed:
                 # Only filled slots are scattered, so no slot holding a failed
                 # read is copied over a device page.
-                unstage_batch_after_get(staging, batch_addresses, batch_sizes, handle, only=landed)
+                with _timed_phase(phases, "unstage"):
+                    unstage_batch_after_get(
+                        staging, batch_addresses, batch_sizes, handle, only=landed
+                    )
                 # The next batch reuses the slots and the forward pass reads
                 # these pages, so the scatter has to complete before either.
-                _sync_stream(handle)
+                with _timed_phase(phases, "sync"):
+                    _sync_stream(handle)
         return failed_requests, num_failed_pages, first_failure, loaded_bytes
 
     def take_failed_load_requests(self) -> Set[int]:
@@ -948,6 +1243,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             Requests that have finished saving, and requests that have finished
             loading.
         """
+        # Runs every iteration on every rank that transfers, so it is where the
+        # load summary comes due.
+        self._maybe_log_load_stats()
         with self._save_lock:
             self._closed_requests.update(finished_gen_req_ids)
             finished_saving = [
@@ -1121,6 +1419,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
     def shutdown(self) -> None:
         """Stop the save thread, then release what it was reading. Idempotent."""
+        # What accumulated since the last line would otherwise be lost.
+        self._maybe_log_hole_stats(force=True)
+        self._maybe_log_load_stats(force=True)
         thread = self._save_thread
         if thread is not None:
             self._save_queue.put(None)

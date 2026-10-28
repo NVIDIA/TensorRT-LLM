@@ -919,6 +919,29 @@ rendered client config, so a deployment that inherits `MOONCAKE_CONFIG_PATH` wit
 `off`. A `producer` or `capacity` server keeps the cache manager's own reuse either way, and a
 server without a one-model draft has no backoff for the setting to act on.
 
+### Diagnostics
+
+`mooncake_store.stats_interval: 60` has every rank of a server that reads the pool (`role: both` or
+`consumer`) log two info-level lines at most once per 60 seconds, each covering the interval since
+its last line and skipped when there is nothing to report:
+
+* `mooncake-store prefix-hole stats` counts lookups (`lookups`, `lookup_blocks`, `hit_blocks`) and
+  the holes they stopped at. A hole is a missing block followed by still-stored blocks of the same
+  chain, which the pool evicted from the middle of a prefix it otherwise holds: `holes` counts the
+  lookups that met one, `hole_blocks` the missing blocks inside them, and `holed_tokens` and
+  `max_holed_tokens` the stored tokens behind a hole that are recomputed anyway. They come from the
+  lookup's own existence probe, so they cost no extra store call. Only a rank that looks prefixes
+  up reports them: rank 0 under tensor parallelism, every owner under attention DP. Frequent holes
+  are what [`soft_pin_ttl_ms` and `group_blocks`](#pool-eviction) address.
+* `mooncake-store load stats` counts loads (`start_load_kv` passes that moved pages), their
+  `pages`, store calls (`batches`) and `loaded_gib`, the transfer time from the destinations being
+  ready to the last page landing (`transfer_ms`), and each pass's mean wall and CPU milliseconds
+  for `fence`, `resolve`, `describe`, `get`, `unstage` and `sync`.
+
+Both are flushed at shutdown. Unset, the default, counts nothing and costs nothing. The lines are
+logged at info level, so a log level above info hides them. Like the eviction settings, the
+interval is rendered into the client config and read back from an inherited `MOONCAKE_CONFIG_PATH`.
+
 ### Restrictions
 
 Checked at startup, before any request is admitted, because each one's failure mode is KV replayed

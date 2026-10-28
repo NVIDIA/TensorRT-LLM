@@ -158,10 +158,10 @@ def test_only_the_values_the_deployment_chose_are_reported_as_overridden(monkeyp
     assert "namespace" not in overrides[0]
 
 
-def test_an_inherited_config_restates_the_eviction_settings(monkeypatch, tmp_path):
-    """Soft pin and grouping are what the ranks read from the client config."""
+def test_an_inherited_config_restates_the_eviction_and_stats_settings(monkeypatch, tmp_path):
+    """Soft pin, grouping and the stats interval are what the ranks read from the client config."""
     inherited = write_client_config(
-        tmp_path / "external.json", soft_pin_ttl_ms=5000, group_blocks=True
+        tmp_path / "external.json", soft_pin_ttl_ms=5000, group_blocks=True, stats_interval=10
     )
     monkeypatch.setenv(CONFIG_PATH_ENV, str(inherited))
     pool = mooncake_store_config()
@@ -170,13 +170,14 @@ def test_an_inherited_config_restates_the_eviction_settings(monkeypatch, tmp_pat
 
     assert pool.soft_pin_ttl_ms == 5000
     assert pool.group_blocks is True
+    assert pool.stats_interval == 10.0
 
 
-def test_an_inherited_config_without_soft_pin_turns_it_off(monkeypatch, tmp_path):
-    """A TTL the inherited config leaves out is off, not unstated."""
+def test_an_inherited_config_without_soft_pin_or_stats_turns_them_off(monkeypatch, tmp_path):
+    """A TTL or stats interval the inherited config leaves out is off, not unstated."""
     inherited = write_client_config(tmp_path / "external.json")
     monkeypatch.setenv(CONFIG_PATH_ENV, str(inherited))
-    pool = mooncake_store_config(soft_pin_ttl_ms=86400000, group_blocks=True)
+    pool = mooncake_store_config(soft_pin_ttl_ms=86400000, group_blocks=True, stats_interval=30)
 
     warnings = []
     monkeypatch.setattr(settings.logger, "warning", warnings.append)
@@ -184,16 +185,24 @@ def test_an_inherited_config_without_soft_pin_turns_it_off(monkeypatch, tmp_path
 
     assert pool.soft_pin_ttl_ms is None
     assert pool.group_blocks is False
+    assert pool.stats_interval is None
     overrides = [line for line in warnings if "joins the pool as" in line]
     assert len(overrides) == 1
     assert "soft_pin_ttl_ms=None" in overrides[0]
     assert "group_blocks=False" in overrides[0]
+    assert "stats_interval=None" in overrides[0]
 
 
 @pytest.mark.parametrize("ttl", [0, -1])
 def test_a_soft_pin_ttl_must_be_positive(ttl):
     with pytest.raises(ValidationError, match="soft_pin_ttl_ms"):
         mooncake_store_config(soft_pin_ttl_ms=ttl)
+
+
+@pytest.mark.parametrize("interval", [0, -1, float("inf"), float("nan")])
+def test_a_stats_interval_must_be_a_positive_number(interval):
+    with pytest.raises(ValidationError, match="stats_interval"):
+        mooncake_store_config(stats_interval=interval)
 
 
 def test_the_pool_replaces_this_engines_own_offload_tiers(monkeypatch, tmp_path):

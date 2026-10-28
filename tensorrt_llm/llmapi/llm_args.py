@@ -2674,6 +2674,16 @@ class MooncakeStoreConfig(StrictBaseModel):
         "master evicts a block whole rather than leaving pages that hold "
         "space but can never hit. Mostly matters under tensor parallelism. "
         "Ignored unless the role writes; needs Mooncake 0.3.13 or newer.")
+    stats_interval: Optional[float] = Field(
+        None,
+        gt=0,
+        allow_inf_nan=False,
+        telemetry=False,
+        description="Seconds between per-rank info-level log lines counting "
+        "prefix lookups stopped by a hole the pool evicted from a prefix it "
+        "otherwise still holds, and timing each phase of a prefix load. "
+        "Only a role that reads the pool counts anything. None disables the "
+        "counters at no cost.")
     local_hostname: Optional[str] = Field(
         None,
         telemetry=False,

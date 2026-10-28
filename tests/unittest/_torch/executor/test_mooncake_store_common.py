@@ -626,7 +626,7 @@ def test_config_requires_an_explicit_model_key(store_config, tmp_path, monkeypat
         config.resolve_model_key("/models/MiniMax-M3/")
 
 
-# ---- pool eviction settings ----
+# ---- pool eviction and diagnostics settings ----
 
 
 def test_config_eviction_settings_default_off_and_read_the_json(store_config):
@@ -659,15 +659,36 @@ def test_config_group_blocks_must_be_a_json_boolean(store_config, value):
         resolve_config()
 
 
+def test_config_stats_interval_defaults_off_and_reads_the_json(store_config):
+    assert resolve_config().stats_interval is None
+
+    set_pool_setting(store_config, stats_interval=30)
+    assert resolve_config().stats_interval == 30.0
+
+    set_pool_setting(store_config, stats_interval=None)
+    assert resolve_config().stats_interval is None
+
+
+@pytest.mark.parametrize("interval", [0, -1, float("inf")])
+def test_config_rejects_a_stats_interval_that_is_not_a_positive_number(store_config, interval):
+    set_pool_setting(store_config, stats_interval=interval)
+    with pytest.raises(ValueError, match="stats_interval"):
+        resolve_config()
+
+
 def test_config_has_no_environment_override_for_eviction_settings(store_config, monkeypatch):
     """The source branch read these from the environment; this connector reads the JSON only."""
     monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_SOFT_PIN_TTL_MS", "86400000")
     monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_GROUP_BLOCKS", "1")
+    monkeypatch.setenv("TRTLLM_MOONCAKE_HOLE_STATS", "1")
+    monkeypatch.setenv("TLLM_M3_LOAD_PHASE_TIMING", "1")
+    monkeypatch.setenv("TLLM_MOONCAKE_LOAD_PHASE_TIMING", "1")
 
     config = resolve_config()
 
     assert config.soft_pin_ttl_ms is None
     assert config.group_blocks is False
+    assert config.stats_interval is None
 
 
 def _rendered_client_config(tmp_path, **settings):
@@ -679,20 +700,24 @@ def _rendered_client_config(tmp_path, **settings):
     return rendered, MooncakeStoreConnectorConfig.from_file(str(path))
 
 
-def test_client_config_renders_eviction_settings(tmp_path):
+def test_client_config_renders_eviction_and_stats_settings(tmp_path):
     rendered, config = _rendered_client_config(
-        tmp_path, soft_pin_ttl_ms=86400000, group_blocks=True
+        tmp_path, soft_pin_ttl_ms=86400000, group_blocks=True, stats_interval=30
     )
     assert rendered["soft_pin_ttl_ms"] == 86400000
     assert rendered["group_blocks"] is True
+    assert rendered["stats_interval"] == 30
     assert config.soft_pin_ttl_ms == 86400000
     assert config.group_blocks is True
+    assert config.stats_interval == 30.0
 
     rendered, config = _rendered_client_config(tmp_path)
     assert "soft_pin_ttl_ms" not in rendered
+    assert "stats_interval" not in rendered
     assert rendered["group_blocks"] is False
     assert config.soft_pin_ttl_ms is None
     assert config.group_blocks is False
+    assert config.stats_interval is None
 
 
 # The connector itself, the registry preset that selects it, and the startup

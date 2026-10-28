@@ -192,7 +192,10 @@ def _restate_pool_block(
     )
     # Settings where `None` means off rather than "not stated", so a config
     # that leaves one out restates the block to off.
-    nullable = (("soft_pin_ttl_ms", effective.soft_pin_ttl_ms, pool.soft_pin_ttl_ms),)
+    nullable = (
+        ("soft_pin_ttl_ms", effective.soft_pin_ttl_ms, pool.soft_pin_ttl_ms),
+        ("stats_interval", effective.stats_interval, pool.stats_interval),
+    )
     # Assignment adds to `model_fields_set`, so what the deployment stated for
     # itself has to be read before any of it is replaced. Only a value it chose
     # is worth reporting; the rest are defaults being resolved.

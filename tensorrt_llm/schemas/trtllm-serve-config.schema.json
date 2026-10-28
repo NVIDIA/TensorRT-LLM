@@ -4305,6 +4305,23 @@
           "title": "Stage Through Host",
           "type": "boolean"
         },
+        "stats_interval": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Seconds between per-rank info-level log lines counting prefix lookups stopped by a hole the pool evicted from a prefix it otherwise still holds, and timing each phase of a prefix load. Only a role that reads the pool counts anything. None disables the counters at no cost.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Stats Interval"
+        },
         "transfer_batch_size": {
           "default": 64,
           "description": "Page keys per store call.",

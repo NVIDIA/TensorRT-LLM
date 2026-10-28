@@ -427,6 +427,7 @@ def _client_config(
         # Omitted when off, which is what a reader that does not know the key
         # assumes too.
         **({"soft_pin_ttl_ms": pool.soft_pin_ttl_ms} if pool.soft_pin_ttl_ms is not None else {}),
+        **({"stats_interval": pool.stats_interval} if pool.stats_interval is not None else {}),
     }
     return config
 
