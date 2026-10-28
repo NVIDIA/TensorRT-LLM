@@ -18,6 +18,29 @@ l0_gb300:
       stage: pre_merge
       backend: pytorch
   tests:
+  # MiniMax-M3 target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/activation
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/attention
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/embedding
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/gemm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/norm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/spec
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_modeling_v2_m3_capture_boundary.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_modeling_v2_m3_dispatch.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_modeling_v2_m3_prebuild.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_modeling_v2_m3_rank_agreement.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/activation
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/attention
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/embedding
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/gemm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/norm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/spec
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_capture_boundary.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_dispatch.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_prebuild.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_rank_agreement.py
   # ------------- PyTorch tests ---------------
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py

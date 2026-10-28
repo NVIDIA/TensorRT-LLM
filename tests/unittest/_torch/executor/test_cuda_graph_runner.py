@@ -76,7 +76,6 @@ def _feature_encoder_runner(
         max_cuda_graph_num_tokens=max(batch_sizes) * fixed_seq_len,
         max_num_tokens=max(batch_sizes) * fixed_seq_len,
         max_seq_len=fixed_seq_len,
-        cuda_graph_mem_pool=None,
         is_encoder_decoder=True,
         use_fixed_sequence_slots=False,
         feature_shape=(480_000,),

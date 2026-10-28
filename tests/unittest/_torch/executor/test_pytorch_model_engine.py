@@ -83,7 +83,7 @@ _TWO_MODEL_SPEC_MODE = SimpleNamespace(use_one_engine=lambda: False)
 def _input_preparer() -> DecoderInputPreparer:
     return DecoderInputPreparer(buffers=None,
                                 config=SimpleNamespace(is_spec_decode=False),
-                                mapping=None,
+                                mapping=Mapping(),
                                 dist=None,
                                 model=None,
                                 get_runtime_tokens_per_gen_step=None,
@@ -366,7 +366,6 @@ def _make_forward_only_engine(
         disable_overlap_scheduler=True,
         is_spec_decode=False,
         max_beam_width=1,
-        is_encode_only=False,
         attention_backend=None,
         original_max_draft_len=0,
         original_max_total_draft_tokens=0,
@@ -1904,12 +1903,12 @@ class DecoderForwardTestCase(unittest.TestCase):
         """Every beam row gets its request's `past + delta` on all 3 axes."""
         beam_width = 2
         engine, kv_cache_manager = create_model_engine_and_kvcache(
+            self,
             llm_args=TorchLlmArgs(model="dummy",
                                   max_batch_size=4,
                                   max_num_tokens=64,
                                   max_beam_width=beam_width),
             model=DummyModel(torch.half, rope_scaling={"type": "mrope"}))
-        self.addCleanup(kv_cache_manager.shutdown)
         preparer = engine._runner._inputs
         # (num_tokens, delta): one delta arrives on the host and one is
         # already a CUDA int32 scalar.
@@ -1973,11 +1972,11 @@ class DecoderForwardTestCase(unittest.TestCase):
             self) -> None:
         """Mixed scalar batching matches the old per-request writes exactly."""
         engine, kv_cache_manager = create_model_engine_and_kvcache(
+            self,
             llm_args=TorchLlmArgs(model="dummy",
                                   max_batch_size=2,
                                   max_num_tokens=64),
             model=DummyModel(torch.half, rope_scaling={"type": "mrope"}))
-        self.addCleanup(kv_cache_manager.shutdown)
         preparer = engine._runner._inputs
         sentinel = 123
 
@@ -2439,7 +2438,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             cuda_graph_runner=Mock(),
             breakable_cuda_graph_runner=Mock(),
             config=None,
-            mapping=None,
+            mapping=Mapping(),
             model=None,
             sparse_attention_config=None,
             metrics={},
@@ -3822,7 +3821,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                         enable_spec_decode=False,
                         runtime_draft_len=0,
                         is_dummy=False)
-                    inputs, gather_ids = prepared.kwargs, prepared.gather_ids
+                    inputs = prepared.kwargs
                     expected_context = list(range(3872, 5000)) if mixed else []
                     self.assertEqual(
                         inputs['input_ids'].cpu().tolist(),
@@ -3830,7 +3829,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                     self.assertEqual(
                         inputs['position_ids'].view(-1).cpu().tolist(),
                         expected_context + ([20, 30] if overlap else [19, 29]))
-                    self.assertIsNone(gather_ids)
                     if mixed:
                         self.assertEqual(inputs['context_requests'], [context])
                         self.assertEqual(metadata.seq_lens.tolist(),

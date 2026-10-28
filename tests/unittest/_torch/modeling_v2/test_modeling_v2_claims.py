@@ -121,9 +121,11 @@ def test_every_target_ships_both_products():
 def test_targets_do_not_share_files():
     """Isolation is the property being demonstrated; measure it.
 
-    Targets are allowed to import the catalog and nothing else of each
-    other's. A shared helper between two targets is the first step back to
-    the abstraction this package exists to avoid.
+    Targets are allowed to import the catalog, and the loader of their own
+    native code (``_native``), and nothing else of each other's. A shared
+    helper between two targets is the first step back to the abstraction this
+    package exists to avoid. The native half of the same rule is
+    ``test_modeling_v2_native_claims.py``.
     """
     for arch in _ARCHS:
         for target_dir, name in _routed_targets(arch):
@@ -133,10 +135,10 @@ def test_targets_do_not_share_files():
                     dots, tail = match.group(1), match.group(2)
                     if len(dots) == 1:
                         continue  # sibling within the target
-                    assert tail.startswith("catalog"), (
+                    assert tail.startswith(("catalog", "_native")), (
                         f"{name}: {source_file.name} reaches outside its own "
                         f"directory for {tail!r}; targets may import the "
-                        f"catalog and nothing else"
+                        f"catalog and _native and nothing else"
                     )
 
 
@@ -257,6 +259,15 @@ def test_every_target_has_the_accuracy_gate_of_its_name():
 # `unittest/`, with what they wait for. They are the only tests no list may
 # reach, and none of them may be listed.
 _NO_CI_STAGE = {
+    "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/comm": (
+        "2 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
+    "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/comm": (
+        "4 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
+    "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/comm": (
+        "2, 4 or 8 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
     "unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/comm": (
         "4 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
     ),

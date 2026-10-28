@@ -15,6 +15,9 @@ l0_gb300_multi_gpus:
       stage: post_merge
       backend: pytorch
   tests:
+  # MiniMax-M3 target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/comm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/comm
   # One ordered sequence in one job: the cases share module-global rank state.
   - unittest/_torch/modeling_v2/comm
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_identity_vs_mtp3[dep4]
@@ -115,3 +118,7 @@ l0_gb300_multi_gpus:
   # DeepSeek-V4-Pro NVFP4 export with the embedded DSpark drafter on MegaMoE
   # CuTe DSL, DEP4 on one node: GSM8K plus an acceptance-length gate.
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl TIMEOUT (30)
+  # DeepSeek-V4 DP4 on 4x GB300 (288 GB/GPU); Pro needs 288 GB-class GPUs for 4 ranks.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_mixed_breakable_cuda_graph[dp4] TIMEOUT (120)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy[dp4] TIMEOUT (240)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp4] TIMEOUT (240)

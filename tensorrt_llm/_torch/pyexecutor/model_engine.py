@@ -73,7 +73,7 @@ from .engine.runners.pooling import PoolingRunner
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest
-from .model_loader import ModelLoader, _construct_checkpoint_loader
+from .model_loader import ModelLoader
 from .resource_manager import ResourceManager, ResourceManagerType
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
@@ -119,7 +119,7 @@ class ModelEngine:
         *,
         model_path: str,
         llm_args: TorchLlmArgs,
-        mapping: Optional[Mapping] = None,
+        mapping: Mapping,
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[Distributed] = None,
         spec_config: Optional[DecodingBaseConfig] = None,
@@ -158,7 +158,7 @@ class ModelEngine:
         *,
         model_path: str,
         llm_args: TorchLlmArgs,
-        mapping: Optional[Mapping],
+        mapping: Mapping,
         attn_runtime_features: Optional[AttentionRuntimeFeatures],
         dist: Optional[Distributed],
         spec_config: Optional[DecodingBaseConfig],
@@ -254,17 +254,7 @@ class ModelEngine:
         model_weights_memory_tag: Optional[str],
         model_weights_restore_mode,
     ) -> None:
-        """Resolve the checkpoint loader, then load the model, or take the given
-        one, at the requested capacity."""
-        if checkpoint_loader is None:
-            checkpoint_loader = _construct_checkpoint_loader(
-                self.llm_args.checkpoint_loader,
-                self.llm_args.checkpoint_format,
-                mx_config=self.llm_args.mx_config,
-                checkpoint_io_policy=self.llm_args.checkpoint_io_policy,
-                load_format=self.llm_args.load_format,
-                partial_model_loading=self.llm_args.is_partial_model_loading,
-            )
+        """Load the model, or take the given one, at the requested capacity."""
         self.moe_load_balancer: Optional[MoeLoadBalancer] = None
         if model is None:
             lora_config: Optional[LoraConfig] = self.llm_args.lora_config
@@ -441,10 +431,6 @@ class ModelEngine:
 
         backend_num_streams = None
         try:
-            use_ub_for_nccl = (
-                self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
-                and self._init_userbuffers(self.model.config.hidden_size))
-            self._nccl_window_tensor_scope_hooks = []
             if torch_compile_enabled:
                 set_torch_compiling(True)
                 if mpi_disabled() and self.mapping.world_size > 1:
@@ -473,9 +459,8 @@ class ModelEngine:
                                 f"{num_mnnvl_allreduces} modules to cover "
                                 f"max_num_tokens={self.max_num_tokens} before "
                                 "torch.compile.")
-                use_ub = not use_ub_for_nccl and (
-                    torch_compile_enable_userbuffers
-                    and self._init_userbuffers(self.model.config.hidden_size))
+                use_ub = (torch_compile_enable_userbuffers and
+                          self._init_userbuffers(self.model.config.hidden_size))
                 backend_num_streams = Backend.Streams([
                     torch.cuda.Stream()
                     for _ in range(torch_compile_max_num_streams - 1)
@@ -500,8 +485,7 @@ class ModelEngine:
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
-                self._nccl_window_tensor_scope_hooks = (
-                    install_eager_nccl_window_tensor_scopes(self.model))
+                install_eager_nccl_window_tensor_scopes(self.model)
 
             # Capture local encoders after their metadata is sized and before
             # KV-cache estimation, so graph memory is included in the profile.
@@ -684,7 +668,6 @@ class ModelEngine:
             dtype=self.model.config.torch_dtype,
             enable_attention_dp=self.enable_attention_dp,
             disable_overlap_scheduler=self.llm_args.disable_overlap_scheduler,
-            is_encode_only=self.llm_args.encode_only,
             is_spec_decode=self.is_spec_decode,
             max_draft_len=self.max_draft_len,
             max_total_draft_tokens=self.max_total_draft_tokens,
@@ -938,7 +921,6 @@ class ModelEngine:
         outputs = self._runner.forward_encoder(
             ScheduledInputs(batch=scheduled_requests),
             resource_manager=resource_manager,
-            is_dummy=self._warmup_depth > 0,
         )
         return (
             outputs["encoder_hidden_states"],

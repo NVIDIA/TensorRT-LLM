@@ -30,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import uses_vswa_kv_cache_layou
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.mapping import CpType, Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -73,6 +74,7 @@ def _make_creator(
     c._cache_transceiver_config = None
     c._speculative_config = None
     c._mapping = Mock()
+    c._draft_config = None
     c._model_engine = Mock(cuda_graph_batch_sizes=[], cuda_graph_padding_enabled=False)
     c._llm_args = SimpleNamespace(kv_cache_compression_config=None, sleep_config=None)
     c._disable_overlap_scheduler = False
@@ -249,6 +251,7 @@ class TestSplitGpuBudgetForDraft:
             model=SimpleNamespace(model_config=target_model_config)
         )
         creator._draft_config = draft_model_config
+        draft_model_config.mapping = creator._mapping
         creator._kv_cache_manager_cls = DraftCostKVCacheManager
         creator._is_disagg = False
         creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
@@ -366,6 +369,7 @@ class TestSplitGpuBudgetForDraft:
             model=SimpleNamespace(model_config=target_model_config)
         )
         creator._draft_config = draft_model_config
+        draft_model_config.mapping = creator._mapping
         creator._kv_cache_manager_cls = RecordingKVCacheManager
         creator._is_disagg = False
         creator._cache_transceiver_config = None
@@ -646,6 +650,97 @@ class TestSplitGpuBudgetForDraft:
 
         with pytest.raises(ValueError, match="GPU budget"):
             c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
+
+
+def test_helix_attention_dp_draft_cost_uses_the_drafter_shard(mocker):
+    """Kimi K3 helix_a2a: a GQA drafter is built head-TP over the CP group.
+
+    Its KV must be charged at that shard (1 of 16 KV heads per rank), the same
+    mapping the draft manager is allocated with, not at the attention-DP
+    repurposed mapping, which would charge all 16 heads on every rank.
+    """
+    cp = 16
+    helix = Mapping(
+        world_size=cp,
+        rank=3,
+        tp_size=1,
+        cp_size=cp,
+        cp_config={"cp_type": CpType.HELIX},
+        enable_attention_dp=True,
+    )
+    drafter_mapping = helix.repurpose_helix_cp_to_tp()
+    drafter_mapping.enable_attention_dp = False
+
+    class DraftModelConfig:
+        quant_config = None
+        sparse_attention_config = None
+        mapping = drafter_mapping
+        pretrained_config = SimpleNamespace(
+            num_hidden_layers=5,
+            hidden_size=7168,
+            num_attention_heads=64,
+            num_key_value_heads=16,
+            head_dim=64,
+            torch_dtype=None,
+        )
+
+        def get_num_attention_layers(self):
+            return 5
+
+    target_model_config = SimpleNamespace(
+        is_encoder_decoder=False, pretrained_config=SimpleNamespace()
+    )
+    draft_model_config = DraftModelConfig()
+    seen = []
+
+    class ProbeKVCacheManager(KVCacheManagerV2):
+        @staticmethod
+        def get_cache_size_per_token(model_config, *args, **kwargs):
+            if model_config is target_model_config:
+                return 0
+            seen.append((args, kwargs))
+            return KVCacheManagerV2.get_cache_size_per_token(model_config, *args, **kwargs)
+
+    c = object.__new__(KvCacheCreator)
+    c._kv_cache_config = KvCacheConfig()
+    c._tokens_per_block = 64
+    c._max_seq_len = 16384
+    c._max_batch_size = 1
+    c._max_num_tokens = 8192
+    c._max_beam_width = 1
+    c._cache_transceiver_config = None
+    c._llm_args = SimpleNamespace(kv_cache_compression_config=None, sleep_config=None)
+    c._mapping = helix
+    c._speculative_config = DSparkDecodingConfig(max_draft_len=7)
+    c._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=target_model_config))
+    c._draft_model_engine = None
+    c._draft_config = draft_model_config
+    c._kv_cache_manager_cls = ProbeKVCacheManager
+    c._is_disagg = True
+    c._is_encoder_decoder = Mock(return_value=False)
+    c._should_create_separate_draft_kv_cache = Mock(return_value=True)
+    c._get_num_draft_layers = Mock(return_value=5)
+    mocker.patch(
+        "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
+        return_value=ProbeKVCacheManager,
+    )
+
+    cost = c._get_kv_size_per_token()
+
+    assert len(seen) == 1
+    args, kwargs = seen[0]
+    # _create_one_model_draft_kv_cache_manager allocates with this same mapping
+    # (test_one_model_draft_kv_uses_the_drafter_mapping_under_helix).
+    assert args[0] is drafter_mapping
+    sharded, _ = KVCacheManagerV2.get_cache_size_per_token(
+        draft_model_config, drafter_mapping, *args[1:], **kwargs
+    )
+    replicated, _ = KVCacheManagerV2.get_cache_size_per_token(
+        draft_model_config, helix.repurpose_helix_cp_to_tp(), *args[1:], **kwargs
+    )
+    assert replicated == 16 * sharded
+    # Helix charges the draft per rank-local target token: x cp.
+    assert cost.slope == cp * sharded
 
 
 class TestSplitHostCacheBudgetForDraft:
@@ -1090,6 +1185,7 @@ class TestExternalDrafterKvDtype:
         c._speculative_config = DSparkDecodingConfig(max_draft_len=4)
         c._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=target_model_config))
         c._draft_config = draft_model_config
+        draft_model_config.mapping = c._mapping
         c._kv_cache_manager_cls = ProbeKVCacheManager
         c._is_disagg = True
         c._cache_transceiver_config = None
@@ -1259,6 +1355,9 @@ class TestMambaEffectiveTpSize:
             # precedence over both of the sharded cases below.
             (8, 1, False, True, 1),
             (8, 4, True, True, 1),
+            # ...except helix at tp_size 1 (Kimi K3 helix_a2a): the CP group
+            # shares every request and keeps the state head-sharded.
+            (1, 16, True, True, 16),
             # Helix repurposes the CP ranks as plain TP for recurrent state.
             (2, 8, True, False, 16),
             (1, 16, True, False, 16),
