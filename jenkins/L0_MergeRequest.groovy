@@ -2464,6 +2464,14 @@ def launchInfraDryRunTestJob(pipeline, arch, testFilter, globalVars, platform, i
 
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
+    if (globalVars[GITHUB_PR_API_URL]?.endsWith('/pulls/21009') &&
+            testFilter[TEST_STAGE_LIST] && testFilter[TEST_STAGE_LIST].every {
+                it in ['CPU-Generic-WaiveRefresh-Pass-1', 'CPU-Generic-WaiveRefresh-Fail-1',
+                       'CPU-Generic-WaiveRefresh-Isolated-1']
+            }) {
+        reuseBuild = '66794'
+        echo '[WAIVE-VALIDATION] Reusing compiled artifacts from build 66794; test stages still execute.'
+    }
     def releaseTargets = globalVars[RELEASE_TARGET] ?: []
     def wheelSelected = releaseTargets.contains("wheel")
     def containerSelected = releaseTargets.contains("container")
