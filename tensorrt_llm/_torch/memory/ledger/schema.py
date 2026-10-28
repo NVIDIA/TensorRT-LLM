@@ -97,6 +97,12 @@ class Category(StrEnum):
     #: :attr:`UNATTRIBUTED_LIVE`.
     ACTIVATION = "activation"
 
+    #: A tag the category table does not recognise. Reported under its own
+    #: name via the entry's ``owner`` rather than folded into a neighbouring
+    #: category, so a missing mapping surfaces as a gap to fill instead of
+    #: silently inflating whichever category it was guessed into.
+    TAGGED_OTHER = "tagged.other"
+
     #: Default home for ``torch_live - sum(tagged)``.
     UNATTRIBUTED_LIVE = "unattributed_live"
 

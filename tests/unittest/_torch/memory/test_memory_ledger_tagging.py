@@ -209,3 +209,64 @@ class TestCheckB:
             assert all(r.passed for r in results)
         finally:
             del weights
+
+
+class TestClaimModuleMemory:
+    """Re-attribution from a module's final parameters."""
+
+    def test_claims_parameters_and_buffers(self, window):
+        from tensorrt_llm._torch.memory.ledger.tagging import claim_module_memory
+
+        module = torch.nn.Linear(512, 512).cuda()
+        module.register_buffer("scratch", torch.empty(1024, 1024, device="cuda"))
+        try:
+            claimed = claim_module_memory(module, "WEIGHTS")
+            assert claimed > 0
+
+            by_tag = live_bytes_by_tag(freeze_tag_map())
+            # The buffer alone is 4 MiB; weight and bias add to that.
+            assert by_tag.get("WEIGHTS", 0) >= 4 * MB
+        finally:
+            del module
+
+    def test_shared_storage_counted_once(self, window):
+        # Tied embeddings: two parameters, one storage. Summing their
+        # logical sizes double counts; claiming by block does not. Measured
+        # on Qwen2-0.5B, this is a 259.7 MiB difference.
+        from tensorrt_llm._torch.memory.ledger.tagging import claim_module_memory
+
+        shared = torch.empty(8 * MB, dtype=torch.uint8, device="cuda")
+
+        class Tied(torch.nn.Module):
+            def __init__(self, storage):
+                super().__init__()
+                self.embed = torch.nn.Parameter(storage, requires_grad=False)
+                self.head = torch.nn.Parameter(storage, requires_grad=False)
+
+        module = Tied(shared)
+        try:
+            claimed = claim_module_memory(module, "WEIGHTS")
+            assert claimed == 8 * MB, f"shared storage must be claimed once, got {claimed}"
+        finally:
+            del module, shared
+
+    def test_survives_the_window_freeze(self, window):
+        # The closing freeze rebuilds the trace-derived map wholesale;
+        # claims are kept apart so they are not discarded by it.
+        from tensorrt_llm._torch.memory.ledger.tagging import claim_module_memory, set_frozen_map
+
+        module = torch.nn.Linear(1024, 1024).cuda()
+        try:
+            claim_module_memory(module, "WEIGHTS")
+            set_frozen_map(freeze_tag_map())  # what startup_window does
+            by_tag = live_bytes_by_tag(freeze_tag_map())
+            assert by_tag.get("WEIGHTS", 0) > 0, (
+                "a freeze must not discard claims made during loading"
+            )
+        finally:
+            del module
+
+    def test_cpu_module_claims_nothing(self):
+        from tensorrt_llm._torch.memory.ledger.tagging import claim_module_memory
+
+        assert claim_module_memory(torch.nn.Linear(8, 8), "WEIGHTS") == 0
