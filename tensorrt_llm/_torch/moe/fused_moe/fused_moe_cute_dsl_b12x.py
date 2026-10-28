@@ -26,6 +26,7 @@ from ...utils import ActivationType, Fp4QuantizedTensor
 from .activation import MoEActivationSupport
 from .cutlass import CutlassFusedMoEBase, TrtllmCutlassNvfp4Impl
 from .cutlass.eligibility import BF16_ONLY, check_dtype, check_oss_cutlass_build
+from .cutlass.lora import moe_lora_active
 from .impl_contract import (
     MoEDeployment,
     MoEEligibility,
@@ -347,9 +348,11 @@ class CuteDslB12xFusedMoEBase:
         """Refuse what neither route of the leaf honours, then join the
         input-ready event before any kernel reads ``ctx.x``.
 
-        On both routes the leaf finalizes, fuses no LoRA, routes nothing itself
-        and holds every expert (its gate rejects ``ep_size > 1``), so a context
-        asking otherwise fails here instead of having the request dropped.
+        On both routes the leaf finalizes, fuses no routed-expert LoRA, routes
+        nothing itself and holds every expert (its gate rejects
+        ``ep_size > 1``), so a context asking otherwise fails here instead of
+        having the request dropped. ``lora_params`` describes every adapter of
+        the forward, so only MoE LoRA on this layer is such a request.
         ``all_rank_num_tokens`` has no reader on either route: ``run_moe`` uses
         it only for the all-to-all tuner shapes, and all-to-all is refused.
         """
@@ -360,8 +363,11 @@ class CuteDslB12xFusedMoEBase:
                 "(gemm2_output, expert_weights, expanded_idx_to_permuted_idx) "
                 "triple that do_finalize=False asks for."
             )
-        if ctx.lora_params is not None:
-            raise NotImplementedError(f"{name} does not fuse routed-expert LoRA; got lora_params.")
+        if ctx.lora_params is not None and moe_lora_active(ctx.lora_params, self.layer_idx):
+            raise NotImplementedError(
+                f"{name} does not fuse routed-expert LoRA; got MoE LoRA tensors "
+                f"for layer {self.layer_idx}."
+            )
         if ctx.token_selected_experts is None or ctx.token_final_scales is None:
             raise ValueError(
                 f"{name} needs precomputed token_selected_experts and "

@@ -44,6 +44,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     NVFP4CuteDslB12xFusedMoEMethod,
     NVFP4CutlassFusedMoEMethod,
 )
+from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -418,6 +419,18 @@ B12X_ROUTES = [
 ]
 B12X_KERNEL_ROUTES = [route for route in B12X_ROUTES if route.values[2] == "b12x"]
 
+_LAYER_IDX = 3
+
+
+def _moe_lora_params(layer_idx: int) -> dict:
+    """``lora_params`` carrying a routed-expert MoE LoRA module for
+    ``layer_idx``."""
+    module_id = int(LoraModuleType.from_string("moe_h_to_4h"))
+    return {
+        "num_seqs": 1,
+        layer_idx: {module_id: {"adapter_size": None, "weight_pointers": None}},
+    }
+
 
 class _B12xWrapperRecorder:
     """Stands in for ``B12xMoEWrapper``, writing bfloat16 as its kernels do."""
@@ -445,7 +458,7 @@ def _leaf_with_recorded_kernels(leaf_cls: type, log: list, monkeypatch) -> CuteD
     ``run_moe`` -- only record that they ran.
 
     ``__new__`` without ``__init__``: the real constructor wants a GPU, while
-    ``run_moe`` reads only the wrapper and its weights.
+    ``run_moe`` reads only the layer index, the wrapper and its weights.
     """
 
     def cutlass_run_moe(self, ctx: MoERunContext, *, workspace=None) -> torch.Tensor:
@@ -454,6 +467,7 @@ def _leaf_with_recorded_kernels(leaf_cls: type, log: list, monkeypatch) -> CuteD
 
     monkeypatch.setattr(TrtllmCutlassNvfp4Impl, "run_moe", cutlass_run_moe)
     leaf = leaf_cls.__new__(leaf_cls)
+    leaf.layer_idx = _LAYER_IDX
     leaf.b12x_wrapper = _B12xWrapperRecorder(log)
     leaf._b12x_weights = {}
     return leaf
@@ -498,7 +512,9 @@ def test_run_moe_hands_back_the_kernel_output_untouched(leaf_cls, num_tokens, ke
         pytest.param(
             dict(do_finalize=False), NotImplementedError, "do_finalize=False", id="unfinalized"
         ),
-        pytest.param(dict(lora_params={"num_seqs": 1}), NotImplementedError, "LoRA", id="lora"),
+        pytest.param(
+            dict(lora_params=_moe_lora_params(_LAYER_IDX)), NotImplementedError, "LoRA", id="lora"
+        ),
         pytest.param(
             dict(
                 token_selected_experts=None,
@@ -537,6 +553,28 @@ def test_run_moe_refuses_what_neither_route_honours(
     with pytest.raises(error, match=match):
         leaf.run_moe(_run_context(num_tokens, **overrides))
     assert log == []
+
+
+@pytest.mark.parametrize(
+    "lora_params",
+    [
+        pytest.param({"num_seqs": 1}, id="no-layer-adapters"),
+        pytest.param(_moe_lora_params(_LAYER_IDX + 1), id="moe-lora-on-another-layer"),
+    ],
+)
+@pytest.mark.parametrize("leaf_cls,num_tokens,kernel", B12X_ROUTES)
+def test_run_moe_admits_lora_params_without_moe_lora_on_its_layer(
+    leaf_cls, num_tokens, kernel, lora_params, monkeypatch
+):
+    """``lora_params`` describes every adapter of the forward. Only
+    routed-expert LoRA on this layer asks the leaf for something it cannot
+    fuse; adapters elsewhere leave its output as it is."""
+    log = []
+    leaf = _leaf_with_recorded_kernels(leaf_cls, log, monkeypatch)
+
+    leaf.run_moe(_run_context(num_tokens, lora_params=lora_params))
+
+    assert log == [kernel]
 
 
 @pytest.mark.parametrize("output_dtype", [torch.float16, torch.float32])
