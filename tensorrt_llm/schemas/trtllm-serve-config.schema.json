@@ -572,7 +572,8 @@
       "enum": [
         "auto",
         "native",
-        "rank_striped_read_ahead"
+        "rank_striped_read_ahead",
+        "model_streamer"
       ],
       "title": "CheckpointIOPolicy",
       "type": "string"
@@ -6531,7 +6532,7 @@
     "checkpoint_io_policy": {
       "$ref": "#/$defs/CheckpointIOPolicy",
       "default": "auto",
-      "description": "Controls checkpoint storage I/O independently of checkpoint format. 'auto' selects rank-striped read-ahead for compatible built-in PyTorch/HF loads and selects native I/O otherwise. 'native' preserves the existing loader. 'rank_striped_read_ahead' lets node-local ranks read disjoint SafeTensors extents while native mapping, materialization, and H2D continue. Incompatible configurations select native I/O before optimized reader or collective setup. Runtime-ineligible loads fall back to native before model mutation.",
+      "description": "Controls checkpoint storage I/O independently of checkpoint format. 'auto' selects rank-striped read-ahead for compatible built-in PyTorch/HF loads and selects native I/O otherwise. 'native' preserves the existing loader. 'rank_striped_read_ahead' lets node-local ranks read disjoint SafeTensors extents while native mapping, materialization, and H2D continue. 'model_streamer' streams node-selected SafeTensors to GPU using Model Streamer (Kimi K3 only; requires load_format='AUTO', checkpoint_format='HF', and a wheel with tensor_names support). Model Streamer rejects unsupported configurations. For auto and rank_striped_read_ahead, incompatible configurations select native I/O before optimized reader or collective setup. Runtime-ineligible loads fall back to native before model mutation.",
       "status": "prototype"
     },
     "checkpoint_loader": {
