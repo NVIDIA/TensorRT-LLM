@@ -142,6 +142,18 @@ def test_flattened_config_exposes_backbone_and_drafter_fields() -> None:
     assert cfg.torch_dtype == torch.bfloat16
 
 
+def test_flattened_config_honors_an_explicit_sliding_window_disable() -> None:
+    """``use_sliding_window: false`` is the DFlash switch that disables the
+    pooled-context window; the block-decode window must follow it instead of
+    being re-created from the HF ``sliding_attention`` spelling."""
+    config = json.loads(json.dumps(_CONFIG))
+    config["text_config"]["use_sliding_window"] = False
+    cfg = build_minimax_dspark_draft_config(config)
+    assert cfg.use_sliding_window is False
+    assert "use_swa" not in cfg.dflash_config
+    assert "swa_window_size" not in cfg.dflash_config
+
+
 def test_flattened_config_keeps_existing_dflash_window_spelling() -> None:
     config = json.loads(json.dumps(_CONFIG))
     config["text_config"]["dflash_config"]["use_swa"] = False
