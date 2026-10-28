@@ -133,7 +133,7 @@ def _kv_replica(tp):
                         BMM1,
                         BMM2,
                         out,
-                        kv_replica_fused_state(q.device, sms),
+                        kv_replica_fused_state(q.device, sms, len(seq)),
                         enable_pdl,
                         gate=gate,
                     )

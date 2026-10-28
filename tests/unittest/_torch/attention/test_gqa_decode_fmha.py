@@ -290,7 +290,7 @@ def test_kv_replica_fused_partial_matches_reference(q_len: int, lens: list) -> N
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     if not F.kv_replica_fused_supported(q_len, CP, hq, b, sms):
         pytest.skip("shape outside the fused KV-replica split partial kernel's limits")
-    state = F.kv_replica_fused_state(torch.device("cuda", 0), sms)
+    state = F.kv_replica_fused_state(torch.device("cuda", 0), sms, b)
     g = torch.Generator(device="cuda").manual_seed(b * 10 + q_len)
     max_pages = max((max(lens) + PAGE - 1) // PAGE, CP)
     nblocks = b * 2 * max_pages + 8

@@ -89,36 +89,42 @@ def kv_replica_fused_supported(
 
 
 class KvReplicaFusedState:
-    """Grid-barrier counters and partial workspace of the kernel on one device, for every batch it supports.
+    """Grid-barrier counters and partial workspace of the kernel on one device, for batches up to ``max_batch``.
 
     Shared by every layer, like the attention workspace: the layers' calls are ordered on one stream. counters: int64
     [max_batch + 1, max_batch], row b serves batch size b; zero-initialized once, never reset.
     """
 
-    def __init__(self, device: torch.device, sm_count: int):
+    def __init__(self, device: torch.device, sm_count: int, max_batch: int):
         self.sm_count = sm_count
-        self.max_batch = _TWO_SLOT_MAX_BATCH
-        need = cp_partial_balanced_ws_bytes(MAX_ROWS, _num_ctas(sm_count), 2)
-        self.workspace = torch.empty(need // 4 + 64, dtype=torch.float32, device=device)
-        self.counters = torch.zeros(
-            self.max_batch + 1, self.max_batch, dtype=torch.int64, device=device
+        self.max_batch = max_batch
+        need = cp_partial_balanced_ws_bytes(
+            MAX_ROWS, _num_ctas(sm_count), 2 if max_batch > _WIDE_PLAN_MAX_BATCH else 1
         )
+        self.workspace = torch.empty(need // 4 + 64, dtype=torch.float32, device=device)
+        self.counters = torch.zeros(max_batch + 1, max_batch, dtype=torch.int64, device=device)
 
 
 _STATES: Dict[int, KvReplicaFusedState] = {}
 
 
-def kv_replica_fused_state(device: torch.device, sm_count: int) -> KvReplicaFusedState:
-    """This device's state, allocated by the first call (which must precede CUDA graph capture) and never
-    reallocated, so captured graphs keep valid addresses."""
+def kv_replica_fused_state(
+    device: torch.device, sm_count: int, max_num_requests: int
+) -> KvReplicaFusedState:
+    """This device's state for batches up to ``max_num_requests`` (capped at the kernel's 128).
+
+    A state is allocated or replaced by a larger one only outside CUDA graph capture, so captured graphs keep valid
+    addresses; callers request it before capture with the engine's ``max_num_requests``.
+    """
+    max_batch = max(1, min(_TWO_SLOT_MAX_BATCH, max_num_requests))
     idx = device.index if device.index is not None else torch.cuda.current_device()
     state = _STATES.get(idx)
-    if state is None:
+    if state is None or state.max_batch < max_batch:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "The KV-replica split counters and workspace must be allocated before CUDA graph capture."
             )
-        state = KvReplicaFusedState(torch.device("cuda", idx), sm_count)
+        state = KvReplicaFusedState(torch.device("cuda", idx), sm_count, max_batch)
         _STATES[idx] = state
     return state
 

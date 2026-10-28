@@ -694,7 +694,7 @@ class GqaKvReplicaFusedFmha(_GqaKvReplicaFmha):
         workspace: torch.Tensor,
     ) -> None:
         super().prepare_workspace(q, k, v, metadata, forward_args, workspace)
-        kv_replica_fused_state(q.device, self._multi_processor_count)
+        kv_replica_fused_state(q.device, self._multi_processor_count, metadata.max_num_requests)
 
     def _run_kv_replica(
         self,
@@ -720,7 +720,9 @@ class GqaKvReplicaFusedFmha(_GqaKvReplicaFmha):
             bmm1_scale,
             bmm2_scale,
             params.output.view(rows, hq, d),
-            kv_replica_fused_state(q.device, self._multi_processor_count),
+            kv_replica_fused_state(
+                q.device, self._multi_processor_count, params.meta.max_num_requests
+            ),
             self._enable_pdl,
             gate=gate,
         )
