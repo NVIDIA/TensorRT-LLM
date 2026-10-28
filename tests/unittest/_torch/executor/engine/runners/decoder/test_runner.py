@@ -18,13 +18,13 @@ import torch
 from _torch.executor.engine.runners.decoder.utils import decoder_config
 from _torch.executor.engine_test_utils import _make_request_stub
 
-import tensorrt_llm._torch.pyexecutor.engine._model_call as model_call_module
+import tensorrt_llm._torch.pyexecutor.engine.model_call as model_call_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner as decoder_runner_module
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
-from tensorrt_llm._torch.pyexecutor.engine._model_call import ModelCaller
+from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
@@ -403,7 +403,8 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
                     return_value=Mock(),
                 ):
                     actual_outputs = engine.forward(
-                        ScheduledInputs(batch=batch), resource_manager=resource_manager
+                        ScheduledInputs(batch=batch, gather_context_logits=return_context_logits),
+                        resource_manager=resource_manager,
                     )
 
                 self.assertEqual(actual_outputs, {**outputs, "runtime_draft_len": 0})

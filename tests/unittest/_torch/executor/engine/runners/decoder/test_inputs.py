@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
 import torch
+from _torch.executor.engine.runners.decoder.utils import decoder_config, input_preparer
 from _torch.executor.engine_test_utils import (
     DummyModel,
     _create_request,
@@ -18,7 +19,6 @@ from _torch.executor.engine_test_utils import (
     _make_request_stub,
 )
 from _torch.executor.engine_test_utils import kv_cache_manager as managed_kv_cache
-from _torch.executor.preparer.runners.decoder.utils import decoder_config, input_preparer
 from utils.util import skip_pre_blackwell_unittest, skip_ray
 
 from tensorrt_llm._torch.attention.backends.interface import (
@@ -27,14 +27,14 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
-from tensorrt_llm._torch.pyexecutor.preparer.runners.decoder.inputs import (
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     DecoderInputBuffers,
     DecoderInputPreparer,
     _get_context_prompt_lookahead_token,
     _zero_fill_row_spans,
 )
-from tensorrt_llm._torch.pyexecutor.preparer.runners.decoder.metadata import DecoderMetadata
-from tensorrt_llm._torch.pyexecutor.preparer.runners.interface import PreparedInputs
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PreparedInputs
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN

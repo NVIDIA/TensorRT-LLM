@@ -23,7 +23,12 @@ from _torch.executor.engine.runners.decoder.utils import (
     decoder_graphs,
     decoder_warmup,
 )
-from _torch.executor.engine_test_utils import DummyModel, _agreement, _capture_tllm_logs
+from _torch.executor.engine_test_utils import (
+    DummyModel,
+    _agreement,
+    _capture_tllm_logs,
+    kv_cache_manager,
+)
 
 import tensorrt_llm._torch.pyexecutor.engine.model_call as model_call_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup as decoder_warmup_module
@@ -49,16 +54,16 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.config import DecoderRunnerConfig
 
 
-def _warmup_and_resources() -> tuple[DecoderWarmup, ResourceManager]:
+@contextlib.contextmanager
+def _warmup_and_resources() -> Iterator[tuple[DecoderWarmup, ResourceManager]]:
     config = decoder_config()
     model = DummyModel(torch.half)
     backend = Mock(enabled=True, is_warmup_only=False)
     backend.allow_capture.side_effect = contextlib.nullcontext
     graphs = decoder_graphs(config, model=model, cuda_graph_runner=backend)
     warmup = decoder_warmup(config, model=model, graphs=graphs)
-    manager = Mock(spec=KVCacheManagerV2, context_swa_layer_limit=None)
-    manager.get_num_available_tokens.return_value = 258
-    return warmup, ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
+    with kv_cache_manager(model=model, max_num_tokens=config.max_num_tokens) as manager:
+        yield warmup, ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
 
 
 class _Tracker:
@@ -731,7 +736,7 @@ class TestWarmupCleanup(unittest.TestCase):
     def test_empty_cache_fires_immediately_after_autotuner(self) -> None:
         """Change 1 placement: empty_cache must be the call right after
         _run_autotuner_warmup."""
-        model_engine, resource_manager = _warmup_and_resources()
+        model_engine, resource_manager = self.enterContext(_warmup_and_resources())
         calls, _ = _run_warmup_tracked(model_engine, resource_manager)
 
         self.assertIn("autotuner", calls)
@@ -751,7 +756,7 @@ class TestWarmupCleanup(unittest.TestCase):
         """Default warmup should call empty_cache exactly twice:
         once at the end of step (a) (pre-existing) and once after step (b)
         (Change 1)."""
-        model_engine, resource_manager = _warmup_and_resources()
+        model_engine, resource_manager = self.enterContext(_warmup_and_resources())
         calls, _ = _run_warmup_tracked(model_engine, resource_manager)
         self.assertEqual(
             calls.count("empty_cache"),
@@ -763,7 +768,7 @@ class TestWarmupCleanup(unittest.TestCase):
         """With Helix CP, can_run_general_warmup is False and the context
         warmups (general, Mamba hybrid) are skipped; the autotuner warmup still
         runs, on generation requests, followed by one empty_cache."""
-        model_engine, resource_manager = _warmup_and_resources()
+        model_engine, resource_manager = self.enterContext(_warmup_and_resources())
         tracker = _Tracker()
         calls, _ = _run_warmup_tracked(
             model_engine, resource_manager, force_helix_cp=True, tracker=tracker
