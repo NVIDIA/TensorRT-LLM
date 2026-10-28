@@ -515,6 +515,22 @@ class KvCacheConnectorScheduler(ABC):
     #: declare it too. Only an explicit True counts, and it is read from the
     #: class before either half is constructed.
     supports_speculative_prefill: bool = False
+    #: Whether `get_num_new_matched_tokens` may be asked while the KV cache
+    #: manager V2 scheduler is still admitting the request, before the batch is
+    #: final (`kv_connector_config.admission_query`). The contract:
+    #: - the answer has no effect beyond itself until `update_state_after_alloc`;
+    #: - asking again for the same allocation replaces the earlier answer;
+    #: - a query may be followed by `request_reset` and another query with no
+    #:   `update_state_after_alloc` in between, which is how a deferred first
+    #:   chunk gives its pages back.
+    #: A request asked at admission can still be dropped before
+    #: `prepare_resources` -- by the disaggregated benchmark gate, batch waiting
+    #: for generation requests, the total-KV cap, the multimodal scheduler
+    #: wrapper, or a batch that cannot be queued -- and is then asked again on a
+    #: later iteration. A connector that starts a transfer inside
+    #: `get_num_new_matched_tokens` must not declare it. Read from the class,
+    #: so every tensor-parallel rank agrees.
+    supports_admission_query: bool = False
 
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
@@ -914,6 +930,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         *,
         enable_attention_dp: bool = False,
         speculative_prefill_only: bool = False,
+        admission_query: bool = False,
     ) -> None:
         """Bind the connector halves and the modes the executor runs them in.
 
@@ -928,6 +945,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 refusing every request that is not context-only (disaggregated
                 prefill), which keeps the connector's append-only page deltas
                 valid. Both halves must declare `supports_speculative_prefill`.
+            admission_query: The connector scheduler declares
+                `KvCacheConnectorScheduler.supports_admission_query`. Decided
+                from the scheduler class, which every rank resolves, because
+                under tensor parallelism only rank 0 holds an instance.
 
         Raises:
             NotImplementedError: When a mode is asked for and a connector half
@@ -949,6 +970,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         #: because this disables most of the per-request path, which is too
         #: much to infer from a merely truthy value.
         self.capacity_only = worker.capacity_only is True
+        #: Whether the KV cache manager may ask the connector while the
+        #: scheduler admits a request; see
+        #: `KvCacheConnectorScheduler.supports_admission_query`. Off under
+        #: attention DP: owners schedule independently, and the batch-start
+        #: status vote and padding in `PyExecutor._kv_connector_start_batch`
+        #: were not validated with requests admitted without a token charge.
+        self.admission_query_capable = bool(admission_query) and not enable_attention_dp
         #: Whether the worker hands failed prefix loads back for a restart
         #: instead of raising; see `KvCacheConnectorWorker.reports_failed_loads`.
         #: Compared against True like `capacity_only`, and off for a role that
@@ -1346,7 +1374,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         The connector ABC promises one query per allocation, so a caller must
         reach this at most once per request per allocation whatever it does with
-        the result. A caller that cannot consume the whole answer -- one
+        the result. The one exception is a scheduler that declares
+        `KvCacheConnectorScheduler.supports_admission_query`: a request asked
+        while it is admitted and then dropped before `prepare_resources` is
+        asked again, and the new answer replaces the old one. A caller that
+        cannot consume the whole answer -- one
         allocating per context chunk, where an offer can outrun the reserved
         pages -- records only the part it honours via
         ``commit_new_matched_tokens``.

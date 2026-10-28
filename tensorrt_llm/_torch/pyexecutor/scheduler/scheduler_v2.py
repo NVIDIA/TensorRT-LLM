@@ -75,6 +75,9 @@ class BudgetTracker:
         self.max_num_requests = max_num_requests
         self.num_tokens = 0
         self.num_requests = 0
+        # Requests admitted with a 0-token charge because the KV connector will
+        # park them for an asynchronous load; they still count in num_requests.
+        self.num_uncharged_parks = 0
 
         # PEFT accounting
         self._peft_cache_manager = peft_cache_manager
@@ -155,6 +158,13 @@ class KVCacheV2Scheduler(RequestScheduler):
     assignment into one unified loop.
     """
 
+    # Admission-time connector queries are off unless __init__ turns them on;
+    # declared on the class so an instance built without __init__ schedules as
+    # before and reports no uncharged request.
+    _connector_admission_query: bool = False
+    _admission_pass_active: bool = False
+    uncharged_park_ids: frozenset = frozenset()
+
     def __init__(
         self,
         max_batch_size: int,
@@ -170,7 +180,38 @@ class KVCacheV2Scheduler(RequestScheduler):
         cross_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for enc-dec cross-attn
         enable_prefix_aware_scheduling: bool = True,
         enable_recompute_pause: bool = True,
+        connector_admission_query: bool = False,
+        max_uncharged_connector_parks: int = 0,
+        max_connector_offer_deferrals: int = 16,
     ) -> None:
+        """Build the scheduler.
+
+        Args:
+            max_batch_size: Maximum number of requests per batch.
+            max_num_tokens: Token budget per iteration, or None for unlimited.
+            kv_cache_manager: The KVCacheManagerV2 that allocates inline.
+            scheduler_policy: Capacity policy; only MAX_UTILIZATION is supported.
+            ctx_chunk_config: ``(policy, chunk_unit_size)`` to chunk context
+                requests, or None.
+            peft_cache_manager: PEFT cache manager, if any.
+            scheduler_capacity: Request capacity; defaults to max_batch_size.
+            no_schedule_until_state: First schedulable request state.
+            no_schedule_after_state: First request state past the schedulable range.
+            draft_kv_cache_manager: KVCacheManagerV2 for the draft layers, if any.
+            cross_kv_cache_manager: KVCacheManagerV2 for cross attention, if any.
+            enable_prefix_aware_scheduling: Defer requests behind a contributor
+                of the same uncached block.
+            enable_recompute_pause: Allow preempting a started request to free pages.
+            connector_admission_query: Ask an admission-capable KV connector for
+                a first chunk's prefix during admission and book the pages a
+                shifting offer needs (``kv_connector_config.admission_query``).
+                Needs context chunking.
+            max_uncharged_connector_parks: Per pass, at most this many first
+                chunks that the connector parks for an asynchronous load are
+                admitted with a 0-token charge.
+            max_connector_offer_deferrals: Passes a first chunk may give its
+                pages back while the KV cache cannot cover its offer's window.
+        """
         self.remote_tail_phase: RemoteTailPhase | None = None
         self._remote_tail_context_ids: frozenset[int] = frozenset()
         self._remote_tail_generation_ids: frozenset[int] = frozenset()
@@ -287,6 +328,40 @@ class KVCacheV2Scheduler(RequestScheduler):
                 f"(max iterations demoted: {self._ctx_demote_max_iters or 'unbounded'})"
             )
 
+        # Admission-time connector queries (kv_connector_config.admission_query).
+        # A connector that declares `supports_admission_query` is asked for a
+        # first chunk's prefix once the chunk is sized and allocated
+        # (`_parks_for_async_load`), and the pages a shifting offer needs are
+        # booked right away. A first chunk the connector will load
+        # asynchronously is parked by the executor before the forward pass, so
+        # up to `max_uncharged_connector_parks` of them per pass are admitted
+        # with a 0-token charge; they still take a request slot. Chunks under
+        # two blocks keep the charge: they free little budget.
+        self._connector_admission_query = connector_admission_query and self.chunking_enabled
+        self._max_uncharged_parks = max(0, max_uncharged_connector_parks)
+        self._max_offer_deferrals = max(0, max_connector_offer_deferrals)
+        self._uncharged_park_min_tokens = 2 * self.tokens_per_block
+        self._admission_pass_active = False
+        self._uncharged_park_ids_pass: set[int] = set()
+        self._offer_page_deferrals_pass = 0
+        self._uncharged_parks_logged = 0
+        #: Request ids admitted with a 0-token charge in the last pass. The
+        #: executor checks that each one parked.
+        self.uncharged_park_ids = frozenset()
+        if connector_admission_query:
+            if ctx_chunk_config is None:
+                logger.warning(
+                    "KVCacheV2Scheduler: kv_connector_config.admission_query has no "
+                    "effect without context chunking"
+                )
+            else:
+                logger.info(
+                    "KVCacheV2Scheduler: admission-time connector queries, up to "
+                    f"{self._max_uncharged_parks} uncharged parks per pass (chunks >= "
+                    f"{self._uncharged_park_min_tokens} tokens), up to "
+                    f"{self._max_offer_deferrals} deferrals for offer pages"
+                )
+
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
 
@@ -340,6 +415,18 @@ class KVCacheV2Scheduler(RequestScheduler):
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
+        # Checked per pass: the manager answers False under attention DP, for a
+        # capacity-only role, with prefix reservations, or without an
+        # admission-capable connector. `is True` because a mocked manager
+        # answers truthily.
+        self._admission_pass_active = (
+            self._connector_admission_query
+            and self.kv_cache_manager.connector_admission_query_enabled() is True
+        )
+        self._uncharged_park_ids_pass = set()
+        self._offer_page_deferrals_pass = 0
+        if self._admission_pass_active:
+            self.kv_cache_manager.begin_connector_admission_pass()
         # Main scheduling loop
         (
             scheduled_encoder,
@@ -350,6 +437,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             disagg_candidates,
             has_chunking,
         ) = self._schedule_loop(active_requests, inflight_request_ids)
+
+        self.uncharged_park_ids = frozenset(self._uncharged_park_ids_pass)
 
         # Sort by LoRA task ID
         scheduled_encoder.sort(key=_get_lora_task_id)
@@ -616,9 +705,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                         break
                     if other.py_request_id in demoted_ids:
                         protected.add(other.py_request_id)
-            return self._try_preempt_for_pages(
+            freed = self._try_preempt_for_pages(
                 requests_list, protected, inflight_request_ids, recompute_paused, preempted_ids
             )
+            if freed and self._admission_pass_active:
+                # Its next admission keeps these pages; see _defer_for_offer_pages.
+                req.py_preempted_for_pages = True
+            return freed
 
         # --- Phase 2: schedule deferred context / encoder requests ---
         # Generation PEFT pages are now fully committed in the budget.
@@ -743,6 +836,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             or evicted
             or recompute_paused
             or deferred_behind_contributor
+            # A deferral for offer pages gives its pages back, and
+            # max_connector_offer_deferrals bounds the wait per request.
+            or self._offer_page_deferrals_pass > 0
         )
         if (
             self.remote_tail_phase is None
@@ -1274,7 +1370,106 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         chunking_flag = req.context_chunk_size < req.context_remaining_length
 
+        # After the pre-grown clamp, MM alignment, allocation and cross context,
+        # so a pre-grown replay is asked with its exact chunk.
+        if self._admission_pass_active:
+            uncharged = self._parks_for_async_load(req, budget, chunk_tokens)
+            if uncharged is None:
+                return ScheduleAction.SKIP, 0, False
+            if uncharged:
+                return ScheduleAction.SCHEDULED, 0, chunking_flag
         return ScheduleAction.SCHEDULED, chunk_tokens, chunking_flag
+
+    def _parks_for_async_load(
+        self, req: LlmRequest, budget: BudgetTracker, chunk_tokens: int
+    ) -> Optional[bool]:
+        """Ask the connector at admission and decide the chunk's token charge.
+
+        Every scheduled first chunk is asked here, once its chunk is sized and
+        its pages allocated; a request dropped before ``prepare_resources`` is
+        asked again on its next pass, as ``supports_admission_query`` allows.
+        An offer that moves the chunk past its sized end gets its pages now
+        (``KVCacheManagerV2.cover_admission_offer``). When the KV cache cannot
+        cover them the request gives its chunk back and waits for a later pass,
+        up to ``max_connector_offer_deferrals`` passes, rather than load only
+        the blocks the chunk's pages hold and recompute the rest. Past that
+        bound it is admitted as before and ``prepare_resources`` falls back to
+        those blocks. So is a request whose last pass preempted a started
+        request for pages: deferring it would hand those pages to the requests
+        behind it and make it preempt again.
+
+        Only the token charge is waived, since the executor removes a parked
+        request from the batch before the forward pass. At most
+        ``max_uncharged_connector_parks`` requests per pass are admitted
+        uncharged, and only chunks of at least two blocks; a synchronous or
+        miss answer does not count. Past the cap a request that parks keeps the
+        normal charge.
+
+        Args:
+            req: The context request just allocated.
+            budget: This pass's budget tracker.
+            chunk_tokens: The tokens the chunk would be charged.
+
+        Returns:
+            None to skip ``req`` this pass (deferred for offer pages), True to
+            admit it with a 0-token charge, False to charge ``chunk_tokens``.
+        """
+        preempted_for_pages = req.py_preempted_for_pages
+        req.py_preempted_for_pages = False
+        parks = self.kv_cache_manager.query_connector_at_admission(req)
+        if (
+            not self.kv_cache_manager.cover_admission_offer(req)
+            and not preempted_for_pages
+            and self._defer_for_offer_pages(req)
+        ):
+            return None
+        if not (
+            parks
+            and budget.num_uncharged_parks < self._max_uncharged_parks
+            and chunk_tokens >= self._uncharged_park_min_tokens
+        ):
+            return False
+        budget.num_uncharged_parks += 1
+        self._uncharged_park_ids_pass.add(req.py_request_id)
+        if self._uncharged_parks_logged < 3:
+            self._uncharged_parks_logged += 1
+            logger.info(
+                f"[ctx-park] request {req.py_request_id} admitted uncharged: its "
+                f"{chunk_tokens}-token chunk waits for an asynchronous load"
+            )
+        return True
+
+    def _defer_for_offer_pages(self, req: LlmRequest) -> bool:
+        """Let ``req`` wait for the pages its connector offer needs.
+
+        Only a first chunk can hold an admission-time offer. The caller returns
+        SKIP, and ``_try_schedule_context`` then runs
+        ``release_context_admission``, which frees every pool, resets the
+        connector's state for the request and rewinds its cursor, so the next
+        pass matches and asks afresh. Counts as progress for the deadlock
+        detector, since the bound keeps the wait finite.
+
+        Args:
+            req: The first chunk whose offer the KV cache could not cover.
+
+        Returns:
+            True to defer ``req`` this pass. False once it has waited
+            ``max_connector_offer_deferrals`` passes; it is then admitted and
+            takes the capped prefix.
+        """
+        deferrals = req.py_connector_offer_deferrals
+        if deferrals >= self._max_offer_deferrals:
+            if deferrals == self._max_offer_deferrals:
+                req.py_connector_offer_deferrals = deferrals + 1
+                logger.debug(
+                    f"[ctx-park] request {req.py_request_id}: no pages for its connector "
+                    f"offer after {deferrals} passes; admitting it with the capped prefix"
+                )
+            return False
+        req.py_connector_offer_deferrals = deferrals + 1
+        req.py_connector_admission_offer = None
+        self._offer_page_deferrals_pass += 1
+        return True
 
     def _reuse_claim_limit(self, req: LlmRequest) -> int | None:
         """Pair the two pools on one depth before either claims.

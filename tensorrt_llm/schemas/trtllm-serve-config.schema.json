@@ -3171,10 +3171,47 @@
       "title": "KvCacheConfig",
       "type": "object"
     },
+    "KvCacheConnectorAdmissionConfig": {
+      "additionalProperties": false,
+      "description": "Admission-time connector queries for the KVCacheManagerV2 scheduler.\n\nThe scheduler asks a connector that declares\n``KvCacheConnectorScheduler.supports_admission_query`` for its prefix while\nit admits a first context chunk, once the chunk is sized and its pages are\nallocated, and books the pages a shifting offer needs at that point.",
+      "properties": {
+        "max_offer_deferrals": {
+          "default": 16,
+          "description": "How many scheduling iterations a first context chunk may give its pages back while the KV cache cannot cover the window a connector offer moves the chunk to. Past this bound, or right after the request preempted another one for pages, it is admitted and the offer is capped to the whole blocks its chunk's pages hold. 0 never defers.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Max Offer Deferrals",
+          "type": "integer"
+        },
+        "max_uncharged_parks": {
+          "default": 0,
+          "description": "Per scheduling iteration, at most this many first context chunks of at least two KV blocks, whose prefix the connector will load asynchronously, are admitted without charging their tokens to max_num_tokens. They still take a batch slot and keep their pages. 0 charges every chunk.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Max Uncharged Parks",
+          "type": "integer"
+        }
+      },
+      "title": "KvCacheConnectorAdmissionConfig",
+      "type": "object"
+    },
     "KvCacheConnectorConfig": {
       "additionalProperties": false,
       "description": "Configuration for the KV Cache Connector.\n\nCan be configured either by specifying a named preset via ``connector``\n(e.g. ``\"lmcache\"``), or by providing explicit ``connector_module``,\n``connector_scheduler_class``, and ``connector_worker_class`` fields.\nWhen ``connector`` is set, the module/class fields are auto-populated\nfrom the preset registry and can be omitted.",
       "properties": {
+        "admission_query": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KvCacheConnectorAdmissionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Ask the connector for a first context chunk's prefix while the scheduler admits it, instead of after the batch is final. None keeps final-batch queries; {} enables admission queries and page booking only; max_uncharged_parks > 0 also admits chunks that park for an asynchronous load without a token charge. Requires KVCacheManagerV2 with context chunking and disable_overlap_scheduler=True. Ignored, with a warning, under attention DP, for a capacity-only role, for prefix-reservation connectors, and for connectors that do not declare supports_admission_query.",
+          "status": "prototype"
+        },
         "connector": {
           "anyOf": [
             {

@@ -934,6 +934,29 @@ def _get_layer_spec_cache_size_components(
     )
 
 
+class ConnectorAdmissionOffer(NamedTuple):
+    """A KV connector's answer taken while the scheduler admitted the request.
+
+    ``epoch`` is the scheduling pass it was taken in. ``prepare_resources``
+    uses the answer only within that pass, and only against the same
+    ``local_end``.
+    """
+
+    # Scheduling pass the answer was taken in.
+    epoch: int
+    # The local match the connector was asked from.
+    local_end: int
+    # Tokens the connector offered past `local_end`.
+    num_tokens: int
+    # Whether the connector loads the offer asynchronously.
+    load_async: bool
+
+    @property
+    def parks(self) -> bool:
+        """Whether the runtime will park the request for an asynchronous load."""
+        return self.load_async and self.num_tokens > 0
+
+
 class _MmRunMetadata(NamedTuple):
     """CPU tensors for exact multimodal run lookup.
 
@@ -1779,6 +1802,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # non-empty pool map lets anything write the limits.
     _disagg_completion_limits: dict[int, int] = {}
     _disagg_completion_pool_counts: dict[int, int] = {}
+    # Scheduling pass of admission-time connector answers (see
+    # `query_connector_at_admission`), on the class for the same reason: the
+    # connector prefix path reads it on instances tests build without __init__.
+    _connector_admission_epoch: int = 0
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -1863,6 +1890,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
         self.kv_connector_manager = kv_connector_manager
+        # Scheduling pass of admission-time connector answers; see
+        # `query_connector_at_admission`.
+        self._connector_admission_epoch = 0
         codec_config = getattr(cold_page_codec_provider, "config", None)
         self._has_lossy_cold_page_codec = (
             getattr(codec_config, "algorithm", None) == "quantization_for_cold_page"
@@ -5951,6 +5981,123 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_connector_manager.update_state_after_alloc(req, flat, by_group)
             req.py_connector_allocation_reported = True
 
+    def begin_connector_admission_pass(self) -> None:
+        """Start a scheduling pass: admission-time answers from earlier passes go stale."""
+        self._connector_admission_epoch += 1
+
+    def connector_admission_query_enabled(self) -> bool:
+        """Whether the scheduler may ask the connector while it admits a request.
+
+        Off without an admission-capable connector (see
+        ``KvCacheConnectorManager.admission_query_capable``, which is off under
+        attention DP), on a draft manager, for a capacity-only role, and for a
+        connector that reserves its prefix during admission instead.
+        """
+        return (
+            self.kv_connector_manager is not None
+            and not self.is_draft
+            and getattr(self.kv_connector_manager, "admission_query_capable", False) is True
+            and not self.kv_connector_manager.capacity_only
+            and not self._connector_reservations_enabled()
+        )
+
+    def query_connector_at_admission(self, req: LlmRequest) -> bool:
+        """Ask the connector now, while the scheduler admits ``req``, and keep the answer.
+
+        Called once the scheduler has sized and allocated ``req``'s chunk, with
+        the guards of ``_run_kv_connector_hooks``. The answer is the
+        allocation's one query: ``_apply_connector_matched_prefix`` uses it in
+        this pass's ``prepare_resources`` instead of asking again. An answer
+        left from an earlier pass is dropped first.
+
+        Args:
+            req: The context request being admitted.
+
+        Returns:
+            Whether the runtime will park ``req`` for an asynchronous load, so
+            the scheduler need not charge its chunk to the token budget.
+        """
+        req.py_connector_admission_offer = None
+        if not self.connector_admission_query_enabled():
+            return False
+        if (
+            not self._connector_may_serve(req)
+            or not req.is_first_context_chunk
+            or req.py_connector_allocation_reported
+            or not self.kv_connector_manager.should_add_sequence(req)
+        ):
+            return False
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return False
+        local_end = kv_cache.num_committed_tokens
+        num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
+            req, local_end
+        )
+        offer = ConnectorAdmissionOffer(
+            self._connector_admission_epoch, local_end, num_tokens, load_async
+        )
+        req.py_connector_admission_offer = offer
+        return offer.parks
+
+    def cover_admission_offer(self, req: LlmRequest) -> bool:
+        """Grow the allocation now to the window this pass's admission answer moves the chunk to.
+
+        An offer that reaches past the scheduled chunk shifts the window and
+        grows the allocation by the offer. Left to ``prepare_resources``, that
+        grow competes with every admission after this one in the pass; when it
+        fails, ``_reserve_connector_prefix`` takes only the whole blocks the
+        pages already hold and the rest of the offer is recomputed. Growing
+        here books the pages before the requests behind it allocate. Only the
+        capacity moves: the history stays at the local match until
+        ``_reserve_connector_prefix`` places the served prefix, so a
+        sliding-window layer group holds the offer's pages until then.
+
+        Args:
+            req: The context request just asked by ``query_connector_at_admission``.
+
+        Returns:
+            False when the KV cache cannot cover the window; the scheduler then
+            gives the chunk back and asks again on a later pass. True when there
+            is nothing to grow (no answer from this pass, a miss, an offer
+            inside the chunk, a shift ``_reserve_connector_prefix`` would refuse
+            anyway, or SWA scratch reuse) or the grow succeeded.
+        """
+        offer = req.py_connector_admission_offer
+        if offer is None or offer.epoch != self._connector_admission_epoch:
+            return True
+        if getattr(self, "enable_swa_scratch_reuse", False) is True:
+            # KVCacheV2Scheduler._pregrown_context_tokens reads the manager-level
+            # flag and replays any capacity grown past the cursor exactly, even
+            # for connector-servable caches whose per-cache scratch flag was
+            # cleared. A grow left on a request dropped before
+            # prepare_resources would come back as an offer+chunk-sized first
+            # chunk charged at that size, or be released and re-admitted. Leave
+            # the shift to prepare_resources, as without admission queries.
+            return True
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return True
+        local_end = offer.local_end
+        offered_end = min(local_end + offer.num_tokens, req.prompt_len - 1)
+        chunk_end = min(local_end + req.context_chunk_size, req.prompt_len)
+        if offered_end <= local_end or offered_end < chunk_end:
+            return True
+        end = self._shifted_chunk_end(req, offered_end)
+        if end <= offered_end:
+            return True
+        target = self._served_prefix_capacity(req, end)
+        pre_cap = kv_cache.capacity
+        if target <= pre_cap:
+            return True
+        grown = kv_cache.resize(target)
+        if not grown:
+            return False
+        if req.py_ctx_pre_resize_cap is None:
+            # As in `_resize_for_served_prefix`: a revert must undo this growth.
+            req.py_ctx_pre_resize_cap = pre_cap
+        return True
+
     def _connector_may_serve(self, req: LlmRequest) -> bool:
         """Whether the connector is allowed to serve a prefix for ``req``."""
         if self.kv_connector_manager is None or self.is_draft:
@@ -5986,9 +6133,21 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
 
         local_end = kv_cache.num_committed_tokens
-        num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
-            req, local_end
-        )
+        offer = getattr(req, "py_connector_admission_offer", None)
+        req.py_connector_admission_offer = None
+        if offer is not None and offer.epoch == self._connector_admission_epoch:
+            # Asked while the scheduler admitted it, this same pass; asking
+            # again would break the one-query-per-allocation contract.
+            if offer.local_end != local_end:
+                raise RuntimeError(
+                    f"req {req.py_request_id}: admission-time connector answer was "
+                    f"taken at {offer.local_end} but the cache is now at {local_end}"
+                )
+            num_tokens, load_async = offer.num_tokens, offer.load_async
+        else:
+            num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
+                req, local_end
+            )
         offered_end = min(local_end + num_tokens, req.prompt_len - 1)
 
         position = local_end
@@ -6037,9 +6196,7 @@ class KVCacheManagerV2(BaseResourceManager):
         allocation, which is why that arm needs a fallback.
         """
         tokens_per_block = self.tokens_per_block
-        prompt_len = req.prompt_len
-        scheduler_chunk = req.context_chunk_size
-        chunk_end = min(local_end + scheduler_chunk, prompt_len)
+        chunk_end = min(local_end + req.context_chunk_size, req.prompt_len)
 
         candidates = []
         if offered_end < chunk_end:
@@ -6047,13 +6204,9 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             # `==` belongs here, not above: an offer that reaches the chunk end
             # exactly leaves the forward pass nothing to compute unless the
-            # window moves.
-            shifted_end = min(offered_end + scheduler_chunk, prompt_len)
-            if shifted_end < prompt_len:
-                # A non-final chunk must end on a block boundary or the next
-                # chunk fragments the cache.
-                shifted_end = (shifted_end // tokens_per_block) * tokens_per_block
-            candidates.append((offered_end, shifted_end))
+            # window moves. With an admission-time answer,
+            # `cover_admission_offer` has normally grown the pages already.
+            candidates.append((offered_end, self._shifted_chunk_end(req, offered_end)))
             # Fall back to the largest whole-block prefix the pages that already
             # exist can hold while still leaving a chunk to compute. Whole
             # blocks because that is the granularity a connector transfers in.
@@ -6066,6 +6219,23 @@ class KVCacheManagerV2(BaseResourceManager):
             if self._resize_for_served_prefix(req, kv_cache, position, end):
                 return position, end - position
         return None
+
+    def _shifted_chunk_end(self, req: LlmRequest, offered_end: int) -> int:
+        """End of the scheduled chunk once a served prefix moves its start to ``offered_end``."""
+        prompt_len = req.prompt_len
+        shifted_end = min(offered_end + req.context_chunk_size, prompt_len)
+        if shifted_end < prompt_len:
+            # A non-final chunk must end on a block boundary or the next chunk
+            # fragments the cache.
+            shifted_end = (shifted_end // self.tokens_per_block) * self.tokens_per_block
+        return shifted_end
+
+    def _served_prefix_capacity(self, req: LlmRequest, end: int) -> int:
+        """The capacity covering ``[0, end)`` for a context chunk ending at ``end``."""
+        target = end + self.num_extra_kv_tokens
+        if end >= req.prompt_len:
+            target += get_draft_token_length(req)
+        return target
 
     def _resize_for_served_prefix(self, req: LlmRequest, kv_cache, position: int, end: int) -> bool:
         """Cover ``[0, end)`` and set the history to ``position``, marking
@@ -6080,9 +6250,7 @@ class KVCacheManagerV2(BaseResourceManager):
         sliding-window layer group. When the capacity is unchanged the call
         cannot fail, since no new slot is requested.
         """
-        target = end + self.num_extra_kv_tokens
-        if end >= req.prompt_len:
-            target += get_draft_token_length(req)
+        target = self._served_prefix_capacity(req, end)
         pre_cap = kv_cache.capacity
         capacity = max(pre_cap, target)
         if not kv_cache.resize(capacity, position):
@@ -7287,6 +7455,10 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_connector_manager.release_prefix_reservation(request)
         # Replay obtains fresh connector metadata for its new destination pages.
         request.py_connector_allocation_reported = False
+        # An admission-time answer belongs to the allocation being released.
+        # `py_connector_offer_deferrals` is not reset: it lasts for the
+        # request's lifetime.
+        request.py_connector_admission_offer = None
         # Same allocation, same lifetime. The pages the served position vouches
         # for are gone, so a replay recomputes from its own reuse match.
         request.py_served_prefix_end = 0

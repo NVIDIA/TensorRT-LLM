@@ -2694,6 +2694,33 @@ class MooncakeStoreConfig(StrictBaseModel):
         return value
 
 
+class KvCacheConnectorAdmissionConfig(StrictBaseModel):
+    """Admission-time connector queries for the KVCacheManagerV2 scheduler.
+
+    The scheduler asks a connector that declares
+    ``KvCacheConnectorScheduler.supports_admission_query`` for its prefix while
+    it admits a first context chunk, once the chunk is sized and its pages are
+    allocated, and books the pages a shifting offer needs at that point.
+    """
+    max_uncharged_parks: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description="Per scheduling iteration, at most this many first context "
+        "chunks of at least two KV blocks, whose prefix the connector will load "
+        "asynchronously, are admitted without charging their tokens to "
+        "max_num_tokens. They still take a batch slot and keep their pages. "
+        "0 charges every chunk.")
+    max_offer_deferrals: NonNegativeInt = Field(
+        default=16,
+        status="prototype",
+        description="How many scheduling iterations a first context chunk may "
+        "give its pages back while the KV cache cannot cover the window a "
+        "connector offer moves the chunk to. Past this bound, or right after "
+        "the request preempted another one for pages, it is admitted and the "
+        "offer is capped to the whole blocks its chunk's pages hold. 0 never "
+        "defers.")
+
+
 class KvCacheConnectorConfig(StrictBaseModel):
     """Configuration for the KV Cache Connector.
 
@@ -2746,6 +2773,18 @@ class KvCacheConnectorConfig(StrictBaseModel):
         "transfers after cancellation or shutdown. Can only shorten the "
         "existing transfer deadline. Expiration fails all ADP owners and requires process restart. "
         "Unused without attention DP.")
+    admission_query: Optional[KvCacheConnectorAdmissionConfig] = Field(
+        default=None,
+        status="prototype",
+        description="Ask the connector for a first context chunk's prefix while "
+        "the scheduler admits it, instead of after the batch is final. None "
+        "keeps final-batch queries; {} enables admission queries and page "
+        "booking only; max_uncharged_parks > 0 also admits chunks that park for "
+        "an asynchronous load without a token charge. Requires KVCacheManagerV2 "
+        "with context chunking and disable_overlap_scheduler=True. Ignored, with "
+        "a warning, under attention DP, for a capacity-only role, for "
+        "prefix-reservation connectors, and for connectors that do not declare "
+        "supports_admission_query.")
 
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":

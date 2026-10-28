@@ -474,6 +474,12 @@ class PyExecutor:
     # If the number of micro batches is too large, the executor will spend too much host memory (No additional GPU memory is required).
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
+    # Declared on the class for executors built without __init__, which the
+    # connector bring-up and shutdown paths still reach.
+    _kv_connector_config = None
+    # The scheduler that runs admission-time connector queries, or None; see
+    # `_resolve_admission_query_scheduler`.
+    _admission_query_scheduler: Optional[KVCacheV2Scheduler] = None
 
     def __init__(
         self,
@@ -1425,6 +1431,9 @@ class PyExecutor:
                 is_kv_cache_manager_v2
                 and (scheduler_config is None
                      or scheduler_config.enable_prefix_aware_scheduling))
+            # After the reservation decision, which excludes admission queries.
+            self._admission_query_scheduler = (
+                self._resolve_admission_query_scheduler())
 
             if is_kv_cache_manager_v2:
                 # A registered region is only a valid address while its page is
@@ -4667,6 +4676,89 @@ class PyExecutor:
         } if scheduled_batch is not None else set())
         self.kv_cache_manager.release_unused_connector_reservations(accepted)
 
+    def _resolve_admission_query_scheduler(
+            self) -> Optional[KVCacheV2Scheduler]:
+        """Find the scheduler that runs admission-time connector queries.
+
+        ``kv_connector_config.admission_query`` is ignored, with a warning,
+        where the connector cannot be asked at admission. Read through
+        ``getattr`` because executors built without ``__init__`` reach this.
+
+        Returns:
+            The KVCacheV2Scheduler, under any wrapper, when admission queries
+            are configured and usable; None otherwise.
+
+        Raises:
+            NotImplementedError: With the overlap scheduler, or without the
+                KVCacheV2Scheduler.
+        """
+        config = getattr(getattr(self, "_kv_connector_config", None),
+                         "admission_query", None)
+        if config is None:
+            return None
+        connector = self.kv_connector_manager
+        reason = None
+        if getattr(connector, "enable_attention_dp", False) is True:
+            reason = "attention data parallelism"
+        elif getattr(connector, "capacity_only", False) is True:
+            reason = "a capacity-only connector role"
+        elif getattr(connector, "prefix_reservations_enabled", False) is True:
+            reason = "a connector that reserves its prefix during admission"
+        elif getattr(connector, "admission_query_capable", False) is not True:
+            reason = ("a connector scheduler that does not declare "
+                      "supports_admission_query")
+        if reason is not None:
+            logger.warning(
+                f"kv_connector_config.admission_query has no effect with {reason}."
+            )
+            return None
+        if not self.disable_overlap_scheduler:
+            raise NotImplementedError(
+                "kv_connector_config.admission_query requires "
+                "disable_overlap_scheduler=True")
+        scheduler = self._find_kv_cache_v2_scheduler()
+        if scheduler is None:
+            raise NotImplementedError(
+                "kv_connector_config.admission_query requires KVCacheManagerV2 "
+                "and its KVCacheV2Scheduler, got "
+                f"{type(getattr(self, 'scheduler', None)).__name__}")
+        return scheduler
+
+    def _find_kv_cache_v2_scheduler(self) -> Optional[KVCacheV2Scheduler]:
+        """The KVCacheV2Scheduler itself or under wrappers that keep it as ``.scheduler``."""
+        scheduler = getattr(self, "scheduler", None)
+        # Wrappers nest one or two deep; the bound only stops a cycle.
+        for _ in range(8):
+            if scheduler is None or isinstance(scheduler, KVCacheV2Scheduler):
+                return scheduler
+            scheduler = getattr(scheduler, "scheduler", None)
+        return None
+
+    def _check_uncharged_parks_left_batch(
+            self, scheduled_batch: ScheduledRequests) -> None:
+        """Fail-stop when a request admitted with a 0-token charge did not park.
+
+        One left in the batch would run a chunk the token budget never counted,
+        so the forward pass could exceed max_num_tokens. Other parked requests'
+        asynchronous loads are already registered and may own destination
+        pages, so this fails through `_kv_connector_fail`, which retains them.
+
+        Args:
+            scheduled_batch: The batch after the connector took its parked
+                requests out.
+        """
+        scheduler = self._admission_query_scheduler
+        if scheduler is None or not scheduler.uncharged_park_ids:
+            return
+        unparked = [
+            req.py_request_id for req in scheduled_batch.context_requests
+            if req.py_request_id in scheduler.uncharged_park_ids
+        ]
+        if unparked:
+            self._kv_connector_fail(
+                f"Context requests {unparked} were admitted with no token "
+                "charge for an asynchronous connector load but did not park")
+
     def _kv_connector_start_batch(
             self, scheduled_batch: ScheduledRequests) -> tuple[bool, bool]:
         """Prepare connector work and return fleet/local compute readiness."""
@@ -4857,6 +4949,7 @@ class PyExecutor:
         ] if self.enable_attention_dp else [])
         self.kv_connector_manager.take_scheduled_requests_pending_load(
             scheduled_batch)
+        self._check_uncharged_parks_left_batch(scheduled_batch)
         self._pad_attention_dp_batch_emptied_by_connector(scheduled_batch)
         self._kv_connector_start_loads(scheduled_batch)
         return loading_context

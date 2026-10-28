@@ -187,6 +187,23 @@ def test_adp_requires_scheduler_on_every_owner(rank: int) -> None:
             KvCacheConnectorManager(ADPAdapterMock(), None, enable_attention_dp=True)
 
 
+def test_admission_query_is_off_under_attention_dp() -> None:
+    """Owners schedule independently, so no owner is asked while it admits a request."""
+    with patch(f"{CONNECTOR_MODULE}.mpi_rank", return_value=1):
+        manager = KvCacheConnectorManager(
+            ADPAdapterMock(), ADPAdapterMock(), enable_attention_dp=True, admission_query=True
+        )
+    assert manager.admission_query_capable is False
+
+
+def test_admission_query_capability_under_tp() -> None:
+    with patch(f"{CONNECTOR_MODULE}.mpi_rank", return_value=0):
+        capable = KvCacheConnectorManager(ADPAdapterMock(), ADPAdapterMock(), admission_query=True)
+        default = KvCacheConnectorManager(ADPAdapterMock(), ADPAdapterMock())
+    assert capable.admission_query_capable is True
+    assert default.admission_query_capable is False
+
+
 @pytest.mark.parametrize("request_counts", [(2, 2), (3, 0), (0, 4)])
 def test_disjoint_owner_callbacks_and_metadata(
     forbid_connector_collectives: None, request_counts: tuple[int, int]

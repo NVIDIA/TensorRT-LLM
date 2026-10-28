@@ -63,6 +63,50 @@ def test_v2_connector_registers_layer_groups(
         windows[0] if len(windows) == 1 else None
     )
     connector.wait_for_initialization.assert_called_once()
+    # No kv_connector_config on an executor built without __init__: no admission queries.
+    assert executor._admission_query_scheduler is None
+
+
+def test_admission_query_is_resolved_during_connector_init(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
+    executor = object.__new__(PyExecutor)
+    connector = Mock(capacity_only=False, enable_attention_dp=False)
+    # Real values: a Mock auto-attribute would answer truthily.
+    connector.admission_query_capable = True
+    connector.prefix_reservations_enabled = False
+    connector.speculative_prefill_only = False
+    executor.kv_connector_manager = connector
+    executor.kv_cache_transceiver = None
+    executor.dist = SimpleNamespace(pp_size=1, cp_size=1)
+    executor.max_beam_width = 1
+    executor.max_draft_len = 0
+    executor.enable_attention_dp = False
+    executor.llm_args = SimpleNamespace(kv_cache_config=None, scheduler_config=None)
+    executor._kv_connector_config = SimpleNamespace(
+        admission_query=SimpleNamespace(max_uncharged_parks=0, max_offer_deferrals=16)
+    )
+    executor.disable_overlap_scheduler = True
+    scheduler = object.__new__(KVCacheV2Scheduler)
+    executor.scheduler = scheduler
+    executor.kv_cache_manager = Mock(spec=KVCacheManagerV2, enable_block_reuse=True)
+    executor.kv_cache_manager.impl = SimpleNamespace(
+        init_config=SimpleNamespace(cache_tiers=[SimpleNamespace(tier=CacheTier.GPU_MEM)])
+    )
+    executor.model_engine = Mock()
+    executor.model_engine.model.named_modules.return_value = []
+    layout = SimpleNamespace(groups=[SimpleNamespace(window_size=None)])
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.build_kv_cache_layout_v2",
+        lambda manager: layout,
+    )
+
+    executor._maybe_init_kv_connector_manager()
+
+    assert executor._admission_query_scheduler is scheduler
+    connector.wait_for_initialization.assert_called_once()
 
 
 def _speculative_connector_executor(

@@ -392,6 +392,9 @@ def make_ctx_request(
     req.encoder_output_len = encoder_output_len
     req.py_encoder_output_ready_event = None
     req.py_skip_cross_kv_projection = False
+    # Real values: the admission-time connector path compares and clears them.
+    req.py_connector_offer_deferrals = 0
+    req.py_preempted_for_pages = False
     return req
 
 
@@ -726,6 +729,9 @@ def make_scheduler(
     cross_kv_cache_manager: Mock | None = None,
     enable_prefix_aware_scheduling: bool = True,
     enable_recompute_pause: bool = True,
+    connector_admission_query: bool = False,
+    max_uncharged_connector_parks: int = 0,
+    max_connector_offer_deferrals: int = 16,
 ) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -753,6 +759,9 @@ def make_scheduler(
             scheduler_capacity=scheduler_capacity,
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             enable_recompute_pause=enable_recompute_pause,
+            connector_admission_query=connector_admission_query,
+            max_uncharged_connector_parks=max_uncharged_connector_parks,
+            max_connector_offer_deferrals=max_connector_offer_deferrals,
             **kwargs,
         )
 
@@ -5377,3 +5386,320 @@ class TestLongContextDemotion:
             assert ids(out.context_requests) == [long_id]
         else:
             assert ids(out.recompute_paused_requests) == [long_id]
+
+
+# ===========================================================================
+# Admission-time connector queries
+# ===========================================================================
+
+
+class TestConnectorAdmission:
+    """kv_connector_config.admission_query: the connector is asked while a first chunk is admitted.
+
+    A chunk the connector will park for an asynchronous load is admitted with no
+    token charge (up to max_uncharged_connector_parks per pass), and a chunk
+    whose offer needs pages the KV cache cannot give waits for a later pass.
+    """
+
+    @staticmethod
+    def _parking_manager(parked_ids, calls=None):
+        """A manager whose connector parks exactly ``parked_ids`` when asked at admission."""
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+
+        def query(req):
+            if calls is not None:
+                calls.append(req.py_request_id)
+            return req.py_request_id in parked_ids
+
+        mgr.query_connector_at_admission.side_effect = query
+        mgr.connector_admission_query_enabled.return_value = True
+        mgr.cover_admission_offer.return_value = True
+        return mgr
+
+    @staticmethod
+    def _scheduler(mgr, parks=2, deferrals=16, max_batch_size=100, admission=True):
+        return make_scheduler(
+            mgr,
+            max_batch_size=max_batch_size,
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+            connector_admission_query=admission,
+            max_uncharged_connector_parks=parks,
+            max_connector_offer_deferrals=deferrals,
+        )
+
+    @staticmethod
+    def _parked_head_and_two_more():
+        return (
+            make_ctx_request(0, context_remaining_length=20000),
+            make_ctx_request(1, context_remaining_length=6000),
+            make_ctx_request(2, context_remaining_length=1000),
+        )
+
+    def test_off_by_default(self):
+        mgr = self._parking_manager({0})
+        sched = self._scheduler(mgr, admission=False)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        out = sched.schedule_request([head, make_ctx_request(1, 1000)], set())
+        assert ids(out.context_requests) == [0]
+        assert head.context_chunk_size == 8192
+        mgr.query_connector_at_admission.assert_not_called()
+        mgr.begin_connector_admission_pass.assert_not_called()
+        assert sched.uncharged_park_ids == frozenset()
+
+    def test_parked_head_is_uncharged_and_the_budget_goes_to_the_rest(self):
+        sched = self._scheduler(self._parking_manager({0}))
+        head, long_second, short = self._parked_head_and_two_more()
+        out = sched.schedule_request([head, long_second, short], set())
+        assert sorted(ids(out.context_requests)) == [0, 1, 2]
+        # The parked head keeps its sized chunk and pages; only the charge is waived.
+        assert head.context_chunk_size == 8192
+        assert sched.uncharged_park_ids == frozenset({0})
+        assert long_second.context_chunk_size == 6000
+        assert short.context_chunk_size == 1000
+
+    def test_without_the_knob_the_park_burns_its_chunk(self):
+        sched = self._scheduler(self._parking_manager({0}), admission=False)
+        head, long_second, short = self._parked_head_and_two_more()
+        out = sched.schedule_request([head, long_second, short], set())
+        assert ids(out.context_requests) == [0]
+        assert long_second.context_chunk_size == 0
+        assert short.context_chunk_size == 0
+
+    def test_a_follower_gets_the_whole_budget(self):
+        sched = self._scheduler(self._parking_manager({0}), parks=1)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        follower = make_ctx_request(1, context_remaining_length=20000)
+        out = sched.schedule_request([head, follower], set())
+        assert sorted(ids(out.context_requests)) == [0, 1]
+        assert head.context_chunk_size == 8192
+        assert follower.context_chunk_size == 8192
+        assert sched.uncharged_park_ids == frozenset({0})
+
+    def test_cap_limits_the_uncharged_parks_per_pass(self):
+        calls = []
+        sched = self._scheduler(self._parking_manager({0, 1, 2}, calls), parks=1)
+        reqs = [make_ctx_request(i, context_remaining_length=6000) for i in range(3)]
+        sched.schedule_request(reqs, set())
+        # Every first chunk is asked, so a pool hit past the cap also gets its pages booked.
+        assert calls == [0, 1, 2]
+        assert sched.uncharged_park_ids == frozenset({0})
+        # Past the cap a parking request is charged: 6000, then the 2192 left
+        # rounded down to the 64-token chunk unit.
+        assert [r.context_chunk_size for r in reqs] == [6000, 6000, 2176]
+        # The cap is per pass: the head is admitted uncharged again.
+        sched.schedule_request(reqs, set())
+        assert sched.uncharged_park_ids == frozenset({0})
+
+    def test_a_miss_does_not_use_up_the_cap(self):
+        """The cap counts parks, not questions: a miss leaves the slot to the next request."""
+        calls = []
+        sched = self._scheduler(self._parking_manager({1}, calls), parks=1)
+        sched.schedule_request(
+            [make_ctx_request(0, context_remaining_length=4000), make_ctx_request(1, 20000)], set()
+        )
+        assert calls == [0, 1]
+        assert sched.uncharged_park_ids == frozenset({1})
+
+    def test_parked_request_still_takes_a_request_slot(self):
+        sched = self._scheduler(self._parking_manager({0}), max_batch_size=1)
+        out = sched.schedule_request(
+            [make_ctx_request(0, context_remaining_length=20000), make_ctx_request(1, 1000)], set()
+        )
+        assert ids(out.context_requests) == [0]
+        assert sched.uncharged_park_ids == frozenset({0})
+
+    def test_a_request_that_fails_allocation_is_never_asked(self):
+        calls = []
+        mgr = self._parking_manager({0, 1}, calls)
+        mgr.resize_context.side_effect = lambda req, n: req.py_request_id != 0
+        sched = self._scheduler(mgr)
+        sched.schedule_request(
+            [make_ctx_request(0, context_remaining_length=20000), make_ctx_request(1, 1000)], set()
+        )
+        assert calls == [1]
+
+    def test_unchunked_scheduling_never_asks(self):
+        mgr = self._parking_manager({0})
+        sched = make_scheduler(mgr, max_num_tokens=8192, connector_admission_query=True)
+        sched.schedule_request([make_ctx_request(0, context_remaining_length=4000)], set())
+        mgr.query_connector_at_admission.assert_not_called()
+        mgr.begin_connector_admission_pass.assert_not_called()
+
+    def test_a_small_chunk_keeps_its_charge(self):
+        """Under two blocks a park frees too little budget to use up an uncharged slot."""
+        calls = []
+        sched = self._scheduler(self._parking_manager({0}, calls))
+        out = sched.schedule_request([make_ctx_request(0, context_remaining_length=100)], set())
+        assert ids(out.context_requests) == [0]
+        assert calls == [0]
+        assert sched.uncharged_park_ids == frozenset()
+
+    def test_uncharged_ids_are_per_pass(self):
+        parked = {0}
+        mgr = self._parking_manager(parked)
+        sched = self._scheduler(mgr)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        sched.schedule_request([head], set())
+        assert sched.uncharged_park_ids == frozenset({0})
+        mgr.begin_connector_admission_pass.assert_called_once()
+        parked.clear()
+        sched.schedule_request([head], set())
+        assert sched.uncharged_park_ids == frozenset()
+        assert mgr.begin_connector_admission_pass.call_count == 2
+
+    def test_an_offer_without_pages_gives_its_chunk_back(self):
+        """Waiting a pass beats loading only the blocks the chunk's pages hold and recomputing the rest."""
+        mgr = self._parking_manager({0})
+        mgr.cover_admission_offer.side_effect = lambda req: req.py_request_id != 0
+        sched = self._scheduler(mgr)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        other = make_ctx_request(1, context_remaining_length=6000)
+        with patch.object(
+            sched, "release_context_admission", wraps=sched.release_context_admission
+        ) as release:
+            out = sched.schedule_request([head, other], set())
+        assert ids(out.context_requests) == [1]
+        assert other.context_chunk_size == 6000
+        assert head.py_connector_offer_deferrals == 1
+        assert head.py_connector_admission_offer is None
+        # The first-chunk release frees the pools and rewinds; nothing is shrunk first.
+        release.assert_called_once_with(head)
+        mgr.revert_allocate_context.assert_not_called()
+        assert sched.uncharged_park_ids == frozenset()
+
+    def test_a_charged_pool_hit_past_the_cap_also_waits_for_pages(self):
+        mgr = self._parking_manager({0, 1})
+        mgr.cover_admission_offer.side_effect = lambda req: req.py_request_id != 1
+        sched = self._scheduler(mgr, parks=1)
+        reqs = [make_ctx_request(i, context_remaining_length=3000) for i in range(3)]
+        out = sched.schedule_request(reqs, set())
+        assert sorted(ids(out.context_requests)) == [0, 2]
+        assert sched.uncharged_park_ids == frozenset({0})
+        assert reqs[1].py_connector_offer_deferrals == 1
+
+    def test_the_wait_is_bounded(self):
+        mgr = self._parking_manager({0})
+        mgr.cover_admission_offer.return_value = False
+        sched = self._scheduler(mgr, deferrals=2)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        with patch.object(
+            sched, "release_context_admission", wraps=sched.release_context_admission
+        ) as release:
+            scheduled = [
+                ids(sched.schedule_request([head], set()).context_requests) for _ in range(4)
+            ]
+        # Two passes waiting, then admitted (uncharged, since it parks) to take the capped prefix.
+        assert scheduled == [[], [], [0], [0]]
+        assert sched.uncharged_park_ids == frozenset({0})
+        assert release.call_count == 2
+
+    def test_a_wait_for_offer_pages_is_not_a_stall(self):
+        mgr = self._parking_manager({0})
+        mgr.cover_admission_offer.return_value = False
+        sched = self._scheduler(mgr)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        for _ in range(5):
+            assert ids(sched.schedule_request([head], set()).context_requests) == []
+        assert sched._stalled_schedules == 0
+        assert head.py_connector_offer_deferrals == 5
+
+    def test_a_request_that_preempted_for_pages_keeps_them(self):
+        """Waiting would hand the pages a re-prefill paid for to the requests behind it."""
+        mgr = self._parking_manager({0})
+        mgr.cover_admission_offer.return_value = False
+        sched = self._scheduler(mgr)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        head.py_preempted_for_pages = True
+        assert ids(sched.schedule_request([head], set()).context_requests) == [0]
+        assert head.py_connector_offer_deferrals == 0
+        assert head.py_preempted_for_pages is False
+        # The flag is spent: the next admission waits for pages again.
+        assert ids(sched.schedule_request([head], set()).context_requests) == []
+        assert head.py_connector_offer_deferrals == 1
+
+    def test_no_wait_without_the_knob(self):
+        mgr = self._parking_manager({0})
+        mgr.cover_admission_offer.return_value = False
+        sched = self._scheduler(mgr, admission=False)
+        out = sched.schedule_request([make_ctx_request(0, context_remaining_length=20000)], set())
+        assert ids(out.context_requests) == [0]
+        mgr.cover_admission_offer.assert_not_called()
+
+    def test_zero_parks_still_books_pages(self):
+        """``admission_query: {}``: the connector is asked and the offer's pages are booked,
+        but every chunk keeps its charge."""
+        mgr = self._parking_manager({0})
+        sched = self._scheduler(mgr, parks=0)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        out = sched.schedule_request([head, make_ctx_request(1, 1000)], set())
+        assert ids(out.context_requests) == [0]
+        assert head.context_chunk_size == 8192
+        mgr.query_connector_at_admission.assert_called_once_with(head)
+        mgr.cover_admission_offer.assert_called_once_with(head)
+        assert sched.uncharged_park_ids == frozenset()
+
+    @pytest.mark.parametrize("admission", [False, True])
+    def test_preemption_marks_the_requester_only_with_admission_queries(self, admission):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0),
+            has_cache_tier_below_gpu=False,
+        )
+        mgr.connector_admission_query_enabled.return_value = True
+        mgr.query_connector_at_admission.return_value = False
+        mgr.cover_admission_offer.return_value = True
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64),
+            connector_admission_query=admission,
+        )
+        requester = make_ctx_request(0, 500)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([requester, victim], set())
+
+        mgr.preempt_request.assert_called_once_with(victim)
+        assert ids(out.recompute_paused_requests) == [99]
+        assert requester.py_preempted_for_pages is admission
+
+    @pytest.mark.parametrize("answer", [False, "mock"])
+    def test_inert_when_the_manager_reports_no_capability(self, answer):
+        """Attention DP, a capacity-only role, prefix reservations or a connector without
+        the capability all read as no capability; a mocked truthy answer does too."""
+        mgr = self._parking_manager({0})
+        mgr.connector_admission_query_enabled.return_value = Mock() if answer == "mock" else False
+        sched = self._scheduler(mgr)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        out = sched.schedule_request([head, make_ctx_request(1, 1000)], set())
+        assert ids(out.context_requests) == [0]
+        assert head.context_chunk_size == 8192
+        mgr.begin_connector_admission_pass.assert_not_called()
+        mgr.query_connector_at_admission.assert_not_called()
+        assert sched.uncharged_park_ids == frozenset()
+
+    def test_pregrown_replay_is_asked_with_its_exact_chunk(self):
+        """Under SWA scratch reuse a pre-grown chunk replays exactly; the connector sees that chunk."""
+        sizes = []
+        mgr = self._parking_manager({0})
+        mgr.query_connector_at_admission.side_effect = lambda req: (
+            sizes.append(req.context_chunk_size),
+            True,
+        )[1]
+        mgr.enable_swa_scratch_reuse = True
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1024,
+            ctx_chunk_config=(None, 64),
+            connector_admission_query=True,
+            max_uncharged_connector_parks=1,
+        )
+        req = make_ctx_request(0, context_remaining_length=10_000)
+        req.context_current_position = 1_024
+        mgr.kv_cache_map[0].capacity = 1_024 + 512 + mgr.num_extra_kv_tokens
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == [0]
+        assert sizes == [512]
+        assert req.context_chunk_size == 512
+        mgr.resize_context.assert_called_once_with(req, 512)
+        assert sched.uncharged_park_ids == frozenset({0})
