@@ -64,10 +64,9 @@ _WEB_SEARCH_TYPE_PREFIX = "web_search"
 _QUERY_ARG = "query"
 
 # What the endpoint does with a web_search tool it cannot honour (see
-# web_search_rejection_reason): "reject", the default, answers the request with
-# a 400; "ignore" serves it without offering the tool to the model. "ignore" is
-# for deployments whose clients always attach the tool, which then have to
-# accept that the model answers without searching. An unknown value rejects.
+# web_search_rejection_reason): "ignore", the default, serves the request
+# without offering the tool to the model; "reject" answers it with a 400, for
+# deployments whose clients drop the tool and retry. An unknown value rejects.
 WEB_SEARCH_UNAVAILABLE_ENV = "TRTLLM_WEB_SEARCH_UNAVAILABLE"
 _UNAVAILABLE_POLICIES = ("reject", "ignore")
 
@@ -111,9 +110,11 @@ def web_search_rejection_reason(tools: Optional[Sequence[Any]]) -> Optional[str]
     response. When that cannot happen, answering anyway is the one outcome the
     client cannot detect - it receives a normal answer and has no way to know
     the model never searched. Rejecting is recoverable (drop the tool and
-    retry); a silently unsearched answer is not. A deployment whose clients
-    always attach the tool can opt out with ``TRTLLM_WEB_SEARCH_UNAVAILABLE=ignore``:
-    such requests are then served, and the model is not offered the tool.
+    retry); a silently unsearched answer is not. Yet clients that attach the
+    tool to every request never drop it, and a rejection would make the server
+    unusable for them. So by default the reason is only logged, once, the
+    request is served and the model is not offered the tool;
+    ``TRTLLM_WEB_SEARCH_UNAVAILABLE=reject`` returns the reason, for a 400.
     """
     spec = web_search_tool_spec(tools)
     if spec is None:
@@ -136,13 +137,13 @@ def web_search_rejection_reason(tools: Optional[Sequence[Any]]) -> Optional[str]
     else:
         reason = f"no web search provider is configured on this server{seen}"
     if _unavailable_policy() == "ignore":
-        # The operator has chosen to answer such requests without searching.
-        # The tool is then not offered to the model (see
-        # _get_chat_completion_function_tools in responses_utils.py).
+        # Such requests are answered without searching. The tool is not
+        # offered to the model (see _get_chat_completion_function_tools in
+        # responses_utils.py).
         logger.warning_once(
             f"Responses web_search cannot be honoured: {reason}. Serving such "
-            "requests without offering the tool to the model, as "
-            f"{WEB_SEARCH_UNAVAILABLE_ENV}=ignore asks.",
+            "requests without offering the tool to the model; set "
+            f"{WEB_SEARCH_UNAVAILABLE_ENV}=reject to answer them with a 400.",
             key="responses_web_search_unavailable_ignored",
         )
         return None
@@ -150,8 +151,11 @@ def web_search_rejection_reason(tools: Optional[Sequence[Any]]) -> Optional[str]
 
 
 def _unavailable_policy() -> str:
-    """The ``TRTLLM_WEB_SEARCH_UNAVAILABLE`` policy; an unknown value reads as "reject"."""
-    value = (os.environ.get(WEB_SEARCH_UNAVAILABLE_ENV) or "reject").strip().lower()
+    """The ``TRTLLM_WEB_SEARCH_UNAVAILABLE`` policy.
+
+    Unset or blank reads as "ignore"; an unknown value reads as "reject".
+    """
+    value = (os.environ.get(WEB_SEARCH_UNAVAILABLE_ENV) or "").strip().lower() or "ignore"
     if value in _UNAVAILABLE_POLICIES:
         return value
     logger.warning_once(

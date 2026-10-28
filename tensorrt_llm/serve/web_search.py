@@ -66,9 +66,9 @@ Environment
                                    server issue unbounded outbound traffic
 ``TRTLLM_WEB_SEARCH_UNAVAILABLE``  what the Responses endpoint does with a
                                    web_search tool it cannot honour:
-                                   ``reject`` (default, a 400) or
-                                   ``ignore`` (serve the request without
-                                   offering the tool to the model)
+                                   ``ignore`` (default, serve the request
+                                   without offering the tool to the model)
+                                   or ``reject`` (a 400)
 """
 
 import asyncio
