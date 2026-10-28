@@ -14,7 +14,8 @@ lazy_loader~=0.5
 mpi4py
 numpy>=2.0.0,<2.4 # numba 0.63.1 requires numpy<2.4
 graphviz
-openai
+# tensorrt_llm/serve imports Responses API types at load time; PartReasoningText needs 1.108.1.
+openai>=1.108.1
 polygraphy
 psutil
 nvidia-ml-py>=13
