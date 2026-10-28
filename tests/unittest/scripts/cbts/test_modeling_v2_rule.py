@@ -20,9 +20,9 @@ from __future__ import annotations
 import pytest
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
-from cbts.blocks import Block, Stage, YAMLIndex, _entry_target
+from cbts.blocks import Block, Stage, YAMLIndex
 from cbts.rules.base import PRInputs
-from cbts.rules.modeling_v2 import ModelingV2Rule, _is_mv2_claim
+from cbts.rules.modeling_v2 import ModelingV2Rule, _is_mv2_claim, _kept_entries
 
 pytestmark = pytest.mark.cpu_only
 
@@ -37,7 +37,7 @@ _CLAIMS = "unittest/_torch/modeling_v2/test_modeling_v2_claims.py"
 
 
 @pytest.fixture
-def rule() -> ModelingV2Rule:
+def rule(tmp_path) -> ModelingV2Rule:
     yaml_index = YAMLIndex()
     yaml_index.blocks = [
         Block(
@@ -67,7 +67,16 @@ def rule() -> ModelingV2Rule:
         "B200-PyTorch-1": Stage("B200-PyTorch-1", "l0_b200", "x86_64", 1, 1),
         "CPU-Generic-x86-1": Stage("CPU-Generic-x86-1", "l0_cpu", "x86_64", 1, 1),
     }
-    return ModelingV2Rule(yaml_index, stages)
+    for family, target, cls in (
+        ("gpt_oss", "gpt_oss_120b__sm_10x__default", "GptOss"),
+        ("deepseek_v3", "target", "Deepseek"),
+        ("kimi_k3_vl", "target", "Kimi"),
+    ):
+        root = tmp_path / _PY / "models" / family
+        (root / target).mkdir(parents=True)
+        (root / target / "modeling.py").touch()
+        (root / "routing.py").write_text(f"from .{target}.modeling import {cls}\n")
+    return ModelingV2Rule(yaml_index, stages, repo_root=tmp_path)
 
 
 def _apply(rule: ModelingV2Rule, *files: str):
@@ -102,12 +111,6 @@ def test_claims_and_families():
         "tensorrt_llm/_torch/pyexecutor/model_loader.py",
     ):
         assert not _is_mv2_claim(path), path
-    assert ModelingV2Rule.family_of(f"{_PY}/models/minimax_m3/csrc/attnMega.cu") == "minimax_m3"
-    assert ModelingV2Rule.family_of(f"{_PY}/models/minimax_m3/m3__sm_107__tp2/csrc/d.cu") == (
-        "minimax_m3"
-    )
-    for path in (f"{_PY}/models/__init__.py", f"{_PY}/catalog/_op.py", f"{_CPP}/CMakeLists.txt"):
-        assert ModelingV2Rule.family_of(path) is None, path
 
 
 def test_entry_runs_family():
@@ -119,16 +122,18 @@ def test_entry_runs_family():
         ("unittest/_torch/modeling_v2/models/gpt_oss_mini", False),
         ("accuracy/modeling_v2/test_deepseek_v3.py", False),
     ):
-        assert ModelingV2Rule._entry_runs_family(entry, _entry_target(entry), "gpt_oss") is runs, (
-            entry
-        )
+        prefixes = {
+            "unittest/_torch/modeling_v2/models/gpt_oss",
+            "accuracy/modeling_v2/test_gpt_oss.py",
+        }
+        assert bool(_kept_entries([entry], prefixes)) is runs, entry
 
 
 def test_scope(rule):
     """A family change selects what runs that family's tests, plus the CPU checks.
 
-    Families union; shared code selects every modeling_v2 entry; a family no entry
-    runs falls back to the full suite.
+    Families union; shared code selects every modeling_v2 entry; an unreadable family
+    selects all modeling_v2 entries.
     """
     result = _apply(rule, f"{_PY}/models/gpt_oss/gpt_oss_120b__sm_10x__default/csrc/k.cu")
     assert result.scope == "modelingv2only" and result.sanity_relevant is False
@@ -149,4 +154,5 @@ def test_scope(rule):
     assert _apply(rule, "tensorrt_llm/_torch/pyexecutor/model_loader.py") is None
     rule.yaml_index.blocks[0].tests.remove(_UNIT)
     result = _apply(rule, f"{_PY}/models/minimax_m3/csrc/attnMega.cu")
-    assert result.scope is None and "minimax_m3" in result.reason
+    assert result.scope == "modelingv2only"
+    assert _COMM in _selected(result)  # unreadable family falls back to all modeling_v2

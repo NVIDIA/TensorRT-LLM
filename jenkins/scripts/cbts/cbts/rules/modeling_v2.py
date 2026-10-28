@@ -11,54 +11,82 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""ModelingV2Rule — narrows CI when only modeling_v2 code changes.
+"""ModelingV2Rule — narrows CI when the modeling_v2 subtree changes.
 
-modeling_v2 is a second modeling path: one self-contained forward per
-(checkpoint, GPU arch, parallel topology), assembled from a catalog of op
-wrappers. It lives under `tensorrt_llm/_torch/_experimental/modeling_v2/`, a
-family's native code included (`models/<family>/csrc/`,
-`models/<family>/<target>/csrc/`), which builds one torch-op library per model
-family, loaded only when routing picks one of the family's targets. What every
-family library shares is in `cpp/tensorrt_llm/modeling_v2/` and
-`cpp/cmake/modules/modeling_v2.cmake`.
+modeling_v2 is a second modeling path living entirely under
+`tensorrt_llm/_torch/_experimental/modeling_v2/`: one self-contained forward per
+(checkpoint, GPU arch, parallel topology), assembled from a catalog of
+op wrappers. Native code lives beside each model in `csrc/`; shared build
+infrastructure lives under `cpp/tensorrt_llm/modeling_v2/` and
+`cpp/cmake/modules/modeling_v2.cmake` and selects every modeling_v2 entry.
 
-Scope — per family, else all of modeling_v2:
-A change confined to one family's directory (`models/<family>/`, its native
-code included) selects the entries that run that family's tests --
-`accuracy/modeling_v2/test_<family>.py`, and any unit entry that collects
-`unittest/_torch/modeling_v2/models/<family>/` (the modeling_v2 directory entry,
-or one under the family's directory) -- plus the modeling_v2 CPU checks. Any
-other modeling_v2 change (catalog, resolver, loader, the native build module, its
-discovery and common headers) selects every modeling_v2 entry. Several families
-in one PR union their entries.
+Block selection: a block belongs to modeling_v2 iff one of its `tests:`
+entries matches a marker in `_MV2_ENTRY_PATTERNS`. Those markers are exact
+by construction rather than by luck: every unit test file in the subtree is
+named `test_modeling_v2_*` precisely so it cannot collide with the upstream
+test of the same op, and the accuracy gates live in their own
+`accuracy/modeling_v2/` directory.
 
-Why no outward fallback is needed: nothing beyond the resolver is imported, and
-no family library is loaded, unless `LLM(modeling_v2=...)` is on -- the model
-loader calls the resolver, which returns immediately when the switch is off,
-and a target's library opens only when routing imports that target. Family
-libraries are separate modules, never linked into libtensorrt_llm.so or
-libth_common.so. The claims tests under `tests/unittest/_torch/modeling_v2/`
-keep that true (stock never references a target, targets never reach a
-sibling, `modeling_v2` defaults to `off`); they run in every scope this rule
-selects. The callers outside the subtree (`_torch/pyexecutor/model_loader.py`,
-`_torch/models/modeling_auto.py`) stay unclaimed: a change to them runs the
-baseline.
+Entry selection: each changed file maps to the tests it can affect.
 
-`.md` exclusion matters here: every catalog entry carries a contract document,
-so a fifth of the Python subtree is Markdown; claiming it would let a
+- `models/` is a tree of nodes. A directory is a node when it, or a
+  directory below it, holds a target's `modeling.py`; a family directory
+  (`models/<family>/`) is always one. Other directories -- `ops/` and the
+  like -- serve the node above them. A changed file belongs to the nearest
+  node at or above it, and selects that node's unit tests
+  (`unittest/_torch/modeling_v2/models/<node>`) plus the accuracy gate of
+  every target under it. A target's gate is `Test<TargetClass>` in
+  `accuracy/modeling_v2/test_<family>.py`, the class name read from the
+  import line in the family's `routing.py` that routes to it.
+- Anything else -- the catalog, the resolver, `models/__init__.py` -- can
+  reach every target and selects every modeling_v2 entry.
+
+The tests directly under `unittest/_torch/modeling_v2/` check the tree as a
+whole (claims, routing, contracts), so any change keeps them.
+
+A unit test prefix that no entry of a block sits at or under keeps the
+longest entry of that block that covers it instead: a family is one
+directory entry, and a change to one of its targets runs the family's
+unit tests. A test file listed at a directory above a node -- a family's
+own test file -- belongs to every node under that directory, so a change
+to any of them keeps it. Whenever the tree on disk cannot answer -- a node directory
+deleted with its `routing.py` -- the file falls back to the wider
+selection. So does a node holding a `modeling.py` that its family's
+`routing.py` does not import, such as a target nested below the family's
+first level: its accuracy gate cannot be named.
+
+Outward fallback: not needed, and that is a property of the design
+rather than an accident. Nothing beyond the resolver module is imported
+unless `LLM(modeling_v2=...)` is on: the model loader calls
+`modeling_v2_resolve`, which returns immediately when the switch is off,
+and the routing modules are imported lazily behind it. The callers
+outside the subtree are `tensorrt_llm/_torch/pyexecutor/model_loader.py`
+(decides) and `tensorrt_llm/_torch/models/modeling_auto.py` (reads the
+decision off `ModelConfig`), neither of which this rule claims -- a PR
+touching them falls back to baseline, which is what a change to the
+shared resolver deserves.
+
+`.md` exclusion matters more here than for most rules: the catalog
+carries a contract document per entry, so roughly a fifth of the files
+in the subtree are Markdown. Claiming them would make a
 documentation-only PR pull in multi-GPU GB300 stages.
 
-PerfSanity policy: `perfsanity_relevant` is True only when a selected block
-lives in a `*_perf_sanity*` yaml -- same as VisualGenRule / SpecDecRule.
+PerfSanity policy: `perfsanity_relevant` is dynamic, True only when a
+matched block lives in a `*_perf_sanity*` yaml -- same as VisualGenRule
+/ SpecDecRule. modeling_v2 has no perf-sanity entries
+today, so this aggregates to False and Groovy Layer 2 drops the
+force-keep of `*-PerfSanity-*` stages.
 
-Sanity policy: `sanity_relevant=False`. Nothing here is imported by
-`trtllm-serve` or `import tensorrt_llm`, and the family libraries are not
-loaded by either, so nothing here is what PackageSanityCheck verifies.
+Sanity policy: `sanity_relevant=False`. The subtree ships no
+user-facing entry point and is not imported by `trtllm-serve` or by
+`import tensorrt_llm`, so nothing it contains is what PackageSanityCheck
+verifies about the wheel.
 """
 
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Optional
 
 from cbts.blocks import Stage, YAMLIndex, _entry_target, _target_in_filter_subtree
@@ -67,36 +95,33 @@ from ._helpers import resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
 from .docs import is_docs_path
 
-_PY_ROOT = "tensorrt_llm/_torch/_experimental/modeling_v2/"
-_PY_MODELS = _PY_ROOT + "models/"
-# What every family library shares: the discovery and the common/ macros.
-_CPP_ROOT = "cpp/tensorrt_llm/modeling_v2/"
-# The native build module: shared by every family library.
+# Source-path prefixes the rule may claim. Tests under tests/** are left
+# to TestsDefRule; the two scopes combine via _TESTSONLY_FAMILY.
+_MV2_SRC_PREFIXES: tuple[str, ...] = (
+    "tensorrt_llm/_torch/_experimental/modeling_v2/",
+    "cpp/tensorrt_llm/modeling_v2/",
+)
 _CPP_BUILD_FILES = frozenset({"cpp/cmake/modules/modeling_v2.cmake"})
-
-# Source-path prefixes the rule may claim. Tests under tests/** are left to
-# TestsDefRule; the two scopes combine via _TESTSONLY_FAMILY.
-_MV2_SRC_PREFIXES: tuple[str, ...] = (_PY_ROOT, _CPP_ROOT)
+_IGNORE = re.compile(r"--ignore=(\S+)")
 
 _UNIT_ROOT = "unittest/_torch/modeling_v2"
 _ACCURACY_ROOT = "accuracy/modeling_v2"
 
 # Substrings that mark a test entry as modeling_v2. All are unambiguous:
-#   - "unittest/_torch/modeling_v2/" → the op-level catalog matrix and the
-#     per-family unit tests (`.../models/<family>`)
+#   - "unittest/_torch/modeling_v2/" → the op and target unit tests
 #   - "accuracy/modeling_v2/" → the per-model accuracy gates
-#   - "test_modeling_v2_" → any unit file named by the subtree's own convention
+#   - "test_modeling_v2_" → any future unit file named by the subtree's
+#     own convention
 _MV2_ENTRY_PATTERNS: tuple[str, ...] = (
     f"{_UNIT_ROOT}/",
     f"{_ACCURACY_ROOT}/",
     "test_modeling_v2_",
 )
 
-# The modeling_v2 CPU checks (claims, routing, native loader): selected in
-# every scope, because they are what keeps the narrowing sound.
-_MV2_CHECK_ENTRY = re.compile(r"^unittest/_torch/modeling_v2/test_modeling_v2_[\w]+\.py$")
-
-_IGNORE = re.compile(r"--ignore=(\S+)")
+# A family's `routing.py` imports each target it routes to by this line, from
+# the target directory directly under the family. The claims test reads the
+# same line with the same pattern.
+_TARGET_IMPORT = re.compile(r"^\s*from \.(\w+)\.modeling import (\w+)$", re.MULTILINE)
 
 
 def _is_mv2_claim(path: str) -> bool:
@@ -110,11 +135,39 @@ def _is_mv2_claim(path: str) -> bool:
     """
     if not (path.startswith(_MV2_SRC_PREFIXES) or path in _CPP_BUILD_FILES):
         return False
-    return not is_docs_path(path)
+    if is_docs_path(path):
+        return False
+    return True
 
 
 def _entry_is_mv2(entry: str) -> bool:
-    return any(p in entry for p in _MV2_ENTRY_PATTERNS)
+    return entry.split()[0].rstrip("/") == _UNIT_ROOT or any(
+        p in entry for p in _MV2_ENTRY_PATTERNS
+    )
+
+
+def _mv2_entries(block) -> list[str]:
+    return [t for t in block.tests if _entry_is_mv2(t)]
+
+
+def _is_whole_tree_test(target: str) -> bool:
+    """A test directly under the unit root, which checks the tree as a whole."""
+    rest = target.removeprefix(f"{_UNIT_ROOT}/").split("::")[0]
+    return target.startswith(f"{_UNIT_ROOT}/") and "/" not in rest and rest.endswith(".py")
+
+
+def _is_ancestor_file(target: str, prefix: str) -> bool:
+    """A test file in a directory below the models root that holds `prefix`.
+
+    A test file at a family (or an intermediate) directory belongs to every
+    node under it, so a change to any of those nodes runs it.
+    """
+    parent, _, name = target.split("::")[0].rpartition("/")
+    return (
+        name.endswith(".py")
+        and parent.startswith(f"{_UNIT_ROOT}/models/")
+        and _target_in_filter_subtree(prefix, parent)
+    )
 
 
 def _is_perf_sanity_stem(stem: str) -> bool:
@@ -130,12 +183,20 @@ def _kept_entries(entries: list[str], prefixes: set[str]) -> list[str]:
     file in a directory above a prefix is kept as well; it does not count as
     sitting under the prefix, so it never displaces the covering entry.
     """
-    targets = {entry: _entry_target(entry) for entry in entries}
+    targets = {entry: _entry_target(entry).split()[0] for entry in entries}
     kept = {e for e, t in targets.items() if _is_whole_tree_test(t)}
     for prefix in prefixes:
         under = {e for e, t in targets.items() if _target_in_filter_subtree(t, prefix)}
         if not under:
-            covering = [e for e, t in targets.items() if _target_in_filter_subtree(prefix, t)]
+            covering = [
+                e
+                for e, t in targets.items()
+                if _target_in_filter_subtree(prefix, t)
+                and not any(
+                    _target_in_filter_subtree(prefix, ignored.rstrip("/"))
+                    for ignored in _IGNORE.findall(e)
+                )
+            ]
             under = {max(covering, key=lambda e: len(targets[e]))} if covering else set()
         kept |= under
         kept |= {e for e, t in targets.items() if _is_ancestor_file(t, prefix)}
@@ -146,90 +207,99 @@ class ModelingV2Rule(Rule):
     name = "modelingv2"
     needs_diff_for: tuple[str, ...] = ()
 
-    def __init__(self, yaml_index: YAMLIndex, stages: dict[str, Stage]) -> None:
+    def __init__(self, yaml_index: YAMLIndex, stages: dict[str, Stage], repo_root: Path) -> None:
         self.yaml_index = yaml_index
         self._stages_by_yaml = stages_by_yaml_stem(stages)
+        self._src_root = Path(repo_root) / _MV2_SRC_PREFIXES[0]
+        self._tests_root = Path(repo_root) / "tests"
 
-    @staticmethod
-    def family_of(path: str) -> Optional[str]:
-        """The family a claimed path belongs to, or None for shared modeling_v2 code."""
-        if path.startswith(_PY_MODELS):
-            parts = path[len(_PY_MODELS) :].split("/")
-            return parts[0] if len(parts) > 1 else None
-        return None
+    def _is_node(self, rel_dir: Path) -> bool:
+        """Whether `models/<rel_dir>` is a node: a family, or holds a target at or below it."""
+        path = self._src_root / "models" / rel_dir
+        return len(rel_dir.parts) == 1 or (path.is_dir() and any(path.rglob("modeling.py")))
 
-    @staticmethod
-    def _entry_runs_family(entry: str, target: str, family: str) -> bool:
-        """Whether a test-db entry runs tests of `family`.
+    def _gates_under(self, node: Path) -> Optional[set[str]]:
+        """Accuracy-gate prefixes of every target at or under `node`.
 
-        Its accuracy gates, or unit tests under its directory, collected by the
-        entry itself or by a directory entry above it that does not `--ignore` it.
+        None if unreadable: no `routing.py`, or a `modeling.py` under `node`
+        that no import line in it routes to, whose gate cannot be named.
         """
-        path = target.split()[0]  # the target keeps long options such as --ignore
-        accuracy = f"accuracy/modeling_v2/test_{family}.py"
-        if path == accuracy or path.startswith(accuracy + "::"):
-            return True
-        unit = f"unittest/_torch/modeling_v2/models/{family}"
-        if path == unit or path.startswith(unit + "/"):
-            return True
-        if not unit.startswith(path.rstrip("/") + "/"):
-            return False
-        ignored = (path.rstrip("/") for path in _IGNORE.findall(entry))
-        return not any(unit == path or unit.startswith(path + "/") for path in ignored)
+        models = self._src_root / "models"
+        family = node.parts[0]
+        routing = models / family / "routing.py"
+        if not routing.is_file():
+            return None
+        routed, gates = set(), set()
+        for target, target_cls in _TARGET_IMPORT.findall(routing.read_text(encoding="utf-8")):
+            leaf = Path(family, target)
+            routed.add(leaf)
+            if leaf == node or node in leaf.parents:
+                gates.add(f"{_ACCURACY_ROOT}/test_{family}.py::Test{target_cls}")
+        if any(
+            m.parent.relative_to(models) not in routed for m in (models / node).rglob("modeling.py")
+        ):
+            return None
+        return gates
 
-    def _select(self, families: Optional[set[str]]):
-        """Select the modeling_v2 entries a change runs.
-
-        Every modeling_v2 entry when `families` is None, else the entries of
-        `families` plus the CPU checks. Also returns the families that matched
-        no entry.
-        """
-        block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
-        matched_families: set[str] = set()
-        for block in self.yaml_index.blocks:
-            for entry in block.tests:
-                if not _entry_is_mv2(entry):
-                    continue
-                target = _entry_target(entry)
-                if not target:
-                    continue
-                if families is not None:
-                    owners = {f for f in families if self._entry_runs_family(entry, target, f)}
-                    if not owners and not _MV2_CHECK_ENTRY.match(target):
-                        continue
-                    matched_families |= owners
-                key = (block.yaml_stem, block.block_index)
-                block_filters.setdefault(key, {}).setdefault(target, set()).add(entry)
-        unmatched = set() if families is None else families - matched_families
-        return block_filters, unmatched
+    def _prefixes_for(self, path: str) -> Optional[set[str]]:
+        """Filter prefixes a changed file selects; None selects every modeling_v2 entry."""
+        if not path.startswith(_MV2_SRC_PREFIXES[0]):
+            return None
+        rel = Path(path[len(_MV2_SRC_PREFIXES[0]) :])
+        if rel.parts[0] != "models" or len(rel.parts) < 3:
+            return None
+        node = Path(*rel.parts[1:-1])
+        while not self._is_node(node):
+            node = node.parent
+        gates = self._gates_under(node)
+        if gates is None:
+            return None
+        return {f"{_UNIT_ROOT}/models/{node.as_posix()}"} | gates
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
         claimed = {f for f in pr.changed_files if _is_mv2_claim(f)}
         if not claimed:
             return None
 
-        owners = {self.family_of(f) for f in claimed}
-        families = None if None in owners else set(owners)
-        block_filters, unmatched = self._select(families)
+        prefixes: Optional[set[str]] = set()
+        for path in sorted(claimed):
+            selected = self._prefixes_for(path)
+            if selected is None:
+                prefixes = None
+                break
+            prefixes |= selected
 
-        if not block_filters or unmatched:
-            # Do not fabricate stages -- fall back to baseline so the change
-            # still gets coverage. Reachable if no entry runs a family's
-            # tests, or the subtree's entries leave the test-db.
-            missing = f" for {sorted(unmatched)}" if unmatched else ""
+        block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
+        for block in self.yaml_index.blocks:
+            entries = _mv2_entries(block)
+            if prefixes is not None:
+                entries = _kept_entries(entries, prefixes)
+            if not entries:
+                continue
+            prefix_dict = block_filters.setdefault((block.yaml_stem, block.block_index), {})
+            for entry in entries:
+                target = _entry_target(entry)
+                if target:
+                    prefix_dict.setdefault(target, set()).add(entry)
+
+        if not block_filters:
+            # Defensive: modeling_v2 source changed but no modeling_v2 block
+            # exists in any yaml. Do not fabricate stages -- fall back to
+            # baseline so the change still gets coverage. Reachable if the
+            # subtree's entries are ever removed from the test-db without
+            # the subtree going with them.
             return RuleResult(
                 handled_files=claimed,
                 affected_stages=set(),
                 scope=None,
                 reason=(
                     f"modelingv2: {len(claimed)} modeling_v2 source file(s); "
-                    f"no modeling_v2 test entry{missing} in any test-db yaml — fallback"
+                    "no modeling_v2 block matched in any test-db yaml — fallback"
                 ),
             )
 
         affected = resolve_affected_stages(block_filters, self.yaml_index, self._stages_by_yaml)
         perfsanity_relevant = any(_is_perf_sanity_stem(stem) for stem, _ in block_filters)
-        scope_text = "all modeling_v2" if families is None else f"families {sorted(families)}"
 
         return RuleResult(
             handled_files=claimed,
@@ -239,7 +309,8 @@ class ModelingV2Rule(Rule):
             sanity_relevant=False,
             perfsanity_relevant=perfsanity_relevant,
             reason=(
-                f"modelingv2: {len(claimed)} modeling_v2 source file(s), {scope_text} → "
-                f"{len(block_filters)} modeling_v2 block(s), {len(affected)} stage(s)"
+                f"modelingv2: {len(claimed)} modeling_v2 source file(s) → "
+                f"{'every modeling_v2 entry' if prefixes is None else f'{len(prefixes)} test prefix(es)'}, "
+                f"{len(block_filters)} block(s), {len(affected)} stage(s)"
             ),
         )
