@@ -41,6 +41,7 @@ namespace kvc = tensorrt_llm::executor::kv_cache;
 
 using bounce_test::freeXferBufs;
 using bounce_test::hasCuda;
+using bounce_test::makeAgentConfig;
 using bounce_test::makeXferBufs;
 using bounce_test::verifyXferBufs;
 using bounce_test::XferBufs;
@@ -108,7 +109,7 @@ int runConcurrentFlows(
 kvc::BaseAgentConfig makeBounceConfig(
     std::string name, std::size_t arenaSizeMb = 2, char const* granularityBytes = "256")
 {
-    kvc::BaseAgentConfig cfg{std::move(name), true, false, true};
+    auto cfg = makeAgentConfig(std::move(name));
     cfg.agentBufferSizeMb = arenaSizeMb;
     if (arenaSizeMb > 0)
     {
@@ -212,7 +213,7 @@ TEST(BounceAgentE2E, EffectiveChunkCapFallsBackToStandardNixl)
     // cap. The descriptor below sits between the two limits.
     auto makeCapConfig = [](char const* name)
     {
-        kvc::BaseAgentConfig cfg{name, true, false, true};
+        auto cfg = makeAgentConfig(name);
         cfg.agentBufferSizeMb = 3;
         cfg.bounceParams = {
             {"min_descriptor_count", "1"},
