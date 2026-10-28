@@ -1687,6 +1687,91 @@ def test_selection_glue_kernels_match_reference(top_k):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @torch.inference_mode()
+def test_shared_active_rows_map_logical_main_rows(dtype):
+    """Shared staging through the page table matches staging from premapped slots."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import stage_shared_rows
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    _fused_rows_arch()
+    torch.manual_seed(947)
+    swa = pack_rows(torch.randn(64, 512, device="cuda", dtype=torch.bfloat16), "swa")
+    records = torch.empty(40, 356, device="cuda", dtype=torch.uint8)
+    main = records[:, :288]
+    main.copy_(pack_rows(torch.randn(40, 512, device="cuda", dtype=torch.bfloat16), "main"))
+    swa_values = [[20, -1, 22, 23], [21, 22, 23, 24], [-1] * 4, [37, 38, 39, 40], [20] * 4]
+    logical_values = [[0, 0, 2, -1], [1, 3, 9, 15], [-1] * 4, [1, 3, 8, 30], [0] * 4]
+    swa_slots = torch.tensor(swa_values, device="cuda", dtype=torch.int64)
+    logical = torch.tensor(logical_values, device="cuda", dtype=torch.int64)
+    requests = torch.tensor([0, 0, 1, 1, -1], device="cuda", dtype=torch.int64)
+    # Request 1 has a hole at its second page; query 1 sees only three positions.
+    main_pages = torch.tensor([[1, 3], [2, -1]], device="cuda", dtype=torch.int32)
+    visible = torch.tensor([16, 3, 16, 16, 16], device="cuda", dtype=torch.int32)
+    page_size, max_positions = 8, 16
+    plan = SimpleNamespace(
+        query_requests=requests,
+        query_positions=torch.tensor([7, 8, 23, 24, 7], device="cuda", dtype=torch.int32),
+        swa_starts=torch.tensor([4, 20], device="cuda", dtype=torch.int64),
+        swa_offsets=torch.tensor([1, 9, 17], device="cuda", dtype=torch.int64),
+        main_offsets=torch.tensor([17, 33, 49], device="cuda", dtype=torch.int64),
+        swa_pages=torch.tensor([[2, 3, -1, -1], [-1, -1, 4, 5]], device="cuda", dtype=torch.int32),
+        main_pages=main_pages,
+        swa_page_size=8,
+        main_page_size=page_size,
+        num_requests=2,
+        swa_rows=16,
+        main_rows=32,
+    )
+    unit = torch.ones(1, device="cuda")
+
+    def stage(main_slots, main_mapping):
+        metadata = SimpleNamespace(
+            num_tokens=5,
+            num_sparse_topk=128,
+            shared_pool=torch.full((49, 512), 7, device="cuda", dtype=dtype),
+            _csa2_shared_selected=torch.empty(49, device="cuda", dtype=torch.int32),
+            prepared_indices=torch.empty(5, 128, device="cuda", dtype=torch.int32),
+            prepared_lens=torch.empty(5, device="cuda", dtype=torch.int32),
+            prepared_counter=torch.empty(1, device="cuda", dtype=torch.uint32),
+            mla_bmm1_scale=torch.empty(2, device="cuda"),
+            mla_bmm2_scale=torch.empty(1, device="cuda"),
+        )
+        stage_shared_rows(
+            swa,
+            swa_slots,
+            main,
+            main_slots,
+            logical,
+            metadata,
+            plan,
+            main_mapping=main_mapping,
+            kv_scale_orig_quant=unit,
+            kv_scale_quant_orig=unit,
+            q_scale_quant_orig=unit,
+        )
+        return (
+            metadata.shared_pool.view(torch.uint8),
+            metadata._csa2_shared_selected,
+            metadata.prepared_indices,
+            metadata.prepared_lens,
+        )
+
+    physical = CSA2TrtllmMetadata._map_global_slots(
+        logical, requests, main_pages, visible, page_size, max_positions
+    )
+    assert bool((physical >= 0).any()) and bool((logical[physical < 0] >= 0).any())
+    expected = stage(physical, None)
+    actual = stage(None, (main_pages, page_size, max_positions, requests, visible))
+    assert int(expected[3].sum()) > 5
+    for got, want in zip(actual, expected):
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+@skip_pre_hopper
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@torch.inference_mode()
 def test_shared_active_rows_heterogeneous_request_domains(dtype: torch.dtype) -> None:
     """Check request ownership across empty domains, page holes and strided tables."""
     from types import SimpleNamespace
