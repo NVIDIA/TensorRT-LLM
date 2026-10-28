@@ -49,6 +49,9 @@ class _Metadata:
         self.locality_domain_workspaces = None
         self.locality_domain_cuda_graph_workspaces = None
         self.locality_domain_spec_decoding_bl_tree_masks = None
+        self.locality_domain_cute_dsl_mla_split_plans = None
+        self._cute_dsl_mla_split_plan = None
+        self._cute_dsl_mla_split_plan_key = None
         self.locality_domain_num_ctx_tokens = list(ctx_tokens)
         self.use_spec_decoding = use_spec_decoding
         self.spec_decoding_generation_lengths = None
@@ -252,6 +255,43 @@ def test_scoped_metadata_slices_generation_indexed_spec_inputs():
     assert metadata.spec_decoding_generation_lengths.numel() == num_gen
     assert metadata.spec_decoding_position_offsets.dim() == 1
     assert metadata.spec_decoding_bl_tree_mask is not domain1_mask
+
+
+def test_scoped_metadata_gives_each_domain_its_own_cute_dsl_mla_split_plan():
+    metadata = _Metadata(num_ctx=0, num_gen=4, gen_tokens=(1,) * 4)
+    full_plan = torch.zeros(4, dtype=torch.int32)
+    metadata._cute_dsl_mla_split_plan = full_plan
+    metadata._cute_dsl_mla_split_plan_key = ("full",)
+    metadata.locality_domain_cute_dsl_mla_split_plans = [(None, None), (None, None)]
+    slices = [
+        _slice(ctx_req=(0, 0), gen_req=(0, 2), gen_tok=(0, 2), n=2),
+        _slice(ctx_req=(0, 0), gen_req=(2, 4), gen_tok=(2, 4), n=2),
+    ]
+    written = []
+    for domain, ld_slice in enumerate(slices):
+        with trtllm_backend._locality_domain_metadata(metadata, ld_slice, domain):
+            # Each domain starts from its own (empty) plan, never another domain's.
+            assert metadata._cute_dsl_mla_split_plan is None
+            assert metadata._cute_dsl_mla_split_plan_key is None
+            plan = torch.full((2,), domain, dtype=torch.int32)
+            metadata._cute_dsl_mla_split_plan = plan
+            metadata._cute_dsl_mla_split_plan_key = (domain,)
+            written.append(plan)
+    assert metadata._cute_dsl_mla_split_plan is full_plan
+    assert metadata._cute_dsl_mla_split_plan_key == ("full",)
+    plans = metadata.locality_domain_cute_dsl_mla_split_plans
+    assert [plan for plan, _ in plans] == written
+    assert [key for _, key in plans] == [(0,), (1,)]
+    # A later layer of the same step reuses its domain's plan.
+    with trtllm_backend._locality_domain_metadata(metadata, slices[1], 1):
+        assert metadata._cute_dsl_mla_split_plan is written[1]
+        assert metadata._cute_dsl_mla_split_plan_key == (1,)
+
+    metadata.locality_domain_enabled = False
+    trtllm_backend.TrtllmAttentionMetadata._invalidate_mla_scheduler_buffers(metadata)
+    assert metadata._cute_dsl_mla_split_plan_key is None
+    assert [plan for plan, _ in plans] == written
+    assert [key for _, key in plans] == [None, None]
 
 
 def _coverage(prepared, kind, num_q_rows, metadata, num_kv_rows=None, dense_ctx_kv=False):
