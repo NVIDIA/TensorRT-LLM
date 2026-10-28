@@ -6126,7 +6126,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 "reuse."
             )
 
-        if isinstance(self.event_manager, StreamingKVCacheEventManager):
+        if chunk_start == 0 and isinstance(self.event_manager, StreamingKVCacheEventManager):
             uuids = req.multimodal_uuids
             if uuids is not None:
                 uuid_pairs = [

@@ -591,9 +591,7 @@ class _StreamingEventSource:
     def _multimodal_key(self, key: tuple) -> MultimodalKey:
         digest = bytes(key[0])
         with self._uuid_lock:
-            uuid = key[2] if len(key) > 2 else None
-            if uuid is None:
-                uuid = self._uuids.get(digest)
+            uuid = self._uuids.get(digest)
         return MultimodalKey(hash=digest.hex(), start_offset=key[1], uuid=uuid)
 
     def set_target_life_cycle(self, life_cycle_id: int) -> None:

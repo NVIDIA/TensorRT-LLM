@@ -124,15 +124,20 @@ For attention DP, each publisher binds `base_port + global_rank`. When event str
 metadata for aggregated Qwen3-VL with KV cache manager V2 explicitly enabled,
 block reuse enabled, and ZMQ event publishing. Image passthrough separately
 requires `supports_multimodal` and `extra.trtllm_supported_modalities` to advertise
-image support. Video, audio, and disaggregated image routing are not advertised.
+image support. Set `use_kv_cache_manager_v2=True` explicitly: `"auto"` is
+excluded from capability discovery even if the engine resolves it to V2.
+Video, audio, and disaggregated image routing are not advertised.
 
 For image blocks, `BlockStored.trtllm_image_routing` contains
 `version` and `token_id_offset` (the vocabulary size). The existing
 `BlockStored.mm_keys` contains the keys, aligned with the stored blocks. Each key
 retains its native content `hash` and `start_offset` and gains an optional `uuid`.
-Keys are serialized only in `mm_keys`. Native image tokens start with a digest
-and continue with IDs above `token_id_offset`; a router can normalize those tokens using identities it
-sent in `MediaItem.uuid`. Native block hashes, parent chains, and removals retain
+Keys are serialized only in `mm_keys`. The publisher emits this extension for
+all multimodal keys, including video/audio keys; the name identifies the current
+image-routing contract, not a modality filter. Only image routing has been
+validated and advertised by OpenEngine. Native image tokens start with a digest
+and continue with IDs above `token_id_offset`; a router can normalize those
+tokens using identities it sent in `MediaItem.uuid`. Native block hashes, parent chains, and removals retain
 their existing meaning. Cache hashing continues to include image content.
 
 The publisher retains at most `max_entries` digest-to-UUID associations and skips

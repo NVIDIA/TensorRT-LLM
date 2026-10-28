@@ -35,7 +35,7 @@ MODEL = "test-model"
 
 
 @pytest.mark.parametrize("model_type", ["qwen3_vl", "qwen2_vl", "text"])
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("enabled", [False, True, "auto"])
 @pytest.mark.parametrize(
     "block_reuse,events_enabled,publisher",
     [(True, True, "zmq"), (False, True, "zmq"), (True, False, "zmq"), (True, True, "null")],
@@ -56,7 +56,7 @@ def test_image_routing_capability_requires_streaming_v2_and_validated_model(
         ),
     )
     expected = (
-        enabled
+        enabled is True
         and model_type == "qwen3_vl"
         and block_reuse
         and events_enabled

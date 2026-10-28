@@ -25,8 +25,7 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 def test_real_image_routing_keeps_cache_identity_content_sensitive(unused_tcp_port, tmp_path):
-    if not torch.cuda.is_available():
-        pytest.skip("requires a GPU and the real Qwen3-VL-2B checkpoint")
+    assert torch.cuda.is_available(), "GPU conformance requires a CUDA device"
     endpoint = f"tcp://127.0.0.1:{unused_tcp_port}"
     context = zmq.Context()
     subscriber = context.socket(zmq.SUB)

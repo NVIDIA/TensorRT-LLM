@@ -144,6 +144,52 @@ def test_request_uuid_pairs_preserve_partial_uuid_slots():
         event_manager.shutdown()
 
 
+def test_chunked_prefill_registers_hints_before_images_without_repeating(monkeypatch):
+    event_manager = events.StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+        mm_token_id_offset=1000,
+    )
+    cache = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    cache.vocab_size = 1000
+    cache.event_manager = event_manager
+    request = SimpleNamespace(
+        multimodal_hashes=[tuple(range(8))],
+        multimodal_uuids=["image-a"],
+        multimodal_positions=[2],
+        multimodal_lengths=[3],
+        multimodal_item_run_cu_offsets=None,
+        multimodal_run_positions=None,
+        multimodal_run_lengths=None,
+    )
+    registrations = []
+    original = event_manager.remember_multimodal_uuids
+
+    def remember(pairs):
+        registrations.append(pairs)
+        original(pairs)
+
+    monkeypatch.setattr(event_manager, "remember_multimodal_uuids", remember)
+    digest = b"".join(value.to_bytes(4, "big", signed=True) for value in range(8))
+    try:
+        tokens = [1, 2, 3, 4, 5, 6]
+        first = cache._augment_tokens_for_block_reuse(tokens, request, start=0, end=2)
+        assert len(registrations) == 1
+        assert event_manager._event_source._multimodal_key((digest, 0)).uuid == "image-a"
+        # Later chunks cannot read or register the request's UUID vector again.
+        del request.multimodal_uuids
+        middle = cache._augment_tokens_for_block_reuse(tokens, request, start=2, end=4)
+        last = cache._augment_tokens_for_block_reuse(tokens, request, start=4, end=6)
+        assert len(registrations) == 1
+        request.multimodal_uuids = ["image-a"]
+        expected = cache._augment_tokens_for_block_reuse(tokens, request)
+        assert first + middle + last == expected
+    finally:
+        event_manager.shutdown()
+
+
 def test_conflicting_request_hints_preserve_inference_cache_keys():
     manager = events.StreamingKVCacheEventManager(
         KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
