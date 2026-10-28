@@ -61,6 +61,7 @@ def chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     output: Optional[torch.Tensor] = None,
     state_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    cu_seqlens_cpu: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Adapter for FlashInfer's ``chunk_gated_delta_rule``.
 
@@ -70,7 +71,9 @@ def chunk_gated_delta_rule(
     update; an in-place update reports through ``initial_state``.
     ``state_workspace`` optionally supplies an (input, output) tensor pair,
     each shaped ``[capacity, H, V, K]`` in the state I/O dtype.
-    Returned states never alias this scratch.
+    Returned states never alias this scratch. A batch with more sequences than
+    ``capacity`` runs in groups of at most ``capacity`` sequences, which needs
+    ``cu_seqlens_cpu``: a host copy of ``cu_seqlens``.
     """
     # FlashInfer is imported lazily so importing this module on a non-FlashInfer
     # build does not error until the function is actually called.
@@ -117,31 +120,25 @@ def chunk_gated_delta_rule(
         q3 = l2norm_fwd(q3)
         k3 = l2norm_fwd(k3)
 
-    # --- Step 4: gather initial state (+ cast dtype only when required) ---
+    # --- Step 4: state I/O dtype ----------------------------------------
     # TRT-LLM's GDN kernels and FlashInfer both use [N, H, V, K] state layout.
     # The SM100/SM103 kernel carries the recurrent state in fp32 in TMEM
     # regardless of the initial/output-state I/O dtype (the state tensors are
     # only the gmem load/store format), so passing bf16/fp16 state there is
     # numerically identical to the fp32 round-trip while moving half the bytes.
-    # SM90/SM120 still require fp32 state. Fuse gather (+ optional cast) and
-    # contiguous into a single Triton kernel.
+    # SM90/SM120 still require fp32 state.
     state_dtype = initial_state.dtype if is_sm_100f() else torch.float32
     num_seqs = cu_seqlens.shape[0] - 1
     if state_workspace is not None:
         assert len(state_workspace) == 2
+        # Both buffers hold one group of sequences, so they share one capacity.
+        assert state_workspace[0].shape == state_workspace[1].shape
         for buffer in state_workspace:
-            assert buffer.shape[0] >= num_seqs
+            assert buffer.shape[0] >= 1
             assert buffer.shape[1:] == initial_state.shape[1:]
             assert buffer.dtype == state_dtype
             assert buffer.device == initial_state.device
-    gathered_init = gather_cast_vk_to_fp32_vk(
-        initial_state,
-        initial_state_indices,
-        out_dtype=state_dtype,
-        output=state_workspace[0][:num_seqs] if state_workspace is not None else None,
-    )
 
-    # --- Step 5+6: call FlashInfer with pre-allocated output/state buffers
     # FI 0.6.10 accepts `output=` / `output_state=`; pre-allocating skips its
     # internal `torch.empty` per call. `num_o_heads` per FI docstring is
     # max(num_q_heads, num_v_heads) — equivalently num_v_heads for GVA.
@@ -157,68 +154,111 @@ def chunk_gated_delta_rule(
         if output is not None
         else q3.new_empty(total_seq_len, num_o_heads, head_size)
     )
-    if need_state:
-        num_seqs = cu_seqlens.shape[0] - 1
-        # Match the initial-state dtype (native bf16/fp16 on SM100/SM103, else
-        # fp32); FlashInfer writes the final state in this dtype and the scatter
-        # below adapts to the destination pool dtype without an extra cast.
-        state_buf = (
-            state_workspace[1][:num_seqs]
-            if state_workspace is not None
-            else q3.new_empty(num_seqs, num_o_heads, head_size, head_size, dtype=state_dtype)
-        )
-        out_packed, out_state = flashinfer.chunk_gated_delta_rule(
-            q=q3,
-            k=k3,
-            v=v3,
-            g=g2,
-            beta=beta2,
-            scale=scale,
-            initial_state=gathered_init,
-            output_final_state=True,
-            cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=False,  # dead param in FlashInfer; we already normalized
-            output=output_buf,
-            output_state=state_buf,
-        )
-    else:
-        # FI returns a single tensor (not a tuple) when output_final_state=False.
-        out_packed = flashinfer.chunk_gated_delta_rule(
-            q=q3,
-            k=k3,
-            v=v3,
-            g=g2,
-            beta=beta2,
-            scale=scale,
-            initial_state=gathered_init,
-            output_final_state=False,
-            cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=False,
-            output=output_buf,
-        )
-        out_state = None
-
-    # --- Step 7: cast state back (if needed), scatter / return ---------
-    # Fuse cast (out_state.dtype -> destination dtype; a no-op on SM100/SM103
-    # where both are the native pool dtype) + optional indexed scatter into a
-    # single Triton pass, mirroring Step 4. The inplace branch writes only the
-    # slots named by ``initial_state_indices`` and leaves the rest untouched.
-    if inplace_indexed_state_update:
-        cast_scatter_fp32_vk_to_vk(out_state, initial_state, initial_state_indices)
-        final_to_return: Optional[torch.Tensor] = None
-    elif output_final_state:
-        num_seqs_out, num_h_out, v_out, k_out = out_state.shape
+    final_to_return: Optional[torch.Tensor] = None
+    if output_final_state and not inplace_indexed_state_update:
         final_to_return = torch.empty(
-            num_seqs_out,
-            num_h_out,
-            v_out,
-            k_out,
+            num_seqs,
+            num_o_heads,
+            head_size,
+            head_size,
             dtype=initial_state.dtype,
-            device=out_state.device,
+            device=initial_state.device,
         )
-        cast_scatter_fp32_vk_to_vk(out_state, final_to_return, None)
+
+    # A workspace smaller than the batch is used for consecutive groups of
+    # sequences. Sequences are independent, so each group gathers, runs and
+    # scatters its own states; group token ranges come from host offsets.
+    if state_workspace is None or num_seqs <= state_workspace[0].shape[0]:
+        groups = [(0, num_seqs, 0, total_seq_len)]
     else:
-        final_to_return = None
+        assert cu_seqlens_cpu is not None, (
+            "cu_seqlens_cpu is required when the batch exceeds the state workspace"
+        )
+        assert cu_seqlens_cpu.shape == cu_seqlens.shape
+        # Split evenly: as few groups as fit, without a small remainder group.
+        num_groups = -(-num_seqs // state_workspace[0].shape[0])
+        size, extra = divmod(num_seqs, num_groups)
+        bounds = [0]
+        for group in range(num_groups):
+            bounds.append(bounds[-1] + size + (group < extra))
+        offsets = cu_seqlens_cpu.tolist()
+        groups = [(lo, hi, offsets[lo], offsets[hi]) for lo, hi in zip(bounds[:-1], bounds[1:])]
+
+    for seq_lo, seq_hi, tok_lo, tok_hi in groups:
+        whole = len(groups) == 1
+        group_seqs = seq_hi - seq_lo
+        if whole:
+            group_state, group_indices = initial_state, initial_state_indices
+        elif initial_state_indices is None:
+            group_state, group_indices = initial_state[seq_lo:seq_hi], None
+        else:
+            group_state, group_indices = initial_state, initial_state_indices[seq_lo:seq_hi]
+        group_cu = cu_seqlens if whole else cu_seqlens[seq_lo : seq_hi + 1] - tok_lo
+        q_g, k_g, v_g = q3[tok_lo:tok_hi], k3[tok_lo:tok_hi], v3[tok_lo:tok_hi]
+        g_g, beta_g = g2[tok_lo:tok_hi], beta2[tok_lo:tok_hi]
+        output_g = output_buf[tok_lo:tok_hi]
+
+        # --- Step 5: gather initial state (+ cast dtype only when required)
+        # Fuse gather (+ optional cast) and contiguous into a single Triton kernel.
+        gathered_init = gather_cast_vk_to_fp32_vk(
+            group_state,
+            group_indices,
+            out_dtype=state_dtype,
+            output=state_workspace[0][:group_seqs] if state_workspace is not None else None,
+        )
+
+        # --- Step 6: call FlashInfer with pre-allocated output/state buffers
+        if need_state:
+            # Match the initial-state dtype (native bf16/fp16 on SM100/SM103, else
+            # fp32); FlashInfer writes the final state in this dtype and the scatter
+            # below adapts to the destination pool dtype without an extra cast.
+            state_buf = (
+                state_workspace[1][:group_seqs]
+                if state_workspace is not None
+                else q3.new_empty(group_seqs, num_o_heads, head_size, head_size, dtype=state_dtype)
+            )
+            _, out_state = flashinfer.chunk_gated_delta_rule(
+                q=q_g,
+                k=k_g,
+                v=v_g,
+                g=g_g,
+                beta=beta_g,
+                scale=scale,
+                initial_state=gathered_init,
+                output_final_state=True,
+                cu_seqlens=group_cu,
+                use_qk_l2norm_in_kernel=False,  # dead param in FlashInfer; we already normalized
+                output=output_g,
+                output_state=state_buf,
+            )
+        else:
+            # FI returns a single tensor (not a tuple) when output_final_state=False.
+            flashinfer.chunk_gated_delta_rule(
+                q=q_g,
+                k=k_g,
+                v=v_g,
+                g=g_g,
+                beta=beta_g,
+                scale=scale,
+                initial_state=gathered_init,
+                output_final_state=False,
+                cu_seqlens=group_cu,
+                use_qk_l2norm_in_kernel=False,
+                output=output_g,
+            )
+            out_state = None
+
+        # --- Step 7: cast state back (if needed), scatter / return -----
+        # Fuse cast (out_state.dtype -> destination dtype; a no-op on SM100/SM103
+        # where both are the native pool dtype) + optional indexed scatter into a
+        # single Triton pass, mirroring Step 5. The inplace branch writes only the
+        # slots named by ``initial_state_indices`` and leaves the rest untouched.
+        if inplace_indexed_state_update:
+            cast_scatter_fp32_vk_to_vk(out_state, group_state, group_indices)
+        elif output_final_state:
+            cast_scatter_fp32_vk_to_vk(out_state, final_to_return[seq_lo:seq_hi], None)
+
+    out_packed = output_buf
 
     # --- Step 8: restore output layout ----------------------------------
     out = out_packed.unsqueeze(0)
