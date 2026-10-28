@@ -900,12 +900,15 @@ def build_minimax_dspark_draft_config(
     })
     dflash = dict(flat.get("dflash_config") or {})
     layer_types = dflash.get("layer_types") or flat.get("layer_types") or []
-    if layer_types:
-        # DFlash and get_layer_attention_window read the per-layer types from
-        # the top level; a list the checkpoint keeps only in dflash_config
-        # would otherwise window every draft layer.
-        flat.setdefault("layer_types", list(layer_types))
     sliding_window = dflash.get("sliding_window") or flat.get("sliding_window")
+    # DFlash and get_layer_attention_window read the per-layer types and the
+    # window size from the top level; values the checkpoint keeps only in
+    # dflash_config would otherwise window every draft layer, or window the
+    # block decode and not the context.
+    if layer_types:
+        flat.setdefault("layer_types", list(layer_types))
+    if sliding_window:
+        flat.setdefault("sliding_window", int(sliding_window))
     if flat.get("use_sliding_window") is False:
         dflash["use_swa"] = False
         dflash.pop("swa_window_size", None)

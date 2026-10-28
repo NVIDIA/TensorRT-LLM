@@ -161,17 +161,22 @@ def test_flattened_config_honors_an_explicit_sliding_window_disable(
     assert "swa_window_size" not in cfg.dflash_config
 
 
-def test_flattened_config_lifts_nested_layer_types_to_the_top_level() -> None:
-    """DFlash resolves per-layer windows from the top-level ``layer_types``; a
-    list the checkpoint keeps only in ``dflash_config`` must surface there."""
+def test_flattened_config_lifts_nested_window_fields_to_the_top_level() -> None:
+    """DFlash and ``get_layer_attention_window`` resolve the per-layer windows
+    from the top-level ``layer_types`` and ``sliding_window``; values the
+    checkpoint keeps only in ``dflash_config`` must surface there."""
     config = json.loads(json.dumps(_CONFIG))
-    config["text_config"].pop("layer_types", None)
-    config.pop("layer_types", None)
+    for key in ("layer_types", "sliding_window"):
+        config["text_config"].pop(key, None)
+        config.pop(key, None)
     mixed = ["sliding_attention", "full_attention"] * 2 + ["sliding_attention"]
     config["text_config"]["dflash_config"]["layer_types"] = list(mixed)
+    config["text_config"]["dflash_config"]["sliding_window"] = 2048
     cfg = build_minimax_dspark_draft_config(config)
     assert cfg.layer_types == mixed
+    assert cfg.sliding_window == 2048
     assert cfg.dflash_config["use_swa"] is True
+    assert cfg.dflash_config["swa_window_size"] == 2048
     assert cfg.dflash_config["layer_types"] == mixed
 
 
