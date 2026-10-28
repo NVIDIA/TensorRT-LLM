@@ -548,6 +548,10 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         "ipc_nvls_allocate", nb::overload_cast<size_t, std::set<int>>(&tr::ipcNvlsAllocate), nb::rv_policy::reference);
     m.def("ipc_nvls_free", &tr::ipcNvlsFree);
     m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
+    m.def("set_nccl_env_defaults", &tr::setNcclEnvDefaults,
+        "Set TRTLLM's NCCL environment defaults, keeping any value that is already set. Call it before the "
+        "first NCCL communicator of the process is created.\n It caches default value computation, "
+        "so OK to call it a second time with no perf impact.");
 
     m.def("steady_clock_now", []() { return std::chrono::steady_clock::now(); });
     // Global (offset-normalized) steady clock, matching what
