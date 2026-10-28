@@ -1485,6 +1485,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             elif self._config.model_name == "minimax_m3_fp4":
                 # Cold MSA JIT compilation can exceed the default 10 minutes.
                 server_timeout = 1800
+            elif self._config.model_name == "glm_5.3_fp8":
+                # Allow time for checkpoint loading and cold executor warmup.
+                server_timeout = 1800
             else:
                 server_timeout = 600
             return PerfServeScriptTestCmds(server_cmd=server_cmd,
