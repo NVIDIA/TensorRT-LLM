@@ -47,6 +47,7 @@ def _compiler_disable(fn: _OpT) -> _OpT:
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer.sampling
+    import flashinfer.topk
 else:
 
     class _FlashInferUnavailable:
@@ -396,6 +397,26 @@ def warmup_sampling_module() -> None:
     except Exception as e:  # noqa: BLE001
         logger.warning(
             "flashinfer sampling module prewarm failed; it will be built "
+            f"lazily on first use. {type(e).__name__}: {e}"
+        )
+
+
+@_compiler_disable
+def warmup_topk_module() -> None:
+    """Build flashinfer's top-k kernels now instead of on the first beam step.
+
+    Since flashinfer 0.7.2 the topk module also compiles CUB's batched top-k,
+    which takes several minutes from a cold cache; built lazily from
+    ``radix_topk_op`` it stalls the rank past the hang detector's threshold.
+    Same best-effort contract as ``warmup_sampling_module``.
+    """
+    if not IS_FLASHINFER_AVAILABLE:
+        return
+    try:
+        flashinfer.topk.get_topk_module()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "flashinfer topk module prewarm failed; it will be built "
             f"lazily on first use. {type(e).__name__}: {e}"
         )
 
