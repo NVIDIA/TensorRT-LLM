@@ -15,9 +15,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/kernels/glmMoeDsa/glmDraftSampleGlue.h"
-#include "tensorrt_llm/runtime/mcastDeviceMemory.h"
+#include "tensorrt_llm/runtime/mcastGPUBuffer.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -47,8 +46,11 @@ int64_t setDraftStepExchange(tk::DraftSampleGlueParams& params, char const* op, 
     at::Tensor& exchange_buffer, at::Tensor& exchange_flags, int64_t group_size, at::Tensor& draft_tokens,
     int64_t draft_step, int64_t slotBytes)
 {
-    auto* mcastMem = tensorrt_llm::common::findMcastDevMemBuffer(exchange_buffer.data_ptr());
+    auto mcastMem = tensorrt_llm::runtime::getMcastDevMemBuffer(exchange_buffer);
     TORCH_CHECK(mcastMem != nullptr, op, ": exchange_buffer must come from a McastGPUBuffer");
+    TORCH_CHECK(mcastMem->isMapped(), op, ": the MNNVL workspace handles are not attached");
+    TORCH_CHECK(exchange_buffer.data_ptr() == mcastMem->getUnicastPtr(mcastMem->getRank()), op,
+        ": exchange_buffer must start at the local unicast allocation base");
     TORCH_CHECK(static_cast<int64_t>(mcastMem->getWorldSize()) == group_size, op, ": group_size ", group_size,
         " does not match the workspace group of ", mcastMem->getWorldSize(), " ranks");
     TORCH_CHECK(exchange_flags.element_size() == 4 && exchange_flags.numel() >= 9, op,

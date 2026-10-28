@@ -15,9 +15,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/kernels/glmMoeDsa/glmMnnvlHop.h"
-#include "tensorrt_llm/runtime/mcastDeviceMemory.h"
+#include "tensorrt_llm/runtime/mcastGPUBuffer.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -62,12 +61,14 @@ void checkRowsAndGamma(at::Tensor const& residual, at::Tensor const& gamma, char
 
 // The MNNVL all-reduce workspace that comm_buffer views ([3, N]: this rank's three Lamport buffers) for a hop of the
 // rows of residual: the shape must be one the hops serve and its Lamport data must fit one buffer.
-tensorrt_llm::runtime::McastDeviceMemory* hopWorkspace(
+tensorrt_llm::runtime::DeviceMemoryOwner hopWorkspace(
     at::Tensor const& comm_buffer, at::Tensor const& buffer_flags, at::Tensor const& residual, char const* op)
 {
-    auto* mcastMem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    auto mcastMem = tensorrt_llm::runtime::getMcastDevMemBuffer(comm_buffer);
     TORCH_CHECK(mcastMem != nullptr, op, ": comm_buffer must be obtained from a McastGPUBuffer instance");
     TORCH_CHECK(mcastMem->isMapped(), op, ": the MNNVL workspace handles are not attached");
+    TORCH_CHECK(comm_buffer.data_ptr() == mcastMem->getUnicastPtr(mcastMem->getRank()), op,
+        ": comm_buffer must start at the local unicast allocation base");
     TORCH_CHECK(comm_buffer.dim() == 2 && comm_buffer.size(0) == 3 && comm_buffer.is_contiguous(), op,
         ": comm_buffer must be the [3, N] view of the workspace's three Lamport buffers");
     TORCH_CHECK(buffer_flags.element_size() == 4 && buffer_flags.numel() >= 9 && buffer_flags.is_contiguous(), op,
@@ -87,7 +88,7 @@ tensorrt_llm::runtime::McastDeviceMemory* hopWorkspace(
     return mcastMem;
 }
 
-glm::MnnvlHopParams makeHopParams(tensorrt_llm::runtime::McastDeviceMemory* mcastMem, at::Tensor& buffer_flags,
+glm::MnnvlHopParams makeHopParams(tensorrt_llm::runtime::DeviceMemoryOwner const& mcastMem, at::Tensor& buffer_flags,
     at::Tensor const& residual, at::Tensor const& gamma, double epsilon, at::Tensor& normOut, at::Tensor& residualOut)
 {
     glm::MnnvlHopParams params{};
@@ -132,7 +133,7 @@ std::vector<at::Tensor> glmMnnvlHop(at::Tensor const& input, at::Tensor const& r
     {
         return {normOut, residualOut};
     }
-    auto* mcastMem = hopWorkspace(comm_buffer, buffer_flags, residual, op);
+    auto mcastMem = hopWorkspace(comm_buffer, buffer_flags, residual, op);
     auto params = makeHopParams(mcastMem, buffer_flags, residual, gamma, epsilon, normOut, residualOut);
     params.input = shard_published ? nullptr : input.const_data_ptr();
     params.shardPublished = shard_published;
@@ -175,7 +176,7 @@ std::vector<at::Tensor> glmMnnvlMoeFinalizeHop(at::Tensor const& gemm2_output, a
     {
         return {normOut, residualOut};
     }
-    auto* mcastMem = hopWorkspace(comm_buffer, buffer_flags, residual, op);
+    auto mcastMem = hopWorkspace(comm_buffer, buffer_flags, residual, op);
     auto const params = makeHopParams(mcastMem, buffer_flags, residual, gamma, epsilon, normOut, residualOut);
     glm::MnnvlMoeFinalizeParams moe{};
     moe.fc2Output = gemm2_output.const_data_ptr();
