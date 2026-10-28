@@ -12,14 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fail-fast + log-tail-dump behavior of wait_for_endpoint_ready (no GPU, no server)."""
+"""Fail-fast behavior for HTTP endpoint wait helpers without GPUs."""
 
+import errno
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import requests
 from test_common.error_utils import check_error, report_error
-from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
+from test_common.http_utils import (
+    fail_if_proc_died,
+    wait_for_endpoint_down,
+    wait_for_endpoint_ready,
+)
 
 # The CPU-Generic CI stages select tests with `-m cpu_only`; without this
 # marker every test here is deselected and pytest exits with code 5.
@@ -74,6 +81,63 @@ def test_ready_timeout_dumps_log_tail(tmp_path):
     msg = str(e.value)
     assert "did not become ready within" in msg
     assert "clean init so far" in msg
+
+
+def test_endpoint_down_wait_retries_a_read_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    clock = SimpleNamespace(now=0.0)
+
+    def monotonic() -> float:
+        return clock.now
+
+    def sleep(seconds: float) -> None:
+        clock.now += seconds
+
+    def get(url: str, timeout: float) -> SimpleNamespace:
+        calls.append(timeout)
+        raise requests.ReadTimeout("server is still responding")
+
+    monkeypatch.setattr("test_common.http_utils.requests.get", get)
+    monkeypatch.setattr(
+        "test_common.http_utils.time",
+        SimpleNamespace(monotonic=monotonic, sleep=sleep),
+    )
+    with pytest.raises(RuntimeError, match="did not become down"):
+        wait_for_endpoint_down("http://127.0.0.1:8000/health", timeout=0.02)
+
+    assert len(calls) == 1
+    assert all(0 < timeout <= 0.02 for timeout in calls)
+
+
+def test_endpoint_down_wait_makes_one_request_per_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    clock = SimpleNamespace(now=0.0)
+
+    def monotonic() -> float:
+        return clock.now
+
+    def sleep(seconds: float) -> None:
+        clock.now += seconds
+
+    def get(url: str, timeout: float) -> SimpleNamespace:
+        calls.append(timeout)
+        if len(calls) == 1:
+            return SimpleNamespace(status_code=503)
+        raise requests.ConnectionError(OSError(errno.ECONNREFUSED, "Connection refused"))
+
+    monkeypatch.setattr("test_common.http_utils.requests.get", get)
+    monkeypatch.setattr(
+        "test_common.http_utils.time",
+        SimpleNamespace(monotonic=monotonic, sleep=sleep),
+    )
+    wait_for_endpoint_down("http://127.0.0.1:8000/health", timeout=2)
+
+    assert len(calls) == 2
+    assert all(0 < timeout <= 2 for timeout in calls)
+
+
+def test_endpoint_down_wait_recognizes_real_connection_refused() -> None:
+    wait_for_endpoint_down(DEAD_URL, timeout=2)
 
 
 def test_missing_check_file_does_not_crash_the_wait(tmp_path):
