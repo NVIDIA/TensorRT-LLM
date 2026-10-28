@@ -818,6 +818,7 @@ class PageIndexConverter:
     scale: int
     expansion: int
     layer_offset: int
+    scratch_pages_per_block: int
 
     def __call__(
         self,

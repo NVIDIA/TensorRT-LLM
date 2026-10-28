@@ -73,10 +73,18 @@ std::vector<int> PageIndexConverter::operator()(
             // Scratch block: slot IDs come from ScratchDesc, not base_indices.
             int blockPos = ordinal - scratch->range.beg;
             int totalOffset = blockPos * scratchPages;
+            bool const crossesSlots = scale % scratchPages != 0;
+            if (crossesSlots)
+            {
+                // Unequal layer shares can put a block across two slots. Pack
+                // the layer's consecutive roles before resolving the slot ID,
+                // so a trailing role cannot wrap over an earlier block's data.
+                totalOffset += appliedLayerOffset % scratchPages;
+            }
             int slotIdx = totalOffset / scale;
             int slotId = scratch->slotIds[static_cast<size_t>(slotIdx)];
             int offset = totalOffset % scale;
-            index = slotId * scale + (offset + appliedLayerOffset) % scale;
+            index = slotId * scale + (crossesSlots ? offset : (offset + appliedLayerOffset) % scale);
         }
         else if (baseIndices[toSizeT(ordinal)] == kBadPageIndex.value())
         {
@@ -490,9 +498,19 @@ TypedVec<LayerGroupId, std::vector<LayerId>> KvCacheManager::layerGrouping() con
 TypedVec<LayerGroupId, std::vector<BufferId>> KvCacheManager::bufferGrouping() const
 {
     TypedVec<LayerGroupId, std::vector<BufferId>> result(mLifeCycles.size());
+    std::unordered_map<LayerId, std::vector<BufferId>> buffersByLayer;
     for (auto const& buffer : allBufferIds())
     {
-        result.at(getBufferGroupId(buffer.layerId, buffer.role)).push_back(buffer);
+        buffersByLayer[buffer.layerId].push_back(buffer);
+    }
+    // Keep layer order consistent with layerGrouping() for consumers that pair
+    // group membership with a declared list of global model layer IDs.
+    for (auto const& [layer, lifeCycles] : mStorage->layerToLifeCycleIds())
+    {
+        for (auto const& buffer : buffersByLayer.at(layer))
+        {
+            result.at(getBufferGroupId(buffer.layerId, buffer.role)).push_back(buffer);
+        }
     }
     return result;
 }

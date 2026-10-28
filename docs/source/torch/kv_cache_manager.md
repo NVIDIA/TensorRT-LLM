@@ -97,7 +97,8 @@ layer = SsmLayerConfig(
 
 REQUIRED buffers constrain the reusable prefix. OPTIONAL buffers are candidates
 at that endpoint; select their group IDs through `resume(optional_reuse_groups=...)`
-on the first resume. An SSM snapshot must match the endpoint exactly. PRIVATE
+on the first resume. Attention candidates retain the block-aligned sliding-window
+checkpoint contract; an SSM snapshot must match the endpoint exactly. PRIVATE
 buffers remain request-local and are never published as reusable checkpoints.
 The consumer must initialize or reconstruct private and unselected optional state
 before inference. Unselected optional snapshots count as neither hits nor misses.
@@ -122,3 +123,9 @@ one page table. Current Mamba kernels similarly couple recurrent, convolution,
 PLE and replay buffers through one state-slot index. These consumers reject
 incompatible policies explicitly; this native configuration does not enable
 separate replay indices in those kernels or add an LLM API configuration field.
+
+The native page-index converter also supports unequal layer shares in scratch
+slots, including a layer's block crossing two physical slots. Existing attention
+scratch-table kernels require whole layer blocks per slot. The wrapper rejects
+unequal shares that require crossing slots; use separate `coalescing_group` values
+or disable SWA scratch reuse for those layouts.

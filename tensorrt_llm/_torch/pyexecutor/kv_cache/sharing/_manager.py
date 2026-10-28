@@ -167,7 +167,8 @@ def layer_configs(manager: KVCacheManagerV2) -> dict[int, object]:
 def layer_group_layer_ids(manager: KVCacheManagerV2) -> list[list[int]]:
     """Internal layer ids per runtime layer group, in layer-group order."""
     return [
-        sorted({int(buffer.layer_id) for buffer in group}) for group in manager.impl.buffer_grouping
+        list(dict.fromkeys(int(buffer.layer_id) for buffer in group))
+        for group in manager.impl.buffer_grouping
     ]
 
 
