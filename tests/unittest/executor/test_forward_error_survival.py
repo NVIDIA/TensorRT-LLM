@@ -76,7 +76,7 @@ def _scheduled_batch():
     return batch
 
 
-def _loop_executor(monkeypatch):
+def _loop_executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     """Executor shell whose one scheduled batch fails its forward.
 
     The first iteration schedules a batch whose forward returns None; the
@@ -130,6 +130,7 @@ def _loop_executor(monkeypatch):
     batches = iter([(_scheduled_batch(), None), (None, None)])
     executor._prepare_and_schedule_batch = lambda: next(batches)
     executor._can_queue = Mock(return_value=(True, True))
+    executor._kv_connector_start_batch = Mock(return_value=(True, True))
     executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
     executor._forward_step = Mock(return_value=None)
     for name in (
@@ -137,7 +138,6 @@ def _loop_executor(monkeypatch):
         "_pause_requests",
         "_prepare_disagg_gen_transmission_complete",
         "_handle_dynamic_draft_len",
-        "_kv_connector_start_batch",
         "_kv_connector_terminate_requests",
         "_finalize_adp_dummy_allocation",
         "_commit_kv_cache_stats",

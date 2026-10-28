@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 from strenum import StrEnum
@@ -35,6 +35,9 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
+if TYPE_CHECKING:
+    from tensorrt_llm.executor.ipc import IpcQueue
+
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
@@ -56,7 +59,7 @@ from .engine.runners.decoder.inputs import uses_full_generation_page_table
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from .model_engine import PyTorchModelEngine
+from .model_engine import ModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
@@ -438,7 +441,7 @@ def create_encoder_executor(
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
     dist = Distributed.get(mapping)
 
-    model_engine = PyTorchModelEngine(
+    model_engine = ModelEngine(
         model_path=checkpoint_dir,
         llm_args=llm_args,
         mapping=mapping,
@@ -469,8 +472,7 @@ def log_memory_usage(stage: str):
 
 
 def _move_model_engine_metrics(py_executor: PyExecutor,
-                               model_engine: PyTorchModelEngine,
-                               stage: str) -> None:
+                               model_engine: ModelEngine, stage: str) -> None:
     """Move model-engine metrics into the executor under a startup stage."""
     py_executor.metrics[f"{stage}_model_engine"] = dict(model_engine.metrics)
     model_engine.metrics.clear()
@@ -482,7 +484,7 @@ def _create_py_executor_impl(
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
-    resource_governor_queue=None,
+    resource_governor_queue: "Optional[IpcQueue]" = None,
 ) -> PyExecutor:
     """Create and initialize a PyExecutor instance from the given LLM arguments.
 
@@ -800,7 +802,7 @@ def _create_py_executor(
             model_weights_restore_mode = sleep_config.restore_modes[
                 ExecutorMemoryType.MODEL_WEIGHTS_MAIN]
 
-        model_engine = PyTorchModelEngine(
+        model_engine = ModelEngine(
             model_path=checkpoint_dir,
             llm_args=llm_args,
             mapping=mapping,
@@ -826,7 +828,7 @@ def _create_py_executor(
                     dist=dist)
     calibrator.maybe_wrap_model(model_engine.model)
 
-    # PyTorchModelEngine modifies these fields, update them
+    # ModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len
     if not llm_args.disable_overlap_scheduler and spec_config is not None:
@@ -1041,10 +1043,10 @@ def _create_py_executor(
                 "that implements the per-layer-group APIs, or use a single attention window."
             )
 
-        if mapping.enable_attention_dp:
+        if mapping.enable_attention_dp and v2_selection is False:
             raise NotImplementedError(
-                "KV connector is not supported with attention data parallelism (enable_attention_dp=True)."
-            )
+                "KV connector attention data parallelism requires KVCacheManagerV2. "
+                "Set kv_cache_config.use_kv_cache_manager_v2=True.")
 
         try:
             module = importlib.import_module(
@@ -1054,6 +1056,13 @@ def _create_py_executor(
             scheduler_cls = getattr(
                 module, kv_connector_config.connector_scheduler_class)
 
+            if mapping.enable_attention_dp:
+                KvCacheConnectorManager.validate_attention_dp(
+                    worker_cls,
+                    scheduler_cls,
+                    pp_size=mapping.pp_size,
+                    cp_size=mapping.cp_size)
+
             rank = tensorrt_llm.mpi_rank()
             # Some connector API implementations may need to establish out-of-band communication between the scheduler and workers.
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
@@ -1061,7 +1070,8 @@ def _create_py_executor(
             with ThreadPoolExecutor(max_workers=2) as executor:
                 connector_worker_task = executor.submit(worker_cls, llm_args)
 
-                if scheduler_cls is not None and rank == 0:
+                if scheduler_cls is not None and (rank == 0 or
+                                                  mapping.enable_attention_dp):
                     connector_scheduler_task = executor.submit(
                         scheduler_cls, llm_args)
                     connector_scheduler = connector_scheduler_task.result()
@@ -1077,7 +1087,9 @@ def _create_py_executor(
                     forward_pass_callable)
 
             kv_connector_manager = KvCacheConnectorManager(
-                connector_worker, connector_scheduler)
+                connector_worker,
+                connector_scheduler,
+                enable_attention_dp=mapping.enable_attention_dp)
 
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")
