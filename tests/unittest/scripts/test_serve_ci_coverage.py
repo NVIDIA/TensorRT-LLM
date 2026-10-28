@@ -318,30 +318,30 @@ def _cli_repo(tmp_path: Path, break_codeowners: bool = False) -> Path:
     return tmp_path
 
 
-def test_cli_exit_codes_and_check_selection(mod, tmp_path, capsys):
+def test_cli_exit_codes_and_check_selection(mod, tmp_path, capfd):
     repo = _cli_repo(tmp_path / "clean")
     args = ["--repo-root", str(repo), "--data", str(repo / "data.yml")]
     assert mod.main(args) == 0
-    assert "serve CI coverage: 3 checks passed" in capsys.readouterr().out
+    assert "serve CI coverage: 3 checks passed" in capfd.readouterr().out
 
     broken = _cli_repo(tmp_path / "broken", break_codeowners=True)
     args = ["--repo-root", str(broken), "--data", str(broken / "data.yml")]
     assert mod.main(args) == 1
-    assert "matches no file" in capsys.readouterr().out
+    assert "matches no file" in capfd.readouterr().out
     # --checks selects subsets: the broken check is not selected, so the run passes.
     assert mod.main(args + ["--checks", "multigpu,visual_gen"]) == 0
-    assert "serve CI coverage: 2 checks passed" in capsys.readouterr().out
+    assert "serve CI coverage: 2 checks passed" in capfd.readouterr().out
     assert mod.main(args + ["--checks", "codeowners"]) == 1
-    capsys.readouterr()
+    capfd.readouterr()
 
 
-def test_cli_rejects_unknown_check_and_invalid_data(mod, tmp_path, capsys):
+def test_cli_rejects_unknown_check_and_invalid_data(mod, tmp_path, capfd):
     repo = _cli_repo(tmp_path)
     args = ["--repo-root", str(repo), "--data", str(repo / "data.yml")]
     with pytest.raises(SystemExit):
         mod.main(args + ["--checks", "nonsense"])
-    capsys.readouterr()
+    capfd.readouterr()
     _write(repo, "bad.yml", "version: 2\n")
     assert mod.main(["--repo-root", str(repo), "--data", str(repo / "bad.yml")]) == 1
-    out = capsys.readouterr().out
+    out = capfd.readouterr().out
     assert "cannot parse" in out and "`version` must be 1" in out
