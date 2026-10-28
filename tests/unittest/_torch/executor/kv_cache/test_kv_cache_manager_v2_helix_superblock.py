@@ -429,6 +429,16 @@ def test_resize_context_rejects_disagg_helix_request(prompt_len: int) -> None:
         )
 
 
+def test_resize_context_allows_disagg_helix_dummy_request() -> None:
+    resizes = []
+    req = _context_req(prompt_len=200, total_input_len_cp=200)
+    req.is_dummy_request = True
+    assert KVCacheManagerV2.resize_context(
+        _context_resize_mgr(is_disagg=True, resizes=resizes), req, num_tokens=32
+    )
+    assert resizes == [64 + 32]
+
+
 def test_dummy_frozen_fields_sum_invariant() -> None:
     """The frozen dummy fiction (last rank active, shared synthetic global
     length) keeps the same books as real requests: per-rank lengths sum to

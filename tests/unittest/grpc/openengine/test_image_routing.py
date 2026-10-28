@@ -10,6 +10,7 @@ import pytest
 from PIL import Image
 
 from tensorrt_llm._torch.pyexecutor import kv_cache_events as events
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.inputs.multimodal import apply_mm_hashes
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 
@@ -71,3 +72,69 @@ def test_streaming_image_hints_are_bounded_and_content_sensitive(monkeypatch, uu
     finally:
         source._event_sink = native_sink
         manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "hashes,uuids,error",
+    [
+        ([tuple(range(8)), tuple(range(8, 16))], ["image-a"], "shorter"),
+        ([tuple(range(8))], ["image-a", "image-b"], "longer"),
+        ([tuple(range(8)), (1, 2, 3)], ["image-a", "image-b"], "Expected 8 int32"),
+    ],
+)
+def test_invalid_request_uuid_pairs_leave_routing_hints_unchanged(hashes, uuids, error):
+    event_manager = events.StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+        max_entries=1,
+        mm_token_id_offset=1000,
+    )
+    try:
+        event_manager.remember_multimodal_uuids([(b"x" * 32, "existing")])
+        before = event_manager._event_source._uuids.copy()
+        manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+        manager.vocab_size = 1000
+        manager.event_manager = event_manager
+        request = SimpleNamespace(
+            multimodal_hashes=hashes,
+            multimodal_uuids=uuids,
+            multimodal_positions=[0] * len(hashes),
+            multimodal_lengths=[1] * len(hashes),
+        )
+        with pytest.raises(ValueError, match=error):
+            manager._augment_tokens_for_block_reuse([1, 2], request)
+        assert event_manager._event_source._uuids == before
+    finally:
+        event_manager.shutdown()
+
+
+def test_request_uuid_pairs_preserve_partial_uuid_slots():
+    hashes = [tuple(range(8)), tuple(range(8, 16))]
+    event_manager = events.StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+        max_entries=1,
+        mm_token_id_offset=1000,
+    )
+    try:
+        manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+        manager.vocab_size = 1000
+        manager.event_manager = event_manager
+        request = SimpleNamespace(
+            multimodal_hashes=hashes,
+            multimodal_uuids=["image-a", None],
+            multimodal_positions=[0, 1],
+            multimodal_lengths=[1, 1],
+            multimodal_item_run_cu_offsets=None,
+            multimodal_run_positions=None,
+            multimodal_run_lengths=None,
+        )
+        manager._augment_tokens_for_block_reuse([1, 2], request)
+        digest = b"".join(value.to_bytes(4, "big", signed=True) for value in hashes[0])
+        assert dict(event_manager._event_source._uuids) == {digest: "image-a"}
+    finally:
+        event_manager.shutdown()

@@ -36,18 +36,33 @@ MODEL = "test-model"
 
 @pytest.mark.parametrize("model_type", ["qwen3_vl", "qwen2_vl", "text"])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_image_routing_capability_requires_streaming_v2_and_validated_model(model_type, enabled):
+@pytest.mark.parametrize(
+    "block_reuse,events_enabled,publisher",
+    [(True, True, "zmq"), (False, True, "zmq"), (True, False, "zmq"), (True, True, "null")],
+)
+def test_image_routing_capability_requires_streaming_v2_and_validated_model(
+    model_type, enabled, block_reuse, events_enabled, publisher
+):
     llm = SimpleNamespace(
         input_processor=SimpleNamespace(config=SimpleNamespace(model_type=model_type)),
         args=SimpleNamespace(
             kv_cache_config=SimpleNamespace(
                 use_kv_cache_manager_v2=enabled,
-                enable_block_reuse=True,
-                kv_events_config=SimpleNamespace(enable_kv_cache_events=True, publisher="zmq"),
+                enable_block_reuse=block_reuse,
+                kv_events_config=SimpleNamespace(
+                    enable_kv_cache_events=events_enabled, publisher=publisher
+                ),
             )
         ),
     )
-    assert supports_image_routing(llm, {"image"}) is (enabled and model_type == "qwen3_vl")
+    expected = (
+        enabled
+        and model_type == "qwen3_vl"
+        and block_reuse
+        and events_enabled
+        and publisher == "zmq"
+    )
+    assert supports_image_routing(llm, {"image"}) is expected
     assert not supports_image_routing(llm, set())
     llm.args.cache_transceiver_config = object()
     assert not supports_image_routing(llm, {"image"})
@@ -209,6 +224,34 @@ async def test_model_info_advertises_loaded_image_support(monkeypatch):
 
     assert info.supports_multimodal is True
     assert list(info.extra["trtllm_supported_modalities"]) == ["image"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("events_enabled", [False, True])
+async def test_model_info_advertises_image_routing_only_with_events(monkeypatch, events_enabled):
+    llm = _llm(
+        kv_cache_config=SimpleNamespace(
+            use_kv_cache_manager_v2=True,
+            enable_block_reuse=True,
+            tokens_per_block=32,
+            kv_events_config=SimpleNamespace(
+                enable_kv_cache_events=events_enabled, publisher="zmq"
+            ),
+        )
+    )
+    llm.input_processor = SimpleNamespace(config=SimpleNamespace(model_type="qwen3_vl"))
+    inference = OpenEngineInferenceServicer(llm, MODEL)
+    monkeypatch.setattr(
+        inference, "_media_capabilities", MediaCapabilities({"image": "<image_{}>"})
+    )
+    info = await OpenEngineControlServicer(llm, MODEL, inference).GetModelInfo(
+        model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
+    )
+    assert info.supports_multimodal
+    if events_enabled:
+        assert info.extra["trtllm_image_routing_version"] == 1
+    else:
+        assert "trtllm_image_routing_version" not in info.extra
 
 
 @pytest.mark.asyncio

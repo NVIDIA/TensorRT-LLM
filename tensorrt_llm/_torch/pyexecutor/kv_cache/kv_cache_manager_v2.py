@@ -6045,11 +6045,12 @@ class KVCacheManagerV2(BaseResourceManager):
         if isinstance(self.event_manager, StreamingKVCacheEventManager):
             uuids = req.multimodal_uuids
             if uuids is not None:
-                self.event_manager.remember_multimodal_uuids(
+                uuid_pairs = [
                     (_hash_to_digest(digest), uuid)
                     for digest, uuid in zip(req.multimodal_hashes, uuids, strict=True)
                     if uuid is not None
-                )
+                ]
+                self.event_manager.remember_multimodal_uuids(uuid_pairs)
 
         # Multimodal path: materialize a Python-int list (digest bytes get spliced in below),
         # which flows through the per-element binding fallback. tokens may be a zero-copy numpy
