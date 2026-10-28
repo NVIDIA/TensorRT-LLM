@@ -37,9 +37,10 @@ import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.arch import Arch
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
-from cutlass.cutlass_dsl import BaseDSL
+from cutlass.cutlass_dsl import BaseDSL, Int32, T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 try:
@@ -66,6 +67,73 @@ added here.
 """
 
 LOG2_E = 1.4426950408889634074
+
+
+@dsl_user_op
+def _store_global_b64(gmem_ptr, value_lo: Int32, value_hi: Int32, *, loc=None, ip=None) -> None:
+    gmem_addr = gmem_ptr.toint(loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [
+            gmem_addr.ir_value(loc=loc, ip=ip),
+            Int32(value_lo).ir_value(loc=loc, ip=ip),
+            Int32(value_hi).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n  .reg .b64 packed;\n  mov.b64 packed, {$1, $2};\n  st.global.u64 [$0], packed;\n}",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _load_shared_b32(smem_ptr, *, loc=None, ip=None) -> Int32:
+    smem_addr = smem_ptr.toint(loc=loc, ip=ip)
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [smem_addr.ir_value(loc=loc, ip=ip)],
+            "ld.shared.b32 $0, [$1];",
+            "=r,r",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _store_shared_b128(
+    smem_ptr,
+    value0: Int32,
+    value1: Int32,
+    value2: Int32,
+    value3: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    smem_addr = smem_ptr.toint(loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [
+            smem_addr.ir_value(loc=loc, ip=ip),
+            Int32(value0).ir_value(loc=loc, ip=ip),
+            Int32(value1).ir_value(loc=loc, ip=ip),
+            Int32(value2).ir_value(loc=loc, ip=ip),
+            Int32(value3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 class DSparkAttentionKernel:
@@ -222,6 +290,7 @@ class DSparkAttentionKernel:
         c_latent_draft: cute.Tensor,
         page_table_win: cute.Tensor,
         o: cute.Tensor,
+        o_scale: Optional[cute.Tensor],
         cache_seqs: Optional[cute.Tensor],
         window_valid_lens: Optional[cute.Tensor],
         capacities: cute.Tensor,
@@ -244,7 +313,7 @@ class DSparkAttentionKernel:
         self.q_dtype = q_latent.element_type
         self.k_dtype = c_latent_draft.element_type
         self.v_dtype = c_latent_draft.element_type
-        self.o_dtype = o.element_type
+        self.o_dtype = cutlass.BFloat16
 
         # check type consistency
         if cutlass.const_expr(
@@ -260,8 +329,18 @@ class DSparkAttentionKernel:
             raise ValueError("c_latent_draft must have leading dimension 1")
         if cutlass.const_expr(c_latent_win.stride[1] != 1):
             raise ValueError("c_latent_win must have leading dimension 1")
-        if cutlass.const_expr(o.stride[1] != 1):
-            raise ValueError("o must have leading dimension 1")
+        if cutlass.const_expr(self.output_groups is None):
+            if cutlass.const_expr(o.element_type is not cutlass.BFloat16 or o.stride[1] != 1):
+                raise ValueError("o must be leading-dimension-1 BF16")
+        else:
+            if cutlass.const_expr(
+                o.element_type is not cutlass.Float8E4M3FN
+                or o_scale is None
+                or o_scale.element_type is not cutlass.Float32
+                or o.stride[2] != 1
+                or o_scale.stride[2] != 1
+            ):
+                raise ValueError("quantized o must be contiguous FP8 with contiguous FP32 scales")
 
         c_latent_draft_transpose_layout = cute.select(c_latent_draft.layout, mode=[1, 0, 2])
         c_latent_draft_transpose = cute.make_tensor(
@@ -453,7 +532,7 @@ class DSparkAttentionKernel:
         self.tma_copy_kc_bytes = kc_copy_size
 
         tile_sched_params, grid = self._compute_grid(
-            o, self.cluster_shape_mnk, self.max_active_clusters
+            q_latent, self.cluster_shape_mnk, self.max_active_clusters
         )
 
         @cute.struct
@@ -477,6 +556,17 @@ class DSparkAttentionKernel:
             ]
             epilogue_smem_exchange: cute.struct.MemRange[
                 self.acc_dtype, self.num_compute_warps * self.threads_per_warp
+            ]
+            fp8_epilogue_scratch: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Int32,
+                    (
+                        self.num_compute_warps * self.threads_per_warp * 32
+                        if self.output_groups is not None
+                        else 1
+                    ),
+                ],
+                128,
             ]
             smem_q_latent: cute.struct.Align[
                 cute.struct.MemRange[self.q_dtype, cute.cosize(q_latent_smem_layout_staged)],
@@ -516,6 +606,7 @@ class DSparkAttentionKernel:
             tma_tensor_c_latent_transpose_draft,
             page_table_win,
             o,
+            o_scale,
             cache_seqs,
             window_valid_lens,
             capacities,
@@ -592,6 +683,7 @@ class DSparkAttentionKernel:
         mCLT_draft: cute.Tensor,
         mPT_win: cute.Tensor,
         mO: Optional[cute.Tensor],
+        mOScale: Optional[cute.Tensor],
         cache_seqs: cute.Tensor,
         window_valid_lens: cute.Tensor,
         capacities: cute.Tensor,
@@ -715,6 +807,14 @@ class DSparkAttentionKernel:
         epilogue_smem_exchange = storage.epilogue_smem_exchange.get_tensor(
             cute.make_layout(self.num_compute_warps * self.threads_per_warp)
         )
+        fp8_epilogue_scratch = None
+        if cutlass.const_expr(self.output_groups is not None):
+            fp8_epilogue_scratch = storage.fp8_epilogue_scratch.get_tensor(
+                cute.make_layout(
+                    (self.num_compute_warps, self.threads_per_warp, 32),
+                    stride=(self.threads_per_warp * 32, 32, 1),
+                )
+            )
 
         #
         # Cluster wait before tensor memory alloc
@@ -937,7 +1037,7 @@ class DSparkAttentionKernel:
                 compute_common_params = SimpleNamespace(
                     blk_coord=blk_coord,
                     smem_exchange=softmax_smem_exchange,
-                    mO=mO,
+                    mO=mQL if cutlass.const_expr(self.output_groups is not None) else mO,
                     K=self.get_cache_seq_len(cache_seqs, blk_coord[2]),
                     window_valid_len=self.get_window_valid_len(
                         window_valid_lens, capacities, cache_seqs, blk_coord[2]
@@ -992,7 +1092,7 @@ class DSparkAttentionKernel:
                 compute_common_params = SimpleNamespace(
                     blk_coord=blk_coord,
                     smem_exchange=epilogue_smem_exchange,
-                    mO=mO,
+                    mO=mQL if cutlass.const_expr(self.output_groups is not None) else mO,
                     K=self.get_cache_seq_len(cache_seqs, blk_coord[2]),
                     L=mCL_draft.shape[1],
                     H=mQL.shape[0],
@@ -1006,6 +1106,9 @@ class DSparkAttentionKernel:
                     output_scale=output_scale,
                     softmax_scale_log2=softmax_scale_log2,
                     mFreqs=inverse_rope_freqs,
+                    mOQuant=mO,
+                    mOScale=mOScale,
+                    sOQuant=fp8_epilogue_scratch,
                 )
                 p_cor_consumer_state, mma_o_consumer_state = self.correction(
                     compute_common_params,
@@ -1970,7 +2073,10 @@ class DSparkAttentionKernel:
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
 
-        elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
+        elif cutlass.const_expr(
+            (arch >= Arch.sm_103 and arch <= Arch.sm_103f)
+            or (arch >= Arch.sm_107 and arch <= Arch.sm_107f)
+        ):
             tmem_load_red_atom = cute.make_copy_atom(
                 tcgen05.copy.LdRed32x32bOp(
                     tcgen05.copy.Repetition(64), redOp=tcgen05.TmemLoadRedOp.MAX
@@ -2368,12 +2474,102 @@ class DSparkAttentionKernel:
                         tR2G_rO_src[i] = (re * cos + im * sin).to(self.o_dtype)
                         tR2G_rO_src[i + 1] = (im * cos - re * sin).to(self.o_dtype)
 
+            if cutlass.const_expr(self.output_groups is not None and cute.size(tR2G_rO_src) != 128):
+                raise ValueError("DSpark FP8 output requires one 128-value block per thread")
+
             if cute.elem_less(tTR_cO[0][0], common_params.H):
-                cute.autovec_copy(
-                    tR2G_rO_src,
-                    tR2G_rO_dst,
-                    l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-                )
+                if cutlass.const_expr(self.output_groups is None):
+                    cute.autovec_copy(
+                        tR2G_rO_src,
+                        tR2G_rO_dst,
+                        l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                    )
+                else:
+                    # Each correction thread owns one complete 1x128 quant
+                    # block. Use eight independent chains so the amax is not
+                    # serialized behind 128 dependent fmax instructions.
+                    partial_absmax = cute.make_rmem_tensor((8,), cutlass.Float32)
+                    for i in cutlass.range_constexpr(8):
+                        partial_absmax[i] = cutlass.Float32(0.0)
+                    for i in cutlass.range_constexpr(0, cute.size(tR2G_rO_src), 8):
+                        for lane in cutlass.range_constexpr(8):
+                            value = cutlass.Float32(tR2G_rO_src[i + lane])
+                            partial_absmax[lane] = cute.arch.fmax(
+                                partial_absmax[lane],
+                                cute.arch.fmax(value, -value),
+                            )
+                    for i in cutlass.range_constexpr(4):
+                        partial_absmax[i] = cute.arch.fmax(partial_absmax[i], partial_absmax[i + 4])
+                    for i in cutlass.range_constexpr(2):
+                        partial_absmax[i] = cute.arch.fmax(partial_absmax[i], partial_absmax[i + 2])
+                    block_absmax = cute.arch.fmax(partial_absmax[0], partial_absmax[1])
+                    block_absmax = cute.arch.fmax(block_absmax, cutlass.Float32(1e-10))
+                    quant_scale = cutlass.Float32(448.0) / block_absmax
+
+                    head = tTR_cO[0][0]
+                    group_size = self.num_heads // self.output_groups
+                    group = head // group_size
+                    row = common_params.blk_coord[2] * self.seq_len_q + common_params.blk_coord[1]
+                    scale_block = ((head % group_size) * self.latent_dim + tTR_cO[0][1]) // 128
+                    epilogue_params.mOScale[group, scale_block, row] = (
+                        cutlass.Float32(1.0) / quant_scale
+                    )
+                    quantized = cute.make_rmem_tensor(
+                        (cute.size(tR2G_rO_src),), cutlass.Float8E4M3FN
+                    )
+                    for i in cutlass.range(
+                        cute.size(tR2G_rO_src), vectorize=True, unroll_full=True
+                    ):
+                        quantized[i] = (cutlass.Float32(tR2G_rO_src[i]) * quant_scale).to(
+                            cutlass.Float8E4M3FN
+                        )
+                    packed_output = cute.recast_tensor(quantized, cutlass.Int32)
+                    lane_idx = tidx % self.threads_per_warp
+                    epilogue_warp_idx = tidx // self.threads_per_warp
+                    scratch_row = cute.domain_offset(
+                        (epilogue_warp_idx, lane_idx, 0), epilogue_params.sOQuant
+                    ).iterator
+                    for i in cutlass.range_constexpr(0, 32, 4):
+                        _store_shared_b128(
+                            scratch_row + i,
+                            packed_output[i],
+                            packed_output[i + 1],
+                            packed_output[i + 2],
+                            packed_output[i + 3],
+                        )
+
+                    # Four adjacent lanes cooperatively drain one scratch row,
+                    # producing fully coalesced 32-byte global sectors.
+                    cute.arch.sync_warp()
+                    row_group_idx = lane_idx // 4
+                    row_lane_idx = lane_idx % 4
+                    warp_head_base = head - lane_idx
+                    for row_batch_idx in cutlass.range_constexpr(4):
+                        output_row = row_batch_idx * 8 + row_group_idx
+                        output_head = warp_head_base + output_row
+                        output_group = output_head // group_size
+                        output_group_k = (output_head % group_size) * self.latent_dim + tTR_cO[0][1]
+                        source_row = cute.domain_offset(
+                            (epilogue_warp_idx, output_row, 0),
+                            epilogue_params.sOQuant,
+                        ).iterator
+                        for segment_idx in cutlass.range_constexpr(4):
+                            word_offset = segment_idx * 8 + row_lane_idx * 2
+                            value_lo = _load_shared_b32(source_row + word_offset)
+                            value_hi = _load_shared_b32(source_row + word_offset + 1)
+                            _store_global_b64(
+                                cute.domain_offset(
+                                    (
+                                        output_group,
+                                        row,
+                                        output_group_k + segment_idx * 32 + row_lane_idx * 8,
+                                    ),
+                                    epilogue_params.mOQuant,
+                                ).iterator,
+                                value_lo,
+                                value_hi,
+                            )
+                    cute.arch.sync_warp()
 
         cute.arch.fence_view_async_tmem_load()
         common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)

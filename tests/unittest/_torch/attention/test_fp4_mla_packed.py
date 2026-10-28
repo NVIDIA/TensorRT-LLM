@@ -387,13 +387,15 @@ def test_packed_plan_wave_plan_env_rolls_back(monkeypatch) -> None:
     monkeypatch.setattr(
         _plan_mod(), "launch_packed_plan", lambda *args, **kwargs: calls.append(kwargs["wave_plan"])
     )
-    geometry = fp4_mla_backend._PackedPlanGeometry(2, 4, 3, 17, 64, 6, 1024, None, None, ("key",))
+    geometry = fp4_mla_packed_plan._PackedPlanGeometry(
+        2, 4, 3, 17, 64, 6, 1024, None, None, ("key",)
+    )
     kv_lens = torch.zeros(2, dtype=torch.int32, device="cuda")
-    metadata = SimpleNamespace(_fp4_mla_packed_plan_key=None)
-    monkeypatch.delenv(fp4_mla_backend.FP4_MLA_PACKED_WAVE_PLAN_ENV, raising=False)
-    fp4_mla_backend._launch_fp4_mla_packed_plan(geometry, kv_lens, metadata)
-    monkeypatch.setenv(fp4_mla_backend.FP4_MLA_PACKED_WAVE_PLAN_ENV, "0")
-    fp4_mla_backend._launch_fp4_mla_packed_plan(geometry, kv_lens, metadata)
+    metadata = SimpleNamespace(fp4_mla_state=SimpleNamespace(packed_plan_key=None))
+    monkeypatch.delenv(fp4_mla_config.FP4_MLA_PACKED_WAVE_PLAN_ENV, raising=False)
+    fp4_mla_packed_plan._launch_fp4_mla_packed_plan(geometry, kv_lens, metadata)
+    monkeypatch.setenv(fp4_mla_config.FP4_MLA_PACKED_WAVE_PLAN_ENV, "0")
+    fp4_mla_packed_plan._launch_fp4_mla_packed_plan(geometry, kv_lens, metadata)
     assert calls == [True, False]
 
 

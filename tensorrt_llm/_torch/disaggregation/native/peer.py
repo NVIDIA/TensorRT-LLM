@@ -15,7 +15,7 @@
 
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -26,7 +26,12 @@ from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import Atte
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind, PoolView
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    AttentionLayerGroup,
+    CacheKind,
+    MapperKind,
+    PoolView,
+)
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_layer_byte_ranges,
     get_layer_to_layer_group,
@@ -184,6 +189,29 @@ class PeerRegistrar:
             peer_ri.page_table,
         )
         AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
+        if self._ri.num_draft_layers != peer_ri.num_draft_layers:
+            # The layer-count tolerance below would transfer only the target
+            # layers and leave the drafter's prompt KV unset on the receiver.
+            raise ValueError(
+                "PeerRegistrar: unified draft KV layer count differs "
+                f"(local={self._ri.num_draft_layers}, peer={peer_ri.num_draft_layers}); "
+                "both peers must use the same speculative decoding KV cache layout; "
+                "set TRTLLM_DISAGG_SHARED_DRAFT_KV identically on both workers."
+            )
+        if self._ri.num_draft_layers:
+            if self._ri.tp_size != peer_ri.tp_size:
+                raise ValueError(
+                    "PeerRegistrar: a shared draft KV cache needs equal tp_size "
+                    f"(local={self._ri.tp_size}, peer={peer_ri.tp_size}); "
+                    "unset TRTLLM_DISAGG_SHARED_DRAFT_KV or use the same TP on both workers."
+                )
+            if self._ri.attention.enable_attention_dp != peer_ri.attention.enable_attention_dp:
+                raise ValueError(
+                    "PeerRegistrar: a shared draft KV cache needs the same attention DP "
+                    f"setting (local={self._ri.attention.enable_attention_dp}, "
+                    f"peer={peer_ri.attention.enable_attention_dp}); unset "
+                    "TRTLLM_DISAGG_SHARED_DRAFT_KV or match it on both workers."
+                )
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
@@ -404,12 +432,34 @@ class PeerRegistrar:
             pool_idx=peer_pi,
         )
 
-        policy = self._attention_policy
+        # Polymorphic dispatch: attention vs mamba policy
+        policy = self._get_policy(self_lg.kind)
+
+        # For mamba, compute ptr-array layer offsets for partial PP overlap.
+        # extract_slot returns ptrs for ALL local_layer_ids in sorted order;
+        # the mapper must slice only the overlapping subset.
+        extra_kwargs = {}
+        if self_lg.kind == CacheKind.STATE:
+            # Positions index the ptr array ``extract_slot`` builds, which is
+            # ordered by view offset.
+            self_gid_to_pos = {gid: i for i, gid in enumerate(self_global_ids)}
+            peer_gid_to_pos = {gid: i for i, gid in enumerate(peer_global_ids)}
+            self_overlap_positions = [self_gid_to_pos[gid] for gid in overlapping_layers]
+            peer_overlap_positions = [peer_gid_to_pos[gid] for gid in overlapping_layers]
+            # Under contiguous PP partitioning, overlapping layers form a
+            # contiguous block in the ptrs array.
+            extra_kwargs["src_layer_off"] = (
+                self_overlap_positions[0] if self_overlap_positions else 0
+            )
+            extra_kwargs["dst_layer_off"] = (
+                peer_overlap_positions[0] if peer_overlap_positions else 0
+            )
+
         mapper_peer_ri = peer_ri
-        if self_lg.cp_as_tp:
+        if getattr(self_lg, "cp_as_tp", False):
             policy = AttentionPolicy(self._group_rank_info(self._ri, self_lg))
             mapper_peer_ri = self._group_rank_info(peer_ri, peer_lg)
-        mapper = policy.build_kv_mapper(
+        mapper = policy.build_mapper(
             peer_ri=mapper_peer_ri,
             mapper_kind=self_pv.mapper_kind,
             self_layer_offsets=self_layer_offsets,
@@ -573,7 +623,7 @@ class PeerRegistrar:
         """
         layer_group = self._self_ext_cache.page_table.layer_groups[layer_group_id]
         pool_view = layer_group.pool_views[pool_idx]
-        if layer_group.cp_as_tp:
+        if getattr(layer_group, "cp_as_tp", False):
             peer_lg_id, _ = self.get_pool_mapping(peer_rank_info)[(layer_group_id, pool_idx)]
             peer_lg = peer_rank_info.page_table.layer_groups[peer_lg_id]
             local = self._group_rank_info(self._ri, layer_group)
@@ -585,9 +635,10 @@ class PeerRegistrar:
                 return False
             duplicate, _ = AttentionPolicy(local).duplicate_head_factors(peer)
             return duplicate <= 1 or peer.dp_rank % duplicate == local.tp_rank % duplicate
-        if pool_view.mapper_kind == MapperKind.REPLICATED:
-            return self._owns_tp_fan_in(peer_rank_info)
-        return self.should_send_kv(peer_overlap, peer_rank_info)
+        # Delegate to the policy's should_send. None means fan-in election.
+        policy = self._get_policy(layer_group.kind)
+        result = policy.should_send(peer_overlap, peer_rank_info, mapper_kind=pool_view.mapper_kind)
+        return self._owns_tp_fan_in(peer_rank_info) if result is None else result
 
     @staticmethod
     def _group_rank_info(rank_info: RankInfo, layer_group: AttentionLayerGroup) -> RankInfo:

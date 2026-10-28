@@ -10,9 +10,10 @@ import cutlass.cute as cute
 import torch
 
 from ..._utils import get_sm_version
-from ..cute_dsl_kernels.blackwell.dspark_rmsnorm_rope import (
+from ..attention.kernels.blackwell.dspark_rmsnorm_rope import (
     DSparkConcatFP8QuantKernel,
     DSparkRMSNormFP8QuantKernel,
+    DSparkRMSNormRoPECacheWriteKernel,
     DSparkRMSNormRoPEDraftBlockKernel,
     DSparkRMSNormRoPEKernel,
     DSparkRMSNormRoPEPageWriteKernel,
@@ -20,12 +21,20 @@ from ..cute_dsl_kernels.blackwell.dspark_rmsnorm_rope import (
 
 _DSV4_DSPARK_HEAD_DIM = 512
 _DSV4_DSPARK_ROPE_DIM = 64
+_DSV4_DSPARK_WINDOW_SIZE = 128
 _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE = 8
-
+_DSV4_DSPARK_BLOCK_SIZES = (5, 6)
 _DSV4_DSPARK_ARCH_BY_SM = {
     100: "sm_100",
     103: "sm_103",
 }
+# The RMSNorm/RoPE kernels are plain SIMT CuTe kernels with no architecture-specific
+# instructions, so they run on more GPUs than the DSV4 DSpark attention kernel gated
+# by _DSV4_DSPARK_ARCH_BY_SM.
+_DSPARK_RMSNORM_ROPE_SM_VERSIONS = frozenset((100, 103, 107))
+
+
+_dspark_fp8_input_compile_allowed = False
 
 
 @functools.cache
@@ -34,6 +43,14 @@ def _get_dspark_arch_str(sm_version: int | None = None) -> str | None:
     if sm_version is None:
         sm_version = get_sm_version()
     return _DSV4_DSPARK_ARCH_BY_SM.get(sm_version)
+
+
+@functools.cache
+def _is_dspark_rmsnorm_rope_sm_supported(sm_version: int | None = None) -> bool:
+    """Return whether the fused RMSNorm/RoPE kernels support this GPU."""
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version in _DSPARK_RMSNORM_ROPE_SM_VERSIONS
 
 
 def _has_regular_row_stride(x: torch.Tensor) -> bool:
@@ -103,6 +120,70 @@ def is_fused_dspark_rmsnorm_rope_supported(
         and _has_regular_row_stride(x)
         and (weight is None or weight.is_contiguous())
         and freqs.is_contiguous()
+    )
+
+
+def _is_dspark_cache_write_supported(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slots: torch.Tensor,
+    start_pos: torch.Tensor,
+) -> bool:
+    batch = x.shape[0] if x.ndim == 3 else -1
+    return (
+        x.shape == (batch, 1, _DSV4_DSPARK_HEAD_DIM)
+        and is_fused_dspark_rmsnorm_rope_supported(
+            x, weight, freqs, num_heads=1, rope_dim=_DSV4_DSPARK_ROPE_DIM
+        )
+        and kv_cache.is_cuda
+        and kv_cache.dtype == x.dtype
+        and kv_cache.ndim == 3
+        and kv_cache.shape[1:] == (_DSV4_DSPARK_WINDOW_SIZE, _DSV4_DSPARK_HEAD_DIM)
+        and kv_cache.stride(1) == _DSV4_DSPARK_HEAD_DIM
+        and kv_cache.stride(2) == 1
+        and slots.is_cuda
+        and slots.dtype == torch.int64
+        and slots.shape == (batch,)
+        and slots.is_contiguous()
+        and start_pos.is_cuda
+        and start_pos.dtype == torch.int64
+        and start_pos.shape == (batch,)
+        and start_pos.is_contiguous()
+    )
+
+
+def _is_dspark_draft_block_supported(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+) -> bool:
+    block_size = x.shape[1] if x.ndim == 3 else -1
+    return (
+        block_size in _DSV4_DSPARK_BLOCK_SIZES
+        and x.shape[-1:] == (_DSV4_DSPARK_HEAD_DIM,)
+        and is_fused_dspark_rmsnorm_rope_supported(
+            x, weight, freqs, num_heads=1, rope_dim=_DSV4_DSPARK_ROPE_DIM
+        )
+    )
+
+
+def is_fused_dspark_attention_preparation_supported(
+    main_x: torch.Tensor,
+    block_x: torch.Tensor,
+    weight: torch.Tensor,
+    main_freqs: torch.Tensor,
+    block_freqs: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slots: torch.Tensor,
+    start_pos: torch.Tensor,
+) -> bool:
+    """Return whether RMSNorm/RoPE can directly prepare the attention inputs."""
+    return (
+        main_x.shape[0] == block_x.shape[0]
+        and _is_dspark_cache_write_supported(main_x, weight, main_freqs, kv_cache, slots, start_pos)
+        and _is_dspark_draft_block_supported(block_x, weight, block_freqs)
     )
 
 
@@ -211,6 +292,105 @@ def _compile_fused_dspark_rope_into(
         kernel,
         x_fake,
         None,
+        freqs_fake,
+        output_fake,
+        stream_fake,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+
+@functools.cache
+def _compile_dspark_rmsnorm_rope_cache_write(eps: float):
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "DSpark RMSNorm/RoPE cache-write must be warmed up before CUDA graph capture"
+        )
+    rows = cute.sym_int()
+    pages = cute.sym_int()
+    x_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (rows, _DSV4_DSPARK_HEAD_DIM), stride_order=(1, 0)
+    )
+    weight_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (_DSV4_DSPARK_HEAD_DIM,), stride_order=(0,)
+    )
+    freqs_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (rows, _DSV4_DSPARK_ROPE_DIM // 2, 2),
+        stride_order=(2, 1, 0),
+    )
+    cache_fake = cute.runtime.make_fake_tensor(
+        cutlass.BFloat16,
+        (pages, _DSV4_DSPARK_WINDOW_SIZE, _DSV4_DSPARK_HEAD_DIM),
+        stride=(cute.sym_int64(), _DSV4_DSPARK_HEAD_DIM, 1),
+    )
+    slots_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int64, (rows,), stride_order=(0,))
+    start_pos_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int64, (rows,), stride_order=(0,)
+    )
+    slots_i32_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (rows,), stride_order=(0,)
+    )
+    cache_seqs_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (rows,), stride_order=(0,)
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    kernel = DSparkRMSNormRoPECacheWriteKernel(
+        _DSV4_DSPARK_HEAD_DIM,
+        _DSV4_DSPARK_ROPE_DIM,
+        eps,
+        _DSV4_DSPARK_WINDOW_SIZE,
+    )
+    return cute.compile(
+        kernel,
+        x_fake,
+        weight_fake,
+        freqs_fake,
+        cache_fake,
+        slots_fake,
+        start_pos_fake,
+        slots_i32_fake,
+        cache_seqs_fake,
+        stream_fake,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+
+@functools.cache
+def _compile_dspark_rmsnorm_rope_draft_block(block_size: int, eps: float, device: int):
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "DSpark RMSNorm/RoPE draft-block must be warmed up before CUDA graph capture"
+        )
+    rows = cute.sym_int()
+    batch = cute.sym_int()
+    x_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (rows, _DSV4_DSPARK_HEAD_DIM), stride_order=(1, 0)
+    )
+    weight_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (_DSV4_DSPARK_HEAD_DIM,), stride_order=(0,)
+    )
+    freqs_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (rows, _DSV4_DSPARK_ROPE_DIM // 2, 2),
+        stride_order=(2, 1, 0),
+    )
+    output_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (batch, _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSV4_DSPARK_HEAD_DIM),
+        stride_order=(2, 1, 0),
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    kernel = DSparkRMSNormRoPEDraftBlockKernel(
+        _DSV4_DSPARK_HEAD_DIM,
+        _DSV4_DSPARK_ROPE_DIM,
+        eps,
+        block_size,
+        _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE,
+    )
+    return cute.compile(
+        kernel,
+        x_fake,
+        weight_fake,
         freqs_fake,
         output_fake,
         stream_fake,
@@ -357,6 +537,93 @@ def _(
     return None
 
 
+@torch.library.custom_op(
+    "trtllm::cute_dsl_dspark_rmsnorm_rope_cache_write",
+    mutates_args=("kv_cache",),
+    device_types="cuda",
+)
+def cute_dsl_dspark_rmsnorm_rope_cache_write(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slots: torch.Tensor,
+    start_pos: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare attention metadata after the caller validates the fused contract."""
+    compiled = _compile_dspark_rmsnorm_rope_cache_write(eps)
+    slots_i32 = torch.empty_like(slots, dtype=torch.int32)
+    cache_seqs = torch.empty_like(start_pos, dtype=torch.int32)
+    compiled(
+        x.view(-1, _DSV4_DSPARK_HEAD_DIM),
+        weight,
+        freqs,
+        kv_cache,
+        slots,
+        start_pos,
+        slots_i32,
+        cache_seqs,
+    )
+    return slots_i32, cache_seqs
+
+
+@torch.library.register_fake("trtllm::cute_dsl_dspark_rmsnorm_rope_cache_write")
+def _(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slots: torch.Tensor,
+    start_pos: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del x, weight, freqs, kv_cache, eps
+    return (
+        torch.empty_like(slots, dtype=torch.int32),
+        torch.empty_like(start_pos, dtype=torch.int32),
+    )
+
+
+@torch.library.custom_op(
+    "trtllm::cute_dsl_dspark_rmsnorm_rope_draft_block",
+    mutates_args=(),
+    device_types="cuda",
+)
+def cute_dsl_dspark_rmsnorm_rope_draft_block(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Prepare a zero-padded draft block after validating the fused contract."""
+    _validate_dspark_preparation(x, weight, freqs)
+    block_size = x.shape[1]
+    if block_size not in (5, 6):
+        raise ValueError("DSpark draft block size must be 5 or 6")
+    with torch.cuda.device(x.device):
+        compiled = _compile_dspark_rmsnorm_rope_draft_block(block_size, eps, x.device.index)
+    output = x.new_empty((x.shape[0], _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSV4_DSPARK_HEAD_DIM))
+    compiled(
+        x.view(-1, _DSV4_DSPARK_HEAD_DIM),
+        weight,
+        freqs,
+        output,
+    )
+    return output
+
+
+@torch.library.register_fake("trtllm::cute_dsl_dspark_rmsnorm_rope_draft_block")
+def _(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    del weight, freqs, eps
+    return x.new_empty((x.shape[0], _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSV4_DSPARK_HEAD_DIM))
+
+
 def _validate_dspark_preparation(
     x: torch.Tensor, weight: torch.Tensor, freqs: torch.Tensor
 ) -> None:
@@ -501,91 +768,6 @@ def _(
     eps: float,
 ) -> None:
     return None
-
-
-@functools.cache
-def _compile_dspark_rmsnorm_rope_draft_block(block_size: int, eps: float, device: int):
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            "DSpark RMSNorm/RoPE draft-block must be warmed up before CUDA graph capture"
-        )
-    rows = cute.sym_int()
-    batch = cute.sym_int()
-    x_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.BFloat16, (rows, _DSV4_DSPARK_HEAD_DIM), stride_order=(1, 0)
-    )
-    weight_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.BFloat16, (_DSV4_DSPARK_HEAD_DIM,), stride_order=(0,)
-    )
-    freqs_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (rows, _DSV4_DSPARK_ROPE_DIM // 2, 2),
-        stride_order=(2, 1, 0),
-    )
-    output_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.BFloat16,
-        (batch, _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSV4_DSPARK_HEAD_DIM),
-        stride_order=(2, 1, 0),
-    )
-    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    kernel = DSparkRMSNormRoPEDraftBlockKernel(
-        _DSV4_DSPARK_HEAD_DIM,
-        _DSV4_DSPARK_ROPE_DIM,
-        eps,
-        block_size,
-        _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE,
-    )
-    return cute.compile(
-        kernel,
-        x_fake,
-        weight_fake,
-        freqs_fake,
-        output_fake,
-        stream_fake,
-        options="--opt-level 2 --enable-tvm-ffi",
-    )
-
-
-@torch.library.custom_op(
-    "trtllm::cute_dsl_dspark_rmsnorm_rope_draft_block",
-    mutates_args=(),
-    device_types="cuda",
-)
-def cute_dsl_dspark_rmsnorm_rope_draft_block(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    freqs: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    """Prepare a zero-padded draft block after validating the fused contract."""
-    _validate_dspark_preparation(x, weight, freqs)
-    block_size = x.shape[1]
-    if block_size not in (5, 6):
-        raise ValueError("DSpark draft block size must be 5 or 6")
-    with torch.cuda.device(x.device):
-        compiled = _compile_dspark_rmsnorm_rope_draft_block(block_size, eps, x.device.index)
-    output = x.new_empty((x.shape[0], _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSV4_DSPARK_HEAD_DIM))
-    compiled(
-        x.view(-1, _DSV4_DSPARK_HEAD_DIM),
-        weight,
-        freqs,
-        output,
-    )
-    return output
-
-
-@torch.library.register_fake("trtllm::cute_dsl_dspark_rmsnorm_rope_draft_block")
-def _(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    freqs: torch.Tensor,
-    eps: float,
-) -> torch.Tensor:
-    del weight, freqs, eps
-    return x.new_empty((x.shape[0], _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSV4_DSPARK_HEAD_DIM))
-
-
-_dspark_fp8_input_compile_allowed = False
 
 
 def _r128c4_scale_numel(rows: int, hidden_dim: int) -> int:

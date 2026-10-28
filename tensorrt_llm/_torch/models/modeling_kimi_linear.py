@@ -110,9 +110,16 @@ from ..._utils import get_sm_version, is_sm_100f
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
-from ..attention_backend import AttentionMetadata
-from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
-from ..kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV, get_kimi_k3_bf16_kv_layer_ids
+from ..attention.attention import _helix_cp_pad
+from ..attention.backends import AttentionMetadata
+from ..distributed import (
+    AllReduce,
+    AllReduceFusionOp,
+    AllReduceParams,
+    AllReduceStrategy,
+    allgather,
+)
+from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from ..model_config import ModelConfig
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
@@ -1818,9 +1825,10 @@ class KimiK3MoERuntime(nn.Module):
         if self._defer_shared_allreduce and not overlap_shared_allreduce:
             shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
         if self._reduce_routed_output:
-            # RMSNorm folded into the routed all-reduce (kARRMSNorm): the
+            # RMSNorm folded into the routed all-reduce (RMS_NORM fusion): the
             # MNNVL kernel normalizes straight out of the lamport buffer, so
             # the reduced row never round-trips through HBM for a norm kernel.
+            # Strategies without the fusion fall back inside AllReduce.
             routed_latent = moe_all_reduce(
                 routed_out,
                 all_reduce_params=AllReduceParams(

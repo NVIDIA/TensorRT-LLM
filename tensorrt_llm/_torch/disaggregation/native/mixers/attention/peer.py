@@ -28,10 +28,14 @@ from tensorrt_llm._torch.disaggregation.base.region import (
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.page import (
     AttentionLayerGroup,
+    CacheKind,
     KVCachePageTable,
     MapperKind,
 )
-from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_to_layer_group
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    find_replicated_role_mismatch,
+    get_layer_to_layer_group,
+)
 from tensorrt_llm._utils import nvtx_range
 
 
@@ -562,10 +566,21 @@ class AttentionPolicy:
 
     @staticmethod
     def validate_peer_compatible(
-        self_page_table: KVCachePageTable | None,
-        peer_page_table: KVCachePageTable | None,
+        self_page_table: Optional[KVCachePageTable],
+        peer_page_table: Optional[KVCachePageTable],
     ) -> None:
-        """Validate standalone draft storage on overlapping layers."""
+        """Reject a peer whose PAGED groups declare different replicated roles.
+
+        Pool matching drops a view with no counterpart silently, so an
+        index-key side cache the peer never declares would leave the receiver
+        holding zeroed state instead of raising. Raises ``ValueError``.
+        """
+        differing = find_replicated_role_mismatch(self_page_table, peer_page_table, CacheKind.PAGED)
+        if differing:
+            raise ValueError(
+                "AttentionPolicy.validate_peer_compatible: replicated roles differ on "
+                f"overlapping layers: {differing}"
+            )
         if self_page_table is not None and peer_page_table is not None:
             local_layers = get_layer_to_layer_group(self_page_table)
             peer_layers = get_layer_to_layer_group(peer_page_table)

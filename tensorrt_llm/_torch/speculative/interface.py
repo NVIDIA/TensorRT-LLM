@@ -1128,8 +1128,10 @@ class SpecMetadata:
             return
         onehot_vocab = (self.draft_probs_last_dim if self.draft_probs_last_dim
                         > 0 else self.draft_probs_vocab_size)
-        bad = [s for s in padding_slot_ids
-               if s is None or s < 0 or s >= self.draft_probs.shape[0]]
+        bad = [
+            s for s in padding_slot_ids
+            if s is None or s < 0 or s >= self.draft_probs.shape[0]
+        ]
         if bad:
             # Writing a different row would leave the real slot's distribution
             # stale and break lossless acceptance, so fail loudly instead.
@@ -1177,14 +1179,11 @@ class SpecMetadata:
         if self.is_cuda_graph:
             return self
 
-        # Allocate the slot-indexed rejection-sampling buffers on the base
-        # metadata BEFORE the shallow copy so every CUDA-graph view shares
-        # them. A copy taken while draft_probs is still None allocates its own
-        # buffer sized by the graph batch size: the drafter then scatters into
-        # one buffer while the captured rejection kernel reads another, and
-        # slot ids >= the graph batch size index out of bounds (seen with
-        # DSpark + attention DP, write_padding_onehot_draft_probs).
+        # Slot-indexed state persists across steps that may run eagerly or under
+        # different graphs, so every view must share one allocation: allocate it
+        # here before the shallow copy rather than lazily in each view.
         self.prepare_rejection_sampling_buffers()
+        self.prepare_penalty_buffers()
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.max_num_requests = max_batch_size

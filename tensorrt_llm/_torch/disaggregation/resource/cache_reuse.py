@@ -19,9 +19,8 @@ from typing import List, Sequence
 
 import numpy as np
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 
 from .page import AttentionLayerGroup
@@ -145,9 +144,8 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         # V2 already returns per-cache-level pool slot indices (not logical block
         # IDs), and active sequences GPU-lock their pages (_UniqPageLock enforces
         # cache_level==GPU), so the slot_ids yielded here are already the right
-        # offsets for primary-pool pointer arithmetic. No translation is needed,
-        # unlike V1 (see _CacheReuseAdapterV1.get_block_ids).
-        if lg.cp_as_tp:
+        # offsets for primary-pool pointer arithmetic. No translation is needed.
+        if getattr(lg, "cp_as_tp", False):
             ordinals = self.get_block_ordinals(req, group_idx, lg)
             return ordinals[ordinals >= 0]
         return np.fromiter(

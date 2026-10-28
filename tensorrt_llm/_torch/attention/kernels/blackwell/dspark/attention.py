@@ -5,7 +5,6 @@
 
 from typing import Optional, Tuple, Type
 
-import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
@@ -273,6 +272,12 @@ class DSparkAttention(DSparkAttentionKernel):
             raise ValueError("DSpark history page size must be 16, 32, 64, 128, or 256")
         if inverse_rope_dim not in (0, 64):
             raise ValueError(f"DSpark inverse_rope_dim must be 0 or 64, got {inverse_rope_dim}")
+        if output_groups is not None and (
+            output_groups <= 0 or self.num_heads % output_groups != 0
+        ):
+            raise ValueError(
+                f"DSpark output groups must divide {self.num_heads}, got {output_groups}"
+            )
 
         super().__init__(
             acc_dtype,

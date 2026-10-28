@@ -39,7 +39,11 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, int tokensPerBlock)
                 return SsmLifeCycle{};
             }
             else
-                return AttnLifeCycle::make(cfg.slidingWindowSize, cfg.numSinkTokens, tokensPerBlock, cfg.cacheDomain);
+            {
+                bool const isSparse = !cfg.buffers.empty() && cfg.buffers.front().isSparse;
+                return AttnLifeCycle::make(cfg.slidingWindowSize, cfg.numSinkTokens, tokensPerBlock, isSparse,
+                    cfg.reusePolicy, cfg.cacheDomain);
+            }
         },
         layer);
 }

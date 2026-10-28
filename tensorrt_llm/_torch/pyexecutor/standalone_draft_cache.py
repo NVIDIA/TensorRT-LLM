@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from .kv_cache_manager_v2 import KVCacheManagerV2
+    from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 
 @dataclass(frozen=True)

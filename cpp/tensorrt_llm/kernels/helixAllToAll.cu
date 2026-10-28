@@ -542,9 +542,9 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
             LL128Proto::protoUnpack(
                 shmem, tail, singlePacked128ByteCount, fifoEntry128ByteIndexBase, loaded128ByteCount, laneId);
 
-            // protoUnpack restores the u64 under each line's flag with ordinary
-            // stores, and the bulk store below reads shared memory through the
-            // async proxy: without this fence it can still read the flag value.
+            // protoUnpack restores the words displaced by the LL128 flags through the generic proxy. Make
+            // those writes visible to the async proxy before cp.async.bulk reads the same buffer for S2G;
+            // otherwise the store can copy a flag (the FIFO step) in place of a restored data word.
             tensorrt_llm::common::fence_view_async_shared();
             __syncwarp();
 

@@ -43,15 +43,10 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_layer_byte_ranges,
     get_physical_pool,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
-    MambaHybridCacheManager,
-    MambaHybridCacheManagerV2,
-)
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
-from tensorrt_llm.bindings import DataType
-from tensorrt_llm.runtime.kv_cache_manager_v2 import PoolGroupDesc, SlotDescVariant
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole, PoolGroupDesc, SlotDescVariant
 
 # Mapper kinds a V2 manager may declare via get_disagg_role_mapper_kinds().
 # A physical pool may mix kinds (V2 storage coalesces buffers purely by
@@ -224,7 +219,7 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     # matching this ID is required to be consistent for.
     inverse = {}
     for (model_layer, attn_type), layer_id in manager._layer_attn_to_layer_id.items():
-        inverse[layer_id] = (model_layer, attn_type.value)
+        inverse.setdefault(layer_id, (model_layer, attn_type.value))
     for draft_layer in getattr(manager, "draft_layer_ids", ()):
         inverse[manager.layer_offsets[draft_layer]] = (draft_layer, 0)
 
@@ -505,6 +500,19 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                     total_kv_head_num=manager._draft_total_num_kv_heads,
                 )
                 continue
+            # A life cycle is recurrent when its layers are the manager's
+            # mamba layers. Recurrent and attention layers never share a life
+            # cycle: their buffer configs differ, so V2 groups them apart.
+            is_recurrent = isinstance(manager, MambaHybridCacheManagerV2) and any(
+                manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
+            )
+            if is_recurrent and not all(
+                manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
+            ):
+                raise ValueError(
+                    f"Layer group {layer_group_id} mixes recurrent and attention layers"
+                )
+            cache_kind = CacheKind.STATE if is_recurrent else CacheKind.PAGED
 
             # Bucket buffer entries by (pool, mapper kind). One PoolView is
             # emitted per bucket and spans every layer of that role class,

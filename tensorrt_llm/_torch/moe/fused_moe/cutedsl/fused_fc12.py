@@ -285,6 +285,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             moe_output=plan.moe_output,
             enable_alltoall=plan.enable_alltoall,
             weight_view=self._build_local_weight_view(),
+            x_ready_event=ctx.x_ready_event,
         )
 
     # Fused-kernel dispatch, with its own autotuner key and outer runner so
@@ -298,6 +299,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         moe_output: torch.Tensor | None = None,
         enable_alltoall: bool = False,
         weight_view: NvFp4WeightView | None = None,
+        x_ready_event: torch.cuda.Event | None = None,
     ) -> torch.Tensor:
         assert self.has_nvfp4
         assert weight_view is not None
@@ -315,6 +317,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         # require at least one output row).
         if token_selected_experts.size(0) == 0:
             return moe_output
+
+        self._pending_x_ready_event = x_ready_event
 
         effective_top_k = token_selected_experts.size(-1)
         tuner = AutoTuner.get()
@@ -399,6 +403,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             local_num_experts=esp,
             tile_tokens_dim=tile_size,
         )
+
+        self._join_pending_x_ready()
 
         # One fused op: gather + FC1 GEMM + gated act (SwiGLU or SiTU) + requant
         # + FC2 GEMM + finalize (scatter-add into moe_output = a2a combine

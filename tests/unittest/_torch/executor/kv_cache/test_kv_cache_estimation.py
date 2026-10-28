@@ -37,11 +37,13 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
+    _get_draft_layer_sizes,
     _get_static_cache_size_layer_components,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import (
@@ -2059,3 +2061,45 @@ def test_create_kv_cache_manager_layer_specs_preserve_window_guards(guard: str) 
 
     assert manager_config is kv_cache_config
     assert manager_config.max_attention_window == ([1024] if guard == "explicit_window" else None)
+
+
+@pytest.mark.parametrize(
+    "attention_backend,dtype,bytes_per_layer",
+    [("TRTLLM", torch.float8_e4m3fn, 2048), ("VANILLA", torch.bfloat16, 4096)],
+)
+def test_standalone_draft_kv_dtype_follows_the_drafter_attention(
+    attention_backend, dtype, bytes_per_layer
+) -> None:
+    """The TRTLLM drafter attention stores the drafter's history in FP8; VANILLA keeps BF16."""
+    creator = object.__new__(KvCacheCreator)
+    draft = SimpleNamespace(
+        fc=SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16)),
+        dflash_attention_backend=attention_backend,
+        config=SimpleNamespace(max_position_embeddings=4096),
+    )
+    creator._model_engine = SimpleNamespace(model=SimpleNamespace(draft_model=draft))
+    creator._speculative_config = SimpleNamespace(
+        spec_dec_mode=SimpleNamespace(is_dspark=lambda: True),
+        draft_is_embedded_in_target=False,
+        _use_shared_kv_cache=False,
+        attention_backend="AUTO",
+        max_draft_len=3,
+    )
+    # Drafter shapes remain unsharded under attention DP.
+    creator._draft_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            num_attention_heads=64,
+            num_key_value_heads=16,
+            head_dim=64,
+            hidden_size=4096,
+            num_hidden_layers=5,
+        )
+    )
+    creator._mapping = SimpleNamespace(
+        has_cp_helix=lambda: False, enable_attention_dp=True, tp_size=16
+    )
+
+    kwargs = creator._get_unified_draft_cache_kwargs()
+
+    assert kwargs["draft_dtype"] == torch_dtype_to_binding(dtype)
+    assert _get_draft_layer_sizes(**kwargs) == (bytes_per_layer,) * 5

@@ -27,7 +27,6 @@ from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  str_dtype_to_binding, torch_dtype_to_binding,
                                  torch_dtype_to_str)
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
@@ -1272,6 +1271,7 @@ class KvCacheCreator:
         kv_cache_config: KvCacheConfig,
         *,
         use_separate_draft_kv_cache: bool,
+        include_request_cost: bool = False,
     ) -> Optional[CacheCost]:
         """Return the draft manager's standalone cache cost, if it has one.
 
@@ -1287,8 +1287,7 @@ class KvCacheCreator:
             helix_cp_scale = self._mapping.cp_size
 
         def scaled(cost: CacheCost) -> CacheCost:
-            return CacheCost(slope=cost.slope * helix_cp_scale,
-                             intercept=cost.intercept)
+            return dataclasses.replace(cost, slope=cost.slope * helix_cp_scale)
 
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
@@ -1328,30 +1327,27 @@ class KvCacheCreator:
                 draft_kv_cache_config)
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
-                # Resolve draft manager class from draft config — may differ
-                # from target (e.g. hybrid target + plain transformer draft).
-                draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-                    effective_draft_config,
-                    draft_kv_cache_config,
-                    is_disagg=self._is_disagg)
-                draft_cost = self._per_manager_cache_cost(
-                    draft_kv_cache_manager_cls,
-                    effective_draft_config,
-                    draft_kv_cache_config,
-                    mapping=draft_mapping,
-                    tokens_per_block=draft_tokens_per_block)
-                return scaled(draft_cost)
+                return scaled(
+                    self._per_manager_cache_cost(
+                        draft_kv_cache_manager_cls,
+                        effective_draft_config,
+                        draft_kv_cache_config,
+                        mapping=draft_mapping,
+                        tokens_per_block=draft_tokens_per_block,
+                        is_draft=True,
+                        include_request_cost=include_request_cost))
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
-                draft_cost = self._per_manager_cache_cost(
-                    self._kv_cache_manager_cls,
-                    effective_draft_config,
-                    draft_kv_cache_config,
-                    mapping=draft_mapping,
-                    tokens_per_block=draft_tokens_per_block,
-                    num_layers=self._get_num_draft_layers(),
-                    is_draft=True)
-                return scaled(draft_cost)
+                return scaled(
+                    self._per_manager_cache_cost(
+                        draft_kv_cache_manager_cls,
+                        effective_draft_config,
+                        draft_kv_cache_config,
+                        mapping=draft_mapping,
+                        tokens_per_block=draft_tokens_per_block,
+                        num_layers=self._get_num_draft_layers(),
+                        is_draft=True,
+                        include_request_cost=include_request_cost))
         return None
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
@@ -2206,11 +2202,6 @@ class KvCacheCreator:
             return "Unified DSpark KV cache does not yet support MLA drafters."
         return None
 
-    def _get_draft_mapping(self) -> Mapping:
-        """Use the drafter's dense TP mapping when target attention uses Helix."""
-        return (self._mapping.repurpose_helix_cp_to_tp()
-                if self._mapping.has_cp_helix() else self._mapping)
-
     def _get_draft_scratch_tokens(self) -> int:
         return 0 if self._is_embedded_dspark(
         ) else self._speculative_config.max_draft_len + 1
@@ -2279,20 +2270,15 @@ class KvCacheCreator:
             return False
         if self._uses_unified_standalone_draft_cache():
             return False
-        is_external_drafter = (
-            self._speculative_config.spec_dec_mode.is_external_drafter())
-        if self._mapping.enable_attention_dp and not is_external_drafter:
-            # Attention-DP uses the target KV cache manager for MTP draft layers
-            # so draft cache state follows the DP-sharded target requests. That
-            # works only because MTP draft layers are target-shaped and can be
-            # appended to the target pool (get_pp_layers). An external drafter
-            # has its own architecture and layer count, so there is nothing to
-            # append and the bail would strand it on the private context arena
-            # -- dense in max_seq_len, and with KV heads unsharded under
-            # attention DP that is the allocation that OOMs at long ISL. Its
-            # own manager follows the DP sharding regardless: same mapping (so
-            # `tp_size = 1 if enable_attention_dp` applies to it too) and block
-            # tables copied per rank from attn_metadata.request_ids.
+        # Narrower than is_external_drafter(): PARD and DRAFT_TARGET_ONE_MODEL
+        # never reach the arena this carve-out exists for.
+        spec_dec_mode = self._speculative_config.spec_dec_mode
+        is_standalone_drafter = (spec_dec_mode.is_dflash()
+                                 or spec_dec_mode.is_dspark())
+        if self._mapping.enable_attention_dp and not is_standalone_drafter:
+            # This bail suits MTP, whose draft layers are target-shaped and
+            # appendable to the target pool. A standalone drafter has nothing to
+            # append, so it would be stranded on the private arena instead.
             logger.info(
                 "Attention DP is enabled, separate draft KV cache is not supported."
             )
@@ -2535,12 +2521,6 @@ class KvCacheCreator:
         # the sparse_attention_config. Get it from effective_draft_config which
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
-        # The standalone drafter is a plain dense model built against the
-        # repurposed mapping under helix (CP ranks become TP ranks; each rank
-        # keeps its full drafter KV). Its paged KV manager must therefore use
-        # the repurposed, CP-free mapping — helix round-robin ledger semantics
-        # apply only to the TARGET KV (and KVCacheManagerV2 rejects
-        # is_draft x helix outright).
         draft_mapping = self._get_draft_mapping()
         draft_tokens_per_block = self._get_draft_tokens_per_block()
         if draft_tokens_per_block != self._tokens_per_block:
@@ -3444,6 +3424,9 @@ def _create_kv_cache_manager(
         head_dim: Optional[Union[int, List[int]]] = None,
         kv_cache_type=None,
         is_disagg: bool = False,
+        disable_overlap_scheduler: bool = False,
+        cold_page_codec_provider: Optional[object] = None,
+        kv_events_config: Optional[KVEventsConfig] = None,
         draft_num_layers: int = 0,
         draft_num_kv_heads: int = 0,
         draft_head_dim: int = 0,
@@ -3454,11 +3437,18 @@ def _create_kv_cache_manager(
         draft_window_size: Optional[int] = None,
         draft_attention_backend: Optional[str] = None,
         draft_max_position_embeddings: Optional[int] = None,
-        joint_kv_cache_reuse: bool = False) -> KVCacheManager:
+        joint_kv_cache_reuse: bool = False,
+        max_cuda_graph_batch_size: Optional[int] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
     """
+    if cold_page_codec_provider is not None and not issubclass(
+            kv_cache_manager_cls, KVCacheManagerV2):
+        raise ValueError(
+            "Cold-page quantization requires the resolved KV cache manager "
+            f"to be KVCacheManagerV2; selected {kv_cache_manager_cls.__name__}")
+
     if draft_num_layers and not issubclass(kv_cache_manager_cls,
                                            KVCacheManagerV2):
         raise ValueError("Unified draft cache layers require KVCacheManagerV2.")
@@ -3602,6 +3592,22 @@ def _create_kv_cache_manager(
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
+        manager_extra_kwargs[
+            "disable_overlap_scheduler"] = disable_overlap_scheduler
+        # Vocab size also enables multimodal event decoding and its per-block
+        # digest scan. Leave it unset for text-only engines. Without an engine
+        # (e.g. separate one-model draft caches), preserve config resolution:
+        # a text sub-config alone cannot identify a multimodal deployment.
+        needs_multimodal_keys = model_engine is None or is_multimodal(
+            model_engine.model, model_engine.input_processor)
+        manager_extra_kwargs["vocab_size"] = (resolve_vocab_size(config) if
+                                              needs_multimodal_keys else None)
+        if (needs_multimodal_keys and manager_extra_kwargs["vocab_size"] is None
+                and kv_cache_config.enable_block_reuse):
+            logger.warning(
+                "Could not resolve vocab_size from the model config; "
+                "multimodal requests will fail when block reuse is on. "
+                "Disable block reuse to serve them.")
         manager_extra_kwargs.update(
             draft_num_layers=draft_num_layers,
             draft_num_kv_heads=draft_num_kv_heads,
@@ -3614,6 +3620,11 @@ def _create_kv_cache_manager(
             draft_attention_backend=draft_attention_backend,
             draft_max_position_embeddings=draft_max_position_embeddings,
         )
+    elif kv_events_config is not None and kv_events_config.enable_kv_cache_events:
+        logger.warning(
+            "kv_cache_config.kv_events_config is set but streaming KV event "
+            "publishing requires KV cache manager V2; events will not be "
+            f"published for {kv_cache_manager_cls.__name__}.")
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 

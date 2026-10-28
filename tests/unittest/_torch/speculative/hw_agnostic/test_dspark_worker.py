@@ -16,12 +16,13 @@
 
 Covers the framework-side logic that does NOT need the full draft model:
 ``DSparkSpecMetadata`` hidden-state capture (incl. the mHC hc-mean reduction)
-and ``DSv4DSparkWorker`` progress-slot / managed-page management. The end-to-end block
+and ``DSv4DSparkWorker`` slot / rolling-KV-window management. The end-to-end block
 draft and acceptance path is covered by the DSpark test in
 ``integration/defs/accuracy/test_llm_api_pytorch.py``.
 """
 
 import types
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -122,58 +123,8 @@ def _fake_draft_model(num_stages=3, window_size=128, head_dim=64):
             "softmax_scale": 1.0,
             "eps": 1e-6,
         },
+        configure_generation_autotuner=Mock(),
     )
-
-
-def _bind_manager(worker, request_ids=()):
-    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-
-    manager = types.SimpleNamespace(
-        draft_layer_ids=tuple(range(worker._num_stages)),
-        draft_window_size=worker._win,
-        kv_factor_per_layer=[1] * worker._num_stages,
-        head_dim_per_layer=[worker._head_dim] * worker._num_stages,
-        layer_offsets=list(range(worker._num_stages)),
-        draft_max_blocks_per_seq=8192,
-        tokens_per_block=128,
-        _draft_dummy_request_ids=set(),
-        enable_block_reuse=False,
-        kv_cache_map={},
-    )
-    buffers = tuple(
-        torch.zeros(65, 1, 1, 128, worker._head_dim, device="cuda", dtype=torch.bfloat16)
-        for _ in range(worker._num_stages)
-    )
-    manager.get_draft_buffers = lambda stage: buffers[stage]
-    manager.get_draft_block_indices = lambda ids: [manager.kv_cache_map[rid].indices for rid in ids]
-    resource_manager = types.SimpleNamespace(
-        get_resource_manager=lambda kind: manager
-        if kind == ResourceManagerType.KV_CACHE_MANAGER
-        else None
-    )
-    worker._bind_managed_history(resource_manager)
-    for i, rid in enumerate(request_ids):
-        manager.kv_cache_map[rid] = types.SimpleNamespace(
-            history_length=1, capacity=4096, indices=[i + 1] * 32
-        )
-    return manager
-
-
-def _prepare(worker, meta, num_contexts=0):
-    if worker._draft_kv_manager is None:
-        _bind_manager(worker)
-    manager = worker._draft_kv_manager
-    for rid in meta.request_ids:
-        if worker._is_managed_request(rid) and rid not in manager.kv_cache_map:
-            manager.kv_cache_map[rid] = types.SimpleNamespace(
-                history_length=1, capacity=4096, indices=[len(manager.kv_cache_map) + 1] * 32
-            )
-    # A previously assigned slot represents already initialized resident history.
-    for rid in worker._req_to_slot:
-        if rid in manager.kv_cache_map:
-            worker._managed_residency.setdefault(rid, manager.kv_cache_map[rid])
-    meta.prepare()
-    worker._prepare_managed_history(meta.request_ids, num_contexts)
 
 
 def test_worker_lazy_init_window_buffers():
@@ -248,78 +199,6 @@ def test_worker_slot_exhaustion_preserves_live_request():
     assert int(worker._valid_len[slot]) == 1
 
 
-def test_seed_context_pages_preserves_state_across_prefill_chunks():
-    class DraftModel:
-        num_stages = 1
-        block_size = 5
-        _attn_params = {
-            "window_size": 8,
-            "head_dim": 4,
-            "n_heads": 128,
-            "softmax_scale": 1.0,
-            "eps": 1e-6,
-        }
-
-        def __init__(self):
-            self.written_positions = []
-
-        def configure_generation_autotuner(self, _max_batch):
-            pass
-
-        def write_context_pages(self, hidden, positions, mask, pools, tables, capacities):
-            from tensorrt_llm._torch.attention_backend.dspark import write_dspark_context
-
-            self.written_positions.append(positions.clone())
-            write_dspark_context(
-                torch.ones(*positions.shape, 4, device="cuda", dtype=torch.bfloat16),
-                positions,
-                mask,
-                pools[0][:, 0, 0],
-                tables,
-                capacities,
-            )
-
-    worker = _make_worker()
-    draft_model = DraftModel()
-    metadata = types.SimpleNamespace(
-        max_num_requests=1,
-        request_ids=[100],
-        get_hidden_states=lambda _num_tokens: torch.zeros(
-            3, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
-        ),
-    )
-    worker._lazy_init(draft_model, metadata)
-    manager = _bind_manager(worker, [100])
-    manager.kv_cache_map[100].history_length = 0
-    worker._prepare_managed_history([100], 1)
-
-    first_chunk = types.SimpleNamespace(num_contexts=1, _seq_lens=[3])
-    worker._seed_context_pages(
-        draft_model, metadata, first_chunk, torch.tensor([[0, 1, 2]], device="cuda"), 3
-    )
-    slot = worker._req_to_slot[100]
-    assert int(worker._ctx_len[slot]) == 3
-    assert int(worker._valid_len[slot]) == 3
-    assert worker._managed_residency[100] is manager.kv_cache_map[100]
-
-    metadata.get_hidden_states = lambda _num_tokens: torch.zeros(
-        2, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
-    )
-    second_chunk = types.SimpleNamespace(num_contexts=1, _seq_lens=[2])
-    worker._seed_context_pages(
-        draft_model, metadata, second_chunk, torch.tensor([[3, 4]], device="cuda"), 2
-    )
-
-    assert int(worker._ctx_len[slot]) == 5
-    assert int(worker._valid_len[slot]) == 5
-    assert [positions.tolist() for positions in draft_model.written_positions] == [
-        [[1, 2, 3]],
-        [[4, 5]],
-    ]
-    assert torch.all(worker._draft_kv_buffers[0][1, 0, 0, :5] == 1.0)
-    assert torch.count_nonzero(worker._draft_kv_buffers[0][1, 0, 0, 5:]) == 0
-
-
 @pytest.mark.parametrize(
     "chunks",
     [
@@ -332,21 +211,25 @@ def test_seed_context_pages_preserves_state_across_prefill_chunks():
 )
 @pytest.mark.parametrize("window", [64, 128, 256])
 @pytest.mark.parametrize("final_window", [False, True])
-def test_seed_context_windows_reads_only_each_chunk_tail(chunks, window, final_window):
+def test_seed_context_pages_reads_only_each_chunk_tail(chunks, window, final_window):
     """Never consume dropped captures, including an entirely skipped chunk."""
     worker = _make_worker()
     draft = _fake_draft_model()
     draft._attn_params = dict(draft._attn_params, window_size=window)
     written = []
 
-    def write(hidden, positions, windows):
+    def write(hidden, positions, valid, pages, tables, capacities):
         assert torch.isfinite(hidden).all()
-        torch.testing.assert_close(hidden[:, 0].float(), positions.float() - 1)
-        written.append(positions.tolist())
+        torch.testing.assert_close(hidden[..., 0].float(), positions.float() - 1)
+        written.append(positions.squeeze(0).tolist())
 
-    draft.write_context_windows = write
+    draft.write_context_pages = write
     meta = types.SimpleNamespace(max_num_requests=2, request_ids=[100, 101])
     worker._lazy_init(draft, meta)
+    manager = _bind_manager(worker, meta.request_ids)
+    for request in manager.kv_cache_map.values():
+        request.history_length = 0
+    worker._prepare_managed_history(meta.request_ids, 2)
     expected = []
     total_kept = 0
     prompt_end = chunks[-1][0] + chunks[-1][1]
@@ -372,7 +255,7 @@ def test_seed_context_windows_reads_only_each_chunk_tail(chunks, window, final_w
         packed_positions = torch.cat(
             (positions, positions.new_tensor([0, 1, 2, 50, 51, 52, 53, 54, 55]))
         )
-        worker._seed_context_windows(draft, meta, attn, packed_positions, len(captured))
+        worker._seed_context_pages(draft, meta, attn, packed_positions, len(captured))
         end = start + length
         if kept:
             expected.append(list(range(end - min(window, kept) + 1, end + 1)))
@@ -544,9 +427,7 @@ def test_prepare_keeps_cuda_graph_slots_across_replays():
     meta = _make_metadata(max_num_requests=4)
     worker._lazy_init(_fake_draft_model(), meta)
     meta._dspark_worker = worker
-    # Not 0: that is ATTENTION_DP_DUMMY_REQUEST_ID, which prepare() routes to
-    # the scratch row by design, so it would never take a persistent slot.
-    meta.request_ids = [11, 12, 13]
+    meta.request_ids = [0, 1, 2]
     meta.num_generations = 3
     meta.is_cuda_graph = True
     _prepare(worker, meta)
@@ -1016,7 +897,8 @@ def test_worker_and_draft_kv_follow_the_draft_form(embedded, worker_cls, uses_se
     worker = get_spec_worker(spec_config, None, Mapping())
     assert type(worker) is worker_cls
 
-    # Embedded drafts share the target manager; standalone drafts can use a separate manager.
+    # The embedded draft owns a rolling window and never reads the paged draft
+    # KV cache; the standalone one is DFlash lineage and does.
     assert should_use_separate_draft_kv_cache(spec_config) is uses_separate_draft_kv
 
 
@@ -1055,10 +937,9 @@ def test_lazy_init_publishes_the_runtime_position_ceiling():
 
     worker._lazy_init(dm, _make_metadata(max_num_requests=2), attn_metadata)
 
-    # start_pos is a frame index (position + 1); a full verification then accepts
-    # K+1 tokens and DSpark indexes K block positions from that start. Length is
-    # max index + 1.
-    expected = 4096 + 1 + 5 + 1 + 5 + 1
+    # A full target verification accepts K+1 tokens, then DSpark indexes K
+    # block positions from that new start. The table length is max index + 1.
+    expected = 4096 + 5 + 1 + 5 + 1
     assert dm._runtime_position_ceiling == expected
     assert dm.dspark_model._runtime_position_ceiling == expected
 
@@ -1182,3 +1063,208 @@ def test_prepare_resets_the_scratch_row_every_iteration():
     assert int(worker._ctx_len[live]) == 17
     assert int(worker._valid_len[live]) == 5
     assert worker._managed_residency[100] is worker._draft_kv_manager.kv_cache_map[100]
+
+
+def test_ragged_draft_gathers_each_requests_hidden_state():
+    worker = _make_worker()
+    draft_model = _RecordingDraftModel()
+    metadata = types.SimpleNamespace(
+        max_num_requests=2,
+        qo_indptr=torch.tensor([0, 4, 6], dtype=torch.int32, device="cuda"),
+        verify_lens=torch.tensor([4, 2], dtype=torch.int32, device="cuda"),
+    )
+    worker._lazy_init(draft_model, metadata)
+    worker._batch_to_slot[:2] = torch.tensor([0, 1], device="cuda")
+    captured = torch.stack(
+        [torch.full((HIDDEN * NCAP,), float(index), device="cuda") for index in range(6)]
+    )
+    metadata.get_hidden_states = lambda _num_tokens: captured
+    accepted = torch.zeros((2, 6), dtype=torch.int32, device="cuda")
+
+    worker._draft_gen_block_batched(
+        draft_model,
+        metadata,
+        types.SimpleNamespace(num_ctx_tokens=0),
+        accepted,
+        torch.ones(2, dtype=torch.int32, device="cuda"),
+        num_contexts=0,
+        batch_size=2,
+        total_target_tokens=6,
+        position_ids=torch.arange(6, device="cuda").unsqueeze(0),
+    )
+
+    assert draft_model.forward_calls[-1]["main_hidden"][:, 0].tolist() == [0.0, 4.0]
+
+
+def test_confidence_rows_are_slot_indexed_and_fail_open():
+    worker = _make_worker(enable_confidence_scheduling=True)
+    worker._lazy_init(_fake_draft_model(), _make_metadata(max_num_requests=8))
+
+    buffer = worker.staged_confidence_buffer()
+    assert buffer is not None
+    neutral = worker.confidence_row_for(12345)
+    assert neutral == worker._neutral_conf_row
+    assert neutral > worker._scratch_slot
+    assert torch.sigmoid(buffer[neutral]).min().item() > 0.999
+
+    worker._req_to_slot = {100: 5, 101: 2, 102: 7}
+    for slot in range(worker._scratch_slot):
+        buffer[slot] = float(slot)
+    rows = [worker.confidence_row_for(request_id) for request_id in (100, 101, 102)]
+    assert rows == [5, 2, 7]
+    assert buffer[rows, 0].tolist() == [5.0, 2.0, 7.0]
+
+
+def test_recycled_confidence_slot_is_reset_to_neutral():
+    worker = _make_worker(enable_confidence_scheduling=True)
+    worker._lazy_init(_fake_draft_model(), _make_metadata(max_num_requests=8))
+    worker._confidence_logits[: worker._scratch_slot] = -20.0
+
+    slot = worker._assign_slot(100, reset=False)
+
+    assert torch.sigmoid(worker._confidence_logits[slot]).min().item() > 0.999
+
+
+def test_confidence_state_is_absent_when_scheduling_is_disabled():
+    worker = _make_worker(enable_confidence_scheduling=False)
+    worker._lazy_init(_fake_draft_model(), _make_metadata(max_num_requests=8))
+
+    assert worker.staged_confidence_buffer() is None
+    assert worker.confidence_stamp_buffer() is None
+    assert worker.verify_planner is None
+
+
+def _bind_manager(worker, request_ids=()):
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+
+    manager = types.SimpleNamespace(
+        draft_layer_ids=tuple(range(worker._num_stages)),
+        draft_window_size=worker._win,
+        kv_factor_per_layer=[1] * worker._num_stages,
+        head_dim_per_layer=[worker._head_dim] * worker._num_stages,
+        layer_offsets=list(range(worker._num_stages)),
+        draft_max_blocks_per_seq=8192,
+        tokens_per_block=128,
+        _draft_dummy_request_ids=set(),
+        enable_block_reuse=False,
+        kv_cache_map={},
+    )
+    buffers = tuple(
+        torch.zeros(65, 1, 1, 128, worker._head_dim, device="cuda", dtype=torch.bfloat16)
+        for _ in range(worker._num_stages)
+    )
+    manager.get_draft_buffers = lambda stage: buffers[stage]
+    manager.get_draft_block_indices = lambda ids: [manager.kv_cache_map[rid].indices for rid in ids]
+    resource_manager = types.SimpleNamespace(
+        get_resource_manager=lambda kind: manager
+        if kind == ResourceManagerType.KV_CACHE_MANAGER
+        else None
+    )
+    worker._bind_managed_history(resource_manager)
+    for i, rid in enumerate(request_ids):
+        manager.kv_cache_map[rid] = types.SimpleNamespace(
+            history_length=1, capacity=4096, indices=[i + 1] * 32
+        )
+    return manager
+
+
+def _prepare(worker, meta, num_contexts=0):
+    if worker._draft_kv_manager is None:
+        _bind_manager(worker)
+    manager = worker._draft_kv_manager
+    for rid in meta.request_ids:
+        if worker._is_managed_request(rid) and rid not in manager.kv_cache_map:
+            manager.kv_cache_map[rid] = types.SimpleNamespace(
+                history_length=1, capacity=4096, indices=[len(manager.kv_cache_map) + 1] * 32
+            )
+    # A previously assigned slot represents already initialized resident history.
+    for rid in worker._req_to_slot:
+        if rid in manager.kv_cache_map:
+            worker._managed_residency.setdefault(rid, manager.kv_cache_map[rid])
+    meta.prepare()
+    worker._prepare_managed_history(meta.request_ids, num_contexts)
+
+
+def test_worker_lazy_init_configures_generation_autotuner_once():
+    worker = _make_worker()
+    draft_model = _fake_draft_model()
+    draft_model.configure_generation_autotuner = Mock()
+    metadata = _make_metadata(max_num_requests=8)
+
+    worker._lazy_init(draft_model, metadata)
+    worker._lazy_init(draft_model, metadata)
+
+    draft_model.configure_generation_autotuner.assert_called_once_with(8)
+
+
+def test_seed_context_pages_preserves_state_across_prefill_chunks():
+    class DraftModel:
+        num_stages = 1
+        block_size = 5
+        _attn_params = {
+            "window_size": 8,
+            "head_dim": 4,
+            "n_heads": 128,
+            "softmax_scale": 1.0,
+            "eps": 1e-6,
+        }
+
+        def __init__(self):
+            self.written_positions = []
+
+        def configure_generation_autotuner(self, _max_batch):
+            pass
+
+        def write_context_pages(self, hidden, positions, mask, pools, tables, capacities):
+            from tensorrt_llm._torch.attention.backends.dspark import write_dspark_context
+
+            self.written_positions.append(positions.clone())
+            write_dspark_context(
+                torch.ones(*positions.shape, 4, device="cuda", dtype=torch.bfloat16),
+                positions,
+                mask,
+                pools[0][:, 0, 0],
+                tables,
+                capacities,
+            )
+
+    worker = _make_worker()
+    draft_model = DraftModel()
+    metadata = types.SimpleNamespace(
+        max_num_requests=1,
+        request_ids=[100],
+        get_hidden_states=lambda _num_tokens: torch.zeros(
+            3, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
+        ),
+    )
+    worker._lazy_init(draft_model, metadata)
+    manager = _bind_manager(worker, [100])
+    manager.kv_cache_map[100].history_length = 0
+    worker._prepare_managed_history([100], 1)
+
+    first_chunk = types.SimpleNamespace(num_contexts=1, _seq_lens=[3])
+    worker._seed_context_pages(
+        draft_model, metadata, first_chunk, torch.tensor([[0, 1, 2]], device="cuda"), 3
+    )
+    slot = worker._req_to_slot[100]
+    assert int(worker._ctx_len[slot]) == 3
+    assert int(worker._valid_len[slot]) == 3
+    assert worker._managed_residency[100] is manager.kv_cache_map[100]
+    assert bool(worker._position_initialized[slot])
+
+    metadata.get_hidden_states = lambda _num_tokens: torch.zeros(
+        2, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
+    )
+    second_chunk = types.SimpleNamespace(num_contexts=1, _seq_lens=[2])
+    worker._seed_context_pages(
+        draft_model, metadata, second_chunk, torch.tensor([[3, 4]], device="cuda"), 2
+    )
+
+    assert int(worker._ctx_len[slot]) == 5
+    assert int(worker._valid_len[slot]) == 5
+    assert [positions.tolist() for positions in draft_model.written_positions] == [
+        [[1, 2, 3]],
+        [[4, 5]],
+    ]
+    assert torch.all(worker._draft_kv_buffers[0][1, 0, 0, :5] == 1.0)
+    assert torch.count_nonzero(worker._draft_kv_buffers[0][1, 0, 0, 5:]) == 0

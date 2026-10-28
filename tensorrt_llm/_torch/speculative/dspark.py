@@ -34,7 +34,8 @@ from ..distributed import AllReduceStrategy
 from ..modules.linear import Linear, TensorParallelMode
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.resource_manager import ResourceManagerType
-from .dflash import DFlashWorker, dflash_draft_slot_ids
+from .dflash import DFlashWorker, VocabParallelDraftTokens, dflash_draft_slot_ids
+from .dspark_schedule import NEUTRAL_CONFIDENCE_LOGIT
 from .interface import SpecMetadata, SpecWorkerBase
 from .vocab_parallel import tp_pair_exchange
 
@@ -284,30 +285,31 @@ class DSv4DSparkWorker(SpecWorkerBase):
     DSpark drafts a whole block of ``block_size`` tokens in one backbone forward
     (``DSv4DSparkDraftModel.forward``): it projects the captured target-layer hidden
     states (``main_proj`` + ``main_norm``) into the draft's captured-context
-    attention, runs the ``num_stages`` DSpark blocks over a captured
+    attention, runs the ``num_stages`` DSpark blocks over a rolling captured
     window, refines the per-position logits with the Markov head, and predicts a
     per-position acceptance confidence used by the verification scheduler.
 
-    Attention reads a sliding window of projected captured context directly
-    from manager-owned KV pages, alongside the current draft block.
+    Unlike DFlash, the draft does NOT use the paged KV cache or mask-token
+    cross-attention: its attention K/V come from the worker-owned rolling window
+    of projected captured context (one ``main_kv`` per decode step, per stage).
     Acceptance of the previous block goes through the unified
     :meth:`SpecWorkerBase.sample_and_accept_draft_tokens` (strict target-verify,
     or rejection sampling for a non-greedy batch), so greedy parity with no-spec
     is preserved regardless of draft quality.
 
-    The context window is kept consistent across the whole decode: it is seeded
+    The rolling window is kept consistent across the whole decode: it is seeded
     from the prompt's captured context at prefill and back-filled with the
     intermediate accepted tokens of a multi-accept step (both via
-    ``DSv4DSparkDraftModel.write_context_pages``), in addition to the per-step bonus
+    ``DSv4DSparkDraftModel.write_context_windows``), in addition to the per-step bonus
     write done by the generation path. These affect draft acceptance rate only,
     not correctness, which the standard target verify guarantees.
 
     Naming: workers are classified by *deployment form*, not by draft
     backbone (see :class:`DSparkWorker`). This one is form-specific
-    because it tracks captured-context history and drives the draft
+    because it owns a rolling captured-context window and drives the draft
     through attributes only an embedded DeepSeek-V4-Pro draft has --
-    ``num_stages``, ``_attn_params``, ``write_context_pages`` and
-    ``forward``. A standalone
+    ``num_stages``, ``_attn_params``, ``write_context_windows``,
+    ``write_context_windows_batched`` and ``forward_batched``. A standalone
     drafter has none of them and is served by :class:`DSparkWorker`.
 
     Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
@@ -323,7 +325,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self.spec_config = spec_config
         self.mapping = mapping
 
-        # Request progress is slot-indexed; managed KV lives only in its pages.
+        # Per-slot rolling captured-context KV windows, built lazily on the
+        # first forward (fixed-size for slot-indexed reads/writes).
+        self._win_inited = False
+        self._output_verify_lens: Optional[torch.Tensor] = None
+        self._attention_warmup_attempted = False
         self._ctx_len: Optional[torch.Tensor] = None  # [max_batch] abs decode position
         self._valid_len: Optional[torch.Tensor] = None  # [max_batch] written window entries
         self._win = 0
@@ -445,7 +451,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
     def _publish_position_ceiling(self, draft_model, attn_metadata, block_size: int) -> None:
         """Size the drafter's RoPE table from the runtime bound, and bound positions by it.
 
-        Refreshes the bound for every batch. The first forward can
+        Runs on EVERY forward, not once behind ``_win_inited``. The first forward can
         land on a KV-estimation probe manager whose ``max_seq_len`` is below the real
         one, and a table pinned to that probe would index out of range for the rest
         of the process; ``DFlashWorker._lazy_init_ctx_buffers`` re-publishes for that
@@ -453,8 +459,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
         Two bounds exist and neither dominates: ``attn_metadata`` carries the KV
         manager's ``max_seq_len`` while ``_freqs_cap`` carries the user's, and
-        ``_create_cuda_graph_warmup_request`` sizes its dummy request at whichever is
-        larger. Covering both is what keeps warmup off the end of the table.
+        ``DummyRequestFactory.create_cuda_graph_warmup_request`` sizes its dummy
+        request at whichever is larger. Covering both is what keeps warmup off
+        the end of the table.
         """
         inner_model = getattr(draft_model, "dspark_model", None) or draft_model
         config_cap = int(getattr(inner_model, "_freqs_cap", 0) or 0)
@@ -490,6 +497,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
         if self._ctx_len is None:
             max_batch = spec_metadata.max_num_requests
+            self._output_verify_lens = torch.empty(max_batch, dtype=torch.int32, device="cuda")
             draft_model.configure_generation_autotuner(max_batch)
             self._num_stages = draft_model.num_stages
             self._win = int(draft_model._attn_params["window_size"])
@@ -517,6 +525,82 @@ class DSv4DSparkWorker(SpecWorkerBase):
             )
             self._free_slots = deque(range(max_batch))
             self._req_to_slot = {}
+            self._position_initialized = torch.zeros(num_rows, dtype=torch.bool, device="cuda")
+            if self.return_confidence:
+                # Neutral fill = large positive logit (sigmoid ~ 1.0):
+                # unscored slots fail safe by verifying the full block. The
+                # neutral row sits one past the scratch row and is never used
+                # as a draft-output destination.
+                self._neutral_conf_row = num_rows
+                self._confidence_logits = torch.full(
+                    (num_rows + 1, block_size),
+                    _NEUTRAL_CONFIDENCE_LOGIT,
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                self._confidence_stamp = torch.zeros(
+                    (num_rows + 1,), dtype=torch.int32, device="cuda"
+                )
+                self._draft_seq_host = 0
+                # The executor updates this scalar outside inference mode;
+                # inference tensors reject that in-place host-side update.
+                with torch.inference_mode(False):
+                    self._draft_seq_cuda = torch.zeros((), dtype=torch.int32, device="cuda")
+                self._build_verify_planner(draft_model, block_size)
+            self._win_inited = True
+
+    def _build_verify_planner(self, draft_model, block_size: int) -> None:
+        """Construct the host-side verify planner (once, at lazy init).
+
+        ModelEngine owns and authenticates the deployment cost table. The
+        worker creates only the policy state and calibration, then receives
+        that exact runtime object before its first decision.
+        """
+        from .dspark_schedule import DSparkScheduleConfig
+        from .dspark_verify import DSparkVerifyPlanner
+
+        cfg = DSparkScheduleConfig(block_size=block_size, min_verify_len=1)
+
+        table_path = self.spec_config.confidence_sps_table_path
+        # ModelEngine owns the actual CUDA graph ladder, so it is the only
+        # component that may read, authenticate, and construct the deployment
+        # cost object. Reopening this path here creates a TOCTOU window in
+        # which graph capture and scheduling can observe different files.
+        logger.info(
+            f"DSpark: deferring exact SPS table {table_path} to the validated "
+            "ModelEngine runtime object"
+        )
+
+        # Calibration lives on the draft's confidence head; fall back to a plain
+        # sigmoid when the head is absent (no confidence to calibrate anyway).
+        head = resolve_confidence_head(draft_model)
+        apply_calibration = head.apply_sts if head is not None else None
+        sts_path = self.spec_config.confidence_sts_path
+        if sts_path and head is None:
+            # Refuse rather than degrade: a configured calibration that cannot
+            # be attached is a wiring bug, never a preference.
+            raise ValueError(
+                f"confidence_sts_path is set but no confidence head was found "
+                f"on {type(draft_model).__name__}; calibration cannot be "
+                f"applied, so the planner would schedule on raw sigmoid "
+                f"survivals. This is a model-wiring bug, not a config choice."
+            )
+        if sts_path and head is not None:
+            # Accepts either key spelling ("sts_temperatures" here,
+            # "temperatures" in SGLang); the vectors are interchangeable.
+            temps = load_sts_temperatures_from_path(sts_path)
+            head.load_sts_temperatures(torch.tensor(temps, dtype=torch.float32))
+            logger.info(f"DSpark: loaded STS calibration from {sts_path}")
+
+        self.verify_planner = DSparkVerifyPlanner(
+            cfg=cfg,
+            apply_calibration=apply_calibration,
+            device_windows=bool(self.spec_config.enable_fused_confidence_scheduler),
+        )
+        logger.info(
+            f"DSpark verify planner: max_verify_len={self.verify_planner.max_verify_len}, "
+            f"device_windows={self.verify_planner.device_windows}"
+        )
 
     def _assign_slot(self, req_id: int) -> int:
         """Get the persistent progress slot for a request."""
@@ -530,7 +614,404 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._req_to_slot[req_id] = slot
             self._ctx_len[slot] = 0
             self._valid_len[slot] = 0
+            self._position_initialized[slot] = False
+            if self._confidence_logits is not None:
+                # A recycled slot still holds the previous occupant's scores;
+                # reset to neutral so the first scheduling decision verifies
+                # the full block.
+                self._confidence_logits[slot].fill_(_NEUTRAL_CONFIDENCE_LOGIT)
         return self._req_to_slot[req_id]
+
+    def _advance_generation_state(
+        self,
+        slots: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        input_positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Bootstrap and advance per-slot decode state without host synchronization."""
+        # Reset inside the captured region: many padding / ADP-idle rows share this
+        # one scratch slot within a single forward, so its position has to restart
+        # from ``input_positions`` rather than accumulate across capture shapes.
+        scratch = self._scratch_slot
+        self._ctx_len[scratch].zero_()
+        self._valid_len[scratch].zero_()
+        self._position_initialized[scratch].zero_()
+        old = torch.where(self._position_initialized[slots], self._ctx_len[slots], input_positions)
+        start_pos = old + num_accepted_tokens
+        # Bound both positions by the RoPE table they index. Warmup reaches this
+        # through a captured graph replay, and prepare() cannot tell a synthetic
+        # warmup request from a real one, so the bound has to live in the graph.
+        # Only a warmup row climbs -- no completion frees its slot, and it ran 53
+        # entries past the table [measured job 3097207] -- while _position_cap sits
+        # exactly at what a full-length real request reaches.
+        if self._position_cap is not None:
+            old = torch.clamp(old, max=self._position_cap)
+            start_pos = torch.clamp(start_pos, max=self._position_cap)
+        self._ctx_len[slots] = start_pos
+        self._valid_len[slots] = torch.clamp(
+            self._valid_len[slots] + num_accepted_tokens, max=self._win
+        )
+        return old, start_pos
+
+    def _draft_gen_block_batched(
+        self,
+        draft_model,
+        spec_metadata: "DSparkSpecMetadata",
+        attn_metadata,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        total_target_tokens: int,
+        position_ids: torch.Tensor,
+        all_rank_num_tokens: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        """CUDA-graph-safe batched gen draft (all gen requests in one forward).
+
+        Free of host syncs and data-dependent shapes: per-request quantities
+        (``nacc``, the bonus, ``main_hidden``, ``start_pos``, the multi-accept
+        back-fill) are gathered as tensors, slots come from the host-built
+        ``_batch_to_slot`` mirror, and the backbone runs once via
+        ``DSv4DSparkDraftModel.forward``. Returns the per-position corrected
+        block logits ``[num_gens, K, vocab]`` (or ``None`` when there is nothing to
+        draft); the worker feeds them to ``SpecWorkerBase.sample_draft_tokens``.
+        Confidence truncation stays disabled — the full block is proposed. When
+        enabled, fixed-shape confidence scores are stored separately for
+        verification scheduling; they never truncate the proposal.
+        """
+        num_gens = batch_size - num_contexts
+        # K is the draft block width (fixed by the checkpoint); Kp1 is the
+        # target's per-gen-request token stride in ``captured``
+        # (runtime_draft_len + 1, which shrinks when verification is trimmed).
+        # Striding by max_draft_len instead reads into the next request's
+        # hidden states.
+        K = self.max_draft_len
+        device = accepted_tokens.device
+
+        if num_gens == 0:
+            return None
+        captured = spec_metadata.get_hidden_states(total_target_tokens)
+        if captured is None:
+            raise RuntimeError(
+                "DSpark generation requires captured target hidden states; "
+                "check target_layer_ids and the target model's capture hooks. "
+                "Refusing to substitute zero draft tokens for a missing capture buffer."
+            )
+
+        # gen-only graph batches have num_ctx_tokens == 0; mixed eager batches put
+        # the gen tokens after the context tokens.
+        gen_start = attn_metadata.num_ctx_tokens
+        slots = self._batch_to_slot[num_contexts:batch_size]  # [G]
+        # Bootstrap iterations can process one target token per request, while
+        # normal speculative verification processes K+1. Use the actual accepted
+        # row width to index both captured hidden states and position IDs.
+        target_width = accepted_tokens.shape[1]
+        nacc = num_accepted_tokens[num_contexts:batch_size].long()  # [G]
+        gidx = nacc - 1  # [G] index of the bonus within each verified prefix
+
+        # Bonus token = last accepted token of the verified prefix.
+        bonus = (
+            accepted_tokens[num_contexts:batch_size].gather(1, gidx.unsqueeze(1)).squeeze(1).long()
+        )  # [G]
+
+        # Start offset of each request's processed tokens inside ``captured``.
+        # Ragged verification uses the same qo_indptr as the packed input;
+        # uniform and bootstrap iterations use the accepted-row width.
+        qo_indptr = spec_metadata.qo_indptr
+        if spec_metadata.verify_lens is not None and qo_indptr is not None:
+            base = gen_start + qo_indptr[:num_gens].to(device=device, dtype=torch.long)
+        else:
+            arange_g = torch.arange(num_gens, device=device)
+            base = gen_start + arange_g * target_width  # [G]
+        # Graph-padding rows own only scratch state and may lie beyond the
+        # captured token extent. Route only those rows to a safe placeholder;
+        # an invalid real-request offset must not silently read another row.
+        is_scratch = slots == self._scratch_slot
+        base = torch.where(is_scratch, torch.zeros_like(base), base)
+        bonus_row = torch.where(is_scratch, torch.zeros_like(base), base + gidx)
+        main_hidden = captured.index_select(0, bonus_row)
+
+        # Fixed-size ([G, K]) masked back-fill of the intermediate accepted tokens
+        # (everything but the bonus) into the rolling window — same frames as the
+        # eager path (old+1 .. old+nacc-1), with j >= nacc-1 masked out.
+        # A disaggregated generation worker never sees prompt prefill, so a new
+        # slot has no absolute decode position. Bootstrap it once from the first
+        # target input position; locally-prefilled and existing slots keep their
+        # monotonically advanced position.
+        input_positions = position_ids.reshape(-1).index_select(0, base).long()
+        old, start_pos = self._advance_generation_state(slots, nacc, input_positions)
+        j = torch.arange(K, device=device)  # [K]
+        interim_valid = j.unsqueeze(0) < (nacc.unsqueeze(1) - 1)  # [G, K]
+        interim_pos = old.unsqueeze(1) + 1 + j.unsqueeze(0)  # [G, K]
+        interim_base = (base.unsqueeze(1) + j.unsqueeze(0)).clamp(
+            min=0, max=captured.shape[0] - 1
+        )  # [G, K] (clamped; invalid entries are masked out anyway)
+        interim_hidden = captured[interim_base]  # [G, K, ncap*hidden]
+        tables = self._draft_block_tables[num_contexts:batch_size]
+        capacities = self._draft_capacities[num_contexts:batch_size]
+        draft_model.write_context_pages(
+            interim_hidden,
+            interim_pos,
+            interim_valid,
+            self._draft_kv_buffers,
+            tables,
+            capacities,
+        )
+
+        # Surface the per-position corrected block logits ([num_gens, K, vocab])
+        # and let SpecWorkerBase.sample_draft_tokens do the (greedy or rejection)
+        # sampling + TP gather + draft_probs scatter, rather than argmaxing here.
+        _toks, confidence, block_logits = draft_model.forward(
+            main_hidden,
+            bonus,
+            start_pos,
+            kv_pages=self._draft_kv_buffers,
+            block_tables=tables,
+            capacities=capacities,
+            valid_len=self._valid_len[slots],
+            temperature=0.0,
+            return_confidence=self.return_confidence,
+            return_logits=True,
+            all_rank_num_tokens=all_rank_num_tokens,
+        )
+        # Stash the [G, K] confidence for the verification scheduler.
+        # Slot-indexed (survives batch reshuffles), written in place (a
+        # captured graph keeps the same storage), and scattered through
+        # ``slots`` so a replay lands on the current batch's slots.
+        if confidence is not None:
+            # Padding may write the same scratch slot repeatedly; its content
+            # is undefined and must never be consumed as a real confidence row.
+            self._confidence_logits[slots] = confidence.detach()
+            # Same slots, same capture region: content-only update, graph-safe.
+            self._confidence_stamp[slots] = self._draft_seq_cuda
+        return block_logits
+
+    def _sample_draft_tokens_guided(
+        self,
+        gen_logits: torch.Tensor,
+        spec_metadata: "DSparkSpecMetadata",
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        K: int,
+    ):
+        """
+        Grammar-constrained draft sampling for the guided-decoding path.
+        """
+        vocab = gen_logits.shape[-1]
+        # Lay the block out step-major ([K, batch, vocab]) so each step's slice is
+        # a contiguous [batch, vocab] tensor.
+        if num_contexts > 0:
+            full_logits = gen_logits.new_zeros((K, batch_size, vocab))
+            full_logits[:, num_contexts:, :] = gen_logits.transpose(0, 1)
+        else:
+            full_logits = gen_logits.transpose(0, 1).contiguous()
+
+        gidx = (num_accepted_tokens - 1).clamp(min=0).unsqueeze(1).long()
+        new_tokens = accepted_tokens.gather(1, gidx).squeeze(1).to(torch.int32)
+
+        gen_draft_tokens = []
+        for k in range(K):
+            self.guided_decoder.add_draft_batch(new_tokens, num_accepted_tokens, draft_step=k)
+            step_logits = full_logits[k]
+            self.guided_decoder.execute_draft_batch(step_logits, draft_step=k)
+            step_tokens = self.sample_draft_tokens(
+                step_logits, spec_metadata, batch_size, draft_step=k
+            )
+            gen_draft_tokens.append(step_tokens[num_contexts:])
+            new_tokens = step_tokens
+        gen_draft_tokens = torch.stack(gen_draft_tokens, dim=1)
+        return gen_draft_tokens
+
+    def _forward_impl(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+        resource_manager=None,
+    ):
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+        raw_logits = logits
+        K = self.max_draft_len
+
+        if self._draft_kv_manager is None:
+            raise RuntimeError("DSpark KV pages must be prepared before worker forward")
+
+        self._execute_guided_decoder_if_present(logits)
+
+        # Target-verify acceptance via the unified SpecWorkerBase entry: it
+        # reshapes the stored draft tokens (default (num_gens, runtime_draft_len)
+        # hook), then routes to strict or rejection sampling. Greedy parity with
+        # the previous hand-rolled path is preserved (rejection only engages for a
+        # non-greedy batch with valid draft_probs).
+        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
+            logits, attn_metadata, spec_metadata
+        )
+
+        total_target_tokens = input_ids.shape[0]
+
+        # CUDA-graph warmup guard: the warmup forwards (is_cuda_graph set, stream
+        # NOT yet capturing) run synthetic gen batches that would otherwise advance
+        # the persistent rolling-window state. Snapshot and restore it so warmup is
+        # side-effect-free. (During the capture pass itself the stream IS capturing,
+        # so we skip the save/restore and let the ops be recorded. Capture-time
+        # mutation stays on dummy/scratch state: a locally-prefilled request
+        # resets its slot at position zero, while a disaggregated generation-only
+        # request receives a freshly zeroed slot.)
+        is_warmup = (
+            getattr(spec_metadata, "is_cuda_graph", False)
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        if is_warmup:
+            saved_ctx_len = self._ctx_len.clone()
+            saved_valid_len = self._valid_len.clone()
+            saved_position_initialized = self._position_initialized.clone()
+            # The confidence buffer is persistent state too; warmup scores
+            # must not reach the verification planner.
+            saved_confidence = (
+                None if self._confidence_logits is None else self._confidence_logits.clone()
+            )
+            saved_stamp = None if self._confidence_stamp is None else self._confidence_stamp.clone()
+
+        # Assign / reset window slots for context (prefill) requests and seed each
+        # request's rolling KV window from its prompt's captured context, so the
+        # first generation step drafts against real context instead of an all-zero
+        # window (acceptance-rate only; verified decoding keeps output correct).
+        if num_contexts > 0:
+            self._seed_context_pages(
+                draft_model,
+                spec_metadata,
+                attn_metadata,
+                position_ids,
+                total_target_tokens,
+            )
+
+        # FUSED_COMM MoE backends (DeepGEMM MegaMoE) synchronize EP ranks with an
+        # in-kernel phase-flip NVLink barrier that flips on every kernel call, so
+        # every rank must invoke the draft MoE the same number of times and with
+        # the same globally-gathered per-rank token list, or the barrier desyncs
+        # (hang / "unspecified launch failure"). The draft runs over generation
+        # requests only, each expanded to ``block`` positions, so the per-rank
+        # draft-MoE token count is ``num_gens * block``. ``all_rank_num_gens`` is
+        # gathered at metadata-prep time (model_engine, outside any CUDA-graph
+        # capture region); it is None for non-ADP / single-rank runs, where the
+        # local ``[num_tokens]`` fallback in ``_forward_stage`` is correct.
+        block = int(draft_model.block_size)
+        all_rank_num_gens = getattr(spec_metadata, "all_rank_num_gens", None)
+        # A rank with zero local gen requests still has to cross the draft MoE's
+        # cross-rank barrier, but DeepseekV4MoE's router / shared-expert dense
+        # GEMMs reject a 0-row input (cuBLAS CUBLAS_STATUS_INVALID_VALUE), so such
+        # a rank runs a single 1-row dummy through the MoE (like ADP padding).
+        # Encode that as ``1`` in the globally-shared per-rank token list so every
+        # rank agrees on the FUSED_COMM chunk count and per-rank slice.
+        all_rank_draft_tokens = (
+            [max(1, int(g) * block) for g in all_rank_num_gens]
+            if all_rank_num_gens is not None
+            else None
+        )
+        global_has_gen = (
+            max(all_rank_num_gens) > 0 if all_rank_num_gens is not None else num_gens > 0
+        )
+
+        if num_gens > 0:
+            # The batched gen-block draft returns the per-position corrected block
+            # logits [num_gens, K, vocab] and is CUDA-graph-safe.
+            gen_logits = self._draft_gen_block_batched(
+                draft_model,
+                spec_metadata,
+                attn_metadata,
+                accepted_tokens,
+                num_accepted_tokens,
+                num_contexts,
+                batch_size,
+                total_target_tokens,
+                position_ids,
+                all_rank_num_tokens=all_rank_draft_tokens,
+            )
+            if gen_logits is not None:
+                if self.guided_decoder is not None:
+                    gen_draft_tokens = self._sample_draft_tokens_guided(
+                        gen_logits,
+                        spec_metadata,
+                        accepted_tokens,
+                        num_accepted_tokens,
+                        num_contexts,
+                        batch_size,
+                        K,
+                    )
+                else:
+                    # SpecWorkerBase samples the draft tokens.
+                    gen_draft_tokens = self.sample_draft_tokens(
+                        gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
+                    )
+                # The context one-hot must match the width the gen scatter just
+                # published to draft_probs, NOT gen_logits.shape[-1]: under TP the
+                # draft logits are vocab-sharded and sample_draft_tokens gathers
+                # them to full vocab before scattering, so the pre-gather shard
+                # width would leave stale columns and corrupt rejection.
+                gen_vocab = spec_metadata.draft_probs_last_dim
+            else:
+                gen_draft_tokens = torch.zeros((num_gens, K), dtype=torch.int32, device="cuda")
+                gen_vocab = None
+        else:
+            # No local generation requests: if any peer EP rank has some, we must
+            # still cross the draft MoE's cross-rank barrier the same number of
+            # times (zero-token) so a FUSED_COMM phase-flip barrier stays lockstep.
+            if global_has_gen:
+                draft_model.run_moe_lockstep_noop(all_rank_draft_tokens, accepted_tokens.device)
+            gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
+            gen_vocab = None
+
+        # Context requests are not drafted by the block worker (zero placeholder
+        # token); fill their draft-prob slot rows with a legal one-hot so they are
+        # a valid distribution when they become gen requests next iteration.
+        self.write_context_onehot_draft_probs(spec_metadata, num_contexts, num_gens, K, gen_vocab)
+
+        if num_contexts > 0:
+            ctx_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
+            next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
+        else:
+            next_draft_tokens = gen_draft_tokens
+
+        next_new_tokens = self._prepare_next_new_tokens(
+            accepted_tokens,
+            next_draft_tokens,
+            spec_metadata.batch_indices_cuda,
+            batch_size,
+            num_accepted_tokens,
+        )
+
+        if is_warmup:
+            self._ctx_len.copy_(saved_ctx_len)
+            self._valid_len.copy_(saved_valid_len)
+            self._position_initialized.copy_(saved_position_initialized)
+            if saved_confidence is not None:
+                self._confidence_logits.copy_(saved_confidence)
+            if saved_stamp is not None:
+                self._confidence_stamp.copy_(saved_stamp)
+
+        outputs = {
+            "logits": raw_logits,
+            "new_tokens": accepted_tokens,
+            "new_tokens_lens": num_accepted_tokens,
+            "next_draft_tokens": next_draft_tokens,
+            "next_new_tokens": next_new_tokens,
+        }
+        _publish_policy_window_output(
+            outputs,
+            spec_metadata.verify_lens,
+            num_contexts=num_contexts,
+            num_generations=num_gens,
+            output_verify_lens=self._output_verify_lens,
+        )
+        return outputs
 
     def _release_inactive_slots(self, request_ids: list[int]) -> None:
         current = set(request_ids)
@@ -713,10 +1194,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 raise RuntimeError(
                     "Embedded DSpark requires captured context to initialize KV history"
                 )
-            if captured is not None:
-                keep = min(self._win, chunk_len)
+            if captured is not None and capture_len:
+                keep = min(self._win, capture_len)
                 # Prefix reuse can publish any complete page in this chunk.
-                count = chunk_len if self._draft_kv_manager.enable_block_reuse else keep
+                count = capture_len if self._draft_kv_manager.enable_block_reuse else keep
                 positions = (chunk_positions[-count:] + 1).unsqueeze(0)
                 draft_model.write_context_pages(
                     captured[
@@ -730,343 +1211,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 )
                 self._valid_len[slot] = torch.clamp(self._valid_len[slot] + keep, max=self._win)
             self._ctx_len[slot] = chunk_positions[-1] + 1
+            self._position_initialized[slot] = True
             context_offset += chunk_len
-
-    def _advance_generation_state(
-        self,
-        slots: torch.Tensor,
-        num_accepted_tokens: torch.Tensor,
-        input_positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Bootstrap and advance per-slot decode state without host synchronization."""
-        # Reset inside the captured region: many padding / ADP-idle rows share this
-        # one scratch slot within a single forward, so its position has to restart
-        # from ``input_positions`` rather than accumulate across capture shapes.
-        scratch = self._scratch_slot
-        self._ctx_len[scratch].zero_()
-        self._valid_len[scratch].zero_()
-        old = torch.where(slots == scratch, input_positions, self._ctx_len[slots])
-        start_pos = old + num_accepted_tokens
-        # Keep dummy graph positions within the RoPE table.
-        if self._position_cap is not None:
-            old = torch.clamp(old, max=self._position_cap)
-            start_pos = torch.clamp(start_pos, max=self._position_cap)
-        self._ctx_len[slots] = start_pos
-        self._valid_len[slots] = torch.clamp(
-            self._valid_len[slots] + num_accepted_tokens, max=self._win
-        )
-        return old, start_pos
-
-    def _draft_gen_block_batched(
-        self,
-        draft_model,
-        spec_metadata: "DSparkSpecMetadata",
-        attn_metadata,
-        accepted_tokens: torch.Tensor,
-        num_accepted_tokens: torch.Tensor,
-        num_contexts: int,
-        batch_size: int,
-        total_target_tokens: int,
-        position_ids: torch.Tensor,
-        all_rank_num_tokens: Optional[List[int]] = None,
-    ) -> torch.Tensor:
-        """CUDA-graph-safe batched gen draft (all gen requests in one forward).
-
-        Free of host syncs and data-dependent shapes: per-request quantities
-        (``nacc``, the bonus, ``main_hidden``, ``start_pos``, the multi-accept
-        back-fill) are gathered as tensors, slots come from the host-built
-        ``_batch_to_slot`` mirror, and the backbone runs once via
-        ``DSv4DSparkDraftModel.forward``. Returns the per-position corrected
-        block logits ``[num_gens, K, vocab]`` (or ``None`` when there is nothing to
-        draft); the worker feeds them to ``SpecWorkerBase.sample_draft_tokens``.
-        Confidence truncation stays disabled — the full block is proposed. When
-        enabled, fixed-shape confidence scores are stored separately for
-        verification scheduling; they never truncate the proposal.
-        """
-        num_gens = batch_size - num_contexts
-        # K is the draft block width (fixed by the checkpoint); Kp1 is the
-        # target's per-gen-request token stride in ``captured``
-        # (runtime_draft_len + 1, which shrinks when verification is trimmed).
-        # Striding by max_draft_len instead reads into the next request's
-        # hidden states.
-        K = self.max_draft_len
-        device = accepted_tokens.device
-
-        if num_gens == 0:
-            return None
-        captured = spec_metadata.get_hidden_states(total_target_tokens)
-        if captured is None:
-            raise RuntimeError("Embedded DSpark requires captured context to advance KV history")
-
-        # gen-only graph batches have num_ctx_tokens == 0; mixed eager batches put
-        # the gen tokens after the context tokens.
-        gen_start = attn_metadata.num_ctx_tokens
-        slots = self._batch_to_slot[num_contexts:batch_size]  # [G]
-        # Bootstrap iterations can process one target token per request, while
-        # normal speculative verification processes K+1. Use the actual accepted
-        # row width to index both captured hidden states and position IDs.
-        target_width = accepted_tokens.shape[1]
-        nacc = num_accepted_tokens[num_contexts:batch_size].long()  # [G]
-        gidx = nacc - 1  # [G] index of the bonus within each verified prefix
-
-        # Bonus token = last accepted token of the verified prefix.
-        bonus = (
-            accepted_tokens[num_contexts:batch_size].gather(1, gidx.unsqueeze(1)).squeeze(1).long()
-        )  # [G]
-
-        # Start offset of each request's processed tokens inside ``captured``.
-        # Ragged verification uses the same qo_indptr as the packed input;
-        # uniform and bootstrap iterations use the accepted-row width.
-        qo_indptr = spec_metadata.qo_indptr
-        if spec_metadata.verify_lens is not None and qo_indptr is not None:
-            base = gen_start + qo_indptr[:num_gens].to(device=device, dtype=torch.long)
-        else:
-            arange_g = torch.arange(num_gens, device=device)
-            base = gen_start + arange_g * target_width  # [G]
-        # Graph-padding rows own only scratch state and may lie beyond the
-        # captured token extent. Route only those rows to a safe placeholder;
-        # an invalid real-request offset must not silently read another row.
-        is_scratch = slots == self._scratch_slot
-        base = torch.where(is_scratch, torch.zeros_like(base), base)
-        bonus_row = torch.where(is_scratch, torch.zeros_like(base), base + gidx)
-        main_hidden = captured.index_select(0, bonus_row)
-
-        # Back-fill intermediate accepted tokens (everything but the bonus) at
-        # frames old+1 .. old+nacc-1. Fixed [G, K] tensors keep this capture-safe;
-        # j >= nacc-1 is masked before any page store.
-        input_positions = position_ids.reshape(-1)[base].long()
-        old, start_pos = self._advance_generation_state(slots, nacc, input_positions)
-        j = torch.arange(K, device=device)  # [K]
-        interim_valid = j.unsqueeze(0) < (nacc.unsqueeze(1) - 1)  # [G, K]
-        interim_pos = old.unsqueeze(1) + 1 + j.unsqueeze(0)  # [G, K]
-        interim_base = (base.unsqueeze(1) + j.unsqueeze(0)).clamp(
-            min=0, max=captured.shape[0] - 1
-        )  # [G, K] (clamped; invalid entries are masked out anyway)
-        interim_hidden = captured[interim_base]  # [G, K, ncap*hidden]
-        tables = self._draft_block_tables[num_contexts:batch_size]
-        capacities = self._draft_capacities[num_contexts:batch_size]
-        draft_model.write_context_pages(
-            interim_hidden, interim_pos, interim_valid, self._draft_kv_buffers, tables, capacities
-        )
-
-        # Surface the per-position corrected block logits ([num_gens, K, vocab])
-        # and let SpecWorkerBase.sample_draft_tokens do the (greedy or rejection)
-        # sampling + TP gather + draft_probs scatter, rather than argmaxing here.
-        _toks, _num_proposed, block_logits = draft_model.forward(
-            main_hidden,
-            bonus,
-            start_pos,
-            kv_pages=self._draft_kv_buffers,
-            block_tables=tables,
-            capacities=capacities,
-            valid_len=self._valid_len[slots],
-            temperature=0.0,
-            return_confidence=self.return_confidence,
-            return_logits=True,
-            all_rank_num_tokens=all_rank_num_tokens,
-        )
-        # Stash the [G, K] confidence for the verification scheduler.
-        # Slot-indexed (survives batch reshuffles), written in place (a
-        # captured graph keeps the same storage), and scattered through
-        # ``slots`` so a replay lands on the current batch's slots.
-        if confidence is not None:
-            # Padding may write the same scratch slot repeatedly; its content
-            # is undefined and must never be consumed as a real confidence row.
-            self._confidence_logits[slots] = confidence.detach()
-            # Same slots, same capture region: content-only update, graph-safe.
-            self._confidence_stamp[slots] = self._draft_seq_cuda
-        return block_logits
-
-    def _sample_draft_tokens_guided(
-        self,
-        gen_logits: torch.Tensor,
-        spec_metadata: "DSparkSpecMetadata",
-        accepted_tokens: torch.Tensor,
-        num_accepted_tokens: torch.Tensor,
-        num_contexts: int,
-        batch_size: int,
-        K: int,
-    ):
-        """
-        Grammar-constrained draft sampling for the guided-decoding path.
-        """
-        vocab = gen_logits.shape[-1]
-        # Lay the block out step-major ([K, batch, vocab]) so each step's slice is
-        # a contiguous [batch, vocab] tensor.
-        if num_contexts > 0:
-            full_logits = gen_logits.new_zeros((K, batch_size, vocab))
-            full_logits[:, num_contexts:, :] = gen_logits.transpose(0, 1)
-        else:
-            full_logits = gen_logits.transpose(0, 1).contiguous()
-
-        gidx = (num_accepted_tokens - 1).clamp(min=0).unsqueeze(1).long()
-        new_tokens = accepted_tokens.gather(1, gidx).squeeze(1).to(torch.int32)
-
-        gen_draft_tokens = []
-        for k in range(K):
-            self.guided_decoder.add_draft_batch(new_tokens, num_accepted_tokens, draft_step=k)
-            step_logits = full_logits[k]
-            self.guided_decoder.execute_draft_batch(step_logits, draft_step=k)
-            step_tokens = self.sample_draft_tokens(
-                step_logits, spec_metadata, batch_size, draft_step=k
-            )
-            gen_draft_tokens.append(step_tokens[num_contexts:])
-            new_tokens = step_tokens
-        gen_draft_tokens = torch.stack(gen_draft_tokens, dim=1)
-        return gen_draft_tokens
-
-    def _forward_impl(
-        self,
-        input_ids,
-        position_ids,
-        hidden_states,
-        logits,
-        attn_metadata,
-        spec_metadata,
-        draft_model,
-        resource_manager=None,
-    ):
-        batch_size = attn_metadata.num_seqs
-        num_contexts = attn_metadata.num_contexts
-        num_gens = batch_size - num_contexts
-        raw_logits = logits
-        K = self.max_draft_len
-
-        if self._draft_kv_manager is None:
-            raise RuntimeError("DSpark KV pages must be prepared before worker forward")
-
-        self._execute_guided_decoder_if_present(logits)
-
-        # Target-verify acceptance via the unified SpecWorkerBase entry: it
-        # reshapes the stored draft tokens (default (num_gens, runtime_draft_len)
-        # hook), then routes to strict or rejection sampling. Greedy parity with
-        # the previous hand-rolled path is preserved (rejection only engages for a
-        # non-greedy batch with valid draft_probs).
-        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
-            logits, attn_metadata, spec_metadata
-        )
-
-        total_target_tokens = input_ids.shape[0]
-
-        if num_contexts > 0:
-            self._seed_context_pages(
-                draft_model,
-                spec_metadata,
-                attn_metadata,
-                position_ids,
-                total_target_tokens,
-            )
-
-        # FUSED_COMM MoE backends (DeepGEMM MegaMoE) synchronize EP ranks with an
-        # in-kernel phase-flip NVLink barrier that flips on every kernel call, so
-        # every rank must invoke the draft MoE the same number of times and with
-        # the same globally-gathered per-rank token list, or the barrier desyncs
-        # (hang / "unspecified launch failure"). The draft runs over generation
-        # requests only, each expanded to ``block`` positions, so the per-rank
-        # draft-MoE token count is ``num_gens * block``. ``all_rank_num_gens`` is
-        # gathered at metadata-prep time (model_engine, outside any CUDA-graph
-        # capture region); it is None for non-ADP / single-rank runs, where the
-        # local ``[num_tokens]`` fallback in ``_forward_stage`` is correct.
-        block = int(draft_model.block_size)
-        all_rank_num_gens = getattr(spec_metadata, "all_rank_num_gens", None)
-        # A rank with zero local gen requests still has to cross the draft MoE's
-        # cross-rank barrier, but DeepseekV4MoE's router / shared-expert dense
-        # GEMMs reject a 0-row input (cuBLAS CUBLAS_STATUS_INVALID_VALUE), so such
-        # a rank runs a single 1-row dummy through the MoE (like ADP padding).
-        # Encode that as ``1`` in the globally-shared per-rank token list so every
-        # rank agrees on the FUSED_COMM chunk count and per-rank slice.
-        all_rank_draft_tokens = (
-            [max(1, int(g) * block) for g in all_rank_num_gens]
-            if all_rank_num_gens is not None
-            else None
-        )
-        global_has_gen = (
-            max(all_rank_num_gens) > 0 if all_rank_num_gens is not None else num_gens > 0
-        )
-
-        if num_gens > 0:
-            # The batched gen-block draft returns the per-position corrected block
-            # logits [num_gens, K, vocab] and is CUDA-graph-safe.
-            gen_logits = self._draft_gen_block_batched(
-                draft_model,
-                spec_metadata,
-                attn_metadata,
-                accepted_tokens,
-                num_accepted_tokens,
-                num_contexts,
-                batch_size,
-                total_target_tokens,
-                position_ids,
-                all_rank_num_tokens=all_rank_draft_tokens,
-            )
-            if gen_logits is not None:
-                if self.guided_decoder is not None:
-                    gen_draft_tokens = self._sample_draft_tokens_guided(
-                        gen_logits,
-                        spec_metadata,
-                        accepted_tokens,
-                        num_accepted_tokens,
-                        num_contexts,
-                        batch_size,
-                        K,
-                    )
-                else:
-                    # SpecWorkerBase samples the draft tokens.
-                    gen_draft_tokens = self.sample_draft_tokens(
-                        gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
-                    )
-                # The context one-hot must match the width the gen scatter just
-                # published to draft_probs, NOT gen_logits.shape[-1]: under TP the
-                # draft logits are vocab-sharded and sample_draft_tokens gathers
-                # them to full vocab before scattering, so the pre-gather shard
-                # width would leave stale columns and corrupt rejection.
-                gen_vocab = spec_metadata.draft_probs_last_dim
-            else:
-                gen_draft_tokens = torch.zeros((num_gens, K), dtype=torch.int32, device="cuda")
-                gen_vocab = None
-        else:
-            # No local generation requests: if any peer EP rank has some, we must
-            # still cross the draft MoE's cross-rank barrier the same number of
-            # times (zero-token) so a FUSED_COMM phase-flip barrier stays lockstep.
-            if global_has_gen:
-                draft_model.run_moe_lockstep_noop(all_rank_draft_tokens, accepted_tokens.device)
-            gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
-            gen_vocab = None
-
-        # Context requests are not drafted by the block worker (zero placeholder
-        # token); fill their draft-prob slot rows with a legal one-hot so they are
-        # a valid distribution when they become gen requests next iteration.
-        self.write_context_onehot_draft_probs(spec_metadata, num_contexts, num_gens, K, gen_vocab)
-
-        if num_contexts > 0:
-            ctx_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
-            next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
-        else:
-            next_draft_tokens = gen_draft_tokens
-
-        next_new_tokens = self._prepare_next_new_tokens(
-            accepted_tokens,
-            next_draft_tokens,
-            spec_metadata.batch_indices_cuda,
-            batch_size,
-            num_accepted_tokens,
-        )
-
-        return {
-            "logits": raw_logits,
-            "new_tokens": accepted_tokens,
-            "new_tokens_lens": num_accepted_tokens,
-            "next_draft_tokens": next_draft_tokens,
-            "next_new_tokens": next_new_tokens,
-        }
-        _publish_policy_window_output(
-            outputs,
-            spec_metadata.verify_lens,
-            num_contexts=num_contexts,
-            num_generations=num_gens,
-            output_verify_lens=self._output_verify_lens,
-        )
-        return outputs
 
 
 class DSparkWorker(DFlashWorker):
@@ -1101,8 +1247,9 @@ class DSparkWorker(DFlashWorker):
     subclass. Naming workers by backbone would produce N classes with
     identical bodies.
 
-    Embedded DSpark uses :class:`DSv4DSparkWorker` to manage captured-context
-    progress and the draft block forward.
+    Deployment form is the axis the runtime state actually splits on: paged
+    draft K/V here, a worker-owned rolling window in
+    :class:`DSv4DSparkWorker`.
     """
 
     def set_draft_model(self, draft_model) -> None:
@@ -1145,6 +1292,16 @@ class DSparkWorker(DFlashWorker):
         ):
             self._markov_tp_exchange = tp_pair_exchange(mapping, AllReduceStrategy.NCCL)
 
+    @staticmethod
+    def block_width_for(spec_config) -> int:
+        """Block slots a DSpark worker computes for ``spec_config``.
+
+        The ``shift_label`` convention, which the DSpark drafter defaults to,
+        reads slots 0..K-1; a checkpoint that turns it off needs K+1 and is
+        caught by the block-within-allocation check.
+        """
+        return spec_config.max_draft_len
+
     def _draft_block_width(self, draft_model) -> int:
         """Block width under the dspark ``shift_label`` convention.
 
@@ -1154,8 +1311,8 @@ class DSparkWorker(DFlashWorker):
         drafters are meant to run.
         """
         if getattr(draft_model, "_dspark_shift_label", False):
-            return self.max_draft_len
-        return super()._draft_block_width(draft_model)
+            return self.block_width_for(self.spec_config)
+        return DFlashWorker.block_width_for(self.spec_config)
 
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int

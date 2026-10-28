@@ -21,13 +21,19 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.pyexecutor import llm_request
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    _GUARD_PAGE_REQUEST_ID,
+    _RESERVED_REQUEST_IDS,
+    CUDA_GRAPH_DUMMY_REQUEST_ID,
     GPU_LEVEL,
     KVCacheManagerV2,
     _estimate_draft_cache_size_components,
+    _fill_kv_pages,
     _get_draft_layer_sizes,
     _get_generation_kv_capacity,
 )
+from tensorrt_llm._torch.pyexecutor.resource_manager import scan_kv_buffer_for_invalid_values
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -950,7 +956,16 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """Return context/generation bytes per token, then fixed bytes per request."""
         compress_ratios = [self._compress_ratios[layer] for layer in self.pp_layers]
         has_fp8_kv_cache = self.dtype == DataType.FP8
-        non_sliding_attn_size_per_token = self.get_cache_bytes_per_token()
+        non_sliding_attn_size_per_token = _estimate_non_sliding_attn_size_per_token(
+            self.head_dim,
+            self.index_head_dim,
+            compress_ratios,
+            has_fp8_kv_cache,
+            indexer_k_dtype=self._indexer_k_dtype,
+            use_fp8_ds_mla=self.use_fp8_ds_mla,
+            has_nvfp4_compress=self._use_nvfp4_compress,
+            nvfp4_residual_dim=self.nvfp4_residual_dim,
+        )
         (
             context_swa_size_per_token,
             context_swa_size_per_request,

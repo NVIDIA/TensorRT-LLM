@@ -630,7 +630,7 @@ def block_bytes_per_group(page_table: KVCachePageTable) -> list[int | None]:
     only once. Non-attention groups retain a ``None`` placeholder so the result
     remains aligned with receive-request layer-group indices.
     """
-    from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
+    from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
     from tensorrt_llm._torch.disaggregation.resource.utils import (
         get_physical_pool,
         get_pool_view_num_layers,

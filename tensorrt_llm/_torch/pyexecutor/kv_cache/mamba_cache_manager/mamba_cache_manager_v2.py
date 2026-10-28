@@ -424,11 +424,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         ]
 
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
-        return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
+        if self._is_standalone_draft_layer(local_layer_idx):
+            return False
+        layer_id = self.pp_layers[local_layer_idx]
+        return layer_id < len(self._mamba_layer_mask) and self._mamba_layer_mask[layer_id]
 
     @override
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
         layer_id = int(self.impl.layer_grouping[pool_id][0])
+        if self._is_standalone_draft_layer(layer_id):
+            return KVCacheManagerV2._get_pool_roles(self, pool_id)
         if self._is_local_mamba_layer(layer_id):
             return MambaRole.SSM_STATE, None
         return super()._get_pool_roles(pool_id)
@@ -573,6 +578,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             else 0
         )
         return attention_quota + state_quota + extra_attention_quota
+
+    def _get_draft_quota_from_max_tokens(self, max_tokens: float) -> int:
+        draft_quota = super()._get_draft_quota_from_max_tokens(max_tokens)
+        snapshot_slots = self._num_ssm_snapshots_for_capacity(max_tokens, self.kv_cache_config)
+        if snapshot_slots > 0:
+            # The snapshot plan's partial-page reserve also covers draft KV.
+            draft_quota += (
+                self._max_resident_sequences()
+                * sum(self._draft_layer_sizes)
+                * self.tokens_per_block
+            )
+        return draft_quota
 
     @override
     def _get_max_tokens_from_quota(self, quota: int) -> float:
@@ -847,9 +864,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     // self._ssm_page_index_scale
                 )
             else:
-                attention_pages.append(
-                    self.impl.get_page_index_upper_bound(layer_id, Role.KEY) // self.kv_factor
-                )
+                attention_pages.append(self._get_attention_pool_num_blocks(local_layer_idx))
         if attention_pages:
             return max(attention_pages)
         return max(ssm_pages) if ssm_pages else 0

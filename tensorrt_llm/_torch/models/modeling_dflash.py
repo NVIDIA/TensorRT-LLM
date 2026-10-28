@@ -68,7 +68,8 @@ def dspark_layer_window_size(
 def declares_lilicorr(config: PretrainedConfig) -> bool:
     """Whether the checkpoint requires the LiLiCorr candidate scorer."""
     return is_lilicorr_checkpoint(
-        getattr(config, "architectures", None), getattr(config, "dflash_config", None) or {}
+        getattr(config, "architectures", None),
+        getattr(config, "dflash_config", None) or {},
     )
 
 
@@ -135,7 +136,8 @@ def dflash2_score_edges(
     top_k = candidate_ids.shape[-1]
     successors = successor_codebook[candidate_ids].float()
     predecessor_ids = torch.cat(
-        (anchor_token_ids[:, None, None].expand(-1, 1, top_k), candidate_ids[:, :-1]), dim=1
+        (anchor_token_ids[:, None, None].expand(-1, 1, top_k), candidate_ids[:, :-1]),
+        dim=1,
     )
     predecessors = predecessor_codebook[predecessor_ids].float()
     return unary_logits.float()[:, :, None] + torch.einsum(
@@ -222,7 +224,11 @@ class DFlash2BlockConv(nn.Module):
         self.kernel_projection.weight.data.copy_(kernel_projection_weight)
 
     def _convolve(
-        self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int, block_size: int
+        self,
+        hidden_states: torch.Tensor,
+        delta: torch.Tensor,
+        side: int,
+        block_size: int,
     ) -> torch.Tensor:
         return dflash2_grouped_conv(
             hidden_states, delta, self.base_kernel[side], block_size, self.group_size
@@ -465,7 +471,6 @@ class DFlashForCausalLM(nn.Module):
         )
 
         self.target_layer_ids = dflash_config.get("target_layer_ids", None)
-        # Upstream keeps the dflash_config override; rubin-advance dropped it.
         self.block_size = dflash_config.get(
             "block_size", getattr(pretrained_config, "block_size", None)
         )
@@ -835,7 +840,10 @@ class DFlashForCausalLM(nn.Module):
         # Laguna DFlash checkpoints may ship a fused self_attn.qkv_proj; the draft
         # loader expects split q/k/v (a fused key is silently dropped otherwise).
         if any(k.endswith("self_attn.qkv_proj.weight") for k in weights):
-            for attr in ("num_attention_heads_per_layer", "num_key_value_heads_per_layer"):
+            for attr in (
+                "num_attention_heads_per_layer",
+                "num_key_value_heads_per_layer",
+            ):
                 per_layer = getattr(self.config, attr, None)
                 if per_layer is not None and len(set(per_layer)) > 1:
                     raise ValueError(
@@ -845,7 +853,9 @@ class DFlashForCausalLM(nn.Module):
                         "is required for this checkpoint."
                     )
             head_dim = getattr(
-                self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads
+                self.config,
+                "head_dim",
+                self.config.hidden_size // self.config.num_attention_heads,
             )
             num_kv_heads = getattr(
                 self.config, "num_key_value_heads", self.config.num_attention_heads
@@ -936,7 +946,11 @@ class DFlashForCausalLM(nn.Module):
             )
             weight = weight[:, self._fc_input_slice]
         self.fc = nn.Linear(
-            weight.shape[1], weight.shape[0], bias=False, device="cuda", dtype=weight.dtype
+            weight.shape[1],
+            weight.shape[0],
+            bias=False,
+            device="cuda",
+            dtype=weight.dtype,
         )
         self.fc.weight.data.copy_(weight)
 
@@ -961,7 +975,10 @@ class DFlashForCausalLM(nn.Module):
         attention_convs = nn.ModuleList()
         mlp_convs = nn.ModuleList()
         for layer_idx in range(len(self.model.layers)):
-            for name, convs in (("attention_conv", attention_convs), ("mlp_conv", mlp_convs)):
+            for name, convs in (
+                ("attention_conv", attention_convs),
+                ("mlp_conv", mlp_convs),
+            ):
                 prefix = f"layers.{layer_idx}.{name}."
                 convs.append(
                     DFlash2BlockConv(
@@ -1636,6 +1653,20 @@ class DFlashForCausalLM(nn.Module):
                 append_pos_long = append_positions.long()
                 fp8_pages = block_tables[append_rows, append_pos_long // page_size].long()
                 fp8_offsets = append_pos_long % page_size
+        else:  # VANILLA
+            # Slot and column that each block K/V row occupies
+            self._prepare_dflash_index_buffers(
+                ctx_k_cache.device,
+                ctx_k_cache.size(0),
+                block_size,
+                need_batch_indices=False,
+            )
+            append_batch_indices = (
+                cache_batch_idx_i32.view(-1, 1).expand(-1, block_size).reshape(-1).long()
+            )
+            append_positions = (
+                (cache_seqlens_i32.view(-1, 1) + self._dflash_block_offsets).reshape(-1).long()
+            )
 
         # Flatten query positions once for the fused QK-norm-RoPE kernel.
         query_positions_flat_i32 = query_positions.reshape(-1).to(torch.int32)
@@ -2082,7 +2113,11 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
         for k in aux_keys:
             w = weights.pop(k)
             norm = nn.RMSNorm(
-                w.shape[0], eps=eps, device="cuda", elementwise_affine=True, dtype=w.dtype
+                w.shape[0],
+                eps=eps,
+                device="cuda",
+                elementwise_affine=True,
+                dtype=w.dtype,
             )
             norm.weight.data.copy_(w)
             norms.append(norm)

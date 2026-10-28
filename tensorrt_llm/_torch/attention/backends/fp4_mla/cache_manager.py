@@ -326,8 +326,8 @@ class Fp4MlaV2CacheLayoutPolicy:
         local_layer = self.layer_offsets[layer_idx]
         if self._is_standalone_draft_layer(local_layer):
             return self.dtype_per_layer[local_layer]
-        if local_layer in self._fp8_mla_local_layer_indices():
-            return DataType.FP8
+        if local_layer in self._bf16_mla_local_layer_indices():
+            return DataType.BF16
         return self.dtype
 
     def get_kv_cache_num_blocks(self, layer_idx: int) -> int:
@@ -1073,7 +1073,7 @@ class Fp4MlaV2CacheLayoutPolicy:
             * num_bf16_layers
         )
         fixed_bytes = hp_bytes * max_batch_size * mapping.pp_size
-        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
             _estimate_draft_cache_size_components,
             _get_draft_layer_sizes,
             _get_generation_kv_capacity,

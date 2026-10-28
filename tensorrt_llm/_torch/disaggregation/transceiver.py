@@ -58,12 +58,10 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_slot_bytes
 from tensorrt_llm._torch.distributed.communicator import Distributed
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
-    MambaHybridCacheManager,
-    MambaHybridCacheManagerV2,
+from tensorrt_llm._torch.pyexecutor import hang_detector
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    BlockReusePolicy,
+    KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -635,6 +633,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         registered by."""
         rid = get_unique_rid(req)
         assert rid is not None
+        self._pack_draft_history(req)
         return CacheExtent(name=rid, local=self._describe_local(req))
 
     def _describe_local(self, req: LlmRequest) -> Chunk:
@@ -654,11 +653,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
-        prompt_len = self._global_prompt_len(req)
-        prompt_blocks = (prompt_len + tpb - 1) // tpb
-        manager = self._kv_cache_manager
-        cp_size = getattr(manager, "_helix_cp_size", 1)
-        cp_rank = getattr(manager, "_helix_cp_rank", 0)
+        remote_tail_start = getattr(req, "py_csa2_remote_tail_start", None)
+        transfer_len = (
+            remote_tail_start if remote_tail_start is not None else self._global_prompt_len(req)
+        )
+        prompt_blocks = (transfer_len + tpb - 1) // tpb
+        remote_tail_split = getattr(req, "py_csa2_remote_tail_split", None)
+        excluded_pool_views = set()
+        if remote_tail_split is not None:
+            exclude = getattr(self._kv_cache_manager, "remote_tail_excluded_pool_views", None)
+            if exclude is None:
+                raise ValueError("remote-tail replay requires a CSA2 cache manager")
+            excluded_pool_views = exclude(self._page_table, remote_tail_split)
 
         is_gen_only = req.is_generation_only_request
         cached_per_lg = (
@@ -667,104 +673,26 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else [0] * len(layer_groups)
         )
 
-        unified_draft = isinstance(manager, KVCacheManagerV2) and bool(manager.draft_layer_ids)
-        transfer_length = prompt_len if unified_draft else req.prompt_len
-        token_range = None
-        if transfer_length > 0:
-            # end must match the trimmed block list below (ceil(prompt_len / tpb)
-            # blocks). num_extra_kv_tokens slots (speculative decoding) are not
-            # transferred. In the previously added support for ctx disabling
-            # speculative decoding while gen enables it, both sides currently
-            # use prompt_len as the transfer range, so the ranges stay
-            # consistent.
-            # TODO: the accuracy impact of not transferring num_extra_kv_tokens
-            # on MTP and other speculative decoding paths is currently unclear;
-            # revisit whether these extra KV slots need to be transferred.
-            token_range = TokenRange(start=0, end=transfer_length)
-
+        empty = np.array([], dtype=np.int64)
         groups = []
         kinds = [lg.kind for lg in layer_groups]
         for idx, lg in enumerate(layer_groups):
-            if isinstance(lg, MambaLayerGroup):
-                groups.append(np.array([], dtype=np.int64))
-                continue
-            if unified_draft:
-                # KVSlice carries a contiguous retained suffix in this protocol.
-                local_prompt_blocks = (
-                    prompt_blocks if lg.cp_as_tp else len(range(cp_rank, prompt_blocks, cp_size))
-                )
-                stale_end = 0
-                if lg.sliding_window_size is not None:
-                    stale_end = max(0, (prompt_len + 1 - lg.sliding_window_size) // tpb)
-                    if not lg.cp_as_tp:
-                        stale_end = len(range(cp_rank, stale_end, cp_size))
-                ordinals = adapter.get_block_ordinals(req, idx, lg)
-                pages = ordinals[stale_end:local_prompt_blocks]
-                if pages.size != local_prompt_blocks - stale_end or np.any(pages < 0):
-                    raise ValueError("Missing allocated prompt pages for unified draft KV transfer")
-                cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
-                groups.append(pages[cache_skip:])
-                continue
-            block_ids = adapter.get_block_ids(req, idx, lg)
-            # Limit to prompt_len blocks, matching C++ cacheFormatter behavior.
-            total_blocks = (req.prompt_len + tpb - 1) // tpb
-            window_size = lg.sliding_window_size
-
-            if window_size is not None:
-                draft_reserve_tokens = get_draft_token_length(req) if is_gen_only else 0
-                allocated_blocks = (
-                    req.prompt_len
-                    + draft_reserve_tokens
-                    + self._kv_cache_manager.num_extra_kv_tokens
-                    + tpb
-                    - 1
-                ) // tpb
-                beam0_block_ids, tail_block_ids = self._split_packed_beam_block_ids(
-                    block_ids,
-                    req.py_beam_width,
-                    allocated_blocks,
-                )
-                if beam0_block_ids.size > allocated_blocks:
-                    beam0_block_ids = beam0_block_ids[:allocated_blocks]
-                    block_ids = (
-                        np.concatenate([beam0_block_ids, tail_block_ids])
-                        if tail_block_ids.size > 0
-                        else beam0_block_ids
-                    )
-                # Current PyExecutor cache managers disable KV-cache token sinks,
-                # so SWA block lists contain an evictable prompt prefix followed
-                # by the speculative scratch tail. If token sinks are enabled,
-                # this must use block-ordinal metadata to preserve the sink prefix.
-                # Remove scratch before trimming stale prompt blocks; otherwise a
-                # boundary-crossing allocation can displace initialized prompt KV.
-                scratch_blocks = max(0, allocated_blocks - total_blocks)
-                if scratch_blocks > 0 and getattr(self._kv_cache_manager, "_has_cp_helix", False):
-                    # Helix ledgers expose one windowed page per
-                    # tokens_per_block * cp_size tokens, so the per-page scratch
-                    # arithmetic above would empty a one-entry HP-tail list.
-                    scratch_blocks = 0
-                if scratch_blocks > 0:
-                    if req.py_beam_width != 1:
-                        raise ValueError("speculative scratch blocks require beam_width == 1")
-                    block_ids = (
-                        block_ids[:-scratch_blocks]
-                        if scratch_blocks < block_ids.size
-                        else np.array([], dtype=np.int64)
-                    )
-                # Drop stale blocks the manager may still expose (V1 pre-eviction).
-                stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
-                expected_valid = max(0, total_blocks - stale_end)
-                # Stale prefix already pruned above; skip reuse-hit blocks that
-                # land inside the window. Clamp to 0: ctx side has cached_per_lg
-                # synthetically 0, and a reuse hit may fall entirely inside the
-                # stale region (those blocks were already pruned, no extra skip).
-                cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
+            if lg.kind == CacheKind.STATE:
+                slot = self._get_mamba_slot_for_request(req)
+                group = np.array([slot], dtype=np.int64) if slot is not None else empty
             else:
                 # Block lists carry beam 0 only (beam-search attention reads
                 # prompt positions through beam 0's block table), so the
                 # positional path applies to every beam width.
                 ordinals = adapter.get_block_ordinals(req, idx, lg)
-                group = self._positional_window(ordinals, prompt_blocks, cached_per_lg[idx] // tpb)
+                local_prompt_blocks = prompt_blocks
+                if not getattr(lg, "cp_as_tp", False):
+                    cp_size = getattr(self._kv_cache_manager, "_helix_cp_size", 1)
+                    cp_rank = getattr(self._kv_cache_manager, "_helix_cp_rank", 0)
+                    local_prompt_blocks = len(range(cp_rank, prompt_blocks, cp_size))
+                group = self._positional_window(
+                    ordinals, local_prompt_blocks, cached_per_lg[idx] // tpb
+                )
             groups.append(group)
 
         return Chunk(
@@ -793,7 +721,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _need_aux_transfer(self, req: LlmRequest) -> bool:
         params = req.py_disaggregated_params
-        return bool(getattr(self._kv_cache_manager, "draft_layer_ids", ())) or (
+        return bool(getattr(self._kv_cache_manager, "_draft_layer_sizes", ())) or (
             params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         )
 
@@ -824,7 +752,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _pack_draft_history(self, req: LlmRequest) -> None:
         manager = getattr(self, "_kv_cache_manager", None)
-        if not getattr(manager, "draft_layer_ids", ()):
+        if not getattr(manager, "_draft_layer_sizes", ()):
             return
         history = self._kv_cache_manager.export_draft_history(req.py_request_id)
         self._validate_draft_history_range(req, history)
@@ -833,7 +761,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _restore_draft_history(self, req: LlmRequest) -> None:
         history = getattr(req, "py_draft_transfer_history", None)
         manager = getattr(self, "_kv_cache_manager", None)
-        has_draft = bool(getattr(manager, "draft_layer_ids", ()))
+        has_draft = bool(getattr(manager, "_draft_layer_sizes", ()))
         if history is None:
             if has_draft:
                 raise ValueError(
@@ -1158,7 +1086,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Unpack aux tokens from session into request's context_phase_params."""
         params = req.py_disaggregated_params
         if params is not None and params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST:
-            # Context-first tokens and usage already arrived in the context response.
             session.unpack_draft_history(req)
             return
         session.unpack_aux(req)
@@ -1291,28 +1218,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         rid = get_unique_rid(req)
         assert rid is not None
         session = self._get_or_create_send_session(req)
-        req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-        # Register before dispatch: dispatch_task may synchronously fail after
-        # enqueueing work for an earlier peer.  Status polling must always have
-        # the matching request while that partial dispatch drains.
-        self._send_reqs[rid] = req
-        try:
-            self._pack_draft_history(req)
-            session.send(self._create_kv_slice(req))
-            self._finalize_send(req, session)
-        except Exception as exc:
-            req.py_disagg_send_setup_failed = True
-            session.cancel()
-            if session.has_transferring_tasks():
-                # At least one worker already entered NIXL.  Keep the session,
-                # request, and pinned pages registered;
-                # normal status polling will classify the safe cancellation
-                # as a setup failure once every active operation has drained.
-                req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-                logger.error(
-                    "CTX send setup failed after transfer started; "
-                    f"retaining rid={rid} until NIXL leaves mid-write: {exc}"
-                )
+        if session is None:
+            return
+        bridge_enabled = getattr(self, "_fp4_mla_bridge_enabled", False)
+        if bridge_enabled:
+            # Root the request before backend admission so its source pages
+            # outlive every ownership-enabled NIXL operation.
+            self._send_reqs[rid] = req
+            req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+            # A remote cancellation can win before the local TxSession is
+            # created. Sender.setup_session() records that terminal state and
+            # acknowledges the fenced session to every known receiver;
+            # leave retirement to the normal status path without attempting
+            # to publish KV or auxiliary memory afterward.
+            if session.has_failed():
                 return
         try:
             if self.pipeline_transfer_enabled:
@@ -1368,9 +1287,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # blocking path has no cross-rank outcome consensus).
                 req.py_kv_transfer_verified = session.kv_write_verified()
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
-                req.set_kv_cache_size(self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor)
-                self._prepare_received_history(session, req)
-                self._rebuild_fp4_mla_disagg_imported_cache(req)
+                req.set_kv_cache_size(self._request_kv_bytes(req, paged_bytes, state_bytes))
+                if self._need_aux_transfer(req):
+                    self._apply_aux(session, req)
+                self._assert_disagg_history_declared(req)
+                self._restore_draft_history(req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -1561,6 +1482,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             0 if need_progress else wait_num,
             block_all,
         )
+
         completed, failed, cancelled = [], [], []
         for rid in to_process:
             session = self._recv_sessions[rid]
@@ -1627,49 +1549,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid in completed:
             session = self._recv_sessions[rid]
             req = self._recv_reqs[rid]
-            completed_reqs[rid] = req
-            try:
-                self._prepare_received_history(session, req)
-                self._rebuild_fp4_mla_disagg_imported_cache(req)
-            except Exception as exc:
-                local_postprocess_failed.append(rid)
-                req.state = LlmRequestState.DISAGG_TRANS_ERROR
-                logger.error(
-                    f"Disagg gen postprocess failed rank={self._dist.rank} rid={rid}: {exc}"
-                )
-            finally:
-                # NIXL is complete at this point, so unregistering is safe even
-                # if aux application or an FP4 MLA sidecar rebuild fails.
-                session.close()
-                del self._recv_reqs[rid]
-                del self._recv_sessions[rid]
-
-        # ``completed`` is globally consistent, so guarding this collective is
-        # itself symmetric and avoids another allgather on empty polling cycles.
-        if completed:
-            all_postprocess_failed = self._allgather_or_passthrough(
-                local_postprocess_failed,
-                self._gen_allgather,
-                self._gen_need_sync,
-            )
-            global_postprocess_failed = self._union(all_postprocess_failed)
-        else:
-            global_postprocess_failed = set()
-        postprocess_failed = [rid for rid in completed if rid in global_postprocess_failed]
-        postprocess_failed_set = set(postprocess_failed)
-        for rid in completed:
-            req = completed_reqs[rid]
-            if rid in postprocess_failed_set:
-                # This also covers remote-only failure: a locally successful
-                # rank must not publish TRANS_COMPLETE when another
-                # participating rank failed the same request.
-                req.state = LlmRequestState.DISAGG_TRANS_ERROR
-            else:
-                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
-
-        completed = [rid for rid in completed if rid not in postprocess_failed_set]
-        transfer_failed = failed
-        failed = transfer_failed + postprocess_failed
+            # Stamp the write-verification verdict on the request before the
+            # session is closed and dropped: commit_blocks_for_reuse runs
+            # later (batch preparation) and gates reuse admission on it.
+            req.py_kv_transfer_verified = rid in verified
+            # transfer_end already stamped at completion detection above.
+            req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
+            if self._need_aux_transfer(req):
+                self._apply_aux(session, req)
+            self._assert_disagg_history_declared(req)
+            self._restore_draft_history(req)
+            self._close_session_or_raise(session, rid, "completed")
+            req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            del self._recv_reqs[rid]
+            del self._recv_sessions[rid]
         if failed:
             logger.warning(
                 f"Disagg gen transfer FAILED rank={self._dist.rank} "

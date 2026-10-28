@@ -9084,7 +9084,11 @@ class PyExecutor:
                 if sample_state is not None:
                     sample_state.draft_history_update = batch_outputs.get(
                         'draft_history_update')
+                self._maybe_record_hang_diagnostic_phase(
+                    "sampling_returned", scheduled_batch)
                 return sample_state
+            self._maybe_record_hang_diagnostic_phase("sampling_skipped",
+                                                     scheduled_batch)
         except Exception as e:
             self._maybe_record_hang_diagnostic_phase("sampling_error",
                                                      scheduled_batch)

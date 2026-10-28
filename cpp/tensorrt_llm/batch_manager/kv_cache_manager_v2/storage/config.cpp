@@ -206,14 +206,31 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         slotGroups.push_back(std::move(var));
     }
 
-    // Only matching ownership domains and slot layouts may share pools.
-    std::map<std::pair<CacheDomain, std::vector<size_t>>, std::vector<SlotDescVariant>> poolGroupsBySizes;
+    // Distinct sparsity and reuse policies need separate GPU pools and eviction queues.
+    struct PoolGroupKey
+    {
+        AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
+        std::vector<size_t> slotSizes;
+        bool isSparse = false;
+        CacheDomain cacheDomain = CacheDomain::kTarget;
+
+        bool operator<(PoolGroupKey const& other) const
+        {
+            return std::tie(reusePolicy, slotSizes, isSparse, cacheDomain)
+                < std::tie(other.reusePolicy, other.slotSizes, other.isSparse, other.cacheDomain);
+        }
+    };
+
+    std::map<PoolGroupKey, std::vector<SlotDescVariant>> poolGroups;
     for (auto& sg : slotGroups)
     {
         auto const sizes = sg.slotSizeList();
         auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
+        bool const isSparse = attn != nullptr && attn->isSparse;
+        auto const policy = attn ? attn->reusePolicy : AttentionReusePolicy::REQUIRED;
         CacheDomain const domain = attn ? attn->cacheDomain : CacheDomain::kTarget;
-        poolGroupsBySizes[{domain, sizes.raw()}].push_back(std::move(sg));
+        poolGroups[{.reusePolicy = policy, .slotSizes = sizes.raw(), .isSparse = isSparse, .cacheDomain = domain}]
+            .push_back(std::move(sg));
     }
 
     StorageConfig out;

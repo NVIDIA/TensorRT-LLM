@@ -32,7 +32,7 @@ from typing import (
     Union,
 )
 
-from ._utils import HalfOpenRange as HalfOpenRange
+from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 
 # From _common.py
 NDEBUG: Final[int]
@@ -97,12 +97,14 @@ LifeCycleId = NewType("LifeCycleId", int)
 LayerGroupId: TypeAlias = LifeCycleId
 
 class AttnLifeCycle:
-    """The attention life cycle, keyed by window, sink-token shape, and cache domain."""
+    """The attention life cycle, keyed by window, sink tokens, sparsity, and reuse policy."""
 
     def __init__(
         self,
         window_size: int | None,
         num_sink_blocks: int,
+        is_sparse: bool = False,
+        reuse_policy: AttentionReusePolicy = ...,
         cache_domain: CacheDomain = CacheDomain.TARGET,
     ) -> None: ...
     @staticmethod
@@ -110,12 +112,18 @@ class AttnLifeCycle:
         window_size: int | None,
         num_sink_tokens: int | None,
         tokens_per_block: int,
+        is_sparse: bool = False,
+        reuse_policy: AttentionReusePolicy = ...,
         cache_domain: CacheDomain = CacheDomain.TARGET,
     ) -> "AttnLifeCycle": ...
     @property
     def window_size(self) -> int | None: ...
     @property
     def num_sink_blocks(self) -> int: ...
+    @property
+    def is_sparse(self) -> bool: ...
+    @property
+    def reuse_policy(self) -> AttentionReusePolicy: ...
     @property
     def cache_domain(self) -> CacheDomain: ...
     def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
@@ -276,6 +284,7 @@ class AttentionLayerConfig:
     buffers: list[BufferConfig]
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
+    reuse_policy: AttentionReusePolicy = AttentionReusePolicy.REQUIRED
     cache_domain: CacheDomain = CacheDomain.TARGET
     @property
     def window_size(self) -> int | None: ...

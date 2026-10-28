@@ -418,6 +418,8 @@ class CuteDslB12xNvfp4FusedMoE(CuteDslB12xFusedMoEBase, TrtllmCutlassNvfp4Impl):
         *,
         workspace: dict | None = None,
     ) -> torch.Tensor:
+        if ctx.x_ready_event is not None:
+            ctx.x_ready_event.wait()
         if self._route_to_cutlass(ctx.x):
             # The inherited ``run_moe`` forwards ``output_dtype`` straight into
             # the C++ ``trtllm::fused_moe`` op, which requires a concrete

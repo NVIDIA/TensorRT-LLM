@@ -117,6 +117,8 @@ create_default_kv_cache_cold_page_codec = _cpp.create_default_kv_cache_cold_page
 # field), matching the binding's constructor.
 import dataclasses as _dataclasses  # noqa: E402
 
+CacheDomain = _cpp.CacheDomain
+
 
 @_dataclasses.dataclass
 class _KVCacheManagerConfigFieldSpec:
@@ -137,17 +139,6 @@ class _KVCacheManagerConfigFieldSpec:
     pool_rebalance: object = None
     cold_tier_offload_min_priority: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
 
-    # Symbols added on main that are not yet ported to the C++ backend.
-    # TODO(kvCacheManagerV2-cpp): port these and replace the fallbacks.
-    AttnLifeCycle = getattr(_cpp, "AttnLifeCycle", None)
-    OutOfMemoryError = getattr(_cpp, "OutOfMemoryError", MemoryError)
-    PageIndexConverter = getattr(_cpp, "PageIndexConverter", None)
-    ReuseScope = getattr(_cpp, "ReuseScope", ReuseScope)
-    ScratchDesc = getattr(_cpp, "ScratchDesc", None)
-    SsmSnapshotIterationStatsDelta = _cpp.SsmSnapshotIterationStatsDelta
-    SwaScratchReuseConfig = getattr(_cpp, "SwaScratchReuseConfig", None)
-    UniqueToken = _cpp.UniqueToken
-    CacheDomain = _cpp.CacheDomain
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
 del _KVCacheManagerConfigFieldSpec, _dataclasses
@@ -319,5 +310,4 @@ __all__ = [
     "typed_range",
 ]
 
-if _BACKEND == "cpp":
-    __all__.append("CacheDomain")
+__all__.append("CacheDomain")

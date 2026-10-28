@@ -688,8 +688,8 @@ class DSACacheManagerV2(KVCacheManagerV2):
                 cache_bytes += self.mla_kv_cache_residual_dim // 16
         if (
             data_role == Role.ALL
-            and local_layer_idx < len(self.indexer_k_cache_local_layer_mask)
-            and self.indexer_k_cache_local_layer_mask[local_layer_idx]
+            and not self._is_standalone_draft_layer(local_layer_idx)
+            and self._indexer_k_cache_layer_mask[self.pp_layers[local_layer_idx]]
         ):
             cache_bytes += self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
         return cache_bytes
@@ -727,7 +727,7 @@ class DSACacheManagerV2(KVCacheManagerV2):
                 model_config, mapping, num_layers
             )
             cache_bytes += num_attention_layers * (residual_dim // 2 + math.ceil(residual_dim / 16))
-        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
             _estimate_draft_cache_size_components,
             _get_draft_layer_sizes,
             _get_generation_kv_capacity,
