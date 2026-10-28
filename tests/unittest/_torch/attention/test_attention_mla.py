@@ -1479,6 +1479,7 @@ class _Prefixes:
         # _invalidate_mla_scheduler_buffers consults these before recomputing
         # the per-locality-domain splits; False short-circuits that branch.
         self.locality_domain_enabled = False
+        self.locality_domain_cute_dsl_mla_split_plans = None
         self.kv_cache_manager = None
         self.request_ids = None
         self._invalidate_mla_scheduler_buffers()
