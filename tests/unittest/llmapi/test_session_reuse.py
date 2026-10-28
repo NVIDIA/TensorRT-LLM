@@ -3,6 +3,7 @@
 """Pure-logic tests for automatic MPI session reuse — no MPI, no GPU."""
 
 import contextlib
+import multiprocessing
 import subprocess
 import sys
 
@@ -618,13 +619,25 @@ def cached_pool_hooks(reuse_cache, monkeypatch):
     monkeypatch.setattr(reuse_cache, "install_pool_factory_if_loaded", lambda: None)
     s = reuse_cache.acquire(_FakePool, 4)
     s.shutdown()
-    return hooks, s._real
+    yield hooks, s._real
+    hooks.pytest_runtest_teardown(_PlainItem())
 
 
-def test_child_process_drains_cached_pools(cached_pool_hooks):
+def test_child_process_drains_cached_pools(cached_pool_hooks, capfd):
     hooks, pool = cached_pool_hooks
     hooks.pytest_runtest_setup(_PlainItem())
     subprocess.run([sys.executable, "-c", "pass"], check=True)
+    assert pool.shut
+    assert "draining before child process" in capfd.readouterr().out
+    hooks.pytest_runtest_teardown(_PlainItem())
+
+
+def test_multiprocessing_child_drains_cached_pools(cached_pool_hooks):
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    process = multiprocessing.get_context("spawn").Process(target=int)
+    process.start()
+    process.join()
     assert pool.shut
     hooks.pytest_runtest_teardown(_PlainItem())
 
