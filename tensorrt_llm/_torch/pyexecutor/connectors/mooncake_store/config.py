@@ -24,12 +24,13 @@ merges the two into the file this reads back.
 """
 
 import json
+import math
 import os
 import re
 import socket
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig, TorchLlmArgs
@@ -37,10 +38,12 @@ if TYPE_CHECKING:
 __all__ = [
     "CLIENT_CONFIG_NAME",
     "CONFIG_PATH_ENV",
+    "DEFAULT_STAGING_BUFFER_BYTES",
     "MooncakeStoreConnectorConfig",
     "SEGMENTS_DIR_NAME",
     "StoreRole",
     "local_address",
+    "local_reuse_backoff",
     "parse_size",
     "pool_config",
     "provisioned_config_path",
@@ -64,6 +67,10 @@ DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200
 #: Per-process Mooncake transfer buffer, not pool capacity. Written into the
 #: rendered config so a vLLM reader of the same file sees the same value.
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824
+#: Pinned host memory per transfer direction under `stage_through_host`. Must
+#: equal `parse_size` of the `MooncakeStoreConfig.staging_buffer_bytes` default,
+#: so a client config without the key stages exactly what an unset field asks.
+DEFAULT_STAGING_BUFFER_BYTES = 1 << 30
 DEFAULT_NAMESPACE = "trtllm"
 #: Mooncake's peer-to-peer handshake, which keeps a separate metadata process
 #: out of the deployment. An empty connstring is not a form `store.setup`
@@ -239,6 +246,18 @@ def parse_size(value: Any, *, strict_units: bool = False) -> int:
     return int(float(magnitude) * scale)
 
 
+def _json_bool(raw: Dict[str, Any], name: str, default: bool, path: str) -> bool:
+    """A JSON boolean setting, refusing anything else.
+
+    `bool("false")` is True, so coercing a quoted value would silently turn on
+    what the file meant to turn off.
+    """
+    value = raw.get(name, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{name}={value!r} in {path} must be true or false")
+    return value
+
+
 def pool_config(llm_args: "TorchLlmArgs") -> Optional["MooncakeStoreConfig"]:
     """The `mooncake_store` block of `llm_args`, if the deployment set one.
 
@@ -247,6 +266,25 @@ def pool_config(llm_args: "TorchLlmArgs") -> Optional["MooncakeStoreConfig"]:
     """
     connector = llm_args.kv_connector_config
     return connector.mooncake_store if connector is not None else None
+
+
+def local_reuse_backoff(llm_args: "TorchLlmArgs") -> Literal["off", "align"]:
+    """How a local prefix match is handled ahead of the pool under a one-model draft.
+
+    See `MooncakeStoreConfig.local_reuse_backoff`. It is an engine setting read
+    from `llm_args` on every rank, not part of the rendered client config, so a
+    deployment that inherits `MOONCAKE_CONFIG_PATH` without a `mooncake_store`
+    block gets the field's default.
+
+    Args:
+        llm_args: The engine arguments every rank parses.
+
+    Returns:
+        `"off"` to drop the draft's reuse-match backoff, or `"align"` to keep it
+        and align local matches down to a block boundary.
+    """
+    pool = pool_config(llm_args)
+    return pool.local_reuse_backoff if pool is not None else "off"
 
 
 def provisioned_config_path(run_dir: Optional[str]) -> Optional[str]:
@@ -290,6 +328,32 @@ class MooncakeStoreConnectorConfig:
     #: pools with Mooncake. Costs a copy each way, but works without GPUDirect
     #: RDMA, which registering device memory requires.
     stage_through_host: bool = False
+    #: Pinned host memory per transfer direction under `stage_through_host`.
+    #: It bounds how many pages one store call stages, not how large a page may
+    #: be. With `async_load` the load direction's share is split evenly across
+    #: the load workers.
+    staging_buffer_bytes: int = DEFAULT_STAGING_BUFFER_BYTES
+    #: Load a prefix the pool serves on background threads while the request
+    #: waits outside the batch, instead of inside the executor iteration.
+    #: Ignored unless the role reads the pool.
+    async_load: bool = False
+    #: Background load threads per rank when `async_load` is set, each with its
+    #: own CUDA stream and, under `stage_through_host`, an equal share of
+    #: `staging_buffer_bytes`.
+    async_load_workers: int = 1
+    #: Soft-pin every page this server writes for this many milliseconds, or
+    #: `None` to leave pages unpinned. Mooncake's first eviction pass refills a
+    #: shortfall in shard order rather than by age, which punches holes into
+    #: prefixes still in use; soft-pinned pages are evicted only by the second,
+    #: age-ordered pass. Must not exceed the master's `--max_kv_soft_pin_ttl`,
+    #: or the master refuses every put.
+    soft_pin_ttl_ms: Optional[int] = None
+    #: Put every page of a block, across layer groups and attention shards,
+    #: into one eviction group, so the master evicts a block whole.
+    group_blocks: bool = False
+    #: Seconds between each rank's prefix-hole and load statistics lines, or
+    #: `None` to count nothing.
+    stats_interval: Optional[float] = None
 
     def __post_init__(self) -> None:
         """Reject settings that would fail later, inside a transfer."""
@@ -301,6 +365,20 @@ class MooncakeStoreConnectorConfig:
             raise ValueError("global_segment_size must be >= 0")
         if self.transfer_batch_size <= 0:
             raise ValueError("transfer_batch_size must be > 0")
+        if self.staging_buffer_bytes <= 0:
+            raise ValueError("staging_buffer_bytes must be > 0")
+        if self.async_load_workers < 1:
+            raise ValueError("async_load_workers must be >= 1")
+        if self.soft_pin_ttl_ms is not None and self.soft_pin_ttl_ms <= 0:
+            raise ValueError(
+                f"soft_pin_ttl_ms must be > 0, or absent to leave pages unpinned; "
+                f"got {self.soft_pin_ttl_ms}"
+            )
+        if self.stats_interval is not None and not 0 < self.stats_interval < math.inf:
+            raise ValueError(
+                f"stats_interval must be a finite number of seconds > 0, or absent "
+                f"to count nothing; got {self.stats_interval}"
+            )
 
     @property
     def capacity_only(self) -> bool:
@@ -336,6 +414,20 @@ class MooncakeStoreConnectorConfig:
             model_key=raw.get("model_key") or None,
             transfer_batch_size=int(raw.get("transfer_batch_size", 64)),
             stage_through_host=bool(raw.get("stage_through_host", False)),
+            # A config provisioned for vLLM carries none of these three, and
+            # gets today's synchronous loads through 1 GiB of staging.
+            staging_buffer_bytes=parse_size(
+                raw.get("staging_buffer_bytes", DEFAULT_STAGING_BUFFER_BYTES), strict_units=True
+            ),
+            async_load=_json_bool(raw, "async_load", False, path),
+            async_load_workers=int(raw.get("async_load_workers", 1)),
+            soft_pin_ttl_ms=(
+                int(raw["soft_pin_ttl_ms"]) if raw.get("soft_pin_ttl_ms") is not None else None
+            ),
+            group_blocks=_json_bool(raw, "group_blocks", False, path),
+            stats_interval=(
+                float(raw["stats_interval"]) if raw.get("stats_interval") is not None else None
+            ),
         )
 
     @staticmethod

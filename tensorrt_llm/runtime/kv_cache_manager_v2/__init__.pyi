@@ -333,6 +333,9 @@ class KVCacheManagerConfig:
     enable_partial_commit: bool = True
     pool_rebalance: PoolRebalanceConfig = ...
     cold_tier_offload_min_priority: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
+    # Required alignment of the final prefix match, after backoff and coverage
+    # pruning; a positive divisor of tokens_per_block. 1 keeps token-granular reuse.
+    reuse_match_alignment: int = 1
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

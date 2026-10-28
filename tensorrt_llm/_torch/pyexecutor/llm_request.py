@@ -872,6 +872,19 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # allocation clears this flag so replay can report its new pages.
         self.py_connector_allocation_reported = False
 
+        # The connector's answer for this allocation when the scheduler asked
+        # at admission (kv_connector_config.admission_query), so
+        # prepare_resources uses it instead of asking again. Cleared when read
+        # and when the allocation is released.
+        self.py_connector_admission_offer = None
+        # Scheduling iterations this request gave its first chunk back because
+        # the KV cache could not cover the window its admission-time connector
+        # offer moves the chunk to. Lasts for the request's lifetime.
+        self.py_connector_offer_deferrals = 0
+        # Set when the scheduler gave up a started request to free pages for
+        # this one, so its next admission keeps those pages rather than defer.
+        self.py_preempted_for_pages = False
+
         # End of the prefix served from outside the manager (a KV cache
         # connector's load, or a staging fetch the request resumes from) retained
         # by this allocation, or 0. This depth survives async parking; local reuse

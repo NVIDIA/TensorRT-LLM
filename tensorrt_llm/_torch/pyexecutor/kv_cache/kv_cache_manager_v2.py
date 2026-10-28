@@ -15,6 +15,7 @@
 import math
 import os
 import sys
+import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -934,6 +935,29 @@ def _get_layer_spec_cache_size_components(
     )
 
 
+class ConnectorAdmissionOffer(NamedTuple):
+    """A KV connector's answer taken while the scheduler admitted the request.
+
+    ``epoch`` is the scheduling pass it was taken in. ``prepare_resources``
+    uses the answer only within that pass, and only against the same
+    ``local_end``.
+    """
+
+    # Scheduling pass the answer was taken in.
+    epoch: int
+    # The local match the connector was asked from.
+    local_end: int
+    # Tokens the connector offered past `local_end`.
+    num_tokens: int
+    # Whether the connector loads the offer asynchronously.
+    load_async: bool
+
+    @property
+    def parks(self) -> bool:
+        """Whether the runtime will park the request for an asynchronous load."""
+        return self.load_async and self.num_tokens > 0
+
+
 class _MmRunMetadata(NamedTuple):
     """CPU tensors for exact multimodal run lookup.
 
@@ -1772,6 +1796,20 @@ class KVCacheManagerV2(BaseResourceManager):
     # _init_mixed_precision assigns fresh per-instance values.
     low_precision_dtype: Optional[DataType] = None
     high_layers: dict[int, int] = {}
+    # Disaggregated completion reservation (see __init__): a logical bound in
+    # ledger blocks per admitted request, and the GPU slots one ledger block
+    # takes in each pool group. Declared on the class for instances built
+    # without __init__; __init__ assigns fresh per-instance dicts, and only a
+    # non-empty pool map lets anything write the limits.
+    _disagg_completion_limits: dict[int, int] = {}
+    _disagg_completion_pool_counts: dict[int, int] = {}
+    # Scheduling pass of admission-time connector answers (see
+    # `query_connector_at_admission`), on the class for the same reason: the
+    # connector prefix path reads it on instances tests build without __init__.
+    _connector_admission_epoch: int = 0
+    # Per-iteration connector offer counters for TLLM_CTX_PARK_STATS, or None
+    # while disabled; see `enable_connector_offer_stats`.
+    _connector_offer_stats: Optional[Dict[str, float]] = None
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -1856,6 +1894,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
         self.kv_connector_manager = kv_connector_manager
+        # Scheduling pass of admission-time connector answers; see
+        # `query_connector_at_admission`.
+        self._connector_admission_epoch = 0
         codec_config = getattr(cold_page_codec_provider, "config", None)
         self._has_lossy_cold_page_codec = (
             getattr(codec_config, "algorithm", None) == "quantization_for_cold_page"
@@ -2015,9 +2056,18 @@ class KVCacheManagerV2(BaseResourceManager):
         # check needs this raw value even where a subclass opts out of reuse-match backoff:
         # a block's reuse key covers no token past its end.
         self._draft_prompt_lookahead = draft_prompt_lookahead(spec_config) or 0
-        # Unsupported adapters keep their main-like reuse endpoint.
+        # Unsupported adapters keep their main-like reuse endpoint, and so does
+        # a manager whose KV connector asks for whole local matches instead.
         self.reuse_match_backoff = self._draft_prompt_lookahead
         if not self._supports_reuse_match_backoff:
+            self.reuse_match_backoff = 0
+        elif self.reuse_match_backoff and self._connector_drops_reuse_match_backoff():
+            logger.info(
+                "[KVCacheManager] The KV connector takes whole local prefix matches: "
+                f"dropping the {self.reuse_match_backoff}-token one-model draft reuse "
+                "backoff. Draft KV at the tail of a reused block may belong to another "
+                "continuation, which affects draft acceptance only."
+            )
             self.reuse_match_backoff = 0
         self.enable_partial_reuse = _effective_partial_reuse(
             kv_cache_config.enable_partial_reuse,
@@ -2479,6 +2529,38 @@ class KVCacheManagerV2(BaseResourceManager):
             self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
 
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
+        # With no eviction tier and a connector or the configuration asking for
+        # it, an admitted full-attention request must keep the pages it needs
+        # to finish: decode its output growth, a connector prefill its
+        # remaining prompt, so a final-batch restore is not truncated by other
+        # requests' chunks. Bounds are logical; no page is allocated early.
+        # The connector is bound above, so the gate can read its declaration.
+        self.enable_disagg_completion_reservation = (
+            kv_cache_config.enable_disagg_completion_reservation
+        )
+        self._disagg_completion_limits = {}
+        self._disagg_completion_pool_counts = {}
+        if self._disagg_completion_reservation_applies():
+            # One slot per ledger block per life cycle, as in get_num_free_blocks.
+            slots_per_block: dict[int, int] = defaultdict(int)
+            for pool_id in self.impl.get_life_cycle_pool_group_indices(GPU_LEVEL):
+                slots_per_block[int(pool_id)] += 1
+            self._disagg_completion_pool_counts = dict(slots_per_block)
+        elif (
+            self.enable_disagg_completion_reservation
+            and not self.is_draft
+            and not self.is_estimating_kv_cache
+        ):
+            # Do not keep the existing admission silently. The common miss is a
+            # server without a connector that keeps the automatic host tier.
+            # The estimation manager is built without the connector, so only
+            # the final manager can tell whether the setting applies.
+            logger.warning(
+                "kv_cache_config.enable_disagg_completion_reservation is ignored: it "
+                "applies only to a disaggregated server with no cache tier below GPU "
+                "(host_cache_size=0 and no disk tier), beam width 1, a single pipeline "
+                "stage and full attention on every layer."
+            )
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
         enable_conversation_manager = (
             self.enable_block_reuse
@@ -3796,7 +3878,10 @@ class KVCacheManagerV2(BaseResourceManager):
             # Keep the lookahead evidence and its backoff in the same tree match.
             # A paired scheduler caps the claim by retaining D evidence past the
             # common usable depth, so this still trims exactly once.
+            # The alignment is applied in the same tree match after the backoff,
+            # so the probe, the claim and the paired probes all trim once too.
             reuse_match_backoff=self.reuse_match_backoff,
+            reuse_match_alignment=self._connector_reuse_match_alignment(),
             enable_stats=self.enable_stats,
             swa_scratch_reuse=scratch_reuse_config,
             commit_min_snapshot=(
@@ -3870,6 +3955,61 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
+
+    def _kv_connector_declares(self, capability: str) -> bool:
+        """Whether the attached KV connector's worker declares ``capability`` exactly True.
+
+        Read through ``getattr``: partially built managers may bind no connector, or a
+        connector without a worker, and only an explicit True counts, so a mock's truthy
+        attribute changes nothing. A capacity-only connector serves nothing, so it never
+        reshapes local reuse or admission.
+
+        Args:
+            capability: Name of a ``KvCacheConnectorWorker`` declaration, such as
+                ``"requires_block_aligned_reuse"``.
+
+        Returns:
+            True only when a serving connector's worker sets ``capability`` to True.
+        """
+        connector = getattr(self, "kv_connector_manager", None)
+        if connector is None or getattr(connector, "capacity_only", False) is True:
+            return False
+        return getattr(getattr(connector, "worker", None), capability, False) is True
+
+    def _connector_drops_reuse_match_backoff(self) -> bool:
+        """Whether the attached KV connector asks for local matches without backoff.
+
+        A connector that serves from block boundaries can prefer reusing whole local
+        blocks to aligning a backed-off match down and loading the trimmed block itself;
+        see `_connector_reuse_match_alignment`. The draft KV at the end of such a block may
+        then belong to a different next token, which affects draft acceptance only. A
+        draft manager never drops its own backoff.
+
+        Returns:
+            True when this target manager should drop the one-model draft backoff.
+        """
+        return not self.is_draft and self._kv_connector_declares("drops_reuse_match_backoff")
+
+    def _connector_reuse_match_alignment(self) -> int:
+        """Alignment a whole-block KV connector needs of every local prefix match.
+
+        Such a connector serves only from a block boundary, and the local match is where
+        its offer starts. Disabling partial radix matching is not enough on its own: a
+        one-model draft's lookahead backoff trims a match of whole blocks to one or more
+        tokens short of a boundary, which would leave the connector nothing to offer for
+        any request with a local hit. Aligning trades the trimmed block for the connector
+        serving it and everything after it. Any other configuration keeps token-granular
+        reuse.
+
+        Returns:
+            The ledger ``tokens_per_block`` when a backoff is in effect, partial reuse is
+            off and the connector requires block-aligned reuse; otherwise 1.
+        """
+        if self.reuse_match_backoff <= 0 or self.enable_partial_reuse:
+            return 1
+        if not self._kv_connector_declares("requires_block_aligned_reuse"):
+            return 1
+        return self._ledger_tokens_per_block
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Exclude empty buffers before creating the runtime storage pools."""
@@ -4792,10 +4932,40 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         self._after_shrink(request_id, kv_cache)
 
+    def drop_context_allocation(self, req: LlmRequest) -> None:
+        """Release a context request's allocation and rewind it to run from the start.
+
+        For a request the scheduler skipped past a connector prefix whose pages
+        could not be filled (`KvCacheConnectorWorker.reports_failed_loads`).
+        Those positions already count as computed, so the request cannot run
+        this iteration.
+
+        `free_resources` releases unstarted prefix loads and refuses a load that
+        is still pending, which turns a misreported failure into a RuntimeError
+        rather than a use-after-free. It resets the connector state and
+        `py_connector_allocation_reported` / `py_served_prefix_end`, and closes
+        the cache without committing it: blocks reach the radix tree only in
+        `try_commit_blocks` after a forward pass, so the never-filled range is
+        not offered for reuse. The next admission therefore matches local reuse
+        and asks the connector afresh. This is the same release as the drop
+        branches of `revert_allocate_context`.
+
+        Args:
+            req: The context request to restart.
+        """
+        self.free_resources(req)
+        rewind_context_after_cache_drop(req, self.tokens_per_block)
+
     def revert_allocate_context(self, req: LlmRequest) -> bool:
         """Undo this iteration's context resize. False means the cache was dropped,
         not shrunk (history outran pre-resize capacity); the caller drops any draft pool.
+
+        Also returns an unconsumed first chunk's completion bound, for a context
+        chunk dropped after scheduling or a disaggregated generation-init request
+        that DisaggCoordinator.revert_deferred_gen_init or the CP admission
+        alignment did not admit.
         """
+        self._release_unconsumed_context_reservation(req)
         if self._connector_reservations_enabled():
             if self.kv_connector_manager.get_prefix_reservation(req) is not None:
                 self.free_resources(req)
@@ -5173,6 +5343,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 rewind_context_after_cache_drop(req, self.tokens_per_block)
             elif req.is_first_context_chunk:
                 kv_cache.suspend()
+                self._release_unconsumed_context_reservation(req)
             return False
         self._fill_fresh_kv_pages(req.py_request_id)
         self._log_window_crossing(req, kv_cache, pre_cap, capacity, "context")
@@ -5191,13 +5362,135 @@ class KVCacheManagerV2(BaseResourceManager):
         target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
         return kv_cache.resize(max(kv_cache.capacity, target))
 
+    def _disagg_completion_reservation_applies(self) -> bool:
+        """Whether admission reserves each request's completion headroom.
+
+        Opt-in: the attached KV connector's worker must declare
+        ``requires_completion_reservation``, or
+        ``kv_cache_config.enable_disagg_completion_reservation`` must be set;
+        the latter lets a disaggregated generation server without a connector
+        reserve its decode headroom. A server with neither keeps its existing
+        admission even without a tier below GPU. Beyond that, only a
+        disaggregated target manager without a tier below GPU, beam search or
+        pipeline parallelism, whose layers all use full attention, qualifies;
+        the configuration does not relax these conditions. Windowed and
+        recurrent caches keep their existing admission policy. PP is excluded
+        because each rank decides alone, and a follower refusing a
+        generation-init request that rank 0 admitted is not reconciled.
+
+        Returns:
+            True when every condition holds.
+        """
+        return (
+            self.is_disagg
+            and not self.can_evict
+            and not self.is_draft
+            and self.max_beam_width == 1
+            and self.mapping.pp_size == 1
+            and (
+                self._kv_connector_declares("requires_completion_reservation")
+                or self.enable_disagg_completion_reservation
+            )
+            and all(
+                isinstance(layer, AttentionLayerConfig)
+                and (
+                    layer.sliding_window_size is None
+                    or layer.sliding_window_size >= self.max_seq_len
+                )
+                for layer in self.kv_cache_manager_py_config.layers
+            )
+        )
+
+    def reserve_context_completion(self, req: LlmRequest) -> bool:
+        """Reserve a connector prefill's completion headroom before chunk allocation.
+
+        Applies on a disaggregated full-attention server without an eviction
+        tier whose connector declares ``requires_completion_reservation`` or
+        whose configuration enables the reservation (see
+        `_disagg_completion_reservation_applies`), to the first chunk of a
+        request the connector may serve, and only
+        for connectors without source reservations: those are queried after the
+        final batch has allocated its chunks (``_run_kv_connector_hooks``), so
+        every admitted request's full restore must stay allocatable. No page is
+        allocated here.
+
+        Args:
+            req: Context request about to allocate its first chunk.
+
+        Returns:
+            False to defer ``req``: its bound does not fit beside the admitted
+            requests' bounds. The scheduler skips it instead of preempting, and
+            its rollback frees the claim it held. True otherwise, including
+            when no reservation applies.
+        """
+        if not (
+            self._disagg_completion_pool_counts
+            and req.is_first_context_chunk
+            and self._connector_may_serve(req)
+            and not self._connector_reservations_enabled()
+        ):
+            return True
+        if req.py_request_id in self._disagg_completion_limits:
+            return True
+        limit = self._disagg_completion_limit(req.prompt_len)
+        if not self._can_reserve_disagg_completion(req.py_request_id, limit):
+            return False
+        self._disagg_completion_limits[req.py_request_id] = limit
+        return True
+
+    def _release_unconsumed_context_reservation(self, req: LlmRequest) -> None:
+        """Drop the bound of a first chunk that neither a load nor a forward consumed."""
+        if (
+            req.py_request_id in self._disagg_completion_limits
+            and req.is_first_context_chunk
+            and not req.py_connector_allocation_reported
+        ):
+            del self._disagg_completion_limits[req.py_request_id]
+
+    def _disagg_generation_limit(self, req: LlmRequest, prompt_len: int) -> int:
+        """Completion bound of a disaggregated decode request, in ledger blocks."""
+        return self._disagg_completion_limit(min(self.max_seq_len, prompt_len + req.max_new_tokens))
+
+    def _disagg_completion_limit(self, end: int) -> int:
+        """Ledger blocks to reach ``end`` plus the maximum generation lead."""
+        capacity = end + self._generation_kv_capacity_headroom
+        blocks = (capacity + self._ledger_tokens_per_block - 1) // self._ledger_tokens_per_block
+        # Matching can share a partial tail page. Reserve its private copy even
+        # when growing that tail does not change the logical block count.
+        return blocks + int(self.enable_block_reuse)
+
+    def _can_reserve_disagg_completion(self, request_id: int, limit: int) -> bool:
+        """Check every full-attention pool without allocating future KV pages.
+
+        ``available`` is free plus evictable slots: it already excludes resident
+        prompts, generation KV and outgoing transfers, and counts droppable
+        reusable pages as free. Add only the unallocated part of each admitted
+        request's bound, including incoming transfers and connector first chunks
+        awaiting their restore.
+        """
+        needed = max(0, limit - self.kv_cache_map[request_id].num_blocks)
+        for req_id, req_limit in self._disagg_completion_limits.items():
+            if req_id == request_id:
+                continue
+            kv_cache = self.kv_cache_map.get(req_id)
+            if kv_cache is None:
+                # Freed without its bound: it holds no pages and will not grow.
+                continue
+            needed += max(0, req_limit - kv_cache.num_blocks)
+        stats = self._get_storage_statistics(GPU_LEVEL)
+        return all(
+            needed * count <= stats[pool_id].available
+            for pool_id, count in self._disagg_completion_pool_counts.items()
+        )
+
     def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
         """Prepare KV cache for a disagg generation init request.
 
         Allocates capacity for the full prompt (+ draft) and sets
         ``kv_cache.history_length`` to ``prompt_len``. Returns True on
         success, False if preparation or resize failed (cache is suspended
-        on resize failure).
+        on resize failure), or if the request's completion bound does not fit
+        beside the admitted requests' bounds (cache is freed, not suspended).
         """
         reused = self.prepare_context_cache(req)
         if reused is None:
@@ -5225,6 +5518,14 @@ class KVCacheManagerV2(BaseResourceManager):
             else (req.total_input_len_cp if self._has_cp_helix else req.prompt_len)
         )
         prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+        limit = None
+        if self._disagg_completion_pool_counts:
+            limit = self._disagg_generation_limit(req, prompt_len)
+            if not self._can_reserve_disagg_completion(req.py_request_id, limit):
+                # No transfer has started. Release a newly matched prefix too:
+                # suspension alone cannot reclaim uncommitted KV without a tier.
+                self.free_resources(req)
+                return False
         target = prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
@@ -5237,6 +5538,8 @@ class KVCacheManagerV2(BaseResourceManager):
         self._fill_fresh_kv_pages(req.py_request_id)
         self._log_window_crossing(req, kv_cache, pre_cap, capacity, "disagg_gen_init")
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
+        if limit is not None:
+            self._disagg_completion_limits[req.py_request_id] = limit
         # RDMA cannot observe cache-stream ordering. Capture readiness here so
         # receive publication waits for admission's copies and recycled-slot
         # dependencies without waiting for later execution-stream work.
@@ -5561,9 +5864,12 @@ class KVCacheManagerV2(BaseResourceManager):
             # Both forms are offered; the manager picks the one this connector
             # implements. With several layer groups the flat list is empty,
             # because a page index is scoped to a group.
+            started = time.perf_counter()
             by_group = self.get_page_indices_by_layer_group(request)
             flat = by_group[0] if len(by_group) == 1 else []
             self.kv_connector_manager.update_state_after_alloc(request, flat, by_group)
+            if self._connector_offer_stats is not None:
+                self._connector_offer_stats["report_ms"] += (time.perf_counter() - started) * 1e3
 
         if served_any:
             # A served prefix can carry a request past its last chunk boundary,
@@ -5682,6 +5988,200 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_connector_manager.update_state_after_alloc(req, flat, by_group)
             req.py_connector_allocation_reported = True
 
+    def begin_connector_admission_pass(self) -> None:
+        """Start a scheduling pass: admission-time answers from earlier passes go stale."""
+        self._connector_admission_epoch += 1
+
+    def connector_admission_query_enabled(self) -> bool:
+        """Whether the scheduler may ask the connector while it admits a request.
+
+        Off without an admission-capable connector (see
+        ``KvCacheConnectorManager.admission_query_capable``, which is off under
+        attention DP), on a draft manager, for a capacity-only role, and for a
+        connector that reserves its prefix during admission instead.
+        """
+        return (
+            self.kv_connector_manager is not None
+            and not self.is_draft
+            and getattr(self.kv_connector_manager, "admission_query_capable", False) is True
+            and not self.kv_connector_manager.capacity_only
+            and not self._connector_reservations_enabled()
+        )
+
+    def query_connector_at_admission(self, req: LlmRequest) -> bool:
+        """Ask the connector now, while the scheduler admits ``req``, and keep the answer.
+
+        Called once the scheduler has sized and allocated ``req``'s chunk, with
+        the guards of ``_run_kv_connector_hooks``. The answer is the
+        allocation's one query: ``_apply_connector_matched_prefix`` uses it in
+        this pass's ``prepare_resources`` instead of asking again. An answer
+        left from an earlier pass is dropped first.
+
+        Args:
+            req: The context request being admitted.
+
+        Returns:
+            Whether the runtime will park ``req`` for an asynchronous load, so
+            the scheduler need not charge its chunk to the token budget.
+        """
+        req.py_connector_admission_offer = None
+        if not self.connector_admission_query_enabled():
+            return False
+        if (
+            not self._connector_may_serve(req)
+            or not req.is_first_context_chunk
+            or req.py_connector_allocation_reported
+            or not self.kv_connector_manager.should_add_sequence(req)
+        ):
+            return False
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return False
+        local_end = kv_cache.num_committed_tokens
+        started = time.perf_counter()
+        num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
+            req, local_end
+        )
+        if self._connector_offer_stats is not None:
+            self._connector_offer_stats["query_ms"] += (time.perf_counter() - started) * 1e3
+        offer = ConnectorAdmissionOffer(
+            self._connector_admission_epoch, local_end, num_tokens, load_async
+        )
+        req.py_connector_admission_offer = offer
+        return offer.parks
+
+    def cover_admission_offer(self, req: LlmRequest) -> bool:
+        """Grow the allocation now to the window this pass's admission answer moves the chunk to.
+
+        An offer that reaches past the scheduled chunk shifts the window and
+        grows the allocation by the offer. Left to ``prepare_resources``, that
+        grow competes with every admission after this one in the pass; when it
+        fails, ``_reserve_connector_prefix`` takes only the whole blocks the
+        pages already hold and the rest of the offer is recomputed. Growing
+        here books the pages before the requests behind it allocate. Only the
+        capacity moves: the history stays at the local match until
+        ``_reserve_connector_prefix`` places the served prefix, so a
+        sliding-window layer group holds the offer's pages until then.
+
+        Args:
+            req: The context request just asked by ``query_connector_at_admission``.
+
+        Returns:
+            False when the KV cache cannot cover the window; the scheduler then
+            gives the chunk back and asks again on a later pass. True when there
+            is nothing to grow (no answer from this pass, a miss, an offer
+            inside the chunk, a shift ``_reserve_connector_prefix`` would refuse
+            anyway, or SWA scratch reuse) or the grow succeeded.
+        """
+        offer = req.py_connector_admission_offer
+        if offer is None or offer.epoch != self._connector_admission_epoch:
+            return True
+        if getattr(self, "enable_swa_scratch_reuse", False) is True:
+            # KVCacheV2Scheduler._pregrown_context_tokens reads the manager-level
+            # flag and replays any capacity grown past the cursor exactly, even
+            # for connector-servable caches whose per-cache scratch flag was
+            # cleared. A grow left on a request dropped before
+            # prepare_resources would come back as an offer+chunk-sized first
+            # chunk charged at that size, or be released and re-admitted. Leave
+            # the shift to prepare_resources, as without admission queries.
+            return True
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return True
+        local_end = offer.local_end
+        offered_end = min(local_end + offer.num_tokens, req.prompt_len - 1)
+        chunk_end = min(local_end + req.context_chunk_size, req.prompt_len)
+        if offered_end <= local_end or offered_end < chunk_end:
+            return True
+        end = self._shifted_chunk_end(req, offered_end)
+        if end <= offered_end:
+            return True
+        target = self._served_prefix_capacity(req, end)
+        pre_cap = kv_cache.capacity
+        if target <= pre_cap:
+            return True
+        grown = kv_cache.resize(target)
+        if self._connector_offer_stats is not None:
+            self._connector_offer_stats["pregrown" if grown else "pregrow_failed"] += 1
+        if not grown:
+            return False
+        if req.py_ctx_pre_resize_cap is None:
+            # As in `_resize_for_served_prefix`: a revert must undo this growth.
+            req.py_ctx_pre_resize_cap = pre_cap
+        return True
+
+    def enable_connector_offer_stats(self) -> None:
+        """Count connector offers per iteration (TLLM_CTX_PARK_STATS); read by `take_connector_offer_stats`."""
+        self._connector_offer_stats = self._new_connector_offer_stats()
+
+    @staticmethod
+    def _new_connector_offer_stats() -> Dict[str, float]:
+        return {
+            "queries": 0,
+            "admission_used": 0,
+            "offers": 0,
+            "async_offers": 0,
+            "offered_tokens": 0,
+            "honoured_tokens": 0,
+            "in_chunk": 0,
+            "shifted": 0,
+            "capped": 0,
+            "not_honoured": 0,
+            # Admission-time grows for a shifting offer (`cover_admission_offer`).
+            "pregrown": 0,
+            "pregrow_failed": 0,
+            # Host time (ms) in the leader query and its broadcast, in fitting the
+            # served prefix into the allocation, and in reporting the pages.
+            "query_ms": 0.0,
+            "reserve_ms": 0.0,
+            "report_ms": 0.0,
+        }
+
+    def take_connector_offer_stats(self) -> Optional[Dict[str, float]]:
+        """This iteration's connector offer counters, reset on read.
+
+        Returns:
+            The counters since the last call, or None while they are disabled.
+        """
+        if self._connector_offer_stats is None:
+            return None
+        stats = self._connector_offer_stats
+        self._connector_offer_stats = self._new_connector_offer_stats()
+        return stats
+
+    def _count_connector_offer(
+        self,
+        used_admission: bool,
+        num_tokens: int,
+        load_async: bool,
+        local_end: int,
+        offered_end: int,
+        chunk_end: int,
+        position: int,
+    ) -> None:
+        """Book one answered query into the TLLM_CTX_PARK_STATS counters.
+
+        The categories follow ``_reserve_connector_prefix``: an offer inside the
+        scheduled chunk, the shifted window, or the capped fallback.
+        """
+        stats = self._connector_offer_stats
+        stats["queries"] += 1
+        stats["admission_used"] += int(used_admission)
+        if offered_end <= local_end:
+            return
+        stats["offers"] += 1
+        stats["async_offers"] += int(load_async)
+        stats["offered_tokens"] += offered_end - local_end
+        stats["honoured_tokens"] += position - local_end
+        if position == local_end:
+            stats["not_honoured"] += 1
+        elif offered_end < chunk_end:
+            stats["in_chunk"] += 1
+        elif position == offered_end:
+            stats["shifted"] += 1
+        else:
+            stats["capped"] += 1
+
     def _connector_may_serve(self, req: LlmRequest) -> bool:
         """Whether the connector is allowed to serve a prefix for ``req``."""
         if self.kv_connector_manager is None or self.is_draft:
@@ -5717,17 +6217,41 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
 
         local_end = kv_cache.num_committed_tokens
-        num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
-            req, local_end
-        )
+        offer = getattr(req, "py_connector_admission_offer", None)
+        req.py_connector_admission_offer = None
+        if offer is not None and offer.epoch == self._connector_admission_epoch:
+            # Asked while the scheduler admitted it, this same pass; asking
+            # again would break the one-query-per-allocation contract.
+            if offer.local_end != local_end:
+                raise RuntimeError(
+                    f"req {req.py_request_id}: admission-time connector answer was "
+                    f"taken at {offer.local_end} but the cache is now at {local_end}"
+                )
+            num_tokens, load_async = offer.num_tokens, offer.load_async
+            used_admission = True
+        else:
+            started = time.perf_counter()
+            num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
+                req, local_end
+            )
+            if self._connector_offer_stats is not None:
+                self._connector_offer_stats["query_ms"] += (time.perf_counter() - started) * 1e3
+            used_admission = False
         offered_end = min(local_end + num_tokens, req.prompt_len - 1)
+        chunk_end = min(local_end + req.context_chunk_size, req.prompt_len)
 
         position = local_end
+        started = time.perf_counter()
         if offered_end > local_end:
             fitted = self._reserve_connector_prefix(req, kv_cache, local_end, offered_end)
             if fitted is not None:
                 position, chunk_size = fitted
                 self._mark_connector_prefix_populated(req, position, chunk_size)
+        if self._connector_offer_stats is not None:
+            self._connector_offer_stats["reserve_ms"] += (time.perf_counter() - started) * 1e3
+            self._count_connector_offer(
+                used_admission, num_tokens, load_async, local_end, offered_end, chunk_end, position
+            )
 
         # The honoured amount, not `num_tokens`: `build_scheduler_output`
         # reports `context_current_position - recorded` as the range computed
@@ -5768,9 +6292,7 @@ class KVCacheManagerV2(BaseResourceManager):
         allocation, which is why that arm needs a fallback.
         """
         tokens_per_block = self.tokens_per_block
-        prompt_len = req.prompt_len
-        scheduler_chunk = req.context_chunk_size
-        chunk_end = min(local_end + scheduler_chunk, prompt_len)
+        chunk_end = min(local_end + req.context_chunk_size, req.prompt_len)
 
         candidates = []
         if offered_end < chunk_end:
@@ -5778,13 +6300,9 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             # `==` belongs here, not above: an offer that reaches the chunk end
             # exactly leaves the forward pass nothing to compute unless the
-            # window moves.
-            shifted_end = min(offered_end + scheduler_chunk, prompt_len)
-            if shifted_end < prompt_len:
-                # A non-final chunk must end on a block boundary or the next
-                # chunk fragments the cache.
-                shifted_end = (shifted_end // tokens_per_block) * tokens_per_block
-            candidates.append((offered_end, shifted_end))
+            # window moves. With an admission-time answer,
+            # `cover_admission_offer` has normally grown the pages already.
+            candidates.append((offered_end, self._shifted_chunk_end(req, offered_end)))
             # Fall back to the largest whole-block prefix the pages that already
             # exist can hold while still leaving a chunk to compute. Whole
             # blocks because that is the granularity a connector transfers in.
@@ -5797,6 +6315,23 @@ class KVCacheManagerV2(BaseResourceManager):
             if self._resize_for_served_prefix(req, kv_cache, position, end):
                 return position, end - position
         return None
+
+    def _shifted_chunk_end(self, req: LlmRequest, offered_end: int) -> int:
+        """End of the scheduled chunk once a served prefix moves its start to ``offered_end``."""
+        prompt_len = req.prompt_len
+        shifted_end = min(offered_end + req.context_chunk_size, prompt_len)
+        if shifted_end < prompt_len:
+            # A non-final chunk must end on a block boundary or the next chunk
+            # fragments the cache.
+            shifted_end = (shifted_end // self.tokens_per_block) * self.tokens_per_block
+        return shifted_end
+
+    def _served_prefix_capacity(self, req: LlmRequest, end: int) -> int:
+        """The capacity covering ``[0, end)`` for a context chunk ending at ``end``."""
+        target = end + self.num_extra_kv_tokens
+        if end >= req.prompt_len:
+            target += get_draft_token_length(req)
+        return target
 
     def _resize_for_served_prefix(self, req: LlmRequest, kv_cache, position: int, end: int) -> bool:
         """Cover ``[0, end)`` and set the history to ``position``, marking
@@ -5811,9 +6346,7 @@ class KVCacheManagerV2(BaseResourceManager):
         sliding-window layer group. When the capacity is unchanged the call
         cannot fail, since no new slot is requested.
         """
-        target = end + self.num_extra_kv_tokens
-        if end >= req.prompt_len:
-            target += get_draft_token_length(req)
+        target = self._served_prefix_capacity(req, end)
         pre_cap = kv_cache.capacity
         capacity = max(pre_cap, target)
         if not kv_cache.resize(capacity, position):
@@ -7018,6 +7551,10 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_connector_manager.release_prefix_reservation(request)
         # Replay obtains fresh connector metadata for its new destination pages.
         request.py_connector_allocation_reported = False
+        # An admission-time answer belongs to the allocation being released.
+        # `py_connector_offer_deferrals` is not reset: it lasts for the
+        # request's lifetime.
+        request.py_connector_admission_offer = None
         # Same allocation, same lifetime. The pages the served position vouches
         # for are gone, so a replay recomputes from its own reuse match.
         request.py_served_prefix_end = 0
@@ -7030,6 +7567,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
+        self._disagg_completion_limits.pop(request.py_request_id, None)
         self._inflight_draft_lens.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
         # The next owner of these pages fills them again; keeping the set would
@@ -7362,6 +7900,7 @@ class KVCacheManagerV2(BaseResourceManager):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
+        self._disagg_completion_limits.clear()
         self._disagg_receive_ready.clear()
         self._on_allocation_stream.clear()
         self._allocation_ready.clear()

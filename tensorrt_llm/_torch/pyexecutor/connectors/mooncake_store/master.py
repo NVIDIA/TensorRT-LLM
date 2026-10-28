@@ -423,6 +423,14 @@ def _client_config(
         "role": StoreRole(pool.role).value,
         "transfer_batch_size": pool.transfer_batch_size,
         "stage_through_host": pool.stage_through_host,
+        "staging_buffer_bytes": parse_size(pool.staging_buffer_bytes, strict_units=True),
+        "async_load": pool.async_load,
+        "async_load_workers": pool.async_load_workers,
+        "group_blocks": pool.group_blocks,
+        # Omitted when off, which is what a reader that does not know the key
+        # assumes too.
+        **({"soft_pin_ttl_ms": pool.soft_pin_ttl_ms} if pool.soft_pin_ttl_ms is not None else {}),
+        **({"stats_interval": pool.stats_interval} if pool.stats_interval is not None else {}),
     }
     return config
 

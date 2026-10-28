@@ -1102,6 +1102,10 @@ _ROUTER_CLS_PATHS = [
         "tensorrt_llm._torch.pyexecutor.scheduler.adp_router.KVCacheAwareADPRouter",
         id="KVCacheAwareADPRouter",
     ),
+    pytest.param(
+        "tensorrt_llm._torch.pyexecutor.scheduler.adp_router.WorkAwareADPRouter",
+        id="WorkAwareADPRouter",
+    ),
 ]
 
 
@@ -1135,6 +1139,9 @@ def _make_unscheduled_request_item(req_id=None):
     req_item.request.py_scheduling_params = None
     req_item.request.input_token_ids = [1, 2, 3]
     req_item.id = req_id if req_id is not None else id(req_item)
+    # RequestQueueItem.child_req_ids is Optional[list]; a bare Mock attribute
+    # is truthy and not iterable.
+    req_item.child_req_ids = None
     return req_item
 
 
@@ -1234,7 +1241,8 @@ class TestADPRouterPerRankCap:
             # ceil(2.0 * ceil(8/4)) = ceil(2.0 * 2) = 4.
             expected_natural = 4
         else:
-            # DefaultADPRouter natural value is ceil(8/4) = 2.
+            # DefaultADPRouter natural value is ceil(8/4) = 2; WorkAwareADPRouter
+            # spreads eight equal requests two per rank.
             expected_natural = 2
         assert expected == expected_natural, (
             f"{cls_name}: natural expected was {expected_natural}, got {expected}"

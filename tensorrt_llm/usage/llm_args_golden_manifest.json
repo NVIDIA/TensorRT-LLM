@@ -34,6 +34,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "attention_dp_config.enable_work_aware_routing"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "attention_dp_config.kv_cache_routing_account_for_in_transfer"
     },
     {
@@ -676,6 +681,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "kv_cache_config.enable_disagg_completion_reservation"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "kv_cache_config.enable_kv_pool_rebalance"
     },
     {
@@ -866,6 +876,16 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_config.use_uvm"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_connector_config.admission_query.max_offer_deferrals"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_connector_config.admission_query.max_uncharged_parks"
     },
     {
       "allowed_values": [

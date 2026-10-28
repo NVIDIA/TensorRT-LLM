@@ -401,6 +401,50 @@ def test_timed_out_requests_under_adp_fail_only_at_the_synced_drain() -> None:
     assert len(h.effects.failed) == 1
 
 
+def test_fail_timed_out_ends_the_receive_state_of_cancelled_requests() -> None:
+    """cancel_request leaves a receive in progress. Failing the request must
+    end that state, or the executor's error path would park the failure for a
+    transfer that no longer exists and then drop it without a response. A
+    receive that completed after its deadline keeps its state."""
+    h = _Harness()
+    cancelled = _Request(
+        1,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+    )
+    completed_late = _Request(
+        2,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+    )
+
+    h.coordinator.fail_timed_out([cancelled, completed_late])
+
+    assert cancelled.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert completed_late.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert h.effects.failed == [
+        ("Request 1 timed out", [cancelled], False),
+        ("Request 2 timed out", [completed_late], False),
+    ]
+
+
+def test_fail_timed_out_ends_the_receive_state_before_the_adp_buffer() -> None:
+    """Under multi-rank ADP the state ends when the request is buffered, not
+    at the synced drain, because the request has already left the active
+    list the error vote reads."""
+    h = _Harness(enable_attention_dp=True, world_size=2)
+    req = _Request(
+        1,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+    )
+
+    h.coordinator.fail_timed_out([req])
+
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert h.effects.failed == []
+
+
 def test_fatal_error_during_the_synced_drain_leaves_no_stale_pending_state() -> None:
     """If the executor's error path raises (fatal), the drained requests must
     not be re-failed by the next drain."""

@@ -797,3 +797,214 @@ def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> 
     # The worker thread first: it is the one still handing the connector work.
     executor.worker_thread.join.assert_called_once_with()
     assert order == ["connector", "kv pools"]
+
+
+# ---- admission-time connector queries ----
+
+
+def _prepare_batch_executor(monkeypatch, parked_ids) -> PyExecutor:
+    """An executor whose connector parks ``parked_ids``, as take_scheduled_requests_pending_load does."""
+    executor = _executor()
+    connector = executor.kv_connector_manager
+
+    def park(batch):
+        batch.context_requests = [
+            r for r in batch.context_requests if r.py_request_id not in parked_ids
+        ]
+
+    connector.take_scheduled_requests_pending_load.side_effect = park
+    # Not on the Mock spec: it is an instance attribute of the real manager.
+    connector.worker = Mock()
+    monkeypatch.setattr("torch.cuda.current_stream", lambda: None)
+    return executor
+
+
+def _ctx_request(request_id: int, chunk: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        py_request_id=request_id, request_id=request_id, context_chunk_size=chunk
+    )
+
+
+def _admission_config(max_uncharged_parks: int = 2) -> SimpleNamespace:
+    return SimpleNamespace(
+        admission_query=SimpleNamespace(
+            max_uncharged_parks=max_uncharged_parks, max_offer_deferrals=16
+        )
+    )
+
+
+def _admission_executor(scheduler) -> PyExecutor:
+    """An executor whose connector can be asked at admission, with ``scheduler`` installed."""
+    executor = _executor()
+    executor._kv_connector_config = _admission_config()
+    executor.kv_connector_manager.admission_query_capable = True
+    executor.kv_connector_manager.prefix_reservations_enabled = False
+    executor.scheduler = scheduler
+    executor.disable_overlap_scheduler = True
+    return executor
+
+
+def test_an_uncharged_request_that_did_not_park_fails_stop(monkeypatch) -> None:
+    """A 0-charged chunk left in the batch would push the forward past max_num_tokens.
+
+    Other parked requests' loads may already own destination pages, so the
+    failure retains DMA resources instead of taking the ordinary crash path.
+    """
+    executor = _prepare_batch_executor(monkeypatch, parked_ids=set())
+    executor._admission_query_scheduler = SimpleNamespace(uncharged_park_ids=frozenset({1}))
+    batch = SimpleNamespace(context_requests=[_ctx_request(1, 8192)])
+    with pytest.raises(RuntimeError, match="did not park"):
+        executor._kv_connector_prepare_batch(batch)
+    assert executor._kv_connector_failed is True
+    executor.kv_connector_manager.worker.start_load_kv.assert_not_called()
+
+
+def test_an_uncharged_request_that_parked_passes(monkeypatch) -> None:
+    executor = _prepare_batch_executor(monkeypatch, parked_ids={1})
+    executor._admission_query_scheduler = SimpleNamespace(uncharged_park_ids=frozenset({1}))
+    batch = SimpleNamespace(context_requests=[_ctx_request(1, 8192), _ctx_request(2, 4096)])
+    executor._kv_connector_prepare_batch(batch)
+    assert [r.py_request_id for r in batch.context_requests] == [2]
+    assert executor._kv_connector_failed is False
+    executor.kv_connector_manager.worker.start_load_kv.assert_called_once()
+
+
+def test_admission_query_resolves_the_v2_scheduler_through_a_wrapper() -> None:
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
+    inner = object.__new__(KVCacheV2Scheduler)
+    executor = _admission_executor(SimpleNamespace(scheduler=inner))
+    assert executor._resolve_admission_query_scheduler() is inner
+    # Off unless configured, including on an executor built without __init__.
+    executor._kv_connector_config = SimpleNamespace(admission_query=None)
+    assert executor._resolve_admission_query_scheduler() is None
+    del executor._kv_connector_config
+    assert executor._resolve_admission_query_scheduler() is None
+
+
+@pytest.mark.parametrize("problem", ["no_v2_scheduler", "overlap_scheduler"])
+def test_admission_query_is_refused_where_unchecked(problem) -> None:
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
+    executor = _admission_executor(
+        SimpleNamespace() if problem == "no_v2_scheduler" else object.__new__(KVCacheV2Scheduler)
+    )
+    executor.disable_overlap_scheduler = problem != "overlap_scheduler"
+    with pytest.raises(NotImplementedError, match="admission_query"):
+        executor._resolve_admission_query_scheduler()
+
+
+@pytest.mark.parametrize(
+    "setting, reason",
+    [
+        ("not_capable", "supports_admission_query"),
+        ("prefix_reservations", "reserves its prefix"),
+        ("capacity_only", "capacity-only"),
+    ],
+)
+def test_admission_query_without_capability_only_warns(monkeypatch, setting, reason) -> None:
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
+    executor = _admission_executor(object.__new__(KVCacheV2Scheduler))
+    # Neither would be accepted if the configuration were not ignored first.
+    executor.disable_overlap_scheduler = False
+    connector = executor.kv_connector_manager
+    if setting == "not_capable":
+        connector.admission_query_capable = False
+    elif setting == "prefix_reservations":
+        connector.prefix_reservations_enabled = True
+    else:
+        connector.capacity_only = True
+    warning = Mock()
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.logger.warning", warning)
+    assert executor._resolve_admission_query_scheduler() is None
+    warning.assert_called_once()
+    assert reason in warning.call_args.args[0]
+
+
+# ---- context-park diagnostics (TLLM_CTX_PARK_STATS) ----
+
+
+def test_park_stats_count_the_parked_chunks(monkeypatch) -> None:
+    from tensorrt_llm._torch.pyexecutor.profiling import ParkStats
+
+    executor = _prepare_batch_executor(monkeypatch, parked_ids={1})
+    # Request 9 was admitted uncharged but dropped before the connector saw the batch.
+    executor._admission_query_scheduler = SimpleNamespace(uncharged_park_ids=frozenset({1, 9}))
+    executor._park_stats = ParkStats()
+    batch = SimpleNamespace(context_requests=[_ctx_request(1, 8192), _ctx_request(2, 4096)])
+    executor._kv_connector_prepare_batch(batch)
+    stats = executor._park_stats
+    assert (stats.parked_reqs, stats.parked_tokens, stats.fwd_ctx_tokens, stats.uncharged) == (
+        1,
+        8192,
+        4096,
+        1,
+    )
+
+
+def test_park_stats_suffix_is_empty_when_off_and_parseable_when_on() -> None:
+    from tensorrt_llm._torch.pyexecutor.profiling import ParkStats
+
+    executor = _executor()
+    assert executor._format_park_stats() == ""
+    executor._park_stats = ParkStats()
+    executor.scheduler = None
+    executor.kv_cache_manager = Mock()
+    executor.kv_cache_manager.take_connector_offer_stats.return_value = {
+        "queries": 2,
+        "query_ms": 1.234,
+    }
+    with executor._park_phase("fwd"):
+        pass
+    suffix = executor._format_park_stats()
+    assert suffix.startswith(", ctx_park = parked=0 parked_tok=0 unc=0 fwd_tok=0 bskip=0 sched_ms=")
+    assert "offer_queries=2 offer_query_ms=1.2" in suffix
+    # No braces: parsers of the `states = {...}` field just before it keep matching.
+    assert "{" not in suffix and "}" not in suffix
+    executor._reset_park_stats()
+    assert executor._park_stats.wall_ms["fwd"] == 0.0
+
+
+def test_park_stats_report_the_schedulers_budget_skips() -> None:
+    from tensorrt_llm._torch.pyexecutor.profiling import ParkStats
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
+    executor = _executor()
+    executor._park_stats = ParkStats()
+    inner = object.__new__(KVCacheV2Scheduler)
+    inner.last_pass_ctx_budget_skips = 3
+    executor.scheduler = SimpleNamespace(scheduler=inner)
+    executor.kv_cache_manager = SimpleNamespace()
+    assert " bskip=3 " in executor._format_park_stats()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_reset_drains_offer_stats_only_when_enabled(enabled) -> None:
+    """Ranks that print no log line still drain the counters; a disabled executor never asks."""
+    from tensorrt_llm._torch.pyexecutor.profiling import ParkStats
+
+    executor = _executor()
+    executor._park_stats = ParkStats() if enabled else None
+    executor._reset_park_stats()
+    assert executor.kv_cache_manager.take_connector_offer_stats.call_count == int(enabled)
+
+
+def test_gil_probe_reports_and_stops() -> None:
+    import time
+
+    from tensorrt_llm._torch.pyexecutor.profiling import GilProbe
+
+    probe = GilProbe(500)
+    try:
+        deadline = time.monotonic() + 2.0
+        while not probe._samples and time.monotonic() < deadline:
+            time.sleep(0.01)
+        reading = probe.take()
+        assert reading is not None
+        worst, p99, count = reading
+        assert worst >= p99 and count > 0
+    finally:
+        probe.stop()
+    probe._thread.join(timeout=1.0)
+    assert not probe._thread.is_alive()

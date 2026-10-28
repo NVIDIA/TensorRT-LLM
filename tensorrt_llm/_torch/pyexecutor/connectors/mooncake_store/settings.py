@@ -188,6 +188,20 @@ def _restate_pool_block(
         ("model_key", effective.model_key, pool.model_key),
         ("transfer_batch_size", effective.transfer_batch_size, pool.transfer_batch_size),
         ("stage_through_host", effective.stage_through_host, pool.stage_through_host),
+        (
+            "staging_buffer_bytes",
+            effective.staging_buffer_bytes,
+            parse_size(pool.staging_buffer_bytes, strict_units=True),
+        ),
+        ("async_load", effective.async_load, pool.async_load),
+        ("async_load_workers", effective.async_load_workers, pool.async_load_workers),
+        ("group_blocks", effective.group_blocks, pool.group_blocks),
+    )
+    # Settings where `None` means off rather than "not stated", so a config
+    # that leaves one out restates the block to off.
+    nullable = (
+        ("soft_pin_ttl_ms", effective.soft_pin_ttl_ms, pool.soft_pin_ttl_ms),
+        ("stats_interval", effective.stats_interval, pool.stats_interval),
     )
     # Assignment adds to `model_fields_set`, so what the deployment stated for
     # itself has to be read before any of it is replaced. Only a value it chose
@@ -196,6 +210,12 @@ def _restate_pool_block(
     overridden = {}
     for setting, value, asked in superseded:
         if value is None or value == asked:
+            continue
+        setattr(pool, setting, value)
+        if setting in stated:
+            overridden[setting] = value
+    for setting, value, asked in nullable:
+        if value == asked:
             continue
         setattr(pool, setting, value)
         if setting in stated:

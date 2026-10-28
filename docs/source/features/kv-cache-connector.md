@@ -67,7 +67,7 @@ on the leader process; with attention DP, they run on each owning rank.
 
 * **`request_reset(self, request: LlmRequest)`**
   * **Description**: Optional, with a no-op default. The request's allocation has been released and it will run again from the start, unlike `request_finished`, which ends it. Any per-request state held in page indices now describes pages another request may own, so it must be dropped or rebuilt here.
-  * **When it fires**: on `KVCacheManagerV2`, from `free_resources`, which is the path a rollback or a failed admission takes. Direct preemption calls `request_finished` instead, so a connector keying state by request id sees exactly one of the two.
+  * **When it fires**: on `KVCacheManagerV2`, from `free_resources`, which is the path a rollback or a failed admission takes. A restart after a failed prefix load (see the worker's `reports_failed_loads` below) takes it too. Direct preemption calls `request_finished` instead, so a connector keying state by request id sees exactly one of the two.
 
 * **`update_state_after_alloc_by_layer_group(self, request: LlmRequest, block_ids_by_layer_group: list[list[int]])`**
 * **`request_finished_by_layer_group(self, request: LlmRequest, cache_block_ids_by_layer_group: list[list[int]]) -> bool`**
@@ -81,6 +81,12 @@ on the leader process; with attention DP, they run on each owning rank.
     | flat | non-VSWA, non-hybrid only |
 
     A set is complete when both of its methods are defined. An existing flat connector needs no change on the models it already covers: with a single layer group the base per-layer-group implementation folds back to the flat call. Hybrid / linear-attention models are not enabled for the connector yet; the per-layer-group set is the shape their cache will need. See [Running under VSWA](#running-under-vswa).
+
+* **`supports_speculative_prefill: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts, read from the class before the scheduler is constructed. Declares a scheduler whose content identity (its store keys) covers the `draft_prompt_lookahead` prompt tokens past each block's end, which never offers or saves a block whose lookahead tokens fall outside the prompt, and which never saves a block the current pass has not computed. Together with the worker's declaration it lets the connector run next to one-model speculative decoding on a disaggregated context server; see [Speculative decoding on a disaggregated context server](#speculative-decoding-on-a-disaggregated-context-server).
+
+* **`supports_admission_query: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts, read from the class so every rank agrees. Declares that `get_num_new_matched_tokens` may be asked while the scheduler is still admitting the request; see [Admission-time queries](#admission-time-queries).
 
 ##### Running under VSWA
 
@@ -198,13 +204,67 @@ following configuration limits at bring-up.
 
 | Configuration | Mechanism |
 |---|---|
-| Speculative decoding | Rejected draft tokens shrink a request's page list, and the freed slot goes to whichever request allocates next. The connector is never told the tail block moved. |
+| Speculative decoding, outside the [speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server) | Rejected draft tokens shrink a request's page list, and the freed slot goes to whichever request allocates next. The connector is never told the tail block moved. |
 | A capacity scheduler policy other than `GUARANTEED_NO_EVICT` with KV cache manager V1 | V1 does not reset the connector block delta when a request is destroyed and replayed. V2 resets that state and permits replay; an active connector load retains its allocation until completion. |
 | A host or disk cache tier | Tier eviction reassigns the GPU slot. See [KV cache tiers are GPU-only under a connector](#kv-cache-tiers-are-gpu-only-under-a-connector). |
 
 The exact set the runtime refuses depends on your cache configuration; the bring-up error is
-authoritative. Speculative decoding is unsupported with a connector wherever it is not refused —
-the same page-list shrink happens there.
+authoritative. Outside the speculative-prefill-only mode below, speculative decoding is unsupported
+with a connector wherever it is not refused — the same page-list shrink happens there.
+
+##### Speculative decoding on a disaggregated context server
+
+A context-only request finishes after prefill and never rejects a draft token, so on a
+disaggregated context server the page list the connector is told about only grows. The runtime
+therefore lets one-model speculative decoding run next to a connector there, in what it calls the
+speculative-prefill-only mode. The mode is on when all of the following hold:
+
+* The KV cache manager is `KVCacheManagerV2`. An explicit `use_kv_cache_manager_v2=False` keeps
+  V1's behaviour unchanged, without this mode; `"auto"` resolving to V1 is rejected once the manager
+  is built.
+* `cache_transceiver_config.backend` is set, so the server takes part in disaggregated serving.
+* Speculative decoding is one-model MTP (MTP-Eagle or vanilla MTP) or EAGLE3. Other modes, such as
+  NGram or the suffix automaton, keep the refusal above.
+* The draft layers share the target KV cache. A separate draft KV cache is not registered with the
+  connector and is refused.
+* The connector's scheduler and worker classes both declare `supports_speculative_prefill = True`.
+
+What the declaration promises:
+
+* The scheduler's content identity covers the `draft_prompt_lookahead(speculative_config)` prompt
+  tokens past each block's end: one for MTP-Eagle and EAGLE3, `max_draft_len` for vanilla MTP. A
+  one-model draft writes the KV at a position from the tokens after it, so a served block's
+  draft-layer KV then belongs to this prompt. A block whose lookahead tokens fall outside the
+  prompt is neither offered nor saved.
+* Only blocks the current pass has computed are saved. One-model speculation allocates
+  `max_draft_len - 1` extra KV slots past every context chunk, so a block can own a page before it
+  is computed.
+* Loads and saves move whole pages of every layer group in the registered `KvCacheLayout`, which
+  includes the draft layers. Per-layer hooks are installed on `DecoderLayer` modules only, and
+  whether a model's draft layers are such modules depends on the model, so a worker that saves per
+  layer must make sure it covers them.
+
+At runtime:
+
+* A request that is not context-only gets an error response at admission, and only that request
+  fails. That includes `/health_generate` sent straight to the context server.
+* The connector manager refuses such a request again at the lookup, the prefix reservation and
+  the per-iteration scheduler output, for anything that bypasses admission. There the error is not
+  confined to the request.
+* A disaggregated generation server should use a connector role that transfers no KV
+  (`capacity_only`). When its classes declare the mode, such a role is exempt from both refusals
+  and may itself run one-model MTP or EAGLE3. A generation server whose connector transfers KV and
+  which meets the conditions above refuses every generation-only request.
+* A one-model draft can back a local reuse match off by its prompt lookahead, which leaves a match
+  of whole blocks short of a block boundary. A worker that stores whole blocks can ask
+  `KVCacheManagerV2` to align local matches down to a block (`requires_block_aligned_reuse`) or to
+  drop the backoff (`drops_reuse_match_backoff`), both described with the worker interface below.
+  Dropping it can lower draft acceptance but never changes the output.
+* The mode composes with [attention data parallelism](#attention-data-parallelism) when both
+  classes also declare `supports_attention_dp`.
+
+The [`mooncake-store`](#mooncake-store) connector declares the mode; see
+[its notes](#attention-data-parallelism-and-speculative-prefill).
 
 ##### `RequestData` fields that may not be populated
 
@@ -302,16 +362,132 @@ worker's transfer stream. Inference does not wait for the retirement control ite
 
 ##### Legacy final-batch queries
 
-`get_num_new_matched_tokens` is called at most once per KV allocation after batch selection.
-Its offer can reduce computation for that request, but does not free token budget for another
-request in the same iteration. With chunked prefill, allocation growth can limit the served prefix;
-`RequestData.computed_position` reflects the load interval that the runtime honors.
+`get_num_new_matched_tokens` is called at most once per KV allocation, after batch selection
+unless [admission-time queries](#admission-time-queries) are enabled. Its offer can reduce
+computation for that request, but does not free token budget for another request in the same
+iteration unless admission-time queries are enabled. With chunked prefill, allocation growth can
+limit the served prefix; `RequestData.computed_position` reflects the load interval that the runtime
+honors.
 
 Destroying an allocation clears its connector state, so replay queries again. Specify
 `enable_block_reuse=True` alongside the connector; see
 [Block reuse alongside the connector](#block-reuse-alongside-the-connector).
+Restarting a request whose prefix load failed (`reports_failed_loads`) is available only on
+this path.
 
 **Deployment note.** Under a connector, a workload that was token-bound becomes KV-bound: the connector removes forward-pass tokens but its prefix still occupies GPU pages. Lowering `max_num_tokens` to hand memory back to the KV pool is usually the right adjustment, the opposite of the guidance for a connector-free deployment.
+
+##### Admission-time queries
+
+A connector without source reservations can be asked while the KV cache manager V2 scheduler
+admits a first context chunk, instead of after the batch is final. Its scheduler declares
+`supports_admission_query = True`, which promises:
+
+- `get_num_new_matched_tokens` has no effect beyond its answer until `update_state_after_alloc`;
+- asking again for the same allocation replaces the earlier answer;
+- a query may be followed by `request_reset` and another query, with no `update_state_after_alloc`
+  in between.
+
+A connector that starts a transfer inside `get_num_new_matched_tokens` must not declare it. A
+request asked at admission can still be dropped before `prepare_resources`: by the disaggregated
+benchmark gate, by batch waiting for generation requests, by the total-KV cap, by the multimodal
+scheduler wrapper, or when the batch cannot be queued. It is asked again on a later iteration.
+The [`mooncake-store`](#asynchronous-loads) connector declares it.
+
+Enable it per server with `kv_connector_config.admission_query`:
+
+```yaml
+kv_connector_config:
+  connector: <name>
+  admission_query:
+    max_uncharged_parks: 2     # default 0
+    max_offer_deferrals: 16    # default 16
+disable_overlap_scheduler: true
+```
+
+The scheduler asks each scheduled first chunk once its chunk is sized and its pages are allocated,
+and `prepare_resources` uses that answer instead of asking again. An offer that reaches past the
+chunk moves the chunk window, so the pages it needs are booked right away. When the KV cache cannot
+cover them, the request gives its chunk and pages back and waits for a later iteration, up to
+`max_offer_deferrals` iterations; after that, or right after it preempted a started request for
+pages, it is admitted and the offer is capped to the whole blocks the chunk's pages hold. With
+`max_uncharged_parks > 0`, up to that many first chunks of at least two blocks per iteration, which
+the connector loads asynchronously, are admitted without charging their tokens to `max_num_tokens`:
+the executor parks them before the forward pass. They still take a batch slot and keep their pages.
+A request admitted without a charge that does not park stops the executor with a connector failure,
+which requires a process restart.
+
+| Setting | Effect |
+|---|---|
+| unset | Final-batch queries only. |
+| `admission_query: {}` | Admission-time queries and page booking. |
+| `admission_query: {max_uncharged_parks: N}` | Also admits up to `N` parking chunks per iteration without a token charge. |
+
+Comparing the first two isolates page booking, and the last two isolate the token charge.
+
+Admission-time queries require KV cache manager V2 and `disable_overlap_scheduler=True`, which the
+executor checks at startup, and chunked prefill, without which they have no effect. They are ignored, with a
+warning, under attention data parallelism, for a capacity-only connector role, for connectors that
+reserve their prefix during admission, and for connector schedulers that do not declare
+`supports_admission_query`. Under `enable_swa_scratch_reuse` the pages a shifting offer needs are
+not booked at admission; `prepare_resources` grows them as on the final-batch path. The settings are
+configuration rather than environment variables because they change admission behavior and can
+differ between the context and generation servers of one disaggregated deployment.
+
+For debugging, `TLLM_CTX_PARK_STATS=1` appends a flat `, ctx_park = key=value ...` suffix to every
+`print_iter_log` line of the non-overlap executor loop, covering the iteration the line reports:
+
+| Field | Meaning |
+|---|---|
+| `parked`, `parked_tok` | Context requests the connector parked for an asynchronous load, and their chunk tokens. |
+| `unc` | Of those, the requests admitted without a token charge. |
+| `fwd_tok` | Context chunk tokens left for the forward pass. |
+| `bskip` | First chunks the scheduler passed over because the token budget was spent. |
+| `<phase>_ms=wall/cpu` | Wall and executor-thread CPU time of the `sched`, `prep`, `meta`, `start`, `fwd`, `upd` and `term` loop phases. |
+| `offer_*` | KV cache manager V2 connector offers: queries (`admission_used` of them answered at admission), offers and asynchronous offers, offered and honoured tokens, how each was placed (`in_chunk`, `shifted`, `capped`, `not_honoured`), admission-time grows (`pregrown`, `pregrow_failed`), and host time in the query, the placement and the page report (`query_ms`, `reserve_ms`, `report_ms`). |
+| `gil=max/p99/n` | With `TLLM_GIL_PROBE_US=<period>`, how late a probe thread sleeping that many microseconds woke up, in ms, a proxy for GIL contention. |
+
+##### Completion headroom on disaggregated servers
+
+A disaggregated server with KV cache manager V2 can reserve logical GPU-page headroom for each
+admitted request to finish; it does not allocate those pages early. The reservation is opt-in: a
+server qualifies only when no tier sits below GPU and either its connector's worker declares
+[`requires_completion_reservation`](#2-worker-interface-kvcacheconnectorworker) or its
+`kv_cache_config.enable_disagg_completion_reservation` (prototype, `False` by default) is set. A
+connector that transfers KV leaves no such tier, because the host tier is dropped automatically and
+the others are refused at bring-up (see
+[KV cache tiers](#kv-cache-tiers-are-gpu-only-under-a-connector)), so its declaration is enough. A
+server with neither keeps its existing admission, `host_cache_size=0` included, whether it has no
+connector, a capacity-only one, or one that does not declare it. The Mooncake store connector
+declares it. The reservation covers full-attention models only, without beam search or pipeline
+parallelism. Windowed, recurrent and mixed-precision caches keep their existing admission policy.
+
+A disaggregated generation server without a connector opts in through the configuration. Without a
+connector the host tier is provisioned automatically, so set `host_cache_size: 0` and configure no
+disk tier; otherwise the cache manager logs a warning and ignores the setting. Such a server
+reserves decode headroom only; the connector-prefill reservation below needs a connector.
+
+```yaml
+kv_cache_config:
+  host_cache_size: 0
+  enable_disagg_completion_reservation: true
+```
+
+- **Decode.** Disaggregated generation admission reserves pages through each request's output
+  limit, including speculative padding. Incoming transfers may overlap decoding, but cannot
+  consume the pages reserved for admitted requests to finish.
+- **Connector prefill.** For connectors without source reservations, the scheduler reserves
+  headroom through the end of each admitted prompt before allocating its first chunk; chunk
+  allocation stays incremental. A new request waits for headroom instead of preempting an
+  admitted one, so other requests' small chunks cannot consume the pages needed to restore its
+  matching prefix after the final-batch query.
+
+A reservation is released when the request finishes or is cancelled, when an unconsumed first
+chunk returns to the queue, when a generation-init admission is reverted before its transfer, and
+on shutdown. The check counts free and evictable GPU pages, so droppable reusable pages do not
+block admission. A server whose pool was clamped below the configured `max_seq_len` may defer a
+request whose output limit reaches `max_seq_len` indefinitely; size the pool above `max_seq_len`.
+This GPU admission budget is separate from any store capacity behind the connector.
 
 #### 2. Worker Interface (`KvCacheConnectorWorker`)
 
@@ -345,6 +521,41 @@ These methods run on all workers (GPU processes) and interact with the actual GP
 * **`get_finished_prefix_loads(self) -> list[int]`**
   * **Description**: Reports locally completed reservation identities for loads dispatched through `SchedulerOutput.prefix_loads`, including synchronous loads. Completion means this worker has finished all reads and writes and established the required CUDA stream visibility. This method must not wait for other workers. The runtime collects reports asynchronously and distributes retirement decisions before scheduling; parked async requests resume and shared resources are released only after every worker has reported.
   * **Compatibility**: Legacy request-ID load and save completions continue through `get_finished`.
+
+* **`reports_failed_loads: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts. Declares a worker whose prefix load can come up short — a page offered at lookup is gone at load time, for example evicted from a full pool — and which reports the affected requests instead of raising. The runtime has already counted those positions as computed, so it restarts each named request from scratch: the request leaves the pass, its allocation is freed and rewound, and the scheduler readmits it and asks `get_num_new_matched_tokens` again. Other requests are unaffected.
+  * **Requirements**: `take_failed_load_requests` and `drop_bound_saves` must be implemented, the KV cache manager must be `KVCacheManagerV2`, and prefix reservations must be off (see [Legacy final-batch queries](#legacy-final-batch-queries)); each is checked at startup. A restart is owner-local, so it applies on a single-rank server or an attention-DP owner. On a tensor-parallel rank, whose peers hold shards of the same pages, the worker must still raise; a report from such a rank fails the executor. A `capacity_only` worker's declaration is ignored.
+
+* **`take_failed_load_requests(self) -> set[int]`**
+  * **Description**: Polled right after every `start_load_kv` when `reports_failed_loads` is set. Returns and forgets the `RequestData.request_id`s whose load in that call came up short. Each must belong to a context request in the metadata that call loaded.
+
+* **`take_failed_async_load_requests(self) -> set[int]`**
+  * **Description**: Polled right after every `get_finished` when `reports_failed_loads` is set. Returns and forgets parked requests whose asynchronous load came up short. Each must have been returned as finished loading by the `get_finished` call this poll follows: after that the scheduler may admit the request over its pages, so a later report comes too late to restart it. An ID for a request that was cancelled while parked names nothing to restart and is ignored.
+  * **Contract for both**: every write into a named request's pages must be complete or abandoned when its ID is returned, because the pages are freed at once and may go to another request. An ID outside the loaded batch, for an asynchronous load not yet reported finished, or for one an earlier `get_finished` already reported finished, is a contract violation and fails the executor.
+
+* **`drop_bound_saves(self, request_ids) -> int`**
+  * **Description**: Removes these requests' saves from the metadata bound for the current pass, so a restarted request does not publish pages it never computed. Called before `wait_for_save`. Must accept IDs with nothing bound and be idempotent; returns the number of entries removed.
+
+* **`shutdown(self)`**
+  * **Description**: Optional, with a no-op default. Releases whatever the worker holds — store handles, registered buffers, background threads. Called once, after the executor's worker thread has joined, so no transfer can start afterwards; implementations must be idempotent. Without it a worker's resources live as long as the process, so engines built back to back in one session accumulate them.
+
+* **`capacity_only(self) -> bool`** (property)
+  * **Description**: Optional, `False` by default. Declares a worker that contributes resources to an external store but transfers no KV of its own — for example a rank that lends host memory to a shared pool other engines read and write. Must be the same on every rank; the runtime gathers it at startup and rejects a deployment whose ranks disagree. Such a worker is never asked for a lookup, a save, a prefix reservation, or a completion, and the runtime keeps its own connector bookkeeping — page-index gathers, scheduler output, the per-layer hooks — off the forward path entirely.
+
+* **`supports_speculative_prefill: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts, read from the class before the worker is constructed. Declares a worker whose every load and save moves whole pages of every layer group in the registered `KvCacheLayout`, including the one-model draft layers that share the target pool. A worker that saves per layer must make sure its hooks cover the draft layers, since hooks are installed on `DecoderLayer` modules only. Together with the scheduler's declaration it lets the connector run next to one-model speculative decoding on a disaggregated context server; see [Speculative decoding on a disaggregated context server](#speculative-decoding-on-a-disaggregated-context-server).
+
+* **`requires_block_aligned_reuse: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts. Declares a connector that stores and offers KV by whole blocks starting at the local prefix match, so that match must end on a block boundary. It matters only when a one-model speculative-decoding draft (for example MTP or one-model EAGLE3) makes `KVCacheManagerV2` back every local reuse match off by the draft's prompt lookahead, which leaves a match of whole blocks a few tokens short of a boundary, and partial reuse is off. The manager then aligns every local match down to a multiple of `tokens_per_block`, trading the trimmed block for the connector serving it along with the rest of the prefix. Partial reuse keeps matches token-granular, so a connector that sets this should also turn `KvCacheConfig.enable_partial_reuse` off.
+
+* **`drops_reuse_match_backoff: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts. Declares a connector that prefers whole local matches to backed-off ones: the target `KVCacheManagerV2` drops the one-model draft's reuse backoff, so a local match of whole blocks is used whole and needs no alignment. The draft KV at the tail of a reused block may then belong to a different next token, which can lower draft acceptance but never changes the output. A draft pool never drops its own backoff.
+
+* **`requires_completion_reservation: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts. Turns on the completion reservation of a disaggregated server with no tier below GPU (see [Completion headroom on disaggregated servers](#completion-headroom-on-disaggregated-servers)): `KVCacheManagerV2` then admits a decode or a connector first chunk only while the pages every admitted request needs to finish still fit. Declare it when the connector restores a prefix only after the final batch is chosen, so other requests' chunks must not take the pages that restore needs. Read from the worker, which every rank holds, once when the cache manager is built after the connector, so a worker may set it per instance in `__init__`. Must be the same on every rank. A `capacity_only` worker's declaration is ignored.
+
+The two reuse declarations above are read once, when the cache manager is built after the connector, so a worker may set them per instance in `__init__`. A `capacity_only` worker's declarations are ignored. They must be the same on every rank: unlike `capacity_only`, they are not gathered at startup, and ranks that disagree would claim different local prefixes for the same request.
+
 ## Attention data parallelism
 
 Set `enable_attention_dp=True` and
@@ -437,14 +648,26 @@ them for the backend. Non-ADP behavior has no new transfer deadline. Workers
 must keep asynchronous start/poll callbacks nonblocking; a callback that itself
 hangs remains subject to the executor's hang detector.
 
+A failed prefix load that a connector reports through `reports_failed_loads` is
+not a connector failure. Only that request restarts, on its owner, without a
+status-vote field or a deadline of its own. Exceptions, polling errors, deadline
+misses and misreported request IDs remain fail-stop through the gate above. If
+the restarted request was the owner's only work and no padding dummy fits, the
+fleet skips one iteration, as it does whenever an owner cannot pad.
+
 ADP requires `KVCacheManagerV2`; an explicit V1 selection is rejected before
 connector construction, and an automatic selection that resolves to V1 is
 rejected after the manager is built. V1 connector behavior remains unchanged.
 PP=1, CP=1 and beam width 1 are required. V2 layer-group layout and callbacks
 are used directly. A backend must implement both grouped callbacks for multiple
 layer groups; the existing layout validation remains in place. Internal host
-or disk tiers, speculative decoding and Mamba/hybrid state remain unsupported.
-This change adds no Mooncake backend, deployment configuration or capacity tuning.
+or disk tiers and Mamba/hybrid state remain unsupported. Speculative decoding
+is supported only in the
+[speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server),
+for which both classes declare `supports_speculative_prefill` as well.
+The [`mooncake-store`](#mooncake-store) connector declares `supports_attention_dp` and
+`supports_speculative_prefill`; see
+[its notes on attention data parallelism and speculative prefill](#attention-data-parallelism-and-speculative-prefill).
 
 Select a connector through `connector_module`, `connector_scheduler_class`,
 and `connector_worker_class` as usual. Both classes must opt in; enabling ADP
@@ -470,11 +693,20 @@ Add `examples/llm-api` to `PYTHONPATH`. The example supports one full-attention
 layer group and no chunked prefill; it demonstrates shared storage, not
 production transfer performance.
 
-* **`shutdown(self)`**
-  * **Description**: Optional, with a no-op default. Releases whatever the worker holds — store handles, registered buffers, background threads. Called once, after the executor's worker thread has joined, so no transfer can start afterwards; implementations must be idempotent. Without it a worker's resources live as long as the process, so engines built back to back in one session accumulate them.
+**Routing by uncached prefill.** With a shared pool, a later request of a
+conversation restores most of its prompt on whichever attention-DP rank it
+lands, so prompt length says little about the prefill it brings. Setting
 
-* **`capacity_only(self) -> bool`** (property)
-  * **Description**: Optional, `False` by default. Declares a worker that contributes resources to an external store but transfers no KV of its own — for example a rank that lends host memory to a shared pool other engines read and write. Must be the same on every rank; the runtime gathers it at startup and rejects a deployment whose ranks disagree. Such a worker is never asked for a lookup, a save, a prefix reservation, or a completion, and the runtime keeps its own connector bookkeeping — page-index gathers, scheduler output, the per-layer hooks — off the forward path entirely.
+```yaml
+attention_dp_config:
+  enable_work_aware_routing: true
+```
+
+balances ranks by each request's prompt growth since the previous request of
+the same conversation (the whole prompt for a first turn). It requires a
+connector that moves KV; without one, a warning is logged and load-based
+routing is used. It cannot be combined with `enable_kv_cache_aware_routing` or
+`kv_cache_routing_conversation_affinity`.
 
 ## Example Implementation
 
@@ -575,6 +807,10 @@ and `org-b/model` share a directory name while meaning different weights. `segme
 rank against a per-node memory limit, so a node's demand is `ranks_on_node × segment_size` and is
 checked against available memory at startup.
 
+A server publishes a block only once the forward pass that computes its last token has been queued
+for saving, so pages it allocates ahead of computation, such as those of a context chunk trimmed to
+the token budget, never reach the pool.
+
 ### Roles
 
 Capacity and traffic are separate: every role lends the memory its config asks for, and the role
@@ -595,6 +831,39 @@ keeps its own host and disk cache tiers, including the host tier
 [`MAX_UTILIZATION` suspends pages into](#kv-cache-tiers-are-gpu-only-under-a-connector), and pays
 no per-request or per-layer connector cost.
 
+### Pool eviction
+
+A full pool evicts on the master, and two settings shape what it evicts. Both apply only to a role
+that writes the pool (`both` or `producer`), both need `mooncake-transfer-engine-cuda13` 0.3.13 or
+newer, and both are off by default.
+
+```yaml
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    pool: file:///shared/pool.json
+    model_key: qwen2-1.5b-instruct
+    soft_pin_ttl_ms: 86400000   # 24 h, the master's default ceiling
+    group_blocks: true
+```
+
+* `soft_pin_ttl_ms` soft-pins every page the server writes for that many milliseconds. Mooncake
+  0.3.13's first eviction pass makes up a shortfall from the shard-ordered rest of the pool when
+  lookups re-lease part of its oldest frontier mid-eviction, which leaves holes in prefixes still in
+  use: a prefix is replayed only up to its first missing block, so every stored block behind a hole
+  is recomputed. Soft-pinned pages are evicted only by the second, age-ordered pass. The TTL must not
+  exceed the master's `--max_kv_soft_pin_ttl` (24 h by default), or the master refuses every put,
+  which the server logs once; and the master must allow evicting soft-pinned objects, which is
+  Mooncake's default.
+* `group_blocks` puts every page a hit on a block needs (all its layer groups and tensor-parallel
+  shards) into one eviction group, `<namespace>/<model_key>/w<world>/<block hash>`, so the master
+  evicts a block whole and never keeps a shard that holds space but can no longer hit. It matters
+  most under tensor parallelism, where a block has one page per rank.
+
+Both are per-server settings like `transfer_batch_size`, rendered into the client config and read
+back from an inherited `MOONCAKE_CONFIG_PATH`. Servers sharing a pool should agree on
+`soft_pin_ttl_ms`, since the master evicts unpinned pages first.
+
 ### Settings this connector overrides
 
 For a role that transfers KV, the pool *is* the deployment's offload tier, so the server's own
@@ -611,17 +880,116 @@ Both are settled in the `LLM` constructor, before the ranks are spawned and befo
 reads the arguments, so `trtllm-serve`, `trtllm-bench` and a direct `LLM(...)` all see the same
 settings. A `capacity` server keeps both as configured.
 
+### Attention data parallelism and speculative prefill
+
+Both classes declare `supports_attention_dp`, so `enable_attention_dp=True` runs a scheduler
+adapter and a worker on every owner, each deciding and moving pages for its own requests only.
+
+* A stored page is one attention shard's KV. Under tensor parallelism each rank keys its own shard
+  and a prefix is a hit only once every shard of it is in the pool. Every attention-DP owner holds
+  all heads, so all owners key their pages as shard 0 of 1 (`w1r0` in the key): a prefix one owner
+  saved is a hit for every other owner, and for a single-rank server with the same `model_key`,
+  `tokens_per_block` and page size. Tensor-parallel keys are unchanged.
+* Under attention DP a save in flight counts against `kv_connector_config.transfer_timeout_sec`
+  (see [Attention data parallelism](#attention-data-parallelism)); size it for the save backlog a
+  congested fabric can build up.
+* A page that is gone between lookup and load restarts only the affected request, on its owner,
+  as on a single-rank server; see [Restrictions](#restrictions).
+* A `role: capacity` server may run with attention DP; it transfers nothing either way.
+
+Both classes also declare `supports_speculative_prefill`, so a disaggregated context server can run
+one-model MTP or EAGLE3 next to this connector in the
+[speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server), with or
+without attention DP.
+
+* A block's key also covers the prompt tokens the draft reads past the block: one for MTP-Eagle and
+  EAGLE3, `max_draft_len` for vanilla MTP. Pages a speculative server writes are therefore never
+  shared with a server without a draft or with a different lookahead, and the keys of a server
+  without a draft are unchanged. A block whose lookahead runs past the prompt is neither offered
+  nor saved.
+* Only the blocks a pass has computed are saved, although one-model speculation allocates pages
+  past every context chunk.
+* Loads and saves move whole pages of every layer group, which includes the draft layers sharing
+  the target KV cache. Any other drafter, and draft layers in a separate KV cache, are refused at
+  startup, since their KV would be missing or stale after a restored prefix. A `role: capacity`
+  server is exempt, since it addresses no page.
+* A disaggregated generation server should run `role: capacity`, which may itself run one-model MTP
+  or EAGLE3, with or without attention DP. A generation server whose role transfers KV refuses
+  every generation-only request in this mode.
+
+`mooncake_store.local_reuse_backoff` sets how a server that reads the pool (`role: both` or
+`consumer`) treats its local prefix match under one-model speculative decoding. The draft backs
+every local match off by its prompt lookahead, which leaves a match of whole blocks short of the
+block boundary the pool serves from.
+
+* `off`, the default, has the worker declare
+  [`drops_reuse_match_backoff`](#2-worker-interface-kvcacheconnectorworker): local hits are used
+  whole. The draft KV at the tail of a reused block may belong to a different next token, which can
+  lower draft acceptance but never changes the output.
+* `align` keeps the backoff, and `KVCacheManagerV2` aligns the match down to a block instead
+  (`requires_block_aligned_reuse`, which a role that reads the pool always declares). The pool then
+  serves the trimmed block along with the rest of the prefix, at the cost of that block's transfer.
+
+It is an engine setting read from the `mooncake_store` block on every rank rather than part of the
+rendered client config, so a deployment that inherits `MOONCAKE_CONFIG_PATH` without the block gets
+`off`. A `producer` or `capacity` server keeps the cache manager's own reuse either way, and a
+server without a one-model draft has no backoff for the setting to act on.
+
+### Diagnostics
+
+`mooncake_store.stats_interval: 60` has every rank of a server that reads the pool (`role: both` or
+`consumer`) log two info-level lines at most once per 60 seconds, each covering the interval since
+its last line and skipped when there is nothing to report:
+
+* `mooncake-store prefix-hole stats` counts lookups (`lookups`, `lookup_blocks`, `hit_blocks`) and
+  the holes they stopped at. A hole is a missing block followed by still-stored blocks of the same
+  chain, which the pool evicted from the middle of a prefix it otherwise holds: `holes` counts the
+  lookups that met one, `hole_blocks` the missing blocks inside them, and `holed_tokens` and
+  `max_holed_tokens` the stored tokens behind a hole that are recomputed anyway. They come from the
+  lookup's own existence probe, so they cost no extra store call. Only a rank that looks prefixes
+  up reports them: rank 0 under tensor parallelism, every owner under attention DP. Frequent holes
+  are what [`soft_pin_ttl_ms` and `group_blocks`](#pool-eviction) address.
+* `mooncake-store load stats` counts loads (`start_load_kv` passes that moved pages, or with
+  [`async_load`](#asynchronous-loads) each parked request's load), their `pages`, store calls
+  (`batches`), `loaded_gib` and `failed_pages`, the transfer time from the destinations being ready
+  to the last page landing (`transfer_ms`), and each load's mean wall and CPU milliseconds for
+  `fence`, `resolve`, `describe`, `get`, `unstage` and `sync`. With `async_load` it also reports
+  the time a load waited for a load thread and the allocation fence (`wait_ms`), and, at the time
+  of the line, the load threads (`workers`) and the loads waiting for one (`queue`) or running
+  (`active`); a line is then logged while loads are waiting even if none finished.
+
+Both are flushed at shutdown. Unset, the default, counts nothing and costs nothing. The lines are
+logged at info level, so a log level above info hides them. Like the eviction settings, the
+interval is rendered into the client config and read back from an inherited `MOONCAKE_CONFIG_PATH`.
+
 ### Restrictions
 
 Checked at startup, before any request is admitted, because each one's failure mode is KV replayed
 without all of the state it was computed with — a wrong answer rather than a slow one.
 
-Beyond beam search, attention data parallelism, speculative decoding and Mamba/hybrid models, which
-are rejected for [every connector](#a-page-slot-must-not-be-reassigned-underneath-the-connector),
+Beyond beam search, Mamba/hybrid models and speculative decoding outside the
+[speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server), which are
+rejected for [every connector](#a-page-slot-must-not-be-reassigned-underneath-the-connector),
 this one also rejects KV cache manager V1, context parallelism, pipeline parallelism,
-sliding-window attention, and `sparse_attention_config` with an index-V cache unless
-`sparse_disable_index_value=True`; it bypasses individual requests that carry a LoRA adapter or
-multimodal content without hashes, leaving the rest of the deployment served.
+sliding-window attention, `sparse_attention_config` with an index-V cache unless
+`sparse_disable_index_value=True`, and, in a role that transfers KV, any drafter other than
+one-model MTP or EAGLE3 sharing the target KV cache; it bypasses individual requests that carry a
+LoRA adapter or multimodal content without hashes, leaving the rest of the deployment served.
+
+A page offered at lookup can still be gone at load time, evicted from a full pool or left behind by
+a put that never completed, whether the load runs synchronously or on a
+[load thread](#asynchronous-loads). The worker declares
+[`reports_failed_loads`](#2-worker-interface-kvcacheconnectorworker), so on a single-rank server or
+an attention-DP owner only the affected request restarts, without the offered prefix, and the rest
+of its batch runs. Under tensor parallelism every rank holds a shard of the same page and cannot
+restart the request alone, so a missing page fails the executor there.
+
+Aggregated serving under attention data parallelism is not supported yet, although startup does
+not refuse it. When the attention-DP gate skips a forward pass after the batch was prepared, the
+executor shrinks each generation request's KV capacity again, and a page the connector was already
+told about can go to another request without the connector hearing of it; a later save could then
+publish that request's bytes under this one's key. A disaggregated context server never runs
+generation requests and is unaffected, as is a role that saves nothing (`consumer`, `capacity`).
 
 ### GPUDirect RDMA
 
@@ -668,3 +1036,50 @@ A host without `nvidia_peermem` usually needs only `WITH_NVIDIA_PEERMEM=0`, whic
 selects on its own where it can. When neither path is available, set `stage_through_host: true` to
 copy pages through a pinned host buffer instead, at the cost of a copy each way. A `capacity` server
 needs neither, since it registers no pages.
+
+Each direction a role drives (loads, saves) pins `staging_buffer_bytes` of host memory per rank,
+1 GiB by default, given as a binary size (`512MiB`) or a byte count. It bounds how many pages one
+store call stages, not how large a page may be: a budget below one page still pins one page, with
+a warning. The startup node memory check counts it per rank and direction, next to
+`segment_size`.
+
+### Asynchronous loads
+
+By default a prefix the pool serves is loaded inside the executor iteration that schedules the
+request, before its forward pass. With `async_load: true`, a server that reads the pool
+(`role: both` or `consumer`) parks such a request outside the batch instead, and
+`async_load_workers` background threads per rank (default 1) load its pages while other requests
+keep computing. The request rejoins the batch once every rank holds its pages. Every hit is
+offered this way, including a one-block offer under `local_reuse_backoff: align`, and parking a
+request costs it at least one iteration.
+
+```yaml
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    pool: file:///shared/pool.json
+    model_key: qwen2-1.5b-instruct
+    async_load: true
+    async_load_workers: 2
+disable_overlap_scheduler: true
+```
+
+| Path | How a load thread fills the pages |
+|---|---|
+| Zero copy (default) | The NIC writes into the registered KV pools, from the load thread. |
+| `stage_through_host` | Each load thread has its own CUDA stream and `staging_buffer_bytes / async_load_workers` of pinned slots, and scatters each batch on that stream. No separate synchronous load buffer is pinned. |
+
+A load thread first waits for the KV cache manager's allocation fence for the request's pages,
+so the executor never blocks on it. A page that is gone by load time restarts only that request,
+without the offered prefix, on a single-rank server or an attention-DP owner, and fails the
+server under tensor parallelism, as for synchronous loads. An exception raised by Mooncake on a
+load thread always fails the server, at the next executor call. Under attention DP a parked load
+counts toward `kv_connector_config.transfer_timeout_sec` (see
+[Attention data parallelism](#attention-data-parallelism)). Asynchronous loads are validated with
+`disable_overlap_scheduler: true`.
+
+The scheduler adapter declares
+[admission-time queries](#admission-time-queries): `kv_connector_config.admission_query: {}` books
+the pages a hit reaching past the first chunk needs while the request is admitted, with or without
+`async_load`. Admitting a chunk without charging its tokens (`max_uncharged_parks`) needs
+`async_load`, since only an asynchronous offer parks the request.

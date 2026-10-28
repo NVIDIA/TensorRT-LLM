@@ -18,15 +18,17 @@ The unit tests drive the connector's own APIs. These drive a model: a real
 engine publishes its KV cache into a real Mooncake pool, a second engine
 replays it, and the generated tokens have to agree. That covers the seams no
 narrower test reaches, namely the KV cache layout a `KVCacheManagerV2` actually
-reports, per-rank namespacing under tensor parallelism, and the scheduler
-interaction when a request is preempted while the connector is still reading
-its pages.
+reports, per-rank namespacing under tensor parallelism, the key space attention
+DP owners share, the draft layers a one-model drafter keeps in the target pool on
+a disaggregated context server, and the scheduler interaction when a request is
+preempted while the connector is still reading its pages.
 
 One master and pool serve the whole module and nothing else on the machine.
 Each test gets a key namespace of its own; see `mooncake_pool`.
 """
 
 import contextlib
+import glob
 import json
 import math
 import os
@@ -36,12 +38,15 @@ from types import SimpleNamespace
 import pytest
 from test_common.mooncake_utils import running_master_on_free_ports
 
-from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     MooncakeStoreConnectorConfig,
     parse_size,
 )
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.ledger import read_segments
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.ledger import (
+    read_segments,
+    segments_dir,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
     POOL_MANIFEST_NAME,
     provision_pool,
@@ -49,7 +54,14 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
     MooncakeStoreConnectorScheduler,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvCacheConnectorConfig, MooncakeStoreConfig
+from tensorrt_llm.llmapi import RequestError, SchedulingParams
+from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig,
+    Eagle3DecodingConfig,
+    KvCacheConfig,
+    KvCacheConnectorConfig,
+    MooncakeStoreConfig,
+)
 
 from ..conftest import llm_models_root
 from .test_llm_api_connector import E2E_MIN_TOKEN_AGREEMENT
@@ -141,15 +153,20 @@ def pool_capacity(config_path: str, segment_size):
         store.close()
 
 
-def _set_namespace(config_path: str, namespace: str) -> None:
-    """Point the rendered client config at `namespace`, renaming into place."""
+def _set_client_settings(config_path: str, **settings) -> None:
+    """Rewrite keys of the rendered client config, renaming into place."""
     with open(config_path) as handle:
         config = json.load(handle)
-    config["namespace"] = namespace
+    config.update(settings)
     staging = f"{config_path}.partial"
     with open(staging, "w") as handle:
         json.dump(config, handle, indent=2)
     os.replace(staging, config_path)
+
+
+def _set_namespace(config_path: str, namespace: str) -> None:
+    """Point the rendered client config at `namespace`."""
+    _set_client_settings(config_path, namespace=namespace)
 
 
 @pytest.fixture(scope="module")
@@ -249,6 +266,25 @@ def matched_token_counts(monkeypatch):
 
 
 @pytest.fixture
+def connector_answers(monkeypatch):
+    """Every answer the leader gave, as (matched tokens, whether asynchronous).
+
+    Only usable when the executor runs in this process, like
+    `matched_token_counts`.
+    """
+    answers = []
+    original = MooncakeStoreConnectorScheduler.get_num_new_matched_tokens
+
+    def recording(self, request, num_computed_tokens):
+        result = original(self, request, num_computed_tokens)
+        answers.append(tuple(result))
+        return result
+
+    monkeypatch.setattr(MooncakeStoreConnectorScheduler, "get_num_new_matched_tokens", recording)
+    return answers
+
+
+@pytest.fixture
 def single_process_worker(monkeypatch):
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     yield
@@ -296,6 +332,59 @@ def test_mooncake_e2e_cross_engine_prefix_reuse(
     assert_tokens_agree(cold_token_ids, warm_token_ids, context="Cross-engine prefix reuse")
 
 
+@pytest.mark.threadleak(enabled=False)
+def test_mooncake_e2e_async_load_matches_sync_tokens(
+    single_process_worker, mooncake_pool, connector_answers
+):
+    """A prefix loaded on background threads replays like one loaded in the iteration.
+
+    The cold engine computes and publishes the prompt synchronously. The warm
+    engine reads the same pool with `async_load` and two load threads, so the
+    request is parked while a load thread fills its pages through that thread's
+    own staging slots, and only rejoins the batch once they landed. Pages reported before they
+    landed, or scattered into the wrong slots, diverge early.
+    """
+    sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+
+    cold = LLM(**llm_kwargs(mooncake_pool))
+    try:
+        cold_output = cold.generate([PROMPT], sampling_params)
+    finally:
+        cold.shutdown()
+    assert connector_answers and not any(tokens for tokens, _ in connector_answers), (
+        f"The first run already found tokens in the pool (answers {connector_answers}), "
+        "so it was not a cold start and the comparison below is meaningless."
+    )
+    connector_answers.clear()
+
+    # The module's tests share this config, so it is restored whatever happens.
+    _set_client_settings(mooncake_pool.config_path, async_load=True, async_load_workers=2)
+    try:
+        warm = LLM(**llm_kwargs(mooncake_pool))
+        try:
+            warm_output = warm.generate([PROMPT], sampling_params)
+        finally:
+            warm.shutdown()
+    finally:
+        _set_client_settings(mooncake_pool.config_path, async_load=False, async_load_workers=1)
+
+    hits = [(tokens, asynchronous) for tokens, asynchronous in connector_answers if tokens]
+    assert hits, (
+        f"The second engine read nothing back from the pool (answers {connector_answers}), "
+        "so it recomputed the prefix and this test would pass with the connector disabled."
+    )
+    assert all(asynchronous for _, asynchronous in hits), (
+        f"The second engine offered a prefix synchronously (answers {connector_answers}), "
+        "so async_load did not reach its scheduler adapter."
+    )
+
+    assert_tokens_agree(
+        list(cold_output[0].outputs[0].token_ids),
+        list(warm_output[0].outputs[0].token_ids),
+        context="Prefix reuse through asynchronous loads",
+    )
+
+
 @pytest.mark.skip_less_device(2)
 @pytest.mark.threadleak(enabled=False)
 def test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks(mooncake_pool):
@@ -341,6 +430,143 @@ def test_mooncake_e2e_prefix_reuse_across_tensor_parallel_ranks(mooncake_pool):
         list(warm_output[0].outputs[0].token_ids),
         context="Prefix reuse at TP 2",
     )
+
+
+def _segment_record_stamps(run_dir: str) -> dict:
+    """Each segment record under `run_dir`, with the inode and time it was last written."""
+    stamps = {}
+    for path in glob.glob(os.path.join(segments_dir(run_dir), "*.json")):
+        with contextlib.suppress(FileNotFoundError):
+            info = os.stat(path)
+            stamps[path] = (info.st_ino, info.st_mtime_ns)
+    return stamps
+
+
+def _ranks_recorded_since(run_dir: str, stamps: dict) -> set:
+    """Ranks whose segment record is new or rewritten since `stamps` was taken.
+
+    Not a count of records: a record is named by host and pid, and the test
+    session reuses MPI worker processes across engines, so an engine can
+    rewrite an earlier engine's record instead of adding one. A rewrite renames
+    a new file into place, which changes the inode.
+    """
+    ranks = set()
+    for path, stamp in _segment_record_stamps(run_dir).items():
+        if stamps.get(path) != stamp:
+            with open(path) as handle:
+                ranks.add(int(json.load(handle)["rank"]))
+    return ranks
+
+
+def _rank0_rows(stats) -> list:
+    """Rank 0's iteration statistics.
+
+    Under attention DP rank 0 reports one row per owner, each tagged with
+    `attentionDpRank`. Connector and KV cache counters ride on rank 0's rows
+    only.
+    """
+    return [entry for entry in stats if entry.get("attentionDpRank", 0) == 0]
+
+
+def _connector_cached_tokens(stats) -> int:
+    """Prompt tokens rank 0's connector served, summed over iteration statistics."""
+    return sum(entry.get("iterConnectorCachedTokens", 0) for entry in _rank0_rows(stats))
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+@pytest.mark.skip_less_device(2)
+def test_mooncake_e2e_prefix_reuse_across_attention_dp_owners(
+    mooncake_pool, disable_overlap_scheduler
+):
+    """Save and reuse at TP 2 with attention DP, where each owner holds every head.
+
+    Every owner keys its pages as attention shard 0 of 1, so a prefix one owner
+    saved is a hit for the other. Under the per-rank keys tensor parallelism
+    uses, an owner would ask for both ranks' shards of a page only one of them
+    could have written, and nothing would ever be reused.
+
+    The cold engine serves one request pinned to owner 1, so rank 0 saves
+    nothing and every page of the prompt in the pool is one owner 1 saved. The
+    warm engine starts with empty GPU caches and serves four copies with one
+    request per owner at a time, so both owners serve the prompt and each one's
+    first copy finds nothing in its own GPU cache. The assertions read rank 0's
+    rows of the iteration statistics. Rank 0 serves at least one of the copies
+    and saved none of the prompt's pages before its first copy looked them up,
+    so a hit there is a page owner 1 saved: a read across owners, not a
+    same-owner hit.
+
+    This runs aggregated serving, which the connector documents as not
+    supported yet under attention DP because of a skipped-pass hazard on
+    generation pages; one request per owner and short generations do not
+    provoke it, and the key space under test is the same on a disaggregated
+    context server.
+    """
+    sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+    kwargs = llm_kwargs(
+        mooncake_pool,
+        tensor_parallel_size=2,
+        enable_attention_dp=True,
+        max_batch_size=1,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        enable_iter_perf_stats=True,
+        # Keep every iteration rather than the most recent 1000, so the sums
+        # below cover the whole run.
+        iter_stats_max_iterations=-1,
+    )
+    records_before = _segment_record_stamps(mooncake_pool.run_dir)
+
+    cold = LLM(**kwargs)
+    try:
+        # Strict, so the router cannot move it to rank 0 for balance.
+        cold_output = cold.generate(
+            [PROMPT],
+            sampling_params,
+            scheduling_params=SchedulingParams(attention_dp_rank=1, attention_dp_relax=False),
+        )
+        cold_stats = cold.get_stats(timeout=30)
+    finally:
+        cold.shutdown()
+    cold_token_ids = list(cold_output[0].outputs[0].token_ids)
+
+    joined = _ranks_recorded_since(mooncake_pool.run_dir, records_before)
+    assert joined == {0, 1}, (
+        "Both attention-DP owners should have joined the pool, but this run recorded "
+        f"ranks {sorted(joined)}. An owner that never opened a store handle saves "
+        "nothing and reads every prefix as a miss."
+    )
+    # The test's own key namespace keeps the pool cold. Rank 0's rows cannot
+    # see owner 1's load, but they do show where the request ran: attention-DP
+    # padding requests are left out of them.
+    cold_context_tokens = sum(
+        entry.get("inflightBatchingStats", {}).get("numCtxTokens", 0)
+        for entry in _rank0_rows(cold_stats)
+    )
+    assert cold_context_tokens == 0, (
+        f"Rank 0 prefilled {cold_context_tokens} tokens in the cold engine, so the cold "
+        "request did not stay on owner 1 and a hit on rank 0 below could be a page rank 0 "
+        "saved itself."
+    )
+
+    warm = LLM(**kwargs)
+    try:
+        warm_outputs = warm.generate([PROMPT] * 4, sampling_params)
+        warm_stats = warm.get_stats(timeout=30)
+    finally:
+        warm.shutdown()
+
+    assert warm_stats, "The warm engine returned no iteration statistics to assert on."
+    assert _connector_cached_tokens(warm_stats) > 0, (
+        f"Rank 0 served no prompt tokens from the pool across {len(warm_stats)} "
+        "iterations, so it recomputed a prefix owner 1 stored and no owner read "
+        "another owner's pages."
+    )
+    for index, output in enumerate(warm_outputs):
+        assert_tokens_agree(
+            cold_token_ids,
+            list(output.outputs[0].token_ids),
+            context=f"Copy {index} replayed under attention DP",
+        )
 
 
 @pytest.mark.threadleak(enabled=False)
@@ -457,3 +683,139 @@ def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(mooncake_pool):
         f"prompt tokens, past the {budget}-token budget. Requests are being "
         "preempted and recomputed repeatedly rather than making progress."
     )
+
+
+#: Target and one-model draft checkpoints under `LLM_MODELS_ROOT`, per drafter:
+#: the pair the single-GPU disaggregated EAGLE3 test serves.
+SPECULATIVE_PREFILL_MODELS = {
+    "eagle3": ("Qwen3/Qwen3-8B", "Qwen3/qwen3_8b_eagle3"),
+}
+
+
+# Two 8B engines, a context and a generation server, share the device.
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("drafter", ["eagle3"])
+def test_mooncake_e2e_speculative_prefill_reuse(
+    single_process_worker, mooncake_pool, matched_token_counts, drafter
+):
+    """A disaggregated context server with a one-model draft replays a prefix it stored.
+
+    One-model EAGLE3 keeps its draft layers in the target KV cache, so a page
+    the pool serves carries draft KV as well, keyed by the prompt token the
+    draft reads past each block. The draft token a context pass hands to the
+    generation server is computed from that draft KV: were the draft layers
+    missing from the layout registered with the connector, or keyed without
+    their lookahead, the warm engine's drafts would degenerate rather than tie.
+    So the first token and the first draft token of every prompt must agree
+    between a cold and a warm context engine, and so must the generation the
+    generation server continues from each.
+
+    Chunked prefill below the prompt length exercises the KV slots one-model
+    speculation allocates past every chunk, which must not be published before
+    a pass computes them. A request that is not context-only is refused at
+    admission, and the engine keeps serving afterwards.
+
+    Both engines run in this process, so the generation server pulls each
+    context request's KV and the context engine shuts down with nothing in
+    flight. The pool keys these pages under the module's model key, inside a
+    namespace of this test's own.
+    """
+    target, draft = SPECULATIVE_PREFILL_MODELS[drafter]
+
+    def engine(*, context: bool) -> dict:
+        """One engine's settings; each gets a speculative config of its own to resolve."""
+        settings = dict(
+            model=f"{llm_models_root()}/{target}",
+            speculative_config=Eagle3DecodingConfig(
+                max_draft_len=3, speculative_model=f"{llm_models_root()}/{draft}"
+            ),
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime="PYTHON"
+            ),
+            max_batch_size=4,
+            # Bounds the warmup allocation, which would otherwise size itself
+            # against the checkpoint's position limit.
+            max_seq_len=1024,
+        )
+        if context:
+            # Two blocks per chunk, shorter than every prompt.
+            settings.update(enable_chunked_prefill=True, max_num_tokens=64)
+            return llm_kwargs(mooncake_pool, **settings)
+        return llm_kwargs(mooncake_pool, kv_connector_config=None, **settings)
+
+    # Distinct from their first token, so no prompt reuses another's blocks.
+    prompts = [f"{index}. {PROMPT}" for index in range(3)]
+    sampling_params = SamplingParams(max_tokens=16, ignore_eos=True)
+
+    def serve(context, generation):
+        """Prefill on `context`, continue on `generation`, and return what each produced."""
+        context_outputs = context.generate(
+            prompts,
+            sampling_params,
+            disaggregated_params=[
+                DisaggregatedParams(request_type="context_only") for _ in prompts
+            ],
+        )
+        handoffs = []
+        for output in context_outputs:
+            params = output.disaggregated_params
+            assert params is not None and params.request_type == "context_only"
+            assert params.first_gen_tokens, "The context pass handed over no first token."
+            assert params.draft_tokens, (
+                "The context pass handed over no draft tokens, so the draft layers "
+                "never ran and this test cannot see the draft KV it is about."
+            )
+            handoffs.append((list(params.first_gen_tokens), list(params.draft_tokens)))
+            params.request_type = "generation_only"
+        generation_outputs = generation.generate(
+            prompts,
+            sampling_params,
+            disaggregated_params=[output.disaggregated_params for output in context_outputs],
+        )
+        return handoffs, [list(output.outputs[0].token_ids) for output in generation_outputs]
+
+    generation = LLM(**engine(context=False))
+    try:
+        cold = LLM(**engine(context=True))
+        try:
+            cold_handoffs, cold_generations = serve(cold, generation)
+        finally:
+            cold.shutdown()
+
+        assert matched_token_counts and not any(matched_token_counts), (
+            f"The cold context engine already found tokens in the pool (matched "
+            f"counts {matched_token_counts}), so the comparison below is meaningless."
+        )
+        matched_token_counts.clear()
+
+        warm = LLM(**engine(context=True))
+        try:
+            with pytest.raises(RequestError, match="context-only"):
+                warm.generate([PROMPT], SamplingParams(max_tokens=4))
+            warm_handoffs, warm_generations = serve(warm, generation)
+        finally:
+            warm.shutdown()
+    finally:
+        generation.shutdown()
+
+    assert matched_token_counts and max(matched_token_counts) > 0, (
+        f"The warm context engine read nothing back from the pool (matched counts "
+        f"{matched_token_counts}), so it recomputed every prefix and this test "
+        "would pass with the connector disabled."
+    )
+    for index, (cold_handoff, warm_handoff) in enumerate(zip(cold_handoffs, warm_handoffs)):
+        (cold_first, cold_drafts), (warm_first, warm_drafts) = cold_handoff, warm_handoff
+        assert warm_first == cold_first, (
+            f"Prompt {index}: the first token changed from {cold_first} to {warm_first} "
+            "once the prefix came from the pool."
+        )
+        assert warm_drafts[0] == cold_drafts[0], (
+            f"Prompt {index}: the first draft token changed from {cold_drafts} to "
+            f"{warm_drafts} once the prefix came from the pool, so the draft read "
+            "draft KV that was missing or belonged to other tokens."
+        )
+    for index, (cold_tokens, warm_tokens) in enumerate(zip(cold_generations, warm_generations)):
+        assert_tokens_agree(
+            cold_tokens, warm_tokens, context=f"Prompt {index} continued after a warm prefill"
+        )

@@ -24,7 +24,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import Decoder
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import ADPRouter, RankState
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase, ScheduledRequests
 
 pytestmark = pytest.mark.cpu_only
@@ -656,6 +656,16 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
         events.append("start_worker")
 
     monkeypatch.setattr(PyExecutor, "start_worker", start_worker)
+    # The router factory must receive the executor's connector manager; a
+    # missing keyword is invisible to every router test.
+    real_create = ADPRouter.create
+    seen_create_kwargs = {}
+
+    def recording_create(**kwargs):
+        seen_create_kwargs.update(kwargs)
+        return real_create(**kwargs)
+
+    monkeypatch.setattr(ADPRouter, "create", recording_create)
     executor = PyExecutor(
         resource_manager,
         scheduler,
@@ -665,6 +675,8 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
         max_num_sequences=8,
         kv_cache_transceiver=transceiver,
     )
+    assert "kv_connector_manager" in seen_create_kwargs
+    assert seen_create_kwargs["kv_connector_manager"] is None
     assert executor.kv_cache_transceiver is transceiver
     assert events == (
         ["warmup", "reserve", "start_worker"] if should_enable else ["warmup", "start_worker"]

@@ -63,6 +63,146 @@ def test_v2_connector_registers_layer_groups(
         windows[0] if len(windows) == 1 else None
     )
     connector.wait_for_initialization.assert_called_once()
+    # No kv_connector_config on an executor built without __init__: no admission queries.
+    assert executor._admission_query_scheduler is None
+
+
+def test_admission_query_is_resolved_during_connector_init(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
+    executor = object.__new__(PyExecutor)
+    connector = Mock(capacity_only=False, enable_attention_dp=False)
+    # Real values: a Mock auto-attribute would answer truthily.
+    connector.admission_query_capable = True
+    connector.prefix_reservations_enabled = False
+    connector.speculative_prefill_only = False
+    executor.kv_connector_manager = connector
+    executor.kv_cache_transceiver = None
+    executor.dist = SimpleNamespace(pp_size=1, cp_size=1)
+    executor.max_beam_width = 1
+    executor.max_draft_len = 0
+    executor.enable_attention_dp = False
+    executor.llm_args = SimpleNamespace(kv_cache_config=None, scheduler_config=None)
+    executor._kv_connector_config = SimpleNamespace(
+        admission_query=SimpleNamespace(max_uncharged_parks=0, max_offer_deferrals=16)
+    )
+    executor.disable_overlap_scheduler = True
+    scheduler = object.__new__(KVCacheV2Scheduler)
+    executor.scheduler = scheduler
+    executor.kv_cache_manager = Mock(spec=KVCacheManagerV2, enable_block_reuse=True)
+    executor.kv_cache_manager.impl = SimpleNamespace(
+        init_config=SimpleNamespace(cache_tiers=[SimpleNamespace(tier=CacheTier.GPU_MEM)])
+    )
+    executor.model_engine = Mock()
+    executor.model_engine.model.named_modules.return_value = []
+    layout = SimpleNamespace(groups=[SimpleNamespace(window_size=None)])
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.build_kv_cache_layout_v2",
+        lambda manager: layout,
+    )
+
+    executor._maybe_init_kv_connector_manager()
+
+    assert executor._admission_query_scheduler is scheduler
+    connector.wait_for_initialization.assert_called_once()
+
+
+def _speculative_connector_executor(
+    monkeypatch: pytest.MonkeyPatch,
+    connector: Mock,
+    *,
+    max_draft_len: int,
+    draft_kv_cache_manager: Mock | None = None,
+    kv_cache_manager: Mock | None = None,
+) -> tuple[PyExecutor, SimpleNamespace]:
+    """The executor shell of `test_v2_connector_registers_layer_groups`, with a draft."""
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = connector
+    executor.kv_cache_transceiver = None
+    executor.dist = SimpleNamespace(pp_size=1, cp_size=1)
+    executor.max_beam_width = 1
+    executor.max_draft_len = max_draft_len
+    executor.draft_kv_cache_manager = draft_kv_cache_manager
+    executor.enable_attention_dp = False
+    executor.llm_args = SimpleNamespace(kv_cache_config=None, scheduler_config=None)
+    if kv_cache_manager is None:
+        kv_cache_manager = Mock(spec=KVCacheManagerV2, enable_block_reuse=True)
+        kv_cache_manager.impl = SimpleNamespace(
+            init_config=SimpleNamespace(cache_tiers=[SimpleNamespace(tier=CacheTier.GPU_MEM)])
+        )
+    executor.kv_cache_manager = kv_cache_manager
+    executor.model_engine = Mock()
+    executor.model_engine.model.named_modules.return_value = []
+    layout = SimpleNamespace(groups=[SimpleNamespace(window_size=None)])
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.build_kv_cache_layout_v2",
+        lambda manager: layout,
+    )
+    return executor, layout
+
+
+@pytest.mark.parametrize(
+    "max_draft_len,speculative_prefill_only,separate_draft_cache,error",
+    [
+        pytest.param(1, False, False, "speculative decoding", id="refused"),
+        pytest.param(1, True, False, None, id="speculative-prefill"),
+        pytest.param(1, True, True, "share the target KV cache", id="separate-draft-cache"),
+        pytest.param(0, False, False, None, id="no-speculation"),
+    ],
+)
+def test_v2_connector_speculative_decoding_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    max_draft_len: int,
+    speculative_prefill_only: bool,
+    separate_draft_cache: bool,
+    error: str | None,
+) -> None:
+    connector = Mock(
+        capacity_only=False,
+        enable_attention_dp=False,
+        speculative_prefill_only=speculative_prefill_only,
+    )
+    executor, layout = _speculative_connector_executor(
+        monkeypatch,
+        connector,
+        max_draft_len=max_draft_len,
+        draft_kv_cache_manager=Mock() if separate_draft_cache else None,
+    )
+
+    if error is not None:
+        with pytest.raises(NotImplementedError, match=error):
+            executor._maybe_init_kv_connector_manager()
+        connector.worker.register_kv_cache_layout.assert_not_called()
+    else:
+        executor._maybe_init_kv_connector_manager()
+        connector.worker.register_kv_cache_layout.assert_called_once_with(layout)
+        connector.wait_for_initialization.assert_called_once()
+
+
+def test_speculative_prefill_requires_kv_cache_manager_v2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = Mock(capacity_only=False, enable_attention_dp=False, speculative_prefill_only=True)
+    executor, _ = _speculative_connector_executor(
+        monkeypatch, connector, max_draft_len=1, kv_cache_manager=Mock()
+    )
+
+    with pytest.raises(NotImplementedError, match="KVCacheManagerV2"):
+        executor._maybe_init_kv_connector_manager()
+    connector.worker.register_kv_caches.assert_not_called()
+
+
+def test_a_mock_mode_attribute_does_not_lift_the_speculative_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `speculative_prefill_only` is a truthy Mock auto-attribute here, not True.
+    connector = Mock(capacity_only=False, enable_attention_dp=False)
+    executor, _ = _speculative_connector_executor(monkeypatch, connector, max_draft_len=1)
+
+    with pytest.raises(NotImplementedError, match="speculative decoding"):
+        executor._maybe_init_kv_connector_manager()
 
 
 @pytest.mark.parametrize(

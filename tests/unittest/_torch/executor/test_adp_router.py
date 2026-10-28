@@ -23,11 +23,13 @@ Tests for:
 """
 
 import inspect
-from unittest.mock import MagicMock, Mock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pytest
 
+import tensorrt_llm._torch.pyexecutor.scheduler.adp_router as adp_router_module
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.request_utils import get_from_waiting_queue
@@ -39,6 +41,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     KVCacheAwareADPRouter,
     RankIterStatsPayload,
     RankState,
+    WorkAwareADPRouter,
     _num_input_tokens,
     build_active_requests_for_overlap,
     count_retiring_requests,
@@ -445,7 +448,12 @@ class TestDefaultADPRouter:
         assert params["has_seq_slot_headroom"].default is inspect.Parameter.empty
 
     def test_router_constructors_default_to_no_headroom(self):
-        for cls in (DefaultADPRouter, ConversationAwareADPRouter, KVCacheAwareADPRouter):
+        for cls in (
+            DefaultADPRouter,
+            ConversationAwareADPRouter,
+            KVCacheAwareADPRouter,
+            WorkAwareADPRouter,
+        ):
             default = inspect.signature(cls.__init__).parameters["has_seq_slot_headroom"].default
             assert default is False, cls.__name__
 
@@ -470,6 +478,11 @@ class TestDefaultADPRouter:
                 kv_cache_routing_fair_share_multiplier=2.0,
                 kv_cache_routing_new_conv_placement="round_robin",
             ),
+            Mock(
+                kv_cache_routing_conversation_affinity=False,
+                enable_kv_cache_aware_routing=False,
+                enable_work_aware_routing=True,
+            ),
         ]
         built = set()
         for attention_dp_config in configs:
@@ -478,14 +491,16 @@ class TestDefaultADPRouter:
                 has_seq_slot_headroom=has_seq_slot_headroom,
                 kv_cache_manager=mgr,
                 attention_dp_config=attention_dp_config,
+                kv_connector_manager=Mock(capacity_only=False),
             )
             built.add(type(router).__name__)
             assert router.exclude_retiring_requests is has_seq_slot_headroom
-        # Anti-vacuity: the three configs must actually reach three branches.
+        # Anti-vacuity: the four configs must actually reach four branches.
         assert built == {
             "DefaultADPRouter",
             "KVCacheAwareADPRouter",
             "ConversationAwareADPRouter",
+            "WorkAwareADPRouter",
         }
 
     def test_router_factory_uses_default_router_for_kv_cache_aware_routing_under_helix(self):
@@ -1918,6 +1933,316 @@ class TestConversationAwareADPRouter:
         assert all(f <= cap for f in final), final
         assert expected <= cap
         assert sum(len(v) for v in assign.values()) == 8  # nothing dropped
+
+
+class TestWorkAwareADPRouter:
+    """Work-aware routing: ranks balanced by estimated uncached prefill."""
+
+    @staticmethod
+    def _item(
+        req_id,
+        prompt_len,
+        conversation_id=None,
+        *,
+        target_dp_rank=None,
+        attention_dp_relax=True,
+        child_req_ids=None,
+        subagent_affinity_id=None,
+    ):
+        scheduling_params = None
+        if target_dp_rank is not None or subagent_affinity_id is not None:
+            scheduling_params = SchedulingParams(
+                attention_dp_rank=target_dp_rank,
+                attention_dp_relax=attention_dp_relax,
+                subagent_affinity_id=subagent_affinity_id,
+            )
+        request = SimpleNamespace(
+            num_input_tokens=prompt_len,
+            py_scheduling_params=scheduling_params,
+            py_conversation_params=None
+            if conversation_id is None
+            else ConversationParams(conversation_id=conversation_id),
+        )
+        return RequestQueueItem(req_id, request, child_req_ids=child_req_ids)
+
+    @staticmethod
+    def _states(*rank_loads):
+        """One RankState per (num_active_requests, num_active_tokens) pair."""
+        return [
+            RankState(rank=r, num_active_requests=a, num_active_tokens=t)
+            for r, (a, t) in enumerate(rank_loads)
+        ]
+
+    @classmethod
+    def _route(cls, router, items, states=None, max_num_active_requests=8):
+        if states is None:
+            states = cls._states((0, 0), (0, 0))
+        return router.route_requests(states, items, max_num_active_requests)
+
+    @staticmethod
+    def _ranks(assigned):
+        return {item.id: rank for rank, items in assigned.items() for item in items}
+
+    @staticmethod
+    def _enabled_config():
+        cfg = AttentionDpConfig(enable_work_aware_routing=True)
+        return AttentionDpConfig.model_validate(cfg.model_dump())
+
+    @staticmethod
+    def _create(attention_dp_config, kv_connector_manager, is_estimating_kv_cache=False):
+        return ADPRouter.create(
+            dist=_mock_dist(tp_size=2),
+            has_seq_slot_headroom=True,
+            kv_cache_manager=SimpleNamespace(
+                enable_block_reuse=True, is_estimating_kv_cache=is_estimating_kv_cache
+            ),
+            attention_dp_config=attention_dp_config,
+            kv_connector_manager=kv_connector_manager,
+        )
+
+    def test_interface_compliance(self):
+        assert isinstance(WorkAwareADPRouter(_mock_dist(tp_size=2)), ADPRouter)
+
+    def test_factory_selects_work_aware_router_from_config(self):
+        router = self._create(self._enabled_config(), Mock(capacity_only=False))
+        assert type(router) is WorkAwareADPRouter
+        assert router.exclude_retiring_requests is True
+
+    @pytest.mark.parametrize("capacity_only", [None, True], ids=["no_connector", "capacity_only"])
+    def test_factory_falls_back_without_a_kv_moving_connector(self, capacity_only):
+        kv_connector_manager = None if capacity_only is None else Mock(capacity_only=True)
+        with patch.object(adp_router_module.logger, "warning") as warning:
+            router = self._create(self._enabled_config(), kv_connector_manager)
+        assert type(router) is DefaultADPRouter
+        warning.assert_called_once()
+        assert "enable_work_aware_routing" in warning.call_args.args[0]
+
+    def test_factory_default_when_work_aware_routing_is_off(self):
+        router = self._create(AttentionDpConfig(), Mock(capacity_only=False))
+        assert type(router) is DefaultADPRouter
+
+    def test_estimation_executor_falls_back_silently(self):
+        """The estimation executor has no connector; the final executor decides."""
+        with patch.object(adp_router_module.logger, "warning") as warning:
+            router = self._create(self._enabled_config(), None, is_estimating_kv_cache=True)
+        assert type(router) is DefaultADPRouter
+        warning.assert_not_called()
+
+    def test_estimate_is_prompt_growth_within_a_conversation(self):
+        router = WorkAwareADPRouter(_mock_dist(tp_size=2))
+        router.set_publish_uncached_estimate(True)
+        steps = [
+            (1, 100_000, "conv", 100_000),
+            # The next turn reuses the previous prompt; only the growth is prefilled.
+            (2, 102_000, "conv", 2_000),
+            # A shrinking prompt (non-monotonic turn) has no usable predecessor.
+            (3, 50_000, "conv", 50_000),
+            # No conversation id: the whole prompt.
+            (4, 7_000, None, 7_000),
+            # An identical resubmission still counts one token.
+            (5, 50_000, "conv", 1),
+        ]
+        for req_id, prompt_len, conversation_id, expected_work in steps:
+            item = self._item(req_id, prompt_len, conversation_id)
+            self._route(router, [item])
+            assert item.request.py_uncached_prefill_tokens == expected_work, req_id
+            assert router._estimated_work[req_id] == expected_work, req_id
+
+    def test_large_prefill_and_small_requests_land_on_different_ranks(self):
+        router = WorkAwareADPRouter(_mock_dist(tp_size=2))
+        seeds = [
+            self._item(1000 + i, 130_000, conv) for i, conv in enumerate(("a", "b", "c", "whale"))
+        ]
+        self._route(router, seeds)
+        # Same prompt length everywhere, but "whale" brings 100K new tokens and the
+        # three others 2K each. Prompt-length balancing would split them 2/2.
+        items = [
+            self._item(10, 230_000, "whale"),
+            self._item(11, 132_000, "a"),
+            self._item(12, 132_000, "b"),
+            self._item(13, 132_000, "c"),
+        ]
+        assigned, expected = self._route(router, items)
+        ranks = self._ranks(assigned)
+        assert ranks[10] != ranks[11] == ranks[12] == ranks[13]
+        assert expected == 3
+
+    def test_new_requests_go_to_the_rank_with_less_outstanding_work(self):
+        router = WorkAwareADPRouter(_mock_dist(tp_size=2))
+        assigned, _ = self._route(
+            router, [self._item(20, 3_000)], states=self._states((0, 50_000), (0, 1_000))
+        )
+        assert [item.id for item in assigned[1]] == [20]
+        assert assigned[0] == []
+
+    def test_expected_count_covers_every_rank_and_respects_capacity(self):
+        router = WorkAwareADPRouter(_mock_dist(tp_size=2))
+        items = [self._item(30 + i, 1_000) for i in range(3)]
+        assigned, expected = self._route(
+            router, items, states=self._states((2, 0), (0, 10**9)), max_num_active_requests=3
+        )
+        # Rank 0 is least loaded but full after one more request; the rest spill over.
+        assert len(assigned[0]) == 1
+        assert len(assigned[1]) == 2
+        assert expected == 3
+
+    def test_expected_is_capped_when_a_rank_is_already_over_capacity(self):
+        router = WorkAwareADPRouter(_mock_dist(tp_size=2))
+        items = [self._item(30 + i, 1_000) for i in range(3)]
+        assigned, expected = self._route(
+            router, items, states=self._states((6, 0), (0, 0)), max_num_active_requests=4
+        )
+        assert assigned[0] == []
+        assert len(assigned[1]) == 3
+        assert expected == 4
+
+    def test_rank_state_counts_only_requests_still_in_context(self):
+        router = WorkAwareADPRouter(_mock_dist(tp_rank=1, tp_size=2))
+        self._route(router, [self._item(1, 6_000, "x")])
+        # Request 40 is estimated at 3_000 (growth over request 1), 41 at 5_000.
+        self._route(router, [self._item(40, 9_000, "x"), self._item(41, 5_000)])
+        table_before = list(router._estimated_work.items())
+        prefilling = SimpleNamespace(
+            py_request_id=40, is_context_init_state=True, py_orig_prompt_len=9_000
+        )
+        transferring = SimpleNamespace(
+            py_request_id=41, is_context_init_state=False, py_orig_prompt_len=5_000
+        )
+        unknown = SimpleNamespace(
+            py_request_id=99, is_context_init_state=True, py_orig_prompt_len=700
+        )
+        state = router.create_rank_state([prefilling, transferring, unknown], [])
+        assert (state.rank, state.num_active_requests, state.num_active_tokens) == (1, 3, 3_700)
+        # Read-only: no insertion and no LRU touch.
+        assert list(router._estimated_work.items()) == table_before
+
+    def test_gather_all_rank_states_keeps_connector_fields(self):
+        dist = _mock_dist(tp_rank=0, tp_size=1)
+        dist.tp_allgather.side_effect = lambda payload: [payload]
+        router = WorkAwareADPRouter(dist)
+        single_rank = self._states((0, 0))
+        self._route(router, [self._item(1, 6_000, "x")], states=single_rank)
+        self._route(router, [self._item(40, 9_000, "x")], states=single_rank)
+        states = router.gather_all_rank_states(
+            [
+                SimpleNamespace(
+                    py_request_id=40, is_context_init_state=True, py_orig_prompt_len=9_000
+                )
+            ],
+            num_connector_transfers=2,
+            connector_poll_failed=True,
+        )
+        assert len(states) == 1
+        assert states[0].num_active_requests == 1
+        assert states[0].num_active_tokens == 3_000
+        assert states[0].num_connector_transfers == 2
+        assert states[0].connector_poll_failed is True
+
+    def test_explicit_rank_requests_are_charged(self):
+        router = WorkAwareADPRouter(_mock_dist(tp_size=2))
+        strict = self._item(1, 5_000, target_dp_rank=0, attention_dp_relax=False)
+        relaxed = self._item(2, 100)
+        assigned, _ = self._route(
+            router, [relaxed, strict], states=self._states((0, 0), (2, 1_000))
+        )
+        # Charged, the loads are [5_000, 1_000]; uncharged, [0, 1_000] would pull
+        # the relaxed request onto rank 0.
+        assert self._ranks(assigned) == {1: 0, 2: 1}
+        assert router._estimated_work[1] == 5_000
+
+    def test_child_ids_inherit_the_estimate(self):
+        router = WorkAwareADPRouter(_mock_dist(tp_size=2))
+        self._route(router, [self._item(6, 1_000, "c")])
+        self._route(router, [self._item(7, 1_300, "c", child_req_ids=[501, 502])])
+        assert router._estimated_work[7] == 300
+        assert router._estimated_work[501] == 300
+        assert router._estimated_work[502] == 300
+
+    def test_estimate_published_only_when_enabled(self):
+        router = WorkAwareADPRouter(_mock_dist(tp_size=2))
+        first = self._item(1, 1_000, "a")
+        self._route(router, [first])
+        assert not hasattr(first.request, "py_uncached_prefill_tokens")
+        router.set_publish_uncached_estimate(True)
+        second = self._item(2, 1_500, "a")
+        self._route(router, [second])
+        assert second.request.py_uncached_prefill_tokens == 500
+
+    def test_estimate_keyed_by_own_conversation_id(self):
+        """Sub-agents share their parent's affinity id but not its prompt history."""
+        router = WorkAwareADPRouter(_mock_dist(tp_size=2))
+        router.set_publish_uncached_estimate(True)
+        self._route(router, [self._item(0, 3_000, "parent")])
+        # Keyed by the affinity id, this would count as 1_000 of growth over the parent.
+        child = self._item(1, 4_000, "child", subagent_affinity_id="parent")
+        self._route(router, [child])
+        assert child.request.py_uncached_prefill_tokens == 4_000
+        child_turn2 = self._item(2, 4_500, "child", subagent_affinity_id="parent")
+        self._route(router, [child_turn2])
+        assert child_turn2.request.py_uncached_prefill_tokens == 500
+        # The parent's history is its own too: growth over its 3_000 prompt.
+        parent_turn2 = self._item(3, 3_200, "parent")
+        self._route(router, [parent_turn2])
+        assert parent_turn2.request.py_uncached_prefill_tokens == 200
+        assert [router._estimated_work[i] for i in range(4)] == [3_000, 4_000, 500, 200]
+
+    def test_routing_is_deterministic_across_ranks(self):
+        """Every rank routes the same inputs, so placements and tables must agree."""
+
+        def batches():
+            return [
+                [self._item(1, 8_000, "A"), self._item(2, 3_000, "B"), self._item(3, 500)],
+                [
+                    self._item(4, 9_000, "A", child_req_ids=[40, 41]),
+                    self._item(5, 2_000, "C", target_dp_rank=1, attention_dp_relax=False),
+                    self._item(6, 3_500, "B"),
+                ],
+                [
+                    self._item(7, 12_000, "A"),
+                    self._item(8, 1_000, "C"),
+                    self._item(9, 700, target_dp_rank=0),
+                ],
+            ]
+
+        def run(tp_rank):
+            router = WorkAwareADPRouter(_mock_dist(tp_rank=tp_rank, tp_size=2))
+            results = []
+            for batch in batches():
+                assigned, expected = self._route(
+                    router, batch, states=self._states((1, 2_000), (0, 0))
+                )
+                results.append(
+                    (
+                        {rank: [item.id for item in items] for rank, items in assigned.items()},
+                        expected,
+                    )
+                )
+            return router, results
+
+        r0, results0 = run(0)
+        r1, results1 = run(1)
+        assert results0 == results1
+        assert list(r0._conv_prompt_len.items()) == list(r1._conv_prompt_len.items())
+        assert list(r0._estimated_work.items()) == list(r1._estimated_work.items())
+
+    def test_lru_tables_are_bounded(self):
+        router = WorkAwareADPRouter(_mock_dist(tp_size=2), max_entries=2)
+        for i in range(5):
+            self._route(router, [self._item(i, 1_000 + i, f"c{i}")])
+        assert list(router._conv_prompt_len) == ["c3", "c4"]
+        assert list(router._estimated_work) == [3, 4]
+
+    @pytest.mark.parametrize(
+        "other_mode", ["kv_cache_routing_conversation_affinity", "enable_kv_cache_aware_routing"]
+    )
+    def test_work_aware_rejects_other_routing_modes(self, other_mode):
+        with pytest.raises(ValueError, match="enable_work_aware_routing"):
+            AttentionDpConfig(enable_work_aware_routing=True, **{other_mode: True})
+
+    def test_work_aware_config_alone_validates(self):
+        cfg = AttentionDpConfig(enable_work_aware_routing=True)
+        assert cfg.enable_work_aware_routing is True
+        assert AttentionDpConfig().enable_work_aware_routing is False
 
 
 class TestNumInputTokens:
