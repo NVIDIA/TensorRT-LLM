@@ -7,6 +7,8 @@
 # and the 1-GPU recipe in examples/configs/curated/qwen3.8-flash-next.yaml.
 # The accepted draft length is pinned so throughput does not depend on the
 # random prompts' acceptance rate.
+# TLLM_V2_SCHED_SEPARATE_PREFILL_DECODE=1 alternates context-only and decode-only
+# passes, so each 8k prompt prefills in one pass and decode keeps its CUDA graph.
 metadata:
   model_name: qwen3.8_flash_next_fp4
   supported_gpus:
@@ -15,7 +17,7 @@ hardware:
   gpus_per_node: 1
 server_configs:
   - name: "qwen3_8_flash_next_fp4_tp1_mtp3_8k1k"
-    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3 TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD=1"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3 TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD=1 TLLM_V2_SCHED_SEPARATE_PREFILL_DECODE=1"
     model_name: "qwen3.8_flash_next_fp4"
     tensor_parallel_size: 1
     moe_expert_parallel_size: 1

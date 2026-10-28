@@ -4317,6 +4317,18 @@ def create_py_executor_instance(
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             # A disaggregated generation worker must not replay context locally.
             enable_recompute_pause=not is_disagg,
+            # Opt-in. Disaggregated workers run one kind of work, and PP/CP
+            # keep the mixed pass. Attention-DP ranks pick each pass's kind
+            # together, in the executor.
+            separate_prefill_and_decode=(os.environ.get(
+                "TLLM_V2_SCHED_SEPARATE_PREFILL_DECODE", "0") == "1"
+                                         and not is_disagg
+                                         and mapping.pp_size == 1
+                                         and mapping.cp_size == 1),
+            separate_min_context_tokens=int(
+                os.environ.get("TLLM_V2_SCHED_SEPARATE_MIN_CONTEXT_TOKENS",
+                               "1")),
+            separation_coordinated=mapping.enable_attention_dp,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):

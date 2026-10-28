@@ -130,7 +130,7 @@ from .scheduler.adp_router import (ADPRouter, RankIterStatsPayload, RankState,
 from .scheduler.gen_admission_queue import (GenAdmissionConfig,
                                             GenAdmissionWaitingQueue)
 from .scheduler.scheduler import RemoteTailPhase
-from .scheduler.scheduler_v2 import KVCacheV2Scheduler
+from .scheduler.scheduler_v2 import KVCacheV2Scheduler, SeparatedBatchKind
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -998,6 +998,13 @@ class PyExecutor:
         self.max_batch_size = max_batch_size
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
+        # Attention-DP ranks alternate context-only and generation-only passes
+        # in lockstep when the scheduler separates them (see
+        # _coordinate_separated_batch_kind).
+        self._coordinate_separated_passes = (
+            self.enable_attention_dp
+            and getattr(self.scheduler, "separation_coordinated", False))
+        self._last_separated_batch_kind: Optional[SeparatedBatchKind] = None
         self.batch_wait_iters_count = 0
         self.encoder_batch_wait_iters_count = 0
 
@@ -7405,6 +7412,55 @@ class PyExecutor:
                     balanced_context_requests = context_requests
         return balanced_context_requests
 
+    def _coordinate_separated_batch_kind(self) -> Optional[SeparatedBatchKind]:
+        """Agree on this pass's kind across attention-DP ranks.
+
+        One rank's context chunk forces an eager forward on every rank, so the
+        ranks run context-only and generation-only passes together. Returns
+        ``None`` (an ordinary pass, balanced as before) unless some rank has
+        context work and some rank has generation work. Otherwise a context
+        pass is released when attention-DP balancing would release context --
+        every rank has context and a free slot, or the wait timed out -- and
+        every other pass is generation-only, so no rank's generation requests
+        wait more than one pass behind context.
+        """
+        has_context, num_generation = self.scheduler.pending_separable_work(
+            self.active_requests, self.inflight_req_ids)
+        gathered = self.dist.tp_allgather_int64(
+            [int(has_context), num_generation]).tolist()
+        if not (any(rank[0]
+                    for rank in gathered) and any(rank[1] > 0
+                                                  for rank in gathered)):
+            self._last_separated_batch_kind = None
+            return None
+        if self._last_separated_batch_kind is SeparatedBatchKind.PREFILL_ONLY:
+            kind = SeparatedBatchKind.DECODE_ONLY
+        elif not self.attention_dp_enable_balance:
+            kind = SeparatedBatchKind.PREFILL_ONLY
+        else:
+            all_ranks_ready = all(rank[0] and rank[1] < self.max_batch_size
+                                  for rank in gathered)
+            timeout_iters = self.attention_dp_time_out_iters
+            if (min(rank[1] for rank in gathered)
+                    < self.attention_dp_min_generation_requests):
+                timeout_iters = self.attention_dp_low_occupancy_timeout_iters
+            if (all_ranks_ready and self.adp_ctx_batching_wait_iters_count
+                    < self.attention_dp_batching_wait_iters):
+                self.adp_ctx_batching_wait_iters_count += 1
+                kind = SeparatedBatchKind.DECODE_ONLY
+            elif (all_ranks_ready
+                  or self.adp_ctx_waiting_iters_count >= timeout_iters
+                  # A rank without generation work gains nothing by waiting.
+                  or not all(rank[1] > 0 for rank in gathered)):
+                self.adp_ctx_waiting_iters_count = 0
+                self.adp_ctx_batching_wait_iters_count = 0
+                kind = SeparatedBatchKind.PREFILL_ONLY
+            else:
+                self.adp_ctx_waiting_iters_count += 1
+                kind = SeparatedBatchKind.DECODE_ONLY
+        self._last_separated_batch_kind = kind
+        return kind
+
     @staticmethod
     def _compute_scheduled_tokens(context_requests, generation_requests):
         """Compute the total number of scheduled tokens for batch waiting decisions.
@@ -7668,6 +7724,11 @@ class PyExecutor:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
+        separated_kind = None
+        if getattr(self, "_coordinate_separated_passes", False):
+            separated_kind = self._coordinate_separated_batch_kind()
+            self.scheduler.set_coordinated_batch_kind(separated_kind)
+
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 
@@ -7682,7 +7743,9 @@ class PyExecutor:
                 scheduler_output.generation_requests)
 
         scheduled_context_requests = scheduler_output.context_requests
-        if self.enable_attention_dp and self.attention_dp_enable_balance:
+        # A coordinated separated pass already applied the balance decision.
+        if (self.enable_attention_dp and self.attention_dp_enable_balance
+                and separated_kind is None):
             scheduled_context_requests = self._balance_adp_requests(
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)

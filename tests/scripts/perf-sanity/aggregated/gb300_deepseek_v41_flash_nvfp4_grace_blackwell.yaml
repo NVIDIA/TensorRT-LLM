@@ -10,6 +10,8 @@
 # The accepted draft length is pinned to 2.51 of 5 (acceptance length 3.51,
 # the DSpark k=5 golden value with thinking on), as in the AgentX recipe, so
 # the numbers measure the runtime rather than draft quality on random prompts.
+# TLLM_V2_SCHED_SEPARATE_PREFILL_DECODE=1 alternates context-only and decode-only
+# passes, so each 8k prompt prefills in one pass and decode keeps its CUDA graph.
 metadata:
   model_name: deepseek_v41_flash_nvfp4_dspark
   supported_gpus:
@@ -19,7 +21,7 @@ hardware:
 server_configs:
   # 8k1k - TEP4 (attention TP4, MoE EP4), DSpark k=5, low concurrency
   - name: "v41_flash_nvfp4_tep4_dspark5_8k1k"
-    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.51"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.51 TLLM_V2_SCHED_SEPARATE_PREFILL_DECODE=1"
     model_name: "deepseek_v41_flash_nvfp4_dspark"
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
@@ -59,7 +61,7 @@ server_configs:
 
   # 8k1k - DEP4 (attention DP4, MoE EP4), DSpark k=5, high concurrency
   - name: "v41_flash_nvfp4_dep4_dspark5_8k1k"
-    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.51"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.51 TLLM_V2_SCHED_SEPARATE_PREFILL_DECODE=1"
     model_name: "deepseek_v41_flash_nvfp4_dspark"
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4

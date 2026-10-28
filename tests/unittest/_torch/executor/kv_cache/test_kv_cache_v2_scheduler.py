@@ -724,6 +724,8 @@ def make_scheduler(
     cross_kv_cache_manager: Mock | None = None,
     enable_prefix_aware_scheduling: bool = True,
     enable_recompute_pause: bool = True,
+    separate_prefill_and_decode: bool = False,
+    separate_min_context_tokens: int = 1,
 ) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -751,6 +753,8 @@ def make_scheduler(
             scheduler_capacity=scheduler_capacity,
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             enable_recompute_pause=enable_recompute_pause,
+            separate_prefill_and_decode=separate_prefill_and_decode,
+            separate_min_context_tokens=separate_min_context_tokens,
             **kwargs,
         )
 
@@ -5306,3 +5310,195 @@ class TestLongContextDemotion:
             assert ids(out.context_requests) == [long_id]
         else:
             assert ids(out.recompute_paused_requests) == [long_id]
+
+
+# ===========================================================================
+# Separated prefill and decode passes
+# ===========================================================================
+
+
+class TestSeparatePrefillAndDecode:
+    """A context pass and a generation pass alternate instead of mixing.
+
+    The budget is the perf-sanity shape: a prompt as long as max_num_tokens,
+    decoded by requests with five draft tokens each.
+    """
+
+    MAX_NUM_TOKENS = 8192
+
+    def _make(self, separate=True, **mgr_kwargs):
+        mgr = make_kv_cache_manager(tokens_per_block=128, **mgr_kwargs)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 128),
+            separate_prefill_and_decode=separate,
+        )
+        return sched, mgr
+
+    def _gens(self, *request_ids):
+        gens = []
+        for request_id in request_ids:
+            gen = make_gen_request(request_id, num_draft_tokens=5)
+            gen.py_batch_idx = request_id
+            gens.append(gen)
+        return gens
+
+    def test_mixed_pass_splits_a_prompt_that_fits_alone(self):
+        sched, _ = self._make(separate=False)
+        gens = self._gens(1, 2)
+        prompt = make_ctx_request(9, context_remaining_length=self.MAX_NUM_TOKENS)
+
+        out = sched.schedule_request([*gens, prompt], set())
+
+        assert ids(out.generation_requests) == [1, 2]
+        # 8192 - 2 * 6 rounds down to 8064: a 128-token tail is left over.
+        assert prompt.context_chunk_size == 8064
+
+    def test_context_pass_runs_the_whole_prompt_and_defers_generation(self):
+        sched, _ = self._make()
+        gens = self._gens(1, 2)
+        prompt = make_ctx_request(9, context_remaining_length=self.MAX_NUM_TOKENS)
+
+        out = sched.schedule_request([*gens, prompt], set())
+
+        assert ids(out.context_requests) == [9]
+        assert out.generation_requests == []
+        assert prompt.context_chunk_size == self.MAX_NUM_TOKENS
+        # The deferred requests resume from their host tokens.
+        assert [gen.py_batch_idx for gen in gens] == [None, None]
+
+    def test_generation_pass_follows_a_context_pass(self):
+        sched, _ = self._make()
+        gens = self._gens(1, 2)
+        first = make_ctx_request(9, context_remaining_length=self.MAX_NUM_TOKENS)
+        sched.schedule_request([*gens, first], set())
+        second = make_ctx_request(10, context_remaining_length=self.MAX_NUM_TOKENS)
+
+        out = sched.schedule_request([*gens, second], set())
+
+        assert ids(out.generation_requests) == [1, 2]
+        assert out.context_requests == []
+        assert second.context_chunk_size == 0
+
+        out = sched.schedule_request([*gens, second], set())
+
+        assert ids(out.context_requests) == [10]
+        assert out.generation_requests == []
+
+    def test_generation_only_and_context_only_passes_are_unchanged(self):
+        sched, _ = self._make()
+        gens = self._gens(1, 2)
+
+        out = sched.schedule_request(gens, set())
+        assert ids(out.generation_requests) == [1, 2]
+        assert [gen.py_batch_idx for gen in gens] == [1, 2]
+
+        prompt = make_ctx_request(9, context_remaining_length=1000)
+        out = sched.schedule_request([prompt], set())
+        assert ids(out.context_requests) == [9]
+        assert prompt.context_chunk_size == 1000
+
+    def test_unadmitted_context_falls_back_to_a_mixed_pass(self):
+        sched, _ = self._make(prepare_context_fn=lambda req, reuse_limit=None: False)
+        gens = self._gens(1, 2)
+        prompt = make_ctx_request(9, context_remaining_length=self.MAX_NUM_TOKENS)
+
+        out = sched.schedule_request([*gens, prompt], set())
+
+        assert ids(out.generation_requests) == [1, 2]
+        assert out.context_requests == []
+        # Still in this iteration's batch: the overlap tensor stays valid.
+        assert [gen.py_batch_idx for gen in gens] == [1, 2]
+
+    def test_short_pending_context_is_mixed(self):
+        mgr = make_kv_cache_manager(tokens_per_block=128)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 128),
+            separate_prefill_and_decode=True,
+            separate_min_context_tokens=1024,
+        )
+        gens = self._gens(1, 2)
+        prompt = make_ctx_request(9, context_remaining_length=512)
+
+        out = sched.schedule_request([*gens, prompt], set())
+
+        assert ids(out.generation_requests) == [1, 2]
+        assert ids(out.context_requests) == [9]
+
+    def test_context_pass_does_not_preempt_deferred_decoders(self):
+        sched, mgr = self._make(
+            has_cache_tier_below_gpu=False,
+            resize_context_fn=lambda req, n: False,
+        )
+        gens = self._gens(1, 2)
+        prompt = make_ctx_request(9, context_remaining_length=self.MAX_NUM_TOKENS)
+
+        out = sched.schedule_request([*gens, prompt], set())
+
+        mgr.preempt_request.assert_not_called()
+        assert out.recompute_paused_requests == []
+        # No room for the prompt: the generation requests still run.
+        assert ids(out.generation_requests) == [1, 2]
+
+    def _make_coordinated(self, **mgr_kwargs):
+        mgr = make_kv_cache_manager(tokens_per_block=128, **mgr_kwargs)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 128),
+            separate_prefill_and_decode=True,
+        )
+        sched.separation_coordinated = True
+        return sched
+
+    def test_pending_separable_work_summarizes_context_and_generation(self):
+        sched, _ = self._make()
+        gens = self._gens(1, 2)
+        prompt = make_ctx_request(9, context_remaining_length=100)
+
+        assert sched.pending_separable_work([*gens, prompt], set()) == (True, 2)
+        assert sched.pending_separable_work(gens, set()) == (False, 2)
+        assert sched.pending_separable_work([*gens, prompt], {1, 9}) == (False, 1)
+
+    def test_coordinated_scheduler_runs_the_kind_it_is_given(self):
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import SeparatedBatchKind
+
+        sched = self._make_coordinated()
+        gens = self._gens(1, 2)
+        prompt = make_ctx_request(9, context_remaining_length=self.MAX_NUM_TOKENS)
+
+        sched.set_coordinated_batch_kind(SeparatedBatchKind.DECODE_ONLY)
+        out = sched.schedule_request([*gens, prompt], set())
+        assert ids(out.generation_requests) == [1, 2]
+        assert out.context_requests == []
+
+        # Without a kind for this pass, the pass is an ordinary mixed one.
+        out = sched.schedule_request([*gens, prompt], set())
+        assert ids(out.generation_requests) == [1, 2]
+        assert ids(out.context_requests) == [9]
+
+    def test_coordinated_rank_without_context_sits_out_a_context_pass(self):
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import SeparatedBatchKind
+
+        sched = self._make_coordinated()
+        gens = self._gens(1, 2)
+
+        sched.set_coordinated_batch_kind(SeparatedBatchKind.PREFILL_ONLY)
+        out = sched.schedule_request(gens, set())
+
+        # No fallback: running these would put every rank in an eager forward.
+        assert out.generation_requests == []
+        assert out.context_requests == []
+        assert [gen.py_batch_idx for gen in gens] == [None, None]
+        assert sched._stalled_schedules == 0
+
+    def test_attention_dp_dummy_is_not_generation_work(self):
+        sched, _ = self._make()
+        dummy = make_gen_request(1, num_draft_tokens=5)
+        dummy.is_attention_dp_dummy = True
+        prompt = make_ctx_request(9, context_remaining_length=100)
+
+        assert sched.pending_separable_work([dummy, prompt], set()) == (True, 0)
