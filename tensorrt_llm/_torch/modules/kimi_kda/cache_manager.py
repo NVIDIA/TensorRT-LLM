@@ -978,6 +978,17 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         return roles
 
     @override
+    def _page_untransferred_roles(self) -> frozenset[str]:
+        """The KDA replay buffers, which a generation server seeds from the transferred conv
+        state instead of receiving."""
+        roles = super()._page_untransferred_roles()
+        if self._kda_replay is not None:
+            roles |= {
+                str(role) for role in self._kda_replay.disagg_ignored_roles(self._state_layout)
+            }
+        return roles
+
+    @override
     def _setup_model_state(self) -> None:
         if self._kda_replay is not None:
             bind_kda_replay_pool(self._kda_replay, self)
@@ -1002,6 +1013,8 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         replay = self._kda_replay
         request_id = request.py_request_id
         cache = self.kv_cache_map.get(request_id)
+        if cache is not None and cache.is_active:
+            self._check_suspendable(cache)
         slot = self._request_id_to_state_index.get(request_id, -1)
         if replay is not None and slot >= 0 and cache is not None and cache.is_active:
             if request_id in replay.acceptance_pending:

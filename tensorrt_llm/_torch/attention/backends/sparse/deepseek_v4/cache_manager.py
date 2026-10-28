@@ -29,6 +29,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     _fill_kv_pages,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import virtual_layers
 from tensorrt_llm._torch.pyexecutor.resource_manager import scan_kv_buffer_for_invalid_values
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (
@@ -81,6 +83,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 
 COMPRESS_BLOCK_SCALE_ROLE = DataRole("deepseek_v4_compress_block_scale")
+_ATTENTION_TYPE_ROLES = frozenset(str(t.role) for t in DeepseekV4AttentionType)
 KV_CACHE_COPY_ALIGNMENT = 16
 NVFP4_VECTOR_SIZE = 16
 
@@ -1481,6 +1484,28 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
         """Exclude storage-only NVFP4 alignment pages from KV transfer."""
         return self._disagg_ignored_roles
+
+    def _page_buffer_tensors(
+        self, layer_id: int, role: str, size: int, tokens: int, state: bool
+    ) -> Tuple[Tensor, ...]:
+        """The cache of each attention type and the compressed cache's block scales hold MLA
+        latents of one KV head, which every tensor rank holds: split by head as the base manager
+        splits K/V. The padding pages never move (``_page_untransferred_roles``)."""
+        if role == COMPRESS_BLOCK_SCALE_ROLE or role in _ATTENTION_TYPE_ROLES:
+            return self._page_head_split(layer_id, size, tokens, state)
+        return super()._page_buffer_tensors(layer_id, role, size, tokens, state)
+
+    def _virtual_layers(self):
+        """Each model layer keeps a cache per DeepSeek-V4 attention type."""
+        return virtual_layers(self._layer_attn_to_layer_id)
+
+    def _page_untransferred_roles(self) -> frozenset[str]:
+        """Storage-only NVFP4 alignment pages, which hold no state a peer needs."""
+        return frozenset(str(role) for role in self._disagg_ignored_roles)
+
+    def _page_quant_mode(self) -> Optional[str]:
+        """``"fp8_ds_mla"`` for FP8 pages carrying their own scales."""
+        return "fp8_ds_mla" if self.use_fp8_ds_mla else super()._page_quant_mode()
 
     def get_indexer_k_cache_buffers(self, layer_idx: int) -> torch.Tensor:
         """

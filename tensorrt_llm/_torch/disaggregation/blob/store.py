@@ -229,7 +229,8 @@ class RowBatch(Sequence[RowIO]):
     Its maker guarantees what a driver would otherwise check row by row: at least one row, no key
     twice, spans of positive size inside their extent that do not overlap within a row, and each
     extent inside one registered region. :meth:`of` checks all but the last, which only the driver
-    can; :meth:`of_slots`, for a maker that checked its rows already, checks nothing.
+    can; :meth:`of_slots` and :meth:`of_spans`, for a maker that checked its rows already, check
+    nothing.
     """
 
     def __init__(
@@ -267,6 +268,26 @@ class RowBatch(Sequence[RowIO]):
         column = addresses[:, None]  # a view of the caller's array, which stays writable
         column.flags.writeable = False
         return cls(_HexKeys(key_stem, object_keys), column, (slot_bytes,), (extent,))
+
+    @classmethod
+    def of_spans(
+        cls,
+        key_stem: str,
+        object_keys: np.ndarray,
+        addresses: np.ndarray,
+        span_bytes: tuple[int, ...],
+        extents: tuple[Span, ...],
+    ) -> RowBatch:
+        """Already checked rows with one address column per span, in payload order.
+
+        ``object_keys`` is ``uint8 [rows, width > 0]`` with no key twice; ``addresses`` is
+        ``int64 [rows, spans]``. Column ``j`` holds spans of ``span_bytes[j]`` inside
+        ``extents[j]``. Checks nothing and copies neither array; the driver's address view is
+        read-only, while the caller's array stays writable.
+        """
+        columns = addresses.view()
+        columns.flags.writeable = False
+        return cls(_HexKeys(key_stem, object_keys), columns, span_bytes, extents)
 
     @classmethod
     def of(cls, rows: Sequence[RowIO]) -> RowBatch:

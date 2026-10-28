@@ -136,8 +136,8 @@ class CpuRegion:
         return self.address + index * self.slot_bytes
 
     def slots(self, *indexes: int) -> np.ndarray:
-        """The addresses of slots ``indexes``, as a view's ``addresses``."""
-        return np.array([self.slot(index) for index in indexes], dtype=np.int64)
+        """Slot indices, as a view's ``slots``."""
+        return np.array(indexes, dtype=np.int64)
 
     def read(self, index: int) -> bytes:
         return self.buffer.read(index * self.slot_bytes, self.slot_bytes)
@@ -155,20 +155,21 @@ class Rows(_Sealable):
         self,
         layer_group_index: int,
         object_keys: np.ndarray | None,
-        addresses: np.ndarray | None,
-        region_index: int | None,
+        slots: np.ndarray | None,
+        region_indices: tuple[int, ...] | None,
         rows: int | None = None,
     ) -> None:
         self.layer_group_index = layer_group_index
         self.object_keys = object_keys
-        self.addresses = addresses
-        self.region_index = region_index
+        self.slots = slots
+        self.region_indices = region_indices
+        self.page_ordinals = np.arange(0 if slots is None else len(slots), dtype=np.int64)
         self.rows = rows
 
     def __len__(self) -> int:
         if self.rows is not None:
             return self.rows
-        return 0 if self.addresses is None else len(self.addresses)
+        return 0 if self.slots is None else len(self.slots)
 
 
 class CpuView(_Sealable):
@@ -483,7 +484,7 @@ class Endpoint:
     def rows(self, names: Sequence[str], layer_group_index: int = 0) -> Rows:
         keys = np.stack([object_key(name) for name in names]) if names else _no_keys()
         slots = self.region.slots(*(self.names.index(name) for name in names))
-        return Rows(layer_group_index, keys, slots, 0)
+        return Rows(layer_group_index, keys, slots, (0,))
 
     def view(self, *names: str) -> CpuView:
         return CpuView([self.rows(names)])

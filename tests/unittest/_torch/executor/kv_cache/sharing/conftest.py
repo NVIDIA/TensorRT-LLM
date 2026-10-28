@@ -19,6 +19,7 @@ addresses, block keys through ``sequence_to_blockchain_keys``. Nothing touches C
 from __future__ import annotations
 
 import ctypes
+import functools
 import gc
 import hashlib
 import inspect
@@ -26,12 +27,26 @@ import sys
 import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Callable, Dict, Generator, Iterator, List, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    Generator,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 from unittest.mock import patch
 
 import numpy as np
 import pytest
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import Lease, LeaseView
 
 TPB = 32
 MAX_SEQ_LEN = 256
@@ -59,10 +74,7 @@ class _RanksAgree:
 
 @contextmanager
 def _collectives_for(mapping):
-    """Stand-in collectives while a multi-rank manager is built in a single process."""
-    if mapping is None or mapping.world_size == 1:
-        yield
-        return
+    """Stand-in collectives while a manager is built outside a process group."""
     from tensorrt_llm._torch.distributed.communicator import Distributed
 
     with patch.object(Distributed, "get", return_value=_RanksAgree()):
@@ -89,11 +101,13 @@ def make_manager(
     joint_kv_cache_reuse: bool = False,
     kv_connector_manager=None,
     cold_page_codec_provider=None,
+    max_beam_width: int = 1,
+    attention_read_windows=None,
     **kv_cache_config,
 ):
     """A small real ``KVCacheManagerV2`` on its own execution stream, FP16 unless ``dtype``, built
     for ``spec_config`` as a target or (``is_draft``) a draft pool, with ``kv_connector_manager`` if
-    given; further keywords go to its ``KvCacheConfig``."""
+    given and up to ``max_beam_width`` beams; further keywords go to its ``KvCacheConfig``."""
     import tensorrt_llm.bindings
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -126,13 +140,14 @@ def make_manager(
             joint_kv_cache_reuse=joint_kv_cache_reuse,
             kv_connector_manager=kv_connector_manager,
             cold_page_codec_provider=cold_page_codec_provider,
+            max_beam_width=max_beam_width,
+            attention_read_windows=attention_read_windows or {},
         )
 
 
-def _make_deepseek_v4_manager(spec_config=None, fp8_ds_mla=False):
-    """A four-layer DeepSeek-V4 manager, FP8 with one KV head: one layer of each compression kind
-    (1, 4, 128) and a last ratio-4 layer the draft layers copy; with ``spec_config`` its one-model
-    draft layers follow. ``fp8_ds_mla``: the footer-scale cache, in SM100+'s 256-token blocks."""
+def _make_deepseek_v4_manager(spec_config=None, fp8_ds_mla=False, compress_ratios=None):
+    """A small FP8 DeepSeek-V4 manager; default ratios cover 1, 4 and 128.
+    ``fp8_ds_mla`` selects footer scales in SM100+'s 256-token blocks."""
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4CacheManager
     from tensorrt_llm._torch.speculative.utils import get_num_spec_layers
     from tensorrt_llm.bindings import DataType
@@ -140,7 +155,7 @@ def _make_deepseek_v4_manager(spec_config=None, fp8_ds_mla=False):
     from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
     from tensorrt_llm.mapping import Mapping
 
-    compress_ratios = [1, 4, 128, 4]
+    compress_ratios = [1, 4, 128, 4] if compress_ratios is None else list(compress_ratios)
     draft_layers = get_num_spec_layers(spec_config) if spec_config is not None else 0
     draft_ratios = [compress_ratios[-1]] * draft_layers
     return DeepseekV4CacheManager(
@@ -171,8 +186,9 @@ def _make_deepseek_v4_manager(spec_config=None, fp8_ds_mla=False):
     )
 
 
-def _make_hybrid_manager():
-    """Nemotron-H shaped, few layers: Mamba2 state at layers 0, 2 and 4, attention at layer 3."""
+def _make_hybrid_manager(mapping=None):
+    """Nemotron-H shaped, few layers: Mamba2 state at layers 0, 2 and 4, attention at layer 3; on
+    one rank of ``mapping`` when given."""
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
         MambaHybridCacheManagerV2,
     )
@@ -184,33 +200,81 @@ def _make_hybrid_manager():
     pattern = "M-M*M-"
     mamba_mask = [c == "M" for c in pattern]
     attn_mask = [c == "*" for c in pattern]
-    return MambaHybridCacheManagerV2(
-        mamba_d_state=128,
-        mamba_d_conv=4,
-        mamba_num_heads=128,
-        mamba_n_groups=8,
-        mamba_head_dim=80,
-        mamba_num_layers=sum(mamba_mask),
-        mamba_layer_mask=mamba_mask,
-        mamba_cache_dtype=torch.bfloat16,
-        mamba_ssm_cache_dtype=torch.float32,
-        kv_cache_config=KvCacheConfig(
-            max_tokens=2048,
-            enable_block_reuse=True,
-            mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256),
-        ),
-        kv_cache_type=CacheType.SELF,
-        num_layers=sum(attn_mask),
-        num_kv_heads=8,
-        head_dim=128,
-        tokens_per_block=32,
-        max_seq_len=1024,
-        max_batch_size=2,
-        mapping=Mapping(world_size=1, rank=0, tp_size=1),
-        layer_mask=attn_mask,
-        vocab_size=1024,
-        dtype=DataType.BF16,
+    mapping = mapping or Mapping(world_size=1, rank=0, tp_size=1)
+    with _collectives_for(mapping):
+        return MambaHybridCacheManagerV2(
+            mamba_d_state=128,
+            mamba_d_conv=4,
+            mamba_num_heads=128,
+            mamba_n_groups=8,
+            mamba_head_dim=80,
+            mamba_num_layers=sum(mamba_mask),
+            mamba_layer_mask=mamba_mask,
+            mamba_cache_dtype=torch.bfloat16,
+            mamba_ssm_cache_dtype=torch.float32,
+            kv_cache_config=KvCacheConfig(
+                max_tokens=2048,
+                enable_block_reuse=True,
+                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256),
+            ),
+            kv_cache_type=CacheType.SELF,
+            num_layers=sum(attn_mask),
+            num_kv_heads=8,
+            head_dim=128,
+            tokens_per_block=32,
+            max_seq_len=1024,
+            max_batch_size=2,
+            mapping=mapping,
+            layer_mask=attn_mask,
+            vocab_size=1024,
+            dtype=DataType.BF16,
+        )
+
+
+def _make_gdn_manager(mapping=None, pattern="MMM*"):
+    """Qwen3-Next shaped, smaller: gated delta-net state, its convolution state in [Q | K | V]
+    sections of 4 key heads, 4 key heads and 8 value heads of 64, at each ``M`` of ``pattern``, and
+    full attention of 2 KV heads at each ``*``; on one rank of ``mapping`` when given."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+        MambaHybridCacheManagerV2,
     )
+    from tensorrt_llm.bindings import DataType
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MambaStateConfig
+    from tensorrt_llm.mapping import Mapping
+
+    mamba_mask = [c == "M" for c in pattern]
+    attn_mask = [c == "*" for c in pattern]
+    mapping = mapping or Mapping(world_size=1, rank=0, tp_size=1)
+    with _collectives_for(mapping):
+        return MambaHybridCacheManagerV2(
+            mamba_d_state=64,
+            mamba_d_conv=4,
+            mamba_num_heads=8,
+            mamba_n_groups=4,
+            mamba_head_dim=64,
+            mamba_num_layers=sum(mamba_mask),
+            mamba_layer_mask=mamba_mask,
+            mamba_cache_dtype=torch.bfloat16,
+            mamba_ssm_cache_dtype=torch.float32,
+            kv_cache_config=KvCacheConfig(
+                max_tokens=2048,
+                enable_block_reuse=True,
+                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256),
+            ),
+            kv_cache_type=CacheType.SELF,
+            num_layers=sum(attn_mask),
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=32,
+            max_seq_len=1024,
+            max_batch_size=2,
+            mapping=mapping,
+            layer_mask=attn_mask,
+            vocab_size=1024,
+            dtype=DataType.BF16,
+            conv_state_layout="q_k_v",
+        )
 
 
 @contextmanager
@@ -273,21 +337,34 @@ def host_tier_manager():
 
 @pytest.fixture
 def deepseek_v4_manager():
-    """``with deepseek_v4_manager(spec_config=None, fp8_ds_mla=False) as mgr:`` a small
-    ``DeepseekV4CacheManager``; callers skip before Blackwell."""
+    """``with deepseek_v4_manager(spec_config=None, fp8_ds_mla=False, compress_ratios=None) as
+    mgr:`` a small ``DeepseekV4CacheManager`` with a layer per entry of ``compress_ratios``, each
+    its layer's compression ratio, ``[1, 4, 128, 4]`` by default. Callers skip before Blackwell."""
 
-    def factory(spec_config=None, fp8_ds_mla=False):
-        return _managed(lambda: _make_deepseek_v4_manager(spec_config, fp8_ds_mla))
+    def factory(spec_config=None, fp8_ds_mla=False, compress_ratios=None):
+        return _managed(lambda: _make_deepseek_v4_manager(spec_config, fp8_ds_mla, compress_ratios))
 
     return factory
 
 
 @pytest.fixture
 def hybrid_manager():
-    """``with hybrid_manager() as mgr:`` a manager whose layer groups include recurrent state."""
+    """``with hybrid_manager(mapping=None) as mgr:`` a manager whose layer groups include recurrent
+    state."""
 
-    def factory():
-        return _managed(_make_hybrid_manager)
+    def factory(mapping=None):
+        return _managed(lambda: _make_hybrid_manager(mapping))
+
+    return factory
+
+
+@pytest.fixture
+def gdn_manager():
+    """``with gdn_manager(mapping=None, pattern="MMM*") as mgr:`` a Qwen3-Next shaped manager of
+    gated delta-net state and attention layers."""
+
+    def factory(mapping=None, pattern="MMM*"):
+        return _managed(lambda: _make_gdn_manager(mapping, pattern))
 
     return factory
 
@@ -351,7 +428,7 @@ def pool_group_of(mgr) -> List[int]:
 
 
 def pool_group_ids(mgr) -> List[int]:
-    """Device pool groups in index order: the order of a staging lender's regions."""
+    """Device pool groups in the order of the lender's host staging regions."""
     return sorted(int(pg.pool_group_index) for pg in mgr.impl.pool_group_descs)
 
 
@@ -486,6 +563,46 @@ def admitted(mgr, request_id: int, tokens: Sequence[int]):
     return request
 
 
+def ready_view(lease: Lease, mgr: KVCacheManagerV2, tries: int = 3) -> LeaseView:
+    """The lease's view once the copies queued so far have run, a round of its lender's progress
+    before each poll, as an executor iteration gives; fails if it never comes."""
+    for _ in range(tries):
+        mgr._stream.synchronize()
+        lender = lease._lender()
+        if lender is not None:
+            lender.progress()
+        view = lease.poll()
+        if view is not None:
+            return view
+    raise AssertionError(f"the lease never became ready: {lease.failure}")
+
+
+def return_write(lender, lease: Lease, arrived, reusable: bool = True):
+    """``lender.return_writes`` of the one entry ``(lease, arrived, reusable)``: its bounds."""
+    (bounds,) = lender.return_writes([(lease, arrived, reusable)])
+    return bounds
+
+
+def settled_bounds(lender, mgr: KVCacheManagerV2, request, tries: int = 8):
+    """The request's bounds once its fetches settle, a round of the lender's progress before each
+    query; fails if they never do."""
+    for _ in range(tries):
+        mgr._stream.synchronize()
+        lender.progress()
+        bounds = lender.poll_resume_bounds(request)
+        if bounds is not None:
+            return bounds
+    raise AssertionError("the request's fetches never settled")
+
+
+def stream_event(mgr: KVCacheManagerV2) -> torch.cuda.Event:
+    """An event recorded after the work queued so far on the manager's execution stream: a lend's
+    ``ready_event`` where that work writes or uses the lent pages."""
+    event = torch.cuda.Event()
+    event.record(mgr._stream)
+    return event
+
+
 def host_bytes(address: int, length: int) -> bytes:
     return ctypes.string_at(address, length)
 
@@ -513,13 +630,25 @@ def staged_row(byte: int, layer_group: int, ordinal: int, nbytes: int) -> bytes:
     return np.random.default_rng(seed).integers(0, 256, nbytes, dtype=np.uint8).tobytes()
 
 
+def staged_slots(lender, rows) -> Tuple[object, List[int]]:
+    """The staging region holding ``rows`` and the address of each row's slot in it, after checking
+    that the rows are staged pages of their layer group."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import MemoryKind
+
+    (index,) = rows.region_indices
+    region = lender.regions[index]
+    assert region.memory_kind is MemoryKind.HOST
+    assert rows.layer_group_index in region.layer_group_indices
+    return region, [region.address + slot * region.slot_bytes for slot in rows.slots.tolist()]
+
+
 def stage(lender, view, byte: int) -> None:
     """Fill every slot of a staging view as a backend's transfer would, each block entry with its
     own bytes (``staged_row``)."""
     for blocks in view.groups:
-        assert blocks.layer_group_index in lender.regions[blocks.region_index].layer_group_indices
-        length = lender.regions[blocks.region_index].slot_bytes
-        for ordinal, address in zip(blocks.block_ordinals.tolist(), blocks.addresses.tolist()):
+        region, addresses = staged_slots(lender, blocks)
+        length = region.slot_bytes
+        for ordinal, address in zip(blocks.page_ordinals.tolist(), addresses):
             ctypes.memmove(
                 address, staged_row(byte, blocks.layer_group_index, ordinal, length), length
             )
@@ -531,25 +660,18 @@ def relay(src_lender, src_view, dst_lender, dst_view, deliver=None) -> Tuple[np.
     entries (default all); returns the masks."""
     by_object_key = {}
     for blocks in src_view.groups:
-        assert (
-            blocks.layer_group_index in src_lender.regions[blocks.region_index].layer_group_indices
-        )
-        length = src_lender.regions[blocks.region_index].slot_bytes
-        for object_key, address in zip(blocks.object_keys, blocks.addresses.tolist()):
-            by_object_key[object_key.tobytes()] = (address, length)
+        region, addresses = staged_slots(src_lender, blocks)
+        for object_key, address in zip(blocks.object_keys, addresses):
+            by_object_key[object_key.tobytes()] = (address, region.slot_bytes)
     masks = []
     for i, blocks in enumerate(dst_view.groups):
-        assert (
-            blocks.layer_group_index in dst_lender.regions[blocks.region_index].layer_group_indices
-        )
+        region, addresses = staged_slots(dst_lender, blocks)
         mask = np.zeros(len(blocks), dtype=bool)
-        for entry_index, (object_key, address) in enumerate(
-            zip(blocks.object_keys, blocks.addresses.tolist())
-        ):
+        for entry_index, (object_key, address) in enumerate(zip(blocks.object_keys, addresses)):
             if deliver is not None and not deliver(i, entry_index):
                 continue
             src, length = by_object_key[object_key.tobytes()]
-            assert length == dst_lender.regions[blocks.region_index].slot_bytes
+            assert length == region.slot_bytes
             ctypes.memmove(address, src, length)
             mask[entry_index] = True
         masks.append(mask)
@@ -743,6 +865,13 @@ def retained() -> Tuple[object, ...]:
     return _lender._retained()
 
 
+def staging_regions(lender) -> Tuple[object, ...]:
+    """The lender's host regions, its staging: what a staging backend registers."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import MemoryKind
+
+    return tuple(region for region in lender.regions if region.memory_kind is MemoryKind.HOST)
+
+
 def staging_memory(regions) -> List[object]:
     """The kept host allocations holding any of ``regions``, compared by address."""
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _lender
@@ -908,23 +1037,42 @@ _KIT = SimpleNamespace(
     pool_pages=pool_pages,
     prefill=prefill,
     published=published,
+    ready_view=ready_view,
     reclaim=reclaim,
     relay=relay,
     retained=retained,
+    return_write=return_write,
+    settled_bounds=settled_bounds,
     stage=stage,
     staged_row=staged_row,
+    staged_slots=staged_slots,
     stale_blocks=stale_blocks,
     staging_kept=staging_kept,
     staging_memory=staging_memory,
+    staging_regions=staging_regions,
+    stream_event=stream_event,
     tier_used=tier_used,
     warm_tier_moves=warm_tier_moves,
     windows=windows,
 )
 
 
+def _lend_keywords() -> None:
+    """The kit's keyword sets of a lend, each with ``ready_event=None``, made at the first use."""
+    if hasattr(_KIT, "DEVICE_ALL"):
+        return
+    from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import MemoryKind, RowSelection
+
+    for kind in MemoryKind:
+        for rows in RowSelection:
+            keywords = dict(memory_kind=kind, rows=rows, ready_event=None)
+            setattr(_KIT, f"{kind.name}_{rows.name}", keywords)
+
+
 @pytest.fixture
 def kit():
     """The helpers and oracles above, for test modules that cannot import this file by name."""
+    _lend_keywords()
     return _KIT
 
 
@@ -965,6 +1113,107 @@ def _let_go_of_what_the_test_kept(request: pytest.FixtureRequest) -> Iterator[No
             owner.free()
         lender._stop_retaining(owner)
     gc.collect()
+
+
+@pytest.fixture(autouse=True)
+def ordered_locks(monkeypatch: pytest.MonkeyPatch) -> List[Dict[int, List[int]]]:
+    """Every lock and lock check asked for with ``ordered`` blocks of a real runtime cache, in every
+    test, each checked for what ``ordered`` promises: ``int`` layer groups, sorted, distinct,
+    non-negative ``int64`` on immutable bytes. The blocks of each, as lists, in order. Stand-in
+    caches, whose tests may hand the lender entries of their own, are not checked."""
+    seen: List[Dict[int, List[int]]] = []
+    locks = sys.modules.get(f"{_SHARING}._page_locks")
+    runtime = sys.modules.get("tensorrt_llm.runtime.kv_cache_manager_v2")
+    if locks is None or runtime is None:
+        return seen
+    lock, check = locks.PageLocks.lock, locks.PageLocks.check
+
+    def promised(kv, blocks):
+        if not isinstance(kv, runtime._KVCache):
+            return
+        for lg, ordinals in blocks.items():
+            assert type(lg) is int and isinstance(ordinals, np.ndarray), (lg, type(ordinals))
+            assert ordinals.dtype == np.int64 and ordinals.ndim == 1, (lg, ordinals)
+            root = ordinals
+            while isinstance(root, np.ndarray) and root.base is not None:
+                root = root.base
+            assert not ordinals.flags.writeable and isinstance(root, bytes), (
+                f"layer group {lg}: ordinals on {type(root).__name__}, "
+                f"writable: {ordinals.flags.writeable}"
+            )
+            values = ordinals.tolist()
+            assert values == sorted(set(values)) and min(values, default=0) >= 0, (lg, values)
+        seen.append({lg: ordinals.tolist() for lg, ordinals in blocks.items()})
+
+    def lock_ordered(self, kv, blocks, mode, level=None, *, ordered=False, **kwargs):
+        if ordered:
+            promised(kv, blocks)
+        return lock(self, kv, blocks, mode, level, ordered=ordered, **kwargs)
+
+    def check_ordered(self, kv, blocks, mode, *, ordered=False, **kwargs):
+        if ordered:
+            promised(kv, blocks)
+        return check(self, kv, blocks, mode, ordered=ordered, **kwargs)
+
+    fresh = locks.PageLocks.lock_fresh
+
+    def lock_fresh_ordered(self, kv, blocks, mode, ready):
+        # A fast lend's blocks, which a fresh cache's lock takes as ``ordered`` promises.
+        taken = fresh(self, kv, blocks, mode, ready)
+        if taken is not None:
+            promised(kv, blocks)
+        return taken
+
+    monkeypatch.setattr(locks.PageLocks, "lock", lock_ordered)
+    monkeypatch.setattr(locks.PageLocks, "check", check_ordered)
+    monkeypatch.setattr(locks.PageLocks, "lock_fresh", lock_fresh_ordered)
+    return seen
+
+
+@pytest.fixture(autouse=True)
+def _lent_slots_are_the_cache_s_pages(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An oracle beside the lender's sources of pages: every in-place lease a test lends over a real
+    runtime cache lends, for each block of a layer group, the page the cache's aggregated page
+    indices give it on beam 0 and the page its base page indices lock, and for a layer group of
+    recurrent state the cache's state slot. Checked as each lease is lent; stand-in caches are not
+    checked."""
+    lender = sys.modules.get(f"{_SHARING}._lender")
+    runtime = sys.modules.get("tensorrt_llm.runtime.kv_cache_manager_v2")
+    if lender is None or runtime is None:
+        return
+
+    def check(self, lease):
+        kv = getattr(lease, "_kv", None)
+        if not isinstance(lease, lender._InPlaceLease) or lease._view is None:
+            return
+        if not isinstance(kv, runtime._KVCache) or not kv.is_active:
+            return
+        for rows, ordinals in zip(lease._view.groups, lease._block_entries.block_ordinals):
+            lg = rows.layer_group_index
+            if lg in self._recurrent_groups:
+                expected = [[int(kv.get_ssm_block_base_index(lg))] * len(ordinals)] * 2
+            else:
+                aggregated = [int(p) for p in kv.get_aggregated_page_indices(lg, valid_only=False)]
+                base = [int(p) for p in kv.get_base_page_indices(lg)[: kv.num_blocks]]
+                expected = [
+                    [pages[b] if b < len(pages) else -1 for b in ordinals.tolist()]
+                    for pages in (aggregated, base)
+                ]
+            assert [rows.slots.tolist()] * 2 == expected, (
+                f"layer group {lg}: lent slots {rows.slots.tolist()} for blocks "
+                f"{ordinals.tolist()}, the cache's aggregated and base pages there {expected}"
+            )
+
+    for name in ("lend_read", "lend_write"):
+        lend = getattr(lender._ManagerLender, name)
+
+        @functools.wraps(lend)
+        def checked(self, *args, _lend=lend, **kwargs):
+            lease = _lend(self, *args, **kwargs)
+            check(self, lease)
+            return lease
+
+        monkeypatch.setattr(lender._ManagerLender, name, checked)
 
 
 @pytest.fixture

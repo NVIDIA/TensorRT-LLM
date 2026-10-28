@@ -12,9 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The staging lender beside the KV cache's host tier. Each check first proves its move: pages to
-host and back by their request's suspension or others' pressure, bystander blocks to host while lent
-pages stay, lent pages to other slots by a pool rebalance, held and late-marked pages to host."""
+"""The staging lender beside the KV cache's host tier; each check first proves the move it tests."""
 
 import ctypes
 from contextlib import contextmanager
@@ -39,27 +37,24 @@ SOURCE, TARGET, SECOND = 1, 2, 3
 SCOPE = b"host-tier-suite"
 
 
-def attach(mgr, *, tokens_per_fetch=END, planned_fetches=1):
+def attach(mgr, *, guaranteed_fetch_tokens=END, capacity_in_fetches=1):
     return attach_lender(
-        mgr, scope=SCOPE, staging=StagingOptions(tokens_per_fetch, planned_fetches)
+        mgr, scope=SCOPE, staging=StagingOptions(guaranteed_fetch_tokens, capacity_in_fetches)
     )
-
-
-def ready_view(lease, mgr, tries=3):
-    for _ in range(tries):
-        mgr._stream.synchronize()
-        view = lease.poll()
-        if view is not None:
-            return view
-    raise AssertionError(f"the lease never became ready: {lease.failure}")
 
 
 def staged(lender, view):
     """Per run, the bytes of every row's staging slot."""
     out = []
     for run in view.groups:
-        length = lender.regions[run.region_index].slot_bytes
-        out.append([ctypes.string_at(a, length) for a in run.addresses.tolist()])
+        (index,) = run.region_indices
+        region = lender.regions[index]
+        out.append(
+            [
+                ctypes.string_at(region.address + slot * region.slot_bytes, region.slot_bytes)
+                for slot in run.slots.tolist()
+            ]
+        )
     return out
 
 
@@ -99,11 +94,11 @@ def test_a_fetch_stays_usable_across_its_request_s_trip_to_host(
     with host_tier_manager() as mgr_a, host_tier_manager() as mgr_b:
         source = kit.published(mgr_a, SOURCE, PROMPT)
         lender_a = attach(mgr_a)
-        publish = lender_a.lend_read(source, 0, END)
-        publish_view = ready_view(publish, mgr_a)
+        publish = lender_a.lend_read(source, 0, END, **kit.HOST_NAMED)
+        publish_view = kit.ready_view(publish, mgr_a)
         target = kit.admitted(mgr_b, TARGET, PROMPT)
         lender_b = attach(mgr_b)
-        lease = lender_b.lend_write(target, 0, END)
+        lease = lender_b.lend_write(target, 0, END, **kit.HOST_NAMED)
         view = lease.poll()
         assert view is not None
         kit.fill_sentinel(mgr_b, target)
@@ -113,13 +108,12 @@ def test_a_fetch_stays_usable_across_its_request_s_trip_to_host(
         with kit.held_stream(mgr_b._stream, strict=False) as gate:
             # The copy into the lent pages waits behind the gate; the suspension and the move to
             # host come after it on the stream, so the move carries the fetched bytes.
-            lease.mark_arrived(masks)
-            lease.release()
+            assert kit.return_write(lender_b, lease, masks) is None, "settled before its copy ran"
             with to_host_and_back(kit, mgr_b, target, dev) as (others, old):
-                assert lender_b.resume_bounds(target) is None, "settled before its copy ran"
+                lender_b.progress()
+                assert lender_b.poll_resume_bounds(target) is None, "settled before its copy ran"
                 gate.open()
-                mgr_b._stream.synchronize()
-                assert lender_b.resume_bounds(target) == (END, 0), "not usable once its copy ran"
+                assert kit.settled_bounds(lender_b, mgr_b, target) == (END, 0), "not usable"
                 for ordinal in range(BLOCKS):
                     got = kit.digest(kit.page(mgr_b, target, 0, ordinal))
                     want = kit.digest(kit.page(mgr_a, source, 0, ordinal))
@@ -136,12 +130,12 @@ def test_a_publish_after_a_trip_to_host_reads_the_pages_where_they_are(
         source = kit.published(mgr, SOURCE, PROMPT)
         original = [kit.page(mgr, source, 0, o) for o in range(BLOCKS)]
         lender = attach(mgr)
-        first = lender.lend_read(source, 0, END)
-        assert kit.digest(staged(lender, ready_view(first, mgr))) == kit.digest([original])
+        first = lender.lend_read(source, 0, END, **kit.HOST_NAMED)
+        assert kit.digest(staged(lender, kit.ready_view(first, mgr))) == kit.digest([original])
         first.release()
         with to_host_and_back(kit, mgr, source):
-            again = lender.lend_read(source, 0, END)
-            got = kit.digest(staged(lender, ready_view(again, mgr)))
+            again = lender.lend_read(source, 0, END, **kit.HOST_NAMED)
+            got = kit.digest(staged(lender, kit.ready_view(again, mgr)))
             assert got == kit.digest([original]), "read a stale page"
             again.release()
 
@@ -149,18 +143,16 @@ def test_a_publish_after_a_trip_to_host_reads_the_pages_where_they_are(
 # -- (b) other requests' pressure while a fetch is lent -----------------------------------------
 
 
-@pytest.mark.parametrize("moment", ["copy_queued", "before_marks"])
+@pytest.mark.parametrize("moment", ["copy_queued", "before_the_return"])
 def test_other_requests_pushing_blocks_to_host_leave_a_fetch_where_its_resume_bounds_says(
     kit, host_tier_manager, moment, attach=attach
 ):
-    """``moment``: ``copy_queued``, the target stays active and its marks' copy waits on the stream
-    while other requests push committed blocks to host; ``before_marks``, the target itself goes to
-    host and back between the grant and the marks."""
+    """Others push blocks to host behind the return's copy, or the target goes before its return."""
     with host_tier_manager() as mgr_a, host_tier_manager() as mgr_b:
         source = kit.published(mgr_a, SOURCE, PROMPT)
         lender_a = attach(mgr_a)
-        publish = lender_a.lend_read(source, 0, END)
-        publish_view = ready_view(publish, mgr_a)
+        publish = lender_a.lend_read(source, 0, END, **kit.HOST_NAMED)
+        publish_view = kit.ready_view(publish, mgr_a)
         original = [kit.page(mgr_a, source, 0, o) for o in range(BLOCKS)]
         got = kit.digest(staged(lender_a, publish_view))
         assert got == kit.digest([original]), "the relay carries rows off their blocks"
@@ -169,7 +161,7 @@ def test_other_requests_pushing_blocks_to_host_leave_a_fetch_where_its_resume_bo
             mgr_b.free_resources(kit.published(mgr_b, 10 + i, tokens))
         target = kit.admitted(mgr_b, TARGET, PROMPT)
         lender_b = attach(mgr_b)
-        lease = lender_b.lend_write(target, 0, END)
+        lease = lender_b.lend_write(target, 0, END, **kit.HOST_NAMED)
         view = lease.poll()
         assert view is not None
         kit.fill_sentinel(mgr_b, target)
@@ -183,29 +175,30 @@ def test_other_requests_pushing_blocks_to_host_leave_a_fetch_where_its_resume_bo
             host_before = kit.tier_used(mgr_b, 1)
             try:
                 with kit.held_stream(mgr_b._stream, strict=False) as gate:
-                    lease.mark_arrived(masks)
-                    lease.release()
+                    bounds = kit.return_write(lender_b, lease, masks)
+                    assert bounds is None, f"settled before its copy ran: {bounds}"
                     assert others.allocate(kit.pool_pages(mgr_b) - BLOCKS, fill=False, chunk=1)
                     moved = kit.tier_used(mgr_b, 1) - host_before
                     assert moved >= len(BYSTANDERS) * BLOCKS, "no bystander block reached host"
 
                     assert kit.pages(kv, 0)[:BLOCKS] == lent, "the lent pages moved"
-                    assert lender_b.resume_bounds(target) is None, "settled before its copy ran"
+                    lender_b.progress()
+                    assert lender_b.poll_resume_bounds(target) is None, "settled before its copy"
                     gate.open()
-                assert lender_b.resume_bounds(target) == (END, 0)
+                assert kit.settled_bounds(lender_b, mgr_b, target) == (END, 0)
                 assert all(dev.read(0, slot) == sentinel for slot in others.pages())
             finally:
                 others.free()
         else:
             with to_host_and_back(kit, mgr_b, target) as (others, old):
                 assert old == lent
-                lease.mark_arrived(masks)
-                lease.release()
+                bounds = kit.return_write(lender_b, lease, masks)
+                assert bounds == (0, 0), f"the return counts rows that never landed: {bounds}"
                 mgr_b._stream.synchronize()
                 assert all(dev.read(0, slot) == sentinel for slot in old), (
-                    "the marks' copy reached another request's page"
+                    "the return's copy reached another request's page"
                 )
-                assert lender_b.resume_bounds(target) == (0, 0), "counts rows that never landed"
+                assert kit.settled_bounds(lender_b, mgr_b, target) == (0, 0), "rows never landed"
         for ordinal in range(BLOCKS):
             got = kit.digest(kit.page(mgr_b, target, 0, ordinal))
             expected = kit.page(mgr_a, source, 0, ordinal) if moment == "copy_queued" else sentinel
@@ -223,16 +216,17 @@ def use_as_a_backend(kit, mgr, lender, lease, reading, original):
     """What a backend does with a lease that became ready: a read's rows are compared with the
     blocks' bytes, a write's rows are filled."""
     mgr._stream.synchronize()
+    lender.progress()
     view = lease.poll()
     if view is None:
         return
     if reading:
         (run,) = view.groups
-        want = [[original[o] for o in run.block_ordinals.tolist()]]
+        want = [[original[o] for o in run.page_ordinals.tolist()]]
         assert kit.digest(staged(lender, view)) == kit.digest(want), SERVED
     else:
         kit.stage(lender, view, 0x5A)
-        lease.mark_arrived(view.row_masks(True))
+        kit.return_write(lender, lease, view.row_masks(True))
 
 
 def test_a_cache_on_host_fails_every_lend_at_the_call_and_lends_again_once_resumed(
@@ -246,7 +240,7 @@ def test_a_cache_on_host_fails_every_lend_at_the_call_and_lends_again_once_resum
         original = [kit.page(mgr, source, 0, o) for o in range(BLOCKS)]
         target = kit.admitted(mgr, TARGET, BYSTANDERS[0])
         assert mgr.resize_context(target, target.context_remaining_length)
-        lender = attach(mgr, planned_fetches=2)
+        lender = attach(mgr, capacity_in_fetches=2)
         writer = target
         kv, kv_writer = kit.kv(mgr, source), kit.kv(mgr, writer)
         old = [p for p in kit.pages(kv, 0) if p >= 0]
@@ -263,7 +257,10 @@ def test_a_cache_on_host_fails_every_lend_at_the_call_and_lends_again_once_resum
                 assert kit.tier_used(mgr, 1) >= host_before + moved, "its pages did not reach host"
             dev = kit.DevicePages(mgr)
             theirs = {slot: dev.read(0, slot) for slot in others.pages()}
-            failed = [lender.lend_read(source, 0, END), lender.lend_write(writer, 0, END)]
+            failed = [
+                lender.lend_read(source, 0, END, **kit.HOST_NAMED),
+                lender.lend_write(writer, 0, END, **kit.HOST_NAMED),
+            ]
             for lease, reading in zip(failed, (True, False)):
                 use_as_a_backend(kit, mgr, lender, lease, reading, original)
             mgr._stream.synchronize()
@@ -273,20 +270,21 @@ def test_a_cache_on_host_fails_every_lend_at_the_call_and_lends_again_once_resum
                 assert lease.failure is not None, "not failed at the call"
                 assert lease.poll() is None
             groups = kit.pool_group_ids(mgr)
-            assert [lender._free_slots(g) for g in groups] == [p.slot_count for p in lender.regions]
+            assert [lender._free_slots(g) for g in groups] == [
+                p.slot_count for p in kit.staging_regions(lender)
+            ]
             for lease in failed:
                 lease.release()
             others.free_all_but(set(old))
             assert mgr.resume_request(source) and mgr.resume_request(target)
             now = [p for p in kit.pages(kv, 0) if p >= 0]
             assert not set(now) & set(old), "it came back to its old pages"
-            read = lender.lend_read(source, 0, END)
-            view = ready_view(read, mgr)
+            read = lender.lend_read(source, 0, END, **kit.HOST_NAMED)
+            view = kit.ready_view(read, mgr)
             assert kit.digest(staged(lender, view)) == kit.digest([original])
-            write = lender.lend_write(writer, 0, END)
-            write_view = ready_view(write, mgr)
-            write.mark_arrived(write_view.row_masks())
-            write.release()
+            write = lender.lend_write(writer, 0, END, **kit.HOST_NAMED)
+            write_view = kit.ready_view(write, mgr)
+            kit.return_write(lender, write, write_view.row_masks())
             read.release()
         finally:
             others.free()
@@ -301,8 +299,8 @@ def test_a_committed_block_has_one_name_on_the_gpu_and_after_a_trip_to_host(
     with host_tier_manager() as mgr:
         first = kit.published(mgr, SOURCE, PROMPT)
         lender = attach(mgr)
-        lease = lender.lend_read(first, 0, END)
-        view = ready_view(lease, mgr)
+        lease = lender.lend_read(first, 0, END, **kit.HOST_NAMED)
+        view = kit.ready_view(lease, mgr)
         first_names, first_bytes = names(view), staged(lender, view)
         lease.release()
         old = kit.pages(kit.kv(mgr, first), 0)[:BLOCKS]
@@ -320,8 +318,8 @@ def test_a_committed_block_has_one_name_on_the_gpu_and_after_a_trip_to_host(
             assert kv.num_committed_tokens == END, "the blocks on host were not reused"
             now = kit.pages(kv, 0)[:BLOCKS]
             assert not set(now) & set(old), "the blocks came back to their old pages"
-            again = lender.lend_read(second, 0, END)
-            view = ready_view(again, mgr)
+            again = lender.lend_read(second, 0, END, **kit.HOST_NAMED)
+            view = kit.ready_view(again, mgr)
             assert names(view) == first_names, "a block's name changed with its tier"
             assert kit.digest(staged(lender, view)) == kit.digest(first_bytes)
             again.release()
@@ -395,9 +393,9 @@ def test_a_rebalance_under_a_fetch_moves_no_copy_off_the_pages_still_lent(
     shape = dict(windows=[WINDOW, 256], num_layers=3, max_tokens=4 * kit.POOL_TOKENS)
     with host_tier_manager(**shape) as mgr_a, host_tier_manager(**shape) as mgr_b:
         source = kit.published(mgr_a, SOURCE, WINDOWED_PROMPT)
-        lender_a = attach(mgr_a, tokens_per_fetch=WINDOWED_END)
-        publish = lender_a.lend_read(source, 0, WINDOWED_END)
-        publish_view = ready_view(publish, mgr_a)
+        lender_a = attach(mgr_a, guaranteed_fetch_tokens=WINDOWED_END)
+        publish = lender_a.lend_read(source, 0, WINDOWED_END, **kit.HOST_NAMED)
+        publish_view = kit.ready_view(publish, mgr_a)
         full = kit.windows(mgr_b).index(None)
         pg_full = kit.pool_group_of(mgr_b)[full]
         device = []
@@ -411,8 +409,8 @@ def test_a_rebalance_under_a_fetch_moves_no_copy_off_the_pages_still_lent(
         while stats(0)[pg_full].total - stats(0)[pg_full].free < 72 and fillers.allocate(7):
             pass
         target = kit.admitted(mgr_b, TARGET, WINDOWED_PROMPT)
-        lender_b = attach(mgr_b, tokens_per_fetch=WINDOWED_END)
-        lease = lender_b.lend_write(target, 0, WINDOWED_END)
+        lender_b = attach(mgr_b, guaranteed_fetch_tokens=WINDOWED_END)
+        lease = lender_b.lend_write(target, 0, WINDOWED_END, **kit.HOST_NAMED)
         view = lease.poll()
         assert view is not None
         kit.fill_sentinel(mgr_b, target)
@@ -434,15 +432,14 @@ def test_a_rebalance_under_a_fetch_moves_no_copy_off_the_pages_still_lent(
         assert now[full] != lent[full] and gone, "the rebalance left the lent pages where they were"
         guard = DeviceCopyGuard(_lender.drv, device, lambda: page_ranges(kit, mgr_b, kv, range(2)))
         monkeypatch.setattr(_lender, "drv", guard)
-        lease.mark_arrived(masks)
-        lease.release()
+        kit.return_write(lender_b, lease, masks)
         mgr_b._stream.synchronize()
-        assert guard.stray == [], "the marks' copy wrote outside the pages the target locks"
+        assert guard.stray == [], "the return's copy wrote outside the pages the target locks"
         assert guard.into_device, "nothing was copied: the check saw no copy"
         stayed = [
             (run.layer_group_index, o)
             for run in view.groups
-            for o in run.block_ordinals.tolist()
+            for o in run.page_ordinals.tolist()
             if now[run.layer_group_index][o] == lent[run.layer_group_index][o] >= 0
         ]
         wrong = [
@@ -453,7 +450,7 @@ def test_a_rebalance_under_a_fetch_moves_no_copy_off_the_pages_still_lent(
         assert stayed and not wrong, (
             f"rows {wrong} of {stayed}, whose pages stayed, hold other bytes"
         )
-        assert lender_b.resume_bounds(target) == (0, WINDOWED_END), "counts rows that never landed"
+        assert kit.settled_bounds(lender_b, mgr_b, target) == (0, WINDOWED_END), "rows never landed"
         publish.release()
 
 
@@ -463,8 +460,8 @@ REB_END = 96  # three whole blocks
 REB_PROMPTS = {
     "queued_read": list(range(11_000, 11_097)),  # a read whose copy is queued behind the stream
     "waiting_read": list(range(12_000, 12_097)),  # a read waiting for slots
-    "unmarked_write": list(range(13_000, 13_097)),  # a write granted, marked after the rebalance
-    "marked_write": list(range(14_000, 14_097)),  # a write marked before, its copy queued
+    "held_write": list(range(13_000, 13_097)),  # a write granted, returned after the rebalance
+    "queued_write": list(range(14_000, 14_097)),  # a write returned before, its copy queued
 }
 REB_GATE_SECONDS = 4.0
 # One pool group, its quota halved with resize(level 0): every page above the new capacity moves
@@ -526,8 +523,9 @@ def staged_right(kit, mgr, lender, view, request):
     """Per row of a read's view, whether its slot holds the block's published bytes."""
     out = {}
     for run in view.groups:
-        nbytes = lender.regions[run.region_index].slot_bytes
-        for ordinal, address in zip(run.block_ordinals.tolist(), run.addresses.tolist()):
+        region, addresses = kit.staged_slots(lender, run)
+        nbytes = region.slot_bytes
+        for ordinal, address in zip(run.page_ordinals.tolist(), addresses):
             want = published_bytes(kit, mgr, request, run.layer_group_index, ordinal, nbytes)
             out[f"{run.layer_group_index}:{ordinal}"] = kit.host_bytes(address, nbytes) == want
     return out
@@ -579,8 +577,8 @@ def rebalance_with_leases_in_flight(
 ):
     """The executor's rebalance (suspend every cache, ``resize`` or ``adjust`` the pools, resume)
     with four leases in flight: a read whose copy waits behind a held stream, a read waiting for
-    slots, a granted write marked after the rebalance and a write marked before, its copy queued. It
-    moves their pages, or with ``stay`` not the waiting read's and unmarked write's. A driver guard
+    slots, a granted write returned after the rebalance and one returned before, its copy queued. It
+    moves their pages, or with ``stay`` not the waiting read's and held write's. A driver guard
     sees every copy to or from a device pool; bytes are checked against what ``published`` wrote."""
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _lender
     from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
@@ -593,11 +591,13 @@ def rebalance_with_leases_in_flight(
         # The publisher of what the writes fetch.
         pubs = {
             k: kit.published(mgr_a, 30 + i, REB_PROMPTS[k])
-            for i, k in enumerate(("unmarked_write", "marked_write"))
+            for i, k in enumerate(("held_write", "queued_write"))
         }
-        lender_a = attach(mgr_a, tokens_per_fetch=REB_END, planned_fetches=2)
-        pub_leases = {k: lender_a.lend_read(p, 0, REB_END) for k, p in pubs.items()}
-        pub_views = {k: ready_view(lease, mgr_a) for k, lease in pub_leases.items()}
+        lender_a = attach(mgr_a, guaranteed_fetch_tokens=REB_END, capacity_in_fetches=2)
+        pub_leases = {
+            k: lender_a.lend_read(p, 0, REB_END, **kit.HOST_NAMED) for k, p in pubs.items()
+        }
+        pub_views = {k: kit.ready_view(lease, mgr_a) for k, lease in pub_leases.items()}
         stats = mgr_b.impl.get_storage_statistics
 
         def used(group):
@@ -607,11 +607,11 @@ def rebalance_with_leases_in_flight(
         totals = [int(stats(0)[g].total) for g in groups]
         total = totals[moving]
         goal = int(total * 0.6)
-        lender_b = attach(mgr_b, tokens_per_fetch=REB_END, planned_fetches=3)
+        lender_b = attach(mgr_b, guaranteed_fetch_tokens=REB_END, capacity_in_fetches=3)
         leases, views, masks, early = {}, {}, {}, {}
 
         def lend_write(k, request):
-            leases[k] = lender_b.lend_write(request, 0, REB_END)
+            leases[k] = lender_b.lend_write(request, 0, REB_END, **kit.HOST_NAMED)
             views[k] = leases[k].poll()
             assert views[k] is not None, leases[k].failure
             kit.fill_sentinel(mgr_b, request)  # a row that never lands shows
@@ -620,8 +620,8 @@ def rebalance_with_leases_in_flight(
         if stay:
             # Admitted and grown before the fillers: their pages sit low, below what moves.
             early["waiting_read"] = kit.published(mgr_b, 22, REB_PROMPTS["waiting_read"])
-            early["unmarked_write"] = kit.admitted(mgr_b, 23, REB_PROMPTS["unmarked_write"])
-            lend_write("unmarked_write", early["unmarked_write"])
+            early["held_write"] = kit.admitted(mgr_b, 23, REB_PROMPTS["held_write"])
+            lend_write("held_write", early["held_write"])
         # Fillers take the low slots (a fresh pool hands out slot ids in order), so the leased
         # requests' pages sit above them; another pool group may fill first, so stop at 70% of it.
         fillers = kit.Requests(mgr_b)
@@ -635,17 +635,17 @@ def rebalance_with_leases_in_flight(
             "queued_read": kit.published(mgr_b, 21, REB_PROMPTS["queued_read"]),
             "waiting_read": early.get("waiting_read")
             or kit.published(mgr_b, 22, REB_PROMPTS["waiting_read"]),
-            "unmarked_write": early.get("unmarked_write")
-            or kit.admitted(mgr_b, 23, REB_PROMPTS["unmarked_write"]),
-            "marked_write": kit.admitted(mgr_b, 24, REB_PROMPTS["marked_write"]),
+            "held_write": early.get("held_write")
+            or kit.admitted(mgr_b, 23, REB_PROMPTS["held_write"]),
+            "queued_write": kit.admitted(mgr_b, 24, REB_PROMPTS["queued_write"]),
         }
         bystanders = [kit.published(mgr_b, 25 + i, t) for i, t in enumerate(BYSTANDERS)]
-        for k in ("unmarked_write", "marked_write"):
+        for k in ("held_write", "queued_write"):
             if k not in leases:
                 lend_write(k, reqs[k])
         rows = {
-            k: [(run.layer_group_index, run.block_ordinals.tolist()) for run in views[k].groups]
-            for k in ("unmarked_write", "marked_write")
+            k: [(run.layer_group_index, run.page_ordinals.tolist()) for run in views[k].groups]
+            for k in ("held_write", "queued_write")
         }
         fillers.free()
         dev = kit.DevicePages(mgr_b)  # built before the gate: building it waits for the device
@@ -667,10 +667,14 @@ def rebalance_with_leases_in_flight(
         guard = PageCopyGuard(_lender.drv, device, lambda: leased_ranges(kit, mgr_b, caches), block)
         monkeypatch.setattr(_lender, "drv", guard)
         with kit.gated_stream(mgr_b._stream, open_after=REB_GATE_SECONDS) as gate:
-            leases["marked_write"].mark_arrived(masks["marked_write"])  # its copy queues
-            leases["marked_write"].release()
-            leases["queued_read"] = lender_b.lend_read(reqs["queued_read"], 0, REB_END)
-            leases["waiting_read"] = lender_b.lend_read(reqs["waiting_read"], 0, REB_END)
+            # Its return queues the copy of its arrived rows.
+            kit.return_write(lender_b, leases["queued_write"], masks["queued_write"])
+            leases["queued_read"] = lender_b.lend_read(
+                reqs["queued_read"], 0, REB_END, **kit.HOST_NAMED
+            )
+            leases["waiting_read"] = lender_b.lend_read(
+                reqs["waiting_read"], 0, REB_END, **kit.HOST_NAMED
+            )
             waiting = (
                 leases["waiting_read"].poll() is None and leases["waiting_read"].failure is None
             )
@@ -686,7 +690,7 @@ def rebalance_with_leases_in_flight(
                 lowest = min(
                     s
                     for k in reqs
-                    if not (stay and k in ("waiting_read", "unmarked_write"))
+                    if not (stay and k in ("waiting_read", "held_write"))
                     for s in before[k][full]
                     if s >= 0
                 )
@@ -720,19 +724,19 @@ def rebalance_with_leases_in_flight(
         dev = kit.DevicePages(mgr_b)  # the pools changed size
         dev_a = kit.DevicePages(mgr_a)
         # The queued read's copy was queued before the rebalance.
-        view_q = ready_view(leases["queued_read"], mgr_b) if granted else None
+        view_q = kit.ready_view(leases["queued_read"], mgr_b) if granted else None
         staged_q = (
             staged_right(kit, mgr_b, lender_b, view_q, reqs["queued_read"]) if view_q else None
         )
-        # The unmarked write is marked after the rebalance.
-        leases["unmarked_write"].mark_arrived(masks["unmarked_write"])
-        leases["unmarked_write"].release()
+        # The held write is returned after the rebalance.
+        kit.return_write(lender_b, leases["held_write"], masks["held_write"])
         mgr_b._stream.synchronize()
-        # The waiting read is granted once the queued read's slots return.
+        # The waiting read is granted at a round of progress once slots return.
         leases["queued_read"].release()
         view_w = None
         for _ in range(3):
             mgr_b._stream.synchronize()
+            lender_b.progress()
             view_w = leases["waiting_read"].poll()
             if view_w is not None or leases["waiting_read"].failure is not None:
                 break
@@ -740,13 +744,14 @@ def rebalance_with_leases_in_flight(
             staged_right(kit, mgr_b, lender_b, view_w, reqs["waiting_read"]) if view_w else None
         )
         mgr_b._stream.synchronize()
+        lender_b.progress()
         resume_bounds = {}
-        for k in ("unmarked_write", "marked_write"):
-            got = lender_b.resume_bounds(reqs[k])
+        for k in ("held_write", "queued_write"):
+            got = lender_b.poll_resume_bounds(reqs[k])
             resume_bounds[k] = None if got is None else tuple(got)
         arrived = {
             k: landed(kit, mgr_b, reqs[k], rows[k], mgr_a, pubs[k], dev, dev_a)
-            for k in ("unmarked_write", "marked_write")
+            for k in ("held_write", "queued_write")
         }
         # Bystanders keep their own bytes wherever their pages went.
         bystanders_kept = []
@@ -760,7 +765,7 @@ def rebalance_with_leases_in_flight(
                         bystanders_kept.append(dev.read(lg, slot) == want)
         # ResumeBounds counts only what landed: every block a start at max_position reads.
         unbacked = {}
-        for k in ("unmarked_write", "marked_write"):
+        for k in ("held_write", "queued_write"):
             if resume_bounds[k] is None:
                 unbacked[k] = ["unsettled"]
                 continue
@@ -777,8 +782,8 @@ def rebalance_with_leases_in_flight(
         assert all(resumed), f"a cache did not resume: {resumed}"
         assert waiting and granted, "the leases were not in the states the scenario needs"
         if stay:
-            assert any(moved["queued_read"]) and any(moved["marked_write"]), moved
-            assert not any(moved["waiting_read"]) and not any(moved["unmarked_write"]), moved
+            assert any(moved["queued_read"]) and any(moved["queued_write"]), moved
+            assert not any(moved["waiting_read"]) and not any(moved["held_write"]), moved
         else:
             assert all(any(m) for m in moved.values()), f"leased pages stayed: {moved}"
         # What the docstrings promise.
@@ -790,7 +795,7 @@ def rebalance_with_leases_in_flight(
         )
         assert all(staged_q.values()), f"the queued read staged wrong bytes: {staged_q}"
         # Both writes cover [0, REB_END) at a history of REB_END, so they lend the same rows.
-        for k in ("unmarked_write", "marked_write"):
+        for k in ("held_write", "queued_write"):
             assert set(arrived[k]) == read_rows, (
                 f"the {k} lent rows {sorted(arrived[k])}, not {sorted(read_rows)}"
             )
@@ -806,17 +811,17 @@ def rebalance_with_leases_in_flight(
             assert view_w is not None, (
                 f"the waiting read failed with its pages in place: {leases['waiting_read'].failure}"
             )
-            assert all(arrived["unmarked_write"].values()), (
-                f"the unmarked write lost rows that stayed: {arrived['unmarked_write']}"
+            assert all(arrived["held_write"].values()), (
+                f"the held write lost rows that stayed: {arrived['held_write']}"
             )
-            assert resume_bounds["unmarked_write"][0] == REB_END, (
-                f"resume_bounds misses rows that landed: {resume_bounds['unmarked_write']}"
+            assert resume_bounds["held_write"][0] == REB_END, (
+                f"resume_bounds misses rows that landed: {resume_bounds['held_write']}"
             )
         assert all(not v for v in unbacked.values()), (
             f"resume_bounds counts rows that never landed: {unbacked}"
         )
-        assert all(arrived["marked_write"].values()), (
-            f"the queued write's rows were lost: {arrived['marked_write']}"
+        assert all(arrived["queued_write"].values()), (
+            f"the queued write's rows were lost: {arrived['queued_write']}"
         )
         assert all(bystanders_kept), "a bystander's pages changed"
 
@@ -829,7 +834,7 @@ def test_a_rebalance_with_every_kind_of_lease_in_flight(
     rebalance_with_leases_in_flight(kit, host_tier_manager, monkeypatch, mechanism, stay=stay)
 
 
-# -- (g) a mark arriving after the window passed the lent blocks --------------------------------
+# -- (g) a return arriving after the window passed the lent blocks ------------------------------
 
 LATE_PROMPT = list(range(2000, 2161))  # five whole blocks and one token
 LATE_END = 2 * TPB  # the lease covers blocks 0 and 1
@@ -860,9 +865,9 @@ def locked_by(kit, mgr, requests):
     return out
 
 
-def late_mark(kit, host_tier_manager, attach, windows, fillers, keep):
+def late_return(kit, host_tier_manager, attach, windows, fillers, keep):
     """One run, ``fillers`` one-block requests allocated first and kept or freed by ``keep``, which
-    moves the slots the target gets. What the marks' copy wrote, or ``None`` when no lent block went
+    moves the slots the target gets. What the return copied, or ``None`` when no lent block went
     to host under its lent GPU slot's number."""
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _lender
 
@@ -876,15 +881,15 @@ def late_mark(kit, host_tier_manager, attach, windows, fillers, keep):
             if not keep:
                 first.free()
             target = kit.admitted(mgr, TARGET, LATE_PROMPT)
-            lender = attach(mgr, tokens_per_fetch=LATE_END)
-            lease = lender.lend_write(target, 0, LATE_END)
+            lender = attach(mgr, guaranteed_fetch_tokens=LATE_END)
+            lease = lender.lend_write(target, 0, LATE_END, **kit.HOST_NAMED)
             view = lease.poll()
             assert view is not None, lease.failure
             kv = kit.kv(mgr, target)
             lent = kit.pages(kv, sliding)[:2]
             assert [int(s) for s in kv.get_base_page_indices(sliding)[:2]] == lent
             kit.stage(lender, view, FETCHED)
-            # Before the marks, a served prefix moves the history past the lent blocks of the
+            # Before the return, a served prefix moves the history past the lent blocks of the
             # sliding group, as a KV connector's reservation does: they keep their pages only held.
             assert mgr._resize_for_served_prefix(target, kv, LATE_HISTORY, LATE_HISTORY + 1)
             stale = kit.stale_blocks(mgr, sliding, kv.history_length)
@@ -903,8 +908,7 @@ def late_mark(kit, host_tier_manager, attach, windows, fillers, keep):
             assert kit.tier_used(mgr, 1) >= host_before + len(moved), "nothing reached host"
             aliased = [o for o in moved if now[o] == lent[o]]
             if not aliased:
-                lease.mark_arrived(view.row_masks(False))
-                lease.release()
+                kit.return_write(lender, lease, view.row_masks(False))
                 return None
             dev = kit.DevicePages(mgr)
             watched = {lent[o]: owners[(group, lent[o])] for o in aliased}
@@ -912,8 +916,7 @@ def late_mark(kit, host_tier_manager, attach, windows, fillers, keep):
             log = DeviceCopyGuard(_lender.drv)
             with pytest.MonkeyPatch.context() as patch:
                 patch.setattr(_lender, "drv", log)
-                lease.mark_arrived(view.row_masks(True))
-                lease.release()
+                kit.return_write(lender, lease, view.row_masks(True))
                 mgr._stream.synchronize()
             written = [device_slot(mgr, dst) for dst in log.copies]
             hit = sorted({w for w in written if w is not None and w in owners})
@@ -924,15 +927,15 @@ def late_mark(kit, host_tier_manager, attach, windows, fillers, keep):
             first.free()
 
 
-def test_a_late_mark_writes_no_slot_its_window_left(kit, host_tier_manager, attach=attach):
+def test_a_late_return_writes_no_slot_its_window_left(kit, host_tier_manager, attach=attach):
     # Slots go out lowest first, so a short search finds a lent block on host under its lent GPU
     # slot's number while another request locks that GPU slot.
     runs = [(w, n, k) for w in ([WINDOW], [WINDOW, 256]) for k in (True, False) for n in range(4)]
     for windows, fillers, keep in runs:
-        result = late_mark(kit, host_tier_manager, attach, windows, fillers, keep)
+        result = late_return(kit, host_tier_manager, attach, windows, fillers, keep)
         if result is not None:
             break
     else:
         raise RuntimeError("no run put a lent block on host under its lent GPU slot's number")
-    assert not result["hit"], f"the marks' copy wrote slots other requests lock: {result['hit']}"
+    assert not result["hit"], f"the return's copy wrote slots other requests lock: {result['hit']}"
     assert not result["changed"], f"requests {result['changed']} now hold the fetch"
