@@ -142,15 +142,22 @@ def test_flattened_config_exposes_backbone_and_drafter_fields() -> None:
     assert cfg.torch_dtype == torch.bfloat16
 
 
-def test_flattened_config_honors_an_explicit_sliding_window_disable() -> None:
+@pytest.mark.parametrize("checkpoint_use_swa", [None, True])
+def test_flattened_config_honors_an_explicit_sliding_window_disable(
+    checkpoint_use_swa: bool | None,
+) -> None:
     """``use_sliding_window: false`` is the DFlash switch that disables the
-    pooled-context window; the block-decode window must follow it instead of
-    being re-created from the HF ``sliding_attention`` spelling."""
+    pooled-context window; the block-decode window must follow it, whether it
+    would come from the HF ``sliding_attention`` spelling or from a
+    ``dflash_config.use_swa`` the checkpoint already carries."""
     config = json.loads(json.dumps(_CONFIG))
     config["text_config"]["use_sliding_window"] = False
+    if checkpoint_use_swa is not None:
+        config["text_config"]["dflash_config"]["use_swa"] = checkpoint_use_swa
+        config["text_config"]["dflash_config"]["swa_window_size"] = 4096
     cfg = build_minimax_dspark_draft_config(config)
     assert cfg.use_sliding_window is False
-    assert "use_swa" not in cfg.dflash_config
+    assert cfg.dflash_config["use_swa"] is False
     assert "swa_window_size" not in cfg.dflash_config
 
 

@@ -884,8 +884,10 @@ def build_minimax_dspark_draft_config(
     DFlash spelling: the block decode keys its per-layer window on the former,
     and the HF reference these drafters are distilled with applies the window
     on exactly those layers. An explicit ``use_sliding_window: false`` (the
-    DFlash operator switch read by ``get_layer_attention_window``) suppresses
-    the translation, so the switch disables the block windows too.
+    DFlash operator switch read by ``get_layer_attention_window``) forces
+    ``use_swa`` off, whether it would come from that translation or from the
+    checkpoint's own ``dflash_config``, so the switch disables the block
+    windows too.
     """
     flat = {
         k: v
@@ -899,9 +901,11 @@ def build_minimax_dspark_draft_config(
     dflash = dict(flat.get("dflash_config") or {})
     layer_types = dflash.get("layer_types") or flat.get("layer_types") or []
     sliding_window = dflash.get("sliding_window") or flat.get("sliding_window")
-    if ("use_swa" not in dflash and sliding_window
-            and "sliding_attention" in layer_types
-            and flat.get("use_sliding_window") is not False):
+    if flat.get("use_sliding_window") is False:
+        dflash["use_swa"] = False
+        dflash.pop("swa_window_size", None)
+    elif ("use_swa" not in dflash and sliding_window
+          and "sliding_attention" in layer_types):
         dflash["use_swa"] = True
         dflash["swa_window_size"] = int(sliding_window)
         dflash.setdefault("layer_types", list(layer_types))
