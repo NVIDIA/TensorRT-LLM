@@ -48,6 +48,7 @@ DATA_FILE_HINT = "scripts/serve_ci_coverage.yml"
 _VG_TUPLE_NAMES = ("_VG_SRC_PREFIXES", "_VG_OUTWARD_PREFIXES")
 _RELATED_LIST_RE = re.compile(r"^\s*def\s+relatedFileList\s*=\s*\[\s*$")
 _RELATED_ENTRY_RE = re.compile(r'^"([^"]+)",?\s*(//.*)?$')
+_YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 
 
 class ParseError(Exception):
@@ -139,6 +140,27 @@ def validate_data(data: object) -> list[str]:
     return errors
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """SafeLoader that rejects a repeated mapping key instead of keeping its last value."""
+
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict:
+        seen: set[object] = set()
+        for key_node, _ in node.value:
+            # Merge keys and (unhashable) non-scalar keys are left to SafeLoader.
+            if not isinstance(key_node, yaml.ScalarNode) or key_node.tag == _YAML_MERGE_TAG:
+                continue
+            key = self.construct_object(key_node)
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
 def load_data(path: Path) -> dict:
     """Load the data file and raise ParseError when it does not match the schema."""
     try:
@@ -146,7 +168,7 @@ def load_data(path: Path) -> dict:
     except OSError as err:
         raise ParseError("the data file", str(err)) from err
     try:
-        data = yaml.safe_load(text)
+        data = yaml.load(text, Loader=_UniqueKeyLoader)
     except yaml.YAMLError as err:
         raise ParseError("the data file", f"invalid YAML: {err}") from err
     errors = validate_data(data)

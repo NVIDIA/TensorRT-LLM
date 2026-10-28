@@ -98,6 +98,29 @@ def test_data_file_is_valid(mod):
         )
 
 
+# --------------------------- load_data ---------------------------
+
+
+def test_load_data_rejects_duplicate_keys(mod, tmp_path):
+    # Valid except for the second `multi_gpu.required`, which would silently replace the
+    # first under a plain safe_load.
+    text = (
+        "version: 1\n"
+        "multi_gpu:\n"
+        "  file: t.groovy\n"
+        "  managed_prefix: p/\n"
+        "  required: [{path: p/a.py, why: w}]\n"
+        "  forbidden: []\n"
+        "  required: []\n"
+        "visual_gen: {file: r.py, tuples: []}\n"
+        "codeowners: {file: O, managed_prefixes: [], required: []}\n"
+    )
+    assert mod.validate_data(yaml.safe_load(text)) == []
+    _write(tmp_path, "data.yml", text)
+    with pytest.raises(mod.ParseError, match=r"(?s)found duplicate key 'required'.*line 7"):
+        mod.load_data(tmp_path / "data.yml")
+
+
 # --------------------------- parse_related_file_list ---------------------------
 
 
@@ -228,6 +251,34 @@ def test_multigpu_rejects_any_prefix_of_the_managed_directory(mod, tmp_path):
     assert len(failures) == 1, "\n\n".join(failures)
     assert "`pkg/serve` must not be in the multi-GPU trigger table" in failures[0]
     assert "it is a prefix of `pkg/serve/`" in failures[0]
+
+
+# --------------------------- check_visual_gen (synthetic) ---------------------------
+
+
+def _vg_data(tuples=("_VG_SRC_PREFIXES", "_VG_OUTWARD_PREFIXES")):
+    return {"visual_gen": {"file": "rules.py", "tuples": list(tuples)}}
+
+
+def test_visual_gen_fails_for_dangling_prefix(mod, tmp_path):
+    _write(tmp_path, "vg/mod.py")
+    _write(
+        tmp_path,
+        "rules.py",
+        '_VG_SRC_PREFIXES = ("vg/", "gone/")\n_VG_OUTWARD_PREFIXES = ("vg/",)\n',
+    )
+    failures = mod.check_visual_gen(tmp_path, _vg_data())
+    assert len(failures) == 1, "\n\n".join(failures)
+    assert "rules.py:1: `_VG_SRC_PREFIXES` entry `gone/` matches no file" in failures[0]
+
+
+def test_visual_gen_fails_for_configured_tuple_missing_from_rule_file(mod, tmp_path):
+    _write(tmp_path, "vg/mod.py")
+    _write(tmp_path, "rules.py", '_VG_SRC_PREFIXES = ("vg/",)\n_VG_OUTWARD_PREFIXES = ("vg/",)\n')
+    failures = mod.check_visual_gen(tmp_path, _vg_data(("_VG_SRC_PREFIXES", "_VG_MISSING")))
+    assert len(failures) == 1, "\n\n".join(failures)
+    assert "rules.py: cannot parse _VG_MISSING" in failures[0]
+    assert "module-level tuple assignment not found" in failures[0]
 
 
 # --------------------------- check_codeowners (synthetic) ---------------------------
