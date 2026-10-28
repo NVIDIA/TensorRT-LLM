@@ -38,12 +38,14 @@ from .mnnvl import MnnvlProvider
 
 __all__ = [
     "DeepEpProvider",
+    "clear_registered_providers",
     "DwdpPagePoolProvider",
     "LedgerProvider",
     "MemoryCountersProvider",
     "MnnvlProvider",
     "collect_all",
     "default_providers",
+    "register_provider",
 ]
 
 
@@ -57,19 +59,46 @@ class LedgerProvider(Protocol):
     def collect(self) -> list[Entry]: ...
 
 
+#: Providers whose host object cannot be reached from here. The KV cache
+#: manager lives in a ``ResourceManager`` owned by the executor and a
+#: ``SymmetricMemoryAllReduce`` is a model submodule; neither has a
+#: process-wide accessor, so the code that builds them registers them
+#: instead of this module guessing where to look.
+_registered: list["LedgerProvider"] = []
+
+
+def register_provider(provider: "LedgerProvider") -> None:
+    """Add a provider built by code that owns the component it reads.
+
+    Registering the same ``name`` twice replaces the earlier one rather than
+    reporting the component twice: a rebuilt KV cache manager supersedes the
+    one it replaced.
+    """
+    global _registered
+    _registered = [p for p in _registered if p.name != provider.name]
+    _registered.append(provider)
+
+
+def clear_registered_providers() -> None:
+    """Drop every registration. For tests, and for executor teardown."""
+    _registered.clear()
+
+
 def default_providers() -> list[LedgerProvider]:
     """Providers that can find their host object without cooperation.
 
-    Absent by design: ``SymmetricMemoryAllReduce`` has no process-wide
-    handle -- each instance is a submodule of the model -- so it needs either
-    a registration call at construction or a model reference to walk. It is
-    not discoverable from here, and guessing zero would be a lie.
+    Includes anything handed to :func:`register_provider`, which is how
+    components that cannot be found from here get in. ``SymmetricMemoryAllReduce``
+    is still absent: each instance is a model submodule, so it needs a model
+    reference to walk rather than a single handle, and guessing zero would
+    be a lie.
     """
     return [
         MnnvlProvider(),
         DeepEpProvider(),
         DwdpPagePoolProvider(),
         MemoryCountersProvider(),
+        *_registered,
     ]
 
 
