@@ -583,10 +583,11 @@ trtllm-serve disaggregated -c disagg_config.yaml -m ./metadata_config.yaml
 
 The metadata_config file looks like
 ```yaml
+server_type: etcd
 hostname: "localhost"
 port: 2379
 health_check_timeout: 5.0
-refersh_interval: 10.0
+refresh_interval: 10.0
 ```
 
 To use an ETCD server with authentication or TLS, add ```user``` and ```password```, and/or ```ca_cert``` (with optional ```cert_key``` and ```cert_cert``` for client certificates) to the metadata_config file. Set ```record_auth_key``` to the same non-empty secret in the metadata_config file of every context, generation and disaggregated server: servers then sign the records they register, and the disaggregated server ignores records without a valid signature.
@@ -594,10 +595,11 @@ To use an ETCD server with authentication or TLS, add ```user``` and ```password
 Without these fields the connection to the ETCD server is anonymous and unencrypted, and the disaggregated server uses every ```trtllm/*``` record found in the store. When the ETCD server is reachable from hosts other than the context, generation and disaggregated servers, enable ETCD authentication (and TLS where available) together with ```record_auth_key```. The signature is checked only by readers, so access control of the store itself still comes from the ETCD server. A metadata_config file with all optional fields looks like
 
 ```yaml
+server_type: etcd
 hostname: "etcd.internal"
 port: 2379
 health_check_timeout: 5.0
-refersh_interval: 10.0
+refresh_interval: 10.0
 user: "trtllm"
 password: "<etcd user credential>"
 ca_cert: "/etc/trtllm/etcd-ca.pem"
