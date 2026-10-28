@@ -51,8 +51,9 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, _fp8_block_scales_uses_cute_dsl_sm107
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
@@ -263,6 +264,9 @@ class DSAVanillaIndexer(nn.Module):
     # between neighboring magnitudes used for round-to-nearest.
     _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
     _E2M1_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+    # Bound [H, tile_q, S] float32 intermediates in weighted_relu_scores on
+    # multi-thousand-token sequences while keeping each query row's reduction exact.
+    _SCORE_QUERY_TILE = 256
 
     def __init__(
         self,
@@ -558,18 +562,26 @@ class DSAVanillaIndexer(nn.Module):
             clamped to the finite E4M3 range first.
         """
         scaled = (x.float() / scale.float()).clamp(-cls.FP8_MAX, cls.FP8_MAX)
-        return scaled.to(torch.float8_e4m3fn).to(x.dtype) * scale.to(x.dtype)
+        return (scaled.to(torch.float8_e4m3fn).float() * scale.float()).to(x.dtype)
 
     @classmethod
-    def _qdq_fp8_blocks(cls, x: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    def _qdq_fp8_blocks(
+        cls,
+        x: torch.Tensor,
+        block_size: int = 128,
+        use_ue8m0: bool = True,
+    ) -> torch.Tensor:
         """Quantize-dequantize activations in 1 x ``block_size`` E4M3 blocks.
 
-        Each block of the last dimension gets its own UE8M0 scale, the
-        activation layout consumed by FP8 block-scaled GEMMs.
+        Each block of the last dimension gets its own 1x128 scale, rounded up
+        to a UE8M0 power of two when the target FP8 block-scaled GEMM path
+        uses UE8M0 activation scales or left as float32 ``amax / 448``
+        otherwise.
 
         Args:
             x: [..., K] activations; K must be divisible by ``block_size``.
             block_size: Elements per scale.
+            use_ue8m0: Whether to round block scales up to powers of two.
 
         Returns:
             QDQ values with x's shape and dtype.
@@ -580,11 +592,43 @@ class DSAVanillaIndexer(nn.Module):
                 f"FP8 block quantization requires K divisible by {block_size}, got {rows.shape[1]}"
             )
         blocks = rows.view(rows.shape[0], -1, block_size)
-        # fp8_quantize_1x128 uses this floor before encoding the UE8M0 scale.
+        # fp8_quantize_1x128 uses this floor before encoding the 1x128 scale.
         amax = blocks.abs().float().amax(dim=-1).clamp_min(1e-10)
-        scale = cls.ceil_to_ue8m0(amax / cls.FP8_MAX)
+        scale = amax / cls.FP8_MAX
+        if use_ue8m0:
+            scale = cls.ceil_to_ue8m0(scale)
         qdq = cls._qdq_fp8(blocks, scale.unsqueeze(-1))
         return qdq.reshape_as(x)
+
+    @staticmethod
+    def _fp8_block_scales_uses_ue8m0(linear: Linear) -> bool:
+        """Return whether ``FP8BlockScalesLinearMethod`` quantizes inputs with UE8M0 scales.
+
+        Matches the dispatch in :meth:`FP8BlockScalesLinearMethod.apply`:
+
+        - Pre-transformed ``int32`` weight scales (DeepGEMM / SM120 layouts)
+          always pair with UE8M0 activation scales.
+        - On the SM100 family, ``fp8_swap_ab_gemm`` uses UE8M0 scales. When
+          ``use_cute_dsl_blockscaling_mm`` or ``disable_deep_gemm`` is set on
+          the Linear, only the SM107 CuTe DSL MXFP8 kernel quantizes with
+          UE8M0; the other kernels call ``fp8_quantize_1x128(input)``, which
+          defaults to ``use_ue8m0=False``.
+        - On SM120, ``per_token_quant_and_transform`` defaults to
+          ``scale_ue8m0=True``.
+        - All other SM versions (including SM90 Hopper) call
+          ``fp8_quantize_1x128(input)`` with ``use_ue8m0=False``.
+        """
+        weight_scale = getattr(linear, "weight_scale", None)
+        if weight_scale is not None and weight_scale.dtype == torch.int32:
+            return True
+        sm_version = get_sm_version()
+        if is_sm_100f(sm_version):
+            if getattr(linear, "use_cute_dsl_blockscaling_mm", False) or getattr(
+                linear, "disable_deep_gemm", False
+            ):
+                return _fp8_block_scales_uses_cute_dsl_sm107(linear)
+            return True
+        return sm_version == 120
 
     @classmethod
     def _round_to_e4m3_rne_satfinite(cls, x: torch.Tensor) -> torch.Tensor:
@@ -718,6 +762,7 @@ class DSAVanillaIndexer(nn.Module):
                 # 128x128 weight blocks with 1x128 input blocks. int32 scales are
                 # UE8M0 exponents packed by FP8BlockScalesLinearMethod on
                 # SM100f/SM120; unpack them to the float32 block grid first.
+                use_ue8m0 = cls._fp8_block_scales_uses_ue8m0(linear)
                 if weight_scale.dtype == torch.int32:
                     from tensorrt_llm.quantization.utils.fp8_utils import inverse_transform_sf
 
@@ -736,9 +781,9 @@ class DSAVanillaIndexer(nn.Module):
                 dequant_weight = weight.float() * expanded_scale[:out_features, :in_features]
                 if qr.dtype == torch.float8_e4m3fn:
                     dequant_input = qr.float() * linear.input_scale.float()
-                    dequant_input = cls._qdq_fp8_blocks(dequant_input).float()
+                    dequant_input = cls._qdq_fp8_blocks(dequant_input, use_ue8m0=use_ue8m0).float()
                 else:
-                    dequant_input = cls._qdq_fp8_blocks(qr).float()
+                    dequant_input = cls._qdq_fp8_blocks(qr, use_ue8m0=use_ue8m0).float()
             return F.linear(
                 dequant_input.to(output_dtype),
                 dequant_weight.to(output_dtype),
@@ -820,8 +865,9 @@ class DSAVanillaIndexer(nn.Module):
         value = values[value_idx]
         return torch.where(sign & (value_idx != 0), -value, value)
 
-    @staticmethod
+    @classmethod
     def weighted_relu_scores(
+        cls,
         q: torch.Tensor,
         k: torch.Tensor,
         weights: torch.Tensor,
@@ -829,6 +875,11 @@ class DSAVanillaIndexer(nn.Module):
         epi_dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
         """Return ``sum_h weights[t, h] * relu(dot(q[t, h], k[s]))`` for one Q/K tile.
+
+        Queries are processed in tiles of at most :attr:`_SCORE_QUERY_TILE`
+        rows so multi-thousand-token sequences do not materialize the full
+        ``[H, T, S]`` intermediate at once. Each query row is independent, so
+        tiling produces identical results.
 
         Args:
             q: [T, H, D] queries, as FP8 codes or dequantized values.
@@ -841,10 +892,27 @@ class DSAVanillaIndexer(nn.Module):
             [T, S] scores in ``epi_dtype``. Masked positions hold 0, not -inf;
             callers apply their own -inf fill before TopK.
         """
-        scores = torch.matmul(q.float().transpose(0, 1), k.float().T)
-        scores = torch.where(mask.unsqueeze(0), scores, scores.new_zeros(())).relu()
-        scores = scores.to(epi_dtype)
-        return (weights.to(epi_dtype).T.unsqueeze(-1) * scores).sum(dim=0)
+        num_queries = q.shape[0]
+        num_keys = k.shape[0]
+        if num_queries == 0 or num_keys == 0:
+            return torch.zeros((num_queries, num_keys), device=q.device, dtype=epi_dtype)
+        k_t = k.float().T
+        if num_queries <= cls._SCORE_QUERY_TILE:
+            scores = torch.matmul(q.float().transpose(0, 1), k_t)
+            scores = torch.where(mask.unsqueeze(0), scores, scores.new_zeros(())).relu()
+            scores = scores.to(epi_dtype)
+            return (weights.to(epi_dtype).T.unsqueeze(-1) * scores).sum(dim=0)
+
+        out = torch.empty((num_queries, num_keys), device=q.device, dtype=epi_dtype)
+        zero = k_t.new_zeros(())
+        weights_epi = weights.to(epi_dtype)
+        for start in range(0, num_queries, cls._SCORE_QUERY_TILE):
+            t_slice = slice(start, min(start + cls._SCORE_QUERY_TILE, num_queries))
+            scores = torch.matmul(q[t_slice].float().transpose(0, 1), k_t)
+            scores = torch.where(mask[t_slice].unsqueeze(0), scores, zero).relu()
+            scores = scores.to(epi_dtype)
+            out[t_slice] = (weights_epi[t_slice].T.unsqueeze(-1) * scores).sum(dim=0)
+        return out
 
     @staticmethod
     def select_top_k(logits: torch.Tensor, topk: int) -> torch.Tensor:

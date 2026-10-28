@@ -87,7 +87,6 @@ _PHASES = _phases_from_window(_NON_SLIDING_PHASE_WINDOW)
 _SPARSE_COMPUTE_DTYPE = "bfloat16"
 _SPARSE_KV_LAYOUT = "HND"
 _SPARSE_PAGE_SIZE = 64
-_SPARSE_USE_KVM_V2 = False
 
 
 def _phases_for(cfg: ModelAttnConfig) -> dict:
@@ -159,27 +158,28 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
     phases = _phases_for(cfg)
 
     # Sparse cases use one model-agnostic sweep (bf16 latent cache, fixed layout/
-    # page/manager). Every backend runs its own indexer over shared weights, so
-    # a case covers selection and execution together; the phase lengths
-    # (top-k + 32) keep every long row genuinely sparse.
+    # page, both v1 and v2 KV cache managers). Every backend runs its own
+    # indexer over shared weights, so a case covers selection and execution
+    # together; the phase lengths (top-k + 32) keep every long row genuinely sparse.
     if cfg.sparse_attention_config is not None:
-        manager = "v2" if _SPARSE_USE_KVM_V2 else "v1"
-        tag = (
-            f"{_prec_tag(_SPARSE_COMPUTE_DTYPE, None)}-{_SPARSE_KV_LAYOUT}"
-            f"-p{_SPARSE_PAGE_SIZE}-{manager}"
-        )
-        for phase_name in ("ctx", "gen", "mix"):
-            yield (
-                f"{cfg.id}-{phase_name}-{tag}",
-                BackendCase(
-                    page_size=_SPARSE_PAGE_SIZE,
-                    kv_layout=_SPARSE_KV_LAYOUT,
-                    dtype=_SPARSE_COMPUTE_DTYPE,
-                    use_kv_cache_manager_v2=_SPARSE_USE_KVM_V2,
-                    **phases[phase_name],
-                    **common,
-                ),
+        for v2 in (False, True):
+            manager = "v2" if v2 else "v1"
+            tag = (
+                f"{_prec_tag(_SPARSE_COMPUTE_DTYPE, None)}-{_SPARSE_KV_LAYOUT}"
+                f"-p{_SPARSE_PAGE_SIZE}-{manager}"
             )
+            for phase_name in ("ctx", "gen", "mix"):
+                yield (
+                    f"{cfg.id}-{phase_name}-{tag}",
+                    BackendCase(
+                        page_size=_SPARSE_PAGE_SIZE,
+                        kv_layout=_SPARSE_KV_LAYOUT,
+                        dtype=_SPARSE_COMPUTE_DTYPE,
+                        use_kv_cache_manager_v2=v2,
+                        **phases[phase_name],
+                        **common,
+                    ),
+                )
         return
 
     # Bidirectional, KV-cache-free DiT / encoder workloads: only compute dtype.

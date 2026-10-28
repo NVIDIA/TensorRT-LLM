@@ -336,7 +336,10 @@ def _build_mla_kv_cache_manager(
     )
 
     if sparse_config is not None:
-        cls = get_sparse_attn_kv_cache_manager(sparse_config)
+        cls = get_sparse_attn_kv_cache_manager(
+            sparse_config,
+            use_kv_cache_manager_v2=case.use_kv_cache_manager_v2,
+        )
         kwargs.update(sparse_attention_config=sparse_config)
     else:
         cls = KVCacheManagerV2 if case.use_kv_cache_manager_v2 else KVCacheManager

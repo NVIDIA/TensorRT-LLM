@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Sparse MLA attention and compact end-to-end indexer comparisons."""
+"""Sparse MLA attention and end-to-end indexer comparisons."""
 
 import math
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import List, Optional
-from unittest.mock import Mock
+from typing import List
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -97,47 +97,6 @@ class RopeConfig:
     model_type: str = "deepseek_v3"
 
 
-def _build_sparse_topk_indices_context(
-    seq_lens: List[int],
-    topk: int,
-    device: torch.device,
-    generator: Optional[torch.Generator] = None,
-) -> torch.Tensor:
-    total_tokens = sum(seq_lens)
-    topk_indices = torch.full((total_tokens, topk), -1, dtype=torch.int32, device=device)
-    token_offset = 0
-    for seq_len in seq_lens:
-        for token_idx in range(seq_len):
-            max_index = token_idx
-            valid_len = min(max_index + 1, topk)
-            indices = torch.randperm(max_index + 1, device=device, generator=generator)[:valid_len]
-            indices, _ = torch.sort(indices)
-            topk_indices[token_offset + token_idx, :valid_len] = indices.to(torch.int32)
-        token_offset += seq_len
-    return topk_indices
-
-
-def _build_sparse_topk_indices_generation(
-    cached_lens: List[int],
-    seq_len_q: int,
-    topk: int,
-    device: torch.device,
-    generator: Optional[torch.Generator] = None,
-) -> torch.Tensor:
-    total_tokens = len(cached_lens) * seq_len_q
-    topk_indices = torch.full((total_tokens, topk), -1, dtype=torch.int32, device=device)
-    row = 0
-    for cached_len in cached_lens:
-        for q_idx in range(seq_len_q):
-            max_index = cached_len + q_idx
-            valid_len = min(max_index + 1, topk)
-            indices = torch.randperm(max_index + 1, device=device, generator=generator)[:valid_len]
-            indices, _ = torch.sort(indices)
-            topk_indices[row, :valid_len] = indices.to(torch.int32)
-            row += 1
-    return topk_indices
-
-
 def _allocate_kv_cache_for_generation(kv_cache_manager, request_ids, num_tokens: int):
     for request_id in request_ids:
         for _ in range(num_tokens):
@@ -176,7 +135,6 @@ accuracy_dict = {
 MAX_COMPOSED_MEAN_ABS_ERROR = 1.2e-2
 
 SPARSE_TOPK = 2048
-MAX_END_TO_END_INDEXER_CONTEXT = 160
 context_topk_cases = [
     pytest.param([10], SPARSE_TOPK, id="dense-indexer-smoke"),
     pytest.param([160], 128, id="genuinely-sparse-indexer"),
@@ -286,7 +244,6 @@ def _assert_matches_vanilla(
         f"[{backend_name} vs VANILLA golden] phase mismatch: {list(actual)} != {list(golden)}"
     )
     atol, rtol = accuracy_dict[kv_cache_dtype]
-    has_indexer_results = any(phase.startswith("indexer_") for phase in golden)
     for phase, golden_output in golden.items():
         if phase.startswith("indexer_"):
             _assert_indexer_topk_matches(
@@ -296,22 +253,13 @@ def _assert_matches_vanilla(
                 phase=phase,
             )
             continue
-        if has_indexer_results:
-            _assert_composed_output_matches(
-                actual[phase],
-                golden_output,
-                atol=atol,
-                rtol=rtol,
-                backend_name=backend_name,
-                phase=phase,
-            )
-            continue
-        torch.testing.assert_close(
+        _assert_composed_output_matches(
             actual[phase],
             golden_output,
             atol=atol,
             rtol=rtol,
-            msg=lambda message: f"[{backend_name} vs VANILLA golden, {phase}]\n{message}",
+            backend_name=backend_name,
+            phase=phase,
         )
 
 
@@ -336,14 +284,7 @@ def test_sparse_attention_mla(
     generation_seq_len_q: int,
     num_generation_steps: int,
 ):
-    """Compare TRTLLM sparse MLA against Vanilla attention and indexer goldens.
-
-    The compact sequence cases run both indexers end to end, including one
-    whose 128-entry selection is genuinely sparse. The long cases
-    inject identical selections so they retain affordable 10K-token sparse
-    attention coverage without making the plain-torch indexer quadratic test
-    runtime dominate this suite.
-    """
+    """Compare TRTLLM sparse MLA against Vanilla attention and indexer goldens."""
     golden = _test_sparse_attention_mla(
         "VANILLA",
         scenario,
@@ -371,7 +312,6 @@ def _test_sparse_attention_mla(
     num_generation_steps: int,
     sparse_topk: int = SPARSE_TOPK,
     seed: int = 123,
-    topk_seed: int = 456,
 ) -> dict[str, torch.Tensor]:
     num_heads = scenario.num_heads
     num_kv_heads = scenario.num_kv_heads
@@ -434,7 +374,6 @@ def _test_sparse_attention_mla(
         num_generation_steps,
         sparse_topk,
         seed,
-        topk_seed,
     )
 
 
@@ -459,7 +398,6 @@ def _run_test_for_backend(
     num_generation_steps,
     sparse_topk,
     seed,
-    topk_seed,
 ) -> dict[str, torch.Tensor]:
     sparse_config = DeepSeekSparseAttentionConfig(
         index_n_heads=64,
@@ -472,11 +410,9 @@ def _run_test_for_backend(
     # When rope_append is False, [448: 512) are used for qk_rope_head_dim
     kv_lora_rank = kv_lora_rank - qk_rope_head_dim if not rope_append else kv_lora_rank
     head_dim = kv_lora_rank + qk_rope_head_dim
-    exercise_indexer = max(context_sequence_lengths) <= MAX_END_TO_END_INDEXER_CONTEXT
 
     # Set seed for reproducibility.
     torch.manual_seed(seed)
-    topk_generator = torch.Generator(device=device).manual_seed(topk_seed)
 
     # Create inputs
     inputs_per_layer = []
@@ -580,6 +516,9 @@ def _run_test_for_backend(
             for i in range(num_generation_steps)
         ]
 
+        index_n_heads = sparse_config.index_n_heads
+        index_head_dim = sparse_config.index_head_dim
+        weight_scale = 0.02
         inputs = {
             "ctx_compressed_kv": ctx_compressed_kv,
             "ctx_k_pe": ctx_k_pe,
@@ -589,57 +528,51 @@ def _run_test_for_backend(
             "gen_k_pe_list": gen_k_pe_list,
             "gen_fused_q_list": gen_fused_q_list,
             "gen_q_pe_list": gen_q_pe_list,
-        }
-        if exercise_indexer:
-            index_n_heads = sparse_config.index_n_heads
-            index_head_dim = sparse_config.index_head_dim
-            weight_scale = 0.02
-            inputs.update(
-                ctx_qr=torch.empty(
-                    [sum(context_sequence_lengths), q_lora_rank], dtype=dtype, device=device
-                ).uniform_(-1, 1),
-                ctx_hidden_states=torch.empty(
-                    [sum(context_sequence_lengths), rope_config.hidden_size],
+            "ctx_qr": torch.empty(
+                [sum(context_sequence_lengths), q_lora_rank], dtype=dtype, device=device
+            ).uniform_(-1, 1),
+            "ctx_hidden_states": torch.empty(
+                [sum(context_sequence_lengths), rope_config.hidden_size],
+                dtype=dtype,
+                device=device,
+            ).uniform_(-1, 1),
+            "gen_qr_list": [
+                torch.empty(
+                    [len(context_sequence_lengths) * generation_seq_len_q, q_lora_rank],
                     dtype=dtype,
                     device=device,
-                ).uniform_(-1, 1),
-                gen_qr_list=[
-                    torch.empty(
-                        [len(context_sequence_lengths) * generation_seq_len_q, q_lora_rank],
-                        dtype=dtype,
-                        device=device,
-                    ).uniform_(-1, 1)
-                    for _ in range(num_generation_steps)
-                ],
-                gen_hidden_states_list=[
-                    torch.empty(
-                        [
-                            len(context_sequence_lengths) * generation_seq_len_q,
-                            rope_config.hidden_size,
-                        ],
-                        dtype=dtype,
-                        device=device,
-                    ).uniform_(-1, 1)
-                    for _ in range(num_generation_steps)
-                ],
-                indexer_weights={
-                    "wq_b": torch.empty(
-                        [index_n_heads * index_head_dim, q_lora_rank],
-                        dtype=dtype,
-                        device=device,
-                    ).uniform_(-weight_scale, weight_scale),
-                    "wk": torch.empty(
-                        [index_head_dim, rope_config.hidden_size],
-                        dtype=torch.float32,
-                        device=device,
-                    ).uniform_(-weight_scale, weight_scale),
-                    "weights_proj": torch.empty(
-                        [index_n_heads, rope_config.hidden_size],
-                        dtype=torch.float32,
-                        device=device,
-                    ).uniform_(-weight_scale, weight_scale),
-                },
-            )
+                ).uniform_(-1, 1)
+                for _ in range(num_generation_steps)
+            ],
+            "gen_hidden_states_list": [
+                torch.empty(
+                    [
+                        len(context_sequence_lengths) * generation_seq_len_q,
+                        rope_config.hidden_size,
+                    ],
+                    dtype=dtype,
+                    device=device,
+                ).uniform_(-1, 1)
+                for _ in range(num_generation_steps)
+            ],
+            "indexer_weights": {
+                "wq_b": torch.empty(
+                    [index_n_heads * index_head_dim, q_lora_rank],
+                    dtype=dtype,
+                    device=device,
+                ).uniform_(-weight_scale, weight_scale),
+                "wk": torch.empty(
+                    [index_head_dim, rope_config.hidden_size],
+                    dtype=torch.float32,
+                    device=device,
+                ).uniform_(-weight_scale, weight_scale),
+                "weights_proj": torch.empty(
+                    [index_n_heads, rope_config.hidden_size],
+                    dtype=torch.float32,
+                    device=device,
+                ).uniform_(-weight_scale, weight_scale),
+            },
+        }
         inputs_per_layer.append(inputs)
         print(f"context sequence lengths: {context_sequence_lengths}")
         for key, val in inputs.items():
@@ -705,19 +638,16 @@ def _run_test_for_backend(
     gen_layers = [create_layer(layer_idx, 1) for layer_idx in range(num_layers)]
     if is_vanilla:
         assert all(type(layer) is DSAVanillaAttention for layer in ctx_layers + gen_layers)
-    if exercise_indexer:
-        for layer_idx, (ctx_layer, gen_layer) in enumerate(
-            zip(ctx_layers, gen_layers, strict=True)
-        ):
-            weights = inputs_per_layer[layer_idx]["indexer_weights"]
-            for layer in (ctx_layer, gen_layer):
-                layer.indexer.to(device)
-                layer.indexer.requires_grad_(False)
-                with torch.no_grad():
-                    layer.indexer.wq_b.weight.copy_(weights["wq_b"])
-                    layer.indexer.wk.weight.copy_(weights["wk"])
-                    layer.indexer.weights_proj.weight.copy_(weights["weights_proj"])
-                layer.indexer.cache_derived_state()
+    for layer_idx, (ctx_layer, gen_layer) in enumerate(zip(ctx_layers, gen_layers, strict=True)):
+        weights = inputs_per_layer[layer_idx]["indexer_weights"]
+        for layer in (ctx_layer, gen_layer):
+            layer.indexer.to(device)
+            layer.indexer.requires_grad_(False)
+            with torch.no_grad():
+                layer.indexer.wq_b.weight.copy_(weights["wq_b"])
+                layer.indexer.wk.weight.copy_(weights["wk"])
+                layer.indexer.weights_proj.weight.copy_(weights["weights_proj"])
+            layer.indexer.cache_derived_state()
 
     # NOTE: set up metadata, refer to tensorrt_llm/_torch/pyexecutor/model_engine.py
     # all layers share the same metadata
@@ -835,64 +765,50 @@ def _run_test_for_backend(
                     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
                     q_pe = inputs_per_layer[layer_idx]["ctx_q_pe"]
                     ctx_fused_q, ctx_latent = fused_q, latent_cache
-                    if exercise_indexer:
-                        position_ids = torch.cat(
-                            [
-                                torch.arange(seq_len, dtype=torch.int32, device=device)
-                                for seq_len in context_sequence_lengths
-                            ]
-                        )
-                        with torch.inference_mode():
-                            indexer_intermediates = list(
-                                ctx_layers[layer_idx].indexer.pre_indexer_proj(
-                                    inputs_per_layer[layer_idx]["ctx_qr"],
-                                    inputs_per_layer[layer_idx]["ctx_hidden_states"],
-                                    position_ids,
-                                )
-                            )
-                            ctx_layers[layer_idx].indexer._update_k_cache(
-                                indexer_intermediates[1], indexer_intermediates[2], attn_metadata
-                            )
-                            indexer_topk = (
-                                ctx_layers[layer_idx]
-                                .indexer.forward_from_projected(
-                                    attn_metadata,
-                                    ctx_fused_q,
-                                    indexer_intermediates,
-                                    is_generation=False,
-                                )
-                                .detach()
-                                .clone()
-                            )
-                        ctx_sba = DSABackendForwardArgs(indexer_intermediates=indexer_intermediates)
-                    else:
-                        topk_indices = _build_sparse_topk_indices_context(
-                            context_sequence_lengths,
-                            sparse_topk,
-                            device,
-                            generator=topk_generator,
-                        )
-                        if is_vanilla:
-                            # Long-sequence cases isolate sparse attention math;
-                            # the compact cases above cover the full indexer path.
-                            ctx_sba = DSABackendForwardArgs(
-                                indexer_intermediates=[], topk_indices=topk_indices
-                            )
-                        else:
-                            ctx_layers[layer_idx].indexer.forward_from_projected = Mock(
-                                return_value=topk_indices
-                            )
-                            ctx_sba = DSABackendForwardArgs(indexer_intermediates=[])
-                    result = ctx_layers[layer_idx].forward(
-                        ctx_fused_q.clone(),
-                        None,
-                        None,
-                        attn_metadata,
-                        attention_input_type=AttentionInputType.context_only,
-                        latent_cache=ctx_latent.clone(),
-                        q_pe=q_pe,
-                        sparse_backend_args=ctx_sba,
+                    position_ids = torch.cat(
+                        [
+                            torch.arange(seq_len, dtype=torch.int32, device=device)
+                            for seq_len in context_sequence_lengths
+                        ]
                     )
+                    with torch.inference_mode():
+                        indexer_intermediates = list(
+                            ctx_layers[layer_idx].indexer.pre_indexer_proj(
+                                inputs_per_layer[layer_idx]["ctx_qr"],
+                                inputs_per_layer[layer_idx]["ctx_hidden_states"],
+                                position_ids,
+                            )
+                        )
+                        ctx_layers[layer_idx].indexer._update_k_cache(
+                            indexer_intermediates[1], indexer_intermediates[2], attn_metadata
+                        )
+                        indexer_topk = (
+                            ctx_layers[layer_idx]
+                            .indexer.forward_from_projected(
+                                attn_metadata,
+                                ctx_fused_q,
+                                indexer_intermediates,
+                                is_generation=False,
+                            )
+                            .detach()
+                            .clone()
+                        )
+                    ctx_sba = DSABackendForwardArgs(indexer_intermediates=indexer_intermediates)
+                    with patch.object(
+                        ctx_layers[layer_idx].indexer,
+                        "forward_from_projected",
+                        return_value=indexer_topk,
+                    ):
+                        result = ctx_layers[layer_idx].forward(
+                            ctx_fused_q.clone(),
+                            None,
+                            None,
+                            attn_metadata,
+                            attention_input_type=AttentionInputType.context_only,
+                            latent_cache=ctx_latent.clone(),
+                            q_pe=q_pe,
+                            sparse_backend_args=ctx_sba,
+                        )
                 else:
                     fused_q = inputs_per_layer[layer_idx]["gen_fused_q_list"][step - 1]
                     q_pe = inputs_per_layer[layer_idx]["gen_q_pe_list"][step - 1]
@@ -903,47 +819,38 @@ def _run_test_for_backend(
                         ctx_len + (step - 1) * generation_seq_len_q
                         for ctx_len in context_sequence_lengths
                     ]
-                    if exercise_indexer:
-                        position_ids = torch.cat(
-                            [
-                                torch.arange(
-                                    cached_len,
-                                    cached_len + generation_seq_len_q,
-                                    dtype=torch.int32,
-                                    device=device,
-                                )
-                                for cached_len in cached_lens
-                            ]
+                    position_ids = torch.cat(
+                        [
+                            torch.arange(
+                                cached_len,
+                                cached_len + generation_seq_len_q,
+                                dtype=torch.int32,
+                                device=device,
+                            )
+                            for cached_len in cached_lens
+                        ]
+                    )
+                    with torch.inference_mode():
+                        indexer_intermediates = list(
+                            gen_layers[layer_idx].indexer.pre_indexer_proj(
+                                inputs_per_layer[layer_idx]["gen_qr_list"][step - 1],
+                                inputs_per_layer[layer_idx]["gen_hidden_states_list"][step - 1],
+                                position_ids,
+                            )
                         )
-                        with torch.inference_mode():
-                            indexer_intermediates = list(
-                                gen_layers[layer_idx].indexer.pre_indexer_proj(
-                                    inputs_per_layer[layer_idx]["gen_qr_list"][step - 1],
-                                    inputs_per_layer[layer_idx]["gen_hidden_states_list"][step - 1],
-                                    position_ids,
-                                )
+                        gen_layers[layer_idx].indexer._update_k_cache(
+                            indexer_intermediates[1], indexer_intermediates[2], attn_metadata
+                        )
+                        indexer_topk = (
+                            gen_layers[layer_idx]
+                            .indexer.forward_from_projected(
+                                attn_metadata,
+                                fused_q,
+                                indexer_intermediates,
+                                is_generation=True,
                             )
-                            gen_layers[layer_idx].indexer._update_k_cache(
-                                indexer_intermediates[1], indexer_intermediates[2], attn_metadata
-                            )
-                            indexer_topk = (
-                                gen_layers[layer_idx]
-                                .indexer.forward_from_projected(
-                                    attn_metadata,
-                                    fused_q,
-                                    indexer_intermediates,
-                                    is_generation=True,
-                                )
-                                .detach()
-                                .clone()
-                            )
-                    else:
-                        topk_indices = _build_sparse_topk_indices_generation(
-                            cached_lens,
-                            generation_seq_len_q,
-                            sparse_topk,
-                            device,
-                            generator=topk_generator,
+                            .detach()
+                            .clone()
                         )
                     num_tokens = fused_q.size(0)
                     num_seqs = attn_metadata.kv_lens_cuda_runtime.size(0)
@@ -987,19 +894,9 @@ def _run_test_for_backend(
                     )
                     backend_fused_q = fused_q
                     backend_latent_cache = latent_cache
-                    if exercise_indexer:
-                        sparse_backend_args = DSABackendForwardArgs(
-                            indexer_intermediates=indexer_intermediates
-                        )
-                    elif is_vanilla:
-                        sparse_backend_args = DSABackendForwardArgs(
-                            indexer_intermediates=[], topk_indices=topk_indices
-                        )
-                    else:
-                        gen_layers[layer_idx].indexer.forward_from_projected = Mock(
-                            return_value=topk_indices
-                        )
-                        sparse_backend_args = DSABackendForwardArgs(indexer_intermediates=[])
+                    sparse_backend_args = DSABackendForwardArgs(
+                        indexer_intermediates=indexer_intermediates
+                    )
                     generation_kwargs = {
                         "cu_q_seqlens": cu_q_seqlens,
                         "cu_kv_seqlens": cu_kv_seqlens,
@@ -1009,16 +906,21 @@ def _run_test_for_backend(
                         "quant_q_buffer": quant_q_buffer,
                         "sparse_backend_args": sparse_backend_args,
                     }
-                    result = gen_layers[layer_idx].forward(
-                        backend_fused_q,
-                        None,
-                        None,
-                        attn_metadata,
-                        attention_input_type=AttentionInputType.generation_only,
-                        latent_cache=backend_latent_cache,
-                        q_pe=q_pe,
-                        **generation_kwargs,
-                    )
+                    with patch.object(
+                        gen_layers[layer_idx].indexer,
+                        "forward_from_projected",
+                        return_value=indexer_topk,
+                    ):
+                        result = gen_layers[layer_idx].forward(
+                            backend_fused_q,
+                            None,
+                            None,
+                            attn_metadata,
+                            attention_input_type=AttentionInputType.generation_only,
+                            latent_cache=backend_latent_cache,
+                            q_pe=q_pe,
+                            **generation_kwargs,
+                        )
                 # Record results for the Vanilla-golden comparison.
                 print(
                     f"{backend_name} output mean: {result.abs().mean().item()}, max: {result.abs().max().item()}"
@@ -1029,10 +931,9 @@ def _run_test_for_backend(
                 print(f"---- step {step} layer {layer_idx} end ----")
                 phase = "context" if step == 0 else f"generation_{step - 1}"
                 outputs[f"{phase}_layer_{layer_idx}"] = result.detach().clone()
-                if exercise_indexer:
-                    outputs[f"indexer_{phase}_layer_{layer_idx}"] = torch.sort(
-                        indexer_topk, dim=-1
-                    ).values.clone()
+                outputs[f"indexer_{phase}_layer_{layer_idx}"] = torch.sort(
+                    indexer_topk, dim=-1
+                ).values.clone()
 
         print(f"Test for sparse MLA in {backend_name} backend passed")
         return outputs

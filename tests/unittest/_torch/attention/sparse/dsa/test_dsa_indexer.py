@@ -185,10 +185,55 @@ def test_vanilla_indexer_q_projection_uses_linear_dtype_for_prequantized_input()
     torch.testing.assert_close(actual, expected)
 
 
-def test_vanilla_indexer_q_projection_supports_fp8_block_weight():
-    qr = torch.linspace(-1.0, 1.0, 128).reshape(1, 128)
+@pytest.mark.parametrize(
+    "sm_version,use_cute_dsl,disable_deep_gemm,rubin_available,int32_scale,expected_ue8m0",
+    [
+        (90, False, False, True, False, False),
+        (100, False, False, True, False, True),
+        (100, True, False, True, False, False),
+        (100, False, True, True, False, False),
+        (103, False, False, True, False, True),
+        (103, True, False, True, False, False),
+        (107, False, False, True, False, True),
+        (107, True, False, True, False, True),
+        (107, False, True, True, False, True),
+        (107, True, False, False, False, False),
+        (120, False, False, True, False, True),
+        (90, False, False, True, True, True),
+    ],
+)
+def test_vanilla_indexer_q_projection_supports_fp8_block_weight(
+    monkeypatch,
+    sm_version,
+    use_cute_dsl,
+    disable_deep_gemm,
+    rubin_available,
+    int32_scale,
+    expected_ue8m0,
+):
+    import tensorrt_llm._torch.attention.backends.sparse.dsa.vanilla_backend as vanilla_mod
+    import tensorrt_llm._torch.modules.linear as linear_mod
+    from tensorrt_llm.quantization.utils.fp8_utils import transform_sf_into_required_layout
+
+    monkeypatch.setattr(vanilla_mod, "get_sm_version", lambda: sm_version)
+    monkeypatch.setattr(linear_mod, "get_sm_version", lambda: sm_version)
+    monkeypatch.setattr(linear_mod, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", rubin_available)
+    # Pick an amax where amax / 448.0 is not a power of two so UE8M0 vs
+    # float32 activation scales produce distinct QDQ values.
+    qr = torch.linspace(-300.0, 300.0, 128, dtype=torch.bfloat16).reshape(1, 128)
     weight = torch.ones(129, 128, dtype=torch.float8_e4m3fn)
-    weight_scale = torch.tensor([[0.25], [0.5]], dtype=torch.float32)
+    raw_weight_scale = torch.tensor([[0.25], [0.5]], dtype=torch.float32)
+    weight_scale = (
+        transform_sf_into_required_layout(
+            raw_weight_scale,
+            mn=129,
+            k=128,
+            recipe=(1, 128, 128),
+            is_sfa=False,
+        )
+        if int32_scale
+        else raw_weight_scale
+    )
     linear = SimpleNamespace(
         weight=weight,
         weight_scale=weight_scale,
@@ -196,16 +241,41 @@ def test_vanilla_indexer_q_projection_supports_fp8_block_weight():
         force_dynamic_quantization=False,
         in_features=128,
         out_features=129,
+        dtype=torch.bfloat16,
+        use_cute_dsl_blockscaling_mm=use_cute_dsl,
+        disable_deep_gemm=disable_deep_gemm,
     )
 
+    assert DSAVanillaIndexer._fp8_block_scales_uses_ue8m0(linear) is expected_ue8m0
     actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
 
-    qdq_qr = DSAVanillaIndexer._qdq_fp8_blocks(qr)
-    expanded_scale = weight_scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    qdq_qr = DSAVanillaIndexer._qdq_fp8_blocks(qr, use_ue8m0=expected_ue8m0)
+    other_qdq_qr = DSAVanillaIndexer._qdq_fp8_blocks(qr, use_ue8m0=not expected_ue8m0)
+    assert not torch.equal(qdq_qr, other_qdq_qr)
+    expanded_scale = raw_weight_scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
     expected = torch.nn.functional.linear(
-        qdq_qr,
-        weight.float() * expanded_scale[:129, :128],
+        qdq_qr.to(torch.bfloat16),
+        (weight.float() * expanded_scale[:129, :128]).to(torch.bfloat16),
     )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_vanilla_weighted_relu_scores_query_tiling_matches_single_pass():
+    torch.manual_seed(0)
+    num_queries = DSAVanillaIndexer._SCORE_QUERY_TILE * 2 + 17
+    num_keys = 37
+    num_heads = 4
+    head_dim = 8
+    q = torch.randn(num_queries, num_heads, head_dim, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    k = torch.randn(num_keys, head_dim, dtype=torch.float32)
+    weights = torch.randn(num_queries, num_heads, dtype=torch.float32)
+    mask = torch.tril(torch.ones(num_queries, num_keys, dtype=torch.bool), diagonal=3)
+
+    actual = DSAVanillaIndexer.weighted_relu_scores(q, k, weights, mask)
+
+    scores = torch.matmul(q.float().transpose(0, 1), k.float().T)
+    scores = torch.where(mask.unsqueeze(0), scores, scores.new_zeros(())).relu()
+    expected = (weights.T.unsqueeze(-1) * scores).sum(dim=0)
     torch.testing.assert_close(actual, expected)
 
 
