@@ -163,14 +163,20 @@ def test_flattened_config_honors_an_explicit_sliding_window_disable(
     assert "swa_window_size" not in cfg.dflash_config
 
 
-def test_flattened_config_lifts_nested_window_fields_to_the_top_level() -> None:
+@pytest.mark.parametrize("top_level", ["absent", None])
+def test_flattened_config_lifts_nested_window_fields_to_the_top_level(
+    top_level: str | None,
+) -> None:
     """DFlash and ``get_layer_attention_window`` resolve the per-layer windows
     from the top-level ``layer_types`` and ``sliding_window``; values the
-    checkpoint keeps only in ``dflash_config`` must surface there."""
+    checkpoint keeps only in ``dflash_config`` must surface there, whether the
+    top-level keys are missing or spelled ``null``."""
     config = json.loads(json.dumps(_CONFIG))
     for key in ("layer_types", "sliding_window"):
         config["text_config"].pop(key, None)
         config.pop(key, None)
+        if top_level is None:
+            config["text_config"][key] = None
     mixed = ["sliding_attention", "full_attention"] * 2 + ["sliding_attention"]
     config["text_config"]["dflash_config"]["layer_types"] = list(mixed)
     config["text_config"]["dflash_config"]["sliding_window"] = 2048
@@ -180,6 +186,16 @@ def test_flattened_config_lifts_nested_window_fields_to_the_top_level() -> None:
     assert cfg.dflash_config["use_swa"] is True
     assert cfg.dflash_config["swa_window_size"] == 2048
     assert cfg.dflash_config["layer_types"] == mixed
+
+
+def test_flattened_config_treats_a_null_use_swa_as_unset() -> None:
+    """``use_swa: null`` must not block the HF-spelling translation the way an
+    explicit ``false`` does; DFlash reads a null as unset."""
+    config = json.loads(json.dumps(_CONFIG))
+    config["text_config"]["dflash_config"]["use_swa"] = None
+    cfg = build_minimax_dspark_draft_config(config)
+    assert cfg.dflash_config["use_swa"] is True
+    assert cfg.dflash_config["swa_window_size"] == 4096
 
 
 def test_flattened_config_keeps_existing_dflash_window_spelling() -> None:
@@ -192,15 +208,21 @@ def test_flattened_config_keeps_existing_dflash_window_spelling() -> None:
     assert cfg.use_sliding_window is False
 
 
-def test_checkpoint_use_swa_false_disables_the_context_window_too() -> None:
+@pytest.mark.parametrize("use_sliding_window", ["absent", None])
+def test_checkpoint_use_swa_false_disables_the_context_window_too(
+    use_sliding_window: str | None,
+) -> None:
     """A nested-only ``sliding_window`` is lifted to the top level; a checkpoint
     that also says ``use_swa: false`` must not end up with a windowed context
-    path and an unwindowed block decode."""
+    path and an unwindowed block decode, whether ``use_sliding_window`` is
+    missing or spelled ``null``."""
     config = json.loads(json.dumps(_CONFIG))
     for key in ("layer_types", "sliding_window"):
         config["text_config"].pop(key, None)
         config.pop(key, None)
     config["text_config"]["dflash_config"]["use_swa"] = False
+    if use_sliding_window is None:
+        config["text_config"]["use_sliding_window"] = None
     cfg = build_minimax_dspark_draft_config(config)
     assert cfg.use_sliding_window is False
     assert cfg.dflash_config["use_swa"] is False

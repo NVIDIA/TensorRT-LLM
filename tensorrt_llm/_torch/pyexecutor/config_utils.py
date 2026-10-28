@@ -901,6 +901,15 @@ def build_minimax_dspark_draft_config(
         for k, v in text.items() if k not in _MINIMAX_DSPARK_DROPPED_KEYS
     })
     dflash = dict(flat.get("dflash_config") or {})
+    # A null window field in config.json counts as unset, which is how DFlash
+    # and get_layer_attention_window read it; dropping the key here lets the
+    # lifts and switches below treat null and missing alike.
+    for key in ("layer_types", "sliding_window", "use_sliding_window"):
+        if key in flat and flat[key] is None:
+            del flat[key]
+    for key in ("layer_types", "sliding_window", "use_swa", "swa_window_size"):
+        if key in dflash and dflash[key] is None:
+            del dflash[key]
     layer_types = dflash.get("layer_types") or flat.get("layer_types") or []
     sliding_window = dflash.get("sliding_window") or flat.get("sliding_window")
     # DFlash and get_layer_attention_window read the per-layer types and the
