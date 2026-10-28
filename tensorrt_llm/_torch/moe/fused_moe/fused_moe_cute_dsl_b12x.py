@@ -352,7 +352,8 @@ class CuteDslB12xFusedMoEBase:
         nothing itself and holds every expert (its gate rejects
         ``ep_size > 1``), so a context asking otherwise fails here instead of
         having the request dropped. ``lora_params`` describes every adapter of
-        the forward, so only MoE LoRA on this layer is such a request.
+        the forward, so only MoE LoRA on this layer is such a request -- with
+        no layer index to read it by, any adapter is.
         ``all_rank_num_tokens`` has no reader on either route: ``run_moe`` uses
         it only for the all-to-all tuner shapes, and all-to-all is refused.
         """
@@ -363,11 +364,22 @@ class CuteDslB12xFusedMoEBase:
                 "(gemm2_output, expert_weights, expanded_idx_to_permuted_idx) "
                 "triple that do_finalize=False asks for."
             )
-        if ctx.lora_params is not None and moe_lora_active(ctx.lora_params, self.layer_idx):
-            raise NotImplementedError(
-                f"{name} does not fuse routed-expert LoRA; got MoE LoRA tensors "
-                f"for layer {self.layer_idx}."
-            )
+        if ctx.lora_params:
+            # Reading the layer's adapters out of ``lora_params`` needs a layer
+            # index. With none the leaf cannot tell MoE LoRA from an adapter it
+            # may ignore, so it refuses rather than return output a caller
+            # reads as carrying a LoRA delta.
+            if self.layer_idx is None:
+                raise NotImplementedError(
+                    f"{name} does not fuse routed-expert LoRA and has no "
+                    "layer_idx to tell whether lora_params carries any; build "
+                    "the leaf with layer_idx to narrow this to one layer."
+                )
+            if moe_lora_active(ctx.lora_params, self.layer_idx):
+                raise NotImplementedError(
+                    f"{name} does not fuse routed-expert LoRA; got MoE LoRA "
+                    f"tensors for layer {self.layer_idx}."
+                )
         if ctx.token_selected_experts is None or ctx.token_final_scales is None:
             raise ValueError(
                 f"{name} needs precomputed token_selected_experts and "

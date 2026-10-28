@@ -577,6 +577,22 @@ def test_run_moe_admits_lora_params_without_moe_lora_on_its_layer(
     assert log == [kernel]
 
 
+@pytest.mark.parametrize("leaf_cls,num_tokens,kernel", B12X_ROUTES)
+def test_run_moe_refuses_lora_params_when_it_has_no_layer_index(
+    leaf_cls, num_tokens, kernel, monkeypatch
+):
+    """``layer_idx`` is what picks this layer's adapters out of ``lora_params``,
+    and it defaults to None. A leaf without one cannot tell MoE LoRA from an
+    adapter it may ignore, so it refuses instead of dropping the delta."""
+    log = []
+    leaf = _leaf_with_recorded_kernels(leaf_cls, log, monkeypatch)
+    leaf.layer_idx = None
+
+    with pytest.raises(NotImplementedError, match="layer_idx"):
+        leaf.run_moe(_run_context(num_tokens, lora_params=_moe_lora_params(_LAYER_IDX)))
+    assert log == []
+
+
 @pytest.mark.parametrize("output_dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("leaf_cls,num_tokens,kernel", B12X_KERNEL_ROUTES)
 def test_b12x_route_refuses_an_output_dtype_it_cannot_write(
