@@ -465,6 +465,11 @@ class DecoderWarmup:
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
+        # Every background TRTLLM-Gen FMHA sweep was queued by the attention
+        # warmup above; finish and verify them before the first graph-shape
+        # forward, so no compile (or wait on one) lands inside a forward that
+        # runs MoE all-to-alls.
+        self._drain_and_verify_trtllm_gen_fmha_jit_warmup()
         with self._warmup_timer.phase("cuda_graph_capture"):
             self._graphs.warmup_and_capture(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
@@ -520,6 +525,38 @@ class DecoderWarmup:
         maybe_bolt_clear_counters()
 
         return self._freeze_eager_workspace_floor()
+
+    def _drain_and_verify_trtllm_gen_fmha_jit_warmup(self) -> None:
+        """Wait for the background TRTLLM-Gen FMHA JIT warmup and verify it.
+
+        Blocks until every background compilation sweep has finished, then
+        re-runs each finished sweep once on this thread: a cache-hit loop when
+        the background pass compiled every kernel, and the place where any
+        kernel it missed (or a sweep whose background task failed) is compiled
+        instead of on the first real request. Runs whether or not CUDA graphs
+        are enabled, so configurations without graphs still finish
+        verification before readiness. A no-op unless async warmup is enabled
+        (``TRTLLM_GEN_FMHA_ASYNC_WARMUP=1``).
+        """
+        if not issubclass(self._config.attention_backend.Metadata, TrtllmAttentionMetadata):
+            return
+        if not torch.ops.trtllm.trtllm_gen_fmha_async_jit_warmup_enabled():
+            return
+        with self._warmup_timer.phase("attention_jit_drain_and_verify"):
+            num_verified = torch.ops.trtllm.trtllm_gen_fmha_jit_warmup_drain_and_verify()
+            if num_verified:
+                logger.info(
+                    f"TRTLLM-Gen FMHA JIT warmup: verified {num_verified} "
+                    "background warmup sweep(s) before CUDA graph capture."
+                )
+            # Each rank only waited for its own compilation. The graph-shape
+            # warmup and capture forwards that follow run MoE all-to-alls, the
+            # capture pass under the serving timeouts, so a rank that enters
+            # one while a peer is still compiling could spend that timeout
+            # waiting. Meet the peers here first.
+            allgather = self._agreement.allgather()
+            if allgather is not None:
+                allgather(1)
 
     def _freeze_eager_workspace_floor(self) -> EagerWorkspaceReclaimer | None:
         if not self._eager_workspace_reclaimable:
