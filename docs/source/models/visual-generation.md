@@ -180,16 +180,6 @@ Ulysses requires VANILLA or FA4 attention. CFG, ring, and Attention2D parallelis
 are not supported. See the
 [2-GPU TP config](../../../examples/visual_gen/configs/minimax-h3-bf16-tp2.yaml).
 
-- FastH3 uses the MiniMax-H3 pipeline and transformer architecture with a
-  distilled 4-step checkpoint. Model-specific VSA is the supported inference path
-  for this checkpoint. Dense attention is a comparison-only path: it does not use
-  the trained compression gate and is not equivalent to the checkpoint's VSA inference.
-  For single-GPU text-to-video with audio, enable VSA using
-  `fasth3-bf16-trtllm-vsa-1gpu.yaml`. To use CUTEDSL instead, set
-  `attention_config.backend: CUTEDSL` in that config.
-  Both backends preserve the trained compression gate and dense text/audio routes.
-  CUTEDSL VSA requires supported Blackwell hardware and at most 4096 tiles;
-  unsupported shapes fail explicitly rather than silently running dense attention.
 - Text-to-video (T2VA), first/last-frame-to-video (FL2VA), and reference-to-video
   with audio (Ref2VA) are supported on one GPU. Enable Ref2VA with
   `pipeline_config: {workflow: ref2va}`; it requires `transformer_ref/` weights.
@@ -201,6 +191,19 @@ are not supported. See the
   model-specific restriction, not a general VisualGen backend requirement.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
+
+- FastH3 uses the MiniMax-H3 pipeline and transformer architecture with a
+  distilled 4-step checkpoint. Model-specific VSA is the supported inference path
+  for this checkpoint and is selected by default with the TRTLLM backend and the
+  checkpoint's sparsity (90% for this release). Explicit incompatible backends
+  or sparse attention algorithms are rejected. Dense attention omits the trained
+  compression gate and is not equivalent to this checkpoint's VSA inference.
+  For single-GPU text-to-video with audio, see
+  `fasth3-bf16-trtllm-vsa-1gpu.yaml`. To use CUTEDSL instead, set
+  `attention_config.backend: CUTEDSL` in that config.
+  Both backends preserve the trained compression gate and dense text/audio routes.
+  CUTEDSL VSA requires supported Blackwell hardware and at most 4096 tiles;
+  unsupported shapes fail explicitly rather than silently running dense attention.
 
 ## Optimizations
 

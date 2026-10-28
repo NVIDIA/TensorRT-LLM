@@ -44,7 +44,12 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline, PipelineComponent
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.visual_gen.args import ParallelConfig, TorchCompileConfig, VisualGenArgs
+from tensorrt_llm.visual_gen.args import (
+    AttentionConfig,
+    ParallelConfig,
+    TorchCompileConfig,
+    VisualGenArgs,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1038,7 +1043,25 @@ def test_hf_download_is_scoped_to_the_supported_h3_components(
     }
 
 
-def test_fasth3_manifest_metadata_controls_pipeline_defaults(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "attention_kwargs,expected_backend,expected_sparsity",
+    [
+        ({}, "TRTLLM", 0.9),
+        ({"backend": "TRTLLM"}, "TRTLLM", 0.9),
+        ({"backend": "CUTEDSL"}, "CUTEDSL", 0.9),
+        (
+            {
+                "backend": "CUTEDSL",
+                "sparse_attention_config": {"algorithm": "vsa", "vsa_sparsity": 0.5},
+            },
+            "CUTEDSL",
+            0.5,
+        ),
+    ],
+)
+def test_fasth3_manifest_metadata_controls_pipeline_defaults(
+    tmp_path: Path, attention_kwargs: dict, expected_backend: str, expected_sparsity: float
+) -> None:
     (tmp_path / "transformer").mkdir()
     (tmp_path / "transformer" / "config.json").write_text(
         json.dumps({"hidden_size": 32}),
@@ -1065,6 +1088,19 @@ def test_fasth3_manifest_metadata_controls_pipeline_defaults(tmp_path: Path) -> 
     )
 
     config = DiffusionPipelineConfig.from_pretrained(str(tmp_path))
+    config.attention = AttentionConfig(**attention_kwargs)
+    MiniMaxH3Pipeline._configure_fasth3_attention(config)
+    assert config.attention.backend == expected_backend
+    assert config.attention.sparse_attention_config.algorithm == "vsa"
+    assert config.attention.sparse_attention_config.vsa_sparsity == expected_sparsity
+    assert config.primary_model_config.attention == config.attention
+    if expected_backend == "TRTLLM":
+        assert config.attention_metadata_state == {"metadata_cache": {}}
+        assert config.primary_model_config.attention_metadata_state == {"metadata_cache": {}}
+        assert (
+            config.primary_model_config.attention_metadata_state
+            is not config.attention_metadata_state
+        )
 
     assert "fastvideo_inference" not in config.extra_attrs
     pipeline = _SyntheticMiniMaxH3Pipeline()
@@ -1073,6 +1109,15 @@ def test_fasth3_manifest_metadata_controls_pipeline_defaults(tmp_path: Path) -> 
         str(tmp_path), torch.device("cpu"), skip_components=list(PipelineComponent)
     )
     assert pipeline.default_generation_params["num_inference_steps"] == 5
+
+    config.attention = AttentionConfig(backend="VANILLA")
+    with pytest.raises(ValueError, match="FastH3 requires VSA"):
+        MiniMaxH3Pipeline._configure_fasth3_attention(config)
+
+    (tmp_path / "fastvideo_inference.json").unlink()
+    MiniMaxH3Pipeline._configure_fasth3_attention(config)
+    assert config.attention.backend == "VANILLA"
+    assert config.attention.sparse_attention_config is None
 
 
 def test_infer_supports_a_last_frame_without_a_first_frame(

@@ -34,7 +34,10 @@ from PIL import Image, ImageOps
 from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
 from tensorrt_llm._torch.visual_gen.checkpoints import WeightLoader
-from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+from tensorrt_llm._torch.visual_gen.config import (
+    DiffusionPipelineConfig,
+    create_attention_metadata_state,
+)
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import (
     BasePipeline,
@@ -47,6 +50,8 @@ from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import MpiTopology
+from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import VideoSparseAttentionConfig
 
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
@@ -212,6 +217,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         return torch.Generator().manual_seed(seed)
 
     def __init__(self, pipeline_config: DiffusionPipelineConfig) -> None:
+        self._configure_fasth3_attention(pipeline_config)
         self.text_encoder_tp_size = int(
             getattr(getattr(pipeline_config, "parallel", None), "text_encoder_tp_size", 1)
         )
@@ -456,6 +462,46 @@ class MiniMaxH3Pipeline(BasePipeline):
             num_inference_steps=steps,
         )
 
+    @staticmethod
+    def _load_fasth3_manifest(checkpoint_dir: str) -> dict:
+        manifest_path = Path(checkpoint_dir) / "fastvideo_inference.json"
+        if manifest_path.exists():
+            with manifest_path.open() as f:
+                manifest = json.load(f)
+            if str(manifest.get("schema_version", "")).startswith("fasth3-"):
+                return manifest
+        return {}
+
+    @classmethod
+    def _configure_fasth3_attention(cls, config: DiffusionPipelineConfig) -> None:
+        pretrained = getattr(config, "primary_pretrained_config", None)
+        checkpoint_dir = getattr(pretrained, "_name_or_path", None)
+        manifest = cls._load_fasth3_manifest(checkpoint_dir) if checkpoint_dir else {}
+        if not manifest:
+            return
+
+        attention = config.attention
+        backend = attention.backend
+        if backend == "VANILLA" and "backend" not in attention.model_fields_set:
+            backend = "TRTLLM"
+        if backend not in ("TRTLLM", "CUTEDSL"):
+            raise ValueError("FastH3 requires VSA with the TRTLLM or CUTEDSL attention backend.")
+        sparse = attention.sparse_attention_config
+        if sparse is None:
+            sparse = VideoSparseAttentionConfig(vsa_sparsity=manifest.get("vsa_sparsity", 0.9))
+        elif sparse.algorithm != "vsa":
+            raise ValueError("FastH3 requires the vsa sparse attention algorithm.")
+        config.attention = AttentionConfig.model_validate(
+            {**attention.model_dump(), "backend": backend, "sparse_attention_config": sparse}
+        )
+        # Resolve defaults before constructing the transformer and loading its trained gate.
+        if backend == "TRTLLM" and config.attention_metadata_state is None:
+            config.attention_metadata_state = create_attention_metadata_state()
+        for model_config in config.model_configs.values():
+            model_config.attention = config.attention.model_copy(deep=True)
+            if backend == "TRTLLM" and model_config.attention_metadata_state is None:
+                model_config.attention_metadata_state = create_attention_metadata_state()
+
     def _init_transformer(self) -> None:
         self.transformer = MiniMaxH3Transformer3DModel(
             self.pipeline_config.model_configs[PipelineComponent.TRANSFORMER]
@@ -506,13 +552,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         del kwargs
         skip_components = skip_components or []
 
-        self._fastvideo_inference = {}
-        fastvideo_inference_path = Path(checkpoint_dir) / "fastvideo_inference.json"
-        if fastvideo_inference_path.exists():
-            with fastvideo_inference_path.open() as f:
-                fastvideo_inference = json.load(f)
-            if str(fastvideo_inference.get("schema_version", "")).startswith("fasth3-"):
-                self._fastvideo_inference = fastvideo_inference
+        self._fastvideo_inference = self._load_fasth3_manifest(checkpoint_dir)
 
         if not _component_skipped(skip_components, PipelineComponent.TOKENIZER):
             self.tokenizer = Qwen2TokenizerFast.from_pretrained(
