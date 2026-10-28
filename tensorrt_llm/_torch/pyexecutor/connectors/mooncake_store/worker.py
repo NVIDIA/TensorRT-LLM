@@ -65,7 +65,13 @@ from tensorrt_llm.logger import logger
 from ..kv_cache_connector import KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
-from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, local_address, pool_config
+from .config import (
+    CONFIG_PATH_ENV,
+    MooncakeStoreConnectorConfig,
+    local_address,
+    local_reuse_backoff,
+    pool_config,
+)
 from .gpudirect import PEERMEM_ENV, allocation_range, format_diagnosis, select_registration_path
 from .keys import KeyNamespace
 from .ledger import record_segment
@@ -213,6 +219,17 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         validate_llm_args(llm_args)
         self._config = MooncakeStoreConnectorConfig.resolve(llm_args)
+        loads = self._config.role.loads
+        #: Read by `KVCacheManagerV2`, which is built after the connector. An
+        #: offer starts at the local match and covers whole blocks, so a role
+        #: that reads the pool needs that match to end on a block boundary.
+        #: Producer and capacity roles never offer and keep the manager's own
+        #: reuse unchanged. Every rank resolves the same role and arguments, so
+        #: the ranks of a server agree.
+        self.requires_block_aligned_reuse = loads
+        #: See `MooncakeStoreConfig.local_reuse_backoff`: "off" takes local
+        #: matches whole instead of aligning a backed-off one down.
+        self.drops_reuse_match_backoff = loads and local_reuse_backoff(llm_args) == "off"
         # Where this rank records the segment it mounts. `None` when the
         # deployment named no directory, which only makes the run
         # unreportable; see `ledger.record_segment`.
