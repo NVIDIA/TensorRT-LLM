@@ -283,7 +283,7 @@ def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
 
 
-def validate_database(path: str | os.PathLike[str]) -> None:
+def validate_database(path: str | os.PathLike[str], *, allow_legacy_schema4: bool = False) -> None:
     """Raise ``ValueError`` unless ``path`` is a compact CBTS database."""
     database_path = Path(path).resolve()
     try:
@@ -297,7 +297,10 @@ def validate_database(path: str | os.PathLike[str]) -> None:
             if missing:
                 raise ValueError(f"{database_path}: {table} is missing columns: {sorted(missing)}")
         metadata = dict(connection.execute("SELECT key, value FROM meta"))
-        if metadata.get("schema_version") != SCHEMA_VERSION:
+        schema_version = metadata.get("schema_version")
+        if schema_version != SCHEMA_VERSION and not (
+            allow_legacy_schema4 and schema_version == "4"
+        ):
             raise ValueError(
                 f"{database_path}: expected schema {SCHEMA_VERSION}, "
                 f"found {metadata.get('schema_version')}"
@@ -528,11 +531,12 @@ def merge_databases(
     output_path: str | os.PathLike[str],
     *,
     query_indexes: bool = True,
+    allow_legacy_schema4: bool = False,
 ) -> sqlite3.Connection:
     """Union compact inputs into a compact output and return its open connection."""
     input_paths = [Path(path).resolve() for path in inputs]
     for input_path in input_paths:
-        validate_database(input_path)
+        validate_database(input_path, allow_legacy_schema4=allow_legacy_schema4)
 
     output = Path(output_path).resolve()
     if output in input_paths:

@@ -673,7 +673,7 @@ def prepare(
                 return None
             source_dbs.append(source_db)
         try:
-            connection = merge_databases(source_dbs, db)
+            connection = merge_databases(source_dbs, db, allow_legacy_schema4=True)
         except (OSError, sqlite3.Error, ValueError) as e:
             print(f"[artifact] merge failed: {e}", file=sys.stderr)
             return None
