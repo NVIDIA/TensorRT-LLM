@@ -19,8 +19,9 @@ engine publishes its KV cache into a real Mooncake pool, a second engine
 replays it, and the generated tokens have to agree. That covers the seams no
 narrower test reaches, namely the KV cache layout a `KVCacheManagerV2` actually
 reports, per-rank namespacing under tensor parallelism, the key space attention
-DP owners share, and the scheduler interaction when a request is preempted while
-the connector is still reading its pages.
+DP owners share, the draft layers a one-model drafter keeps in the target pool on
+a disaggregated context server, and the scheduler interaction when a request is
+preempted while the connector is still reading its pages.
 
 One master and pool serve the whole module and nothing else on the machine.
 Each test gets a key namespace of its own; see `mooncake_pool`.
@@ -37,7 +38,7 @@ from types import SimpleNamespace
 import pytest
 from test_common.mooncake_utils import running_master_on_free_ports
 
-from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     MooncakeStoreConnectorConfig,
     parse_size,
@@ -53,8 +54,14 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
     MooncakeStoreConnectorScheduler,
 )
-from tensorrt_llm.llmapi import SchedulingParams
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvCacheConnectorConfig, MooncakeStoreConfig
+from tensorrt_llm.llmapi import RequestError, SchedulingParams
+from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig,
+    Eagle3DecodingConfig,
+    KvCacheConfig,
+    KvCacheConnectorConfig,
+    MooncakeStoreConfig,
+)
 
 from ..conftest import llm_models_root
 from .test_llm_api_connector import E2E_MIN_TOKEN_AGREEMENT
@@ -599,3 +606,139 @@ def test_mooncake_e2e_chunked_prefill_survives_a_small_cache(mooncake_pool):
         f"prompt tokens, past the {budget}-token budget. Requests are being "
         "preempted and recomputed repeatedly rather than making progress."
     )
+
+
+#: Target and one-model draft checkpoints under `LLM_MODELS_ROOT`, per drafter:
+#: the pair the single-GPU disaggregated EAGLE3 test serves.
+SPECULATIVE_PREFILL_MODELS = {
+    "eagle3": ("Qwen3/Qwen3-8B", "Qwen3/qwen3_8b_eagle3"),
+}
+
+
+# Two 8B engines, a context and a generation server, share the device.
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("drafter", ["eagle3"])
+def test_mooncake_e2e_speculative_prefill_reuse(
+    single_process_worker, mooncake_pool, matched_token_counts, drafter
+):
+    """A disaggregated context server with a one-model draft replays a prefix it stored.
+
+    One-model EAGLE3 keeps its draft layers in the target KV cache, so a page
+    the pool serves carries draft KV as well, keyed by the prompt token the
+    draft reads past each block. The draft token a context pass hands to the
+    generation server is computed from that draft KV: were the draft layers
+    missing from the layout registered with the connector, or keyed without
+    their lookahead, the warm engine's drafts would degenerate rather than tie.
+    So the first token and the first draft token of every prompt must agree
+    between a cold and a warm context engine, and so must the generation the
+    generation server continues from each.
+
+    Chunked prefill below the prompt length exercises the KV slots one-model
+    speculation allocates past every chunk, which must not be published before
+    a pass computes them. A request that is not context-only is refused at
+    admission, and the engine keeps serving afterwards.
+
+    Both engines run in this process, so the generation server pulls each
+    context request's KV and the context engine shuts down with nothing in
+    flight. The pool keys these pages under the module's model key, inside a
+    namespace of this test's own.
+    """
+    target, draft = SPECULATIVE_PREFILL_MODELS[drafter]
+
+    def engine(*, context: bool) -> dict:
+        """One engine's settings; each gets a speculative config of its own to resolve."""
+        settings = dict(
+            model=f"{llm_models_root()}/{target}",
+            speculative_config=Eagle3DecodingConfig(
+                max_draft_len=3, speculative_model=f"{llm_models_root()}/{draft}"
+            ),
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime="PYTHON"
+            ),
+            max_batch_size=4,
+            # Bounds the warmup allocation, which would otherwise size itself
+            # against the checkpoint's position limit.
+            max_seq_len=1024,
+        )
+        if context:
+            # Two blocks per chunk, shorter than every prompt.
+            settings.update(enable_chunked_prefill=True, max_num_tokens=64)
+            return llm_kwargs(mooncake_pool, **settings)
+        return llm_kwargs(mooncake_pool, kv_connector_config=None, **settings)
+
+    # Distinct from their first token, so no prompt reuses another's blocks.
+    prompts = [f"{index}. {PROMPT}" for index in range(3)]
+    sampling_params = SamplingParams(max_tokens=16, ignore_eos=True)
+
+    def serve(context, generation):
+        """Prefill on `context`, continue on `generation`, and return what each produced."""
+        context_outputs = context.generate(
+            prompts,
+            sampling_params,
+            disaggregated_params=[
+                DisaggregatedParams(request_type="context_only") for _ in prompts
+            ],
+        )
+        handoffs = []
+        for output in context_outputs:
+            params = output.disaggregated_params
+            assert params is not None and params.request_type == "context_only"
+            assert params.first_gen_tokens, "The context pass handed over no first token."
+            assert params.draft_tokens, (
+                "The context pass handed over no draft tokens, so the draft layers "
+                "never ran and this test cannot see the draft KV it is about."
+            )
+            handoffs.append((list(params.first_gen_tokens), list(params.draft_tokens)))
+            params.request_type = "generation_only"
+        generation_outputs = generation.generate(
+            prompts,
+            sampling_params,
+            disaggregated_params=[output.disaggregated_params for output in context_outputs],
+        )
+        return handoffs, [list(output.outputs[0].token_ids) for output in generation_outputs]
+
+    generation = LLM(**engine(context=False))
+    try:
+        cold = LLM(**engine(context=True))
+        try:
+            cold_handoffs, cold_generations = serve(cold, generation)
+        finally:
+            cold.shutdown()
+
+        assert matched_token_counts and not any(matched_token_counts), (
+            f"The cold context engine already found tokens in the pool (matched "
+            f"counts {matched_token_counts}), so the comparison below is meaningless."
+        )
+        matched_token_counts.clear()
+
+        warm = LLM(**engine(context=True))
+        try:
+            with pytest.raises(RequestError, match="context-only"):
+                warm.generate([PROMPT], SamplingParams(max_tokens=4))
+            warm_handoffs, warm_generations = serve(warm, generation)
+        finally:
+            warm.shutdown()
+    finally:
+        generation.shutdown()
+
+    assert matched_token_counts and max(matched_token_counts) > 0, (
+        f"The warm context engine read nothing back from the pool (matched counts "
+        f"{matched_token_counts}), so it recomputed every prefix and this test "
+        "would pass with the connector disabled."
+    )
+    for index, (cold_handoff, warm_handoff) in enumerate(zip(cold_handoffs, warm_handoffs)):
+        (cold_first, cold_drafts), (warm_first, warm_drafts) = cold_handoff, warm_handoff
+        assert warm_first == cold_first, (
+            f"Prompt {index}: the first token changed from {cold_first} to {warm_first} "
+            "once the prefix came from the pool."
+        )
+        assert warm_drafts[0] == cold_drafts[0], (
+            f"Prompt {index}: the first draft token changed from {cold_drafts} to "
+            f"{warm_drafts} once the prefix came from the pool, so the draft read "
+            "draft KV that was missing or belonged to other tokens."
+        )
+    for index, (cold_tokens, warm_tokens) in enumerate(zip(cold_generations, warm_generations)):
+        assert_tokens_agree(
+            cold_tokens, warm_tokens, context=f"Prompt {index} continued after a warm prefill"
+        )

@@ -207,6 +207,7 @@ l0_h100:
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[True-True-Qwen3-8B-FP8]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_llama_context_capacity[False-False-DeepSeek-V3-Lite-fp8/fp8]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_spec_dec_batch_slot_limit[False-Qwen3-8B-eagle3-Qwen3-8B]
+  - llmapi/test_llm_api_connector_mooncake.py::test_mooncake_e2e_speculative_prefill_reuse[eagle3]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_cancel_gen_requests[Qwen3-0.6B]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[False-Qwen3-0.6B]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[True-Qwen3-0.6B]

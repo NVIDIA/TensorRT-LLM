@@ -263,6 +263,9 @@ At runtime:
 * The mode composes with [attention data parallelism](#attention-data-parallelism) when both
   classes also declare `supports_attention_dp`.
 
+The [`mooncake-store`](#mooncake-store) connector declares the mode; see
+[its notes](#attention-data-parallelism-and-speculative-prefill).
+
 ##### `RequestData` fields that may not be populated
 
 Two `RequestData` fields can be reported empty depending on the cache configuration. A connector must tolerate both.
@@ -661,8 +664,9 @@ or disk tiers and Mamba/hybrid state remain unsupported. Speculative decoding
 is supported only in the
 [speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server),
 for which both classes declare `supports_speculative_prefill` as well.
-The [`mooncake-store`](#mooncake-store) connector declares `supports_attention_dp`; see
-[its notes on attention data parallelism](#attention-data-parallelism-and-speculative-prefill).
+The [`mooncake-store`](#mooncake-store) connector declares `supports_attention_dp` and
+`supports_speculative_prefill`; see
+[its notes on attention data parallelism and speculative prefill](#attention-data-parallelism-and-speculative-prefill).
 
 Select a connector through `connector_module`, `connector_scheduler_class`,
 and `connector_worker_class` as usual. Both classes must opt in; enabling ADP
@@ -844,9 +848,25 @@ adapter and a worker on every owner, each deciding and moving pages for its own 
   as on a single-rank server; see [Restrictions](#restrictions).
 * A `role: capacity` server may run with attention DP; it transfers nothing either way.
 
-`mooncake-store` does not declare `supports_speculative_prefill`, so the
-[speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server) is refused
-for it at startup.
+Both classes also declare `supports_speculative_prefill`, so a disaggregated context server can run
+one-model MTP or EAGLE3 next to this connector in the
+[speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server), with or
+without attention DP.
+
+* A block's key also covers the prompt tokens the draft reads past the block: one for MTP-Eagle and
+  EAGLE3, `max_draft_len` for vanilla MTP. Pages a speculative server writes are therefore never
+  shared with a server without a draft or with a different lookahead, and the keys of a server
+  without a draft are unchanged. A block whose lookahead runs past the prompt is neither offered
+  nor saved.
+* Only the blocks a pass has computed are saved, although one-model speculation allocates pages
+  past every context chunk.
+* Loads and saves move whole pages of every layer group, which includes the draft layers sharing
+  the target KV cache. Any other drafter, and draft layers in a separate KV cache, are refused at
+  startup, since their KV would be missing or stale after a restored prefix. A `role: capacity`
+  server is exempt, since it addresses no page.
+* A disaggregated generation server should run `role: capacity`, which may itself run one-model MTP
+  or EAGLE3, with or without attention DP. A generation server whose role transfers KV refuses
+  every generation-only request in this mode.
 
 `mooncake_store.local_reuse_backoff` sets how a server that reads the pool (`role: both` or
 `consumer`) treats its local prefix match under one-model speculative decoding. The draft backs
@@ -863,20 +883,22 @@ block boundary the pool serves from.
 
 It is an engine setting read from the `mooncake_store` block on every rank rather than part of the
 rendered client config, so a deployment that inherits `MOONCAKE_CONFIG_PATH` without the block gets
-`off`. A `producer` or `capacity` server keeps the cache manager's own reuse either way. The setting
-has no effect while this connector refuses speculative decoding.
+`off`. A `producer` or `capacity` server keeps the cache manager's own reuse either way, and a
+server without a one-model draft has no backoff for the setting to act on.
 
 ### Restrictions
 
 Checked at startup, before any request is admitted, because each one's failure mode is KV replayed
 without all of the state it was computed with — a wrong answer rather than a slow one.
 
-Beyond beam search, speculative decoding and Mamba/hybrid models, which are rejected for
-[every connector](#a-page-slot-must-not-be-reassigned-underneath-the-connector),
+Beyond beam search, Mamba/hybrid models and speculative decoding outside the
+[speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server), which are
+rejected for [every connector](#a-page-slot-must-not-be-reassigned-underneath-the-connector),
 this one also rejects KV cache manager V1, context parallelism, pipeline parallelism,
-sliding-window attention, and `sparse_attention_config` with an index-V cache unless
-`sparse_disable_index_value=True`; it bypasses individual requests that carry a LoRA adapter or
-multimodal content without hashes, leaving the rest of the deployment served.
+sliding-window attention, `sparse_attention_config` with an index-V cache unless
+`sparse_disable_index_value=True`, and, in a role that transfers KV, any drafter other than
+one-model MTP or EAGLE3 sharing the target KV cache; it bypasses individual requests that carry a
+LoRA adapter or multimodal content without hashes, leaving the rest of the deployment served.
 
 A page offered at lookup can still be gone at load time, evicted from a full pool or left behind by
 a put that never completed. The worker declares

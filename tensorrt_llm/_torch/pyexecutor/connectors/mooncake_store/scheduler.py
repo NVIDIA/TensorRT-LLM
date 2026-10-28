@@ -28,6 +28,10 @@ look prefixes up. That needs two pieces of per-request bookkeeping:
 Prompt hashes and pages both exist before the KV they name is computed, so a
 block is published only by the pass that computes its last token, and it
 counts as stored only once the worker's `wait_for_save` queued that pass.
+
+Next to a one-model draft on a disaggregated context server, a block's hash
+also covers the prompt tokens the draft reads past the block, so a block whose
+lookahead runs past the prompt is neither offered nor saved.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -135,6 +139,10 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     #: Request state is owner-local and lookups go to the worker in this
     #: process, whose attention-DP keys every owner shares.
     supports_attention_dp = True
+    #: Block keys cover a one-model draft's prompt lookahead, offers stop at the
+    #: last block whose lookahead the prompt holds, and saves publish only the
+    #: blocks a pass computed.
+    supports_speculative_prefill = True
 
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
@@ -142,6 +150,25 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         validate_llm_args(llm_args)
         self._config = MooncakeStoreConnectorConfig.resolve(llm_args)
         self._tokens_per_block = int(llm_args.kv_cache_config.tokens_per_block)
+        # Imported here, as `KVCacheManagerV2` does: the speculative package
+        # pulls in every drafter, and processes that import this package without
+        # serving, such as `trtllm-serve mooncake_master`, need none of them.
+        from tensorrt_llm._torch.speculative import draft_prompt_lookahead
+
+        spec_config = getattr(llm_args, "speculative_config", None)
+        if spec_config is not None and spec_config.max_draft_len is None:
+            # Vanilla MTP's lookahead is its draft length, so an unresolved one
+            # would key draft KV as if the draft read nothing past a block.
+            raise RuntimeError(
+                "mooncake-store must be built after the speculative config is "
+                "resolved from the checkpoint: max_draft_len is still unset, so "
+                "the prompt lookahead its block keys cover is unknown."
+            )
+        # Prompt tokens past a block that the draft's KV in the block depends
+        # on: 0 without a draft. The worker refuses every drafter except
+        # one-model MTP and EAGLE3 unless this server transfers nothing, so the
+        # `None` of an unestablished span never keys a page.
+        self._prompt_lookahead = draft_prompt_lookahead(spec_config) or 0
         self._requests: Dict[int, _RequestState] = {}
         self._worker: Optional[MooncakeStoreConnectorWorker] = None
         # Saves bound in the last metadata, by request: the block ordinal they
@@ -150,7 +177,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
 
         logger.warning(
             f"mooncake-store scheduler adapter ready (role={self._config.role.value}, "
-            f"tokens_per_block={self._tokens_per_block})"
+            f"tokens_per_block={self._tokens_per_block}, "
+            f"prompt_lookahead={self._prompt_lookahead})"
         )
 
     def wait_for_initialization(self):
@@ -163,6 +191,11 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         self, request: LlmRequest, num_computed_tokens: int
     ) -> Tuple[int, bool]:
         """Offer the longest stored prefix beyond what the device already has.
+
+        Only whole blocks are offered, starting at the local match and stopping
+        short of the prompt's last token. Under a one-model draft a block whose
+        prompt lookahead runs past the prompt has no hash, so it is neither
+        offered nor, later, saved.
 
         Args:
             request: The request being scheduled.
@@ -375,7 +408,11 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     ) -> _RequestState:
         state = self._requests.get(request.request_id)
         if state is None:
-            state = _RequestState(BlockHashChain(self._tokens_per_block, scope=scope))
+            state = _RequestState(
+                BlockHashChain(
+                    self._tokens_per_block, scope=scope, prompt_lookahead=self._prompt_lookahead
+                )
+            )
             self._requests[request.request_id] = state
         # The lookup runs before the request is scheduled, so the chain has to
         # be ready before any scheduler output exists.

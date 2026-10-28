@@ -18,8 +18,12 @@ A disaggregated context server with a one-model drafter (MTP or EAGLE3) serves
 context-only requests, which never reject a draft token, so a connector whose
 two halves declare `supports_speculative_prefill` stays valid there. Every other
 combination keeps the speculative-decoding refusal, and an explicit
-KVCacheManagerV1 selection keeps V1's unchanged behaviour.
+KVCacheManagerV1 selection keeps V1's unchanged behaviour. `mooncake-store` is
+the connector shipped with such declarations.
 """
+
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -28,6 +32,17 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     KvCacheConnectorScheduler,
     KvCacheConnectorWorker,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
+    MooncakeStoreConnectorConfig,
+    StoreRole,
+)
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
+    MooncakeStoreConnectorScheduler,
+)
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
+    MooncakeStoreConnectorWorker,
+)
+from tensorrt_llm._torch.pyexecutor.py_executor import _validate_connector_admission
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     _connector_runs_speculative_prefill_only,
 )
@@ -72,18 +87,76 @@ def _eagle3() -> Eagle3DecodingConfig:
     return config
 
 
+MOONCAKE = (MooncakeStoreConnectorWorker, MooncakeStoreConnectorScheduler)
+
+
 @pytest.mark.parametrize("use_v2", [True, "auto"], ids=["v2", "auto"])
+@pytest.mark.parametrize(
+    "connector_classes",
+    [(_Declaring, _Declaring), MOONCAKE],
+    ids=["declaring", "mooncake_store"],
+)
 @pytest.mark.parametrize(
     "make_spec_config",
     [_mtp_eagle, _mtp_vanilla, _eagle3],
     ids=["mtp_eagle", "mtp_vanilla", "eagle3"],
 )
 def test_one_model_drafter_runs_prefill_only_on_a_declaring_disagg_connector(
-    make_spec_config, use_v2
+    make_spec_config, connector_classes, use_v2
 ) -> None:
+    worker_cls, scheduler_cls = connector_classes
     assert _connector_runs_speculative_prefill_only(
-        make_spec_config(), _Declaring, _Declaring, DISAGG, use_v2
+        make_spec_config(), worker_cls, scheduler_cls, DISAGG, use_v2
     )
+
+
+@pytest.mark.parametrize(
+    "spec_config, transceiver",
+    [
+        (_eagle3(), None),
+        (_mtp_eagle(), None),
+        (_eagle3(), CacheTransceiverConfig()),
+        (NGramDecodingConfig(max_draft_len=3, max_matching_ngram_size=2), DISAGG),
+    ],
+    ids=["eagle3_aggregated", "mtp_aggregated", "transceiver_without_backend", "ngram"],
+)
+def test_mooncake_store_keeps_the_refusal_off_a_disaggregated_context_server(
+    spec_config, transceiver
+) -> None:
+    assert not _connector_runs_speculative_prefill_only(spec_config, *MOONCAKE, transceiver, True)
+
+
+def test_a_capacity_role_mooncake_server_runs_mtp_with_attention_dp() -> None:
+    """A disaggregated generation server lends memory and serves generation work.
+
+    Its classes declare the mode, so one-model MTP on a disaggregated server
+    selects it, and attention DP is accepted too. A role that transfers no KV is
+    exempt from the context-only refusal, so generation requests are admitted.
+    """
+    assert _connector_runs_speculative_prefill_only(_mtp_eagle(), *MOONCAKE, DISAGG, True)
+    KvCacheConnectorManager.validate_attention_dp(*MOONCAKE, pp_size=1, cp_size=1)
+
+    # The halves as an attention-DP owner holds them, without opening a pool.
+    worker = object.__new__(MooncakeStoreConnectorWorker)
+    worker._config = MooncakeStoreConnectorConfig(
+        master_server_address="127.0.0.1:50051", role=StoreRole.CAPACITY
+    )
+    scheduler = object.__new__(MooncakeStoreConnectorScheduler)
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_rank", return_value=1
+    ):
+        manager = KvCacheConnectorManager(
+            worker, scheduler, enable_attention_dp=True, speculative_prefill_only=True
+        )
+    assert manager.capacity_only is True
+    assert manager.speculative_prefill_only is True
+    generation_request = SimpleNamespace(
+        is_context_only_request=False,
+        is_generation_only_request=True,
+        is_dummy_request=False,
+        is_attention_dp_dummy=False,
+    )
+    _validate_connector_admission(manager, generation_request)
 
 
 @pytest.mark.parametrize(
