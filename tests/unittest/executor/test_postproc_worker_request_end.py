@@ -183,11 +183,11 @@ def test_a_hook_exception_releases_the_request_in_the_hook():
 
 
 @pytest.mark.parametrize(
-    "response",
-    [ErrorResponse(7, "boom", 7), _BrokenResponse(7)],
+    "response, expected_msg",
+    [(ErrorResponse(7, "boom", 7), None), (_BrokenResponse(7), "unreadable result")],
     ids=["executor_error", "postprocessing_error"],
 )
-def test_a_raising_on_request_end_lookup_still_forwards_the_error(response):
+def test_a_raising_on_request_end_lookup_still_forwards_the_error(response, expected_msg):
     hook = _HookWithRaisingEndLookup()
     worker = _worker(hook, [[PostprocWorker.Input(rsp=response)]])
     worker._records[7] = _Record(7, hook)
@@ -197,6 +197,10 @@ def test_a_raising_on_request_end_lookup_still_forwards_the_error(response):
     assert worker._records == {}
     assert isinstance(batches[0][0], ErrorResponse)
     assert batches[0][0].client_id == 7
+    if expected_msg is None:
+        assert batches[0][0] is response, "the executor's own error must be forwarded"
+    else:
+        assert expected_msg in batches[0][0].error_msg
 
 
 def test_an_error_for_a_request_the_worker_never_saw_is_harmless():
