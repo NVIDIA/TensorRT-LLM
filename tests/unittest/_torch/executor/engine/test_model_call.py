@@ -33,8 +33,12 @@ def test_model_caller_uses_current_forward_and_restores_outer_attribute_context(
     with model_extra_attrs(outer_attrs):
         with model_extra_attrs(attrs):
             assert caller(attn_metadata=metadata, spec_metadata=spec_metadata) == "first"
+            model.forward.assert_called_once_with(
+                attn_metadata=metadata, spec_metadata=spec_metadata
+            )
             model.forward = Mock(return_value="replacement")
             assert caller(attn_metadata=metadata) == "replacement"
+            model.forward.assert_called_once_with(attn_metadata=metadata)
             assert attrs["spec_metadata"] is None
             model.forward.side_effect = RuntimeError("model failure")
             with pytest.raises(RuntimeError, match="model failure"):

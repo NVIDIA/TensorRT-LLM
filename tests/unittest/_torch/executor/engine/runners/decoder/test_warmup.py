@@ -1361,8 +1361,10 @@ def test_mamba_midforward_runtime_error_recovers_when_alone() -> None:
 
     # Every shape is attempted, and each failed forward has to leave the MoE
     # all-to-all state clean for the shape that follows it.
-    assert engine._forward_warmup.call_count >= 1
-    assert engine._reset_moe_alltoall_state.call_count == engine._forward_warmup.call_count
+    attempted = engine._dummy_requests.create_warmup_request.call_count
+    assert attempted == 2
+    assert engine._forward_warmup.call_count == attempted
+    assert engine._reset_moe_alltoall_state.call_count == attempted
 
 
 @pytest.mark.cpu_only

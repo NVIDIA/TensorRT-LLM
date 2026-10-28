@@ -1072,6 +1072,9 @@ class TestWarmupCleanup(unittest.TestCase):
             model_engine.warmup(resource_manager)
 
         model_engine._runner.warmup.assert_called_once_with(resource_manager)
+        resource_manager.get_resource_manager.assert_called_once_with(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
 
     @pytest.mark.cpu_only
     def test_warmup_total_timing_and_kv_cache_cleanup(self) -> None:
@@ -1090,6 +1093,9 @@ class TestWarmupCleanup(unittest.TestCase):
         ):
             model_engine.warmup(resource_manager)
         warmup_impl.assert_called_once_with(resource_manager)
+        resource_manager.get_resource_manager.assert_called_once_with(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         kv_cache_manager.check_invalid_values_in_kv_cache.assert_called_once_with(
             fill_with_zero=True
         )

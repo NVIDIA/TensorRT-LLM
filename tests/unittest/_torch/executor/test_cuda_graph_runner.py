@@ -209,6 +209,9 @@ class GraphKeyTestCase(unittest.TestCase):
             )
 
         self.assertEqual(result, (None, None, None))
+        runner.get_graph_key.assert_called_once_with(
+            batch, None, None, None, frozenset(), torch.float8_e4m3fn, False, None
+        )
 
     def test_graph_key_includes_lora_variant(self) -> None:
         runner = Mock()
