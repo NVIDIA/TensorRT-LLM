@@ -144,9 +144,10 @@ class AuxBufferBase(ABC):
         ...
 
     @abstractmethod
-    def fill_slot(self, slot: int, request: LlmRequest) -> None:
+    def fill_slot(self, slot: int, request: LlmRequest, with_tokens: bool = True) -> None:
         """
-        Fill/overwrite the contents of the given slot with data from the request.
+        Fill/overwrite the contents of the given slot with data from the request; without
+        ``with_tokens``, leave out its first generated and draft tokens.
         """
         ...
 
@@ -268,15 +269,14 @@ class AuxBuffer(AuxBufferBase):
     def meta(self) -> AuxBufferMeta:
         return self._meta
 
-    def fill_slot(self, slot: int, request: LlmRequest) -> None:
+    def fill_slot(self, slot: int, request: LlmRequest, with_tokens: bool = True) -> None:
         if slot not in self._occupied_slots:
             raise ValueError(
                 f"Cannot fill slot {slot}: slot is not currently allocated. "
                 "Call `alloc_slot` first."
             )
-        remote_tail = getattr(request, "py_csa2_remote_tail_mode", None) == "source"
-        first_gen_tokens = [] if remote_tail else request.get_last_tokens()
-        draft_tokens = [] if remote_tail else request.py_draft_tokens
+        first_gen_tokens = request.get_last_tokens() if with_tokens else []
+        draft_tokens = request.py_draft_tokens if with_tokens else []
 
         if len(first_gen_tokens) > self._beam_width:
             raise ValueError(

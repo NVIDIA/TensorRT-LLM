@@ -56,14 +56,12 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
 )
-from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_slot_bytes
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor import hang_detector
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, nvtx_range
@@ -503,13 +501,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.shutdown()
 
-    def _get_mamba_slot_for_request(self, req: LlmRequest) -> Optional[int]:
-        """Get the mamba state slot index for a request, or None."""
-        if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
-            if self._kv_cache_manager.local_num_mamba_layers > 0:
-                return self._kv_cache_manager._request_id_to_state_index[req.py_request_id]
-        return None
-
     def _create_chunk(self, req: LlmRequest) -> Chunk:
         """Just the blocks, for the callers that have no use for the rest of the extent."""
         return self._describe_local(req)
@@ -533,21 +524,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         transferred; both sides use prompt_len, so the ranges stay consistent). On the receiver
         the already-cached prefix is masked so the sender skips it. A STATE group carries one
         slot, or nothing when this rank has none.
+
+        How much of the prompt moves, which buffers the receiver rebuilds instead and which slot
+        holds the recurrent state are the cache manager's to say (its ``disagg_*`` methods).
         """
         adapter = self._reuse_adapter
+        manager = self._kv_cache_manager
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
-        remote_tail_start = getattr(req, "py_csa2_remote_tail_start", None)
-        transfer_len = remote_tail_start if remote_tail_start is not None else req.prompt_len
+        transfer_len = manager.disagg_transfer_length(req)
         prompt_blocks = (transfer_len + tpb - 1) // tpb
-        remote_tail_split = getattr(req, "py_csa2_remote_tail_split", None)
-        excluded_pool_views = set()
-        if remote_tail_split is not None:
-            exclude = getattr(self._kv_cache_manager, "remote_tail_excluded_pool_views", None)
-            if exclude is None:
-                raise ValueError("remote-tail replay requires a CSA2 cache manager")
-            excluded_pool_views = exclude(self._page_table, remote_tail_split)
 
         is_gen_only = req.is_generation_only_request
         cached_per_lg = (
@@ -561,7 +548,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         kinds = [lg.kind for lg in layer_groups]
         for idx, lg in enumerate(layer_groups):
             if lg.kind == CacheKind.STATE:
-                slot = self._get_mamba_slot_for_request(req)
+                slot = manager.disagg_state_slot(req)
                 group = np.array([slot], dtype=np.int64) if slot is not None else empty
             else:
                 # Block lists carry beam 0 only (beam-search attention reads
@@ -576,7 +563,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             kind_per_layer_group=kinds,
             token_range=TokenRange(start=0, end=transfer_len),
             is_last=True,
-            excluded_pool_views=excluded_pool_views,
+            excluded_buffers=manager.disagg_untransferred_buffers(req),
         )
 
     @staticmethod
@@ -596,21 +583,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return window
 
     def _chunk_num_bytes(self, chunk: Chunk) -> int:
-        """Local-rank KV bytes covered by a chunk: per view, the valid block count times the view's
-        transferable slot region. Populates kv_cache_size (and the perf-metric timestamps that gate
-        on it) and is the exact expected-write total the verified-reuse admission checks attested
-        sender bytes against, so it must count what the mappers move, never physical slot bytes: a
-        coalesced pool carries one view per role class (summing slot_bytes per view would double
-        count the slot) and ignored-role buffers occupy slot offsets no view transfers.
+        """Local-rank KV bytes covered by a chunk: per layer group, the valid block count times the
+        bytes of the group's buffers this transfer moves into one page. Populates kv_cache_size (and
+        the perf-metric timestamps that gate on it) and is the exact expected-write total the
+        verified-reuse admission checks attested sender bytes against, so it counts what the
+        mappers move, never physical slot bytes: buffers that never move or that this transfer
+        leaves to the receiver (``chunk.excluded_buffers``) occupy slot bytes no sender writes.
 
         Counterpart accounting: the bounce reserve sizing (bounce/impl.py block_bytes_per_group)
         computes per-block bytes for the same layer groups but reads pool 0 only, while this sums
-        every pool view of a group. The pool-0-only sizing gap for multi-pool attention groups is
+        every pool of a group. The pool-0-only sizing gap for multi-pool attention groups is
         tracked under TRTLLM-15194; keep the two accountings in mind together when changing either.
         """
         pt = self._page_table
         if pt is None:
             return 0
+        layout = pt.layout
         total = 0
         for lg_id, block_ids in enumerate(chunk.block_ids_per_layer_groups):
             if block_ids is None or block_ids.size == 0:
@@ -618,19 +606,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             n = int((block_ids >= 0).sum())
             if n == 0:
                 continue
-            lg = pt.layer_groups[lg_id]
-            for pool_idx, pv in enumerate(lg.pool_views):
-                if (lg_id, pool_idx) in chunk.excluded_pool_views:
-                    continue
-                # The view's byte regions within one slot (all of its layers).
-                view_bytes = get_pool_view_slot_bytes(pv)
-                if lg.kind == CacheKind.STATE:
-                    # STATE: one slot per request; the transfer covers each
-                    # view region once regardless of the block count.
-                    total += view_bytes
-                else:
-                    # Attention: n blocks, each covering the view's regions.
-                    total += n * view_bytes
+            desc = layout.layer_groups[lg_id]
+            page_bytes = sum(
+                b.size
+                for b in layout.buffers
+                if b.transferred
+                and b.pool_group == desc.pool_group
+                and b.layer in desc.layers
+                and (b.layer, b.role) not in chunk.excluded_buffers
+            )
+            # STATE: one slot per request, moved once whatever the block count; attention: n
+            # blocks.
+            total += (
+                page_bytes if pt.layer_groups[lg_id].kind == CacheKind.STATE else n * page_bytes
+            )
         return total
 
     @staticmethod
@@ -977,7 +966,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         rid = get_unique_rid(req)
         assert rid is not None
         if self._need_aux_transfer(req):
-            session.pack_aux(req)
+            session.pack_aux(req, with_tokens=self._kv_cache_manager.disagg_sends_first_tokens(req))
             session.send_aux()
         req.context_phase_params = ContextPhaseParams(
             first_gen_tokens=[],
@@ -1054,7 +1043,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 kind_per_layer_group=whole.kind_per_layer_group,
                 token_range=TokenRange(start=chunk_start * tpb, end=chunk_end_token),
                 is_last=is_last_chunk,
-                excluded_pool_views=whole.excluded_pool_views,
+                excluded_buffers=whole.excluded_buffers,
             ),
         )
 
@@ -1478,9 +1467,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         fill-phase).
 
         """
-        prompt_len = getattr(req, "py_csa2_remote_tail_start", None)
-        if prompt_len is None:
-            prompt_len = getattr(req, "prompt_len", None)
+        prompt_len = self._kv_cache_manager.disagg_transfer_length(req)
         if not prompt_len or prompt_len <= 0:
             return
         history = self._kv_cache_manager.get_history_length(req)
@@ -1606,8 +1593,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"the Python bounce buffer (kv_cache_bounce_size_mb="
                 f"{cfg.kv_cache_bounce_size_mb} without agent_bounce_buffer_enable)"
             )
-        if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
-            blockers.append("a Mamba/hybrid cache manager")
+        manager_blocker = self._kv_cache_manager.disagg_pipelined_transfer_blocker()
+        if manager_blocker is not None:
+            blockers.append(manager_blocker)
         # Refused for the configuration, not for the piece: the per-chunk guard downstream only sees
         # a piece short of the whole prompt, so a prompt that fits one chunk would slip past it.
         if self._mapping.cp_size > 1:

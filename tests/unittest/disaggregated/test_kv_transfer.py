@@ -412,6 +412,9 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     transceiver._kv_cache_manager = SimpleNamespace(
         tokens_per_block=tokens_per_block,
         num_extra_kv_tokens=0,
+        disagg_transfer_length=lambda req: req.prompt_len,
+        disagg_untransferred_buffers=lambda req: frozenset(),
+        disagg_state_slot=lambda req: None,
     )
     transceiver._send_reqs = {}
 
@@ -424,8 +427,6 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     req.py_last_context_chunk = (11 * tokens_per_block, 13 * tokens_per_block)
     req.context_remaining_length = 3 * tokens_per_block
     req.is_generation_only_request = False
-    req.py_csa2_remote_tail_start = None
-    req.py_csa2_remote_tail_split = None
 
     extent = KvCacheTransceiverV2._build_prefill_extent(transceiver, req)
 

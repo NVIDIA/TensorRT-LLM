@@ -714,6 +714,14 @@ def test_rank_info_carries_the_page_layout_to_peers():
     )
 
 
+def test_peer_registrar_get_kv_map_leaves_out_excluded_buffers():
+    """Buffers a transfer leaves for the receiver to rebuild move no bytes."""
+    reg, peer_ri = _registered(make_page_table(), make_page_table(), layer_num_per_pp=[2])
+    assert runs_of(reg.get_kv_map(peer_ri, (0, 0), (0, 0))) == [(0, 0, 1024)]
+    layer_1 = frozenset({(1, "key"), (1, "value")})
+    assert runs_of(reg.get_kv_map(peer_ri, (0, 0), (0, 0), excluded=layer_1)) == [(0, 0, 512)]
+
+
 def test_peer_registrar_get_kv_map_is_cached_until_unregister():
     reg, peer_ri = _registered(make_page_table(), make_page_table(), layer_num_per_pp=[2])
     mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))

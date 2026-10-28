@@ -1371,9 +1371,12 @@ class Sender(SenderBase):
         # The mapper of a pool pair holds the runs this rank is elected to send
         # (layout_mapping); an empty one means another rank sends that pair.
         for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
-            if (self_lg, self_pi) in task._chunk.excluded_pool_views:
-                continue
-            mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
+            mapper = self._registrar.get_kv_map(
+                peer_ri,
+                (self_lg, self_pi),
+                (peer_lg, peer_pi),
+                excluded=task._chunk.excluded_buffers,
+            )
             if mapper.empty:
                 continue
 
@@ -2161,11 +2164,12 @@ class TxSession(TxSessionBase):
         for info in req_infos:
             self._sender._send_aux_result_to_receiver(info, AgentResult.FAILED)
 
-    def pack_aux(self, request: LlmRequest) -> None:
-        """Fill the aux buffer slot with token data from the given request."""
+    def pack_aux(self, request: LlmRequest, with_tokens: bool = True) -> None:
+        """Fill the aux buffer slot from the given request; without ``with_tokens``, without its
+        first generated and draft tokens."""
         assert self._aux_buffer is not None, "No aux_buffer set for this session"
         assert self.aux_slot is not None, "No aux_slot set for this session"
-        self._aux_buffer.fill_slot(self.aux_slot, request)
+        self._aux_buffer.fill_slot(self.aux_slot, request, with_tokens=with_tokens)
 
     def is_completed(self) -> bool:
         """Non-blocking check: has the transfer completed successfully?"""

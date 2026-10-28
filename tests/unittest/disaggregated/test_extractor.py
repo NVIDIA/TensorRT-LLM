@@ -248,7 +248,7 @@ def test_layer_group_meta_serialization():
     assert len(restored_lg.pool_views[0].buffer_entries) == 2
 
 
-def _page_table(groups, pool_slot_bytes, buffers, bases, view_partition=None):
+def _page_table(groups, pool_slot_bytes, buffers, bases):
     """Native's page table of a manager's page table with these layer groups and buffers.
 
     Each group has one internal layer per global layer, in order; device pools lie at
@@ -262,16 +262,10 @@ def _page_table(groups, pool_slot_bytes, buffers, bases, view_partition=None):
         layer_groups=groups,
         buffers=buffers,
     )
-    return native_page_table(
-        layout,
-        bases,
-        kv_heads=1,
-        num_slots=4,
-        view_partition=view_partition,
-    )
+    return native_page_table(layout, bases, kv_heads=1, num_slots=4)
 
 
-def _attention_page_table(buffers, pool_slot_bytes, view_partition=None):
+def _attention_page_table(buffers, pool_slot_bytes):
     from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import LayerGroupDesc
 
     return _page_table(
@@ -279,7 +273,6 @@ def _attention_page_table(buffers, pool_slot_bytes, view_partition=None):
         {0: pool_slot_bytes},
         buffers,
         {0: [0x1000] * len(pool_slot_bytes)},
-        view_partition,
     )
 
 
@@ -408,24 +401,6 @@ def test_page_table_reads_view_kinds_off_tensors():
         (1, 256, 128),
         (1, 384, 128),
     ]
-
-
-def test_page_table_view_partition_splits_views():
-    """Buffers of one pool and kind whose partition keys differ get views of their own."""
-    views = (
-        _attention_page_table(
-            tuple(
-                _kv(layer, role, 0, 256 * layer + 128 * j)
-                for layer in (0, 1)
-                for j, role in enumerate(("key", "value"))
-            ),
-            (512,),
-            view_partition=lambda layer, role: layer,
-        )
-        .layer_groups[0]
-        .pool_views
-    )
-    assert [get_unique_layers(v) for v in views] == [{0}, {1}]
 
 
 @pytest.mark.cpu_only

@@ -368,6 +368,7 @@ class PeerRegistrar:
         peer_ri: RankInfo,
         self_pool_key: LGPoolKey,
         peer_pool_key: LGPoolKey,
+        excluded: frozenset = frozenset(),
     ) -> RunsMapper:
         """What this rank sends the peer rank of one view pair: the bytes of the views' buffers
         that ``layout_mapping`` elects this rank to send, relative to each side's pool slot. An
@@ -377,9 +378,10 @@ class PeerRegistrar:
             peer_ri: Peer rank info.
             self_pool_key: (self_lg_idx, self_pool_idx).
             peer_pool_key: (peer_lg_idx, peer_pool_idx).
+            excluded: Buffers, as (global layer id, role), this transfer leaves out.
         """
         peer_key = self._unique_key(peer_ri.instance_name, peer_ri.instance_rank)
-        cache_key = (peer_key, self_pool_key, peer_pool_key)
+        cache_key = (peer_key, self_pool_key, peer_pool_key, excluded)
         if cache_key in self._kv_map_cache:
             return self._kv_map_cache[cache_key]
 
@@ -397,6 +399,7 @@ class PeerRegistrar:
             for r in runs
             if (r.src.layer, r.src.pool_index, r.src.slot_offset) in self_view
             and (r.dst.layer, r.dst.pool_index, r.dst.slot_offset) in peer_view
+            and (r.src.layer, r.src.role) not in excluded
         ]
         if parts:
             mapper = RunsMapper(

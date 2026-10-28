@@ -163,7 +163,18 @@ def _build_transceiver_for_kv_slice(
         get_block_ordinals=get_block_ordinals,
     )
     page_table = SimpleNamespace(layer_groups=[layer_group])
-    cache_manager = SimpleNamespace(num_extra_kv_tokens=num_extra_kv_tokens)
+
+    def transfer_length(req):
+        # A CSA2 manager under remote-tail replay moves the prompt before the remote tail.
+        start = getattr(req, "py_csa2_remote_tail_start", None)
+        return req.prompt_len if start is None else start
+
+    cache_manager = SimpleNamespace(
+        num_extra_kv_tokens=num_extra_kv_tokens,
+        disagg_transfer_length=transfer_length,
+        disagg_untransferred_buffers=lambda req: frozenset(),
+        disagg_state_slot=lambda req: None,
+    )
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._reuse_adapter = reuse_adapter

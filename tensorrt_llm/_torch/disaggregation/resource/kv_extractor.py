@@ -15,7 +15,7 @@
 
 import math
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -147,16 +147,13 @@ def _pool_views(
     lg: int,
     state: bool,
     buffers: List[Tuple[int, BufferDesc]],
-    view_partition: Optional[Callable],
 ) -> List[PoolView]:
-    """One layer group's views: its transferred buffers, by (pool, kind, partition)."""
+    """One layer group's views: its transferred buffers, by (pool, kind)."""
     bucket_entries: Dict[tuple, list] = defaultdict(list)
     bucket_roles: Dict[tuple, set] = defaultdict(set)
     bucket_layouts: Dict[tuple, set] = defaultdict(set)
     for internal, buffer in buffers:
-        kind = native_kind(buffer)
-        partition = None if view_partition is None else view_partition(internal, buffer.role)
-        key = (buffer.pool_index, kind, partition)
+        key = (buffer.pool_index, native_kind(buffer))
         bucket_entries[key].append((internal, buffer.slot_offset, buffer.size))
         bucket_roles[key].add(buffer.role)
         bucket_layouts[key].add(_state_geometry(buffer) if state else RoleLayout())
@@ -165,7 +162,7 @@ def _pool_views(
     # offset), their entries' order (slot offset) and role text must not follow iteration order.
     views = []
     for key in sorted(bucket_entries, key=lambda k: (k[0], min(e[1] for e in bucket_entries[k]))):
-        pool_idx, kind, _ = key
+        pool_idx, kind = key
         roles = frozenset(bucket_roles[key])
         context = f"View(layer_group={lg}, pool={pool_idx}, kind={kind.name}, role={sorted(roles)})"
         entries = np.array(
@@ -191,17 +188,12 @@ def _pool_views(
     return views
 
 
-def page_table_from_layout(
-    table: ManagerLayout, *, view_partition: Optional[Callable] = None
-) -> KVCachePageTable:
+def page_table_from_layout(table: ManagerLayout) -> KVCachePageTable:
     """Native's page table of a manager's page table: its device pools, and per layer group the
     views of each pool that bucket its transferred buffers, carrying the page layout itself.
 
     Args:
         table: The manager's page table (``KVCacheManagerV2.get_page_table``).
-        view_partition: ``(internal layer id, role) -> key``: buffers of one pool and kind whose
-            keys differ go to views of their own, so native can select them alone; None keeps one
-            view per pool and kind.
     """
     layout = table.page_layout
     pool_index_of = {g: i for i, g in enumerate(table.device_pools)}
@@ -225,7 +217,7 @@ def page_table_from_layout(
             if b.transferred and b.pool_group == desc.pool_group and b.layer in internal_of
         ]
         state = desc.kind == "state"
-        views = _pool_views(lg, state, buffers, view_partition)
+        views = _pool_views(lg, state, buffers)
         if state:
             layer_groups.append(
                 MambaLayerGroup(
@@ -256,7 +248,4 @@ def build_page_table_from_manager(manager: KVCacheManagerV2) -> KVCachePageTable
     """The native page table of a V2 cache manager, from the page table the manager builds."""
     if not isinstance(manager, KVCacheManagerV2):
         raise ValueError("Python KV cache transfer requires KVCacheManagerV2; V1 is unsupported.")
-    return page_table_from_layout(
-        manager.get_page_table(),
-        view_partition=getattr(manager, "get_disagg_pool_view_partition", None),
-    )
+    return page_table_from_layout(manager.get_page_table())

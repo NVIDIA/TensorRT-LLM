@@ -32,6 +32,7 @@ from unittest.mock import MagicMock, Mock
 
 import numpy as np
 import pytest
+from layout_test_utils import native_page_table
 
 import tensorrt_llm._torch.disaggregation.native.bounce as bounce_mod
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
@@ -39,7 +40,7 @@ from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native.extent import Chunk
-from tensorrt_llm._torch.disaggregation.native.runs import RunsMapper
+from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVRecvTask,
@@ -47,18 +48,16 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TaskStatus,
 )
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import (
-    BUFFER_ENTRY_DTYPE,
-    AttentionLayerGroup,
-    KVCachePageTable,
-    LocalLayer,
-    MapperKind,
-    PhysicalPool,
-    PhysicalPoolGroup,
-    PoolView,
-)
+from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import merge_runs
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+    BufferDesc,
+    LayerGroupDesc,
+    PageLayout,
+    head_major,
+    replicated,
+    token_major,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -414,89 +413,61 @@ def _make_block_chunk(num_blocks: int) -> Chunk:
     )
 
 
+def _attention_page_table(buffers, slot_units: int) -> KVCachePageTable:
+    """One attention layer group of layers 0 to 3 over one pool of ``slot_units`` units."""
+    layout = PageLayout(
+        tokens_per_page=16,
+        pool_slot_bytes={0: (slot_units * _UNIT,)},
+        layer_groups=(LayerGroupDesc("attention", None, 0, 0, (0, 1, 2, 3)),),
+        buffers=tuple(buffers),
+    )
+    return native_page_table(layout, {0: [0x10000]}, kv_heads=1, num_slots=8)
+
+
 def _coalesced_page_table() -> KVCachePageTable:
     """Coalesced-pool page table mirroring the MiniMax M3 TP=2 layout.
 
     K == V == index-K bytes per block, so V2 coalesces all three roles into
     one physical pool. The slot interleaves the sparse layer's index-K
     between K/V regions (L0K L0V L1K L1V L1IDX L2K L2V L3K L3V), yielding
-    two views over the same pool: an NHD K/V view with a non-uniform layer
-    stride and a REPLICATED index-K view. Mirrors
-    test_minimax_m3_pool_view_scheme_coalesced_vs_separate.
+    two views over the same pool: a token-major K/V view with a non-uniform
+    layer stride and a replicated index-K view.
     """
     u = _UNIT
-    kv_entries = np.array(
-        [
-            (0, 0 * u, u),
-            (0, 1 * u, u),
-            (1, 2 * u, u),
-            (1, 3 * u, u),
-            (2, 5 * u, u),
-            (2, 6 * u, u),
-            (3, 7 * u, u),
-            (3, 8 * u, u),
-        ],
-        dtype=BUFFER_ENTRY_DTYPE,
-    )
-    idx_entries = np.array([(1, 4 * u, u)], dtype=BUFFER_ENTRY_DTYPE)
-    layer_group = AttentionLayerGroup(
-        pool_group_idx=0,
-        local_layers=[LocalLayer(i, i) for i in range(4)],
-        pool_views=[
-            PoolView(
-                pool_idx=0,
-                buffer_entries=kv_entries,
-                pool_role=frozenset({"key", "value"}),
-                mapper_kind=MapperKind.NHD,
-                bytes_per_layer=2 * u,
-            ),
-            PoolView(
-                pool_idx=0,
-                buffer_entries=idx_entries,
-                pool_role=frozenset({"index_key"}),
-                mapper_kind=MapperKind.REPLICATED,
-                bytes_per_layer=u,
-            ),
-        ],
-        kv_head_num_per_rank=1,
-    )
-    pool = PhysicalPool(base_address=0x10000, slot_bytes=9 * u, num_slots=8)
-    return KVCachePageTable(
-        tokens_per_block=16,
-        layer_groups=[layer_group],
-        pool_groups=[PhysicalPoolGroup(pools=[pool])],
-    )
+    kv = token_major(u, 16, 1, 1)
+    buffers = [
+        BufferDesc(0, "key", 0, 0, 0 * u, u, kv),
+        BufferDesc(0, "value", 0, 0, 1 * u, u, kv),
+        BufferDesc(1, "key", 0, 0, 2 * u, u, kv),
+        BufferDesc(1, "value", 0, 0, 3 * u, u, kv),
+        BufferDesc(1, "index_key", 0, 0, 4 * u, u, replicated(u)),
+        BufferDesc(2, "key", 0, 0, 5 * u, u, kv),
+        BufferDesc(2, "value", 0, 0, 6 * u, u, kv),
+        BufferDesc(3, "key", 0, 0, 7 * u, u, kv),
+        BufferDesc(3, "value", 0, 0, 8 * u, u, kv),
+    ]
+    return _attention_page_table(buffers, 9)
+
+
+_KV_BUFFERS = frozenset((layer, role) for layer in range(4) for role in ("key", "value"))
+_INDEX_BUFFERS = frozenset({(1, "index_key")})
 
 
 def _ignored_role_page_table() -> KVCachePageTable:
     """Page table whose slot holds regions no view transfers.
 
-    The slot interleaves a local-only ignored-role buffer after each layer's
-    K region (L0K L0LOCAL L1K L1LOCAL). Ignored roles occupy slot offsets
+    The slot interleaves a local-only buffer after each layer's K region
+    (L0K L0LOCAL L1K L1LOCAL). Buffers that never move occupy slot offsets
     but appear in no view, so no writer ever covers them.
     """
     u = _UNIT
-    entries = np.array([(0, 0 * u, u), (1, 2 * u, u)], dtype=BUFFER_ENTRY_DTYPE)
-    layer_group = AttentionLayerGroup(
-        pool_group_idx=0,
-        local_layers=[LocalLayer(0, 0), LocalLayer(1, 1)],
-        pool_views=[
-            PoolView(
-                pool_idx=0,
-                buffer_entries=entries,
-                pool_role=frozenset({"key"}),
-                mapper_kind=MapperKind.INDEXED,
-                bytes_per_layer=u,
-            ),
-        ],
-        kv_head_num_per_rank=1,
-    )
-    pool = PhysicalPool(base_address=0x20000, slot_bytes=4 * u, num_slots=8)
-    return KVCachePageTable(
-        tokens_per_block=16,
-        layer_groups=[layer_group],
-        pool_groups=[PhysicalPoolGroup(pools=[pool])],
-    )
+    buffers = [
+        BufferDesc(0, "key", 0, 0, 0 * u, u, head_major(u, 1, 1)),
+        BufferDesc(0, "local", 0, 0, 1 * u, u, transferred=False),
+        BufferDesc(1, "key", 0, 0, 2 * u, u, head_major(u, 1, 1)),
+        BufferDesc(1, "local", 0, 0, 3 * u, u, transferred=False),
+    ]
+    return _attention_page_table(buffers, 4)
 
 
 def _expected_write_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:
@@ -505,25 +476,24 @@ def _expected_write_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:
 
 
 def _summed_sender_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:
-    """Destination bytes a matched-layout, head-matched sender submits for *chunk*.
+    """Destination bytes a matched-layout sender submits for *chunk*.
 
-    The extract -> mapper -> WriteMeta.sizes path of
+    The extract -> get_kv_map -> WriteMeta.sizes path of
     Sender._build_kv_write_meta, run per pool view against itself as the
     peer. This is the quantity each writer attests on completion and the
     receiver sums into verified_write_bytes.
     """
     extractor = KVRegionExtractorV1(page_table)
+    registrar = PeerRegistrar(SimpleNamespace(), extractor)
+    peer = SimpleNamespace(page_table=page_table, instance_name="peer", instance_rank=0, dp_rank=0)
     total = 0
     for lg_idx, block_ids in enumerate(chunk.block_ids_per_layer_groups):
         layer_group = page_table.layer_groups[lg_idx]
-        for view_idx, pool_view in enumerate(layer_group.pool_views):
-            if (lg_idx, view_idx) in chunk.excluded_pool_views:
+        for view_idx in range(len(layer_group.pool_views)):
+            key = (lg_idx, view_idx)
+            mapper = registrar.get_kv_map(peer, key, key, excluded=chunk.excluded_buffers)
+            if mapper.empty:
                 continue
-            # Each buffer of the view whole, merged, as get_kv_map yields them for a peer of the
-            # same layout.
-            offsets = pool_view.buffer_entries["offset"].astype(np.int64)
-            sizes = pool_view.buffer_entries["size"].astype(np.int64)
-            mapper = RunsMapper(*merge_runs(offsets, offsets.copy(), sizes))
             region = extractor.extract(block_ids, lg_idx, view_idx)
             pairs = mapper.map(region, region)
             for pair in pairs if isinstance(pairs, list) else [pairs]:
@@ -542,22 +512,22 @@ class TestExpectedWriteBytesMatchSenderBytes:
     """
 
     @pytest.mark.parametrize(
-        "excluded_pool_views,units_per_block",
+        "excluded_buffers,units_per_block",
         [
-            pytest.param(set(), 9, id="all-views"),
-            pytest.param({(0, 0)}, 1, id="index-only"),
-            pytest.param({(0, 1)}, 8, id="kv-only"),
-            pytest.param({(0, 0), (0, 1)}, 0, id="no-views"),
+            pytest.param(frozenset(), 9, id="all-buffers"),
+            pytest.param(_KV_BUFFERS, 1, id="index-only"),
+            pytest.param(_INDEX_BUFFERS, 8, id="kv-only"),
+            pytest.param(_KV_BUFFERS | _INDEX_BUFFERS, 0, id="no-buffers"),
         ],
     )
-    def test_coalesced_pool_layout(self, excluded_pool_views, units_per_block):
+    def test_coalesced_pool_layout(self, excluded_buffers, units_per_block):
         page_table = _coalesced_page_table()
         chunk = _make_block_chunk(num_blocks=2)
-        chunk.excluded_pool_views = excluded_pool_views
+        chunk.excluded_buffers = excluded_buffers
         expected = _expected_write_bytes(page_table, chunk)
         assert expected == _summed_sender_bytes(page_table, chunk)
-        # Both views share physical pool 0. Remote-tail exclusions name the
-        # view index, so each included region contributes exactly once.
+        # Both views share physical pool 0; each buffer the transfer moves contributes exactly
+        # once, and the ones it leaves to the receiver (excluded_buffers) not at all.
         assert expected == 2 * units_per_block * _UNIT
 
     def test_ignored_role_layout(self):

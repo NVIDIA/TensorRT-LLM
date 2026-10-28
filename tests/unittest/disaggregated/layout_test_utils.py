@@ -50,8 +50,6 @@ def manager_layout(layout, pool_bases, kv_heads=0, num_slots=128):
     )
 
 
-def native_page_table(layout, pool_bases, *, kv_heads=0, num_slots=128, view_partition=None):
+def native_page_table(layout, pool_bases, *, kv_heads=0, num_slots=128):
     """Native's page table of ``manager_layout(layout, ...)`` (``page_table_from_layout``)."""
-    return page_table_from_layout(
-        manager_layout(layout, pool_bases, kv_heads, num_slots), view_partition=view_partition
-    )
+    return page_table_from_layout(manager_layout(layout, pool_bases, kv_heads, num_slots))

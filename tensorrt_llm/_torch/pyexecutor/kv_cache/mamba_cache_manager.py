@@ -3607,6 +3607,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """
         return super()._page_untransferred_roles() | self._kda_replay_roles()
 
+    def disagg_state_slot(self, request) -> Optional[int]:
+        """The request's recurrent-state slot, while this rank holds recurrent layers."""
+        if self.local_num_mamba_layers == 0:
+            return None
+        return self._request_id_to_state_index[request.py_request_id]
+
+    def disagg_pipelined_transfer_blocker(self) -> Optional[str]:
+        """Recurrent state is one checkpoint at the end of the prompt, which no piece carries."""
+        return "a Mamba/hybrid cache manager"
+
     def _kda_replay_roles(self) -> frozenset[str]:
         """The roles of the KDA replay buffers, or none without them."""
         replay_roles = {str(name) for name in self._kda_replay_layout()}

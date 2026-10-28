@@ -202,8 +202,9 @@ def test_context_only_physical_cache_transfer_preserves_logical_owners(
         )
 
         source_slice, target_slice = _slice(source, source_request), _slice(target, target_request)
-        assert source_slice.excluded_pool_views == set()
-        assert len(target_slice.excluded_pool_views) == 20
+        # The generation side rebuilds the sliding-window caches of the layers from the split on.
+        assert source_slice.excluded_buffers == frozenset()
+        assert len(target_slice.excluded_buffers) == 20
         sender = Sender.__new__(Sender)
         sender._registrar = registrar
         task = SimpleNamespace(

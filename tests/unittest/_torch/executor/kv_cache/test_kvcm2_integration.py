@@ -2784,6 +2784,20 @@ def test_page_buffer_tensors_default_to_head_major():
     assert manager._page_buffer_tensors(0, Role.INDEX_KEY, 128, 16, False) == replicated(128)
 
 
+def test_disagg_request_rules_default_to_the_whole_prompt():
+    """A transfer moves the whole prompt, every buffer and the first tokens; the base manager
+    keeps no recurrent state and lets its pages move in pieces."""
+    from types import SimpleNamespace
+
+    manager = object.__new__(KVCacheManagerV2)
+    request = SimpleNamespace(prompt_len=37, py_request_id=1)
+    assert manager.disagg_transfer_length(request) == 37
+    assert manager.disagg_untransferred_buffers(request) == frozenset()
+    assert manager.disagg_sends_first_tokens(request)
+    assert manager.disagg_state_slot(request) is None
+    assert manager.disagg_pipelined_transfer_blocker() is None
+
+
 def _index_mapper_capacity_for(
     *,
     max_batch_size: int,

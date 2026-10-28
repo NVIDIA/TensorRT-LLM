@@ -1107,37 +1107,28 @@ class CSA2CacheManager(KVCacheManagerV2):
         """Each model layer keeps a cache per CSA2 attention type."""
         return virtual_layers(self._layer_attn_to_layer_id)
 
-    def get_disagg_pool_view_partition(self, layer_id: LayerId, role: DataRole):
-        """Keep remote-tail SWA independently selectable in the transfer layout."""
-        if not self.bounded_replay_on_generation or role != CSA2CacheRole.SWA.role:
-            return None
-        return int(layer_id)
+    def disagg_transfer_length(self, request) -> int:
+        """Under remote-tail replay the generation worker recomputes the prompt from the remote
+        tail's start, so the transfer moves the pages before it."""
+        start = getattr(request, "py_csa2_remote_tail_start", None)
+        return request.prompt_len if start is None else start
 
-    def remote_tail_excluded_pool_views(self, page_table, split_layer: int):
-        """Return decoder/draft SWA views that generation rebuilds locally."""
-        excluded = set()
-        for group_idx, group in enumerate(page_table.layer_groups):
-            for pool_idx, view in enumerate(group.pool_views):
-                identities = {
-                    identity
-                    for entry in view.buffer_entries
-                    for (layer_id, role), identity in self._physical_roles.items()
-                    if layer_id == LayerId(int(entry["local_layer_id"]))
-                    and str(role) in view.pool_role
-                }
-                if not identities:
-                    continue
-                transfer = {
-                    cache_role != CSA2CacheRole.SWA or model_layer < split_layer
-                    for model_layer, _ratio, cache_role in identities
-                }
-                if len(transfer) != 1:
-                    raise ValueError(
-                        f"CSA2 pool view ({group_idx}, {pool_idx}) mixes encoder and decoder state"
-                    )
-                if not transfer.pop():
-                    excluded.add((group_idx, pool_idx))
-        return excluded
+    def disagg_untransferred_buffers(self, request) -> frozenset[tuple[int, str]]:
+        """Under remote-tail replay the generation worker rebuilds the sliding-window caches of the
+        decoder and draft layers (model layers from the split on), so the transfer leaves them."""
+        split = getattr(request, "py_csa2_remote_tail_split", None)
+        if split is None:
+            return frozenset()
+        global_of = {lid: ids[0] for lid, ids in self._page_layer_ids().items()}
+        return frozenset(
+            (global_of[int(layer_id)], str(role))
+            for (layer_id, role), (model_layer, _ratio, cache_role) in self._physical_roles.items()
+            if cache_role == CSA2CacheRole.SWA and model_layer >= split
+        )
+
+    def disagg_sends_first_tokens(self, request) -> bool:
+        """A remote-tail source sends no first tokens: the destination generates them."""
+        return getattr(request, "py_csa2_remote_tail_mode", None) != "source"
 
     def _fill_fresh_kv_pages(self, request_id: int) -> None:
         """Fill actual CSA2 buffers without treating model IDs as physical IDs.

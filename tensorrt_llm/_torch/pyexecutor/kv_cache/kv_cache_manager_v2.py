@@ -3799,6 +3799,35 @@ class KVCacheManagerV2(BaseResourceManager):
         cache per model layer."""
         return None
 
+    # -- what a disaggregated transfer of one request moves ------------------------------------------
+    # The transceiver asks these of every request; a manager whose caches move differently for some
+    # requests overrides them, so the transfer itself knows no manager.
+
+    def disagg_transfer_length(self, request: LlmRequest) -> int:
+        """The prompt tokens whose pages a disaggregated transfer of the request moves: the whole
+        prompt. A manager whose receiver recomputes a tail of the prompt overrides this."""
+        return request.prompt_len
+
+    def disagg_untransferred_buffers(self, request: LlmRequest) -> frozenset[tuple[int, str]]:
+        """The buffers, as (global layer id, role), a transfer of this request leaves for the
+        receiver to rebuild: none. Buffers that never move for any request are
+        ``_page_untransferred_roles``."""
+        return frozenset()
+
+    def disagg_sends_first_tokens(self, request: LlmRequest) -> bool:
+        """Whether a transfer of the request carries its first generated and draft tokens: yes."""
+        return True
+
+    def disagg_state_slot(self, request: LlmRequest) -> Optional[int]:
+        """The recurrent-state slot of the request, which its state layer groups transfer; None for
+        a manager keeping no recurrent state."""
+        return None
+
+    def disagg_pipelined_transfer_blocker(self) -> Optional[str]:
+        """Why this manager's pages cannot move in pieces while the prompt is still computed, or
+        None when they can."""
+        return None
+
     @property
     def draft_prompt_lookahead(self) -> int:
         """Prompt tokens the configured draft reads ahead, before reuse-backoff opt-outs."""
