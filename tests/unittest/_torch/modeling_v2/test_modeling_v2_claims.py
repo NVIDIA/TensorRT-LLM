@@ -121,9 +121,11 @@ def test_every_target_ships_both_products():
 def test_targets_do_not_share_files():
     """Isolation is the property being demonstrated; measure it.
 
-    Targets are allowed to import the catalog and nothing else of each
-    other's. A shared helper between two targets is the first step back to
-    the abstraction this package exists to avoid.
+    Targets are allowed to import the catalog, and the loader of their own
+    native code (``_native``), and nothing else of each other's. A shared
+    helper between two targets is the first step back to the abstraction this
+    package exists to avoid. The native half of the same rule is
+    ``test_modeling_v2_native_claims.py``.
     """
     for arch in _ARCHS:
         for target_dir, name in _routed_targets(arch):
@@ -133,10 +135,10 @@ def test_targets_do_not_share_files():
                     dots, tail = match.group(1), match.group(2)
                     if len(dots) == 1:
                         continue  # sibling within the target
-                    assert tail.startswith("catalog"), (
+                    assert tail.startswith(("catalog", "_native")), (
                         f"{name}: {source_file.name} reaches outside its own "
                         f"directory for {tail!r}; targets may import the "
-                        f"catalog and nothing else"
+                        f"catalog and _native and nothing else"
                     )
 
 

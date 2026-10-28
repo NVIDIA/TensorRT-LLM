@@ -185,7 +185,7 @@ class DecoderCudaGraphs:
     def __init__(
         self,
         *,
-        cuda_graph_runner: CUDAGraphRunner | None,
+        cuda_graph_runner: CUDAGraphRunner,
         breakable_cuda_graph_runner: BreakableCUDAGraphRunner | None,
         config: DecoderRunnerConfig,
         mapping: Mapping,
@@ -249,7 +249,7 @@ class DecoderCudaGraphs:
     @property
     def enabled(self) -> bool:
         """Return whether generation batches may run as CUDA graphs."""
-        return self.cuda_graph_runner is not None and self.cuda_graph_runner.enabled
+        return self.cuda_graph_runner.enabled
 
     def register_sample_type_resolver(self, resolver: Callable | None) -> None:
         """Register how a batch maps to its sampling tier, for the graph key."""
@@ -368,9 +368,6 @@ class DecoderCudaGraphs:
 
     @contextlib.contextmanager
     def no_cuda_graph(self) -> Iterator[None]:
-        if self.cuda_graph_runner is None:
-            yield
-            return
         _run_cuda_graphs = self.cuda_graph_runner.enabled
         self.cuda_graph_runner.enabled = False
         try:
@@ -723,7 +720,7 @@ class DecoderCudaGraphs:
         # avoid creating warmup requests whose position_ids exceed the RoPE
         # table (max_position_embeddings).
         effective_max_seq_len = self._config.max_seq_len
-        if self.mapping is not None and self.mapping.has_cp_helix():
+        if self.mapping.has_cp_helix():
             effective_max_seq_len = self._config.max_seq_len // self.mapping.cp_size
 
         short_long_seq_len_threshold = self.cuda_graph_runner.short_long_seq_len_threshold
@@ -1004,8 +1001,7 @@ class DecoderCudaGraphs:
                     torch.cuda.synchronize()
 
     def release(self, *, release_nccl_window_owners: bool = True) -> None:
-        if self.cuda_graph_runner is not None:
-            self.cuda_graph_runner.clear(release_nccl_window_owners=release_nccl_window_owners)
+        self.cuda_graph_runner.clear(release_nccl_window_owners=release_nccl_window_owners)
         if self.breakable_cuda_graph_runner is not None:
             self.breakable_cuda_graph_runner.clear(
                 release_nccl_window_owners=release_nccl_window_owners

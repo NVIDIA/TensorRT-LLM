@@ -2562,6 +2562,7 @@ def test_mla_transform_weights_is_idempotent(monkeypatch):
     monkeypatch.setattr(mla_mod, "get_sm_version", lambda: 120)
     quant_mode = SimpleNamespace(has_fp8_block_scales=lambda: True)
     mla = MLA.__new__(MLA)
+    mla.mapping = mapping_mod.Mapping()
     mla._weights_transformed = False
     mla.kv_b_proj = SimpleNamespace(quant_config=SimpleNamespace(quant_mode=quant_mode))
     mla.k_b_proj_trans = "k_weight"

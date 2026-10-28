@@ -340,7 +340,10 @@ def test_minimax_workspace_constructors_use_tp_process_group(
         workspace = create()
         assert workspace.comm is pg
         assert workspace.rank == mapping.tp_rank
-        assert workspace.world_size == tp_size
+        if kind == "sampled_accept":
+            assert workspace.world == tp_size
+        else:
+            assert workspace.world_size == tp_size
         assert workspace.handle is handle
         allocate.assert_called_once()
         assert allocate.call_args.args[0] is pg
