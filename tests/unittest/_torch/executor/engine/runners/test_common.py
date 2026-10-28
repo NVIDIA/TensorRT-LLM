@@ -8,7 +8,13 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
-from tensorrt_llm._torch.pyexecutor.engine.runners import common
+from tensorrt_llm._torch.pyexecutor.engine.runners import (
+    DecoderRunner,
+    EncoderDecoderRunner,
+    EncoderRunner,
+    NoKVCacheRunner,
+    common,
+)
 from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     apply_position_id_offset,
     get_all_rank_num_tokens,
@@ -20,10 +26,40 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     ship_multimodal_indices,
     token_model_inputs,
 )
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ModelRunner
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize(
+    ("runner_type", "initializer_name"),
+    [
+        (EncoderRunner, "_initialize_encoder_runner"),
+        (EncoderDecoderRunner, "_initialize_encoder_decoder_runner"),
+        (NoKVCacheRunner, "_initialize_no_kv_cache_runner"),
+        (DecoderRunner, "_initialize_decoder_runner"),
+        (ModelRunner, None),
+    ],
+)
+def test_model_engine_initializes_runner_by_family(
+    runner_type: type[ModelRunner], initializer_name: str | None
+) -> None:
+    engine = object.__new__(ModelEngine)
+    engine._model_caller = Mock()
+    if initializer_name is None:
+        with pytest.raises(TypeError, match="No runner initializer registered"):
+            engine._initialize_runner(runner_type)
+        return
+
+    expected = Mock(spec=runner_type)
+    initializer = Mock(return_value=expected)
+    setattr(engine, initializer_name, initializer)
+
+    assert engine._initialize_runner(runner_type) is expected
+    initializer.assert_called_once_with(runner_type)
 
 
 @pytest.mark.parametrize("token_id_attribute", ["multimodal_token_ids", "mm_token_ids"])
