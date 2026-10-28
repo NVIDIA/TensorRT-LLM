@@ -73,11 +73,8 @@ TEST(KvCacheManagerV2ConfigTest, MixedBuffersInOneLayerAreRejected)
         auto layer = makeAttentionLayer(0, firstIsSparse);
         layer.buffers.push_back(BufferConfig{.role = "value", .size = 4096, .isSparse = !firstIsSparse});
         config.layers = {layer};
-        EXPECT_NO_THROW(config.validate());
-        auto const storage = createStorageConfig(config);
-        LifeCycleRegistry const registry(config);
-        auto const attr = storage.bufferAttributes().at(BufferId{0, buffer.role});
-        EXPECT_EQ(std::get<AttnLifeCycle>(registry[attr.lifeCycleId]).reusePolicy, policy);
+        EXPECT_THROW(config.validate(), std::invalid_argument);
+        EXPECT_THROW(createStorageConfig(config), std::invalid_argument);
     }
 }
 
