@@ -151,7 +151,7 @@ async def _serving() -> None:
     llm = _FakeLlm([])
     llm.args = _args()
     llm.llm_id = "test-engine"
-    llm._check_health = lambda: True
+    llm.check_health = lambda: True
     reads = []
 
     def get_stats(timeout):
