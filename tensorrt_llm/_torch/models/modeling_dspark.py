@@ -3627,18 +3627,19 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
 MINIMAX_DSPARK_WEIGHT_PREFIX = "language_model.model.dspark."
 _MINIMAX_DSPARK_DECODER_LAYER_INFIX = ".decoder_layer."
 _MINIMAX_DSPARK_RENAMES = {"final_norm.weight": "norm.weight"}
-# Every RMSNorm in this drafter is a Gemma norm, (1 + weight) * x. The backbone
-# and the wrapper-owned ``hidden_norm`` are plain norms, so the stored weights
-# are pre-incremented at load (the same fold the MiniMax-M3 target applies to
-# its layer-boundary norms).
+# Every RMSNorm in this drafter is a Gemma norm, (1 + weight) * x. The three
+# backbone norms (``input_layernorm``, ``post_attention_layernorm``, ``norm``)
+# are built with ``use_gemma=True`` and keep the stored weight. Only the norms
+# whose consumers read the raw weight get ``1 + weight`` folded in at load:
+# ``q_norm`` / ``k_norm`` (the stacked k_norm read and the fused qk-norm + RoPE
+# kernel in the block decode) and the wrapper-owned ``hidden_norm`` (a torch
+# ``nn.RMSNorm``). The fold rounds ``1 + weight`` to bf16 once, which the
+# MiniMax-M3 target also accepts for its layer-boundary norms.
 _MINIMAX_DSPARK_GEMMA_NORM_SUFFIXES = (
-    "input_layernorm.weight",
-    "post_attention_layernorm.weight",
     "q_norm.weight",
     "k_norm.weight",
     "hidden_norm.weight",
 )
-_MINIMAX_DSPARK_GEMMA_NORM_KEYS = ("norm.weight",)
 _MXFP8_BLOCK_SIZE = 32
 _MXFP8_SCALE_SUFFIX = ".weight_scale_inv"
 
@@ -3684,7 +3685,8 @@ def prepare_minimax_dspark_weights(weights: Dict, dtype: torch.dtype) -> Dict:
 
     Returns a new dict keyed by the DFlash/DSpark loader names, with every
     MXFP8 ``weight`` / ``weight_scale_inv`` pair replaced by one ``dtype``
-    tensor and every Gemma norm weight incremented by one.
+    tensor and the raw-weight-consumed Gemma norms
+    (``_MINIMAX_DSPARK_GEMMA_NORM_SUFFIXES``) incremented by one.
     """
     renamed = {remap_minimax_dspark_weight_name(k): v for k, v in weights.items()}
     # Every tensor is materialized whole on the host, and the dequantization
@@ -3700,9 +3702,7 @@ def prepare_minimax_dspark_weights(weights: Dict, dtype: torch.dtype) -> Dict:
             scale = renamed[scale_name]
             scale = scale[:] if hasattr(scale, "__getitem__") else scale
             tensor = dequantize_mxfp8_weight(tensor, scale, dtype)
-        elif name.endswith(_MINIMAX_DSPARK_GEMMA_NORM_SUFFIXES) or name in (
-            _MINIMAX_DSPARK_GEMMA_NORM_KEYS
-        ):
+        elif name.endswith(_MINIMAX_DSPARK_GEMMA_NORM_SUFFIXES):
             tensor = tensor + 1.0
         out[name] = tensor
     return out
@@ -3774,10 +3774,16 @@ class MiniMaxDSparkDecoderLayer(DecoderLayer):
             layer_idx=layer_idx,
         )
         self.input_layernorm = RMSNorm(
-            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
         )
         self.post_attention_layernorm = RMSNorm(
-            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
         )
 
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
@@ -3810,7 +3816,10 @@ class MiniMaxDSparkModel(DecoderModel):
             ]
         )
         self.norm = RMSNorm(
-            hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
         )
 
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:

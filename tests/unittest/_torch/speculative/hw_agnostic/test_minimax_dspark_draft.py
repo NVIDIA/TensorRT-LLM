@@ -22,7 +22,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models import modeling_dspark
 from tensorrt_llm._torch.models.modeling_dspark import (
+    _MINIMAX_DSPARK_GEMMA_NORM_SUFFIXES,
     GQADSparkForCausalLM,
     MiniMaxDSparkBackbone,
     MiniMaxDSparkForCausalLM,
@@ -258,12 +261,45 @@ def test_prepare_weights_dequantizes_and_folds_gemma_norms() -> None:
         out["layers.0.self_attn.k_proj.weight"],
         torch.full((2, 64), 2.0, dtype=torch.bfloat16),
     )
-    for key in (
-        "layers.0.self_attn.k_norm.weight",
-        "layers.0.input_layernorm.weight",
-        "hidden_norm.weight",
-        "norm.weight",
-    ):
+    # Only the norms whose consumers read the raw weight are folded.
+    for key in ("layers.0.self_attn.k_norm.weight", "hidden_norm.weight"):
         torch.testing.assert_close(out[key], torch.full((8,), 1.25, dtype=torch.bfloat16))
+    # The backbone norms are Gemma modules (use_gemma=True) and keep the stored weight.
+    for key in ("layers.0.input_layernorm.weight", "norm.weight"):
+        torch.testing.assert_close(out[key], norm)
     # Head tensors are not norms and are passed through untouched.
     torch.testing.assert_close(out["markov_head.markov_w1.weight"], norm)
+
+
+def test_backbone_norms_are_gemma_modules_and_only_raw_weight_norms_are_folded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The load-time ``1 + weight`` fold and the ``use_gemma`` flags must pair
+    up: a norm is folded exactly when its module does not add the one itself.
+
+    Attention, MLP and embedding construction allocate on CUDA (RoPE tables,
+    backend buffers), so they are stubbed; the norms are built for real.
+    """
+
+    class _Stub(torch.nn.Module):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(modeling_dspark, "MiniMaxDSparkAttention", _Stub)
+    monkeypatch.setattr(modeling_dspark, "GatedMLP", _Stub)
+    monkeypatch.setattr(modeling_dspark, "Embedding", _Stub)
+
+    tiny = json.loads(json.dumps(_CONFIG))
+    tiny["text_config"].update(hidden_size=64, num_hidden_layers=1)
+    cfg = build_minimax_dspark_draft_config(tiny)
+    cfg.torch_dtype = torch.bfloat16
+    model = modeling_dspark.MiniMaxDSparkModel(ModelConfig(pretrained_config=cfg))
+    layer = model.layers[0]
+
+    for norm in (layer.input_layernorm, layer.post_attention_layernorm, model.norm):
+        assert norm.use_gemma
+        assert norm.weight.dtype == torch.bfloat16
+    # q_norm / k_norm (plain RMSNorm in MiniMaxDSparkAttention) and the
+    # wrapper-owned hidden_norm are the only folded weights.
+    folded = {suffix.split(".")[0] for suffix in _MINIMAX_DSPARK_GEMMA_NORM_SUFFIXES}
+    assert folded == {"q_norm", "k_norm", "hidden_norm"}
