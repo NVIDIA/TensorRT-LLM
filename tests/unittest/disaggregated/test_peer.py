@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 from layout_test_utils import native_page_table
@@ -1050,25 +1053,105 @@ def test_context_parallelism_on_both_sides_is_refused():
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
-def test_index_cache_moves_whole_from_one_writer():
-    """A replicated index cache comes from one of two writers, so they do not send alike."""
+def test_a_receiver_asks_each_writer_what_it_sends(monkeypatch):
+    """On first contact, the receiver records what each context rank writing it sends.
+
+    It asks every context rank that may write its pages for that rank's own rank info, before it
+    registers with the instance.
+    """
+    transfer = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    writers = [
+        make_rankinfo(
+            instance_name="ctx",
+            instance_rank=r,
+            tp_size=2,
+            tp_rank=r,
+            page_table=make_page_table(tp_rank=r, index_key_bytes=32),
+        )
+        for r in range(2)
+    ]
+    endpoints = ["tcp://ctx-0", "tcp://ctx-1"]
+    replies = {
+        "tcp://info": dataclasses.replace(writers[0], sender_endpoints=endpoints),
+        **dict(zip(endpoints, writers)),
+    }
+    sent = []
+
+    class Messenger:
+        def __init__(self, mode, endpoint):
+            self.endpoint = endpoint
+
+        def send(self, messages):
+            sent.append((self.endpoint, messages[0]))
+
+        def receive(self):
+            return [replies[self.endpoint].to_bytes()]
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(transfer, "ZMQMessenger", Messenger)
+    receiver = object.__new__(transfer.Receiver)
+    receiver._registrar = _make_peer_registrar(
+        make_rankinfo(
+            instance_name="gen",
+            tp_size=1,
+            page_table=make_page_table(
+                block_bytes=[2048], mamba_tp=1, kv_heads=4, index_key_bytes=32
+            ),
+        )
+    )
+    receiver._incompatible_peers = {}
+    receiver._sender_ep_instance_map = {}
+    receiver._dealers = {}
+
+    info = receiver._get_sender_info(SimpleNamespace(ctx_info_endpoint="tcp://info"))
+
+    kind = transfer.MessageType
+    assert sent == [
+        ("tcp://info", kind.REQUEST_INSTANCE_INFO),
+        ("tcp://ctx-0", kind.REQUEST_RANK_INFO),
+        ("tcp://ctx-1", kind.REQUEST_RANK_INFO),
+        ("tcp://ctx-0", kind.REGISTER_RANK_INFO),
+        ("tcp://ctx-1", kind.REGISTER_RANK_INFO),
+    ]
+    assert [receiver._registrar.writer_share(info, r) for r in range(2)] == [
+        {0: 1024 + 64, 1: 2 * (1024 + 2048)},
+        {0: 1024, 1: 2 * (1024 + 2048)},
+    ]
+
+
+def test_each_writer_s_share_is_what_it_sends_into_a_page():
+    """Two TP ranks writing a TP1 rank's pages have different shares.
+
+    Each sends its heads of K/V and its share of the recurrent state, and one of them the
+    replicated index cache.
+    """
     receiver = make_rankinfo(
         instance_name="gen",
         tp_size=1,
         page_table=make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4, index_key_bytes=32),
     )
-    sender = make_rankinfo(
-        instance_name="ctx", tp_size=2, page_table=make_page_table(index_key_bytes=32)
-    )
     reg = _make_peer_registrar(receiver)
-    overlap = reg.get_peer_overlap(sender, peer_dp_rank=0)
-    assert overlap.ranks == [0, 1]
-    assert not reg.writers_send_alike(sender, overlap)
-    plain = make_rankinfo(instance_name="ctx2", tp_size=2, page_table=make_page_table())
-    receiver_plain = make_rankinfo(
-        instance_name="gen2",
-        tp_size=1,
-        page_table=make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4),
+    writers = [
+        make_rankinfo(
+            instance_name="ctx",
+            instance_rank=r,
+            tp_size=2,
+            tp_rank=r,
+            page_table=make_page_table(tp_rank=r, index_key_bytes=32),
+        )
+        for r in range(2)
+    ]
+    shares = [reg.add_writer(writer) for writer in writers]
+    assert [reg.writer_share(writers[0], r) for r in range(2)] == shares
+    # Per attention page: 2 of 4 heads of two layers' K and V (256 B each), and the 32 B index-K
+    # of both layers from one writer; per state slot: half of both layers' conv (1024 B) and SSM
+    # (2048 B) state.
+    assert shares == [{0: 1024 + 64, 1: 2 * (1024 + 2048)}, {0: 1024, 1: 2 * (1024 + 2048)}]
+
+    stray = make_rankinfo(
+        instance_name="ctx", instance_rank=2, page_table=make_page_table(side_state_bytes=8)
     )
-    reg_plain = _make_peer_registrar(receiver_plain)
-    assert reg_plain.writers_send_alike(plain, reg_plain.get_peer_overlap(plain, peer_dp_rank=0))
+    with pytest.raises(ValueError, match="transferred by one rank only"):
+        reg.add_writer(stray)

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import queue
 import threading
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -69,7 +69,7 @@ class VmmBounceTransport(BounceTransport):
 
     @classmethod
     def from_config(
-        cls, agent, cfg, *, device_id: int, block_bytes_per_group: list[int | None]
+        cls, agent, cfg, *, device_id: int, state_groups: Iterable[int] = ()
     ) -> VmmBounceTransport | None:
         """Build a transport sized from the config and clamped to free memory, or None if not even one
         chunk fits."""
@@ -94,7 +94,7 @@ class VmmBounceTransport(BounceTransport):
             device_id=device_id,
             capacity_bytes=capacity_bytes,
             phys_chunk_size=chunk,
-            block_bytes_per_group=block_bytes_per_group,
+            state_groups=state_groups,
             min_bytes=cfg.min_bytes,
             min_blocks=cfg.min_blocks,
         )
@@ -106,7 +106,7 @@ class VmmBounceTransport(BounceTransport):
         device_id: int,
         capacity_bytes: int,
         phys_chunk_size: int,
-        block_bytes_per_group: list[int | None],
+        state_groups: Iterable[int] = (),
         min_bytes: int = DEFAULT_MIN_BYTES,
         min_blocks: int = 96,
         quarantine_grace_s: float = _QUARANTINE_GRACE_S,
@@ -114,8 +114,8 @@ class VmmBounceTransport(BounceTransport):
     ):
         self._agent = agent
         self._device_id = device_id
-        # The byte size of one cache block, listed for each attention layer group.
-        self._block_bytes_per_group = list(block_bytes_per_group)
+        # The layer groups holding recurrent state, whose one slot per request counts as a page.
+        self._state_groups = frozenset(state_groups)
         # Size gates below which bounce is skipped: coalescing only pays off once the transfer is
         # large enough to beat the gather+scatter overhead (see config.DEFAULT_MIN_BYTES for the
         # rationale). min_bytes applies to payloads carrying recurrent (mamba/KDA) state;
@@ -238,52 +238,31 @@ class VmmBounceTransport(BounceTransport):
     def reserve(
         self,
         recv_req,
-        num_writers: int = 1,
+        shares: Sequence[Mapping[int, int]],
         *,
         timeout: Optional[float] = _RECV_RESERVE_TIMEOUT_S,
-        extra_bytes: int = 0,
     ) -> bool:
         """Reserve a region and create its state, recording the address for the senders. Returns
-        False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
-        must divide across the writers. ``extra_bytes`` is the non-paged payload the sender appends
-        to the same coalesced write (mamba/KDA recurrent state, sized by the receiver via
-        ``layout_mapping.received_bytes``); the region must cover it or the write would overrun into
-        the neighboring slot."""
-        total = 0
-        has_state_group = False
+        False to fall back to the per-fragment path. ``shares[i][g]`` is what writer ``i`` sends
+        into one page of layer group ``g`` (``PeerRegistrar.add_writer``), a recurrent-state
+        group's slot counting as its page: each writer gets that times the pages it fills, right
+        after the writer before it, so a writer's coalesced write (KV and recurrent state alike)
+        never reaches another's."""
         # Block tables are positional with -1 holes (see Chunk); only the
         # slots the receiver actually accepts are written into the region.
         valid_counts = [
             int((block_ids >= 0).sum()) for block_ids in recv_req.block_ids_per_layer_groups
         ]
-        for g, n_valid in enumerate(valid_counts):
-            if n_valid == 0:
-                continue
-            if g >= len(self._block_bytes_per_group):
-                return self._skip_bounce(
-                    f"layer group {g} has blocks but no known slot size",
-                    warn_key="kv-bounce-unknown-slot-size",
-                )
-            if not self._block_bytes_per_group[g]:
-                # This group holds recurrent state (mamba/KDA), not paged KV blocks;
-                # its size is accounted for by extra_bytes below, not per-block math.
-                has_state_group = True
-                continue
-            total += n_valid * self._block_bytes_per_group[g]
-        if has_state_group and num_writers > 1:
-            # Fan-in with recurrent-state groups is unsafe: each writer may
-            # append its own state fragments (different PP stages hold different
-            # mamba layers), and the representative extra_bytes (computed from
-            # one sender's page table) may not reflect all participating senders.
-            # Even when extra_bytes == 0 (e.g. the representative rank has no
-            # mamba overlap), another PP sender may still contribute state bytes
-            # that were not reserved in the bounce region.
-            return self._skip_bounce(
-                f"fan-in across {num_writers} senders with STATE groups present; the "
-                f"equal split cannot account for per-writer state fragments",
-                warn_key="kv-bounce-mamba-fanin",
-            )
-        total += int(extra_bytes)
+        writer_bytes = tuple(
+            sum(n * share.get(g, 0) for g, n in enumerate(valid_counts)) for share in shares
+        )
+        total = sum(writer_bytes)
+        state_bytes = sum(
+            valid_counts[g] * share.get(g, 0)
+            for share in shares
+            for g in self._state_groups
+            if g < len(valid_counts)
+        )
         if total <= 0:
             return self._skip_bounce(
                 f"computed transfer size {total} <= 0", warn_key="kv-bounce-nonpositive-size"
@@ -299,7 +278,7 @@ class VmmBounceTransport(BounceTransport):
         # safe (or better) for plain-KV payloads too, so this special case can be removed and
         # both payload kinds share one gate.
         nblocks = sum(valid_counts)
-        if extra_bytes > 0:
+        if state_bytes > 0:
             if total < self._min_bytes:
                 return self._skip_bounce(
                     f"{total}B ({nblocks} blocks + recurrent state) < min {self._min_bytes}B "
@@ -312,28 +291,6 @@ class VmmBounceTransport(BounceTransport):
                 f"TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS)",
                 warn_key="kv-bounce-below-min-blocks",
             )
-        if num_writers > 1 and total % num_writers != 0:
-            return self._skip_bounce(
-                f"fan-in {total}B across {num_writers} senders is not an even split "
-                f"({total % num_writers}B remainder); head-mismatch explosion NOT mitigated",
-                warn_key="kv-bounce-uneven-fanin",
-            )
-        if num_writers > 1:
-            # Fan-in gives each writer an equal share of the region, which only matches where it
-            # writes when all writers send the same bytes. Equal layer count guarantees that only
-            # when the per-block sizes match, so require that here, else fall back.
-            # Exclude None entries (STATE groups) — they are already guarded above.
-            present_slot_bytes = {
-                self._block_bytes_per_group[g]
-                for g, n_valid in enumerate(valid_counts)
-                if n_valid > 0 and self._block_bytes_per_group[g]
-            }
-            if len(present_slot_bytes) > 1:
-                return self._skip_bounce(
-                    f"fan-in across {num_writers} senders with non-uniform layer-group slot bytes "
-                    f"{sorted(present_slot_bytes)}; the equal split would overrun a sub-region",
-                    warn_key="kv-bounce-heterogeneous-fanin",
-                )
         if total > self._recv_alloc.capacity:  # too big to ever fit, unlike transient backpressure
             return self._skip_bounce(
                 f"transfer {total // _MIB}MiB exceeds the {self._recv_alloc.capacity // _MIB}MiB bounce "
@@ -353,8 +310,7 @@ class VmmBounceTransport(BounceTransport):
                 rid_slice=(recv_req.unique_rid, recv_req.slice_id),
                 slot_id=slot_id,
                 base_addr=addr,
-                per_writer_bytes=total // num_writers,
-                num_writers=num_writers,
+                writer_bytes=writer_bytes,
             )
             self._reserved_map[ctx.rid_slice] = ctx  # inactive until the first writer reports
         # Positive marker: all fall-back guards above passed, so this transfer provably takes the
@@ -362,13 +318,14 @@ class VmmBounceTransport(BounceTransport):
         # bounce actually engaged instead of silently falling back to the per-fragment path.
         logger.info_once(
             f"[kv-bounce] coalesced {nblocks} blocks / {total // _MIB}MiB into one region "
-            f"across {num_writers} writer(s)",
+            f"across {len(writer_bytes)} writer(s)",
             key="kv-bounce-coalesced",
         )
         return True
 
     def writer_base(self, rid_slice: RidSlice, writer_index: int) -> Optional[int]:
-        """Where the given fan-in writer writes in the region."""
+        """Where the given fan-in writer writes in the region; None for a writer with nothing to
+        write, which writes in place."""
         with self._reserved_map_lock:
             ctx = self._reserved_map.get(rid_slice)
             return None if ctx is None else ctx.writer_base(writer_index)
@@ -527,10 +484,9 @@ class NoBounceTransport(BounceTransport):
     def reserve(
         self,
         recv_req,
-        num_writers: int = 1,
+        shares: Sequence[Mapping[int, int]],
         *,
         timeout: Optional[float] = _RECV_RESERVE_TIMEOUT_S,
-        extra_bytes: int = 0,
     ) -> bool:
         return False
 
@@ -568,7 +524,7 @@ def create_bounce(agent, cfg, *, device_id: int, page_table) -> BounceTransport:
         return NoBounceTransport()
     try:
         transport = VmmBounceTransport.from_config(
-            agent, cfg, device_id=device_id, block_bytes_per_group=block_bytes_per_group(page_table)
+            agent, cfg, device_id=device_id, state_groups=state_groups(page_table)
         )
         return transport if transport is not None else NoBounceTransport()
     except (
@@ -622,30 +578,10 @@ def decode_result_tail(message):
     return None, None, None
 
 
-def block_bytes_per_group(page_table: KVCachePageTable) -> list[int | None]:
-    """Return transferred bytes per cache block for each layer group.
-
-    Every physical pool holding a transferred buffer of an attention group
-    contributes its slot to the group's transfer size. Non-attention groups
-    retain a ``None`` placeholder so the result remains aligned with
-    receive-request layer-group indices.
-    """
+def state_groups(page_table: KVCachePageTable) -> frozenset[int]:
+    """The layer groups of ``page_table`` holding recurrent state."""
     from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
-    from tensorrt_llm._torch.disaggregation.resource.utils import (
-        get_physical_pool,
-        get_transferred_pool_indices,
-    )
 
-    assert page_table is not None
-    out: list[int | None] = []
-    for lg_idx, lg in enumerate(page_table.layer_groups):
-        if lg.kind != CacheKind.PAGED:
-            out.append(None)
-            continue
-        out.append(
-            sum(
-                int(get_physical_pool(page_table, lg_idx, pool_idx).slot_bytes)
-                for pool_idx in get_transferred_pool_indices(page_table, lg_idx)
-            )
-        )
-    return out
+    return frozenset(
+        g for g, lg in enumerate(page_table.layer_groups) if lg.kind == CacheKind.STATE
+    )

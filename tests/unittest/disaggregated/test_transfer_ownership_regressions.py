@@ -67,8 +67,7 @@ class _BounceProbe:
     def record_failure(self, rid_slice: tuple[int, int], peer_rank: int) -> None:
         self.failed_writers.append((rid_slice, peer_rank))
 
-    def reserve(self, _receiver_req, _num_writers: int, *, extra_bytes: int = 0) -> bool:
-        del extra_bytes
+    def reserve(self, _receiver_req, _shares) -> bool:
         return False
 
     def release_idle_reservation(self, _rid_slice: tuple[int, int]) -> None:
@@ -108,14 +107,12 @@ class _PartialFanInBounce(_BounceProbe):
         self.release_count = 0
         self.scatter_count = 0
 
-    def reserve(self, receiver_req, num_writers: int, *, extra_bytes: int = 0) -> bool:
-        del extra_bytes
+    def reserve(self, receiver_req, shares) -> bool:
         self.context = TransferContext(
             rid_slice=(receiver_req.unique_rid, receiver_req.slice_id),
             slot_id=0,
             base_addr=0x1000,
-            per_writer_bytes=0x100,
-            num_writers=num_writers,
+            writer_bytes=(0x100,) * len(shares),
         )
         return True
 
@@ -602,6 +599,7 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
     }
     receiver._registrar = SimpleNamespace(
         get_peer_overlap=Mock(side_effect=lambda _peer, dp_rank: overlaps[dp_rank]),
+        writer_share=Mock(return_value={0: 0x100}),
         self_extractor=SimpleNamespace(page_table=None),
         self_rank_info=SimpleNamespace(
             cp_size=1,
@@ -697,7 +695,7 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
     )
     receiver._registrar = SimpleNamespace(
         get_peer_overlap=Mock(return_value=overlap),
-        writers_send_alike=Mock(return_value=True),
+        writer_share=Mock(return_value={0: 0x100}),
         self_extractor=SimpleNamespace(page_table=None),
         self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0, cp_size=1),
     )
@@ -871,6 +869,7 @@ def test_cancel_after_publication_cannot_overtake_request_data(
     overlap = SimpleNamespace(ranks=[0])
     receiver._registrar = SimpleNamespace(
         get_peer_overlap=Mock(return_value=overlap),
+        writer_share=Mock(return_value={0: 0x100}),
         self_extractor=SimpleNamespace(page_table=None),
         self_rank_info=SimpleNamespace(cp_size=1),
     )

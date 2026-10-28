@@ -589,11 +589,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         verified-reuse admission checks attested sender bytes against, so it counts what the
         mappers move, never physical slot bytes: buffers that never move or that this transfer
         leaves to the receiver (``chunk.excluded_buffers``) occupy slot bytes no sender writes.
-
-        Counterpart accounting: the bounce reserve sizing (bounce/impl.py block_bytes_per_group)
-        computes per-block bytes for the same layer groups but reads pool 0 only, while this sums
-        every pool of a group. The pool-0-only sizing gap for multi-pool attention groups is
-        tracked under TRTLLM-15194; keep the two accountings in mind together when changing either.
+        A bounce region is sized from the same runs, writer by writer
+        (``PeerRegistrar.add_writer``).
         """
         pt = self._page_table
         if pt is None:

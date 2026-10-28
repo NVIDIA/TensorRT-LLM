@@ -18,7 +18,7 @@ machine. No CUDA or NIXL imports, so it is unit-testable on CPU."""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 class TransferState(Enum):
@@ -67,8 +67,8 @@ class TransferContext:
     rid_slice: Tuple[int, int]
     slot_id: int
     base_addr: int
-    per_writer_bytes: int
-    num_writers: int
+    # Bytes each fan-in writer writes, in writer order; each writes right after the one before.
+    writer_bytes: Tuple[int, ...]
     on_done: Optional[Callable[[bool], None]] = None
 
     # Whether each writer that reported succeeded, keyed by rank; presence means it reported.
@@ -82,9 +82,16 @@ class TransferContext:
     state: TransferState = TransferState.INIT
     settled: bool = False
 
-    def writer_base(self, writer_index: int) -> int:
-        """Where this fan-in writer writes in the region."""
-        return self.base_addr + writer_index * self.per_writer_bytes
+    @property
+    def num_writers(self) -> int:
+        return len(self.writer_bytes)
+
+    def writer_base(self, writer_index: int) -> Optional[int]:
+        """Where this fan-in writer writes in the region; None for a writer with nothing to write,
+        which writes in place."""
+        if not self.writer_bytes[writer_index]:
+            return None
+        return self.base_addr + sum(self.writer_bytes[:writer_index])
 
     def _writers_final(self) -> bool:
         return self.settled or self.state in (
@@ -231,18 +238,18 @@ class BounceTransport(ABC):
     def reserve(
         self,
         recv_req,
-        num_writers: int = 1,
+        shares: Sequence[Mapping[int, int]],
         *,
         timeout: Optional[float] = None,
-        extra_bytes: int = 0,
     ) -> bool:
         """Reserve a region and record its address for the senders. False falls back to per-fragment.
-        ``extra_bytes`` sizes the sender's non-paged payload (mamba/KDA recurrent state) that rides
-        the same coalesced write as the KV blocks."""
+        ``shares[i][g]`` is what writer ``i`` sends into one page of the receiver's layer group
+        ``g``, a recurrent-state group's slot counting as its page."""
 
     @abstractmethod
     def writer_base(self, rid_slice, writer_index: int) -> Optional[int]:
-        """Where the given fan-in writer writes in the region."""
+        """Where the given fan-in writer writes in the region; None for a writer that writes in
+        place."""
 
     @abstractmethod
     def is_bounced(self, rid_slice) -> bool:

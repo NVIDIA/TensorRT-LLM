@@ -63,7 +63,7 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
 from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_params
-from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import check_compatible, received_bytes
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import check_compatible, sent_bytes
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManagerV2,
     MambaRole,
@@ -240,7 +240,7 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
 
         # Matched-parallelism payload: a receiver receives
         # NUM_KDA_LAYERS * (conv + ssm) of recurrent state.
-        payload = received_bytes(pt.layout, pt.layout, "state")
+        payload = sent_bytes(pt.layout, pt.layout)[pt.layer_groups.index(mlg)]
         assert payload == NUM_KDA_LAYERS * (CONV_SLOT_BYTES + SSM_SLOT_BYTES)
     finally:
         mgr.shutdown()

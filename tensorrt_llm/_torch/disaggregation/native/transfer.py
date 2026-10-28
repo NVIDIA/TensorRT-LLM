@@ -77,7 +77,7 @@ from tensorrt_llm._torch.disaggregation.native.ownership import SendOperationOwn
 from tensorrt_llm._torch.disaggregation.native.ownership import (
     TransferNotSubmittedError as _TransferNotSubmittedError,
 )
-from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
+from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
@@ -86,7 +86,6 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExt
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import received_bytes
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import CUASSERT, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
@@ -191,6 +190,7 @@ class MessageType:
     REQUEST_DATA = b"REQUEST_DATA"
     REQUEST_INSTANCE_INFO = b"REQUEST_INSTANCE_INFO"
     REGISTER_RANK_INFO = b"REGISTER_RANK_INFO"
+    REQUEST_RANK_INFO = b"REQUEST_RANK_INFO"
     AUX_AGENT_RESULT = b"AUX_AGENT_RESULT"
     CANCEL_SESSION = b"CANCEL_SESSION"
     SESSION_QUIESCED = b"SESSION_QUIESCED"
@@ -1567,6 +1567,11 @@ class Sender(SenderBase):
                         self._register_peer_rank(send_id, msg)
                     except Exception as e:
                         logger.error(f"Sender: error handling REGISTER_RANK_INFO: {e}")
+                case MessageType.REQUEST_RANK_INFO:
+                    try:
+                        self._messenger.send([send_id, self._registrar.self_rank_info.to_bytes()])
+                    except Exception as e:
+                        logger.error(f"Sender: error handling REQUEST_RANK_INFO: {e}")
                 case MessageType.CANCEL_SESSION:
                     try:
                         self._handle_cancel_session(msg)
@@ -2749,44 +2754,6 @@ class Receiver(ReceiverBase):
             slice_id=task.slice_id,
         )
 
-    @staticmethod
-    def _fanin_bounce_safe(
-        overlap: PeerOverlap,
-        peer_ri: RankInfo,
-        writers_send_alike: bool,
-    ) -> bool:
-        """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
-        The split assumes every writer contributes the same size, which holds when:
-          * every writer sends the same bytes per page (``writers_send_alike``, from
-            PeerRegistrar.writers_send_alike) -- else, as when one rank sends a head or an index
-            cache every rank holds, the live writers overflow their slots;
-          * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
-            for PP fan-in, every overlapping stage must hold the same number of layers
-            (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
-            list isn't available (shorter than the fan-in degree), be conservative and fall back.
-        Otherwise fall back to the per-fragment path (correct, just not coalesced).
-        Equal layer count means equal bytes only when the per-block sizes match; reserve() rejects
-        the mismatched case, so this only needs the count to split evenly."""
-        if not writers_send_alike:
-            return False
-        if overlap.overlap_pp_size > 1:
-            lpp = getattr(peer_ri, "layer_num_per_pp", None)
-            if not lpp or len(lpp) < overlap.overlap_pp_size or len(set(lpp)) != 1:
-                return False
-        return True
-
-    def _get_mamba_slot(self, req_info: RecvReqInfo) -> Optional[int]:
-        """Extract the mamba slot index from block_ids_per_layer_groups, or None."""
-        pt = self._registrar.self_extractor.page_table
-        if pt is None:
-            return None
-        for lg_idx, lg in enumerate(pt.layer_groups):
-            if lg.kind == CacheKind.STATE:
-                block_ids = req_info.block_ids_per_layer_groups[lg_idx]
-                if block_ids.size > 0:
-                    return int(block_ids[0])
-        return None
-
     def dispatch_task(self, task: KVRecvTask) -> None:
         params = task._params
         logger.debug(
@@ -2849,39 +2816,16 @@ class Receiver(ReceiverBase):
             task.expected_transfers = len(peer_overlap.ranks)
         else:
             task.expected_transfers = len(dp0_overlap.ranks)
-        # TP fan-in splits ONE region equally, so allow it only for a uniform writer set:
-        # _fanin_bounce_safe() (TP-by-head / even-PP), and never under ADP broadcast (sender_dp_rank
-        # None), where the real writer count exceeds expected_transfers and would overflow the slot.
-        topo_overlap = peer_overlap if sender_dp_rank is not None else dp0_overlap
-        # Helix writers contribute unequal shares (one KV owner, one state
-        # sender, the rest empty), so the fan-in equal split would overflow
-        # into neighboring reservations; use the per-fragment path.
-        cp_involved = self._registrar.self_rank_info.cp_size > 1 or peer_infos.cp_size > 1
-        allow_bounce = task.expected_transfers == 1 or (
-            sender_dp_rank is not None
-            and not cp_involved
-            and self._fanin_bounce_safe(
-                topo_overlap,
-                peer_infos,
-                self._registrar.writers_send_alike(peer_infos, topo_overlap),
-            )
-        )
-        # Recurrent (mamba/KDA) state rides the SAME coalesced write as the KV blocks,
-        # so the bounce region must be sized for those bytes too.
-        extra_bytes = 0
-        mamba_dst_slot = self._get_mamba_slot(receiver_req)
-        if mamba_dst_slot is not None:
-            if peer_infos.page_table is None:
-                allow_bounce = False  # cannot size the recurrent-state payload
-            else:
-                extra_bytes = received_bytes(
-                    peer_infos.page_table.layout,
-                    self._registrar.self_extractor.page_table.layout,
-                    "state",
-                )
-        bounced = allow_bounce and self._bounce.reserve(
-            receiver_req, task.expected_transfers, extra_bytes=extra_bytes
-        )
+        # A bounce region gives each writer what it sends this rank (its share, recorded when the
+        # peer registered), KV and recurrent state alike. Under a Gen-first ADP broadcast
+        # (sender_dp_rank None) the data-parallel group that answers is not known yet: one writer
+        # bounces, given the most any candidate sends of each layer group, and fan-in does not.
+        shares = [self._registrar.writer_share(peer_infos, rank) for rank in peer_overlap.ranks]
+        if sender_dp_rank is None:
+            groups = {g for share in shares for g in share}
+            most = {g: max(share.get(g, 0) for share in shares) for g in groups}
+            shares = [most] if task.expected_transfers == 1 else []
+        bounced = bool(shares) and self._bounce.reserve(receiver_req, shares)
         session = self._get_session(task._unique_rid)
         if session is None:
             raise RuntimeError(
@@ -2969,6 +2913,16 @@ class Receiver(ReceiverBase):
             self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
         return self._dealers[endpoint]
 
+    @staticmethod
+    def _request_rank_info(endpoint: str) -> RankInfo:
+        """The rank info of the sender rank listening at ``endpoint``."""
+        messenger = ZMQMessenger(mode="DEALER", endpoint=endpoint)
+        try:
+            messenger.send([MessageType.REQUEST_RANK_INFO])
+            return RankInfo.from_bytes(messenger.receive()[0])
+        finally:
+            messenger.stop()
+
     def _get_sender_info(self, params: DisaggregatedParams) -> RankInfo:
         info_endpoint = self._extract_info_endpoint(params)
         if info_endpoint in self._incompatible_peers:
@@ -2995,11 +2949,17 @@ class Receiver(ReceiverBase):
             # fail, and cached so later requests fail fast.
             try:
                 self._registrar.check_peer_compatible(sender_info)
-                # Every data-parallel group of writers covers this rank's pages
-                # (map_buffers refuses a pairing that leaves it short).
-                for dp_rank in range(sender_info.dp_size):
-                    self._registrar.writers_send_alike(
-                        sender_info, self._registrar.get_peer_overlap(sender_info, dp_rank)
+                # Each rank that may write this rank's pages, from any data-parallel group,
+                # with its own page layout: what each sends sizes its share of a bounce
+                # region, and a pairing that leaves this rank short is refused (map_buffers).
+                writers = {
+                    rank
+                    for dp_rank in range(sender_info.dp_size)
+                    for rank in self._registrar.get_peer_overlap(sender_info, dp_rank).ranks
+                }
+                for rank in sorted(writers):
+                    self._registrar.add_writer(
+                        self._request_rank_info(sender_info.sender_endpoints[rank])
                     )
             except ValueError as e:
                 msg = (

@@ -43,7 +43,7 @@ except ImportError:  # pragma: no cover - CPU-only env without CUDA bindings
     _HAVE_TRANSPORT = False
 
 from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
-from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import map_buffers, received_bytes
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import map_buffers, sent_bytes
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
     LayerGroupDesc,
@@ -221,39 +221,6 @@ def test_make_kv_result_msg_uses_binary_frame(result_name):
 
 
 # --------------------------------------------------------------------------- #
-# fan-in safety gate — equal total//num_writers split only for uniform writers
-# --------------------------------------------------------------------------- #
-def test_fanin_bounce_safe_gate() -> None:
-    """Restrict multi-writer equal-split bounce to writers that send alike.
-
-    Writers sending different bytes (one rank sending a head or an index cache every rank holds,
-    PeerRegistrar.writers_send_alike) and uneven PP splits must fall back to the per-fragment path.
-    """
-    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
-
-    safe = tfr.Receiver._fanin_bounce_safe
-
-    def ov(pp: int, ranks: tuple[int, ...] = (0,)) -> SimpleNamespace:
-        return SimpleNamespace(overlap_pp_size=pp, ranks=list(ranks))
-
-    def ri(lpp: list[int]) -> SimpleNamespace:
-        return SimpleNamespace(layer_num_per_pp=lpp)
-
-    # single PP stage (overlap_pp_size <= 1): only whether the writers send alike matters
-    assert safe(ov(1), ri([24]), True) is True
-    assert safe(ov(0), ri([24]), True) is True
-    assert safe(ov(1, ranks=(0, 1)), ri([24]), False) is False
-    # EVEN PP fan-in (equal layers per overlapping stage) -> allowed
-    assert safe(ov(4), ri([20, 20, 20, 20]), True) is True
-    # UNEVEN PP fan-in -> per-writer sizes differ -> fall back
-    assert safe(ov(4), ri([20, 20, 20, 19]), True) is False
-    # incomplete per-stage info (single element for a multi-stage fan-in) -> conservative fall back
-    assert safe(ov(4), ri([20]), True) is False
-    # unequal writers block even an otherwise-even PP split
-    assert safe(ov(4), ri([20, 20, 20, 20]), False) is False
-
-
-# --------------------------------------------------------------------------- #
 # NoBounceTransport — disabled no-op fallback
 # --------------------------------------------------------------------------- #
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
@@ -261,7 +228,7 @@ class TestNoBounce:
     def test_noop_behaviour(self):
         nb = btr.NoBounceTransport()
         assert nb.enabled is False
-        assert nb.reserve(SimpleNamespace()) is False
+        assert nb.reserve(SimpleNamespace(), [{0: 100}]) is False
         assert nb.build_request(SimpleNamespace()) is None
         assert nb.writer_base(("r", 0), 1) is None
         assert nb.is_bounced(("r", 0)) is False
@@ -324,9 +291,7 @@ class _FakeAlloc:
         return []
 
 
-def _make_transport(
-    monkeypatch, block_bytes_per_group, capacity=1 << 30, min_bytes=1, min_blocks=1
-):
+def _make_transport(monkeypatch, state_groups=(), capacity=1 << 30, min_bytes=1, min_blocks=1):
     monkeypatch.setattr(btr, "SlotAllocator", _FakeAlloc)
     monkeypatch.setattr(btr.VmmBounceTransport, "_new_stream", lambda self: 0)
     monkeypatch.setattr(
@@ -340,7 +305,7 @@ def _make_transport(
         device_id=0,
         capacity_bytes=capacity,
         phys_chunk_size=32 * _MIB,
-        block_bytes_per_group=block_bytes_per_group,
+        state_groups=state_groups,
         min_bytes=min_bytes,
         min_blocks=min_blocks,
     )
@@ -364,107 +329,79 @@ def _recv_req(block_counts, rid=1, slice_id=0):
 
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
 class TestFanInReserve:
-    def test_block_bytes_include_distinct_physical_pools_once(self) -> None:
-        layout = PageLayout(
-            tokens_per_page=32,
-            pool_slot_bytes={0: (100, 25)},
-            layer_groups=(LayerGroupDesc("attention", None, 0, 0, (0,)),),
-            buffers=(
-                BufferDesc(0, "key", 0, 0, 0, 50),
-                BufferDesc(0, "value", 0, 0, 50, 50),
-                BufferDesc(0, "index_key", 0, 1, 0, 12),
-                BufferDesc(0, "index_scale", 0, 1, 12, 13),
-            ),
-        )
-        page_table = native_page_table(layout, {0: [0x200000, 0x300000]}, num_slots=8)
-
-        assert btr.block_bytes_per_group(page_table) == [125]
-
-    def test_reserve_stamps_base_and_per_writer(self, monkeypatch):
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
-        req = _recv_req([2])  # total = 2 * 100 = 200
-        assert t.reserve(req, num_writers=2) is True
+    def test_reserve_gives_each_writer_its_share_after_the_one_before(self, monkeypatch):
+        t = _make_transport(monkeypatch)
+        req = _recv_req([2])  # two pages; the trailing hole is not counted
+        assert t.reserve(req, [{0: 30}, {0: 70}]) is True
         assert req.bounce_dst_base == 0x100000
-        # writer i lands at base + i * (total // num_writers); per_writer = 100.
-        assert t.writer_base((req.unique_rid, req.slice_id), 0) == 0x100000
-        assert t.writer_base((req.unique_rid, req.slice_id), 1) == 0x100000 + 100
+        assert t._recv_alloc.reserved_sizes == [200]
+        rid_slice = (req.unique_rid, req.slice_id)
+        assert t.writer_base(rid_slice, 0) == 0x100000
+        assert t.writer_base(rid_slice, 1) == 0x100000 + 60
 
-    def test_reserve_uneven_fanin_falls_back(self, monkeypatch):
-        t = _make_transport(monkeypatch, block_bytes_per_group=[3])
-        req = _recv_req([1])  # total = 3, not divisible by 2
-        assert t.reserve(req, num_writers=2) is False
-        assert req.bounce_dst_base is None
+    def test_reserve_sizes_shares_over_every_layer_group(self, monkeypatch):
+        # Writers send different groups, a recurrent-state group's slot counting once.
+        t = _make_transport(monkeypatch, state_groups={1})
+        req = _recv_req([2, 1, 3])
+        assert t.reserve(req, [{0: 100, 1: 50}, {0: 100, 2: 10}]) is True
+        assert t._recv_alloc.reserved_sizes == [(200 + 50) + (200 + 30)]
+        assert t.writer_base((req.unique_rid, req.slice_id), 1) == 0x100000 + 250
 
-    def test_reserve_heterogeneous_fanin_falls_back(self, monkeypatch):
-        # Two groups with different per-block sizes: the equal split would overrun a sub-region, so
-        # fall back (even though the total is divisible).
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100, 200])
-        req = _recv_req([2, 2])  # total = 2*100 + 2*200 = 600
-        assert t.reserve(req, num_writers=2) is False
-        assert req.bounce_dst_base is None
-
-    def test_reserve_uniform_multigroup_fanin_ok(self, monkeypatch):
-        # Uniform slot bytes across present groups -> even byte split -> bounce allowed.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100, 100])
-        assert t.reserve(_recv_req([2, 2]), num_writers=2) is True
-
-    def test_reserve_heterogeneous_single_writer_ok(self, monkeypatch):
-        # num_writers==1 has no split, so heterogeneous slot bytes are fine.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100, 200])
-        assert t.reserve(_recv_req([2, 2]), num_writers=1) is True
+    def test_a_writer_with_nothing_to_send_writes_in_place(self, monkeypatch):
+        t = _make_transport(monkeypatch)
+        req = _recv_req([2])
+        assert t.reserve(req, [{0: 100}, {}, {0: 100}]) is True
+        rid_slice = (req.unique_rid, req.slice_id)
+        assert [t.writer_base(rid_slice, i) for i in range(3)] == [0x100000, None, 0x100000 + 200]
 
     def test_reserve_single_writer_ok(self, monkeypatch):
-        t = _make_transport(monkeypatch, block_bytes_per_group=[3])
-        req = _recv_req([1])  # total = 3, num_writers=1 -> no even-split requirement
-        assert t.reserve(req, num_writers=1) is True
+        t = _make_transport(monkeypatch)
+        req = _recv_req([1])
+        assert t.reserve(req, [{0: 3}]) is True
+        assert t._recv_alloc.reserved_sizes == [3]
+
+    def test_reserve_of_nothing_falls_back(self, monkeypatch):
+        t = _make_transport(monkeypatch)
+        req = _recv_req([2])
+        assert t.reserve(req, [{}, {1: 100}]) is False
+        assert req.bounce_dst_base is None
 
     def test_reserve_below_min_bytes_falls_back(self, monkeypatch):
         # Recurrent-state payloads gate on BYTES: 4 blocks x 100B + 100B state = 500B < 1000B
         # falls back, regardless of how many blocks that is.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100], min_bytes=1000)
-        req = _recv_req([4])
-        assert t.reserve(req, num_writers=1, extra_bytes=100) is False
+        t = _make_transport(monkeypatch, state_groups={1}, min_bytes=1000)
+        req = _recv_req([4, 1])
+        assert t.reserve(req, [{0: 100, 1: 100}]) is False
         assert req.bounce_dst_base is None
 
     def test_reserve_at_min_bytes_bounces(self, monkeypatch):
         # exactly at the threshold (9 x 100B + 100B state = 1000B >= 1000B) the transfer bounces
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100], min_bytes=1000)
-        req = _recv_req([9])
-        assert t.reserve(req, num_writers=1, extra_bytes=100) is True
+        t = _make_transport(monkeypatch, state_groups={1}, min_bytes=1000)
+        req = _recv_req([9, 1])
+        assert t.reserve(req, [{0: 100, 1: 100}]) is True
         assert req.bounce_dst_base == 0x100000
 
     def test_reserve_recurrent_payload_ignores_block_gate(self, monkeypatch):
         # The K3 regression shape: FEW but LARGE blocks plus recurrent state must clear the byte
         # gate even though a block-count gate of 96 fails (67 blocks x 6.5 MiB = 433 MiB).
-        t = _make_transport(
-            monkeypatch,
-            block_bytes_per_group=[int(6.5 * _MIB)],
-            min_bytes=2 * _MIB,
-            min_blocks=96,
-        )
-        assert t.reserve(_recv_req([67]), num_writers=1, extra_bytes=1024) is True
+        t = _make_transport(monkeypatch, state_groups={1}, min_bytes=2 * _MIB, min_blocks=96)
+        assert t.reserve(_recv_req([67, 1]), [{0: int(6.5 * _MIB), 1: 1024}]) is True
 
     def test_reserve_plain_kv_uses_block_gate(self, monkeypatch):
         # Plain-KV payloads (no recurrent state) keep the original block-count gate, and the byte
         # gate does not apply to them (96 x 100B = 9600B passes despite min_bytes far above it).
-        t = _make_transport(
-            monkeypatch, block_bytes_per_group=[100], min_blocks=96, min_bytes=1 << 20
-        )
-        assert t.reserve(_recv_req([4]), num_writers=1) is False  # 4 < 96 blocks
-        assert t.reserve(_recv_req([96]), num_writers=1) is True
-
-    def test_reserve_unknown_slot_size_falls_back(self, monkeypatch):
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])  # only 1 group known
-        assert t.reserve(_recv_req([2, 2]), num_writers=1) is False  # 2nd group unknown
+        t = _make_transport(monkeypatch, min_blocks=96, min_bytes=1 << 20)
+        assert t.reserve(_recv_req([4]), [{0: 100}]) is False  # 4 < 96 blocks
+        assert t.reserve(_recv_req([96]), [{0: 100}]) is True
 
     def test_reserve_oversize_falls_back(self, monkeypatch):
-        t = _make_transport(monkeypatch, block_bytes_per_group=[1000], capacity=500)
-        assert t.reserve(_recv_req([2]), num_writers=1) is False  # total 2000 > cap 500
+        t = _make_transport(monkeypatch, capacity=500)
+        assert t.reserve(_recv_req([2]), [{0: 1000}]) is False  # total 2000 > cap 500
 
     def test_reserve_does_not_wait_for_recv_space(self, monkeypatch):
         # The receiver reserves on the executor thread, so a full recv region must fall back to
         # the per-fragment path at once instead of waiting for space to free up.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t = _make_transport(monkeypatch)
         timeouts = []
 
         def full_region(size, timeout=None):
@@ -473,32 +410,14 @@ class TestFanInReserve:
 
         monkeypatch.setattr(t._recv_alloc, "reserve", full_region)
         req = _recv_req([2])
-        assert t.reserve(req, num_writers=1) is False
+        assert t.reserve(req, [{0: 100}]) is False
         assert timeouts == [0.0]
         assert req.bounce_dst_base is None
 
-    def test_reserve_state_group_fanin_falls_back(self, monkeypatch):
-        # STATE groups (None bytes) with num_writers > 1 must disable bounce even
-        # when extra_bytes == 0: the representative sender may have no mamba
-        # overlap, but another PP sender might still append state fragments that
-        # were not reserved in the bounce region.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100, None])
-        # Two groups: PAGED (2 blocks x 100B) + STATE (1 slot ID, None bytes).
-        req = _recv_req([2, 1])
-        assert t.reserve(req, num_writers=2, extra_bytes=0) is False
-        assert req.bounce_dst_base is None
-
-    def test_reserve_state_group_single_writer_ok(self, monkeypatch):
-        # Single writer with STATE group is fine — no fan-in split concern.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100, None])
-        req = _recv_req([2, 1])
-        assert t.reserve(req, num_writers=1, extra_bytes=50) is True
-        assert req.bounce_dst_base is not None
-
     def test_fanin_scatters_ordered_by_src_base(self, monkeypatch):
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t = _make_transport(monkeypatch)
         req = _recv_req([2])
-        assert t.reserve(req, num_writers=2) is True
+        assert t.reserve(req, [{0: 50}, {0: 50}]) is True
         rid_slice = (req.unique_rid, req.slice_id)
         # writer for the HIGHER src_base reports first; scatter must reorder by src_base.
         t.record_result(
@@ -526,9 +445,9 @@ class TestFanInReserve:
     def test_fanin_fallback_writer_leaves_survivor_at_its_own_base(self, monkeypatch):
         # Regression: if one fan-in writer falls back to in-place (SUCCESS, empty tail) while a
         # sibling bounces, the survivor must be scattered from ITS OWN src_base, not packed to 0.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t = _make_transport(monkeypatch)
         req = _recv_req([2])
-        assert t.reserve(req, num_writers=2) is True
+        assert t.reserve(req, [{0: 50}, {0: 50}]) is True
         rid_slice = (req.unique_rid, req.slice_id)
         t.record_result(
             rid_slice, 7, None, None
@@ -547,9 +466,9 @@ class TestFanInReserve:
 
     def test_fanin_failed_then_success_releases_only_after_both(self, monkeypatch):
         # A FAILED writer must not free the shared region until every writer is terminal.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t = _make_transport(monkeypatch)
         req = _recv_req([2])
-        assert t.reserve(req, num_writers=2) is True
+        assert t.reserve(req, [{0: 50}, {0: 50}]) is True
         rid_slice = (req.unique_rid, req.slice_id)
         t.record_failure(rid_slice, 7)  # first writer fails
         assert not t._recv_alloc.released  # region held while a sibling may still be in flight
@@ -566,9 +485,9 @@ class TestFanInReserve:
     def test_on_done_fires_after_scatter_lands(self, monkeypatch):
         # The completion cb rides the context and fires only when the worker records the scatter as
         # done -> the gen never observes completion before the KV is scattered into place.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t = _make_transport(monkeypatch)
         req = _recv_req([2])
-        assert t.reserve(req, num_writers=1) is True
+        assert t.reserve(req, [{0: 100}]) is True
         rid_slice = (req.unique_rid, req.slice_id)
         calls = []
         t.record_result(
@@ -590,9 +509,9 @@ class TestFanInReserve:
     def test_empty_acc_fires_on_done_inline_and_releases(self, monkeypatch):
         # Bounced SUCCESS that carried no scatter tail: nothing to copy, but the task must still
         # complete -> on_done(True) inline + slot released, nothing queued.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t = _make_transport(monkeypatch)
         req = _recv_req([2])
-        assert t.reserve(req, num_writers=1) is True
+        assert t.reserve(req, [{0: 100}]) is True
         rid_slice = (req.unique_rid, req.slice_id)
         calls = []
         t.record_result(rid_slice, 3, None, None, on_done=lambda ok: calls.append(ok))
@@ -603,7 +522,7 @@ class TestFanInReserve:
     def test_missing_key_is_dropped(self, monkeypatch):
         # A late/duplicate result for an already-settled (popped) rid_slice is dropped: the context's own
         # settle already fired completion, so re-firing here would double-report.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t = _make_transport(monkeypatch)
         calls = []
         t.record_result(
             ("missing", 0),
@@ -617,9 +536,9 @@ class TestFanInReserve:
 
     def test_duplicate_writer_is_ignored(self, monkeypatch):
         # A duplicate SUCCESS from the same peer_rank must not double-count toward all-terminal.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t = _make_transport(monkeypatch)
         req = _recv_req([2])
-        assert t.reserve(req, num_writers=2) is True
+        assert t.reserve(req, [{0: 50}, {0: 50}]) is True
         rid_slice = (req.unique_rid, req.slice_id)
         arr = (np.array([10], dtype=np.int64), np.array([8], dtype=np.int64))
         t.record_result(rid_slice, 7, *arr, src_base=0)
@@ -637,9 +556,9 @@ class TestFanInReserve:
 
     def test_release_idle_reservation_frees_slot_and_is_idempotent(self, monkeypatch):
         # INIT-cancel immediate release (nothing published) must free the recv slot; idempotent.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t = _make_transport(monkeypatch)
         req = _recv_req([2])
-        assert t.reserve(req, num_writers=1) is True
+        assert t.reserve(req, [{0: 100}]) is True
         rid_slice = (req.unique_rid, req.slice_id)
         assert t.is_bounced(rid_slice) is True
         t.release_idle_reservation(rid_slice)
@@ -650,9 +569,9 @@ class TestFanInReserve:
     def test_orphan_reservation_quarantines_and_is_idempotent(self, monkeypatch):
         # Giving up on an in-flight reservation must quarantine the region (a write may still land),
         # not release or leak it; a second give-up is a no-op.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        t = _make_transport(monkeypatch)
         req = _recv_req([2])
-        assert t.reserve(req, num_writers=1) is True
+        assert t.reserve(req, [{0: 100}]) is True
         rid_slice = (req.unique_rid, req.slice_id)
         t.orphan_reservation(rid_slice)
         assert t._recv_alloc.quarantined == [0]  # quarantined, not released
@@ -663,8 +582,8 @@ class TestFanInReserve:
 
 
 # --------------------------------------------------------------------------- #
-# Hybrid layouts (Kimi K3: KDA mamba + MLA attention) — page-table gate,
-# trailing-empty-group handling, and recurrent-state (extra_bytes) sizing
+# Hybrid layouts (Kimi K3: KDA mamba + MLA attention) — the writer's share of KV and
+# recurrent state, and the sizing and gates it drives
 # --------------------------------------------------------------------------- #
 
 # Kimi K3 geometry: 24 MLA layers in one attention layer group; 69 KDA layers
@@ -714,60 +633,52 @@ def _k3_page_table(kda: bool = True) -> KVCachePageTable:
 
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
 class TestHybridK3Bounce:
-    def test_block_bytes_per_group_keeps_mamba_placeholder(self):
-        # The mamba group must stay in the list as a placeholder (None), aligned with the
-        # layer-group indices a recv request uses, instead of truncating the list.
-        assert btr.block_bytes_per_group(_k3_page_table()) == [_K3_MLA_BLOCK_BYTES, None]
+    def test_state_groups_name_the_recurrent_layer_groups(self):
+        assert btr.state_groups(_k3_page_table()) == {1}
+        assert btr.state_groups(_k3_page_table(kda=False)) == frozenset()
 
     def test_reserve_engages_on_k3_mixed_layout(self, monkeypatch):
-        # Regression pin: a K3 recv request always carries a trailing EMPTY entry for
-        # the mamba layer group (transceiver._create_chunk), which used to trip the
-        # unknown-slot-size guard and silently push every K3 request onto the per-fragment
-        # (~0.4 GB/s host-staged) path. It must engage bounce, sized for MLA KV + KDA state.
+        # Regression pin: a K3 recv request carries the MLA blocks and the KDA slot, and must
+        # engage bounce, sized for MLA KV plus KDA state.
+        page_table = _k3_page_table()
         t = _make_transport(
-            monkeypatch,
-            block_bytes_per_group=btr.block_bytes_per_group(_k3_page_table()),
-            min_bytes=2 * _MIB,
+            monkeypatch, state_groups=btr.state_groups(page_table), min_bytes=2 * _MIB
         )
-        req = _recv_req([67, 0])  # 67 MLA blocks (~2144 tokens) + the empty mamba entry
-        assert t.reserve(req, num_writers=1, extra_bytes=_K3_KDA_PAYLOAD_BYTES) is True
+        req = _recv_req([67, 1])  # 67 MLA blocks (~2144 tokens) + the KDA slot
+        share = sent_bytes(page_table.layout, page_table.layout)
+        assert t.reserve(req, [share]) is True
         assert req.bounce_dst_base == 0x100000
         # the region covers the MLA KV blocks plus the appended KDA state
         assert t._recv_alloc.reserved_sizes == [67 * _K3_MLA_BLOCK_BYTES + _K3_KDA_PAYLOAD_BYTES]
 
-    def test_reserve_nonempty_slot_group_with_unknown_size_skipped(self, monkeypatch):
-        # Non-attention groups (STATE-based) carry a slot index but their bytes
-        # are in extra_bytes — bounce skips them rather than rejecting.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[_K3_MLA_BLOCK_BYTES, None])
-        assert t.reserve(_recv_req([2, 1]), num_writers=1) is True
+    def test_reserve_counts_state_toward_min_bytes(self, monkeypatch):
+        t = _make_transport(monkeypatch, state_groups={1}, min_bytes=1000)
+        assert t.reserve(_recv_req([4, 1]), [{0: 100, 1: 599}]) is False  # 999 < 1000
+        assert t.reserve(_recv_req([4, 1]), [{0: 100, 1: 600}]) is True  # exactly 1000
 
-    def test_reserve_extra_bytes_counts_toward_min_bytes(self, monkeypatch):
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100], min_bytes=1000)
-        assert t.reserve(_recv_req([4]), num_writers=1, extra_bytes=599) is False  # 999 < 1000
-        assert t.reserve(_recv_req([4]), num_writers=1, extra_bytes=600) is True  # exactly 1000
+    def test_reserve_counts_state_toward_capacity(self, monkeypatch):
+        # The state is part of the reservation, or the sender's coalesced write (KV + recurrent
+        # state) would overrun the region into the neighboring slot.
+        t = _make_transport(monkeypatch, state_groups={1}, capacity=500)
+        assert t.reserve(_recv_req([2, 1]), [{0: 100, 1: 400}]) is False  # 600 > 500
 
-    def test_reserve_extra_bytes_counts_toward_capacity(self, monkeypatch):
-        # extra_bytes must be part of the reservation, or the sender's coalesced write
-        # (KV + recurrent state) would overrun the region into the neighboring slot.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100], capacity=500)
-        assert t.reserve(_recv_req([2]), num_writers=1, extra_bytes=400) is False  # 600 > 500
+    def test_reserve_fans_in_writers_holding_different_state(self, monkeypatch):
+        # PP stages hold different recurrent layers: each writer's region holds its own state.
+        t = _make_transport(monkeypatch, state_groups={1})
+        req = _recv_req([2, 1])
+        assert t.reserve(req, [{0: 100, 1: 64}, {0: 100}]) is True
+        assert t._recv_alloc.reserved_sizes == [264 + 200]
+        assert t.writer_base((req.unique_rid, req.slice_id), 1) == 0x100000 + 264
 
-    def test_reserve_extra_bytes_fanin_falls_back(self, monkeypatch):
-        # Fan-in with a STATE group present falls back: per-writer recurrent-state
-        # fragments can differ (PP stages hold different mamba layers).
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100, None])
-        assert t.reserve(_recv_req([2, 1]), num_writers=2, extra_bytes=64) is False
-        assert t.reserve(_recv_req([2, 0]), num_writers=2) is True  # no state blocks -> fan-in fine
-
-    def test_receiver_payload_bytes_matches_k3_geometry(self):
+    def test_writer_share_matches_k3_geometry(self):
         layout = _k3_page_table().layout
-        assert received_bytes(layout, layout, "state") == _K3_KDA_PAYLOAD_BYTES
+        assert sent_bytes(layout, layout) == {0: _K3_MLA_BLOCK_BYTES, 1: _K3_KDA_PAYLOAD_BYTES}
 
-    def test_receiver_payload_bytes_zero_without_kda_on_either_side(self):
+    def test_writer_share_has_no_state_without_kda_on_either_side(self):
         layout = _k3_page_table().layout
         attention_only = _k3_page_table(kda=False).layout
-        assert received_bytes(attention_only, layout, "state") == 0
-        assert received_bytes(layout, attention_only, "state") == 0
+        assert sent_bytes(attention_only, layout) == {0: _K3_MLA_BLOCK_BYTES}
+        assert sent_bytes(layout, attention_only) == {0: _K3_MLA_BLOCK_BYTES}
 
 
 # --------------------------------------------------------------------------- #
@@ -881,21 +792,22 @@ class TestSlotAllocator:
 # No CUDA / NIXL / allocator, so these run on any CPU (no skipif).
 # --------------------------------------------------------------------------- #
 class TestLifecycle:
-    def _ctx(self, num_writers, per_writer_bytes=100, base_addr=0x1000):
+    def _ctx(self, num_writers, writer_bytes=100, base_addr=0x1000):
         return bcore.TransferContext(
             rid_slice=(1, 0),
             slot_id=0,
             base_addr=base_addr,
-            per_writer_bytes=per_writer_bytes,
-            num_writers=num_writers,
+            writer_bytes=(writer_bytes,) * num_writers,
         )
 
     def _dst(self, v=10):
         return dict(dst_ptrs=np.array([v], dtype=np.int64), sizes=np.array([8], dtype=np.int64))
 
     def test_writer_base_layout(self):
-        c = self._ctx(3, per_writer_bytes=0x64, base_addr=0x1000)
+        c = self._ctx(3, writer_bytes=0x64, base_addr=0x1000)
         assert [c.writer_base(i) for i in range(3)] == [0x1000, 0x1064, 0x10C8]
+        uneven = bcore.TransferContext((1, 0), 0, 0x1000, writer_bytes=(0x10, 0, 0x30))
+        assert [uneven.writer_base(i) for i in range(3)] == [0x1000, None, 0x1010]
 
     def test_single_writer_success_scatters_then_releases(self):
         c = self._ctx(1)

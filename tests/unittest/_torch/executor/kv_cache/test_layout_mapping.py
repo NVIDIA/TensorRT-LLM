@@ -34,7 +34,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
     fan,
     map_buffers,
     merge_runs,
-    received_bytes,
+    sent_bytes,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     Axis,
@@ -361,15 +361,22 @@ def test_state_pages_of_other_token_counts_correspond():
     check_compatible(state, dataclasses.replace(state, tokens_per_page=8))
 
 
-def test_received_bytes_count_what_both_transfer_of_one_kind():
-    topology = Instance(tp=2).ranks(0)[0]
+def test_sent_bytes_count_what_one_source_sends_into_each_layer_group():
+    """Per page of each of the destination's layer groups (attention 0, state 1 here), what one
+    source rank sends it."""
     specs = [
         ("key", kv(4), "attention"),
         ("ssm", state_heads(4), "state"),
         ("ple", whole(12), "state"),
     ]
-    dst = layout(topology, (0, 1), specs)
+    dst = layout(Instance(tp=2).ranks(0)[0], (0, 1), specs)
     src = layout(Instance().ranks(0)[0], (1, 2), specs)
-    # Layer 1 only: its SSM share (2 of 4 heads) and its replicated PLE.
-    assert received_bytes(src, dst, "state") == 2 * HEAD + 12
-    assert received_bytes(src, dst, "attention") == 2 * HEAD
+    # Layer 1 only: 2 of its 4 K heads, its SSM share (2 of 4 heads) and its replicated PLE.
+    assert sent_bytes(src, dst) == {0: 2 * HEAD, 1: 2 * HEAD + 12}
+    # Two tensor ranks fan into one: each sends its heads of both layers, one of them the PLE.
+    whole_dst = layout(Instance().ranks(0)[0], (0, 1), specs)
+    shares = [sent_bytes(layout(t, (0, 1), specs), whole_dst) for t in Instance(tp=2).ranks(0)]
+    assert sorted(shares, key=lambda s: -s[1]) == [
+        {0: 4 * HEAD, 1: 4 * HEAD + 24},
+        {0: 4 * HEAD, 1: 4 * HEAD},
+    ]

@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import dataclasses
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -30,9 +29,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
     BufferRuns,
     check_compatible,
     fan,
-    group_kinds,
+    layer_group_of,
     map_buffers,
     merge_runs,
+    sent_bytes,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import PageLayout
 
@@ -61,8 +61,9 @@ class PeerRegistrar:
         self._self_ext_cache = self_extractor
         self._peer_ext_cache: Dict[str, KVRegionExtractorV1] = {}
         self._overlap_cache: Dict[str, PeerOverlap] = {}
-        # (peer instance, writer ranks) -> whether those writers send alike.
-        self._writers_alike_cache: Dict[Tuple[str, Tuple[int, ...]], bool] = {}
+        # peer_key of a rank writing this rank's pages -> what it sends per page of each of this
+        # rank's layer groups.
+        self._writer_shares: Dict[str, Dict[int, int]] = {}
         self._aux_transfer_layout_cache: Dict[str, AuxTransferLayout] = {}
 
     def register(self, peer_name: str, peer_rank: int, peer_ri: RankInfo):
@@ -182,56 +183,25 @@ class PeerRegistrar:
                 "allowing partial layer transfer."
             )
 
-    def writers_send_alike(self, peer_ri: RankInfo, overlap: PeerOverlap) -> bool:
-        """Whether the peer ranks writing this rank's pages (``overlap.ranks``) each send it the
-        same bytes per page of its attention groups, so that one region split evenly among them
-        holds each writer's share.
-
-        Only the writers on the stage whose page layout the peer rank info carries are computed,
-        each from that layout with the writer's place put in, as the ranks of one stage lay out
-        pages alike apart from where they stand. Writers on other stages may hold other layers,
-        so with several stages any attention buffer every rank holds whole, of which one writer
-        sends all, counts as unequal.
+    def add_writer(self, writer: RankInfo) -> Dict[int, int]:
+        """Record what a peer rank writing this rank's pages sends it: its share, the bytes it
+        sends into one page of each of this rank's layer groups, a state group's slot counting as
+        its page (``layout_mapping.sent_bytes``), from the writer's own page layout.
 
         Raises:
-            ValueError: If a writer's pages do not correspond to this rank's (``map_buffers``).
+            ValueError: If the writer's pages do not correspond to this rank's, or the ranks it
+                pairs with leave this rank's short (``map_buffers``).
         """
-        cache_key = (peer_ri.instance_name, tuple(overlap.ranks))
-        if cache_key in self._writers_alike_cache:
-            return self._writers_alike_cache[cache_key]
         own = _layout_of(self._self_ext_cache.page_table)
-        template = _layout_of(peer_ri.page_table)
-        kinds = group_kinds(own)
-        place = template.topology
-        per_stage = peer_ri.tp_size * peer_ri.cp_size
-        sent = set()
-        for rank in overlap.ranks:
-            pp, rest = divmod(rank, per_stage)
-            if pp != place.pp_rank:
-                continue
-            tp, cp = divmod(rest, peer_ri.cp_size)
-            writer = dataclasses.replace(
-                place, tp_rank=tp, cp_rank=cp, dp_rank=tp if place.attention_dp else place.dp_rank
-            )
-            sent.add(
-                sum(
-                    int(runs.sizes.sum())
-                    for runs in map_buffers(
-                        dataclasses.replace(template, topology=writer),
-                        own,
-                        key=own.topology.dp_rank,
-                    )
-                    if kinds.get((runs.dst.pool_group, runs.dst.layer)) == "attention"
-                )
-            )
-        alike = len(sent) <= 1
-        if alike and overlap.overlap_pp_size > 1 and len(overlap.ranks) > 1:
-            alike = not any(
-                b.transferred and not b.split and kinds.get((b.pool_group, b.layer)) == "attention"
-                for b in own.buffers
-            )
-        self._writers_alike_cache[cache_key] = alike
-        return alike
+        theirs = _layout_of(writer.page_table)
+        check_compatible(theirs, own)
+        share = sent_bytes(theirs, own, key=self._ri.dp_rank)
+        self._writer_shares[self._unique_key(writer.instance_name, writer.instance_rank)] = share
+        return share
+
+    def writer_share(self, peer_ri: RankInfo, peer_rank: int) -> Dict[int, int]:
+        """The share ``add_writer`` recorded for rank ``peer_rank`` of the peer's instance."""
+        return self._writer_shares[self._unique_key(peer_ri.instance_name, peer_rank)]
 
     def get_kv_maps(
         self, peer_ri: RankInfo, excluded: frozenset = frozenset()
@@ -253,7 +223,7 @@ class PeerRegistrar:
         if runs is None:
             own = _layout_of(self._self_ext_cache.page_table)
             peer = _layout_of(peer_ri.page_table)
-            own_group, peer_group = _layer_group_of(own), _layer_group_of(peer)
+            own_group, peer_group = layer_group_of(own), layer_group_of(peer)
             runs = defaultdict(list)
             # Ties between ranks holding the same bytes rotate by the destination's DP rank.
             for r in map_buffers(own, peer, key=peer_ri.dp_rank):
@@ -354,19 +324,6 @@ class PeerRegistrar:
                 return should_send_in_tp and p == self._ri.pp_rank
             offset += n
         return False
-
-
-def _layer_group_of(layout: PageLayout) -> Dict[Tuple[int, int], int]:
-    """(pool group, global layer) -> index of the layer group holding that layer's buffers there."""
-    out: Dict[Tuple[int, int], int] = {}
-    for index, group in enumerate(layout.layer_groups):
-        for layer in group.layers:
-            if out.setdefault((group.pool_group, layer), index) != index:
-                raise ValueError(
-                    f"PeerRegistrar: layer {layer} lies in layer groups {out[group.pool_group, layer]} "
-                    f"and {index} of pool group {group.pool_group}"
-                )
-    return out
 
 
 def _layout_of(page_table: Optional[KVCachePageTable]) -> PageLayout:

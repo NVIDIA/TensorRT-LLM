@@ -331,13 +331,13 @@ def _state_layout(*, side_bytes=128):
     )
 
 
-def test_received_state_bytes_matched_tp():
-    """A receiver of the same layout receives all of its recurrent state."""
-    from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import received_bytes
+def test_sent_state_bytes_matched_tp():
+    """A rank of the same layout sends all of its recurrent state."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import sent_bytes
 
     layout = _state_layout()
     # Standard state covers both layers; the side role exists only on layer 2.
-    assert received_bytes(layout, layout, "state") == 2 * (1024 + 2048) + 128
+    assert sent_bytes(layout, layout) == {0: 2 * (1024 + 2048) + 128}
 
 
 def test_incompatible_replicated_side_state_is_refused():

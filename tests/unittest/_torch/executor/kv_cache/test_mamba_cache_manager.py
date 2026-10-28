@@ -4829,10 +4829,7 @@ def test_v2_kda_replay_survives_cache_lifecycle(snapshot, kda_draft_records):
 def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
     """A context server without replay caches and a generation server with them describe the same transferable
     recurrent state, and the generation server seeds its replay caches from the transferred conv state."""
-    from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
-        check_compatible,
-        received_bytes,
-    )
+    from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import check_compatible, sent_bytes
 
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
     ctx = _build_kda_replay_manager(is_disagg=True)
@@ -4854,7 +4851,8 @@ def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
             assert {
                 b.role for b in table.layout.buffers if b.transferred and b.layer in layers
             } == {str(MambaRole.CONV_STATE), str(MambaRole.SSM_STATE)}
-        assert received_bytes(src_table.layout, dst_table.layout, "state") == sum(
+        state_group = dst_table.layer_groups.index(dst_group)
+        assert sent_bytes(src_table.layout, dst_table.layout)[state_group] == sum(
             gen.mamba_layer_cache(i).conv[dst_slot].numel() * 2
             + gen.mamba_layer_cache(i).temporal[dst_slot].numel() * 4
             for i in range(2)

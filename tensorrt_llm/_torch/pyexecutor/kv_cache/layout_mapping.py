@@ -52,7 +52,15 @@ from .page_layout import (
     held,
 )
 
-__all__ = ["BufferRuns", "check_compatible", "fan", "map_buffers", "merge_runs", "received_bytes"]
+__all__ = [
+    "BufferRuns",
+    "check_compatible",
+    "fan",
+    "layer_group_of",
+    "map_buffers",
+    "merge_runs",
+    "sent_bytes",
+]
 
 
 def fan(src_size: int, dst_size: int, dst_rank: int) -> range:
@@ -341,6 +349,23 @@ def group_kinds(layout: PageLayout) -> dict[tuple[int, int], str]:
     return {(g.pool_group, layer): g.kind for g in layout.layer_groups for layer in g.layers}
 
 
+def layer_group_of(layout: PageLayout) -> dict[tuple[int, int], int]:
+    """(pool group, global layer) -> index of the layer group holding that layer's buffers there.
+
+    Raises:
+        ValueError: If a layer lies in two layer groups of one pool group.
+    """
+    out: dict[tuple[int, int], int] = {}
+    for index, group in enumerate(layout.layer_groups):
+        for layer in group.layers:
+            if out.setdefault((group.pool_group, layer), index) != index:
+                raise ValueError(
+                    f"layer {layer} lies in layer groups {out[group.pool_group, layer]} and "
+                    f"{index} of pool group {group.pool_group}"
+                )
+    return out
+
+
 def _transferred(layout: PageLayout) -> dict[tuple[int, str], BufferDesc]:
     return {(b.layer, b.role): b for b in layout.buffers if b.transferred}
 
@@ -384,14 +409,17 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
         raise ValueError("page layouts do not correspond: " + "; ".join(problems))
 
 
-def received_bytes(src: PageLayout, dst: PageLayout, kind: str) -> int:
-    """Bytes the destination receives into one page of its layer groups of ``kind`` from the
-    sources laid out as ``src``: those of each buffer it transfers that ``src`` transfers too, all
-    of which arrive (a destination its paired sources leave short is refused)."""
-    sent = _transferred(src)
-    kinds = group_kinds(dst)
-    return sum(
-        b.size
-        for key, b in _transferred(dst).items()
-        if key in sent and kinds.get((b.pool_group, b.layer)) == kind
-    )
+def sent_bytes(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> dict[int, int]:
+    """Bytes the rank of ``src`` sends the rank of ``dst`` into one page of each of the
+    destination's layer groups, a state group's slot counting as its page: ``map_buffers``' runs,
+    summed by the index of the destination's layer group. Groups it sends nothing of are left out.
+
+    Raises:
+        ValueError: As ``map_buffers`` and ``layer_group_of`` do.
+    """
+    group_of = layer_group_of(dst)
+    out: dict[int, int] = {}
+    for runs in map_buffers(src, dst, key=key):
+        group = group_of[runs.dst.pool_group, runs.dst.layer]
+        out[group] = out.get(group, 0) + int(runs.sizes.sum())
+    return out
