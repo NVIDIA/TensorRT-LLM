@@ -70,6 +70,13 @@
           "title": "Enable Kv Cache Aware Routing",
           "type": "boolean"
         },
+        "enable_work_aware_routing": {
+          "default": false,
+          "description": "Route attention-DP requests by estimated uncached prefill instead of prompt length. A request's estimate is its prompt growth since the previous request with the same conversation_params.conversation_id (its whole prompt when there is none or the prompt shrank); a rank's load is the summed estimate of its requests still in the context phase, and new requests go, largest first, to the least-loaded rank below max_num_active_requests. Intended for context servers whose KV cache connector restores prefixes from a pool shared by all attention-DP ranks, where a conversation's earlier prompt is reusable on any rank. Without a KV cache connector that moves KV, load-based routing is used and a warning is logged. Cannot be combined with enable_kv_cache_aware_routing or kv_cache_routing_conversation_affinity.",
+          "status": "prototype",
+          "title": "Enable Work Aware Routing",
+          "type": "boolean"
+        },
         "kv_cache_routing_account_for_in_transfer": {
           "default": false,
           "description": "In-transfer load accounting in KV cache-aware routing. When True, requests still streaming KV to the GEN worker (tracked by the PyExecutor AsyncTransferManager but no longer in active_requests) are folded back into the per-rank load reported via RankState. This can improve balance under heavy disagg traffic but inflates num_active_requests reported upstream, which lets the inference loop's idle-fetch wait expire even when no requests are runnable and causes empty fetch cycles. Default False preserves the prior behaviour (fetch blocks when truly idle). Only used when enable_kv_cache_aware_routing is True.",

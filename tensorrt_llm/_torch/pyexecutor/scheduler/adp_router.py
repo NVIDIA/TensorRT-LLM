@@ -28,6 +28,10 @@ Includes:
     - DefaultADPRouter: load-balanced min-heap routing
     - KVCacheAwareADPRouter: cache-aware routing that factors in
       prefix match length from the KV cache radix tree
+    - ConversationAwareADPRouter: explicit conversation-to-rank affinity
+    - WorkAwareADPRouter: balances ranks by estimated uncached prefill on
+      servers whose KV cache connector restores prefixes from a pool shared
+      by all ranks
 """
 
 from __future__ import annotations
@@ -48,6 +52,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed.communicator import Distributed
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
+    from ..connectors.kv_cache_connector import KvCacheConnectorManager
     from ..executor_request_queue import RequestQueueItem
 
 HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
@@ -62,6 +67,23 @@ def _num_input_tokens(request) -> int:
     if isinstance(num_input_tokens, int):
         return num_input_tokens
     return len(getattr(request, "input_token_ids", []))
+
+
+def _lru_put(table: OrderedDict, key, value, cap: int) -> None:
+    """Insert or refresh ``key`` as most recent, then evict the oldest entries above ``cap``."""
+    table[key] = value
+    table.move_to_end(key)
+    while len(table) > cap:
+        table.popitem(last=False)
+
+
+def _attention_dp_relax(req_item) -> bool:
+    """Sort key that puts requests with a strict ``attention_dp_rank`` first."""
+    scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+    if scheduling_params is None or scheduling_params.attention_dp_rank is None:
+        return True
+    relax = scheduling_params.attention_dp_relax
+    return True if relax is None else relax
 
 
 def is_retiring_request(request) -> bool:
@@ -110,6 +132,7 @@ class ADPRouter(ABC):
         kv_cache_manager=None,
         attention_dp_config=None,
         async_transfer_manager=None,
+        kv_connector_manager: Optional["KvCacheConnectorManager"] = None,
     ) -> "ADPRouter":
         """Factory method to create the appropriate ADP router.
 
@@ -122,12 +145,20 @@ class ADPRouter(ABC):
             async_transfer_manager: PyExecutor's AsyncTransferManager, used by
                 KVCacheAwareADPRouter to account for KV-transfer-in-progress
                 requests in per-rank load.  Ignored by DefaultADPRouter.
+            kv_connector_manager: The executor's KV cache connector manager (may
+                be None). WorkAwareADPRouter needs one that moves KV (not
+                ``capacity_only``). Under attention DP the manager has already
+                validated that such a connector shares one storage pool across
+                the ranks (``KvCacheConnectorManager.validate_attention_dp``), so
+                a conversation's earlier prompt is restorable on any rank.
 
         Returns:
             A ConversationAwareADPRouter if kv_cache_routing_conversation_affinity
             is set; otherwise a KVCacheAwareADPRouter if enable_kv_cache_aware_routing
             is set, the kv_cache_manager has block reuse enabled and helix CP is
-            off; otherwise a DefaultADPRouter.
+            off; otherwise a WorkAwareADPRouter if enable_work_aware_routing is
+            set and a KV-moving connector is attached; otherwise a
+            DefaultADPRouter.
         """
         if (
             attention_dp_config is not None
@@ -175,6 +206,22 @@ class ADPRouter(ABC):
                 async_transfer_manager=async_transfer_manager,
                 account_for_in_transfer=attention_dp_config.kv_cache_routing_account_for_in_transfer,
             )
+
+        # `is True`: unvalidated (Mock) configs carry truthy auto-attributes.
+        if (
+            attention_dp_config is not None
+            and attention_dp_config.enable_work_aware_routing is True
+        ):
+            if kv_connector_manager is not None and not kv_connector_manager.capacity_only:
+                return WorkAwareADPRouter(dist=dist, has_seq_slot_headroom=has_seq_slot_headroom)
+            # The KV-cache estimation executor is built without its connector
+            # (create_py_executor); the final executor decides, so stay quiet here.
+            if getattr(kv_cache_manager, "is_estimating_kv_cache", False) is not True:
+                logger.warning(
+                    "attention_dp_config.enable_work_aware_routing requires a KV cache "
+                    "connector that restores prefixes from a pool shared by the "
+                    "attention-DP ranks; falling back to load-based attention-DP routing."
+                )
 
         return DefaultADPRouter(dist=dist, has_seq_slot_headroom=has_seq_slot_headroom)
 
@@ -1079,4 +1126,158 @@ class ConversationAwareADPRouter(ADPRouter):
             f"tracked_convs={len(self._conv_to_rank)}"
         )
 
+        return all_ranks_new_requests, expected_num_active_requests
+
+
+class WorkAwareADPRouter(ADPRouter):
+    """Balances attention-DP ranks by estimated prefill work, not prompt length.
+
+    With prefix reuse (and especially a shared KV store), most of a prompt is
+    restored rather than computed, so prompt length says little about the work a
+    request brings: two prompts of the same length can differ by 50x in the
+    tokens they actually prefill. The default router balances by prompt length,
+    which leaves one rank working through a large uncached prefill while the
+    others run padding iterations in lockstep.
+
+    The estimate for a request is how much its prompt grew since the previous
+    request of the same conversation (the earlier prompt is the reusable part);
+    a request with no known predecessor, or whose prompt shrank, counts its
+    whole prompt. A rank's load is the summed estimate of its requests still in
+    the context phase, and each new request goes, largest first, to the
+    least-loaded rank with room for it.
+
+    Every rank routes the same new requests in the same order, so the
+    conversation and per-request bookkeeping stay identical across ranks.
+
+    Intended for context servers whose KV cache connector restores prefixes
+    from a pool shared by all attention-DP ranks: a conversation's earlier
+    prompt is restorable on whichever rank a later request lands, so the
+    estimate does not depend on the rank. ``ADPRouter.create`` builds it only
+    when such a connector is attached.
+
+    Only ``route_requests`` changes the two tables, including their LRU order,
+    and it runs on every rank with the same gathered states and broadcast
+    requests, so the tables stay identical across ranks. ``create_rank_state``
+    only reads them. The estimate is also published as
+    ``py_uncached_prefill_tokens`` for the V2 scheduler's long-prefill demotion
+    (``TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS``) while that is enabled (see
+    ``set_publish_uncached_estimate``).
+    """
+
+    # LRU cap on each table (entries are tens of bytes each), bounding memory on
+    # long-running servers as conversations and requests churn.
+    DEFAULT_MAX_ENTRIES = 1 << 16
+
+    def __init__(
+        self,
+        dist: "Distributed",
+        has_seq_slot_headroom: bool = False,
+        max_entries: int = DEFAULT_MAX_ENTRIES,
+    ):
+        super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
+        self._max_entries = max(1, int(max_entries))
+        # conversation_id -> prompt length of its latest request.
+        self._conv_prompt_len: "OrderedDict[str, int]" = OrderedDict()
+        # request id (and n>1 child ids) -> estimated prefill tokens.
+        self._estimated_work: "OrderedDict[int, int]" = OrderedDict()
+        self._publish_uncached_estimate_enabled = False
+        logger.info(
+            "[adp_router] work-aware attention-DP routing: ranks balanced by "
+            "estimated uncached prefill tokens"
+        )
+
+    @staticmethod
+    def _conversation_id(req_item) -> Optional[str]:
+        # The request's own conversation_id, never subagent_affinity_id: sub-agents
+        # have prompts of their own (same rule as ConversationAwareADPRouter's estimate).
+        params = getattr(req_item.request, "py_conversation_params", None)
+        return None if params is None else params.conversation_id
+
+    def set_publish_uncached_estimate(self, enabled: bool) -> None:
+        """Publish py_uncached_prefill_tokens only while the scheduler uses it.
+
+        Args:
+            enabled: Whether to set ``py_uncached_prefill_tokens`` on routed
+                requests.
+        """
+        self._publish_uncached_estimate_enabled = enabled
+
+    def _estimate_prefill_tokens(self, req_item: RequestQueueItem) -> int:
+        """Estimate, record and (optionally) publish a new request's uncached prefill.
+
+        Args:
+            req_item: A new request being routed.
+
+        Returns:
+            The estimated prefill tokens, at least 1.
+        """
+        prompt_len = _num_input_tokens(req_item.request)
+        conv_id = self._conversation_id(req_item)
+        work = prompt_len
+        if conv_id is not None:
+            previous = self._conv_prompt_len.get(conv_id)
+            if previous is not None and prompt_len >= previous:
+                work = prompt_len - previous
+            _lru_put(self._conv_prompt_len, conv_id, prompt_len, self._max_entries)
+        work = max(1, work)
+        _lru_put(self._estimated_work, req_item.id, work, self._max_entries)
+        for child_id in req_item.child_req_ids or ():
+            _lru_put(self._estimated_work, child_id, work, self._max_entries)
+        if self._publish_uncached_estimate_enabled and req_item.request is not None:
+            req_item.request.py_uncached_prefill_tokens = work
+        return work
+
+    def create_rank_state(
+        self,
+        active_requests: list[LlmRequest],
+        new_requests: list[RequestQueueItem],
+    ) -> RankState:
+        # Read-only on the tables (dict.get, no LRU touch): active requests are
+        # rank-local, and the tables must stay identical across ranks.
+        load = 0
+        for req in active_requests:
+            if not req.is_context_init_state:
+                continue
+            load += self._estimated_work.get(req.py_request_id, req.py_orig_prompt_len)
+        return RankState(
+            rank=self.dist.tp_rank,
+            num_active_requests=len(active_requests),
+            num_active_tokens=load,
+        )
+
+    def route_requests(
+        self,
+        all_rank_states: list[RankState],
+        new_requests: list[RequestQueueItem],
+        max_num_active_requests: int,
+    ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
+        tp_size = len(all_rank_states)
+        all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
+            s.rank: [] for s in all_rank_states
+        }
+        counts = [s.num_active_requests for s in all_rank_states]
+        loads = [s.num_active_tokens for s in all_rank_states]
+        ordered = sorted(new_requests, key=_attention_dp_relax)
+        # Every request is estimated once, in this order, identically on every rank.
+        work = {req_item.id: self._estimate_prefill_tokens(req_item) for req_item in ordered}
+        remaining = self._assign_explicit_dp_ranks(
+            ordered, all_ranks_new_requests, counts, max_num_active_requests
+        )
+        for rank, assigned in all_ranks_new_requests.items():
+            loads[rank] += sum(work[req_item.id] for req_item in assigned)
+        # Largest first, so big prefills spread before small ones fill in (stable sort).
+        for req_item in sorted(remaining, key=lambda item: work[item.id], reverse=True):
+            candidates = [r for r in range(tp_size) if counts[r] < max_num_active_requests]
+            rank = min(candidates or range(tp_size), key=lambda r: (loads[r], counts[r], r))
+            all_ranks_new_requests[rank].append(req_item)
+            loads[rank] += work[req_item.id]
+            counts[rank] += 1
+        # Capped like the other routers; a rank already above the cap is
+        # tolerated by PyExecutor's padding check.
+        expected_num_active_requests = min(max(counts), max_num_active_requests)
+        logger.debug(
+            f"[adp_router][work] new_reqs_per_rank="
+            f"{[len(all_ranks_new_requests[r]) for r in range(tp_size)]} "
+            f"est_load_per_rank={loads}"
+        )
         return all_ranks_new_requests, expected_num_active_requests

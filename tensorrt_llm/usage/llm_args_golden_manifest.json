@@ -34,6 +34,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "attention_dp_config.enable_work_aware_routing"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "attention_dp_config.kv_cache_routing_account_for_in_transfer"
     },
     {

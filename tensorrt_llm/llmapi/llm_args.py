@@ -2114,6 +2114,23 @@ class AttentionDpConfig(StrictBaseModel):
             "Active prompt tokens estimate work, not cached KV residency. Existing "
             "conversation->rank pins are unaffected. Only used when "
             "kv_cache_routing_conversation_affinity is True.")
+    enable_work_aware_routing: bool = Field(
+        default=False,
+        description=
+        "Route attention-DP requests by estimated uncached prefill instead of "
+        "prompt length. A request's estimate is its prompt growth since the "
+        "previous request with the same conversation_params.conversation_id "
+        "(its whole prompt when there is none or the prompt shrank); a rank's "
+        "load is the summed estimate of its requests still in the context "
+        "phase, and new requests go, largest first, to the least-loaded rank "
+        "below max_num_active_requests. Intended for context servers whose KV "
+        "cache connector restores prefixes from a pool shared by all "
+        "attention-DP ranks, where a conversation's earlier prompt is reusable "
+        "on any rank. Without a KV cache connector that moves KV, load-based "
+        "routing is used and a warning is logged. Cannot be combined with "
+        "enable_kv_cache_aware_routing or "
+        "kv_cache_routing_conversation_affinity.",
+        status="prototype")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':
@@ -2126,6 +2143,13 @@ class AttentionDpConfig(StrictBaseModel):
                 raise ValueError(
                     "attention_dp_config.timeout_iters must be greater or equal to 0 when enable_balance is true"
                 )
+        if self.enable_work_aware_routing and (
+                self.enable_kv_cache_aware_routing
+                or self.kv_cache_routing_conversation_affinity):
+            raise ValueError(
+                "attention_dp_config.enable_work_aware_routing cannot be "
+                "combined with enable_kv_cache_aware_routing or "
+                "kv_cache_routing_conversation_affinity")
         return self
 
 

@@ -693,6 +693,21 @@ Add `examples/llm-api` to `PYTHONPATH`. The example supports one full-attention
 layer group and no chunked prefill; it demonstrates shared storage, not
 production transfer performance.
 
+**Routing by uncached prefill.** With a shared pool, a later request of a
+conversation restores most of its prompt on whichever attention-DP rank it
+lands, so prompt length says little about the prefill it brings. Setting
+
+```yaml
+attention_dp_config:
+  enable_work_aware_routing: true
+```
+
+balances ranks by each request's prompt growth since the previous request of
+the same conversation (the whole prompt for a first turn). It requires a
+connector that moves KV; without one, a warning is logged and load-based
+routing is used. It cannot be combined with `enable_kv_cache_aware_routing` or
+`kv_cache_routing_conversation_affinity`.
+
 ## Example Implementation
 
 The file `examples/llm-api/llm_kv_cache_connector.py` provides a reference implementation of a **Persistent KV Cache**.
