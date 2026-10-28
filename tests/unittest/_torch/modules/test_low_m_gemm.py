@@ -248,6 +248,39 @@ def test_apply_force_active_bypasses_low_m_gemm_active(monkeypatch) -> None:
     assert reached.get("called"), "split-K kernel was not invoked"
 
 
+def test_attach_force_survives_a_lazy_init_by_an_ordinary_apply(monkeypatch) -> None:
+    """attach(force=True), then a first apply() without force_active (a BF16 Linear call): the
+    lazy init keeps the force and builds the runners and the tuning config the race reads."""
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", False)
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", "0")
+    monkeypatch.setattr(LowMGemmDispatcher, "_is_candidate_shape", staticmethod(lambda *_: True))
+
+    module = torch.nn.Linear(128, 256, bias=False)
+    dispatcher = LowMGemmDispatcher()
+    dispatcher.attach(module, force=True)
+    assert not dispatcher._prepared
+
+    def fake_runner(inputs, tactic, bias, out):
+        return out.fill_(1.0)
+
+    def choose_one(op, runners, tuning_config, inputs, **kwargs):
+        assert tuning_config is not None
+        assert all(runner is not None for runner in runners)
+        return fake_runner, -1
+
+    mock_at = MagicMock()
+    mock_at.choose_one.side_effect = choose_one
+    monkeypatch.setattr(_mod, "AutoTuner", MagicMock(get=staticmethod(lambda: mock_at)))
+
+    with torch.inference_mode():
+        output = _mod.apply_low_m_gemm(
+            module, torch.empty((4, 128), dtype=torch.bfloat16), module.weight, None
+        )
+
+    assert dispatcher._force and dispatcher._prepared
+    assert output is not None and mock_at.choose_one.call_count == 1
+
+
 # ---------------------------------------------------------------------------
 # _SplitKGemmRunner
 # ---------------------------------------------------------------------------

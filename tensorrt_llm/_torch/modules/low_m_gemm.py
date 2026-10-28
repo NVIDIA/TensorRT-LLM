@@ -560,11 +560,7 @@ class LowMGemmDispatcher:
         if self._prepared:
             return
         if not LOW_M_GEMM_ACTIVE and not self._force:
-            # Mark prepared *before* returning so repeated apply() calls in the
-            # inactive-but-not-forced path skip the check without creating runners
-            # that would remain None.  apply() re-checks LOW_M_GEMM_ACTIVE / force_active
-            # before reaching here, so the None-runner state is never observed by callers.
-            self._prepared = True
+            # Stay unprepared: a later forced call must still create the runners.
             return
         pdl = get_env_enable_pdl()
         self._runner_no_bias = _SplitKGemmRunner(has_bias=False, pdl=pdl)
@@ -690,8 +686,8 @@ class LowMGemmDispatcher:
             return None
         if not self._prepared:
             # Unit tests and direct callers that bypass ModelEngine / attach().
-            # Save force so _init_runners() can honour it.
-            self._force = force_active
+            # Never drop the force of attach(): the runners must exist past the gate above.
+            self._force = self._force or force_active
             self._init_runners()
         if not self._is_candidate_shape(input_tensor, weight, bias):
             return None
