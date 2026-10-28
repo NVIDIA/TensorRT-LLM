@@ -95,6 +95,25 @@ inline void fhcZeroWorkspaces(float* y_acc, uint32_t y_elems, float* r_acc, uint
 
 } // namespace
 
+int mhcFusedHcMmaKSplits(int M, int num_k_splits, bool all_in_one)
+{
+    if (num_k_splits > 0)
+        return num_k_splits;
+    if (all_in_one)
+        return 1;
+    // Heuristic split-K selection driven by M. Keeps large-M waves compute-bound
+    // (low splits) and low-M waves fully occupied (high splits).
+    if (M <= 512)
+        return 16;
+    if (M <= 1024)
+        return 8;
+    if (M <= 2048)
+        return 4;
+    if (M <= 4096)
+        return 2;
+    return 1;
+}
+
 // ---- mHC fused kernel shape constants (mirrors the Python module) ----
 // HC_MULT * (2 + HC_MULT) = 4 * 6 = 24.
 static constexpr uint32_t FHC_SHAPE_N = 24;
@@ -372,27 +391,6 @@ static FusedRoutFn pickFhc(uint32_t ks)
     }
 }
 
-// Heuristic split-K selection driven by M. Keeps large-M waves compute-bound
-// (low splits) and low-M waves fully occupied (high splits).
-//
-// NOTE: split > 1 introduces atomic accumulation into D and sqr_sum. Atomic
-// ordering is non-deterministic across runs, which breaks CUDA-graph bit-exact
-// replay equality. Consumers that require bit-exact determinism should keep
-// M small enough to land in the splits=1 bucket, or supply an explicit
-// deterministic variant if needed.
-static uint32_t pickKSplits(int M)
-{
-    if (M <= 512)
-        return 16;
-    if (M <= 1024)
-        return 8;
-    if (M <= 2048)
-        return 4;
-    if (M <= 4096)
-        return 2;
-    return 1;
-}
-
 static int selectBigFuseBS(int M)
 {
     if (M >= 4096)
@@ -425,17 +423,10 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     uint32_t const m_u = static_cast<uint32_t>(M);
     int device_id = 0;
     TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
-    uint32_t const ks = (num_k_splits > 0) ? static_cast<uint32_t>(num_k_splits) : pickKSplits(M);
+    // Workspaces are per-split: y_acc [ks, M, SHAPE_N] and r_acc [ks, M]. Every slot is written by exactly
+    // one CTA (no atomics, no pre-zeroing), and the big-fuse step sums the splits in split order.
+    uint32_t const ks = static_cast<uint32_t>(mhcFusedHcMmaKSplits(M, num_k_splits, /*all_in_one=*/false));
     int const bs = (bigfuse_block_size > 0) ? bigfuse_block_size : selectBigFuseBS(M);
-
-    // ---- Zero workspace buffers (atomic accumulators) ----
-    // KS=1 takes the direct-store path in the kernel epilogue (no atomicAdd,
-    // each (m,n) written by exactly one CTA), so pre-zeroing is unnecessary.
-    if (ks > 1)
-    {
-        fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * FHC_SHAPE_N, r_acc_workspace,
-            static_cast<uint32_t>(M), /*done_counter=*/nullptr, /*done_elems=*/0, stream);
-    }
 
     // ---- Build TMA descriptors (cached by ptr+shape) ----
     CUtensorMap desc_res = getCachedTma2D(const_cast<__nv_bfloat16*>(residual_prev), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
@@ -479,8 +470,8 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     // instantiating the mhcBigFuseKernel template in this TU.
     mhcBigFuseLaunch(y_acc_workspace, r_acc_workspace, residual_cur, hc_scale, hc_base, post_mix_cur, comb_mix_cur,
         layer_input_cur, M, /*K=*/static_cast<int>(SHAPE_K), hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-        hc_post_mult_value, sinkhorn_repeat, /*num_splits=*/1, /*block_size=*/bs, norm_weight, norm_eps, stream,
-        pre_mix_ext, pre_mix_out);
+        hc_post_mult_value, sinkhorn_repeat, /*num_splits=*/static_cast<int>(ks), /*block_size=*/bs, norm_weight,
+        norm_eps, stream, pre_mix_ext, pre_mix_out);
 }
 
 void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev, float const* post_mix_prev,
@@ -611,8 +602,10 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
 // All-in-one single-kernel fused hyper-connection launcher (TF32 tcgen05).
 //
 // Wraps fused_allinone_tf32_pmap_gemm_atomic_impl: pmap + GEMM + bigfuse
-// all fused into one kernel.  Phase 3 elects last-home CTA per m-block via
-// atomic done_counter; Phase 4 runs bigfuse inline on the elected CTA.
+// all fused into one kernel.  Each split CTA stores its partial into
+// y_acc [ks, M, SHAPE_N] / r_acc [ks, M]; Phase 3 is a per-m-block barrier on
+// done_counter, and Phase 4 sums the splits in split order and runs bigfuse
+// inline.
 // ===================================================================
 
 #ifdef TRTLLM_MHC_ENABLE_FUSED_HC
@@ -706,17 +699,16 @@ static void mhcFusedHcAllInOneLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloa
     uint32_t const m_u = static_cast<uint32_t>(M);
     int device_id = 0;
     TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
-    uint32_t const ks = (num_k_splits > 0) ? static_cast<uint32_t>(num_k_splits) : 1u;
+    uint32_t const ks = static_cast<uint32_t>(mhcFusedHcMmaKSplits(M, num_k_splits, /*all_in_one=*/true));
     uint32_t const m_tiles = (m_u + FHC_BLOCK_M - 1) / FHC_BLOCK_M;
 
-    // ---- Zero workspace buffers (atomic accumulators + done counter) ----
-    // KS=1 takes the direct-store path (no atomic on y_acc/r_acc) and skips
-    // the done_counter atomic election (Phase 3 just __threadfence_block +
-    // __syncthreads). All three buffers are unused at KS=1 → skip the zero.
+    // ---- Zero the per-m_block done counters (Phase-3 barrier) ----
+    // y_acc [ks, M, SHAPE_N] / r_acc [ks, M] hold per-split partials, each slot written by exactly one CTA,
+    // so they need no zeroing. KS=1 skips the barrier (Phase 3 is just __threadfence_block + __syncthreads).
     if (ks > 1)
     {
-        fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * FHC_SHAPE_N, r_acc_workspace,
-            static_cast<uint32_t>(M), done_counter_workspace, m_tiles, stream);
+        fhcZeroWorkspaces(/*y_acc=*/nullptr, /*y_elems=*/0, /*r_acc=*/nullptr, /*r_elems=*/0, done_counter_workspace,
+            m_tiles, stream);
     }
 
     // ---- Build TMA descriptors (cached by ptr+shape) ----
@@ -927,6 +919,8 @@ void mhcFusedHcFmaAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     // num_k_splits == 1. Adding the direct-store branch would require kernel
     // changes in fused_pmap_gemm_fma_allinone; deferred since Path F is the
     // small-M (M <= 32) winner where the workspace zero is ~1 µs anyway.
+    // Path F only instantiates num_k_splits <= 2: at most two partials are added onto the zeroed slot, and that
+    // sum is the same in either order, so the accumulation stays deterministic.
     fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * static_cast<uint32_t>(N), r_acc_workspace,
         static_cast<uint32_t>(M), done_counter_workspace, static_cast<uint32_t>(m_batches), stream);
 

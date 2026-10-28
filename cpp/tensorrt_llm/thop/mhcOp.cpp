@@ -162,6 +162,19 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
         norm_weight_ptr = reinterpret_cast<__nv_bfloat16 const*>(norm_weight->data_ptr<at::BFloat16>());
     }
 
+    // The TF32 MMA backends (0 = half, 2 = all-in-one) store one partial per split, so the workspaces must hold
+    // [ks, M, hc_mult * (2 + hc_mult)] and [ks, M] for the split count the launcher actually runs with.
+    if (backend == 0 || backend == 2)
+    {
+        num_k_splits = tk::mhcFusedHcMmaKSplits(static_cast<int>(M), static_cast<int>(num_k_splits), backend == 2);
+        int64_t const shape_n = hc_mult * (2 + hc_mult);
+        TORCH_CHECK(
+            y_acc_workspace.numel() >= num_k_splits * M * shape_n && r_acc_workspace.numel() >= num_k_splits * M,
+            "mhc_fused_hc: MMA backend with num_k_splits=", num_k_splits, " needs y_acc_workspace of ",
+            num_k_splits * M * shape_n, " and r_acc_workspace of ", num_k_splits * M, " fp32 elements, got ",
+            y_acc_workspace.numel(), " and ", r_acc_workspace.numel());
+    }
+
     // backend codes:
     //   0 = fused_half_mma (2-kernel: fused_tf32_pmap_gemm_rout + mhcBigFuseKernel)
     //   1 = fused_half_fma (2-kernel: fused_pmap_gemm_fma_ksplit + mhcBigFuseKernel)

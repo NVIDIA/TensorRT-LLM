@@ -675,6 +675,95 @@ def test_mhc_fused_hc_fused_norm(n: int, hidden_size: int, hc_mult: int):
     torch.testing.assert_close(layer_input_ref, layer_input_f, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize(
+    "n,hidden_size,tactic",
+    [
+        # Split counts outside {1, 2, 4, 8, 16} reach the runtime-split big-fuse reduction.
+        (48, 7168, ("fused_half_mma", 0, 112, 512, 1)),
+        (96, 7168, ("fused_half_mma", 0, 56, 512, 1)),
+        (384, 7168, ("fused_half_mma", 0, 16, 512, 1)),
+        (384, 7168, ("fused_all_mma", 0, 16, 0, 1)),
+        (1536, 7168, ("fused_half_mma", 0, 4, 256, 1)),
+        (256, 4096, ("fused_half_mma", 0, 32, 256, 1)),
+        (256, 4096, ("fused_all_mma", 0, 8, 0, 1)),
+        # num_k_splits == 0: the launcher's own split heuristic.
+        (384, 7168, ("fused_half_mma", 0, 0, 0, 1)),
+    ],
+)
+@skip_pre_blackwell
+def test_mhc_fused_hc_mma_split_k_deterministic(n: int, hidden_size: int, tactic):
+    """Split-K MMA fused_hc returns bit-identical outputs for identical inputs.
+
+    The split partials are reduced in split order, so repeated calls must not
+    differ in any bit, and the result must still match the torch reference.
+    """
+    if not _mhc_fused_hc_mma_available():
+        pytest.skip("TF32 MMA fused_hc backend not available")
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+
+    hc_mult = 4
+    pre_data = generate_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
+    torch.random.manual_seed(7)
+    device = "cuda"
+    x_prev = torch.randn((n, hidden_size), dtype=torch.bfloat16, device=device) / hidden_size
+    residual_prev = (
+        torch.randn((n, hc_mult, hidden_size), dtype=torch.float, device=device) / hidden_size
+    ).bfloat16()
+    post_mix_prev = torch.randn((n, hc_mult, 1), dtype=torch.float32, device=device) * 0.1
+    comb_mix_prev = torch.randn((n, hc_mult, hc_mult), dtype=torch.float32, device=device) * 0.1
+
+    cur_module = mHC(
+        mult=hc_mult,
+        hidden_size=hidden_size,
+        sinkhorn_iters=pre_data["sinkhorn_repeat"],
+        dtype=None,
+        eps=pre_data["hc_pre_eps"],
+        norm_eps=pre_data["rms_eps"],
+        post_mult_value=pre_data["hc_post_mult_value"],
+    ).cuda()
+    cur_module.fn.copy_(pre_data["fn"])
+    cur_module.scale.copy_(pre_data["hc_scale"])
+    cur_module.base.copy_(pre_data["hc_base"])
+    residual_cur_ref = cur_module.post_mapping(
+        x_prev.clone(), residual_prev.clone(), post_mix_prev.clone(), comb_mix_prev.clone()
+    )
+    post_mix_ref, comb_mix_ref, layer_input_ref = cur_module.pre_mapping(residual_cur_ref.clone())
+
+    runner = MhcFusedHcRunner(
+        n=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=pre_data["rms_eps"],
+        hc_pre_eps=pre_data["hc_pre_eps"],
+        hc_sinkhorn_eps=pre_data["hc_sinkhorn_eps"],
+        hc_post_mult_value=pre_data["hc_post_mult_value"],
+        sinkhorn_repeat=pre_data["sinkhorn_repeat"],
+    )
+    inputs = [
+        x_prev,
+        residual_prev.contiguous(),
+        post_mix_prev.reshape(n, hc_mult).contiguous(),
+        comb_mix_prev.reshape(n, hc_mult, hc_mult).contiguous(),
+        cur_module.fn.detach().contiguous(),
+        cur_module.scale.detach(),
+        cur_module.base.detach(),
+    ]
+
+    outputs = [runner(inputs=[t.clone() for t in inputs], tactic=tactic) for _ in range(4)]
+    for repeat in outputs[1:]:
+        for first, other in zip(outputs[0], repeat):
+            assert torch.equal(first, other), (
+                f"tactic={tactic} n={n}: outputs differ between identical calls"
+            )
+
+    residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = outputs[0]
+    torch.testing.assert_close(residual_cur, residual_cur_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(post_mix_cur.view(n, hc_mult, 1), post_mix_ref, rtol=1e-3, atol=5e-3)
+    torch.testing.assert_close(
+        comb_mix_cur.view(n, hc_mult, hc_mult), comb_mix_ref, rtol=1e-3, atol=5e-3
+    )
+    torch.testing.assert_close(layer_input_cur, layer_input_ref, rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize("n", list(_BACKEND_TACTICS_BY_M.keys()))
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("hc_mult", [4])
@@ -1037,13 +1126,9 @@ def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
     verifies that (a) fused_hc can be captured without host syncs, and
     (b) replay produces bit-exact results to eager.
 
-    To keep the bit-exact assertion structurally valid, we drive the runner
-    with an explicit ``num_k_splits=1`` tactic (Path B, fused_half_mma).
-    That disables split-K atomic accumulation entirely, so none of the four
-    outputs depend on the non-deterministic FP ordering that pickKSplits(M)
-    would otherwise introduce (it picks ks=16 at M=128 and ks=4 at M=2048
-    for the autotuner fallback — atomics active, not deterministic across
-    replays).
+    The runner is driven with an explicit ``num_k_splits=1`` tactic (Path B,
+    fused_half_mma); test_mhc_fused_hc_cuda_graph_high_splitk_tactics covers
+    replay of the split-K tactics.
     """
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
 
@@ -1083,10 +1168,9 @@ def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
         hc_post_mult_value=pre_data["hc_post_mult_value"],
         sinkhorn_repeat=pre_data["sinkhorn_repeat"],
     )
-    # Pin tactic to Path B with num_k_splits=1 → no atomic accumulation on
-    # any output. Tactic tuple matches MhcFusedHcRunner.get_tactics().
+    # Pin tactic to Path B with num_k_splits=1. Tactic tuple matches
+    # MhcFusedHcRunner.get_tactics().
     tactic = ("fused_half_mma", 0, 1, 128, 1)
-    assert tactic[2] == 1, "bit-exact assertion requires num_k_splits=1"
 
     def _inputs():
         return [
@@ -1122,8 +1206,7 @@ def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
     g.replay()
     torch.cuda.synchronize()
 
-    # With ks=1 the kernel has no atomic accumulation anywhere, so replay must
-    # be bit-exact against eager on all four outputs.
+    # Replay must be bit-exact against eager on all four outputs.
     for ge, ee, name in zip(
         graph_out, eager_out, ["residual", "post_mix", "comb_mix", "layer_input"]
     ):
@@ -1277,9 +1360,12 @@ def test_mhc_fused_hc_force_deterministic(
 @pytest.mark.parametrize(
     "backend,num_k_splits,tile_m,expected_shapes",
     [
-        ("fused_half_mma", 56, 1, ((129, 24), (129,), (1,))),
+        ("fused_half_mma", 56, 1, ((56, 129, 24), (56, 129), (1,))),
+        # num_k_splits == 0: sized for the launcher's heuristic (16 splits at M <= 512 for half, 1 for all-in-one).
+        ("fused_half_mma", 0, 1, ((16, 129, 24), (16, 129), (1,))),
         ("fused_half_fma", 4, 1, ((4, 129, 24), (4, 129), (1,))),
-        ("fused_all_mma", 56, 1, ((129, 24), (129,), (3,))),
+        ("fused_all_mma", 56, 1, ((56, 129, 24), (56, 129), (3,))),
+        ("fused_all_mma", 0, 1, ((129, 24), (129,), (3,))),
         ("fused_all_fma", 2, 4, ((129, 24), (129,), (33,))),
     ],
 )
@@ -1456,13 +1542,13 @@ def _assert_graph_replay_matches_eager(runner, inputs, tactic):
     for actual, expected, name in zip(
         graph_out, eager_out, ("residual", "post_mix", "comb_mix", "layer_input")
     ):
-        # splitK atomics are not bit-exact, but stale graph pointers or bad
-        # workspace reuse would diverge far beyond this bf16-scale tolerance.
+        # Split-K partials are reduced in a fixed order, so a replay must
+        # reproduce the eager result bit for bit.
         torch.testing.assert_close(
             actual,
             expected,
-            rtol=3e-2,
-            atol=5e-2,
+            rtol=0,
+            atol=0,
             msg=f"fused_hc CUDA-graph replay mismatch in {name}; tactic={tactic}",
         )
 
@@ -1478,9 +1564,8 @@ def _assert_graph_replay_matches_eager(runner, inputs, tactic):
 def test_mhc_fused_hc_cuda_graph_high_splitk_tactics(n: int, tactic):
     """Reduced autotune maps decode buckets to high-splitK MMA tactics.
 
-    Unlike the bit-exact ks=1 graph test above, this covers the actual
-    M=64/128 PR autotune path where splitK atomics and CUDA graph replay are
-    both active.
+    Unlike the ks=1 graph test above, this covers the actual M=64/128 PR
+    autotune path where high split-K and CUDA graph replay are both active.
     """
     runner, inputs = _make_fused_hc_runner_case(n=n, hidden_size=4096, hc_mult=4, seed=41 + n)
     _assert_graph_replay_matches_eager(runner, inputs, tactic)

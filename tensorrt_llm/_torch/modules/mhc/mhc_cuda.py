@@ -786,6 +786,22 @@ def _fused_hc_call(
     )
 
 
+def _fused_hc_mma_k_splits(M: int, num_k_splits: int, all_in_one: bool) -> int:
+    """Split count the TF32 MMA fused-HC launchers run with (C++ ``mhcFusedHcMmaKSplits``).
+
+    ``num_k_splits <= 0`` selects the launcher's built-in heuristic. The op checks
+    that the workspaces sized from this value cover what the launcher writes.
+    """
+    if num_k_splits > 0:
+        return num_k_splits
+    if all_in_one:
+        return 1
+    for max_m, ks in ((512, 16), (1024, 8), (2048, 4), (4096, 2)):
+        if M <= max_m:
+            return ks
+    return 1
+
+
 def _alloc_fused_hc_scratch(
     backend: str,
     B: int,
@@ -794,12 +810,23 @@ def _alloc_fused_hc_scratch(
     tile_m: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Allocate backend-specific scratch for one fused-HC invocation."""
+    """Allocate backend-specific scratch for one fused-HC invocation.
+
+    The split-K backends other than Path F keep one GEMM partial per split
+    ([ks, B, shape_n] / [ks, B]) and sum the splits in split order, so their
+    output does not depend on how the split CTAs were scheduled.
+    """
     shape_n = n * (2 + n)
 
-    if backend == "fused_half_fma" and num_k_splits > 1:
-        y_acc_ws = torch.empty((num_k_splits, B, shape_n), dtype=torch.float32, device=device)
-        r_acc_ws = torch.empty((num_k_splits, B), dtype=torch.float32, device=device)
+    if backend in ("fused_half_mma", "fused_all_mma"):
+        num_splits = _fused_hc_mma_k_splits(B, num_k_splits, backend == "fused_all_mma")
+    elif backend == "fused_half_fma":
+        num_splits = max(num_k_splits, 1)
+    else:
+        num_splits = 1
+    if num_splits > 1:
+        y_acc_ws = torch.empty((num_splits, B, shape_n), dtype=torch.float32, device=device)
+        r_acc_ws = torch.empty((num_splits, B), dtype=torch.float32, device=device)
     else:
         y_acc_ws = torch.empty((B, shape_n), dtype=torch.float32, device=device)
         r_acc_ws = torch.empty((B,), dtype=torch.float32, device=device)
@@ -818,10 +845,10 @@ def _alloc_fused_hc_scratch(
 
 # Fallback tactic: backend, tile_n, num_k_splits, bigfuse_bs, tile_m.
 #
-# The MMA (tcgen05) default delegates ks/bs to the C++ heuristic (pickKSplits
-# + selectBigFuseBS). That backend requires SM100+, so on pre-SM100 GPUs we
-# fall back to the half-fused FMA path with an explicit ks=1 tactic that is
-# valid everywhere.
+# The MMA (tcgen05) default delegates ks/bs to the C++ heuristic
+# (mhcFusedHcMmaKSplits, mirrored by _fused_hc_mma_k_splits, + selectBigFuseBS).
+# That backend requires SM100+, so on pre-SM100 GPUs we fall back to the
+# half-fused FMA path with an explicit ks=1 tactic that is valid everywhere.
 _FUSED_HC_FALLBACK_TACTIC_MMA = ("fused_half_mma", 0, 0, 0, 1)
 _FUSED_HC_FALLBACK_TACTIC_FMA = ("fused_half_fma", 2, 1, 256, 1)
 
@@ -1121,7 +1148,7 @@ def mhc_fused_hc(
     backend carries it as a template variant, so the tactic space is unchanged.
 
     The autotuner chooses between four backends:
-      * "fused_half_mma" — 2-kernel tcgen05 TF32 pmap+GEMM atomic + bigfuse.
+      * "fused_half_mma" — 2-kernel tcgen05 TF32 pmap+GEMM (per-split partials) + bigfuse.
       * "fused_half_fma" — 2-kernel pmap inline + FMA GEMM + sqrsum + bigfuse.
       * "fused_all_mma"  — 1-kernel TF32 tcgen05 all-in-one (Path D).
       * "fused_all_fma"  — 1-kernel FMA all-in-one (Path F).
@@ -1154,7 +1181,7 @@ def mhc_fused_hc(
     if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
         # This fixed FMA tactic has no cross-CTA floating-point atomics and
         # uses the same reduction order for context and generation shapes.
-        # Bypass tuning so an existing cache cannot reintroduce atomic split-K.
+        # Bypass tuning so a cached tactic cannot change the reduction order.
         best_tactic = _FUSED_HC_FALLBACK_TACTIC_FMA
     else:
         tuner = AutoTuner.get()
