@@ -1796,6 +1796,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/thop/allreduceOp.cpp",
         "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
         "cpp/tests/unit_tests/multi_gpu/",
+        "jenkins/L0_Test.groovy",
         "requirements.txt",
         "security_scanning/pyproject.toml",
         "tensorrt_llm/_ipc_utils.py",

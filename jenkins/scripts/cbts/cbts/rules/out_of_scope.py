@@ -53,9 +53,6 @@ OUT_OF_SCOPE_EXACT_PATHS: tuple[str, ...] = (
     ".nspect-allowlist.toml",
     "scripts/bandit.yaml",
     "jenkins/license_cpp.json",
-    # Temporary Tier 2 smoke test: remove these entries before merging the PR.
-    "jenkins/L0_Test.groovy",
-    "jenkins/L0_MergeRequest.groovy",
     "legacy-files.txt",
     "ruff-legacy.toml",
     "ruff-legacy-baseline.json",
