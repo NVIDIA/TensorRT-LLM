@@ -2327,6 +2327,57 @@ def test_cutedsl_fc12_small_batch_matches_fc12_kernel(num_tokens):
     assert rel < 3e-2, f"relative difference to the FC12 kernel {rel:.3e}"
 
 
+@nvfp4_moe_supported
+def test_cutedsl_fc12_die_major_weights():
+    """Die-major placement on a two-domain device: the expert parameters keep their shapes, the
+    small-batch kernel reads them (same NVFP4 MoE), and a call it does not serve raises instead
+    of running the FC12 kernel on die-major bytes. The placement is not taken when the
+    deployment's calls can exceed the small-batch kernel."""
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+    from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
+
+    if get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("CUTEDSL_FC12 needs SM107 and CuTe DSL Rubin support")
+    if not is_locality_domain_enabled():
+        pytest.skip("needs two locality domains")
+
+    num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
+    gate = _make_test_gate(num_experts=num_experts)
+    torch.manual_seed(95)
+    x = torch.randn(64, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
+    act_scale = float(x.abs().max().float() / (448 * 6))
+    w1, w2, w3 = (
+        [
+            torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda") * 0.05
+            for _ in range(num_experts)
+        ]
+        for rows, cols in ((inter, hidden), (hidden, inter), (inter, hidden))
+    )
+    bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], act_scale) for e in range(num_experts)]
+    moe = _make_nvfp4_moe(gate, num_experts=num_experts, moe_backend="CUTEDSL_FC12")
+    _stream_nvfp4_bank(moe, bank)
+    moe.backend._weights_transformed = False
+    moe.post_load_weights()
+    backend = moe.backend
+    # the default max_num_tokens exceeds the small-batch kernel
+    assert not backend._die_major_applies() and not backend.weights_die_major
+
+    x8 = x[:8]
+    logits8 = gate.compute_logits(x8)
+    default = moe.forward(x8, logits8, all_rank_num_tokens=None).float()
+    shapes = [p.shape for p in (backend.w3_w1_weight, backend.w2_weight_scale)]
+    backend._max_call_tokens = 32
+    assert backend._die_major_applies()
+    backend._place_weights_die_major()
+    assert backend.weights_die_major
+    assert [p.shape for p in (backend.w3_w1_weight, backend.w2_weight_scale)] == shapes
+    die_major = moe.forward(x8, logits8, all_rank_num_tokens=None).float()
+    rel = (die_major - default).norm() / default.norm().clamp_min(1e-30)
+    assert rel < 1e-2, f"relative difference to the default placement {rel:.3e}"
+    with pytest.raises(RuntimeError, match="die-major"):
+        moe.forward(x, gate.compute_logits(x), all_rank_num_tokens=None)
+
+
 def test_fp8_block_scaled_dequantization():
     """FP8_PB_WO attention weights must be dequantized, never reinterpreted.
 

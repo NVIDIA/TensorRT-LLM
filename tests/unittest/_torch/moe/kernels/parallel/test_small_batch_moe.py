@@ -137,7 +137,7 @@ def _counters():
     return new_small_batch_moe_counters(torch.device("cuda"))
 
 
-def _run(d, out, counters, *, token_indexed, deterministic, num_ctas=0):
+def _run(d, out, counters, *, token_indexed, deterministic, num_ctas=0, die_major=False):
     torch.ops.trtllm.cute_dsl_nvfp4_small_batch_moe_rubin(
         input=d["x"].view(torch.float4_e2m1fn_x2),
         input_scale=d["x_sf"].view(torch.uint8),
@@ -162,6 +162,7 @@ def _run(d, out, counters, *, token_indexed, deterministic, num_ctas=0):
         token_indexed=token_indexed,
         num_ctas=num_ctas,
         deterministic_combine=deterministic,
+        die_major=die_major,
     )
 
 
@@ -331,3 +332,68 @@ def test_small_batch_moe_no_local_expert(token_indexed, deterministic):
     torch.cuda.synchronize()
     assert int(out.abs().sum().item()) == 0
     assert int(counters.abs().sum().item()) == 0
+
+
+@pytest.mark.parametrize("shape", list(SHAPES))
+@pytest.mark.parametrize("num_tokens", [1, 8, 16, 32])
+@pytest.mark.parametrize("token_indexed", [False, True])
+def test_small_batch_moe_die_major_matches_default(shape, num_tokens, token_indexed, monkeypatch):
+    """Die-major weights with per-domain claiming: the same units and arithmetic as the default
+    layout, so with the slice combine the output is bitwise the default's, for any CTA count and
+    over graph replays; counters reset. On a device without two locality domains the weights
+    stay in default memory and a synthetic SM -> domain table drives the claiming."""
+    from tensorrt_llm._torch.locality_domain import placement
+    from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
+    from tensorrt_llm._torch.moe.custom_ops.cute_dsl_small_batch_moe_custom_op import (
+        die_major_layout,
+    )
+
+    d = _setup(shape, num_tokens, 8642 + num_tokens)
+    counters = _counters()
+    ref = torch.full((num_tokens, d["hidden"]), float("nan"), dtype=torch.bfloat16, device="cuda")
+    _run(d, ref, counters, token_indexed=token_indexed, deterministic=True)
+
+    two_domains = is_locality_domain_enabled()
+    if not two_domains:
+        num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+        domains = tuple((sm >> 1) & 1 for sm in range(num_sms))
+        monkeypatch.setattr(placement, "sm_locality_domains", lambda device_index: domains)
+    dm = dict(d)
+    for key in ("w1", "w1_sf", "w2", "w2_sf"):
+        layout = die_major_layout(d[key])
+        if two_domains:
+            layout = placement.split_domain_copy(layout, layout.numel() // 2)
+        dm[key] = layout.view(d[key].shape)
+
+    for ctas in (0, 1, 37):
+        out = torch.full_like(ref, float("nan"))
+        _run(
+            dm,
+            out,
+            counters,
+            token_indexed=token_indexed,
+            deterministic=True,
+            num_ctas=ctas,
+            die_major=True,
+        )
+        torch.cuda.synchronize()
+        assert int(counters.abs().sum().item()) == 0, f"counters not reset (ctas={ctas})"
+        assert torch.equal(ref.view(torch.int16), out.view(torch.int16)), f"bits (ctas={ctas})"
+    out_g = torch.empty_like(ref)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        _run(dm, out_g, counters, token_indexed=token_indexed, deterministic=True, die_major=True)
+    for _ in range(2):
+        out_g.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(ref.view(torch.int16), out_g.view(torch.int16)), "graph replay"
+        assert int(counters.abs().sum().item()) == 0
+    out_r = torch.full_like(ref, float("nan"))
+    _run(dm, out_r, counters, token_indexed=token_indexed, deterministic=False, die_major=True)
+    torch.cuda.synchronize()
+    assert int(counters.abs().sum().item()) == 0
+    a, b = out_r.float(), ref.float()
+    assert float((a - b).norm() / b.norm().clamp_min(1e-30)) < 1e-2, "red combine"

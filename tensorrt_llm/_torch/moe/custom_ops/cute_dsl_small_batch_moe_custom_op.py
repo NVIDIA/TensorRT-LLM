@@ -28,6 +28,7 @@ from tensorrt_llm._utils import get_sm_version
 
 __all__ = [
     "SMALL_BATCH_MOE_MAX_TOKENS",
+    "die_major_layout",
     "new_small_batch_moe_counters",
     "small_batch_moe_supports",
 ]
@@ -39,12 +40,15 @@ _MAX_TILES = 1024
 #: Persistent CTAs per token tile by SM version (others: one per SM). On Rubin the grid leaves
 #: SMs free for the shared expert, which runs on a concurrent stream.
 _PERSISTENT_CTAS = {107: {8: 204, 16: 196, 32: 180}}
-#: (claim_free, max_slices, ring stage cap) of the expert-parallel (permuted) layout and of the
-#: token-indexed layout of MoE-TP slices. Small intermediates make FC2 tasks short, so the
-#: token-indexed schedule claims an FC2 task only once 4 ring stages are free for it and splits
-#: the tiles into more slices.
-_PERMUTED_SCHEDULE = (0, 16, 8)
-_TOKEN_INDEXED_SCHEDULE = (4, 24, 8)
+#: (claim_free, max_slices) of the expert-parallel (permuted) layout and of the token-indexed
+#: layout of MoE-TP slices. Small intermediates make FC2 tasks short, so the token-indexed schedule
+#: claims an FC2 task only once 4 ring stages are free for it and splits the tiles into more
+#: slices.
+_PERMUTED_SCHEDULE = (0, 16)
+_TOKEN_INDEXED_SCHEDULE = (4, 24)
+#: Ring stage cap: die-major weights stream from the SM's own domain and keep more stages busy.
+_RING_STAGES = 8
+_DIE_MAJOR_RING_STAGES = 12
 
 
 def small_batch_moe_supports(intermediate_size: int, hidden_size: int) -> bool:
@@ -55,6 +59,15 @@ def small_batch_moe_supports(intermediate_size: int, hidden_size: int) -> bool:
     return intermediate_size % 256 == 0 and RubinSmallBatchFusedMoeKernel.supports(
         SMALL_BATCH_MOE_MAX_TOKENS, 2 * intermediate_size, hidden_size
     )
+
+
+def die_major_layout(t: torch.Tensor) -> torch.Tensor:
+    """``[L, R, C]`` expert weights or block scales -> ``[2 L, R / 2, C]``: slot e holds rows
+    ``[0, R / 2)`` of expert e, slot L + e rows ``[R / 2, R)``. The halves keep whole 128-row scale
+    blocks, so the 128x4-blocked scales split the same way."""
+    rows = t.size(1)
+    assert rows % 256 == 0, "die-major halves need whole 128-row blocks"
+    return torch.cat([t[:, : rows // 2], t[:, rows // 2 :]], dim=0).contiguous()
 
 
 def new_small_batch_moe_counters(device: torch.device) -> torch.Tensor:
@@ -101,6 +114,7 @@ class _SmallBatchMoeRunner:
         token_indexed: bool,
         num_ctas: int,
         deterministic_combine: bool,
+        die_major: bool,
     ) -> None:
         import cutlass
         import cutlass.cute as cute
@@ -111,12 +125,20 @@ class _SmallBatchMoeRunner:
             RubinSmallBatchFusedMoeKernel,
             counter_words,
             n_tok_for,
+            pack_sm_domain_words,
             workspace_words,
         )
         from ..kernels.rubin.utils import TRTLLM_ENABLE_PDL, make_ptr
 
         orig_m = x.size(0)
         num_local, n1, k1 = w1.size(0), w1.size(1), w2.size(1)
+        if die_major:
+            num_local, n1, k1 = num_local // 2, 2 * n1, 2 * k1
+        sm_domain_words = ()
+        if die_major:
+            from ...locality_domain.placement import sm_locality_domains
+
+            sm_domain_words = pack_sm_domain_words(sm_locality_domains(x.device.index))
         k2 = n1 // 2
         assert k2 % 256 == 0, "the FC1-output scale buffer is not zero-padded"
         m = permuted_idx_to_expanded_idx.size(0)
@@ -177,11 +199,13 @@ class _SmallBatchMoeRunner:
             token_indexed,
             num_ctas,
             deterministic_combine,
+            die_major,
+            sm_domain_words,
             TRTLLM_ENABLE_PDL,
         )
         compiled = cls.kernel_cache.get(key)
         if compiled is None:
-            claim_free, max_slices, max_ab_stage = (
+            claim_free, max_slices = (
                 _TOKEN_INDEXED_SCHEDULE if token_indexed else _PERMUTED_SCHEDULE
             )
             kernel = RubinSmallBatchFusedMoeKernel(
@@ -194,9 +218,11 @@ class _SmallBatchMoeRunner:
                 token_indexed=token_indexed,
                 claim_free=claim_free,
                 max_slices=max_slices,
-                max_ab_stage=max_ab_stage,
+                max_ab_stage=_DIE_MAJOR_RING_STAGES if die_major else _RING_STAGES,
                 deterministic_combine=deterministic_combine,
                 use_pdl=TRTLLM_ENABLE_PDL,
+                die_major=die_major,
+                sm_domain_words=sm_domain_words,
             )
             compiled = cute.compile(kernel.wrapper, *ptrs, orig_m, m, num_local, num_ctas, stream)
             cls.kernel_cache[key] = compiled
@@ -232,6 +258,7 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
     token_indexed: bool,
     num_ctas: int = 0,
     deterministic_combine: bool = False,
+    die_major: bool = False,
 ) -> None:
     """Routed NVFP4 SiTU MoE of at most 32 tokens: writes the sum of this rank's experts'
     weighted down-projections into every element of ``output`` [tokens, hidden].
@@ -243,7 +270,14 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
     ``token_indexed``: the token-indexed FC1 output layout (MoE-TP slices of the intermediate).
     ``num_ctas`` > 0 overrides the persistent CTA count. ``deterministic_combine``: the
     schedule-independent slice combine instead of BF16 vector reds (a test reference).
+    ``die_major``: the four weight tensors hold :func:`die_major_layout` bytes under their
+    ``[L, rows, cols]`` shapes (see ``RubinSmallBatchFusedMoeKernel``).
     """
+    if die_major:
+        fc1_weight, fc1_weight_scale, fc2_weight, fc2_weight_scale = (
+            t.view(2 * t.size(0), t.size(1) // 2, *t.shape[2:])
+            for t in (fc1_weight, fc1_weight_scale, fc2_weight, fc2_weight_scale)
+        )
     _SmallBatchMoeRunner.run(
         input,
         input_scale,
@@ -268,6 +302,7 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
         token_indexed,
         num_ctas,
         deterministic_combine,
+        die_major,
     )
 
 
@@ -296,5 +331,6 @@ def _(
     token_indexed,
     num_ctas=0,
     deterministic_combine=False,
+    die_major=False,
 ) -> None:
     return None

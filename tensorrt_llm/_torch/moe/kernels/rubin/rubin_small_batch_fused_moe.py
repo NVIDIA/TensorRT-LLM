@@ -51,6 +51,13 @@ tables, and writes every element of the routed output.
   and exit counters, so the counter buffer is zero after every launch. FC1 units have no
   dependency and every CTA runs its FC1 units before its FC2 tasks, so the grid cannot deadlock
   with any number of resident CTAs.
+* Die-major weights (``die_major``, for two locality domains): every expert's first half of W1
+  row blocks and of W2 output m-tiles lives in the first half of the weight tensors (domain 0),
+  the second halves in the second half (domain 1), as tensors ``[2 L, rows / 2, cols]`` (slot e =
+  first half of expert e, slot L + e = second half). FC1 units and FC2 tasks are claimed per
+  domain from four counters (own domain's FC1, the other's, own FC2, the other's), so both domains
+  hold the same work for any routing and every weight load is domain-local until the steals. The
+  units and their arithmetic are the default ones (same bits).
 * Warp roles: epilogue warpgroups (warpgroup 0 also converts the token scales and runs every FC1
   epilogue; FC2 tasks alternate between the warpgroups), the MMA warp, the weight TMA warp, the
   token warp.
@@ -89,8 +96,13 @@ MAX_TOKENS = SUPPORTED_N_TOK[-1]
 _SACC_PAD = 4
 #: Named barrier of epilogue warpgroup ``wg``: ``_EPI_BARRIER_BASE + wg``.
 _EPI_BARRIER_BASE = 1
-#: int32 words of the counter buffer: [0] work, [1] exited CTAs, [CTR_MTILE_BASE + c] FC2 arrivals
-#: of m-tile c, [CTR_TILE_BASE + t] FC1 units stored / FC2 tasks started of tile t.
+#: int32 words of the counter buffer: [0] work (die-major: FC1 units of domain 0), [1] exited CTAs,
+#: die-major claiming: [CTR_DIE1] FC1 units of domain 1, [CTR_FC2] / [CTR_FC2_DIE1] FC2 tasks of
+#: domain 0 / 1 (own 128-byte lines); [CTR_MTILE_BASE + c] FC2 arrivals of m-tile c,
+#: [CTR_TILE_BASE + t] FC1 units stored / FC2 tasks started of tile t.
+CTR_DIE1 = 32
+CTR_FC2 = 48
+CTR_FC2_DIE1 = 56
 CTR_MTILE_BASE = 64
 MAX_MTILES = 64
 CTR_TILE_BASE = CTR_MTILE_BASE + MAX_MTILES
@@ -444,6 +456,20 @@ def _ballot(pred, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _smid(*, loc=None, ip=None):
+    return Int32(_asm(T.i32(), [], "mov.u32 $0, %smid;", "=r", loc=loc, ip=ip))
+
+
+def pack_sm_domain_words(domains: tuple) -> tuple:
+    """Bit ``s % 32`` of word ``s // 32`` is the locality domain of SM ``s`` (signed 32-bit)."""
+    words = [0] * (-(-len(domains) // 32))
+    for sm, domain in enumerate(domains):
+        if domain == 1:
+            words[sm // 32] |= 1 << (sm % 32)
+    return tuple(w - (1 << 32) if w >= (1 << 31) else w for w in words)
+
+
 def _s2t_copy_and_partition(sSF: cute.Tensor, tSF: cute.Tensor, sf_dtype):
     """tcgen05.cp (SMEM -> TMEM) partitions of a scale-factor operand."""
     tCsSF_compact = cute.filter_zeros(sSF)
@@ -477,6 +503,8 @@ class RubinSmallBatchFusedMoeKernel:
     :param slice_tiles: Target tiles per FC2 slice.
     :param queue_depth: Entries of the shared-memory unit queue.
     :param use_pdl: Launch with programmatic dependent launch.
+    :param die_major: Die-major expert weights, work claimed per locality domain.
+    :param sm_domain_words: :func:`pack_sm_domain_words` of the device (with ``die_major``).
     """
 
     @staticmethod
@@ -515,8 +543,13 @@ class RubinSmallBatchFusedMoeKernel:
         slice_tiles: int = 1,
         queue_depth: int = 16,
         use_pdl: bool = True,
+        die_major: bool = False,
+        sm_domain_words: tuple = (),
     ):
         assert self.supports(n_tok, n1, k1), (n_tok, n1, k1)
+        assert not die_major or sm_domain_words, "die-major claiming needs the SM table"
+        self.die_major = die_major
+        self.sm_domain_words = tuple(sm_domain_words)
         assert num_epi_wg in (1, 2) and num_acc >= 2
         assert 1 <= max_slices <= MAX_SLICES and slice_tiles >= 1
         assert situ_beta > 0 and situ_linear_beta > 0
@@ -587,6 +620,8 @@ class RubinSmallBatchFusedMoeKernel:
         self.num_ab_stage = min(max_ab_stage, (_smem_capacity() - fixed) // per_stage)
         assert self.num_ab_stage >= 2, "ring too small"
         self.claim_free = min(self.claim_free_req, self.num_ab_stage)
+        if self.die_major:
+            assert self.nblk1 % 2 == 0 and self.nblk2 % 2 == 0, "die-major halves need even blocks"
         S = self.num_ab_stage
         # Region after the weight ring: [B2 stages | x] (token-operand view), then
         # [SFB2 stages | x scales] (token-scale view), then warpgroup 1's token accumulator.
@@ -906,11 +941,12 @@ class RubinSmallBatchFusedMoeKernel:
             griddepcontrol_wait()
             griddepcontrol_launch_dependents()
         # The CTA's first claim after the grid dependency: the previous launch on this counter
-        # buffer may still run until then.
+        # buffer may still run until then (die-major: claimed by the weight producer).
         first = Int32(0)
-        if warp_idx == self.tma_warp:
-            if cute.arch.lane_idx() == 0:
-                first = _atom_add_relaxed(ctr_ptr.toint(), 1)
+        if cutlass.const_expr(not self.die_major):
+            if warp_idx == self.tma_warp:
+                if cute.arch.lane_idx() == 0:
+                    first = _atom_add_relaxed(ctr_ptr.toint(), 1)
 
         t2e_pre = Int32(0)
         if warp_idx == self.tma_warp:
@@ -1065,6 +1101,65 @@ class RubinSmallBatchFusedMoeKernel:
         return g + 1
 
     @cute.jit
+    def _sm_domain(self, smid: Int32) -> Int32:
+        """Locality domain of the SM with ``%smid`` ``smid`` (0 beyond the table)."""
+        word = Int32(0)
+        for i in cutlass.range_constexpr(len(self.sm_domain_words)):
+            if (smid >> 5) == i:
+                word = Int32(self.sm_domain_words[i])
+        return (word >> (smid & 31)) & 1
+
+    @cute.jit
+    def _dm_claim(self, ctr, own_die: Int32, phase: Int32, w1: Int32, nt: Int32, ns: Int32):
+        """Die-major claiming (whole warp; lane 0 claims): phase 0 / 1 = FC1 units of the own / the
+        other domain (domain d: row blocks [d nblk1 / 2, (d + 1) nblk1 / 2) of every tile,
+        tile-major), phase 2 / 3 = FC2 tasks of the own / the other domain (m-tiles
+        [d nblk2 / 2, ...) of every slice, slice-major), 4 = done. Returns the unit in the default
+        numbering (an FC1 unit ``tile * nblk1 + blk`` or ``w1 +`` the FC2 task) and the phase."""
+        lane = cute.arch.lane_idx()
+        h1 = self.nblk1 // 2
+        h2 = self.nblk2 // 2
+        n1d = nt * h1
+        n2d = ns * h2
+        idx = Int32(0)
+        ph = phase
+        if lane == 0:
+            searching = Int32(1)
+            while searching != 0:
+                if ph >= 4:
+                    idx = w1 + 2 * n2d  # past the last unit
+                    searching = Int32(0)
+                else:
+                    die = own_die
+                    if (ph & 1) == 1:
+                        die = 1 - own_die
+                    if ph < 2:
+                        word = Int64(0)
+                        if die == 1:
+                            word = Int64(CTR_DIE1)
+                        i = _atom_add_relaxed(ctr + word * 4, 1)
+                        if i < n1d:
+                            tile = i // h1
+                            idx = tile * self.nblk1 + die * h1 + (i - tile * h1)
+                            searching = Int32(0)
+                        else:
+                            ph = ph + 1
+                    else:
+                        word = Int64(CTR_FC2)
+                        if die == 1:
+                            word = Int64(CTR_FC2_DIE1)
+                        i = _atom_add_relaxed(ctr + word * 4, 1)
+                        if i < n2d:
+                            s2 = i // h2
+                            idx = w1 + s2 * self.nblk2 + die * h2 + (i - s2 * h2)
+                            searching = Int32(0)
+                        else:
+                            ph = ph + 1
+        idx = cute.arch.shuffle_sync(idx, 0)
+        ph = cute.arch.shuffle_sync(ph, 0)
+        return idx, ph
+
+    @cute.jit
     def _expert_of(self, tile_idx_to_expert_idx, t2e_pre: Int32, tile: Int32):
         """Expert of ``tile`` (warp-uniform): from the prefetched lanes for the first 32 tiles."""
         expert = Int32(0)
@@ -1127,18 +1222,35 @@ class RubinSmallBatchFusedMoeKernel:
         lane = cute.arch.lane_idx()
         ctr = ctr_ptr.toint()
         cur = cute.arch.shuffle_sync(first, 0)
+        own_die = Int32(0)
+        queue = Int32(0)
+        nloc = Int32(0)
+        if cutlass.const_expr(self.die_major):
+            nloc = Int32(cute.size(mA1, mode=[2])) // 2
+            own_die = self._sm_domain(_smid())
+            cur, queue = self._dm_claim(ctr, own_die, queue, w1, nt, ns)
         g = Int32(0)
         j = Int32(0)
         while cur < total:
             nxt = Int32(0)
             if cutlass.const_expr(self.claim_free == 0):
-                if lane == 0:
-                    nxt = _atom_add_relaxed(ctr, 1)
+                if cutlass.const_expr(self.die_major):
+                    nxt, queue = self._dm_claim(ctr, own_die, queue, w1, nt, ns)
+                else:
+                    if lane == 0:
+                        nxt = _atom_add_relaxed(ctr, 1)
             self._q_write(st, j, cur, g)
             if cur < w1:
                 tile = cur // self.nblk1
                 blk = cur - tile * self.nblk1
                 expert = self._expert_of(tile_idx_to_expert_idx, t2e_pre, tile)
+                tblk = blk
+                texp = expert
+                if cutlass.const_expr(self.die_major):
+                    # die-major slot of this row block: second half -> slot L + e
+                    if blk >= self.nblk1 // 2:
+                        tblk = blk - self.nblk1 // 2
+                        texp = expert + nloc
                 for kb in cutlass.range(self.nkb1, unroll=1):
                     g = self._load_stage(
                         tma_a1,
@@ -1147,9 +1259,9 @@ class RubinSmallBatchFusedMoeKernel:
                         tAgA1,
                         tAsSFA1,
                         tAgSFA1,
-                        blk,
+                        tblk,
                         kb,
-                        expert,
+                        texp,
                         a_full,
                         a_empty,
                         g,
@@ -1157,8 +1269,14 @@ class RubinSmallBatchFusedMoeKernel:
                     )
             else:
                 c, _s, t0, t1 = self._fc2_task(cur - w1, nt, ns)
+                tc = c
+                eoff = Int32(0)
+                if cutlass.const_expr(self.die_major):
+                    if c >= self.nblk2 // 2:
+                        tc = c - self.nblk2 // 2
+                        eoff = nloc
                 for t in cutlass.range(t0, t1, unroll=1):
-                    expert = self._expert_of(tile_idx_to_expert_idx, t2e_pre, t)
+                    expert = self._expert_of(tile_idx_to_expert_idx, t2e_pre, t) + eoff
                     for kb in cutlass.range(self.nkb2, unroll=1):
                         g = self._load_stage(
                             tma_a2,
@@ -1167,7 +1285,7 @@ class RubinSmallBatchFusedMoeKernel:
                             tAgA2,
                             tAsSFA2,
                             tAgSFA2,
-                            c,
+                            tc,
                             kb,
                             expert,
                             a_full,
@@ -1180,7 +1298,12 @@ class RubinSmallBatchFusedMoeKernel:
                 # right away; FC2 tasks only once claim_free ring stages are free for them
                 peek = Int32(0)
                 if lane == 0:
-                    peek = _ld_relaxed_u32(ctr)
+                    if cutlass.const_expr(self.die_major):
+                        # FC1 work is left for this CTA until it is past both domains' FC1 queues
+                        if queue >= 2:
+                            peek = w1
+                    else:
+                        peek = _ld_relaxed_u32(ctr)
                 peek = cute.arch.shuffle_sync(peek, 0)
                 gw = g + (self.claim_free - 1)
                 if peek >= w1:
@@ -1188,8 +1311,11 @@ class RubinSmallBatchFusedMoeKernel:
                         cute.arch.mbarrier_wait(
                             a_empty + gw % self.num_ab_stage, ((gw // self.num_ab_stage) & 1) ^ 1
                         )
-                if lane == 0:
-                    nxt = _atom_add_relaxed(ctr, 1)
+                if cutlass.const_expr(self.die_major):
+                    nxt, queue = self._dm_claim(ctr, own_die, queue, w1, nt, ns)
+                else:
+                    if lane == 0:
+                        nxt = _atom_add_relaxed(ctr, 1)
             cur = cute.arch.shuffle_sync(nxt, 0)
             j += 1
         self._q_write(st, j, Int32(-1), g)
@@ -1198,6 +1324,10 @@ class RubinSmallBatchFusedMoeKernel:
             if _atom_add_acq_rel(ctr + 4, 1) == nctas - 1:
                 _st_relaxed_u32(ctr, 0)
                 _st_relaxed_u32(ctr + 4, 0)
+                if cutlass.const_expr(self.die_major):
+                    _st_relaxed_u32(ctr + CTR_DIE1 * 4, 0)
+                    _st_relaxed_u32(ctr + CTR_FC2 * 4, 0)
+                    _st_relaxed_u32(ctr + CTR_FC2_DIE1 * 4, 0)
 
     @cute.jit
     def _token_producer(
@@ -1967,7 +2097,8 @@ class RubinSmallBatchFusedMoeKernel:
         output buffers ([m, k2] rows, 128x4-blocked scales); ``out`` the BF16 [orig_m, k1] output
         (fully written); ``ctr`` int32 [counter_words(m // 128)] zeros; ``ws``
         [workspace_words(...)] scratch of the slice combine; ``expanded_idx_to_permuted_idx``
-        [orig_m * topk] (read with the token-indexed layout only)."""
+        [orig_m * topk] (read with the token-indexed layout only). Die-major weights are
+        ``[2 L, rows / 2, cols]`` (``num_local`` is L)."""
         n1, k1, n2, k2 = self.n1, self.k1, self.n2, self.k2
         L = num_local
         num_tiles = m // _MMA_M
@@ -1985,13 +2116,16 @@ class RubinSmallBatchFusedMoeKernel:
                 ),
             )
 
+        wn1, wn2, wl = n1, n2, L
+        if cutlass.const_expr(self.die_major):
+            wn1, wn2, wl = n1 // 2, n2 // 2, 2 * L
         self(
             kmajor(x_ptr, orig_m, k1, 1),
-            kmajor(w1_ptr, n1, k1, L),
-            blocked_sf(w1_sf_ptr, n1, k1, L),
+            kmajor(w1_ptr, wn1, k1, wl),
+            blocked_sf(w1_sf_ptr, wn1, k1, wl),
             kmajor(h_ptr, m, k2, 1),
-            kmajor(w2_ptr, n2, k2, L),
-            blocked_sf(w2_sf_ptr, n2, k2, L),
+            kmajor(w2_ptr, wn2, k2, wl),
+            blocked_sf(w2_sf_ptr, wn2, k2, wl),
             x_sf_ptr,
             h_ptr,
             h_sf_ptr,

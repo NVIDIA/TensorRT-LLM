@@ -23,24 +23,32 @@ round-trips through global memory.
 Uses the grouped-GEMM NVFP4 weight layout (``NVFP4CuteDslFusedMoEMethod``),
 ``NvFp4WeightView``, ``quantize_input_nvfp4`` and ``CuteDslFusedMoENvfp4Runner``
 (narrowed to the fused kernel's tiles) without inheriting from that leaf. No
-locality-domain (uGPU) support.
+locality-domain (uGPU) partitioned execution.
 
 Calls of at most ``small_batch_max_tokens`` tokens (SiTU layers without
 all-to-all) run the small-batch kernel
 (``trtllm::cute_dsl_nvfp4_small_batch_moe_rubin``) instead: FC1, SiTU, NVFP4
 requantization, FC2 and the combine in one persistent grid on the same weights
-and ``moe_sort`` tables, with a token-indexed FC1 output on MoE-TP slices.
+and ``moe_sort`` tables, with a token-indexed FC1 output on MoE-TP slices. When
+that kernel serves every call of the deployment, the device has two locality
+domains and the weights stay where they are loaded (no EPLB, no DWDP),
+``post_load_weights`` places the expert weights die-major (each domain homes
+one half of every expert), which only the small-batch kernel reads.
 """
 
 import torch
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ....autotuner import AutoTuner
+from ....locality_domain.placement import sm_locality_domains, split_domain_copy
+from ....locality_domain_utils import is_locality_domain_enabled
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType, EventType
 from ...custom_ops.cute_dsl_small_batch_moe_custom_op import (
     SMALL_BATCH_MOE_MAX_TOKENS,
+    die_major_layout,
     new_small_batch_moe_counters,
     small_batch_moe_supports,
 )
@@ -245,6 +253,13 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         # Created by the first small-batch call (warmup runs before any graph capture); every
         # launch leaves it zero.
         self._small_batch_counters: torch.Tensor | None = None
+        # Largest MoE call of the deployment: the scheduler's chunk, at most every DP rank's tokens.
+        self._max_call_tokens = min(
+            model_config.moe_max_num_tokens or model_config.max_num_tokens,
+            model_config.max_num_tokens * model_config.mapping.dp_size,
+        )
+        # Set by post_load_weights; only the small-batch kernel reads die-major weights.
+        self.weights_die_major = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -299,6 +314,52 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         dwdp_handle_collector = getattr(self, "dwdp_handle_collector", None)
         if dwdp_handle_collector is not None:
             dwdp_handle_collector.register_weights(self)
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        if not self.weights_die_major and self._die_major_applies():
+            self._place_weights_die_major()
+
+    def pre_reload_weights(self) -> None:
+        super().pre_reload_weights()
+        # The reloaded bytes arrive in the default layout; post_load_weights places them again.
+        self.weights_die_major = False
+
+    def _die_major_applies(self) -> bool:
+        """Die-major weights need every MoE call of the deployment served by the small-batch
+        kernel (the FC12 kernel cannot read them; attention DP would add all-to-all calls), two
+        locality domains, and weights that stay where they are loaded (no EPLB, no DWDP)."""
+        return (
+            self._max_call_tokens <= self.small_batch_max_tokens
+            and not self.use_dp
+            and (2 * self.intermediate_size_per_partition) % 256 == 0
+            and self.hidden_size % 256 == 0
+            and not self._using_load_balancer()
+            and getattr(self, "dwdp_handle_collector", None) is None
+            and is_locality_domain_enabled()
+        )
+
+    def _place_weights_die_major(self) -> None:
+        """Re-home the expert weights and block scales die-major (same parameter shapes, new
+        bytes); keeps the default placement when the device has no localized allocations."""
+        params = (self.w3_w1_weight, self.w3_w1_weight_scale, self.w2_weight, self.w2_weight_scale)
+        copies = []
+        for param in params:
+            layout = die_major_layout(param.data)
+            copy = split_domain_copy(layout, layout.numel() * layout.element_size() // 2)
+            if copy is None:
+                logger.warning_once(
+                    "Localized allocations are unavailable: the MoE expert weights keep the "
+                    "default placement",
+                    key="fc12_die_major_unavailable",
+                )
+                return
+            copies.append(copy)
+        for param, copy in zip(params, copies):
+            param.data = copy.view(param.data.shape)
+        self.weights_die_major = True
+        # measured here, ahead of CUDA graph capture
+        sm_locality_domains(self.w3_w1_weight.device.index)
 
     def _build_local_weight_view(self) -> NvFp4WeightView:
         """Build the weight view from this backend's per-layer weights."""
@@ -384,6 +445,11 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
                 moe_output,
                 weight_view,
                 sort_tables,
+            )
+        if self.weights_die_major:
+            raise RuntimeError(
+                f"Layer {self.layer_idx}: {token_selected_experts.size(0)} tokens reach the FC12 "
+                "kernel, which cannot read the die-major expert weights placed at load"
             )
 
         effective_top_k = token_selected_experts.size(-1)
@@ -488,6 +554,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             situ_linear_beta=situ_linear_beta,
             # MoE-TP ranks hold a slice of every expert's intermediate
             token_indexed=self.tp_size > 1,
+            die_major=self.weights_die_major,
         )
         return moe_output
 
