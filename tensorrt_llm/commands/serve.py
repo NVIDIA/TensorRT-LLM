@@ -2332,6 +2332,30 @@ def _serve_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
                 process.terminate()
 
 
+_COORDINATOR_UDS_NAME = "coordinator.sock"
+# Linux's sun_path holds 108 bytes, including the terminating NUL.
+_MAX_UDS_PATH_BYTES = 107
+
+
+def _make_coordinator_uds_dir(public_port: int) -> tempfile.TemporaryDirectory:
+    """Create a new directory for the coordinator's Unix socket.
+
+    The directory is created with mode 0o700, so only this user can reach the
+    socket inside it. It is made in the temporary directory, or in /tmp when
+    the socket path there would not fit in a Unix socket address.
+    """
+    prefix = f"trtllm_disagg_coord_{public_port}_"
+    uds_dir = tempfile.TemporaryDirectory(prefix=prefix)
+    uds_path = os.path.join(uds_dir.name, _COORDINATOR_UDS_NAME)
+    if len(os.fsencode(uds_path)) <= _MAX_UDS_PATH_BYTES:
+        return uds_dir
+    uds_dir.cleanup()
+    logger.warning(f"Coordinator socket path {uds_path} is longer than "
+                   f"{_MAX_UDS_PATH_BYTES} bytes; creating its directory in "
+                   f"/tmp instead.")
+    return tempfile.TemporaryDirectory(prefix=prefix, dir="/tmp")  # nosec B108
+
+
 def _serve_coordinator_and_fleet(disagg_cfg, config_file,
                                  metadata_server_config_file,
                                  metadata_server_cfg, request_timeout,
@@ -2354,9 +2378,11 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     # that dominated per-request latency). Opt-out via the UDS env = "0".
     use_uds = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS,
                              "1") == "1"
-    coord_uds = (
-        f"/tmp/trtllm_disagg_coord_{public_port}.sock"  # nosec B108
-        if use_uds else None)
+    # The socket lives in a new directory that only this user can enter; the
+    # permissions uvicorn sets on the socket file itself do not widen that.
+    coord_uds_dir = _make_coordinator_uds_dir(public_port) if use_uds else None
+    coord_uds = (os.path.join(coord_uds_dir.name, _COORDINATOR_UDS_NAME)
+                 if coord_uds_dir is not None else None)
     # Fleet points at the UDS when enabled; the TCP port stays up for health.
     coord_url = f"unix:{coord_uds}" if coord_uds else \
         f"http://{public_host}:{coord_port}"
@@ -2450,6 +2476,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         for process in fleet:
             if process.poll() is None:
                 process.terminate()
+        if coord_uds_dir is not None:
+            coord_uds_dir.cleanup()
 
 
 def _init_fleet_worker_process():
