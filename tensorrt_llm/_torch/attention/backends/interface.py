@@ -360,6 +360,10 @@ class AttentionMetadata:
         """
         self._prepare_mamba_metadata()
 
+    def supports_steady_gen_step(self) -> bool:
+        """Whether ``prepare_steady_gen_step`` may advance this metadata."""
+        return False
+
     def _has_mixed_precision_staging(self) -> bool:
         """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have
