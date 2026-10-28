@@ -267,11 +267,15 @@ def test_attention_takes_the_gqa_decode_kernel_on_qwen3_5_sm103_only(
 
     monkeypatch.setattr(modeling_qwen3_next, "get_sm_version", lambda: sm)
     monkeypatch.setattr(Qwen3Attention, "__init__", record_init)
-    config = SimpleNamespace(pretrained_config=SimpleNamespace(model_type=model_type))
+    config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(model_type=model_type),
+        mapping=SimpleNamespace(enable_attention_dp=False),
+    )
 
     modeling_qwen3_next.Qwen3NextAttention(config, layer_idx=0, fuse_qk_norm_rope=True)
 
     assert built["use_gqa_decode_fmha"] is enabled
+    assert built["cache_context_plan"] is enabled
 
 
 @pytest.mark.parametrize("can_defer_finalize", [False, True])

@@ -86,6 +86,7 @@ def create_attention(
     kv_cache_dtype: str = "auto",
     skip_correction_threshold: float = 0.0,
     gqa_decode: Optional["GqaDecodeSetup"] = None,
+    cache_context_plan: bool = False,
 ) -> AttentionBackend:
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
@@ -123,6 +124,7 @@ def create_attention(
         kv_cache_dtype=kv_cache_dtype,
         skip_correction_threshold=skip_correction_threshold,
         gqa_decode=gqa_decode,
+        cache_context_plan=cache_context_plan,
     )
 
     return attn_cls(

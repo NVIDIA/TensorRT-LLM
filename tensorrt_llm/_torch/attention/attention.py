@@ -502,6 +502,7 @@ class Attention(nn.Module):
         mapping_with_cp: Optional[Mapping] = None,
         head_dim: Optional[int] = None,
         use_gqa_decode_fmha: bool = False,
+        cache_context_plan: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -525,6 +526,7 @@ class Attention(nn.Module):
             mapping_with_cp (Optional[Mapping]): Override mapping with CP configuration.
             use_gqa_decode_fmha (bool): With the TRTLLM backend, serve generation calls with the GQA decode FMHA
                 library (backends/fmha/gqa_decode.py), offering it the output gate and the prologue's FP8 KV append.
+            cache_context_plan (bool): Let the TRTLLM backend plan a context-only forward once for all layers.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -804,7 +806,11 @@ class Attention(nn.Module):
             attention_chunk_size=self.attention_chunk_size,
             sparse_params=sparse_params,
             gqa_decode=gqa_decode,
+            cache_context_plan=cache_context_plan,
         )
+        self.cache_context_plan = cache_context_plan
+        # (_use_quantize_output(), FP4 KV cache) once the weights are loaded, with cache_context_plan.
+        self._output_quant_flags: Optional[Tuple[bool, bool]] = None
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
 
@@ -910,6 +916,16 @@ class Attention(nn.Module):
 
         return self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale and not self.is_marlin_enabled
 
+    def _get_output_quant_flags(self) -> Tuple[bool, bool]:
+        """(_use_quantize_output(), FP4 KV cache); both depend only on the loaded quant config and o_proj."""
+        flags = self._output_quant_flags
+        if flags is None:
+            flags = (self._use_quantize_output(), self.quant_config is not None
+                     and self.quant_config.layer_quant_mode.has_fp4_kv_cache())
+            if self.cache_context_plan:
+                self._output_quant_flags = flags
+        return flags
+
     def create_output(self, q: torch.Tensor, attn_metadata: AttentionMetadata,
                       mask_type: str):
         # Attention is treated as mixed request by default.
@@ -1013,14 +1029,14 @@ class Attention(nn.Module):
         # not populated yet at this call site.
         out_scale = None
         out_scale_sf = None
-        if self._use_quantize_output() and not has_lora:
+        quantize_output, fp4_kv_cache = self._get_output_quant_flags()
+        if quantize_output and not has_lora:
             out_scale = self.o_proj.inv_input_scale
             out_scale_sf = self.o_proj.input_scale
 
         kv_scale_orig_quant = None
         kv_scale_quant_orig = None
-        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp4_kv_cache(
-        ):
+        if fp4_kv_cache:
             kv_scale_orig_quant = self.qkv_proj.inv_kv_scales
             kv_scale_quant_orig = self.qkv_proj.kv_scales
 

@@ -169,6 +169,7 @@ class QKNormRoPEAttention(Attention):
         mapping_with_cp: Optional[Mapping] = None,
         head_dim: Optional[int] = None,
         use_gqa_decode_fmha: bool = False,
+        cache_context_plan: bool = False,
     ):
         self.pretrained_config = config.pretrained_config
 
@@ -208,6 +209,7 @@ class QKNormRoPEAttention(Attention):
             mapping_with_cp=mapping_with_cp,
             head_dim=head_dim,
             use_gqa_decode_fmha=use_gqa_decode_fmha,
+            cache_context_plan=cache_context_plan,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,

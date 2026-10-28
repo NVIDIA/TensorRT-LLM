@@ -39,6 +39,7 @@ class Qwen3Attention(QKNormRoPEAttention):
         reduce_output: bool = True,
         mapping_with_cp: Optional[Mapping] = None,
         use_gqa_decode_fmha: bool = False,
+        cache_context_plan: bool = False,
     ):
         config = model_config.pretrained_config
         self.pretrained_config = config
@@ -85,6 +86,7 @@ class Qwen3Attention(QKNormRoPEAttention):
             reduce_output=reduce_output,
             mapping_with_cp=mapping_with_cp,
             use_gqa_decode_fmha=use_gqa_decode_fmha,
+            cache_context_plan=cache_context_plan,
         )
 
 

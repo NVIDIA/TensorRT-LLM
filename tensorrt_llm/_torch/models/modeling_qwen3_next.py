@@ -976,7 +976,9 @@ class Qwen3NextAttention(Qwen3Attention):
                          fuse_qk_norm_rope=fuse_qk_norm_rope,
                          attn_output_gate=True,
                          use_gemma_rms_norm=True,
-                         use_gqa_decode_fmha=decode_kernels)
+                         use_gqa_decode_fmha=decode_kernels,
+                         cache_context_plan=decode_kernels
+                         and not model_config.mapping.enable_attention_dp)
         self._fuse_qk_norm_rope_gate = True
 
 
