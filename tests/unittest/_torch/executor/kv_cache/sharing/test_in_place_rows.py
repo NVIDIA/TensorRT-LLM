@@ -405,6 +405,7 @@ def test_helix_refuses_recurrent_state_and_windows_at_the_attach(monkeypatch, ki
         windows=(None, 64 if kind == "window" else None),
         sink_blocks=(0, 1 if kind == "sinks" else 0),
         sparse=(False, False),
+        prefix_required=(),
     )
     plain = SimpleNamespace(**vars(lay))
     plain.recurrent, plain.windows, plain.sink_blocks = (False, False), (None, None), (0, 0)

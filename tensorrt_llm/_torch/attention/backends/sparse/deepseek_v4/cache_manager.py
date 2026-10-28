@@ -1481,6 +1481,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """Exclude storage-only NVFP4 alignment pages from KV transfer."""
         return self._disagg_ignored_roles
 
+    def _page_quant_mode(self) -> Optional[str]:
+        """``"fp8_ds_mla"`` for FP8 pages carrying their own scales."""
+        return "fp8_ds_mla" if self.use_fp8_ds_mla else super()._page_quant_mode()
+
     def get_indexer_k_cache_buffers(self, layer_idx: int) -> torch.Tensor:
         """
         Get the buffers for the indexer k cache for a specific layer.

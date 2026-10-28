@@ -1517,6 +1517,7 @@ def test_attach_rejects_model_wide_features_on_every_pipeline_stage(monkeypatch,
         windows=(None,),
         sink_blocks=(0,),
         sparse=(False,),
+        prefix_required=(),
     )
     manager = SimpleNamespace(
         mapping=SimpleNamespace(cp_size=2, pp_rank=pp_rank, has_cp_helix=lambda: True),
@@ -1526,8 +1527,6 @@ def test_attach_rejects_model_wide_features_on_every_pipeline_stage(monkeypatch,
         num_layers=2,
     )
     monkeypatch.setattr(_manager, "require_v2", lambda manager: None)
-    monkeypatch.setattr(_manager, "layer_configs", lambda manager: {})
-    monkeypatch.setattr(_manager, "layer_group_layer_ids", lambda manager: [])
     monkeypatch.setattr(_lender, "derive_layout", lambda manager: stage)
     monkeypatch.setattr(_manager, "model_has_recurrent_state", lambda manager: feature == "state")
     with pytest.raises(ValueError, match="sparse buffers" if feature == "sparse" else "Helix"):

@@ -80,7 +80,6 @@ INTERNALS = {
     "pool_group_descs",
     "_has_lossy_cold_page_codec",
     "get_disagg_global_layer_ids",
-    "get_model_layer_ids",
     "get_disagg_role_mapper_kinds",
     "get_disagg_role_layouts",
     "get_disagg_ignored_roles",
@@ -662,56 +661,6 @@ def test_install_accepts_the_complete_private_hook_protocol():
     assert all(callable(getattr(_lender._ManagerLender, name)) for name in MANAGER_HOOKS)
     _manager.install_lender(manager, lender)
     assert manager._sharing is lender
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("config_source", ["manager", "runtime", "runtime_none"])
-def test_manager_facade_reads_layer_configs_by_id_with_the_existing_fallback(config_source):
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _manager
-
-    layers = [
-        SimpleNamespace(layer_id="7"),
-        SimpleNamespace(layer_id=4),
-        SimpleNamespace(),
-        SimpleNamespace(layer_id=0),
-    ]
-    config = SimpleNamespace(layers=layers)
-    if config_source == "manager":
-        manager = SimpleNamespace(kv_cache_manager_py_config=config)
-    else:
-        manager = SimpleNamespace(impl=SimpleNamespace(init_config=config))
-        if config_source == "runtime_none":
-            manager.kv_cache_manager_py_config = None
-    actual = _manager.layer_configs(manager)
-    assert list(actual) == [7, 4, 2, 0]
-    assert all(actual[layer_id] is layer for layer_id, layer in zip([7, 4, 2, 0], layers))
-
-
-@pytest.mark.cpu_only
-def test_manager_facade_preserves_layer_group_order_and_normalizes_ids():
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _manager
-
-    grouping = [[np.int64(5), "7"], [2]]
-    manager = SimpleNamespace(impl=SimpleNamespace(layer_grouping=grouping))
-    actual = _manager.layer_group_layer_ids(manager)
-    assert actual == [[5, 7], [2]]
-    assert all(type(layer_id) is int for group in actual for layer_id in group)
-    assert actual is not grouping and all(a is not b for a, b in zip(actual, grouping))
-
-
-@pytest.mark.cpu_only
-def test_manager_facade_returns_the_runtime_pool_group_descriptors_unchanged():
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _manager
-
-    descriptors = [object(), object()]
-    manager = SimpleNamespace(impl=SimpleNamespace(pool_group_descs=descriptors))
-    assert _manager.pool_group_descriptors(manager) is descriptors
 
 
 @pytest.mark.cpu_only

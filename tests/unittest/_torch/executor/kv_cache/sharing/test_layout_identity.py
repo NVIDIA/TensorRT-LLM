@@ -36,7 +36,8 @@ import torch
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 import tensorrt_llm
-from tensorrt_llm._torch.pyexecutor.kv_cache import page_layout, sharing
+from tensorrt_llm._torch.pyexecutor.kv_cache import page_layout, page_table, sharing
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
     LayerGroupDesc,
@@ -46,6 +47,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     RoleLayout,
     ShardDesc,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import attention_shard
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     MemoryKind,
     MemoryRegion,
@@ -58,7 +60,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing._identity import Identity
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing._layout import (
     LAYOUT_ID_VERSION,
-    _Heads,
     canonical_bytes,
     canonical_order,
     derive_layout,
@@ -353,11 +354,25 @@ def coalesced(size, members):
 class Manager:
     """One layer group per entry of ``groups``: ``(layer config class, [internal layer ids],
     [(role, size, override)])``; group ``i`` draws from pool group ``pool_group_of[i]`` (its own by
-    default), one pool per role, and has window ``windows[i]`` and ``sinks[i]`` sink tokens."""
+    default), one pool per role, and has window ``windows[i]`` and ``sinks[i]`` sink tokens. It
+    builds its page table with ``KVCacheManagerV2``'s methods, from the state that manager keeps."""
+
+    get_page_table = KVCacheManagerV2.get_page_table
+    _page_layer_configs = KVCacheManagerV2._page_layer_configs
+    _page_layer_ids = KVCacheManagerV2._page_layer_ids
+    _page_kv_heads = KVCacheManagerV2._page_kv_heads
+    _page_untransferred_roles = KVCacheManagerV2._page_untransferred_roles
+    _page_dtype = KVCacheManagerV2._page_dtype
+    _page_quant_mode = KVCacheManagerV2._page_quant_mode
+    _virtual_layers = KVCacheManagerV2._virtual_layers
 
     _model_has_attention_window = False
     _model_has_sparse_buffers = False
     _model_attention_window_pattern = ()
+    _has_cp_helix = False
+    _helix_cp_rank = 0
+    _helix_cp_size = 1
+    dtype = None
 
     def __init__(
         self,
@@ -429,12 +444,18 @@ class Manager:
                 ],
                 slot_desc=SimpleNamespace(variants=[variant]),
             )
+        self.windows = windows
+        self.kv_cache_manager_py_config = SimpleNamespace(layers=layers)
         self.impl = SimpleNamespace(
             layer_grouping=[list(lids) for _, lids, _ in groups],
             pool_group_descs=list(descs.values()),
             get_life_cycle_pool_group_indices=lambda: list(pool_group_of),
-            init_config=SimpleNamespace(layers=layers),
+            init_config=self.kv_cache_manager_py_config,
         )
+
+    def _attention_read_window(self, layer_group):
+        """Attention reads the whole window it keeps."""
+        return self.windows[layer_group]
 
     def get_disagg_role_mapper_kinds(self):
         return self.mappers
@@ -533,15 +554,6 @@ def test_kv_heads_name_the_share_each_rank_holds(case):
             assert (names[rank] == names[other]) == (share == other_share)
 
 
-def heads_on(rank, tp_size, total, per_rank):
-    """``_Heads`` of a rank that holds ``per_rank`` of ``total`` KV heads over ``tp_size`` ranks."""
-    mapping = SimpleNamespace(tp_size=tp_size, tp_rank=rank, enable_attention_dp=False)
-    manager = SimpleNamespace(
-        mapping=mapping, num_kv_heads_per_layer=[per_rank], num_kv_heads=total, pp_layers=[0]
-    )
-    return _Heads(manager)
-
-
 # (KV heads T, TP size, heads per rank) -> each rank's share. Rank r holds its heads from
 # r * T // tp; where any rank's range starts inside a share, every rank is a share of its own.
 UNALIGNED_HEADS = {
@@ -556,7 +568,7 @@ UNALIGNED_HEADS = {
 @pytest.mark.cpu_only
 def test_unaligned_head_ranges_give_every_rank_its_own_share():
     for (total, tp_size, per_rank), shares in UNALIGNED_HEADS.items():
-        got = [heads_on(r, tp_size, total, per_rank).attention_shard(0) for r in range(tp_size)]
+        got = [attention_shard(tp_size, r, per_rank, total) for r in range(tp_size)]
         assert got == shares, f"{total} heads over {tp_size} ranks: {got}"
 
 
@@ -901,6 +913,19 @@ def test_head_geometry_is_described_per_buffer():
 
 
 @pytest.mark.cpu_only
+def test_layer_configs_are_keyed_by_their_layer_id_or_position():
+    layers = [
+        SimpleNamespace(layer_id="7"),
+        SimpleNamespace(layer_id=4),
+        SimpleNamespace(),
+        SimpleNamespace(layer_id=0),
+    ]
+    actual = page_table.layer_configs_by_id(SimpleNamespace(layers=layers))
+    assert list(actual) == [7, 4, 2, 0]
+    assert all(actual[layer_id] is layer for layer_id, layer in zip([7, 4, 2, 0], layers))
+
+
+@pytest.mark.cpu_only
 def test_layers_are_global_ids_stable_across_pipeline_stages():
     """Stage 2 of a pipeline holds model layers 10 and 11 as internal layers 0 and 1."""
     manager = Manager([kv_group()], pp_layers=[10, 11])
@@ -908,7 +933,7 @@ def test_layers_are_global_ids_stable_across_pipeline_stages():
     assert geometry.page_layout.layer_groups[0].layers == (10, 11)
     assert geometry.layers == ((10, 11),)
     assert {b.layer for b in geometry.page_layout.buffers} == {10, 11}
-    assert _manager.global_layer_ids(manager, [1, 0]) == [11, 10]
+    assert manager._page_layer_ids() == {0: (10, 10), 1: (11, 11)}
     # A manager without the map is refused, not named by its stage-local ids, which another
     # stage reuses for other layers.
     del manager.pp_layers
@@ -932,7 +957,7 @@ def test_virtual_layers_are_numbered_by_model_layer_and_attention_type():
         (4, AttentionType.COMPRESSED): 1,
         (5, AttentionType.SLIDING): 2,
     }
-    assert _manager.global_layer_ids(manager, [0, 1, 2]) == [12, 13, 15]
+    assert manager._page_layer_ids() == {0: (12, 4), 1: (13, 4), 2: (15, 5)}
     assert derive_layout(manager).layers == ((12, 13, 15),)
 
 
@@ -952,7 +977,7 @@ def test_an_internal_layer_several_attention_types_share_takes_the_first_s_globa
         (5, AttentionType.SLIDING): 2,
         (5, AttentionType.COMPRESSED): 1,  # shares model layer 4's compressed cache
     }
-    assert _manager.global_layer_ids(manager, [0, 1, 2]) == [12, 13, 15]
+    assert manager._page_layer_ids() == {0: (12, 4), 1: (13, 4), 2: (15, 5)}
     assert derive_layout(manager).layers == ((12, 13, 15),)
 
 
@@ -998,27 +1023,25 @@ def test_a_declared_read_window_narrows_the_kept_one():
 
 
 @pytest.mark.cpu_only
-def test_declared_global_layer_ids_name_extra_internal_layers():
+def test_a_manager_naming_its_own_layers_names_extra_internal_layers():
     """A manager whose internal layers outnumber its model layers (FP4 MLA keeps its tail on
-    extra ones) declares the ids per layer group; they are used as declared, in group order."""
+    extra ones) names them itself (``_page_layer_ids``); a layer it leaves unnamed is refused."""
     manager = Manager(
         [kv_group(lids=(1, 0)), (AttentionLayerConfig, [2, 3], [("tail", 64, None)])],
         pp_layers=[0, 1],
         mappers={"tail": MapperKind.REPLICATED},
     )
-    declared = {0: [2, 0], 1: [1, 3]}
-    manager.get_disagg_global_layer_ids = lambda lg: declared[lg]
-    manager.get_model_layer_ids = lambda lg: {0: [1, 0], 1: [0, 1]}[lg]
-    assert _manager.global_layer_ids(manager, [0, 1, 2, 3]) == [0, 2, 1, 3]
+    named = {1: (2, 1), 0: (0, 0), 2: (1, 0), 3: (3, 1)}
+    manager._page_layer_ids = lambda: named
     layout = derive_layout(manager).page_layout
     assert [g.layers for g in layout.layer_groups] == [(0, 2), (1, 3)]
     assert {(b.layer, b.role) for b in layout.buffers if b.role == "tail"} == {
         (1, "tail"),
         (3, "tail"),
     }
-    manager.get_disagg_global_layer_ids = lambda lg: declared[lg][:1]
-    with pytest.raises(ValueError, match="declared global ids"):
-        _manager.global_layer_ids(manager, [0])
+    manager._page_layer_ids = lambda: {k: v for k, v in named.items() if k != 3}
+    with pytest.raises(ValueError, match=r"names no global layer for internal layers \[3\]"):
+        derive_layout(manager)
 
 
 @pytest.mark.cpu_only
@@ -1064,34 +1087,29 @@ def test_virtual_layers_publish_the_model_layer_they_belong_to():
         ((12, 15), (4, 5)),
         ((13, 19), (4, 6)),
     ]
-    assert _manager.model_layer_ids(manager, [3, 2, 1, 0]) == [6, 5, 4, 4]
+    assert {lid: ids[1] for lid, ids in manager._page_layer_ids().items()} == {
+        0: 4,
+        1: 4,
+        2: 5,
+        3: 6,
+    }
 
 
 @pytest.mark.cpu_only
-def test_declared_layer_ids_publish_the_model_layers_declared_beside_them():
-    """A manager declaring its layer ids (FP4 MLA: ``2 * m`` for model layer ``m``'s cache and
-    ``2 * m + 1`` for its tail) declares their model layers too; ids declared without them, or a
-    model layer short, are refused."""
+def test_layers_a_manager_names_publish_the_model_layers_named_beside_them():
+    """A manager naming its layers (FP4 MLA: ``2 * m`` for model layer ``m``'s cache and
+    ``2 * m + 1`` for its tail) names each one's model layer beside it."""
     manager = Manager(
         [kv_group(lids=(1, 0)), (AttentionLayerConfig, [2, 3], [("tail", 64, None)])],
         pp_layers=[0, 1],
         mappers={"tail": MapperKind.REPLICATED},
     )
-    declared = {0: [2, 0], 1: [1, 3]}
-    model_layers = {0: [1, 0], 1: [0, 1]}
-    manager.get_disagg_global_layer_ids = lambda lg: declared[lg]
-    manager.get_model_layer_ids = lambda lg: model_layers[lg]
+    manager._page_layer_ids = lambda: {1: (2, 1), 0: (0, 0), 2: (1, 0), 3: (3, 1)}
     layout = derive_layout(manager).page_layout
     assert [(g.layers, g.model_layers) for g in layout.layer_groups] == [
         ((0, 2), (0, 1)),
         ((1, 3), (0, 1)),
     ]
-    manager.get_model_layer_ids = lambda lg: model_layers[lg][:1]
-    with pytest.raises(ValueError, match="1 declared model layers for 2 layers"):
-        derive_layout(manager)
-    del manager.get_model_layer_ids
-    with pytest.raises(ValueError, match="declares global layer ids without their model layers"):
-        derive_layout(manager)
 
 
 @pytest.mark.cpu_only
@@ -1275,8 +1293,7 @@ def check_buffers(mgr, layout):
         seen[(b.layer, b.role)] = b
         width = layout.pool_slot_bytes[b.pool_group][b.pool_index]
         assert 0 <= b.slot_offset and b.slot_offset + b.size <= width
-    internal = sorted({int(bid.layer_id) for bid in mgr.impl.all_buffer_ids})
-    global_of = dict(zip(internal, _manager.global_layer_ids(mgr, internal)))
+    global_of = {lid: ids[0] for lid, ids in mgr._page_layer_ids().items()}
     native = {(global_of[int(bid.layer_id)], str(bid.role)) for bid in mgr.impl.all_buffer_ids}
     assert set(seen) == native
 
@@ -1490,7 +1507,7 @@ def test_retained_precision_twins_describe_their_original_layer_s_head_stride(ki
     ) as mgr:
         layout = derive_layout(mgr).page_layout
         for original, internal in mgr.high_layers.items():
-            global_layer = _manager.global_layer_ids(mgr, [internal])[0]
+            global_layer = mgr._page_layer_ids()[internal][0]
             actual = mgr.get_buffers(original, "HND", mixed_precision_pool="high")
             head_bytes = actual.stride(-3) * actual.element_size()
             buffers = [b for b in layout.buffers if b.layer == global_layer]
@@ -1499,8 +1516,9 @@ def test_retained_precision_twins_describe_their_original_layer_s_head_stride(ki
 
 @pytest.mark.cpu_only
 def test_fp4_mla_installs_its_model_layers_beside_its_layer_ids():
-    """A manager the FP4 MLA policy installs its methods on declares each layer's model layer
-    beside its layer id, as an FP4 MLA manager does."""
+    """A manager the FP4 MLA policy installs its methods on names each layer and its model layer,
+    and lends the roles native's transfer leaves to the receiver's rebuild, as an FP4 MLA manager
+    does."""
     from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import (
         Fp4MlaV2CacheLayoutPolicy,
     )
@@ -1516,8 +1534,10 @@ def test_fp4_mla_installs_its_model_layers_beside_its_layer_ids():
         pp_layers=[4, 7],
     )
     Fp4MlaV2CacheLayoutPolicy.install_manager_capabilities(manager)
-    assert _manager.declared_global_layer_ids(manager) == {0: 8, 1: 14, 2: 9, 3: 15}
-    assert _manager.declared_model_layer_ids(manager) == {0: 4, 1: 7, 2: 4, 3: 7}
+    assert manager._page_layer_ids() == {0: (8, 4), 1: (14, 7), 2: (9, 4), 3: (15, 7)}
+    # Native's transfer skips the V sidecars, which the receiver rebuilds; a page table lends them.
+    assert manager.get_disagg_ignored_roles()
+    assert manager._page_untransferred_roles() == frozenset()
 
 
 M3_TPB = 128
@@ -1717,8 +1737,8 @@ def test_the_deepseek_v4_layout_covers_every_virtual_layer_and_pool(
         # Buffers and layer groups name layers by global layer id: for virtual layers, model layer
         # times the number of attention types plus a type the internal layer holds.
         internal = sorted(int(i) for group in mgr.impl.layer_grouping for i in group)
-        global_of = dict(zip(internal, _manager.global_layer_ids(mgr, internal)))
-        assert len(set(global_of.values())) == len(internal)
+        global_of = {lid: ids[0] for lid, ids in mgr._page_layer_ids().items()}
+        assert sorted(global_of) == internal and len(set(global_of.values())) == len(internal)
         virtual = mgr._layer_attn_to_layer_id
         num_types = max(t.value for t in type(next(iter(virtual))[1])) + 1
         for (model_layer, attn_type), layer_id in virtual.items():
@@ -1817,6 +1837,7 @@ def test_private_reuse_policy_stays_internal_and_disables_named_rows():
     manager.impl.init_config.layers[1].reuse_policy = AttentionReusePolicy.PRIVATE
     internal = derive_layout(manager)
     assert internal.named_groups == (True, False)
+    assert internal.prefix_required == (True, False)
     assert all(not hasattr(group, "reuse_policy") for group in internal.page_layout.layer_groups)
     ref = weakref.ref(manager)
     lender = _lender._ManagerLender(ref, internal, None, (), SlotQueue({}), ref)
@@ -2122,7 +2143,7 @@ def test_a_manager_declaring_no_role_all_mapper_derives_no_layout():
     with pytest.raises(ValueError, match="Role.ALL"):
         derive_layout(partial)
     bare = attention(1, 0, 4)
-    bare.get_disagg_role_mapper_kinds = None
+    bare.mappers = {}
     with pytest.raises(ValueError, match="Role.ALL"):
         derive_layout(bare)
 
@@ -2231,8 +2252,8 @@ def test_the_layout_types_keep_their_module_fields_and_members():
         [*(t.__name__ for t in (*LAYOUT_TYPES, MapperKind)), "replica_ranks"]
     )
     assert not hasattr(sharing, "PageLayout") and "PageLayout" not in sharing.__all__
-    for name in ("BufferDesc", "RoleLayout", "MapperKind", "LayerGroupDesc", "ShardDesc"):
-        assert getattr(_layout, name) is getattr(page_layout, name), name
+    assert _layout.ManagerLayout is page_table.ManagerLayout
+    assert _layout.DevicePool is page_table.DevicePool
     assert pinned_fields(PageLayout) == (
         "tokens_per_page pool_slot_bytes layer_groups buffers topology=RankTopology(tp_size=1, "
         "tp_rank=0, pp_size=1, pp_rank=0, cp_size=1, cp_rank=0, dp_size=1, dp_rank=0, "
@@ -2352,28 +2373,32 @@ def test_the_quantization_is_one_the_layout_names():
 )
 def test_the_topology_is_what_native_rank_info_reads_from_the_mapping(mapping, expected):
     """As native's ``RankInfo``: under attention DP, ``dp_size`` and ``dp_rank`` are the TP ones."""
-    assert _layout._topology(SimpleNamespace(**mapping)) == expected
-    assert _layout._topology(None) == RankTopology()
+    assert page_table.rank_topology(SimpleNamespace(**mapping)) == expected
+    assert page_table.rank_topology(None) == RankTopology()
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "dtype,ds_mla,quant",
-    [
-        ("BF16", False, None),
-        ("HALF", False, None),
-        ("FP8", False, "fp8"),
-        ("NVFP4", False, "nvfp4"),
-        ("FP8", True, "fp8_ds_mla"),
-        (None, False, None),
-    ],
+    "dtype,quant",
+    [("BF16", None), ("HALF", None), ("FP8", "fp8"), ("NVFP4", "nvfp4"), (None, None)],
 )
-def test_the_quantization_follows_the_element_type_the_manager_declares(dtype, ds_mla, quant):
-    manager = SimpleNamespace(use_fp8_ds_mla=ds_mla)
+def test_the_quantization_follows_the_element_type_the_manager_declares(dtype, quant):
+    manager = attention(1, 0, 4)
     if dtype is not None:
         manager.dtype = SimpleNamespace(name=dtype)
-    assert _manager.kv_dtype(manager) == dtype
-    assert _manager.kv_quant_mode(manager) == quant
+    assert (manager._page_dtype(), manager._page_quant_mode()) == (dtype, quant)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("ds_mla,quant", [(True, "fp8_ds_mla"), (False, "fp8")])
+def test_deepseek_v4_names_its_fp8_pages_with_their_scales(ds_mla, quant):
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
+        DeepseekV4CacheManager,
+    )
+
+    manager = DeepseekV4CacheManager.__new__(DeepseekV4CacheManager)
+    manager.dtype, manager.use_fp8_ds_mla = SimpleNamespace(name="FP8"), ds_mla
+    assert manager._page_quant_mode() == quant
 
 
 @pytest.mark.cpu_only
