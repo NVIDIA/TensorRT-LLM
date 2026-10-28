@@ -177,7 +177,10 @@ class _StubGroupingImpl:
     """Stub ``manager.impl`` exposing only what ``_kv_pool_mapping_offset`` reads."""
 
     def __init__(self, grouping, key_addrs):
-        self.layer_grouping = grouping
+        self.buffer_grouping = [
+            [SimpleNamespace(layer_id=layer, role=Role.KEY) for layer in group]
+            for group in grouping
+        ]
         self._key_addrs = key_addrs
 
     def get_mem_pool_base_address(self, layer_id, role, index_mode=None):

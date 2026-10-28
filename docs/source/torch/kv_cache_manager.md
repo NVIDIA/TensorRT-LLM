@@ -71,3 +71,54 @@ In `KvCacheCreator._create_kv_cache_manager`, the `KVCacheManager` is instantiat
 
 For local testing or proof of concept, update these lines to use your implementation.
 Then, test it to ensure the `PyExecutor` runs with your customized `KVCacheManager`.
+
+
+## Native V2 buffer reuse policies
+
+Custom cache managers can override a layer's reuse policy per buffer through
+`tensorrt_llm.runtime.kv_cache_manager_v2`. Both attention and SSM layers default
+to `ReusePolicy.REQUIRED`; a buffer's `reuse_policy=None` inherits its layer's
+policy. For example, a custom recurrent consumer with independent state indices
+can configure:
+
+```python
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, ReusePolicy, SsmLayerConfig
+
+layer = SsmLayerConfig(
+    layer_id=0,
+    reuse_policy=ReusePolicy.REQUIRED,
+    buffers=[
+        BufferConfig(role="state", size=4096),
+        BufferConfig(role="checkpoint", size=2048, reuse_policy=ReusePolicy.OPTIONAL),
+        BufferConfig(role="scratch", size=1024, reuse_policy=ReusePolicy.PRIVATE),
+    ],
+)
+```
+
+REQUIRED buffers constrain the reusable prefix. OPTIONAL buffers are candidates
+at that endpoint; select their group IDs through `resume(optional_reuse_groups=...)`
+on the first resume. An SSM snapshot must match the endpoint exactly. PRIVATE
+buffers remain request-local and are never published as reusable checkpoints.
+The consumer must initialize or reconstruct private and unselected optional state
+before inference. Unselected optional snapshots count as neither hits nor misses.
+
+Use `manager.get_buffer_group_id(layer_id, role)` to resolve a buffer and
+`manager.buffer_grouping[group_id]` to enumerate membership. Buffers with the same
+lifecycle properties share a group, including across layers; selecting a group
+selects all of its buffers. Policy overrides add at most three policy variants
+per attention window/sink/sparsity combination and at most three SSM groups.
+Coalescing remains within lifecycle groups and compatible buffer sizes/coalescing
+groups.
+
+`get_layer_group_id(layer_id)` and `layer_grouping` are deprecated in documentation
+only and produce no deprecation warnings. The former returns a uniform layer's
+group and raises `ValueError` for a split layer. The latter preserves its
+partition-of-layers result and raises if any layer is split. `LayerGroupId` retains
+its name; it identifies a lifecycle group, not a physical storage pool.
+
+Independent policies require independent indices in the consumer. The default
+attention view requires compatible policies for K/V and scales because they share
+one page table. Current Mamba kernels similarly couple recurrent, convolution,
+PLE and replay buffers through one state-slot index. These consumers reject
+incompatible policies explicitly; this native configuration does not enable
+separate replay indices in those kernels or add an LLM API configuration field.

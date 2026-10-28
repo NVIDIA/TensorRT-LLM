@@ -3391,7 +3391,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self, attention_only: bool = False
     ) -> Dict[int, int]:
         # Assumes every layer listed in a group shares the same sliding_window_size,
-        # which is how `impl.layer_grouping` groups layers today. Only the
+        # which is part of the lifecycle identity. Only the
         # first layer's window is read; if the grouping policy ever permits
         # mixed windows in one group, this needs to fan out per-layer. A layer
         # can belong to several groups through buffer policy overrides.
@@ -5556,7 +5556,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """Attention life cycle per layer group.
 
         The layers listed in a group share its window and sinks, which is how
-        ``impl.layer_grouping`` groups layers, so the first layer describes the
+        the lifecycle identity groups buffers, so the first layer describes the
         group, including when buffer policies split a layer. A group
         with no window -- full attention, or a group whose layers carry no
         window at all -- yields an empty stale range.

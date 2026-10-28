@@ -301,7 +301,7 @@ def get_layer_to_layer_group(
         kind = CacheKind.PAGED
     out: Dict[int, int] = {}
     for lg_idx, lg in enumerate(page_table.layer_groups):
-        if lg.kind == kind and lg.pool_views:
+        if lg.kind == kind:
             for ll in lg.local_layers:
                 gid = int(ll.global_layer_id)
                 if gid in out:
