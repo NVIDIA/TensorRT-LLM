@@ -19,12 +19,14 @@ import pickle
 import sys
 import threading
 import time
+import uuid
 from importlib.util import find_spec
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import msgspec
 import pytest
+import zmq
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
     KVEventBatch,
@@ -345,6 +347,108 @@ def test_native_streaming_sink_to_python_wire_structs(real_block_factory, lora_i
         assert published[-1].events[0].lora_id == lora_id
     finally:
         manager.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("populated", [False, True])
+def test_streaming_cache_reset_is_published_while_idle_and_replayed(populated):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    init_cuda_once()
+    endpoint = f"inproc://kv-reset-{uuid.uuid4().hex}"
+    events = StreamingKVCacheEventManager(
+        KVEventsConfig(
+            enable_kv_cache_events=True,
+            publisher="zmq",
+            endpoint=endpoint,
+            replay_endpoint=f"{endpoint}-replay",
+        ),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+        max_entries=1,
+    )
+    events.set_layer_group_window_sizes({0: 128})
+    manager = _create_test_manager(events.event_sink)
+    wrapper = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    wrapper.impl = manager
+    wrapper.event_manager = events
+    wrapper.conversation_manager = None
+    wrapper._sharing = None
+    stream_holder = CachedCudaStream()
+    stream = cast(CudaStream, stream_holder.handle)
+    replay = zmq.Context.instance().socket(zmq.DEALER)
+    replay.setsockopt(zmq.RCVTIMEO, 5000)
+    replay.setsockopt(zmq.SNDTIMEO, 5000)
+    subscriber = zmq.Context.instance().socket(zmq.SUB)
+    subscriber.setsockopt(zmq.SUBSCRIBE, b"")
+    subscriber.setsockopt(zmq.RCVTIMEO, 5000)
+    events.start()
+    replay.connect(f"{endpoint}-replay")
+    subscriber.connect(endpoint)
+
+    def replay_through(expected_batches, start_seq):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            replay.send_multipart((b"", start_seq.to_bytes(8, "big")))
+            batches = []
+            while True:
+                _, _, seq, payload = replay.recv_multipart()
+                if seq == events._publisher.END_SEQ:
+                    break
+                batches.append((int.from_bytes(seq, "big"), msgspec.msgpack.decode(payload)))
+            if len(batches) >= expected_batches:
+                return batches
+        pytest.fail("Reset was not published without another inference iteration")
+
+    try:
+        # Establish the SUB subscription using real resets, without relying on a
+        # sleep or on future inference traffic to make the connection usable.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            wrapper.reset_reuse_state()
+            if subscriber.poll(100):
+                _, seq, payload = subscriber.recv_multipart()
+                # A subscription may become ready after an earlier reset was
+                # queued. Consume through this attempt before fixing the cursor.
+                while int.from_bytes(seq, "big") < events.enqueued_batches - 1:
+                    _, seq, payload = subscriber.recv_multipart()
+                assert msgspec.msgpack.decode(payload)[1][-1] == {"type": "AllBlocksCleared"}
+                start_seq = int.from_bytes(seq, "big") + 1
+                break
+        else:
+            pytest.fail("Idle reset did not reach the live subscriber")
+
+        if populated:
+            _commit_and_close(manager, stream, _token_ids(1, 5))
+        # Reset must flush both pending cache changes and the reset itself. No
+        # executor iteration or explicit flush is allowed between reset and replay.
+        wrapper.reset_reuse_state()
+        _, seq, payload = subscriber.recv_multipart()
+        assert int.from_bytes(seq, "big") == start_seq
+        assert msgspec.msgpack.decode(payload)[1][-1] == {"type": "AllBlocksCleared"}
+        batches = replay_through(1, start_seq)
+        first_events = batches[0][1][1]
+        assert first_events[-1] == {"type": "AllBlocksCleared"}
+        if populated:
+            assert first_events[0]["type"] == "BlockStored"
+            assert first_events[0]["token_ids"] == [1, 2, 3, 4]
+
+        # Reusing the same tokens after reset must emit fresh stored data.
+        _commit_and_close(manager, stream, _token_ids(1, 5))
+        events.flush_iteration_events()
+        wrapper.reset_reuse_state()
+        batches = replay_through(3, start_seq)
+        assert [seq for seq, _ in batches] == list(range(start_seq, start_seq + 3))
+        assert batches[1][1][1][0]["type"] == "BlockStored"
+        assert batches[1][1][1][0]["token_ids"] == [1, 2, 3, 4]
+        assert batches[2][1][1][-1] == {"type": "AllBlocksCleared"}
+        assert events.dropped_events == 0
+    finally:
+        replay.close(linger=0)
+        subscriber.close(linger=0)
+        manager.shutdown()
+        events.shutdown()
 
 
 def test_native_streaming_sink_separates_lora_scopes(real_block_factory):

@@ -1015,6 +1015,10 @@ void BlockRadixTree::clear()
     TLLM_CHECK_DEBUG(mRoots.size() == mPendingRootErases.size());
     mRoots.clear();
     mPendingRootErases.clear();
+    if (mEventSink)
+    {
+        mEventSink->addAllBlocksCleared();
+    }
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

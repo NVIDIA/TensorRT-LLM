@@ -99,6 +99,7 @@ KVCacheEventManager = _cpp.KVCacheEventManager
 KVCacheIterationStatsDelta = _cpp.KVCacheIterationStatsDelta
 KVCacheManager = _cpp.KVCacheManager
 KVCacheManagerConfig = _cpp.KVCacheManagerConfig
+StreamingAllBlocksClearedData = _cpp.StreamingAllBlocksClearedData
 StreamingBlockRemovedData = _cpp.StreamingBlockRemovedData
 StreamingBlockStoredData = _cpp.StreamingBlockStoredData
 StreamingEventSink = _cpp.StreamingEventSink
@@ -284,6 +285,7 @@ __all__ = [
     "SsmLayerConfig",
     "StreamingBlockRemovedData",
     "StreamingBlockStoredData",
+    "StreamingAllBlocksClearedData",
     "StreamingEventSink",
     "StreamingEventStats",
     "SwaScratchReuseConfig",

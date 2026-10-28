@@ -8193,3 +8193,5 @@ class KVCacheManagerV2(BaseResourceManager):
             self.conversation_manager.clear()
         if self._sharing is not None:
             self._sharing._on_reset()
+        # A reset can run while inference is paused or idle, with no next iteration.
+        self.flush_iteration_events()

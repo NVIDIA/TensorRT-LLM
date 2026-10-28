@@ -591,6 +591,8 @@ class _StreamingEventSource:
                 )
             elif isinstance(event, kv_cache_manager_v2_runtime.StreamingBlockRemovedData):
                 result.append(BlockRemoved(block_hashes=list(event.block_hashes), medium="GPU"))
+            elif isinstance(event, kv_cache_manager_v2_runtime.StreamingAllBlocksClearedData):
+                result.append(AllBlocksCleared())
             else:
                 raise TypeError(f"Unsupported native streaming KV event: {type(event)!r}")
         return result

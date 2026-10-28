@@ -426,10 +426,9 @@ kv_cache_config = KvCacheConfig(
 no events while streaming is enabled. Draft models and KV-cache-size estimation do not publish
 events. Use buffered mode for cache-tier, priority, and other lifecycle updates.
 
-Streaming exposes only the full-block residency information external routers need, using the
-attention lifecycle with the largest window. Conversion to `BlockStored`/`BlockRemoved` is
-centralized at the once-per-iteration publisher boundary, keeping internal lifecycle details
-contained and avoiding Python callbacks from native cache operations.
+A successful prefix-cache reset emits ordered `AllBlocksCleared` after preceding stored or removed events. Reset flushes events without waiting for another inference iteration, including while inference is idle or paused. The marker is retained in bounded replay history and does not change the engine lifetime ID.
+
+Streaming exposes only the full-block residency information external routers need, using the attention lifecycle with the largest window. Conversion to `BlockStored`, `BlockRemoved`, and `AllBlocksCleared` is centralized at iteration and reset publication boundaries, keeping internal lifecycle details contained and avoiding Python callbacks from native cache operations.
 
 **Multimodal payloads.** `token_ids` can contain integers and hexadecimal digest strings;
 integer-only consumers are incompatible. Each `mm_keys[i]` describes the multimodal segments
