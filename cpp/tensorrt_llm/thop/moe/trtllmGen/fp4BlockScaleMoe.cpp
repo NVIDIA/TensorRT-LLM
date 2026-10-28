@@ -226,10 +226,12 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
         args.num_tokens, args.top_k, args.local_num_experts, tile_tokens_dim);
     if (prerouted != nullptr)
     {
-        auto check = [](torch::Tensor const& t, int64_t min_numel, char const* name)
+        // The kernels launch on the device of hidden_states and read these buffers directly.
+        auto check = [&hidden_states](torch::Tensor const& t, int64_t min_numel, char const* name)
         {
             TORCH_CHECK(t.is_cuda() && t.scalar_type() == at::ScalarType::Int && t.is_contiguous(), name,
                 " must be a contiguous int32 CUDA tensor.");
+            TORCH_CHECK(t.device() == hidden_states.device(), name, " must be on the device of hidden_states.");
             TORCH_CHECK(t.numel() >= min_numel, name, " has ", t.numel(), " elements, needs ", min_numel, ".");
         };
         TORCH_CHECK(topk_ids.has_value() && topk_weights.has_value() && !routing_logits.has_value(),
@@ -247,7 +249,8 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
         ? prerouted->total_num_padded_tokens
         : at::empty({}, at::TensorOptions().device(routing_device).dtype(at::ScalarType::Int));
     at::Tensor expanded_idx_to_permuted_idx = prerouted != nullptr
-        ? prerouted->expanded_idx_to_permuted_idx.narrow(0, 0, args.num_tokens * args.top_k)
+        ? prerouted->expanded_idx_to_permuted_idx.view(-1)
+              .narrow(0, 0, args.num_tokens * args.top_k)
               .view({args.num_tokens, args.top_k})
         : at::Tensor(
             at::detail::empty_cuda({args.num_tokens, args.top_k}, at::ScalarType::Int, routing_device, std::nullopt));
