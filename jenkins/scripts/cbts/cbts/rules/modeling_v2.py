@@ -109,7 +109,11 @@ _ACCURACY_ROOT = "accuracy/modeling_v2"
 
 # Some family tests also exercise stock/CuTe wrappers and live outside models/<family>.
 _FAMILY_TEST_PREFIXES = {
-    "kimi_k3_vl": ("unittest/_torch/kernels/kimi_k3", f"{_UNIT_ROOT}/comm"),
+    "kimi_k3_vl": (
+        "unittest/_torch/kernels/kimi_k3",
+        f"{_UNIT_ROOT}/comm",
+        f"{_UNIT_ROOT}/norm/test_modeling_v2_attn_res_rmsnorm_fwd.py",
+    ),
 }
 
 # Substrings that mark a test entry as modeling_v2. All are unambiguous:
