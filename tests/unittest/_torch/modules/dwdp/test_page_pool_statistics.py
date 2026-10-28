@@ -146,10 +146,10 @@ class TestSlotCountSurvivesRelease:
             p.release()
 
 
-class TestLedgerProviderUsesHeldPages:
+class TestMonitorProviderUsesHeldPages:
     def test_reports_zero_after_release(self, monkeypatch, pool):
-        from tensorrt_llm._torch.memory.ledger.providers.misc import DwdpPagePoolProvider
-        from tensorrt_llm._torch.memory.ledger.schema import Basis
+        from tensorrt_llm._torch.memory.monitor.providers.misc import DwdpPagePoolProvider
+        from tensorrt_llm._torch.memory.monitor.schema import Basis
 
         provider = DwdpPagePoolProvider()
         monkeypatch.setattr(provider, "_pool", lambda: pool)
@@ -163,7 +163,7 @@ class TestLedgerProviderUsesHeldPages:
 
     def test_release_failure_is_surfaced_as_a_lower_bound(self, monkeypatch, pool):
         import tensorrt_llm._torch.modules.dwdp.page_pool as mod
-        from tensorrt_llm._torch.memory.ledger.providers.misc import DwdpPagePoolProvider
+        from tensorrt_llm._torch.memory.monitor.providers.misc import DwdpPagePoolProvider
 
         monkeypatch.setattr(
             mod, "release_handle", lambda h: (_ for _ in ()).throw(RuntimeError("x"))

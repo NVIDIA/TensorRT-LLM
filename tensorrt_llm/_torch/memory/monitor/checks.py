@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Conservation checks over a ledger reading.
+"""Conservation checks over a monitor reading.
 
 A check earns its place only if some input could fail it. ``used = total -
 free`` cannot: it restates its own definition and would hold against

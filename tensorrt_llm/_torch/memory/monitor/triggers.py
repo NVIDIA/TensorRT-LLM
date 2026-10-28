@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""When the ledger reports.
+"""When the monitor reports.
 
 The memory lives in the executor's process, not the one that created the
 ``LLM``. A report taken from the parent describes the parent -- its CUDA
@@ -42,7 +42,7 @@ __all__ = [
 ]
 
 #: Set to an integer to allow more than one OOM report per process.
-_MAX_REPORTS_VAR = "TLLM_MEM_LEDGER_OOM_REPORTS"
+_MAX_REPORTS_VAR = "TLLM_MEM_MONITOR_OOM_REPORTS"
 
 #: Whether the callback is attached to torch. Never cleared: torch keeps
 #: every observer it is handed and offers no way to remove one, so a second
@@ -64,7 +64,7 @@ def _max_reports() -> int:
 
 
 def report_now(tag: str, rank: int | None = None) -> str | None:
-    """Render the ledger for this process, or ``None`` if it is disabled.
+    """Render the monitor for this process, or ``None`` if it is disabled.
 
     Returns the text as well as logging it so a caller can attach it to an
     exception or a crash dump rather than hoping the log survives.
@@ -74,7 +74,7 @@ def report_now(tag: str, rank: int | None = None) -> str | None:
     try:
         snapshot = capture(tag=tag, rank=rank)
     except Exception as exc:  # noqa: BLE001 - a report must not add a failure
-        logger.warning(f"memory ledger: capture for {tag!r} failed ({type(exc).__name__}: {exc})")
+        logger.warning(f"memory monitor: capture for {tag!r} failed ({type(exc).__name__}: {exc})")
         return None
 
     if snapshot is None:
@@ -83,7 +83,7 @@ def report_now(tag: str, rank: int | None = None) -> str | None:
     try:
         return render_capture(snapshot)
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"memory ledger: rendering {tag!r} failed ({type(exc).__name__}: {exc})")
+        logger.warning(f"memory monitor: rendering {tag!r} failed ({type(exc).__name__}: {exc})")
         return None
 
 
@@ -97,7 +97,7 @@ def _on_out_of_memory(device: int, allocation_bytes: int, allocated: int, reserv
     gib = 1 << 30
     try:
         header = (
-            f"memory ledger: out of memory on device {device} -- "
+            f"memory monitor: out of memory on device {device} -- "
             f"request {allocation_bytes / gib:.2f} GiB, "
             f"torch allocated {allocated / gib:.2f} GiB, "
             f"torch reserved {reserved / gib:.2f} GiB"
@@ -109,7 +109,7 @@ def _on_out_of_memory(device: int, allocation_bytes: int, allocated: int, reserv
 
 
 def install_oom_reporter(rank: int | None = None) -> bool:
-    """Report the ledger the next time an allocation runs out of memory.
+    """Report the monitor the next time an allocation runs out of memory.
 
     Returns whether reporting is active. Safe to call repeatedly: the
     callback is attached to torch at most once per process, because torch
@@ -129,14 +129,14 @@ def install_oom_reporter(rank: int | None = None) -> bool:
 
     attach = getattr(torch._C, "_cuda_attach_out_of_memory_observer", None)
     if attach is None:
-        logger.debug("memory ledger: this torch has no OOM observer")
+        logger.debug("memory monitor: this torch has no OOM observer")
         return False
 
     try:
         attach(_on_out_of_memory)
     except Exception as exc:  # noqa: BLE001
         logger.debug(
-            f"memory ledger: could not attach the OOM observer ({type(exc).__name__}: {exc})"
+            f"memory monitor: could not attach the OOM observer ({type(exc).__name__}: {exc})"
         )
         return False
 

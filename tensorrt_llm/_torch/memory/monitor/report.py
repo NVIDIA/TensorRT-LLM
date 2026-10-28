@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Rendering for the memory ledger.
+"""Rendering for the memory monitor.
 
 Three rules the renderer enforces, because each corresponds to a way these
 reports mislead in practice:
@@ -75,9 +75,9 @@ def render(
     out: list[str] = []
     add = out.append
 
-    header = "=== TensorRT-LLM GPU memory ledger ==="
+    header = "=== TensorRT-LLM GPU memory monitor ==="
     if tag:
-        header = f"=== TensorRT-LLM GPU memory ledger: {tag} ==="
+        header = f"=== TensorRT-LLM GPU memory monitor: {tag} ==="
     add(header)
 
     ident = []
@@ -127,7 +127,7 @@ def render(
             "   <- incl. blocks awaiting release on other streams",
         )
     )
-    add(_line("provider ledgers", frame.nontorch_known))
+    add(_line("component counters", frame.nontorch_known))
     residual_suffix = ""
     if frame.residual_is_negative:
         residual_suffix = "   <- NEGATIVE, see below"
@@ -144,14 +144,14 @@ def render(
         add(_entry_line(entry))
     add(_entry_line(derived[0]))
 
-    ledger_entries = [
+    component_entries = [
         e for e in frame.entries if e.placement is Placement.NON_TORCH and e.counts_toward_total
     ]
     add("")
-    add("[provider ledgers]")
-    if not ledger_entries:
+    add("[component counters]")
+    if not component_entries:
         add("  (none registered)")
-    for entry in sorted(ledger_entries, key=lambda e: -(e.size_bytes or 0)):
+    for entry in sorted(component_entries, key=lambda e: -(e.size_bytes or 0)):
         add(_entry_line(entry))
     add(_entry_line(derived[1]))
 

@@ -26,7 +26,7 @@ explicit home::
         |   |   |-- <tagged categories>
         |   |   `-- unattributed_live      subtraction (1)
         |   `-- torch_reserved_unallocated
-        |-- nontorch_known                 sum of provider ledgers
+        |-- nontorch_known                 sum of component counters
         `-- nontorch_residual              subtraction (2)
 
 The two subtractions mean different things and are never merged:
@@ -181,7 +181,7 @@ def build_frame(
 
 
 def derived_entries(frame: Frame) -> list[Entry]:
-    """The two subtraction results, as ledger entries."""
+    """The two subtraction results, as monitor entries."""
     return [
         Entry(
             category=Category.UNATTRIBUTED_LIVE,

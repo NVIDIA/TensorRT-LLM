@@ -25,8 +25,8 @@ Needs a GPU: the attribution is read back out of a real allocator snapshot.
 import pytest
 import torch
 
-from tensorrt_llm._torch.memory.ledger.checks import check_tag_coverage
-from tensorrt_llm._torch.memory.ledger.tagging import (
+from tensorrt_llm._torch.memory.monitor.checks import check_tag_coverage
+from tensorrt_llm._torch.memory.monitor.tagging import (
     UNTAGGED,
     TagSnapshot,
     freeze_tag_map,
@@ -141,7 +141,7 @@ class TestUnsupportedIsNotZero:
         assert not empty
 
     def test_tag_is_a_noop_when_unsupported(self, monkeypatch):
-        import tensorrt_llm._torch.memory.ledger.tagging as mod
+        import tensorrt_llm._torch.memory.monitor.tagging as mod
 
         monkeypatch.setattr(mod, "tagging_supported", lambda: False)
         # Call sites must not need a guard of their own.
@@ -149,7 +149,7 @@ class TestUnsupportedIsNotZero:
             pass
 
     def test_freeze_reports_unsupported_rather_than_empty(self, monkeypatch):
-        import tensorrt_llm._torch.memory.ledger.tagging as mod
+        import tensorrt_llm._torch.memory.monitor.tagging as mod
 
         monkeypatch.setattr(mod, "tagging_supported", lambda: False)
         snapshot = mod.freeze_tag_map()
@@ -215,7 +215,7 @@ class TestClaimModuleMemory:
     """Re-attribution from a module's final parameters."""
 
     def test_claims_parameters_and_buffers(self, window):
-        from tensorrt_llm._torch.memory.ledger.tagging import claim_module_memory
+        from tensorrt_llm._torch.memory.monitor.tagging import claim_module_memory
 
         module = torch.nn.Linear(512, 512).cuda()
         module.register_buffer("scratch", torch.empty(1024, 1024, device="cuda"))
@@ -233,7 +233,7 @@ class TestClaimModuleMemory:
         # Tied embeddings: two parameters, one storage. Summing their
         # logical sizes double counts; claiming by block does not. Measured
         # on Qwen2-0.5B, this is a 259.7 MiB difference.
-        from tensorrt_llm._torch.memory.ledger.tagging import claim_module_memory
+        from tensorrt_llm._torch.memory.monitor.tagging import claim_module_memory
 
         shared = torch.empty(8 * MB, dtype=torch.uint8, device="cuda")
 
@@ -253,7 +253,7 @@ class TestClaimModuleMemory:
     def test_survives_the_window_freeze(self, window):
         # The closing freeze rebuilds the trace-derived map wholesale;
         # claims are kept apart so they are not discarded by it.
-        from tensorrt_llm._torch.memory.ledger.tagging import claim_module_memory, set_frozen_map
+        from tensorrt_llm._torch.memory.monitor.tagging import claim_module_memory, set_frozen_map
 
         module = torch.nn.Linear(1024, 1024).cuda()
         try:
@@ -267,7 +267,7 @@ class TestClaimModuleMemory:
             del module
 
     def test_cpu_module_claims_nothing(self):
-        from tensorrt_llm._torch.memory.ledger.tagging import claim_module_memory
+        from tensorrt_llm._torch.memory.monitor.tagging import claim_module_memory
 
         assert claim_module_memory(torch.nn.Linear(8, 8), "WEIGHTS") == 0
 
@@ -284,10 +284,10 @@ class TestCaptureBuildsTagEntries:
     def test_capture_succeeds_with_tagged_memory(self, window, monkeypatch):
         if not window:
             pytest.skip("tagging unsupported here")
-        monkeypatch.setenv("TLLM_MEM_LEDGER", "1")
+        monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
 
-        from tensorrt_llm._torch.memory.ledger import capture, render_capture
-        from tensorrt_llm._torch.memory.ledger.tagging import set_frozen_map
+        from tensorrt_llm._torch.memory.monitor import capture, render_capture
+        from tensorrt_llm._torch.memory.monitor.tagging import set_frozen_map
 
         with tag("WEIGHTS"):
             weights = torch.empty(32 * MB, dtype=torch.uint8, device="cuda")
@@ -304,11 +304,11 @@ class TestCaptureBuildsTagEntries:
     def test_tag_entries_use_a_real_placement(self, window, monkeypatch):
         if not window:
             pytest.skip("tagging unsupported here")
-        monkeypatch.setenv("TLLM_MEM_LEDGER", "1")
+        monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
 
-        from tensorrt_llm._torch.memory.ledger import _tag_entries
-        from tensorrt_llm._torch.memory.ledger.schema import Placement
-        from tensorrt_llm._torch.memory.ledger.tagging import set_frozen_map
+        from tensorrt_llm._torch.memory.monitor import _tag_entries
+        from tensorrt_llm._torch.memory.monitor.schema import Placement
+        from tensorrt_llm._torch.memory.monitor.tagging import set_frozen_map
 
         with tag("WEIGHTS"):
             weights = torch.empty(16 * MB, dtype=torch.uint8, device="cuda")

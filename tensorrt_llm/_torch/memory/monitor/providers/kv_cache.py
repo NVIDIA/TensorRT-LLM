@@ -46,7 +46,7 @@ def _slot_bytes(stats) -> int:
 def kv_pool_group_stats(manager) -> list[dict]:
     """Per-pool-group figures in bytes, derived only from stored fields.
 
-    Returned rather than logged so the conservation checks and the ledger
+    Returned rather than logged so the conservation checks and the monitor
     entries work from one reading; sampling twice would let the pool change
     underneath a comparison.
     """
@@ -89,7 +89,7 @@ class KvCacheProvider:
     the way ``MnnvlMemory`` can. The code that builds it registers one of
     these via ``register_provider``.
 
-    The reference is weak. A ledger that kept the manager alive would pin
+    The reference is weak. A monitor that kept the manager alive would pin
     the largest allocation in the process -- the pool is tens of GiB -- and
     a diagnostic that prevents memory from being released is worse than one
     that reports nothing. Once the manager is gone the provider reports
@@ -112,7 +112,7 @@ class KvCacheProvider:
             # than take a strong reference that would outlive the executor
             # in the module-level registry and pin the pool forever.
             logger.warning(
-                f"memory ledger: {type(manager).__name__} cannot be "
+                f"memory monitor: {type(manager).__name__} cannot be "
                 "referenced weakly; KV cache rows will be absent"
             )
 
@@ -136,7 +136,7 @@ class KvCacheProvider:
                 Entry(
                     category=Category.KV_CACHE_POOL,
                     size_bytes=row["capacity_bytes"],
-                    source=Source.LEDGER,
+                    source=Source.COMPONENT,
                     placement=Placement.NON_TORCH,
                     basis=Basis.PHYSICAL_BACKING,
                     owner=f"kv_cache_v2.pool_group[{row['pool_group_id']}]",
@@ -154,7 +154,7 @@ class KvCacheProvider:
                 Entry(
                     category=Category.KV_CACHE_POOL,
                     size_bytes=row["in_use_bytes"],
-                    source=Source.LEDGER,
+                    source=Source.COMPONENT,
                     placement=Placement.NON_TORCH,
                     basis=Basis.LOGICAL,
                     owner=f"kv_cache_v2.pool_group[{row['pool_group_id']}]",
