@@ -2636,6 +2636,101 @@ class TestRouteEngineValidationError:
 
 
 # =========================================================================
+# The visual-gen validation-error envelope (both entry points)
+# =========================================================================
+
+
+class TestVisualGenValidationErrorRendering:
+    """Characterize the visual-gen 422 envelope at both entry points.
+
+    Routes with a declared request model fail with FastAPI's
+    ``RequestValidationError``; handlers that build their own request
+    model (video sync/async, image edit, multipart) fail with pydantic's
+    ``ValidationError``. Every path must render byte-identical bodies.
+    These tests pin the full body, so they must pass unchanged before
+    and after any refactor of the rendering code.
+    """
+
+    # The exact envelope every unknown-field request below must produce.
+    _UNKNOWN_FIELD_BODY = {
+        "object": "error",
+        "message": "Unknown request field 'not_a_field'. Pass model-specific "
+        "parameters via 'extra_params' instead.",
+        "type": "BadRequestError",
+        "param": None,
+        "code": 422,
+    }
+
+    def test_route_level_unknown_field_body_is_exact(self, image_client):
+        """``POST /v1/images/generations`` declares its request model, so an
+        unknown field arrives as a ``RequestValidationError``; the body is
+        pinned in full."""
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={"prompt": "a cat", "not_a_field": 1},
+        )
+        assert resp.status_code == 422
+        assert resp.json() == self._UNKNOWN_FIELD_BODY
+
+    def test_route_level_type_error_names_the_field(self, image_client):
+        """A type error reads ``<field>: <pydantic msg>``. The expected
+        message is computed from the model in the test, so the assertion
+        does not hard-code pydantic's wording."""
+        from pydantic import ValidationError
+
+        from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest
+
+        payload = {"prompt": "a cat", "seed": "abc"}
+        with pytest.raises(ValidationError) as exc_info:
+            ImageGenerationRequest.model_validate(payload)
+        expected_msg = exc_info.value.errors()[0]["msg"]
+
+        resp = image_client.post("/v1/images/generations", json=payload)
+        assert resp.status_code == 422
+        body = resp.json()
+        _assert_llm_envelope(body, code=422)
+        assert body["message"] == f"seed: {expected_msg}"
+
+    def test_handler_level_bodies_match_route_level(self, tmp_path, monkeypatch):
+        """Handlers that build their own request model (video sync JSON,
+        video async JSON, image edit JSON) return the same 422 body as the
+        route-level path."""
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+
+        video_client = _create_server(MockVisualGen(video_output=_make_dummy_video_tensor()))
+        for url in ("/v1/videos/sync", "/v1/videos"):
+            resp = video_client.post(url, json={"prompt": "a cat", "not_a_field": 1})
+            assert resp.status_code == 422, (url, resp.text)
+            assert resp.json() == self._UNKNOWN_FIELD_BODY, url
+
+        edit_client = _create_server(
+            MockVisualGen(
+                image_output=_make_dummy_image_tensor(),
+                supports_image_edit=True,
+            )
+        )
+        resp = edit_client.post(
+            "/v1/images/edits",
+            json={"prompt": "a cat", "image": _b64_white_png_1x1(), "not_a_field": 1},
+        )
+        assert resp.status_code == 422, resp.text
+        assert resp.json() == self._UNKNOWN_FIELD_BODY
+
+    def test_multipart_handler_level_body_is_exact(self, video_client):
+        """The multipart path funnels through the same pydantic model and
+        renders the same envelope. The unknown field is sent as a plain
+        multipart text part (no filename) so it is the only validation
+        error and the body matches the route-level one byte for byte."""
+        resp = video_client.post(
+            "/v1/videos/sync",
+            data={"prompt": "a cat"},
+            files={"not_a_field": (None, "1")},
+        )
+        assert resp.status_code == 422, resp.text
+        assert resp.json() == self._UNKNOWN_FIELD_BODY
+
+
+# =========================================================================
 # Non-visual-gen routes keep FastAPI's default validation response
 # =========================================================================
 
