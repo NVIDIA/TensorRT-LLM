@@ -48,7 +48,8 @@ from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
 from pydantic import (AliasChoices, BaseModel, ConfigDict, Field,
-                      NonNegativeInt, PositiveInt, field_validator,
+                      NonNegativeInt, PositiveInt, ValidationError,
+                      ValidatorFunctionWrapHandler, field_validator,
                       model_serializer, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
@@ -1359,6 +1360,62 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "Message-level `tools` are only allowed on system "
                     "messages.")
         return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_streaming_only_tool_call_index(cls, data: Any) -> Any:
+        """Drop ``index`` from the tool calls of the request's messages.
+
+        ``index`` belongs to streamed tool-call deltas
+        (``ChoiceDeltaToolCall``), not to the tool calls of an assistant
+        message. A client that rebuilds a turn from the stream and sends it
+        back keeps it, and the OpenAI message types reject it as an extra
+        key. ``tool_calls`` is validated lazily, so that rejection does not
+        fail validation: rendering the messages raises later, and
+        serializing the request to forward it leaves the call out. The key
+        carries no meaning in a request, so it is dropped, not declared.
+        """
+        if not isinstance(data, dict):
+            return data
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return data
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            for call in tool_calls:
+                if isinstance(call, dict):
+                    call.pop("index", None)
+        return data
+
+    @field_validator("messages", mode="wrap")
+    @classmethod
+    def _materialize_lazy_message_fields(
+            cls, value: Any, handler: ValidatorFunctionWrapHandler) -> Any:
+        """Turn the lazily validated ``tool_calls`` of messages into lists.
+
+        OpenAI declares an assistant message's ``tool_calls`` as an
+        ``Iterable``, which pydantic validates into a single-use
+        ``ValidatorIterator``. Its first reader consumes it: rendering the
+        prompt, or serializing the request to forward it to a disaggregated
+        worker. Any later serialization, such as the resend after a failed
+        attempt, would then carry no tool calls.
+
+        Tool calls that fail the OpenAI types (object-valued
+        ``function.arguments``, for one) stay lazy: the chat route reads
+        those from the raw request body when iterating them fails
+        (``chat_utils._parse_fallback_tool_calls``), and materializing them
+        here would reject the request instead. They are validated afresh for
+        that, since the failed attempt consumed the first iterators.
+        """
+        validated = handler(value)
+        try:
+            return _materialize_validator_iterators(validated)
+        except ValidationError:
+            return handler(value)
 
     @model_validator(mode="before")
     @classmethod
