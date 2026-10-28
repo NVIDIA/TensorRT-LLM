@@ -1401,6 +1401,12 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
                                               request_ids: List[int]) -> None:
         self._impl.seed_kda_replay_caches_for_disagg_gen(request_ids)
 
+    def rebuild_disagg_imported_cache(self,
+                                      requests: Iterable[LlmRequest]) -> None:
+        """Seed the KDA replay caches of requests whose state was imported."""
+        self.seed_kda_replay_caches_for_disagg_gen(
+            [request.py_request_id for request in requests])
+
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
         return self._impl.get_ssm_states(layer_idx)
 
@@ -3616,6 +3622,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def disagg_pipelined_transfer_blocker(self) -> Optional[str]:
         """Recurrent state is one checkpoint at the end of the prompt, which no piece carries."""
         return "a Mamba/hybrid cache manager"
+
+    def rebuild_disagg_imported_cache(self,
+                                      requests: Iterable[LlmRequest]) -> None:
+        """Seed the KDA replay caches, which no transfer carries, from the
+        imported conv state."""
+        requests = list(requests)
+        super().rebuild_disagg_imported_cache(requests)
+        self.seed_kda_replay_caches_for_disagg_gen(
+            [request.py_request_id for request in requests])
 
     def _kda_replay_roles(self) -> frozenset[str]:
         """The roles of the KDA replay buffers, or none without them."""

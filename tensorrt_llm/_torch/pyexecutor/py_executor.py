@@ -8169,27 +8169,11 @@ class PyExecutor:
         self.resource_manager.resource_managers[
             ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(requests)
         self._setup_sampler_step(requests)
-        # KDA fused-verify replay caches: the ctx->gen state transfer
-        # populates only the base mamba conv/ssm pools; with one-model
-        # spec decoding (e.g. SA) the first forward for these requests
-        # takes the fused verify path, which reads the per-slot
-        # kda_conv_* replay caches instead of the conv pool. Seed them
-        # from the transferred conv states before the first step
-        # (otherwise the recurrent state is permanently contaminated by
-        # a zero/stale conv window; K3 SA-in-disagg GSM8K -0.6pp).
-        if self.enable_spec_decode:
-            kv_mgr = self.resource_manager.resource_managers.get(
-                ResourceManagerType.KV_CACHE_MANAGER)
-            seed = getattr(kv_mgr, 'seed_kda_replay_caches_for_disagg_gen',
-                           None)
-            if seed is not None:
-                seed([
-                    req.py_request_id for req in cache_trans_complete_requests
-                ])
-        # Cache state that the generation worker derives from the imported KV
-        # (e.g. FP4 MLA V scales and packed V) is not transferred. Rebuild it
-        # before the first forward reads it. The sampler setup above may have
-        # terminated requests, whose caches must not be touched.
+        # Caches the generation worker derives from the imported ones (FP4 MLA
+        # V sidecars, KDA replay conv windows) are not transferred; the cache
+        # manager rebuilds them before the first forward reads them. The
+        # sampler setup above may have terminated requests, whose caches must
+        # not be touched.
         kv_mgr = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
         rebuild = getattr(kv_mgr, "rebuild_disagg_imported_cache", None)

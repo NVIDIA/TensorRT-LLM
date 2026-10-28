@@ -3828,6 +3828,11 @@ class KVCacheManagerV2(BaseResourceManager):
         None when they can."""
         return None
 
+    def rebuild_disagg_imported_cache(self, requests: Iterable[LlmRequest]) -> None:
+        """Derive, before their first generation step, the caches of requests whose transfer just
+        completed that the transfer did not carry: nothing. A manager with such caches overrides
+        this and calls it through ``super()``."""
+
     @property
     def draft_prompt_lookahead(self) -> int:
         """Prompt tokens the configured draft reads ahead, before reuse-backoff opt-outs."""

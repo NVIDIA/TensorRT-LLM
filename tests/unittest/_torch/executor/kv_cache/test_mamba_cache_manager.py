@@ -4992,6 +4992,22 @@ def test_kda_cache_budget_counts_live_dummy_and_fixed_snapshot_slots(
     assert result == (baseline[0], baseline[1] + slots * replay_bytes_per_slot)
 
 
+def test_imported_requests_are_rebuilt_by_seeding_their_kda_replay_caches():
+    """The executor's one post-import call seeds the KDA replay caches, on either manager."""
+    requests = [SimpleNamespace(py_request_id=101), SimpleNamespace(py_request_id=202)]
+
+    v2 = object.__new__(MambaHybridCacheManagerV2)
+    seeded = []
+    v2.seed_kda_replay_caches_for_disagg_gen = seeded.append
+    v2.rebuild_disagg_imported_cache(iter(requests))
+    assert seeded == [[101, 202]]
+
+    v1 = object.__new__(MambaCacheManager)
+    v1._impl = SimpleNamespace(seed_kda_replay_caches_for_disagg_gen=seeded.append)
+    v1.rebuild_disagg_imported_cache(iter(requests))
+    assert seeded == [[101, 202], [101, 202]]
+
+
 def test_v2_kda_replay_seeds_disaggregated_generation_slots():
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr._use_kda_replay_update = True
