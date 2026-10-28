@@ -56,6 +56,16 @@ def validate_internal_request_auth_key(value: object) -> str | None:
             "internal_request_auth_key must be a non-empty string") from None
 
 
+def validate_metadata_record_auth_key(value: object) -> str | None:
+    """Validate the metadata record key without including its value in errors."""
+    try:
+        return _AUTH_KEY_ADAPTER.validate_python(value)
+    except ValidationError:
+        raise ValueError(
+            "metadata server record_auth_key must be a non-empty string"
+        ) from None
+
+
 def _extract_internal_request_auth_key(
         top_level_key: Optional[str], context_servers: dict,
         generation_servers: dict) -> Optional[str]:
@@ -193,6 +203,28 @@ class MetadataServerConfig():
     port: int = 2379
     health_check_timeout: float = 5.0
     refresh_interval: float = 10.0
+    # Optional etcd client credentials and TLS files.
+    user: Optional[str] = None
+    password: Optional[str] = None
+    ca_cert: Optional[str] = None
+    cert_key: Optional[str] = None
+    cert_cert: Optional[str] = None
+    # Shared secret used to sign and verify server records. When set, records
+    # without a valid signature are ignored by readers.
+    record_auth_key: Optional[str] = None
+
+    def __post_init__(self):
+        self.record_auth_key = validate_metadata_record_auth_key(
+            self.record_auth_key)
+        if (self.user is None) != (self.password is None):
+            raise ValueError(
+                "metadata server user and password must be set together")
+        if (self.cert_key is None) != (self.cert_cert is None):
+            raise ValueError(
+                "metadata server cert_key and cert_cert must be set together")
+        if self.cert_key is not None and self.ca_cert is None:
+            raise ValueError(
+                "metadata server cert_key and cert_cert require ca_cert")
 
 
 def get_usage_tokens_from_ctx(
