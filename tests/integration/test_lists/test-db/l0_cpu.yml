@@ -31,7 +31,6 @@ l0_cpu:
   - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references
   - unittest/test_s3_output.py
   - unittest/others/test_http_utils_fail_fast.py
-  - unittest/scripts/test_perf_client_readiness.py
   - unittest/_torch/visual_gen/multi_gpu/test_worker_pool.py
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
