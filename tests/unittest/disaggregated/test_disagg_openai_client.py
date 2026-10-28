@@ -1381,12 +1381,24 @@ class TestRequestTimeout:
         assert (timeout.total, timeout.connect, timeout.sock_read) == (None, 180, 180)
 
     @pytest.mark.asyncio
-    async def test_a_zero_timeout_does_not_bound_the_response_start(
-        self, mock_router, mock_session, completion_request
+    @pytest.mark.parametrize("timeout_secs", [0, -1])
+    async def test_a_timeout_that_is_not_positive_does_not_bound_the_response_start(
+        self, mock_router, mock_session, completion_request, monkeypatch, timeout_secs
     ):
+        bounds = []
+        wait_for = asyncio.wait_for
+
+        async def recording_wait_for(awaitable, timeout):
+            bounds.append(timeout)
+            return await wait_for(awaitable, timeout)
+
+        monkeypatch.setattr(asyncio, "wait_for", recording_wait_for)
         _reset_prometheus_registry()
         client = OpenAIHttpClient(
-            router=mock_router, role=ServerRole.GENERATION, timeout_secs=0, session=mock_session
+            router=mock_router,
+            role=ServerRole.GENERATION,
+            timeout_secs=timeout_secs,
+            session=mock_session,
         )
         http_response = AsyncMock()
         http_response.status = 200
@@ -1399,6 +1411,7 @@ class TestRequestTimeout:
         response = await client.send_request(completion_request)
 
         assert isinstance(response, CompletionResponse)
+        assert bounds == [None]
 
 
 def test_a_forwarded_request_keeps_the_field_names_it_arrived_with():

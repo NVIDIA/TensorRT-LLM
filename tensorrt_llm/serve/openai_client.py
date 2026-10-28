@@ -268,8 +268,8 @@ class OpenAIHttpClient(OpenAIClient):
         self._stream_timeout = aiohttp.ClientTimeout(
             total=None, connect=timeout_secs, sock_read=timeout_secs
         )
-        # Zero disables the bound, as it does aiohttp's.
-        self._response_start_timeout_secs = timeout_secs or None
+        # A timeout that is not positive disables the bound, as it does aiohttp's.
+        self._response_start_timeout_secs = timeout_secs if timeout_secs > 0 else None
         self._session = session or aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(
                 limit=0,
