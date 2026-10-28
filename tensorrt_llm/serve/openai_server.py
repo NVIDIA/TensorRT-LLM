@@ -69,6 +69,8 @@ from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
+from tensorrt_llm.serve._visual_gen_errors import \
+    render_visual_gen_validation_error
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
     convert_anthropic_count_tokens_request, convert_anthropic_request,
@@ -901,7 +903,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 return anthropic_error_response(str(exc),
                                                 "invalid_request_error", 400)
             if self.server_role is ServerRole.VISUAL_GEN:
-                return self._create_visual_gen_validation_error_response(exc)
+                return render_visual_gen_validation_error(
+                    exc, self.create_error_response)
             # Non-visual-gen roles keep the shared 400 + ``{"error": ...}``
             # response shape that integration tests (e.g.
             # ``test_malformed_json_request``) and existing clients
@@ -1189,36 +1192,6 @@ class OpenAIServer(_VideoRoutesMixin):
             err_type="NotImplementedError",
             message=message,
             status_code=HTTPStatus.NOT_IMPLEMENTED,
-        )
-
-    def _create_visual_gen_validation_error_response(
-            self, exc: RequestValidationError) -> Response:
-        """Render a ``RequestValidationError`` as the visual-gen 422 envelope.
-
-        The body has the LLM-style ``{message, type, code}`` shape with
-        HTTP 422. The ``message`` field names the offending field(s) for
-        each error in ``exc.errors()`` so clients can fix the request
-        without parsing the full Pydantic payload.
-        """
-        parts: List[str] = []
-        for err in exc.errors():
-            loc = ".".join(
-                str(seg) for seg in err.get("loc", ()) if seg != "body")
-            etype = err.get("type", "")
-            msg = err.get("msg", "")
-            if etype == "extra_forbidden":
-                parts.append(
-                    f"Unknown request field {loc!r}. Pass model-specific "
-                    "parameters via 'extra_params' instead.")
-            elif loc:
-                parts.append(f"{loc}: {msg}")
-            else:
-                parts.append(msg)
-        message = "; ".join(parts) if parts else str(exc)
-        return self.create_error_response(
-            message=message,
-            err_type="BadRequestError",
-            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
         )
 
     def _check_health(self) -> bool:
@@ -4198,7 +4171,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 output = self.generator.generate(inputs=request.prompt,
                                                  params=params)
             except ValidationError as exc:
-                return self._render_pydantic_validation_error(exc)
+                return render_visual_gen_validation_error(
+                    exc, self.create_error_response)
             except ValueError as exc:
                 logger.error(f"Image edit request error: {exc}")
                 return self.create_error_response(
@@ -4260,7 +4234,8 @@ class OpenAIServer(_VideoRoutesMixin):
             return JSONResponse(content=response.model_dump(), headers=headers)
 
         except ValidationError as exc:
-            return self._render_pydantic_validation_error(exc)
+            return render_visual_gen_validation_error(
+                exc, self.create_error_response)
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(
