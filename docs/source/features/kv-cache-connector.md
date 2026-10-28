@@ -661,7 +661,8 @@ or disk tiers and Mamba/hybrid state remain unsupported. Speculative decoding
 is supported only in the
 [speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server),
 for which both classes declare `supports_speculative_prefill` as well.
-This change adds no Mooncake backend, deployment configuration or capacity tuning.
+The [`mooncake-store`](#mooncake-store) connector declares `supports_attention_dp`; see
+[its notes on attention data parallelism](#attention-data-parallelism-and-speculative-prefill).
 
 Select a connector through `connector_module`, `connector_scheduler_class`,
 and `connector_worker_class` as usual. Both classes must opt in; enabling ADP
@@ -826,13 +827,34 @@ Both are settled in the `LLM` constructor, before the ranks are spawned and befo
 reads the arguments, so `trtllm-serve`, `trtllm-bench` and a direct `LLM(...)` all see the same
 settings. A `capacity` server keeps both as configured.
 
+### Attention data parallelism and speculative prefill
+
+Both classes declare `supports_attention_dp`, so `enable_attention_dp=True` runs a scheduler
+adapter and a worker on every owner, each deciding and moving pages for its own requests only.
+
+* A stored page is one attention shard's KV. Under tensor parallelism each rank keys its own shard
+  and a prefix is a hit only once every shard of it is in the pool. Every attention-DP owner holds
+  all heads, so all owners key their pages as shard 0 of 1 (`w1r0` in the key): a prefix one owner
+  saved is a hit for every other owner, and for a single-rank server with the same `model_key`,
+  `tokens_per_block` and page size. Tensor-parallel keys are unchanged.
+* Under attention DP a save in flight counts against `kv_connector_config.transfer_timeout_sec`
+  (see [Attention data parallelism](#attention-data-parallelism)); size it for the save backlog a
+  congested fabric can build up.
+* A page that is gone between lookup and load restarts only the affected request, on its owner,
+  as on a single-rank server; see [Restrictions](#restrictions).
+* A `role: capacity` server may run with attention DP; it transfers nothing either way.
+
+`mooncake-store` does not declare `supports_speculative_prefill`, so the
+[speculative-prefill-only mode](#speculative-decoding-on-a-disaggregated-context-server) is refused
+for it at startup.
+
 ### Restrictions
 
 Checked at startup, before any request is admitted, because each one's failure mode is KV replayed
 without all of the state it was computed with — a wrong answer rather than a slow one.
 
-Beyond beam search, attention data parallelism, speculative decoding and Mamba/hybrid models, which
-are rejected for [every connector](#a-page-slot-must-not-be-reassigned-underneath-the-connector),
+Beyond beam search, speculative decoding and Mamba/hybrid models, which are rejected for
+[every connector](#a-page-slot-must-not-be-reassigned-underneath-the-connector),
 this one also rejects KV cache manager V1, context parallelism, pipeline parallelism,
 sliding-window attention, and `sparse_attention_config` with an index-V cache unless
 `sparse_disable_index_value=True`; it bypasses individual requests that carry a LoRA adapter or
@@ -840,11 +862,17 @@ multimodal content without hashes, leaving the rest of the deployment served.
 
 A page offered at lookup can still be gone at load time, evicted from a full pool or left behind by
 a put that never completed. The worker declares
-[`reports_failed_loads`](#2-worker-interface-kvcacheconnectorworker), so on a single-rank server
-(and on attention-DP owners once `mooncake-store` supports attention data parallelism) only the
-affected request restarts, without the offered prefix, and the rest of its batch runs. Under tensor
-parallelism every rank holds a shard of the same page and cannot restart the request alone, so a
-missing page fails the executor there.
+[`reports_failed_loads`](#2-worker-interface-kvcacheconnectorworker), so on a single-rank server or
+an attention-DP owner only the affected request restarts, without the offered prefix, and the rest
+of its batch runs. Under tensor parallelism every rank holds a shard of the same page and cannot
+restart the request alone, so a missing page fails the executor there.
+
+Aggregated serving under attention data parallelism is not supported yet, although startup does
+not refuse it. When the attention-DP gate skips a forward pass after the batch was prepared, the
+executor shrinks each generation request's KV capacity again, and a page the connector was already
+told about can go to another request without the connector hearing of it; a later save could then
+publish that request's bytes under this one's key. A disaggregated context server never runs
+generation requests and is unaffected, as is a role that saves nothing (`consumer`, `capacity`).
 
 ### GPUDirect RDMA
 

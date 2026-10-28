@@ -17,15 +17,22 @@
 One worker per rank owns a `MooncakeDistributedStore` handle and moves pages
 between that pool and its own GPU KV cache. It is also the only place that
 knows how a page is addressed and how a key is spelled, which is why the
-leader, colocated with rank 0's worker, asks it to run prefix lookups.
+scheduler adapter in the same process asks it to run prefix lookups: rank 0's
+under tensor parallelism, every owner's under attention data parallelism.
+
+A stored page is one attention shard's KV. Under tensor parallelism each rank
+keys its own shard and a prefix counts only when every shard is present. Under
+attention data parallelism every owner holds all heads, so all owners key their
+pages as shard 0 of 1 and share one key space on the pool, while transfers,
+completion and the store handle stay owner-local.
 
 Loads are synchronous, and the runtime has already counted the loaded tokens as
 computed, so a page missing at load time must never reach a forward pass. A
 rank that holds whole pages and its own batch hands the affected request back
 for a restart without the offered prefix (`reports_failed_loads`): a single-rank
-server, and an attention-DP owner once this connector supports attention data
-parallelism. Under tensor parallelism the ranks hold shards of the same page and
-cannot restart a request alone, so there a missing page fails the executor.
+server or an attention-DP owner. Under tensor parallelism the ranks hold shards
+of the same page and cannot restart a request alone, so there a missing page
+fails the executor.
 
 Saves are asynchronous and gated on a CUDA event, since the pages are complete
 only once the forward pass that wrote them has retired and blocking the
@@ -78,10 +85,11 @@ __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
 
 _GIB = 1 << 30
 
-#: Set by the worker's constructor so the leader, which the executor builds in
-#: the same process on rank 0, can reach the store handle without a second
+#: Set by the worker's constructor so the scheduler adapter, which the executor
+#: builds in the same process (on rank 0 under tensor parallelism, on every
+#: owner under attention DP), can reach the store handle without a second
 #: connection. `py_executor_creator` constructs the two concurrently, so the
-#: leader waits on `_LOCAL_WORKER_READY`.
+#: adapter waits on `_LOCAL_WORKER_READY`.
 _LOCAL_WORKER: Optional["MooncakeStoreConnectorWorker"] = None
 _LOCAL_WORKER_READY = threading.Event()
 
@@ -99,9 +107,10 @@ def resolve_local_worker(timeout: float = 60.0) -> "MooncakeStoreConnectorWorker
     """
     if not _LOCAL_WORKER_READY.wait(timeout):
         raise RuntimeError(
-            "The mooncake-store leader could not find a worker in its process. "
-            "The leader only runs on rank 0, where the executor also builds a "
-            "worker, so this means worker construction failed."
+            "The mooncake-store scheduler adapter could not find a worker in its "
+            "process. Each adapter (rank 0 under tensor parallelism, every owner "
+            "under attention DP) is built next to a worker, so this means worker "
+            "construction failed."
         )
     assert _LOCAL_WORKER is not None
     return _LOCAL_WORKER
@@ -183,6 +192,10 @@ def _stream_handle(stream: Optional[torch.cuda.Stream]) -> int:
 class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     """Moves KV pages between this rank's GPU cache and the Mooncake pool."""
 
+    #: Transfers, completion and the store handle are owner-local, and under
+    #: attention DP every owner keys its pages as attention shard 0 of 1, so all
+    #: owners share one key space on the pool.
+    supports_attention_dp = True
     #: A page offered at lookup can be gone by load time, evicted from a full
     #: pool or left behind by a put that never completed. On a single rank or an
     #: attention-DP owner the affected requests are handed back to the executor
@@ -207,22 +220,32 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._run_dir = pool.run_dir if pool is not None else None
         self._rank = mpi_rank()
         self._world_size = mpi_world_size()
+        enable_attention_dp = getattr(llm_args, "enable_attention_dp", False) is True
+        # A stored page is one attention shard's KV. Every attention-DP owner
+        # holds all heads, so all owners key shard 0 of 1 on the shared pool;
+        # under tensor parallelism each rank keeps its own shard. The global
+        # rank still names this process in the ledger, thread names and logs.
+        if enable_attention_dp:
+            self._attention_rank, self._attention_world_size = 0, 1
+        else:
+            self._attention_rank, self._attention_world_size = self._rank, self._world_size
         self._model_key = self._config.resolve_model_key(llm_args.model)
 
         self._addressing: Optional[PageAddressing] = None
-        # Namespaces for this rank, used for both directions of transfer.
+        # Namespaces for this rank's attention shard, used for both directions
+        # of transfer.
         self._namespaces: Dict[int, KeyNamespace] = {}
-        # The same namespaces for every rank. A prefix is only reusable when all
-        # shards of it are present, so a lookup has to ask about all of them.
+        # The same namespaces for every attention shard. A prefix is only
+        # reusable when all shards of it are present, so a lookup has to ask
+        # about all of them: every tensor-parallel rank's, or the single shard
+        # every attention-DP owner shares.
         self._peer_namespaces: Dict[int, Tuple[KeyNamespace, ...]] = {}
         # A rank that holds whole pages and its own batch can restart a request
         # whose page went missing: a single-rank server, or an attention-DP
         # owner. Tensor-parallel ranks hold shards of the same page and would
         # have to agree on the restart, which they cannot do here, so a failed
         # load stays fatal there.
-        holds_whole_pages = (
-            getattr(llm_args, "enable_attention_dp", False) is True or self._world_size == 1
-        )
+        holds_whole_pages = enable_attention_dp or self._world_size == 1
         self._recover_failed_loads = (
             getattr(type(self), "reports_failed_loads", False) is True and holds_whole_pages
         )
@@ -284,7 +307,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         logger.warning(
             f"mooncake-store worker rank {self._rank}/{self._world_size} ready "
-            f"(role={self._config.role.value}, model_key={self._model_key}, "
+            f"(attention shard {self._attention_rank}/{self._attention_world_size}, "
+            f"role={self._config.role.value}, model_key={self._model_key}, "
             f"master={self._config.master_server_address}, "
             f"segment={self._config.global_segment_size / (1 << 30):.1f} GiB "
             f"on {self._segment_host})"
@@ -356,11 +380,11 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         for layer_group_id in addressing.layer_group_ids:
             bytes_per_page = addressing.bytes_per_page(layer_group_id)
             self._namespaces[layer_group_id] = self._namespace(
-                self._rank, layer_group_id, bytes_per_page
+                self._attention_rank, layer_group_id, bytes_per_page
             )
             self._peer_namespaces[layer_group_id] = tuple(
-                self._namespace(rank, layer_group_id, bytes_per_page)
-                for rank in range(self._world_size)
+                self._namespace(shard, layer_group_id, bytes_per_page)
+                for shard in range(self._attention_world_size)
             )
 
         if self._config.role.saves:
@@ -485,18 +509,19 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 f"more. Lower transfer_batch_size to make the reduction explicit."
             )
 
-    def _namespace(self, rank: int, layer_group_id: int, bytes_per_page: int) -> KeyNamespace:
+    def _namespace(self, shard: int, layer_group_id: int, bytes_per_page: int) -> KeyNamespace:
+        """The key namespace of one attention shard's pages of a layer group."""
         return KeyNamespace(
             namespace=self._config.namespace,
             model_key=self._model_key,
-            rank=rank,
-            world_size=self._world_size,
+            rank=shard,
+            world_size=self._attention_world_size,
             layer_group_id=layer_group_id,
             tokens_per_block=self._addressing.tokens_per_block,
             bytes_per_page=bytes_per_page,
         )
 
-    # ---- leader-facing lookup ----
+    # ---- lookup, for the scheduler adapter in this process ----
 
     @property
     def config(self) -> MooncakeStoreConnectorConfig:
@@ -511,9 +536,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     def count_prefix_hit(self, block_hashes: Sequence[bytes]) -> int:
         """How many leading blocks of `block_hashes` are fully present.
 
-        A block counts only when every layer group and every rank has its
-        page, since a prefix is replayed as a whole. The scan stops at the
-        first incomplete block, a later hit being unusable on its own.
+        A block counts only when every layer group and every attention shard
+        has its page, since a prefix is replayed as a whole. The scan stops at
+        the first incomplete block, a later hit being unusable on its own.
 
         Args:
             block_hashes: Candidate hashes in block order.
@@ -803,9 +828,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             for transfers in metadata.saves:
                 self._outstanding_saves[transfers.request_id] += 1
         self._save_queue.put((event, list(metadata.saves)))
-        # Replaced rather than accumulated: only the adapter colocated with
-        # rank 0's worker takes these, so the other ranks must not grow the
-        # set every pass.
+        # Replaced rather than accumulated: under tensor parallelism only rank
+        # 0's adapter takes these, so the other ranks must not grow the set
+        # every pass.
         self._submitted_saves = {transfers.request_id for transfers in metadata.saves}
 
     def take_submitted_saves(self) -> Set[int]:
