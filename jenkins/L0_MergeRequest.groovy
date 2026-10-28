@@ -378,7 +378,7 @@ boolean enableUpdateGitlabStatus =
     testFilter[TEST_BACKEND] == null
 
 
-def createKubernetesPodConfig(image, type, arch = "amd64")
+def createKubernetesPodConfig(image, type, arch = "amd64", stageName = null)
 {
     def targetCould = "kubernetes-cpu"
     def selectors = """
@@ -482,7 +482,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
         """.stripIndent(),
     ]
 
-    return podConfig
+    return ciNodePolicy.apply(podConfig, [pipeline: "L0_MergeRequest", stage: stageName])
 }
 
 def echoNodeAndGpuInfo(pipeline, stageName)
@@ -859,7 +859,7 @@ def launchReleaseCheck(pipeline, globalVars)
 
     def image = "artifactory.pdx.nvidia.com/docker-remote/golang:1.23"
     stageName = "Release-Check"
-    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package", "amd64", stageName), "trt-llm", {
         stage("[${stageName}] Run") {
             if (RELEASE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
                 echo "Release Check job is skipped due to Jenkins configuration"
@@ -889,7 +889,7 @@ def launchTestListCheck(pipeline, globalVars)
 {
     def key = "Check Test List"
     def image = globalVars["LLM_DOCKER_IMAGE"]
-    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package", "amd64", key), "trt-llm", {
         stage("[${key}] Run") {
             echoNodeAndGpuInfo(pipeline, key)
             sh "git config --global --add safe.directory \"*\""
@@ -1997,7 +1997,7 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
         : "grep -v -E '${sbsaPrefixPattern}' result_file_names.txt > arch_file_names.txt || true"
     try {
         timeout(time: 15, unit: 'MINUTES') {
-            def podSpec = createKubernetesPodConfig("", "agent")
+            def podSpec = createKubernetesPodConfig("", "agent", "amd64", "Upload Single-GPU Coverage (${arch})")
             trtllm_utils.launchKubernetesPod(pipeline, podSpec, "alpine", {
                 stage("Upload Single-GPU Coverage (${arch})") {
                     def testResultLink = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results"
@@ -2047,7 +2047,7 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
 
 def collectTestResults(pipeline, testFilter, globalVars)
 {
-    collectResultPodSpec = createKubernetesPodConfig("", "agent")
+    collectResultPodSpec = createKubernetesPodConfig("", "agent", "amd64", "Collect Test Result")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
         // 1. Serial: download tarballs, extract, and run junit
         stage ("Collect Test Result") {
@@ -2528,7 +2528,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         // pod instead (same image used by preparation()'s mergeWaiveList.py call).
                         def cached
                         def packageImage = "urm.nvidia.com/docker/buildpack-deps:trixie-scm"
-                        trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(packageImage, "package"), "trt-llm", {
+                        trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(packageImage, "package", "amd64", "OSS-Compliance-Check"), "trt-llm", {
                             trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                             cached = findCachedPLCSourceScanResult(env.gitlabCommit)
                         })
