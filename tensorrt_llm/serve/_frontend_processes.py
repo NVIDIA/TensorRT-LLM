@@ -321,6 +321,38 @@ def _frontend_affinity_sockets(
             sock.close()
 
 
+def _watch_attached_frontends(children: list, interval_s: float = 1.0) -> threading.Event:
+    """Log an attached frontend that exits while the launcher serves.
+
+    The kernel drops a dead frontend's socket from the shared port, so the
+    others keep serving and only its in-flight requests are lost; nothing else
+    reports it. Set the returned event before terminating the group, so the
+    expected exits stay quiet.
+    """
+    stopping = threading.Event()
+
+    def watch() -> None:
+        alive = dict(enumerate(children, start=1))
+        while alive and not stopping.wait(interval_s):
+            for frontend_id, child in list(alive.items()):
+                code = child.poll()
+                if code is None or stopping.is_set():
+                    continue
+                del alive[frontend_id]
+                if code == 0:  # e.g. Ctrl-C reaching the whole process group
+                    logger.info(f"Attached serving frontend {frontend_id} (pid {child.pid}) exited")
+                    continue
+                how = f"exit code {code}" if code > 0 else f"signal {-code}"
+                logger.error(
+                    f"Attached serving frontend {frontend_id} (pid {child.pid}) exited with "
+                    f"{how}; {len(alive) + 1} of {len(children) + 1} frontends keep serving, "
+                    "and the requests it was handling are lost."
+                )
+
+    threading.Thread(target=watch, name="attached-frontend-watch", daemon=True).start()
+    return stopping
+
+
 def _terminate_attached_frontends(children: list) -> None:
     """Stop and reap the group with one shared grace deadline."""
     for child in children:

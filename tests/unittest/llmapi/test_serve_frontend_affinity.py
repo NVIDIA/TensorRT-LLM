@@ -84,17 +84,21 @@ def test_attached_frontend_adopts_inherited_socket(monkeypatch):
     assert own.fileno() == -1
 
 
-def test_launch_server_serves_the_affinity_port(monkeypatch):
+def test_launch_server_serves_the_affinity_port(monkeypatch, tmp_path):
     from tensorrt_llm.commands import serve
 
     num_frontends, stride = 3, 7
     base = _free_port_layout(num_frontends, stride)
     monkeypatch.delenv("TLLM_EXECUTOR_ATTACH_INFO", raising=False)
     monkeypatch.setenv("TRTLLM_RESPONSES_API_DISABLE_STORE", "1")
-    monkeypatch.setattr(serve, "PyTorchLLM", Mock())
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    llm = Mock()
+    # The launcher binds its forwarding socket in the executor's ipc dir.
+    llm._executor._multi_frontend_ipc_dir = str(tmp_path)
+    monkeypatch.setattr(serve, "PyTorchLLM", Mock(return_value=llm))
     handed_off = {}
 
-    def fake_spawn(llm, num_frontends, *, report_failure, affinity_sockets):
+    def fake_spawn(llm, num_frontends, *, extra_env, report_failure, affinity_sockets):
         handed_off.update({i: s.getsockname()[1] for i, s in affinity_sockets.items()})
         return []
 
@@ -105,7 +109,8 @@ def test_launch_server_serves_the_affinity_port(monkeypatch):
             self.app = Mock()
 
         def __call__(self, host, port, sockets):
-            served["ports"] = [s.getsockname()[1] for s in sockets]
+            served["ports"] = [s.getsockname()[1] for s in sockets if s.family != socket.AF_UNIX]
+            served["uds"] = [s.getsockname() for s in sockets if s.family == socket.AF_UNIX]
 
     monkeypatch.setattr(serve, "_spawn_attached_frontends", fake_spawn)
     monkeypatch.setattr(serve, "OpenAIServer", FakeServer)
@@ -123,6 +128,7 @@ def test_launch_server_serves_the_affinity_port(monkeypatch):
     )
 
     assert served["ports"] == [base, base + stride]
+    assert served["uds"] == [str(tmp_path / serve.LAUNCHER_UDS_NAME)]
     assert handed_off == {1: base + 2 * stride, 2: base + 3 * stride}
     # Everything the launcher bound is released once it stops serving.
     assert all(_is_free(base + stride * i) for i in range(num_frontends + 1))
