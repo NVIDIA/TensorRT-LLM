@@ -88,15 +88,31 @@ def test_transient_http_failure_still_retries(client: ModuleType, endpoint, stat
     assert len(requests) == 2
 
 
+class _FakeClock:
+    """Stands in for the client's ``time`` module; ``sleep`` advances ``monotonic``."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
 def test_retryable_failure_reason_reaches_the_timeout_message(
     client: ModuleType, endpoint, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     url, _, requests = endpoint
-    # Every request gets the stub's default 503 until the 1 s budget runs out.
-    monkeypatch.setenv("AGENTX_READY_TIMEOUT", "1")
+    # On the fake clock, a 30 s budget with a 15 s retry interval allows exactly
+    # two requests. Both get the stub's default 503.
+    monkeypatch.setattr(client, "time", _FakeClock())
+    monkeypatch.setenv("AGENTX_READY_TIMEOUT", "30")
+    monkeypatch.setenv("AGENTX_READY_INTERVAL", "15")
     with pytest.raises(RuntimeError, match="Last response: HTTP 503: not ready"):
         client.verify_endpoint(url, "model")
-    assert requests
+    assert len(requests) == 2
 
 
 def test_error_body_naming_choices_is_not_a_completion(client: ModuleType, endpoint) -> None:
