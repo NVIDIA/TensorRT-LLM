@@ -64,10 +64,10 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Wan 2.1 VSA** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
 | **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
-| **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | Yes |
+| **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
 | **MiniMax-H3** | Yes | Yes | No | No | No | No | Yes | Yes | No | Yes | Yes | No | No | Yes | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
-| **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
+| **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
 | **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
@@ -118,7 +118,8 @@ The asynchronous `/v1/videos` job advances through `GET /v1/videos/{id}`: `queue
 Qwen-Image-Layered supports BF16 image-conditioned layer decomposition through
 `trtllm-serve` image-edit routing. It returns one RGBA image per generated layer;
 set `extra_params.save_layers_to_grid` to `true` to pack layers into one saveable
-image grid. Quantization, cache acceleration, attention-parallel/Sage/VSA backends,
+image grid. FP8 block-scale quantization and Cache-DiT are supported; NVFP4,
+TeaCache, the attention-parallel backends (CFG, Ulysses, Attention2D, ring), VSA,
 and Tensor Parallelism are not enabled for this pipeline yet.
 
 Conditioning references are supplied through the typed fields `image_reference`, `video_reference`, and `audio_reference`. Each field takes a single reference or a list. A reference is `MediaRef(content=..., format=...)`, and `format` is required.
@@ -328,12 +329,12 @@ cache_config:
 |---|---|---|---|
 | `teacache_thresh` | float | `0.2` | Accumulated timestep-embedding distance threshold. A step is skipped when the accumulated polynomial-rescaled L1 change stays below this value; higher values cache more aggressively (more speedup, possible quality loss). The example configs use `0.6` for FLUX.1 and `0.2` for all other supported models. |
 | `use_ret_steps` | bool | `false` | Enable retention-step caching variant. |
-| `coefficients` | list[float] | per-model | Polynomial coefficients used by the TeaCache decision function. Set automatically at load time based on the checkpoint. |
+| `coefficients` | list[float] | per-model | Polynomial coefficients used by the TeaCache decision function. When not supplied, filled automatically at load time if a built-in coefficient table matches the checkpoint; otherwise, set explicitly. |
 
 Wan 2.2 and LTX-2 have no built-in TeaCache coefficient tables. Set
-`cache_config.coefficients` explicitly for LTX-2. Wan 2.2 requires both
-`cache_config.coefficients` for its high-noise transformer and
-`cache_config.coefficients_2` for its low-noise transformer.
+`cache_config.coefficients` explicitly for LTX-2 and Wan 2.2 TI2V-5B. Wan 2.2
+A14B models require both `cache_config.coefficients` for the high-noise
+transformer and `cache_config.coefficients_2` for the low-noise transformer.
 
 #### Cache-DiT
 
