@@ -907,6 +907,57 @@ def _normalize_file_uri(uri: str) -> str:
     return uri
 
 
+# Directory from which request-supplied local media paths may be read.
+# Media parts of a server request may name a `file://` URI or a bare path; such
+# a reference is read from the server's own filesystem, so it is accepted only
+# when TRTLLM_MEDIA_ALLOWED_LOCAL_PATH names a directory and the resolved path
+# lies inside it. Unset (the default) refuses every local reference. The
+# offline Python API does not go through this check.
+_ALLOWED_LOCAL_MEDIA_PATH_ENV = "TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"
+
+
+def is_local_media_url(url: str) -> bool:
+    """Whether *url* names a server-side file (a `file://` URI or a bare path)."""
+    return urlparse(url).scheme in ("", "file")
+
+
+def resolve_allowed_local_media_path(url: str) -> str:
+    """Return the resolved path of a request-supplied local media reference.
+
+    Raises ``ValueError`` unless ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`` names a
+    directory, the reference resolves (symlinks and ``..`` included) to a path
+    inside it, and that path is a regular file within the media size limit. A
+    reference refused for its location gets the same message whether or not it
+    exists.
+    """
+    refused = ValueError(
+        "Local media paths are not accepted by this server. Send the media as "
+        "an http(s) or base64 data URL, or start the server with "
+        f"{_ALLOWED_LOCAL_MEDIA_PATH_ENV}=<directory> to allow files under "
+        "that directory."
+    )
+    allowed_root = os.environ.get(_ALLOWED_LOCAL_MEDIA_PATH_ENV, "")
+    if not allowed_root:
+        raise refused
+    parsed = urlparse(url)
+    if parsed.scheme == "file" and parsed.netloc not in ("", "localhost"):
+        raise refused
+    root = os.path.realpath(allowed_root)
+    if not os.path.isdir(root):
+        raise ValueError(f"{_ALLOWED_LOCAL_MEDIA_PATH_ENV} is not a directory: {allowed_root!r}")
+    resolved = os.path.realpath(_normalize_file_uri(url))
+    if os.path.commonpath([root, resolved]) != root:
+        raise refused
+    try:
+        stat = os.stat(resolved)
+    except OSError as exc:
+        raise ValueError(f"Local media file could not be read: {url!r}") from exc
+    if not S_ISREG(stat.st_mode):
+        raise ValueError(f"Local media path is not a regular file: {url!r}")
+    _check_media_size(stat.st_size, _MAX_RESPONSE_BYTES)
+    return resolved
+
+
 def _check_media_size(size: int, max_bytes: int) -> None:
     if size > max_bytes:
         raise ValueError(f"Media input exceeds maximum allowed size of {max_bytes} bytes.")

@@ -894,3 +894,118 @@ class TestChatCompletionRequestSchemaValidation:
 
         request = ChatCompletionRequest(**payload)
         assert len(request.messages) == 3
+
+
+class TestRequestLocalMediaPaths:
+    """Local media references in a request are read only from the allowed directory."""
+
+    _ENV = "TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"
+
+    @pytest.fixture
+    def media_dirs(self, tmp_path):
+        from PIL import Image
+
+        allowed = tmp_path / "allowed"
+        other = tmp_path / "other"
+        allowed.mkdir()
+        other.mkdir()
+        for directory in (allowed, other):
+            Image.new("RGB", (8, 8), (0, 128, 255)).save(directory / "img.png")
+        (allowed / "notes.txt").write_text("text")
+        (allowed / "link.png").symlink_to(other / "img.png")
+        return allowed, other
+
+    @staticmethod
+    async def _load(url, kind="image_url"):
+        tracker = MultimodalDataTracker(model_type="dummy")
+        part = {"type": kind, kind: {"url": url}}
+        return await parse_chat_message_content_part(part, tracker)["data"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("form", ["file_uri", "bare_path"])
+    async def test_refused_without_allowed_directory(self, monkeypatch, media_dirs, form):
+        monkeypatch.delenv(self._ENV, raising=False)
+        path = media_dirs[0] / "img.png"
+        url = f"file://{path}" if form == "file_uri" else str(path)
+        with pytest.raises(ValueError, match="Local media paths are not accepted"):
+            await self._load(url)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["image_url", "video_url", "audio_url"])
+    async def test_refused_for_every_media_part(self, monkeypatch, media_dirs, kind):
+        monkeypatch.delenv(self._ENV, raising=False)
+        with pytest.raises(ValueError, match="Local media paths are not accepted"):
+            await self._load(str(media_dirs[0] / "img.png"), kind=kind)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("form", ["file_uri", "bare_path"])
+    async def test_loaded_inside_allowed_directory(self, monkeypatch, media_dirs, form):
+        allowed, _ = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        path = allowed / "img.png"
+        url = f"file://{path}" if form == "file_uri" else str(path)
+        image = await self._load(url)
+        assert tuple(image.shape) == (3, 8, 8)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "relative",
+        ["../other/img.png", "link.png", "missing.png"],
+        ids=["parent_dir", "symlink_out", "missing"],
+    )
+    async def test_paths_resolving_outside_refused(self, monkeypatch, media_dirs, relative):
+        allowed, _ = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        url = f"file://{allowed}/{relative}"
+        if relative == "missing.png":
+            with pytest.raises(ValueError, match="could not be read"):
+                await self._load(url)
+        else:
+            with pytest.raises(ValueError, match="Local media paths are not accepted"):
+                await self._load(url)
+
+    @pytest.mark.asyncio
+    async def test_other_directory_refused(self, monkeypatch, media_dirs):
+        allowed, other = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        with pytest.raises(ValueError, match="Local media paths are not accepted"):
+            await self._load(str(other / "img.png"))
+
+    @pytest.mark.asyncio
+    async def test_non_regular_file_refused(self, monkeypatch, media_dirs):
+        allowed, _ = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        with pytest.raises(ValueError, match="not a regular file"):
+            await self._load(f"file://{allowed}")
+
+    @pytest.mark.asyncio
+    async def test_remote_file_host_refused(self, monkeypatch, media_dirs):
+        allowed, _ = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        with pytest.raises(ValueError, match="Local media paths are not accepted"):
+            await self._load(f"file://otherhost{allowed}/img.png")
+
+    @pytest.mark.asyncio
+    async def test_data_url_unaffected(self, monkeypatch):
+        import base64
+        import io
+
+        from PIL import Image
+
+        monkeypatch.delenv(self._ENV, raising=False)
+        with io.BytesIO() as buf:
+            Image.new("RGB", (8, 8), (0, 128, 255)).save(buf, format="PNG")
+            encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+        image = await self._load(f"data:image/png;base64,{encoded}")
+        assert tuple(image.shape) == (3, 8, 8)
+
+    @pytest.mark.asyncio
+    async def test_remote_url_not_checked_as_local(self, monkeypatch):
+        monkeypatch.delenv(self._ENV, raising=False)
+        with patch(
+            "tensorrt_llm.inputs.media_io.ImageMediaIO.async_load",
+            new_callable=AsyncMock,
+            return_value="loaded",
+        ) as load:
+            assert await self._load("https://example.com/img.png") == "loaded"
+        load.assert_awaited_once_with("https://example.com/img.png")
