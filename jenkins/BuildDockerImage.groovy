@@ -117,7 +117,7 @@ def globalVars = [
 @Field
 def imageKeyToTag = [:]
 
-def createKubernetesPodConfig(type, arch = "amd64")
+def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 {
     def targetCould = "kubernetes-cpu"
     def containerConfig = ""
@@ -710,6 +710,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         args: "",
         torchInstallType: "skip",
         arch: "amd64",
+        build_wheel: false,
         dependent: [:],
         dockerfileStage: "tritondevel",
     ]
@@ -731,12 +732,14 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-x86_64",
+            build_wheel: true,
             dockerfileStage: "tritonrelease",
         ],
         (stageNames.internalReleaseSBSA): [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-sbsa",
+            build_wheel: true,
             arch: "arm64",
             dockerfileStage: "tritonrelease",
         ],
@@ -764,6 +767,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             target: "ngc-release",
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/amd64'",
+            build_wheel: true,
             dependent: [
                 target: "ngc-devel",
                 dockerfileStage: "devel",
@@ -775,6 +779,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/arm64'",
             arch: "arm64",
+            build_wheel: true,
             dependent: [
                 target: "ngc-devel",
                 dockerfileStage: "devel",
@@ -825,7 +830,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
                 config[defaultKey] = defaultValue
             }
         }
-        config.podConfig = createKubernetesPodConfig("build", config.arch)
+        config.podConfig = createKubernetesPodConfig("build", config.arch, config.build_wheel)
     }
     echo "Build configs:"
     println buildConfigs
