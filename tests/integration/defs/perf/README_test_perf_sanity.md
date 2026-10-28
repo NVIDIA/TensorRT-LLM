@@ -374,6 +374,10 @@ Notes:
 - The pass's perf_metrics records are excluded from the time breakdown (see below),
   and in e2e its iterations come before the measured client's gen-log window, so
   neither `d_tb_*` nor the gen-worker device step time includes it.
+- With the time breakdown on, only a server's first measured client gets a pass. The
+  breakdown pools every record after the first measured client's start, so it cannot
+  leave a later pass out; the later clients log a warning and upload
+  `l_warmup_pass_requests` 0. CI's time_breakdown lanes have one client per server.
 - Uploaded rows carry `l_warmup_pass_requests` (0 when no pass ran). It is not a match
   key.
 - With a dataset file, a few of the pass's prompts can coincide with the measured

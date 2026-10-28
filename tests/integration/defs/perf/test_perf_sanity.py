@@ -60,6 +60,7 @@ from .warmup_pass import (
     send_warmup_pass,
     warmup_pass_applies,
     warmup_pass_enabled,
+    warmup_pass_plan,
 )
 
 SUPPORTED_GPU_MAPPING = {
@@ -1813,6 +1814,40 @@ def warmup_pass_requests_for(
     return client_config.warmup_pass_requests
 
 
+def warmup_pass_plan_for(
+    client_configs: List[Optional["ClientConfig"]],
+    benchmark_mode: Optional[str],
+    time_breakdown: bool,
+) -> List[int]:
+    """Warmup pass size for each client of one server, in run order; 0 for none.
+
+    The run loops send these passes and the uploaded rows report them. While the
+    time breakdown is collected, only the first measured client gets one; see
+    warmup_pass_plan.
+
+    Args:
+        client_configs: The server's client configs in run order; None entries are
+            measured clients without a config.
+        benchmark_mode: The case's benchmark mode; None or "" for a plain
+            aggregated case.
+        time_breakdown: Whether the time breakdown is collected for the server.
+    """
+    return warmup_pass_plan(
+        [warmup_pass_requests_for(config, benchmark_mode) for config in client_configs],
+        [config is None or not config.only_run_accuracy for config in client_configs],
+        time_breakdown,
+    )
+
+
+def warn_skipped_warmup_pass(client_idx: int) -> None:
+    """Log that a client gets no warmup pass because the time breakdown is on."""
+    print_warning(
+        f"Warmup pass: none before client {client_idx}. With the time breakdown on, only "
+        "the first measured client gets one: the breakdown cannot leave out the records "
+        "of a later pass, so they would count as measured."
+    )
+
+
 def run_warmup_pass(
     client_cmd: List[str],
     client_config: "ClientConfig",
@@ -2831,17 +2866,21 @@ class AggrTestCmds(NamedTuple):
                 )
                 write_startup_observations(self.test_output_dir, server_idx, [observation])
 
+            client_cmds = self.client_cmds[server_idx]
+            loop_configs = [
+                client_configs[client_idx] if client_idx < len(client_configs) else None
+                for client_idx in range(len(client_cmds))
+            ]
+            warmup_plan = warmup_pass_plan_for(
+                loop_configs, self.benchmark_mode, collect_time_breakdown
+            )
             # Run all clients for this server
-            for client_idx, client_cmd in enumerate(self.client_cmds[server_idx]):
-                client_config = (
-                    client_configs[client_idx] if client_idx < len(client_configs) else None
-                )
+            for client_idx, client_cmd in enumerate(client_cmds):
+                client_config = loop_configs[client_idx]
                 only_run_accuracy = bool(client_config and client_config.only_run_accuracy)
 
                 if not only_run_accuracy:
-                    num_warmup_requests = warmup_pass_requests_for(
-                        client_config, self.benchmark_mode
-                    )
+                    num_warmup_requests = warmup_plan[client_idx]
                     if num_warmup_requests:
                         num_unmeasured_requests += run_warmup_pass(
                             client_cmd,
@@ -2852,10 +2891,11 @@ class AggrTestCmds(NamedTuple):
                             warmup_pass_log_path(self.test_output_dir, server_idx, client_idx),
                             timeout=min(self.timeout, DEFAULT_TIMEOUT),
                         )
+                    elif warmup_pass_requests_for(client_config, self.benchmark_mode):
+                        warn_skipped_warmup_pass(client_idx)
                     # The time breakdown skips only leading lines, so count them
-                    # once, before the first measured client. CI's time_breakdown
-                    # lanes have a single client; with more, a later client's pass
-                    # joins the breakdown.
+                    # once, before the first measured client. warmup_plan gives
+                    # the later clients no pass while it is collected.
                     if (
                         collect_time_breakdown
                         and num_unmeasured_requests
@@ -3834,18 +3874,26 @@ class DisaggTestCmds(NamedTuple):
                     )
 
                 client_configs = self.client_configs.get(server_idx, [])
+                client_cmds = self.client_cmds[server_idx]
+                loop_configs = [
+                    client_configs[client_idx] if client_idx < len(client_configs) else None
+                    for client_idx in range(len(client_cmds))
+                ]
+                warmup_plan = warmup_pass_plan_for(
+                    loop_configs, benchmark_mode_for_idx, collect_time_breakdown
+                )
 
                 # Run all clients for this server
-                for client_idx, client_cmd in enumerate(self.client_cmds[server_idx]):
-                    client_config = (
-                        client_configs[client_idx] if client_idx < len(client_configs) else None
-                    )
+                for client_idx, client_cmd in enumerate(client_cmds):
+                    client_config = loop_configs[client_idx]
                     only_run_accuracy = bool(client_config and client_config.only_run_accuracy)
 
                     if not only_run_accuracy:
-                        num_warmup_requests = warmup_pass_requests_for(
+                        num_warmup_requests = warmup_plan[client_idx]
+                        if not num_warmup_requests and warmup_pass_requests_for(
                             client_config, benchmark_mode_for_idx
-                        )
+                        ):
+                            warn_skipped_warmup_pass(client_idx)
                         if num_warmup_requests:
                             # The pass runs between two clients' gen-log windows,
                             # so neither one's device step time counts its
@@ -3865,9 +3913,8 @@ class DisaggTestCmds(NamedTuple):
                                 timeout=min(self.timeout, DEFAULT_TIMEOUT),
                             )
                         # The time breakdown skips only leading lines, so count
-                        # them once, before the first measured client. CI's
-                        # time_breakdown lanes have a single client; with more, a
-                        # later client's pass joins the breakdown.
+                        # them once, before the first measured client. warmup_plan
+                        # gives the later clients no pass while it is collected.
                         if (
                             collect_time_breakdown
                             and num_unmeasured_requests
@@ -5379,6 +5426,9 @@ class PerfSanityTestConfig:
                 if len(server_perf_results) != len(client_configs):
                     cmd_idx += len(client_configs)
                     continue
+                warmup_plan = warmup_pass_plan_for(
+                    client_configs, self.benchmark_mode, self.time_breakdown
+                )
 
                 for client_idx, client_config in enumerate(client_configs):
                     client_config_dict = client_config.to_db_data()
@@ -5399,9 +5449,7 @@ class PerfSanityTestConfig:
                     }
                     new_data.update(server_config_dict)
                     new_data.update(client_config_dict)
-                    new_data["l_warmup_pass_requests"] = warmup_pass_requests_for(
-                        client_config, self.benchmark_mode
-                    )
+                    new_data["l_warmup_pass_requests"] = warmup_plan[client_idx]
                     # Add test_case_name for convenient filtering on OpenSearch
                     new_data["s_test_case_name"] = f"{server_config.name}-{client_config.name}"
 
@@ -5455,6 +5503,9 @@ class PerfSanityTestConfig:
                 if len(server_perf_results) != len(client_configs):
                     cmd_idx += len(client_configs)
                     continue
+                warmup_plan = warmup_pass_plan_for(
+                    client_configs, disagg_config.benchmark_mode, self.time_breakdown
+                )
 
                 for client_idx, client_config in enumerate(client_configs):
                     # Skip if metrics missing
@@ -5491,9 +5542,7 @@ class PerfSanityTestConfig:
                     if num_gen_servers > 0:
                         new_data.update(gen_server_config_dict)
                     new_data.update(client_config_dict)
-                    new_data["l_warmup_pass_requests"] = warmup_pass_requests_for(
-                        client_config, disagg_config.benchmark_mode
-                    )
+                    new_data["l_warmup_pass_requests"] = warmup_plan[client_idx]
                     # Add test_case_name for convenient filtering on OpenSearch
                     new_data["s_test_case_name"] = f"{disagg_config.name}-{client_config.name}"
 

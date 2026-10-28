@@ -213,6 +213,25 @@ def test_warmup_pass_modes(benchmark_mode, applies: bool) -> None:
     assert warmup_pass.warmup_pass_applies(benchmark_mode) is applies
 
 
+@pytest.mark.parametrize(
+    ("eligible", "measured", "time_breakdown", "expected_plan"),
+    [
+        # Without the breakdown, every client keeps its pass.
+        ([4, 8], [True, True], False, [4, 8]),
+        # With it, only the first measured client gets one.
+        ([4, 8], [True, True], True, [4, 0]),
+        # An accuracy-only client is not measured, so it does not count as first.
+        ([0, 4, 8], [False, True, True], True, [0, 4, 0]),
+        # A first client that gets no pass still makes later passes unsafe.
+        ([0, 8], [True, True], True, [0, 0]),
+    ],
+)
+def test_warmup_pass_plan(
+    eligible: List[int], measured: List[bool], time_breakdown: bool, expected_plan: List[int]
+) -> None:
+    assert warmup_pass.warmup_pass_plan(eligible, measured, time_breakdown) == expected_plan
+
+
 def _send_warmup_pass(
     run_benchmark: Callable[[List[str]], str], num_requests: int = 4
 ) -> Tuple[int, List[str]]:

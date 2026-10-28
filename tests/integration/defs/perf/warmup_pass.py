@@ -98,6 +98,30 @@ def warmup_pass_applies(benchmark_mode: Optional[str]) -> bool:
     return (benchmark_mode or "") in WARMUP_PASS_MODES
 
 
+def warmup_pass_plan(
+    eligible_requests: Sequence[int], measured: Sequence[bool], time_breakdown: bool
+) -> List[int]:
+    """Return each client's warmup pass size for one server, in run order (0: none).
+
+    The time breakdown leaves out only the records written before the server's
+    first measured client, and pools every later record. So while it is collected,
+    only that first measured client gets a pass: a later pass's records would count
+    as measured for every client of the server. Without it, each client keeps its
+    own pass.
+
+    Args:
+        eligible_requests: Each client's pass size on its own; 0 if it gets none.
+        measured: Whether each client is measured; False for accuracy-only clients.
+        time_breakdown: Whether the time breakdown is collected for the server.
+    """
+    plan: List[int] = []
+    after_first_measured = False
+    for num_requests, is_measured in zip(eligible_requests, measured):
+        plan.append(0 if time_breakdown and after_first_measured else num_requests)
+        after_first_measured = after_first_measured or is_measured
+    return plan
+
+
 def one_wave_requests(concurrency: int, num_requests: int, max_batch_size: int) -> int:
     """Return the requests in one wave of a benchmark: those it keeps in flight at once.
 
