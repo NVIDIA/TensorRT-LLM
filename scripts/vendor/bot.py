@@ -707,7 +707,10 @@ class Monitor:
                 f"@{pr['user']['login']} — {message}\n\n"
                 f"Checked PR revision: [`{head[:12]}`]"
                 f"(https://github.com/{self.gh.consumer_repo}/pull/{number}/commits/{head}). "
-                "This is a snapshot; newer results are posted as new comments."
+                "This is a snapshot; newer results are posted as new comments. "
+                "Observed dev/upstream tip SHAs may be stale: tip movement alone does not "
+                "post a new comment when the result is unchanged. Fetch the live branch "
+                "before rebasing or choosing a new pin."
             )
             if source is not None:
                 body += (

@@ -360,16 +360,6 @@ def _check_canonical_tip(gh: GitHub, previous: vendor.Vendor, reviewed: vendor.V
     if gh.compare(repo, tip, reviewed.commit)["merge_base_commit"]["sha"] != tip:
 
         def describe(dev_tip: str) -> Diagnostic:
-            if _is_upstream_main(gh, reviewed):
-                return Diagnostic(
-                    f"The pinned upstream commit {field(reviewed.commit)} does not contain "
-                    f"the latest canonical branch tip {field(dev_tip)}.",
-                    "Select a newer upstream commit containing that exact dev tip, or use a "
-                    "temporary fork branch based on the latest dev tip with vendor-promotion "
-                    "metadata. If upstream and dev have diverged, a maintainer must use the "
-                    "explicit refresh workflow. Update the lock and vendored snapshot; "
-                    "equivalent patches under different SHAs do not establish Git ancestry.",
-                )
             return Diagnostic(
                 f"The pinned temporary source commit {field(reviewed.commit)} does not contain "
                 f"the latest canonical branch tip {field(dev_tip)}.",
@@ -582,6 +572,11 @@ def _make_plan(
     upstream_proof = _check_source(gh, previous, reviewed)
     _check_fork(gh, fork, gh.consumer_repo)
     if upstream_proof is not None:
+        if args.upstream_pr or args.unpaired_reason is not None or args.map_upstream:
+            raise ValueError(
+                "Upstream-main promotion uses ancestry proof, not per-commit attribution. "
+                "Remove --upstream-pr, --unpaired-reason, and --map-upstream."
+            )
         record.update(upstream_proof)
         record["attribution_scope"] = {"source": reviewed.source, "include": list(reviewed.include)}
         _check_current(gh, plan)
@@ -618,7 +613,6 @@ def _make_plan(
         raise ValueError(
             "Promote requires a nonempty, linear source commit range; rebase merges first."
         )
-    _check_canonical_tip(gh, previous, reviewed)
     prs = {}
     for reference in args.upstream_pr:
         upstream_number = _pr_number(reference, gh.upstream_repo)

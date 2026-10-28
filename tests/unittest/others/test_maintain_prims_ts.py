@@ -739,6 +739,19 @@ def test_plan_rejects_tip_newer_than_pinned_source(world: World) -> None:
     assert not any(method != "GET" for method, _, _ in world.calls)
 
 
+def test_plan_checks_live_tip_before_and_after_attribution(world: World) -> None:
+    m._make_plan(world.args(), world)
+    endpoint = "repos/maintainer/flashinfer/git/ref/heads/trtllm-prims-ts-dev"
+    checks = [index for index, (_, route, _) in enumerate(world.calls) if route == endpoint]
+    attribution = next(
+        index
+        for index, (_, route, _) in enumerate(world.calls)
+        if route == f"repos/{_UPSTREAM}/pulls/4829"
+    )
+    assert len(checks) == 2
+    assert checks[0] < attribution < checks[1]
+
+
 def test_canonical_rewind_is_operator_error(world: World) -> None:
     _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", world.upstream)
     with pytest.raises(RuntimeError, match="Canonical branch no longer contains"):
@@ -915,10 +928,39 @@ def test_upstream_main_cli_does_not_require_metadata(
     assert all(method == "GET" for method, _, _ in world.calls)
 
 
-@pytest.mark.parametrize("failure", ["wrong-branch", "not-reachable", "diverged", "selection"])
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("upstream_pr", ["4829"]),
+        ("unpaired_reason", "downstream-only change"),
+        ("unpaired_reason", ""),
+        ("map_upstream", ["COMMIT=4829"]),
+    ],
+)
+def test_upstream_main_rejects_explicit_attribution(
+    world: World, option: str, value: object
+) -> None:
+    _pin_upstream(world)
+    options = {"upstream_pr": [], option: value}
+    with pytest.raises(
+        ValueError, match="Remove --upstream-pr, --unpaired-reason, and --map-upstream"
+    ):
+        m._make_plan(world.args(**options), world)
+    assert all(method == "GET" for method, _, _ in world.calls)
+    assert not any(call[0] == "push" for call in world.git_calls)
+
+
+@pytest.mark.parametrize(
+    "failure", ["wrong-branch", "not-reachable", "diverged", "selection", "missing-previous"]
+)
 def test_upstream_main_exception_is_narrow(world: World, failure: str) -> None:
+    if failure == "missing-previous":
+        world.reviewed = world.upstream
     _pin_upstream(world, branch="release" if failure == "wrong-branch" else "main")
-    if failure == "not-reachable":
+    if failure == "missing-previous":
+        # Even if dev equals the reviewed pin, it must retain the previous lock revision.
+        _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", world.reviewed)
+    elif failure == "not-reachable":
         world.upstream = world.previous
     elif failure == "diverged":
         _git(world.source, "switch", "-q", "--detach", world.previous)
@@ -935,6 +977,7 @@ def test_upstream_main_exception_is_narrow(world: World, failure: str) -> None:
         "not-reachable": "not reachable",
         "diverged": "latest canonical branch tip",
         "selection": "unchanged lock source/include",
+        "missing-previous": "does not contain.*latest canonical branch tip and its history",
     }
     with pytest.raises(m.Diagnostic, match=messages[failure]):
         m._make_plan(world.args(upstream_pr=[]), world)
@@ -1130,7 +1173,14 @@ def test_upstream_main_recovery_rejects_tampered_proof(world: World, tamper: str
     world.overrides[endpoint] = commit
     world.calls.clear()
     world.git_calls.clear()
-    with pytest.raises(ValueError):
+    expected = {
+        "mode": "does not describe this source update",
+        "source": "does not describe this source update",
+        "tip": "ancestry is invalid",
+        "upstream": "ancestry is invalid",
+        "mixed-version": "Missing or ambiguous",
+    }
+    with pytest.raises(ValueError, match=expected[tamper]):
         m._recover_plan(args, world, m._plan_identity(args, world))
     assert all(method == "GET" for method, _, _ in world.calls)
     assert not any(call[0] == "push" for call in world.git_calls)

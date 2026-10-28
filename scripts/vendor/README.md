@@ -504,7 +504,9 @@ unchanged snapshots; the bot's marked reviews link to the newest result with
 
 Unchanged polls do not post again. Moving observed dev/upstream tips alone or
 unrelated consumer commits do not notify unless they change the validation
-result. The bot still revalidates against live tips on each poll. Deduplication
+result. Each comment warns that observed tip SHAs can become stale; fetch the
+live branch before rebasing or selecting a new pin. The bot still revalidates
+against live tips on each poll. Deduplication
 compares a versioned fingerprint in the newest bot-owned GitHub comment, not
 SQLite or every historical result: A → B → A posts three results. This also
 recovers after a lost POST response or a restart without SQLite. Legacy comments
@@ -575,12 +577,13 @@ assertions but cannot accompany automatic matching. `--source-repo` selects a
 local immutable source checkout for materialization; `--worktree` overrides the
 follow-up checkout location. `--wait` optionally waits for and verifies merge.
 
-For the verified upstream-main exception, omit all three attribution options
-(`--from-pr-description`, `--upstream-pr`, `--unpaired-reason`). The engine infers
+For the verified upstream-main exception, omit the attribution options
+(`--from-pr-description`, `--upstream-pr`, `--unpaired-reason`, `--map-upstream`). The engine infers
 the mode from the reviewed lock and verifies live ancestry; no additional opt-in
 flag or PR list is needed. If `--from-pr-description` is supplied, it is ignored
-only for this qualifying mode. Omitting attribution for an ordinary fork update
-still fails with instructions to provide it.
+only for this qualifying mode. Explicit `--upstream-pr`, `--unpaired-reason`, or
+`--map-upstream` values are rejected rather than silently discarded. Omitting
+attribution for an ordinary fork update still fails with instructions to provide it.
 
 Publication checks the merged source PR, expected previous canonical lock,
 fast-forward ancestry (linear for temporary forks), current consumer pin, complete materialization,

@@ -372,6 +372,12 @@ your TensorRT-LLM fork (replace the remote name below):
 
 ```bash
 git add 3rdparty/vendor_sources.lock.yaml tensorrt_llm/_torch/attention/backends/prims_ts
+# If the compatibility patch changed or was removed by pin:
+git add -u -- 3rdparty/vendor_patches/flashinfer-prims-ts.patch
+# Replace these placeholders with the specific regression tests you changed or added:
+git add -- path/to/changed_test.py path/to/new_test.py
+git diff --cached --stat
+git diff --cached
 git commit -s -m '[None][fix] update vendored PrimTS context validation'
 git push -u YOUR_TRTLLM_FORK_REMOTE HEAD
 ```
@@ -451,14 +457,24 @@ mappings. See the [toolkit exception and provenance contract](../scripts/vendor/
 If your changes have not yet been exported, first export and commit at the
 locked SHA as in steps 3–4. If you already exported and pinned the change, keep
 working on that temporary source branch; do not export the same change again.
-Fetch the latest canonical branch and rebase your temporary source branch onto
-it, resolving conflicts and rerunning tests:
+Save the previously observed dev tip before fetching, and require the new tip
+to contain both that tip and the locked revision. Rebase only after these
+checks succeed, resolving conflicts and rerunning tests:
 
 ```bash
+PRIMTS_PREVIOUS_DEV_TIP=$PRIMTS_DEV_TIP
 git -C "$PRIMTS_REPO" fetch "$PRIMTS_DEV_URL" "$PRIMTS_DEV_BRANCH"
 PRIMTS_DEV_TIP=$(git -C "$PRIMTS_REPO" rev-parse FETCH_HEAD)
+if ! git -C "$PRIMTS_REPO" merge-base --is-ancestor "$PRIMTS_PREVIOUS_DEV_TIP" "$PRIMTS_DEV_TIP" ||
+   ! git -C "$PRIMTS_REPO" merge-base --is-ancestor "$PRIMTS_LOCKED_SHA" "$PRIMTS_DEV_TIP"; then
+  echo 'STOP: canonical history changed; ask the maintainer before rebasing.' >&2
+  exit 1
+fi
 git -C "$PRIMTS_REPO" rebase "$PRIMTS_DEV_TIP"
 ```
+
+If either ancestry check fails, do not rebase or force-push. Ask the maintainer
+whether a refresh or history rewrite occurred and which canonical branch to use.
 
 Update the TensorRT-LLM destination to match the rebased selected source files
 plus the existing compatibility patch, retaining downstream adaptations. This

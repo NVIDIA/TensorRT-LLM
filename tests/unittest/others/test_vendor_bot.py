@@ -1331,10 +1331,10 @@ def test_upstream_diagnostic_does_not_blame_author_for_incomplete_checks(
     assert monitor.store.get("health")["counts"]["errors"] == 1
 
 
-def test_upstream_exception_does_not_waive_other_vendors_metadata(
+def test_temporary_fork_requires_own_vendor_metadata(
     monitor: b.Monitor, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The description mentions an upstream-main update for another vendor only.
+    # Metadata for another vendor does not cover this vendor's temporary fork.
     monitor.gh.pr["body"] = m.template("other-vendor", "org/library")
     previous = _vendor("a" * 40, "https://github.com/operator/library.git", "dev")
     reviewed = _vendor("b" * 40, "https://github.com/author/library.git", "main")
@@ -2008,10 +2008,14 @@ def test_retarget_cleanup_preserves_unrelated_feedback(
     monitor.poll()
     assert monitor.store.get("tracked") == []
     if mixed:
+        assert len(gh.comments) == 3
         assert gh.comments[:1] == before[0] and gh.reviews[:1] == before[1]
-        if len(gh.reviews) > 1:
+        if existing == "other-actor":
+            assert len(gh.reviews) == 2
             assert "not applicable on this target branch" in gh.reviews[-1]["body"]
             assert gh.reviews[-1]["state"] == "DISMISSED"
+        else:
+            assert len(gh.reviews) == 1
     else:
         assert not gh.writes and (gh.comments, gh.reviews) == before
 
@@ -2371,6 +2375,8 @@ def test_upstream_invalid_feedback_suppresses_tip_churn_but_not_check_changes(
         monitor._feedback(gh.pr, failure.value, source=reviewed)
 
     check()
+    assert "Observed dev/upstream tip SHAs may be stale" in gh.comments[-1]["body"]
+    assert "Fetch the live branch" in gh.comments[-1]["body"]
     writes = copy.deepcopy(gh.writes)
     gh.canonical_tip, upstream_tip = "c" * 40, "d" * 40
     check()
@@ -2396,6 +2402,8 @@ def test_temporary_fork_same_ancestry_failure_does_not_repeat_for_new_dev_tip(
             p._check_canonical_tip(gh, previous, reviewed)
         monitor._feedback(gh.pr, failure.value, source=reviewed)
     assert len(gh.comments) == 1 and len(gh.writes) == 2
+    assert "Observed dev/upstream tip SHAs may be stale" in gh.comments[0]["body"]
+    assert "Fetch the live branch" in gh.comments[0]["body"]
 
 
 @pytest.mark.parametrize(
