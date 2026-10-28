@@ -670,6 +670,22 @@ _FUSED_HC_ALL_FMA_TN_KS_TM = tuple(
 )
 # Shared BigFuse block-size options (same as pre_mapping autotuner).
 _FUSED_HC_BIGFUSE_BS = _BIGFUSE_BLOCK_SIZE_OPTIONS
+# Small-M half-fused FMA candidates share one split count and one BigFuse block size per token
+# bucket: (max M, num_k_splits). Both change the floating-point summation order (the K partition
+# and the fused-norm reduction width), while the tile width only assigns output columns to CTAs
+# and computes the same sums. At these sizes the split counts are near-ties, so leaving them all
+# to the autotuner lets timing noise pick the numerics of every small decode step. Values are the
+# autotuner's majority pick on B300.
+_FUSED_HC_SMALL_M_FMA_KS = ((4, 4), (32, 2))
+_FUSED_HC_SMALL_M_FMA_BS = 512
+
+
+def _fused_hc_small_m_fma_ks(M: int) -> int:
+    """Split count of the small-M half-fused FMA candidates for token bucket ``M``."""
+    for max_m, ks in _FUSED_HC_SMALL_M_FMA_KS:
+        if M <= max_m:
+            return ks
+    return _FUSED_HC_SMALL_M_FMA_KS[-1][1]
 
 
 def _fused_hc_mma_ks_options(hidden_size: int) -> tuple[int, ...]:
@@ -948,11 +964,13 @@ class MhcFusedHcRunner(TunableRunner):
                 if m_batches * (self.n * (2 + self.n) // tn) * ks > 148 * 4:
                     continue
                 add(("fused_all_fma", tn, ks, 0, tm))
+            fma_ks = _fused_hc_small_m_fma_ks(M)
             for tn, ks in _FUSED_HC_HALF_FMA_TN_KS:
+                if ks != fma_ks:
+                    continue
                 if ks > 1 and M * (self.n * (2 + self.n) // tn) >= 148 * 2:
                     continue
-                for bs in _FUSED_HC_BIGFUSE_BS:
-                    add(("fused_half_fma", tn, ks, bs, 1))
+                add(("fused_half_fma", tn, ks, _FUSED_HC_SMALL_M_FMA_BS, 1))
 
         if mma_ok and M >= 32:
             props = torch.cuda.get_device_properties(inputs[0].device)
