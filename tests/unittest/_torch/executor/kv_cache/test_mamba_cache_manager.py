@@ -2100,7 +2100,13 @@ def test_v2_hybrid_fp4_mla_advances_history_with_pending_snapshot(fp4_mla: bool)
         expect_snapshot_points=[256],
         is_last_context_chunk=False,
     )
-    kv_cache = SimpleNamespace(is_active=True, resize=MagicMock(return_value=True))
+    # History stays at the committed end while the snapshot is pending.
+    kv_cache = SimpleNamespace(
+        is_active=True,
+        history_length=0,
+        num_committed_tokens=0,
+        resize=MagicMock(return_value=True),
+    )
     mgr.kv_cache_map = {request.py_request_id: kv_cache}
     batch = ScheduledRequests()
     batch.append_context_request(request)
