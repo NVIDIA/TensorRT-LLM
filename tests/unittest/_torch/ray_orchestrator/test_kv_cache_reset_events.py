@@ -175,5 +175,7 @@ def test_streaming_reset_is_published_before_control_rpc_resumes(tmp_path):
 @pytest.mark.ray
 @pytest.mark.gpu2
 @pytest.mark.timeout(240)
-def test_buffered_attention_dp_reset_with_an_empty_rank(tmp_path):
+def test_buffered_attention_dp_reset_with_an_empty_rank(tmp_path, monkeypatch):
+    """Exercise the event gather through Gloo's CPU object transport."""
+    monkeypatch.setenv("TLLM_CUDA_OBJECT_COLLECTIVES", "0")
     _check_cache_reset_events_through_control_rpc(False, tmp_path)
