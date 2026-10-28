@@ -354,6 +354,9 @@ moonshotai/Kimi-K2.5:
 # layer does not surface — the reference matcher sees quant_algo=None.
 moonshotai/Kimi-K3:
   - accuracy: 96.5
+  # Apply the existing full-model accuracy gate to FP8 KV-cache qualification.
+  - kv_cache_quant_algo: FP8
+    accuracy: 96.5
   # SA spec dec is lossless; scores match the baseline within noise.
   - spec_dec_algo: SA
     accuracy: 96.5
