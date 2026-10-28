@@ -64,20 +64,16 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Wan 2.1 VSA** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
 | **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
-| **LTX-2** | Yes | Yes | Yes [^7] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
+| **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
 | **MiniMax-H3** | Yes | Yes | No | No | No | No | Yes | Yes | No | Yes | Yes | No | No | Yes | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
-| **Qwen-Image-Layered** [^6] | Yes | No | No | Yes | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
+| **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
 | **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
 | **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
 
 \* Wan 2.1 and Wan 2.2 (not VSA) also support a token-sharded TP layout (prototype), enabled with `parallel_config.tp_layout: token_sharded`; see [Multi-GPU Parallelism](#multi-gpu-parallelism).
-
-[^6]: Qwen-Image-Layered supports FP8 block-scale dynamic quantization (`quant_config.quant_algo: FP8_BLOCK_SCALES`, see [`configs/qwen-image-layered-fp8-1gpu.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/configs/qwen-image-layered-fp8-1gpu.yaml)) and Cache-DiT. NVFP4, the attention-parallel backends, VSA, and Tensor Parallelism are not implemented for this pipeline.
-
-[^7]: LTX-2 ships no built-in TeaCache coefficient table, so TeaCache requires an explicit `coefficients` list in `cache_config` (alongside `cache_backend: teacache`); without it the pipeline raises at load time.
 
 SOL-Attn is a runtime sparse-attention feature of the `TRTLLM` and `CUTEDSL` backends (bfloat16 self-attention with `head_dim=128` on SM100/SM103); it needs no dedicated checkpoint. Video Sparse Attention (VSA) requires a VSA-fine-tuned checkpoint and is therefore listed as its own model, `Wan 2.1 VSA`. See [VisualGen Sparse Attention](../features/visualgen-sparse-attention.md) for both.
 
@@ -122,9 +118,9 @@ The asynchronous `/v1/videos` job advances through `GET /v1/videos/{id}`: `queue
 Qwen-Image-Layered supports BF16 image-conditioned layer decomposition through
 `trtllm-serve` image-edit routing. It returns one RGBA image per generated layer;
 set `extra_params.save_layers_to_grid` to `true` to pack layers into one saveable
-image grid. FP8 block-scale quantization and Cache-DiT are supported; NVFP4, the
-attention-parallel backends (CFG, Ulysses, Attention2D, ring), VSA, and Tensor
-Parallelism are not enabled for this pipeline yet.
+image grid. FP8 block-scale quantization and Cache-DiT are supported; NVFP4,
+TeaCache, the attention-parallel backends (CFG, Ulysses, Attention2D, ring), VSA,
+and Tensor Parallelism are not enabled for this pipeline yet.
 
 Conditioning references are supplied through the typed fields `image_reference`, `video_reference`, and `audio_reference`. Each field takes a single reference or a list. A reference is `MediaRef(content=..., format=...)`, and `format` is required.
 
