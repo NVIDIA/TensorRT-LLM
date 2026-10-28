@@ -1217,8 +1217,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         described by the kv lengths and the KV block table: this class itself
         (the sparse-attention subclasses keep per-step state in their own
         ``prepare()``), no FP4-MLA state, no helix / cross attention / locality
-        domains / flash-MLA / MLA cached-kv prefill handling, and a KV cache
-        manager with a known block size.
+        domains / flash-MLA / MLA cached-kv prefill handling, no mixed-precision
+        KV staging, and a KV cache manager with a known block size.
         """
         return (type(self) is TrtllmAttentionMetadata
                 and self.fp4_mla_state is None
@@ -1228,6 +1228,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 and not getattr(self, 'locality_domain_enabled', False)
                 and not self.enable_flash_mla
                 and not self.enable_context_mla_with_cached_kv
+                and not self._has_mixed_precision_kv()
                 and self.kv_cache_params is not None
                 and self.kv_cache_params.use_cache)
 
