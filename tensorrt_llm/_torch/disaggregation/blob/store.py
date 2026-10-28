@@ -63,8 +63,8 @@ class RowStatus(enum.Enum):
     """The logical state of one row within an operation.
 
     READY and FAULT are the only two that carry a verdict. MISS, NOT_READY, DECLINED and CANCELLED
-    say that nothing was delivered and nothing went wrong: the backend reports such a row as not
-    delivered without a fault, and none of them counts toward isolation.
+    say that nothing was delivered and charge the row no fault: the backend reports such a row as
+    not delivered without a fault, and none of them counts toward isolation.
     """
 
     PENDING = "pending"
@@ -82,14 +82,18 @@ class RowStatus(enum.Enum):
     MISS."""
 
     NOT_READY = "not_ready"
-    """The key is held by a write that has not finished: a get delivered nothing, a put published
-    nothing of its own. ``probe`` gives the same answer for such a key. Only for a hold the store
-    confirmed; a store that cannot tell an unfinished write from another refusal answers FAULT."""
+    """A write of the key is known of, but no readable complete object stands under it: a get
+    delivered nothing and left the row's memory untouched, a put published nothing of its own.
+    Either the store reported an object of the key without a readable complete replica, as while
+    a write has not finished or when no complete replica can be read, or another put of the same
+    driver, still running, writes the key. ``probe`` answers NOT_READY where a get would. RPC,
+    transfer and integrity errors are FAULT, never NOT_READY."""
 
     DECLINED = "declined"
-    """For a put: the store would not take the row, for space or policy, and said so. Nothing was
-    published; the other rows of the operation go on. A refusal the driver cannot place is
-    FAULT."""
+    """For a put: the store would not take the row, for space or policy, and said so; or the
+    driver will not write the key again because an earlier put of its own left the key unresolved
+    in the store, and that put concluded FAULT. Nothing was published; the other rows of the
+    operation go on. A refusal the driver cannot place is FAULT."""
 
     CANCELLED = "cancelled"
     """Never started, because of a cancel or a drain; no byte moved and the row's memory was not
@@ -555,9 +559,9 @@ class StoreDriver(Protocol):
 
         Keys the store did not answer in time are UNKNOWN, never MISS; the call returns within the
         budget whatever the store does, and a driver with no capacity to ask answers UNKNOWN at
-        once. A key held by an unfinished write is NOT_READY, as a get would report. Called only
-        when ``capabilities.probe`` is set, and with a hint only when ``capabilities.hints`` is.
-        Raises on a store error rather than answering MISS.
+        once. A key a get would find NOT_READY is NOT_READY here too. Called only when
+        ``capabilities.probe`` is set, and with a hint only when ``capabilities.hints`` is. Raises
+        on a store error rather than answering MISS.
         """
         ...
 

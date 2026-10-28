@@ -83,8 +83,9 @@ The boundary is `store.py`; its docstrings are the specification. The rules that
    name a key twice, and every span lies inside one registered extent, so a driver checks memory
    once per extent. A driver that cannot take a call refuses it with `DriverRejected`.
 4. **Only READY and FAULT are verdicts.** MISS, NOT_READY, DECLINED and CANCELLED say that
-   nothing was delivered and nothing went wrong, each under a condition the store confirmed;
-   an error the driver cannot place is FAULT.
+   nothing was delivered and charge the row no fault, each only under the conditions `RowStatus`
+   names for it. RPC, transfer and integrity errors are FAULT, and so is any error the driver
+   cannot place.
 5. **`drain` is one-way and never forces an end.** After it the driver accepts no new work;
    it returns True only when nothing can still touch memory. `close` is allowed only after a
    True drain and with every registration revoked.

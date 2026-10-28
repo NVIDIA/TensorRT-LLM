@@ -151,25 +151,20 @@ _CANCELLED = RowResult(RowStatus.CANCELLED)
 _NO_WORKER_LEFT = faulted("no worker thread is left to run the row")
 _instance_ids = itertools.count()  # names each driver's worker threads
 
-# Why a row was skipped (nothing moved and nothing went wrong), and the result it gets; ``stats()``
-# counts skipped rows by both, and a part's warning names its first row that faulted or was
-# skipped, with the skip's reason.
-#
-# NOT_READY here departs from the protocol's "only for a hold the store confirmed": 0.3.13 cannot
-# tell a write in progress from a complete replica it cannot read. -703 answers both, and so does
-# batch_is_exist's 0 after a -705. A session left open after a start that raised may not exist,
-# and once the master frees one after put_start_release_timeout_sec, its key stays NOT_READY for
-# this driver's life, as it is never put again. The usual cause is a write in progress, which as
-# a FAULT would stop every fetch that races a writer and count toward isolation; a replica that
-# stays unreadable costs only its rows.
+# Why a row was skipped (nothing moved, and the row is charged no fault), and the result it gets;
+# ``stats()`` counts skipped rows by both, and a part's warning names its first row that faulted
+# or was skipped, with the skip's reason.
 _SKIP_RESULTS = {
-    # get -703: no complete replica, as while the object is written or once its replica's
-    # endpoint went stale
+    # get -703 on a first read: the master holds no readable complete replica, as while the
+    # object is written or once its replica's endpoint went stale; the slot is untouched
     "no_complete_replica": _NOT_READY,
-    # put: a put of this driver is writing the key now, or a session it left open holds the key and
-    # the master shows no complete object; no session is started
+    # put: another put of this driver is writing the key now; no session is started
     "held_by_own_put": _NOT_READY,
-    "uncommitted": _NOT_READY,  # put start -705, and the master shows the object uncommitted
+    "uncommitted": _NOT_READY,  # put start -705, and the master shows no readable complete object
+    # put: a session this driver left open holds the key and the master shows no complete object.
+    # The driver never writes such a key again (class docstring), so it refuses the row; the put
+    # that left the session open already concluded FAULT.
+    "held_by_session_left_open": _DECLINED,
     "pool_full": _DECLINED,  # put start -200: no space for the object
 }
 
@@ -302,7 +297,7 @@ class MooncakeDriver:
 
     1. Reserves each key that no put of this driver is writing and no session it left open holds.
        A key another put is writing is NOT_READY at once. A key whose session it left open is
-       READY when the master shows its object complete, NOT_READY when it shows none, and FAULT
+       READY when the master shows its object complete, DECLINED when it shows none, and FAULT
        when the existence check fails; it is never put again.
     2. Starts a session per reserved key, writes every started row in one scatter, ends the
        session of each row written whole (its object becomes readable) and revokes the rest.
@@ -767,8 +762,9 @@ class MooncakeDriver:
         closed: set[str] = set()
         to_master: set[str] = set()
         try:
-            if held_by_left_session:  # never put again, but another client may have written it
-                self._confirm_existing(held_by_left_session, results, "held_by_own_put")
+            # Never put again, but a late end of its own or another client may have completed it.
+            if held_by_left_session:
+                self._confirm_existing(held_by_left_session, results, "held_by_session_left_open")
             if not reserved:
                 return results, True
             access_ended = self._put_reserved(rows.only(reserved), results, closed, to_master)
