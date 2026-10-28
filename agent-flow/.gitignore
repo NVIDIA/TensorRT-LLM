@@ -216,6 +216,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 workspace/
+!agent_flow/workflows/trtllm_modeling_v2/run/workspace/
 logs/
 .tmp/
 .codex
