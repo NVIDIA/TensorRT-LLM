@@ -20,6 +20,7 @@ from tensorrt_llm.executor import base_worker
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
 from tensorrt_llm.executor.result import LogProbsResult
+from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
 from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.sampling_params import LogprobParams, SamplingParams
@@ -502,3 +503,41 @@ def test_submit_cleans_up_failed_enqueue(
         result = BaseWorker.submit(worker, request)
         assert worker._results == {7: result, 8: peer_result}
         assert worker._client_id_to_request_id == {7: 70, 8: 80}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("unsupported_adapter", [False, True])
+def test_rpc_submit_rejects_prompt_adapters_before_dispatch(
+        unsupported_adapter: bool) -> None:
+    if unsupported_adapter:
+        with pytest.warns(DeprecationWarning,
+                          match="prompt_adapter_request is deprecated"):
+            request = GenerationRequest(
+                prompt_token_ids=[10, 11],
+                sampling_params=SamplingParams(max_tokens=1),
+                prompt_adapter_request=object(),
+            )
+    else:
+        request = GenerationRequest(
+            prompt_token_ids=[10, 11],
+            sampling_params=SamplingParams(max_tokens=1))
+    peer_result = object()
+    proxy = MagicMock(_results={8: peer_result}, _handle_background_error=None)
+    proxy._get_next_client_id.return_value = 7
+    proxy._get_logprob_params.return_value = None
+
+    if unsupported_adapter:
+        with pytest.raises(RequestError,
+                           match="Prompt adapters are not supported"):
+            RpcExecutorMixin.submit(proxy, request)
+        proxy.rpc_client.submit.assert_not_called()
+        proxy._get_next_client_id.assert_not_called()
+        assert request.id is None
+        assert proxy._results == {8: peer_result}
+    else:
+        result = RpcExecutorMixin.submit(proxy, request)
+        proxy.rpc_client.submit.assert_called_once_with(request)
+        proxy.rpc_client.submit.return_value.remote.assert_called_once_with(
+            need_response=False)
+        assert request.id == 7
+        assert proxy._results == {7: result, 8: peer_result}
