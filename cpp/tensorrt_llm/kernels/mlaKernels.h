@@ -70,9 +70,10 @@ struct MlaParams
     // Separate tensor K for context MLA, contiguous. Pre-process kernel will apply RoPE and modify it in-place.
     // shape: [total_kv_len, h * (d_nope + d_rope)], stride: [h * (d_nope + d_rope), 1]
     T* k_buf = nullptr;
-    // Separate tensor V for context MLA, NOT contiguous,
-    // shape: [total_kv_len, h * d_v], stride: [h * (d_nope + d_v), 1]
+    // Separate tensor V for context MLA, shape [total_kv_len, h * d_v] with unit feature stride.
     T const* v_buf = nullptr;
+    // Physical V token stride in elements; zero uses the packed [K_nope | V] layout.
+    int64_t v_token_stride_elements = 0;
     // Tensor quantized Q for both context and generation MLA.
     // For context MLA, shape: [total_q_len, h * (d_nope + d_rope)], stride: [h * (d_nope + d_rope), 1]
     void* quant_q_buf = nullptr;

@@ -186,8 +186,8 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
         config.numAttrs = 1;
         config.attrs = attrs;
-        cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
-            reinterpret_cast<uint32_t*>(SFOuput), layout);
+        TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
+            reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput), layout));
     }
 }
 
@@ -227,10 +227,10 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
-    cudaLaunchKernelEx(&config,
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config,
         quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_MXFP8, T, SF_VEC_SIZE, true, SF_OUTPUT_VEC_SIZE>,
         b, m, n, padded_n, input, nullptr, reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOuput),
-        layout);
+        layout));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -225,9 +225,6 @@ def test_llm_request():
         "is_streaming": True,
         "prompt_embedding_table": torch.tensor((10, 10)),
         "prompt_vocab_size": 2,
-        "return_log_probs": True,
-        "return_context_logits": False,
-        "return_generation_logits": False
     }
     llm_request = _tb.internal.batch_manager.LlmRequest(**kwargs)
 
@@ -263,26 +260,11 @@ def test_llm_request():
     llm_request.max_sent_token_len = 1
     assert llm_request.max_sent_token_len == 1
 
-    assert llm_request.return_log_probs
-    llm_request.set_log_probs([0.1], 0)
-    llm_request.set_log_probs([0.2], 1)
-    assert np.allclose(llm_request.get_log_probs(0), np.array([0.1]))
-    assert np.allclose(llm_request.log_probs, np.array([[0.1], [0.2]]))
-
-    llm_request.set_return_encoder_output(True)
-    assert llm_request.get_return_encoder_output()
-    llm_request.set_return_encoder_output(False)
-    assert not llm_request.get_return_encoder_output()
-
     assert np.allclose(llm_request.priority(), 0.5)
     llm_request.set_priority(1.0)
     assert np.allclose(llm_request.priority(), 1.0)
     llm_request.set_priority(0.0)
     assert np.allclose(llm_request.priority(), 0.0)
-
-    llm_request.set_cum_log_prob(0.1, 0)
-    llm_request.set_cum_log_prob(0.2, 1)
-    assert np.allclose(llm_request.cum_log_probs, np.array([0.1, 0.2]))
 
     assert llm_request.orig_prompt_len == 3
 

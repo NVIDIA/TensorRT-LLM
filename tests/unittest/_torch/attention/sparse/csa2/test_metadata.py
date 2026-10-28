@@ -1932,6 +1932,37 @@ def test_swa_refresh_preserves_per_layer_page_domains(device: str) -> None:
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("shared_rows", [None, 1, 127, 128, 257])
+def test_native_staging_pools_cover_tma_fetch_window(
+    dtype: torch.dtype, shared_rows: int | None
+) -> None:
+    q = torch.empty(1, 8, 512, device="cuda", dtype=torch.bfloat16)
+    metadata = CSA2TrtllmMetadata.for_query_tile(
+        q,
+        0,
+        staging_dtype=dtype,
+        context_lengths=[1] if shared_rows is not None else None,
+        shared_rows=shared_rows,
+    )
+    if shared_rows is None:
+        assert metadata.swa_pool.shape == (1, 128, 512)
+        assert metadata.extra_pool.shape == (1, 1, 512)
+    else:
+        assert metadata.shared_pool.shape == (shared_rows, 512)
+        assert metadata.swa_pool is metadata.extra_pool is metadata.shared_pool
+    for pool in (metadata.swa_pool, metadata.extra_pool):
+        assert pool.dtype == dtype and pool.is_contiguous()
+        # TMA's encoded row domain is larger than these small logical pools.
+        # Padding must be mapped memory retained by the view itself.
+        backing = pool.untyped_storage()
+        available = backing.nbytes() - (pool.data_ptr() - backing.data_ptr())
+        assert available >= 128 * 1024
+    assert metadata.host_kv_cache_pool_pointers[0, 0].item() == metadata.swa_pool.data_ptr()
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_context_tile_cache_retains_latest_and_preserves_graph_and_dtype():
     source = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=64)
@@ -2232,7 +2263,7 @@ def test_decode_graph_defers_derived_uploads_and_refreshes_all_outputs(
     manager_requests, monkeypatch, batch_size
 ):
     from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm.bindings import SamplingConfig
 
@@ -2254,15 +2285,15 @@ def test_decode_graph_defers_derived_uploads_and_refreshes_all_outputs(
     starts = [127] * batch_size
     _prepare_decode_metadata(metadata, selected, starts, deferred=True)
     assert metadata._csa2_deferred_decode_outputs
-    engine = object.__new__(DecoderRunner)
-    engine.guided_decoder = None
+    inputs = object.__new__(DecoderInputPreparer)
+    inputs.guided_decoder = None
     pointers = {
         name: tensor.data_ptr() for name, tensor in _decode_derived_outputs(metadata).items()
     }
 
     def forward():
         # The real engine's preprocessing is captured ahead of every consumer.
-        engine._preprocess_inputs(
+        inputs.preprocess_inputs(
             {"attn_metadata": metadata}, enable_spec_decode=False, runtime_draft_len=0
         )
         return {name: tensor.clone() for name, tensor in _decode_derived_outputs(metadata).items()}

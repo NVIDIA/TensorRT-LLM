@@ -45,6 +45,9 @@ def _latent_append(
 ) -> None:
     """Quantize the new latent rows and scatter them into the main pool."""
     metadata._ensure_pool_view_cached()
+    page_index_scale, layer_offset = metadata.kv_cache_manager.get_primary_pool_page_index_params(
+        attn.get_local_layer_idx(metadata)
+    )
     positions = metadata.token_positions_cuda[start_idx:end_idx]
     if is_generation:
         block_table = metadata._cached_block_table_gen
@@ -58,8 +61,8 @@ def _latent_append(
         positions.unsqueeze(1).contiguous(),
         metadata._cached_tokens_per_block,
         1,
-        metadata._cached_stride_factor,
-        attn.get_local_layer_idx(metadata),
+        page_index_scale * metadata._cached_tokens_per_block,
+        layer_offset,
     ).view(-1)
     pool = _inline_scale_pool_paged(metadata)
     inline_scale_kv.quant_scatter(

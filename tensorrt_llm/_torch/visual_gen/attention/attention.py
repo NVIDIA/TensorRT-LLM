@@ -89,6 +89,8 @@ class Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads or num_attention_heads
         self.head_dim = head_dim or (hidden_size // num_attention_heads)
         self.qkv_mode = QKVMode(qkv_mode) if isinstance(qkv_mode, str) else qkv_mode
+        # Read by the token-sharded TP converter (parallel/token_sharded_modules.py).
+        self.separate_qkv_is_self_attention = separate_qkv_is_self_attention
         self.bias = bias
 
         self.tp_size = self.mapping.tp_size if self.mapping else 1
@@ -717,10 +719,6 @@ class Attention(nn.Module):
         # fused norm+quant kernel; downstream Linear accepts either.
         if not isinstance(hidden_states, Fp4QuantizedTensor):
             assert hidden_states.ndim == 3, "hidden_states must be a 3D tensor"
-        batch_size, seq_len = hidden_states.shape[:2]
-        kv_seq_len = (
-            encoder_hidden_states.shape[1] if encoder_hidden_states is not None else seq_len
-        )
 
         # Fused path: QKV projection → fused QK norm + RoPE → attention
         if (
@@ -742,6 +740,9 @@ class Attention(nn.Module):
 
         # Apply RoPE if provided (model handles RoPE, not attention backend)
         if freqs is not None:
+            # From q/k, not hidden_states: a token-sharded TP projection gathers all tokens.
+            batch_size, seq_len = q.shape[:2]
+            kv_seq_len = k.shape[1]
             freqs_cos, freqs_sin = freqs
             q = q.view(
                 batch_size, seq_len, self.local_num_attention_heads, self.head_dim

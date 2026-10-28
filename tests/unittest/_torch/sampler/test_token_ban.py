@@ -443,12 +443,13 @@ class TestAddMinLengthBans:
     class MockLlmRequest:
         """Minimal stub exposing the attributes the min-length path reads."""
 
-        def __init__(self, num_tokens, *, min_length=None, prompt_len=0, end_id=5):
+        def __init__(self, num_tokens, *, min_length=None, prompt_len=0, end_id=5, stop_words=None):
             self._num_tokens = num_tokens  # total tokens (prompt + generated)
             self.py_min_length = min_length
             self.py_orig_prompt_len = prompt_len
             self.py_original_end_id = end_id
             self.py_end_id = end_id
+            self.py_stop_words_list = stop_words
 
         def get_num_tokens(self, beam_idx):
             return self._num_tokens
@@ -510,6 +511,19 @@ class TestAddMinLengthBans:
         req = self.MockLlmRequest(num_tokens=1, min_length=5, end_id=-1)
         logits = self._run([req])
         assert self._banned_cols(logits[0]) == set()
+
+    def test_single_token_stop_words_banned_with_eos(self):
+        # A model's extra EOS ids reach the request as single-token stop words;
+        # they would end the request early just like end_id. Multi-token stop
+        # words cannot be suppressed by banning one token.
+        req = self.MockLlmRequest(num_tokens=2, min_length=5, stop_words=[[7], [9, 11]])
+        logits = self._run([req])
+        assert self._banned_cols(logits[0]) == {self.END_ID, 7}
+
+    def test_stop_words_banned_without_end_id(self):
+        req = self.MockLlmRequest(num_tokens=2, min_length=5, end_id=-1, stop_words=[[7]])
+        logits = self._run([req])
+        assert self._banned_cols(logits[0]) == {7}
 
     def test_multi_step_stops_at_min_length(self):
         # 3 generated, min_length 5, 3 speculative steps: gen+step < 5 for

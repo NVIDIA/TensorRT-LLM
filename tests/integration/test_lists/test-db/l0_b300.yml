@@ -34,22 +34,25 @@ l0_b300:
   #               rebind mpi4py's serializer at import time, which applies process-wide on
   #               every stage that collects them, including where the tests themselves skip.
   # The sparse/dsa/test_cute_dsl_* files ignored below keep their own entries (pre-existing).
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py
-  # Keep cold-JIT MSA coverage out of the 60-minute attention aggregate.
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py TIMEOUT (90)
+  # Run cold-JIT MSA coverage separately from the attention aggregate.
   # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py TIMEOUT (45)
+  - unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py
   - unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
   - unittest/_torch/modeling/test_qsa_runtime_wiring.py
   - unittest/_torch/modeling/test_qwen4_exp_support.py
-  - unittest/_torch/thop/parallel TIMEOUT (90)
+  - unittest/_torch/moe/kernels/parallel
+  - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/visual_gen/test_attention_flashinfer.py
   # ------------- Visual Gen sparse attention (sm103) ---------------
   - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_attention.py
-  - unittest/_torch/thop/serial
+  - unittest/_torch/moe/kernels/serial
+  - unittest/_torch/kernels/serial
   - unittest/_torch/executor # 250s
   - unittest/_torch/disaggregation
   # ------------- modules (non-MoE) ---------------
@@ -132,9 +135,43 @@ l0_b300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=fp8-kv_cache_reuse=True-fp8kv=True-overlap_scheduler=True] # Cover nvbugs 6084445
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
-  # TIMEOUT measured: 348 cases in 5m34s on one GB300, so 30 is 5x headroom.
-  - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm TIMEOUT (30)
-  - accuracy/test_modeling_v2_gpt_oss.py::TestModelingV2GptOss120bSm103Tp1::test_gsm8k
+  # modeling_v2 unit tests, one entry per catalog op test and one per model
+  # family that has unit tests, so CBTS can select the ones a change reaches.
+  # The whole-tree tests that need no GPU are in l0_cpu; the comm tests in
+  # l0_gb300_multi_gpus.
+  - unittest/_torch/modeling_v2/activation/test_modeling_v2_flashinfer_silu_and_mul.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_fused_qk_norm_rope.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_load_paged_kv_cache_for_mla.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_mla_rope_append_paged_kv_assign_q.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_mla_rope_generation.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_thop_attention.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_bmm_out.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_cublas_mm.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_nvfp4_gemm.py
+  - unittest/_torch/modeling_v2/graph/test_modeling_v2_eager_on_graph.py
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_fp4_block_scale_moe_runner.py
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_mxe4m3_mxe2m1_block_scale_moe_runner.py
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_noaux_tc_op.py
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_flashinfer_fused_add_rmsnorm.py
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_flashinfer_rmsnorm.py
+  - unittest/_torch/modeling_v2/quantization/test_modeling_v2_fp4_quantize.py
+  - unittest/_torch/modeling_v2/quantization/test_modeling_v2_mxfp8_quantize.py
+  - unittest/_torch/modeling_v2/models/deepseek_v3
+  - unittest/_torch/modeling_v2/models/qwen4_exp
+  - unittest/_torch/modeling_v2/test_modeling_v2_deepseek_weight_table.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_mnnvl_workspace.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_no_stale_claims.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_target_contract.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_weight_table.py
+  - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp1]
+  # qwen4_exp target, pre-merge: gsm8k; one MTP engine for gsm8k with the acceptance-length
+  # floor (the only gate that sees a miscomputed draft layer), mmmu (the vision tower) and
+  # synthetic videos; and 3k-6k-token pass keys with three drafts and IndexShare over bf16 KV,
+  # the only prompts long enough to run the sparse attention path. The opt-in variants run
+  # post-merge (below).
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_gsm8k_mmmu_and_video
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_long_context_passkey
 - condition:
     ranges:
       system_gpu_count:
@@ -155,3 +192,11 @@ l0_b300:
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM"
+  # qwen4_exp target, post-merge: the opt-in variants -- three drafts over CuteDSL experts, fp8
+  # KV and a bf16 recurrent state in one engine (gsm8k and the pass keys); seven drafts over
+  # 3k-12k-token pass keys on NVFP4 KV and a bf16 state (the verify step's eight rows per
+  # request); and the breakable prefill CUDA graph replayed against eager greedy continuations
+  # at the bucket edges and with context and generation rows in one batch.
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_cutedsl_fp8_kv_bf16_state
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_long_context_passkey
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_breakable_prefill_matches_eager

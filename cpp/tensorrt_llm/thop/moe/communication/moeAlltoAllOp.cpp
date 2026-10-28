@@ -28,8 +28,10 @@
 #include <cuda_runtime.h>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <torch/extension.h>
 #include <torch/types.h>
+#include <unordered_map>
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -40,15 +42,29 @@ namespace torch_ext
 namespace moe_comm
 {
 
-// Process-wide budget copied into subsequent dispatch/combine launch arguments.
+// Process-wide completion-flag budget copied into subsequent dispatch/combine launch arguments,
+// so a captured CUDA graph keeps the budget that was current at capture.
+//
+// No collective separates a rank's first-touch JIT/autotune work from its dispatch launch, so
+// this device-side budget is in effect a deadline on the slowest peer's host-side progress.
+// Python raises it during warmup (tensorrt_llm/_torch/moe/fused_moe/moe_comm_timeout_guard.py).
 static std::atomic<int64_t> gTimeoutCycles{tensorrt_llm::kernels::moe_comm::kDefaultTimeoutCycles};
 
+// Set the budget of subsequent launches in seconds; 0 restores the default.
 void moeA2ASetTimeoutOp(int64_t timeoutSec)
 {
     constexpr int64_t kMaxTimeoutSec = 24 * 60 * 60;
-    TORCH_CHECK(timeoutSec > 0 && timeoutSec <= kMaxTimeoutSec, "MoE all-to-all timeout must be in 1..", kMaxTimeoutSec,
-        " seconds");
-    gTimeoutCycles.store(timeoutSec * tensorrt_llm::kernels::moe_comm::kAssumedClockHz, std::memory_order_relaxed);
+    TORCH_CHECK(timeoutSec >= 0 && timeoutSec <= kMaxTimeoutSec, "MoE all-to-all timeout must be in 0..",
+        kMaxTimeoutSec, " seconds (0 restores the default), got ", timeoutSec);
+    int64_t const timeoutCycles = timeoutSec == 0 ? tensorrt_llm::kernels::moe_comm::kDefaultTimeoutCycles
+                                                  : timeoutSec * tensorrt_llm::kernels::moe_comm::kAssumedClockHz;
+    gTimeoutCycles.store(timeoutCycles, std::memory_order_relaxed);
+}
+
+// Return the budget of subsequent launches in seconds.
+int64_t moeA2AGetTimeoutOp()
+{
+    return gTimeoutCycles.load(std::memory_order_relaxed) / tensorrt_llm::kernels::moe_comm::kAssumedClockHz;
 }
 
 static constexpr size_t CACHELINE_ALIGNMENT = 128;
@@ -290,16 +306,55 @@ void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& met
 // CFT Handle-Based Counted Writes Initialization
 // ============================================================================
 
-// Static CftLeManager — one per process, bound to a single workspace.
+using CftLeManager = tensorrt_llm::kernels::moe_comm::CftLeManager;
+
+// One CftLeManager per workspace, keyed by this rank's workspace region. Each
+// workspace has its own MNNVL allocation handle, so it needs its own logical
+// endpoint.
 //
-// The manager owns a logical endpoint bound to the workspace's MNNVL
-// allocation, so it must be destroyed before that allocation is freed and its
-// virtual address is recycled; otherwise a later binding could resolve to an
-// endpoint left over from a dead allocation. The Python NVLinkOneSided
-// teardown calls moe_a2a_cft_release while the workspace is still alive.
-// MoeAlltoAll otherwise retains its shared workspaces for the process
-// lifetime, so the manager normally survives until static destruction.
-static std::unique_ptr<tensorrt_llm::kernels::moe_comm::CftLeManager> g_cft_manager;
+// A manager owns a logical endpoint bound to its workspace's MNNVL allocation,
+// so it must be destroyed before that allocation is freed and its virtual
+// address is recycled; otherwise a later binding at the same address could
+// resolve to an endpoint left over from a dead allocation. The Python
+// NVLinkOneSided teardown calls moe_a2a_cft_release while the workspace is
+// still alive, which destroys the manager and erases its entry. MoeAlltoAll
+// otherwise retains its shared workspaces for the process lifetime, so a
+// manager normally survives until static destruction.
+//
+// g_cft_managers_mutex guards every access to the map and to the managers in
+// it. No pointer into a manager escapes the lock: dispatch and combine copy the
+// peer LE ids out under it (copyCftPeerLeIds), so a release cannot leave them
+// holding a destroyed manager. Releasing a workspace while a dispatch or
+// combine on it is still running remains a caller error, as it is for the
+// workspace memory itself.
+static std::unordered_map<CUdeviceptr, std::unique_ptr<CftLeManager>> g_cft_managers;
+static std::mutex g_cft_managers_mutex;
+
+static bool hasInitializedCftManager(CUdeviceptr workspaceRankPtr)
+{
+    std::lock_guard<std::mutex> lock(g_cft_managers_mutex);
+    auto const it = g_cft_managers.find(workspaceRankPtr);
+    return it != g_cft_managers.end() && it->second->isInitialized();
+}
+
+// Copy the peer LE ids of this workspace's manager into dst. Returns false when
+// the workspace has no initialized manager.
+template <typename LeId>
+static bool copyCftPeerLeIds(CUdeviceptr workspaceRankPtr, int64_t epSize, LeId* dst)
+{
+    std::lock_guard<std::mutex> lock(g_cft_managers_mutex);
+    auto const it = g_cft_managers.find(workspaceRankPtr);
+    if (it == g_cft_managers.end() || !it->second->isInitialized())
+    {
+        return false;
+    }
+    auto const* leIds = it->second->getAllLeIds();
+    for (int64_t i = 0; i < epSize; ++i)
+    {
+        dst[i] = static_cast<LeId>(leIds[i]);
+    }
+    return true;
+}
 
 // Initialize CFT Logical Endpoints by binding the LE to the MNNVL workspace.
 // The workspace memory IS the LE backing store — fabric.try_put.counted writes land
@@ -348,23 +403,20 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
     CUdeviceptr workspaceRankPtr
         = reinterpret_cast<CUdeviceptr>(workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0));
 
-    if (g_cft_manager && g_cft_manager->isInitialized())
+    if (hasInitializedCftManager(workspaceRankPtr))
     {
-        TORCH_CHECK(g_cft_manager->getLocalBackingPtr() == workspaceRankPtr,
-            "CFT logical endpoints are already bound to a different workspace. Only one workspace "
-            "per process may use CFT counted writes.");
         return;
     }
 
-    g_cft_manager = std::make_unique<tensorrt_llm::kernels::moe_comm::CftLeManager>();
+    auto manager = std::make_unique<CftLeManager>();
 
-    TORCH_CHECK(g_cft_manager->loadApis(),
+    TORCH_CHECK(manager->loadApis(),
         "CftLeManager: Failed to load LE driver APIs. The installed driver does not export the "
         "CUDA logical endpoint API that CFT requires.");
 
     int localDevIdx = -1;
     TORCH_CHECK(cudaGetDevice(&localDevIdx) == cudaSuccess, "cudaGetDevice failed during CFT initialization");
-    TORCH_CHECK(g_cft_manager->createEndpointExternal(localDevIdx,
+    TORCH_CHECK(manager->createEndpointExternal(localDevIdx,
                     static_cast<CUmemGenericAllocationHandle>(workspaceMemHandle), workspaceRankPtr,
                     static_cast<size_t>(workspaceSizePerRank), static_cast<int>(epRank), static_cast<int>(epSize)),
         "CftLeManager: Failed to create LE endpoint bound to workspace on device ", localDevIdx);
@@ -372,7 +424,7 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
     auto allgatherFn = [](void const* sendBuf, void* recvBuf, size_t bytesPerRank)
     { moeA2AAllgatherBytes(sendBuf, recvBuf, bytesPerRank); };
 
-    TORCH_CHECK(g_cft_manager->exchangeEndpoints(allgatherFn), "CftLeManager: Failed to exchange LE endpoints");
+    TORCH_CHECK(manager->exchangeEndpoints(allgatherFn), "CftLeManager: Failed to exchange LE endpoints");
 
     cudaError_t initErr = cudaDeviceSynchronize();
     if (initErr != cudaSuccess)
@@ -393,15 +445,19 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
     {
         moeA2ABarrier();
     }
+    std::lock_guard<std::mutex> lock(g_cft_managers_mutex);
+    bool const inserted = g_cft_managers.try_emplace(workspaceRankPtr, std::move(manager)).second;
+    TORCH_CHECK(inserted, "CFT logical endpoints were initialized concurrently for the same workspace");
 }
 
 // Release the CFT logical endpoint before its backing workspace is freed.
 //
-// Idempotent, and a no-op unless the manager is actually bound to this
-// workspace's rank region: the caller passes the workspace it is tearing down,
-// and a manager bound to some other allocation must outlive that teardown.
-// Destroying the manager here — rather than at static destruction — keeps the
-// endpoint from outliving the virtual address it is bound to.
+// Idempotent, and only touches the manager bound to this workspace's rank
+// region: the caller passes the workspace it is tearing down, and managers bound
+// to other workspaces must outlive that teardown. Destroying the manager here --
+// rather than at static destruction -- keeps the endpoint from outliving the
+// virtual address it is bound to, and erasing the entry lets a later
+// allocation at the same address bind a fresh endpoint.
 void moeA2ACftReleaseOp(torch::Tensor const& workspace, int64_t epRank)
 {
     CHECK_TH_CUDA(workspace);
@@ -409,29 +465,19 @@ void moeA2ACftReleaseOp(torch::Tensor const& workspace, int64_t epRank)
     TORCH_CHECK(workspace.dim() == 2, "workspace must be a 2D tensor of shape [epSize, sizePerRank]");
     TORCH_CHECK(epRank >= 0 && epRank < workspace.size(0), "epRank must be in the range [0, epSize)");
 
-    if (!g_cft_manager)
-    {
-        return;
-    }
-
-    // An uninitialized manager holds no endpoint (initialization threw part
-    // way through); drop it unconditionally so a retry starts clean.
-    if (!g_cft_manager->isInitialized())
-    {
-        g_cft_manager.reset();
-        return;
-    }
-
     CUdeviceptr workspaceRankPtr
         = reinterpret_cast<CUdeviceptr>(workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0));
-    if (g_cft_manager->getLocalBackingPtr() != workspaceRankPtr)
+
+    std::lock_guard<std::mutex> lock(g_cft_managers_mutex);
+    auto const it = g_cft_managers.find(workspaceRankPtr);
+    if (it == g_cft_managers.end())
     {
         return;
     }
-
     // ~CftLeManager runs destroy(): unbind, destroy the local and imported
-    // endpoints, and release the reserved LE id block.
-    g_cft_manager.reset();
+    // endpoints, and release the reserved LE id block. Then drop the entry.
+    it->second.reset();
+    g_cft_managers.erase(it);
 }
 
 // MoE All-to-All Dispatch Operation
@@ -689,15 +735,9 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     // CFT handle-based counted writes
     if (useCftCountedWrites)
     {
-        TORCH_CHECK(g_cft_manager && g_cft_manager->isInitialized(),
-            "CFT counted writes requested but moe_a2a_cft_initialize has not been called");
-
         // Fill peer LE IDs
-        auto const* leIds = g_cft_manager->getAllLeIds();
-        for (int i = 0; i < static_cast<int>(epSize); i++)
-        {
-            params.cft_peer_le_ids[i] = leIds[i];
-        }
+        TORCH_CHECK(copyCftPeerLeIds(reinterpret_cast<CUdeviceptr>(rankWorkSpacePtr), epSize, params.cft_peer_le_ids),
+            "CFT counted writes requested but moe_a2a_cft_initialize has not been called for this workspace");
 
         // LE payload offsets = workspace payload offsets (LE IS the workspace).
         // No separate LE layout — fabric.try_put.counted writes directly into workspace recv_buffers.
@@ -900,13 +940,8 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     params.use_cft_for_combine = useCftCountedWrites;
     if (useCftCountedWrites)
     {
-        TORCH_CHECK(g_cft_manager && g_cft_manager->isInitialized(),
-            "CFT counted writes requested but moe_a2a_cft_initialize has not been called");
-        auto const* leIds = g_cft_manager->getAllLeIds();
-        for (int i = 0; i < static_cast<int>(epSize); i++)
-        {
-            params.cft_peer_le_ids[i] = leIds[i];
-        }
+        TORCH_CHECK(copyCftPeerLeIds(reinterpret_cast<CUdeviceptr>(rankWorkSpacePtr), epSize, params.cft_peer_le_ids),
+            "CFT counted writes requested but moe_a2a_cft_initialize has not been called for this workspace");
 
         // Dedicated combine receive region: prepare writes the local slice and fabric pushes write peer slices.
         int64_t const combineRecvRegionOffset = offsets[COMBINE_RECV_OFFSET_INDEX];
@@ -1083,6 +1118,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "moe_a2a_get_combine_payload_tensor(Tensor(a) workspace, Tensor metainfo, int ep_rank, int ep_size, "
         "int runtime_max_tokens_per_rank, ScalarType out_dtype, int hidden_size) -> Tensor(a)");
     module.def("moe_a2a_set_timeout(int timeout_sec) -> ()", &tensorrt_llm::torch_ext::moe_comm::moeA2ASetTimeoutOp);
+    module.def("moe_a2a_get_timeout() -> int", &tensorrt_llm::torch_ext::moe_comm::moeA2AGetTimeoutOp);
     module.def(
         "moe_a2a_get_workspace_layout(int ep_size, int max_num_tokens_per_rank, int top_k, "
         "int dispatch_payload_bytes, int combine_input_bytes, int combine_recv_bytes, "

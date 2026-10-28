@@ -24,6 +24,8 @@ from tensorrt_llm._torch.moe.fused_moe import (
 from tensorrt_llm._torch.moe.fused_moe import routing as moe_routing
 from tensorrt_llm._torch.moe.fused_moe.routing import \
     get_cached_perfect_router_logits
+from tensorrt_llm._torch.nccl_window_tensor_scope import \
+    discard_nccl_window_tensor_outputs
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
 
@@ -909,7 +911,8 @@ def _perfect_router_worker(parallel_mode, routing_name, num_tokens, dtype,
                                    dtype=dtype,
                                    device=device)
 
-        with torch.inference_mode():
+        with torch.inference_mode(), discard_nccl_window_tensor_outputs(
+            (x, dummy_logits)):
             _ = fused_moe.forward(x,
                                   dummy_logits,
                                   all_rank_num_tokens=all_rank_num_tokens)

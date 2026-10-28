@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for Python, Cpp, and V2 Mamba cache managers."""
 
+import contextlib
+import math
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -9,13 +11,40 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
+    Glm5NextCacheManager,
+)
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import (
     MAMBA_CONV_ROLE,
+    MAMBA_SSM_ROLE,
     AttentionLayerGroup,
     MambaLayerGroup,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.modules.fla.cache_manager import (
+    GDNReplayState,
+    Qwen35HybridCacheManager,
+    _use_flashinfer_ring_replay,
+)
+from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import FLASHINFER_REPLAY_RING_SIZE
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
+    _KDA_BETA_CACHE_ALIGNMENT_BYTES,
+    KDAIntermediateState,
+    KDAReplayLayerCache,
+    KDAReplayState,
+    KimiK3HybridCacheManager,
+    _kda_replay_layout,
+)
+from tensorrt_llm._torch.modules.mamba.cache_manager import (
+    MIN_REPLAY_HISTORY_SIZE,
+    Mamba2State,
+    NemotronHybridCacheManager,
+    ReplayHistory,
+    ReplayStateUpdateMetadata,
+    _advance_replay_state,
+)
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
@@ -32,21 +61,21 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    _KDA_BETA_CACHE_ALIGNMENT_BYTES,
-    MIN_REPLAY_HISTORY_SIZE,
     CppMambaHybridCacheManager,
     MambaCacheManager,
     MambaHybridCacheManagerV2,
     MambaRole,
     MixedMambaHybridCacheManager,
     PythonMambaCacheManager,
-    ReplayStateUpdateMetadata,
-    _advance_replay_state,
     _get_local_mamba_cache_layout,
     _get_mamba_hybrid_pool_size,
     _get_num_cuda_graph_padding_dummy_slots,
     _mamba_snapshot_rule_counts,
     _promote_mamba_state_triton,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
+    MambaAcceptanceBatch,
+    _stack_state_views,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
@@ -61,8 +90,10 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
     CacheTransceiverConfig,
@@ -77,9 +108,11 @@ from tensorrt_llm.llmapi.llm_utils import (
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    GPU_LEVEL,
     AttentionLayerConfig,
     BatchDesc,
     BufferConfig,
+    DataRole,
     GpuCacheTierConfig,
     KVCacheDesc,
     KVCacheManagerConfig,
@@ -151,7 +184,9 @@ def _hybrid_model_config():
     return SimpleNamespace(
         pretrained_config=config,
         sparse_attention_config=None,
+        spec_config=None,
         get_num_mamba_layers=lambda: 1,
+        mapping=Mapping(),
     )
 
 
@@ -297,8 +332,10 @@ def _kimi_model_config() -> SimpleNamespace:
     )
     return SimpleNamespace(
         pretrained_config=config,
+        mapping=Mapping(),
         quant_config=None,
         sparse_attention_config=None,
+        spec_config=None,
         get_num_mamba_layers=lambda: 2,
     )
 
@@ -306,12 +343,13 @@ def _kimi_model_config() -> SimpleNamespace:
 def _capture_kimi_v2_manager_ctor(
     monkeypatch: pytest.MonkeyPatch,
     spec_config=None,
+    model_engine=None,
 ) -> tuple[tuple, dict]:
     """Route a Kimi config through _create_kv_cache_manager with an explicit
     V2 manager and capture the constructor arguments."""
     captured: dict[str, object] = {}
 
-    class RecordingV2Manager(MambaHybridCacheManagerV2):
+    class RecordingV2Manager(KimiK3HybridCacheManager):
         def __init__(self, *args: object, **kwargs: object) -> None:
             captured["args"] = args
             captured["kwargs"] = kwargs
@@ -321,10 +359,10 @@ def _capture_kimi_v2_manager_ctor(
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
     monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
 
-    assert get_kv_cache_manager_cls(model_config, kv_cache_config) is MambaHybridCacheManagerV2
+    assert get_kv_cache_manager_cls(model_config, kv_cache_config) is KimiK3HybridCacheManager
 
     _create_kv_cache_manager(
-        model_engine=None,
+        model_engine=model_engine,
         kv_cache_manager_cls=RecordingV2Manager,
         mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
         kv_cache_config=kv_cache_config,
@@ -367,7 +405,7 @@ def test_kimi_explicit_v2_manager_geometry(monkeypatch: pytest.MonkeyPatch) -> N
     assert "kda_replay_num_spec" not in kwargs
 
 
-def test_kimi_explicit_v2_manager_enables_kda_replay(
+def test_kimi_explicit_v2_manager_enables_owned_kda_replay_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec_config = MTPDecodingConfig(max_draft_len=3)
@@ -378,8 +416,84 @@ def test_kimi_explicit_v2_manager_enables_kda_replay(
 
     _, kwargs = _capture_kimi_v2_manager_ctor(monkeypatch, spec_config)
 
-    assert kwargs["kda_replay_num_spec"] == spec_config.tokens_per_gen_step - 1
+    assert "speculative_state" not in kwargs
+    mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr.spec_config = spec_config
+    mgr._mamba_ssm_stochastic_rounding = False
+    mgr._requested_num_spec = None
+    mgr._requested_draft_records = False
+    mgr._state_layout = SimpleNamespace(spec_config=spec_config, mamba_pp_layers=())
+    mgr._speculative_state = mgr._initialize_spec_state()
+    policy = mgr._kda_replay
+    assert isinstance(policy, KDAReplayState)
+    assert policy.num_speculative_tokens == spec_config.tokens_per_gen_step - 1
     assert kwargs["conv_state_layout"] == "q_k_v"
+    assert "kda_replay_num_spec" not in kwargs
+    assert "kda_draft_records" not in kwargs
+
+
+@pytest.mark.parametrize("backbone_asks", [True, False])
+def test_kimi_explicit_v2_manager_kda_draft_records_follow_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+    backbone_asks: bool,
+) -> None:
+    """The factory asks the V2 manager for per-token KDA verify states only when
+    the model's backbone sets ``kda_draft_records``."""
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
+        lambda: True,
+    )
+    backbone = SimpleNamespace(kda_draft_records=True) if backbone_asks else SimpleNamespace()
+    model_engine = SimpleNamespace(
+        model=SimpleNamespace(model=backbone),
+        max_cuda_graph_batch_size=4,
+        input_processor=MagicMock(spec=BaseMultimodalInputProcessor),
+    )
+
+    _, kwargs = _capture_kimi_v2_manager_ctor(
+        monkeypatch, MTPDecodingConfig(max_draft_len=3), model_engine
+    )
+
+    assert "kda_replay_num_spec" not in kwargs
+    assert kwargs.get("kda_draft_records", False) is backbone_asks
+
+
+@pytest.mark.parametrize("max_draft_len, replay_enabled", [(7, True), (8, False)])
+def test_kimi_kda_replay_respects_fused_verify_draft_limit(
+    monkeypatch: pytest.MonkeyPatch, max_draft_len: int, replay_enabled: bool
+) -> None:
+    """Draft lengths beyond the fused KDA verify kernel's limit keep the
+    legacy intermediate buffers (sequential FLA verify) instead of
+    allocating replay caches the kernel would reject."""
+    kda_kernels = "tensorrt_llm._torch.modules.kimi_kda._kda_kernels"
+    monkeypatch.setattr(f"{kda_kernels}.is_kda_mtp_verify_available", lambda: True)
+    monkeypatch.setattr(f"{kda_kernels}.kda_mtp_max_num_spec", lambda: 7)
+    spec_config = MTPDecodingConfig(max_draft_len=max_draft_len)
+
+    _, kwargs = _capture_kimi_v2_manager_ctor(monkeypatch, spec_config)
+
+    assert "kda_replay_num_spec" not in kwargs
+    mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr.spec_config = spec_config
+    mgr._mamba_ssm_stochastic_rounding = False
+    mgr._requested_num_spec = None
+    mgr._requested_draft_records = False
+    mgr._state_layout = SimpleNamespace(spec_config=spec_config, mamba_pp_layers=())
+    state = mgr._initialize_spec_state()
+    assert isinstance(state, KDAReplayState) is replay_enabled
+    if replay_enabled:
+        assert state.num_speculative_tokens == max_draft_len
+
+
+def test_kda_mtp_max_num_spec_fits_the_kernel_chunk() -> None:
+    pytest.importorskip("cutlass")
+    from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda.kda_mtp_decode import T_PAD
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import kda_mtp_max_num_spec
+
+    max_num_spec = kda_mtp_max_num_spec()
+    # A verify chunk holds up to max_num_spec replayed drafts plus 1 + max_num_spec new tokens.
+    assert max_num_spec == 7
+    assert 2 * max_num_spec + 1 <= T_PAD
 
 
 def test_kimi_explicit_v2_manager_uses_qkv_convolution_layout(
@@ -395,12 +509,10 @@ def test_kimi_explicit_v2_manager_uses_qkv_convolution_layout(
     assert "model_type" not in kwargs
 
 
-def test_kimi_v1_manager_still_selects_qwen3_next_model_type(
+def test_kimi_v1_manager_receives_model_identity_for_replay_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The V1 managers have no `conv_state_layout` parameter; they must keep
-    getting `model_type='qwen3_next'` and must not receive V2 KDA replay
-    parameters (TRTLLM-15216 regression guard)."""
+    """V1 resolves Kimi replay and its Q/K/V layout inside the constructor."""
     captured: dict[str, object] = {}
 
     class RecordingV1Manager(CppMambaHybridCacheManager):
@@ -431,7 +543,7 @@ def test_kimi_v1_manager_still_selects_qwen3_next_model_type(
     )
     kwargs = captured["kwargs"]
     assert "vocab_size" not in kwargs
-    assert kwargs["model_type"] == "qwen3_next"
+    assert kwargs["model_type"] == "kimi_linear"
     assert "conv_state_layout" not in kwargs
     assert "kda_replay_num_spec" not in kwargs
 
@@ -467,8 +579,8 @@ def test_v2_manager_rejects_model_type_kwarg() -> None:
 @pytest.mark.parametrize(
     ("use_v2", "enable_block_reuse", "expected"),
     [
-        (True, False, MambaHybridCacheManagerV2),
-        (True, True, MambaHybridCacheManagerV2),
+        (True, False, Qwen35HybridCacheManager),
+        (True, True, Qwen35HybridCacheManager),
         (False, True, CppMambaHybridCacheManager),
         ("auto", True, CppMambaHybridCacheManager),
     ],
@@ -532,7 +644,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
         mamba_ssm_cache_dtype=torch.bfloat16,
     )
     monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "1")
-    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor._util.get_sm_version", lambda: 90)
+    monkeypatch.setattr("tensorrt_llm._torch.modules.fla.cache_manager.get_sm_version", lambda: 90)
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor._util.extract_mamba_kv_cache_params",
         lambda *args, **kwargs: mamba_params,
@@ -575,19 +687,43 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
         **common_kwargs,
     )
 
-    assert captured_cpp["use_replay_state_update"] is True
+    assert captured_cpp["use_replay_state_update"] is None
     assert captured_cpp["model_type"] == "qwen3_next"
     assert captured_cpp["max_num_tokens"] == 256
     assert "vocab_size" not in captured_cpp
-    assert captured_mixed["use_replay_state_update"] is False
+    assert "vocab_size" not in captured_mixed
+    assert captured_mixed["use_replay_state_update"] is None
     assert captured_mixed["model_type"] == "qwen3_next"
     assert captured_mixed["max_num_tokens"] == 256
-    assert "vocab_size" not in captured_mixed
-    assert captured_v2["use_replay_state_update"] is True
+    assert captured_v2["use_replay_state_update"] is None
+    assert "speculative_state" not in captured_v2
+    mgr = object.__new__(Qwen35HybridCacheManager)
+    mgr.spec_config = common_kwargs["spec_config"]
+    mgr.ssm_state_dtype = torch.bfloat16
+    mgr._requested_replay = None
+    mgr.local_num_mamba_layers = 0
+    mgr._state_layout = SimpleNamespace(
+        spec_config=mgr.spec_config, mamba_pp_layers=(), n_groups_per_rank=1
+    )
+    mgr._speculative_state = mgr._initialize_spec_state()
+    assert isinstance(mgr._speculative_state, GDNReplayState)
     assert captured_v2["max_num_tokens"] == 256
     assert captured_v2["vocab_size"] == pretrained_config.vocab_size
     assert "model_type" not in captured_v2
     assert captured_v2["conv_state_layout"] == "q_k_v"
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.legacy import (
+        _resolve_legacy_replay_options,
+    )
+
+    for manager_cls, enabled in ((RecordingCppManager, True), (RecordingMixedManager, False)):
+        assert _resolve_legacy_replay_options(
+            manager_cls,
+            "qwen3_next",
+            common_kwargs["spec_config"],
+            torch.bfloat16,
+            False,
+            None,
+        ) == ("qwen3_next", enabled, None)
     fallback_logs = [str(call.args[0]) for call in info_log.call_args_list]
     assert any("RecordingMixedManager was selected" in log for log in fallback_logs)
     assert not any("RecordingV2Manager was selected" in log for log in fallback_logs)
@@ -630,7 +766,6 @@ def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls,
         dtype=torch.bfloat16,
         mamba_ssm_cache_dtype=torch.bfloat16,
     )
-    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor._util.get_sm_version", lambda: 90)
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor._util.extract_mamba_kv_cache_params",
         lambda *args, **kwargs: mamba_params,
@@ -751,7 +886,7 @@ def test_hybrid_cache_manager_factory_routes_explicit_v2_disagg(monkeypatch, bac
                 backend=backend, transceiver_runtime="PYTHON"
             ),
         )
-        is MambaHybridCacheManagerV2
+        is Qwen35HybridCacheManager
     )
 
 
@@ -949,7 +1084,7 @@ def test_qwen3_gdn_replay_uses_v2_preference(
     )
 
     assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is expected_v2
-    expected_manager = MambaHybridCacheManagerV2 if expected_v2 else CppMambaHybridCacheManager
+    expected_manager = Qwen35HybridCacheManager if expected_v2 else CppMambaHybridCacheManager
     assert (
         get_kv_cache_manager_cls(
             _hybrid_model_config(),
@@ -1027,7 +1162,34 @@ def test_kimi_disagg_rejects_non_python_transceiver_route(
         )
 
 
-def test_kimi_disagg_python_nixl_routes_to_mixed_manager(
+def test_kimi_disagg_defaults_use_v2_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Kimi's default V2 manager supports the resolved Python NIXL route."""
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
+
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    llm_args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False, tokens_per_block=64),
+        cache_transceiver_config=CacheTransceiverConfig(backend="NIXL", transceiver_runtime="auto"),
+    )
+    _resolve_transceiver_runtime_auto(llm_args, KimiLinearForCausalLM)
+    _resolve_kv_cache_manager_v2_auto(llm_args, KimiLinearForCausalLM)
+
+    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+    assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+    assert (
+        get_kv_cache_manager_cls(
+            _kimi_model_config(),
+            llm_args.kv_cache_config,
+            is_disagg=True,
+            cache_transceiver_config=llm_args.cache_transceiver_config,
+        )
+        is KimiK3HybridCacheManager
+    )
+
+
+def test_kimi_disagg_explicit_v1_python_nixl_routes_to_mixed_manager(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
@@ -1407,7 +1569,7 @@ def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
     mgr = object.__new__(CppMambaHybridCacheManager)
     mgr.local_num_mamba_layers = 1
     mgr._use_replay_state_update = True
-    mgr._dummy_request_mask = torch.tensor([False, True])
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.tensor([False, True]))
     mgr.prev_num_accepted_tokens = torch.tensor([13, 7], dtype=torch.int32)
     mgr.cache_buf_idx = torch.tensor([1, 0], dtype=torch.int32)
     mgr.replay_step_width = 4
@@ -1419,16 +1581,13 @@ def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
 
     promote_calls = []
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._promote_mamba_state_triton",
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.legacy._promote_mamba_state_triton",
         lambda *args, **kwargs: promote_calls.append((args, kwargs)),
     )
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._advance_replay_state",
-        lambda *args, **kwargs: pytest.fail(
-            "Cpp replay bookkeeping must not advance before conv promotion"
-        ),
-    )
 
+    mgr._generation_state_indices = torch.arange(64, dtype=torch.int32)
+    if not hasattr(mgr, "_dummy_request_mask"):
+        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(64, dtype=torch.bool))
     mgr.update_mamba_states(
         SimpleNamespace(num_seqs=2, num_contexts=0),
         torch.tensor([3, 2], dtype=torch.int32),
@@ -1653,7 +1812,73 @@ def test_v2_hybrid_snapshot_sizing_scales_with_pp_and_explicit_rules():
         mamba_state_config=MambaStateConfig(periodic_snapshot_interval=48),
     )
     assert mgr._num_ssm_states_per_typical_request(47, periodic_config) == 1
-    assert mgr._num_ssm_states_per_typical_request(48, periodic_config) == 1
+    assert mgr._num_ssm_states_per_typical_request(48, periodic_config) == 2
+
+
+@pytest.mark.parametrize(
+    "capacity, interval, from_start, from_end, reuse, branch, expected_states",
+    [
+        (128, 0, [], [], True, False, 1),
+        (128, 256, [], [], True, False, 1),
+        (47, 48, [], [], True, False, 1),
+        # At the endpoint, the snapshot and live state have identical values but
+        # separate storage so decoding can update the live state independently.
+        (48, 48, [], [], True, False, 2),
+        (49, 48, [], [], True, False, 2),
+        (128, 48, [], [], True, False, 3),
+        (128, 64, [], [], True, False, 3),
+        # Capacity models a typical length, not a hard limit: offset 129 is
+        # excluded from the from-start estimate. Each unique from-end offset
+        # counts separately, even if it coincides with another modeled point
+        # or needs a longer actual prompt to produce a positive position.
+        (128, 0, [64, 64, 128, 129], [0, 64, 128], True, False, 6),
+        (128, 64, [64, 64, 128, 129], [0, 32, 64, 128], True, False, 7),
+        (128, 48, [64, 96], [0, 32, 64], True, False, 7),
+        # Identical from-end offsets always coincide, regardless of prompt length.
+        (128, 0, [], [0, 64, 64, 128, 129], True, False, 5),
+        # max_seq_len is 256: reachable offsets above capacity still count,
+        # but offsets at or above the maximum cannot yield a positive position.
+        (128, 0, [], [128, 255, 255, 256, 4096], True, False, 3),
+        (128, 0, [], [256], True, False, 1),
+        (128, 0, [], [4096], True, False, 1),
+        (128, 0, [], [256, 4096], True, True, 2),
+        (128, 64, [32], [0], False, False, 1),
+        # Even a zero length estimate reserves space for configured from-end rules.
+        (0, 64, [32], [0], True, False, 2),
+        (128, 0, [], [], True, True, 2),
+        (128, 256, [], [], True, True, 2),
+        (128, 64, [], [], True, True, 3),
+        (128, 0, [32], [], True, True, 2),
+        (128, 0, [], [0], True, True, 2),
+    ],
+)
+def test_v2_hybrid_typical_state_count(
+    capacity: int,
+    interval: int,
+    from_start: list[int],
+    from_end: list[int],
+    reuse: bool,
+    branch: bool,
+    expected_states: int,
+) -> None:
+    config = KvCacheConfig(
+        max_gpu_total_bytes=32 << 20,
+        host_cache_size=0,
+        avg_seq_len=max(1, capacity),
+        enable_block_reuse=reuse,
+        block_reuse_config=BlockReuseConfig(enable_branch_snapshot=branch),
+        mamba_state_config=MambaStateConfig(
+            periodic_snapshot_interval=interval,
+            additional_snapshot_offsets_from_start=from_start,
+            additional_snapshot_offsets_from_end=from_end,
+        ),
+    )
+
+    # The conservative estimate can exceed runtime placement for a particular
+    # prompt length; expected_states includes one live state plus snapshots.
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.max_seq_len = 256
+    assert mgr._num_ssm_states_per_typical_request(capacity, config) == expected_states
 
 
 def test_cpp_mamba_estimator_handles_disabled_snapshots_without_attention():
@@ -1804,7 +2029,7 @@ def test_v2_hybrid_estimator_counts_dummy_states_without_attention_capacity(
         lambda *args, **kwargs: 11,
     )
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._get_local_mamba_cache_layout",
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common._get_local_mamba_cache_layout",
         lambda *args, **kwargs: (
             SimpleNamespace(get_states_bytes_per_layer=lambda mapping: 64),
             1,
@@ -1860,6 +2085,13 @@ def _base_attention_layer_configs(num_layers):
     ]
 
 
+def _install_default_v2_state(mgr):
+    """Populate local layer IDs for tests of V2 config building alone."""
+    mgr.mamba_pp_layers = [
+        layer_id for layer_id in mgr.pp_layers if mgr._mamba_layer_mask[layer_id]
+    ]
+
+
 def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies():
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.kv_cache_type = CacheTypeCpp.SELF
@@ -1876,6 +2108,7 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     mgr.tokens_per_block = 32
     mgr.num_local_layers = 2
     mgr.local_num_mamba_layers = 1
+    _install_default_v2_state(mgr)
     mgr._num_reserved_dummy_slots = 1
     mgr.dtype = DataType.HALF
     mgr.enable_swa_scratch_reuse = False
@@ -1908,7 +2141,11 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     assert isinstance(config.layers[1], AttentionLayerConfig)
     assert int(config.layers[1].layer_id) == int(base_layers[1].layer_id)
     assert config.typical_step == BatchDesc(
-        [KVCacheDesc(capacity=32, history_length=31)] * 6
+        (
+            [KVCacheDesc(capacity=20, history_length=19)]
+            + [KVCacheDesc(capacity=19, history_length=18)] * 4
+        )
+        * 2
         + [KVCacheDesc(capacity=0, history_length=0)]
     )
     # The caller-provided constraint keeps its dummy-slot padding.
@@ -1935,12 +2172,90 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     assert not hasattr(config.typical_step.kv_caches[0], "num_ssm_slots")
 
 
+@skip_no_cuda
+@pytest.mark.parametrize("pool_ratio", [None, [0.25, 0.75]])
+@pytest.mark.parametrize(
+    "interval, reuse, states_per_request, runtime_snapshots",
+    [(0, True, 3, 2), (48, True, 5, 3), (192, True, 3, 2), (48, False, 1, 0)],
+)
+def test_v2_hybrid_typical_batch_accounts_for_snapshot_retention(
+    pool_ratio: list[float] | None,
+    interval: int,
+    reuse: bool,
+    states_per_request: int,
+    runtime_snapshots: int,
+) -> None:
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=2,
+        max_num_tokens=128,
+        kv_cache_config=KvCacheConfig(
+            max_gpu_total_bytes=32 << 20,
+            host_cache_size=0,
+            enable_block_reuse=reuse,
+            pool_ratio=pool_ratio,
+            avg_seq_len=96,
+            mamba_state_config=MambaStateConfig(
+                periodic_snapshot_interval=interval,
+                additional_snapshot_offsets_from_start=[32],
+                additional_snapshot_offsets_from_end=[0],
+            ),
+        ),
+    )
+    try:
+        config = mgr.kv_cache_manager_py_config
+        assert isinstance(config.layers[0], SsmLayerConfig)
+        assert isinstance(config.layers[1], AttentionLayerConfig)
+        assert config.initial_pool_ratio == pool_ratio
+        if pool_ratio is None:
+            capacity_per_state, remainder = divmod(96, states_per_request)
+            capacities = [
+                capacity_per_state + int(i < remainder) for i in range(states_per_request)
+            ]
+            assert config.typical_step == BatchDesc(
+                [
+                    KVCacheDesc(capacity=capacity, history_length=capacity - 1)
+                    for capacity in capacities
+                ]
+                * 2
+                + [KVCacheDesc(capacity=0, history_length=0)]
+            )
+            assert sum(kv.capacity for kv in config.typical_step.kv_caches) == 2 * 96
+            assert (
+                BatchDesc(
+                    [
+                        KVCacheDesc(capacity=128, history_length=0),
+                        KVCacheDesc(capacity=0, history_length=0),
+                    ]
+                )
+                in config.constraints
+            )
+        else:
+            assert config.typical_step is None
+
+        # Snapshot retention affects the typical batch, not the feasibility floors.
+        assert BatchDesc([KVCacheDesc(capacity=0, history_length=0)] * 3) in config.constraints
+        assert len(config.constraints) == (2 if pool_ratio is None else 1)
+        assert mgr.all_ssm_states[0].shape[0] >= 3
+
+        request = LlmRequest(
+            request_id=1,
+            max_new_tokens=1,
+            input_tokens=list(range(96)),
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        mgr.prepare_expect_snapshot_points([request])
+        assert len(request.expect_snapshot_points) == runtime_snapshots
+    finally:
+        mgr.shutdown()
+
+
 def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.max_seq_len = 4096
     warnings_seen = []
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.logger.warning",
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2.logger.warning",
         lambda message: warnings_seen.append(message),
     )
 
@@ -1953,19 +2268,40 @@ def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
     assert "workload's average total sequence length" in warnings_seen[0]
 
 
+@skip_no_cuda
+def test_v2_hybrid_fallback_warns_about_snapshot_retention(monkeypatch) -> None:
+    warnings_seen = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2.logger.warning",
+        lambda message: warnings_seen.append(message),
+    )
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        kv_cache_config=KvCacheConfig(max_gpu_total_bytes=32 << 20, host_cache_size=0),
+    )
+    try:
+        assert len(warnings_seen) == 1
+        assert "snapshot retention" in warnings_seen[0]
+        assert "prompt-length upper bound" in warnings_seen[0]
+    finally:
+        mgr.shutdown()
+
+
 def test_v2_hybrid_rejects_quota_below_live_state_floor():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.layer_specs = None
     mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
     mgr.max_batch_size = 2
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     mgr.local_num_mamba_layers = 1
+    mgr._mamba_layer_mask = [True, False]
     mgr.ssm_bytes = 64
     mgr.conv_bytes = 32
     mgr._num_reserved_dummy_slots = 1
     mgr.tokens_per_block = 32
     mgr.num_local_layers = 2
     mgr.pp_layers = [0, 1]
+    _install_default_v2_state(mgr)
     mgr.max_attention_window_vec = [128, 128]
     mgr.max_num_tokens = 128
     mgr.enable_swa_scratch_reuse = False
@@ -1984,19 +2320,73 @@ def test_v2_hybrid_rejects_quota_below_live_state_floor():
         mgr._build_cache_config(base_config)
 
 
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "spec_config",
+    [
+        None,
+        MTPDecodingConfig(
+            max_draft_len=4,
+            acceptance_rate_window_size=8,
+            acceptance_rate_threshold=0.5,
+        ),
+    ],
+)
+def test_v2_hybrid_snapshot_retention_preserves_live_state_floor(
+    spec_config: MTPDecodingConfig | None,
+) -> None:
+    minimum_quotas = []
+    for interval in (0, 32):
+        mgr = _build_v2_hybrid_with_mamba_layer(
+            max_batch_size=2,
+            max_num_tokens=128,
+            spec_config=spec_config,
+            kv_cache_config=KvCacheConfig(
+                max_gpu_total_bytes=32 << 20,
+                host_cache_size=0,
+                enable_partial_reuse=False,
+                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=interval),
+            ),
+        )
+        try:
+            minimum_quotas.append(mgr._minimum_live_gpu_quota())
+            dummy_slots = 1 if spec_config is None else 2
+            assert mgr._num_reserved_dummy_slots == dummy_slots
+            assert mgr.all_ssm_states[0].shape[0] >= 2 + dummy_slots
+        finally:
+            mgr.shutdown()
+
+    assert minimum_quotas[0] == minimum_quotas[1]
+    with pytest.raises(ValueError, match="too small for live recurrent states"):
+        _build_v2_hybrid_with_mamba_layer(
+            max_batch_size=2,
+            max_num_tokens=128,
+            spec_config=spec_config,
+            kv_cache_config=KvCacheConfig(
+                max_gpu_total_bytes=minimum_quotas[0] - 1,
+                host_cache_size=0,
+                enable_partial_reuse=False,
+                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=32),
+            ),
+        )
+
+
 def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.layer_specs = None
     mgr._generation_kv_capacity_headroom = 1
     mgr._has_cp_helix = False
     mgr.max_batch_size = 2
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     mgr.local_num_mamba_layers = 1
+    mgr._mamba_layer_mask = [True]
     mgr.ssm_bytes = 64
     mgr.conv_bytes = 32
     mgr._num_reserved_dummy_slots = 1
     mgr.tokens_per_block = 32
     mgr.num_local_layers = 1
     mgr.pp_layers = [0]
+    _install_default_v2_state(mgr)
     mgr.max_attention_window_vec = [128]
     mgr.max_num_tokens = 128
     mgr.enable_swa_scratch_reuse = False
@@ -2069,11 +2459,11 @@ def test_cpp_hybrid_state_indices_skip_context_placeholders(
     mgr.recurrent_states_pool_index = 0
     mgr.blocks_per_window = {LinearCacheType.RECURRENT_STATES.value: (1264, 0)}
     mgr._host_state_indices = torch.zeros(1, dtype=torch.int32)
-    mgr.cuda_state_indices = torch.zeros(1, dtype=torch.int32)
+    mgr._state_indices_buffer = DeviceCopyBuffer(torch.zeros(1, dtype=torch.int32))
     mgr._row_indices = torch.arange(1, dtype=torch.long)
     mgr._request_id_to_state_index = {}
     mgr._request_id_to_is_dummy = {}
-    mgr._dummy_request_mask = None
+    mgr._dummy_request_mask_buffer = None
 
     mgr._setup_state_indices()
 
@@ -2214,6 +2604,7 @@ def test_expect_snapshot_points_binding_round_trip():
 def test_v2_hybrid_pool_ratio_controls_allocated_memory():
     def allocated_memory(pool_ratio):
         mgr = object.__new__(MambaHybridCacheManagerV2)
+        mgr.layer_specs = None
         mgr._generation_kv_capacity_headroom = 1
         mgr._has_cp_helix = False
         mgr.kv_cache_type = CacheTypeCpp.SELF
@@ -2230,6 +2621,7 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
         mgr.tokens_per_block = 32
         mgr.num_local_layers = 2
         mgr.local_num_mamba_layers = 1
+        _install_default_v2_state(mgr)
         mgr._num_reserved_dummy_slots = 1
         mgr.dtype = DataType.HALF
         mgr.enable_swa_scratch_reuse = False
@@ -2273,6 +2665,63 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
     assert high_actual_ratio == pytest.approx([0.75, 0.25])
     assert high_mamba_allocation[0] > low_mamba_allocation[0]
     assert high_mamba_allocation[1] < low_mamba_allocation[1]
+
+
+@skip_no_cuda
+def test_v2_hybrid_snapshot_retention_changes_automatic_pool_allocation() -> None:
+    def allocated_memory(
+        pool_ratio: list[float] | None, interval: int = 64
+    ) -> tuple[list[int], list[float]]:
+        # State demand must exceed the GPU allocation granularity for the
+        # automatic pool-ratio difference to be observable.
+        mgr = _build_v2_hybrid_with_mamba_layer(
+            max_batch_size=2,
+            max_num_tokens=128,
+            mamba_d_state=128,
+            mamba_head_dim=128,
+            mamba_num_heads=32,
+            kv_cache_config=KvCacheConfig(
+                max_gpu_total_bytes=64 << 20,
+                host_cache_size=0,
+                pool_ratio=pool_ratio,
+                avg_seq_len=96,
+                enable_partial_reuse=False,
+                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=interval),
+            ),
+        )
+        try:
+            assert mgr.kv_cache_manager_py_config.initial_pool_ratio == pool_ratio
+            statistics = mgr.impl.get_storage_statistics()
+            allocated_bytes = [
+                int(stats.total) * sum(int(size) for size in stats.slot_sizes)
+                for stats in statistics
+            ]
+            pool_groups = mgr.impl.get_life_cycle_pool_group_indices(0)
+            ratios = _introspection.current_gpu_ratio(mgr.impl)
+            return (
+                [allocated_bytes[int(group)] for group in pool_groups],
+                [ratios[int(group)] for group in pool_groups],
+            )
+        finally:
+            mgr.shutdown()
+
+    low_mamba_allocation, low_actual_ratio = allocated_memory([0.25, 0.75])
+    high_mamba_allocation, high_actual_ratio = allocated_memory([0.75, 0.25])
+
+    # Physical page sizes make the realized byte ratios approximate.
+    assert low_actual_ratio == pytest.approx([0.25, 0.75], abs=0.01)
+    assert high_actual_ratio == pytest.approx([0.75, 0.25], abs=0.01)
+    assert high_mamba_allocation[0] > low_mamba_allocation[0]
+    assert high_mamba_allocation[1] < low_mamba_allocation[1]
+
+    assert allocated_memory([0.25, 0.75], interval=0) == (
+        low_mamba_allocation,
+        low_actual_ratio,
+    )
+    no_periodic_allocation, _ = allocated_memory(None, interval=0)
+    periodic_allocation, _ = allocated_memory(None, interval=32)
+    assert periodic_allocation[0] > no_periodic_allocation[0]
+    assert periodic_allocation[1] < no_periodic_allocation[1]
 
 
 # ---------------------------------------------------------------------------
@@ -2358,12 +2807,26 @@ def _build_v2_hybrid_with_mamba_layer(
     dtype=DataType.HALF,
     kv_cache_dtype="auto",
     conv_state_layout="x_b_c",
+    speculative_state=None,
     mamba_d_conv=4,
     mamba_num_heads=4,
     mamba_n_groups=1,
     mamba_ssm_cache_dtype=torch.float16,
     kda_replay_num_spec=None,
-):
+    enable_kv_pool_rebalance=False,
+    max_tokens=512,
+    max_gpu_total_bytes=0,
+    kda_draft_records=False,
+    cold_tier_offload_min_priority=None,
+    host_cache_size=None,
+    is_disagg=False,
+    enable_stats=False,
+    model_manager_cls=None,
+    kv_cache_config: KvCacheConfig | None = None,
+    mamba_d_state: int = 8,
+    mamba_head_dim: int = 8,
+    max_num_tokens: int = 8192,
+) -> MambaHybridCacheManagerV2:
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
     attn_mask = [False] * num_mamba_layers + [True] * num_attention_layers
@@ -2375,28 +2838,65 @@ def _build_v2_hybrid_with_mamba_layer(
             pp_size=1,
             enable_attention_dp=enable_attention_dp,
         )
-    kv_cache_config = KvCacheConfig(
-        max_tokens=512,
-        enable_block_reuse=enable_block_reuse,
-        enable_partial_reuse=enable_partial_reuse,
-        block_reuse_config=BlockReuseConfig(
-            policy=block_reuse_policy,
-            max_num_turns=max_num_turns,
-        ),
-        enable_swa_scratch_reuse=enable_swa_scratch_reuse,
-        mamba_state_config=MambaStateConfig(
-            periodic_snapshot_interval=periodic_snapshot_interval,
-            additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end or []),
-            enable_branch_snapshot=enable_branch_snapshot,
-        ),
-        dtype=kv_cache_dtype,
+    if kv_cache_config is None:
+        kv_cache_config = KvCacheConfig(
+            max_tokens=max_tokens,
+            max_gpu_total_bytes=max_gpu_total_bytes,
+            enable_block_reuse=enable_block_reuse,
+            enable_partial_reuse=enable_partial_reuse,
+            block_reuse_config=BlockReuseConfig(
+                policy=block_reuse_policy,
+                max_num_turns=max_num_turns,
+                enable_branch_snapshot=enable_branch_snapshot,
+            ),
+            enable_swa_scratch_reuse=enable_swa_scratch_reuse,
+            mamba_state_config=MambaStateConfig(
+                periodic_snapshot_interval=periodic_snapshot_interval,
+                additional_snapshot_offsets_from_end=list(
+                    additional_snapshot_offsets_from_end or []
+                ),
+            ),
+            dtype=kv_cache_dtype,
+            enable_kv_pool_rebalance=enable_kv_pool_rebalance,
+            cold_tier_offload_min_priority=cold_tier_offload_min_priority,
+            host_cache_size=host_cache_size,
+        )
+    if speculative_state is None and kda_replay_num_spec is not None:
+        speculative_state = KDAReplayState(kda_replay_num_spec, draft_records=kda_draft_records)
+    model_cls = (
+        KimiK3HybridCacheManager
+        if isinstance(speculative_state, KDAReplayState) or kda_draft_records
+        else Qwen35HybridCacheManager
+        if conv_state_layout == "q_k_v"
+        else NemotronHybridCacheManager
     )
-    return MambaHybridCacheManagerV2(
-        mamba_d_state=8,
+    if model_manager_cls is not None:
+        model_cls = model_manager_cls
+
+    class ModelStateManager(model_cls):
+        def _initialize_spec_state(self):
+            if getattr(self, "kda_context_only", False):
+                return None
+            if kda_draft_records and speculative_state is None:
+                return KDAIntermediateState()
+            if speculative_state is None:
+                return super()._initialize_spec_state()
+            elif isinstance(speculative_state, KDAReplayState):
+                self._kda_replay = speculative_state
+                self._kda_replay.validate(self._state_layout)
+            else:
+                from tensorrt_llm._torch.modules.fla.cache_manager import validate_gdn_layout
+
+                validate_gdn_layout(self, speculative_state)
+            return speculative_state
+
+    manager_cls = ModelStateManager
+    return manager_cls(
+        mamba_d_state=mamba_d_state,
         mamba_d_conv=mamba_d_conv,
         mamba_num_heads=mamba_num_heads,
         mamba_n_groups=mamba_n_groups,
-        mamba_head_dim=8,
+        mamba_head_dim=mamba_head_dim,
         mamba_num_layers=num_mamba_layers,
         mamba_layer_mask=mamba_mask,
         mamba_cache_dtype=torch.float16,
@@ -2408,6 +2908,7 @@ def _build_v2_hybrid_with_mamba_layer(
         head_dim=64,
         tokens_per_block=32,
         max_seq_len=128,
+        max_num_tokens=max_num_tokens,
         max_batch_size=max_batch_size,
         mapping=mapping,
         spec_config=spec_config,
@@ -2416,7 +2917,15 @@ def _build_v2_hybrid_with_mamba_layer(
         use_replay_state_update=use_replay_state_update,
         dtype=dtype,
         conv_state_layout=conv_state_layout,
-        kda_replay_num_spec=kda_replay_num_spec,
+        is_disagg=is_disagg,
+        enable_stats=enable_stats,
+        **(
+            {"kda_draft_records": kda_draft_records}
+            if issubclass(model_cls, KimiK3HybridCacheManager)
+            else {"index_state_dim": 16}
+            if issubclass(model_cls, Glm5NextCacheManager)
+            else {}
+        ),
     )
 
 
@@ -2438,6 +2947,7 @@ def _make_v2_conversation_request(
     request_id: int,
     tokens: list[int],
     conversation_id: str,
+    retention: KvCacheRetentionConfig | None = None,
 ) -> LlmRequest:
     request = LlmRequest(
         request_id=request_id,
@@ -2445,6 +2955,7 @@ def _make_v2_conversation_request(
         input_tokens=tokens,
         sampling_config=SamplingConfig(),
         is_streaming=False,
+        kv_cache_retention_config=retention,
     )
     request.py_conversation_params = ConversationParams(conversation_id=conversation_id)
     return request
@@ -2453,6 +2964,8 @@ def _make_v2_conversation_request(
 def _run_v2_hybrid_context(
     manager: MambaHybridCacheManagerV2,
     request: LlmRequest,
+    *,
+    state_value: int | None = None,
 ) -> None:
     manager.prepare_expect_snapshot_points([request])
     assert manager.prepare_context(request)
@@ -2462,6 +2975,10 @@ def _run_v2_hybrid_context(
     batch = ScheduledRequests()
     batch.append_context_request(request)
     manager.prepare_resources(batch)
+    if state_value is not None:
+        state_index = manager.get_state_indices([request.py_request_id], [False])[0]
+        for buffer in (*manager.all_ssm_states, *manager.all_conv_states):
+            buffer[state_index].fill_(state_value)
     request.context_current_position = request.prompt_len
     assert request.context_remaining_length == 0
     manager.update_context_resources(batch)
@@ -2743,7 +3260,8 @@ def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
     log_debug = MagicMock()
     monkeypatch.setattr(KVCacheManagerV2, "_create_kv_cache", create_kv_cache)
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.logger.debug", log_debug
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2.logger.debug",
+        log_debug,
     )
 
     mgr = object.__new__(MambaHybridCacheManagerV2)
@@ -2811,7 +3329,8 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
     monkeypatch.setattr(KVCacheManagerV2, "get_iteration_stats", MagicMock(return_value=report))
     log_debug = MagicMock()
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.logger.debug", log_debug
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2.logger.debug",
+        log_debug,
     )
 
     mgr = object.__new__(MambaHybridCacheManagerV2)
@@ -2885,8 +3404,15 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
         block_reuse_policy="per_conversation",
         max_num_turns=2,
         additional_snapshot_offsets_from_end=[0],
+        cold_tier_offload_min_priority=50,
+        host_cache_size=0,
     )
-    request_a = _make_v2_conversation_request(1, list(range(64)), "conv-1")
+    request_a = _make_v2_conversation_request(
+        1,
+        list(range(64)),
+        "conv-1",
+        KvCacheRetentionConfig([KvCacheRetentionConfig.TokenRangeRetentionConfig(0, None, 80)]),
+    )
     request_b = _make_v2_conversation_request(2, list(range(100, 164)), "conv-1")
     # Use fresh conversation IDs so probes query the shared prefix cache
     # without altering conv-1's retained-turn accounting.
@@ -2906,12 +3432,25 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
         request_b_after_eviction,
     ]
 
+    def assert_reused_state(request: LlmRequest, value: int) -> None:
+        state_index = mgr.get_state_indices([request.py_request_id], [False])[0]
+        # Reuse preserves payloads even when cache offload/onboard moves their slots.
+        for buffer in (*mgr.all_ssm_states, *mgr.all_conv_states):
+            torch.testing.assert_close(
+                buffer[state_index], torch.full_like(buffer[state_index], value), rtol=0, atol=0
+            )
+
     try:
-        _run_v2_hybrid_context(mgr, request_a)
-        request_a_state_index = mgr.get_state_indices([request_a.py_request_id], [False])[0]
+        _run_v2_hybrid_context(mgr, request_a, state_value=1)
+        cache_a = mgr.kv_cache_map[request_a.py_request_id]
+        attention_group = mgr.impl.get_layer_group_id(1)
+        priorities = cache_a.get_page_priorities(attention_group)
+        assert priorities and set(priorities) == {80}
+        assert mgr.impl.init_config.cold_tier_offload_min_priority == 50
+        assert not mgr.can_evict
+        assert mgr.prefetch_for_context_tokens([request_a]) is True
         mgr.free_resources(request_a)
-        _run_v2_hybrid_context(mgr, request_b)
-        request_b_state_index = mgr.get_state_indices([request_b.py_request_id], [False])[0]
+        _run_v2_hybrid_context(mgr, request_b, state_value=2)
         mgr.free_resources(request_b)
 
         mgr.prepare_expect_snapshot_points([request_a_probe])
@@ -2920,9 +3459,7 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
         probe_batch.append_context_request(request_a_probe)
         mgr.prepare_resources(probe_batch)
         assert request_a_probe.prepopulated_prompt_len == request_a_probe.prompt_len - 1
-        assert mgr.get_state_indices([request_a_probe.py_request_id], [False]) == [
-            request_a_state_index
-        ]
+        assert_reused_state(request_a_probe, 1)
         mgr.free_resources(request_a_probe)
 
         mgr.prepare_expect_snapshot_points([request_b_probe])
@@ -2931,12 +3468,10 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
         probe_batch.append_context_request(request_b_probe)
         mgr.prepare_resources(probe_batch)
         assert request_b_probe.prepopulated_prompt_len == request_b_probe.prompt_len - 1
-        assert mgr.get_state_indices([request_b_probe.py_request_id], [False]) == [
-            request_b_state_index
-        ]
+        assert_reused_state(request_b_probe, 2)
         mgr.free_resources(request_b_probe)
 
-        _run_v2_hybrid_context(mgr, request_c)
+        _run_v2_hybrid_context(mgr, request_c, state_value=3)
         mgr.free_resources(request_c)
 
         mgr.prepare_expect_snapshot_points([request_a_after_eviction])
@@ -2952,9 +3487,7 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
             request_b_after_eviction.prepopulated_prompt_len
             == request_b_after_eviction.prompt_len - 1
         )
-        assert mgr.get_state_indices([request_b_after_eviction.py_request_id], [False]) == [
-            request_b_state_index
-        ]
+        assert_reused_state(request_b_after_eviction, 2)
     finally:
         for request in requests:
             if request.py_request_id in mgr.kv_cache_map:
@@ -2977,10 +3510,10 @@ def _branch_snapshot_manager(
     mgr.local_num_mamba_layers = local_num_mamba_layers
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=enable_block_reuse,
+        block_reuse_config=BlockReuseConfig(enable_branch_snapshot=enable_branch_snapshot),
         mamba_state_config=MambaStateConfig(
             periodic_snapshot_interval=periodic_snapshot_interval,
             additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end or []),
-            enable_branch_snapshot=enable_branch_snapshot,
         ),
     )
     mgr._branch_snapshot_points = {}
@@ -3343,7 +3876,7 @@ def test_branch_snapshot_entry_is_released_with_the_request():
         enable_branch_snapshot=True,
     )
     try:
-        assert mgr.kv_cache_config.mamba_state_config.enable_branch_snapshot
+        assert mgr.kv_cache_config.block_reuse_config.enable_branch_snapshot
         request = _fake_context_request(rid=11, prompt_len=128)
         mgr._record_branch_snapshot_point(
             request, _fake_reuse_match(divergence=64), num_lookup_tokens=127
@@ -3385,7 +3918,7 @@ def test_branch_snapshot_coexists_with_per_conversation_and_zero_interval():
     try:
         assert mgr.block_reuse_policy is BlockReusePolicy.PER_CONVERSATION
         assert mgr.kv_cache_config.mamba_state_config.periodic_snapshot_interval == 0
-        assert mgr.kv_cache_config.mamba_state_config.enable_branch_snapshot
+        assert mgr.kv_cache_config.block_reuse_config.enable_branch_snapshot
         assert mgr.tokens_per_block == 32
 
         request = _fake_context_request(rid=13, prompt_len=150)
@@ -3593,8 +4126,12 @@ def test_v2_hybrid_intermediate_states_size_by_tokens_per_gen_step():
 
 
 @skip_no_cuda
-def test_v2_kda_replay_allocates_logical_slot_caches():
+@pytest.mark.parametrize("max_tokens,byte_limit", [(512, 0), (None, 16 << 20), (512, 16 << 20)])
+def test_v2_kda_replay_policy_allocates_logical_slot_caches(max_tokens, byte_limit):
     spec_config = MTPDecodingConfig(max_draft_len=2)
+    policy = KDAReplayState(
+        num_speculative_tokens=2,
+    )
     mgr = _build_v2_hybrid_with_mamba_layer(
         max_batch_size=4,
         num_mamba_layers=2,
@@ -3604,24 +4141,34 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
         mamba_num_heads=6,
         mamba_n_groups=6,
         mamba_ssm_cache_dtype=torch.float32,
-        kda_replay_num_spec=2,
+        speculative_state=policy,
+        max_tokens=max_tokens,
+        max_gpu_total_bytes=byte_limit,
     )
     try:
-        assert mgr.intermediate_ssm_states is None
-        assert mgr.intermediate_conv_states is None
-        assert mgr.intermediate_state_indices.shape == (4,)
-        assert not mgr.use_replay_state_update
+        assert mgr._kda_replay is policy
+        assert policy.intermediate_indices.shape == (4,)
+        assert not hasattr(mgr, "get_replay_state_update_metadata")
+
+        native_bytes = mgr.impl.get_quota(GPU_LEVEL)
+        assert mgr._get_external_cache_bytes(mgr.impl) == 0
+        if byte_limit:
+            assert native_bytes <= byte_limit
+        assert mgr.kv_cache_manager_py_config.cache_tiers[0].quota <= native_bytes
 
         layer_cache = mgr.mamba_layer_cache(0)
+        assert not hasattr(layer_cache, "intermediate_ssm")
+        assert not hasattr(layer_cache, "intermediate_conv_window")
         cache_size = layer_cache.temporal.shape[0]
         assert layer_cache.kda_conv_q.shape == (cache_size, 48, 6)
         assert layer_cache.kda_conv_k.shape == (cache_size, 48, 6)
         assert layer_cache.kda_conv_v.shape == (cache_size, 48, 6)
-        assert layer_cache.kda_conv_q.dtype is torch.float32
+        assert layer_cache.kda_conv_q.dtype is torch.bfloat16
         assert layer_cache.kda_conv_q.stride(-2) == 1
-        assert layer_cache.kda_qkg_cache.shape == (cache_size, 2, 3, 48)
+        assert layer_cache.kda_k_cache.shape == (cache_size, 2, 48)
+        assert layer_cache.kda_g_cache.shape == (cache_size, 2, 48)
         assert layer_cache.kda_v_cache.shape == (cache_size, 2, 48)
-        # Six fp32 heads are 24 bytes, so the row is padded to 32 (stride 8)
+        # Six bf16 heads are 12 bytes, so the row is padded to 16 (stride 8)
         # to keep every nested per-draft view 16-byte aligned for CuTe.
         assert layer_cache.kda_beta_cache.shape == (cache_size, 2, 6)
         assert layer_cache.kda_beta_cache.stride(-2) == 8
@@ -3629,61 +4176,337 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
             for slot_idx in range(cache_size):
                 for draft_idx in range(2):
                     assert (
-                        mgr.kda_beta_cache[layer_idx, slot_idx, draft_idx].data_ptr()
+                        mgr.mamba_layer_cache(layer_idx)
+                        .kda_beta_cache[slot_idx, draft_idx]
+                        .data_ptr()
                         % _KDA_BETA_CACHE_ALIGNMENT_BYTES
                         == 0
                     )
-        assert layer_cache.kda_qkg_cache.dtype is torch.float32
+        assert layer_cache.kda_k_cache.dtype is torch.bfloat16
+        assert layer_cache.kda_g_cache.dtype is torch.float32
+        assert layer_cache.kda_v_cache.dtype is torch.bfloat16
+        assert layer_cache.kda_beta_cache.dtype is torch.bfloat16
         assert layer_cache.prev_num_accepted_tokens.data_ptr() == (
-            mgr.prev_num_accepted_tokens.data_ptr()
+            policy.prev_num_accepted_tokens.data_ptr()
         )
-        assert layer_cache.intermediate_ssm is None
-        assert layer_cache.intermediate_conv_window is None
+        assert not hasattr(layer_cache, "intermediate_ssm")
+        assert not hasattr(layer_cache, "intermediate_conv_window")
     finally:
         mgr.shutdown()
 
 
 @pytest.mark.parametrize(
-    ("spec_config", "use_replay_state_update", "conv_state_layout", "num_spec", "match"),
+    ("spec_config", "conv_state_layout", "num_spec", "match"),
     [
-        (None, False, "q_k_v", 2, "require speculative decoding"),
+        (None, "q_k_v", 2, "require speculative decoding"),
         (
             MTPDecodingConfig(max_draft_len=2),
-            True,
-            "q_k_v",
-            2,
-            "mutually exclusive",
-        ),
-        (
-            MTPDecodingConfig(max_draft_len=2),
-            False,
             "q_k_v",
             1,
             "must match the draft length",
         ),
         (
             MTPDecodingConfig(max_draft_len=2),
-            False,
             "x_b_c",
             2,
             "requires conv_state_layout='q_k_v'",
         ),
+        (
+            MTPDecodingConfig(max_draft_len=2),
+            "q_k_v",
+            2,
+            "require equal",
+        ),
     ],
 )
-def test_v2_kda_replay_validates_configuration(
+def test_v2_kda_replay_policy_validates_configuration(
     spec_config,
-    use_replay_state_update,
     conv_state_layout,
     num_spec,
     match,
 ):
+    policy = KDAReplayState(
+        num_speculative_tokens=num_spec,
+    )
     with pytest.raises(ValueError, match=match):
         _build_v2_hybrid_with_mamba_layer(
             spec_config=spec_config,
-            use_replay_state_update=use_replay_state_update,
             conv_state_layout=conv_state_layout,
-            kda_replay_num_spec=num_spec,
+            speculative_state=policy,
         )
+
+
+@skip_no_cuda
+def test_v2_kda_replay_policy_supports_attention_only_pp_rank():
+    policy = KDAReplayState(
+        num_speculative_tokens=2,
+    )
+    mapping = Mapping(world_size=2, rank=1, tp_size=1, pp_size=2)
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=1,
+        mapping=mapping,
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        conv_state_layout="q_k_v",
+        mamba_n_groups=4,
+        speculative_state=policy,
+    )
+    try:
+        assert mgr.local_num_mamba_layers == 0
+        assert mgr._kda_replay is policy
+        assert policy.prev_num_accepted_tokens is None
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("kda_replay", [True, False], ids=["kda_replay", "no_replay"])
+def test_v2_kda_replay_refuses_kv_pool_rebalance(kda_replay):
+    """The KDA replay caches and prev_num_accepted_tokens hold one entry per SSM slot the pool keeps at construction,
+    and a KV pool rebalance can grow that pool past them, so the manager refuses enable_kv_pool_rebalance with them;
+    without them the rebalance stays allowed."""
+    if not kda_replay:
+        _build_v2_hybrid_with_mamba_layer(enable_kv_pool_rebalance=True).shutdown()
+        return
+    with pytest.raises(ValueError, match="enable_kv_pool_rebalance=False"):
+        _build_v2_hybrid_with_mamba_layer(
+            spec_config=MTPDecodingConfig(max_draft_len=2),
+            conv_state_layout="q_k_v",
+            mamba_n_groups=4,
+            mamba_ssm_cache_dtype=torch.float32,
+            kda_replay_num_spec=2,
+            enable_kv_pool_rebalance=True,
+        )
+
+
+def _v2_kda_draft_record_manager(kda_draft_records, enable_block_reuse):
+    """A V2 hybrid manager stub for _build_cache_config: one KDA layer with the replay caches and one attention
+    layer."""
+    mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr.layer_specs = None
+    mgr._generation_kv_capacity_headroom = 1
+    mgr._has_cp_helix = False
+    mgr.kv_cache_type = CacheTypeCpp.SELF
+    mgr.head_dim_per_layer = [64, 64]
+    mgr.pp_layers = [0, 1]
+    mgr.mamba_pp_layers = [0]
+    mgr._mamba_layer_mask = [True, False]
+    # One 2 MiB grain per state slot, so the pool's slot count follows its grains (a Kimi K3 slot holds 27 MB).
+    mgr.ssm_bytes = 2 << 20
+    mgr.conv_bytes = 64 << 10
+    mgr.max_attention_window_vec = [128, 128]
+    mgr.max_batch_size = 2
+    mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+    mgr.max_seq_len = 128
+    mgr.max_num_tokens = 128
+    mgr.tokens_per_block = 32
+    mgr.num_local_layers = 2
+    mgr.local_num_mamba_layers = 1
+    mgr._num_reserved_dummy_slots = 1
+    mgr.dtype = DataType.HALF
+    mgr.enable_swa_scratch_reuse = False
+    mgr.enable_stats = False
+    mgr.num_extra_kv_tokens = 0
+    mgr.get_layer_bytes_per_token = lambda **kwargs: 8
+    # Layer 1's 256-byte pages of 32 tokens (_base_attention_layer_configs; layer 0 becomes the SSM layer).
+    mgr._attention_cache_bytes_per_token = lambda: 8
+    mgr._kda_replay = KDAReplayState(2, draft_records=kda_draft_records)
+    # The replay buffers count in each slot's state bytes (_mamba_state_bytes_per_slot); the drafts' records are,
+    # per draft, vn, beta * k and the decay, fp32 [H, K] each (24 KiB here).
+    mgr.ssm_state_shape = [8, 256, 256]
+    mgr.conv_section_dims = [8 * 256] * 3
+    mgr.conv_state_shape = [3 * 8 * 256, 3]
+    mgr._state_layout = SimpleNamespace(
+        mamba_pp_layers=tuple(mgr.mamba_pp_layers),
+        ssm_state_shape=tuple(mgr.ssm_state_shape),
+        conv_state_shape=tuple(mgr.conv_state_shape),
+        conv_section_dims=tuple(mgr.conv_section_dims),
+    )
+    mgr.kv_cache_config = KvCacheConfig(
+        avg_seq_len=64,
+        enable_block_reuse=enable_block_reuse,
+        enable_partial_reuse=False,
+    )
+    return mgr
+
+
+def _ring_gate_manager(
+    *,
+    draft_len=3,
+    head_dim=128,
+    d_state=128,
+    conv_dtype=torch.bfloat16,
+    ssm_dtype=torch.bfloat16,
+    conv_state_layout="q_k_v",
+    mamba_pp_layers=(0,),
+):
+    return SimpleNamespace(
+        spec_config=MTPDecodingConfig(max_draft_len=draft_len),
+        _state_layout=SimpleNamespace(
+            mamba_pp_layers=mamba_pp_layers,
+            ssm_state_shape=(4, head_dim, d_state) if mamba_pp_layers else (),
+            conv_state_dtype=conv_dtype,
+            ssm_state_dtype=ssm_dtype,
+            conv_state_layout=conv_state_layout,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("env", "replay_enabled", "available", "overrides", "expected", "warns"),
+    [
+        ("1", True, True, {}, True, False),
+        ("1", True, True, {"draft_len": 7}, True, False),
+        (None, True, True, {}, False, False),
+        ("1", False, True, {}, False, True),
+        ("1", True, False, {}, False, True),
+        ("1", True, True, {"ssm_dtype": torch.float32}, False, True),
+        ("1", True, True, {"conv_dtype": torch.float16}, False, True),
+        ("1", True, True, {"head_dim": 64}, False, True),
+        ("1", True, True, {"draft_len": 2}, False, True),
+        ("1", True, True, {"conv_state_layout": "x_b_c"}, False, True),
+        ("force", True, True, {"mamba_pp_layers": ()}, False, False),
+    ],
+    ids=[
+        "eligible_T4",
+        "eligible_T8",
+        "not_opted_in",
+        "replay_off",
+        "kernel_unavailable",
+        "fp32_state",
+        "fp16_model",
+        "head_dim_64",
+        "T3",
+        "x_b_c_layout",
+        "no_local_gdn_layers",
+    ],
+)
+def test_gdn_flashinfer_ring_replay_gate(
+    monkeypatch, env, replay_enabled, available, overrides, expected, warns
+):
+    if env is None:
+        monkeypatch.delenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", env)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fla.flashinfer_cached_replay."
+        "is_flashinfer_cached_replay_available",
+        lambda: available,
+    )
+    warning_log = MagicMock()
+    monkeypatch.setattr("tensorrt_llm._torch.modules.fla.cache_manager.logger.warning", warning_log)
+
+    assert _use_flashinfer_ring_replay(_ring_gate_manager(**overrides), replay_enabled) is expected
+    assert warning_log.called is warns
+
+
+@pytest.mark.parametrize("available", [True, False], ids=["eligible", "kernel_unavailable"])
+def test_gdn_flashinfer_ring_replay_gate_force(monkeypatch, available):
+    monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "force")
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fla.flashinfer_cached_replay."
+        "is_flashinfer_cached_replay_available",
+        lambda: available,
+    )
+    if available:
+        assert _use_flashinfer_ring_replay(_ring_gate_manager(), True) is True
+    else:
+        with pytest.raises(RuntimeError, match="force"):
+            _use_flashinfer_ring_replay(_ring_gate_manager(), True)
+
+
+def test_gdn_flashinfer_ring_replay_gate_force_replay_disabled(monkeypatch):
+    monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "force")
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fla.flashinfer_cached_replay."
+        "is_flashinfer_cached_replay_available",
+        lambda: True,
+    )
+    with pytest.raises(RuntimeError, match="requires GDN replay"):
+        _use_flashinfer_ring_replay(_ring_gate_manager(), False)
+
+
+@skip_no_cuda
+def test_v2_gdn_ring_replay_allocates_rings_instead_of_double_buffer():
+    policy = GDNReplayState(tokens_per_gen_step=4, use_flashinfer_ring=True)
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=2,
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        conv_state_layout="q_k_v",
+        speculative_state=policy,
+    )
+    ring_size = FLASHINFER_REPLAY_RING_SIZE
+    try:
+        assert mgr.use_gdn_flashinfer_ring_replay
+        assert not mgr.use_gdn_cached_replay_all_layer_commit
+        assert policy.old_x is None and policy.old_B is None
+        assert policy.old_dt is None and policy.old_dA_cumsum is None
+        nheads, head_dim, d_state = mgr.ssm_state_shape
+        layers, slots = mgr.local_num_mamba_layers, policy.cache_base.shape[0]
+        n_groups = mgr._state_layout.n_groups_per_rank
+        assert policy.k_ring.shape == (layers, slots, n_groups, ring_size, d_state)
+        assert policy.u_ring.shape == (layers, slots, nheads, ring_size, head_dim)
+        assert policy.g_ring.shape == (layers, slots, nheads, ring_size)
+        assert policy.g_ring.dtype == torch.float32
+        for t in (policy.cache_base, policy.k_ring, policy.u_ring, policy.g_ring):
+            assert not t.any()
+
+        layer_cache = mgr.mamba_layer_cache(1)
+        offset = mgr.mamba_layer_offsets[1]
+        assert layer_cache.old_x is None
+        assert layer_cache.cache_base is policy.cache_base
+        assert layer_cache.k_ring.data_ptr() == policy.k_ring[offset].data_ptr()
+        assert layer_cache.u_ring.data_ptr() == policy.u_ring[offset].data_ptr()
+        assert layer_cache.g_ring.data_ptr() == policy.g_ring[offset].data_ptr()
+    finally:
+        mgr.shutdown()
+    assert policy.cache_base is None and policy.k_ring is None
+    assert policy.u_ring is None and policy.g_ring is None
+
+
+def test_v2_gdn_ring_replay_update_advances_ring_start():
+    policy = GDNReplayState(tokens_per_gen_step=4, use_flashinfer_ring=True)
+    policy.prev_num_accepted_tokens = torch.tensor([13, 13, 2, 13, 13], dtype=torch.int32)
+    policy.cache_buf_idx = torch.zeros(5, dtype=torch.int32)
+    policy.cache_base = torch.tensor([5, 20, 30, 7, 9], dtype=torch.int32)
+
+    # Slot 0 holds a context request, slot 3 a dummy and slot 4 CUDA-graph padding.
+    generation_slots = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    policy.update(
+        MambaAcceptanceBatch(
+            attention_metadata=None,
+            num_contexts=1,
+            num_generations=4,
+            num_accepted_tokens=torch.tensor([3, 2, 3, 3], dtype=torch.int32),
+            accepted_positions=torch.tensor([2, 1, 2, 2], dtype=torch.int32),
+            source_state_indices=generation_slots,
+            destination_state_indices=generation_slots,
+            is_dummy_request=torch.tensor([False, False, True, True]),
+        )
+    )
+
+    # Slot 1 flushed (13 + 4 > 16): its start moves past the 13 folded rows and
+    # wraps, (20 + 13) % 32 = 1. Slot 2 only appended. Others are untouched.
+    assert policy.cache_base.tolist() == [5, 1, 30, 7, 9]
+    assert policy.prev_num_accepted_tokens.tolist() == [13, 3, 4, 13, 13]
+
+
+def test_v2_gdn_ring_replay_resets_context_slots():
+    policy = GDNReplayState(tokens_per_gen_step=4, use_flashinfer_ring=True)
+    policy.prev_num_accepted_tokens = torch.tensor([5, 6, 7], dtype=torch.int32)
+    policy.cache_buf_idx = torch.ones(3, dtype=torch.int32)
+    policy.cache_base = torch.tensor([5, 6, 7], dtype=torch.int32)
+    ring_size = FLASHINFER_REPLAY_RING_SIZE
+    policy.k_ring = torch.ones(2, 3, 1, ring_size, 4)
+    policy.u_ring = torch.ones(2, 3, 2, ring_size, 4)
+    policy.g_ring = torch.ones(2, 3, 2, ring_size)
+
+    policy.reset_slots(torch.tensor([2]), [2])
+
+    assert policy.prev_num_accepted_tokens.tolist() == [5, 6, 0]
+    assert policy.cache_base.tolist() == [5, 6, 0]
+    for ring in (policy.k_ring, policy.u_ring, policy.g_ring):
+        assert not ring[:, 2].any()  # the new request's slot, in every layer
+        assert ring[:, :2].all()  # other slots untouched
 
 
 def test_mamba_cache_manager_delegates_kda_replay_capability() -> None:
@@ -3693,43 +4516,67 @@ def test_mamba_cache_manager_delegates_kda_replay_capability() -> None:
     assert mgr.use_kda_replay_update
 
 
-def test_v2_kda_replay_records_acceptance_and_skips_dummy_rows():
-    mgr = object.__new__(MambaHybridCacheManagerV2)
+def test_v2_kda_replay_policy_records_acceptance_and_skips_dummy_rows():
+    mgr = object.__new__(KimiK3HybridCacheManager)
     mgr.local_num_mamba_layers = 1
-    mgr._use_kda_replay_update = True
-    mgr._use_replay_state_update = False
-    mgr.prev_num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32)
-    mgr._dummy_request_mask = torch.tensor([False, False, True])
+    policy = KDAReplayState(
+        num_speculative_tokens=2,
+    )
+    policy.prev_num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32)
+    policy.intermediate_indices = torch.arange(3, dtype=torch.int32)
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.tensor([False, False, True]))
+    mgr._kda_replay = policy
+    mgr._speculative_state = policy
 
+    mgr._generation_state_indices = torch.arange(64, dtype=torch.int32)
+    if not hasattr(mgr, "_dummy_request_mask"):
+        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(64, dtype=torch.bool))
     mgr.update_mamba_states(
         SimpleNamespace(num_seqs=3, num_contexts=1),
         torch.tensor([1, 3, 2], dtype=torch.int32),
         state_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
     )
 
-    assert mgr.prev_num_accepted_tokens.tolist() == [7, 2, 9]
+    assert policy.prev_num_accepted_tokens.tolist() == [7, 2, 9]
 
 
-def test_v2_kda_replay_resets_context_slots():
-    mgr = object.__new__(MambaHybridCacheManagerV2)
-    mgr._use_kda_replay_update = True
-    mgr._use_replay_state_update = False
-    mgr.cuda_state_indices = torch.tensor([2, 1], dtype=torch.int32)
-    mgr.prev_num_accepted_tokens = torch.tensor([5, 6, 7], dtype=torch.int32)
-    mgr.mamba_ssm_rand_seed = None
+def test_legacy_mamba_cache_manager_delegates_kda_replay_capability() -> None:
+    mgr = object.__new__(MambaCacheManager)
+    mgr._impl = SimpleNamespace(use_kda_replay_update=True)
 
+    assert mgr.use_kda_replay_update
+
+
+def test_v2_kda_replay_policy_resets_context_slots():
+    mgr = object.__new__(KimiK3HybridCacheManager)
+    policy = KDAReplayState(
+        num_speculative_tokens=2,
+    )
+    policy.prev_num_accepted_tokens = torch.tensor([5, 6, 7], dtype=torch.int32)
+    mgr._kda_replay = policy
+    mgr._speculative_state = policy
+    mgr._state_indices_buffer = DeviceCopyBuffer(torch.tensor([2, 1], dtype=torch.int32))
+    mgr._host_state_indices = torch.tensor([2, 1], dtype=torch.int32)
+
+    mgr._host_state_indices = mgr.cuda_state_indices.clone()
     mgr._reset_context_mamba_slots(num_contexts=1)
 
-    assert mgr.prev_num_accepted_tokens.tolist() == [5, 6, 0]
+    assert policy.prev_num_accepted_tokens.tolist() == [5, 6, 0]
 
 
 def test_v2_kda_replay_host_drafter_records_active_requests(monkeypatch):
-    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr = object.__new__(KimiK3HybridCacheManager)
     mgr.local_num_mamba_layers = 1
-    mgr._record_kda_replay_in_update_resources = True
+    mgr.spec_config = SimpleNamespace(decoding_type="NGram")
     mgr._request_id_to_state_index = {101: 1, 303: 2}
     mgr._request_id_to_is_dummy = {101: False, 303: True}
-    mgr.prev_num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32)
+    policy = KDAReplayState(
+        num_speculative_tokens=2,
+    )
+    policy.prev_num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32)
+    mgr._kda_replay = policy
+    mgr._speculative_state = policy
+    policy.acceptance_pending = {101, 202, 404}
     base_update = MagicMock()
     monkeypatch.setattr(KVCacheManagerV2, "update_resources", base_update)
     active = SimpleNamespace(
@@ -3752,112 +4599,497 @@ def test_v2_kda_replay_host_drafter_records_active_requests(monkeypatch):
     mgr.update_resources(scheduled_batch)
 
     base_update.assert_called_once_with(scheduled_batch, None, None)
-    assert mgr.prev_num_accepted_tokens.tolist() == [7, 2, 9]
+    assert policy.prev_num_accepted_tokens.tolist() == [7, 2, 9]
+    # The batch's acceptances are recorded; another batch's are still pending.
+    assert policy.acceptance_pending == {404}
 
 
-@skip_no_cuda
-def test_v2_kda_replay_relocates_live_slot_history():
-    mgr = _build_v2_hybrid_with_mamba_layer(
-        spec_config=MTPDecodingConfig(max_draft_len=2),
-        conv_state_layout="q_k_v",
-        mamba_n_groups=4,
+_KDA_REPLAY_BUFFERS = (
+    "kda_conv_q",
+    "kda_conv_k",
+    "kda_conv_v",
+    "kda_k_cache",
+    "kda_g_cache",
+    "kda_v_cache",
+    "kda_beta_cache",
+)
+
+
+class _SlotCache:
+    """A V2 KV cache stand-in that reports one SSM slot and can be suspended."""
+
+    def __init__(self, slot: int) -> None:
+        self.slot = slot
+        self.is_active = True
+
+    def get_ssm_block_base_index(self, _layer_group_id) -> int:
+        return self.slot
+
+    def suspend(self) -> None:
+        self.is_active = False
+
+
+def _v2_kda_replay_stub(num_slots=4, manager_cls=KimiK3HybridCacheManager, draft_records=False):
+    """A V2 hybrid manager stub with CPU KDA replay buffers and one layer's V2 conv states ([Q | K | V] sections of 2
+    channels, a committed window of 3), for the state-index setup that prepare_resources runs. Committing pending drafts
+    is recorded instead of run (it needs the GPU kernels)."""
+    mgr = object.__new__(manager_cls)
+    mgr.local_num_mamba_layers = 1
+    mgr._kda_replay = KDAReplayState(2, draft_records=draft_records)
+    mgr._speculative_state = mgr._kda_replay
+    mgr.spec_config = SimpleNamespace(decoding_type="MTP")
+    mgr._stream = None
+    mgr._request_id_to_state_index = {}
+    mgr._request_id_to_is_dummy = {}
+    mgr._kda_replay.suspended_requests = set()
+    mgr._kda_replay.acceptance_pending = set()
+    mgr._kda_replay.unseeded_requests = set()
+    mgr._host_state_indices = torch.zeros(num_slots, dtype=torch.int32)
+    mgr._state_indices_buffer = DeviceCopyBuffer(torch.zeros(num_slots, dtype=torch.int32))
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(num_slots, dtype=torch.bool))
+    mgr._dummy_request_mask_host = torch.zeros(num_slots, dtype=torch.bool)
+    mgr.kv_cache_map = {}
+    mgr.ssm_layer_group_id = 0
+    mgr._kda_replay.prev_num_accepted_tokens = torch.zeros(num_slots, dtype=torch.int32)
+    for name in _KDA_REPLAY_BUFFERS:
+        setattr(mgr._kda_replay, name, torch.zeros(1, num_slots, 2, 4))
+    if draft_records:
+        for name in _KDA_REPLAY_BUFFERS[3:]:
+            setattr(mgr._kda_replay, name, None)
+        mgr._kda_replay.kda_state_tok = torch.zeros(1, num_slots, 3, 2, 1, 2)
+    mgr.conv_state_shape = [6, 3]
+    mgr.conv_section_dims = [2, 2, 2]
+    mgr.all_conv_states = [torch.zeros(num_slots, 6, 3)]
+    mgr._kda_replay._conv_states = tuple(mgr.all_conv_states)
+    mgr._kda_replay._committed_window = 3
+    mgr._kda_replay._conv_section_dims = (2, 2, 2)
+    mgr.committed_slots = []
+    mgr._kda_replay.commit_pending_drafts = mgr.committed_slots.append
+    mgr._kda_replay.on_cache_stream = lambda stream: contextlib.nullcontext()
+    return mgr
+
+
+def _write_kda_replay_slot(mgr, slot, accepted, value):
+    """What a verify step leaves in its request's slot for the next one."""
+    mgr._kda_replay.prev_num_accepted_tokens[slot] = accepted
+    for buffer in mgr._kda_replay._layer_replay_buffers():
+        buffer[:, slot] = value
+
+
+def _kda_replay_slot(mgr, slot):
+    return int(mgr._kda_replay.prev_num_accepted_tokens[slot]), [
+        float(buffer[0, slot].flatten()[0]) for buffer in mgr._kda_replay._layer_replay_buffers()
+    ]
+
+
+@pytest.mark.parametrize("resume_slot", [1, 0], ids=["new_slot", "old_slot"])
+@pytest.mark.parametrize(
+    "manager_cls, draft_records",
+    [
+        (KimiK3HybridCacheManager, False),
+        (KimiK3HybridCacheManager, True),
+        (Glm5NextCacheManager, False),
+    ],
+)
+def test_v2_kda_replay_suspended_request_resumes_from_its_v2_states(
+    resume_slot, manager_cls, draft_records
+):
+    """A suspend commits the request's pending drafts and conv window into its slot's V2 states and forgets the slot,
+    which can then go to another request. The request resumes in a new slot, or in its old one after that request has
+    finished. Either way its replay caches are seeded from the V2 conv state it resumes with, nothing is pending, and
+    the other request's replay state is left alone."""
+    mgr = _v2_kda_replay_stub(manager_cls=manager_cls, draft_records=draft_records)
+    first = SimpleNamespace(py_request_id=1, is_dummy=False)
+    second = SimpleNamespace(py_request_id=2, is_dummy=False)
+    mgr.kv_cache_map[1] = _SlotCache(0)
+    mgr._setup_state_indices([first], num_contexts=0)
+    _write_kda_replay_slot(mgr, 0, accepted=2, value=1.0)
+    mgr.suspend_request(first)
+    assert mgr.committed_slots == [0]
+    assert 1 not in mgr._request_id_to_state_index
+    assert not mgr.kv_cache_map[1].is_active
+
+    mgr.kv_cache_map[2] = _SlotCache(0)
+    mgr._setup_state_indices([second], num_contexts=1)
+    mgr._reset_context_mamba_slots(1)
+    mgr._setup_state_indices([second], num_contexts=0)
+    _write_kda_replay_slot(mgr, 0, accepted=3, value=7.0)
+    resumed = [first]
+    if resume_slot == 0:
+        del mgr.kv_cache_map[2]
+        del mgr._request_id_to_state_index[2]
+    else:
+        resumed.append(second)
+    # The V2 conv state the runtime brings back with the request's page.
+    window = torch.arange(18.0).view(6, 3)
+    mgr.all_conv_states[0][resume_slot] = window
+    mgr.kv_cache_map[1].slot = resume_slot
+    mgr.kv_cache_map[1].is_active = True
+    mgr._setup_state_indices(resumed, num_contexts=0)
+
+    assert int(mgr._kda_replay.prev_num_accepted_tokens[resume_slot]) == 0
+    for section, name in enumerate(("kda_conv_q", "kda_conv_k", "kda_conv_v")):
+        cache = getattr(mgr._kda_replay, name)[0, resume_slot]
+        assert torch.equal(cache[:, :3], window[2 * section : 2 * section + 2])
+        assert not cache[:, 3:].any()
+    for name in ("kda_k_cache", "kda_g_cache", "kda_v_cache", "kda_beta_cache"):
+        buffer = getattr(mgr._kda_replay, name)
+        if buffer is not None:
+            assert not buffer[0, resume_slot].any()
+    if draft_records:
+        # A resumed slot has no pending drafts, so its old records remain unread.
+        expected_records = 7.0 if resume_slot == 0 else 0.0
+        assert torch.all(mgr._kda_replay.kda_state_tok[0, resume_slot] == expected_records)
+    if resume_slot != 0:
+        assert _kda_replay_slot(mgr, 0) == (3, [7.0] * len(mgr._kda_replay._layer_replay_buffers()))
+    assert not mgr._kda_replay.suspended_requests
+
+
+@pytest.mark.parametrize("recorded_by", ["update_resources", "revert_allocate_generation"])
+@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
+def test_v2_kda_replay_refuses_a_suspend_before_the_host_drafter_acceptance(
+    monkeypatch, recorded_by, manager_cls
+):
+    """With a host drafter, update_resources records the acceptance of a batch's verify, and a suspend needs it to
+    commit the request's pending drafts. A suspend between the batch's prepare_resources and its update_resources
+    raises instead of committing a stale count. Once update_resources has recorded it, or the batch is reverted without
+    running, the suspend commits."""
+    mgr = _v2_kda_replay_stub(manager_cls=manager_cls)
+    mgr.spec_config = SimpleNamespace(decoding_type="NGram")
+    for method in ("prepare_resources", "update_resources", "revert_allocate_generation"):
+        monkeypatch.setattr(KVCacheManagerV2, method, MagicMock())
+    request = SimpleNamespace(
+        py_request_id=1, is_dummy=False, py_draft_tokens=[11, 12], py_num_accepted_draft_tokens=2
+    )
+    mgr.kv_cache_map[1] = _SlotCache(0)
+    batch = SimpleNamespace(context_requests=[], generation_requests=[request])
+    mgr.prepare_resources(batch)
+
+    with pytest.raises(RuntimeError, match="acceptance"):
+        mgr.suspend_request(request)
+    assert not mgr.committed_slots
+    assert mgr.kv_cache_map[1].is_active
+
+    if recorded_by == "update_resources":
+        mgr.update_resources(batch)
+        assert int(mgr._kda_replay.prev_num_accepted_tokens[0]) == 2
+    else:
+        mgr.revert_allocate_generation(request)
+    mgr.suspend_request(request)
+    assert mgr.committed_slots == [0]
+    assert not mgr.kv_cache_map[1].is_active
+
+
+@pytest.mark.parametrize("seeded", [False, True], ids=["before_seeding", "after_seeding"])
+@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
+def test_v2_kda_replay_disagg_generation_request_suspends_its_transferred_state(
+    monkeypatch, seeded, manager_cls
+):
+    mgr = _v2_kda_replay_stub(manager_cls=manager_cls)
+    monkeypatch.setattr(KVCacheManagerV2, "prepare_resources", MagicMock())
+    request = SimpleNamespace(py_request_id=1, is_dummy=False, is_disagg_generation_init_state=True)
+    mgr.kv_cache_map[1] = _SlotCache(0)
+    _write_kda_replay_slot(mgr, 0, accepted=0, value=5.0)
+    mgr.prepare_resources(SimpleNamespace(context_requests=[request], generation_requests=[]))
+    request.is_disagg_generation_init_state = False
+    window = torch.arange(18.0).view(6, 3)
+    mgr.all_conv_states[0][0] = window
+    if seeded:
+        mgr.seed_kda_replay_caches_for_disagg_gen([1])
+
+    mgr.suspend_request(request)
+    assert mgr.committed_slots == ([0] if seeded else [])
+    assert 1 not in mgr._request_id_to_state_index
+    assert not mgr.kv_cache_map[1].is_active
+
+    mgr.kv_cache_map[1].slot = 2
+    mgr.kv_cache_map[1].is_active = True
+    mgr.all_conv_states[0][2] = window
+    mgr._setup_state_indices([request], num_contexts=0)
+    for section, name in enumerate(("kda_conv_q", "kda_conv_k", "kda_conv_v")):
+        assert torch.equal(
+            getattr(mgr._kda_replay, name)[0, 2][:, :3], window[2 * section : 2 * section + 2]
+        )
+    assert not mgr._kda_replay.unseeded_requests
+
+    mgr.suspend_request(request)
+    assert mgr.committed_slots == ([0, 2] if seeded else [2])
+
+
+def _v2_kda_replay_manager_with_large_slots():
+    """A real V2 hybrid manager at Kimi K3's per-rank KDA shapes (6 heads, K = V = 128, conv width 4) on 6 layers. An
+    SSM slot (~2.25 MiB) is larger than the 2 MiB allocation grain, so the SSM pool holds a handful of slots and runs
+    out before the attention pages do. max_util_for_resume 1.0 lets resume admit caches until the pool is full."""
+    num_mamba_layers = 6
+    return KimiK3HybridCacheManager(
+        mamba_d_state=128,
+        mamba_d_conv=4,
+        mamba_num_heads=6,
+        mamba_n_groups=6,
+        mamba_head_dim=128,
+        mamba_num_layers=num_mamba_layers,
+        mamba_layer_mask=[True] * num_mamba_layers + [False],
+        mamba_cache_dtype=torch.bfloat16,
         mamba_ssm_cache_dtype=torch.float32,
+        kv_cache_config=KvCacheConfig(
+            max_tokens=4096, enable_block_reuse=False, max_util_for_resume=1.0
+        ),
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=1,
+        num_kv_heads=4,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=128,
+        max_batch_size=4,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        layer_mask=[False] * num_mamba_layers + [True],
+        vocab_size=1024,
+        conv_state_layout="q_k_v",
         kda_replay_num_spec=2,
     )
+
+
+def _take_ssm_slot(mgr, slot, others):
+    """Create caches until the V2 runtime gives one of them ``slot``, moving the suspended owner's SSM page to the host
+    tier; keep that one and close the rest."""
+    holder = None
+    for _ in range(mgr._kda_replay.prev_num_accepted_tokens.shape[0] + 1):
+        cache = mgr.impl.create_kv_cache()
+        assert cache.resume(mgr._stream.cuda_stream)
+        others.append(cache)
+        assert cache.resize(1)
+        if cache.get_ssm_block_base_index(mgr.ssm_layer_group_id) == slot:
+            holder = cache
+            break
+    assert holder is not None, "no cache took the suspended request's SSM slot"
+    for cache in others:
+        if cache is not holder:
+            cache.close()
+    others[:] = [holder]
+
+
+def _fill_kda_slot(mgr, slot, generator):
+    """Random V2 states and replay state at ``slot``: a new owner's prefill and verify rounds."""
+    for layer_offset, (ssm_states, conv_states) in enumerate(
+        zip(mgr.all_ssm_states, mgr.all_conv_states)
+    ):
+        ssm_states[slot] = torch.randn(ssm_states.shape[1:], generator=generator, device="cuda")
+        conv_states[slot] = torch.randn(conv_states.shape[1:], generator=generator, device="cuda")
+        for name in _KDA_REPLAY_BUFFERS:
+            buffer = mgr._kda_replay.pool_layers[layer_offset][name]
+            buffer[slot] = torch.randn(buffer.shape[1:], generator=generator, device="cuda")
+    mgr._kda_replay.prev_num_accepted_tokens[slot] = 1
+
+
+def _kda_verify_round(mgr, slot, layer_weights, round_idx, num_spec):
+    """One verify of 1 + num_spec tokens on every KDA layer for the request in ``slot``, as the KDA mixer runs it; the
+    inputs depend only on the round. Returns the outputs."""
+    tokens = 1 + num_spec
+    pending = mgr._kda_replay.prev_num_accepted_tokens[slot : slot + 1].clone()
+    slots = torch.tensor([slot], dtype=torch.int32, device="cuda")
+    cu_seqlens = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
+    cu_seqlens[:1].sub_(pending)
+    outputs = []
+    for layer_offset, weights in enumerate(layer_weights):
+        replay = mgr._kda_replay.pool_layers[layer_offset]
+        generator = torch.Generator(device="cuda").manual_seed(1000 * round_idx + layer_offset)
+        num_heads, head_dim = weights["A_log"].shape[0], 128
+
+        def inputs(*shape):
+            return torch.randn(shape, generator=generator, device="cuda").bfloat16()
+
+        outputs.append(
+            torch.ops.trtllm.kda_mtp_decode(
+                x_q=inputs(1, tokens, num_heads, head_dim),
+                x_k=inputs(1, tokens, num_heads, head_dim),
+                x_v=inputs(1, tokens, num_heads, head_dim),
+                w_q=weights["w_q"],
+                w_k=weights["w_k"],
+                w_v=weights["w_v"],
+                cs_q=replay["kda_conv_q"],
+                cs_k=replay["kda_conv_k"],
+                cs_v=replay["kda_conv_v"],
+                g=inputs(1, tokens, num_heads, head_dim),
+                beta=inputs(1, tokens, num_heads),
+                A_log=weights["A_log"],
+                dt_bias=weights["dt_bias"],
+                recurrent_state=mgr.all_ssm_states[layer_offset],
+                k_cache=replay["kda_k_cache"],
+                g_cache=replay["kda_g_cache"],
+                v_cache=replay["kda_v_cache"],
+                beta_cache=replay["kda_beta_cache"],
+                ssm_state_indices=slots,
+                cu_seqlens=cu_seqlens,
+                num_spec=num_spec,
+                num_accepted_tokens=pending,
+                lower_bound=-5.0,
+                scale=head_dim**-0.5,
+            )
+        )
+    return torch.stack(outputs)
+
+
+def _run_kda_verify_rounds(accepted_per_round, suspend_after=None, slot_taken=False):
+    """Verify rounds of one request on a V2 manager at Kimi K3's per-rank KDA shapes, each accepting the given number
+    of drafts. With ``suspend_after``, the request is suspended after that round's acceptance and resumed, its slot
+    taken and overwritten by another cache meanwhile when ``slot_taken``. Returns every round's outputs and the
+    request's final SSM states."""
+    num_spec = 2
+    mgr = _v2_kda_replay_manager_with_large_slots()
+    others = []
+    request = None
     try:
-        assert mgr.prev_num_accepted_tokens is not None
-        mgr.prev_num_accepted_tokens[:3].copy_(
-            torch.tensor([10, 20, 30], dtype=torch.int32, device="cuda")
+        (request,) = mgr.add_dummy_requests(
+            [1], token_nums=[8], is_gen=True, max_num_draft_tokens=num_spec
         )
-        replay_buffers = (
-            mgr.kda_conv_q,
-            mgr.kda_conv_k,
-            mgr.kda_conv_v,
-            mgr.kda_qkg_cache,
-            mgr.kda_v_cache,
-            mgr.kda_beta_cache,
-        )
-        source_rows = []
-        for offset, replay_buffer in enumerate(replay_buffers):
-            assert replay_buffer is not None
-            replay_buffer.zero_()
-            replay_buffer[:, 0].fill_(offset * 10)
-            replay_buffer[:, 1].fill_(offset * 10 + 1)
-            source_rows.append((replay_buffer[:, 0].clone(), replay_buffer[:, 1].clone()))
+        generator = torch.Generator(device="cuda").manual_seed(7)
+        num_heads, head_dim, width = 6, 128, 4
+        layer_weights = [
+            {
+                "w_q": torch.randn(num_heads * head_dim, width, generator=generator, device="cuda")
+                * 0.5,
+                "w_k": torch.randn(num_heads * head_dim, width, generator=generator, device="cuda")
+                * 0.5,
+                "w_v": torch.randn(num_heads * head_dim, width, generator=generator, device="cuda")
+                * 0.5,
+                "A_log": torch.randn(num_heads, generator=generator, device="cuda"),
+                "dt_bias": torch.randn(num_heads * head_dim, generator=generator, device="cuda"),
+            }
+            for _ in mgr.all_ssm_states
+        ]
+        # The state a prefill leaves: the V2 states, and the replay caches seeded from them with nothing pending.
+        slot = mgr._request_id_to_state_index[1]
+        for ssm_states, conv_states in zip(mgr.all_ssm_states, mgr.all_conv_states):
+            ssm_states[slot] = 0.1 * torch.randn(
+                ssm_states.shape[1:], generator=generator, device="cuda"
+            )
+            conv_states[slot] = torch.randn(
+                conv_states.shape[1:], generator=generator, device="cuda"
+            )
+        mgr.seed_kda_replay_caches_for_disagg_gen([1])
 
-        mgr._relocate_kda_replay_slots([0, 1], [1, 2])
-
-        assert mgr.prev_num_accepted_tokens[:3].tolist() == [10, 10, 20]
-        for replay_buffer, (source_zero, source_one) in zip(replay_buffers, source_rows):
-            torch.testing.assert_close(replay_buffer[:, 1], source_zero)
-            torch.testing.assert_close(replay_buffer[:, 2], source_one)
+        outputs = []
+        for round_idx, accepted in enumerate(accepted_per_round):
+            slot = mgr._request_id_to_state_index[1]
+            outputs.append(_kda_verify_round(mgr, slot, layer_weights, round_idx, num_spec))
+            mgr._kda_replay.prev_num_accepted_tokens[slot] = accepted
+            if round_idx == suspend_after:
+                mgr.suspend_request(request)
+                if slot_taken:
+                    _take_ssm_slot(mgr, slot, others)
+                    _fill_kda_slot(mgr, slot, generator)
+                assert mgr.resume_request(request)
+                mgr._setup_state_indices([request], num_contexts=0)
+                if slot_taken:
+                    assert mgr._request_id_to_state_index[1] != slot
+        slot = mgr._request_id_to_state_index[1]
+        states = torch.stack([ssm_states[slot] for ssm_states in mgr.all_ssm_states])
+        torch.cuda.synchronize()
+        return outputs, states
     finally:
+        for cache in others:
+            cache.close()
+        if request is not None:
+            mgr.free_resources(request)
         mgr.shutdown()
 
 
 @skip_no_cuda
-def test_v2_kda_state_index_setup_relocates_generation_history():
-    class StateCache:
-        def __init__(self, slot: int) -> None:
-            self.slot = slot
+@pytest.mark.parametrize("slot_taken", [True, False], ids=["slot_taken", "slot_kept"])
+def test_v2_kda_replay_suspend_resume_matches_an_unsuspended_run(slot_taken):
+    """A request is suspended with two accepted drafts pending and resumes; every later verify gives the outputs and
+    leaves the states of the same request never suspended. The verifies up to the suspend match bit for bit. The
+    suspend commits the pending drafts as a chunk of their own, and the tensor-core verify computes each chunk in one
+    WY-form pass, so the later ones match to the kernel's accuracy rather than bit for bit.
 
-        def get_ssm_block_base_index(self, _layer_group_id) -> int:
-            return self.slot
+    slot_taken: while the request is suspended, new caches fill the SSM pool, so the V2 runtime moves its SSM page to
+    the host tier and gives its slot to one of them, which overwrites the slot's states; the request resumes in
+    another slot. slot_kept: nothing else runs while it is suspended."""
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import is_kda_mtp_verify_available
 
-        def close(self) -> None:
-            pass
-
-    mgr = _build_v2_hybrid_with_mamba_layer(
-        spec_config=MTPDecodingConfig(max_draft_len=2),
-        conv_state_layout="q_k_v",
-        mamba_n_groups=4,
-        mamba_ssm_cache_dtype=torch.float32,
-        kda_replay_num_spec=2,
+    if not is_kda_mtp_verify_available():
+        pytest.skip("needs the fused KDA verify kernel (sm_100 / sm_103 with the CuTe DSL)")
+    accepted_per_round = [2, 1, 2, 0, 2, 1]
+    suspend_after = 2
+    expected_outputs, expected_states = _run_kda_verify_rounds(accepted_per_round)
+    outputs, states = _run_kda_verify_rounds(
+        accepted_per_round, suspend_after=suspend_after, slot_taken=slot_taken
     )
-    context = SimpleNamespace(py_request_id=101, is_dummy=False)
-    relocated = SimpleNamespace(py_request_id=202, is_dummy=False)
-    first_generation = SimpleNamespace(py_request_id=303, is_dummy=False)
-    mgr.kv_cache_map.update({101: StateCache(0), 202: StateCache(1)})
-    try:
-        mgr._setup_state_indices([context, relocated], num_contexts=1)
-        assert mgr.prev_num_accepted_tokens is not None
-        mgr.prev_num_accepted_tokens[1] = 7
-        mgr.prev_num_accepted_tokens[3] = 9
-        replay_buffers = (
-            mgr.kda_conv_q,
-            mgr.kda_conv_k,
-            mgr.kda_conv_v,
-            mgr.kda_qkg_cache,
-            mgr.kda_v_cache,
-            mgr.kda_beta_cache,
-        )
-        relocated_rows = []
-        for offset, replay_buffer in enumerate(replay_buffers):
-            assert replay_buffer is not None
-            replay_buffer[:, 1].fill_(offset + 1)
-            relocated_rows.append(replay_buffer[:, 1].clone())
 
-        mgr.kv_cache_map[202].slot = 2
-        mgr.kv_cache_map[303] = StateCache(3)
-        mgr._setup_state_indices([context, relocated, first_generation], num_contexts=1)
-
-        assert mgr._request_id_to_state_index == {101: 0, 202: 2, 303: 3}
-        assert mgr.prev_num_accepted_tokens[2] == 7
-        assert mgr.prev_num_accepted_tokens[3] == 0
-        for replay_buffer, relocated_row in zip(replay_buffers, relocated_rows):
-            torch.testing.assert_close(replay_buffer[:, 2], relocated_row)
-    finally:
-        mgr.shutdown()
+    for round_idx, (actual, expected) in enumerate(zip(outputs, expected_outputs)):
+        if round_idx <= suspend_after:
+            assert torch.equal(actual, expected), f"verify round {round_idx}"
+        else:
+            torch.testing.assert_close(
+                actual, expected, atol=2e-2, rtol=2e-2, msg=f"verify round {round_idx}"
+            )
+    torch.testing.assert_close(states, expected_states, atol=1e-3, rtol=1e-3)
 
 
-def test_v2_kda_replay_seeds_disaggregated_generation_slots():
-    mgr = object.__new__(MambaHybridCacheManagerV2)
-    mgr._use_kda_replay_update = True
+def test_v2_kda_replay_policy_seeds_disaggregated_generation_slots():
+    policy = KDAReplayState(
+        num_speculative_tokens=2,
+    )
+    policy._conv_section_dims = (2, 2, 2)
+    policy.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32)
+
+    def dim_contiguous_conv_cache() -> torch.Tensor:
+        return torch.full((2, 4, 6, 2), 7.0).transpose(-1, -2)
+
+    policy.kda_conv_q = dim_contiguous_conv_cache()
+    policy.kda_conv_k = dim_contiguous_conv_cache()
+    policy.kda_conv_v = dim_contiguous_conv_cache()
+    policy.kda_k_cache = torch.full((2, 4, 2, 2), 7.0, dtype=torch.bfloat16)
+    policy.kda_g_cache = torch.full((2, 4, 2, 2), 7.0)
+    policy.kda_v_cache = torch.full((2, 4, 2, 2), 7.0, dtype=torch.bfloat16)
+    policy.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0, dtype=torch.bfloat16)
+    manager = SimpleNamespace(
+        conv_state_shape=[6, 4],
+        _request_id_to_state_index={101: 1, 202: 3},
+        all_conv_states=[
+            torch.arange(4 * 6 * 4, dtype=torch.float32).reshape(4, 6, 4),
+            torch.arange(4 * 6 * 4, dtype=torch.float32).reshape(4, 6, 4) + 1000,
+        ],
+    )
+
+    policy._conv_states = tuple(manager.all_conv_states)
+    policy._committed_window = manager.conv_state_shape[1]
+    policy.seed_transferred_slots(torch.tensor([1, 3]))
+
+    for layer_offset, conv_state in enumerate(manager.all_conv_states):
+        for slot in (1, 3):
+            for replay_buffer, start in (
+                (policy.kda_conv_q, 0),
+                (policy.kda_conv_k, 2),
+                (policy.kda_conv_v, 4),
+            ):
+                torch.testing.assert_close(
+                    replay_buffer[layer_offset, slot, :, :4],
+                    conv_state[slot, start : start + 2, :],
+                )
+                assert torch.count_nonzero(replay_buffer[layer_offset, slot, :, 4:]) == 0
+            assert torch.count_nonzero(policy.kda_k_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(policy.kda_g_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(policy.kda_v_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(policy.kda_beta_cache[layer_offset, slot]) == 0
+            assert policy.prev_num_accepted_tokens[slot] == 0
+    assert policy.prev_num_accepted_tokens[0] == 5
+    assert policy.prev_num_accepted_tokens[2] == 5
+
+
+def test_v2_kda_draft_records_seed_disaggregated_generation_slots():
+    """Without the per-draft replay caches, seeding a transferred request's slot sets its conv caches and clears its
+    draft count; its drafts' records stay as they are, since with no pending drafts none of them is read."""
+    mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr._kda_replay = KDAReplayState(2, draft_records=True)
+    mgr._speculative_state = mgr._kda_replay
     mgr.local_num_mamba_layers = 2
     mgr.conv_state_shape = [6, 4]
     mgr.conv_section_dims = [2, 2, 2]
     mgr._request_id_to_state_index = {101: 1, 202: 3}
-    mgr.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32)
+    mgr._kda_replay.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32)
     mgr.all_conv_states = [
         torch.arange(4 * 6 * 4, dtype=torch.float32).reshape(4, 6, 4),
         torch.arange(4 * 6 * 4, dtype=torch.float32).reshape(4, 6, 4) + 1000,
@@ -3866,33 +5098,56 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
     def dim_contiguous_conv_cache() -> torch.Tensor:
         return torch.full((2, 4, 6, 2), 7.0).transpose(-1, -2)
 
-    mgr.kda_conv_q = dim_contiguous_conv_cache()
-    mgr.kda_conv_k = dim_contiguous_conv_cache()
-    mgr.kda_conv_v = dim_contiguous_conv_cache()
-    mgr.kda_qkg_cache = torch.full((2, 4, 2, 3, 2), 7.0)
-    mgr.kda_v_cache = torch.full((2, 4, 2, 2), 7.0)
-    mgr.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0)
+    mgr._kda_replay.kda_conv_q = dim_contiguous_conv_cache()
+    mgr._kda_replay.kda_conv_k = dim_contiguous_conv_cache()
+    mgr._kda_replay.kda_conv_v = dim_contiguous_conv_cache()
+    mgr._kda_replay.kda_k_cache = None
+    mgr._kda_replay.kda_g_cache = None
+    mgr._kda_replay.kda_v_cache = None
+    mgr._kda_replay.kda_beta_cache = None
+    mgr._kda_replay.kda_state_tok = torch.full((2, 4, 3, 2, 1, 2), 7.0)
 
-    mgr.seed_kda_replay_caches_for_disagg_gen([101, 202])
+    mgr._kda_replay._conv_states = tuple(mgr.all_conv_states)
+    mgr._kda_replay._conv_section_dims = tuple(mgr.conv_section_dims)
+    mgr._kda_replay._committed_window = mgr.conv_state_shape[1]
+    mgr.on_state_transfer_complete([101, 202])
 
     for layer_offset, conv_state in enumerate(mgr.all_conv_states):
         for slot in (1, 3):
             for replay_buffer, start in (
-                (mgr.kda_conv_q, 0),
-                (mgr.kda_conv_k, 2),
-                (mgr.kda_conv_v, 4),
+                (mgr._kda_replay.kda_conv_q, 0),
+                (mgr._kda_replay.kda_conv_k, 2),
+                (mgr._kda_replay.kda_conv_v, 4),
             ):
                 torch.testing.assert_close(
                     replay_buffer[layer_offset, slot, :, :4],
                     conv_state[slot, start : start + 2, :],
                 )
                 assert torch.count_nonzero(replay_buffer[layer_offset, slot, :, 4:]) == 0
-            assert torch.count_nonzero(mgr.kda_qkg_cache[layer_offset, slot]) == 0
-            assert torch.count_nonzero(mgr.kda_v_cache[layer_offset, slot]) == 0
-            assert torch.count_nonzero(mgr.kda_beta_cache[layer_offset, slot]) == 0
-            assert mgr.prev_num_accepted_tokens[slot] == 0
-    assert mgr.prev_num_accepted_tokens[0] == 5
-    assert mgr.prev_num_accepted_tokens[2] == 5
+            assert mgr._kda_replay.prev_num_accepted_tokens[slot] == 0
+    assert mgr._kda_replay.prev_num_accepted_tokens.tolist() == [5, 0, 5, 0]
+    assert (mgr._kda_replay.kda_state_tok == 7.0).all()
+
+
+def test_kda_replay_path_stays_on_with_the_drafts_records():
+    """``has_kda_replay_caches`` follows the replay conv caches: it holds with the per-draft replay caches and with
+    the drafts' records in their place, and not without the replay path."""
+    t = torch.zeros(1)
+    conv_caches = dict(kda_conv_q=t, kda_conv_k=t, kda_conv_v=t)
+    with_caches = KDAReplayLayerCache(
+        conv=t,
+        temporal=t,
+        kda_k_cache=t,
+        kda_g_cache=t,
+        kda_v_cache=t,
+        kda_beta_cache=t,
+        **conv_caches,
+    )
+    with_records = KDAReplayLayerCache(conv=t, temporal=t, kda_state_tok=t, **conv_caches)
+    assert with_caches.has_kda_replay_caches
+    assert with_records.has_kda_replay_caches
+    assert not KDAReplayLayerCache(conv=t, temporal=t).has_kda_replay_caches
+    assert not PythonMambaCacheManager.State(conv=t, temporal=t).has_kda_replay_caches
 
 
 def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
@@ -3901,70 +5156,77 @@ def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
     ``extract_mamba_kv_cache_params`` forces the KDA delta-rule (ssm) pool to
     fp32 but leaves the short-convolution pool at the model dtype, so what the
     context rank serializes and the generation rank restores for the conv slot
-    is bf16 while the SA replay caches the generation rank rebuilds from it are
-    fp32. Seeding must widen the restored rows losslessly, keep the logical
+    is bf16, the same dtype as the replay conv caches the generation rank
+    rebuilds from it (k / v / beta replay caches are bf16 too, the gate cache
+    fp32). Seeding must copy the restored rows bit for bit, keep the logical
     shape, leave the restored bf16 pool itself untouched so the decode path
     reuses exactly what was transferred, and clear only the draft scratch of
     the seeded slots.
     """
     torch.manual_seed(0)
-    mgr = object.__new__(MambaHybridCacheManagerV2)
-    mgr._use_kda_replay_update = True
-    mgr.local_num_mamba_layers = 2
-    mgr.conv_state_shape = [6, 4]
-    mgr.conv_section_dims = [2, 2, 2]
+    mgr = object.__new__(KimiK3HybridCacheManager)
+    policy = KDAReplayState(num_speculative_tokens=2)
+    mgr._kda_replay = policy
+    policy._committed_window = 4
+    policy._conv_section_dims = (2, 2, 2)
     mgr._request_id_to_state_index = {101: 1, 202: 3}
-    mgr.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32)
+    policy.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32)
     # The restored (transferred) conv pool, in the dtype the transceiver moves.
     mgr.all_conv_states = [(torch.randn(4, 6, 4) * 0.1).to(torch.bfloat16) for _ in range(2)]
+    policy._conv_states = tuple(mgr.all_conv_states)
     restored = [conv.clone() for conv in mgr.all_conv_states]
 
+    # Same dtypes as _allocate_pool_replay_buffers: bf16 conv / k / v / beta
+    # replay caches, fp32 gate cache.
     def dim_contiguous_conv_cache() -> torch.Tensor:
-        return torch.full((2, 4, 6, 2), 7.0).transpose(-1, -2)
+        return torch.full((2, 4, 6, 2), 7.0, dtype=torch.bfloat16).transpose(-1, -2)
 
-    mgr.kda_conv_q = dim_contiguous_conv_cache()
-    mgr.kda_conv_k = dim_contiguous_conv_cache()
-    mgr.kda_conv_v = dim_contiguous_conv_cache()
-    mgr.kda_qkg_cache = torch.full((2, 4, 2, 3, 2), 7.0)
-    mgr.kda_v_cache = torch.full((2, 4, 2, 2), 7.0)
-    mgr.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0)
+    policy.kda_conv_q = dim_contiguous_conv_cache()
+    policy.kda_conv_k = dim_contiguous_conv_cache()
+    policy.kda_conv_v = dim_contiguous_conv_cache()
+    policy.kda_k_cache = torch.full((2, 4, 2, 2), 7.0, dtype=torch.bfloat16)
+    policy.kda_g_cache = torch.full((2, 4, 2, 2), 7.0)
+    policy.kda_v_cache = torch.full((2, 4, 2, 2), 7.0, dtype=torch.bfloat16)
+    policy.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0, dtype=torch.bfloat16)
 
-    mgr.seed_kda_replay_caches_for_disagg_gen([101, 202])
+    mgr.on_state_transfer_complete([101, 202])
 
     for layer_offset, conv_state in enumerate(mgr.all_conv_states):
         assert conv_state.dtype is torch.bfloat16
         for slot in (1, 3):
             for replay_buffer, start in (
-                (mgr.kda_conv_q, 0),
-                (mgr.kda_conv_k, 2),
-                (mgr.kda_conv_v, 4),
+                (policy.kda_conv_q, 0),
+                (policy.kda_conv_k, 2),
+                (policy.kda_conv_v, 4),
             ):
-                # fp32 replay cache, logical shape unchanged by the widening.
-                assert replay_buffer.dtype is torch.float32
+                # bf16 replay cache, logical shape unchanged by the seeding.
+                assert replay_buffer.dtype is torch.bfloat16
                 seeded = replay_buffer[layer_offset, slot, :, :4]
                 assert seeded.shape == (2, 4)
-                # bf16 -> fp32 is lossless, so the restored values must survive
-                # the widening bit for bit.
+                # Same dtype on both sides: the restored values are copied bit
+                # for bit.
                 torch.testing.assert_close(
                     seeded,
-                    conv_state[slot, start : start + 2, :].float(),
+                    conv_state[slot, start : start + 2, :],
                     rtol=0,
                     atol=0,
                 )
                 assert torch.count_nonzero(replay_buffer[layer_offset, slot, :, 4:]) == 0
-            assert torch.count_nonzero(mgr.kda_qkg_cache[layer_offset, slot]) == 0
-            assert torch.count_nonzero(mgr.kda_v_cache[layer_offset, slot]) == 0
-            assert torch.count_nonzero(mgr.kda_beta_cache[layer_offset, slot]) == 0
-            assert mgr.prev_num_accepted_tokens[slot] == 0
+            assert torch.count_nonzero(policy.kda_k_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(policy.kda_g_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(policy.kda_v_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(policy.kda_beta_cache[layer_offset, slot]) == 0
+            assert policy.prev_num_accepted_tokens[slot] == 0
         # Slots no request restored keep their pre-seed contents.
         for slot in (0, 2):
-            assert (mgr.kda_conv_q[layer_offset, slot] == 7.0).all()
-            assert (mgr.kda_qkg_cache[layer_offset, slot] == 7.0).all()
+            assert (policy.kda_conv_q[layer_offset, slot] == 7.0).all()
+            assert (policy.kda_k_cache[layer_offset, slot] == 7.0).all()
+            assert (policy.kda_g_cache[layer_offset, slot] == 7.0).all()
         # The restored bf16 pool is read-only here: plain decode (speculation
         # off) reuses exactly the state the transfer wrote.
         torch.testing.assert_close(conv_state, restored[layer_offset], rtol=0, atol=0)
-    assert mgr.prev_num_accepted_tokens[0] == 5
-    assert mgr.prev_num_accepted_tokens[2] == 5
+    assert policy.prev_num_accepted_tokens[0] == 5
+    assert policy.prev_num_accepted_tokens[2] == 5
 
 
 @skip_no_cuda
@@ -3984,7 +5246,7 @@ def test_v2_hybrid_static_dynamic_tree_capacity():
         assert mgr.intermediate_conv_states.shape[2] == 32
         assert mgr._kv_reserve_draft_tokens == 31
         assert mgr._num_reserved_dummy_slots == 1
-        assert not mgr.use_replay_state_update
+        assert mgr.get_replay_state_update_metadata() is None
     finally:
         mgr.shutdown()
 
@@ -4004,7 +5266,6 @@ def test_hybrid_replay_buffers_size_by_tokens_per_gen_step(builder):
     )
     try:
         replay_metadata = mgr.get_replay_state_update_metadata()
-        assert mgr.use_replay_state_update is True
         assert replay_metadata is not None
         assert replay_metadata.replay_step_width == spec_config.tokens_per_gen_step
         assert replay_metadata.replay_history_size == max(
@@ -4020,17 +5281,18 @@ def test_hybrid_replay_buffers_size_by_tokens_per_gen_step(builder):
 
 @skip_no_cuda
 def test_v2_gdn_replay_builds_affine_state_layout():
+    policy = GDNReplayState(tokens_per_gen_step=4)
     mgr = _build_v2_hybrid_with_mamba_layer(
         max_batch_size=16,
         num_mamba_layers=3,
         spec_config=MTPDecodingConfig(max_draft_len=3),
-        use_replay_state_update=True,
         conv_state_layout="q_k_v",
+        speculative_state=policy,
     )
     try:
         assert mgr.use_gdn_cached_replay_all_layer_commit
-        assert mgr._gdn_cached_replay_state_descriptors is None
-        state_strides = mgr._gdn_cached_replay_state_strides
+        assert policy._state_descriptors is None
+        state_strides = policy._state_strides
         assert state_strides is not None
         states = mgr.all_ssm_states
         first_state = states[0]
@@ -4053,27 +5315,28 @@ def test_v2_gdn_replay_all_layer_commit_matches_contiguous_layout():
     )
 
     batch_size = 16
+    policy = GDNReplayState(tokens_per_gen_step=4)
     mgr = _build_v2_hybrid_with_mamba_layer(
         max_batch_size=batch_size,
         num_mamba_layers=3,
         spec_config=MTPDecodingConfig(max_draft_len=3),
-        use_replay_state_update=True,
         conv_state_layout="q_k_v",
+        speculative_state=policy,
     )
     try:
         torch.manual_seed(1234)
         for state in mgr.all_ssm_states:
             state.normal_()
-        mgr.old_x.normal_()
-        mgr.old_B.normal_()
-        mgr.old_dt.uniform_(-0.2, -0.01)
+        policy.old_x.normal_()
+        policy.old_B.normal_()
+        policy.old_dt.uniform_(-0.2, -0.01)
 
         positions = torch.arange(batch_size, device="cuda", dtype=torch.int32)
         replay_work_items = torch.stack(
             (
                 positions,
                 positions,
-                torch.full_like(positions, mgr.replay_history_size),
+                torch.full_like(positions, policy.replay_history_size),
                 torch.zeros_like(positions),
             ),
             dim=1,
@@ -4082,15 +5345,15 @@ def test_v2_gdn_replay_all_layer_commit_matches_contiguous_layout():
         expected = torch.stack(mgr.all_ssm_states)
         commit_gdn_cached_replay_history_layers(
             ssm_states=expected,
-            old_u=mgr.old_x,
-            old_k=mgr.old_B,
-            old_G=mgr.old_dt,
+            old_u=policy.old_x,
+            old_k=policy.old_B,
+            old_G=policy.old_dt,
             replay_work_items=replay_work_items,
             n_writes=n_writes,
-            history_size=mgr.replay_history_size,
+            history_size=policy.replay_history_size,
         )
 
-        mgr._commit_gdn_cached_replay_history_layers(
+        policy.commit_all_layers(
             SimpleNamespace(
                 mamba_metadata=SimpleNamespace(
                     replay_num_decodes=batch_size,
@@ -4107,25 +5370,32 @@ def test_v2_gdn_replay_all_layer_commit_matches_contiguous_layout():
 
 
 def test_v2_gdn_replay_commits_before_advancing_bookkeeping(monkeypatch):
-    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr = object.__new__(Qwen35HybridCacheManager)
     batch_size = 16
     mgr.local_num_mamba_layers = 1
-    mgr._use_replay_state_update = True
-    mgr._use_gdn_cached_replay_all_layer_commit = True
-    mgr.replay_step_width = 4
-    mgr.replay_history_size = MIN_REPLAY_HISTORY_SIZE
-    mgr.prev_num_accepted_tokens = torch.zeros(batch_size, dtype=torch.int32)
-    mgr.cache_buf_idx = torch.zeros(batch_size, dtype=torch.int32)
-    mgr.intermediate_state_indices = torch.arange(batch_size, dtype=torch.int32)
-    mgr._dummy_request_mask = torch.zeros(batch_size, dtype=torch.bool)
+    policy = GDNReplayState(tokens_per_gen_step=4)
+    policy.prev_num_accepted_tokens = torch.zeros(batch_size, dtype=torch.int32)
+    policy.cache_buf_idx = torch.zeros(batch_size, dtype=torch.int32)
+    policy.intermediate_indices = torch.arange(batch_size, dtype=torch.int32)
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(batch_size, dtype=torch.bool))
+    policy.intermediate_conv = torch.empty((1, batch_size, 1))
+    policy.old_x = torch.empty(0)
+    policy.old_B = torch.empty(0)
+    policy.old_dt = torch.empty(0)
+    policy._state_strides = (1, 0, 0)
+    mgr._speculative_state = policy
+    mgr.all_ssm_states = [torch.empty(0)]
     mgr.all_conv_states = [torch.empty(0)]
-    mgr._stacked_conv_states = None
-    mgr.intermediate_conv_states = torch.empty(0)
+    policy._ssm_states = tuple(mgr.all_ssm_states)
+    policy._conv_states = tuple(mgr.all_conv_states)
 
     events = []
-    mgr._commit_gdn_cached_replay_history_layers = lambda *_args, **_kwargs: events.append("commit")
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._advance_replay_state",
+        "tensorrt_llm._torch.modules.fla.cache_manager.commit_gdn_cached_replay_history_layers",
+        lambda **_kwargs: events.append("commit"),
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fla.cache_manager._advance_replay_state",
         lambda *_args, **_kwargs: events.append("advance"),
     )
     monkeypatch.setattr(
@@ -4133,8 +5403,19 @@ def test_v2_gdn_replay_commits_before_advancing_bookkeeping(monkeypatch):
         lambda *_args, **_kwargs: None,
     )
 
+    mgr._generation_state_indices = torch.arange(64, dtype=torch.int32)
+    if not hasattr(mgr, "_dummy_request_mask"):
+        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(64, dtype=torch.bool))
     mgr.update_mamba_states(
-        SimpleNamespace(num_seqs=batch_size, num_contexts=0),
+        SimpleNamespace(
+            num_seqs=batch_size,
+            num_contexts=0,
+            mamba_metadata=SimpleNamespace(
+                replay_num_decodes=batch_size,
+                replay_work_items=torch.empty((batch_size, 4), dtype=torch.int32),
+                replay_n_writes=torch.empty(1, dtype=torch.int32),
+            ),
+        ),
         torch.full((batch_size,), 3, dtype=torch.int32),
         state_indices=torch.arange(batch_size, dtype=torch.int32),
     )
@@ -4143,7 +5424,7 @@ def test_v2_gdn_replay_commits_before_advancing_bookkeeping(monkeypatch):
 
 
 def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):
-    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr = object.__new__(NemotronHybridCacheManager)
     mgr.local_num_mamba_layers = 1
     mgr._request_id_to_state_index = {
         100: 0,
@@ -4157,18 +5438,18 @@ def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):
         102: True,
         103: False,
     }
-    mgr._dummy_request_mask = torch.zeros(4, dtype=torch.bool)
+    policy = ReplayHistory(tokens_per_gen_step=5)
+    mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(4, dtype=torch.bool))
     mgr._dummy_request_mask_host = torch.zeros(4, dtype=torch.bool)
-    mgr._use_replay_state_update = True
-    mgr.replay_step_width = 5
-    mgr.replay_history_size = 16
-    mgr.prev_num_accepted_tokens = torch.full((4,), 13, dtype=torch.int32)
-    mgr.cache_buf_idx = torch.ones(4, dtype=torch.int32)
-    mgr.intermediate_state_indices = torch.arange(4, dtype=torch.int32)
+    policy.prev_num_accepted_tokens = torch.full((4,), 13, dtype=torch.int32)
+    policy.cache_buf_idx = torch.ones(4, dtype=torch.int32)
+    policy.intermediate_indices = torch.arange(4, dtype=torch.int32)
+    policy.intermediate_conv = torch.empty((1, 4, 1))
+    mgr._speculative_state = policy
     mgr.all_ssm_states = []
     mgr.all_conv_states = [torch.empty(0)]
-    mgr._stacked_conv_states = None
-    mgr.intermediate_conv_states = torch.empty(0)
+    policy._ssm_states = tuple(mgr.all_ssm_states)
+    policy._conv_states = tuple(mgr.all_conv_states)
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._promote_mamba_state_triton",
         lambda *args, **kwargs: None,
@@ -4181,27 +5462,31 @@ def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):
     )
     assert mgr._dummy_request_mask.tolist() == [False, False, True, True]
 
+    mgr._generation_state_indices = torch.arange(64, dtype=torch.int32)
+    if not hasattr(mgr, "_dummy_request_mask"):
+        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(64, dtype=torch.bool))
     mgr.update_mamba_states(
         SimpleNamespace(num_seqs=4, num_contexts=1),
         torch.tensor([1, 3, 3, 3], dtype=torch.int32),
         state_indices=state_indices,
     )
 
-    assert mgr.prev_num_accepted_tokens.tolist() == [13, 3, 13, 13]
-    assert mgr.cache_buf_idx.tolist() == [1, 0, 1, 1]
+    assert policy.prev_num_accepted_tokens.tolist() == [13, 3, 13, 13]
+    assert policy.cache_buf_idx.tolist() == [1, 0, 1, 1]
 
 
 def test_v2_hybrid_dynamic_tree_promotes_accepted_leaf_state(monkeypatch):
-    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr = object.__new__(NemotronHybridCacheManager)
     mgr.local_num_mamba_layers = 1
-    mgr._use_replay_state_update = False
-    mgr.intermediate_state_indices = torch.arange(2, dtype=torch.int32)
+    policy = Mamba2State()
+    policy.intermediate_indices = torch.arange(2, dtype=torch.int32)
+    policy.intermediate_ssm = torch.empty((1, 2, 8))
+    policy.intermediate_conv = torch.empty((1, 2, 8))
+    mgr._speculative_state = policy
     mgr.all_ssm_states = [torch.empty(0)]
     mgr.all_conv_states = [torch.empty(0)]
-    mgr._stacked_ssm_states = None
-    mgr._stacked_conv_states = None
-    mgr.intermediate_ssm_states = torch.empty((1, 2, 8))
-    mgr.intermediate_conv_states = torch.empty((1, 2, 8))
+    policy._ssm_states = tuple(mgr.all_ssm_states)
+    policy._conv_states = tuple(mgr.all_conv_states)
 
     promoted_positions = []
 
@@ -4213,6 +5498,9 @@ def test_v2_hybrid_dynamic_tree_promotes_accepted_leaf_state(monkeypatch):
         capture_promoted_position,
     )
 
+    mgr._generation_state_indices = torch.arange(64, dtype=torch.int32)
+    if not hasattr(mgr, "_dummy_request_mask"):
+        mgr._dummy_request_mask_buffer = DeviceCopyBuffer(torch.zeros(64, dtype=torch.bool))
     mgr.update_mamba_states(
         SimpleNamespace(num_seqs=3, num_contexts=1),
         torch.tensor([1, 2, 3], dtype=torch.int32),
@@ -4610,7 +5898,7 @@ def test_v2_stack_state_views_detects_affine_layout():
     pool = torch.zeros(3, 4, 8, device="cuda")
     layers = [pool[i] for i in range(3)]
 
-    stacked = MambaHybridCacheManagerV2._stack_state_views(layers)
+    stacked = _stack_state_views(layers)
 
     assert stacked.shape == (3, 4, 8)
     stacked[2, 1, 3] = 5.0
@@ -4619,8 +5907,821 @@ def test_v2_stack_state_views_detects_affine_layout():
 
 def test_v2_stack_state_views_rejects_non_affine_layout():
     pool = torch.zeros(4, 4, 8)
-    stack = MambaHybridCacheManagerV2._stack_state_views
+    stack = _stack_state_views
 
     assert stack([pool[0], pool[1], pool[3]]) is None
     assert stack([pool[0], torch.zeros(5, 8)]) is None
     assert stack([]) is None
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=skip_no_cuda)])
+def test_v2_kda_admission_slot_updates_without_sync(device):
+    """Disagg GEN admission resets, relocates and seeds KDA replay slots; on CUDA none of it may
+    synchronize the stream (the previous step is still queued)."""
+    num_slots, num_layers, num_spec, dim, window = 8, 2, 2, 2, 3
+    mgr = object.__new__(KimiK3HybridCacheManager)
+    policy = KDAReplayState(num_spec)
+    mgr._kda_replay = policy
+    mgr._speculative_state = policy
+    mgr.local_num_mamba_layers = num_layers
+    policy.prev_num_accepted_tokens = torch.arange(
+        1, num_slots + 1, dtype=torch.int32, device=device
+    )
+    # Stale device indices: the reset must take its slots from _host_state_indices.
+    mgr._state_indices_buffer = DeviceCopyBuffer(
+        torch.full((num_slots,), 7, dtype=torch.int32, device=device)
+    )
+    mgr._host_state_indices = torch.tensor([5, 1, 0, 0, 0, 0, 0, 0], dtype=torch.int32)
+    mgr._request_id_to_state_index = {10: 4, 11: 2}
+    mgr.conv_state_shape = [3 * dim, window]
+    mgr.conv_section_dims = [dim] * 3
+    mgr.all_conv_states = [
+        torch.randn(num_slots, 3 * dim, window, device=device) for _ in range(num_layers)
+    ]
+    policy.kda_conv_q, policy.kda_conv_k, policy.kda_conv_v = (
+        torch.randn(num_layers, num_slots, dim, window + num_spec, device=device) for _ in range(3)
+    )
+    policy.kda_k_cache, policy.kda_g_cache, policy.kda_v_cache, policy.kda_beta_cache = (
+        torch.randn(num_layers, num_slots, num_spec, dim, device=device) for _ in range(4)
+    )
+
+    policy._conv_states = tuple(mgr.all_conv_states)
+    policy._conv_section_dims = tuple(mgr.conv_section_dims)
+    policy._committed_window = window
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+        previous_mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+    try:
+        mgr._reset_context_mamba_slots(2)
+        policy.reset_slots(torch.tensor([3]), [3])
+        policy.relocate_slots([1], [6])
+        mgr.seed_kda_replay_caches_for_disagg_gen([10, 11])
+    finally:
+        if device == "cuda":
+            torch.cuda.set_sync_debug_mode(previous_mode)
+
+    # Reset 5, 1 and 3; slot 6 takes slot 1's (reset) count; seeding resets 4 and 2; 7 untouched.
+    assert policy.prev_num_accepted_tokens.tolist() == [1, 0, 0, 0, 0, 0, 0, 8]
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("kda_replay_num_spec", [2, None])
+def test_v2_kda_draft_records_replace_the_replay_caches(kda_replay_num_spec):
+    """On the KDA replay path, ``kda_draft_records`` allocates the fp32 records of every draft of each slot (vn,
+    beta * k, decay), per layer, in place of the per-draft replay caches; the conv caches and the replay path stay.
+    Without the replay path it allocates nothing."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=4,
+        num_mamba_layers=2,
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        conv_state_layout="q_k_v",
+        mamba_d_conv=5,
+        mamba_num_heads=6,
+        mamba_n_groups=6,
+        mamba_ssm_cache_dtype=torch.float32,
+        kda_replay_num_spec=kda_replay_num_spec,
+        kda_draft_records=True,
+    )
+    try:
+        if kda_replay_num_spec is None:
+            assert getattr(mgr, "kda_state_tok", None) is None
+            assert not mgr.keeps_kda_draft_records
+            return
+        assert mgr.keeps_kda_draft_records
+        assert set(mgr._kda_replay_layout()) == {
+            "kda_conv_q",
+            "kda_conv_k",
+            "kda_conv_v",
+            "kda_state_tok",
+        }
+        # A KVCM state buffer of the SSM layers, kept out of disaggregated transfers like the other replay buffers.
+        assert DataRole("kda_state_tok") in mgr.get_disagg_ignored_roles()
+        assert len(mgr.kda_state_tok) == 2
+        for layer_idx in range(2):
+            layer_cache = mgr.mamba_layer_cache(layer_idx)
+            cache_size = layer_cache.temporal.shape[0]
+            assert layer_cache.has_kda_replay_caches
+            assert layer_cache.kda_conv_q.shape == (cache_size, 48, 6)
+            assert layer_cache.kda_k_cache is None
+            assert layer_cache.kda_g_cache is None
+            assert layer_cache.kda_v_cache is None
+            assert layer_cache.kda_beta_cache is None
+            states = layer_cache.kda_state_tok
+            num_heads, _, head_dim = layer_cache.temporal.shape[1:]
+            assert states.shape == (cache_size, 3, 2, num_heads, head_dim)
+            assert states.dtype is torch.float32
+            assert states.data_ptr() == mgr.kda_state_tok[layer_idx].data_ptr()
+            # The records' replay addresses a slot by its stride and reads its records contiguously.
+            assert states[0].is_contiguous()
+    finally:
+        mgr.shutdown()
+    # Released with the other replay buffers.
+    assert mgr.kda_state_tok is None
+
+
+@skip_no_cuda
+def test_v2_kda_draft_records_count_in_the_per_slot_budget():
+    """The capacity math sees the drafts' records in place of the per-draft replay caches: per draft and layer, a slot
+    costs vn, beta * k and the decay, fp32 [H, K] each, instead of the k / g / v / beta entries."""
+    kwargs = dict(
+        num_mamba_layers=2,
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        conv_state_layout="q_k_v",
+        mamba_d_conv=5,
+        mamba_num_heads=6,
+        mamba_n_groups=6,
+        mamba_ssm_cache_dtype=torch.float32,
+        kda_replay_num_spec=2,
+    )
+    plain = _build_v2_hybrid_with_mamba_layer(**kwargs)
+    try:
+        plain_bytes = plain._mamba_state_bytes_per_slot()
+    finally:
+        plain.shutdown()
+    with_states = _build_v2_hybrid_with_mamba_layer(kda_draft_records=True, **kwargs)
+    try:
+        num_heads, _, head_dim = with_states.ssm_state_shape
+        per_token = 2 * 2 * 3 * num_heads * head_dim * 4
+        replay_caches = 2 * sum(
+            dtype.itemsize * math.prod(shape)
+            for name, (dtype, shape) in _kda_replay_layout(2, num_heads, head_dim, 4).items()
+            if name in _KDA_REPLAY_BUFFERS[3:]
+        )
+        assert with_states._mamba_state_bytes_per_slot() == plain_bytes - replay_caches + per_token
+    finally:
+        with_states.shutdown()
+
+
+@skip_no_cuda
+def test_v2_state_index_setup_skips_unchanged_uploads(monkeypatch):
+    """A step whose state indices and dummy flags did not change enqueues no upload of either: the device buffers
+    keep values the host never sent. A changed step uploads both again."""
+    # The test writes the buffers behind _setup_state_indices to see the skip, which the check of skipped copies
+    # reports.
+    monkeypatch.setattr("tensorrt_llm._device_copy._verify_skipped_device_copies", False)
+
+    class StateCache:
+        def __init__(self, slot: int) -> None:
+            self.slot = slot
+
+        def get_ssm_block_base_index(self, _layer_group_id) -> int:
+            return self.slot
+
+        def close(self) -> None:
+            pass
+
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        conv_state_layout="q_k_v",
+        mamba_n_groups=4,
+        mamba_ssm_cache_dtype=torch.float32,
+        kda_replay_num_spec=2,
+    )
+    live = SimpleNamespace(py_request_id=101, is_dummy=False)
+    padding = SimpleNamespace(py_request_id=202, is_dummy=True)
+    mgr.kv_cache_map.update({101: StateCache(0), 202: StateCache(1)})
+    try:
+        mgr._setup_state_indices([live, padding])
+        torch.cuda.synchronize()
+        assert mgr.cuda_state_indices[:2].tolist() == [0, 1]
+        assert mgr._dummy_request_mask[:2].tolist() == [False, True]
+
+        mgr.cuda_state_indices.fill_(-1)
+        mgr._dummy_request_mask.fill_(True)
+        mgr._setup_state_indices([live, padding])
+        torch.cuda.synchronize()
+        assert mgr.cuda_state_indices[:2].tolist() == [-1, -1]
+        assert mgr._dummy_request_mask[:2].tolist() == [True, True]
+
+        mgr.kv_cache_map[202].slot = 2
+        padding.is_dummy = False
+        mgr._setup_state_indices([live, padding])
+        torch.cuda.synchronize()
+        assert mgr.cuda_state_indices[:2].tolist() == [0, 2]
+        assert mgr._dummy_request_mask[:2].tolist() == [False, False]
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_kda_replay_allocates_logical_slot_caches():
+    spec_config = MTPDecodingConfig(max_draft_len=2)
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=4,
+        num_mamba_layers=2,
+        spec_config=spec_config,
+        conv_state_layout="q_k_v",
+        mamba_d_conv=5,
+        mamba_num_heads=6,
+        mamba_n_groups=6,
+        mamba_ssm_cache_dtype=torch.float32,
+        kda_replay_num_spec=2,
+    )
+    try:
+        assert mgr.intermediate_ssm_states is None
+        assert mgr.intermediate_conv_states is None
+        assert mgr.intermediate_state_indices.shape == (4,)
+        assert not hasattr(mgr, "get_replay_state_update_metadata")
+
+        layer_cache = mgr.mamba_layer_cache(0)
+        cache_size = layer_cache.temporal.shape[0]
+        assert layer_cache.kda_conv_q.shape == (cache_size, 48, 6)
+        assert layer_cache.kda_conv_k.shape == (cache_size, 48, 6)
+        assert layer_cache.kda_conv_v.shape == (cache_size, 48, 6)
+        assert layer_cache.kda_conv_q.dtype is torch.bfloat16
+        assert layer_cache.kda_conv_q.stride(-2) == 1
+        assert layer_cache.kda_k_cache.shape == (cache_size, 2, 48)
+        assert layer_cache.kda_g_cache.shape == (cache_size, 2, 48)
+        assert layer_cache.kda_v_cache.shape == (cache_size, 2, 48)
+        # Six bf16 heads are 12 bytes, so the row is padded to 16 (stride 8)
+        # to keep every nested per-draft view 16-byte aligned for CuTe.
+        assert layer_cache.kda_beta_cache.shape == (cache_size, 2, 6)
+        assert layer_cache.kda_beta_cache.stride(-2) == 8
+        for layer_idx in range(2):
+            for slot_idx in range(cache_size):
+                for draft_idx in range(2):
+                    assert (
+                        mgr.mamba_layer_cache(layer_idx)
+                        .kda_beta_cache[slot_idx, draft_idx]
+                        .data_ptr()
+                        % _KDA_BETA_CACHE_ALIGNMENT_BYTES
+                        == 0
+                    )
+        assert layer_cache.kda_k_cache.dtype is torch.bfloat16
+        assert layer_cache.kda_g_cache.dtype is torch.float32
+        assert layer_cache.kda_v_cache.dtype is torch.bfloat16
+        assert layer_cache.kda_beta_cache.dtype is torch.bfloat16
+        assert layer_cache.prev_num_accepted_tokens.dtype == torch.int32
+        assert layer_cache.prev_num_accepted_tokens.shape == (cache_size,)
+        assert layer_cache.prev_num_accepted_tokens is (
+            mgr.mamba_layer_cache(1).prev_num_accepted_tokens
+        )
+        assert not hasattr(layer_cache, "intermediate_ssm")
+        assert not hasattr(layer_cache, "intermediate_conv_window")
+        assert layer_cache.kda_state_tok is None
+        assert not mgr.keeps_kda_draft_records
+        assert layer_cache.has_kda_replay_caches
+    finally:
+        mgr.shutdown()
+
+
+def _kda_draft_record_build_config(quota, initial_pool_ratio=None):
+    return KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=quota)],
+        layers=_base_attention_layer_configs(2),
+        initial_pool_ratio=initial_pool_ratio,
+    )
+
+
+@pytest.mark.parametrize("pool_sizing", ["typical_step", "block_reuse", "pool_ratio"])
+def test_v2_kda_draft_records_size_with_the_ssm_pool(pool_sizing):
+    """The drafts' records are a buffer of the SSM layer in each recurrent-state slot, in place of the k / g / v /
+    beta caches. However the SSM pool is sized (by the typical step, with block reuse, or by a pool_ratio), every slot
+    holds them: the build leaves the whole GPU quota to the pools, and the quotas count the records per state slot."""
+    enable_block_reuse = pool_sizing == "block_reuse"
+    mgr = _v2_kda_draft_record_manager(
+        kda_draft_records=True, enable_block_reuse=enable_block_reuse
+    )
+    plain = _v2_kda_draft_record_manager(
+        kda_draft_records=False, enable_block_reuse=enable_block_reuse
+    )
+    records = 3 * 2 * 8 * 256 * 4
+    replay_caches = sum(
+        dtype.itemsize * math.prod(shape)
+        for name, (dtype, shape) in _kda_replay_layout(2, 8, 256, 3).items()
+        if name in _KDA_REPLAY_BUFFERS[3:]
+    )
+    slot_delta = records - replay_caches
+    assert mgr._mamba_state_bytes_per_slot() - plain._mamba_state_bytes_per_slot() == slot_delta
+    live_slots = mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots
+    assert (
+        mgr._minimum_live_gpu_quota() - plain._minimum_live_gpu_quota() == live_slots * slot_delta
+    )
+
+    quota = 128 << 20
+    pool_ratio = [0.5, 0.5] if pool_sizing == "pool_ratio" else None
+    built = mgr._build_cache_config(_kda_draft_record_build_config(quota, pool_ratio))
+    assert built.cache_tiers[0].quota == quota
+    ssm_buffers = {str(buffer.role): buffer.size for buffer in built.layers[0].buffers}
+    assert ssm_buffers["kda_state_tok"] == records
+    assert not set(ssm_buffers) & set(_KDA_REPLAY_BUFFERS[3:])
+    with pytest.raises(ValueError, match="too small for live recurrent states"):
+        mgr._build_cache_config(_kda_draft_record_build_config(mgr._minimum_live_gpu_quota() - 1))
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("enable_block_reuse", [False, True])
+def test_v2_kda_draft_records_leave_the_quota_to_the_pools(enable_block_reuse):
+    """With the drafts' records inside the SSM pool, the runtime pools take the whole GPU quota (rounded up to whole
+    2 MiB grains) with or without block reuse: nothing is set aside beside them."""
+    mgr = _v2_kda_draft_record_manager(
+        kda_draft_records=True, enable_block_reuse=enable_block_reuse
+    )
+    runtime_manager = RuntimeKVCacheManager(
+        mgr._build_cache_config(_kda_draft_record_build_config(128 << 20))
+    )
+    try:
+        pool_bytes = runtime_manager.get_quota(GPU_LEVEL)
+    finally:
+        runtime_manager.shutdown()
+    assert 128 << 20 <= pool_bytes < (128 << 20) + (2 << 20)
+
+
+@skip_no_cuda
+def test_v2_kda_replay_commit_without_the_replay_caches():
+    """With the verify kernels' draft records (``kda_state_tok``) in place of the per-draft replay caches, the
+    suspend-time commit replays a slot's records onto its V2 SSM state and stores its conv window, bit for bit as the
+    records' replay and the conv store do on their own, and clears only that slot's draft count."""
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (
+        replay_kda_token_records,
+        store_kda_replay_conv_window,
+    )
+
+    num_layers, num_slots, num_spec, num_heads, head_dim, width = 2, 4, 2, 6, 128, 4
+    section_dim = num_heads * head_dim
+    generator = torch.Generator(device="cuda").manual_seed(13)
+
+    def randn(*shape):
+        return 0.1 * torch.randn(*shape, generator=generator, device="cuda")
+
+    mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr._kda_replay = KDAReplayState(num_spec, draft_records=True)
+    mgr._stream = torch.cuda.Stream()
+    mgr.all_ssm_states = [
+        randn(num_slots, num_heads, head_dim, head_dim) for _ in range(num_layers)
+    ]
+    mgr.all_conv_states = [randn(num_slots, 3 * section_dim, width - 1) for _ in range(num_layers)]
+    mgr._kda_replay.pool_layers = [
+        {
+            **{
+                name: randn(num_slots, width - 1 + num_spec, section_dim).transpose(-1, -2)
+                for name in ("kda_conv_q", "kda_conv_k", "kda_conv_v")
+            },
+            "kda_state_tok": randn(num_slots, 3, num_spec, num_heads, head_dim),
+        }
+        for _ in range(num_layers)
+    ]
+    mgr._kda_replay.prev_num_accepted_tokens = torch.tensor(
+        [0, 2, 1, 0], dtype=torch.int32, device="cuda"
+    )
+    assert mgr.keeps_kda_draft_records
+
+    mgr._kda_replay._ssm_states = tuple(mgr.all_ssm_states)
+    mgr._kda_replay._conv_states = tuple(mgr.all_conv_states)
+    slot = 1
+    slots = torch.tensor([slot], dtype=torch.int32, device="cuda")
+    num_accepted = mgr._kda_replay.prev_num_accepted_tokens[slots.long()].clone()
+    expected_ssm, expected_conv = [], []
+    for layer_offset, replay in enumerate(mgr._kda_replay.pool_layers):
+        ssm = mgr.all_ssm_states[layer_offset].clone()
+        conv = mgr.all_conv_states[layer_offset].clone()
+        replay_kda_token_records(ssm, replay["kda_state_tok"], slots, num_accepted)
+        store_kda_replay_conv_window(
+            conv,
+            replay["kda_conv_q"],
+            replay["kda_conv_k"],
+            replay["kda_conv_v"],
+            slots,
+            num_accepted,
+        )
+        expected_ssm.append(ssm)
+        expected_conv.append(conv)
+
+    mgr._kda_replay.commit_pending_drafts(slot)
+    torch.cuda.synchronize()
+
+    assert mgr._kda_replay.prev_num_accepted_tokens.tolist() == [0, 0, 1, 0]
+    for actual, expected in zip(mgr.all_ssm_states, expected_ssm):
+        assert torch.equal(actual, expected)
+    for actual, expected in zip(mgr.all_conv_states, expected_conv):
+        assert torch.equal(actual, expected)
+
+
+def _build_kda_replay_manager(**kwargs):
+    """A real V2 hybrid manager with two KDA layers (6 heads, K = V = 8) and replay caches for two drafts."""
+    return _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=2,
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        conv_state_layout="q_k_v",
+        mamba_num_heads=6,
+        mamba_n_groups=6,
+        mamba_ssm_cache_dtype=torch.float32,
+        kda_replay_num_spec=2,
+        **kwargs,
+    )
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
+def test_v2_kda_replay_buffers_are_kvcm_state_buffers(manager_cls):
+    """Replay caches and the accepted-draft count are registered as SSM-layer buffers, counted in the per-slot state
+    bytes, and kept out of disaggregated transfers."""
+    mgr = _build_kda_replay_manager(model_manager_cls=manager_cls)
+    try:
+        layout = _kda_replay_layout(2, 6, 8, 3)
+        replay_roles = {str(DataRole(name)) for name in layout}
+        for layer in mgr.mamba_pp_layers:
+            local_layer_id = mgr.layer_offsets[layer]
+            roles = {
+                str(buffer_id.role)
+                for pool_group in mgr.impl.pool_group_descs
+                for variant in pool_group.slot_desc.variants
+                for coalesced in variant.coalesced_buffers
+                for buffer_id in coalesced.buffer_ids
+                if int(buffer_id.layer_id) == local_layer_id
+            }
+            assert replay_roles <= roles
+            assert ("prev_num_accepted_tokens" in roles) == (layer == mgr.mamba_pp_layers[0])
+        layer_bytes = sum(dtype.itemsize * math.prod(shape) for dtype, shape in layout.values())
+        assert mgr._mamba_state_bytes_per_slot() == (
+            2 * (mgr.ssm_bytes + mgr.conv_bytes) + 2 * layer_bytes + 16
+        )
+        ignored = {str(role) for role in mgr.get_disagg_ignored_roles()}
+        assert replay_roles | {"prev_num_accepted_tokens"} <= ignored
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_kda_replay_acceptance_and_cuda_graph():
+    mgr = _build_kda_replay_manager()
+    try:
+        requests = [_make_v2_conversation_request(i, list(range(8)), str(i)) for i in (101, 102)]
+        for req in requests:
+            _run_v2_hybrid_context(mgr, req)
+        slots = torch.tensor(mgr.get_state_indices([101, 102]), device="cuda")
+        # Mark the second row as padding through the public metadata interface.
+        mgr.get_state_indices([101, 102], [False, True])
+        accepted = torch.tensor([3, 2], dtype=torch.int32, device="cuda")
+        metadata = SimpleNamespace(num_seqs=2, num_contexts=0)
+        for layer_id in range(2):
+            counts = mgr.mamba_layer_cache(layer_id).prev_num_accepted_tokens
+            assert counts[slots].tolist() == [0, 0]
+        counts[slots[1]] = 1
+        # Warm up on a side stream before capture.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            mgr.update_mamba_states(metadata, accepted, state_indices=slots)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            mgr.update_mamba_states(metadata, accepted, state_indices=slots)
+        accepted[0] = 2
+        graph.replay()
+        for layer_id in range(2):
+            assert mgr.mamba_layer_cache(layer_id).prev_num_accepted_tokens[slots].tolist() == [
+                1,
+                1,
+            ]
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
+@pytest.mark.parametrize(
+    "role,is_disagg", [("context", True), ("generation", True), (None, True), ("context", False)]
+)
+def test_v2_kda_worker_role_cache(monkeypatch, role, is_disagg, manager_cls):
+    """Only a disaggregated context server drops the KDA replay and draft-verify state."""
+    if role is None:
+        monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
+    mgr = _build_kda_replay_manager(is_disagg=is_disagg, model_manager_cls=manager_cls)
+    try:
+        req = _make_v2_conversation_request(123, list(range(8)), "role")
+        _run_v2_hybrid_context(mgr, req)
+        cache = mgr.mamba_layer_cache(0)
+        ctx_only = is_disagg and role == "context"
+        assert mgr.kda_context_only == ctx_only
+        assert mgr.use_kda_replay_update != ctx_only
+        assert isinstance(cache, KDAReplayLayerCache) != ctx_only
+        assert cache.conv.shape[1:] == (144, 3)
+        assert cache.temporal.shape[1:] == (6, 8, 8)
+        if ctx_only:
+            assert mgr.intermediate_ssm_states is None
+            assert mgr.intermediate_conv_states is None
+            assert not mgr.get_disagg_ignored_roles() & {
+                DataRole(name) for name in _KDA_REPLAY_FIELDS
+            }
+            mgr.update_mamba_states(
+                SimpleNamespace(num_seqs=1, num_contexts=1),
+                torch.ones(1, device="cuda", dtype=torch.int32),
+            )
+        else:
+            slot = mgr.get_state_indices([123])[0]
+            assert cache.prev_num_accepted_tokens[slot].item() == 0
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("kda_draft_records", [False, True], ids=["replay_caches", "draft_records"])
+@pytest.mark.parametrize("snapshot", [False, True])
+def test_v2_kda_replay_survives_cache_lifecycle(snapshot, kda_draft_records):
+    """KVCM moves the replay caches, or the drafts' records in their place, with the recurrent state through
+    suspend, offload to host and snapshot reuse."""
+    mgr = _build_kda_replay_manager(
+        host_cache_size=16 << 20,
+        enable_stats=True,
+        kda_draft_records=kda_draft_records,
+        enable_block_reuse=True,
+    )
+    replay_fields = (*mgr._kda_replay_layout(), "prev_num_accepted_tokens")
+    assert ("kda_state_tok" in replay_fields) == kda_draft_records
+    assert mgr.reuse_match_backoff == 0
+    kv = None
+    reused = None
+    pressure = []
+    try:
+        stream = torch.cuda.current_stream().cuda_stream
+        kv = mgr.impl.create_kv_cache()
+        assert kv.resume(stream)
+        assert kv.resize(32)
+        group = mgr.impl.get_layer_group_id(LayerId(0))
+        slot = kv.get_ssm_block_base_index(group)
+        expected = []
+        for layer_id in range(2):
+            cache = mgr.mamba_layer_cache(layer_id)
+            fields = {}
+            for offset, name in enumerate((*replay_fields, "conv", "temporal")):
+                tensor = getattr(cache, name)
+                # Accepted counts describe the request and are shared across layers.
+                value = offset + 1 if name == "prev_num_accepted_tokens" else offset + layer_id + 1
+                tensor[slot].fill_(value)
+                fields[name] = tensor[slot].clone()
+            expected.append(fields)
+        if snapshot:
+            kv.commit(list(range(32)))
+            kv.close()
+            kv = None
+        else:
+            kv.suspend()
+        # Fill the recurrent pool with newer suspended requests, forcing
+        # the original state to host while respecting KVCM's quota floor.
+        pool = next(
+            pool
+            for pool in mgr.impl.pool_group_descs
+            if any(variant.layer_group_id == group for variant in pool.slot_desc.variants)
+        )
+        for _ in range(pool.num_slots + 1):
+            other = mgr.impl.create_kv_cache()
+            pressure.append(other)
+            assert other.resume(stream)
+            other.suspend()
+        for other in pressure:
+            other.commit_pending_stats()
+            other.close()
+        pressure.clear()
+        stats = mgr.impl.get_and_reset_iteration_stats()
+        assert stats[group].iter_offload_blocks > 0
+        if snapshot:
+            reused = mgr.impl.create_kv_cache(input_tokens=list(range(32)))
+            assert reused.num_committed_tokens == 32
+            active = reused
+        else:
+            active = kv
+        assert active.resume(stream)
+        assert active.resize(33)
+        new_slot = active.get_ssm_block_base_index(group)
+        for layer_id, fields in enumerate(expected):
+            cache = mgr.mamba_layer_cache(layer_id)
+            for name, value in fields.items():
+                torch.testing.assert_close(getattr(cache, name)[new_slot], value, rtol=0, atol=0)
+        torch.cuda.synchronize()
+    finally:
+        for other in pressure:
+            other.close()
+        if reused is not None:
+            reused.close()
+        if kv is not None:
+            kv.close()
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
+    """A context server without replay caches and a generation server with them describe the same transferable
+    recurrent state, and the generation server seeds its replay caches from the transferred conv state."""
+    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
+        MambaPolicy,
+        mamba_receiver_payload_bytes,
+    )
+    from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+    ctx = _build_kda_replay_manager(is_disagg=True)
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "generation")
+    gen = _build_kda_replay_manager(is_disagg=True)
+    try:
+        assert ctx.kda_context_only and not gen.kda_context_only
+        for mgr in (ctx, gen):
+            _run_v2_hybrid_context(mgr, _make_v2_conversation_request(101, [1, 2], "transfer"))
+        src_slot = ctx.get_state_indices([101])[0]
+        dst_slot = gen.get_state_indices([101])[0]
+        src_table = build_page_table_from_manager(ctx)
+        dst_table = build_page_table_from_manager(gen)
+        src_rank = RankInfo.from_kv_cache_manager("ctx", ctx, device_id=0)
+        dst_rank = RankInfo.from_kv_cache_manager("gen", gen, device_id=0)
+        MambaPolicy.validate_peer_compatible(src_rank, dst_rank, src_table, dst_table)
+        src_group = next(g for g in src_table.layer_groups if isinstance(g, MambaLayerGroup))
+        dst_group = next(g for g in dst_table.layer_groups if isinstance(g, MambaLayerGroup))
+        for group in (src_group, dst_group):
+            assert {pv.pool_role for pv in group.pool_views} == {MAMBA_CONV_ROLE, MAMBA_SSM_ROLE}
+        assert mamba_receiver_payload_bytes(src_table, dst_table, dst_slot) == sum(
+            gen.mamba_layer_cache(i).conv[dst_slot].numel() * 2
+            + gen.mamba_layer_cache(i).temporal[dst_slot].numel() * 4
+            for i in range(2)
+        )
+
+        # What the transfer writes into the generation slot.
+        for layer_id in range(2):
+            source = ctx.mamba_layer_cache(layer_id)
+            target = gen.mamba_layer_cache(layer_id)
+            source.conv[src_slot].fill_(layer_id + 1)
+            source.temporal[src_slot].fill_(layer_id + 2)
+            target.conv[dst_slot].copy_(source.conv[src_slot])
+            target.temporal[dst_slot].copy_(source.temporal[src_slot])
+        gen.seed_kda_replay_caches_for_disagg_gen([101])
+        for layer_id in range(2):
+            source = ctx.mamba_layer_cache(layer_id)
+            target = gen.mamba_layer_cache(layer_id)
+            assert target.prev_num_accepted_tokens[dst_slot] == 0
+            for section, name in enumerate(_KDA_REPLAY_BUFFERS[:3]):
+                torch.testing.assert_close(
+                    getattr(target, name)[dst_slot, :, :3],
+                    source.conv[src_slot, section * 48 : (section + 1) * 48].to(torch.bfloat16),
+                )
+    finally:
+        ctx.shutdown()
+        gen.shutdown()
+
+
+def _kda_cache_budget(monkeypatch, available, model, mapping, **kwargs):
+    from tensorrt_llm._torch.modules.kimi_kda import _kda_kernels
+
+    monkeypatch.setattr(_kda_kernels, "is_kda_mtp_verify_available", lambda: available)
+    monkeypatch.setattr(_kda_kernels, "kda_mtp_max_num_spec", lambda: 7)
+    return KimiK3HybridCacheManager.get_cache_size_per_token(model, mapping, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "role,is_disagg,available",
+    [
+        ("context", True, True),
+        ("generation", True, True),
+        (None, True, True),
+        ("context", False, True),
+        ("generation", True, False),
+    ],
+)
+@pytest.mark.parametrize("interval,replay_slope", [(0, 0), (32, 95), (33, 92), (48, 63), (256, 0)])
+def test_kda_cache_budget_accounts_for_replay_role(
+    monkeypatch, role, is_disagg, available, interval, replay_slope
+):
+    if role is None:
+        monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
+    model = _kimi_model_config()
+    spec_config = MTPDecodingConfig(max_draft_len=2)
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+    kwargs = dict(
+        max_batch_size=2,
+        max_seq_len=128,
+        tokens_per_block=32,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=True,
+            mamba_state_config=MambaStateConfig(periodic_snapshot_interval=interval),
+        ),
+        spec_config=spec_config,
+        is_disagg=is_disagg,
+    )
+    baseline = _kda_cache_budget(monkeypatch, False, model, mapping, **kwargs)
+    result = _kda_cache_budget(monkeypatch, available, model, mapping, **kwargs)
+    if available and not (is_disagg and role == "context"):
+        # Two layers: three BF16 [5,32] conv windows, two BF16 and one
+        # FP32 [2,32] histories and BF16 [2,8] padded beta per layer;
+        # one shared count per slot, padded to 16 bytes.
+        per_layer = 3 * 5 * 32 * 2 + 2 * 32 * 8 + 2 * 8 * 2
+        # At interval 33, round the combined recurrent + replay snapshot
+        # cost once: ceil(6224 / 33) - ceil(3200 / 33) = 92 bytes/token.
+        assert result[0] - baseline[0] == replay_slope
+        live_and_dummy_slots = 2 + _get_num_cuda_graph_padding_dummy_slots(spec_config, 2)
+        assert result[1] - baseline[1] == live_and_dummy_slots * (2 * per_layer + 16)
+    else:
+        assert result == baseline
+
+
+@pytest.mark.parametrize("enable_block_reuse", [False, True])
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("pp_partition,stage_kda_layers", [(None, [2, 0]), ([2, 2], [1, 1])])
+def test_kda_cache_budget_counts_live_dummy_and_fixed_snapshot_slots(
+    monkeypatch, enable_block_reuse, enable_attention_dp, rank, pp_partition, stage_kda_layers
+):
+    model = _kimi_model_config()
+    mapping = Mapping(
+        world_size=2,
+        rank=rank,
+        tp_size=1,
+        pp_size=2,
+        enable_attention_dp=enable_attention_dp,
+        pp_partition=pp_partition,
+    )
+    spec_config = MTPDecodingConfig(max_draft_len=2, draft_len_schedule={1: 2, 2: 1})
+    kwargs = dict(
+        max_batch_size=4,
+        max_seq_len=128,
+        tokens_per_block=32,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=enable_block_reuse,
+            mamba_state_config=MambaStateConfig(
+                periodic_snapshot_interval=0,
+                additional_snapshot_offsets_from_start=[32, 64, 64, 256],
+                additional_snapshot_offsets_from_end=[0, 32, 128],
+            ),
+        ),
+        spec_config=spec_config,
+        is_disagg=False,
+    )
+    baseline = _kda_cache_budget(monkeypatch, False, model, mapping, **kwargs)
+    result = _kda_cache_budget(monkeypatch, True, model, mapping, **kwargs)
+    # Without an explicit partition, splitting the four target layers plus
+    # one MTP layer puts both KDA layers on rank 0. Partition [2,2] places one
+    # KDA layer on each rank, with the MTP layer appended to rank 1.
+    # Every live slot (max_batch_size * pp_size), every CUDA-graph padding
+    # dummy plus one more for attention DP, and with reuse four reachable,
+    # distinct snapshot rules per resident sequence carry replay caches.
+    local_kda_layers = stage_kda_layers[rank]
+    replay_bytes_per_slot = 1504 * local_kda_layers + (16 if local_kda_layers else 0)
+    slots = (
+        8
+        + _get_num_cuda_graph_padding_dummy_slots(spec_config, 4)
+        + int(enable_attention_dp)
+        + (8 * 4 if enable_block_reuse else 0)
+    )
+    assert result == (baseline[0], baseline[1] + slots * replay_bytes_per_slot)
+
+
+def test_v2_kda_replay_seeds_disaggregated_generation_slots():
+    mgr = object.__new__(KimiK3HybridCacheManager)
+    mgr._kda_replay = KDAReplayState(2)
+    mgr.local_num_mamba_layers = 2
+    mgr.conv_state_shape = [6, 4]
+    mgr.conv_section_dims = [2, 2, 2]
+    mgr._request_id_to_state_index = {101: 1, 202: 3}
+    mgr._kda_replay.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32)
+    mgr.all_conv_states = [
+        torch.arange(4 * 6 * 4, dtype=torch.float32).reshape(4, 6, 4),
+        torch.arange(4 * 6 * 4, dtype=torch.float32).reshape(4, 6, 4) + 1000,
+    ]
+
+    def dim_contiguous_conv_cache() -> torch.Tensor:
+        return torch.full((2, 4, 6, 2), 7.0).transpose(-1, -2)
+
+    replay = {}
+    replay["kda_conv_q"] = dim_contiguous_conv_cache()
+    replay["kda_conv_k"] = dim_contiguous_conv_cache()
+    replay["kda_conv_v"] = dim_contiguous_conv_cache()
+    replay["kda_k_cache"] = torch.full((2, 4, 2, 2), 7.0)
+    replay["kda_g_cache"] = torch.full((2, 4, 2, 2), 7.0)
+    replay["kda_v_cache"] = torch.full((2, 4, 2, 2), 7.0)
+    replay["kda_beta_cache"] = torch.full((2, 4, 2, 1), 7.0)
+
+    mgr._kda_replay.pool_layers = [
+        {name: buffer[layer] for name, buffer in replay.items()} for layer in range(2)
+    ]
+
+    mgr._kda_replay._conv_states = tuple(mgr.all_conv_states)
+    mgr._kda_replay._conv_section_dims = tuple(mgr.conv_section_dims)
+    mgr._kda_replay._committed_window = mgr.conv_state_shape[1]
+    mgr.seed_kda_replay_caches_for_disagg_gen([101, 202])
+
+    for layer_offset, conv_state in enumerate(mgr.all_conv_states):
+        for slot in (1, 3):
+            for replay_buffer, start in (
+                (replay["kda_conv_q"], 0),
+                (replay["kda_conv_k"], 2),
+                (replay["kda_conv_v"], 4),
+            ):
+                torch.testing.assert_close(
+                    replay_buffer[layer_offset, slot, :, :4],
+                    conv_state[slot, start : start + 2, :],
+                )
+                assert torch.count_nonzero(replay_buffer[layer_offset, slot, :, 4:]) == 0
+            assert torch.count_nonzero(replay["kda_k_cache"][layer_offset, slot]) == 0
+            assert torch.count_nonzero(replay["kda_g_cache"][layer_offset, slot]) == 0
+            assert torch.count_nonzero(replay["kda_v_cache"][layer_offset, slot]) == 0
+            assert torch.count_nonzero(replay["kda_beta_cache"][layer_offset, slot]) == 0
+            assert mgr._kda_replay.prev_num_accepted_tokens[slot] == 0
+    assert mgr._kda_replay.prev_num_accepted_tokens[0] == 5
+    assert mgr._kda_replay.prev_num_accepted_tokens[2] == 5
+
+
+_KDA_REPLAY_FIELDS = (*_KDA_REPLAY_BUFFERS, "prev_num_accepted_tokens")

@@ -93,8 +93,8 @@ def _dummy_yaml_with_injections(injections_yaml: str) -> str:
         generation_servers: {}
         stress_config:
           duration_min: 1
-          kv_cache_manager: v1
-          transceiver: cpp
+          kv_cache_manager: v2
+          transceiver: python
           injections:
         """
     )
@@ -345,8 +345,8 @@ def test_respawn_uses_allocated_port_and_bounded_health_wait(
             generation_servers: {}
             stress_config:
               duration_min: 1
-              kv_cache_manager: v1
-              transceiver: cpp
+              kv_cache_manager: v2
+              transceiver: python
               injections: []
             """
         )
@@ -367,33 +367,45 @@ def test_respawn_uses_allocated_port_and_bounded_health_wait(
         device: str,
         save_log: bool,
         env: dict[str, str],
+        worker_index: int,
     ) -> SimpleNamespace:
         assert model_name == spec.model_name
         assert worker_config == spec.worker_config
         assert role == "gen"
-        assert port == 23456
+        assert port == 0
         assert work_dir == spec.work_dir
         assert device == spec.device
         assert save_log is False
         assert env == spec.env
-        return SimpleNamespace(process=None, port=port, log_file=None, log_path=None)
+        assert worker_index == spec.index
+        return SimpleNamespace(
+            process=SimpleNamespace(pid=12345), port=0, log_file=None, log_path=None
+        )
 
     health_calls: list[tuple[int, float]] = []
+
+    def _fake_registered_port(role: str, pid: int, *, deadline: float) -> int:
+        assert role == "gen"
+        assert pid == 12345
+        assert deadline > time.monotonic()
+        return 23456
 
     def _fake_health(port: int, *, timeout_s: float) -> bool:
         health_calls.append((port, timeout_s))
         return True
 
     fake_disagg_test_utils = ModuleType("disagg_test_utils")
-    fake_disagg_test_utils.get_free_port = lambda: 23456
     fake_disagg_test_utils._run_worker = _fake_run_worker
     monkeypatch.setitem(sys.modules, "disagg_test_utils", fake_disagg_test_utils)
+    monkeypatch.setattr(h, "_await_registered_worker_port", _fake_registered_port)
     monkeypatch.setattr(h, "_wait_for_worker_health", _fake_health)
 
     assert h._respawn_tracked_worker(tracked, timeout_s=7.0) is True
     assert tracked.wrapper.port == 23456
     assert spec.port == 23456
-    assert health_calls == [(23456, 7.0)]
+    assert len(health_calls) == 1
+    assert health_calls[0][0] == 23456
+    assert 0 < health_calls[0][1] <= 7.0
 
 
 def test_injector_exits_on_stop_event_before_distant_injection(tmp_path: Path) -> None:
@@ -467,8 +479,8 @@ def test_injector_empty_schedule_exits_immediately(tmp_path: Path) -> None:
             generation_servers: {}
             stress_config:
               duration_min: 1
-              kv_cache_manager: v1
-              transceiver: cpp
+              kv_cache_manager: v2
+              transceiver: python
               injections: []
             """
         )

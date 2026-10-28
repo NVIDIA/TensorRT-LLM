@@ -665,6 +665,12 @@ def _run_test_for_backend(
         * kv_cache_tokens_per_block
         * max_num_contexts
     )
+    # The static token-sparse context FMHA may load KV rows beyond the selected ones, and its
+    # TMA descriptor does not bound rows to the pool. A pool sized only for these short
+    # sequences (a single 64-token block for context_sequence_lengths=[10]) can therefore be
+    # read past its end, which faults whenever the following address range is unmapped. Keep
+    # at least TopK rows in the pool, as any real deployment does.
+    max_tokens = max(max_tokens, SPARSE_TOPK)
 
     pretrained_config = SimpleNamespace(
         rms_norm_eps=1e-6,

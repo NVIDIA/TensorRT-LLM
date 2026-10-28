@@ -278,6 +278,72 @@ def test_cute_dsl_fp8_paged_mqa_logits(
 
 
 @skip_not_sm100
+@pytest.mark.parametrize(
+    "next_n,num_next_n_atoms,atom",
+    [
+        (4, 2, 2),  # even split
+        (5, 2, 3),  # uneven: 3 + 2
+        (7, 2, 4),  # uneven: 4 + 3, the indexer's pick for next_n=7
+        (7, 3, 3),  # uneven: 3 + 2 + 2
+    ],
+)
+@pytest.mark.parametrize("num_heads", [64, 32])
+@pytest.mark.parametrize("batch_size", [1, 8])
+def test_cute_dsl_fp8_paged_mqa_logits_kernel_split(
+    next_n, num_next_n_atoms, atom, num_heads, batch_size
+):
+    """In-kernel next_n atom split matches the unsplit reference.
+
+    The schedule enumerates batch * num_next_n_atoms atom rows with the
+    staggered causal context the indexer metadata builds (_atom_ctx_offsets).
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import _atom_ctx_offsets
+    from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
+
+    head_dim, block_kv, avg_ctx = 128, 128, 4096
+    max_model_len = avg_ctx * 2
+    data = _generate_test_data(
+        batch_size, next_n, num_heads, head_dim, block_kv, avg_ctx, max_model_len, fix_length=False
+    )
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    offsets = torch.tensor(
+        _atom_ctx_offsets(next_n, num_next_n_atoms), dtype=torch.int32, device="cuda"
+    )
+    atom_ctx = (data["context_lens"].unsqueeze(1) - offsets).reshape(-1, 1)
+    schedule_meta = get_paged_mqa_logits_metadata(atom_ctx, 64, num_sms)
+
+    ref_logits = paged_mqa_logits_quantized(
+        data["q_fp8"],
+        data["kv_fp8"],
+        data["kv_scales"],
+        data["weights"],
+        data["context_lens"],
+        data["block_table"],
+        max_model_len,
+        block_kv,
+    )
+    dsl_logits = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+        data["q_fp8"],
+        data["kv_fused"],
+        data["weights"],
+        data["context_lens"],
+        data["block_table"],
+        schedule_meta,
+        max_model_len,
+        num_next_n_atoms=num_next_n_atoms,
+        atom=atom,
+    )
+
+    positions = torch.arange(max_model_len, device="cuda").unsqueeze(0)
+    rows = torch.arange(batch_size * next_n, device="cuda")
+    end_pos = data["context_lens"][rows // next_n] - next_n + rows % next_n
+    mask = positions <= end_pos.unsqueeze(1)
+    dsl = dsl_logits.float().masked_fill(~mask, 0)
+    ref = ref_logits.float().masked_fill(~mask, 0)
+    torch.testing.assert_close(dsl, ref, atol=5e-5, rtol=1e-5)
+
+
+@skip_not_sm100
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("next_n", [1, 2, 3, 4])
 @pytest.mark.parametrize("num_heads", [64])

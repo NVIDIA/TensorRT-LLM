@@ -203,7 +203,7 @@ def _run_attention_distributed(
 
     # Single generation step.
     for req_id in range(scenario.batch):
-        kv_cache_manager.impl.add_token(req_id)
+        assert kv_cache_manager.kv_cache_map[req_id].capacity >= (ctx_len_per_gpu + 1) * world_size
     helix_is_inactive_rank = [rank != world_size - 1] * scenario.batch
     attn_metadata = create_helix_gen_metadata(
         scenario.batch, ctx_len_per_gpu, kv_cache_manager, helix_is_inactive_rank, position_ids_gen
@@ -291,7 +291,7 @@ def _full_test_multi_gpu(
 
         # Single generation step.
         for req_id in range(scenario.batch):
-            ref_kv_cache_manager.impl.add_token(req_id)
+            assert ref_kv_cache_manager.kv_cache_map[req_id].capacity >= scenario.ctx_len + 1
         ref_attn_metadata = get_attention_backend("TRTLLM").Metadata(
             seq_lens=torch.tensor([1] * scenario.batch, dtype=torch.int),
             request_ids=list(range(scenario.batch)),

@@ -48,6 +48,9 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
         "skip_mla_rope_generation",  # handled in ``TrtllmAttention.forward`` for the test-only MLA path
         "timestep",  # consumed by sparse prediction before FMHA dispatch
         "sparse_attn_phase",  # host-resolved sparse phase, consumed before FMHA dispatch
+        "qk_fp8_per_tensor",  # per-tensor FP8 recipe flag, consumed by FMHA selection and the PrimTS FMHA
+        "v_fp8_per_tensor",  # per-tensor FP8 recipe flag, consumed by FMHA selection and the PrimTS FMHA
+        "sage_quantized",  # for libraries taking quantized Sage inputs; the op quantizes its own
     }
 )
 
@@ -232,7 +235,7 @@ class FallbackFmha(Fmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        del k, v, phase
+        del k, v
         # A context phase served by the thop op with use_paged_context_fmha
         # enabled would silently corrupt the cached prefix wherever the fused
         # context kernel is absent. Raise rather than return False: no
@@ -243,6 +246,23 @@ class FallbackFmha(Fmha):
         # (``context_batch_size``), so the admitted result cannot be reused
         # for a context batch.
         if metadata.num_contexts > 0:
+            # Extra page sizes are supported by TRTLLM-Gen, not the thop
+            # paged-context kernel. Refuse before the kernel can read KV.
+            extra_page_sizes = getattr(
+                metadata.kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ()
+            )
+            if (
+                extra_page_sizes
+                and phase != FmhaPhase.GENERATION
+                and metadata.use_paged_context_fmha
+                and metadata.tokens_per_block in extra_page_sizes
+            ):
+                raise RuntimeError(
+                    f"FallbackFmha cannot serve paged prefill with "
+                    f"{metadata.tokens_per_block}-token KV pages. "
+                    "Use a supported TRTLLM-Gen configuration or disable "
+                    "chunked prefill, KV reuse and speculative decoding."
+                )
             self._validate_paged_context_fmha(metadata)
         # A verify group may straddle a page boundary onto two CP ranks, so
         # its KV ownership is per-token. The fused thop path cannot express
@@ -277,6 +297,12 @@ class FallbackFmha(Fmha):
         forward_args: AttentionForwardArgs,
     ) -> None:
         attn = self.attn
+        if forward_args.sage_attn_smooth_v:
+            logger.warning_once(
+                "The attention op quantizes V without the V smoothing this SageAttention "
+                "recipe requests.",
+                key="fallback_fmha_sage_attn_smooth_v",
+            )
 
         # Every kwarg sources from ``attn`` / ``metadata`` / ``forward_args``
         # (with ``forward_args.sparse_runtime_params`` for sparse inputs),

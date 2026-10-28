@@ -61,7 +61,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     RopeParams,
 )
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -340,7 +340,7 @@ def _cupti_kernel_counter():
 # --------------------------------------------------------------------------- #
 
 
-def _build_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheManager:
+def _build_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheManagerV2:
     num_blocks = case.batch_size * case.num_pages
     tokens_per_block = case.page_size
     max_seq_len = num_blocks * tokens_per_block
@@ -348,7 +348,7 @@ def _build_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheManag
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
 
-    mgr = KVCacheManager(
+    mgr = KVCacheManagerV2(
         kv_cache_config,
         cache_type,
         num_layers=num_layers,
@@ -366,7 +366,7 @@ def _build_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheManag
     return mgr
 
 
-def _build_metadata(case: AttnCase, kv_mgr: KVCacheManager):
+def _build_metadata(case: AttnCase, kv_mgr: KVCacheManagerV2):
     request_ids = list(range(case.batch_size))
     num_cached = [case.num_cached_tokens] * case.batch_size
     kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=num_cached)
@@ -496,7 +496,7 @@ def _mla_tokens_per_block() -> int:
     return 32 if major >= 10 else 64
 
 
-def _build_mla_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheManager:
+def _build_mla_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheManagerV2:
     tokens_per_block = _mla_tokens_per_block()
     head_dim = _mla_kv_head_dim(case)
     per_seq = case.num_cached_tokens + case.seq_len
@@ -508,7 +508,7 @@ def _build_mla_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheM
         * case.batch_size
     )
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
-    mgr = KVCacheManager(
+    mgr = KVCacheManagerV2(
         KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
         num_layers=num_layers,
@@ -530,7 +530,7 @@ def _build_mla_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheM
     return mgr
 
 
-def _build_mla_gen_metadata(case: AttnCase, kv_mgr: KVCacheManager):
+def _build_mla_gen_metadata(case: AttnCase, kv_mgr: KVCacheManagerV2):
     request_ids = list(range(case.batch_size))
     kv_cache_params = KVCacheParams(
         use_cache=True, num_cached_tokens_per_seq=[case.num_cached_tokens] * case.batch_size
@@ -597,12 +597,10 @@ def _make_mla_gen_inputs(case: AttnCase, device: torch.device):
 # Mirrors tests/unittest/_torch/attention/sparse/test_sparse_mla_forward.py
 # ::test_forward_sparse_mla_unified (the pure-context branch). DSA = MLA + a
 # sparse Indexer: the module builds DSATrtllmAttention (subclass of TrtllmAttention)
-# which owns an Indexer submodule; the forward is two-stage:
-#   topk = mla.mqa.indexer(qr, hidden_states, metadata, position_ids)
-#   mla.forward_context_dsa(q, compressed_kv, k_pe, metadata, output,
-#                           latent_cache, topk_indices=topk, position_ids=...)
+# which owns an Indexer submodule; its projections feed _forward_dsa_attn,
+# which updates the indexer cache and dispatches sparse MLA attention.
 # Unlike the GQA/MLA paths this needs the FULL MLA module (weights + indexer),
-# a DSACacheManager (indexer-K pool), and DSAtrtllmAttentionMetadata.
+# a DSACacheManagerV2 (indexer-K pool), and DSAtrtllmAttentionMetadata.
 #
 # ARCH: the indexer's DeepGEMM MQA-logits kernels exist only for sm90/sm100/sm103.
 # On sm120 (and any arch without DeepGEMM) construction/forward raises; the caller
@@ -681,7 +679,7 @@ def _build_dsa_ctx(case: AttnCase, device: torch.device):
 
     Pure prefill: batch_size requests of seq_len new tokens, no cached tokens.
     """
-    from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManager
+    from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManagerV2
     from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 
     sparse_config = _dsa_sparse_config(case)
@@ -694,8 +692,13 @@ def _build_dsa_ctx(case: AttnCase, device: torch.device):
     per_seq = case.seq_len  # context: seq_len tokens, no cache
     max_seq_len = (per_seq + tokens_per_block - 1) // tokens_per_block * tokens_per_block
 
-    kv_mgr = DSACacheManager(
-        KvCacheConfig(max_tokens=max_seq_len * case.batch_size, enable_block_reuse=False),
+    kv_mgr = DSACacheManagerV2(
+        KvCacheConfig(
+            max_tokens=max_seq_len * case.batch_size,
+            enable_block_reuse=False,
+            # Account for allocation granularity in both the MLA and indexer pools.
+            avg_seq_len=per_seq,
+        ),
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
         num_layers=1,
         num_kv_heads=1,
@@ -703,18 +706,20 @@ def _build_dsa_ctx(case: AttnCase, device: torch.device):
         tokens_per_block=tokens_per_block,
         max_seq_len=max_seq_len,
         max_batch_size=case.batch_size,
+        max_num_tokens=case.seq_len * case.batch_size,
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         dtype=_DTYPE_TO_BINDING[case.dtype],
         sparse_attn_config=sparse_config,
         model_config=model_config,
     )
     request_ids = list(range(case.batch_size))
-    kv_mgr.add_dummy_requests(
+    assert kv_mgr.max_seq_len >= case.seq_len
+    requests = kv_mgr.add_dummy_requests(
         request_ids=request_ids,
         token_nums=[case.seq_len] * case.batch_size,
         is_gen=False,
-        prepare_resource=True,
     )
+    assert requests is not None
 
     AttentionCls = get_attention_backend("TRTLLM", sparse_config)
     metadata = AttentionCls.Metadata(
@@ -833,23 +838,28 @@ def _collect_signals_inproc(
         kv_mgr = _build_mla_kv_cache_manager(case) if case.is_mla else _build_kv_cache_manager(case)
     try:
         if case.is_dsa:
+            from tensorrt_llm._torch.attention.backends.sparse.dsa.module import _forward_dsa_attn
+
             # DSA context: indexer (sparse top-k select) + sparse MLA forward.
             # use_paged_context_fmha is recorded for parity (MLA-family forces it
             # off); the DSA tripwire is launch_count (indexer + sparse-FMHA chain).
             sig.use_paged_context_fmha = bool(getattr(metadata, "use_paged_context_fmha", None))
 
             def _fwd():
-                topk = mla.mqa.indexer(
-                    fwd["qr"], fwd["hidden_states"], metadata, fwd["position_ids"]
+                indexer_intermediates = list(
+                    mla.mqa.indexer.pre_indexer_proj(
+                        fwd["qr"], fwd["hidden_states"], fwd["position_ids"]
+                    )
                 )
-                return mla.forward_context_dsa(
+                return _forward_dsa_attn(
+                    mla,
                     q=fwd["q"],
                     compressed_kv=fwd["compressed_kv"],
                     k_pe=fwd["k_pe"],
                     attn_metadata=metadata,
                     output=fwd["output"],
                     latent_cache=fwd["latent_cache"],
-                    topk_indices=topk,
+                    indexer_intermediates=indexer_intermediates,
                     position_ids=fwd["position_ids"],
                 )
         elif case.is_mla:

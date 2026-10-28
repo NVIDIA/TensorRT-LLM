@@ -12,34 +12,44 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""What a cache backend is asked to do, and what it still owes the caller word about."""
+"""The backend contract: what a lease holder hands a backend, and what it gets back.
+
+The lease holder holds a lease from the KV cache lender and submits its view to a backend. The
+caller asks the lease holder for a transfer and supplies its hint. The assembly builds each
+backend and hands it the lender's regions, in the lender's order, and its ``WakeFn``. The
+obligations stated on each type are part of the contract, checked or not. Methods beyond
+:class:`Backend` come as optional protocols, which a backend declares by implementing them.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
-from typing import List, Optional, Protocol, Set, Tuple, Union, runtime_checkable
+from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 
-# TODO:
-# 1. Something outside the engine cannot implement this until the file leaves this package.
-# 2. Wrapping request ids and endpoints belongs to a later repo-wide typing pass.
-# 3. Retrying from a second source needs an (id, epoch) key here and in ``native`` together.
+from .memory import MemoryKind
 
 __all__ = [
     "Attempt",
-    "CacheExtent",
+    "Backend",
     "CacheKind",
-    "Cancelled",
-    "Chunk",
-    "Delivered",
-    "Failed",
-    "Fetches",
+    "Capabilities",
+    "Hint",
+    "InvalidSubmission",
+    "LayerGroupRows",
+    "MemoryKind",
     "Outcome",
-    "Publishes",
+    "SlotRegion",
+    "SubmissionRejected",
     "TokenRange",
+    "View",
+    "WakeFn",
 ]
+
+# Native's token range and layer-group kind, read by its per-request pieces and its page table;
+# not part of the backend contract.
 
 
 @dataclass
@@ -57,225 +67,384 @@ class TokenRange:
 
 
 class CacheKind(IntEnum):
-    """How one layer group's region ids are read, and with them its share of a token range.
+    """How one layer group's pool slot ids are read, and with them its share of a token range.
 
-    PAGED: several block ids covering a span, whose end is an upper bound -- any prefix of it is
-           valid cache (attention).
-    STATE: one slot id standing for the request as a whole, whose end is an exact checkpoint -- a
-           slot rolled to another position is not a prefix of this one (recurrent state).
+    PAGED: a positional pool-slot table covering a span, whose end is an upper bound -- any prefix
+           of it is valid cache (attention).
+    STATE: one pool slot id standing for the request as a whole, whose end is an exact checkpoint
+           -- a slot rolled to another position is not a prefix of this one (recurrent state).
 
-    A backend that cannot tell the two apart reads a slot id as a block id and a checkpoint as a
-    bound, and neither mistake announces itself.
+    A backend that cannot tell the two apart reads a state's one slot as a one-entry table and its
+    checkpoint as a bound, and neither mistake announces itself.
     """
 
     PAGED = 0
     STATE = 1
 
 
-@dataclass
-class Chunk:
-    """One piece of a transfer. A monolithic transfer is the sole piece.
+Hint = Any
+"""The caller's hint for the other end of a submission (its source or destination), handed to
+the backend unread by the lease holder. A hint is an immutable snapshot that the caller never
+changes, so the backend may keep a reference to it, for as long as it needs, without copying it.
+It describes only the other end: which rows this end reads or writes comes from the view alone."""
 
-    ``block_ids_per_layer_groups[g]`` of a PAGED group is positional: entry ``i`` is the local pool
-    slot holding block ordinal ``i`` (tokens ``[i * tpb, (i + 1) * tpb)``), or ``-1`` when this side
-    has nothing to offer/accept there -- SWA-evicted, not yet allocated, already cached on the
-    receiver, or outside this piece's range. Paged groups carry ``ceil(prompt_len / tpb)`` entries
-    and beam 0 only; a STATE group carries a single slot. The sender pairs ordinals that are
-    ``>= 0`` on both sides, so neither side needs to know the other's eviction or reuse state.
+WakeFn = Callable[[], None]
+"""Handed to a backend by the assembly and called from any thread at least when an outcome lands or
+an access ends, and on any further occasion an optional protocol names: thread-safe, reentrant,
+never blocks or raises, harmless after shutdown. A backend calls it only after every change it
+reports is visible: an outcome or an access end through :meth:`Attempt.poll` or
+:meth:`Attempt.quiesced`, a change an optional protocol names where that protocol says."""
 
-    ``token_range`` is the span this piece moves, not a claim that every layer group covers it: a
-    recurrent-state group carries one slot rather than a span, and a windowed group's table is
-    mostly holes.
+
+@runtime_checkable
+class SlotRegion(Protocol):
+    """A contiguous memory region divided into equal-sized slots; a row given by an address
+    occupies one slot.
+
+    A backend registers only the regions whose :attr:`memory_kind` it can access, each once as
+    ``(address, nbytes)``; rows in a region it has not registered are rows it does not recognize.
+    Slot ``k`` starts at ``address + k * slot_bytes`` for ``0 <= k < slot_count``; ``nbytes``
+    covers all slots, so it is at least ``slot_bytes * slot_count``. A view may select
+    nonconsecutive slots.
+    The descriptor and its backing memory remain valid while the backend may access them.
     """
 
-    block_ids_per_layer_groups: List[np.ndarray]
+    @property
+    def layout_label(self) -> str:
+        """An opaque layout label, equal for regions laid out alike; not an allocation identity."""
+        ...
 
-    kind_per_layer_group: List[CacheKind]
-    """How to read each list above, in the same order.
+    @property
+    def address(self) -> int: ...
 
-    Stated rather than inferred: both kinds are arrays of integers, so nothing in the ids themselves
-    separates a page from a slot.
+    @property
+    def nbytes(self) -> int: ...
+
+    @property
+    def slot_bytes(self) -> int:
+        """Bytes of one slot."""
+        ...
+
+    @property
+    def slot_count(self) -> int:
+        """Number of slots, back to back from :attr:`address`."""
+        ...
+
+    @property
+    def memory_kind(self) -> MemoryKind:
+        """The kind of memory the region lies in. ``DEVICE`` is the GPU of this rank's lender; the
+        region names no device id."""
+        ...
+
+
+@runtime_checkable
+class LayerGroupRows(Protocol):
+    """One layer group's rows of a view, described by aligned arrays.
+
+    A row is one transfer unit. When addresses are provided, each row occupies one slot in the
+    region. These members are all a backend reads of a group, apart from those a capability it
+    declares names. Row addresses need not be consecutive. A backend given rows it does not
+    recognize rejects the submission with :class:`InvalidSubmission`; it never skips them.
     """
 
-    token_range: TokenRange  # (0, prompt_len) when not cut along tokens
-    is_last: bool
-    """Whether this piece ends the series. Getting it wrong ends the transfer early and in silence.
+    @property
+    def layer_group_index(self) -> int:
+        """The lender's local layer-group index, not the group's position in :attr:`View.groups`."""
+        ...
 
-    Cannot be derived from ``token_range``: a windowed or recurrent-state group never fills the
-    span, so comparing against the full length lies."""
+    @property
+    def object_keys(self) -> np.ndarray | None:
+        """One opaque object key per row, ``uint8`` of shape ``[rows, width]`` with the lender's
+        fixed width. Keys are compared only for equality under the lender's identity rules;
+        they are not payload checksums. ``None`` for rows without keys, which reach only a backend
+        that declares a capability admitting them."""
+        ...
 
-    excluded_pool_views: Set[Tuple[int, int]] = field(default_factory=set)
+    @property
+    def addresses(self) -> np.ndarray | None:
+        """One address per row, ``int64`` of shape ``[rows]``: row ``i`` is the slot at
+        ``addresses[i]`` in the :class:`SlotRegion` at index :attr:`region_index`. ``None`` exactly
+        when :attr:`region_index` is."""
+        ...
+
+    @property
+    def region_index(self) -> int | None:
+        """The index, among the lender's regions, of the :class:`SlotRegion` the rows sit in, or
+        ``None``."""
+        ...
+
+    def __len__(self) -> int: ...
+
+
+@runtime_checkable
+class View(Protocol):
+    """The rows one submission moves, all from one lease: at most one :class:`LayerGroupRows`
+    per layer group.
+
+    Its groups and their members, the rows' metadata, are an immutable snapshot, never changed or
+    reused: they stay valid for as long as the lease holder keeps the view, after the lease is
+    returned too. The lease bounds only the protection of the payload, the bytes in the memory
+    the rows locate.
+    """
+
+    @property
+    def groups(self) -> Sequence[LayerGroupRows]: ...
+
+    def row_masks(self, fill_value: bool = False) -> tuple[np.ndarray, ...]:
+        """One new writable ``bool`` mask of shape ``[len(group)]`` per group, in :attr:`groups`
+        order.
+
+        Args:
+            fill_value: What every entry starts as.
+        """
+        ...
+
+
+class SubmissionRejected(Exception):
+    """Refused before work, a peer notification or memory access escaped; also every submission
+    after :meth:`Backend.shutdown`. Only this type certifies that nothing escaped."""
+
+
+class InvalidSubmission(SubmissionRejected, ValueError):
+    """Bad arguments or hint, or an undeclared direction; raised before anything escaped."""
+
+
+@dataclass(frozen=True)
+class Capabilities:
+    """What a backend implements, fixed for the backend's life. A new capability is a field whose
+    default means not supported, and rows that need a capability reach only a backend that
+    declares it.
+
+    Attributes:
+        fetch: Implements :meth:`Backend.fetch`.
+        publish: Implements :meth:`Backend.publish`.
+        cancel: Implements the advisory :meth:`Attempt.cancel`.
+
+    Raises:
+        ValueError: Neither ``fetch`` nor ``publish`` is set.
+    """
+
+    fetch: bool
+    publish: bool
+    cancel: bool = False
 
     def __post_init__(self):
-        if len(self.kind_per_layer_group) != len(self.block_ids_per_layer_groups):
+        if not (self.fetch or self.publish):
+            raise ValueError("a backend implements at least one of fetch and publish")
+
+
+def _delivery_mask(mask: np.ndarray) -> np.ndarray:
+    """``mask`` itself if it is a read-only ``bool`` array whose type is exactly ``numpy.ndarray``;
+    otherwise a read-only copy of it.
+
+    Raises:
+        TypeError: ``mask`` is not of dtype ``bool``.
+    """
+    if type(mask) is np.ndarray and mask.dtype == np.bool_ and not mask.flags.writeable:
+        return mask
+    copy = np.array(mask)
+    if copy.dtype != np.bool_:
+        raise TypeError(f"a delivery mask is bool, not {copy.dtype}")
+    copy.flags.writeable = False
+    return copy
+
+
+@dataclass(frozen=True, eq=False)
+class Outcome:
+    """How one submission ended.
+
+    A delivered row is one the destination holds whole and readable: byte for byte as the source
+    holds it, or as the destination already held it under the row's object key. A
+    delivered row is final: every write to it has completed and none will follow. A row not
+    delivered may have been partly written; its memory is reused only once ``quiesced()`` is true.
+    A miss is nothing delivered and no fault; deliveries and a fault can coexist; a peer's cancel is
+    a fault, a local cancel is not. An outcome says neither when the request may use the rows,
+    which the lender decides, nor whether access has ended (``quiesced()``).
+
+    Attributes:
+        delivered_masks: One read-only ``bool`` mask of shape ``[len(group)]`` per group of the
+            view, in order. A read-only mask of dtype ``bool`` whose type is exactly
+            ``numpy.ndarray`` is kept as it is, and its giver writes neither it nor memory it
+            shares afterwards; any other mask is copied.
+        fault: What went wrong, or ``None``.
+
+    Raises:
+        TypeError: A mask given is not of dtype ``bool``.
+    """
+
+    delivered_masks: tuple[np.ndarray, ...]
+    fault: str | None = None
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "delivered_masks",
+            tuple(_delivery_mask(mask) for mask in self.delivered_masks),
+        )
+
+    @classmethod
+    def for_view(
+        cls,
+        view: View,
+        delivered_masks: Sequence[np.ndarray] | None = None,
+        fault: str | None = None,
+    ) -> Outcome:
+        """Returns an outcome for ``view``.
+
+        Args:
+            view: The view submitted; gives the all-false masks when ``delivered_masks`` is
+                ``None``.
+            delivered_masks: One mask per group of ``view``, not checked against it (see
+                :meth:`check_mask_shapes`), or ``None`` for nothing delivered.
+            fault: What went wrong, or ``None``.
+        """
+        return cls(
+            tuple(delivered_masks) if delivered_masks is not None else view.row_masks(False), fault
+        )
+
+    def check_mask_shapes(self, view: View) -> None:
+        """Checks the mask count and shapes against ``view``; does not prove delivery.
+
+        Args:
+            view: The view the outcome is for.
+
+        Raises:
+            ValueError: The outcome does not hold one mask of shape ``[len(group)]`` per group of
+                ``view``.
+        """
+        if len(self.delivered_masks) != len(view.groups):
             raise ValueError(
-                f"{len(self.block_ids_per_layer_groups)} layer groups but "
-                f"{len(self.kind_per_layer_group)} kinds"
+                f"outcome has {len(self.delivered_masks)} masks for {len(view.groups)} groups"
             )
-
-
-@dataclass
-class CacheExtent:
-    """One ask: which content, and where this rank's blocks for it are.
-
-    One ``name`` covers the request, while ``local``'s blocks are per layer group, positional with
-    ``-1`` holes (see ``Chunk``).
-
-    Handing one to ``fetch`` or ``publish`` lends it out: a backend may keep it and read it on
-    another thread. Neither it, its ``Chunk``, nor the arrays inside may be changed while it is
-    lent -- the transfer would quietly move a different shape, and since a backend is not required
-    to copy it, nothing would report the change.
-
-    TODO: An ``Attempt`` concluding does not end the loan. It reports a logical outcome, and one
-    can be reached while writers are still going -- a failure settles the piece while its siblings
-    write on -- so a backend may still be reading afterwards. Nothing on this surface says when a
-    caller may write to the extent again; native answers it by holding the only reference until
-    the session retires. How long this description stays readable and how long the pages it names
-    stay held are two questions, and neither is answered here.
-    """
-
-    name: int
-
-    local: Chunk
-    """This rank's blocks: the destination when receiving, the source when sending. Same shape,
-    opposite direction."""
-
-    # TODO: Which layer groups a delivery leaves whole is the answering side's to say, not the
-    # asking side's, and nothing carries it today.
-
-
-@dataclass(frozen=True)
-class Delivered:
-    """The ask was met.
-
-    TODO: The evidence is reports, not a fence; the reports travel on a different channel from the
-    data and the two are not ordered.
-    """
-
-    token_end: int
-    """How far this delivery reaches, as an absolute offset rather than a count.
-
-    One value for every layer group, read by each group's kind: a bound for ``PAGED``, a checkpoint
-    for ``STATE``.
-    """
-
-    reports_pending: bool = False
-    """Always false: every report this transfer was owed has arrived. Setting it raises; success
-    still owed a report is what ``Failed`` and ``Cancelled`` are for.
-    """
-
-    def __post_init__(self):
-        if self.reports_pending:
-            raise ValueError("a delivery cannot still be owed a report")
-
-
-@dataclass(frozen=True)
-class Failed:
-    """The transfer could not be completed."""
-
-    reason: str
-    reports_pending: bool
-    """Whether a report this transfer was owed has yet to arrive. Says nothing about hardware."""
-
-
-@dataclass(frozen=True)
-class Cancelled:
-    """Someone asked for this to stop, and it ended without delivering.
-
-    Says nothing about whether the peers have stopped -- nothing here does. A cancelled piece is
-    normally still owed reports, which is a different question again.
-
-    Cancellation is an act on the whole transfer, not on one piece: there is no way to stop a single
-    chunk while its siblings continue.
-    """
-
-    by_peer: bool = False
-    """A local cancel is an ordinary end; a peer's is a transfer error, and only the backend knows
-    which of the two happened."""
-
-    reports_pending: bool = True
-
-
-Outcome = Union[Delivered, Failed, Cancelled]
-"""How one delivery ended. ``None`` rather than a member means it has not ended yet.
-
-The logical member and its cause are committed at the task/session transition;
-polling only observes that decision. ``reports_pending`` can still change, so a
-stored outcome carries stale report progress, not a different logical result.
-
-``reports_pending`` asks one question and only one: is a report this transfer was owed still to
-arrive. Receiving waits on the writers' reports, sending on word about its own writes.
-
-**It is not a release condition, and answering it is not permission to hand memory back.** Reports
-and data travel on different channels and are not ordered, so no value of it means the peers have
-stopped touching the destination. Whatever eventually answers that is a separate question this
-contract does not ask.
-
-TODO: A backend that has torn down whatever a report would arrive on answers false -- which is how
-this converges today, rather than by the reports arriving. An ``Attempt`` cannot yet settle on its
-own evidence.
-
-TODO: Content addressing needs a member for "the source does not hold this", which is worth asking
-somewhere else for while a failure is not.
-"""
+        for mask, group in zip(self.delivered_masks, view.groups):
+            if mask.shape != (len(group),):
+                raise ValueError(
+                    f"layer group {group.layer_group_index}: outcome mask has shape {mask.shape} "
+                    f"for {len(group)} rows"
+                )
 
 
 @runtime_checkable
 class Attempt(Protocol):
-    """One delivery of one extent."""
+    """The handle of one submission.
 
-    def poll(self) -> Optional[Outcome]:
-        """Non-blocking. ``None`` while the delivery has not reached a conclusion.
-
-        A failure is reported as soon as it is known, which may be before every report is in --
-        that second question is carried by the outcome itself.
-        The logical result is stable and does not depend on when the first poll occurs.
-        """
-        ...
-
-
-@runtime_checkable
-class Fetches(Protocol):
-    """Somewhere cache can be pulled from. An instance is bound to one request, though it may be a
-    throwaway wrapper around longer-lived state; the request is not on the wire of this protocol, so
-    a backend serving an aggregated engine can implement it too."""
-
-    def fetch(self, extent: CacheExtent, *, src: Optional[str] = None) -> Attempt:
-        """Start pulling ``extent``, optionally naming which peer to pull it from.
-
-        An implementation must either honour ``src`` or refuse it. Quietly reading from somewhere
-        else -- the request's own endpoint, say -- is a disagreement nothing reports.
-
-        A submission that fails part way raises rather than answering with a handle, so the caller
-        stops the request the way it always has.
-
-        TODO: Peers are told one at a time, so a partial failure leaves some already holding the
-        destination, and raising says nothing about them. Answering with a handle needs a caller
-        that polls one.
-        """
-        ...
-
-
-@runtime_checkable
-class Publishes(Protocol):
-    """Somewhere cache can be offered from: the side that generated it, bound to one request.
-
-    The other direction of ``Fetches``, and a separate protocol because a backend may serve one and
-    not the other -- a store that only answers reads implements ``Fetches`` alone.
+    Conclusion (:meth:`poll`) and quiescence (:meth:`quiesced`) are independent and come in either
+    order. Neither depends on these calls: a backend advances its own work, so a lease holder that
+    calls them only after a wake misses nothing. No method blocks or raises; trouble is a
+    ``fault``. Every attempt concludes, at the latest when :meth:`Backend.shutdown` forces it; the
+    lease holder may act on its own deadline before then. The backend alone settles each physical
+    operation, never an adapter or the lease holder, and :meth:`Backend.shutdown` never stops what
+    produces the evidence that an operation ended. An attempt's methods are called in its
+    backend's call sequence (see :class:`Backend`).
     """
 
-    def publish(self, extent: CacheExtent) -> Attempt:
-        """Offer ``extent`` to whoever this request's cache is owed to.
+    def poll(self) -> Outcome | None:
+        """``None`` until concluded; the same outcome on every call after."""
+        ...
 
-        No counterpart to ``Fetches``'s ``src``: a fetch chooses among sources, while publishing
-        answers the peers that already asked. Naming a destination is a routing question that
-        arrives with content addressing, not before.
+    def quiesced(self) -> bool:
+        """True once access to the lent memory has ended, with evidence; its lease may be returned
+        on it alone.
 
-        A submission that fails part way raises rather than answering with a handle, the same way
-        the other direction does.
+        A pure read that never advances a transfer. It may turn true late, only on evidence, and
+        never turns false again. It covers the whole submission: a backend may leave a row not
+        proven ended, which holds every row's memory, so the leases lent for such a backend are
+        kept small.
+        """
+        ...
 
-        Whether the extent is visible to a reader only once all of it has landed is the
-        implementation's to guarantee, not this protocol's to express: a store that reveals a
-        half-written extent hands out cache that was never generated.
+    def cancel(self) -> None:
+        """Advisory: the backend tries not to start what it has not started, and a started transfer
+        may still finish. Called only when ``capabilities.cancel`` is true. Never raises, and never
+        turns :meth:`quiesced` true without evidence; the outcome reads as if not cancelled. Calling
+        it again, or after the attempt concluded, does nothing."""
+        ...
+
+
+@runtime_checkable
+class Backend(Protocol):
+    """Moves a view's rows between lent memory and a peer or a store.
+
+    An instance serves every submission of every request in its domain, that of one lender, and
+    itself registers the memory it reads or writes. A process may hold several instances, of one
+    class or of several, each registering its memory and shutting down on its own; a backend that
+    allows only one instance has its factory refuse to construct a second.
+
+    The methods of a backend and those of its attempts (:meth:`Attempt.poll`,
+    :meth:`Attempt.quiesced`, :meth:`Attempt.cancel`) belong to one call sequence: one thread at a
+    time calls them, the builder, then the executor loop, then the shutdown thread.
+    :meth:`Attempt.poll` and :meth:`Attempt.quiesced` are also safe against anything the backend
+    runs concurrently. The lease holder never calls :meth:`shutdown` on one thread while it goes
+    on calling an attempt's methods on another.
+    """
+
+    @property
+    def capabilities(self) -> Capabilities: ...
+
+    def fetch(self, view: View, source: Hint) -> Attempt:
+        """Writes the view's rows from ``source``. Returns without waiting on a peer or store.
+
+        The lease holder guarantees that the memory the view's rows locate is writable when it
+        calls, that no two rows locate overlapping memory, and that nothing but this submission
+        writes it until the submission's :meth:`Attempt.quiesced` is true.
+
+        :class:`InvalidSubmission` and :class:`SubmissionRejected` have no side effect; any other
+        raise, a plain ``ValueError`` included, may have let access to the memory escape, and the
+        lease holder then keeps the lease until :meth:`shutdown` returns an empty set. Once the
+        lent memory may be accessed, the call returns the handle and reports any later failure
+        through it.
+
+        Args:
+            view: The rows to write.
+            source: The caller's hint for where the rows come from.
+
+        Returns:
+            The submission's handle.
+
+        Raises:
+            InvalidSubmission: Bad arguments or hint, or a direction the backend does not declare.
+            SubmissionRejected: The backend refuses the submission.
+        """
+        ...
+
+    def publish(self, view: View, destination: Hint) -> Attempt:
+        """Offers the view's rows to ``destination``. Returns without waiting on a peer or store.
+
+        The lease holder guarantees that the payload the view's rows locate is completely written
+        and readable when it calls, and stays unchanged until the submission's
+        :meth:`Attempt.quiesced` is true.
+
+        :class:`InvalidSubmission` and :class:`SubmissionRejected` have no side effect; any other
+        raise, a plain ``ValueError`` included, may have let access to the memory escape, and the
+        lease holder then keeps the lease until :meth:`shutdown` returns an empty set. Once the
+        lent memory may be accessed, the call returns the handle and reports any later failure
+        through it.
+
+        Args:
+            view: The rows to offer.
+            destination: The caller's hint for where the rows go.
+
+        Returns:
+            The submission's handle.
+
+        Raises:
+            InvalidSubmission: Bad arguments or hint, or a direction the backend does not declare.
+            SubmissionRejected: The backend refuses the submission.
+        """
+        ...
+
+    def shutdown(self, timeout: float) -> frozenset:
+        """Stops serving peers and forces an outcome onto every unconcluded attempt.
+
+        A forced outcome's fault names the shutdown. Repeatable: each call does what is left.
+        Registrations are dropped only for memory nothing can access any more.
+
+        Args:
+            timeout: Seconds the call may take.
+
+        Returns:
+            Labels of the backend's choosing for the memory that may still be accessed after this
+            call: that of unquiesced submissions and that still registered. Empty exactly when
+            nothing may still be accessed.
         """
         ...

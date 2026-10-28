@@ -10,10 +10,13 @@ and a change to the context contract would be caught by whichever copy happened
 to model it.
 """
 
-from types import SimpleNamespace
-from typing import Any, Sequence
+from __future__ import annotations
 
-import grpc
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Sequence
+
+if TYPE_CHECKING:
+    import grpc
 
 
 class AbortError(Exception):

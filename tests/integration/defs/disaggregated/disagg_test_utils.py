@@ -133,6 +133,13 @@ def _run_worker(
             env = os.environ.copy()
         else:
             env = env.copy()
+        # Every KVCacheManagerV2 worker prefaults a pinned host tier at startup.
+        # With transparent huge pages, a fragmented page cache on CI nodes turns
+        # each 2 MiB fault into direct compaction, and populating the tiers of
+        # several co-located workers can outlast the readiness budget
+        # (nvbugs/6888251). Tests only need the tier to exist, so use 4 KiB
+        # pages unless the caller asks for THP.
+        env.setdefault("TLLM_KV_CACHE_MANAGER_V2_THP", "0")
         log_file = None
         log_path = None
         # WAR for QA env (pytest --capture=tee-sys): sys.stdout/sys.stderr lack

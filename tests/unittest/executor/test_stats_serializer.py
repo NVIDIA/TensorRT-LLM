@@ -361,8 +361,9 @@ class TestStatsSerializer:
                     window_size=16,
                     kind="attention",
                     stats=life_cycle_stats,
-                    full_reused_blocks_by_level=[3, 1, 0],
+                    full_reused_blocks_by_level=[1, 1, 0],
                     partial_reused_blocks_by_level=[0, 1, 0],
+                    connector_reused_blocks=2,
                 ),
                 4: KVCacheV2SsmLifeCycleIterationStats(
                     life_cycle_id=4,
@@ -439,8 +440,10 @@ class TestStatsSerializer:
         assert "iterGenAllocBlocks" not in life_cycle
         # Indexed by cache level, so a deployment with a hot and a cold GPU level reports them
         # separately instead of merging both into one "gpu" bucket.
-        assert life_cycle["iterFullReusedBlocksByLevel"] == [3, 1, 0]
+        assert life_cycle["iterFullReusedBlocksByLevel"] == [1, 1, 0]
         assert life_cycle["iterPartialReusedBlocksByLevel"] == [0, 1, 0]
+        # Connector-loaded blocks sit on no cache level: they are the rest of the full reuse.
+        assert life_cycle["iterConnectorReusedBlocks"] == 2
         # An SSM life cycle carries no block-level reuse split.
         assert "iterFullReusedBlocksByLevel" not in d["kvCacheIterationStatsByLifecycle"]["4"]
         ssm_life_cycle = d["kvCacheIterationStatsByLifecycle"]["4"]
@@ -488,6 +491,7 @@ class TestStatsSerializer:
             disk_prefetch_blocks=7,
             cached_tokens_by_level=[5, 2, 1],
             cache_level_tiers=["gpu", "host", "disk"],
+            connector_cached_tokens=4,
         )
 
         result = BaseWorker._stats_serializer((iter_stats, None, kv_iter))
@@ -498,6 +502,7 @@ class TestStatsSerializer:
         assert d["iterDiskPrefetchBlocks"] == 7
         assert d["iterCachedTokensByLevel"] == [5, 2, 1]
         assert d["kvCacheLevelTiers"] == ["gpu", "host", "disk"]
+        assert d["iterConnectorCachedTokens"] == 4
         # Manager-level, not nested inside the per-pool-group breakdown.
         pool_group = d["kvCacheIterationStatsByPoolGroup"]["0"]
         assert "iterSuspendedRequests" not in pool_group

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 from pathlib import Path
 from queue import Queue
 from threading import Event
@@ -12,7 +14,6 @@ from .._utils import mpi_rank
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.tokenizer import TokenizerBase
 from ..logger import set_level
-from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker
 from .postproc_worker import PostprocWorkerConfig
 from .rpc import RPCServer
@@ -46,9 +47,7 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
-        engine: Path,
         is_llm_executor: Optional[bool] = None,
-        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         hf_model_dir: Optional[Path] = None,
         tokenizer: Optional[TokenizerBase] = None,
@@ -57,8 +56,6 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
         fetch_timeout: Optional[float] = None,
     ) -> None:
         super().__init__(
-            engine=engine,
-            batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
             hf_model_dir=hf_model_dir,
@@ -107,10 +104,8 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
 
     @staticmethod
     def main_task(
-        engine: Path,
         rpc_addr: str,
         *,
-        batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         llm_args: Optional[BaseLlmArgs] = None,
@@ -125,10 +120,8 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
 
         # Step 1: Create the worker instance
         worker = RpcWorker(
-            engine=engine,
             is_llm_executor=is_llm_executor,
             llm_args=llm_args,
-            batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             hf_model_dir=hf_model_dir,
             tokenizer=tokenizer,

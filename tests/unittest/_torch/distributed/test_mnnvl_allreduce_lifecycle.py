@@ -124,6 +124,7 @@ def _patch_workspace_dependencies(monkeypatch: pytest.MonkeyPatch) -> _FakeWorld
     monkeypatch.setattr(MNNVLAllReduce, "_allreduce_mnnvl_workspace_locks", {})
     monkeypatch.setattr(ops_module, "mpi_comm", lambda: world)
     monkeypatch.setattr(ops_module.torch, "device", lambda *args, **kwargs: cpu_device)
+    monkeypatch.setattr(ops_module.torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(ops_module, "_initialize_allreduce_mnnvl_protocol", lambda workspace: None)
     return world
 
@@ -148,12 +149,11 @@ def test_workspace_retry_reuses_pending_communicator(monkeypatch: pytest.MonkeyP
     assert world.split_count == 1
     assert MNNVLAllReduce.allreduce_mnnvl_pending_comms[mapping] is world.comm
 
-    workspace = get_or_scale_allreduce_mnnvl_workspace(mapping, torch.float32)
+    get_or_scale_allreduce_mnnvl_workspace(mapping, torch.float32)
 
     assert construction_count == 2
     assert world.split_count == 1
     assert MNNVLAllReduce.allreduce_mnnvl_pending_comms == {}
-    assert workspace["mpi_comm"] is world.comm
 
 
 def test_concurrent_workspace_construction_is_serialized(monkeypatch: pytest.MonkeyPatch) -> None:

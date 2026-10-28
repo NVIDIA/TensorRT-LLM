@@ -418,6 +418,101 @@ def test_cute_dsl_fp4_paged_mqa_logits(
     )
 
 
+@skip_not_sm100
+@pytest.mark.parametrize(
+    "next_n,num_next_n_atoms,atom,num_heads",
+    [
+        (4, 2, 2, 64),  # even split
+        (5, 2, 3, 64),  # uneven: 3 + 2
+        (7, 3, 3, 64),  # uneven: 3 + 2 + 2, the indexer's pick for next_n=7
+        (7, 2, 4, 32),  # 32 heads allow a 4-wide tile
+    ],
+)
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("phys_block_kv", [64, 128])
+def test_cute_dsl_fp4_paged_mqa_logits_kernel_split(
+    next_n, num_next_n_atoms, atom, num_heads, batch_size, phys_block_kv
+):
+    """In-kernel next_n atom split matches the unsplit reference.
+
+    phys_block_kv=128 with several atoms per sequence is where the KV/SF stage
+    release raced the UMMA reading it, before that release moved to
+    tcgen05.commit.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import _atom_ctx_offsets
+
+    torch.manual_seed(0)
+    head_dim, avg_ctx, device = 128, 4096, "cuda"
+    max_model_len = avg_ctx * 2
+    context_lens = torch.randint(
+        int(0.7 * avg_ctx), int(1.3 * avg_ctx) + 1, (batch_size,), dtype=torch.int32, device=device
+    )
+    num_blocks_per_seq = ceil_div_tensor(context_lens, phys_block_kv)
+    num_total_blocks = num_blocks_per_seq.sum().item() + batch_size * 2
+    block_table = torch.zeros(
+        (batch_size, num_blocks_per_seq.max().item()), dtype=torch.int32, device=device
+    )
+    pool = torch.randperm(num_total_blocks, device=device, dtype=torch.int32)
+    offset = 0
+    for i, n_blks in enumerate(num_blocks_per_seq.tolist()):
+        block_table[i, :n_blks] = pool[offset : offset + n_blks]
+        offset += n_blks
+
+    q = torch.randn((batch_size, next_n, num_heads, head_dim), device=device, dtype=torch.bfloat16)
+    kv_cache = torch.randn(
+        (num_total_blocks, phys_block_kv, 1, head_dim), device=device, dtype=torch.bfloat16
+    )
+    weights = torch.randn((batch_size * next_n, num_heads), device=device, dtype=torch.float32)
+    q_packed, sf_q_packed = DSAVanillaIndexer.quantize_fp4(
+        q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+    q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
+    sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+    q_simulated = DSAVanillaIndexer.dequantize_fp4(
+        q_packed, sf_q_packed, gran_k=32, use_packed_ue8m0=True
+    ).view(batch_size, next_n, num_heads, head_dim)
+    kv_fused, kv_simulated = kv_cache_cast_to_fp4(kv_cache)
+
+    offsets_t = torch.tensor(
+        _atom_ctx_offsets(next_n, num_next_n_atoms), dtype=torch.int32, device=device
+    )
+    atom_ctx = (context_lens.unsqueeze(1) - offsets_t).reshape(-1, 1)
+    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(atom_ctx, 64, deep_gemm.get_num_sms())
+
+    ref = paged_mqa_logits(
+        q_simulated.float(),
+        kv_simulated.float(),
+        weights,
+        context_lens,
+        context_lens,
+        block_table,
+        max_model_len,
+    )
+    logits = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+        q_fp4,
+        sf_q,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+        output_dtype=torch.bfloat16,
+        num_next_n_atoms=num_next_n_atoms,
+        atom=atom,
+    )
+
+    positions = torch.arange(max_model_len, device=device).unsqueeze(0)
+    rows = torch.arange(batch_size * next_n, device=device)
+    limits = (context_lens[rows // next_n] - next_n + rows % next_n).unsqueeze(1)
+    mask = positions <= limits
+    got = logits.float().masked_fill(~mask, 0)
+    want = ref.float().masked_fill(~mask, 0)
+    atol, rtol = ELEM_TOL[(torch.float32, torch.bfloat16)]
+    torch.testing.assert_close(got, want, atol=atol, rtol=rtol)
+    assert calc_diff(got, want) < 0.02
+
+
 # ---------------------------------------------------------------------------
 # Block-meta emission (emit_block_meta — fused-GVR support).
 # ---------------------------------------------------------------------------

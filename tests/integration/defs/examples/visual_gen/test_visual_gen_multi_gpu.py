@@ -17,6 +17,7 @@
 import glob
 import os
 import sys
+from pathlib import Path
 from typing import Callable
 
 import pytest
@@ -89,11 +90,21 @@ WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD = 0.30
 # trajectory), so this bound intentionally has large headroom and exists
 # only to catch outputs that are far from everything.
 WAN_MULTI_GPU_GOLDEN_BACKSTOP_LPIPS_THRESHOLD = 0.32
-# MiniMax-H3's iterative denoising amplifies the benign BF16 differences from
-# repartitioning attention heads.  The 384x384 L0 cases measured 0.117972 on
-# two GPUs and 0.203348 on four GPUs.  These topology-specific bounds keep
-# roughly 0.03-0.05 headroom while still rejecting visibly unrelated output.
-MINIMAX_H3_MULTI_GPU_LPIPS_THRESHOLDS = {2: 0.15, 4: 0.25}
+# MiniMax-H3 Ulysses is in the REDUCTION-REORDERING class: unlike Wan, its
+# multi-GPU run is not bit-exact with the single-GPU run, and the 27-step
+# sampler amplifies the one-ULP seed to a saturation band instead of a fixed
+# value.  Same-seed draws of the 384x384 L0 case measured 0.1180, 0.1528 and
+# 0.1732 on two GPUs and 0.0926, 0.1528, 0.1732, 0.1858 and 0.2033 on four
+# (FA4 gives the same output on two and four GPUs); the fusion toggle alone
+# moves the video 0.1776 on one GPU.  That fusion (QK-norm + RoPE) is lossless
+# in accuracy but not in bits: it keeps FP32 and rounds to BF16 once where
+# eager rounds after each of five ops, so 39 % of its outputs differ from
+# eager by one BF16 ULP (rel. L2 3.5e-3; the torch.compile'd unfused path is
+# equally far from eager, 3.6e-3).  Any such whole-build rounding change
+# re-draws from the band, so a bound taken from one draw is not stable.
+# 0.30 keeps ~0.10 over the worst benign draw; broken output (other seed
+# 0.585, time-reversed video 0.459) lands above it.
+MINIMAX_H3_MULTI_GPU_LPIPS_THRESHOLD = WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD
 WAN22_MULTI_GPU_LPIPS_ATTENTION_BACKEND = "FA4"
 WAN22_MULTI_GPU_LPIPS_GOLDEN_VIDEO = "wan22_t2v_fa4_fully_eager_lpips_golden_video.mp4"
 # (variant name, parallel kwargs, within-build LPIPS bound) -- pick the bound
@@ -134,6 +145,12 @@ WAN22_LPIPS_TP_VARIANTS = [
     (
         "tp2_attn2d_2x1",
         {"tp_size": 2, "attn2d_size": (2, 1)},
+        WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD,
+    ),
+    # Token-sharded TP: bitwise equal to all-reduce TP at TP2; the worker asserts it engaged.
+    (
+        "cfg2_tp2_ts",
+        {"cfg_size": 2, "tp_size": 2, "tp_layout": "token_sharded"},
         WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD,
     ),
 ]
@@ -500,7 +517,69 @@ def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size,
     print(
         f"H3 Ulysses={ulysses_size} + parallel_vae_size={vae_size} vs single GPU: mean LPIPS={score:.6f}"
     )
-    lpips_threshold = MINIMAX_H3_MULTI_GPU_LPIPS_THRESHOLDS[ulysses_size]
-    assert score < lpips_threshold, (
-        f"H3 parallelism changed output: mean LPIPS={score:.6f} >= {lpips_threshold}"
+    assert score < MINIMAX_H3_MULTI_GPU_LPIPS_THRESHOLD, (
+        f"H3 parallelism changed output: mean LPIPS={score:.6f} "
+        f">= {MINIMAX_H3_MULTI_GPU_LPIPS_THRESHOLD}"
+    )
+
+
+def test_minimax_h3_tp2_example_lpips(tmp_path):
+    """Check the shipped TP2 configuration against a same-build TP1 pipeline."""
+    from defs.examples.visual_gen.test_minimax_h3_e2e import (
+        MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD,
+        MINIMAX_H3_LPIPS_THRESHOLD,
+        _mean_lpips_distance,
+        _minimax_h3_checkpoint_path,
+        _multi_resolution_log_stft_distance,
+    )
+
+    from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Requires two CUDA GPUs")
+    config_path = (
+        Path(__file__).resolve().parents[5] / "examples/visual_gen/configs/minimax-h3-bf16-tp2.yaml"
+    )
+    model = _minimax_h3_checkpoint_path()
+    prompt = "A woman smiles and waves in a sunlit park, with birds chirping."
+    videos, audios = [], []
+    for tp_size in (1, 2):
+        args = VisualGenArgs.from_yaml(config_path, model=model)
+        assert args.parallel_config.tp_size == 2
+        assert args.attention_config.backend == "VANILLA"
+        assert args.torch_compile_config.enable
+        assert not args.cuda_graph_config.enable
+        # Keep the reference identical to the example except for TP degree.
+        args.parallel_config.tp_size = tp_size
+        engine = VisualGen(model=model, args=args)
+        try:
+            output = engine.generate(
+                inputs=prompt,
+                params=VisualGenParams(
+                    height=128, width=128, num_frames=124, num_inference_steps=28, seed=42
+                ),
+            )
+            video = torch.as_tensor(output.video).cpu()
+            if video.ndim == 4:
+                video = video.unsqueeze(0)
+            audio = torch.as_tensor(output.audio).cpu()
+            assert video.shape == (1, 124, 128, 128, 3)
+            assert video.float().std() > 1
+            assert torch.isfinite(audio).all()
+            assert audio.float().std() > 0
+            torch.save({"video": video, "audio": audio}, tmp_path / f"h3_tp{tp_size}.pt")
+            videos.append(video)
+            audios.append(audio)
+        finally:
+            engine.shutdown()
+
+    reference = videos[0].permute(0, 1, 4, 2, 3).float().div(255)
+    video_score = _mean_lpips_distance(videos[1], reference)
+    audio_score = _multi_resolution_log_stft_distance(audios[1], audios[0])
+    print(f"H3 TP2 example vs TP1: LPIPS={video_score:.6f}, audio log-STFT={audio_score:.6f}")
+    assert video_score < MINIMAX_H3_LPIPS_THRESHOLD, (
+        f"H3 TP2 changed video: LPIPS={video_score:.6f} >= {MINIMAX_H3_LPIPS_THRESHOLD}"
+    )
+    assert audio_score < MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD, (
+        f"H3 TP2 changed audio: log-STFT={audio_score:.6f} >= {MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD}"
     )

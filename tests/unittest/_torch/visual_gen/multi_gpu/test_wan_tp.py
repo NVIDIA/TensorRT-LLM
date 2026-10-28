@@ -32,7 +32,6 @@ from typing import Callable
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
@@ -42,7 +41,9 @@ from tensorrt_llm._torch.visual_gen.config import (
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.visual_gen.args import ParallelConfig
 
+from ._worker_pool import run_distributed
 from .tp_shard_utils import copy_tp_parameter
 
 
@@ -58,62 +59,12 @@ def _cleanup_mpi_env():
 # =============================================================================
 
 
-def init_distributed_worker(rank: int, world_size: int, backend: str = "nccl", port: int = 29500):
-    """Initialize distributed environment for a worker process."""
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-
-    torch.cuda.set_device(rank % torch.cuda.device_count())
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-
-
-def cleanup_distributed():
-    """Clean up distributed environment."""
-    # Reset the DeviceMesh singleton before destroying the process group
-    # to prevent NCCL process group destructor segfaults during interpreter exit.
-    try:
-        from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
-
-        DeviceMeshTopologyImpl.device_mesh = None
-        DeviceMeshTopologyImpl.tp_mesh = None
-    except ImportError:
-        pass
-    if dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
-
-
-def _distributed_worker(rank, world_size, backend, test_fn, port):
-    """Worker function that runs in each process. Module-level for pickling."""
-    try:
-        init_distributed_worker(rank, world_size, backend, port)
-        test_fn(rank, world_size)
-    except Exception as e:
-        print(f"Rank {rank} failed with error: {e}")
-        raise
-    finally:
-        cleanup_distributed()
-
-
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
     """Run a test function in a distributed environment."""
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-
-    backend = "nccl" if use_cuda else "gloo"
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    from ._visual_gen_dist_utils import spawn_with_retry
-
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            _distributed_worker,
-            args=(world_size, backend, test_fn, port),
-            nprocs=world_size,
-            join=True,
-        )
+    run_distributed(
+        world_size, test_fn, dist_backend="nccl" if use_cuda else "gloo", preload=("tensorrt_llm",)
     )
 
 
@@ -154,7 +105,9 @@ _WAN_I2V_UNEVEN_TP3_CONFIG = dict(_WAN_I2V_TEST_CONFIG)
 # =============================================================================
 
 
-def _make_model_config(pretrained_dict, tp_size=1, ulysses_size=1, backend="VANILLA"):
+def _make_model_config(
+    pretrained_dict, tp_size=1, ulysses_size=1, backend="VANILLA", tp_layout=None
+):
     """Create DiffusionModelConfig for testing with TP and/or Ulysses."""
     pretrained_config = SimpleNamespace(**pretrained_dict)
     ws = tp_size * ulysses_size
@@ -171,6 +124,7 @@ def _make_model_config(pretrained_dict, tp_size=1, ulysses_size=1, backend="VANI
         torch_compile=TorchCompileConfig(enable=False),
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
+        parallel=ParallelConfig(tp_size=tp_size, ulysses_size=ulysses_size, tp_layout=tp_layout),
         cache=None,
         attention_metadata_state=(
             create_attention_metadata_state() if backend.upper() == "TRTLLM" else None

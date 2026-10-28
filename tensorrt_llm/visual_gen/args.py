@@ -103,6 +103,15 @@ class QuantAttentionConfig(StrictBaseModel):
             "quantized type has to cover. SageAttention only."
         ),
     )
+    smooth_v: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Subtract the per-channel V mean before quantizing V and add it back to the output. "
+            "SageAttention only; applied where the attention runs on the PrimTS kernels, while "
+            "the trtllm-gen kernels quantize V without it."
+        ),
+    )
 
 
 # Discriminated union of sparse attention configs.
@@ -152,10 +161,23 @@ class AttentionConfig(StrictBaseModel):
                 ("int8", "fp8", (1, 16, 1)),
                 ("fp8", "fp8", (1, 1, 1)),
                 ("fp8", "fp8", (1, 4, 1)),
+                ("fp8", "fp8", (1, 16, 1)),
             },
             103: {
                 ("fp8", "fp8", (1, 1, 1)),
                 ("fp8", "fp8", (1, 4, 1)),
+                ("fp8", "fp8", (1, 16, 1)),
+            },
+        }
+        # PrimTS serves the per-tensor FP8 recipes on Blackwell (TLLM_FMHA_LIBS=+prims_ts).
+        PRIMSTS_RECIPES = {
+            100: {
+                ("bf16", "fp8", (0, 0, 0)),
+                ("fp8", "fp8", (0, 0, 0)),
+            },
+            103: {
+                ("bf16", "fp8", (0, 0, 0)),
+                ("fp8", "fp8", (0, 0, 0)),
             },
         }
         # Other recipes verify the hardware at corresponding backend implementations.
@@ -165,6 +187,7 @@ class AttentionConfig(StrictBaseModel):
         }
         CUTEDSL_RECIPES = {
             ("bf16", "fp8", (0, 0, 0)),
+            ("fp8", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 1)),
             ("nvfp4", "fp8", (0, 0, 0)),
@@ -186,17 +209,28 @@ class AttentionConfig(StrictBaseModel):
             (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
         )
         if self.backend == "TRTLLM":
-            recipes = SAGE_RECIPES.get(get_sm_version(), set())
+            sm_version = get_sm_version()
+            recipes = SAGE_RECIPES.get(sm_version, set()) | PRIMSTS_RECIPES.get(sm_version, set())
             if recipe not in recipes:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='TRTLLM'. Supported SAGE recipes on this device: "
+                    f"for backend='TRTLLM'. Supported SAGE and PrimTS recipes on this device: "
                     f"{sorted(recipes)}."
                 )
-        elif q_config.smooth_k:
+            if (q_config.smooth_k or q_config.smooth_v) and q_config.q_block_size == 0:
+                raise ValueError(
+                    "smooth_k and smooth_v are SageAttention options and do not apply to the "
+                    f"per-tensor recipe {recipe!r}."
+                )
+            if q_config.smooth_v and sm_version not in (100, 103):
+                raise ValueError(
+                    "smooth_v needs the PrimTS kernels, which add the V mean back to the "
+                    f"attention output and run on SM100 and SM103 only; got SM{sm_version}."
+                )
+        elif q_config.smooth_k or q_config.smooth_v:
             raise ValueError(
-                f"smooth_k is a SageAttention option and requires backend='TRTLLM', got "
-                f"backend='{self.backend}'."
+                f"smooth_k and smooth_v are SageAttention options and require backend='TRTLLM', "
+                f"got backend='{self.backend}'."
             )
         elif self.backend == "CUTEDSL":
             if recipe not in CUTEDSL_RECIPES:
@@ -259,15 +293,23 @@ class AttentionConfig(StrictBaseModel):
         if self.quant_attention_config is None or self.sparse_attention_config is None:
             return self
 
-        # VSA and SOL replace the dense attention path on every backend that
-        # serves them and never consume quant_attention_config, so accepting a
-        # quantization recipe would silently ignore user configuration.
+        # VSA and SOL replace the dense attention path. On TRTLLM every call
+        # carries the SageAttention recipe to the attention kernels, which either
+        # apply it or reject the call, so the recipe is never silently dropped.
+        # The other backends never consume quant_attention_config on that path,
+        # so accepting a recipe there would silently ignore user configuration.
         # SkipSoftmax is part of the dense path itself and can compose.
+        if self.backend == "TRTLLM":
+            return self
         algorithm = self.sparse_attention_config.algorithm
         if algorithm == "vsa":
-            raise ValueError("VSA and quant_attention_config are mutually exclusive.")
+            raise ValueError(
+                "VSA and quant_attention_config are mutually exclusive except on backend='TRTLLM'."
+            )
         if algorithm == "sol_attn":
-            raise ValueError("SOL and quant_attention_config are mutually exclusive.")
+            raise ValueError(
+                "SOL and quant_attention_config are mutually exclusive except on backend='TRTLLM'."
+            )
         return self
 
 
@@ -355,6 +397,21 @@ class ParallelConfig(StrictBaseModel):
         status="prototype",
         description=("Tensor parallel group size. Heads are sharded across tp_size GPUs."),
     )
+    tp_layout: Optional[Literal["replicated", "token_sharded"]] = Field(
+        None,
+        status="prototype",
+        description=(
+            "Activation layout between TP projections: 'replicated' (all-reduce TP; the default "
+            "when unset) or 'token_sharded' (each TP rank holds 1/tp_size of the tokens; each "
+            "all-reduce becomes a reduce-scatter plus an all-gather). 'token_sharded' requires "
+            "tp_size > 1 and no ulysses/ring/attn2d."
+        ),
+    )
+
+    @property
+    def token_sharded_tp(self) -> bool:
+        """True iff ``tp_layout`` is ``'token_sharded'`` (test this, not the field's truthiness)."""
+        return self.tp_layout == "token_sharded"
 
     @property
     def seq_parallel_size(self) -> int:
@@ -395,6 +452,25 @@ class ParallelConfig(StrictBaseModel):
                     "async_ulysses forces SEPARATE_QKV which bypasses the "
                     "RingAttention wrapper. Set ring_size=1 or async_ulysses=False "
                     f"(got ring_size={self.ring_size})."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_tp_layout(self) -> "ParallelConfig":
+        # async_ulysses is excluded transitively (it requires ulysses_size > 1).
+        if self.token_sharded_tp:
+            if self.tp_size == 1:
+                raise ValueError(
+                    "parallel_config.tp_layout='token_sharded' requires tp_size > 1 "
+                    f"(got tp_size={self.tp_size}). Set tp_size > 1 or leave tp_layout unset."
+                )
+            if self.seq_parallel_size > 1:
+                raise ValueError(
+                    "parallel_config.tp_layout='token_sharded' cannot be combined with "
+                    f"ulysses_size/ring_size/attn2d_size yet (got ulysses_size={self.ulysses_size}, "
+                    f"ring_size={self.ring_size}, attn2d_size={tuple(self.attn2d_size)}): both "
+                    "shard the token dimension of the transformer's residual stream. Use "
+                    "cfg_size x tp_size with the token-sharded layout, or unset tp_layout."
                 )
         return self
 
