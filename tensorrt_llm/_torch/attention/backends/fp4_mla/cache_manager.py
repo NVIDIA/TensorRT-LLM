@@ -215,7 +215,9 @@ class Fp4MlaV2CacheLayoutPolicy:
             "get_disagg_role_mapper_kinds",
             "get_disagg_ignored_roles",
             "rebuild_disagg_imported_cache",
+            "_model_layers_and_tails",
             "get_disagg_global_layer_ids",
+            "get_model_layer_ids",
             "_get_runtime_cache_size_layer_components",
             "_get_generation_request_capacity",
         )
@@ -956,7 +958,9 @@ class Fp4MlaV2CacheLayoutPolicy:
             [request.prompt_len for request in requests],
         )
 
-    def get_disagg_global_layer_ids(self, layer_group_id: int) -> list[int]:
+    def _model_layers_and_tails(self, layer_group_id: int) -> list[tuple[int, bool]]:
+        """Per internal layer of the layer group, its model layer and whether it holds that
+        layer's high-precision tail."""
         local_layer_ids = list(self.impl.layer_grouping[layer_group_id])
         cache_local = {
             int(layer_id): self._fp4_mla_compact_to_local[compact_layer]
@@ -973,12 +977,23 @@ class Fp4MlaV2CacheLayoutPolicy:
         for layer_id in local_layer_ids:
             internal_layer = int(layer_id)
             if internal_layer in cache_local:
-                result.append(2 * int(self.pp_layers[cache_local[internal_layer]]))
+                result.append((int(self.pp_layers[cache_local[internal_layer]]), False))
             elif internal_layer in hp_local:
-                result.append(2 * int(self.pp_layers[hp_local[internal_layer]]) + 1)
+                result.append((int(self.pp_layers[hp_local[internal_layer]]), True))
             else:
                 raise ValueError(f"Unknown FP4 MLA V2 internal layer {internal_layer}.")
         return result
+
+    def get_disagg_global_layer_ids(self, layer_group_id: int) -> list[int]:
+        return [
+            2 * model_layer + int(tail)
+            for model_layer, tail in self._model_layers_and_tails(layer_group_id)
+        ]
+
+    def get_model_layer_ids(self, layer_group_id: int) -> list[int]:
+        """The model layer of each internal layer of the layer group; a tail layer belongs to the
+        model layer whose high-precision tail it holds."""
+        return [model_layer for model_layer, _ in self._model_layers_and_tails(layer_group_id)]
 
     def _get_runtime_cache_size_layer_components(self) -> tuple[list[int], list[Optional[int]]]:
         fp4_local_layers = self._fp4_mla_local_layer_indices()

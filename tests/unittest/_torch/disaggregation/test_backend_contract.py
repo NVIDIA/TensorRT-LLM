@@ -67,13 +67,13 @@ class _SlotRegion:
 @dataclasses.dataclass(frozen=True, eq=False)
 class _LayerGroupRows:
     layer_group_index: int
-    row_count: int
+    page_ordinals: np.ndarray
     object_keys: typing.Optional[np.ndarray] = None
-    addresses: typing.Optional[np.ndarray] = None
-    region_index: typing.Optional[int] = None
+    slots: typing.Optional[np.ndarray] = None
+    region_indices: typing.Optional[typing.Tuple[int, ...]] = None
 
     def __len__(self) -> int:
-        return self.row_count
+        return len(self.page_ordinals)
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -86,22 +86,17 @@ class _View:
 
 def _keyed_view(*row_counts: int) -> _View:
     """One group per row count, in order: ``_keyed_view(2, 3)`` has two rows in layer group 0
-    and three in layer group 1. Rows occupy consecutive slots in region 0; their keys encode
-    their slot indices. The arrays are read-only, as a view's metadata is immutable."""
-    region = _SlotRegion(
-        "pool", address=4096, slot_bytes=64, slot_count=sum(row_counts), memory_kind=MemoryKind.HOST
-    )
-    groups, first_slot_index = [], 0
+    and three in layer group 1. Rows hold pages 0, 1, ... and occupy consecutive slots of region 0;
+    their keys encode their slots. The arrays are read-only, as a view's metadata is immutable."""
+    groups, first_slot = [], 0
     for layer_group_index, row_count in enumerate(row_counts):
-        slot_indices = np.arange(first_slot_index, first_slot_index + row_count, dtype=np.int64)
-        object_keys = slot_indices.astype("<u4").view(np.uint8).reshape(row_count, 4)
-        addresses = region.address + region.slot_bytes * slot_indices
-        for array in (object_keys, addresses):
+        page_ordinals = np.arange(row_count, dtype=np.int64)
+        slots = np.arange(first_slot, first_slot + row_count, dtype=np.int64)
+        object_keys = slots.astype("<u4").view(np.uint8).reshape(row_count, 4)
+        for array in (page_ordinals, object_keys, slots):
             array.flags.writeable = False
-        groups.append(
-            _LayerGroupRows(layer_group_index, row_count, object_keys, addresses, region_index=0)
-        )
-        first_slot_index += row_count
+        groups.append(_LayerGroupRows(layer_group_index, page_ordinals, object_keys, slots, (0,)))
+        first_slot += row_count
     return _View(tuple(groups))
 
 
@@ -189,9 +184,10 @@ PROTOCOLS = {
     },
     "LayerGroupRows": {
         "layer_group_index": "-> int",
+        "page_ordinals": "-> np.ndarray",
         "object_keys": "-> np.ndarray | None",
-        "addresses": "-> np.ndarray | None",
-        "region_index": "-> int | None",
+        "slots": "-> np.ndarray | None",
+        "region_indices": "-> tuple[int, ...] | None",
         "__len__": "(self) -> 'int'",
     },
     "SlotRegion": {
@@ -246,7 +242,7 @@ def test_minimal_structural_implementations_pass_runtime_protocol_checks():
     region = _SlotRegion(
         "pool", address=4096, slot_bytes=64, slot_count=8, memory_kind=MemoryKind.HOST
     )
-    view = _View((_keyed_view(2).groups[0], _LayerGroupRows(1, 3)))
+    view = _View((_keyed_view(2).groups[0], _LayerGroupRows(1, np.arange(3))))
     assert isinstance(region, SlotRegion) and region.nbytes == 512
     assert isinstance(view, View)
     assert all(isinstance(group, LayerGroupRows) for group in view.groups)

@@ -132,6 +132,19 @@ def test_a_batch_of_slots_builds_nothing_until_read() -> None:
     assert list(batch) == [batch[0], batch[1], batch[2]]  # read row by row, as a Sequence[RowIO]
 
 
+def test_a_batch_of_spans_keeps_the_listed_payload_order_without_copying() -> None:
+    keys = np.array([[1], [2]], dtype=np.uint8)
+    addresses = np.array([[80, 8], [96, 12]], dtype=np.int64)
+    extents = (Span(80, 24), Span(8, 8))
+    batch = RowBatch.of_spans("s/", keys, addresses, (8, 4), extents)
+    assert np.shares_memory(batch.addresses, addresses)
+    assert addresses.flags.writeable and not batch.addresses.flags.writeable
+    assert batch.spans_per_row == 2 and batch.row_bytes == 12
+    assert batch.extents == extents
+    assert batch[0] == RowIO("s/01", (Span(80, 8), Span(8, 4)))
+    assert list(batch[1:]) == [RowIO("s/02", (Span(96, 8), Span(12, 4)))]
+
+
 def test_a_slice_of_a_batch_is_the_batch_of_those_rows() -> None:
     names = np.arange(8, dtype=np.uint8).reshape(4, 2)
     batch = RowBatch.of_slots("s/", names, np.arange(4, dtype=np.int64) * 8, 8, Span(0, 32))

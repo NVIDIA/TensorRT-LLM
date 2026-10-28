@@ -1002,6 +1002,8 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         replay = self._kda_replay
         request_id = request.py_request_id
         cache = self.kv_cache_map.get(request_id)
+        if cache is not None and cache.is_active:
+            self._check_suspendable(cache)
         slot = self._request_id_to_state_index.get(request_id, -1)
         if replay is not None and slot >= 0 and cache is not None and cache.is_active:
             if request_id in replay.acceptance_pending:

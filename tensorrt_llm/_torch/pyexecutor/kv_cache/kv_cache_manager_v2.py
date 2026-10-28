@@ -137,6 +137,7 @@ from ..resource_manager import (
     scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
+from . import _lender_hooks
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -1788,13 +1789,36 @@ class KVCacheManagerV2(BaseResourceManager):
     # symptom is a small perturbation that flips an argmax a couple of steps into
     # decode, which reads as ordinary sampling variation rather than as a bug.
     _supports_partial_reuse = True
-    # The lender sharing.attach_lender installs, one per manager for its life; None without one.
-    # On the class so it exists without running __init__.
+    # Whole-model capabilities include layers outside this manager's local pools.
+    _model_has_attention_window: bool = False
+    _model_has_sparse_buffers: bool = False
+    # One optional lender for the manager's lifetime.
     _sharing = None
     # Branch snapshots (block_reuse_config.enable_branch_snapshot); declared on
     # the class for instances built without running __init__.
     _commit_branch_snapshots = False
     _record_branch_snapshots = False
+
+    def _check_suspendable(self, kv_cache: _KVCache) -> None:
+        _lender_hooks.check_suspendable(self, kv_cache)
+
+    def _commit_gate(self, kv_cache: _KVCache, request: LlmRequest, end: int) -> int:
+        return _lender_hooks.commit_gate(self, kv_cache, request, end)
+
+    def _commit_held_back(self, kv_cache: _KVCache) -> None:
+        _lender_hooks.retry_held_commit(self, kv_cache)
+
+    def _drop_held_commit(self, kv_cache: _KVCache, start: int) -> None:
+        _lender_hooks.drop_held_commit(self, kv_cache, start)
+
+    def _lent_history(self, kv_cache: _KVCache, history: int) -> int:
+        return _lender_hooks.lent_history(self, kv_cache, history)
+
+    def _history_lock_state(self) -> _lender_hooks._PageLockState | None:
+        return _lender_hooks.history_lock_state(self)
+
+    def _holds_page_locks(self, request_id: int | None) -> bool:
+        return _lender_hooks.holds_page_locks(self, request_id)
 
     def __init__(
         self,
@@ -1862,6 +1886,8 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         # Filled on first use; the layer grouping does not change after init.
         self._layer_group_life_cycles: Optional[List[AttnLifeCycle]] = None
+        # Global layer id -> the window the model's attention declares it reads (None: none).
+        self._model_attention_windows = kwargs.get("attention_read_windows", {})
 
         self.kv_cache_type = kv_cache_type
         if self.layer_specs is None:
@@ -2056,6 +2082,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 else layer.sliding_window_size
                 for layer in self.layer_specs
             ]
+        self._model_attention_window_pattern = tuple(kv_cache_config.max_attention_window or ())
 
         # A D-token match backoff needs D more physical SWA history at the
         # committed endpoint so commit_min_snapshot still covers the rewind.
@@ -2426,6 +2453,8 @@ class KVCacheManagerV2(BaseResourceManager):
         self._allocation_stream: torch.cuda.Stream | None = None
         self._on_allocation_stream: set[int] = set()
         self._allocation_ready: dict[int, torch.cuda.Event] = {}
+        # By cache id: cache, request, first held end, and whether a fetch touched its suffix.
+        self._held_commits: dict[int, tuple[_KVCache, LlmRequest, int, bool]] = {}
         self._request_stats_enabled_ids: set[int] = set()
 
         # Lazily built map of layer-group id -> sliding window size, restricted
@@ -4300,6 +4329,15 @@ class KVCacheManagerV2(BaseResourceManager):
             return self._allocation_stream.cuda_stream
         return self._stream.cuda_stream
 
+    def _allocation_fence(self, request_id: int) -> Optional[torch.cuda.Event]:
+        """An event after the work queued so far on the allocation side stream while the request's
+        cache is still on it; ``None`` once the execution stream adopted the cache."""
+        if request_id not in self._on_allocation_stream:
+            return None
+        fence = torch.cuda.Event()
+        fence.record(self._allocation_stream)
+        return fence
+
     def _place_on_allocation_stream(self, req: LlmRequest, kv_cache: _KVCache | None) -> None:
         """Allocate a connector-served context cache on the side stream.
 
@@ -4822,7 +4860,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"to {pre_cap}"
             )
         self._after_shrink(req.py_request_id, kv_cache)
-        if pre_cap > 0:
+        if pre_cap > 0 and not self._holds_page_locks(req.py_request_id):
             kv_cache.suspend()
         return True
 
@@ -4870,8 +4908,20 @@ class KVCacheManagerV2(BaseResourceManager):
         copy_batch_block_offsets still reads from the host buffer, so we
         must re-connect the buffers to avoid stale/zero page indices that
         would cause illegal memory accesses during the forward pass.
+
+        A request whose index slot was released early has no buffer row:
+        its cache keeps its beam-0 page indices in the lender's parked row
+        instead, if it has one, which is connected again.
         """
+        if request_id in self._early_freed_index_requests:
+            parked = _lender_hooks.parked_row(self, request_id)
+            if parked is not None:
+                for pool_idx in range(self.num_pools):
+                    kv_cache.set_base_page_index_buf(BeamIndex(0), pool_idx, parked[pool_idx])
+            _lender_hooks.on_resume(self, request_id)
+            return
         self._set_page_index_bufs(request_id, kv_cache)
+        _lender_hooks.on_resume(self, request_id)
 
         if self.sparse_metadata_batch is not None:
             index = self.index_mapper.get_index(request_id)
@@ -5171,7 +5221,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if reservation is not None:
                 self.free_resources(req)
                 rewind_context_after_cache_drop(req, self.tokens_per_block)
-            elif req.is_first_context_chunk:
+            elif req.is_first_context_chunk and not self._holds_page_locks(req.py_request_id):
                 kv_cache.suspend()
             return False
         self._fill_fresh_kv_pages(req.py_request_id)
@@ -5196,8 +5246,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         Allocates capacity for the full prompt (+ draft) and sets
         ``kv_cache.history_length`` to ``prompt_len``. Returns True on
-        success, False if preparation or resize failed (cache is suspended
-        on resize failure).
+        success, False if preparation or resize failed (an unlocked cache
+        is suspended on first-chunk resize failure).
         """
         reused = self.prepare_context_cache(req)
         if reused is None:
@@ -5231,7 +5281,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         success = kv_cache.resize(capacity, history_len)
         if not success:
-            if req.is_first_context_chunk:
+            if req.is_first_context_chunk and not self._holds_page_locks(req.py_request_id):
                 kv_cache.suspend()
             return False
         self._fill_fresh_kv_pages(req.py_request_id)
@@ -5303,6 +5353,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """Suspend a request's KV cache, allowing pages to migrate to a secondary tier."""
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is not None and kv_cache.is_active:
+            self._check_suspendable(kv_cache)
             kv_cache.suspend()
 
     def resume_request(self, req: LlmRequest) -> bool:
@@ -5446,6 +5497,23 @@ class KVCacheManagerV2(BaseResourceManager):
                 for layer in (layers[int(layer_ids[0])] for layer_ids in self.impl.layer_grouping)
             ]
         return self._layer_group_life_cycles
+
+    def _attention_read_window(self, layer_group_id: int) -> Optional[int]:
+        """The largest declared read window, ``kept`` for missing, non-positive or virtual layers
+        and at most ``kept``; overrides return None without retention, else a value in (0, kept]."""
+        kept = self._life_cycle_by_layer_group()[layer_group_id].window_size
+        if kept is None:
+            return None
+        declared = self._model_attention_windows
+        if not declared or len(self.kv_cache_manager_py_config.layers) != len(self.pp_layers):
+            return kept
+        return max(
+            kept if window is None or window <= 0 else min(int(window), kept)
+            for window in (
+                declared.get(self.pp_layers[int(lid)])
+                for lid in self.impl.layer_grouping[layer_group_id]
+            )
+        )
 
     def _stale_block_range(self, layer_group_id: int, history_length: int) -> Tuple[int, int]:
         """Block ordinals ``[start, end)`` that ``layer_group_id`` no longer reads.
@@ -5612,12 +5680,17 @@ class KVCacheManagerV2(BaseResourceManager):
             or not self.kv_connector_manager.should_add_sequence(req)
         ):
             return
-        local_end = self.kv_cache_map[req.py_request_id].num_committed_tokens
+        kv_cache = self.kv_cache_map[req.py_request_id]
+        # A connector loads past what a lender's fetch served, never over it.
+        local_end = max(kv_cache.num_committed_tokens, req.py_served_prefix_end)
         reservation = self.kv_connector_manager.reserve_prefix(req, local_end)
         if reservation is None:
             return
-        # Loads end at full blocks and leave the final prompt token for logits.
-        end = min(reservation.end, req.prompt_len - 1)
+        # Loads end at full blocks and leave the final prompt token for logits; the history they
+        # move to keeps the blocks a lender locks.
+        end = min(
+            reservation.end, req.prompt_len - 1, self._lent_history(kv_cache, reservation.end)
+        )
         end = end // self.tokens_per_block * self.tokens_per_block
         # A connector-served prefix starves a hidden-state drafter exactly like
         # local reuse does. Cap the reservation at the same claim limit, so
@@ -5716,11 +5789,16 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             return False
 
-        local_end = kv_cache.num_committed_tokens
+        local_end = max(kv_cache.num_committed_tokens, req.py_served_prefix_end)
         num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
             req, local_end
         )
-        offered_end = min(local_end + num_tokens, req.prompt_len - 1)
+        # The served end becomes the history, which keeps the blocks a lender locks.
+        offered_end = min(
+            local_end + num_tokens,
+            req.prompt_len - 1,
+            self._lent_history(kv_cache, local_end + num_tokens),
+        )
 
         position = local_end
         if offered_end > local_end:
@@ -6903,21 +6981,51 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return requests
 
-    def try_commit_blocks(self, request: LlmRequest) -> None:
+    def _retry_held_commit(
+        self, request: LlmRequest, kv_cache: _KVCache, end: int, fetch_touched_suffix: bool
+    ) -> bool:
+        """Keep a fetch from publishing a later, potentially overwritten suffix."""
+        return self.try_commit_blocks(
+            request, kv_cache, held_end=end if fetch_touched_suffix else None
+        )
+
+    def _held_commit_drop_end(self, held: tuple[_KVCache, LlmRequest, int, bool]) -> int:
+        """Use the saved attention prefix when a fetch overlaps a held commit."""
+        return held[2]
+
+    def try_commit_blocks(
+        self, request: LlmRequest, kv_cache: _KVCache | None = None, held_end: int | None = None
+    ) -> bool:
+        """Commit computed context blocks; return whether committing stopped. Locks defer the commit
+        until unlock and a lender's refusal of reuse skips it, as in Mamba."""
         should_block_reuse = (
             self.enable_block_reuse
             and self._can_publish_block_reuse
             and not request.is_dummy_request
         )
         if not should_block_reuse:
-            return
+            return False
 
-        kv_cache = self.kv_cache_map.get(request.py_request_id)
         if kv_cache is None:
-            return
+            kv_cache = self.kv_cache_map.get(request.py_request_id)
+        if kv_cache is None:
+            return False
 
-        commit_end = request.context_current_position
-        if commit_end > kv_cache.num_committed_tokens:
+        current_position = request.context_current_position
+        commit_end = current_position if held_end is None else min(held_end, current_position)
+        commits = commit_end > kv_cache.num_committed_tokens
+        keep_committing = self._can_commit_generation_blocks(request)
+        stops = (
+            request.context_remaining_length == 0
+            and not keep_committing
+            and commit_end == current_position
+        )
+        gate = _lender_hooks.COMMIT
+        if commits or stops:
+            gate = self._commit_gate(kv_cache, request, commit_end)
+        if gate == _lender_hooks.HOLD:
+            return False
+        if commits and gate == _lender_hooks.COMMIT:
             tokens = self._augment_tokens_for_block_reuse(
                 self._reuse_token_source(request),
                 request,
@@ -6927,9 +7035,9 @@ class KVCacheManagerV2(BaseResourceManager):
             # TODO: On a disaggregated prefill server, pass is_end=True for
             # the last context chunk to improve performance.
             kv_cache.commit(tokens)
-        keep_committing = self._can_commit_generation_blocks(request)
-        if request.context_remaining_length == 0 and not keep_committing:
+        if stops:
             kv_cache.stop_committing()
+        return stops
 
     def _can_commit_generation_blocks(self, request: LlmRequest) -> bool:
         """Whether decode KV remains a valid reusable logical prefix."""
@@ -6995,14 +7103,21 @@ class KVCacheManagerV2(BaseResourceManager):
             # mirrored, and the target may release the same request twice.
             return
         if kv_cache is not None:
-            if self.sparse_metadata_batch is not None:
-                self.sparse_metadata_batch.record_read(self._stream.cuda_stream)
-                self.sparse_metadata_batch.remove(kv_cache)
-            for beam_idx in range(int(kv_cache.beam_width)):
-                for pool_idx in range(self.num_pools):
-                    kv_cache.set_base_page_index_buf(BeamIndex(beam_idx), pool_idx, None)
+            self._detach_index_slot(kv_cache, request_id)
         self.index_mapper.remove_sequence(request_id)
         self._early_freed_index_requests.add(request_id)
+
+    def _detach_index_slot(self, kv_cache: _KVCache, released: int | None = None) -> None:
+        """Detach native index pointers before the row is reused while the cache stays open; at
+        ``released``'s early slot release, beam 0 binds the lender's parked row, if any."""
+        if self.sparse_metadata_batch is not None:
+            self.sparse_metadata_batch.record_read(self._stream.cuda_stream)
+            self.sparse_metadata_batch.remove(kv_cache)
+        parked = None if released is None else _lender_hooks.parking_row(self, released, kv_cache)
+        for beam_idx in range(int(kv_cache.beam_width)):
+            for pool_idx in range(self.num_pools):
+                buffer = parked[pool_idx] if parked is not None and beam_idx == 0 else None
+                kv_cache.set_base_page_index_buf(BeamIndex(beam_idx), pool_idx, buffer)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # A request awaiting preemption can still be cancelled or fail while
@@ -7043,9 +7158,11 @@ class KVCacheManagerV2(BaseResourceManager):
             self.impl.clear_stats_excluded(request.py_request_id)
             return
         kv_cache.discard_pending_stats()
-        if self._sharing is not None:
-            self._sharing._on_free(request.py_request_id, kv_cache)
-        kv_cache.close()
+        _lender_hooks.on_free(self, request.py_request_id, kv_cache)
+        if not _lender_hooks.defer_close(self, kv_cache):
+            kv_cache.close()
+        elif request.py_request_id not in self._early_freed_index_requests:
+            self._detach_index_slot(kv_cache)
         self.impl.clear_stats_excluded(request.py_request_id)
         if request.py_request_id in self._early_freed_index_requests:
             self._early_freed_index_requests.discard(request.py_request_id)
@@ -7053,11 +7170,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self.index_mapper.remove_sequence(request.py_request_id)
 
     def _after_shrink(self, request_id: int, kv_cache: _KVCache) -> None:
-        """Tell the lender, if one is attached, that ``kv_cache`` may have shrunk in place: blocks
-        past its capacity lost their pages, and growing again does not bring their contents back.
-        Every in-place shrink the manager makes calls this right after it."""
-        if self._sharing is not None:
-            self._sharing._on_shrink(request_id, kv_cache)
+        """Notify the lender after an in-place shrink invalidates pages past capacity."""
+        _lender_hooks.on_shrink(self, request_id, kv_cache)
 
     def get_layer_page_index_scale(self, layer_idx: int) -> int:
         """Page-index scale of this layer's KV buffer. Layers in one pool can
@@ -7354,7 +7468,14 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def shutdown(self):
         if self._sharing is not None:
-            self._sharing._on_shutdown()
+            self._held_commits.clear()
+            _lender_hooks.on_shutdown(self)
+            # Locked caches close at their last unlock.
+            for request_id, kv_cache in list(self.kv_cache_map.items()):
+                if _lender_hooks.defer_close(self, kv_cache):
+                    if request_id not in self._early_freed_index_requests:
+                        self._detach_index_slot(kv_cache)
+                    del self.kv_cache_map[request_id]
         if self.sparse_metadata_batch is not None:
             self.sparse_metadata_batch.record_read(self._stream.cuda_stream)
             self.sparse_metadata_batch.close()
@@ -7371,11 +7492,16 @@ class KVCacheManagerV2(BaseResourceManager):
         # its plan, which mutates manager state.
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
-        self.impl.shutdown()
-        if self._sharing is not None:
-            # After the runtime's shutdown, which raises while any cache is open, in the map or not;
-            # a poisoned runtime returns at once, and a close then does nothing.
-            self._sharing._on_caches_closed()
+        if _lender_hooks.keeps_pools(self):
+            logger.warning(
+                "KVCacheManagerV2: a lender still holds KV caches or the pools at shutdown, so the "
+                "KV cache pools stay allocated until the process exits"
+            )
+        else:
+            self.impl.shutdown()
+            # After the runtime's shutdown, which raises while any cache is open, in the map or
+            # not; a poisoned runtime returns at once, and a close then does nothing.
+            _lender_hooks.on_caches_closed(self)
         # Shut the streaming event manager down last so removals emitted during
         # cache / impl teardown (via the radix tree's own event-manager
         # reference) are still flushed before the publisher stops. Do not null
@@ -7801,7 +7927,10 @@ class KVCacheManagerV2(BaseResourceManager):
         layer. In non-overlap scheduler, you should call it together with
         update_resources().
         """
-        for req in scheduled_batch.context_requests:
+        requests = scheduled_batch.context_requests
+        # The lender is asked only where a lock can cap a history, through a window.
+        lock_state = self._history_lock_state() if requests else None
+        for req in requests:
             if req.py_request_id not in self.kv_cache_map:
                 continue
             kv_cache = self.kv_cache_map[req.py_request_id]
@@ -7834,11 +7963,14 @@ class KVCacheManagerV2(BaseResourceManager):
             should_commit = is_all_reusable or is_branch_point or req.context_remaining_length == 0
 
             if should_resize:
-                self._resize_context_history(req, kv_cache, req.context_current_position)
-            if should_commit:
-                self.try_commit_blocks(req)
+                position = req.context_current_position
+                if lock_state is not None:
+                    position = self._lent_history(kv_cache, position)
+                self._resize_context_history(req, kv_cache, position)
+            stopped = should_commit and self.try_commit_blocks(req)
             if req.context_remaining_length == 0:
-                if self.conversation_manager is not None:
+                # Without reuse nothing commits; a held-back commit saves the plan at its retry.
+                if self.conversation_manager is not None and (stopped or not should_block_reuse):
                     self.conversation_manager.save_drop_plan(req, kv_cache)
                 # Scratch blocks are only for prefill chunks. Disable them at
                 # the context/generation boundary so generation uses normal KV
@@ -7872,6 +8004,10 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         # Context request KV cache updates are handled by
         # update_context_resources, called separately from the executor loop.
+        lock_state = _lender_hooks.generation_lock_state(self)
+        has_lender = lock_state is not None
+        # A lender's lock caps a history only through a window.
+        caps_history = has_lender and lock_state.caps_history
         for req in scheduled_batch.generation_requests:
             if req.py_request_id not in self.kv_cache_map:
                 continue
@@ -7915,13 +8051,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
                 else kv_cache.capacity - rewind_len
             )
-            history_length = (
-                None
-                # Reuse (history's consumer) is disabled under helix, and
-                # max_beam_num_tokens mixes rank-local and global counts.
-                if self.kv_compression_manages_history or self._has_cp_helix
-                else req.max_beam_num_tokens - 1
-            )
+            # Reuse (history's consumer) is disabled under helix, and
+            # max_beam_num_tokens mixes rank-local and global counts.
+            if self.kv_compression_manages_history or self._has_cp_helix:
+                history_length = None
+            else:
+                history_length = req.max_beam_num_tokens - 1
+                if caps_history and lock_state.holding:
+                    history_length = self._lent_history(kv_cache, history_length)
+            num_blocks_before = kv_cache.num_blocks if has_lender else 0
             success = kv_cache.resize(new_capacity, history_length)
             if not success:
                 raise ValueError(
@@ -7929,8 +8067,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"to capacity {new_capacity} and history length "
                     f"{history_length} tokens at generation update"
                 )
-            # Inline check: without a lender this per-request hot path makes no extra call.
-            if new_capacity is not None and self._sharing is not None:
+            if has_lender and kv_cache.num_blocks < num_blocks_before:
                 self._after_shrink(req.py_request_id, kv_cache)
             self._allocated_draft_lens.pop(req.py_request_id, None)
             self.try_commit_generation_blocks(req)
@@ -8086,6 +8223,7 @@ class KVCacheManagerV2(BaseResourceManager):
             **priority_kwargs,
         )
         self.kv_cache_map[request_id] = kv_cache
+        _lender_hooks.on_create(self, request_id)
         if enable_request_stats and not self.enable_stats:
             self._request_stats_enabled_ids.add(request_id)
         if is_dummy:
@@ -8188,8 +8326,8 @@ class KVCacheManagerV2(BaseResourceManager):
         return success
 
     def reset_reuse_state(self):
+        _lender_hooks.before_reset(self)
         self.impl.clear_reusable_blocks()
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
-        if self._sharing is not None:
-            self._sharing._on_reset()
+        _lender_hooks.on_reset(self)
