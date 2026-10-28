@@ -134,7 +134,7 @@ class MnnvlProvider:
             Entry(
                 category=Category.COMM_MNNVL,
                 size_bytes=resident,
-                source=Source.LEDGER,
+                source=Source.COMPONENT,
                 placement=Placement.NON_TORCH,
                 basis=Basis.PHYSICAL_BACKING,
                 owner="MnnvlMemory",
@@ -146,7 +146,7 @@ class MnnvlProvider:
                 Entry(
                     category=Category.COMM_MNNVL,
                     size_bytes=None,
-                    source=Source.LEDGER,
+                    source=Source.COMPONENT,
                     placement=Placement.NON_TORCH,
                     basis=Basis.PHYSICAL_BACKING,
                     owner="MnnvlMemory",
@@ -161,7 +161,7 @@ class MnnvlProvider:
                 Entry(
                     category=Category.COMM_MNNVL,
                     size_bytes=sum(va_windows.values()),
-                    source=Source.LEDGER,
+                    source=Source.COMPONENT,
                     placement=Placement.NON_TORCH,
                     basis=Basis.LOGICAL,
                     owner="MnnvlMemory",

@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Ledger providers.
+"""Monitor providers.
 
 A provider reads a component that already keeps its own accounting. The
 contract is deliberately narrow:
@@ -40,7 +40,7 @@ __all__ = [
     "DeepEpProvider",
     "clear_registered_providers",
     "DwdpPagePoolProvider",
-    "LedgerProvider",
+    "MonitorProvider",
     "MemoryCountersProvider",
     "MnnvlProvider",
     "collect_all",
@@ -50,7 +50,7 @@ __all__ = [
 
 
 @runtime_checkable
-class LedgerProvider(Protocol):
+class MonitorProvider(Protocol):
     name: str
     category: Category
 
@@ -64,10 +64,10 @@ class LedgerProvider(Protocol):
 #: ``SymmetricMemoryAllReduce`` is a model submodule; neither has a
 #: process-wide accessor, so the code that builds them registers them
 #: instead of this module guessing where to look.
-_registered: list["LedgerProvider"] = []
+_registered: list["MonitorProvider"] = []
 
 
-def register_provider(provider: "LedgerProvider") -> None:
+def register_provider(provider: "MonitorProvider") -> None:
     """Add a provider built by code that owns the component it reads.
 
     Registering the same ``name`` twice replaces the earlier one rather than
@@ -84,7 +84,7 @@ def clear_registered_providers() -> None:
     _registered.clear()
 
 
-def default_providers() -> list[LedgerProvider]:
+def default_providers() -> list[MonitorProvider]:
     """Providers that can find their host object without cooperation.
 
     Includes anything handed to :func:`register_provider`, which is how
@@ -102,7 +102,7 @@ def default_providers() -> list[LedgerProvider]:
     ]
 
 
-def collect_all(providers: list[LedgerProvider] | None = None) -> list[Entry]:
+def collect_all(providers: list[MonitorProvider] | None = None) -> list[Entry]:
     """Collect from every available provider, tolerating individual failures."""
     entries: list[Entry] = []
     for provider in default_providers() if providers is None else providers:
@@ -115,7 +115,7 @@ def collect_all(providers: list[LedgerProvider] | None = None) -> list[Entry]:
             # exc_info; formatting here keeps the handler itself from
             # raising, which would defeat the point of catching.
             logger.debug(
-                f"memory ledger: provider {provider.name!r} failed "
+                f"memory monitor: provider {provider.name!r} failed "
                 f"({type(exc).__name__}: {exc}); skipped"
             )
     return entries

@@ -12,19 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GPU memory ledger: where did the device memory go?
+"""GPU memory monitor: where did the device memory go?
 
-Enabled with ``TLLM_MEM_LEDGER=1``; off by default and zero-cost when off.
+Enabled with ``TLLM_MEM_MONITOR=1``; off by default and zero-cost when off.
 
 Usage::
 
-    from tensorrt_llm._torch.memory.ledger import capture, render_capture
+    from tensorrt_llm._torch.memory.monitor import capture, render_capture
 
     snapshot = capture(tag="after_weights")
     if snapshot is not None:
         print(render_capture(snapshot))
 
-The ledger only reads. It never calls ``empty_cache()``, never synchronises,
+The monitor only reads. It never calls ``empty_cache()``, never synchronises,
 and never resets peak stats -- ``_util.configure_kv_cache_capacity`` already
 resets the global peak, and a second resetter would silently corrupt its
 measurements.
@@ -45,7 +45,7 @@ __all__ = [
     "Capability",
     "Category",
     "Entry",
-    "LedgerCapture",
+    "MonitorCapture",
     "Placement",
     "Source",
     "capture",
@@ -54,12 +54,12 @@ __all__ = [
     "summarize_by_category",
 ]
 
-ENV_VAR = "TLLM_MEM_LEDGER"
-RANK_ENV_VAR = "TLLM_MEM_LEDGER_RANKS"
+ENV_VAR = "TLLM_MEM_MONITOR"
+RANK_ENV_VAR = "TLLM_MEM_MONITOR_RANKS"
 
 
 @dataclass(frozen=True)
-class LedgerCapture:
+class MonitorCapture:
     """One resolved snapshot plus the context needed to read it."""
 
     frame: Frame
@@ -72,9 +72,9 @@ class LedgerCapture:
 
 
 def enabled(rank: int | None = None) -> bool:
-    """Whether the ledger should run in this process.
+    """Whether the monitor should run in this process.
 
-    ``TLLM_MEM_LEDGER_RANKS`` optionally restricts collection to a
+    ``TLLM_MEM_MONITOR_RANKS`` optionally restricts collection to a
     comma-separated rank list, so a multi-rank job can pay the cost on one
     rank only.
     """
@@ -137,7 +137,7 @@ def _read_torch(device_index: int) -> TorchReading:
     return TorchReading(reserved=torch.cuda.memory_reserved(device_index), live=live)
 
 
-#: Tags the executor sets during startup, mapped onto ledger categories.
+#: Tags the executor sets during startup, mapped onto report categories.
 #: A tag with no mapping is still reported, under its own name, rather than
 #: dropped -- an unmapped tag is a gap in this table, not absent memory.
 _TAG_CATEGORIES = {
@@ -147,7 +147,7 @@ _TAG_CATEGORIES = {
 
 
 def _tag_entries() -> list[Entry]:
-    """Ledger entries for the frozen startup tags.
+    """Monitor entries for the frozen startup tags.
 
     Returns nothing when tagging is unsupported or the startup window never
     ran, so the torch-side rows stay absent rather than appearing as zeros.
@@ -183,8 +183,8 @@ def capture(
     entries: list[Entry] | None = None,
     rank: int | None = None,
     device_index: int | None = None,
-) -> LedgerCapture | None:
-    """Collect a snapshot, or ``None`` when the ledger is disabled.
+) -> MonitorCapture | None:
+    """Collect a snapshot, or ``None`` when the monitor is disabled.
 
     ``entries`` carries provider contributions. Step 1 ships no providers, so
     the default report shows the frame with everything in
@@ -204,7 +204,7 @@ def capture(
 
         entries = collect_all() + _tag_entries()
 
-    return LedgerCapture(
+    return MonitorCapture(
         frame=build_frame(_read_device(device_index), _read_torch(device_index), entries),
         capability=probe_capability(),
         tag=tag,
@@ -215,7 +215,7 @@ def capture(
     )
 
 
-def render_capture(snapshot: LedgerCapture) -> str:
+def render_capture(snapshot: MonitorCapture) -> str:
     """Render a capture produced by :func:`capture`."""
     return render(
         snapshot.frame,

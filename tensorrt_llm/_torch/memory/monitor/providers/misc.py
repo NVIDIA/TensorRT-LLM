@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Providers that read an existing component ledger.
+"""Providers that read a component's own accounting.
 
 Each one declares its ``Basis``, because being able to read a number says
 nothing about what the number means. ``DeepEP`` reports what it asked for;
@@ -68,7 +68,7 @@ class DeepEpProvider:
             Entry(
                 category=Category.COMM_DEEPEP,
                 size_bytes=total,
-                source=Source.LEDGER,
+                source=Source.COMPONENT,
                 placement=Placement.NON_TORCH,
                 basis=Basis.REQUESTED,
                 owner="deep_ep.BufferPool",
@@ -127,7 +127,7 @@ class DwdpPagePoolProvider:
                 Entry(
                     category=Category.DWDP_PAGES,
                     size_bytes=None,
-                    source=Source.LEDGER,
+                    source=Source.COMPONENT,
                     placement=Placement.NON_TORCH,
                     basis=Basis.CONFIGURED_CAPACITY,
                     owner="dwdp.PagePool",
@@ -155,7 +155,7 @@ class DwdpPagePoolProvider:
             Entry(
                 category=Category.DWDP_PAGES,
                 size_bytes=held * pool.page_size,
-                source=Source.LEDGER,
+                source=Source.COMPONENT,
                 placement=Placement.NON_TORCH,
                 basis=Basis.PHYSICAL_BACKING,
                 owner="dwdp.PagePool",
@@ -206,7 +206,7 @@ class MemoryCountersProvider:
             Entry(
                 category=Category.CPP_BUFFERS,
                 size_bytes=int(MemoryCounters.instance().gpu),
-                source=Source.LEDGER,
+                source=Source.COMPONENT,
                 placement=Placement.NON_TORCH,
                 basis=Basis.PHYSICAL_BACKING,
                 owner="MemoryCounters",

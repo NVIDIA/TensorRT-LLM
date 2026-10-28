@@ -50,10 +50,10 @@ from ..attention.backends.sparse.params import \
 from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
                                                    create_kv_cache_transceiver)
 from ..hostfunc import set_low_latency_dispatch
-from ..memory.ledger.providers import \
-    register_provider as _ledger_register_provider
-from ..memory.ledger.providers.kv_cache import \
-    KvCacheProvider as _LedgerKvCacheProvider
+from ..memory.monitor.providers import \
+    register_provider as _monitor_register_provider
+from ..memory.monitor.providers.kv_cache import \
+    KvCacheProvider as _MonitorKvCacheProvider
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..modules.dwdp.dense.manager import DenseDwdpManager
@@ -3665,12 +3665,12 @@ class KvCacheCreator:
         # provider holds the manager weakly.
         if kv_cache_manager is not None:
             try:
-                _ledger_register_provider(
-                    _LedgerKvCacheProvider(kv_cache_manager))
+                _monitor_register_provider(
+                    _MonitorKvCacheProvider(kv_cache_manager))
             except Exception as exc:  # noqa: BLE001
                 # A diagnostic must never be the reason an executor fails
                 # to come up.
-                logger.debug(f"memory ledger: could not register the KV "
+                logger.debug(f"memory monitor: could not register the KV "
                              f"cache provider ({type(exc).__name__}: {exc})")
 
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager

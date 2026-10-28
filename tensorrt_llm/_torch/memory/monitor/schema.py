@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Schema for the GPU memory ledger.
+"""Schema for the GPU memory monitor.
 
 Three orthogonal axes describe every entry, and they must stay orthogonal:
 
@@ -119,7 +119,7 @@ class Source(StrEnum):
     #: Per-allocation attribution from allocator metadata.
     TAG = "tag"
     #: Read from a component that keeps its own accounting.
-    LEDGER = "ledger"
+    COMPONENT = "component"
     #: Computed by subtracting other quantities.
     DERIVED = "derived"
     #: Top-level catch-all remainder.
@@ -164,7 +164,7 @@ class Basis(StrEnum):
 
 @dataclass(frozen=True)
 class Entry:
-    """One line of the ledger.
+    """One line of the monitor.
 
     ``size_bytes`` is ``None`` when the value is genuinely unknown. Providers
     must not substitute ``0``: a reader cannot distinguish "this component

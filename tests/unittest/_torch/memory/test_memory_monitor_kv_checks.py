@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""KV cache ledger entries and the conservation checks over them.
+"""KV cache monitor entries and the conservation checks over them.
 
 The first thing these tests establish is that check C can *fail*. A check
 that cannot be broken by any input is decoration, and the obvious way to
@@ -24,12 +24,12 @@ CPU only: the statistics objects are fakes shaped like the real binding.
 
 import types
 
-from tensorrt_llm._torch.memory.ledger.checks import check_kv_pool_conservation, check_kv_quota
-from tensorrt_llm._torch.memory.ledger.providers.kv_cache import (
+from tensorrt_llm._torch.memory.monitor.checks import check_kv_pool_conservation, check_kv_quota
+from tensorrt_llm._torch.memory.monitor.providers.kv_cache import (
     KvCacheProvider,
     kv_pool_group_stats,
 )
-from tensorrt_llm._torch.memory.ledger.schema import Basis, Category
+from tensorrt_llm._torch.memory.monitor.schema import Basis, Category
 
 MB = 1 << 20
 
@@ -171,7 +171,7 @@ class TestPhysicalVersusLogical:
         def physical(entries):
             return next(e.size_bytes for e in entries if e.basis is Basis.PHYSICAL_BACKING)
 
-        # The device has not taken anything back, so neither may the ledger.
+        # The device has not taken anything back, so neither may the monitor.
         assert physical(busy) == physical(idle) == 100 * MB
 
     def test_category_and_owner(self):
@@ -194,7 +194,7 @@ class TestProviderAvailability:
         assert provider.collect() == []
 
     def test_not_in_the_default_set(self):
-        from tensorrt_llm._torch.memory.ledger.providers import default_providers
+        from tensorrt_llm._torch.memory.monitor.providers import default_providers
 
         assert not any(isinstance(p, KvCacheProvider) for p in default_providers()), (
             "the manager has no process-wide accessor, so it must be "
