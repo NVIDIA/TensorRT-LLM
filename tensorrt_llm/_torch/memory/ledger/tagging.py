@@ -61,10 +61,14 @@ from tensorrt_llm.logger import logger
 
 __all__ = [
     "UNTAGGED",
+    "claim_module_memory",
     "TagSnapshot",
     "freeze_tag_map",
+    "get_frozen_map",
     "live_bytes_by_tag",
+    "set_frozen_map",
     "start_tagging_window",
+    "startup_window",
     "stop_tagging_window",
     "tag",
     "tagging_supported",
@@ -228,7 +232,7 @@ def live_bytes_by_tag(snapshot: TagSnapshot) -> dict[str, int]:
     Returns an empty mapping when tagging is unsupported -- not a dict of
     zeros, which would read as a measurement.
     """
-    if not snapshot.supported:
+    if not snapshot.supported and not _claims:
         return {}
 
     try:
@@ -242,6 +246,150 @@ def live_bytes_by_tag(snapshot: TagSnapshot) -> dict[str, int]:
         for block in segment["blocks"]:
             if block["state"] != "active_allocated":
                 continue
-            label = snapshot.owners.get(block["address"], UNTAGGED)
+            address = block["address"]
+            label = _claims.get(address) or snapshot.owners.get(address, UNTAGGED)
             totals[label] = totals.get(label, 0) + block["size"]
     return totals
+
+
+_frozen: TagSnapshot = TagSnapshot(supported=False)
+
+#: Addresses claimed from a module's final parameters. Kept apart from the
+#: trace-derived map because the window's closing freeze rebuilds that map
+#: wholesale; merging them there would discard every claim made during
+#: loading. Claims win on read: they describe the state the model ended up
+#: in, while the trace describes what was asked for on the way there.
+_claims: dict[int, str] = {}
+
+
+def set_frozen_map(snapshot: TagSnapshot) -> None:
+    """Publish the map captured at the end of the startup window."""
+    global _frozen
+    _frozen = snapshot
+
+
+def get_frozen_map() -> TagSnapshot:
+    """The published map, or an unsupported one if startup never ran."""
+    return _frozen
+
+
+@contextlib.contextmanager
+def startup_window(rank: int | None = None):
+    """Record tags for the duration of startup, then freeze and stop.
+
+    Costs roughly 2x per allocation while open, so it is gated on the ledger
+    being enabled and closes before steady state begins. Tagged categories
+    are all allocated during startup, so nothing is lost by closing it.
+
+    Freezing happens in ``finally``: a startup that raises part way through
+    still publishes what it managed to tag, which is exactly the case where
+    a memory report is worth having.
+    """
+    from . import enabled
+
+    if not enabled(rank) or not start_tagging_window():
+        yield False
+        return
+
+    try:
+        yield True
+    finally:
+        try:
+            snapshot = freeze_tag_map()
+            set_frozen_map(snapshot)
+            _log_window_result(snapshot)
+        finally:
+            stop_tagging_window()
+
+
+def _log_window_result(snapshot: TagSnapshot) -> None:
+    """Report what the window captured, including when it captured nothing.
+
+    A startup tag that silently fails to record is the failure mode this
+    whole module is built around, so the closing line states the totals
+    rather than leaving the first sign of trouble to be a missing row in a
+    report read much later.
+    """
+    if not snapshot.supported:
+        logger.info("memory ledger: tagging unsupported; no startup tags")
+        return
+
+    totals = live_bytes_by_tag(snapshot)
+    tagged = {k: v for k, v in totals.items() if k != UNTAGGED and v}
+    if not tagged:
+        logger.warning(
+            "memory ledger: startup window closed with no tagged bytes; "
+            "torch-side rows will be absent rather than zero"
+        )
+        return
+
+    summary = ", ".join(
+        f"{name}={size / (1 << 20):.1f} MiB" for name, size in sorted(tagged.items())
+    )
+    logger.info(f"memory ledger: startup tags captured -- {summary}")
+
+
+def _block_index() -> list[tuple[int, int]]:
+    """Sorted ``(address, size)`` of every live block, for containment search."""
+    try:
+        segments = torch.cuda.memory._snapshot()["segments"]
+    except Exception:  # noqa: BLE001
+        return []
+    blocks = [
+        (block["address"], block["size"])
+        for segment in segments
+        for block in segment["blocks"]
+        if block["state"] == "active_allocated"
+    ]
+    blocks.sort()
+    return blocks
+
+
+def claim_module_memory(module, label: str) -> int:
+    """Attribute a module's *current* parameters and buffers to ``label``.
+
+    Tagging at the allocation site under-reports anything the loader later
+    replaces. Measured on Qwen2-0.5B: the weight allocation region tagged
+    944 MiB while the model held 1.17 GiB of parameters, because fusing and
+    quantising weights frees the originally tagged blocks and allocates new,
+    untagged ones. Reading the final parameters instead is immune to that,
+    and needs no history recording.
+
+    Each block in a snapshot is one allocation, so a storage maps to exactly
+    one block and claiming is not an over-estimate. Returns the bytes
+    claimed.
+    """
+    import bisect
+
+    blocks = _block_index()
+    if not blocks:
+        return 0
+    addresses = [address for address, _ in blocks]
+
+    claimed: dict[int, int] = {}
+    tensors = []
+    get_params = getattr(module, "parameters", None)
+    get_buffers = getattr(module, "buffers", None)
+    if get_params is not None:
+        tensors.extend(get_params())
+    if get_buffers is not None:
+        tensors.extend(get_buffers())
+
+    for tensor in tensors:
+        if not getattr(tensor, "is_cuda", False):
+            continue
+        try:
+            pointer = tensor.untyped_storage().data_ptr()
+        except Exception:  # noqa: BLE001
+            continue
+        position = bisect.bisect_right(addresses, pointer) - 1
+        if position < 0:
+            continue
+        address, size = blocks[position]
+        if pointer < address + size:
+            claimed[address] = size
+
+    if claimed:
+        _claims.update({address: label for address in claimed})
+
+    return sum(claimed.values())

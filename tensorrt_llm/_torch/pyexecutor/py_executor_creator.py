@@ -46,6 +46,8 @@ if TYPE_CHECKING:
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
+from ..memory.ledger.tagging import startup_window as ledger_startup_window
+from ..memory.ledger.tagging import tag as ledger_tag
 from ..models.modeling_utils import timing_metric
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager,
@@ -1155,7 +1157,7 @@ def _create_py_executor(
                         f"Guided decoding is not supported for speculative decoding mode: {spec_config.spec_dec_mode.name}."
                     )
 
-    with allocation_scope(ExecutorMemoryType.SAMPLER):
+    with allocation_scope(ExecutorMemoryType.SAMPLER), ledger_tag("SAMPLER"):
         sampler = instantiate_sampler(
             model_engine,
             llm_args,
@@ -1551,8 +1553,8 @@ def create_py_executor(
     previous_dwdp_manager = get_global_dwdp_manager()
     previous_dense_manager = get_global_dense_dwdp_manager()
     try:
-        with monitor_executor_initialization(), _StartupTimer(
-                "executor_creation") as startup_timer:
+        with ledger_startup_window(), monitor_executor_initialization(
+        ), _StartupTimer("executor_creation") as startup_timer:
             return _create_py_executor_impl(
                 _startup_timer=startup_timer,
                 llm_args=llm_args,
