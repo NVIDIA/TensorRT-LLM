@@ -61,6 +61,7 @@ from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._perf_metrics_schema import (
+    SERVER_TIMING_HEADER,
     DisaggPerfMetricsRecord,
     PerfMetrics,
     PerfMetricsRecord,
@@ -194,7 +195,6 @@ class DisaggPerfMetricsCollector:
         return self._metrics[key]
 
 
-SERVER_TIMING_HEADER = "Server-Timing"
 START_END_TIME_HEADER = "X-TRTLLM-Start-End-Time"
 STEP_METRICS_HEADER = "X-TRTLLM-Step-Metrics"
 CTX_CHUNK_METRICS_HEADER = "X-TRTLLM-Ctx-Chunk-Metrics"

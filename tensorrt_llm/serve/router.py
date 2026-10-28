@@ -94,14 +94,6 @@ class ServerState:
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
 
-    async def is_healthy(self) -> bool:
-        try:
-            async with self._session.get(
-                    f"{self._base_url}/health") as response:
-                return response.status == 200
-        except Exception:
-            return False
-
 
 class KvCacheAwareServerState(ServerState):
 
@@ -2047,7 +2039,6 @@ def build_disagg_routers(
     metadata_server: Optional[JsonDictionary] = None,
     server_preparation_func: Optional[Callable[[str], Awaitable[None]]] = None,
     disagg_node_id: int = 0,
-    is_delegating_client: bool = False,
 ) -> tuple[Router, Router]:
     """Build the ctx and gen routers for one disagg process.
 
@@ -2057,10 +2048,7 @@ def build_disagg_routers(
     caller (:class:`CoordinatorClient`) wraps those in a
     :class:`CoordinatorDelegatingRouter` so placement is delegated to the
     coordinator. Round-robin placement stays local.
-    ``is_delegating_client`` is accepted for call-site symmetry; router
-    construction itself does not depend on it.
     """
-    del is_delegating_client  # no build-time behavior differs by this flag
     ctx_router = create_router(ctx_router_config, ctx_servers,
                                metadata_server_cfg, metadata_server,
                                server_preparation_func, disagg_node_id)

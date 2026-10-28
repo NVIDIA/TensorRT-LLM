@@ -201,8 +201,6 @@ def is_non_default_or_required(param_name, value, explicit_cli_keys):
     # name (e.g. `--free_gpu_memory_fraction` constructs `kv_cache_config`).
     cli_derived_fields = {
         **SERVE_CLI_CONFIG_FIELDS,
-        "build_config":
-        ("max_batch_size", "max_num_tokens", "max_beam_width", "max_seq_len"),
     }
     if any(s in explicit_cli_keys
            for s in cli_derived_fields.get(param_name, ())):
