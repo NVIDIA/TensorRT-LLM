@@ -404,7 +404,10 @@ class Manager:
     _page_kv_heads = KVCacheManagerV2._page_kv_heads
     _page_dtype = KVCacheManagerV2._page_dtype
     _page_quant_mode = KVCacheManagerV2._page_quant_mode
-    _virtual_layers = KVCacheManagerV2._virtual_layers
+
+    def _virtual_layers(self):
+        """The model layers and attention types a test names in ``_layer_attn_to_layer_id``."""
+        return page_table.virtual_layers(getattr(self, "_layer_attn_to_layer_id", None))
 
     _model_has_attention_window = False
     _model_has_sparse_buffers = False

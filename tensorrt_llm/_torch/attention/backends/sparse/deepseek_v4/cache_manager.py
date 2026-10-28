@@ -29,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     _fill_kv_pages,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import virtual_layers
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -1476,6 +1477,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # The generic layers in the base config are replaced by
         # _build_cache_config, so their buffer sizes are only placeholders.
         return 1
+
+    def _virtual_layers(self):
+        """Each model layer keeps a cache per DeepSeek-V4 attention type."""
+        return virtual_layers(self._layer_attn_to_layer_id)
 
     def _page_untransferred_roles(self) -> frozenset[str]:
         """Storage-only NVFP4 alignment pages, which hold no state a peer needs."""

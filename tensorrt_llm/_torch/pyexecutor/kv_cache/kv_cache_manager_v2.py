@@ -3775,19 +3775,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _virtual_layers(self) -> tuple[dict[int, tuple[int, int]], int] | None:
         """(internal id -> (model layer, attention type), type count) of a manager keeping several
-        caches per model layer in ``_layer_attn_to_layer_id``, or None. An internal id shared by
-        several types takes its first: under DeepSeek-V4.1 long-range layers sharing a compressed
-        cache resolve to the layer that allocated it, which comes first on every pipeline stage."""
-        # Set only by managers that keep several caches per model layer (mixed precision,
-        # DeepSeek-V4, CSA2).
-        virtual = getattr(self, "_layer_attn_to_layer_id", None)
-        if not virtual:
-            return None
-        types_of: dict[int, tuple[int, int]] = {}
-        for (model_layer, attn_type), layer in virtual.items():
-            types_of.setdefault(int(layer), (int(model_layer), int(attn_type.value)))
-        # Every member of the enum counts, so stages holding different attention types agree.
-        return types_of, max(int(member.value) for member in type(next(iter(virtual))[1])) + 1
+        caches per model layer, which overrides this (``page_table.virtual_layers``); None: one
+        cache per model layer."""
+        return None
 
     @property
     def draft_prompt_lookahead(self) -> int:

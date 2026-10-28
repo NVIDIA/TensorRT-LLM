@@ -19,6 +19,7 @@ of the table, such as the lender, never look into the manager."""
 
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Mapping, Sequence
 
@@ -80,6 +81,24 @@ class ManagerLayout:
     def pool_groups(self) -> tuple[int, ...]:
         """The device pool groups, sorted; staging regions follow this order."""
         return tuple(sorted(self.device_pools))
+
+
+def virtual_layers(
+    attn_to_layer_id: Mapping[tuple[int, enum.Enum], int] | None,
+) -> tuple[dict[int, tuple[int, int]], int] | None:
+    """(internal id -> (model layer, attention type), type count) of a manager keeping several
+    caches per model layer, from its (model layer, attention type) -> internal id map; None for an
+    empty map. An internal id shared by several types takes its first: under DeepSeek-V4.1
+    long-range layers sharing a compressed cache resolve to the layer that allocated it, which
+    comes first on every pipeline stage. Every member of the attention-type enum counts, so stages
+    holding different attention types agree."""
+    if not attn_to_layer_id:
+        return None
+    types_of: dict[int, tuple[int, int]] = {}
+    for (model_layer, attn_type), layer in attn_to_layer_id.items():
+        types_of.setdefault(int(layer), (int(model_layer), int(attn_type.value)))
+    kinds = type(next(iter(attn_to_layer_id))[1])
+    return types_of, max(int(member.value) for member in kinds) + 1
 
 
 # -- what a layer config says ---------------------------------------------------------------------
