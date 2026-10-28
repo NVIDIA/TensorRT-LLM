@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import socket
 
@@ -15,6 +16,7 @@ from tensorrt_llm.logger import logger
 
 __all__ = [
     "init_torch_distributed",
+    "ensure_model_streamer_torch_distributed",
     "ensure_cutedsl_torch_distributed",
     "ensure_deepgemm_torch_distributed",
 ]
@@ -236,3 +238,74 @@ def ensure_deepgemm_torch_distributed() -> None:
         f"(rank={rank}, local_rank={local_rank}, "
         f"world_size={world_size}, master={host}:{port}, backend=nccl)"
     )
+
+
+def _select_model_streamer_endpoint(ranks_span_nodes: bool) -> tuple[str, str] | str:
+    """Select rank 0's address and a free port on rank 0's host.
+
+    Returns:
+        ``(address, port)``, or a message that says why rank 0 cannot select them.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("", 0))
+            port = str(sock.getsockname()[1])
+        address = socket.gethostbyname(socket.gethostname())
+    except OSError as error:
+        return f"rank 0 cannot select a rendezvous endpoint: {error}"
+    # Some /etc/hosts files map the hostname to a loopback address such as
+    # 127.0.1.1. Ranks on the same node can use it; ranks on other nodes cannot.
+    if ranks_span_nodes and ipaddress.ip_address(address).is_loopback:
+        return (
+            f"the hostname of rank 0 resolves to the loopback address {address}, which "
+            "ranks on other nodes cannot reach. Map the hostname to a routable address."
+        )
+    return address, port
+
+
+def ensure_model_streamer_torch_distributed(rank: int, world_size: int) -> None:
+    """Join the TRT-LLM MPI world with a NCCL group for node streaming.
+
+    All MPI ranks must participate when the group has not been initialized.
+    An existing group must match the requested mapping. A single rank needs
+    no group. Rank 0 always selects a fresh rendezvous endpoint and shares it
+    through MPI; inherited MASTER_ADDR/MASTER_PORT are neither used nor changed.
+
+    Args:
+        rank: Rank in the TRT-LLM model's MPI world.
+        world_size: Number of ranks in that world.
+
+    Raises:
+        RuntimeError: If the group or the MPI world does not match ``rank`` and
+            ``world_size``, or if rank 0 cannot select an endpoint that all ranks
+            can reach.
+    """
+    if world_size == 1:
+        return
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        if dist.get_rank() != rank or dist.get_world_size() != world_size:
+            raise RuntimeError("Torch distributed group does not match the TRT-LLM mapping")
+    else:
+        from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
+
+        if mpi_rank() != rank or mpi_world_size() != world_size:
+            raise RuntimeError("MPI world does not match the TRT-LLM mapping")
+
+        ranks_span_nodes = len(set(mpi_comm().allgather(socket.gethostname()))) > 1
+        # Every rank joins the broadcast; only rank 0 chooses the endpoint.
+        # When rank 0 cannot choose one, it broadcasts the reason, so that every
+        # rank raises instead of waiting.
+        # Launcher MASTER_ADDR/MASTER_PORT can describe an outer job: the
+        # context and generation servers of a disaggregated launch may inherit
+        # the same values, and their groups would then meet at one endpoint.
+        endpoint = mpi_comm().bcast(
+            _select_model_streamer_endpoint(ranks_span_nodes) if rank == 0 else None, root=0
+        )
+        if isinstance(endpoint, str):
+            raise RuntimeError(f"Cannot create the Model Streamer process group: {endpoint}")
+        address, port = endpoint
+        dist.init_process_group(
+            "nccl", init_method=f"tcp://{address}:{port}", rank=rank, world_size=world_size
+        )
