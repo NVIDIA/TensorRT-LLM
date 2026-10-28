@@ -21,7 +21,6 @@ from stat import S_ISREG
 from types import MappingProxyType
 from typing import (
     Any,
-    Callable,
     ClassVar,
     Dict,
     Generic,
