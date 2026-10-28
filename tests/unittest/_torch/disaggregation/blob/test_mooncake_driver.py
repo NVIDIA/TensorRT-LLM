@@ -928,7 +928,7 @@ def test_sessions_left_open_are_revoked_only_in_close() -> None:
     bench.run("get", "C")
     assert bench.keys_of(PUT_REVOKE) == [key("A")]  # only its own first try
     results, _ = bench.run("put", "A")  # the driver holds A's session: it starts no other
-    assert summary(results) == [("not_ready", None)]  # and no complete object exists
+    assert summary(results) == [("declined", None)]  # and no complete object exists
     assert bench.keys_of(PUT_START).count(key("A")) == 1
 
     assert bench.driver.drain(WAIT_S) is True  # sessions left open hold no lender memory
@@ -989,7 +989,7 @@ def test_a_put_whose_worker_thread_exits_leaves_its_session_open_for_close(
     assert key("A") in bench.fake.put_sessions
     assert bench.driver.stats()["put_sessions_left_for_close"] == 1
     results, _ = bench.run("put", "A")  # the driver holds A's session: it starts no other
-    assert summary(results) == [("not_ready", None)]
+    assert summary(results) == [("declined", None)]
     assert bench.keys_of(PUT_START).count(key("A")) == 1
     wait_for_an_escape(thread_escapes)
 
@@ -1028,7 +1028,8 @@ def test_a_key_whose_session_was_left_open_is_ready_once_its_object_exists(left:
     bench.run("put", "A")
     assert bench.driver.stats()[f"put_sessions_left_{left}"] == 1
     results, _ = bench.run("put", "A")
-    assert summary(results) == [("not_ready", None)]  # no complete object yet
+    assert summary(results) == [("declined", None)]  # no complete object, and none of its own
+    assert skipped_counts(bench) == {"rows_declined_held_by_session_left_open": 1}
     # The master freed the unfinished put, and another client then wrote the key whole.
     bench.fake.pool.reserved.pop(key("A"))
     bench.store(A=b"a" * SLOT)
