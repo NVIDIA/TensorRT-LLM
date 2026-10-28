@@ -17,6 +17,7 @@ from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.models.checkpoints import memory_init, model_hooks
 from tensorrt_llm._torch.models.checkpoints.gms import model_loading as gms_loading
 from tensorrt_llm._torch.models.checkpoints.mx import model_loading as mx_loading
+from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
@@ -198,14 +199,14 @@ def _install_gms_backend(monkeypatch, backend):
     monkeypatch.setattr(memory_mod, "GMSBackend", MagicMock(return_value=backend))
 
 
-class _PostTransformMxLoader:
-    checkpoint_format = "MX"
+class _PostTransformMxLoader(MXCheckpointLoader):
+    """MX loader whose P2P read delivers post-transform weights."""
 
     def __init__(self) -> None:
+        super().__init__()
         self.load_weights = MagicMock(side_effect=self._load_weights)
         self.is_weights_preloaded = MagicMock(return_value=True)
-        self.post_load_apply = MagicMock()
-        self.post_load_publish = MagicMock()
+        self.publish_as_source = MagicMock()
 
     @staticmethod
     def _load_weights(
@@ -360,15 +361,6 @@ def test_gms_ro_materializes_between_alias_setup_and_cache_state(monkeypatch):
     checkpoint_loader = MagicMock(name="checkpoint_loader")
     checkpoint_loader.checkpoint_format = "HF"
 
-    def record(event):
-        def _append(*_args, **_kwargs):
-            events.append(event)
-
-        return _append
-
-    checkpoint_loader.post_load_apply.side_effect = record("post_load_apply")
-    checkpoint_loader.post_load_publish.side_effect = record("post_load_publish")
-
     # The STRICT pre-materialize identity gate runs between alias setup and
     # materialization; record it to pin the ordering without exercising the
     # comparison logic, which is covered in test_source_identity.py.
@@ -381,12 +373,10 @@ def test_gms_ro_materializes_between_alias_setup_and_cache_state(monkeypatch):
     loader.load("/ckpt", checkpoint_loader)
 
     assert events == [
-        "post_load_apply",
         "setup_aliases",
         "check_source_identity",
         "materialize",
         "cache_derived_state",
-        "post_load_publish",
     ]
     assert "post_load_weights" not in events
     checkpoint_loader.load_weights.assert_not_called()
@@ -398,7 +388,7 @@ def test_gms_rw_post_load_runs_inside_pool_before_finalize(monkeypatch):
 
     The widened ``mem_pool_scope`` covers meta-tensor materialization,
     ``model.to('cuda')``, weight load, draft weight load, and the
-    post_load_* hooks. Only ``finalize_write`` runs after the pool closes,
+    post-load hooks. Only ``finalize_write`` runs after the pool closes,
     so the committed layout reflects the post-post_load model. Asserts the
     exact ordering so a future refactor cannot silently re-narrow the scope.
     """
@@ -421,12 +411,6 @@ def test_gms_rw_post_load_runs_inside_pool_before_finalize(monkeypatch):
     checkpoint_loader = MagicMock(name="checkpoint_loader")
     checkpoint_loader.checkpoint_format = "HF"
     checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
-    checkpoint_loader.post_load_apply.side_effect = lambda *_a, **_kw: events.append(
-        "post_load_apply"
-    )
-    checkpoint_loader.post_load_publish.side_effect = lambda *_a, **_kw: events.append(
-        "post_load_publish"
-    )
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
@@ -436,10 +420,8 @@ def test_gms_rw_post_load_runs_inside_pool_before_finalize(monkeypatch):
         "to",
         "load_weights",
         "load_draft_weights",
-        "post_load_apply",
         "post_load_weights",
         "move_untracked_params",
-        "post_load_publish",
         "pool_exit",
         "finalize_write",
     ]
@@ -456,8 +438,6 @@ def test_gms_rw_post_load_runs_inside_pool_before_finalize(monkeypatch):
         "to",
         "load_weights",
         "load_draft_weights",
-        "post_load_apply",
-        "post_load_publish",
         "post_load_weights",
         "move_untracked_params",
     ):
@@ -492,10 +472,11 @@ def test_gms_rw_loader_preload_skips_mapping_pipeline(monkeypatch):
     backend = _build_gms_backend(is_rw=True, events=events)
     _install_gms_backend(monkeypatch, backend)
 
-    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader = MagicMock(spec=MXCheckpointLoader, name="checkpoint_loader")
     checkpoint_loader.checkpoint_format = "MX"
     checkpoint_loader.load_weights.return_value = {}
     checkpoint_loader.is_weights_preloaded.return_value = True
+    checkpoint_loader.is_post_transform_weights_preloaded.return_value = False
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
@@ -522,11 +503,8 @@ def test_gms_rw_mx_post_transform_preload_uses_staged_path(monkeypatch):
     _install_gms_backend(monkeypatch, backend)
 
     checkpoint_loader = _PostTransformMxLoader()
-    checkpoint_loader.post_load_apply.side_effect = lambda *_a, **_kw: events.append(
-        "post_load_apply"
-    )
-    checkpoint_loader.post_load_publish.side_effect = lambda *_a, **_kw: events.append(
-        "post_load_publish"
+    checkpoint_loader.publish_as_source.side_effect = lambda *_a, **_kw: events.append(
+        "publish_as_source"
     )
 
     model, _ = loader.load("/ckpt", checkpoint_loader)
@@ -536,11 +514,10 @@ def test_gms_rw_mx_post_transform_preload_uses_staged_path(monkeypatch):
         "_apply",
         "to",
         "setup_aliases",
-        "post_load_apply",
         "setup_aliases",
         "cache_derived_state",
         "move_untracked_params",
-        "post_load_publish",
+        "publish_as_source",
         "pool_exit",
         "finalize_write",
     ]
@@ -552,17 +529,14 @@ def test_gms_rw_mx_post_transform_preload_uses_staged_path(monkeypatch):
     source_identity = _gms_load_source_identity()
     assert source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
     model_hooks.call_load_weights.assert_not_called()
-    checkpoint_loader.post_load_publish.assert_called_once_with(
-        model,
-        checkpoint_dir="/ckpt",
-        weights_preloaded=True,
-        source_identity=source_identity,
+    checkpoint_loader.publish_as_source.assert_called_once_with(
+        model, source_identity=source_identity
     )
     backend.finalize_write.assert_called_once_with(model)
 
 
 def test_gms_rw_no_load_and_no_preload_raises(monkeypatch):
-    """RW + empty ``weights`` + ``is_weights_preloaded()=False`` is a bug.
+    """RW + empty ``weights`` from a loader that did not preload them is a bug.
 
     Without weights and without a loader-driven preload, the model is
     not populated. Committing it to GMS would expose an uninitialized
@@ -576,7 +550,6 @@ def test_gms_rw_no_load_and_no_preload_raises(monkeypatch):
     checkpoint_loader = MagicMock(name="checkpoint_loader")
     checkpoint_loader.checkpoint_format = "HF"
     checkpoint_loader.load_weights.return_value = {}
-    checkpoint_loader.is_weights_preloaded.return_value = False
 
     with pytest.raises(RuntimeError, match="Refusing to commit an unpopulated model"):
         loader.load("/ckpt", checkpoint_loader)

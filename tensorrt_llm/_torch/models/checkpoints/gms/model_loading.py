@@ -144,7 +144,6 @@ def load_gms_weights(
             _load_gms_reader_weights(
                 gms_backend,
                 model,
-                checkpoint_dir=checkpoint_dir,
                 checkpoint_loader=checkpoint_loader,
                 qualification=qualification,
                 source_identity=source_identity,
@@ -231,7 +230,7 @@ def _load_gms_writer_weights(
         with timing_metric(ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.value, metrics):
             weights = checkpoint_loader.load_weights(weight_source, **load_weights_kwargs)
 
-        weights_preloaded = checkpoint_loader.is_weights_preloaded()
+        weights_preloaded = mx_loading.is_mx_weights_preloaded(checkpoint_loader)
         check_gms_writer_weights_loaded(checkpoint_loader, weights, weights_preloaded)
         if weights:
             weight_mapper = checkpoint_loader.get_initialized_weight_mapper(model, config)
@@ -257,7 +256,6 @@ def _load_gms_writer_weights(
             # in GMS and become part of the committed layout that RO peers
             # receive. Closes hhzhang16's narrow-scope and commit-ordering
             # concerns.
-            checkpoint_loader.post_load_apply(model, weights_preloaded=weights_preloaded)
             mx_loading.run_post_load_walks(
                 checkpoint_loader,
                 model,
@@ -265,10 +263,9 @@ def _load_gms_writer_weights(
                 qualification=qualification,
             )
             move_stray_params_into_gms_pool(gms_backend, model)
-            mx_loading.post_load_publish(
+            mx_loading.publish_mx_weights(
                 checkpoint_loader,
                 model,
-                checkpoint_dir=checkpoint_dir,
                 weights_preloaded=weights_preloaded,
                 qualification=qualification,
                 source_identity=source_identity,
@@ -316,7 +313,6 @@ def _load_gms_reader_weights(
     gms_backend: "GMSBackend",
     model: "DecoderModelForCausalLM",
     *,
-    checkpoint_dir: str,
     checkpoint_loader: "BaseCheckpointLoader",
     qualification: PostTransformQualificationDecision,
     source_identity: Optional[SourceIdentity],
@@ -325,39 +321,35 @@ def _load_gms_reader_weights(
     """Zero-copy map the committed GMS weights into ``model``.
 
     Weights come from a GMS donor that has already committed the
-    post-post_load layout, so the reader passes ``weights_preloaded=True`` to
-    the checkpoint-loader hooks. This prevents duplicate transforms while
-    leaving any reader-side publication policy to the format-specific hook.
+    post-post_load layout, so the reader publishes with
+    ``weights_preloaded=True``. This prevents duplicate transforms while
+    leaving any reader-side publication policy to MX.
 
     Hook order:
 
-    1. ``post_load_apply``: format-specific apply work (e.g. MX preshard
-       markers).
-    2. Per-module ``setup_aliases``: creates structural aliases BEFORE
+    1. Per-module ``setup_aliases``: creates structural aliases BEFORE
        ``materialize_module`` walks the final module tree (including
        ``draft_model`` for spec dec).
-    3. SourceIdentity gate: STRICT pre-materialize compatibility check (GMS
+    2. SourceIdentity gate: STRICT pre-materialize compatibility check (GMS
        has no disk fallback).
-    4. ``materialize_module``: zero-copy bind GMS pool storage onto the model
+    3. ``materialize_module``: zero-copy bind GMS pool storage onto the model
        parameters.
-    5. Per-module ``cache_derived_state``: recompute Python-side state from
+    4. Per-module ``cache_derived_state``: recompute Python-side state from
        real, materialized tensors without re-running one-shot transforms.
-    6. ``post_load_publish``: apply the format-specific reader publication
+    5. `mx_loading.publish_mx_weights`: apply the MX reader publication
        policy.
     """
     # Imported here because model_loader.py imports this module.
     from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoaderMetricNames
 
     with timing_metric(ModelLoaderMetricNames.POST_LOAD_PROCESSING_SECONDS.value, metrics):
-        checkpoint_loader.post_load_apply(model, weights_preloaded=True)
         model_hooks.setup_aliases(model)
         check_gms_source_identity(source_identity, gms_backend)
         gms_backend.materialize_module(model)
         model_hooks.walk_cache_state(model)
-        mx_loading.post_load_publish(
+        mx_loading.publish_mx_weights(
             checkpoint_loader,
             model,
-            checkpoint_dir=checkpoint_dir,
             weights_preloaded=True,
             qualification=qualification,
             source_identity=source_identity,
