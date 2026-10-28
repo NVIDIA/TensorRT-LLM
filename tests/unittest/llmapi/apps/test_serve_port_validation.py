@@ -20,6 +20,9 @@ import pytest
 import tensorrt_llm.commands.serve as serve_mod
 from tensorrt_llm.commands.serve import launch_server
 
+# The CPU CI stage runs pytest with -m cpu_only and skips files without this marker.
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("port", [0, -1])
 def test_launch_server_rejects_nonpositive_port_without_disagg(port: int) -> None:
