@@ -166,6 +166,8 @@ unittest/_torch/executor/kv_cache/test_kv_cache_v2_vocab_size.py::test_branch_on
 unittest/_torch/executor/kv_cache/test_kv_cache_v2_vocab_size.py::test_branch_only_enables_multimodal_keys_when_needed[qwen3_5_hybrid-text_only] SKIP (https://nvbugs/6818710)
 unittest/_torch/executor/kv_cache/test_kv_cache_v2_vocab_size.py::test_unresolvable_vocab_size_only_warns_when_multimodal_keys_are_needed[False] SKIP (https://nvbugs/6818710)
 unittest/_torch/executor/kv_cache/test_kv_cache_v2_vocab_size.py::test_unresolvable_vocab_size_only_warns_when_multimodal_keys_are_needed[True] SKIP (https://nvbugs/6818710)
+unittest/_torch/executor/test_pytorch_model_engine.py::DecoderForwardTestCase::test_mrope_mixed_batched_and_fallback_positions_match_fallback SKIP (https://nvbugs/7003540)
+unittest/_torch/executor/test_pytorch_model_engine.py::DecoderForwardTestCase::test_mrope_multi_beam_generation_positions SKIP (https://nvbugs/7003540)
 unittest/_torch/executor/test_pytorch_model_engine.py::PyTorchModelEngineTestCase::test_prepare_inputs_with_helix_parallelism SKIP (https://nvbugs/6818710)
 unittest/_torch/kernels/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_backend[mnk2-cublaslt] SKIP (https://nvbugs/6581067)
 unittest/_torch/kernels/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_backend[mnk2-cutlass] SKIP (https://nvbugs/6581067)
