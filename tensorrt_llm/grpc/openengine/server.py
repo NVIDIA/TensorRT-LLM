@@ -225,11 +225,7 @@ class OpenEngineServer:
                 except (RuntimeError, ValueError, OSError, CoordinationError) as error:
                     logger.warning(f"OpenEngine inference health check failed: {error}")
                     self._engine_healthy = False
-                executor = getattr(self._llm, "_executor", None)
-                if executor is not None and (
-                    getattr(executor, "_fatal_error", None) is not None
-                    or getattr(executor, "_engine_dead", False)
-                ):
+                if self._llm.engine_dead:
                     self._fatal_engine_failure = True
             if self._stopping:
                 return
@@ -422,11 +418,7 @@ def launch_server(
             )
 
         def terminal_engine_failure() -> bool:
-            executor = getattr(llm, "_executor", None)
-            return executor is not None and (
-                getattr(executor, "_fatal_error", None) is not None
-                or getattr(executor, "_engine_dead", False)
-            )
+            return llm.engine_dead
 
         async def supervise() -> None:
             while not stop_event.is_set():
@@ -438,7 +430,7 @@ def launch_server(
                     return
                 if server is None:
                     engine_ready = await asyncio.wait_for(
-                        asyncio.to_thread(llm._check_health),
+                        asyncio.to_thread(llm.check_health),
                         timeout=_HEALTH_CHECK_TIMEOUT_SECONDS,
                     )
                     if server is None and not engine_ready:
