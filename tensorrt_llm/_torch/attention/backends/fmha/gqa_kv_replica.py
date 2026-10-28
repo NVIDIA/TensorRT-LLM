@@ -56,6 +56,9 @@ def _kv_replica_prep_kernel(
     extra_o,
     extra_lse,
     valid,
+    q_loc,
+    ql_stride_tok,
+    ql_stride_head,
     QL: tl.constexpr,
     HQL: tl.constexpr,
     CP: tl.constexpr,
@@ -70,6 +73,7 @@ def _kv_replica_prep_kernel(
     BQL: tl.constexpr = 8,
     HAS_BMM1_PTR: tl.constexpr = False,
     HAS_BMM2_PTR: tl.constexpr = False,
+    DRAFT_PRE_WAIT: tl.constexpr = False,
 ):
     """Programs [0, num_req * S): the page-strided segment table / length (and the folded q) of one FMHA request
     (request order s * num_req + r). Programs [num_req * S, + rows * HQL): the causal draft-block partial of one
@@ -95,6 +99,9 @@ def _kv_replica_prep_kernel(
             extra_o,
             extra_lse,
             valid,
+            q_loc,
+            ql_stride_tok,
+            ql_stride_head,
             num_req,
             QL,
             HQL,
@@ -106,6 +113,7 @@ def _kv_replica_prep_kernel(
             HAS_BMM1_PTR,
             HAS_BMM2_PTR,
             LAUNCH_WITH_PDL,
+            DRAFT_PRE_WAIT,
         )
     else:
         _cp_prep_table(
@@ -231,6 +239,9 @@ def _cp_prep_draft(
     extra_o,
     extra_lse,
     valid,
+    q_loc,
+    ql_stride_tok,
+    ql_stride_head,
     num_req,
     QL: tl.constexpr,
     HQL: tl.constexpr,
@@ -242,6 +253,7 @@ def _cp_prep_draft(
     HAS_BMM1_PTR: tl.constexpr,
     HAS_BMM2_PTR: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    DRAFT_PRE_WAIT: tl.constexpr,
 ):
     """Draft-block partial (O, base-2 LSE) of (row, own head h) = divmod(dp, HQL) -> extra_o / extra_lse. The h == 0
     program of each row also writes valid[c, s, row] = (member c's segment s of this row's request is non-empty): an
@@ -251,7 +263,7 @@ def _cp_prep_draft(
     r = row // QL
     t = row % QL
     d = tl.arange(0, D)
-    # Pre-wait: host-uploaded lengths / block tables only.
+    # Pre-wait: host-uploaded lengths / block tables (and the DRAFT_PRE_WAIT draft block below).
     L = tl.load(seq_lens + r)
     j = tl.arange(0, BQL)
     jmask = (j <= t) & (j < QL)
@@ -260,6 +272,32 @@ def _cp_prep_draft(
     blk_k = tl.load(tab + pos // PAGE, mask=jmask, other=0).to(tl.int64)
     blk_v = tl.load(tab + table_stride_kv + pos // PAGE, mask=jmask, other=0).to(tl.int64)
     off = (pos % PAGE).to(tl.int64)
+    if DRAFT_PRE_WAIT:
+        # Only behind a q all-gather that releases this grid after ITS wait (kv_replica_decode): the QKV preprocess
+        # (this rank's q = q_loc, the draft K/V, the scales) has completed, so the draft overlaps the exchange.
+        o_suf, lse_suf = draft_block(
+            q_loc,
+            ql_stride_tok,
+            ql_stride_head,
+            h,
+            kv_pool,
+            0,
+            blk_k,
+            blk_v,
+            off,
+            jmask,
+            row,
+            bmm1_ptr,
+            bmm1_val,
+            bmm2_ptr,
+            bmm2_val,
+            d,
+            1,
+            PAGE,
+            D,
+            HAS_BMM1_PTR,
+            HAS_BMM2_PTR,
+        )
     if LAUNCH_WITH_PDL:
         gdc_wait_with_memory_clobber()
     # Writes only after the wait (fresh allocations, see _cp_prep_table).
@@ -269,30 +307,31 @@ def _cp_prep_draft(
             for sg in tl.static_range(S):
                 _, _, n_seg, _ = seg_geometry(L, sg, QL, S, PAGE, CP, c)
                 tl.store(valid + (c * S + sg) * rows + row, (n_seg > 0).to(tl.int32))
-    # This rank's own q: member `rank` of the all-gather.
-    o_suf, lse_suf = draft_block(
-        q_all + rank * q_stride_src,
-        q_stride_tok,
-        q_stride_head,
-        h,
-        kv_pool,
-        0,
-        blk_k,
-        blk_v,
-        off,
-        jmask,
-        row,
-        bmm1_ptr,
-        bmm1_val,
-        bmm2_ptr,
-        bmm2_val,
-        d,
-        1,
-        PAGE,
-        D,
-        HAS_BMM1_PTR,
-        HAS_BMM2_PTR,
-    )
+    if not DRAFT_PRE_WAIT:
+        # This rank's own q: member `rank` of the all-gather.
+        o_suf, lse_suf = draft_block(
+            q_all + rank * q_stride_src,
+            q_stride_tok,
+            q_stride_head,
+            h,
+            kv_pool,
+            0,
+            blk_k,
+            blk_v,
+            off,
+            jmask,
+            row,
+            bmm1_ptr,
+            bmm1_val,
+            bmm2_ptr,
+            bmm2_val,
+            d,
+            1,
+            PAGE,
+            D,
+            HAS_BMM1_PTR,
+            HAS_BMM2_PTR,
+        )
     tl.store(extra_o + (row.to(tl.int64) * HQL + h) * D + d, o_suf.to(extra_o.dtype.element_ty))
     tl.store(extra_lse + row.to(tl.int64) * HQL + h, lse_suf)
     if LAUNCH_WITH_PDL:
@@ -315,9 +354,14 @@ def kv_replica_partial_merge_free(
     counter: torch.Tensor,
     enable_pdl: bool,
     out_dtype: torch.dtype = torch.bfloat16,
+    q_local: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """This rank's partials for TPGroupExchange.alltoall_merge with extra_o / extra_lse (no local merge kernel): the
     segmented decode (gqa_segmented_decode.py) of the pages this rank owns, for every head of the KV group.
+
+    Args:
+        q_local: [b * q_len, Hq_local, D], this rank's own q, read by the draft programs BEFORE the prep kernel's
+            wait. Only valid when the q all-gather releases its dependents after its own wait on the QKV preprocess.
 
     Returns:
         o [cp, S, b * q_len, Hq_local, D] (group head d * Hq_local + h for destination d) and lse [cp, S, b * q_len,
@@ -375,6 +419,9 @@ def kv_replica_partial_merge_free(
         extra_o,
         extra_lse,
         valid,
+        q_local if q_local is not None else q_all,
+        q_local.stride(0) if q_local is not None else 0,
+        q_local.stride(1) if q_local is not None else 0,
         QL=q_len,
         HQL=HQL,
         CP=CP,
@@ -389,6 +436,7 @@ def kv_replica_partial_merge_free(
         BQL=max(2, triton.next_power_of_2(q_len)),
         HAS_BMM1_PTR=has_b1,
         HAS_BMM2_PTR=has_b2,
+        DRAFT_PRE_WAIT=q_local is not None,
         num_warps=8,
         launch_pdl=enable_pdl,
     )
@@ -415,7 +463,8 @@ def _allgather_q(exchange, q: torch.Tensor, enable_pdl: bool) -> torch.Tensor:
     """q of every member of the KV group, [cp, b * q_len, Hq_local, D] (channel 0).
 
     With PDL the all-gather releases its dependents right after its own wait on the QKV preprocessing; before their
-    own wait they read only host-uploaded lengths / tables and KV written by earlier steps.
+    own wait they read only host-uploaded lengths / tables, KV written by earlier steps and the preprocess outputs
+    (this rank's q, the step's K/V, the scales).
     """
     rows, hq, d = q.shape
     trigger = "after_wait" if enable_pdl else False
@@ -512,6 +561,7 @@ def kv_replica_decode(
         counter,
         enable_pdl,
         out_dtype=out.dtype,
+        q_local=q if enable_pdl else None,
     )
     exchange.alltoall_merge(
         o,
