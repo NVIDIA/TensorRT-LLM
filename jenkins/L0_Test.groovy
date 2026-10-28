@@ -2476,7 +2476,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
             }
 
-            stage("[${stageName}] Run Pytest") {
+            runPytestStage(stageName) {
                 // Submit the Slurm job. Submit/metadata/track all run on the one
                 // frontend the enclosing withSlurmFrontendFailover pinned, so they
                 // share the job workspace (slurm_job_id.txt, scripts) on that login
@@ -5006,7 +5006,7 @@ Map refreshFailedTestWaives(String llmSrc, String stageName, Map options = [:]) 
             "WAIVE_REFRESH_EXPECTED=${(options.expectedTestLists ?: []).join(':')}",
             "WAIVE_REFRESH_ISOLATED=${options.isolatedTestList ?: ''}",
         ]) {
-            status = sh(returnStatus: true, script: '''
+            status = sh(label: 'Check failed tests against latest TOT waives', returnStatus: true, script: '''
                 python3 "$WAIVE_REFRESH_SCRIPT" \
                     --result-dir "$WAIVE_REFRESH_RESULTS" \
                     --stage-name "$WAIVE_REFRESH_STAGE" \
@@ -5027,7 +5027,23 @@ Map refreshFailedTestWaives(String llmSrc, String stageName, Map options = [:]) 
         }
         // The script refuses to run over an existing report, so one present now is its own.
         def reportPath = "${auditDir}/report.json"
-        def report = fileExists(reportPath) ? readJSON(text: readFile(reportPath), returnPojo: true) : null
+        def report = null
+        try {
+            report = fileExists(reportPath) ? readJSON(text: readFile(reportPath), returnPojo: true) : null
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            echo "Could not read the TOT waive details for ${stageName}: ${e.message}"
+        }
+        def waived = report?.waived ?: []
+        def retained = report?.remaining_failures ?: []
+        def summary = report == null ? verdict :
+            "${waived.collect { it.test }.unique().size()} skipped, ${retained.collect { it.test }.unique().size()} retained"
+        stage("[${stageName}] TOT Waive Result: ${summary}") {
+            echo "TOT waive result: ${verdict}. Full report: ${stageName}/waive_refresh/report.json in the test-results artifact."
+            waived.each { entry -> echo "SKIPPED by new TOT waive: ${entry.test}; ${entry.reason}" }
+            retained.each { entry -> echo "FAILURE RETAINED: ${entry.test}; ${entry.reason}" }
+        }
         return [allFailuresWaived: status == 0, report: report]
     } catch (InterruptedException e) {
         throw e
@@ -5290,6 +5306,25 @@ def priorAttemptTags(String postTag) {
     return priors
 }
 
+// Annotate a step before nested stages so Jenkins colors Run Pytest itself.
+// Rethrow the original exception to preserve failure classification and retries.
+def runPytestStage(String stageName, Closure body) {
+    stage("[${stageName}] Run Pytest") {
+        def stageFailure = null
+        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
+            try {
+                body()
+            } catch (Throwable e) {
+                stageFailure = e
+                throw e
+            }
+        }
+        if (stageFailure != null) {
+            throw stageFailure
+        }
+    }
+}
+
 def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map retryContext=null)
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
@@ -5446,7 +5481,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
     }
 
-    stage ("[${stageName}] Run Pytest")
+    runPytestStage(stageName)
     {
         def noRegularTests = false
         def noIsolateTests = false
@@ -5796,8 +5831,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         // Checked after perfMode so perf artifacts are generated first.
-        // Unguarded error() on purpose -- catchError here would swallow the
-        // throw that cacheErrorAndUploadResult relies on to fail the build.
+        // The exception must reach cacheErrorAndUploadResult to fail the build.
         if (rerunFailed) {
             error "Some tests still failed after rerun attempts, please check the test report."
         }
