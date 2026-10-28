@@ -179,7 +179,7 @@ def test_k3_native_change_keeps_existing_kernel_and_collective_tests(rule):
     norm = "unittest/_torch/modeling_v2/norm/test_modeling_v2_attn_res_rmsnorm_fwd.py"
     rule.yaml_index.blocks[2].tests.append(norm)
     result = _apply(rule, f"{_PY}/models/kimi_k3_vl/csrc/k3MnnvlAllreduce.cu")
-    assert kernel_tests | {matrix, norm, _COMM} <= _selected(result)
+    assert _selected(result) == kernel_tests | {matrix, norm, _COMM, _UNIT, _CLAIMS}
     assert "B200-PyTorch-1" in result.affected_stages
     assert result.scope == "modelingv2only"
     other = _selected(_apply(rule, f"{_PY}/models/gpt_oss/csrc/kernel.cu"))
