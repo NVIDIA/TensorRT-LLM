@@ -7914,7 +7914,7 @@
       "type": "string"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc2/_static/schemas/trtllm-serve-disagg-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc2.post1/_static/schemas/trtllm-serve-disagg-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Static YAML checks only; runtime validation remains authoritative.",
@@ -9584,6 +9584,6 @@
     }
   },
   "required": [],
-  "title": "TensorRT-LLM 1.4.0rc2 trtllm-serve disaggregated --config",
+  "title": "TensorRT-LLM 1.4.0rc2.post1 trtllm-serve disaggregated --config",
   "type": "object"
 }
